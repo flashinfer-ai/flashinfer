@@ -10300,12 +10300,17 @@ def test_ssd_combined_fwd_state_dtype_without_state_tensors(state_dtype):
 def test_cake_ssd_combined_caller_final_states_validation():
     """A caller ``final_states`` must be returned (``return_final_states``),
     match the state shape, dtype and contiguity, and not overlap the
-    initial or checkpoint states."""
+    initial or checkpoint states.  A strided dense ``initial_states`` is
+    packed before the launch: a ``final_states`` in the gaps between its
+    rows (but on none of its elements) is accepted and gives the same
+    result."""
 
     _skip_unless_cake_arch()
     constructor, tensors, arguments = _case(varlen=False)
     runner = SSDCombined(**constructor, backend="cake")
-    _, final = runner.run(*tensors, **arguments)
+    out, final = runner.run(*tensors, **arguments)
+    out = out.clone()
+    final = final.clone()
     with pytest.raises(ValueError, match="return_final_states"):
         runner.run(
             *tensors,
@@ -10321,6 +10326,26 @@ def test_cake_ssd_combined_caller_final_states_validation():
             runner.run(*tensors, **arguments, final_states=bad)
     with pytest.raises(ValueError, match="must not overlap initial_states"):
         runner.run(*tensors, **arguments, final_states=arguments["initial_states"])
+    # Rows 0 and 4 of a five-row storage hold the initial states, rows 2..3
+    # take the final states: disjoint elements inside the initial extent.
+    storage = torch.zeros((5, *final.shape[1:]), dtype=final.dtype, device=final.device)
+    strided = storage[::4]
+    strided.copy_(arguments["initial_states"])
+    run_out, run_final = runner.run(
+        *tensors,
+        **{**arguments, "initial_states": strided},
+        final_states=storage[2:4],
+    )
+    assert run_final.data_ptr() == storage[2:4].data_ptr()
+    assert torch.equal(run_out, out) and torch.equal(run_final, final)
+    # Contiguous dense views that share a row still race and are refused.
+    storage[:2].copy_(arguments["initial_states"])
+    with pytest.raises(ValueError, match="must not overlap initial_states"):
+        runner.run(
+            *tensors,
+            **{**arguments, "initial_states": storage[:2]},
+            final_states=storage[1:3],
+        )
 
 
 def test_cake_ssd_combined_rejects_state_rows_beyond_32_bit_offsets():

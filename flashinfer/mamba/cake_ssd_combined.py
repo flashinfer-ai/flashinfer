@@ -5131,6 +5131,13 @@ class CakeSSDCombined:
                     raise ValueError(
                         f"initial_states must have shape {expected_states}"
                     )
+        # A non-contiguous dense ``initial_states`` is packed into a private
+        # workspace buffer before the launch (``_contiguous_input``), so only an
+        # initial pool or a contiguous dense tensor can alias a state the call
+        # stores.
+        initial_in_place = initial_states is not None and (
+            initial_state_slots is not None or initial_states.is_contiguous()
+        )
         if final_states is not None:
             if not return_final_states:
                 raise ValueError("final_states requires return_final_states=True")
@@ -5166,7 +5173,10 @@ class CakeSSDCombined:
                 and _same_tensor(final_states, initial_states)
             )
             for name, other in (
-                ("initial_states", None if same_pool else initial_states),
+                (
+                    "initial_states",
+                    None if same_pool or not initial_in_place else initial_states,
+                ),
                 ("checkpoint_states", None if state_slots else checkpoint_states),
             ):
                 if other is not None and _storage_overlaps(final_states, other):
@@ -5179,7 +5189,11 @@ class CakeSSDCombined:
             # host cannot check without reading the slot values); any other
             # overlap with either state tensor, pool or dense, is refused.
             for name, other, pool in (
-                ("initial_states", initial_states, initial_state_slots is not None),
+                (
+                    "initial_states",
+                    initial_states if initial_in_place else None,
+                    initial_state_slots is not None,
+                ),
                 ("final_states", final_states, final_state_slots is not None),
             ):
                 if other is None or (pool and _same_tensor(checkpoint_states, other)):

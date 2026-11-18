@@ -548,8 +548,48 @@ def main() -> None:
             return runner.run(*arms["cake"]["tensors"], **arguments, out=out)
 
         slot_out, _ = invoke_slots()
+        # The timed calls keep updating the pool in place: read the final rows
+        # of this first call now.
+        final_rows = arguments["final_state_slots"].long()
+        slot_final = arguments["final_states"][final_rows].clone()
         slot_fields["program"] = runner._cake_runner.last_program_name
-        slot_fields["out_vs_cake"] = _diagnostic(slot_out, outputs["cake"][0])
+        flags = arguments.get("initial_state_flags")
+        if flags is None:
+            dense_out, dense_final = outputs["cake"]
+            slot_fields["out_vs_cake_reference"] = "dense_cake"
+        else:
+            # A sequence whose flag is 0 starts from a zero state whatever its
+            # pool row holds: compare with a dense Cake call on the
+            # flag-masked initial states, so both sides run one recurrence.
+            masked = initial_states * flags.view(-1, 1, 1, 1).to(initial_states.dtype)
+            dense_runner = SSDCombined(
+                chunk_size=128,
+                nheads=args.nheads,
+                headdim=64,
+                dstate=128,
+                ngroups=args.ngroups,
+                io_dtype=torch.bfloat16,
+                state_dtype=torch.bfloat16,
+                has_d=True,
+                d_has_hdim=False,
+                has_initial_states=True,
+                has_varlen=True,
+                has_z=args.has_z,
+                seq_idx_dtype=torch.int32,
+                backend="cake",
+            )
+            dense_arguments = {
+                **arms["cake"]["arguments"],
+                "initial_states": masked,
+                "num_seqs": None,
+            }
+            dense_out, dense_states = dense_runner.run(
+                *arms["cake"]["tensors"], **dense_arguments, out=torch.empty_like(out)
+            )
+            dense_final = dense_states[:num_sequences]
+            slot_fields["out_vs_cake_reference"] = "dense_cake_flag_masked_states"
+        slot_fields["out_vs_cake"] = _diagnostic(slot_out, dense_out)
+        slot_fields["final_states_vs_cake"] = _diagnostic(slot_final, dense_final)
         samples = bench_gpu_time(
             invoke_slots,
             enable_cupti=True,
