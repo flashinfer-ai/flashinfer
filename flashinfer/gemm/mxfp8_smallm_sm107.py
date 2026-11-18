@@ -46,6 +46,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from ..autotuner import TunableRunner
 from ..jit.gemm.mxfp8_smallm_sm107 import gen_mm_mxfp8_smallm_sm107_module
 from ..utils import get_compute_capability
 
@@ -267,6 +268,44 @@ def _specialized_supported(
     return _device_supported(a)
 
 
+def specialized_mm_mxfp8_eligible(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    use_8x4_sf_layout: bool,
+) -> Optional[str]:
+    """Eligibility probe for auto/autotune candidacy; ``None`` = eligible.
+
+    Identical to the dispatch guards, but tolerates ``out=None`` (the probe
+    runs before ``mm_mxfp8`` allocates its output, which is a fresh
+    contiguous, aligned tensor of ``out_dtype`` and therefore passes the
+    output guards by construction).
+    """
+    if out is None:
+        if out_dtype != torch.bfloat16:
+            return "out_dtype"
+        out = _PROBE_OUT
+    reason = _specialized_supported(
+        a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+    )
+    if reason is not None:
+        return reason
+    # Candidacy requires a loadable kernel: the JIT module builds once here
+    # (cached; failures are logged once) so backend="auto" never selects a
+    # candidate whose forward would fail.
+    if _get_specialized_module() is None:
+        return "jit_unavailable"
+    return None
+
+
+# Stands in for a fresh allocation in the ``out=None`` eligibility probe:
+# bf16, contiguous, allocator-aligned — exactly what mm_mxfp8 will allocate.
+_PROBE_OUT = torch.empty(1, dtype=torch.bfloat16)
+
+
 def _launch_specialized(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -284,6 +323,57 @@ def _launch_specialized(
         return False
     module.mm_mxfp8_smallm_sm107_run(a, b.t(), a_descale, b_descale, out)
     return True
+
+
+class SpecializedMxfp8SmallMRunner(TunableRunner):
+    """``TunableRunner`` for the specialized kernel: a first-class autotune
+    candidate of ``mm_mxfp8``.
+
+    The kernel has a single fixed tactic (``-1``); ``get_valid_tactics``
+    returns it only when the synthesized/real inputs are on the measured
+    allowlist (and the JIT module loads), so the autotuner races the kernel
+    as itself exactly where it is dispatchable and skips it elsewhere.
+    ``supports_inputs`` / ``is_tactic_compatible`` let bucketed cache
+    entries recorded on an allowlisted shape fall back on shapes the kernel
+    does not serve.
+    """
+
+    def __init__(self, use_8x4_sf_layout: bool = False):
+        self._use_8x4_sf_layout = use_8x4_sf_layout
+
+    def get_cache_key_extras(self, inputs) -> tuple:
+        a, b, _, _, _, out, _ = inputs
+        return (a.dtype, b.dtype, out.dtype)
+
+    def _eligible(self, inputs) -> bool:
+        a, b, a_descale, b_descale, _, out, _ = inputs
+        reason = _specialized_supported(
+            a, b, a_descale, b_descale, out, out.dtype, self._use_8x4_sf_layout
+        )
+        return reason is None and _get_specialized_module() is not None
+
+    def supports_inputs(self, inputs) -> bool:
+        return self._eligible(inputs)
+
+    def is_tactic_compatible(self, inputs, tactic) -> bool:
+        return tactic in (-1, 0) and self._eligible(inputs)
+
+    def get_valid_tactics(self, inputs, profile):
+        return [-1] if self._eligible(inputs) else []
+
+    def precompile_tactics(self, inputs, tactics, profile, **kwargs) -> bool:
+        _get_specialized_module()
+        return True
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        a, b, a_descale, b_descale, _, out, _ = inputs
+        if not _launch_specialized(a, b, a_descale, b_descale, out):
+            raise RuntimeError(
+                "mm_mxfp8 specialized SM107 kernel: JIT module unavailable "
+                f"({_stats['module_error']})"
+            )
+        _stats["backend_dispatches"]["specialized"] += 1
+        return out
 
 
 # ---------------------------------------------------------------------------

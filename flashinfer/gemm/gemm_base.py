@@ -74,7 +74,11 @@ from .gemm_mm_fp4_cute_dsl import (
     precompile_mm_fp4_tactics,
 )
 from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
-from .mxfp8_smallm_sm107 import dispatch_mm_mxfp8_specialized
+from .mxfp8_smallm_sm107 import (
+    SpecializedMxfp8SmallMRunner,
+    dispatch_mm_mxfp8_specialized,
+    specialized_mm_mxfp8_eligible,
+)
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
@@ -8095,9 +8099,12 @@ def _cudnn_mm_mxfp8_runner():
 # backend must stay selectable (explicitly and in auto resolution) everywhere,
 # because its dispatcher owns the exact device gate (CC 10.7) and serves
 # explicit "specialized" calls on other devices via the composable path. The
-# auto heuristic never returns "specialized", so the broad list adds no auto
-# candidate. The decorator also supplies is_compute_capability_supported,
-# which suitable_auto_backends calls on EVERY registered checker.
+# auto heuristic ranks "specialized" FIRST exactly when the call is on the
+# kernel's measured allowlist (specialized_mm_mxfp8_eligible), so it is a
+# default auto candidate and a first-class autotune candidate there; this
+# checker stays permissive so explicit selection works everywhere. The
+# decorator also supplies is_compute_capability_supported, which
+# suitable_auto_backends calls on EVERY registered checker.
 @supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _specialized_mm_mxfp8_requirement(
     a: torch.Tensor,  # unused
@@ -8133,29 +8140,48 @@ def _heuristic_func_mm_mxfp8(
     if batch_invariant:
         # the batch-invariant class runs in place of the backends: their availability does not decide the call
         return ["batch_invariant"]
+    # The specialized SM107 small-M kernel ranks first exactly on its
+    # measured (M, N, K) allowlist (and the rest of its dispatch guards):
+    # there it is the default auto choice (untuned calls run the first
+    # suitable backend) AND a first-class autotune candidate (the tuner
+    # races it as itself against the stock backends below). Off the
+    # allowlist it is absent and the stock ranking is untouched.
+    specialized_first: List[str] = []
+    if "specialized" in suitable_backends and (
+        specialized_mm_mxfp8_eligible(
+            a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+        )
+        is None
+    ):
+        specialized_first = ["specialized"]
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
         order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])
-        return [c for c in order if c in suitable_backends]
+        return specialized_first + [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         major, minor = get_compute_capability(a.device)
         if (major, minor) != (10, 7):
-            return ["cutlass"]
-        # On SM107 untuned calls run CUTLASS; the autotuner also ranks CuTe-DSL and cuDNN.
-        return [c for c in ("cutlass", "cute-dsl", "cudnn") if c in suitable_backends]
+            return specialized_first + ["cutlass"]
+        # On SM107 untuned calls run the first suitable backend (the
+        # specialized kernel on its allowlist, CUTLASS otherwise); the
+        # autotuner ranks every listed candidate.
+        return specialized_first + [
+            c for c in ("cutlass", "cute-dsl", "cudnn") if c in suitable_backends
+        ]
     # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
     # requirements are not met) when it is available.
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
-        return ["cudnn"]
+        return specialized_first + ["cudnn"]
     if CUTE_DSL_AVAILABLE and "cutedsl_low_latency" in suitable_backends:
-        return ["cutedsl_low_latency"]
-    return []
+        return specialized_first + ["cutedsl_low_latency"]
+    return specialized_first
 
 
 # Backends of mm_mxfp8, as plain strings. "specialized" is the agent-generated
-# SM107 small-M kernel (flashinfer/gemm/mxfp8_smallm_sm107.py); "auto" routes
-# to it only on its shape allowlist and otherwise runs the heuristic order.
+# SM107 small-M kernel (flashinfer/gemm/mxfp8_smallm_sm107.py): a default
+# auto/autotune candidate on its shape allowlist (ranked first by the
+# heuristic there), absent elsewhere.
 MM_MXFP8_BACKENDS = (
     "auto",
     "specialized",
@@ -8266,15 +8292,18 @@ def mm_mxfp8(
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/107/110/120/121.
         - The ``"specialized"`` backend is an agent-generated SM107 small-M
           kernel for decode-size shapes (bf16 out, 1D swizzled 128x4 scales).
-          ``"auto"`` routes to it only on its exact measured (M, N, K)
-          allowlist (``flashinfer/mm_mxfp8_specialized_sm107_workloads.json``),
-          ahead of the SM107 autotuner ranking, which keeps serving every
-          other shape. An explicitly selected backend is never silently
-          swapped: explicit ``backend="specialized"`` that cannot serve a call
-          (off-list shape, non-SM107 device, kill switch, JIT failure) takes
-          the composable dequant + ``torch.mm`` path, never another fused
-          backend. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call
-          time) forces the composable/stock path.
+          It is a DEFAULT auto candidate on its exact measured (M, N, K)
+          allowlist (``flashinfer/mm_mxfp8_specialized_sm107_workloads.json``):
+          there the heuristic ranks it first (untuned ``"auto"`` runs it) and
+          the autotuner races it as a first-class candidate against the stock
+          SM107 backends, caching whichever wins per bucket; every other
+          shape keeps the stock ranking. An explicitly selected backend is
+          never silently swapped: explicit ``backend="specialized"`` that
+          cannot serve a call (off-list shape, non-SM107 device, kill switch,
+          JIT failure) takes the composable dequant + ``torch.mm`` path,
+          never another fused backend.
+          ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time)
+          forces the composable/stock path.
 
     batch_invariant: bool
         ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
@@ -8349,17 +8378,18 @@ def mm_mxfp8(
             dtype=out_dtype,
         )
 
-    # The "specialized" backend (agent-generated SM107 small-M kernel): "auto"
-    # routes to it only on its strict (M, N, K) allowlist of measured
-    # decode-size shapes, resolved by exact shape BEFORE the heuristic /
-    # autotuner candidate ranking below (which on SM107 ranks CUTLASS,
-    # CuTe-DSL and cuDNN and keeps serving every off-allowlist shape). An
-    # explicitly selected backend is never swapped, so only
-    # backend="specialized" or "auto" can reach it, and explicit "specialized"
-    # that cannot be served takes the composable path inside the dispatcher
-    # (True is then returned). FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces
-    # the composable/stock path. See flashinfer/gemm/mxfp8_smallm_sm107.py.
-    if backend in ("auto", "specialized"):
+    # The "specialized" backend (agent-generated SM107 small-M kernel).
+    # Explicit backend="specialized" is served here: the kernel on its
+    # strict (M, N, K) allowlist of measured decode-size shapes, the
+    # composable dequant + torch.mm path otherwise — never another fused
+    # backend. Under backend="auto" the kernel is a DEFAULT candidate of the
+    # runner machinery below instead: the heuristic ranks it first exactly
+    # on its allowlist (untuned auto therefore runs it there, via the
+    # runners[0] fallback convention) and the autotuner races it as itself
+    # against the stock backends. An explicitly selected stock backend is
+    # never swapped. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the
+    # composable/stock path. See flashinfer/gemm/mxfp8_smallm_sm107.py.
+    if backend == "specialized":
         if dispatch_mm_mxfp8_specialized(
             a,
             b,
@@ -8368,11 +8398,9 @@ def mm_mxfp8(
             out,
             out_dtype,
             use_8x4_sf_layout,
-            explicit=backend == "specialized",
+            explicit=True,
         ):
             return out
-        # Only backend="auto" reaches here (the dispatcher always serves
-        # explicit "specialized", on the kernel or the composable path).
 
     workspace_buffer = _get_stream_cache_buf(
         "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -8396,6 +8424,7 @@ def mm_mxfp8(
     ]
 
     backend_to_runner_factory = {
+        "specialized": lambda: SpecializedMxfp8SmallMRunner(use_8x4_sf_layout),
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),
@@ -10494,9 +10523,11 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
         ConstraintSpec(
             2,
             0,
-            lambda shapes: shapes[0][0]
-            * _mxfp8_swizzled_scale_len(
-                shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+            lambda shapes: (
+                shapes[0][0]
+                * _mxfp8_swizzled_scale_len(
+                    shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+                )
             ),
         ),
         ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),

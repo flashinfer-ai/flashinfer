@@ -324,3 +324,73 @@ def test_auto_non_bf16_out_keeps_stock_path(monkeypatch):
     calls = _count_kernel_launches(monkeypatch)
     mm_mxfp8(a_q, b_q.T, a_sf, b_sf, out_dtype=torch.float16)
     assert len(calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Default-candidate / autotune-availability surface (GPU-free)
+# ---------------------------------------------------------------------------
+
+
+def _cpu_mxfp8_args(m=8, n=768, k=384):
+    a = torch.zeros((m, k), dtype=torch.float8_e4m3fn)
+    b = torch.zeros((k, n), dtype=torch.float8_e4m3fn)
+    a_sf = torch.zeros(specialized._swizzled_sf_numel(m, k), dtype=torch.uint8)
+    b_sf = torch.zeros(specialized._swizzled_sf_numel(n, k), dtype=torch.uint8)
+    return a, b, a_sf, b_sf
+
+
+def test_heuristic_ranks_specialized_first_when_eligible(monkeypatch):
+    """On its allowlist the specialized kernel is a DEFAULT auto candidate,
+    ranked first (untuned auto runs it; the autotuner races it as itself)."""
+    from flashinfer.gemm import gemm_base
+
+    a, b, a_sf, b_sf = _cpu_mxfp8_args()
+    monkeypatch.setattr(
+        gemm_base, "specialized_mm_mxfp8_eligible", lambda *args, **kw: None
+    )
+    order = gemm_base._heuristic_func_mm_mxfp8(
+        ["specialized", "cutedsl_low_latency"], a, b, a_sf, b_sf
+    )
+    assert order and order[0] == "specialized", order
+
+
+def test_heuristic_excludes_specialized_when_ineligible(monkeypatch):
+    from flashinfer.gemm import gemm_base
+
+    a, b, a_sf, b_sf = _cpu_mxfp8_args()
+    monkeypatch.setattr(
+        gemm_base,
+        "specialized_mm_mxfp8_eligible",
+        lambda *args, **kw: "shape_not_allowlisted",
+    )
+    order = gemm_base._heuristic_func_mm_mxfp8(
+        ["specialized", "cutedsl_low_latency"], a, b, a_sf, b_sf
+    )
+    assert "specialized" not in order, order
+
+
+def test_runner_declines_ineligible_inputs_cpu():
+    """The TunableRunner candidate advertises no tactic off its guards, so
+    the autotuner skips it instead of timing a kernel it cannot launch."""
+    a, b, a_sf, b_sf = _cpu_mxfp8_args()
+    out = torch.zeros((a.shape[0], b.shape[1]), dtype=torch.bfloat16)
+    runner = specialized.SpecializedMxfp8SmallMRunner(False)
+    inputs = [a, b, a_sf, b_sf, torch.bfloat16, out, None]
+    assert runner.get_valid_tactics(inputs, None) == []
+    assert runner.supports_inputs(inputs) is False
+    assert runner.is_tactic_compatible(inputs, -1) is False
+
+
+def test_eligibility_probe_tolerates_out_none():
+    a, b, a_sf, b_sf = _cpu_mxfp8_args()
+    # CPU tensors fail the device guard, never raise.
+    reason = specialized.specialized_mm_mxfp8_eligible(
+        a, b, a_sf, b_sf, None, torch.bfloat16, False
+    )
+    assert isinstance(reason, str) and reason
+    assert (
+        specialized.specialized_mm_mxfp8_eligible(
+            a, b, a_sf, b_sf, None, torch.float16, False
+        )
+        == "out_dtype"
+    )
