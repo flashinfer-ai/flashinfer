@@ -66,10 +66,12 @@ def nccl_lsa_teams(released_runtime):
 
     comm = get_nccl_comm_from_group()
     try:
-        count = int(getattr(comm, "n_lsa_teams", 0))
+        # The direct team query also works with older NCCL property structs.
+        team = getattr(comm, "team_lsa", None)
+        width = getattr(team, "n_ranks", 0)
         counts = [None] * dist.get_world_size()
-        dist.all_gather_object(counts, count)
-        return 1 if all(value == 1 for value in counts) else 0
+        dist.all_gather_object(counts, width)
+        return 1 if all(value == dist.get_world_size() for value in counts) else 0
     finally:
         comm.destroy()
 
