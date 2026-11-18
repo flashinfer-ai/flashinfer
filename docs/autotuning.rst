@@ -381,7 +381,11 @@ Context manager for autotuning with optional file-based caching.
    * - ``cache``
      - ``str | None``
      - Optional path to a JSON config file.
-       On entry, configs are loaded from this file if it exists.
+       On entry, configs are loaded from this file if it exists and added
+       to those already loaded in this process (for a key present in several
+       files, the file loaded last wins; entries for the same workload under
+       different runner classes are distinct keys, so between them the
+       caller's runner order decides, as with ``load_configs()``).
        On exit, configs are saved back to this file when ``tune_mode=True``.
 
 **Behavior matrix:**
