@@ -59,8 +59,8 @@ from ..jit.core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_fla
 from ..utils import log2e
 
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_trtllm_mla_blackwell_6fd51a4e3cfb9efffa83": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6fd51a4e3cfb9efffa83_kernel.cu",
+    "cake_trtllm_mla_blackwell_9b61e7b02cfb810aec3e": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_9b61e7b02cfb810aec3e_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a"],
     },
@@ -69,47 +69,43 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0_kernel.cu",
+    "cake_trtllm_mla_blackwell_9836e82803b347d1e9e4": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_9836e82803b347d1e9e4_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5_kernel.cu",
+    "cake_trtllm_mla_blackwell_e1672985b7233c94b1a6": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_e1672985b7233c94b1a6_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95_kernel.cu",
+    "cake_trtllm_mla_blackwell_c5f637fcd75d965a649f": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_c5f637fcd75d965a649f_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_74250d91903d28576cba_kernel.cu",
-        "source_flags": [
-            "-DCAKE_ARCH_SM103=1",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4",
-        ],
+    "cake_trtllm_mla_blackwell_c5ad7b615951adb801f7": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_c5ad7b615951adb801f7_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_0738dc80fead18e5c948": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_0738dc80fead18e5c948_kernel.cu",
+    "cake_trtllm_mla_blackwell_94380cee7659fe7ed103": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_94380cee7659fe7ed103_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a"],
     },
-    "cake_trtllm_mla_blackwell_727d8c54797965d53945": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_727d8c54797965d53945_kernel.cu",
+    "cake_trtllm_mla_blackwell_d0021c4f5addd97b5dd6": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d0021c4f5addd97b5dd6_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_6e07f00469cd68db34b5": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6e07f00469cd68db34b5_kernel.cu",
+    "cake_trtllm_mla_blackwell_fe7678aaf6597970ac2c": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_fe7678aaf6597970ac2c_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_7caa905d3847d2737402": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_7caa905d3847d2737402_kernel.cu",
+    "cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a"],
     },
@@ -118,8 +114,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_989e1e1ed03c93435753": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_989e1e1ed03c93435753_kernel.cu",
+    "cake_trtllm_mla_blackwell_af1a9fc22424703e2072": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_af1a9fc22424703e2072_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
@@ -137,12 +133,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95_kernel.cu",
-        "source_flags": [
-            "-DCAKE_TAIL_FP8=1",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3",
-        ],
+    "cake_trtllm_mla_blackwell_be26fb2478234a5b59c4": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_be26fb2478234a5b59c4_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -176,7 +168,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_19d4f449d63830a1",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3_sm_103a_86cb2cfc2808",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5"],
+        "dependencies": ["cake_trtllm_mla_blackwell_e1672985b7233c94b1a6"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vhalf",
     },
@@ -230,7 +222,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_619a0eadc032",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_fe7678aaf6597970ac2c",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_6e07f00469cd68db34b5"],
+        "dependencies": ["cake_trtllm_mla_blackwell_fe7678aaf6597970ac2c"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
@@ -255,7 +247,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_KERNEL_1=kernel_cake_trtllm_mla_blackwell_af1a9fc22424703e2072",
         ],
         "dependencies": [
-            "cake_trtllm_mla_blackwell_989e1e1ed03c93435753",
+            "cake_trtllm_mla_blackwell_af1a9fc22424703e2072",
             "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29",
         ],
         "compile_flags": ["-std=c++17"],
@@ -264,14 +256,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0"],
+        "dependencies": ["cake_trtllm_mla_blackwell_9836e82803b347d1e9e4"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vquarter",
     },
     "cake_trtllm_mla_blackwell_family_69765950411de111b0b4": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_69765950411de111b0b4_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95"],
+        "dependencies": ["cake_trtllm_mla_blackwell_c5f637fcd75d965a649f"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_tail",
     },
@@ -283,7 +275,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_7e6581cd96059318",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95_sm_103a_ff4ee8ca878a",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95"],
+        "dependencies": ["cake_trtllm_mla_blackwell_c5f637fcd75d965a649f"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_tail",
     },
@@ -295,7 +287,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_7fed1cfb7b2de23e",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e_sm_103a_0d7b430385a9",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0"],
+        "dependencies": ["cake_trtllm_mla_blackwell_9836e82803b347d1e9e4"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vquarter",
     },
@@ -308,14 +300,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_c68808045858",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_d0021c4f5addd97b5dd6",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_727d8c54797965d53945"],
+        "dependencies": ["cake_trtllm_mla_blackwell_d0021c4f5addd97b5dd6"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
     "cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5"],
+        "dependencies": ["cake_trtllm_mla_blackwell_e1672985b7233c94b1a6"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vhalf",
     },
@@ -342,7 +334,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_100a_7457914cd525",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_0738dc80fead18e5c948"],
+        "dependencies": ["cake_trtllm_mla_blackwell_94380cee7659fe7ed103"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
@@ -354,7 +346,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_21950b2bed39ae08",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3_sm_103a_043580e76b77",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3"],
+        "dependencies": ["cake_trtllm_mla_blackwell_be26fb2478234a5b59c4"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_fp8_tail",
     },
@@ -362,7 +354,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_c461bee2a4bb9454ff11_binding.cu",
         "dependencies": [
-            "cake_trtllm_mla_blackwell_6fd51a4e3cfb9efffa83",
+            "cake_trtllm_mla_blackwell_9b61e7b02cfb810aec3e",
             "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29",
         ],
         "compile_flags": ["-std=c++17"],
@@ -390,7 +382,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_df17a573e48e469242d2": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_df17a573e48e469242d2_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_7caa905d3847d2737402"],
+        "dependencies": ["cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
@@ -410,7 +402,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4_sm_103a_e88d791b199e",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_c5ad7b615951adb801f7",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4"],
+        "dependencies": ["cake_trtllm_mla_blackwell_c5ad7b615951adb801f7"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
@@ -424,7 +416,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_f662abe7edbd911e086f": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_f662abe7edbd911e086f_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_d6056fe83ccbe21f79b3"],
+        "dependencies": ["cake_trtllm_mla_blackwell_be26fb2478234a5b59c4"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_fp8_tail",
     },
