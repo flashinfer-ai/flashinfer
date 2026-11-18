@@ -3593,6 +3593,12 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Stock DeepSeek-fp8 block-scale backend (SM90): the incumbent that
+        # serves every dsfp8 call the specialized small-T candidate below
+        # declines (the 17..255 token gap and off-contract geometry) — with
+        # neither of these in the default list, SM90 dsfp8 layers would have
+        # no default backend at all (TrtllmFp8BlockConfig is SM100+).
+        CutlassFp8BlockConfig(),
         # Specialized agent-generated kernels: first-class auto/autotune
         # candidates on the layers they were optimized for (supported() and
         # the runners gate arch + contract; out-of-domain calls are declined

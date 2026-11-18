@@ -282,6 +282,38 @@ def test_allowlist_rejects_off_contract_kernel_geometry():
     assert one(256) == "device cpu"
     # T in [2, 16] keeps the generic small-path envelope
     assert one(4, k=8, e=512, h=384) == "device cpu"
+    # ... bounded by the small-path launches' dynamic shared memory, which
+    # is data-dependent and launched without the >48KiB opt-in
+    assert "fc2 smem" in one(4, i=4096)  # top_k * I halves
+    assert "fc1 smem" in one(4, h=25600)  # H halves + the fc1 scale grid
+    assert "fc1 staging smem" in one(1, h=25088, i=256)  # T=1: H halves
+
+
+def test_allowlist_rejects_misaligned_views():
+    # Contiguity does not imply address alignment: a contiguous view with a
+    # storage offset can be only element-aligned, while the kernels read
+    # activations and weights through 16-byte (uint4) vectors (GPU-free:
+    # the rejection precedes the device check; mirrored natively).
+    T = 4
+    a = _elig_args()
+    base = torch.zeros((T * H + 8,), dtype=torch.bfloat16)
+    a["input"] = base[1 : 1 + T * H].reshape(T, H)  # 2-byte-aligned view
+    assert a["input"].is_contiguous()
+    assert "input not 16-byte aligned" in _eligibility(**a)
+    a = _elig_args()
+    wbase = torch.zeros((E * 2 * I * H + 16,), dtype=torch.float8_e4m3fn)
+    a["fc1_expert_weights"] = wbase[1 : 1 + E * 2 * I * H].reshape(E, 2 * I, H)
+    assert "fc1 not 16-byte aligned" in _eligibility(**a)
+    a = _elig_args()
+    obase = torch.zeros((T * H + 8,), dtype=torch.bfloat16)
+    a["output"] = obase[1 : 1 + T * H].reshape(T, H)
+    assert "output not 16-byte aligned" in _eligibility(**a)
+    # a 16-byte storage offset stays aligned and passes through to the
+    # device check
+    a = _elig_args()
+    base = torch.zeros((T * H + 8,), dtype=torch.bfloat16)
+    a["input"] = base[8 : 8 + T * H].reshape(T, H)
+    assert _eligibility(**a) == "device cpu"
 
 
 def test_stats_report_build_state_and_counters():
@@ -561,6 +593,14 @@ def test_unified_config_gating_and_registration():
         isinstance(c, SpecializedFp8BlockSmallTConfig)
         for c in _DEFAULT_BACKEND.valid_for(120)
     )
+    # The incumbent stock dsfp8 backend is ALSO a default candidate: it
+    # serves every SM90 dsfp8 call the specialized runner declines (the
+    # 17..255 gap, off-contract geometry, the kill switch), so default-auto
+    # dsfp8 layers on SM90 always have a named backend.
+    assert any(isinstance(c, CutlassFp8BlockConfig) for c in _DEFAULT_BACKEND)
+    assert any(
+        isinstance(c, CutlassFp8BlockConfig) for c in _DEFAULT_BACKEND.valid_for(90)
+    )
     # Same prepared-weight contract as the stock dsfp8 backend.
     assert SpecializedFp8BlockSmallTRunner.weight_view_aliases == ("cutlass_fp8_block",)
     assert (
@@ -650,3 +690,33 @@ def test_unified_out_of_band_tokens_route_to_stock():
     layer_only, act2, weights2, _ = _unified_layer(64, None)
     with pytest.raises(NotImplementedError, match="routing_input_mode"):
         layer_only(act2, weights2)
+
+
+def test_unified_override_views_route_to_stock():
+    """A stock dsfp8 view carrying per-expert activation overrides (a
+    stock-kernel feature the specialized kernel does not implement) is
+    declined at eligibility time: auto serves the call with the stock
+    backend instead of failing inside the specialized runner's
+    pack_inputs."""
+    _sm90_or_skip()
+    layer, act, weights, b = _unified_layer(
+        4, (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig())
+    )
+    device = b["x"].device
+    view = dict(weights.get_view("cutlass_fp8_block"))
+    view["gemm1_beta"] = torch.ones((E,), dtype=torch.float32, device=device)
+    weights_over = MoEWeightPack()
+    weights_over.prepare_for("cutlass_fp8_block", view)
+    runners = {r.backend_key: r for r in layer.runners}
+    assert not runners["specialized_fp8_block_smallt"].accepts(act, weights_over)
+    assert runners["cutlass_fp8_block"].accepts(act, weights_over)
+    out = layer(act, weights_over)
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert layer.winner_backend == "cutlass_fp8_block"
+    assert torch.isfinite(out.float()).all()
+    # without the override the same layer reaches the specialized kernel
+    out2 = layer(act, weights)
+    assert _moe_smallt_sm90_stats()["runs_dispatched"] > 0
+    ts, l2 = _gate(out2, _reference(b))
+    assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)

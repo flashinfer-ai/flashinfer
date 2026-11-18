@@ -305,10 +305,16 @@ class MoELayer:
                 )
                 runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
+                # build() binds backend resources (a JIT module, workspace
+                # plans); an optional backend whose build fails must reject
+                # THIS candidate so selection continues over the remaining
+                # usable backends, not abort layer construction. Building at
+                # init also keeps module loading outside any later CUDA
+                # graph capture.
+                runner.build()
             except (NotImplementedError, ValueError, RuntimeError) as exc:
                 rejected.append(f"{runner_cls.__name__}: {exc}")
                 continue
-            runner.build()
             self.runners.append(runner)
             self._tuning_runner_ids.append(backend_index)
 

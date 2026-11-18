@@ -2759,6 +2759,14 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
     # The specialized kernel consumes the stock CUTLASS dsfp8 weight view
     # unchanged, so a pack prepared for that backend serves this one too.
     weight_view_aliases = ("cutlass_fp8_block",)
+    # Weight-view keys that request per-expert activation overrides — a
+    # stock-kernel feature the specialized kernel does not implement, so a
+    # view carrying any of them is declined at eligibility time.
+    _ACTIVATION_OVERRIDE_KEYS: ClassVar[tuple[str, ...]] = (
+        "gemm1_alpha",
+        "gemm1_beta",
+        "gemm1_clamp_limit",
+    )
     # The kernel implements the canonical gated-SiLU epilogue only.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
         SwiGLU,
@@ -2827,6 +2835,22 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
         if hidden.ndim != 2:
             return False
         return self._band_geometry_ok(act.num_tokens, hidden.shape[1])
+
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        if not super().accepts(act, weights):
+            return False
+        # A stock dsfp8 view may carry per-expert activation overrides
+        # (gemm1_alpha / gemm1_beta / gemm1_clamp_limit). Declining such
+        # views here lets MoELayer skip this candidate and serve the call
+        # with a backend that implements them; the pack_inputs raise below
+        # stays as a defensive check for callers that bypass eligibility.
+        for key in (self.backend_key, *self.weight_view_aliases):
+            view = weights.native_views.get(key)
+            if view is not None and any(
+                name in view for name in self._ACTIVATION_OVERRIDE_KEYS
+            ):
+                return False
+        return True
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
