@@ -304,12 +304,19 @@ def test_unified_config_supported_arch_gating():
         assert not W4A16MxFp4LatentConfig.supported(arch), arch
 
 
-def test_unified_config_registered_but_not_default():
+def test_unified_config_registered_and_default_visible():
     assert _BACKEND_RUNNERS[W4A16MxFp4LatentConfig] is W4A16MxFp4LatentRunner
-    # Opt-in only: specialized fixed-geometry backends stay out of the
-    # default candidate tuple (the SM12x / B12x precedent).
+    # DEFAULT-VISIBLE: a matching layer reaches the kernel through
+    # backend=auto with no opt-in; supported() gates the arch and the
+    # runner gates the fixed contract.
+    assert any(isinstance(c, W4A16MxFp4LatentConfig) for c in moe_api._DEFAULT_BACKEND)
+    assert any(
+        isinstance(c, W4A16MxFp4LatentConfig)
+        for c in moe_api._DEFAULT_BACKEND.valid_for(90)
+    )
     assert not any(
-        isinstance(c, W4A16MxFp4LatentConfig) for c in moe_api._DEFAULT_BACKEND
+        isinstance(c, W4A16MxFp4LatentConfig)
+        for c in moe_api._DEFAULT_BACKEND.valid_for(120)
     )
     assert W4A16MxFp4LatentConfig in moe_api.ALL_BACKEND_CONFIGS
 
@@ -414,9 +421,10 @@ def test_unified_layer_ep_rejected_cpu(monkeypatch):
 
 
 def test_unified_runner_dispatch_monkeypatched_launch(monkeypatch):
-    """CPU dispatch logic: the runner forwards to the flat entry with
-    backend="specialized", passes the pack/view tensors through unchanged,
-    and suspends autotune tuning mode only for the duration of the call."""
+    """CPU dispatch logic: the runner calls the kernel module's entry with
+    backend="specialized" and passes the pack/view tensors through
+    unchanged; an explicit backend runs under autotune tuning mode (no
+    tuner-state games), so the shootout times the real dispatch."""
     from flashinfer.autotuner import AutoTuner
 
     _fake_sm90(monkeypatch)
@@ -446,8 +454,10 @@ def test_unified_runner_dispatch_monkeypatched_launch(monkeypatch):
     out = runner.forward(inputs, tactic=-1)
     assert seen["backend"] == "specialized"
     assert seen["tensors_ok"]
-    assert seen["tuning_mode_inside"] is False
-    assert tuner.is_tuning_mode is True  # restored
+    # The runner no longer mutates tuner state: the explicit backend form
+    # runs under tuning mode (only the flat "auto" form refuses it).
+    assert seen["tuning_mode_inside"] is True
+    assert tuner.is_tuning_mode is True
     assert out.shape == x.shape
 
 

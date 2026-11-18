@@ -9625,12 +9625,12 @@ class W4A16MxFp4LatentRunner(MoERunner):
     flat API's global-id / rank-partial semantics are not routable through
     the layer.
 
-    The op has a single fixed tactic (``get_valid_tactics`` → ``[-1]``). The
-    flat op refuses to run while ``AutoTuner.is_tuning_mode`` is set — it
-    must not be timed into flat-path tactic tables — but as a layer
-    candidate it must be timeable in the cross-backend shootout, so
-    ``forward`` suspends tuning mode around the dispatch: the call is a real
-    fixed-tactic dispatch, not a tactic enumeration.
+    The op has a single fixed tactic (``get_valid_tactics`` → ``[-1]``).
+    Only the flat ``backend="auto"`` form refuses tuning-mode calls (it must
+    not be enumerated into flat-path tactic tables); the explicit
+    ``backend="specialized"`` this runner dispatches runs under tuning mode,
+    so ``MoELayer``'s cross-backend shootout times the real fixed-tactic
+    dispatch with no tuner-state mutation.
     """
 
     backend_key = "w4a16_mxfp4_latent"
@@ -9796,25 +9796,20 @@ class W4A16MxFp4LatentRunner(MoERunner):
                 f"{self.backend_key} expects [hidden, topk_ids, topk_weights]."
             )
         view = self._view
-        # The flat op refuses tuning-mode calls so it is never enumerated into
-        # flat-path tactic tables; a layer dispatch of the single fixed tactic
-        # is a real run, so suspend the flag only around this call.
-        tuner = AutoTuner.get()
-        saved_tuning_mode = tuner.is_tuning_mode
-        tuner.is_tuning_mode = False
-        try:
-            return self._flat.w4a16_mxfp4_latent_routed_moe(
-                inputs[0],
-                view["w13_packed"],
-                view["w13_scale"],
-                view["w2_packed"],
-                view["w2_scale"],
-                inputs[1],
-                inputs[2],
-                backend="specialized",
-            )
-        finally:
-            tuner.is_tuning_mode = saved_tuning_mode
+        # The kernel module's own entry, with the backend named explicitly:
+        # only the flat "auto" form refuses tuning-mode calls (it has no
+        # tactic space to enumerate), so this runner needs no tuner-state
+        # games while MoELayer times it as a first-class candidate.
+        return self._flat.w4a16_mxfp4_latent_routed_moe(
+            inputs[0],
+            view["w13_packed"],
+            view["w13_scale"],
+            view["w2_packed"],
+            view["w2_scale"],
+            inputs[1],
+            inputs[2],
+            backend="specialized",
+        )
 
 
 # ---------------------------------------------------------------------------

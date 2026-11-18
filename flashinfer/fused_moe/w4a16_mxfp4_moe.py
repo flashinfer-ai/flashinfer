@@ -73,8 +73,12 @@ CUDA-graph rules
   eager call.  Capture therefore requires a prior eager warm-up call on the
   capture stream with a token count >= the captured one (tracked per stream;
   violating calls raise instead of allocating under capture).
-- Autotune tuning mode raises: this path has a single fixed tactic and must
-  not be timed into tactic tables.
+- Autotune tuning mode raises on ``backend="auto"`` only: the flat auto form
+  has a single fixed tactic and must not be enumerated into flat-path tactic
+  tables. An explicitly selected backend runs regardless — the unified
+  ``MoELayer`` runner (``W4A16MxFp4LatentRunner``) dispatches
+  ``backend="specialized"`` while being timed as a first-class cross-backend
+  autotune candidate.
 """
 
 import os
@@ -336,10 +340,16 @@ def w4a16_mxfp4_latent_routed_moe(
             f"w4a16_mxfp4_latent_routed_moe supports backend in {BACKENDS}; "
             "an explicitly selected backend is never silently swapped"
         )
-    if _autotune_active():
+    if backend == "auto" and _autotune_active():
+        # The flat "auto" entry has a single fixed tactic, so it refuses to
+        # be enumerated by flat-path autotuners. An EXPLICITLY selected
+        # backend runs regardless: the unified MoELayer runner selects
+        # "specialized" while it is itself being timed as a first-class
+        # cross-backend autotune candidate.
         raise RuntimeError(
-            "w4a16_mxfp4_latent_routed_moe has a single fixed tactic and "
-            "refuses to run in autotune tuning mode"
+            "w4a16_mxfp4_latent_routed_moe(backend='auto') has a single "
+            "fixed tactic and refuses to run in autotune tuning mode; "
+            "select backend='specialized' or 'reference' explicitly"
         )
 
     _check(x.is_cuda, "x must be a CUDA tensor")

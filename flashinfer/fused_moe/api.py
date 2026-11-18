@@ -2929,6 +2929,11 @@ class W4A16MxFp4LatentConfig:
     global-expert-id / rank-partial-output semantics are reachable only
     through the flat entry point, not through :class:`MoELayer`.
 
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM90) and
+    the runner gates the kernel's fixed contract, so a matching layer
+    reaches the kernel through ``backend=auto`` — timed by the cross-backend
+    autotune shootout as a first-class candidate — with no opt-in.
+
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call by the flat
     op) forces its composable reference path; dispatches through the layer
     honor it identically.
@@ -3635,6 +3640,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runner gate arch + contract; out-of-domain configurations are
+        # rejected at layer construction and served by the other candidates).
+        W4A16MxFp4LatentConfig(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),
