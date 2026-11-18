@@ -20,8 +20,6 @@ explicit / kill switch / off-allowlist raise), and CUDA-graph replay ==
 eager.
 """
 
-import os
-
 import pytest
 import torch
 
@@ -222,17 +220,16 @@ def test_off_allowlist_stays_stock_and_explicit_raises():
 
 
 @requires_sm103
-def test_kill_switch_restores_stock():
+def test_kill_switch_restores_stock(monkeypatch):
     inp = _make_inputs(1, 6, 32768, seed=23)
-    os.environ[spec_mod.KILL_SWITCH_ENV] = "1"
-    try:
-        before = dict(spec_mod.DISPATCH_STATS)
-        out = _api(inp)
-        assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
-        assert spec_mod.LAST_FALLBACK_REASONS[0].startswith("kill_switch")
-        _assert_close(out, _reference(inp).float())
-    finally:
-        os.environ.pop(spec_mod.KILL_SWITCH_ENV, None)
+    # monkeypatch restores the pre-test value on teardown (os.environ.pop
+    # would delete a kill switch the invoker had set for the whole run).
+    monkeypatch.setenv(spec_mod.KILL_SWITCH_ENV, "1")
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = _api(inp)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+    assert spec_mod.LAST_FALLBACK_REASONS[0].startswith("kill_switch")
+    _assert_close(out, _reference(inp).float())
 
 
 @requires_sm103
