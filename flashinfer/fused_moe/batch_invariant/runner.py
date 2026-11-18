@@ -19,6 +19,11 @@ layer's unfinalized triple ``[gemm2_output, expert_weights, expanded_idx_to_perm
 weights and the positions exactly as the class's combine would fold them (a placement of the op: the rows are reproducible
 intermediates). The tactics are the ranked grouped-GEMM records of the dispatcher (any tactic gives the same bits), and an
 unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+
+The pack / plan / launch flow is :class:`BatchInvariantMoeRunnerBase`'s, shared with the fp8 per-tensor backend
+(:mod:`.runner_fp8`): a class runner names its operand format (the activation dtype and 16-byte row alignment), its
+weight view and the tensors it packs, the two GEMMs' chains, its support rules beyond the shared ones and the launch of
+the fused op.
 """
 
 from __future__ import annotations
@@ -148,18 +153,29 @@ class _PackedInputs(list):
     w_round: bool = False  # f32 weights of the packed mode: rounded to bf16 by the combine kernel, not on the host
 
 
-class BatchInvariantMoeRunner(MoERunner):
-    """The unified layer's runner for the batch-invariant bf16 MoE classes."""
+class BatchInvariantMoeRunnerBase(MoERunner):
+    """The unified layer's runner flow of the batch-invariant MoE classes: the support rules, the pack (the activations,
+    the routing or the caller's ids and weights, the weight view's tensors, the output, the fused route + plan at small
+    token counts), the ranked tactics of the two GEMMs and the launch. A class runner sets the format hooks:
 
-    backend_key = "batch_invariant_bf16"
+    * ``CLASS`` / ``ARCHS``: the class name of the errors and the parts it is stated for;
+    * ``X_DTYPE`` / ``ROW_ALIGN`` / ``X_RULE`` / ``ROW_RULE`` / ``SCALE_RULE``: the activation dtype, the elements per
+      16-byte row (the activations' and the intermediate's alignment) and the wording of their refusals;
+    * ``TACTIC_TAG``: the class's tag in the autotuner's cache key; ``N_WEIGHT_TENSORS``: the weight view's tensors in the
+      pack (after the activations, the ids and the weights, before the output);
+    * ``_check_experts`` / ``_check_support_extra``: the class's rules beyond the shared ones (the expert-parallel shard's
+      range or its refusal, the finalize mode);
+    * ``_weights_from_view`` / ``_weight_tensors`` / ``_weights_from_tensors``: the weight view as the kernels consume it;
+    * ``_chain1`` / ``_chain2``: the two GEMMs' epilogue chains for the dispatcher; ``_launch``: the fused op.
+    """
+
     supported_routing_modes = (
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     )
-    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
     supported_output_formats = (QuantFormat.BF16,)
-    # every typed activation of the layer: a declared chain of the class each (``spec.activation_of``)
+    # every typed activation of the layer: a declared chain of the classes each (``spec.activation_of``)
     supported_activation_classes = (
         SwiGLU,
         SwiGLUStep,
@@ -173,9 +189,16 @@ class BatchInvariantMoeRunner(MoERunner):
         ReLU,
         SiLU,
     )
-    # An expert-parallel shard computes its local experts' slots: the other slots are dropped (the term +0 in the fold),
-    # a placement of the within-rank class on the local experts.
-    supports_expert_parallelism = True
+
+    CLASS: str = CLASS
+    ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
+    X_DTYPE: torch.dtype = torch.bfloat16
+    ROW_ALIGN: int = 8
+    X_RULE: str = "a bf16 [num_tokens, hidden_size]"
+    ROW_RULE: str = "a positive multiple of 8"
+    SCALE_RULE: str = "no activation scale (bf16 activations)"
+    TACTIC_TAG: str = "moe.bf16-v2"  # v2: the tactic carries the swapped flag
+    N_WEIGHT_TENSORS: int = 2
 
     def __init__(self, config, device) -> None:
         super().__init__()
@@ -204,46 +227,55 @@ class BatchInvariantMoeRunner(MoERunner):
             self.config.routing.num_experts if n is None else n
         )
 
-    def _check_support(self) -> None:
-        super()._check_support()
+    def _check_experts(self) -> None:
+        """The class's rule on the expert range: the bf16 classes compute a shard's local experts (a range inside the
+        experts); a class without the EP form refuses a shard."""
         cfg = self.config
-        check_device(self.device, CLASS, MOE_BF16_ARCHS)
+        e_off, e_local = self._local_experts()
+        if not (
+            e_off >= 0 and e_local >= 1 and e_off + e_local <= cfg.routing.num_experts
+        ):
+            raise unsupported(
+                self.CLASS,
+                f"local experts [{e_off}, {e_off + e_local}) of {cfg.routing.num_experts}",
+                "a local expert range inside [0, num_experts)",
+            )
+
+    def _check_support_extra(self) -> None:
+        """The class's rules beyond the shared ones (none for the bf16 classes)."""
+
+    def _check_support(self) -> None:
+        MoERunner._check_support(self)
+        cfg = self.config
+        check_device(self.device, self.CLASS, self.ARCHS)
         try:
             self._activation()
         except ValueError as e:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"activation {cfg.activation!r}",
                 "one of the layer's typed activations",
             ) from e
         experts = cfg.experts
         if experts.num_fused_shared_experts:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "fused shared experts",
                 "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
             )
-        e_off, e_local = self._local_experts()
-        if not (
-            e_off >= 0 and e_local >= 1 and e_off + e_local <= cfg.routing.num_experts
-        ):
+        self._check_experts()
+        if experts.intermediate_size % self.ROW_ALIGN or experts.intermediate_size <= 0:
             raise unsupported(
-                CLASS,
-                f"local experts [{e_off}, {e_off + e_local}) of {cfg.routing.num_experts}",
-                "a local expert range inside [0, num_experts)",
-            )
-        if experts.intermediate_size % 8 or experts.intermediate_size <= 0:
-            raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"intermediate_size {experts.intermediate_size}",
-                "a positive multiple of 8",
+                self.ROW_RULE,
             )
         routing = cfg.routing
         from .spec import MAX_TOP_K
 
         if not 1 <= routing.top_k <= min(routing.num_experts, MAX_TOP_K):
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"top_k {routing.top_k}",
                 f"1 <= top_k <= min(num_experts, {MAX_TOP_K})",
             )
@@ -251,11 +283,12 @@ class BatchInvariantMoeRunner(MoERunner):
 
         if not 1 <= routing.num_experts <= MAX_E:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"num_experts {routing.num_experts}",
                 f"1 <= num_experts <= {MAX_E}",
             )
-        self._routing_term(routing, CLASS)
+        self._routing_term(routing, self.CLASS)
+        self._check_support_extra()
 
     def _routing_term(self, routing: Any, cls: str) -> None:
         """``_method`` / ``_grouped_other`` from :func:`routing_term`; a refusal (a group shape or a Llama4 top-k outside the
@@ -300,52 +333,83 @@ class BatchInvariantMoeRunner(MoERunner):
             self._scale = s
         return s
 
+    # ---- the weight view (format hooks) -------------------------------------------------------------------------------
+    def _weights_from_view(self, view):
+        """The weight view as the kernels consume it (``MoEWeights`` / ``MoEWeightsE4M3``)."""
+        from .api import MoEWeights
+
+        return MoEWeights.from_view(view)
+
+    def _weight_tensors(self, w) -> List[torch.Tensor]:
+        """The view's tensors in the pack, in the order ``_weights_from_tensors`` rebuilds them."""
+        return [w.w1i, w.w2]
+
+    def _weights_from_tensors(self, a, tensors: List[torch.Tensor]):
+        from .api import MoEWeights
+
+        w1i, w2 = tensors
+        return MoEWeights(w1i, w2, a.gated, a.act, a.params)
+
+    def _chain1(self, a):
+        """GEMM1's epilogue chain of the layer's activation ``a`` (``spec.ActSpec``), for the dispatcher."""
+        from .blocks.epilogue import GroupedChain
+
+        return GroupedChain("glu" if a.gated else "act", a.act, "bf16", a.params)
+
+    def _chain2(self):
+        """GEMM2's epilogue chain, for the dispatcher."""
+        return "plain"
+
     # ---- inputs ----------------------------------------------------------------------------------------------------
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
-        return x.ndim == 2 and x.dtype == torch.bfloat16 and x.shape[1] % 8 == 0
+        return (
+            x.ndim == 2 and x.dtype == self.X_DTYPE and x.shape[1] % self.ROW_ALIGN == 0
+        )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        from .api import MoEWeights, route, route_plan
+        from .api import route, route_plan
 
         cfg = self.config
+        cls = self.CLASS
         plan: List[torch.Tensor] = []
         x = act.hidden_states_q
-        if x.dtype != torch.bfloat16 or x.ndim != 2:
+        if x.dtype != self.X_DTYPE or x.ndim != 2:
             raise unsupported(
-                CLASS,
-                f"hidden_states_q {x.dtype} of rank {x.ndim}",
-                "a bf16 [num_tokens, hidden_size]",
+                cls, f"hidden_states_q {x.dtype} of rank {x.ndim}", self.X_RULE
             )
         if act.hidden_states_scale is not None:
-            raise unsupported(
-                CLASS, "hidden_states_scale", "no activation scale (bf16 activations)"
-            )
+            raise unsupported(cls, "hidden_states_scale", self.SCALE_RULE)
         x = x.contiguous()
         T = x.shape[0]
         k, E = cfg.routing.top_k, cfg.routing.num_experts
         e_off, e_local = self._local_experts()
-        view = weights.get_view(self.backend_key)
-        w = MoEWeights.from_view(view)
+        w = self._weights_from_view(weights.get_view(self.backend_key))
         if (
             x.shape[1] != w.hidden_size
             or w.num_experts != e_local
             or cfg.experts.intermediate_size != w.intermediate_size
         ):
             raise unsupported(
-                CLASS,
+                cls,
                 f"weights (E {w.num_experts}, I {w.intermediate_size}, H {w.hidden_size}) for hidden {x.shape[1]}, "
                 f"local experts {e_local}, I {cfg.experts.intermediate_size}",
                 "weights prepared for this configuration (the local experts of a shard)",
             )
+        if x.shape[1] % self.ROW_ALIGN:
+            raise unsupported(
+                cls,
+                f"hidden size {x.shape[1]}",
+                f"a multiple of {self.ROW_ALIGN} (16-byte rows)",
+            )
         a = self._activation()
         if (w.gated, w.act, w.params) != (a.gated, a.act, a.params):
             raise unsupported(
-                CLASS,
+                cls,
                 f"a weight view of the {'gated' if w.gated else 'ungated'} chain {w.act!r} with parameters "
                 f"{w.params!r} under {type(cfg.activation).__name__} (the {'gated' if a.gated else 'ungated'} chain "
                 f"{a.act!r} with parameters {a.params!r})",
@@ -361,7 +425,7 @@ class BatchInvariantMoeRunner(MoERunner):
             # meaning in this module (with pre-routed ids the group structure never enters the computation)
             if getattr(self, "_grouped_other", False):
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
                     "the groups with DeepSeekV3, or pre-routed ids",
                 )
@@ -371,14 +435,14 @@ class BatchInvariantMoeRunner(MoERunner):
                 if refusal is not None:
                     raise refusal
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"routing method {cfg.routing.method!r} from logits",
                     "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     "a routing bias" if bias is not None else "no routing bias",
                     "a bias exactly for the methods that select on sigmoid(l) + bias",
                 )
@@ -433,7 +497,7 @@ class BatchInvariantMoeRunner(MoERunner):
                 weights_dtype = wts.dtype
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
-        packed = _PackedInputs([x, ids, wts, w.w1i, w.w2, out] + plan)
+        packed = _PackedInputs([x, ids, wts] + self._weight_tensors(w) + [out] + plan)
         packed.weights_dtype = weights_dtype
         packed.w_round = w_round
         return packed
@@ -450,8 +514,6 @@ class BatchInvariantMoeRunner(MoERunner):
             cfg.routing.top_k,
             cfg.experts.intermediate_size,
         )
-        from .blocks.epilogue import GroupedChain
-
         E_local = self._local_experts()[1]
         H = self._hidden
         # the rows per expert follow the global routing; the groups are the shard's experts
@@ -459,13 +521,28 @@ class BatchInvariantMoeRunner(MoERunner):
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         n1 = 2 * I if a.gated else I
-        chain1 = GroupedChain("glu" if a.gated else "act", a.act, "bf16", a.params)
         return (
             rank_grouped(
-                rows, n1, H, E_local, chain1, sm_count, family, TOP_K, n_active=n_act
+                rows,
+                n1,
+                H,
+                E_local,
+                self._chain1(a),
+                sm_count,
+                family,
+                TOP_K,
+                n_active=n_act,
             ),
             rank_grouped(
-                rows, H, I, E_local, "plain", sm_count, family, TOP_K, n_active=n_act
+                rows,
+                H,
+                I,
+                E_local,
+                self._chain2(),
+                sm_count,
+                family,
+                TOP_K,
+                n_active=n_act,
             ),
         )
 
@@ -476,31 +553,14 @@ class BatchInvariantMoeRunner(MoERunner):
         return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + (
-            "moe.bf16-v2",
-        )  # v2: the tactic carries the swapped flag
+        return MoERunner._cache_key_extras(self) + (self.TACTIC_TAG,)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
-    def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: Any = -1,
-        do_preparation: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        self._require_built()
-        from .api import MoEWeights, fused_moe
+    def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
+        """The fused op on the packed inputs with the records ``c1`` / ``c2``; the layer's output (or its unfinalized
+        triple)."""
+        from .api import fused_moe
 
-        x, ids, wts, w1i, w2, out = inputs[:6]
-        plan = tuple(inputs[6:9]) if len(inputs) >= 9 else None
-        self._hidden = int(x.shape[1])
-        if tactic == -1 or tactic is None:
-            r1, r2 = self._ranked(int(x.shape[0]))
-            c1, c2 = r1[0], r2[0]
-        else:
-            c1, c2 = _configs_from_tactic(tuple(tactic))
-        a = self._activation()
-        w = MoEWeights(w1i, w2, a.gated, a.act, a.params)
         if not self.config.finalize.do_finalize:
             # the layer's unfinalized triple: GEMM2's per-slot rows grouped by expert in expert order and, inside a group,
             # in token-slot order (rows past the valid ones -- a dropped slot's share -- are not written), the weights as the
@@ -533,3 +593,34 @@ class BatchInvariantMoeRunner(MoERunner):
             w_round=getattr(inputs, "w_round", False),
         )
         return out
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        self._require_built()
+        n = 3 + self.N_WEIGHT_TENSORS
+        x, ids, wts = inputs[:3]
+        tensors, out = inputs[3:n], inputs[n]
+        plan = tuple(inputs[n + 1 : n + 4]) if len(inputs) >= n + 4 else None
+        self._hidden = int(x.shape[1])
+        if tactic == -1 or tactic is None:
+            r1, r2 = self._ranked(int(x.shape[0]))
+            c1, c2 = r1[0], r2[0]
+        else:
+            c1, c2 = _configs_from_tactic(tuple(tactic))
+        w = self._weights_from_tensors(self._activation(), tensors)
+        return self._launch(x, ids, wts, w, out, c1, c2, plan, inputs)
+
+
+class BatchInvariantMoeRunner(BatchInvariantMoeRunnerBase):
+    """The unified layer's runner for the batch-invariant bf16 MoE classes."""
+
+    backend_key = "batch_invariant_bf16"
+    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    # An expert-parallel shard computes its local experts' slots: the other slots are dropped (the term +0 in the fold),
+    # a placement of the within-rank class on the local experts.
+    supports_expert_parallelism = True

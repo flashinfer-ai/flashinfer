@@ -5,7 +5,7 @@
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
 proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
-operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``, ``kda``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -151,26 +151,51 @@ def _mm_fp4_fingerprint(
     )
 
 
-def _moe_bf16_fingerprint(
-    H: int,
-    I: int,
+def _mm_mxfp4w8a_fingerprint(
+    N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
+    from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
+    if N <= 0 or K <= 0:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} and K {K} must be positive"
+        )
+    gran = k_granule(fmt)
+    if K % gran:  # the operator's contract: the class exists for these weights only
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): K {K} must be a multiple of {gran} for the {fmt} class"
+        )
+    if N % 8:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} must be a multiple of 8"
+        )
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "mm_mxfp8_mxfp4"), chunks_for(N, K, fmt), fmt
+    )
+
+
+def _moe_class_terms(
+    op: str,
     top_k: int,
     num_experts: int,
-    method: object = "Renormalize",
-    act: object = "swiglu",
-    params: Sequence[Optional[float]] = (),
-    gated: Optional[bool] = None,
-    n_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
-) -> str:
-    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
-    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
-    ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
-    the routing term), or the class's own method name (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same
-    class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
-    scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
-    ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
-    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``.
+    method: object,
+    act: object,
+    params: Sequence[Optional[float]],
+    gated: Optional[bool],
+    n_group: Optional[int],
+    topk_group: Optional[int],
+):
+    """The MoE classes' shared dimensions resolved to the specification's terms: ``(routing method, chain name, parameters,
+    gating)`` for the bf16 and the fp8 per-tensor fingerprints. ``method`` is a :class:`flashinfer.RoutingMethodType` (or
+    its name) among the ones the classes implement, with ``n_group`` / ``topk_group`` for ``DeepSeekV3``'s group-limited
+    selection (``RoutingConfig``'s values; the groups are a parameter of the routing term), or the classes' own method name
+    (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same class as the enum form with the groups) or a
+    ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters),
+    ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``
+    with ``params`` (and ``gated`` for the names in both tables). The receipt names a class some layer can build: the
+    runners' bounds and group rule apply here as ``ValueError``.
     """
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
@@ -180,11 +205,11 @@ def _moe_bf16_fingerprint(
 
     if not 1 <= num_experts <= MAX_E:
         raise ValueError(
-            f"fingerprint('fused_moe'): num_experts {num_experts} must lie in [1, {MAX_E}]"
+            f"fingerprint({op!r}): num_experts {num_experts} must lie in [1, {MAX_E}]"
         )
     if not 1 <= top_k <= min(num_experts, spec.MAX_TOP_K):
         raise ValueError(
-            f"fingerprint('fused_moe'): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
+            f"fingerprint({op!r}): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
         )
     if isinstance(method, str) and method in RoutingMethodType.__members__:
         method = RoutingMethodType[method]
@@ -238,9 +263,69 @@ def _moe_bf16_fingerprint(
             gated = act in spec.ACTS
     else:
         raise ValueError(f"no MoE chain named {act!r}")
+    return rm, name, params, gated
+
+
+def _moe_bf16_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: the dimensions of
+    :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)."""
+    from flashinfer.fused_moe.batch_invariant import spec
+
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe", top_k, num_experts, method, act, params, gated, n_group, topk_group
+    )
     return spec.spec_fingerprint(
         H, I, top_k, num_experts, rm, "bf16", name, params, gated
     )
+
+
+def _moe_fp8_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTensorConfig``: the dimensions of
+    :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)
+    under the same bounds; the scales' values are inputs, not dimensions."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import ALIGN_E4M3
+    from flashinfer.fused_moe.batch_invariant.spec_fp8 import spec_fingerprint_fp8
+
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % ALIGN_E4M3:
+            raise ValueError(
+                f"fingerprint('fused_moe_fp8'): {dim} {value} must be a positive multiple of {ALIGN_E4M3} "
+                "(the class's e4m3 row alignment)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_fp8",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    return spec_fingerprint_fp8(H, I, top_k, num_experts, rm, name, params, gated)
 
 
 def _megamoe_bf16_fingerprint(
@@ -515,6 +600,15 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
+    # the mixed MX classes (e2m1 weights x e4m3 activations, UE8M0 scales per 32 on both) behind `mm_mxfp8_mxfp4`, the
+    # pair's only dense kernel in FlashInfer (both values of its `batch_invariant` flag run the class); the architecture is
+    # a dimension as for mm_mxfp8 (gemm.mxfp4w8a.*64 on SM107, gemm.mxfp4w8a.* elsewhere)
+    "mm_mxfp8_mxfp4": ClassInfo(
+        "gemm.mxfp4w8a",
+        ("N", "K", "out_dtype"),
+        _mm_mxfp4w8a_fingerprint,
+        ("arch",),
+    ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
     # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
@@ -525,6 +619,14 @@ CLASSES: Dict[str, ClassInfo] = {
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
+    # scales are inputs of the class (their values never enter the identifier)
+    "fused_moe_fp8": ClassInfo(
+        "moe.e4m3",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_fp8_fingerprint,
+        ("method", "act", "params", "gated", "n_group", "topk_group"),
     ),
 }
 
@@ -598,6 +700,21 @@ def fingerprint(op: str, **dims) -> str:
     (``gemm.mxfp4.*128`` on SM107; ``gemm.nvfp4.*128`` on SM107 for the weight shapes its chunk rule leaves unsplit,
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
+    ``mm_mxfp8_mxfp4`` takes ``N, K`` and ``out_dtype``, and optionally ``arch`` as for ``mm_mxfp8``: the mixed-operand
+    block-scaled step of that architecture's instruction (e4m3 activations against e2m1 weights, 32 elements per step on
+    SM100 / SM103, 64 on SM107: ``gemm.mxfp4w8a.*`` and ``gemm.mxfp4w8a.*64``), the mixed classes' chunk count of the
+    weight shape, the chain's ``mul.rn`` by the caller's alpha and the conversion are the specification; the API's
+    ``batch_invariant`` flag does not enter it (both values run the class).
+
+    ``chunk_gated_delta_rule`` takes no dimension: the class ``gdn.bf16.c64`` is the native SM100 / SM103 / SM107 chunked GDN
+    prefill kernel without context parallelism (64-token chunks, fp32 state, log-domain gates and the Q / K l2-norm)
+    and the decode step kernel that computes its rows; the head counts, the batch, the slot and the position are not
+    dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
+
+    ``recurrent_kda`` takes no dimension: the class ``kda.bf16.c16`` is the native SM100 / SM103 / SM107 chunked KDA prefill
+    kernel on its pinned route (16-token chunks, fp32 state, the fused gate and Q / K normalization) and the decode
+    step kernel that computes its rows from the open chunk's cached rows; the head count, the batch, the slot and the position are
+    not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
 
     The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
     functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
@@ -618,6 +735,17 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("recurrent_kda")  # doctest: +SKIP
+    'kda-bf16-c16-engine-...'
+    >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
+    'moe-...'
+
+    ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
+    ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
+    activation on the alpha-scaled accumulators and GEMM2's scaled chain are the specification; the static per-tensor
+    scales, like the operands, are inputs.
+    >>> fingerprint("chunk_gated_delta_rule")  # doctest: +SKIP
+    'gdn-bf16-c64-...'
     """
     info = CLASSES.get(op)
     if info is None:
@@ -639,7 +767,8 @@ def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
     ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
     ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
-    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
+    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``; ``"gemm.mxfp4w8a"`` for the mixed MX classes behind
+    ``mm_mxfp8_mxfp4``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(
@@ -658,9 +787,13 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
+# The quantization, sampling, GDN and KDA classes register themselves here (their modules keep the mode's registry generic).
+from .gdn.classes import register as _register_gdn  # noqa: E402
+from .kda.classes import register as _register_kda  # noqa: E402
 from .quantization.classes import register as _register_quantization  # noqa: E402
 from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
 _register_sampling(CLASSES, ClassInfo)
+_register_gdn(CLASSES, ClassInfo)
+_register_kda(CLASSES, ClassInfo)

@@ -99,7 +99,8 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   // False: exclude the current block from top-k and always append its visible tokens.
   bool count_current_block_in_topk;
   // Nonzero for request-aligned fixed Q; query_positions then stores KV lengths.
-  int32_t fixed_query_len;
+  // Rows map to (request, query offset) with this precomputed divisor.
+  uint_fastdiv fixed_query_len;
 };
 
 namespace detail {
@@ -107,9 +108,13 @@ namespace detail {
 template <typename PositionType>
 __device__ __forceinline__ int64_t
 QueryPosition(const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params, int32_t row) {
-  if (params.fixed_query_len > 0) {
-    const int64_t length = params.query_positions[row / params.fixed_query_len];
-    return length > 0 ? length - params.fixed_query_len + row % params.fixed_query_len : -1;
+  const uint32_t query_len = params.fixed_query_len;
+  if (query_len > 0) {
+    uint32_t request;
+    uint32_t offset;
+    params.fixed_query_len.divmod(static_cast<uint32_t>(row), request, offset);
+    const int64_t length = params.query_positions[request];
+    return length > 0 ? length - query_len + offset : -1;
   }
   return static_cast<int64_t>(params.query_positions[row]);
 }
@@ -208,8 +213,10 @@ __device__ __forceinline__ void InitRoute(
   int32_t lane_request = -1;
   int64_t lane_position = -1;
   if (lane < query_count) {
-    lane_request = params.fixed_query_len > 0 ? (first_row + lane) / params.fixed_query_len
-                                              : params.token_to_request[first_row + lane];
+    lane_request =
+        static_cast<uint32_t>(params.fixed_query_len) > 0
+            ? static_cast<int32_t>(static_cast<uint32_t>(first_row + lane) / params.fixed_query_len)
+            : params.token_to_request[first_row + lane];
     lane_position = QueryPosition(params, first_row + lane);
   }
   const int32_t request = __shfl_sync(0xffffffffu, lane_request, 0);
@@ -236,8 +243,13 @@ __device__ __forceinline__ void InitRoute(
   }
 }
 
-// Permit the attention prologue to start early. Its dependency wait still
-// covers completion and visibility of every metadata CTA's output stores.
+// Permit the dependent attention grid to launch. Correctness does not depend
+// on this placement: the attention dependency wait covers completion and
+// visibility of every metadata CTA's output stores. Each kernel calls it after
+// its last output store, so attention CTAs overlap only this grid's tail rather
+// than idling resident through the whole metadata grid; measured on GB300, the
+// long residency slowed attention's later TMA issue and output stores under a
+// cold L2 by about 5 us on single-wave decode shapes.
 template <typename PositionType>
 __device__ __forceinline__ void ReleasePdlDependents(
     const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params) {
@@ -300,7 +312,6 @@ template <typename PositionType, bool PackedQuery>
 __global__
 __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1MetadataKernel(
     const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
-  ReleasePdlDependents(params);
   __shared__ QTokenKvBlockSparseRouteState route;
   if (threadIdx.x == 0) {
     route = {0, -1, 0, 0, -1, -1};
@@ -348,6 +359,7 @@ __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1
     params.seq_lens[blockIdx.x] = max(compact_length, 1);
   }
   __syncthreads();
+  ReleasePdlDependents(params);
 }
 
 // Call after publishing the live membership bytes with a CTA barrier.
@@ -522,7 +534,6 @@ __global__ __launch_bounds__(
                                                                          QTokenKvBlockSparseTouchedMetadataParams<
                                                                              PositionType>
                                                                              params) {
-  ReleasePdlDependents(params);
   constexpr int kBlockThreads =
       QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
   constexpr int kItemsPerThread =
@@ -535,8 +546,7 @@ __global__ __launch_bounds__(
   __shared__ QTokenKvBlockSparseTouchedMetadataSharedStorage<kBlockThreads, kItemsPerThread> shared;
 
   // Initialize CTA-local state before reading semantic inputs. This metadata
-  // kernel has no producer dependency. Its entry release lets the attention
-  // prologue overlap; the consumer wait still covers all output stores.
+  // kernel has no producer dependency; it releases attention after its outputs.
   if (threadIdx.x == 0) {
     shared.route = {0, -1, 0, 0, -1, -1};
     shared.union_pages = 0;
@@ -606,6 +616,7 @@ __global__ __launch_bounds__(
     StoreQueryMajorMemberships<PositionType, kBlockThreads, GroupSize>(params, group_memberships,
                                                                        shared.union_pages);
   }
+  ReleasePdlDependents(params);
 }
 
 // ---------------------------------------------------------------------------
@@ -709,7 +720,6 @@ template <typename PositionType, int GroupSize, bool PackedQuery, bool QueryMajo
 __global__
 __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSparseBitmapMetadataKernel(
     const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
-  ReleasePdlDependents(params);
   const uint32_t group = blockIdx.x / params.pattern_heads;
   const uint32_t head = blockIdx.x % params.pattern_heads;
   constexpr int kBlockThreads = kQTokenKvBlockSparseBitmapBlockThreads;
@@ -736,10 +746,27 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
     shared.union_pages = 0;
   }
 
-  // The first warp resolves the route while the other warps prefetch their
-  // fixed-layout rows. The ignored indexer suffix need not be initialized, so
-  // bound those loads by each row's visible completed-block prefix.
-  InitRoute<PositionType, GroupSize, PackedQuery>(params, &shared.route);
+  // Every warp first prefetches its fixed-layout rows; the first warp then
+  // resolves the route while those loads are in flight. The ignored indexer
+  // suffix need not be initialized, so bound those loads by each row's visible
+  // completed-block prefix.
+  // Request-aligned fixed Q: the host requires fixed_query_len % GroupSize == 0,
+  // so a group never crosses a request and one KV-length load per thread gives
+  // every row's position, instead of one dependent division and load per item.
+  // An empty request (length <= 0) keeps a sentinel far below zero, so every
+  // row's position stays negative and is rejected below, as QueryPosition does.
+  const uint32_t fixed_query_len = params.fixed_query_len;
+  int64_t group_first_position = -1;
+  if constexpr (!PackedQuery) {
+    const int64_t first_row = static_cast<int64_t>(group) * GroupSize;
+    if (fixed_query_len > 0 && first_row < params.rows) {
+      uint32_t request;
+      uint32_t offset;
+      params.fixed_query_len.divmod(static_cast<uint32_t>(first_row), request, offset);
+      const int64_t length = params.query_positions[request];
+      group_first_position = length > 0 ? length - fixed_query_len + offset : INT64_MIN / 2;
+    }
+  }
   int32_t prefetched_blocks[kItemsPerThread];
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
@@ -752,7 +779,9 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
       const int64_t row = static_cast<int64_t>(group) * GroupSize + query;
       if (query < static_cast<uint32_t>(GroupSize) &&
           query_item < static_cast<uint32_t>(params.block_topk) && row < params.rows) {
-        const int64_t position = QueryPosition(params, static_cast<int32_t>(row));
+        const int64_t position = fixed_query_len > 0
+                                     ? group_first_position + query
+                                     : QueryPosition(params, static_cast<int32_t>(row));
         if (position >= 0 && position < params.max_seq_len_kv &&
             query_item < static_cast<uint64_t>(SelectedBlockBound(params, position + 1))) {
           prefetched_blocks[item] =
@@ -764,6 +793,7 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
       }
     }
   }
+  InitRoute<PositionType, GroupSize, PackedQuery>(params, &shared.route);
   __syncthreads();
 
   const int64_t causal_block_bound =
@@ -981,41 +1011,57 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
     static_assert(GroupSize >= 2 && GroupSize <= 8);
     group_memberships = reinterpret_cast<uint8_t*>(block_map);
   }
-  // Resolve independent page-table loads before publishing each output batch.
-  // A semantic block may cross multiple noncontiguous physical cache pages.
+  // Resolve independent page-table loads before publishing each output batch:
+  // issue the whole batch's loads before consuming any page ID, so that their
+  // round trips overlap. A semantic block may cross multiple noncontiguous
+  // physical cache pages.
   constexpr int kEmitBatch = 4;
   const int union_fragments = union_pages * params.fragments_per_block;
   const int fragment_shift = __ffs(params.fragments_per_block) - 1;
   for (int rank_base = 0; rank_base < union_fragments; rank_base += kEmitBatch * kBlockThreads) {
-    int32_t locators[kEmitBatch];
+    int32_t physical_pages[kEmitBatch];
+    uint32_t subpages[kEmitBatch];
     uint32_t memberships[kEmitBatch];
 #pragma unroll
     for (int j = 0; j < kEmitBatch; ++j) {
       const int rank = rank_base + j * kBlockThreads + threadIdx.x;
-      locators[j] = -1;
+      physical_pages[j] = -1;
+      subpages[j] = 0;
       memberships[j] = 0;
       if (rank < union_fragments) {
         const uint32_t entry = shared.compact_union[rank >> fragment_shift];
         const uint32_t fragment =
             ((entry & 0xFFFFFFu) << fragment_shift) + (rank & (params.fragments_per_block - 1));
         const int64_t first_token = static_cast<int64_t>(fragment) * params.fragment_size;
-        if (first_token <= shared.route.last_position) {
-          locators[j] = ResolveFragment(params, shared.route, fragment);
+        uint32_t storage_page;
+        params.subpages_per_storage_page.divmod(fragment, storage_page, subpages[j]);
+        if (first_token <= shared.route.last_position &&
+            storage_page < static_cast<uint32_t>(params.page_table_width)) {
+          physical_pages[j] =
+              params
+                  .block_table[static_cast<int64_t>(shared.route.request) *
+                                   params.block_table_request_stride +
+                               static_cast<int64_t>(storage_page) * params.block_table_page_stride];
         }
         uint32_t membership = entry >> 24;
         const int64_t first_visible_query = first_token - shared.route.first_position;
         if (first_visible_query > 0) {
           membership &= first_visible_query < 8 ? (0xffu << first_visible_query) : 0u;
         }
-        memberships[j] = locators[j] >= 0 ? membership : 0;
+        memberships[j] = membership;
       }
     }
 #pragma unroll
     for (int j = 0; j < kEmitBatch; ++j) {
       const int rank = rank_base + j * kBlockThreads + threadIdx.x;
       if (rank < union_fragments) {
-        group_indices[rank] = locators[j];
-        group_memberships[rank] = static_cast<uint8_t>(memberships[j]);
+        const bool mapped = physical_pages[j] >= 0;
+        group_indices[rank] =
+            mapped ? static_cast<int32_t>(static_cast<uint32_t>(physical_pages[j]) *
+                                              static_cast<uint32_t>(params.locator_page_stride) +
+                                          subpages[j])
+                   : -1;
+        group_memberships[rank] = mapped ? static_cast<uint8_t>(memberships[j]) : 0;
       }
     }
   }
@@ -1042,6 +1088,7 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
     StoreQueryMajorMemberships<PositionType, kBlockThreads, GroupSize>(params, group_memberships,
                                                                        shared.union_pages);
   }
+  ReleasePdlDependents(params);
 }
 
 // Cached per host thread, device, and kernel specialization: no shared mutable
