@@ -15,7 +15,7 @@ limitations under the License.
 
 Tests for the SM103 "specialized" block-sparse MSA decode backend of
 msa_sparse_decode_attention (bf16 Q over paged fp8 E4M3 KV): correctness vs
-an fp32 reference, backend semantics (auto / specialized / native, kill
+an fp32 reference, backend semantics (auto / specialized / cake, kill
 switch, off-allowlist raise), out= handling, and CUDA-graph replay == eager.
 """
 
@@ -143,9 +143,10 @@ def test_specialized_correct_and_routed(B, SEQ):
 def test_backend_semantics():
     inp = _make_inputs(4, 300, seed=1)
     gold = _reference(inp).float()
-    # backend="native" never routes to the specialized kernel
+    # backend="cake" (the Cake-generated Blackwell programs, the former
+    # arch-dispatch "native" label) never routes to the specialized kernel
     before = dict(spec_mod.DISPATCH_STATS)
-    out = _api(inp, backend="native")
+    out = _api(inp, backend="cake")
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
     _assert_close(out, gold)
     # explicit specialized raises off-allowlist (fp16 q) with reasons
@@ -158,7 +159,7 @@ def test_backend_semantics():
 
 
 @requires_sm103
-def test_kill_switch_restores_native():
+def test_kill_switch_restores_stock():
     inp = _make_inputs(4, 300, seed=2)
     gold = _reference(inp).float()
     os.environ[spec_mod.KILL_SWITCH_ENV] = "1"
@@ -193,3 +194,24 @@ def test_cuda_graph_replay_matches_eager():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(buf, eager)
+
+
+@requires_sm103
+def test_backend_names_reflect_implementations():
+    """Round-3 naming: no arbitrary labels. "cake"/"cutedsl" name real
+    implementations; "native" is gone; "auto" only selects."""
+    from flashinfer.msa_ops.sparse_decode import MSA_SPARSE_DECODE_BACKENDS
+
+    assert MSA_SPARSE_DECODE_BACKENDS == ("auto", "specialized", "cake", "cutedsl")
+    inp = _make_inputs(B=2, SEQ=256, seed=31)
+    with pytest.raises(ValueError, match="backend must be one of"):
+        _api(inp, backend="native")
+    # explicit cutedsl on SM103 raises (it serves SM120/SM121 here)
+    with pytest.raises(ValueError, match="cutedsl"):
+        _api(inp, backend="cutedsl")
+    # explicit cake on SM103 equals what auto selects off-allowlist and
+    # the stock Blackwell path
+    out_cake = _api(inp, backend="cake")
+    gold = _reference(inp)
+    diff = (out_cake.float() - gold.float()).abs()
+    assert float((diff <= 0.02 + 0.05 * gold.float().abs()).float().mean()) >= 0.99
