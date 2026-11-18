@@ -35,9 +35,8 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe,
 )
 from flashinfer.fused_moe.smallt_sm90 import (
-    CUTLASS_FUSED_MOE_BACKENDS,
-    _dispatch_table,
     _eligibility,
+    _moe_smallt_sm90_dispatch,
     _moe_smallt_sm90_stats,
     _reset_moe_smallt_sm90_stats,
 )
@@ -152,7 +151,8 @@ def _gate(y, ref):
     return ts, l2
 
 
-def _call(b, **kw):
+def _stock_call(b, **kw):
+    """The stock flat entry (negative-control arm): always the CUTLASS route."""
     r = cutlass_fused_moe(
         input=b["x"],
         token_selected_experts=b["ids"],
@@ -164,11 +164,25 @@ def _call(b, **kw):
         use_deepseek_fp8_block_scale=True,
         **kw,
     )
-    # The stock cutlass route returns [output] (list); the specialized route
-    # returns the output tensor. Unwrap so arms compare uniformly.
     if isinstance(r, (tuple, list)):
         r = r[0]
     return r
+
+
+def _dispatch(b, output=None):
+    """Call the specialized kernel's own module directly (what the unified
+    SpecializedFp8BlockSmallTRunner does); None means the call was declined."""
+    return _moe_smallt_sm90_dispatch(
+        b["x"],
+        b["ids"],
+        b["tw"],
+        b["w13"],
+        b["w2"],
+        torch.bfloat16,
+        [b["s13"], b["s2"]],
+        output,
+        flags={},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -277,40 +291,39 @@ def test_stats_report_build_state_and_counters():
         "runs_dispatched",
         "module_loaded",
         "module_error",
-        "backends",
         "backend_dispatches",
         "fallback_reasons",
-        "dispatch_table_loaded",
     ):
         assert key in stats
-    assert stats["backends"] == CUTLASS_FUSED_MOE_BACKENDS
-    assert set(stats["backend_dispatches"]) == {"specialized", "stock"}
+    assert set(stats["backend_dispatches"]) == {"specialized", "declined"}
 
 
-def test_backends_tuple_and_dispatch_table():
-    assert CUTLASS_FUSED_MOE_BACKENDS == ("auto", "specialized", "cutlass", "cake")
-    table = _dispatch_table()
-    assert table is not None
-    assert table["kill_switch"] == DISABLE_ENV
-    op = table["ops"]["cutlass_fused_moe_dsfp8"]
-    assert op["token_bands"] == [[1, 16], [256, 4096]]
-    assert op["compute_capability"] == [9, 0]
+def test_flat_entry_is_untouched_negative_control():
+    """The specialized kernel is NOT a cutlass_fused_moe backend: the flat
+    vendor entry keeps its stock ("cutlass", "cake") surface and default,
+    and rejects "specialized"/"auto" — the kernel's only public home is the
+    unified MoELayer surface (GPU-free: the rejection precedes device
+    work)."""
+    import inspect
 
-
-def test_unknown_backend_raises_gpu_free():
-    x = torch.zeros((1, H), dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="never silently swapped"):
-        cutlass_fused_moe(
-            input=x,
-            token_selected_experts=torch.zeros((1, K), dtype=torch.int32),
-            token_final_scales=torch.zeros((1, K)),
-            fc1_expert_weights=torch.zeros((E, 2 * I, H), dtype=torch.float8_e4m3fn),
-            fc2_expert_weights=torch.zeros((E, H, I), dtype=torch.float8_e4m3fn),
-            output_dtype=torch.bfloat16,
-            quant_scales=[],
-            use_deepseek_fp8_block_scale=True,
-            backend="fa2",
-        )
+    assert (
+        inspect.signature(cutlass_fused_moe).parameters["backend"].default == "cutlass"
+    )
+    for name in ("specialized", "auto"):
+        with pytest.raises(ValueError, match="unsupported fused MoE backend"):
+            cutlass_fused_moe(
+                input=torch.zeros((1, H), dtype=torch.bfloat16),
+                token_selected_experts=torch.zeros((1, K), dtype=torch.int32),
+                token_final_scales=torch.zeros((1, K)),
+                fc1_expert_weights=torch.zeros(
+                    (E, 2 * I, H), dtype=torch.float8_e4m3fn
+                ),
+                fc2_expert_weights=torch.zeros((E, H, I), dtype=torch.float8_e4m3fn),
+                output_dtype=torch.bfloat16,
+                quant_scales=[],
+                use_deepseek_fp8_block_scale=True,
+                backend=name,
+            )
 
 
 # --------------------------------------------------------------------------
@@ -325,7 +338,8 @@ def test_specialized_matches_reference_and_stock(T, monkeypatch):
     b = _make(T, device)
     ref = _reference(b)
 
-    out = _call(b)  # backend defaults to "auto" -> allowlisted -> dispatched
+    out = _dispatch(b)  # the kernel's own dispatch, in-band -> served
+    assert out is not None
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched"] == 1, stats
     assert stats["backend_dispatches"]["specialized"] == 1, stats
@@ -333,47 +347,39 @@ def test_specialized_matches_reference_and_stock(T, monkeypatch):
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
     # determinism: the kernel is atomics-free and bit-stable
-    out2 = _call(b)
+    out2 = _dispatch(b)
     assert torch.equal(out, out2)
 
-    # NEVER-SWAPPED: explicit backend="cutlass" must not reach the kernel
-    out_pin = _call(b, backend="cutlass")
+    # NEGATIVE CONTROL: the flat entry is the stock kernel, always — the
+    # specialized kernel is not reachable through it.
+    out_stock = _stock_call(b)
     stats = _moe_smallt_sm90_stats()
-    assert stats["runs_dispatched"] == 2, stats  # unchanged by the pinned call
-    ts, l2 = _gate(out_pin, ref)
+    assert stats["runs_dispatched"] == 2, stats  # unchanged by the flat call
+    ts, l2 = _gate(out_stock, ref)
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
-    # explicit backend="specialized" dispatches
-    out_spec = _call(b, backend="specialized")
-    stats = _moe_smallt_sm90_stats()
-    assert stats["runs_dispatched"] == 3, stats
-    assert torch.equal(out_spec, out)
-
-    # kill switches (new + deprecated alias): the stock cutlass path serves
+    # kill switches (new + deprecated alias): the dispatch declines
     for env, nexpected in ((DISABLE_ENV, 1), (DISABLE_ENV_LEGACY, 2)):
         monkeypatch.setenv(env, "1")
-        out_stock = _call(b)
+        assert _dispatch(b) is None
         monkeypatch.delenv(env)
         stats = _moe_smallt_sm90_stats()
         assert stats["calls_disabled"] == nexpected, stats
-        assert stats["runs_dispatched"] == 3  # unchanged by disabled calls
-        ts, l2 = _gate(out_stock, ref)
-        assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+        assert stats["runs_dispatched"] == 2  # unchanged by disabled calls
+        assert stats["backend_dispatches"]["declined"] >= nexpected
 
 
-def test_above_envelope_takes_the_stock_path():
+def test_above_envelope_is_declined():
     # T=64 sits in the excluded 17..255 gap: the measured class where the
-    # stock cutlass kernel held at contract
+    # stock cutlass kernel held at contract. The dispatch declines; the
+    # unified layer serves such calls with another configured backend.
     _sm90_or_skip()
     device = torch.device("cuda:0")
     b = _make(64, device)
-    ref = _reference(b)
-    out = _call(b)
+    assert _dispatch(b) is None
     stats = _moe_smallt_sm90_stats()
-    # the core.py pre-filter (T <= 16) keeps the hook out of the call
     assert stats["runs_dispatched"] == 0, stats
-    ts, l2 = _gate(out, ref)
-    assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+    assert any("outside the measured won bands" in r for r in stats["fallback_reasons"])
 
 
 def test_graph_capture_replays_bitwise_equal_to_eager():
@@ -381,17 +387,17 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     device = torch.device("cuda:0")
     b = _make(4, device)
     out = torch.empty((4, H), dtype=torch.bfloat16, device=device)
-    eager = _call(b).clone()
+    eager = _dispatch(b).clone()
     assert _moe_smallt_sm90_stats()["runs_dispatched"] == 1
 
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _call(b, output=out)  # warmup on the side stream
+        assert _dispatch(b, output=out) is not None  # warmup on the side stream
     torch.cuda.current_stream().wait_stream(stream)
     with torch.cuda.graph(graph):
-        _call(b, output=out)
+        assert _dispatch(b, output=out) is not None
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched_capturing"] == 1, stats
 
@@ -404,7 +410,7 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     b["x"].copy_(_make(4, device, seed=7)["x"])
     graph.replay()
     torch.cuda.synchronize()
-    eager2 = _call(b)
+    eager2 = _dispatch(b)
     assert torch.equal(out, eager2)
 
 
@@ -424,7 +430,8 @@ def test_fc1_half_chunk_headroom_with_activation_outliers(T):
     b["w13"][:, :I, :16] = 448.0  # quantization peaks in the up branch
     b["x"][:, :16] = 25.0  # outlier activation channels
     ref = _reference(b)
-    out = _call(b, backend="specialized")
+    out = _dispatch(b)
+    assert out is not None
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched"] == 1, stats
     assert torch.isfinite(out.float()).all()
@@ -432,25 +439,18 @@ def test_fc1_half_chunk_headroom_with_activation_outliers(T):
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
 
-def test_nvfp4_4over6_pinned_recipe_declines_specialized():
-    # An eligible dsfp8 call with an explicitly pinned nvfp4_4over6 recipe
-    # must raise the stock route's ValueError, not be silently served by
-    # the specialized kernel (which would ignore the recipe). An explicit
-    # None (recipe off) stays eligible.
-    _sm90_or_skip()
+def test_nvfp4_4over6_pinned_recipe_rejects_at_config_time():
+    # A pinned nvfp4_4over6 recipe can never reach the specialized dsfp8
+    # backend: the unified QuantConfig rejects it on a non-NVFP4 activation
+    # outright, so no silently-dropped-recipe path exists (GPU-free).
     from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 
-    device = torch.device("cuda:0")
-    b = _make(4, device)
-    with pytest.raises(ValueError, match="nvfp4_4over6 requires"):
-        _call(b, nvfp4_4over6=NVFP44Over6Config())
-    stats = _moe_smallt_sm90_stats()
-    assert stats["runs_dispatched"] == 0, stats
-    assert any("nvfp4_4over6" in r for r in stats["fallback_reasons"]), stats
-    out = _call(b, nvfp4_4over6=None)
-    assert _moe_smallt_sm90_stats()["runs_dispatched"] == 1
-    ts, l2 = _gate(out, _reference(b))
-    assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+    with pytest.raises(ValueError, match="nvfp4_4over6"):
+        QuantConfig(
+            weight=QuantFormat.DeepSeekFp8,
+            activation=QuantFormat.DeepSeekFp8,
+            nvfp4_4over6=NVFP44Over6Config(),
+        )
 
 
 def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
@@ -470,11 +470,11 @@ def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
 
     b = _make(4, device)
     ref = _reference(b)
-    out_default = _call(b)
+    out_default = _dispatch(b)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        out_side = _call(b)
+        out_side = _dispatch(b)
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     stats = _moe_smallt_sm90_stats()
@@ -489,7 +489,7 @@ def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
     # old buffer instead of dropping the only reference to it
     retired_before = len(smallt._retired_workspaces)
     big = _make(256, device)
-    out_big = _call(big)
+    out_big = _dispatch(big)
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched"] == 3, stats
     assert stats["workspace_allocs"] == 3, stats
@@ -498,50 +498,8 @@ def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
-    reason="needs an sm90 device",
-)
-def test_return_type_parity_across_backends(monkeypatch):
-    """The backend taken must not be observable in the return type:
-    cutlass_fused_moe returns [output] on the stock route, on the
-    specialized route, under auto, and with the kill switch forcing
-    stock."""
-    device = torch.device("cuda")
-    b = _make(4, device)
-
-    def raw(**kw):
-        return cutlass_fused_moe(
-            input=b["x"],
-            token_selected_experts=b["ids"],
-            token_final_scales=b["tw"],
-            fc1_expert_weights=b["w13"],
-            fc2_expert_weights=b["w2"],
-            output_dtype=torch.bfloat16,
-            quant_scales=[b["s13"], b["s2"]],
-            use_deepseek_fp8_block_scale=True,
-            **kw,
-        )
-
-    results = {
-        "auto": raw(),
-        "specialized": raw(backend="specialized"),
-        "cutlass": raw(backend="cutlass"),
-    }
-    monkeypatch.setenv(DISABLE_ENV, "1")
-    results["auto+kill"] = raw()
-    monkeypatch.delenv(DISABLE_ENV)
-    # The stock route's own length varies by path (it may carry aux tensors
-    # after the output), so the stable cross-backend contract is: a list
-    # whose FIRST element is the output tensor.
-    for name, r in results.items():
-        assert isinstance(r, list) and len(r) >= 1, (name, type(r))
-        assert isinstance(r[0], torch.Tensor) and r[0].dtype == torch.bfloat16, name
-        assert r[0].shape == b["x"].shape, name
-
-
 # --------------------------------------------------------------------------
-# Unified MoELayer surface: first-class cross-backend autotune candidacy
+# Unified MoELayer surface: the kernel's public home (default-visible)
 # --------------------------------------------------------------------------
 
 
@@ -578,7 +536,7 @@ def _unified_layer(T, backends=None, tune_max=64, seed=0):
 
 
 def test_unified_config_gating_and_registration():
-    """GPU-free: SM90-only gating, runner registration, opt-in default."""
+    """GPU-free: SM90-only gating, runner registration, DEFAULT visibility."""
     from flashinfer.fused_moe.api import _DEFAULT_BACKEND, ALL_BACKEND_CONFIGS
     from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 
@@ -591,10 +549,17 @@ def test_unified_config_gating_and_registration():
         is SpecializedFp8BlockSmallTRunner
     )
     assert SpecializedFp8BlockSmallTConfig in ALL_BACKEND_CONFIGS
-    # ... but opt-in, like the other specialized backends: never in the
-    # default search order.
+    # ... and DEFAULT-VISIBLE: a matching layer reaches the kernel through
+    # backend=auto with no opt-in, on SM90 only (supported() gates the arch,
+    # the runner gates the contract and token bands).
+    assert any(isinstance(c, SpecializedFp8BlockSmallTConfig) for c in _DEFAULT_BACKEND)
+    assert any(
+        isinstance(c, SpecializedFp8BlockSmallTConfig)
+        for c in _DEFAULT_BACKEND.valid_for(90)
+    )
     assert not any(
-        isinstance(c, SpecializedFp8BlockSmallTConfig) for c in _DEFAULT_BACKEND
+        isinstance(c, SpecializedFp8BlockSmallTConfig)
+        for c in _DEFAULT_BACKEND.valid_for(120)
     )
     # Same prepared-weight contract as the stock dsfp8 backend.
     assert SpecializedFp8BlockSmallTRunner.weight_view_aliases == ("cutlass_fp8_block",)
@@ -645,30 +610,43 @@ def test_unified_autotune_reaches_both_backends():
     assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
 
 
-def test_unified_kill_switch_serves_stock_route(monkeypatch):
-    """With the kill switch set, the specialized runner serves through the
-    stock cutlass route — the layer keeps working, nothing launches the
-    specialized kernel."""
+def test_unified_kill_switch_declines_and_stock_serves(monkeypatch):
+    """With the kill switch set, the specialized runner declines every call
+    (it never serves through another kernel); a layer that also configures
+    the stock dsfp8 backend keeps working through it."""
     _sm90_or_skip()
     monkeypatch.setenv(DISABLE_ENV, "1")
-    layer, act, weights, b = _unified_layer(4, None)
+    layer, act, weights, b = _unified_layer(
+        4, (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig())
+    )
     out = layer(act, weights)
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched"] == 0
-    assert stats["backend_dispatches"]["stock"] > 0
-    assert any("kill switch" in r for r in stats["fallback_reasons"])
+    assert layer.winner_backend == "cutlass_fp8_block"
     ts, l2 = _gate(out, _reference(b))
     assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
+    # A specialized-ONLY layer has no eligible backend while disabled: it
+    # raises instead of silently serving the call with a different kernel.
+    layer_only, act2, weights2, _ = _unified_layer(4, None)
+    with pytest.raises(NotImplementedError, match="routing_input_mode"):
+        layer_only(act2, weights2)
 
 
-def test_unified_out_of_band_tokens_serve_stock_route():
-    """A specialized-only layer still serves token counts outside the won
-    bands (the 17..255 gap) through the stock route instead of failing."""
+def test_unified_out_of_band_tokens_route_to_stock():
+    """Out-of-band token counts (the 17..255 gap) are declined at
+    eligibility time: auto routes them to the stock dsfp8 backend, and a
+    specialized-only layer refuses them instead of serving a different
+    kernel (negative control for the removed in-runner fallback)."""
     _sm90_or_skip()
-    layer, act, weights, b = _unified_layer(64, None)
+    layer, act, weights, b = _unified_layer(
+        64, (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig())
+    )
     out = layer(act, weights)
     stats = _moe_smallt_sm90_stats()
     assert stats["runs_dispatched"] == 0
-    assert any("outside the measured won bands" in r for r in stats["fallback_reasons"])
+    assert layer.winner_backend == "cutlass_fp8_block"
     ts, l2 = _gate(out, _reference(b))
     assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
+    layer_only, act2, weights2, _ = _unified_layer(64, None)
+    with pytest.raises(NotImplementedError, match="routing_input_mode"):
+        layer_only(act2, weights2)

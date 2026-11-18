@@ -13,57 +13,49 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Specialized SM90 small-batch (decode-step) fast-path for
-``cutlass_fused_moe(..., use_deepseek_fp8_block_scale=True)``
+Specialized SM90 small-batch (decode-step) fused-MoE kernel for the
+DeepSeek-style fp8 [128,128]-block-scale contract
 (csrc/moe_fp8_grouped_smallt_sm90.cu,
 flashinfer/jit/moe_fp8_grouped_smallt_sm90.py).
 
-ALLOWLIST (fails closed to the stock cutlass path otherwise): SM90 device,
-DeepSeek-style fp8 [128,128]-block-scale weights (``quant_scales ==
-[fc1_block_scales, fc2_block_scales]``), bf16 unquantized activations, bf16
-output, gated SiLU (Swiglu) activation, no biases / input_sf / swiglu
-parameters / expert parallelism / min-latency mode, the measured kernel
-geometry per launch class (T == 1: hidden 512-aligned, intermediate 256,
-top_k 9; the grouped band: hidden 256-aligned, intermediate 256, top_k 9,
-at most 288 experts), and token counts inside the measured won bands **T <= 16 or 256 <= T <= 4096**
-— the measured envelope where this kernel beats the serving engines'
-dispatched triton fused-MoE on the captured GLM-class routing. At the
-measured T >= 64 classes the kernel LOSES to that incumbent (0.55-0.81x),
-so batches above the bound keep the stock path by design, not by omission.
-The kernel consumes the cutlass_fused_moe fc1 stacking as-is (rows [0:I] =
-up, rows [I:2I] = gate).
+This module is the kernel's OWN dispatch surface. Its sole public home is
+the unified MoE API: ``SpecializedFp8BlockSmallTConfig`` (``api.py``, a
+default backend candidate on SM90) and ``SpecializedFp8BlockSmallTRunner``
+(``runners.py``) call :func:`_moe_smallt_sm90_dispatch` directly. The kernel
+is NOT a CUTLASS kernel and is not reachable through ``cutlass_fused_moe``
+or any other backend's entry point: ``MoELayer``'s ``backend=auto``
+per-token-bucket shootout times it as its own named candidate and routes to
+it where it wins, and an explicitly selected other backend is never served
+by it.
 
-The fast-path is selected through ``cutlass_fused_moe``'s ``backend`` kwarg
-(#5667 pattern): ``backend="specialized"`` selects it explicitly (a call it
-cannot serve falls back to the stock cutlass route — this op's composable
-path — never another fused backend, reason recorded); ``backend="auto"``
-(the new default) routes to it only on the dispatch allowlist
-(``flashinfer/moe_fp8_grouped_smallt_sm90_dispatch.json``, which carries the
-measured won BANDS); an explicitly named backend (``"cutlass"``, ``"cake"``)
-is NEVER served by it. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per
-call; the kill switch shared by FlashInfer's specialized kernels) restores
-the stock cutlass route bitwise;
+ALLOWLIST (the dispatch declines otherwise; the runner never serves a
+declined call with a different kernel): SM90 device, DeepSeek-style fp8
+[128,128]-block-scale weights (``quant_scales == [fc1_block_scales,
+fc2_block_scales]``), bf16 unquantized activations, bf16 output, gated SiLU
+(Swiglu) activation, no biases / input_sf / swiglu parameters / expert
+parallelism / min-latency mode, the measured kernel geometry per launch
+class (T == 1: hidden 512-aligned, intermediate 256, top_k 9; the grouped
+band: hidden 256-aligned, intermediate 256, top_k 9, at most 288 experts),
+and token counts inside the measured won bands **T <= 16 or
+256 <= T <= 4096** — the measured envelope where this kernel beats the
+serving engines' dispatched triton fused-MoE on the captured GLM-class
+routing. At the measured T >= 64 classes the kernel LOSES to that incumbent
+(0.55-0.81x), so batches in the 17..255 gap are declined by design, not by
+omission (``MoELayer`` routes them to the stock dsfp8 backend when it is
+configured, as it is by default). The kernel consumes the stock dsfp8 fc1
+stacking as-is (rows [0:I] = up, rows [I:2I] = gate).
+
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call; the kill switch
+shared by FlashInfer's specialized kernels) makes the runner decline every
+call, so ``MoELayer`` selects among the remaining backends;
 ``FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90=1`` is a deprecated alias
 kept for one release.
 
-On the unified ``MoELayer`` surface the kernel is a FIRST-CLASS cross-backend
-autotune candidate through the opt-in ``SpecializedFp8BlockSmallTConfig``
-backend (``api.py``; not in the default search order, matching the SM12x/B12x
-specialized backends) and its ``SpecializedFp8BlockSmallTRunner``
-(``runners.py``), which routes through ``backend="specialized"`` with no
-pinned tactics: ``MoELayer``'s per-token-bucket shootout times the kernel
-directly against the other configured backends and caches the winner. The
-kernel is deliberately NOT reachable through the stock
-``CutlassFp8BlockRunner``: that runner always pins CUTLASS tactics
-(``profile_ids``), which this dispatch declines — a tactic-pinned call is the
-stock kernel's own tuned launch, and serving it with a different kernel would
-silently invalidate the autotuner's measurements.
-
 The dispatch never allocates on the hot path except the output tensor when
-the caller did not pass one (the stock path allocates it in the same
-place): the fp16 intermediate workspace is cached per (device, stream) at
-the serving band's capacity and the JIT build happens on the first eligible call outside any
-CUDA-graph capture (a capture without a built module takes the stock path).
+the caller did not pass one: the fp16 intermediate workspace is cached per
+(device, stream) at the serving band's capacity and the JIT build happens at
+layer init or on the first eligible call outside any CUDA-graph capture (a
+capture without a built module is declined).
 """
 
 import os
@@ -78,24 +70,19 @@ from ..utils import get_compute_capability
 _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 # Deprecated alias (kept for one release).
 _DISABLE_ENV = "FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90"
-# Backends of cutlass_fused_moe, as plain strings (#5667): "specialized" is
-# the agent-generated small-T/banded fast path; "cutlass"/"cake" are the
-# existing routes. An explicitly selected backend is never silently swapped.
-CUTLASS_FUSED_MOE_BACKENDS = ("auto", "specialized", "cutlass", "cake")
-_DISPATCH_FILE = "moe_fp8_grouped_smallt_sm90_dispatch.json"
 _MAX_TOKENS = 16  # small-path band cap (measured won rows T=1/4/16)
 # Expansion (measured vs FI's own grouped-fp8 route at contract): the
-# candidate also wins the T=256/1024/4096 classes against the stock cutlass
+# candidate also wins the T=256/1024/4096 classes against FI's stock cutlass
 # dsfp8 path, so a second band [256, 4096] is admitted; interior points
 # (e.g. T=512/2048) are admitted by BAND INTERPOLATION between the measured
 # classes, the same semantics as the shipped 1..16 band. The 17..255 gap —
 # containing the measured T=64 class, where FI's own kernel held at contract
-# (and in-venv) — stays on the stock path.
+# (and in-venv) — is declined (served by the stock dsfp8 backend).
 _BAND2_LO = 256
 _BAND2_HI = 4096
 _COMPUTE_CAPABILITY = (9, 0)
 
-_backend_dispatches: Dict[str, int] = {"specialized": 0, "stock": 0}
+_backend_dispatches: Dict[str, int] = {"specialized": 0, "declined": 0}
 _fallback_reasons: Dict[str, int] = {}
 
 
@@ -146,37 +133,14 @@ def _disabled() -> bool:
     return False
 
 
-def _dispatch_table():
-    """Load the dispatch surface (package data) once; ``None`` means
-    ``backend="auto"`` never routes to "specialized"."""
-    global _DISPATCH_TABLE
-    try:
-        return _DISPATCH_TABLE
-    except NameError:
-        pass
-    try:
-        import json
-        from importlib import resources
-
-        payload = json.loads(
-            resources.files("flashinfer").joinpath(_DISPATCH_FILE).read_text()
-        )
-        _DISPATCH_TABLE = payload if isinstance(payload, dict) else None
-    except Exception:
-        _DISPATCH_TABLE = None
-    return _DISPATCH_TABLE
-
-
 def _moe_smallt_sm90_stats() -> Dict[str, Any]:
     """Introspection for benchmarks and tests: per-process call census and
     build state of the specialized SM90 small-T dsfp8 MoE kernel."""
     stats: Dict[str, Any] = dict(_counters)
     stats["module_loaded"] = _module is not None
     stats["module_error"] = _module_error
-    stats["backends"] = CUTLASS_FUSED_MOE_BACKENDS
     stats["backend_dispatches"] = dict(_backend_dispatches)
     stats["fallback_reasons"] = dict(_fallback_reasons)
-    stats["dispatch_table_loaded"] = _dispatch_table() is not None
     return stats
 
 
@@ -202,12 +166,12 @@ def _get_module() -> Any:
         )
 
         _module = gen_moe_fp8_grouped_smallt_sm90_module().build_and_load()
-    except Exception as exc:  # build or load failure: stock path, say why
+    except Exception as exc:  # build or load failure: decline, say why
         _module_error = f"{type(exc).__name__}: {exc}"[:800]
         _counters["build_failed"] += 1
         logger.warning_once(
-            "moe_fp8_grouped_smallt_sm90: JIT build failed (%s); small-T "
-            "dsfp8 calls are served by the stock cutlass path",
+            "moe_fp8_grouped_smallt_sm90: JIT build failed (%s); the "
+            "specialized backend declines every call",
             _module_error,
         )
         return None
@@ -226,7 +190,7 @@ def _eligibility(
     flags: Dict[str, Any],
 ) -> Optional[str]:
     """Return None when the call is the measured small-T dsfp8 contract, else
-    a reason string (logged once; the stock cutlass path serves the call).
+    a reason string (logged once; the call is declined).
     Semantics first, then shapes/dtypes, device last; no synchronisation."""
     for name, val in flags.items():
         if val:
@@ -327,7 +291,7 @@ def _eligibility(
     return None
 
 
-def _moe_smallt_sm90_try_dispatch(
+def _moe_smallt_sm90_dispatch(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
     token_final_scales: Optional[torch.Tensor],
@@ -337,28 +301,23 @@ def _moe_smallt_sm90_try_dispatch(
     quant_scales: List[torch.Tensor],
     output: Optional[torch.Tensor],
     flags: Dict[str, Any],
-    requested: str = "auto",
 ) -> Optional[torch.Tensor]:
-    """Serve the call with the specialized small-T kernel, or return None so
-    the stock cutlass path runs (nothing launched; this op's composable
-    route). ``requested`` is the public backend kwarg: only "auto" (on the
-    dispatch allowlist) and "specialized" reach the kernel."""
+    """Serve the call with the specialized small-T kernel, or return None
+    (nothing launched; the call is DECLINED and the reason recorded — the
+    caller, ``SpecializedFp8BlockSmallTRunner``, decides what a declined
+    call means; it never serves one with a different kernel)."""
     global _announced
     _counters["calls_seen"] += 1
     if _disabled():
         _counters["calls_disabled"] += 1
-        _fallback(f"{requested}: kill switch")
-        _backend_dispatches["stock"] += 1
+        _fallback("kill switch")
+        _backend_dispatches["declined"] += 1
         logger.info_once(
             "moe_fp8_grouped_smallt_sm90: disabled (%s, or its deprecated "
-            "alias %s); the stock cutlass path serves small-T dsfp8 calls",
+            "alias %s); every call is declined",
             _SPECIALIZED_KERNEL_DISABLE_ENV,
             _DISABLE_ENV,
         )
-        return None
-    if requested == "auto" and _dispatch_table() is None:
-        _fallback("auto: dispatch allowlist unavailable")
-        _backend_dispatches["stock"] += 1
         return None
     try:
         reason = _eligibility(
@@ -372,15 +331,14 @@ def _moe_smallt_sm90_try_dispatch(
             output,
             flags,
         )
-    except Exception as exc:  # a guard failure must never break the stock path
+    except Exception as exc:  # a guard failure must never break the caller
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         _counters["calls_ineligible"] += 1
-        _fallback(f"{requested}: {reason}")
-        _backend_dispatches["stock"] += 1
+        _fallback(reason)
+        _backend_dispatches["declined"] += 1
         logger.info_once(
-            "moe_fp8_grouped_smallt_sm90: not dispatched (%s); the stock "
-            "cutlass path serves this call",
+            "moe_fp8_grouped_smallt_sm90: not dispatched (%s); the call is declined",
             reason,
         )
         return None
@@ -389,15 +347,15 @@ def _moe_smallt_sm90_try_dispatch(
         and torch.cuda.is_current_stream_capturing()
     )
     if capturing and _module is None:
-        # never compile inside a capture; the stock path is baked
+        # never compile inside a capture
         _counters["runs_capture_unready"] += 1
-        _fallback(f"{requested}: uncompiled under capture")
-        _backend_dispatches["stock"] += 1
+        _fallback("uncompiled under capture")
+        _backend_dispatches["declined"] += 1
         return None
     module = _get_module()
     if module is None:
-        _fallback(f"{requested}: JIT build failed")
-        _backend_dispatches["stock"] += 1
+        _fallback("JIT build failed")
+        _backend_dispatches["declined"] += 1
         return None
 
     T = input.shape[0]
@@ -430,8 +388,8 @@ def _moe_smallt_sm90_try_dispatch(
                 ws = cand
         if ws is None:
             _counters["runs_capture_unready"] += 1
-            _fallback(f"{requested}: workspace alloc under capture")
-            _backend_dispatches["stock"] += 1
+            _fallback("workspace alloc under capture")
+            _backend_dispatches["declined"] += 1
             return None
     elif ws is None:
         old = _workspaces.get(ws_key)
@@ -446,8 +404,8 @@ def _moe_smallt_sm90_try_dispatch(
     if ids.dtype != torch.int32:
         if capturing:
             _counters["runs_capture_unready"] += 1
-            _fallback(f"{requested}: int64 ids cast under capture")
-            _backend_dispatches["stock"] += 1
+            _fallback("int64 ids cast under capture")
+            _backend_dispatches["declined"] += 1
             return None
         ids = ids.to(torch.int32)
     out = output

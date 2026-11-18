@@ -2329,26 +2329,26 @@ class CutlassFp8BlockConfig:
 
 @dataclass(frozen=True)
 class SpecializedFp8BlockSmallTConfig:
-    """Specialized SM90 small/banded-batch backend over the CUTLASS DeepSeek
-    128x128 FP8 block-scale format (an agent-generated kernel).
+    """Specialized SM90 small/banded-batch MoE backend for the DeepSeek
+    128x128 FP8 block-scale contract (an agent-generated kernel; its own
+    module, :mod:`flashinfer.fused_moe.smallt_sm90` — not a CUTLASS kernel).
 
-    Same weight, activation and routing contract as
-    :class:`CutlassFp8BlockConfig`: prepare weights once with either class and
-    register the view under either backend key — the runner accepts the
-    ``"cutlass_fp8_block"`` view as its own. Calls on the kernel's measured
-    allowlist (:mod:`flashinfer.fused_moe.smallt_sm90`: the won token bands,
-    geometry, contiguity, SM90) launch the specialized kernel; every other
-    call is served by the stock CUTLASS dsfp8 route — this op's composable
-    path, never another fused backend — so a layer configured with this
-    backend alone still serves every batch size.
+    Same weight and routing contract as :class:`CutlassFp8BlockConfig`:
+    prepare weights once with either class and register the view under
+    either backend key — the runner accepts the ``"cutlass_fp8_block"``
+    view as its own, with no second weight copy.
 
-    Opt-in: not part of the default backend search order, matching the SM12x /
-    B12x specialized backends. List it next to :class:`CutlassFp8BlockConfig`
-    in ``BackendOptions`` to make the specialized kernel a first-class
-    cross-backend autotune candidate: ``MoELayer``'s per-token-bucket shootout
-    then times the kernel directly and caches the per-bucket winner.
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM90) and
+    the runner gates the kernel's contract (dsfp8 quant, canonical SwiGLU,
+    each band's geometry) and per-call token bands (T <= 16 and
+    256 <= T <= 4096, the measured won bands), so under ``backend=auto``
+    the ``MoELayer`` per-token-bucket shootout times the specialized kernel
+    directly on matching layers and routes to it where it wins. The runner
+    serves ONLY the kernel's own domain: out-of-band calls are declined at
+    eligibility time and served by whichever other configured backend wins
+    them (the stock dsfp8 backend, by default never this one).
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) makes the
-    runner serve exclusively through the stock route.
+    runner decline every call.
     """
 
     @classmethod
@@ -3593,6 +3593,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runners gate arch + contract; out-of-domain calls are declined
+        # and served by the other candidates).
+        SpecializedFp8BlockSmallTConfig(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),

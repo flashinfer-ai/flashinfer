@@ -2729,56 +2729,104 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
 
 
 class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
-    """First-class unified adapter for the specialized SM90 small-T dsfp8 MoE
-    kernel (:mod:`flashinfer.fused_moe.smallt_sm90`; an agent-generated
-    kernel).
+    """Unified adapter for the specialized SM90 small-T dsfp8 MoE kernel
+    (:mod:`flashinfer.fused_moe.smallt_sm90`; an agent-generated kernel).
 
-    ``forward`` routes through ``cutlass_fused_moe(backend="specialized")``
-    with no pinned tactics: calls on the kernel's allowlist (the measured won
-    token bands, geometry, contiguity, SM90) launch the specialized kernel,
-    and every other call — including every call while
-    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` is set — is served by the
-    stock CUTLASS dsfp8 route with its default tactic heuristic, this op's
-    composable path. The runner therefore accepts every call its
-    configuration supports: ``MoELayer``'s per-token-bucket cross-backend
-    shootout times the specialized kernel directly on allowlisted buckets
-    (first-class candidacy), while on out-of-band buckets this candidate
-    times (and would serve) the stock route, where the tactic-tuned
-    ``CutlassFp8BlockRunner`` normally wins the bucket.
+    ``forward`` calls the kernel's own module directly
+    (:func:`~flashinfer.fused_moe.smallt_sm90._moe_smallt_sm90_dispatch`) —
+    the kernel is not a CUTLASS kernel and does not route through
+    ``cutlass_fused_moe``. The runner serves EXACTLY the kernel's measured
+    domain: ``_accepts_shape`` admits only the won token bands (T <= 16 and
+    256 <= T <= 4096) with each band's geometry, so ``MoELayer``'s
+    ``backend=auto`` per-token-bucket shootout times the specialized kernel
+    on in-band buckets — as a first-class named candidate — and never routes
+    an out-of-band call here. A declined dispatch after acceptance raises
+    rather than silently serving the call with another kernel (a backend
+    carries only its own behavior).
+
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) makes
+    ``_accepts_shape`` decline every call, so auto selects among the
+    remaining backends.
 
     The specialized kernel has no tactic space, so ``get_valid_tactics``
     returns the single sentinel tactic and tactic preparation is a no-op.
-    Reuses ``CutlassFp8BlockRunner``'s packing, workspace and support checks
-    (same quant family, archs and prepared-weight view).
+    Reuses ``CutlassFp8BlockRunner``'s packing and support checks (same
+    quant family, archs and prepared-weight view); the kernel manages its
+    own fp16 intermediate workspace, so no CUTLASS workspace is allocated.
     """
 
     backend_key = "specialized_fp8_block_smallt"
     # The specialized kernel consumes the stock CUTLASS dsfp8 weight view
     # unchanged, so a pack prepared for that backend serves this one too.
     weight_view_aliases = ("cutlass_fp8_block",)
+    # The kernel implements the canonical gated-SiLU epilogue only.
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+    )
 
     def _check_support(self) -> None:
         super()._check_support()
-        # The config-static slice of the kernel's allowlist. The per-call
-        # slice (token bands, hidden alignment, per-band top_k/expert
-        # geometry, contiguity, kill switch) is enforced by the dispatch at
-        # call time, with the stock route serving declined calls.
+        # The config-static slice of the kernel's allowlist; the per-call
+        # slice (token bands and each band's geometry, contiguity, kill
+        # switch) is gated by _accepts_shape and re-validated by the
+        # dispatch itself.
         if self.config.experts.intermediate_size % 128:
             raise NotImplementedError(
                 f"{type(self).__name__} requires 128-aligned intermediate_size "
                 f"(the [128,128] block-scale grid), got "
                 f"{self.config.experts.intermediate_size}."
             )
+        if self.config.activation != SwiGLU():
+            raise NotImplementedError(
+                f"{type(self).__name__} implements only the canonical "
+                f"SwiGLU() epilogue; got {self.config.activation!r}."
+            )
 
     def _build(self) -> None:
-        super()._build()
-        # Build the specialized module at layer init, never inside a CUDA
-        # graph capture (the dispatch refuses to compile under capture). A
-        # failed build is recorded once and every call is then served by the
-        # stock route; smallt_sm90 logs the reason.
+        # No CUTLASS inner runner: this backend launches only its own
+        # module. Build it at layer init, never inside a CUDA graph capture
+        # (the dispatch refuses to compile under capture); a failed JIT
+        # build rejects the backend here, so MoELayer reports the reason
+        # and selects among the remaining candidates.
         from .smallt_sm90 import _get_module
 
-        _get_module()
+        if _get_module() is None:
+            from .smallt_sm90 import _module_error
+
+            raise RuntimeError(
+                f"{type(self).__name__}: specialized module build failed "
+                f"({_module_error})."
+            )
+
+    def _band_geometry_ok(self, num_tokens: int, hidden_size: int) -> bool:
+        from .smallt_sm90 import _BAND2_LO, _BAND2_HI, _MAX_TOKENS
+
+        routing = self.config.routing
+        intermediate = self.config.experts.intermediate_size
+        if 1 <= num_tokens <= _MAX_TOKENS:
+            if num_tokens == 1 and not (
+                hidden_size % 512 == 0 and intermediate == 256 and routing.top_k == 9
+            ):
+                return False
+            return hidden_size % 128 == 0
+        if _BAND2_LO <= num_tokens <= _BAND2_HI:
+            return (
+                routing.top_k == 9
+                and routing.num_experts <= 288
+                and hidden_size % 256 == 0
+                and intermediate == 256
+            )
+        return False
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        from .smallt_sm90 import _disabled
+
+        if _disabled():
+            return False
+        hidden = act.hidden_states_q
+        if hidden.ndim != 2:
+            return False
+        return self._band_geometry_ok(act.num_tokens, hidden.shape[1])
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -2792,16 +2840,24 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                 if alias in weights.native_views:
                     weights.prepare_for(self.backend_key, weights.get_view(alias))
                     break
-        return super().pack_inputs(act, weights)
+        inputs = super().pack_inputs(act, weights)
+        # Per-expert activation-scalar overrides are a stock-kernel feature
+        # the specialized kernel does not implement; never drop them.
+        overridden = [
+            name for name, t in self._activation_params.items() if t is not None
+        ]
+        if overridden:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not consume per-expert "
+                f"activation overrides {overridden}."
+            )
+        return inputs
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
         self._require_built()
         self._validate_input_count(inputs)
-        # No tactic space: the specialized kernel's launch is fully determined
-        # by the call shape, and the stock-route fallback runs its default
-        # heuristic rather than a pinned pair (a tactic-pinned call is the
-        # stock kernel's own tuned launch, which the specialized dispatch
-        # declines by design).
+        # No tactic space: the specialized kernel's launch is fully
+        # determined by the call shape.
         return [-1]
 
     def forward(
@@ -2813,43 +2869,37 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
     ) -> torch.Tensor:
         self._require_built()
         self._validate_input_count(inputs)
-        if self._workspace is None:
-            raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
         if do_preparation:
             return inputs[0]  # no tactics to prepare
 
-        # Deterministic geometric-capacity workspace for the stock-route
-        # fallback; older cached buffers remain alive for captured graphs.
-        num_tokens = inputs[1].shape[0]
-        bucket = map_to_hybrid_bucket(
-            num_tokens, self.config.execution.tune_max_num_tokens
-        )
-        self._ensure_workspace(bucket, self._hidden_size_of(inputs[1]))
+        from .smallt_sm90 import _fallback_reasons, _moe_smallt_sm90_dispatch
 
-        from .core import cutlass_fused_moe
-
-        # profile_ids stays unset: the specialized dispatch declines
-        # tactic-pinned calls, and pinning would also constrain the fallback.
-        cutlass_fused_moe(
+        before = dict(_fallback_reasons)
+        out = _moe_smallt_sm90_dispatch(
             inputs[1],
             inputs[2],
             inputs[3],
             inputs[4],
             inputs[5],
-            output_dtype=torch.bfloat16,
-            quant_scales=self._quant_scales(inputs),
-            input_sf=self._input_sf(inputs),
-            output=inputs[0],
-            tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
-            enable_pdl=self._enable_pdl,
-            activation_type=self.config.activation.type,
-            use_deepseek_fp8_block_scale=True,
-            use_fused_finalize=self._use_fused_finalize,
-            workspace_buffer=self._workspace,
-            backend="specialized",
-            **self._activation_params,
-            nvfp4_4over6=self.config.quant.nvfp4_4over6,
+            torch.bfloat16,
+            self._quant_scales(inputs),
+            inputs[0],
+            flags={},
         )
+        if out is None:
+            # _accepts_shape admitted the call, so a decline here is a
+            # call-time state change (kill switch flipped, capture without a
+            # primed workspace, guard mismatch). Raising keeps the backend
+            # honest: it never serves a call with a different kernel.
+            new_reasons = [
+                reason
+                for reason, count in _fallback_reasons.items()
+                if count > before.get(reason, 0)
+            ]
+            raise RuntimeError(
+                f"{type(self).__name__}: the specialized kernel declined an "
+                f"accepted call ({'; '.join(new_reasons) or 'unknown reason'})."
+            )
         return inputs[0]
 
 
