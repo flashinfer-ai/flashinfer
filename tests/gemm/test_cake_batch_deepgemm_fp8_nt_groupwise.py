@@ -1163,16 +1163,18 @@ def test_domain_twin_counters_zero_and_reused(cell):
     torch.cuda.synchronize()
     first = _valid_bits(prepared.out, valid)
     _assert_valid_rows_close(prepared.out, reference, masked_m)
-    before = torch.cuda.memory_stats()
     for _ in range(3):
         assert all(int(t.abs().sum()) == 0 for t in counters)
         prepared.out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()
         prepared.launch()
         torch.cuda.synchronize()
+        after = torch.cuda.memory_stats()
+        assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+        assert after["allocation.all.freed"] == before["allocation.all.freed"]
         assert torch.equal(_valid_bits(prepared.out, valid), first)
     assert all(int(t.abs().sum()) == 0 for t in counters)
-    after = torch.cuda.memory_stats()
-    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
     owned = dict(
         zip(
             ("counters0", "counters1"),
