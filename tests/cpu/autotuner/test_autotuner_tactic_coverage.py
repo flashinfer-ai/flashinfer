@@ -174,9 +174,45 @@ def test_persisted_signature_text_is_canonical():
             return (frozenset(dtypes), ("rev", 2, frozenset({3, 1})))
 
     keys = _ProfilingCandidates.from_runners([SetRunner([1])], [torch.zeros(1)])
-    expected = (tuple(sorted(dtypes)), ("rev", 2, (1, 3)))
+    expected = (
+        "('SetRunner', (), (frozenset({"
+        + ", ".join(map(repr, sorted(dtypes)))
+        + "}), ('rev', 2, frozenset({1, 3}))))"
+    )
     # str(frozenset) follows the per-process hash seed; the persisted key must not.
-    assert keys.file_keys == (str(("SetRunner", (), expected)),)
+    assert keys.file_keys == (expected,)
+
+
+@pytest.mark.parametrize("mode", ["v1", "managed"])
+def test_frozenset_and_tuple_signatures_stay_distinct_after_reload(
+    setup, monkeypatch, tmp_path, mode
+):
+    tuner, calls = setup
+
+    class TypedRunner(PoolRunner):
+        def get_tactic_cache_key(self, inputs):
+            return (self.signature,)
+
+    runner = TypedRunner([1])
+    runner.signature = (1, 2)
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning(mode):
+        assert tuner.choose_one("typed", [runner], config, inputs) == (runner, 1)
+    path = tmp_path / "typed.json"
+    if mode == "v1":
+        tuner.save_configs(str(path))
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    if mode == "v1":
+        assert tuner.load_configs(str(path))
+
+    # Equal items, different type: the persisted coverage must not match.
+    runner.tactics.append(2)
+    runner.signature = frozenset({1, 2})
+    calls.clear()
+    with tuning(mode):
+        assert tuner.choose_one("typed", [runner], config, inputs) == (runner, 2)
+    assert (TypedRunner, 2) in calls
 
 
 @pytest.mark.parametrize("mode", ["v1", "managed"])

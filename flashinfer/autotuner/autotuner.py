@@ -1485,14 +1485,24 @@ class ProfilingCacheKey:
         return str(self.key_fields)
 
 
+class _SortedFrozensetText(tuple):
+    """A frozenset's items in sorted order that still prints as a frozenset."""
+
+    def __repr__(self) -> str:
+        return f"frozenset({{{', '.join(map(repr, self))}}})" if self else "frozenset()"
+
+
 def _canonical_signature(value: Any) -> Any:
     """Order frozensets so a signature's persisted text is process-stable.
 
     ``str()`` of a frozenset of strings depends on the per-process hash seed,
-    so equal signatures could otherwise be written differently.
+    so equal signatures could otherwise be written differently. Frozensets
+    keep their ``frozenset(...)`` text so they never match an equal tuple.
     """
     if isinstance(value, frozenset):
-        return tuple(sorted((_canonical_signature(v) for v in value), key=repr))
+        return _SortedFrozensetText(
+            sorted((_canonical_signature(v) for v in value), key=repr)
+        )
     if isinstance(value, tuple):
         items = tuple(_canonical_signature(v) for v in value)
         return (
