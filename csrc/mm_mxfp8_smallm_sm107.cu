@@ -32,7 +32,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <stdexcept>
 #include <type_traits>
 
 #include "tvm_ffi_utils.h"
@@ -1185,8 +1184,8 @@ static void launch(const Args& A, int64_t gpc, cudaStream_t st) {
   // No context, stream or resource decision is cached between calls.
   if constexpr (CLS >= 4) {
     CUgreenCtx green = nullptr;
-    if (cuStreamGetGreenCtx(reinterpret_cast<CUstream>(st), &green) != CUDA_SUCCESS)
-      throw std::runtime_error("cannot query stream green context");
+    TVM_FFI_ICHECK(cuStreamGetGreenCtx(reinterpret_cast<CUstream>(st), &green) == CUDA_SUCCESS)
+        << "mm_mxfp8_smallm_sm107: cannot query stream green context";
     if (green) {
       cudaLaunchConfig_t cfg = {};
       cfg.gridDim = grid;
@@ -1204,12 +1203,17 @@ static void launch(const Args& A, int64_t gpc, cudaStream_t st) {
         gen_m<MSUB>(A, st);
         return;
       }
-      if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "mm_mxfp8_smallm_sm107: cluster occupancy query failed: "
+          << cudaGetErrorString(status);
     }
   }
   kmain<MSUB, NSUB, 1, WK, PIPE, BPS, (CLS > 1), (CLS > 1 ? CLSC : 0), SCV, HALF, GPW, Q32, AFFB,
         AFFA, FS, DACC, CM, CN, CK, CGPC, L2P, MBH, L1B><<<grid, 32 * WK, 0, st>>>(
       A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, CLS, A.m0);
+  cudaError_t launch_status = cudaGetLastError();
+  TVM_FFI_ICHECK(launch_status == cudaSuccess)
+      << "mm_mxfp8_smallm_sm107: kernel launch failed: " << cudaGetErrorString(launch_status);
 }
 
 // Fallback for shapes outside the measured families: correct and reasonable
@@ -1225,6 +1229,10 @@ static void launch_gen(const Args& A, int CLS, int64_t gpc, cudaStream_t st) {
     kmain<MSUB, 2, 1, WK, false, BPS, false, 0, SCVD, false, 0, false, false, false, false, false,
           0, 0, 0, 0, false, false, false, WIDE><<<grid, 32 * WK, 0, st>>>(
         A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, 1, A.m0);
+    cudaError_t launch_status = cudaGetLastError();
+    TVM_FFI_ICHECK(launch_status == cudaSuccess)
+        << "mm_mxfp8_smallm_sm107: fallback kernel launch failed: "
+        << cudaGetErrorString(launch_status);
   } else {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
@@ -1238,11 +1246,15 @@ static void launch_gen(const Args& A, int CLS, int64_t gpc, cudaStream_t st) {
     attr[0].val.clusterDim.z = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg,
-                       kmain<MSUB, 2, 1, WK, false, BPS, true, 0, SCVD, false, 0, false, false,
-                             false, false, false, 0, 0, 0, 0, false, false, false, WIDE>,
-                       A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, CLS,
-                       A.m0);
+    cudaError_t launch_status =
+        cudaLaunchKernelEx(&cfg,
+                           kmain<MSUB, 2, 1, WK, false, BPS, true, 0, SCVD, false, 0, false, false,
+                                 false, false, false, 0, 0, 0, 0, false, false, false, WIDE>,
+                           A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc,
+                           CLS, A.m0);
+    TVM_FFI_ICHECK(launch_status == cudaSuccess)
+        << "mm_mxfp8_smallm_sm107: clustered fallback launch failed: "
+        << cudaGetErrorString(launch_status);
   }
 }
 
