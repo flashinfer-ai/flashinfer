@@ -1,3 +1,5 @@
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM and CuTe-DSL MoE runners."""
+
 from __future__ import annotations
 
 import argparse

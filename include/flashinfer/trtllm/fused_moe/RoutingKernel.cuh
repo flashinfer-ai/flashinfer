@@ -181,10 +181,35 @@ __host__ __device__ constexpr T divUpMulTileN(T a, T tileN) {
   return divUpTileN(a, tileN) * tileN;
 }
 
-__device__ __forceinline__ void fillRoutingPadding(int32_t* indices, int32_t begin, int32_t end,
-                                                   int32_t value, int32_t rank = 0,
-                                                   int32_t stride = 1) {
+// The thread writing a tile's MnLimit owns its unused routing-map entries.
+// TMA gathers may read these rows even though the GEMM masks their outputs.
+// Write -1 to suppress those loads, without touching live rows or allocation slack.
+__device__ __forceinline__ void initRoutingTilePadding(int32_t* tokenIdx, int32_t begin,
+                                                       int32_t end) {
+  if (tokenIdx == nullptr) return;
+  // Vectorize the bulk stores, including when a caller supplies an offset view.
+  for (; begin < end && reinterpret_cast<uintptr_t>(tokenIdx + begin) % alignof(int4) != 0;
+       ++begin) {
+    tokenIdx[begin] = -1;
+  }
+  for (; end - begin >= 4; begin += 4) {
+    *reinterpret_cast<int4*>(tokenIdx + begin) = make_int4(-1, -1, -1, -1);
+  }
+  for (; begin < end; ++begin) {
+    tokenIdx[begin] = -1;
+  }
+}
+
+// Optional padding for consumers that gather expanded token/top-k indices.
+// Cluster blocks share the aligned stores through rank and stride.
+template <typename Params>
+__device__ __forceinline__ void initRoutingExpandedIdxPadding(Params const& params, int32_t begin,
+                                                              int32_t end, int32_t rank = 0,
+                                                              int32_t stride = 1) {
+  if (!params.mFillExpandedIdxPadding) return;
+  int32_t* indices = params.mPtrPermutedIdxToExpandedIdx;
   if (indices == nullptr) return;
+  int32_t const value = params.mExpandedIdxPadding;
   // Keep vector stores aligned even when the caller supplies an offset view.
   int32_t const head = min(
       end,
@@ -199,18 +224,6 @@ __device__ __forceinline__ void fillRoutingPadding(int32_t* indices, int32_t beg
   }
   for (int32_t i = head + rank * 4; i < tail; i += stride * 4) {
     *reinterpret_cast<int4*>(indices + i) = make_int4(value, value, value, value);
-  }
-}
-
-// The thread writing a tile's MnLimit owns its unused routing-map entries.
-// TMA token gathers use -1; expanded-index padding is opt-in with a caller-supplied value.
-// Neither map's live rows nor allocation slack are touched here.
-template <typename Params>
-__device__ __forceinline__ void initRoutingTilePadding(Params const& params, int32_t begin,
-                                                       int32_t end) {
-  fillRoutingPadding(params.mPtrPermutedIdxToTokenIdx, begin, end, -1);
-  if (params.mFillExpandedIdxPadding) {
-    fillRoutingPadding(params.mPtrPermutedIdxToExpandedIdx, begin, end, params.mExpandedIdxPadding);
   }
 }
 
@@ -378,34 +391,31 @@ __device__ void routingPermutation(KernelParams params,
   // Define a lambda to avoid code duplication in both branches.
   auto loopBody = [&](int ii, int expandedIdx) {
     TypePacked scoreIdx;
-    int32_t expertIdx;
     if constexpr (LoadExpertIdxFromGlobal) {
-      // Preserve unpacked int32 IDs until the range check; narrowing can turn
-      // an invalid ID such as 65536 into local expert 0.
       if (precomputedExpertIds != nullptr) {
-        expertIdx = precomputedExpertIds[expandedIdx];
+        scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
+                              static_cast<int16_t>(precomputedExpertIds[expandedIdx])};
       } else if (params.mPtrTopKIds != nullptr) {
-        expertIdx = params.mPtrTopKIds[expandedIdx];
+        scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
+                              static_cast<int16_t>(params.mPtrTopKIds[expandedIdx])};
       } else {
         scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKPacked[expandedIdx].score),
                               static_cast<int16_t>(params.mPtrTopKPacked[expandedIdx].idx)};
-        expertIdx = scoreIdx.idx;
       }
     } else {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       TypePacked const* remoteSmem = cg::cluster_group::map_shared_rank(
           smemPackedScoreIdx, expandedIdx / (NumWarps * params.mTopK));
       scoreIdx = remoteSmem[expandedIdx % (NumWarps * params.mTopK)];
-      expertIdx = scoreIdx.idx;
 #endif
     }
 
-    expertIndexes[ii] = expertIdx;
+    expertIndexes[ii] = scoreIdx.idx;
     // check whether this expert is local to our GPU at all and ignore if not
-    auto localExpertIdx = expertIdx - params.mLocalExpertsStartIdx;
+    auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
                          (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
-    expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIdx, 1) : 0;
+    expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
     if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr &&
         precomputedExpertIds == nullptr) {
       params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
@@ -541,7 +551,7 @@ __device__ void routingPermutation(KernelParams params,
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
-        fillRoutingPadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1, -1);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
 
       // get the padded offset associated with this expert (token-space, CGA granularity)
@@ -554,11 +564,9 @@ __device__ void routingPermutation(KernelParams params,
 
       // Share expanded-map padding across cluster blocks; a small batch may have
       // only one tile per expert, leaving all other blocks idle in the CTA loop.
-      if (params.mFillExpandedIdxPadding) {
-        fillRoutingPadding(params.mPtrPermutedIdxToExpandedIdx, offset + count[e],
-                           offset + numCta[e] * params.mTileTokensDim, params.mExpandedIdxPadding,
-                           clusterBlockRank, NumBlocks);
-      }
+      initRoutingExpandedIdxPadding(params, offset + count[e],
+                                    offset + numCta[e] * params.mTileTokensDim, clusterBlockRank,
+                                    NumBlocks);
 
       // write expert offsets to shared
       smemExpertOffset[expert] = offset + blockExpertOffset[e];
@@ -860,7 +868,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
-        initRoutingTilePadding(params, min(mnLimit1, mnLimit2), mnLimit1);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+        initRoutingExpandedIdxPadding(params, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
   }
@@ -1241,7 +1250,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
     }
     params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
-    initRoutingTilePadding(params, min(mnLimit1, mnLimit2), mnLimit1);
+    initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+    initRoutingExpandedIdxPadding(params, min(mnLimit1, mnLimit2), mnLimit1);
   }
 
   // get the padded offset associated with this expert (token-space, CGA granularity)

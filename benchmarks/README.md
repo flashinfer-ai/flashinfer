@@ -130,21 +130,6 @@ Nemotron-3.5-Lightning MoE shape:
 python3 flashinfer_benchmark.py --routine unified_moe --backends cutlass cutile cudnn --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune
 ```
 
-BF16 comparisons also accept `colonels`, `trtllm`, `prims_ts`, `frost_low_latency`,
-`cake_stepfun`, and `cudnn_frost`. Frost low-latency is enabled through eight
-tokens; larger batches are skipped. Cake StepFun requires `SwigluStep` and
-uses unpacked precomputed routing with the same expert IDs and scores.
-Architecture, activation, and installed-library restrictions are checked per backend.
-
-```bash
-python3 flashinfer_benchmark.py --routine unified_moe --backends colonels cutlass trtllm prims_ts cudnn frost_low_latency cake_stepfun cudnn_frost --quant-variant bf16 --num_tokens 8 --hidden_size 1024 --intermediate_size 512 --num_experts 8 --top_k 2 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck
-```
-
-`deepseek_fp8` comparisons accept `colonels`, `cutlass`, `trtllm`, and `prims_ts`
-on their supported architectures. TRT-LLM and Prims-TS prepare their K128
-activation scales outside timing, matching the existing Colonels convention;
-CUTLASS consumes BF16 inputs and quantizes inside the timed invocation.
-
 CUDA graph timing is enabled by default and captures one MoE invocation per
 graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
 timing. Without `--autotune`, results are named after the backend (`cutlass`,
