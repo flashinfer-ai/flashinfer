@@ -1,11 +1,11 @@
-.. _apinm35_nvfp4:
+.. _apicake_nvfp4:
 
-flashinfer.nm35_nvfp4
+flashinfer.cake_nvfp4
 =====================
 
-``nm35-nvfp4`` is an explicit attention backend for Nemotron 3.5 Super
+``cake-nvfp4`` is an explicit attention backend for Nemotron 3.5 Super
 with an NVFP4 KV cache on SM100 GPUs (``sm_100a``); it was validated on GB200.
-It is selected with ``backend="nm35-nvfp4"`` on
+It is selected with ``backend="cake-nvfp4"`` on
 :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` and
 :func:`flashinfer.prefill.trtllm_batch_context_with_kv_cache`, takes the same
 arguments as ``backend="trtllm-gen"``, and never participates in automatic
@@ -129,7 +129,7 @@ passes ``q_len_per_req`` instead.
 
 A kernel also declines a call it cannot serve, such as a workspace that is too
 small or tensors that are not contiguous; that call runs on ``trtllm-gen``. The
-reason is logged at ``DEBUG`` level on the ``flashinfer.nm35_nvfp4``
+reason is logged at ``DEBUG`` level on the ``flashinfer.cake_nvfp4``
 logger.
 
 **Prefill** (:func:`select_prefill_kernel`): a call with one request of at most
@@ -151,7 +151,7 @@ will see:
 
 .. code-block:: python
 
-    from flashinfer.nm35_nvfp4 import prefill_workspace_bytes
+    from flashinfer.cake_nvfp4 import prefill_workspace_bytes
 
     workspace_buffer = torch.zeros(
         prefill_workspace_bytes(max_model_len), dtype=torch.uint8, device="cuda"
@@ -200,7 +200,7 @@ quickest way to confirm what a deployment runs.
 API
 ---
 
-.. currentmodule:: flashinfer.nm35_nvfp4
+.. currentmodule:: flashinfer.cake_nvfp4
 
 .. autosummary::
     :toctree: ../generated

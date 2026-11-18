@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Routing rules of ``backend="nm35-nvfp4"``: functions of the shape and,
+"""Routing rules of ``backend="cake-nvfp4"``: functions of the shape and,
 for decode, of whether the kernels use the fused NVFP4 multiply."""
 
 import logging
@@ -21,9 +21,9 @@ import threading
 import pytest
 import torch
 
-from flashinfer import nm35_nvfp4 as nm35
+from flashinfer import cake_nvfp4
 
-MTP, BASE = nm35.DECODE_MTP, nm35.DECODE_BASE
+MTP, BASE = cake_nvfp4.DECODE_MTP, cake_nvfp4.DECODE_BASE
 MIB = 1 << 20
 
 
@@ -58,7 +58,7 @@ MIB = 1 << 20
     ],
 )
 def test_select_decode_kernel(batch_size, q_len, max_kv_len, expected):
-    kernel = nm35.select_decode_kernel(batch_size, q_len, max_kv_len, fused=True)
+    kernel = cake_nvfp4.select_decode_kernel(batch_size, q_len, max_kv_len, fused=True)
     assert kernel == expected
 
 
@@ -110,7 +110,7 @@ def test_select_decode_kernel(batch_size, q_len, max_kv_len, expected):
     ],
 )
 def test_select_decode_kernel_non_fused(batch_size, q_len, max_kv_len, expected):
-    kernel = nm35.select_decode_kernel(batch_size, q_len, max_kv_len, fused=False)
+    kernel = cake_nvfp4.select_decode_kernel(batch_size, q_len, max_kv_len, fused=False)
     assert kernel == expected
 
 
@@ -119,9 +119,9 @@ def test_non_fused_routes_a_subset_of_the_fused_ones():
         for q_len in range(10):
             for max_kv_len in (8192, 8193, 16384, 32769, 65537, 1 << 20):
                 args = (batch_size, q_len, max_kv_len)
-                kernel = nm35.select_decode_kernel(*args, fused=False)
+                kernel = cake_nvfp4.select_decode_kernel(*args, fused=False)
                 if kernel is not None:
-                    assert kernel == nm35.select_decode_kernel(*args, fused=True)
+                    assert kernel == cake_nvfp4.select_decode_kernel(*args, fused=True)
 
 
 @pytest.mark.parametrize("fused", [True, False])
@@ -133,79 +133,82 @@ def test_select_decode_kernel_ragged(q_len, expected, fused):
     # Requests of different query lengths never reach "mtp", which declines them.
     batch_sizes = (1, 2, 32) if fused else (1,)
     for batch_size in batch_sizes:
-        kernel = nm35.select_decode_kernel(
+        kernel = cake_nvfp4.select_decode_kernel(
             batch_size, q_len, 131072, ragged=True, fused=fused
         )
         assert kernel == expected
-    assert nm35.select_decode_kernel(4, q_len, 8192, ragged=True, fused=fused) is None
+    assert (
+        cake_nvfp4.select_decode_kernel(4, q_len, 8192, ragged=True, fused=fused)
+        is None
+    )
 
 
 def test_select_decode_kernel_asks_the_module_only_when_needed(monkeypatch):
     def unexpected():
         raise AssertionError("the kernel module must not be asked")
 
-    monkeypatch.setattr(nm35, "_fused_fp4_mul", unexpected)
-    assert nm35.select_decode_kernel(4, 1, 8192) is None
-    assert nm35.select_decode_kernel(4, 9, 131072) is None
-    assert nm35.select_decode_kernel(4, 2, 131072, ragged=True) is None
+    monkeypatch.setattr(cake_nvfp4, "_fused_fp4_mul", unexpected)
+    assert cake_nvfp4.select_decode_kernel(4, 1, 8192) is None
+    assert cake_nvfp4.select_decode_kernel(4, 9, 131072) is None
+    assert cake_nvfp4.select_decode_kernel(4, 2, 131072, ragged=True) is None
 
     for fused, expected in ((True, BASE), (False, None)):
-        monkeypatch.setattr(nm35, "_fused_fp4_mul", lambda fused=fused: fused)
-        assert nm35.select_decode_kernel(4, 1, 131072) == expected
+        monkeypatch.setattr(cake_nvfp4, "_fused_fp4_mul", lambda fused=fused: fused)
+        assert cake_nvfp4.select_decode_kernel(4, 1, 131072) == expected
 
 
 @pytest.mark.parametrize("fused", [True, False])
 def test_fused_fp4_mul_reads_the_module(monkeypatch, fused):
     class Module:
         @staticmethod
-        def nm35_nvfp4_fused_fp4_mul():
+        def cake_nvfp4_fused_fp4_mul():
             return fused
 
-    monkeypatch.setattr(nm35, "_module", Module)
-    assert nm35._fused_fp4_mul.__wrapped__() == fused
+    monkeypatch.setattr(cake_nvfp4, "_module", Module)
+    assert cake_nvfp4._fused_fp4_mul.__wrapped__() == fused
     # Without a module every call runs on trtllm-gen whatever the answer.
-    monkeypatch.setattr(nm35, "_module", lambda: None)
-    assert nm35._fused_fp4_mul.__wrapped__()
+    monkeypatch.setattr(cake_nvfp4, "_module", lambda: None)
+    assert cake_nvfp4._fused_fp4_mul.__wrapped__()
 
 
 def test_select_prefill_kernel():
-    assert nm35.select_prefill_kernel(1, 1, 8193)
-    assert nm35.select_prefill_kernel(1, 32768, 1 << 20)
-    assert not nm35.select_prefill_kernel(1, 32769, 1 << 20)
-    assert not nm35.select_prefill_kernel(2, 1024, 1 << 20)
-    assert not nm35.select_prefill_kernel(0, 1024, 1 << 20)
+    assert cake_nvfp4.select_prefill_kernel(1, 1, 8193)
+    assert cake_nvfp4.select_prefill_kernel(1, 32768, 1 << 20)
+    assert not cake_nvfp4.select_prefill_kernel(1, 32769, 1 << 20)
+    assert not cake_nvfp4.select_prefill_kernel(2, 1024, 1 << 20)
+    assert not cake_nvfp4.select_prefill_kernel(0, 1024, 1 << 20)
     # A KV of at most 8192 tokens runs on trtllm-gen.
-    assert not nm35.select_prefill_kernel(1, 1024, 8192)
-    assert not nm35.select_prefill_kernel(1, 1, 0)
+    assert not cake_nvfp4.select_prefill_kernel(1, 1024, 8192)
+    assert not cake_nvfp4.select_prefill_kernel(1, 1, 0)
 
 
 def test_prefill_workspace_bytes():
     # 64 KiB per page, plus a 72 MiB reserve.
-    assert nm35.prefill_workspace_bytes(1) == 65536 + 72 * MIB
-    assert nm35.prefill_workspace_bytes(128) == 65536 + 72 * MIB
-    assert nm35.prefill_workspace_bytes(129) == 2 * 65536 + 72 * MIB
-    assert nm35.prefill_workspace_bytes(1 << 20) == 584 * MIB
-    assert nm35.prefill_workspace_bytes((1 << 20) + 32768) == 600 * MIB
+    assert cake_nvfp4.prefill_workspace_bytes(1) == 65536 + 72 * MIB
+    assert cake_nvfp4.prefill_workspace_bytes(128) == 65536 + 72 * MIB
+    assert cake_nvfp4.prefill_workspace_bytes(129) == 2 * 65536 + 72 * MIB
+    assert cake_nvfp4.prefill_workspace_bytes(1 << 20) == 584 * MIB
+    assert cake_nvfp4.prefill_workspace_bytes((1 << 20) + 32768) == 600 * MIB
     with pytest.raises(ValueError):
-        nm35.prefill_workspace_bytes(0)
+        cake_nvfp4.prefill_workspace_bytes(0)
 
 
 def test_route_counts_are_thread_safe():
-    nm35.reset_route_counts()
+    cake_nvfp4.reset_route_counts()
     calls, threads = 20000, 8
 
     def count():
         for _ in range(calls):
-            nm35._count_route("decode", "trtllm-gen")
+            cake_nvfp4._count_route("decode", "trtllm-gen")
 
     workers = [threading.Thread(target=count) for _ in range(threads)]
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join()
-    assert nm35.route_counts() == {("decode", "trtllm-gen"): calls * threads}
-    nm35.reset_route_counts()
-    assert nm35.route_counts() == {}
+    assert cake_nvfp4.route_counts() == {("decode", "trtllm-gen"): calls * threads}
+    cake_nvfp4.reset_route_counts()
+    assert cake_nvfp4.route_counts() == {}
 
 
 def _cpu_call(query_dtype=torch.float8_e4m3fn):
@@ -236,19 +239,21 @@ def test_calls_outside_the_geometry_are_not_served(monkeypatch, reason):
     def unexpected():
         raise AssertionError("the kernel module must not be loaded")
 
-    monkeypatch.setattr(nm35, "_module", unexpected)
+    monkeypatch.setattr(cake_nvfp4, "_module", unexpected)
     call = _cpu_call(torch.int8 if reason == "dtype" else torch.float8_e4m3fn)
     if reason == "no block scales":
         call["k_block_scales"] = None
     plain = reason != "feature"
 
-    nm35.reset_route_counts()
-    assert not nm35.try_decode(
+    cake_nvfp4.reset_route_counts()
+    assert not cake_nvfp4.try_decode(
         **call, enable_pdl=False, cum_seq_lens_q=None, plain=plain
     )
     cum_seq_lens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
-    assert not nm35.try_prefill(**call, cum_seq_lens_q=cum_seq_lens_q, plain=plain)
-    assert nm35.route_counts() == {
+    assert not cake_nvfp4.try_prefill(
+        **call, cum_seq_lens_q=cum_seq_lens_q, plain=plain
+    )
+    assert cake_nvfp4.route_counts() == {
         ("decode", "trtllm-gen"): 1,
         ("prefill", "trtllm-gen"): 1,
     }
@@ -261,7 +266,7 @@ def test_prefill_with_several_requests_runs_trtllm_gen(monkeypatch, batch_size):
     prefills = []
 
     class Module:
-        def nm35_nvfp4_prefill(self, *args):
+        def cake_nvfp4_prefill(self, *args):
             prefills.append(args)
             return ""
 
@@ -270,8 +275,8 @@ def test_prefill_with_several_requests_runs_trtllm_gen(monkeypatch, batch_size):
             raise AssertionError("the kernel module must not be loaded")
         return Module()
 
-    monkeypatch.setattr(nm35, "is_supported_device", lambda device: True)
-    monkeypatch.setattr(nm35, "_module", module)
+    monkeypatch.setattr(cake_nvfp4, "is_supported_device", lambda device: True)
+    monkeypatch.setattr(cake_nvfp4, "_module", module)
     call = _cpu_call()
     rows = torch.zeros((batch_size, 32, 128), dtype=torch.uint8)
     call["query"] = rows.view(torch.float8_e4m3fn)
@@ -281,12 +286,12 @@ def test_prefill_with_several_requests_runs_trtllm_gen(monkeypatch, batch_size):
     call["batch_size"] = batch_size
     cum_seq_lens_q = torch.arange(batch_size + 1, dtype=torch.int32)
 
-    nm35.reset_route_counts()
-    served = nm35.try_prefill(**call, cum_seq_lens_q=cum_seq_lens_q, plain=True)
+    cake_nvfp4.reset_route_counts()
+    served = cake_nvfp4.try_prefill(**call, cum_seq_lens_q=cum_seq_lens_q, plain=True)
     assert served == (batch_size == 1)
     assert len(prefills) == int(batch_size == 1)
     kernel = "prefill" if batch_size == 1 else "trtllm-gen"
-    assert nm35.route_counts() == {("prefill", kernel): 1}
+    assert cake_nvfp4.route_counts() == {("prefill", kernel): 1}
 
 
 @pytest.mark.parametrize("offsets", [False, True])
@@ -294,12 +299,12 @@ def test_decode_with_query_offsets_is_routed_as_ragged(monkeypatch, offsets):
     # Uniform query rows prove nothing when the call passes cum_seq_lens_q: a
     # CUDA graph replays whatever offsets it holds then.
     selected = []
-    monkeypatch.setattr(nm35, "is_supported_device", lambda device: True)
+    monkeypatch.setattr(cake_nvfp4, "is_supported_device", lambda device: True)
     monkeypatch.setattr(
-        nm35, "select_decode_kernel", lambda *args: selected.append(args)
+        cake_nvfp4, "select_decode_kernel", lambda *args: selected.append(args)
     )
     cum_seq_lens_q = torch.tensor([0, 1, 2], dtype=torch.int32) if offsets else None
-    assert not nm35.try_decode(
+    assert not cake_nvfp4.try_decode(
         **_cpu_call(), enable_pdl=False, cum_seq_lens_q=cum_seq_lens_q, plain=True
     )
     assert selected == [(2, 1, 10000, offsets)]
@@ -312,21 +317,21 @@ class _Spec:
 
 def _patch_toolkit(monkeypatch, is_compiled, new_enough):
     import flashinfer.jit.cpp_ext as cpp_ext
-    import flashinfer.jit.nm35_nvfp4 as jit_nm35
+    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
 
     monkeypatch.setattr(
-        jit_nm35, "gen_nm35_nvfp4_fmha_module", lambda: _Spec(is_compiled)
+        jit_cake_nvfp4, "gen_cake_nvfp4_fmha_module", lambda: _Spec(is_compiled)
     )
     monkeypatch.setattr(cpp_ext, "is_cuda_version_at_least", lambda _: new_enough)
     monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: "12.9")
 
 
 def test_build_is_blocked_only_by_an_old_toolkit(monkeypatch):
-    blocker = nm35._build_blocker.__wrapped__
+    blocker = cake_nvfp4._build_blocker.__wrapped__
     monkeypatch.delenv("FLASHINFER_NVCC", raising=False)
 
     _patch_toolkit(monkeypatch, is_compiled=False, new_enough=False)
-    assert nm35.MIN_CUDA_TOOLKIT == "13.0"
+    assert cake_nvfp4.MIN_CUDA_TOOLKIT == "13.0"
     assert "13.0 toolkit or newer (found 12.9)" in blocker()
     # Another compiler is named explicitly: its build is attempted.
     monkeypatch.setenv("FLASHINFER_NVCC", "/opt/cuda/bin/nvcc")
@@ -340,39 +345,39 @@ def test_build_is_blocked_only_by_an_old_toolkit(monkeypatch):
 
 
 def test_blocked_build_is_not_started(monkeypatch):
-    import flashinfer.jit.nm35_nvfp4 as jit_nm35
+    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
 
     def unexpected():
         raise AssertionError("a build that cannot succeed must not start")
 
-    monkeypatch.setattr(jit_nm35, "load_nm35_nvfp4_fmha_module", unexpected)
-    monkeypatch.setattr(nm35, "_build_blocker", lambda: "old toolkit")
-    assert nm35._module.__wrapped__() is None
+    monkeypatch.setattr(jit_cake_nvfp4, "load_cake_nvfp4_fmha_module", unexpected)
+    monkeypatch.setattr(cake_nvfp4, "_build_blocker", lambda: "old toolkit")
+    assert cake_nvfp4._module.__wrapped__() is None
 
 
 def test_failed_build_falls_back(monkeypatch):
-    import flashinfer.jit.nm35_nvfp4 as jit_nm35
+    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
 
     def failing():
         raise RuntimeError("nvcc failed")
 
-    monkeypatch.setattr(jit_nm35, "load_nm35_nvfp4_fmha_module", failing)
-    monkeypatch.setattr(nm35, "_build_blocker", lambda: None)
-    assert nm35._module.__wrapped__() is None
+    monkeypatch.setattr(jit_cake_nvfp4, "load_cake_nvfp4_fmha_module", failing)
+    monkeypatch.setattr(cake_nvfp4, "_build_blocker", lambda: None)
+    assert cake_nvfp4._module.__wrapped__() is None
 
 
 @pytest.mark.parametrize("fused", [True, False])
 def test_slower_dequantization_path_is_logged(monkeypatch, caplog, fused):
-    import flashinfer.jit.nm35_nvfp4 as jit_nm35
+    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
 
     class Module:
         @staticmethod
-        def nm35_nvfp4_fused_fp4_mul():
+        def cake_nvfp4_fused_fp4_mul():
             return fused
 
-    monkeypatch.setattr(jit_nm35, "load_nm35_nvfp4_fmha_module", Module)
-    monkeypatch.setattr(nm35, "_build_blocker", lambda: None)
-    with caplog.at_level(logging.INFO, logger="flashinfer.nm35_nvfp4"):
-        assert nm35._module.__wrapped__() is not None
+    monkeypatch.setattr(jit_cake_nvfp4, "load_cake_nvfp4_fmha_module", Module)
+    monkeypatch.setattr(cake_nvfp4, "_build_blocker", lambda: None)
+    with caplog.at_level(logging.INFO, logger="flashinfer.cake_nvfp4"):
+        assert cake_nvfp4._module.__wrapped__() is not None
     logged = any("slower NVFP4 dequantization" in m for m in caplog.messages)
     assert logged == (not fused)

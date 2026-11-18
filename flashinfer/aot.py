@@ -51,7 +51,7 @@ from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cake_fp4_allreduce import gen_cake_fp4_allreduce_aot_modules
-from .jit.nm35_nvfp4 import gen_nm35_nvfp4_fmha_module
+from .jit.cake_nvfp4 import gen_cake_nvfp4_fmha_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
@@ -746,12 +746,12 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
-    # Nemotron 3.5 Super NVFP4-KV attention (backend="nm35-nvfp4" of the
+    # Nemotron 3.5 Super NVFP4-KV attention (backend="cake-nvfp4" of the
     # trtllm paged decode and context APIs): sm_100a only.
     # Built with the CUDA 13.0 toolkit or newer; its decode kernels are fastest
     # from 13.4 on, which assembles their fused NVFP4 dequantization instruction.
     if has_sm100a_exact and get_cuda_version() >= Version("13.0"):
-        jit_specs.append(gen_nm35_nvfp4_fmha_module())
+        jit_specs.append(gen_cake_nvfp4_fmha_module())
     # Fused MLA context K/V pack (attention side, not MoE), two backends behind
     # concat_mla_kv_quant_fp8: the Cake programs, one per head group, one
     # library each per exact target (the loader spells the targets "sm_100a" /

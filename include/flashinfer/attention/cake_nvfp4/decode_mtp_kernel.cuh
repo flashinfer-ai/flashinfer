@@ -20,17 +20,18 @@
 // the 16 heads x G tokens form the N = 16G columns of the swapped-AB GEMMs. Each token keeps its
 // own causal length, max, sum and output.
 //
-// This is the "base" kernel: G = 1, 3 or 5.
+// This is the "mtp" kernel: G = 2, 4 or 8.
 //
-// Persistent, warp-specialized kernel (one CTA per SM, 640 threads):
-//   warps 0-7   softmax, two warpgroups: S from TMEM -> reference max / sum, P = exp2(...) as E4M3
-//               into smem. Warpgroup g takes the S blocks b = g (mod 2) of each step; warpgroups
+// Persistent, warp-specialized kernel (one CTA per SM, 896 threads; G = 2 has two softmax
+// warpgroups, 640 threads, and the later warps move down by 8):
+//   warps 0-15  softmax, four warpgroups: S from TMEM -> reference max / sum, P = exp2(...) as E4M3
+//               into smem. Warpgroup g takes the S blocks b = g (mod 4) of each step; warpgroups
 //               sharing a token vote / reduce together, the token's owner keeps its O columns
-//   warp  8     QK MMA issuer (tcgen05.mma kind::f8f6f4, A operand from TMEM)
-//   warp  9     V page loader (TMA)
-//   warp  10    computes this CTA's KV segment list, then issues PV MMA
-//   warp  11    Q + K page loader (TMA)
-//   warps 12-19 two dequant warpgroups: FP4 x E4M3 scale -> E4M3 into TMEM (K: token rows,
+//   warp  16    QK MMA issuer (tcgen05.mma kind::f8f6f4, A operand from TMEM)
+//   warp  17    V page loader (TMA)
+//   warp  18    computes this CTA's KV segment list, then issues PV MMA
+//   warp  19    Q + K page loader (TMA)
+//   warps 20-27 two dequant warpgroups: FP4 x E4M3 scale -> E4M3 into TMEM (K: token rows,
 //               V: transposed, head-dim rows)
 // Swapped-AB GEMMs: S^T[128 tok x 16G] = K[tok x d] Q^T, O^T[128 d x 16G] += V^T P^T.
 // Each CTA pair (one CTA per KV head) processes an equal page range of the concatenated virtual
@@ -46,8 +47,8 @@
 #include "fp4_mul.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
-namespace decode_base {
+namespace cake_nvfp4 {
+namespace decode_mtp {
 
 namespace {
 
@@ -65,30 +66,31 @@ constexpr int kCachedSegs = 5;
 template <int G>
 struct Cfg {
   static constexpr int N = 16 * G;
-  static_assert(G == 1 || G == 3 || G == 5, "fused query tokens");
-  static constexpr int NG = 2;  // softmax warpgroups
+  static_assert(G == 2 || G == 4 || G == 8, "fused query tokens");
+  // Softmax warpgroups.
+  static constexpr int NG = G == 2 ? 2 : 4;
   static constexpr int Threads = 32 * (4 * NG + 4 + 8);
   static constexpr int WarpQk = 4 * NG;  // then V loader, segments + PV, Q + K loader, 8 dequant
   // Registers per thread: the launch share, then softmax / dequant up and the four 1-warp roles
   // down.
   static constexpr int RegsLaunch = 65536 / Threads / 8 * 8;
-  static constexpr int RegsSoftmax = G == 1 ? 104 : 112;
-  static constexpr int RegsDequant = G == 1 ? 112 : 104;
-  static constexpr int RegsMisc = 48;
+  static constexpr int RegsSoftmax = G == 8 ? 88 : (G == 4 ? 80 : 112);
+  static constexpr int RegsDequant = G == 8 ? 56 : (G == 4 ? 72 : 104);
+  static constexpr int RegsMisc = G == 8 ? 32 : (G == 4 ? 40 : 48);
   static_assert(4 * NG * RegsSoftmax + 8 * RegsDequant + 4 * RegsMisc <= RegsLaunch * Threads / 32,
                 "register split");
-  static constexpr int SP = G == 1 ? 4 : 1;
+  static constexpr int SP = G == 2 ? 4 : (G == 4 ? 2 : 1);
   // S (TMEM) / P (smem) stages: QK may run Stages - 1 steps ahead of the softmax.
-  static constexpr int Stages = 3;
+  static constexpr int Stages = 2;
   // TMEM stages of dequantized K and V pages (32 columns each).
-  static constexpr int KT = G == 5 ? 2 : 4;
-  static constexpr int VT = G == 1 ? 5 : (G == 3 ? 4 : 2);
+  static constexpr int KT = G == 8 ? 3 : 4;
+  static constexpr int VT = G == 2 ? 3 : (G == 4 ? 2 : 1);
   // Shared memory stages of NVFP4 K and V pages.
-  static constexpr int KS = G == 1 ? 6 : 4;
-  static constexpr int VS = G == 5 ? 7 : 8;
+  static constexpr int KS = G == 2 ? 6 : (G == 4 ? 5 : 4);
+  static constexpr int VS = G == 2 ? 7 : 6;
   // P (smem) stages may exceed the S (TMEM) stages: QK then waits for S[s] directly and P lags one
   // more step.
-  static constexpr int PStages = Stages;
+  static constexpr int PStages = G == 4 ? 3 : Stages;
   static constexpr int SCols = SP * N;
   static constexpr uint32_t TmemS = 0;
   static constexpr uint32_t TmemO = Stages * SCols;
@@ -111,23 +113,26 @@ struct Cfg {
   static_assert(SmemBytes <= kMaxSmem, "smem layout");
   static_assert(SmemP % 1024 == 0, "P tiles need 1024-byte alignment");
   // Barrier indices.
-  static constexpr int BarQFull = 0;                   // 2: TMA tx
-  static constexpr int BarQEmpty = 2;                  // 2: MMA commit
-  static constexpr int BarKFull = 4;                   // KS: K TMA tx
-  static constexpr int BarKEmpty = BarKFull + KS;      // KS: four K dequant warps
-  static constexpr int BarTkFull = BarKEmpty + KS;     // KT: 128 K dequant threads
-  static constexpr int BarTkEmpty = BarTkFull + KT;    // KT: MMA commit
-  static constexpr int BarVFull = BarTkEmpty + KT;     // VS: V TMA tx
-  static constexpr int BarVEmpty = BarVFull + VS;      // VS: four V dequant warps
-  static constexpr int BarTvFull = BarVEmpty + VS;     // VT: 128 V dequant threads
-  static constexpr int BarTvEmpty = BarTvFull + VT;    // VT: MMA commit
-  static constexpr int BarSFull = BarTvEmpty + VT;     // Stages: MMA commit
-  static constexpr int BarSEmpty = BarSFull + Stages;  // Stages: all softmax threads
+  static constexpr int BarQFull = 0;                 // 2: TMA tx
+  static constexpr int BarQEmpty = 2;                // 2: MMA commit
+  static constexpr int BarKFull = 4;                 // KS: K TMA tx
+  static constexpr int BarKEmpty = BarKFull + KS;    // KS: four K dequant warps
+  static constexpr int BarTkFull = BarKEmpty + KS;   // KT: 128 K dequant threads
+  static constexpr int BarTkEmpty = BarTkFull + KT;  // KT: MMA commit
+  static constexpr int BarVFull = BarTkEmpty + KT;   // VS: V TMA tx
+  static constexpr int BarVEmpty = BarVFull + VS;    // VS: four V dequant warps
+  static constexpr int BarTvFull = BarVEmpty + VS;   // VT: 128 V dequant threads
+  static constexpr int BarTvEmpty = BarTvFull + VT;  // VT: MMA commit
+  static constexpr int BarSFull = BarTvEmpty + VT;   // Stages: MMA commit
+  static constexpr int BarSEmpty =
+      BarSFull + Stages;  // Stages: all softmax threads, once S is in registers
   static constexpr int BarOFull = BarSEmpty + Stages;  // 1: MMA commit at segment end
   static constexpr int BarOFree = BarOFull + 1;        // 1: O-owning threads read the final O
   static constexpr int BarODone = BarOFree + 1;  // PStages ring: PV commit after every step's MMAs
+  static constexpr int BarPFull =
+      BarODone + PStages;  // PStages: all softmax threads, P[s] (and O rescale) done
   static constexpr int BarPCons =
-      BarODone + PStages;  // PStages: PV commit, the MMAs reading P[s] are complete
+      BarPFull + PStages;  // PStages (!EarlyS): PV commit, the MMAs reading P[s] are complete
   static_assert(BarPCons + PStages <= kNumBars, "barrier storage");
   // tcgen05 instruction descriptor: D F32, A/B E4M3, K-major, M=128, N=16G.
   static constexpr uint32_t Idesc = (1u << 4) | ((uint32_t(N) >> 3) << 17) | ((128u >> 4) << 24);
@@ -142,8 +147,19 @@ struct Cfg {
   static constexpr int ShareGrps = Shared ? NG / G : 1;
   static constexpr int NumOwners = G < NG ? G : NG;
   static_assert(Shared || SP == 1, "softmax split");
-  // Headroom (base 2) of P over the reference max: reference updates (and O rescales) stay rare.
-  static constexpr float Headroom = 5.f;
+  // Headroom (base 2) of P over the reference max: reference updates (and O rescales, which wait
+  // for the previous step's PV MMAs) stay rare. With 8 bits P <= 448 * 2^-8 right after an update.
+  static constexpr float Headroom = 8.f;
+  // Release each S stage as soon as the softmax holds it in registers (P readiness then has its own
+  // barrier); otherwise S is released together with P, as in the original pipeline.
+  static constexpr bool EarlyS = G == 2;
+  // Speculative single-pass softmax: convert against the current reference and only reload S (TMEM)
+  // and reduce the exact max when some exponent exceeds log2(448). Needs S in TMEM until P is
+  // written.
+  static constexpr bool Spec = G == 8;
+  static_assert(!(Spec && EarlyS), "speculative softmax reloads S");
+  // Dequant in halves (smaller register footprint) where the dequant budget is tight.
+  static constexpr bool SplitDequant = RegsDequant < 64;
 };
 
 constexpr uint32_t kLane16 = 16u << 16;
@@ -327,6 +343,15 @@ __device__ __forceinline__ void tcSt32x32x32(uint32_t taddr, uint32_t const (&r)
       "r"(r[16]), "r"(r[17]), "r"(r[18]), "r"(r[19]), "r"(r[20]), "r"(r[21]), "r"(r[22]),
       "r"(r[23]), "r"(r[24]), "r"(r[25]), "r"(r[26]), "r"(r[27]), "r"(r[28]), "r"(r[29]),
       "r"(r[30]), "r"(r[31])
+      : "memory");
+}
+
+__device__ __forceinline__ void tcSt32x32x16(uint32_t taddr, uint32_t const (&r)[16]) {
+  asm volatile(
+      "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, "
+      "%12, %13, %14, %15, %16};" ::"r"(taddr),
+      "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]), "r"(r[4]), "r"(r[5]), "r"(r[6]), "r"(r[7]),
+      "r"(r[8]), "r"(r[9]), "r"(r[10]), "r"(r[11]), "r"(r[12]), "r"(r[13]), "r"(r[14]), "r"(r[15])
       : "memory");
 }
 
@@ -557,9 +582,44 @@ __device__ void issueKvPages(DecodeParams const& p, uint8_t* smem, uint64_t* bar
 
 // K tile (packed bytes, 64B swizzle: 16B chunk c of row r at chunk c ^ ((r >> 1) & 3)). The thread
 // owning token row r writes its 128 E4M3 values to its TMEM lane: column c = dims 4c..4c+3.
+// waitT() waits for the TMEM stage to be free; it runs only before the first TMEM store, so the
+// shared loads and FP4 multiplies overlap the wait for the MMA that last read the stage.
+template <bool kSplit, class W>
 __device__ __forceinline__ void dequantK(uint8_t const* stage, uint32_t taddr, int warpInWg,
-                                         int lane) {
+                                         int lane, W const& waitT) {
   int const row = warpInWg * 32 + lane;
+  if constexpr (kSplit) {
+    // Two halves of 64 dims: 8 packed words + 16 output words live at a time.
+    uint8_t const* rowPtrS = stage + row * 64;
+    int const swzS = (row >> 1) & 3;
+    uint2 const sfS = *reinterpret_cast<uint2 const*>(stage + kKScaleOffset + row * 8);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      uint32_t packedH[8];
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        uint4 const v = *reinterpret_cast<uint4 const*>(rowPtrS + (((2 * h + c) ^ swzS) * 16));
+        packedH[4 * c + 0] = v.x;
+        packedH[4 * c + 1] = v.y;
+        packedH[4 * c + 2] = v.z;
+        packedH[4 * c + 3] = v.w;
+      }
+      uint32_t outH[16];
+#pragma unroll
+      for (int gg = 0; gg < 4; ++gg) {
+        Fp4Scale const sfb = fp4ScaleUniform(
+            __byte_perm(h == 0 ? sfS.x : sfS.y, 0, 0x1111u * static_cast<uint32_t>(gg)));
+#pragma unroll
+        for (int w = 0; w < 2; ++w) {
+          mulFp4x8Packed(packedH[2 * gg + w], sfb, outH[4 * gg + 2 * w + 0],
+                         outH[4 * gg + 2 * w + 1]);
+        }
+      }
+      if (h == 0) waitT();
+      tcSt32x32x16(taddr + h * 16, outH);
+    }
+    return;
+  }
   uint8_t const* rowPtr = stage + row * 64;
   int const swz = (row >> 1) & 3;
   uint32_t packed[16];
@@ -582,15 +642,38 @@ __device__ __forceinline__ void dequantK(uint8_t const* stage, uint32_t taddr, i
       mulFp4x8Packed(packed[2 * g + w], sfb, out[4 * g + 2 * w + 0], out[4 * g + 2 * w + 1]);
     }
   }
+  waitT();
   tcSt32x32x32(taddr, out);
 }
 
 // V tile (4-bit values padded to bytes, 128B swizzle) with interleaved scales: the scale of token
 // t, group g sits at (t / 4) * 32 + g * 4 + t % 4. Written transposed: TMEM lane = head dim, column
 // c = tokens 4c..4c+3.
+template <bool kSplit, class W>
 __device__ __forceinline__ void dequantV(uint8_t const* stage, uint32_t taddr, int warpInWg,
-                                         int lane) {
+                                         int lane, W const& waitT) {
   uint8_t const* sfBase = stage + kVScaleOffset + (lane % 4) * 32 + warpInWg * 8;
+  if constexpr (kSplit) {
+    // Lanes 0-15 then 16-31 of the transposed tile: 16 output words live at a time.
+    int const swzS = (lane % 8) * 16;
+    uint32_t const rowBaseS = smemAddr(stage) + lane * 128;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      uint32_t dst[16];
+#pragma unroll
+      for (int it = 0; it < 8; ++it) {
+        Fp4Scale const sfw =
+            fp4Scale(*reinterpret_cast<uint32_t const*>(sfBase + it * 128 + h * 4));
+        uint32_t s0, s1;
+        ldsmFp4Trans16x16(s0, s1, rowBaseS + ((it * 2048 + warpInWg * 32 + h * 16) ^ swzS));
+        dst[2 * it + 0] = mulFp4x4Unpacked(s0, sfw);
+        dst[2 * it + 1] = mulFp4x4Unpacked(s1, sfw);
+      }
+      if (h == 0) waitT();
+      tcSt16x128x8(taddr + h * kLane16, dst);
+    }
+    return;
+  }
   uint2 sfV[8];
 #pragma unroll
   for (int it = 0; it < 8; ++it) sfV[it] = *reinterpret_cast<uint2 const*>(sfBase + it * 128);
@@ -610,6 +693,7 @@ __device__ __forceinline__ void dequantV(uint8_t const* stage, uint32_t taddr, i
     dst1[2 * it + 0] = mulFp4x4Unpacked(s2, sf1);
     dst1[2 * it + 1] = mulFp4x4Unpacked(s3, sf1);
   }
+  waitT();
   tcSt16x128x8(taddr, dst0);
   tcSt16x128x8(taddr + kLane16, dst1);
 }
@@ -634,15 +718,18 @@ __device__ void runDequantPipeline(uint8_t* smem, uint64_t* bars, uint32_t tmem,
     KvSeg const seg = loadSegUniform(segs, si);
     int const n = seg.numPages;
     for (int page = 0; page < n; ++page) {
-      mbarWait(&bars[kTmemEmptyBar + tmemStage], tmemPhase ^ 1u);
       mbarWait(&bars[kSmemFullBar + smemStage], smemPhase);
-      tcFenceAfter();
       uint8_t const* src = smem + kSmemBase + smemStage * kSmemStageBytes;
       uint32_t const taddr = tmem + kTmemBase + tmemStage * 32;
+      // The TMEM stage is only needed for the stores: wait for it after the loads and multiplies.
+      auto waitT = [&]() {
+        mbarWait(&bars[kTmemEmptyBar + tmemStage], tmemPhase ^ 1u);
+        tcFenceAfter();
+      };
       if constexpr (kIsV) {
-        dequantV(src, taddr, warpInWg, lane);
+        dequantV<C::SplitDequant>(src, taddr, warpInWg, lane, waitT);
       } else {
-        dequantK(src, taddr, warpInWg, lane);
+        dequantK<C::SplitDequant>(src, taddr, warpInWg, lane, waitT);
       }
       tcWaitSt();
       tcFenceBefore();
@@ -712,6 +799,7 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
       mbarInit(&bars[C::BarOFree], 128 * C::NumOwners);
       for (int i = 0; i < C::PStages; ++i) {
         mbarInit(&bars[C::BarODone + i], 1);
+        mbarInit(&bars[C::BarPFull + i], 128 * C::NG);  // all softmax threads
         mbarInit(&bars[C::BarPCons + i], 1);
       }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -818,19 +906,23 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
           stepSum[lt][1] = make_float2(0.f, 0.f);
         }
         float2 const scale2 = make_float2(scaleLog2, scaleLog2);
-        // Loads block j of this step's S tile, masks tokens beyond its token's causal length, (when
-        // trackMax) updates this thread's column maxima, and converts it to E4M3 probabilities
-        // against the current reference: P = exp2(S * scale - ref * scale + log2(448) - headroom).
-        // Regs (i, i+1) hold heads (0, 1) of the thread's column group when (i / 4) is even, else
-        // (2, 3).
-        auto convertBlock = [&](int j, bool trackMax, bool convert) {
-          int const lt = C::Shared ? 0 : j;
-          float qk[16];
-          uint32_t const taddr = tmem + C::TmemS + sStage * C::SCols + (NG * j + grp) * 16;
-          tcLd16x256x2(reinterpret_cast<uint32_t(&)[8]>(qk[0]), taddr);
-          tcLd16x256x2(reinterpret_cast<uint32_t(&)[8]>(qk[8]), taddr + kLane16);
+        // Block j of this step's S tile (128 tokens x 16 heads, TMEM columns 16b..16b+15), held in
+        // registers. Regs (i, i+1) hold heads (0, 1) of the thread's column group when (i / 4) is
+        // even, else (2, 3). Tokens beyond the block's token causal length are masked.
+        float qk[C::BlkPerGrp][16];
+        auto loadBlocks = [&]() {
+#pragma unroll
+          for (int j = 0; j < C::BlkPerGrp; ++j) {
+            if (!blkValid(j)) continue;
+            uint32_t const taddr = tmem + C::TmemS + sStage * C::SCols + (NG * j + grp) * 16;
+            tcLd16x256x2(reinterpret_cast<uint32_t(&)[8]>(qk[j][0]), taddr);
+            tcLd16x256x2(reinterpret_cast<uint32_t(&)[8]>(qk[j][8]), taddr + kLane16);
+          }
           tcWaitLd();
-          if (needMask) {
+          if (!needMask) return;
+#pragma unroll
+          for (int j = 0; j < C::BlkPerGrp; ++j) {
+            if (!blkValid(j)) continue;
             int const lim = seqLen0 + blkTok(j);
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
@@ -839,53 +931,91 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
               int const tok = stepTok + (blkPage(j) << kPageSizeLog2) + rowIdx + r * 8;
               int const b = (r / 2) * 8 + (r % 2) * 2;
               if (tok >= lim) {
-                qk[b + 0] = kNegMax;
-                qk[b + 1] = kNegMax;
-                qk[b + 4] = kNegMax;
-                qk[b + 5] = kNegMax;
+                qk[j][b + 0] = kNegMax;
+                qk[j][b + 1] = kNegMax;
+                qk[j][b + 4] = kNegMax;
+                qk[j][b + 5] = kNegMax;
               }
             }
           }
-          if (trackMax) {
+        };
+        // This thread's column maxima of the raw scores.
+        auto trackMax = [&]() {
+#pragma unroll
+          for (int j = 0; j < C::BlkPerGrp; ++j) {
+            if (!blkValid(j)) continue;
+            int const lt = C::Shared ? 0 : j;
 #pragma unroll
             for (int i = 0; i < 16; i += 4) {
               int const c = ((i / 4) % 2) * 2;
-              lmax[lt][c] = fmaxf(lmax[lt][c], fmaxf(qk[i], qk[i + 2]));
-              lmax[lt][c + 1] = fmaxf(lmax[lt][c + 1], fmaxf(qk[i + 1], qk[i + 3]));
+              lmax[lt][c] = fmaxf(lmax[lt][c], fmaxf(qk[j][i], qk[j][i + 2]));
+              lmax[lt][c + 1] = fmaxf(lmax[lt][c + 1], fmaxf(qk[j][i + 1], qk[j][i + 3]));
             }
           }
-          if (!convert) return;
-          float2 const nsm01 = make_float2(nsm[lt][0], nsm[lt][1]);
-          float2 const nsm23 = make_float2(nsm[lt][2], nsm[lt][3]);
-#pragma unroll
-          for (int i = 0; i < 16; i += 2) {
-            int const hi = (i / 4) % 2;
-            float2 x = ffma2(make_float2(qk[i], qk[i + 1]), scale2, hi ? nsm23 : nsm01);
-            x.x = exp2f(x.x);
-            x.y = exp2f(x.y);
-            qk[i] = x.x;
-            qk[i + 1] = x.y;
-            stepSum[lt][hi] = fadd2(stepSum[lt][hi], x);
-          }
-#pragma unroll
-          for (int k = 0; k < 4; ++k)
-            pk[j][k] = f32x4ToE4m3x4(qk[4 * k], qk[4 * k + 1], qk[4 * k + 2], qk[4 * k + 3]);
         };
+        // E4M3 probabilities against the current reference, P = exp2(S * scale - ref * scale +
+        // log2(448)
+        // - headroom); returns the largest exponent.
+        auto convertBlocks = [&]() {
+          float xmax = kNegMax;
 #pragma unroll
-        for (int j = 0; j < C::BlkPerGrp; ++j) {
-          // Pass 1: scores and column maxima only; P is produced once, after the reference is
-          // settled.
-          if (blkValid(j)) convertBlock(j, true, false);
+          for (int j = 0; j < C::BlkPerGrp; ++j) {
+            if (!blkValid(j)) continue;
+            int const lt = C::Shared ? 0 : j;
+            float2 const nsm01 = make_float2(nsm[lt][0], nsm[lt][1]);
+            float2 const nsm23 = make_float2(nsm[lt][2], nsm[lt][3]);
+#pragma unroll
+            for (int i = 0; i < 16; i += 2) {
+              int const hi = (i / 4) % 2;
+              float2 x = ffma2(make_float2(qk[j][i], qk[j][i + 1]), scale2, hi ? nsm23 : nsm01);
+              if constexpr (C::Spec) xmax = fmaxf(xmax, fmaxf(x.x, x.y));
+              x.x = exp2f(x.x);
+              x.y = exp2f(x.y);
+              qk[j][i] = x.x;
+              qk[j][i + 1] = x.y;
+              stepSum[lt][hi] = fadd2(stepSum[lt][hi], x);
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+              pk[j][k] =
+                  f32x4ToE4m3x4(qk[j][4 * k], qk[j][4 * k + 1], qk[j][4 * k + 2], qk[j][4 * k + 3]);
+          }
+          return xmax;
+        };
+        loadBlocks();
+        if constexpr (C::EarlyS) {
+          // S is in registers: the TMEM stage goes straight back to the QK issuer, so the next QK
+          // MMAs overlap this step's softmax.
+          tcFenceBefore();
+          mbarArrive(&bars[C::BarSEmpty + sStage]);
         }
         bool over = false;
+        if constexpr (C::Spec) {
+          // Speculative single pass: P against the current reference is valid unless some exponent
+          // exceeds log2(448), i.e. a score exceeds ref + headroom (or a reference is still unset).
+          // Only then (rare once the reference has settled) is S reloaded and the exact column max
+          // reduced.
+          over = convertBlocks() > kLog2E4m3Max;
 #pragma unroll
-        for (int lt = 0; lt < C::TokPerGrp; ++lt) {
+          for (int lt = 0; lt < C::TokPerGrp; ++lt) {
 #pragma unroll
-          for (int c = 0; c < 4; ++c) over = over || (lmax[lt][c] > ref[lt][c] + headroomRaw);
+            for (int c = 0; c < 4; ++c) over = over || (ltValid(lt) && ref[lt][c] == kNegMax);
+          }
+        } else {
+          trackMax();
+#pragma unroll
+          for (int lt = 0; lt < C::TokPerGrp; ++lt) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) over = over || (lmax[lt][c] > ref[lt][c] + headroomRaw);
+          }
         }
         float scales[C::TokPerGrp][4];
         bool const anyOver = namedBarSyncOr(nbVote, nbThreads, over);
         if (anyOver) {
+          if constexpr (C::Spec) {
+            loadBlocks();
+            trackMax();
+          }
           // Exact column max over the threads of the token's barrier group. Lanes with equal
           // lane % 4 hold the same 4 heads for 8 token rows; a 3-level butterfly halves the columns
           // per lane at each level, leaving lane l with the 8-row max of column
@@ -939,18 +1069,14 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
             nextRed[ltTok(tid / 16) * 16 + tid % 16] = encodeMax(kNegMax);
           }
           ++redIt;
+          if constexpr (C::Spec) convertBlocks();
         }
-        // Pass 2: reload S (TMEM) and convert it to E4M3 probabilities against the settled
-        // reference.
-#pragma unroll
-        for (int j = 0; j < C::BlkPerGrp; ++j) {
-          if (blkValid(j)) convertBlock(j, false, true);
-        }
+        if constexpr (!C::Spec) convertBlocks();
         // O accumulated in earlier steps needs the new reference (the first step overwrites O).
         bool const rescaleO = anyOver && ownsO && step > 0;
         if (rescaleO) {
           // Rescale O once the PV MMAs of the previous step are complete (ring of per-step PV
-          // commits); the S-empty release below orders it before this step's PV MMAs.
+          // commits); the P-full release below orders it before this step's PV MMAs.
           uint32_t const prev = sIt - 1;
           mbarWait(&bars[C::BarODone + prev % C::PStages], (prev / C::PStages) & 1u);
           tcFenceAfter();
@@ -972,6 +1098,11 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
           }
           tcWaitSt();
         }
+        if (C::EarlyS && sIt >= C::PStages) {
+          // P[sIt % PStages] was last read by the PV MMAs of step sIt - PStages.
+          uint32_t const old = sIt - C::PStages;
+          mbarWait(&bars[C::BarODone + old % C::PStages], (old / C::PStages) & 1u);
+        }
         {
           uint8_t* pStage = smemP + (sIt % C::PStages) * C::PStageBytes;
 #pragma unroll
@@ -980,10 +1111,12 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
           }
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         }
-        // Release S; this also tells the PV warp that this part of P (and any O rescale) is
-        // complete.
+        // Tell the PV warp that this part of P (and any O rescale) is complete (without EarlyS this
+        // also releases S). P readiness has its own PStages ring: with PStages > Stages, the S ring
+        // can complete a phase twice before PV observes it.
         tcFenceBefore();
-        mbarArrive(&bars[C::BarSEmpty + sStage]);
+        mbarArrive(&bars[C::BarPFull + sIt % C::PStages]);
+        if constexpr (!C::EarlyS) mbarArrive(&bars[C::BarSEmpty + sStage]);
         ++sIt;
 #pragma unroll
         for (int lt = 0; lt < C::TokPerGrp; ++lt) {
@@ -1096,16 +1229,25 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
       tcFenceAfter();
       uint64_t const qDesc = smemDescSw128(smem + C::SmemQ + (qIt % 2) * C::QStageBytes);
       for (int t = 0; t < numSteps; ++t) {
-        // PV publishes that the MMAs reading P[s] are complete before QK makes S[s + PStages]
-        // available to softmax, which overwrites the same probability buffer.
-        if (C::PStages > C::Stages && sIt >= C::Stages) {
-          // S[sIt - Stages] has been read by the softmax (P lags further behind).
-          uint32_t const prevS = sIt - C::Stages;
-          mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
-        }
-        if (sIt >= C::PStages) {
-          uint32_t const prev = sIt - C::PStages;
-          mbarWait(&bars[C::BarPCons + prev % C::PStages], (prev / C::PStages) & 1u);
+        if constexpr (C::EarlyS) {
+          // S[sIt - Stages] has been loaded into the softmax registers (P reuse is guarded by the
+          // softmax).
+          if (sIt >= C::Stages) {
+            uint32_t const prevS = sIt - C::Stages;
+            mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
+          }
+        } else {
+          // PV publishes that the MMAs reading P[s] are complete before QK makes S[s + PStages]
+          // available to softmax, which overwrites the same probability buffer.
+          if (C::PStages > C::Stages && sIt >= C::Stages) {
+            // S[sIt - Stages] has been read by the softmax (P lags further behind).
+            uint32_t const prevS = sIt - C::Stages;
+            mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
+          }
+          if (sIt >= C::PStages) {
+            uint32_t const prev = sIt - C::PStages;
+            mbarWait(&bars[C::BarPCons + prev % C::PStages], (prev / C::PStages) & 1u);
+          }
         }
         uint32_t const sCol = tmem + C::TmemS + (sIt % C::Stages) * C::SCols;
 #pragma unroll 1
@@ -1177,8 +1319,7 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
       int const numSteps = seg.numPages / C::SP;
       if (numSteps == 0) continue;
       for (int t = 0; t < numSteps; ++t) {
-        uint32_t const pStageIdx = pIt % C::Stages;
-        mbarWait(&bars[C::BarSEmpty + pStageIdx], (pIt / C::Stages) & 1u);
+        mbarWait(&bars[C::BarPFull + pIt % C::PStages], (pIt / C::PStages) & 1u);
         tcFenceAfter();
         uint32_t const pSlot = pIt % C::PStages;
         uint8_t const* pStage = smem + C::SmemP + pSlot * C::PStageBytes;
@@ -1215,14 +1356,14 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
         }
         if (electOne()) tcCommit(&bars[C::BarODone + pIt % C::PStages]);
         __syncwarp();
-        if (t == numSteps - 1) {
-          if (electOne()) tcCommit(&bars[C::BarOFull]);
-          __syncwarp();
-        }
         // P[pSlot] may be overwritten once the MMAs that read it complete (tcgen05.mma is
         // asynchronous, so issuing them is not enough).
-        if (static_cast<int>(pIt) + C::PStages < totalSteps) {
+        if (!C::EarlyS && static_cast<int>(pIt) + C::PStages < totalSteps) {
           if (electOne()) tcCommit(&bars[C::BarPCons + pIt % C::PStages]);
+          __syncwarp();
+        }
+        if (t == numSteps - 1) {
+          if (electOne()) tcCommit(&bars[C::BarOFull]);
           __syncwarp();
         }
         ++pIt;
@@ -1233,7 +1374,10 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
     namedBarArrive(kNbTmemDone, kTmemUserThreads);
   } else {
     // ============================================================================== dequant
-    if constexpr (C::RegsDequant > C::RegsLaunch) setMaxNRegInc<C::RegsDequant>();
+    if constexpr (C::RegsDequant > C::RegsLaunch)
+      setMaxNRegInc<C::RegsDequant>();
+    else if constexpr (C::RegsDequant < C::RegsLaunch)
+      setMaxNRegDec<C::RegsDequant>();
     int const dq = warp - (C::WarpQk + 4);
     if (dq < 4) {
       runDequantPipeline<C, false>(smem, bars, tmem, segs, numSegs, dq, lane);
@@ -1246,30 +1390,29 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
 }
 
 // Merges the pieces of one (virtual request, kvHead) unit for one (query token, head) column of its
-// group into the FP8 output. 256 threads: the piece weights are computed one piece per thread,
-// while warp w already holds the O rows of pieces w, w + 8, ... (lane l owns head dims [4l, 4l +
-// 4)), so the O loads overlap the stats loads and the max / sum reductions.
+// group into the FP8 output. 256 threads. kWarpCols: each warp merges one column on its own (units
+// with few pieces); otherwise the eight warps share a column, warp w taking pieces w, w + 8, ...
+// Lane l owns head dims [4l, 4l + 4). The stats and O rows of kChunk pieces per warp are loaded in
+// one round trip and merged with a running max.
 constexpr int kCombineThreads = 256;
 constexpr int kCombineWarps = kCombineThreads / 32;
-constexpr int kCombineMaxPieces = 512;
-constexpr int kCombineChunk = 8;  // O pieces held in registers per warp and pass
-extern "C" __global__ void __launch_bounds__(kCombineThreads)
-    nm35_nvfp4_decode_base_combine(__grid_constant__ DecodeParams const p) {
-  __shared__ float pieceW[kCombineMaxPieces];
-  __shared__ float4 red[kCombineWarps][32];
+template <int kChunk, bool kWarpCols>
+__device__ __forceinline__ void combineBody(DecodeParams const& p) {
+  constexpr int kPieceStride = kWarpCols ? 1 : kCombineWarps;
+  __shared__ float4 red[kWarpCols ? 1 : kCombineWarps][32];
   __shared__ float redM[kCombineWarps];
   __shared__ float redS[kCombineWarps];
   int const unit = blockIdx.x;  // virt * kNumHeadsKv + kvHead
   int const virt = unit / kNumHeadsKv;
   int const kvHead = unit % kNumHeadsKv;
-  int const G = gridDim.y / kHeadsPerKv;
-  int const col = blockIdx.y;  // t * 16 + head
-  int const t = col / kHeadsPerKv;
-  int const head = col % kHeadsPerKv;
-  int const N = 16 * G;
   int const tid = threadIdx.x;
   int const lane = tid % 32;
   int const warp = tid / 32;
+  int const N = kWarpCols ? gridDim.y * kCombineWarps : gridDim.y;
+  int const G = N / kHeadsPerKv;
+  int const col = kWarpCols ? blockIdx.y * kCombineWarps + warp : blockIdx.y;  // t * 16 + head
+  int const t = col / kHeadsPerKv;
+  int const head = col % kHeadsPerKv;
   int const req = virt / p.numGroups;
   int const grpIdx = virt - req * p.numGroups;
   // This is the first global-memory access, including inactive/ragged group checks.
@@ -1285,7 +1428,8 @@ extern "C" __global__ void __launch_bounds__(kCombineThreads)
                           head) *
                              kHeadDim;
   if (seqLen - tokens + 1 + grpIdx * G + t <= 0) {
-    if (tid < 32) reinterpret_cast<uint32_t*>(dst)[tid] = 0u;  // no visible cache entry
+    if (kWarpCols || tid < 32)
+      reinterpret_cast<uint32_t*>(dst)[lane] = 0u;  // no visible cache entry
     return;
   }
   int const n = range.y - range.x + 1;
@@ -1295,106 +1439,121 @@ extern "C" __global__ void __launch_bounds__(kCombineThreads)
   size_t const statStride = static_cast<size_t>(kNumHeadsKv) * N * 2;
   float const* oBase = p.ws + slot0 * N * kHeadDim + col * kHeadDim + lane * 4;
   size_t const oStride = static_cast<size_t>(kNumHeadsKv) * N * kHeadDim;
-  // First chunk of this warp's O pieces, issued before the stats are reduced.
-  float4 x[kCombineChunk];
-#pragma unroll
-  for (int k = 0; k < kCombineChunk; ++k) {
-    int const i = warp + k * kCombineWarps;
-    x[k] = i < n ? *reinterpret_cast<float4 const*>(oBase + i * oStride)
-                 : make_float4(0.f, 0.f, 0.f, 0.f);
-  }
-  float m = kNegMax;
-  float2 st = make_float2(kNegMax, 0.f);
-  if (tid < n) {
-    st = *reinterpret_cast<float2 const*>(stats + tid * statStride);
-    m = st.x;
-  }
-  for (int i = tid + kCombineThreads; i < n; i += kCombineThreads)
-    m = fmaxf(m, stats[i * statStride]);
-#pragma unroll
-  for (int off = 16; off > 0; off /= 2) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-  if (lane == 0) redM[warp] = m;
-  __syncthreads();
-  m = redM[0];
-#pragma unroll
-  for (int w = 1; w < kCombineWarps; ++w) m = fmaxf(m, redM[w]);
-  float sum = 0.f;
-  if (tid < n) {
-    float const a = exp2f((st.x - m) * scaleLog2);
-    pieceW[tid] = a;
-    sum = a * st.y;
-  }
-  for (int i = tid + kCombineThreads; i < n; i += kCombineThreads) {
-    float2 const s2 = *reinterpret_cast<float2 const*>(stats + i * statStride);
-    float const a = exp2f((s2.x - m) * scaleLog2);
-    pieceW[i] = a;
-    sum = fmaf(a, s2.y, sum);
-  }
-#pragma unroll
-  for (int off = 16; off > 0; off /= 2) sum += __shfl_xor_sync(0xffffffffu, sum, off);
-  if (lane == 0) redS[warp] = sum;
-  __syncthreads();
+  float mW = kNegMax;  // running max of this warp's pieces
+  float sW = 0.f;      // their sum, relative to mW
   float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+  for (int base = kWarpCols ? 0 : warp; base < n; base += kPieceStride * kChunk) {
+    // Lane k < kChunk holds the (max, sum) of piece base + k * stride; every lane holds 4 dims of
+    // each O row.
+    int const iSt = base + lane * kPieceStride;
+    float2 const st = (lane < kChunk && iSt < n)
+                          ? *reinterpret_cast<float2 const*>(stats + iSt * statStride)
+                          : make_float2(kNegMax, 0.f);
+    float4 x[kChunk];
 #pragma unroll
-  for (int k = 0; k < kCombineChunk; ++k) {
-    int const i = warp + k * kCombineWarps;
-    float const a = i < n ? pieceW[i] : 0.f;
-    acc.x = fmaf(a, x[k].x, acc.x);
-    acc.y = fmaf(a, x[k].y, acc.y);
-    acc.z = fmaf(a, x[k].z, acc.z);
-    acc.w = fmaf(a, x[k].w, acc.w);
-  }
-#pragma unroll 4
-  for (int i = warp + kCombineChunk * kCombineWarps; i < n; i += kCombineWarps) {
-    float const a = pieceW[i];
-    float4 const y = *reinterpret_cast<float4 const*>(oBase + i * oStride);
-    acc.x = fmaf(a, y.x, acc.x);
-    acc.y = fmaf(a, y.y, acc.y);
-    acc.z = fmaf(a, y.z, acc.z);
-    acc.w = fmaf(a, y.w, acc.w);
-  }
-  red[warp][lane] = acc;
-  __syncthreads();
-  if (warp == 0) {
-    float tot = 0.f;
-#pragma unroll
-    for (int w = 0; w < kCombineWarps; ++w) tot += redS[w];
-    float4 v = red[0][lane];
-#pragma unroll
-    for (int w = 1; w < kCombineWarps; ++w) {
-      float4 const y = red[w][lane];
-      v.x += y.x;
-      v.y += y.y;
-      v.z += y.z;
-      v.w += y.w;
+    for (int k = 0; k < kChunk; ++k) {
+      int const i = base + k * kPieceStride;
+      x[k] = i < n ? *reinterpret_cast<float4 const*>(oBase + i * oStride)
+                   : make_float4(0.f, 0.f, 0.f, 0.f);
     }
-    float const inv = (p.outputScalePtr ? *p.outputScalePtr : p.outputScale) / tot;
-    uint32_t const lo =
-        __nv_cvt_float2_to_fp8x2(make_float2(v.x * inv, v.y * inv), __NV_SATFINITE, __NV_E4M3);
-    uint32_t const hi =
-        __nv_cvt_float2_to_fp8x2(make_float2(v.z * inv, v.w * inv), __NV_SATFINITE, __NV_E4M3);
-    reinterpret_cast<uint32_t*>(dst)[lane] = lo | (hi << 16);
+    float cm = st.x;
+#pragma unroll
+    for (int off = 16; off > 0; off /= 2) cm = fmaxf(cm, __shfl_xor_sync(0xffffffffu, cm, off));
+    float const newM = fmaxf(mW, cm);
+    float const r = exp2f((mW - newM) * scaleLog2);
+    mW = newM;
+    sW *= r;
+    acc.x *= r;
+    acc.y *= r;
+    acc.z *= r;
+    acc.w *= r;
+    float const a = exp2f((st.x - mW) * scaleLog2);
+    float ps = a * st.y;
+#pragma unroll
+    for (int off = 16; off > 0; off /= 2) ps += __shfl_xor_sync(0xffffffffu, ps, off);
+    sW += ps;
+#pragma unroll
+    for (int k = 0; k < kChunk; ++k) {
+      float const ak = __shfl_sync(0xffffffffu, a, k);
+      acc.x = fmaf(ak, x[k].x, acc.x);
+      acc.y = fmaf(ak, x[k].y, acc.y);
+      acc.z = fmaf(ak, x[k].z, acc.z);
+      acc.w = fmaf(ak, x[k].w, acc.w);
+    }
   }
+  float4 v = acc;
+  float tot = sW;
+  if constexpr (!kWarpCols) {
+    red[warp][lane] = acc;
+    if (lane == 0) {
+      redM[warp] = mW;
+      redS[warp] = sW;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    float m = redM[0];
+#pragma unroll
+    for (int w = 1; w < kCombineWarps; ++w) m = fmaxf(m, redM[w]);
+    tot = 0.f;
+    v = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+    for (int w = 0; w < kCombineWarps; ++w) {
+      // A warp without pieces has max -max and contributes nothing.
+      float const f = exp2f((redM[w] - m) * scaleLog2);
+      float4 const y = red[w][lane];
+      tot = fmaf(f, redS[w], tot);
+      v.x = fmaf(f, y.x, v.x);
+      v.y = fmaf(f, y.y, v.y);
+      v.z = fmaf(f, y.z, v.z);
+      v.w = fmaf(f, y.w, v.w);
+    }
+  }
+  float const inv = (p.outputScalePtr ? *p.outputScalePtr : p.outputScale) / tot;
+  uint32_t const lo =
+      __nv_cvt_float2_to_fp8x2(make_float2(v.x * inv, v.y * inv), __NV_SATFINITE, __NV_E4M3);
+  uint32_t const hi =
+      __nv_cvt_float2_to_fp8x2(make_float2(v.z * inv, v.w * inv), __NV_SATFINITE, __NV_E4M3);
+  reinterpret_cast<uint32_t*>(dst)[lane] = lo | (hi << 16);
 }
 
-extern "C" __global__ void __launch_bounds__(Cfg<1>::Threads, 1)
-    nm35_nvfp4_decode_base_g1(__grid_constant__ DecodeParams const p) {
-  nvfp4PagedDecodeBody<1>(p);
+// Combine variants by expected pieces per unit: one CTA per column with 10 / 5 / 3 loads per warp
+// (1 to ~4 requests), or one warp per column with up to 12 loads (more requests, fewer pieces
+// each).
+extern "C" __global__ void __launch_bounds__(kCombineThreads)
+    cake_nvfp4_decode_mtp_combine_c10(__grid_constant__ DecodeParams const p) {
+  combineBody<10, false>(p);
 }
-extern "C" __global__ void __launch_bounds__(Cfg<3>::Threads, 1)
-    nm35_nvfp4_decode_base_g3(__grid_constant__ DecodeParams const p) {
-  nvfp4PagedDecodeBody<3>(p);
+extern "C" __global__ void __launch_bounds__(kCombineThreads)
+    cake_nvfp4_decode_mtp_combine_c5(__grid_constant__ DecodeParams const p) {
+  combineBody<5, false>(p);
 }
-extern "C" __global__ void __launch_bounds__(Cfg<5>::Threads, 1)
-    nm35_nvfp4_decode_base_g5(__grid_constant__ DecodeParams const p) {
-  nvfp4PagedDecodeBody<5>(p);
+extern "C" __global__ void __launch_bounds__(kCombineThreads)
+    cake_nvfp4_decode_mtp_combine_c3(__grid_constant__ DecodeParams const p) {
+  combineBody<3, false>(p);
+}
+extern "C" __global__ void __launch_bounds__(kCombineThreads)
+    cake_nvfp4_decode_mtp_combine_w12(__grid_constant__ DecodeParams const p) {
+  combineBody<12, true>(p);
+}
+
+extern "C" __global__ void __launch_bounds__(Cfg<2>::Threads, 1)
+    cake_nvfp4_decode_mtp_g2(__grid_constant__ DecodeParams const p) {
+  nvfp4PagedDecodeBody<2>(p);
+}
+extern "C" __global__ void __launch_bounds__(Cfg<4>::Threads, 1)
+    cake_nvfp4_decode_mtp_g4(__grid_constant__ DecodeParams const p) {
+  nvfp4PagedDecodeBody<4>(p);
+}
+extern "C" __global__ void __launch_bounds__(Cfg<8>::Threads, 1)
+    cake_nvfp4_decode_mtp_g8(__grid_constant__ DecodeParams const p) {
+  nvfp4PagedDecodeBody<8>(p);
 }
 
 // The host launch code reads Cfg<G>::SmemBytes and Cfg<G>::Threads; pin the tuned values.
-static_assert(Cfg<1>::SmemBytes == 225232 && Cfg<1>::Threads == 640, "G1 resources");
-static_assert(Cfg<3>::SmemBytes == 211280 && Cfg<3>::Threads == 640, "G3 resources");
-static_assert(Cfg<5>::SmemBytes == 216784 && Cfg<5>::Threads == 640, "G5 resources");
+static_assert(Cfg<2>::SmemBytes == 221328 && Cfg<2>::Threads == 640, "G2 resources");
+static_assert(Cfg<4>::SmemBytes == 225808 && Cfg<4>::Threads == 896, "G4 resources");
+static_assert(Cfg<8>::SmemBytes == 225552 && Cfg<8>::Threads == 896, "G8 resources");
 
-}  // namespace decode_base
-}  // namespace nm35_nvfp4
+}  // namespace decode_mtp
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

@@ -20,7 +20,7 @@
 #include "common.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 namespace prefill {
 namespace pmax {
 
@@ -33,7 +33,7 @@ constexpr int kSharedBytes = 197632;
 
 extern "C" {
 
-__global__ __launch_bounds__(kThreads, 1) void nm35_nvfp4_prefill_pmax(
+__global__ __launch_bounds__(kThreads, 1) void cake_nvfp4_prefill_pmax(
     float* __restrict__ pmax, int* __restrict__ block_tables, int* __restrict__ q_indptr,
     int* __restrict__ kv_lengths, int table_stride, int n_qtiles, int nctas, int qf, int tile_base,
     float x_frac, int pchunks, __grid_constant__ TensorMaps<2> const tensor_maps) {
@@ -597,5 +597,5 @@ __global__ __launch_bounds__(kThreads, 1) void nm35_nvfp4_prefill_pmax(
 
 }  // namespace pmax
 }  // namespace prefill
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

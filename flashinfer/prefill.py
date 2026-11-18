@@ -9441,13 +9441,13 @@ def trtllm_batch_context_with_kv_cache(
     backend : str = "trtllm-gen"
         The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
         selects the separately versioned Cake FMHA product. The default remains
-        the conventional TRTLLM implementation. ``nm35-nvfp4`` is an
+        the conventional TRTLLM implementation. ``cake-nvfp4`` is an
         explicit backend for Nemotron 3.5 Super with an NVFP4 KV cache on sm_100
         (FP8 query and output, 32 query heads, 2 KV heads, head dimension 128,
         128-token pages): a single-request call with a KV longer than 8192 tokens
         and a large enough ``workspace_buffer`` runs on a kernel written for that
         geometry, and every other call on ``trtllm-gen``. Size the workspace with
-        :func:`flashinfer.nm35_nvfp4.prefill_workspace_bytes`.
+        :func:`flashinfer.cake_nvfp4.prefill_workspace_bytes`.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -9467,13 +9467,13 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl = device_support_pdl(query.device)
     # The Nemotron 3.5 Super NVFP4 kernel serves one attention geometry. Every
     # other call runs on trtllm-gen.
-    use_nm35_nvfp4 = backend == "nm35-nvfp4"
-    if use_nm35_nvfp4:
+    use_cake_nvfp4 = backend == "cake-nvfp4"
+    if use_cake_nvfp4:
         backend = "trtllm-gen"
     if backend not in ("trtllm-gen", "cake"):
         raise ValueError(
             "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen', "
-            "'cake' or 'nm35-nvfp4'"
+            "'cake' or 'cake-nvfp4'"
         )
     if isinstance(window_left, bool) or not isinstance(window_left, int):
         raise TypeError("window_left must be an integer")
@@ -9813,11 +9813,11 @@ def trtllm_batch_context_with_kv_cache(
     if backend != "cake":
         run_args.append(1.0)  # lse_scale
     run_args.extend((lse_stride_tokens, lse_stride_heads))
-    ran_nm35_nvfp4 = False
-    if use_nm35_nvfp4:
-        from .nm35_nvfp4 import try_prefill as try_nm35_nvfp4_prefill
+    ran_cake_nvfp4 = False
+    if use_cake_nvfp4:
+        from .cake_nvfp4 import try_prefill as try_cake_nvfp4_prefill
 
-        ran_nm35_nvfp4 = try_nm35_nvfp4_prefill(
+        ran_cake_nvfp4 = try_cake_nvfp4_prefill(
             out=out,
             query=query,
             k_cache=k_cache,
@@ -9847,7 +9847,7 @@ def trtllm_batch_context_with_kv_cache(
                 and not uses_spcompress
             ),
         )
-    if not ran_nm35_nvfp4:
+    if not ran_cake_nvfp4:
         run_func(*run_args)
     result_out = (
         out

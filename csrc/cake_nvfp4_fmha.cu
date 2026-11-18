@@ -18,7 +18,7 @@
 // Each entry point returns an empty string after enqueueing its kernels, or the reason the kernel
 // does not serve the call. A declined call has launched nothing and written to no tensor, so the
 // caller can run it on another backend. A CUDA failure is raised as an error, never returned as a
-// reason. Which kernel to try for a shape is decided in flashinfer/nm35_nvfp4.py.
+// reason. Which kernel to try for a shape is decided in flashinfer/cake_nvfp4.py.
 #include <cuda_runtime.h>
 #include <tvm/ffi/container/variant.h>
 
@@ -26,8 +26,8 @@
 #include <cstdint>
 #include <string>
 
-#include "flashinfer/attention/nm35_nvfp4/fp4_mul.cuh"
-#include "flashinfer/attention/nm35_nvfp4/host.h"
+#include "flashinfer/attention/cake_nvfp4/fp4_mul.cuh"
+#include "flashinfer/attention/cake_nvfp4/host.h"
 #include "flashinfer/math.cuh"
 #include "tvm_ffi_utils.h"
 
@@ -37,7 +37,7 @@ using tvm::ffi::Variant;
 
 namespace {
 
-namespace nm35 = flashinfer::nm35_nvfp4;
+namespace cake_nvfp4 = flashinfer::cake_nvfp4;
 
 constexpr int64_t kDecodeMtp = 0;
 constexpr int64_t kDecodeBase = 1;
@@ -49,10 +49,10 @@ bool sameDtype(DLDataType a, DLDataType b) {
 // Returns "" when `t` is a dense [rows, 32, 128] E4M3 tensor.
 std::string tokenTensorReason(TensorView const& t, char const* name) {
   if (!sameDtype(t.dtype(), dl_float8_e4m3fn)) return std::string(name) + " dtype is not E4M3";
-  if (t.ndim() != 3 || t.size(1) != nm35::kNumHeadsQ || t.size(2) != nm35::kHeadDim)
+  if (t.ndim() != 3 || t.size(1) != cake_nvfp4::kNumHeadsQ || t.size(2) != cake_nvfp4::kHeadDim)
     return std::string(name) + " is not [tokens, 32, 128]";
-  if (t.stride(2) != 1 || t.stride(1) != nm35::kHeadDim ||
-      t.stride(0) != nm35::kNumHeadsQ * nm35::kHeadDim)
+  if (t.stride(2) != 1 || t.stride(1) != cake_nvfp4::kHeadDim ||
+      t.stride(0) != cake_nvfp4::kNumHeadsQ * cake_nvfp4::kHeadDim)
     return std::string(name) + " is not packed";
   return "";
 }
@@ -61,7 +61,7 @@ std::string tokenTensorReason(TensorView const& t, char const* name) {
 std::string pageTensorReason(TensorView const& t, DLDataType dtype, int64_t inner,
                              char const* name) {
   if (!sameDtype(t.dtype(), dtype)) return std::string(name) + " has the wrong dtype";
-  if (t.ndim() != 4 || t.size(1) != nm35::kNumHeadsKv || t.size(2) != nm35::kPageSize ||
+  if (t.ndim() != 4 || t.size(1) != cake_nvfp4::kNumHeadsKv || t.size(2) != cake_nvfp4::kPageSize ||
       t.size(3) != inner)
     return std::string(name) + " is not [pages, 2, 128, " + std::to_string(inner) + "]";
   if (t.stride(3) != 1 || t.stride(2) != inner) return std::string(name) + " tokens are not dense";
@@ -81,7 +81,7 @@ std::string indexTensorReason(TensorView const& t, int64_t elements, char const*
 
 // Reads the call from the tensors. Returns the first reason the geometry is not the one the
 // kernels serve, or "".
-std::string readCall(nm35::Call& c, TensorView const& out, TensorView const& query,
+std::string readCall(cake_nvfp4::Call& c, TensorView const& out, TensorView const& query,
                      TensorView const& k_cache, TensorView const& v_cache, TensorView const& k_sf,
                      TensorView const& v_sf, TensorView const& workspace,
                      TensorView const& block_tables, TensorView const& seq_lens,
@@ -105,12 +105,14 @@ std::string readCall(nm35::Call& c, TensorView const& out, TensorView const& que
   std::string reason = tokenTensorReason(query, "query");
   if (reason.empty()) reason = tokenTensorReason(out, "out");
   if (reason.empty() && out.size(0) != query.size(0)) reason = "out and query row counts differ";
-  if (reason.empty()) reason = pageTensorReason(k_cache, dl_uint8, nm35::kHeadDim / 2, "k_cache");
-  if (reason.empty()) reason = pageTensorReason(v_cache, dl_uint8, nm35::kHeadDim / 2, "v_cache");
   if (reason.empty())
-    reason = pageTensorReason(k_sf, dl_float8_e4m3fn, nm35::kHeadDim / 16, "k_cache_sf");
+    reason = pageTensorReason(k_cache, dl_uint8, cake_nvfp4::kHeadDim / 2, "k_cache");
   if (reason.empty())
-    reason = pageTensorReason(v_sf, dl_float8_e4m3fn, nm35::kHeadDim / 16, "v_cache_sf");
+    reason = pageTensorReason(v_cache, dl_uint8, cake_nvfp4::kHeadDim / 2, "v_cache");
+  if (reason.empty())
+    reason = pageTensorReason(k_sf, dl_float8_e4m3fn, cake_nvfp4::kHeadDim / 16, "k_cache_sf");
+  if (reason.empty())
+    reason = pageTensorReason(v_sf, dl_float8_e4m3fn, cake_nvfp4::kHeadDim / 16, "v_cache_sf");
   if (reason.empty() && (k_cache.size(0) != v_cache.size(0) || k_cache.size(0) != k_sf.size(0) ||
                          k_cache.size(0) != v_sf.size(0)))
     reason = "K, V and scale page counts differ";
@@ -175,9 +177,9 @@ std::string readCall(nm35::Call& c, TensorView const& out, TensorView const& que
   return "";
 }
 
-nm35::Device currentDevice() {
+cake_nvfp4::Device currentDevice() {
   int device = 0;
-  nm35::Device dev;
+  cake_nvfp4::Device dev;
   TVM_FFI_ICHECK(cudaGetDevice(&device) == cudaSuccess);
   TVM_FFI_ICHECK(cudaDeviceGetAttribute(&dev.major, cudaDevAttrComputeCapabilityMajor, device) ==
                  cudaSuccess);
@@ -192,7 +194,7 @@ nm35::Device currentDevice() {
 
 // Decode with `kernel` 0 ("mtp") or 1 ("base"). Without cum_seq_lens_q every request has
 // max_q_len query tokens.
-String nm35_nvfp4_decode(int64_t kernel, TensorView out, TensorView query, TensorView k_cache,
+String cake_nvfp4_decode(int64_t kernel, TensorView out, TensorView query, TensorView k_cache,
                          TensorView v_cache, TensorView k_cache_sf, TensorView v_cache_sf,
                          TensorView workspace_buffer, TensorView block_tables, TensorView seq_lens,
                          int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
@@ -200,53 +202,53 @@ String nm35_nvfp4_decode(int64_t kernel, TensorView out, TensorView query, Tenso
                          Variant<double, ffi::Tensor> bmm2_scale, bool enable_pdl,
                          Optional<TensorView> cum_seq_lens_q) {
   TVM_FFI_ICHECK(kernel == kDecodeMtp || kernel == kDecodeBase) << "unknown decode kernel";
-  nm35::Call call;
+  cake_nvfp4::Call call;
   std::string reason =
       readCall(call, out, query, k_cache, v_cache, k_cache_sf, v_cache_sf, workspace_buffer,
                block_tables, seq_lens, cum_seq_lens_q, batch_size, max_q_len, max_kv_len,
                bmm1_scale, bmm2_scale, enable_pdl);
   if (!reason.empty()) return String(reason);
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
-  nm35::Device const dev = currentDevice();
-  nm35::DecodePlan const plan =
-      kernel == kDecodeMtp ? nm35::planDecodeMtp(call, dev) : nm35::planDecodeBase(call, dev);
+  cake_nvfp4::Device const dev = currentDevice();
+  cake_nvfp4::DecodePlan const plan = kernel == kDecodeMtp ? cake_nvfp4::planDecodeMtp(call, dev)
+                                                           : cake_nvfp4::planDecodeBase(call, dev);
   if (!plan.reason.empty()) return String(plan.reason);
   void* const stream = get_stream(query.device());
   if (kernel == kDecodeMtp) {
-    nm35::launchDecodeMtp(call, plan, stream);
+    cake_nvfp4::launchDecodeMtp(call, plan, stream);
   } else {
-    nm35::launchDecodeBase(call, plan, stream);
+    cake_nvfp4::launchDecodeBase(call, plan, stream);
   }
   return String("");
 }
 
 // Prefill. Request i owns query rows cum_seq_lens_q[i] to cum_seq_lens_q[i + 1] and attends to
 // its first seq_lens[i] KV tokens, which already include those rows.
-String nm35_nvfp4_prefill(TensorView out, TensorView query, TensorView k_cache, TensorView v_cache,
+String cake_nvfp4_prefill(TensorView out, TensorView query, TensorView k_cache, TensorView v_cache,
                           TensorView k_cache_sf, TensorView v_cache_sf, TensorView workspace_buffer,
                           TensorView block_tables, TensorView seq_lens, TensorView cum_seq_lens_q,
                           int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
                           Variant<double, ffi::Tensor> bmm1_scale,
                           Variant<double, ffi::Tensor> bmm2_scale) {
-  nm35::Call call;
+  cake_nvfp4::Call call;
   std::string reason =
       readCall(call, out, query, k_cache, v_cache, k_cache_sf, v_cache_sf, workspace_buffer,
                block_tables, seq_lens, Optional<TensorView>(cum_seq_lens_q), batch_size, max_q_len,
                max_kv_len, bmm1_scale, bmm2_scale, /*enable_pdl=*/false);
   if (!reason.empty()) return String(reason);
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
-  nm35::Device const dev = currentDevice();
-  reason = nm35::prefillReason(call, dev);
+  cake_nvfp4::Device const dev = currentDevice();
+  reason = cake_nvfp4::prefillReason(call, dev);
   if (!reason.empty()) return String(reason);
-  nm35::launchPrefill(call, dev, get_stream(query.device()));
+  cake_nvfp4::launchPrefill(call, dev, get_stream(query.device()));
   return String("");
 }
 
 // Whether the decode kernels were built with the fused NVFP4 dequantization instruction, which
 // the CUDA 13.4 toolkit introduced (fp4_mul.cuh). Every translation unit of the module is built
 // by one compiler.
-bool nm35_nvfp4_fused_fp4_mul() { return NM35_NVFP4_FUSED_FP4_MUL != 0; }
+bool cake_nvfp4_fused_fp4_mul() { return CAKE_NVFP4_FUSED_FP4_MUL != 0; }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nm35_nvfp4_decode, nm35_nvfp4_decode);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nm35_nvfp4_prefill, nm35_nvfp4_prefill);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nm35_nvfp4_fused_fp4_mul, nm35_nvfp4_fused_fp4_mul);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_nvfp4_decode, cake_nvfp4_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_nvfp4_prefill, cake_nvfp4_prefill);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_nvfp4_fused_fp4_mul, cake_nvfp4_fused_fp4_mul);

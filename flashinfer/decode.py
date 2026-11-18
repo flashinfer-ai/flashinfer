@@ -4518,12 +4518,12 @@ def trtllm_batch_decode_with_kv_cache(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
-        ``nm35-nvfp4`` is an explicit backend for Nemotron 3.5 Super with an
+        ``cake-nvfp4`` is an explicit backend for Nemotron 3.5 Super with an
         NVFP4 KV cache on sm_100: FP8 query and output, 32 query heads, 2 KV heads,
         head dimension 128 and 128-token pages. It runs each call on a kernel
         written for that geometry, or on ``trtllm-gen`` where that is faster or the
         call is outside the geometry. It never participates in automatic backend
-        selection. See :mod:`flashinfer.nm35_nvfp4`.
+        selection. See :mod:`flashinfer.cake_nvfp4`.
 
     q_len_per_req : Optional[int] = 1
         Number of query tokens per request (i.e. speculative-decoding / MTP depth).
@@ -4691,8 +4691,8 @@ def trtllm_batch_decode_with_kv_cache(
     """
     # The Nemotron 3.5 Super NVFP4 kernels serve one attention geometry. Every
     # other call, and every shape where trtllm-gen is faster, runs on trtllm-gen.
-    use_nm35_nvfp4 = backend == "nm35-nvfp4"
-    if use_nm35_nvfp4:
+    use_cake_nvfp4 = backend == "cake-nvfp4"
+    if use_cake_nvfp4:
         backend = "trtllm-gen"
     if request_order is not None and backend != "cake":
         raise ValueError("request_order requires the explicit backend='cake'")
@@ -5450,11 +5450,11 @@ def trtllm_batch_decode_with_kv_cache(
                     None,  # use_fp16_softmax
                 )
             )
-        ran_nm35_nvfp4 = False
-        if use_nm35_nvfp4:
-            from .nm35_nvfp4 import try_decode as try_nm35_nvfp4_decode
+        ran_cake_nvfp4 = False
+        if use_cake_nvfp4:
+            from .cake_nvfp4 import try_decode as try_cake_nvfp4_decode
 
-            ran_nm35_nvfp4 = try_nm35_nvfp4_decode(
+            ran_cake_nvfp4 = try_cake_nvfp4_decode(
                 out=out,
                 query=query,
                 k_cache=k_cache,
@@ -5483,7 +5483,7 @@ def trtllm_batch_decode_with_kv_cache(
                     and uses_shared_paged_kv_idx
                 ),
             )
-        if not ran_nm35_nvfp4:
+        if not ran_cake_nvfp4:
             run_func(*run_args)
 
         result_out = (

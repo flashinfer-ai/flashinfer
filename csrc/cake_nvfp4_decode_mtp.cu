@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 // Nemotron 3.5 Super NVFP4-KV decode, "mtp" kernel: 2, 4, 6 or 8 query tokens per request.
-#include "flashinfer/attention/nm35_nvfp4/decode_mtp_kernel.cuh"
-#include "flashinfer/attention/nm35_nvfp4/host_cuda.cuh"
+#include "flashinfer/attention/cake_nvfp4/decode_mtp_kernel.cuh"
+#include "flashinfer/attention/cake_nvfp4/host_cuda.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 
 namespace mtp = decode_mtp;
 
@@ -28,15 +28,15 @@ void launchDecodeMtp(Call const& c, DecodePlan const& plan, void* streamPtr) {
   dim3 const mainGrid(plan.ctas);
   switch (plan.g) {
     case 2:
-      launchKernel(mtp::nm35_nvfp4_decode_mtp_g2, mainGrid, mtp::Cfg<2>::Threads,
+      launchKernel(mtp::cake_nvfp4_decode_mtp_g2, mainGrid, mtp::Cfg<2>::Threads,
                    mtp::Cfg<2>::SmemBytes, stream, false, p);
       break;
     case 4:
-      launchKernel(mtp::nm35_nvfp4_decode_mtp_g4, mainGrid, mtp::Cfg<4>::Threads,
+      launchKernel(mtp::cake_nvfp4_decode_mtp_g4, mainGrid, mtp::Cfg<4>::Threads,
                    mtp::Cfg<4>::SmemBytes, stream, false, p);
       break;
     default:
-      launchKernel(mtp::nm35_nvfp4_decode_mtp_g8, mainGrid, mtp::Cfg<8>::Threads,
+      launchKernel(mtp::cake_nvfp4_decode_mtp_g8, mainGrid, mtp::Cfg<8>::Threads,
                    mtp::Cfg<8>::SmemBytes, stream, false, p);
       break;
   }
@@ -47,20 +47,20 @@ void launchDecodeMtp(Call const& c, DecodePlan const& plan, void* streamPtr) {
   bool const overlap = p.pdlMode != 0;
   dim3 const columnGrid(plan.virt * kNumHeadsKv, plan.g * kHeadsPerKv);
   if (pieces > 40) {
-    launchKernel(mtp::nm35_nvfp4_decode_mtp_combine_c10, columnGrid, mtp::kCombineThreads, 0,
+    launchKernel(mtp::cake_nvfp4_decode_mtp_combine_c10, columnGrid, mtp::kCombineThreads, 0,
                  stream, overlap, p);
   } else if (pieces > 24) {
-    launchKernel(mtp::nm35_nvfp4_decode_mtp_combine_c5, columnGrid, mtp::kCombineThreads, 0, stream,
+    launchKernel(mtp::cake_nvfp4_decode_mtp_combine_c5, columnGrid, mtp::kCombineThreads, 0, stream,
                  overlap, p);
   } else if (pieces > 12) {
-    launchKernel(mtp::nm35_nvfp4_decode_mtp_combine_c3, columnGrid, mtp::kCombineThreads, 0, stream,
+    launchKernel(mtp::cake_nvfp4_decode_mtp_combine_c3, columnGrid, mtp::kCombineThreads, 0, stream,
                  overlap, p);
   } else {
     dim3 const warpGrid(plan.virt * kNumHeadsKv, plan.g * kHeadsPerKv / 8);
-    launchKernel(mtp::nm35_nvfp4_decode_mtp_combine_w12, warpGrid, mtp::kCombineThreads, 0, stream,
+    launchKernel(mtp::cake_nvfp4_decode_mtp_combine_w12, warpGrid, mtp::kCombineThreads, 0, stream,
                  overlap, p);
   }
 }
 
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

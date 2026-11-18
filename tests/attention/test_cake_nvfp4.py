@@ -1,4 +1,4 @@
-"""Tests of the ``backend="nm35-nvfp4"`` kernels (sm_100).
+"""Tests of the ``backend="cake-nvfp4"`` kernels (sm_100).
 
 A call a kernel serves is compared row by row, where a row is one head of one
 query token, with ``backend="trtllm-gen"`` and with an FP32 reference on the
@@ -6,7 +6,7 @@ same quantized inputs. A call that falls back must return exactly what
 ``backend="trtllm-gen"`` returns. The route counters tell the two apart.
 
 The routing rules are tested without a GPU in
-``tests/cpu/attention/test_nm35_nvfp4_routing.py``.
+``tests/cpu/attention/test_cake_nvfp4_routing.py``.
 """
 
 import math
@@ -17,18 +17,18 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer import nm35_nvfp4 as nm35
+from flashinfer import cake_nvfp4
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import get_device_sm_count
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="the nm35-nvfp4 kernels run on sm_100 only",
+    reason="the cake-nvfp4 kernels run on sm_100 only",
 )
 
-MTP, BASE = nm35.DECODE_MTP, nm35.DECODE_BASE
-NM35, TRTLLM_GEN = nm35.BACKEND, "trtllm-gen"
+MTP, BASE = cake_nvfp4.DECODE_MTP, cake_nvfp4.DECODE_BASE
+CAKE_NVFP4, TRTLLM_GEN = cake_nvfp4.BACKEND, "trtllm-gen"
 NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE = 32, 2, 128, 128
 MIB = 1 << 20
 O_SCALE = 0.05
@@ -43,37 +43,37 @@ MAX_MEAN_ROW_ERROR = 0.06
 
 
 @pytest.fixture(scope="module", autouse=True)
-def nm35_kernels():
+def cake_nvfp4_kernels():
     """Build the kernels. Skips only where they cannot be built at all: a build
     that was attempted and failed is an error."""
-    from flashinfer.jit.nm35_nvfp4 import load_nm35_nvfp4_fmha_module
+    from flashinfer.jit.cake_nvfp4 import load_cake_nvfp4_fmha_module
 
-    blocker = nm35._build_blocker()
+    blocker = cake_nvfp4._build_blocker()
     if blocker is not None:
         pytest.skip(blocker)
-    load_nm35_nvfp4_fmha_module()
-    assert nm35._module() is not None
+    load_cake_nvfp4_fmha_module()
+    assert cake_nvfp4._module() is not None
 
 
-_BUILD_FUSED_FP4_MUL = nm35._fused_fp4_mul
+_BUILD_FUSED_FP4_MUL = cake_nvfp4._fused_fp4_mul
 
 
 @pytest.fixture(autouse=True)
 def fused_routing(monkeypatch):
     """Route decode as a build with the fused NVFP4 multiply does, so that every
     build runs the same kernels on the same shapes."""
-    monkeypatch.setattr(nm35, "_fused_fp4_mul", lambda: True)
+    monkeypatch.setattr(cake_nvfp4, "_fused_fp4_mul", lambda: True)
 
 
 def test_dequantization_path_follows_the_toolkit():
     # The fused NVFP4 multiply needs the CUDA 13.4 assembler; older toolkits
     # build the FP16 path, which every other test here then runs.
-    from flashinfer.jit.nm35_nvfp4 import gen_nm35_nvfp4_fmha_module
+    from flashinfer.jit.cake_nvfp4 import gen_cake_nvfp4_fmha_module
 
-    if gen_nm35_nvfp4_fmha_module().is_aot or "FLASHINFER_NVCC" in os.environ:
+    if gen_cake_nvfp4_fmha_module().is_aot or "FLASHINFER_NVCC" in os.environ:
         pytest.skip("the module was not built by this toolkit's compiler")
-    fused = nm35._module().nm35_nvfp4_fused_fp4_mul()
-    assert fused == is_cuda_version_at_least(nm35.FUSED_DEQUANT_CUDA_TOOLKIT)
+    fused = cake_nvfp4._module().cake_nvfp4_fused_fp4_mul()
+    assert fused == is_cuda_version_at_least(cake_nvfp4.FUSED_DEQUANT_CUDA_TOOLKIT)
 
 
 class Inputs(NamedTuple):
@@ -247,7 +247,7 @@ def _workspace(num_bytes: int = 128 * MIB) -> torch.Tensor:
 
 def _decode_workspace_bytes(batch_size: int, q_len: int, fused: int) -> int:
     """Workspace a decode kernel needs when it fuses ``fused`` query tokens: the
-    layout of ``fillDecodePlan`` in ``nm35_nvfp4/host.h``."""
+    layout of ``fillDecodePlan`` in ``cake_nvfp4/host.h``."""
     ctas = get_device_sm_count(torch.device("cuda")) & ~1
     units = batch_size * (q_len // fused)
     slots = (units + ctas // 2) * 2
@@ -298,12 +298,12 @@ def _run_decode(backend, inputs: Inputs, q_len, cum_seq_lens_q=None, **overrides
 
 
 def _check_decode(kernel, inputs, q_len, q_lens=None, **overrides):
-    """Decode on both backends; ``kernel`` must serve the nm35 call, and its
+    """Decode on both backends; ``kernel`` must serve the cake_nvfp4 call, and its
     output must match trtllm-gen and the reference."""
     cum_seq_lens_q = None if q_lens is None else _cumulative(q_lens)
-    nm35.reset_route_counts()
-    out = _run_decode(NM35, inputs, q_len, cum_seq_lens_q, **overrides)
-    assert nm35.route_counts() == _routes("decode", kernel)
+    cake_nvfp4.reset_route_counts()
+    out = _run_decode(CAKE_NVFP4, inputs, q_len, cum_seq_lens_q, **overrides)
+    assert cake_nvfp4.route_counts() == _routes("decode", kernel)
     # A workspace sized for the kernel can be too small for trtllm-gen.
     overrides.pop("workspace_buffer", None)
     expected = _run_decode(TRTLLM_GEN, inputs, q_len, cum_seq_lens_q, **overrides)
@@ -314,15 +314,15 @@ def _check_decode(kernel, inputs, q_len, q_lens=None, **overrides):
 
 
 def _check_decode_fallback(inputs, q_len, cum_seq_lens_q=None, **overrides):
-    """The nm35 call must run on trtllm-gen and return exactly its output.
+    """The cake_nvfp4 call must run on trtllm-gen and return exactly its output.
     ``overrides`` maps an argument to a function that builds it per call."""
     outs = []
-    for backend in (NM35, TRTLLM_GEN):
+    for backend in (CAKE_NVFP4, TRTLLM_GEN):
         made = {name: make() for name, make in overrides.items()}
-        nm35.reset_route_counts()
+        cake_nvfp4.reset_route_counts()
         outs.append(_run_decode(backend, inputs, q_len, cum_seq_lens_q, **made))
-        if backend == NM35:
-            assert nm35.route_counts() == _routes("decode", TRTLLM_GEN)
+        if backend == CAKE_NVFP4:
+            assert cake_nvfp4.route_counts() == _routes("decode", TRTLLM_GEN)
     _assert_same_bytes(*outs)
 
 
@@ -367,10 +367,10 @@ def test_decode_shapes_routed_to_trtllm_gen(batch_size, q_len, seq_lens):
 def test_decode_routing_follows_the_build(monkeypatch):
     # 4 requests of 1 query token: "base" with the fused multiply, trtllm-gen
     # without it.
-    monkeypatch.setattr(nm35, "_fused_fp4_mul", _BUILD_FUSED_FP4_MUL)
+    monkeypatch.setattr(cake_nvfp4, "_fused_fp4_mul", _BUILD_FUSED_FP4_MUL)
     torch.manual_seed(10)
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4)
-    if nm35._module().nm35_nvfp4_fused_fp4_mul():
+    if cake_nvfp4._module().cake_nvfp4_fused_fp4_mul():
         _check_decode(BASE, inputs, 1)
     else:
         _check_decode_fallback(inputs, 1)
@@ -378,7 +378,7 @@ def test_decode_routing_follows_the_build(monkeypatch):
 
 def test_decode_mtp_six_tokens_with_more_requests_than_routed(monkeypatch):
     # "mtp" runs 6 query tokens as 3 groups of 2; the rules send it 2 requests.
-    monkeypatch.setattr(nm35, "select_decode_kernel", lambda *args: MTP)
+    monkeypatch.setattr(cake_nvfp4, "select_decode_kernel", lambda *args: MTP)
     torch.manual_seed(6)
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4 * 6, sharpness=4.0)
     _check_decode(MTP, inputs, 6)
@@ -389,7 +389,7 @@ def test_decode_kernel_declines_query_lengths_it_does_not_serve(
     monkeypatch, kernel, q_len
 ):
     # "base" fuses 1, 3 or 5 query tokens and "mtp" 2, 4 or 8.
-    monkeypatch.setattr(nm35, "select_decode_kernel", lambda *args: kernel)
+    monkeypatch.setattr(cake_nvfp4, "select_decode_kernel", lambda *args: kernel)
     torch.manual_seed(q_len)
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4 * q_len)
     _check_decode_fallback(inputs, q_len)
@@ -404,7 +404,7 @@ def test_decode_ragged_queries_run_base(q_lens):
 
 def test_decode_ragged_queries_on_base_up_to_six_tokens(monkeypatch):
     # The longest ragged request "base" accepts, which the rules do not send it.
-    monkeypatch.setattr(nm35, "select_decode_kernel", lambda *args: BASE)
+    monkeypatch.setattr(cake_nvfp4, "select_decode_kernel", lambda *args: BASE)
     torch.manual_seed(8)
     q_lens = [6, 1, 4, 2]
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), sum(q_lens), 4.0)
@@ -498,7 +498,7 @@ def test_decode_device_scales(q_len, kernel, scales):
     # A bmm1_scale tensor is converted to log2 in FP32, a float in FP64, so only
     # the other two forms carry exactly the scales of the float call.
     if scales in ("bmm2", "bmm1_log2"):
-        _assert_same_bytes(out, _run_decode(NM35, inputs, q_len))
+        _assert_same_bytes(out, _run_decode(CAKE_NVFP4, inputs, q_len))
 
 
 @pytest.mark.parametrize("q_len,kernel", [(1, BASE), (2, MTP)])
@@ -511,7 +511,7 @@ def test_decode_nhd_layout(q_len, kernel):
         kv_layout="NHD",
     )
     out = _check_decode(kernel, inputs, q_len, **nhd)
-    _assert_same_bytes(out, _run_decode(NM35, inputs, q_len))
+    _assert_same_bytes(out, _run_decode(CAKE_NVFP4, inputs, q_len))
 
 
 @pytest.mark.parametrize("q_len,kernel", [(1, BASE), (2, MTP)])
@@ -521,7 +521,7 @@ def test_decode_stacked_kv_cache(q_len, kernel):
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4 * q_len)
     stacked = torch.stack(inputs.kv_cache, dim=1)
     out = _check_decode(kernel, inputs, q_len, kv_cache=stacked)
-    _assert_same_bytes(out, _run_decode(NM35, inputs, q_len))
+    _assert_same_bytes(out, _run_decode(CAKE_NVFP4, inputs, q_len))
 
 
 @pytest.mark.parametrize("q_len", [1, 2])
@@ -565,7 +565,7 @@ def test_decode_declined_calls_run_trtllm_gen(q_len, declined):
     _check_decode_fallback(inputs, q_len, **overrides)
     if declined == "workspace too small":
         # The kernel serves the call with exactly the workspace it asks for.
-        kernel = nm35.select_decode_kernel(4, q_len, int(inputs.seq_lens.max()))
+        kernel = cake_nvfp4.select_decode_kernel(4, q_len, int(inputs.seq_lens.max()))
         _check_decode(kernel, inputs, q_len, workspace_buffer=_workspace(required))
 
 
@@ -580,12 +580,12 @@ def test_decode_unaligned_tensors_fail_as_on_trtllm_gen(unaligned):
     else:
         k_cache, v_cache = inputs.kv_cache
         overrides = dict(kv_cache=(_offset(k_cache, 8), v_cache))
-    for backend in (NM35, TRTLLM_GEN):
-        nm35.reset_route_counts()
+    for backend in (CAKE_NVFP4, TRTLLM_GEN):
+        cake_nvfp4.reset_route_counts()
         with pytest.raises(RuntimeError):
             _run_decode(backend, inputs, 1, **overrides)
-        if backend == NM35:
-            assert nm35.route_counts() == _routes("decode", TRTLLM_GEN)
+        if backend == CAKE_NVFP4:
+            assert cake_nvfp4.route_counts() == _routes("decode", TRTLLM_GEN)
 
 
 def test_decode_features_run_trtllm_gen():
@@ -605,8 +605,8 @@ def test_decode_other_geometry_runs_trtllm_gen():
     block_tables = torch.arange(40, dtype=torch.int32, device="cuda").reshape(2, 20)
     seq_lens = torch.tensor([1280, 1000], dtype=torch.int32, device="cuda")
     outs = []
-    for backend in (NM35, TRTLLM_GEN):
-        nm35.reset_route_counts()
+    for backend in (CAKE_NVFP4, TRTLLM_GEN):
+        cake_nvfp4.reset_route_counts()
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query,
             kv_cache,
@@ -621,8 +621,8 @@ def test_decode_other_geometry_runs_trtllm_gen():
             kv_cache_sf=kv_cache_sf,
         )
         outs.append(out)
-        if backend == NM35:
-            assert nm35.route_counts() == _routes("decode", TRTLLM_GEN)
+        if backend == CAKE_NVFP4:
+            assert cake_nvfp4.route_counts() == _routes("decode", TRTLLM_GEN)
     _assert_same_bytes(*outs)
 
 
@@ -632,14 +632,14 @@ def test_decode_cuda_graph(q_len, kernel):
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4 * q_len)
     # Nothing may be copied to or from the device during capture.
     fixed = dict(workspace_buffer=_workspace(), max_seq_len=int(inputs.seq_lens.max()))
-    eager = _run_decode(NM35, inputs, q_len, **fixed).clone()
+    eager = _run_decode(CAKE_NVFP4, inputs, q_len, **fixed).clone()
 
     out = torch.empty_like(inputs.query)
     graph = torch.cuda.CUDAGraph()
-    nm35.reset_route_counts()
+    cake_nvfp4.reset_route_counts()
     with torch.cuda.graph(graph):
-        _run_decode(NM35, inputs, q_len, out=out, **fixed)
-    assert nm35.route_counts() == _routes("decode", kernel)
+        _run_decode(CAKE_NVFP4, inputs, q_len, out=out, **fixed)
+    assert cake_nvfp4.route_counts() == _routes("decode", kernel)
     for _ in range(2):
         out.zero_()
         graph.replay()
@@ -667,10 +667,10 @@ def test_decode_cuda_graph_replays_new_query_offsets(kv, q_len, kernel):
 
     out = torch.empty_like(inputs.query)
     graph = torch.cuda.CUDAGraph()
-    nm35.reset_route_counts()
+    cake_nvfp4.reset_route_counts()
     with torch.cuda.graph(graph):
-        _run_decode(NM35, inputs, q_len, cum_seq_lens_q, out=out, **fixed)
-    routes = nm35.route_counts()
+        _run_decode(CAKE_NVFP4, inputs, q_len, cum_seq_lens_q, out=out, **fixed)
+    routes = cake_nvfp4.route_counts()
 
     layouts = [
         [q_len] * batch_size,
@@ -724,7 +724,7 @@ def _run_prefill(backend, inputs: Inputs, q_lens, workspace_bytes=None, **overri
         args["max_kv_len"] = int(seq_lens.max())
     if args["workspace_buffer"] is None:
         if workspace_bytes is None:
-            workspace_bytes = nm35.prefill_workspace_bytes(int(seq_lens.max()))
+            workspace_bytes = cake_nvfp4.prefill_workspace_bytes(int(seq_lens.max()))
         args["workspace_buffer"] = _workspace(workspace_bytes)
     if args["cum_seq_lens_q"] is None:
         args["cum_seq_lens_q"] = _cumulative(q_lens)
@@ -737,10 +737,10 @@ def _run_prefill(backend, inputs: Inputs, q_lens, workspace_bytes=None, **overri
 
 
 def _check_prefill(inputs, q_len, **overrides):
-    """Prefill one request on both backends; the kernel must serve the nm35 call."""
-    nm35.reset_route_counts()
-    out = _run_prefill(NM35, inputs, [q_len], **overrides)
-    assert nm35.route_counts() == _routes("prefill", "prefill")
+    """Prefill one request on both backends; the kernel must serve the cake_nvfp4 call."""
+    cake_nvfp4.reset_route_counts()
+    out = _run_prefill(CAKE_NVFP4, inputs, [q_len], **overrides)
+    assert cake_nvfp4.route_counts() == _routes("prefill", "prefill")
     expected = _run_prefill(TRTLLM_GEN, inputs, [q_len], **overrides)
     _assert_kernel_output(out, expected, inputs, [q_len])
     return out
@@ -748,12 +748,12 @@ def _check_prefill(inputs, q_len, **overrides):
 
 def _check_prefill_fallback(inputs, q_lens, workspace_bytes=None, **overrides):
     outs = []
-    for backend in (NM35, TRTLLM_GEN):
+    for backend in (CAKE_NVFP4, TRTLLM_GEN):
         made = {name: make() for name, make in overrides.items()}
-        nm35.reset_route_counts()
+        cake_nvfp4.reset_route_counts()
         outs.append(_run_prefill(backend, inputs, q_lens, workspace_bytes, **made))
-        if backend == NM35:
-            assert nm35.route_counts() == _routes("prefill", TRTLLM_GEN)
+        if backend == CAKE_NVFP4:
+            assert cake_nvfp4.route_counts() == _routes("prefill", TRTLLM_GEN)
     _assert_same_bytes(*outs)
 
 
@@ -806,7 +806,7 @@ def test_prefill_tail_only_schedule():
     q_len = _tail_only_q_len()
     torch.manual_seed(q_len)
     # The prefill kernel serves only KV lengths above 8192 (fewer SMs mean a shorter q_len).
-    prefix_len = max(2000, nm35.TRTLLM_GEN_MAX_KV_LEN + 1 - q_len)
+    prefix_len = max(2000, cake_nvfp4.TRTLLM_GEN_MAX_KV_LEN + 1 - q_len)
     inputs = _make_inputs([prefix_len + q_len], q_len, sharpness=4.0)
     _check_prefill(inputs, q_len)
 
@@ -827,7 +827,7 @@ def test_prefill_shapes_routed_to_trtllm_gen(seq_lens, q_lens):
 def test_prefill_workspace_bytes_is_what_the_kernel_needs():
     torch.manual_seed(4)
     inputs = _make_inputs([9000], 512)
-    required = nm35.prefill_workspace_bytes(9000)
+    required = cake_nvfp4.prefill_workspace_bytes(9000)
     _check_prefill(inputs, 512, workspace_buffer=_workspace(required))
     for too_small in (required - 1, 64 * MIB, MIB):
         _check_prefill_fallback(inputs, [512], too_small)
@@ -846,7 +846,7 @@ def test_prefill_workspace_bytes_is_what_the_kernel_needs():
 def test_prefill_declined_calls_run_trtllm_gen(declined):
     torch.manual_seed(5)
     inputs = _make_inputs([9000], 512)
-    required = nm35.prefill_workspace_bytes(9000 + PAGE_SIZE)
+    required = cake_nvfp4.prefill_workspace_bytes(9000 + PAGE_SIZE)
     k_cache, v_cache = inputs.kv_cache
     overrides = {
         "workspace not 128-byte aligned": dict(
@@ -889,7 +889,7 @@ def test_prefill_input_variants(variant):
         overrides = dict(kv_cache=torch.stack(inputs.kv_cache, dim=1))
     out = _check_prefill(inputs, 512, **overrides)
     if variant != "device scales":  # those round bmm1_scale differently
-        _assert_same_bytes(out, _run_prefill(NM35, inputs, [512]))
+        _assert_same_bytes(out, _run_prefill(CAKE_NVFP4, inputs, [512]))
 
 
 @pytest.mark.parametrize("q_len", [300, 2048])
@@ -898,19 +898,19 @@ def test_prefill_cuda_graph(q_len):
     inputs = _make_inputs([9000 + q_len], q_len)
     # Nothing may be copied to or from the device during capture.
     fixed = dict(
-        workspace_buffer=_workspace(nm35.prefill_workspace_bytes(9000 + q_len)),
+        workspace_buffer=_workspace(cake_nvfp4.prefill_workspace_bytes(9000 + q_len)),
         max_kv_len=9000 + q_len,
         cum_seq_lens_q=_cumulative([q_len]),
         cum_seq_lens_kv=_cumulative([inputs.block_tables.size(1)]),
     )
-    eager = _run_prefill(NM35, inputs, [q_len], **fixed).clone()
+    eager = _run_prefill(CAKE_NVFP4, inputs, [q_len], **fixed).clone()
 
     out = torch.empty_like(inputs.query)
     graph = torch.cuda.CUDAGraph()
-    nm35.reset_route_counts()
+    cake_nvfp4.reset_route_counts()
     with torch.cuda.graph(graph):
-        _run_prefill(NM35, inputs, [q_len], out=out, **fixed)
-    assert nm35.route_counts() == _routes("prefill", "prefill")
+        _run_prefill(CAKE_NVFP4, inputs, [q_len], out=out, **fixed)
+    assert cake_nvfp4.route_counts() == _routes("prefill", "prefill")
     for _ in range(2):
         out.zero_()
         graph.replay()

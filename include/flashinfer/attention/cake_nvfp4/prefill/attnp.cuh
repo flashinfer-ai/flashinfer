@@ -20,7 +20,7 @@
 #include "common.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 namespace prefill {
 namespace attnp {
 
@@ -35,7 +35,7 @@ constexpr int kSharedBytes = 197632;
 
 extern "C" {
 
-__global__ __launch_bounds__(kThreads, 1) void nm35_nvfp4_prefill_attnp(
+__global__ __launch_bounds__(kThreads, 1) void cake_nvfp4_prefill_attnp(
     uint8_t* __restrict__ out, int* __restrict__ block_tables, int* __restrict__ q_indptr,
     int* __restrict__ kv_lengths, int table_stride, int n_qtiles, int tile_start, float scale_log2,
     float out_scale, const float* scale_log2_ptr, const float* out_scale_ptr,
@@ -1245,5 +1245,5 @@ __global__ __launch_bounds__(kThreads, 1) void nm35_nvfp4_prefill_attnp(
 
 }  // namespace attnp
 }  // namespace prefill
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

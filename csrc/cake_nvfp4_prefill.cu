@@ -18,15 +18,15 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "flashinfer/attention/nm35_nvfp4/host_cuda.cuh"
-#include "flashinfer/attention/nm35_nvfp4/prefill/attn.cuh"
-#include "flashinfer/attention/nm35_nvfp4/prefill/attnp.cuh"
-#include "flashinfer/attention/nm35_nvfp4/prefill/comb.cuh"
-#include "flashinfer/attention/nm35_nvfp4/prefill/conv.cuh"
-#include "flashinfer/attention/nm35_nvfp4/prefill/pmax.cuh"
+#include "flashinfer/attention/cake_nvfp4/host_cuda.cuh"
+#include "flashinfer/attention/cake_nvfp4/prefill/attn.cuh"
+#include "flashinfer/attention/cake_nvfp4/prefill/attnp.cuh"
+#include "flashinfer/attention/cake_nvfp4/prefill/comb.cuh"
+#include "flashinfer/attention/cake_nvfp4/prefill/conv.cuh"
+#include "flashinfer/attention/cake_nvfp4/prefill/pmax.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 
 namespace {
 
@@ -72,7 +72,7 @@ void launchPrefill(Call const& c, Device const& dev, void* streamPtr) {
   CUtensorMap const vMap = byteMap(v8, {128, 128, 2, pages}, {128, 16384, 32768}, {128, 128, 1, 1});
 
   // The conversion kernel reads 32-bit words: strides are in words.
-  launchKernel(conv::nm35_nvfp4_prefill_conv, dim3(unsigned(cachePages) * kNumHeadsKv),
+  launchKernel(conv::cake_nvfp4_prefill_conv, dim3(unsigned(cachePages) * kNumHeadsKv),
                conv::kThreads, 0, stream, false, asWords(c.k), asWords(c.v), asWords(c.kSf),
                asWords(c.vSf), k8, v8, int(c.kStridePage / 4), int(c.kStrideHead / 4),
                int(c.kSfStridePage / 4), int(c.kSfStrideHead / 4), c.pageTable, c.seqLensKv,
@@ -85,29 +85,29 @@ void launchPrefill(Call const& c, Device const& dev, void* streamPtr) {
   int const plainTiles = schedule.plainTiles(qTiles * kNumHeadsQ);
   if (plainTiles > 0) {
     prefill::TensorMaps<3> const maps{{qMap, kMap, vMap}};
-    launchKernel(plain::nm35_nvfp4_prefill_attnp, dim3(plainTiles), plain::kThreads,
+    launchKernel(plain::cake_nvfp4_prefill_attnp, dim3(plainTiles), plain::kThreads,
                  plain::kSharedBytes, stream, false, out, pageTable, qIndptr, kvLengths,
                  tableStride, qTiles, /*tile_start=*/0, c.scaleSoftmaxLog2, c.outputScale,
                  c.scaleSoftmaxLog2Ptr, c.outputScalePtr, maps);
   }
   if (schedule.nrem > 0) {
     prefill::TensorMaps<2> const maxMaps{{qMap, kMap}};
-    launchKernel(rowmax::nm35_nvfp4_prefill_pmax, dim3(schedule.nrem * schedule.pchunks),
+    launchKernel(rowmax::cake_nvfp4_prefill_pmax, dim3(schedule.nrem * schedule.pchunks),
                  rowmax::kThreads, rowmax::kSharedBytes, stream, false, rowMax, pageTable, qIndptr,
                  kvLengths, tableStride, qTiles, schedule.nctas, schedule.qf, schedule.tileBase,
                  schedule.xFrac, schedule.pchunks, maxMaps);
     prefill::TensorMaps<3> const maps{{qMap, kMap, vMap}};
-    launchKernel(split::nm35_nvfp4_prefill_attn, dim3(schedule.nctas), split::kThreads,
+    launchKernel(split::cake_nvfp4_prefill_attn, dim3(schedule.nctas), split::kThreads,
                  split::kSharedBytes, stream, false, out, partO, partMl, rowMax, schedule.pchunks,
                  pageTable, qIndptr, kvLengths, tableStride, qTiles, schedule.nctas, schedule.qf,
                  schedule.tileBase, schedule.nrem, schedule.xFrac, c.scaleSoftmaxLog2,
                  c.outputScale, c.scaleSoftmaxLog2Ptr, c.outputScalePtr, maps);
-    launchKernel(combine::nm35_nvfp4_prefill_comb, dim3(schedule.nrem), combine::kThreads, 0,
+    launchKernel(combine::cake_nvfp4_prefill_comb, dim3(schedule.nrem), combine::kThreads, 0,
                  stream, false, out, partO, partMl, qIndptr, qTiles, schedule.nctas, schedule.qf,
                  schedule.tileBase, c.scaleSoftmaxLog2, c.outputScale, c.scaleSoftmaxLog2Ptr,
                  c.outputScalePtr);
   }
 }
 
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

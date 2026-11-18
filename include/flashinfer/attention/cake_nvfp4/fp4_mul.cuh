@@ -26,20 +26,20 @@
 // lets a caller do once per scale word.
 #include <cstdint>
 
-#ifndef NM35_NVFP4_FUSED_FP4_MUL
+#ifndef CAKE_NVFP4_FUSED_FP4_MUL
 #if defined(__CUDACC_VER_MAJOR__) && \
     (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
-#define NM35_NVFP4_FUSED_FP4_MUL 1
+#define CAKE_NVFP4_FUSED_FP4_MUL 1
 #else
-#define NM35_NVFP4_FUSED_FP4_MUL 0
+#define CAKE_NVFP4_FUSED_FP4_MUL 0
 #endif
 #endif
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 namespace fp4 {
 
-#if NM35_NVFP4_FUSED_FP4_MUL
+#if CAKE_NVFP4_FUSED_FP4_MUL
 
 // Four E4M3 scales, one per byte.
 using Fp4Scale = uint32_t;
@@ -139,5 +139,5 @@ __device__ __forceinline__ uint32_t mulFp4x4Unpacked(uint32_t fp4, Fp4Scale sf) 
 #endif
 
 }  // namespace fp4
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

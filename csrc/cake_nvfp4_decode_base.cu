@@ -15,11 +15,11 @@
  */
 // Nemotron 3.5 Super NVFP4-KV decode, "base" kernel: 1, 3 or 5 query tokens per request, or
 // requests of different query lengths.
-#include "flashinfer/attention/nm35_nvfp4/decode_base_kernel.cuh"
-#include "flashinfer/attention/nm35_nvfp4/host_cuda.cuh"
+#include "flashinfer/attention/cake_nvfp4/decode_base_kernel.cuh"
+#include "flashinfer/attention/cake_nvfp4/host_cuda.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 
 namespace base = decode_base;
 
@@ -29,23 +29,23 @@ void launchDecodeBase(Call const& c, DecodePlan const& plan, void* streamPtr) {
   dim3 const mainGrid(plan.ctas);
   switch (plan.g) {
     case 1:
-      launchKernel(base::nm35_nvfp4_decode_base_g1, mainGrid, base::Cfg<1>::Threads,
+      launchKernel(base::cake_nvfp4_decode_base_g1, mainGrid, base::Cfg<1>::Threads,
                    base::Cfg<1>::SmemBytes, stream, false, p);
       break;
     case 3:
-      launchKernel(base::nm35_nvfp4_decode_base_g3, mainGrid, base::Cfg<3>::Threads,
+      launchKernel(base::cake_nvfp4_decode_base_g3, mainGrid, base::Cfg<3>::Threads,
                    base::Cfg<3>::SmemBytes, stream, false, p);
       break;
     default:
-      launchKernel(base::nm35_nvfp4_decode_base_g5, mainGrid, base::Cfg<5>::Threads,
+      launchKernel(base::cake_nvfp4_decode_base_g5, mainGrid, base::Cfg<5>::Threads,
                    base::Cfg<5>::SmemBytes, stream, false, p);
       break;
   }
   // Combine grid: one CTA per (virtual request, KV head) x (query token, query head of the group).
   dim3 const combineGrid(plan.virt * kNumHeadsKv, plan.g * kHeadsPerKv);
-  launchKernel(base::nm35_nvfp4_decode_base_combine, combineGrid, base::kCombineThreads, 0, stream,
+  launchKernel(base::cake_nvfp4_decode_base_combine, combineGrid, base::kCombineThreads, 0, stream,
                p.pdlMode != 0, p);
 }
 
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

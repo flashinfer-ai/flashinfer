@@ -15,7 +15,7 @@ limitations under the License.
 
 Attention kernels for Nemotron 3.5 Super with an NVFP4 KV cache (``sm_100a``).
 
-``backend="nm35-nvfp4"`` of
+``backend="cake-nvfp4"`` of
 :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` and
 :func:`flashinfer.prefill.trtllm_batch_context_with_kv_cache` runs each call on
 one of three kernels written for this model's attention geometry, or on
@@ -46,7 +46,7 @@ from .utils import get_compute_capability
 
 logger = logging.getLogger(__name__)
 
-BACKEND = "nm35-nvfp4"
+BACKEND = "cake-nvfp4"
 # Oldest toolkit the kernels are built and tested with. A prebuilt module runs on
 # any driver that serves sm_100a.
 MIN_CUDA_TOOLKIT = "13.0"
@@ -100,7 +100,7 @@ NON_FUSED_DECODE_ROUTES: Dict[int, Tuple[int, Optional[int]]] = {
 PREFILL_MAX_BATCH_SIZE = 1
 PREFILL_MAX_Q_LEN = 32768
 # Mirror kPrefillFp8PageBytes and kPrefillSplitReserveBytes of
-# include/flashinfer/attention/nm35_nvfp4/host.h, whose gate is the one
+# include/flashinfer/attention/cake_nvfp4/host.h, whose gate is the one
 # that decides. The formula is repeated here because a server sizes its
 # workspace before the kernel module is loaded.
 _PREFILL_FP8_PAGE_BYTES = NUM_KV_HEADS * PAGE_SIZE * HEAD_DIM
@@ -282,11 +282,11 @@ def _build_blocker() -> Optional[str]:
     """Return why the kernel module cannot be built here, or ``None`` when it
     is prebuilt or its build can be attempted."""
     from .jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
-    from .jit.nm35_nvfp4 import gen_nm35_nvfp4_fmha_module
+    from .jit.cake_nvfp4 import gen_cake_nvfp4_fmha_module
 
     # FLASHINFER_NVCC names another compiler than the toolkit's, so the toolkit
     # version says nothing about it.
-    if gen_nm35_nvfp4_fmha_module().is_compiled or "FLASHINFER_NVCC" in os.environ:
+    if gen_cake_nvfp4_fmha_module().is_compiled or "FLASHINFER_NVCC" in os.environ:
         return None
     try:
         if is_cuda_version_at_least(MIN_CUDA_TOOLKIT):
@@ -303,7 +303,7 @@ def _build_blocker() -> Optional[str]:
 @functools.cache
 def _module():
     """Return the kernel module, or ``None`` when it cannot be built here."""
-    from .jit.nm35_nvfp4 import load_nm35_nvfp4_fmha_module
+    from .jit.cake_nvfp4 import load_cake_nvfp4_fmha_module
 
     # Do not start a build that cannot succeed: it would run inside the first
     # routed call and only then fail.
@@ -316,7 +316,7 @@ def _module():
         )
         return None
     try:
-        module = load_nm35_nvfp4_fmha_module()
+        module = load_cake_nvfp4_fmha_module()
     except RuntimeError as error:  # a failed JIT build
         logger.error(
             "backend=%r failed to build, so every call runs on trtllm-gen: %s",
@@ -324,7 +324,7 @@ def _module():
             error,
         )
         return None
-    if not module.nm35_nvfp4_fused_fp4_mul():
+    if not module.cake_nvfp4_fused_fp4_mul():
         logger.info(
             "backend=%r was built with a CUDA toolkit older than %s: its decode "
             "kernels use the slower NVFP4 dequantization path and serve fewer "
@@ -340,7 +340,7 @@ def _fused_fp4_mul() -> bool:
     """Return whether the decode kernels use the fused NVFP4 multiply. Without
     a kernel module every call runs on trtllm-gen, so the answer is moot."""
     module = _module()
-    return module is None or bool(module.nm35_nvfp4_fused_fp4_mul())
+    return module is None or bool(module.cake_nvfp4_fused_fp4_mul())
 
 
 def try_decode(
@@ -381,7 +381,7 @@ def try_decode(
     if kernel is not None and _module() is None:
         kernel = None
     if kernel is not None:
-        declined = _module().nm35_nvfp4_decode(
+        declined = _module().cake_nvfp4_decode(
             _DECODE_KERNEL_IDS[kernel],
             out,
             query,
@@ -440,7 +440,7 @@ def try_prefill(
         and _module() is not None
     )
     if served:
-        declined = _module().nm35_nvfp4_prefill(
+        declined = _module().cake_nvfp4_prefill(
             out,
             query,
             k_cache,

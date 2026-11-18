@@ -27,13 +27,13 @@
 //
 // Everything here is pure C++: no CUDA calls, no device memory reads, no allocation that outlives
 // the call. A gate returns an empty reason when its kernel can serve the call. Which kernel is
-// *preferred* for a shape is decided in Python (flashinfer/nm35_nvfp4.py).
+// *preferred* for a shape is decided in Python (flashinfer/cake_nvfp4.py).
 #include <cstdint>
 #include <initializer_list>
 #include <string>
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 
 constexpr int kNumHeadsQ = 32;
 constexpr int kNumHeadsKv = 2;
@@ -258,7 +258,7 @@ constexpr int kPrefillMaxSms = 256;
 // one tensor (K or V) is 2 heads x 128 tokens x 128 bytes.
 constexpr int64_t kPrefillFp8PageBytes = int64_t(kNumHeadsKv) * kPageSize * kHeadDim;
 // Upper bound of the split-schedule helper buffers for up to 256 SMs.
-// flashinfer/nm35_nvfp4.py repeats this formula to size a workspace before this module is
+// flashinfer/cake_nvfp4.py repeats this formula to size a workspace before this module is
 // loaded: change both together.
 constexpr int64_t kPrefillSplitReserveBytes = int64_t(72) << 20;
 constexpr uintptr_t kPrefillWorkspaceAlign = 128;
@@ -350,11 +350,11 @@ inline std::string prefillReason(Call const& c, Device const& dev) {
   return "";
 }
 
-// Launchers, one per kernel translation unit (csrc/nm35_nvfp4_*.cu). Each expects a call
+// Launchers, one per kernel translation unit (csrc/cake_nvfp4_*.cu). Each expects a call
 // its gate accepted and returns once every kernel is enqueued on `stream`.
 void launchDecodeMtp(Call const& c, DecodePlan const& plan, void* stream);
 void launchDecodeBase(Call const& c, DecodePlan const& plan, void* stream);
 void launchPrefill(Call const& c, Device const& dev, void* stream);
 
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

@@ -443,7 +443,7 @@ routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache
-        # NOTE: nm35-nvfp4 calls it with backend="nm35-nvfp4"
+        # NOTE: cake-nvfp4 calls it with backend="cake-nvfp4"
         # NOTE: cudnn-native calls cudnn_batch_decode_with_kv_cache
         "7.5": ["fa2", "auto"],
         "8.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
@@ -459,7 +459,7 @@ routine_cc_to_supported_backends = {
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
-            "nm35-nvfp4",
+            "cake-nvfp4",
         ],
         "10.3": [
             "fa2",
@@ -486,7 +486,7 @@ routine_cc_to_supported_backends = {
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
-        # NOTE: nm35-nvfp4 calls it with backend="nm35-nvfp4"
+        # NOTE: cake-nvfp4 calls it with backend="cake-nvfp4"
         # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
@@ -502,7 +502,7 @@ routine_cc_to_supported_backends = {
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
-            "nm35-nvfp4",
+            "cake-nvfp4",
         ],
         "10.3": [
             "fa2",

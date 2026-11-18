@@ -21,11 +21,11 @@
 #include <cstdint>
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-#error "the nm35-nvfp4 prefill kernels need sm_100: tcgen05 and the three-input max.f32"
+#error "the cake-nvfp4 prefill kernels need sm_100: tcgen05 and the three-input max.f32"
 #endif
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 namespace prefill {
 
 // The TMA descriptors of a kernel, passed by value as its last parameter. Each takes a 128-byte
@@ -193,5 +193,5 @@ __device__ __forceinline__ int broadcast_lane0(int x) {
 }
 
 }  // namespace prefill
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

@@ -109,40 +109,45 @@ def _get_prims_ts_module():
     return prims_ts
 
 
-def _get_nm35_nvfp4_module():
+def _get_cake_nvfp4_module():
     """Import the backend's routing module only when a benchmark requests it."""
-    from flashinfer import nm35_nvfp4
+    from flashinfer import cake_nvfp4
 
-    return nm35_nvfp4
+    return cake_nvfp4
 
 
-def _nm35_nvfp4_unsupported_reason(
+def _cake_nvfp4_unsupported_reason(
     q_dtype, kv_dtype, out_dtype, num_qo_heads, num_kv_heads, head_dims, page_size
 ):
-    """Return why nm35-nvfp4 cannot serve a case, or None.
+    """Return why cake-nvfp4 cannot serve a case, or None.
 
     The backend runs any other geometry on trtllm-gen, so benchmarking it there
     would only time trtllm-gen again.
     """
-    nm35 = _get_nm35_nvfp4_module()
+    cake_nvfp4 = _get_cake_nvfp4_module()
     if kv_dtype != "nvfp4":
         return "requires --kv_dtype nvfp4"
     if q_dtype != torch.float8_e4m3fn or out_dtype != torch.float8_e4m3fn:
         return "requires FP8 E4M3 query and output"
-    if (num_qo_heads, num_kv_heads) != (nm35.NUM_QO_HEADS, nm35.NUM_KV_HEADS):
-        return f"requires {nm35.NUM_QO_HEADS} query and {nm35.NUM_KV_HEADS} KV heads"
-    if any(head_dim != nm35.HEAD_DIM for head_dim in head_dims):
-        return f"requires head dimension {nm35.HEAD_DIM}"
-    if page_size != nm35.PAGE_SIZE:
-        return f"requires page_size {nm35.PAGE_SIZE}"
+    if (num_qo_heads, num_kv_heads) != (
+        cake_nvfp4.NUM_QO_HEADS,
+        cake_nvfp4.NUM_KV_HEADS,
+    ):
+        return f"requires {cake_nvfp4.NUM_QO_HEADS} query and {cake_nvfp4.NUM_KV_HEADS} KV heads"
+    if any(head_dim != cake_nvfp4.HEAD_DIM for head_dim in head_dims):
+        return f"requires head dimension {cake_nvfp4.HEAD_DIM}"
+    if page_size != cake_nvfp4.PAGE_SIZE:
+        return f"requires page_size {cake_nvfp4.PAGE_SIZE}"
     return None
 
 
-def _nm35_nvfp4_resolved_backend(stage):
-    """Name the kernels that served nm35-nvfp4 since its counters were reset."""
-    nm35 = _get_nm35_nvfp4_module()
-    kernels = sorted({kernel for (s, kernel) in nm35.route_counts() if s == stage})
-    return f"nm35-nvfp4({'+'.join(kernels)})"
+def _cake_nvfp4_resolved_backend(stage):
+    """Name the kernels that served cake-nvfp4 since its counters were reset."""
+    cake_nvfp4 = _get_cake_nvfp4_module()
+    kernels = sorted(
+        {kernel for (s, kernel) in cake_nvfp4.route_counts() if s == stage}
+    )
+    return f"cake-nvfp4({'+'.join(kernels)})"
 
 
 def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype, *, is_nvfp4_kv):
@@ -420,9 +425,9 @@ def parse_attention_args(line, parser):
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
             "cute-dsl-prims",
-            "nm35-nvfp4",
+            "cake-nvfp4",
         ],
-        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. nm35-nvfp4 selects the Nemotron 3.5 Super NVFP4-KV kernels of trtllm_batch_decode_with_kv_cache / trtllm_batch_context_with_kv_cache (paged decode and prefill, SM100). backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. cake-nvfp4 selects the Nemotron 3.5 Super NVFP4-KV kernels of trtllm_batch_decode_with_kv_cache / trtllm_batch_context_with_kv_cache (paged decode and prefill, SM100). backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -964,8 +969,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                     "does not support full-mask speculative decode",
                 )
 
-    if "nm35-nvfp4" in backends:
-        reason = _nm35_nvfp4_unsupported_reason(
+    if "cake-nvfp4" in backends:
+        reason = _cake_nvfp4_unsupported_reason(
             q_dtype,
             args.kv_dtype,
             o_data_type,
@@ -977,7 +982,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if reason is None and speculative_decode and spec_dec_mask_mode == "full":
             reason = "uses implicit causal masking and does not support full-mask speculative decode"
         if reason is not None:
-            _drop_backend(backends, "nm35-nvfp4", reason)
+            _drop_backend(backends, "cake-nvfp4", reason)
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1337,7 +1342,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 out=out,
                 out_dtype=o_data_type,
             )
-        elif backend == "nm35-nvfp4":
+        elif backend == "cake-nvfp4":
             # The same call as trtllm-native, with the draft-block mask left
             # implicit: SM100 trtllm-gen applies it as causal, and the
             # Nemotron kernels serve only calls without an explicit mask.
@@ -1351,7 +1356,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 bmm1_scale=k_scale * scale,
                 bmm2_scale=v_scale,
                 kv_layout="HND",
-                backend="nm35-nvfp4",
+                backend="cake-nvfp4",
                 q_len_per_req=s_qo,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
@@ -1391,8 +1396,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
         runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
-        if cur_backend == "nm35-nvfp4":
-            _get_nm35_nvfp4_module().reset_route_counts()
+        if cur_backend == "cake-nvfp4":
+            _get_cake_nvfp4_module().reset_route_counts()
         if run_refcheck:
             outputs[cur_backend] = (
                 run_backend_wrapper(
@@ -1448,10 +1453,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 runtime_out,
             ),
         )
-        if cur_backend == "nm35-nvfp4":
+        if cur_backend == "cake-nvfp4":
             # Report which kernel served the shape: outside the routed shapes
             # the backend runs trtllm-gen.
-            resolved_backends[cur_backend] = _nm35_nvfp4_resolved_backend("decode")
+            resolved_backends[cur_backend] = _cake_nvfp4_resolved_backend("decode")
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -1725,8 +1730,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if "trtllm-fmha-v2" in backends and is_nvfp4_kv:
         print("[INFO] trtllm-fmha-v2 backend does not support NVFP4. Skipping.")
         backends.remove("trtllm-fmha-v2")
-    if "nm35-nvfp4" in backends:
-        reason = _nm35_nvfp4_unsupported_reason(
+    if "cake-nvfp4" in backends:
+        reason = _cake_nvfp4_unsupported_reason(
             q_dtype,
             args.kv_dtype,
             o_data_type,
@@ -1738,7 +1743,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         if reason is None and not causal:
             reason = "requires causal = True"
         if reason is not None:
-            _drop_backend(backends, "nm35-nvfp4", reason)
+            _drop_backend(backends, "cake-nvfp4", reason)
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1951,12 +1956,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_bytes = 512 * 1024 * 1024
-    if "nm35-nvfp4" in backends:
+    if "cake-nvfp4" in backends:
         # Its prefill kernel declines a workspace smaller than this and runs
         # the call on trtllm-gen instead.
         workspace_bytes = max(
             workspace_bytes,
-            _get_nm35_nvfp4_module().prefill_workspace_bytes(s_kv),
+            _get_cake_nvfp4_module().prefill_workspace_bytes(s_kv),
         )
     workspace_buffer = torch.empty(workspace_bytes, dtype=torch.int8, device=device)
 
@@ -2193,7 +2198,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
             )
-        elif backend in ("trtllm-native", "nm35-nvfp4"):
+        elif backend in ("trtllm-native", "cake-nvfp4"):
             # Compute combined bmm1_scale: q_scale * k_scale * sm_scale
             # For FP8: all scales are float values
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -2307,8 +2312,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             else kv_cache
         )
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
-        if cur_backend == "nm35-nvfp4":
-            _get_nm35_nvfp4_module().reset_route_counts()
+        if cur_backend == "cake-nvfp4":
+            _get_cake_nvfp4_module().reset_route_counts()
         if run_refcheck:
             outputs[cur_backend] = (
                 run_backend_wrapper(
@@ -2369,10 +2374,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 runtime_out,
             ),
         )
-        if cur_backend == "nm35-nvfp4":
+        if cur_backend == "cake-nvfp4":
             # Report which kernel served the shape: outside the routed shapes
             # the backend runs trtllm-gen.
-            resolved_backends[cur_backend] = _nm35_nvfp4_resolved_backend("prefill")
+            resolved_backends[cur_backend] = _cake_nvfp4_resolved_backend("prefill")
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -2521,7 +2526,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 f"auto({resolved_backend})"
                 if backend == "auto"
                 else resolved_backend
-                if backend == "nm35-nvfp4"
+                if backend == "cake-nvfp4"
                 else backend
             )
             print_perf_metrics(

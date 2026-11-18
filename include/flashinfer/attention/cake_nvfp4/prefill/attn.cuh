@@ -21,7 +21,7 @@
 #include "common.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 namespace prefill {
 namespace attn {
 
@@ -36,7 +36,7 @@ constexpr int kSharedBytes = 197632;
 
 extern "C" {
 
-__global__ __launch_bounds__(kThreads, 1) void nm35_nvfp4_prefill_attn(
+__global__ __launch_bounds__(kThreads, 1) void cake_nvfp4_prefill_attn(
     uint8_t* __restrict__ out, float* __restrict__ part_o, float* __restrict__ part_ml,
     float* __restrict__ pmax, int pmax_chunks, int* __restrict__ block_tables,
     int* __restrict__ q_indptr, int* __restrict__ kv_lengths, int table_stride, int n_qtiles,
@@ -1489,5 +1489,5 @@ __global__ __launch_bounds__(kThreads, 1) void nm35_nvfp4_prefill_attn(
 
 }  // namespace attn
 }  // namespace prefill
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

@@ -23,7 +23,7 @@
 #include "host.h"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 
 constexpr int kPageSizeLog2 = 7;
 static_assert((1 << kPageSizeLog2) == kPageSize, "page size");
@@ -56,5 +56,5 @@ struct DecodeParams {
   int32_t pdlMode;
 };
 
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

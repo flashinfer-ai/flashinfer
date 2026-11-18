@@ -20,7 +20,7 @@
 #include "common.cuh"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 namespace prefill {
 namespace comb {
 
@@ -28,7 +28,7 @@ constexpr int kThreads = 256;
 
 extern "C" {
 
-__global__ __launch_bounds__(kThreads, 2) void nm35_nvfp4_prefill_comb(
+__global__ __launch_bounds__(kThreads, 2) void cake_nvfp4_prefill_comb(
     uint8_t* __restrict__ out, float* __restrict__ part_o, float* __restrict__ part_ml,
     int* __restrict__ q_indptr, int n_qtiles, int nctas, int qf, int tile_base, float scale_log2,
     float out_scale, const float* scale_log2_ptr, const float* out_scale_ptr) {
@@ -129,5 +129,5 @@ __global__ __launch_bounds__(kThreads, 2) void nm35_nvfp4_prefill_comb(
 
 }  // namespace comb
 }  // namespace prefill
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer

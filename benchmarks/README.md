@@ -38,7 +38,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
     - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
     - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
-    - `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper` accept `--backends nm35-nvfp4` on SM100: `trtllm_batch_decode_with_kv_cache` / `trtllm_batch_context_with_kv_cache` with `backend="nm35-nvfp4"`, the Nemotron 3.5 Super kernels for FP8 E4M3 Q/O and NVFP4 K/V (`--q_dtype fp8_e4m3 --kv_dtype nvfp4 --out_dtype fp8_e4m3`, 32 query heads, 2 KV heads, head dimension 128, `--page_size 128`). Shapes the backend routes to trtllm-gen report `nm35-nvfp4(trtllm-gen)`.
+    - `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper` accept `--backends cake-nvfp4` on SM100: `trtllm_batch_decode_with_kv_cache` / `trtllm_batch_context_with_kv_cache` with `backend="cake-nvfp4"`, the Nemotron 3.5 Super kernels for FP8 E4M3 Q/O and NVFP4 K/V (`--q_dtype fp8_e4m3 --kv_dtype nvfp4 --out_dtype fp8_e4m3`, 32 query heads, 2 KV heads, head dimension 128, `--page_size 128`). Shapes the backend routes to trtllm-gen report `cake-nvfp4(trtllm-gen)`.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
@@ -266,7 +266,7 @@ The output CSV will contain detailed metrics including:
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
 | `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
 | `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
-| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, nm35-nvfp4, cute-dsl, cute-dsl-prims, cublas, trtllm_low_latency, batch_invariant. (`prims_ts` aliases `prims-ts`; `auto` support is routine-dependent; `batch_invariant` is described below.)|
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, cake-nvfp4, cute-dsl, cute-dsl-prims, cublas, trtllm_low_latency, batch_invariant. (`prims_ts` aliases `prims-ts`; `auto` support is routine-dependent; `batch_invariant` is described below.)|
 
 ### Batch-invariant mode
 `--backends batch_invariant` runs the routine's operator with `batch_invariant=True` (and `backend="auto"`): the
@@ -539,12 +539,12 @@ Legend:
 - trtllm-gen: TensorRT-LLM (generic wrapper)
 - trtllm-native: TensorRT-LLM (native API)
 - prims-ts: Experimental task-scheduled attention (SM100/SM103)
-- nm35-nvfp4: Nemotron 3.5 Super NVFP4-KV attention (SM100)
+- cake-nvfp4: Nemotron 3.5 Super NVFP4-KV attention (SM100)
 -->
 | Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
 |---------|-----|-----|-----|-----|-----|-------|-------|-------|
-| **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts, nm35-nvfp4 | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn |
-| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts, nm35-nvfp4 | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
+| **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts, cake-nvfp4 | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn |
+| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts, cake-nvfp4 | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
 | **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
@@ -619,7 +619,7 @@ Backend Legend:
 - trtllm-gen: TensorRT-LLM
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
-- nm35-nvfp4: Nemotron 3.5 Super NVFP4-KV attention kernels (Blackwell SM100; trtllm-gen outside their shapes)
+- cake-nvfp4: Nemotron 3.5 Super NVFP4-KV attention kernels (Blackwell SM100; trtllm-gen outside their shapes)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
 - batch_invariant: FlashInfer's batch-invariant kernels (`batch_invariant=True`: a row's bits depend only on its own

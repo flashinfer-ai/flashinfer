@@ -27,18 +27,18 @@
 #include "host.h"
 
 namespace flashinfer {
-namespace nm35_nvfp4 {
+namespace cake_nvfp4 {
 
 inline void cudaCheck(cudaError_t status, char const* what) {
   if (status == cudaSuccess) return;
-  FLASHINFER_ERROR(std::string("nm35-nvfp4 ") + what + ": " + cudaGetErrorString(status));
+  FLASHINFER_ERROR(std::string("cake-nvfp4 ") + what + ": " + cudaGetErrorString(status));
 }
 
 inline void driverCheck(CUresult result, char const* what) {
   if (result == CUDA_SUCCESS) return;
   char const* message = nullptr;
   cuGetErrorString(result, &message);
-  FLASHINFER_ERROR(std::string("nm35-nvfp4 ") + what + ": " +
+  FLASHINFER_ERROR(std::string("cake-nvfp4 ") + what + ": " +
                    (message ? message : std::to_string(static_cast<int>(result))));
 }
 
@@ -121,5 +121,5 @@ inline DecodeParams makeDecodeParams(Call const& c, DecodePlan const& plan) {
   return p;
 }
 
-}  // namespace nm35_nvfp4
+}  // namespace cake_nvfp4
 }  // namespace flashinfer
