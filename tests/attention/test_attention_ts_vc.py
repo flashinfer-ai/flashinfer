@@ -259,11 +259,15 @@ _CASES = (
     _VCCase("one-shot", 1, 2000, 2, one_shot=True),
     _VCCase("qk8", 2, 2048, 2, qk_dtype=_FP8),
     _VCCase("qk8-partial-tile", 1, 2000, 2, qk_dtype=_FP8),
-    # V repair, one repair tile before the masked partial tail, two tiles with no tail.
+    # V repair. 2000 tokens place one repair tile before the masked partial tail,
+    # 4096 two tiles with no tail, 35 a repair tile ahead of a tail whose zero
+    # padding outnumbers the tokens.
     _VCCase("repair-partial-tile", 1, 2000, 2, repair_budget=0.02),
     _VCCase("repair-two-batches", 2, 4096, 2, repair_budget=0.05),
+    _VCCase("repair-short", 1, 35, 2, repair_budget=0.02),
     _VCCase("qk8-repair-partial-tile", 1, 2000, 2, qk_dtype=_FP8, repair_budget=0.02),
     _VCCase("qk8-repair-two-batches", 2, 4096, 2, qk_dtype=_FP8, repair_budget=0.05),
+    _VCCase("qk8-repair-short", 1, 35, 2, qk_dtype=_FP8, repair_budget=0.02),
     # Q and K/V lengths differ, so the Q and K scale tables have different block counts.
     _VCCase("cross-length", 2, 2000, 2, seq_len_q=1000),
     _VCCase("qk8-cross-length", 2, 2000, 2, seq_len_q=1000, qk_dtype=_FP8),
