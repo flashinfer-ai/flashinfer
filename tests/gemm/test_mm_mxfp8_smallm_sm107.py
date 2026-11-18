@@ -2,11 +2,12 @@
 
 Dispatch contract under test: backend="auto" routes to the specialized kernel
 only on its strict (M, N, K) allowlist; an explicitly selected backend is
-never silently swapped (explicit "cute-dsl" never gets the specialized kernel,
-explicit "specialized" that cannot serve a call takes the composable path,
-never another fused backend); FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces
-the composable/stock path. GPU tests are skipped unless the device is SM107
-(compute capability 10.7).
+never silently swapped and never falls back (explicit "cute-dsl" never gets
+the specialized kernel, explicit "specialized" that cannot serve a call
+raises NotImplementedError with the refusal reason);
+FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the kernel (auto: stock
+path, explicit "specialized": raise). GPU tests are skipped unless the device
+is SM107 (compute capability 10.7).
 """
 
 import pytest
@@ -235,34 +236,26 @@ def test_explicit_specialized_serves_allowlist(monkeypatch):
 
 
 @requires_sm107
-def test_explicit_specialized_off_list_takes_composable_path(monkeypatch):
-    """Explicit "specialized" off the allowlist falls back to the composable
-    dequant + torch.mm path (never another fused backend) with a recorded
-    reason, and the result matches the quantized-exact reference."""
+def test_explicit_specialized_off_list_raises(monkeypatch):
+    """Explicit "specialized" off the allowlist raises NotImplementedError
+    with the refusal reason (an explicitly selected backend never falls
+    back), and the reason is recorded in the dispatch stats."""
     monkeypatch.delenv(_DISABLE_ENV, raising=False)
     m, n, k = _OFF_LIST_SHAPE
     a_q, b_q, a_sf, b_sf, _ = _quantized_problem(m, n, k)
     calls = _count_kernel_launches(monkeypatch)
     before = _mm_mxfp8_specialized_stats()
 
-    res = mm_mxfp8(
-        a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
-    )
+    with pytest.raises(NotImplementedError, match="shape_not_allowlisted"):
+        mm_mxfp8(
+            a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+        )
     assert len(calls) == 0, "off-list explicit call must not run the kernel"
     after = _mm_mxfp8_specialized_stats()
-    assert after["composable_dispatches"] == before["composable_dispatches"] + 1
+    assert after["explicit_refusals"] == before["explicit_refusals"] + 1
     assert after["fallback_reasons"].get("shape_not_allowlisted", 0) > (
         before["fallback_reasons"].get("shape_not_allowlisted", 0)
     )
-
-    # The composable path is dequant-exact for the quantized operands.
-    # b_q from mxfp8_quantize is already (N, K) row-major — the layout
-    # _unswizzle_sf(b_sf, n, k) scales — so it is dequantized as-is.
-    exact = (
-        specialized._dequant(a_q, specialized._unswizzle_sf(a_sf, m, k))
-        @ specialized._dequant(b_q, specialized._unswizzle_sf(b_sf, n, k)).t()
-    )
-    assert torch.equal(res, exact.to(torch.bfloat16))
 
 
 @requires_sm107
@@ -287,7 +280,7 @@ def test_auto_off_list_takes_stock_path(monkeypatch):
 
 
 @requires_sm107
-def test_kill_switch_forces_composable_or_stock_path(monkeypatch):
+def test_kill_switch_disables_specialized(monkeypatch):
     m, n, k = _ON_LIST_SHAPES[0]
     a_q, b_q, a_sf, b_sf, reference = _quantized_problem(m, n, k)
     calls = _count_kernel_launches(monkeypatch)
@@ -297,18 +290,19 @@ def test_kill_switch_forces_composable_or_stock_path(monkeypatch):
     res = mm_mxfp8(a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16)
     assert len(calls) == 0, "kill switch must disable the specialized kernel"
     _assert_close_to_reference(reference, res, "kill-switch auto")
-    # explicit specialized: the composable path serves the call.
+    # explicit specialized: raises with the kill_switch reason (an explicitly
+    # selected backend never falls back).
     before = _mm_mxfp8_specialized_stats()
-    res = mm_mxfp8(
-        a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
-    )
+    with pytest.raises(NotImplementedError, match="kill_switch"):
+        mm_mxfp8(
+            a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+        )
     assert len(calls) == 0
     after = _mm_mxfp8_specialized_stats()
-    assert after["composable_dispatches"] == before["composable_dispatches"] + 1
+    assert after["explicit_refusals"] == before["explicit_refusals"] + 1
     assert after["fallback_reasons"].get("kill_switch", 0) > (
         before["fallback_reasons"].get("kill_switch", 0)
     )
-    _assert_close_to_reference(reference, res, "kill-switch explicit specialized")
 
     monkeypatch.delenv(_DISABLE_ENV)
     mm_mxfp8(a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16)

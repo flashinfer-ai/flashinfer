@@ -8097,12 +8097,13 @@ def _cudnn_mm_mxfp8_runner():
 
 # The CC list spans every arch mm_mxfp8 itself supports: the specialized
 # backend must stay selectable (explicitly and in auto resolution) everywhere,
-# because its dispatcher owns the exact device gate (CC 10.7) and serves
-# explicit "specialized" calls on other devices via the composable path. The
-# auto heuristic ranks "specialized" FIRST exactly when the call is on the
+# because its dispatcher owns the exact device gate (CC 10.7) and refuses
+# explicit "specialized" calls it cannot serve with a precise reason
+# (NotImplementedError) rather than a generic checker error. The auto
+# heuristic ranks "specialized" FIRST exactly when the call is on the
 # kernel's measured allowlist (specialized_mm_mxfp8_eligible), so it is a
 # default auto candidate and a first-class autotune candidate there; this
-# checker stays permissive so explicit selection works everywhere. The
+# checker stays permissive so the dispatcher's refusal carries the reason. The
 # decorator also supplies is_compute_capability_supported, which
 # suitable_auto_backends calls on EVERY registered checker.
 @supported_compute_capability([100, 103, 107, 110, 120, 121])
@@ -8117,11 +8118,11 @@ def _specialized_mm_mxfp8_requirement(
     backend: str = "auto",  # unused
     batch_invariant: bool = False,  # unused
 ):
-    # The specialized backend is always selectable: a call its kernel cannot
-    # serve (shape off the allowlist, non-SM107 device, kill switch, JIT
-    # failure) takes the composable dequant + torch.mm path inside mm_mxfp8,
-    # never another fused backend. Input-representability errors (e.g. 8x4 or
-    # 2D scale layouts) are raised there with a precise message.
+    # The specialized backend is always selectable: an explicit call its
+    # kernel cannot serve (shape off the allowlist, non-SM107 device, kill
+    # switch, JIT failure) raises NotImplementedError inside mm_mxfp8 with
+    # the precise refusal reason — it never falls back to any other
+    # implementation.
     return True
 
 
@@ -8298,12 +8299,14 @@ def mm_mxfp8(
           the autotuner races it as a first-class candidate against the stock
           SM107 backends, caching whichever wins per bucket; every other
           shape keeps the stock ranking. An explicitly selected backend is
-          never silently swapped: explicit ``backend="specialized"`` that
-          cannot serve a call (off-list shape, non-SM107 device, kill switch,
-          JIT failure) takes the composable dequant + ``torch.mm`` path,
-          never another fused backend.
+          never silently swapped and never falls back: explicit
+          ``backend="specialized"`` that cannot serve a call (off-list shape,
+          non-SM107 device, kill switch, JIT failure) raises
+          ``NotImplementedError`` with the refusal reason; only ``"auto"``
+          routes around a refusal.
           ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time)
-          forces the composable/stock path.
+          disables the kernel: ``"auto"`` keeps the stock path, explicit
+          ``backend="specialized"`` raises.
 
     batch_invariant: bool
         ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
@@ -8380,15 +8383,16 @@ def mm_mxfp8(
 
     # The "specialized" backend (agent-generated SM107 small-M kernel).
     # Explicit backend="specialized" is served here: the kernel on its
-    # strict (M, N, K) allowlist of measured decode-size shapes, the
-    # composable dequant + torch.mm path otherwise — never another fused
-    # backend. Under backend="auto" the kernel is a DEFAULT candidate of the
-    # runner machinery below instead: the heuristic ranks it first exactly
-    # on its allowlist (untuned auto therefore runs it there, via the
-    # runners[0] fallback convention) and the autotuner races it as itself
-    # against the stock backends. An explicitly selected stock backend is
-    # never swapped. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the
-    # composable/stock path. See flashinfer/gemm/mxfp8_smallm_sm107.py.
+    # strict (M, N, K) allowlist of measured decode-size shapes; a call it
+    # cannot serve raises NotImplementedError with the refusal reason — an
+    # explicitly selected backend never falls back. Under backend="auto" the
+    # kernel is a DEFAULT candidate of the runner machinery below instead:
+    # the heuristic ranks it first exactly on its allowlist (untuned auto
+    # therefore runs it there, via the runners[0] fallback convention) and
+    # the autotuner races it as itself against the stock backends. An
+    # explicitly selected stock backend is never swapped.
+    # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the kernel (auto:
+    # stock path; explicit: raise). See flashinfer/gemm/mxfp8_smallm_sm107.py.
     if backend == "specialized":
         if dispatch_mm_mxfp8_specialized(
             a,

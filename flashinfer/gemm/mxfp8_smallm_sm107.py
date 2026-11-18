@@ -22,16 +22,18 @@ Dispatch contract (the specialized-backend pattern):
 - ``backend="auto"`` routes to "specialized" only on the exact shapes of the
   package allowlist (``mm_mxfp8_specialized_sm107_workloads.json``); every
   other call keeps the stock path, with the reason recorded.
-- An explicitly selected backend is never silently swapped: only
-  ``backend="specialized"`` (or "auto") can reach this kernel, and explicit
-  ``backend="specialized"`` that cannot serve a call falls back to the
-  composable dequant + ``torch.mm`` path — never to another fused backend.
+- An explicitly selected backend is never silently swapped AND never falls
+  back: only ``backend="specialized"`` (or "auto") can reach this kernel, and
+  explicit ``backend="specialized"`` that cannot serve a call raises
+  ``NotImplementedError`` with the refusal reason. Only ``"auto"`` may route
+  around a refusal (to the stock ranking).
 - Guard order: GPU-free checks (kill switch, dtypes, geometry, contiguity,
   allowlist) first, then scale-layout guards, then device guards.
-- A JIT build failure is logged once and the call falls through (auto: the
-  stock path; explicit: the composable path).
-- ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) forces the
-  composable/stock path.
+- A JIT build failure is logged once; auto falls through to the stock path,
+  explicit ``backend="specialized"`` raises.
+- ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) disables
+  the kernel: auto keeps the stock path, explicit ``backend="specialized"``
+  raises (reason ``kill_switch``).
 - ``fallback_reasons`` and per-backend dispatch counters are recorded; see
   ``_mm_mxfp8_specialized_stats``.
 """
@@ -98,10 +100,10 @@ _stats: Dict[str, Any] = {
     "calls": 0,
     "backend_dispatches": {"specialized": 0},
     # Calls the specialized backend declined: auto ones continue into the
-    # stock path, explicit ones take the composable dequant + torch.mm path.
+    # stock path, explicit ones raise with the recorded reason.
     "fallback_dispatches": 0,
     "fallback_reasons": {},
-    "composable_dispatches": 0,
+    "explicit_refusals": 0,
     "module_loaded": False,
     "module_error": None,
 }
@@ -377,9 +379,10 @@ class SpecializedMxfp8SmallMRunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# Composable path: unswizzle + dequant + torch.mm. Serves explicit
-# backend="specialized" calls the kernel declines (any shape, any device),
-# so an explicitly selected backend never silently becomes another fused one.
+# Reference helpers: unswizzle + dequant (used by the test suite as the
+# quantized-exact reference for the kernel's scale decode). Explicit
+# backend="specialized" calls the kernel declines RAISE — there is no
+# fallback path on the explicit route.
 # ---------------------------------------------------------------------------
 
 
@@ -397,36 +400,6 @@ def _dequant(q: torch.Tensor, sf_lin: torch.Tensor) -> torch.Tensor:
     return (q.float().view(rows, k // 32, 32) * scale.unsqueeze(-1)).view(rows, k)
 
 
-def _composable_mm_mxfp8(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    out: torch.Tensor,
-    use_8x4_sf_layout: bool,
-) -> None:
-    """Composable stock path (fp32 accumulation), correct for any geometry the
-    1D swizzled 128x4 scale layout can express."""
-    m, k = a.shape[0], a.shape[1]
-    n = b.shape[1]
-    if (
-        use_8x4_sf_layout
-        or k % 32 != 0
-        or a_descale.ndim != 1
-        or b_descale.ndim != 1
-        or a_descale.numel() < _swizzled_sf_numel(m, k)
-        or b_descale.numel() < _swizzled_sf_numel(n, k)
-    ):
-        raise ValueError(
-            "specialized mm_mxfp8 requires K % 32 == 0 and 1D swizzled 128x4 "
-            "scale tensors (mxfp8_quantize(..., is_sf_swizzled_layout=True), "
-            "use_8x4_sf_layout=False)"
-        )
-    a_deq = _dequant(a, _unswizzle_sf(a_descale, m, k))
-    b_deq = _dequant(b.t().contiguous(), _unswizzle_sf(b_descale, n, k))
-    out.copy_(torch.mm(a_deq, b_deq.t()).to(out.dtype))
-
-
 def dispatch_mm_mxfp8_specialized(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -439,11 +412,12 @@ def dispatch_mm_mxfp8_specialized(
 ) -> bool:
     """Specialized-backend dispatch for ``mm_mxfp8``.
 
-    Returns True when ``out`` was written (the specialized kernel, or — for
-    explicit ``backend="specialized"`` only — the composable path). Returns
+    Returns True when ``out`` was written by the specialized kernel. Returns
     False only for ``backend="auto"`` calls the backend declined, which then
-    continue into the stock path; the decline reason is recorded in
-    ``fallback_reasons`` either way.
+    continue into the stock path. Explicit ``backend="specialized"`` calls
+    the backend declines raise ``NotImplementedError`` with the refusal
+    reason — an explicitly selected backend never falls back. The decline
+    reason is recorded in ``fallback_reasons`` either way.
     """
     global _marker_logged
     _stats["calls"] += 1
@@ -466,14 +440,12 @@ def dispatch_mm_mxfp8_specialized(
         reason = "jit_unavailable"
     _bump_fallback(reason)
     if explicit:
-        # An explicitly selected backend is never silently swapped: serve the
-        # call on the composable path, not on another fused backend.
-        _stats["composable_dispatches"] += 1
-        logger.debug(
-            "flashinfer.mm_mxfp8: backend='specialized' cannot serve this call "
-            "(%s); using the composable path",
-            reason,
+        # An explicitly selected backend never falls back: refuse loudly with
+        # the reason instead of serving the call on any other implementation.
+        _stats["explicit_refusals"] += 1
+        raise NotImplementedError(
+            f"mm_mxfp8 backend='specialized' cannot serve this call ({reason}); "
+            "an explicitly selected backend never falls back — use "
+            "backend='auto' to route among the supported backends"
         )
-        _composable_mm_mxfp8(a, b, a_descale, b_descale, out, use_8x4_sf_layout)
-        return True
     return False
