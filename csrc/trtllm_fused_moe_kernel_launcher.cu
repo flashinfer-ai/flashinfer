@@ -1004,13 +1004,7 @@ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_
 
 inline ActivationType validateAndCastActivationType(int64_t act_type) {
   if (act_type == static_cast<int64_t>(ActivationType::ClampedRelu2)) {
-#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
     return ActivationType::ClampedRelu2;
-#else
-    TVM_FFI_ICHECK(false)
-        << "TRTLLM ClampedRelu2 requires a kernel artifact with "
-           "ClampedRelu2 headers and kernels; the installed artifact lacks support.";
-#endif
   }
   TVM_FFI_ICHECK(act_type >= 0 && act_type < static_cast<int64_t>(ActivationType::InvalidType))
       << "Invalid activation type: " << act_type;

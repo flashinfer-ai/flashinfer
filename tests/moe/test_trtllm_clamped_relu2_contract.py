@@ -19,7 +19,6 @@ limitations under the License.
 import ast
 from enum import IntEnum
 from pathlib import Path
-import re
 from types import SimpleNamespace
 import unittest
 
@@ -115,22 +114,6 @@ class ClampedRelu2ContractTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "float32"),
             ):
                 self.validate(1, Activation.ClampedRelu2, None, None, scale)
-
-    def test_export_feature_detection(self):
-        supports = load_function(
-            "flashinfer/jit/fused_moe.py", "_has_trtllm_clamped_relu2", {"re": re}
-        )
-        self.assertTrue(
-            supports(b"enum class EltwiseActType : int {None, Relu2, ClampedRelu2};")
-        )
-        self.assertFalse(supports(b"enum class EltwiseActType {None, Relu2};"))
-        self.assertFalse(
-            supports(b"// ClampedRelu2\nenum class EltwiseActType {Relu2};")
-        )
-        self.assertFalse(supports(b"enum class ActType {ClampedRelu2};"))
-        self.assertFalse(
-            supports(b"enum class EltwiseActType {/* ClampedRelu2 */ Relu2};")
-        )
 
 
 if __name__ == "__main__":

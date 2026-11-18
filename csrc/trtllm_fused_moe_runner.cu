@@ -133,10 +133,8 @@ static inline EltwiseActType activationTypeToEltwiseActType(ActivationType actTy
   switch (actType) {
     case ActivationType::Relu2:
       return EltwiseActType::Relu2;
-#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
     case ActivationType::ClampedRelu2:
       return EltwiseActType::ClampedRelu2;
-#endif
     case ActivationType::Identity:
       return EltwiseActType::None;
     default:
@@ -155,13 +153,11 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   int64_t actTypeInt = static_cast<int64_t>(activationType);
   bool validActivation =
       0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType);
-#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
   validActivation = validActivation ||
                     (activationType == ActivationType::ClampedRelu2 &&
                      ((dtypeAct == btg::Dtype::MxE4m3 && dtypeWeights == btg::Dtype::MxE4m3) ||
                       (dtypeAct == btg::Dtype::Bfloat16 && dtypeWeights == btg::Dtype::Bfloat16)) &&
                      !useDeepSeekFp8);
-#endif
   FLASHINFER_CHECK(validActivation, "Unknown or unsupported activation type",
                    serializeActivationType(activationType), "of enum", actTypeInt);
   bool isGatedAct = isGatedActivation(activationType);
