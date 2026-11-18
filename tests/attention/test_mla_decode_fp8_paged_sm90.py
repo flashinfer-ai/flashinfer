@@ -439,19 +439,28 @@ def test_nonpositive_sm_scale_is_ineligible(sm_scale):
     """The kernels reduce max(score) BEFORE applying the fused qk scale,
     which is only order-preserving for a positive sm_scale (and a zero scale
     would turn -inf masks into NaN); such plans stay on the stock path
-    ('auto') or raise ('specialized')."""
+    ('auto') or raise ('specialized'). What the stock path then does with the
+    degenerate scale is its own (upstream) behavior and is not asserted here:
+    plan() itself rejects nonfinite scales, and the stock kernels produce NaN
+    at sm_scale<=0."""
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([2983], device)
     _reset_mla_dec_fp8q_sm90_stats()
-    w = _plan_wrapper(batch, device, sm_scale=sm_scale)
-    stats = _mla_dec_fp8q_sm90_stats()
-    assert stats["plans_prepared"] == 0, stats
-    out = _run(w, batch)
-    stats = _mla_dec_fp8q_sm90_stats()
-    assert stats["runs_dispatched"] == 0, stats
-    if sm_scale != float("inf"):
-        assert torch.isfinite(out.float()).all()
+    if sm_scale == float("inf"):
+        # The stock plan itself rejects nonfinite scales (pre-existing
+        # _MLAPlanArguments validation); the fast path was never prepared.
+        with pytest.raises(ValueError, match="finite"):
+            _plan_wrapper(batch, device, sm_scale=sm_scale)
+        stats = _mla_dec_fp8q_sm90_stats()
+        assert stats["plans_prepared"] == 0, stats
+    else:
+        w = _plan_wrapper(batch, device, sm_scale=sm_scale)
+        stats = _mla_dec_fp8q_sm90_stats()
+        assert stats["plans_prepared"] == 0, stats
+        _run(w, batch)  # served by the stock path; its numerics are its own
+        stats = _mla_dec_fp8q_sm90_stats()
+        assert stats["runs_dispatched"] == 0, stats
 
     with pytest.raises(RuntimeError, match="finite positive"):
         _plan_wrapper(batch, device, fp8q_backend="specialized", sm_scale=sm_scale)
