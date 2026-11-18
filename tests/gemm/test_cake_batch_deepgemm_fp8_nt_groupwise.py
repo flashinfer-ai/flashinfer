@@ -944,27 +944,10 @@ _RACE_PLACEMENTS = ("stream", "occupier-die0", "occupier-die1", "one-die0", "one
 # The cells of the twins' source rule, keyed by serving key: a (die class,
 # expected_m class) cell is listed where the twin ran below 0.98 x the fastest
 # whole-GPU build of the same N, K and groups on every timed 212-SM GPU of that
-# die class.
+# die class.  Only the keys of the shape localize_weights homes are shipped: the
+# twins of the other shapes' keys are unreachable.
 _SOURCE_ROUTES = {
-    "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": {
-        ("even", "em2-7"),
-        ("uneven", "em2-7"),
-        ("even", "em8-15"),
-        ("uneven", "em8-15"),
-    },
     "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": {
-        ("even", "em2-7"),
-        ("uneven", "em2-7"),
-        ("even", "em8-15"),
-        ("uneven", "em8-15"),
-    },
-    "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8": {
-        ("even", "em2-7"),
-        ("uneven", "em2-7"),
-        ("even", "em8-15"),
-        ("uneven", "em8-15"),
-    },
-    "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": {
         ("even", "em2-7"),
         ("uneven", "em2-7"),
         ("even", "em8-15"),
