@@ -82,6 +82,12 @@ def _inputs(kind, rank, world, hidden=384, intermediate=192):
 
 def _config(kind, early, recipe=None, **kwargs):
     from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.validation.common import (
+        is_bf16_mxfp8_cutedsl_supported,
+    )
+
+    if kind != "w4a16" and not is_bf16_mxfp8_cutedsl_supported():
+        pytest.skip("W8A16 MegaMoE requires CUDA 13+")
 
     common = dict(
         intermediate_size=192,
