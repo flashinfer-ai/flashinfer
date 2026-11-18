@@ -134,15 +134,20 @@ def test_explicit_reference_never_fused_and_auto_routes():
     assert stats["backend_dispatches"]["specialized"] == 1, stats
 
 
-def test_off_geometry_served_by_reference_only():
+def test_off_geometry_explicit_raises_auto_takes_reference():
     _sm90_or_skip()
     # smaller expert count: consistent shapes, off the fixed geometry
     args = _case(T=2, el=8)
-    y = w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
+    # explicit "specialized" raises with the reason (never falls back)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
     stats = _w4a16_mxfp4_latent_moe_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert stats["backend_dispatches"]["reference"] == 1, stats
     assert any("specialized:" in r for r in stats["fallback_reasons"]), stats
+    # auto routes the same call to the composable reference path
+    y = w4a16_mxfp4_latent_routed_moe(*args, backend="auto")
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["reference"] == 1, stats
     out = torch.empty_like(y)
     ref = _composable_reference(*args, out)
     assert _matched(y, ref) >= 0.999
@@ -188,8 +193,12 @@ def test_misaligned_packed_weights_fall_back():
     buf[8:] = w13p.reshape(-1)
     w13p_off = buf[8:].view(w13p.shape)
     assert w13p_off.is_contiguous() and w13p_off.data_ptr() % 16 == 8
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        w4a16_mxfp4_latent_routed_moe(
+            x, w13p_off, w13s, w2p, w2s, ids, w, backend="specialized"
+        )
     y = w4a16_mxfp4_latent_routed_moe(
-        x, w13p_off, w13s, w2p, w2s, ids, w, backend="specialized"
+        x, w13p_off, w13s, w2p, w2s, ids, w, backend="auto"
     )
     stats = _w4a16_mxfp4_latent_moe_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
@@ -230,6 +239,9 @@ def test_kill_switch_forces_the_reference_path(env, val, monkeypatch):
     stats = _w4a16_mxfp4_latent_moe_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert stats["backend_dispatches"]["reference"] == 1, stats
+    # explicit "specialized" raises under the kill switch (never falls back)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
 
 
 # ---------------------------------------------------------------------------

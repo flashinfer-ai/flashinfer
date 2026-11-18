@@ -1,0 +1,1 @@
+branch w4a16-mxfp4-latent-moe-sm90 @ 0605d322 (v3: W4A16MxFp4LatentConfig in _DEFAULT_BACKEND; flat auto-only autotune refusal; runner needs no tuner-state suspension; replaces e0f013b4 tip). Replacement PR body: publish_staging/remediation/9581_body_full.md in the fca repo.

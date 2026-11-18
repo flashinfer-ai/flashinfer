@@ -40,23 +40,26 @@ Backend selection (#5667 pattern)
 ---------------------------------
 ``BACKENDS = ("auto", "specialized", "reference")`` on the keyword-only
 ``backend`` kwarg. ``"specialized"`` selects the fused kernel explicitly; a
-call it cannot serve (off the fixed geometry, off-SM90) is served by the
-composable ``"reference"`` torch path — exact mxfp4 dequant + situ + combine
-math, slow, never another fused backend — with the reason recorded in the
-dispatch stats (no other fused SM90 W4A16 latent-MoE path exists in
-FlashInfer: ``cutlass_fused_moe`` refuses bf16-activation / uint8-weight
-inputs, the trtllm fp4 paths are arch-gated to SM10x/12x and the B12x W4A16
-path is SM120/121-only). ``"reference"`` selects that path explicitly and
-never runs the fused kernel; unknown names raise. ``"auto"`` routes to
-``"specialized"`` only on the dispatch allowlist
-(``flashinfer/w4a16_mxfp4_latent_moe_sm90_dispatch.json``).
+call it cannot serve (off the fixed geometry, off-SM90, kill switch) raises
+``NotImplementedError`` with the refusal reason (also recorded in the
+dispatch stats) — an explicitly selected backend never falls back (no other
+fused SM90 W4A16 latent-MoE path exists in FlashInfer anyway:
+``cutlass_fused_moe`` refuses bf16-activation / uint8-weight inputs, the
+trtllm fp4 paths are arch-gated to SM10x/12x and the B12x W4A16 path is
+SM120/121-only). ``"reference"`` selects the composable torch path — exact
+mxfp4 dequant + situ + combine math, slow — explicitly and never runs the
+fused kernel; unknown names raise. ``"auto"`` routes to ``"specialized"``
+only on the dispatch allowlist
+(``flashinfer/w4a16_mxfp4_latent_moe_sm90_dispatch.json``) and to the
+reference path otherwise — only ``"auto"`` routes around a refusal.
 Malformed/inconsistent arguments still raise.
 
 Kill switch
 -----------
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (checked per call; the switch
-shared by FlashInfer's specialized kernels) forces the composable
-``"reference"`` path. ``FLASHINFER_W4A16_MXFP4_LATENT_MOE=0`` is a
+shared by FlashInfer's specialized kernels) disables the fused kernel:
+``"auto"`` routes to the composable ``"reference"`` path, explicit
+``"specialized"`` raises. ``FLASHINFER_W4A16_MXFP4_LATENT_MOE=0`` is a
 deprecated alias kept for one release (it now also routes to the reference
 path instead of raising).
 
@@ -312,14 +315,17 @@ def w4a16_mxfp4_latent_routed_moe(
     backend : str
         One of ``BACKENDS = ("auto", "specialized", "reference")``.
         ``"specialized"`` selects the fused SM90 kernel explicitly; a call it
-        cannot serve (off the fixed geometry, off-SM90) is served by the
-        composable ``"reference"`` torch path — never another fused backend —
-        with the reason recorded. ``"reference"`` selects that exact-math
-        (slow) path explicitly and never runs the fused kernel; unknown names
-        raise. ``"auto"`` (default) routes to ``"specialized"`` only on the
-        dispatch allowlist. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
-        forces the reference path (``FLASHINFER_W4A16_MXFP4_LATENT_MOE=0`` is
-        a deprecated alias).
+        cannot serve (off the fixed geometry, off-SM90, kill switch) raises
+        ``NotImplementedError`` with the refusal reason (recorded in the
+        dispatch stats) — an explicitly selected backend never falls back.
+        ``"reference"`` selects the composable exact-math (slow) torch path
+        explicitly and never runs the fused kernel; unknown names raise.
+        ``"auto"`` (default) routes to ``"specialized"`` only on the
+        dispatch allowlist and to the reference path otherwise — only
+        ``"auto"`` routes around a refusal.
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the fused
+        kernel (auto: reference path; explicit: raise;
+        ``FLASHINFER_W4A16_MXFP4_LATENT_MOE=0`` is a deprecated alias).
 
     Returns
     -------
@@ -473,6 +479,13 @@ def w4a16_mxfp4_latent_routed_moe(
     chosen = None
     if _killed():
         _fallback(f"{backend}: kill switch")
+        if backend == "specialized":
+            # An explicitly selected backend never falls back.
+            raise NotImplementedError(
+                "w4a16_mxfp4_latent_routed_moe backend='specialized' is "
+                "disabled (kill switch); an explicitly selected backend "
+                "never falls back — use backend='auto' or 'reference'"
+            )
         chosen = "reference"
     elif backend == "reference":
         chosen = "reference"
@@ -481,7 +494,12 @@ def w4a16_mxfp4_latent_routed_moe(
             chosen = "specialized"
         else:
             _fallback(f"specialized: {_spec_reason}")
-            chosen = "reference"
+            # An explicitly selected backend never falls back.
+            raise NotImplementedError(
+                "w4a16_mxfp4_latent_routed_moe backend='specialized' cannot "
+                f"serve this call ({_spec_reason}); an explicitly selected "
+                "backend never falls back — use backend='auto' or 'reference'"
+            )
     else:  # "auto"
         if _spec_reason is None and _dispatch_table() is not None:
             chosen = "specialized"
