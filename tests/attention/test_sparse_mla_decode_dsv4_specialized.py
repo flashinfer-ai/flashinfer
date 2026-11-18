@@ -243,6 +243,10 @@ def test_cuda_graph_replay_matches_eager():
     eager = out.clone()
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
+    # The eager call and out.clone() were submitted to the current stream;
+    # the side-stream warmup writes the same `out`, so it must order after
+    # them (the reverse wait below only orders capture after the warmup).
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         _api(inp, out=out)
     torch.cuda.current_stream().wait_stream(stream)
@@ -302,3 +306,25 @@ def test_invalid_table_entries_never_reach_a_gather():
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
     _assert_close(out, gold)
+
+
+def test_module_build_failure_is_cached(monkeypatch):
+    """A failed build_and_load must be attempted once: later calls re-raise
+    the remembered error instead of re-running the JIT build, so repeated
+    backend="auto" fallbacks stay cheap."""
+    calls = {"n": 0}
+
+    class _FailingSpec:
+        def build_and_load(self):
+            calls["n"] += 1
+            raise RuntimeError("synthetic build failure")
+
+    monkeypatch.setattr(spec_mod, "_MODULE", None)
+    monkeypatch.setattr(spec_mod, "_MODULE_ERROR", None)
+    monkeypatch.setattr(
+        spec_mod, "gen_sparse_mla_decode_dsv4_module", lambda: _FailingSpec()
+    )
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="synthetic build failure"):
+            spec_mod.get_sparse_mla_decode_dsv4_module()
+    assert calls["n"] == 1

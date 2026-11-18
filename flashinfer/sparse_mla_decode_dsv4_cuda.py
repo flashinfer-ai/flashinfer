@@ -71,11 +71,27 @@ def _allowlist():
     }
 
 
-@functools.cache
+_MODULE = None
+_MODULE_ERROR = None
+
+
 def get_sparse_mla_decode_dsv4_module():
-    mod = gen_sparse_mla_decode_dsv4_module().build_and_load()
+    """Build-and-load exactly once. functools.cache would not remember a
+    *failed* build, so every later backend="auto" call would repeat the JIT
+    compile attempt (seconds per decode step); remember the first failure
+    and re-raise it so the fallback to stock dispatch stays cheap."""
+    global _MODULE, _MODULE_ERROR
+    if _MODULE is not None:
+        return _MODULE
+    if _MODULE_ERROR is not None:
+        raise _MODULE_ERROR
+    try:
+        _MODULE = gen_sparse_mla_decode_dsv4_module().build_and_load()
+    except Exception as exc:
+        _MODULE_ERROR = exc
+        raise
     _BUILT["ready"] = True
-    return mod
+    return _MODULE
 
 
 def supported_with_reasons(

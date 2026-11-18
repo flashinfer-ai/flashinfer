@@ -13,6 +13,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <mutex>
 
 namespace ffi = tvm::ffi;
 namespace cg = cooperative_groups;
@@ -3254,6 +3255,10 @@ struct DevCfg {
 };
 constexpr int kMaxDevices = 64;
 static DevCfg g_devcfg[kMaxDevices];
+// TVM FFI releases the GIL, so two host threads can race the per-device
+// init block; call_once makes a cold concurrent call wait for a complete,
+// published configuration instead of reading one mid-rewrite.
+static std::once_flag g_devcfg_once[kMaxDevices];
 
 #define SET_ATTR(N)                                                                  \
   cudaFuncSetAttribute(mla_main<32, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
@@ -3299,7 +3304,7 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
 #endif
   ffi::CUDADeviceGuard device_guard(dev.device_id);
   DevCfg& dc = g_devcfg[dev.device_id & (kMaxDevices - 1)];
-  if (!dc.init) {
+  std::call_once(g_devcfg_once[dev.device_id & (kMaxDevices - 1)], [&] {
     SET_ATTR(1)
     SET_ATTR(2)
     SET_ATTR(3)
@@ -3412,7 +3417,7 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
     PROBE(10)
 #undef PROBE
     dc.init = true;
-  }
+  });
   const int64_t T64 = q.shape()[0];
   // CUDA grid Y is limited to 65535.  Large in-scope packed-token counts use
   // the unchanged single-rank generic kernel in same-stream pointer chunks.
