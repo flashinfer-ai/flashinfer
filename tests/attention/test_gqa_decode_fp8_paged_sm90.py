@@ -194,10 +194,8 @@ def test_auto_routes_only_on_the_allowlist():
 
 
 def test_backend_order_never_swaps_an_explicit_stock_backend():
-    assert _gqa_dec_fp8q_sm90_backend_order("specialized", False) == (
-        "specialized",
-        "composable",
-    )
+    # explicit "specialized" never falls back: it runs the kernel or raises
+    assert _gqa_dec_fp8q_sm90_backend_order("specialized", False) == ("specialized",)
     assert _gqa_dec_fp8q_sm90_backend_order("auto", True) == (
         "specialized",
         "composable",
@@ -362,11 +360,19 @@ def test_specialized_matches_reference_and_stock(kv_lens, monkeypatch):
     out2 = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     assert torch.equal(out, out2)
 
-    # kill-switch: the same call is served by dequant + stock fa2
+    # kill-switch: the explicit plan raises (never falls back); an auto-armed
+    # plan serves the same call by dequant + stock fa2
     monkeypatch.setenv(DISABLE_ENV, "1")
-    out_stock = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_dec_fp8q_sm90_stats()
-    assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
+    assert stats["runs_disabled"] == 1, stats
+    monkeypatch.delenv(DISABLE_ENV)
+    wrapper_auto = _plan_wrapper(batch, device, backend="auto")
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    out_stock = wrapper_auto.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["runs_dequant_fallback"] == 1, stats
     assert _matched_ratio(out_stock, ref) >= MATCHED
     assert _matched_ratio(out, out_stock) >= MATCHED
 
@@ -377,9 +383,13 @@ def test_non_uniform_q_len_takes_the_stock_path():
     batch = _make_batch([584, 727, 75], device)
     # break uniformity: 5 + 7 + 6 rows instead of 6 + 6 + 6
     batch["qo_indptr"] = torch.tensor([0, 5, 12, 18], dtype=torch.int32, device=device)
-    wrapper = _plan_wrapper(batch, device)
+    # explicit "specialized" refuses the ineligible plan loudly
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        _plan_wrapper(batch, device)
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 0 and stats["plans_ineligible"] == 1, stats
+    # auto keeps the stock resolution and serves the call by the dequant path
+    wrapper = _plan_wrapper(batch, device, backend="auto")
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0
@@ -391,13 +401,19 @@ def test_legacy_kill_switch_alias_still_disables(monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([584, 727, 75], device)
-    wrapper = _plan_wrapper(batch, device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
     monkeypatch.setenv(DISABLE_ENV_LEGACY, "1")
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
     assert stats["runs_dispatched"] == 0
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
+    # explicit "specialized" raises under the alias too
+    monkeypatch.delenv(DISABLE_ENV_LEGACY)
+    wrapper_exp = _plan_wrapper(batch, device)
+    monkeypatch.setenv(DISABLE_ENV_LEGACY, "1")
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        wrapper_exp.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
 
 
 def test_explicit_specialized_raises_for_contracts_it_has_no_kernel_for():
@@ -453,18 +469,24 @@ def test_auto_routes_to_specialized_on_the_allowlist_only():
     assert any(r.startswith("auto:") for r in stats["fallback_reasons"]), stats
 
 
-def test_run_guard_falls_back_on_mismatched_arguments():
+def test_run_guard_declines_on_mismatched_arguments():
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([584, 727, 75], device)
+    # return_lse is outside the contract: explicit "specialized" raises
     wrapper = _plan_wrapper(batch, device)
-    # return_lse is outside the contract: dequant fallback serves it
-    out, lse = wrapper.run(
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), return_lse=True)
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0 and stats["runs_ineligible"] == 1
+    # an auto-armed plan is served by the dequant fallback
+    wrapper_auto = _plan_wrapper(batch, device, backend="auto")
+    out, lse = wrapper_auto.run(
         batch["q"], (batch["k_cache"], batch["v_cache"]), return_lse=True
     )
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0
-    assert stats["runs_ineligible"] == 1 and stats["runs_dequant_fallback"] == 1
+    assert stats["runs_ineligible"] == 2 and stats["runs_dequant_fallback"] == 1
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
 
 
@@ -537,15 +559,18 @@ def test_per_sequence_v_descale_is_applied_in_fp32():
 
 
 def test_kill_switch_still_serves_per_sequence_q_scale(monkeypatch):
-    """The composable path must serve a per-sequence q_scale tensor even when
-    the specialized kernel never prepared (kill switch set at plan time)."""
+    """On an auto-armed plan the composable path must serve a per-sequence
+    q_scale tensor even when the specialized kernel never prepared (kill
+    switch set at plan time); an explicit plan raises at plan time."""
     _sm90_or_skip()
     device = torch.device("cuda:0")
     monkeypatch.setenv(DISABLE_ENV, "1")
     batch = _make_batch([584, 75], device)
-    wrapper = _plan_wrapper(batch, device)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        _plan_wrapper(batch, device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
     stats = _gqa_dec_fp8q_sm90_stats()
-    assert stats["plans_disabled"] == 1 and stats["plans_prepared"] == 0, stats
+    assert stats["plans_disabled"] == 2 and stats["plans_prepared"] == 0, stats
     qd = torch.tensor([1.5, 0.25], dtype=torch.float32, device=device)
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=qd)
     stats = _gqa_dec_fp8q_sm90_stats()
@@ -556,14 +581,18 @@ def test_kill_switch_still_serves_per_sequence_q_scale(monkeypatch):
 
 def test_positional_scale_args_are_rejected_on_the_fallback():
     """Positional fp8 scale *args would be silently dropped by the bf16
-    dequant fallback; they must be rejected loudly instead."""
+    dequant fallback; they must be rejected loudly instead (on an auto-armed
+    plan — the explicit form raises on the decline itself)."""
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([584, 75], device)
-    wrapper = _plan_wrapper(batch, device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
     s = torch.ones(1, dtype=torch.float32, device=device)
     with pytest.raises(NotImplementedError, match="positional"):
         wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), s, s, s)
+    wrapper_exp = _plan_wrapper(batch, device)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        wrapper_exp.run(batch["q"], (batch["k_cache"], batch["v_cache"]), s, s, s)
 
 
 def test_workspace_size_sizes_the_composable_fa2_plan():
