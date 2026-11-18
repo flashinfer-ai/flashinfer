@@ -197,7 +197,11 @@ _SM120_RUN_KEYS = (
     "lse_scale",
 )
 
-# Front-cached SM120 runners keyed on (device, frozen constructor knobs).
+# Front-cached SM120 runners keyed on (device, stream, frozen constructor
+# knobs). The wrapper owns writable split-K scratch and LSE storage, so a
+# runner is never shared between CUDA streams that could execute
+# concurrently: each stream gets its own runner, while same-stream calls
+# (which the stream orders) keep full reuse.
 _sm120_runners: Dict[Tuple[Any, ...], Any] = {}
 
 
@@ -282,7 +286,8 @@ def _run_sm120_wrapper(
     device = query.device
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    key = (device,) + tuple(sorted(ctor.items()))
+    stream = torch.cuda.current_stream(device)
+    key = (device, stream.cuda_stream) + tuple(sorted(ctor.items()))
     runner = _sm120_runners.get(key)
     if runner is None:
         from ._sparse_mla_sm120 import SparseMLASm120Wrapper

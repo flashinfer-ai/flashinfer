@@ -205,6 +205,13 @@ def _composable_reference(
             idx = indices[b, j].to(torch.int64)
             valid = idx >= 0
             rows = flat[idx.clamp_min(0)]
+            # Zero the gathered bytes of invalid slots before dequantising:
+            # row 0 may hold unused cache storage whose bytes decode to NaN
+            # (fp8 NaN encodings or NaN fp32 scales), and the logits mask
+            # alone does not stop `pr @ ckv` from evaluating 0 * NaN. Zero
+            # bytes decode to exact zeros (torch.where keeps this capture
+            # safe).
+            rows = torch.where(valid.unsqueeze(-1), rows, torch.zeros_like(rows))
             nope = (
                 rows[:, :CKV]
                 .contiguous()
@@ -338,16 +345,35 @@ def _device_supported(device: torch.device) -> bool:
 def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
     """Whether ``device`` qualifies for :func:`sparse_mla_decode_sm90`.
 
-    True only on compute capability 9.0 devices with at least 93568 bytes of
-    opt-in dynamic shared memory per block, and only while the
-    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` kill switch (and its deprecated
-    alias ``FLASHINFER_DISABLE_SPARSE_MLA_SM90``) is unset. Calling this
-    builds the JIT module, so call it (or the op) eagerly before any CUDA
-    Graph capture.
+    Parameters
+    ----------
+    device : torch.device
+        The CUDA device to probe (a ``torch.device`` or anything
+        ``torch.device`` accepts, e.g. ``"cuda"`` or ``"cuda:1"``). An
+        unindexed ``"cuda"`` device is resolved to the current CUDA device.
+
+    Returns
+    -------
+    bool
+        True only on compute capability 9.0 devices with at least 93568
+        bytes of opt-in dynamic shared memory per block, and only while the
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` kill switch (and its
+        deprecated alias ``FLASHINFER_DISABLE_SPARSE_MLA_SM90``) is unset.
+
+    Notes
+    -----
+    Calling this builds the JIT module, so call it (or the op) eagerly
+    before any CUDA Graph capture.
     """
     if _disabled():
         return False
-    return _device_supported(torch.device(device))
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        # An unindexed CUDA device is a valid spelling of the current
+        # device; the native probe needs a concrete ordinal (and the
+        # functools cache must key on the resolved device).
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _device_supported(device)
 
 
 def _validate(
