@@ -2286,7 +2286,7 @@ class SmemSageKScalesResource(MemoryResource):
     @cute.jit
     def open_stage(self, stage_info: StageInfo) -> Int32:
         """Publish the waited stage's shared-memory offset for the passes that read it."""
-        return Int32(self._alloc.offset) + Int32(self.consumer_work_stage) * Int32(
+        return Int32(self._alloc.offset) + Int32(consumer_work_stage(self)) * Int32(
             self.cfg.sage_k_tile_bytes
         )
 

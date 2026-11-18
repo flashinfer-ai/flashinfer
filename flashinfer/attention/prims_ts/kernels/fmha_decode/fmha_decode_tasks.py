@@ -885,11 +885,40 @@ class DecodeGenTask(TaskCacheStageInfoMixin, Task):
                 resource.q_token_offset = q_token_offset
             resource.seq_len_q = seq_len_q
 
-    # Tree-walking hooks, called by ``TaskCacheStageInfoMixin``. The
-    # pre-tree-walking overrides below (``_run_packed_skip_iteration``,
+    @cute.jit
+    def _q_group_has_tokens(self, work_tile: Any) -> Any:
+        """Return whether a packed-Q tile's Q group starts inside its sequence."""
+        assert self.cfg is not None
+        work_queue = (
+            self._find_work_tile_loop().work_queue
+            if TS_TREE_WALKING_TASK
+            else self.work_queue
+        )
+        assert isinstance(work_queue, PackedDecodeWorkQueue)
+        q_group_cta_idx, _, b_idx = work_tile.tile_idx
+        _, seq_len_q = _q_seq_bounds(
+            self.cfg,
+            work_queue.cu_seqlens_q,
+            cutlass.Int32(b_idx),
+        )
+        q_group_idx = cutlass.Int32(q_group_cta_idx)
+        return _q_group_token_base(self.cfg, q_group_idx) < seq_len_q
+
+    # Tree-walking hooks, called by ``TaskCacheStageInfoMixin`` and the tree
+    # walker. The pre-tree-walking overrides below (``_run_packed_skip_iteration``,
     # ``_run_task_body_impl`` and ``_run_task_body_persistent``) are never called
     # by the tree walker; it skips tiles through the schedule's ``skip_if`` /
     # ``skippable()`` nodes, so these hooks restore their per-tile side effects.
+    def _initial_body_work_tile(self) -> Any:
+        """Map a compact split-KV launch's block coordinate to its task tile."""
+        work_tile = super()._initial_body_work_tile()
+        if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
+            work_tile = WorkTileInfo(
+                split_kv_grid_coord(self.cfg, work_tile.tile_idx),
+                work_tile.is_valid_tile,
+            )
+        return work_tile
+
     @cute.jit
     def _begin_work_tile(self, work_tile: Any) -> None:
         """Point the packed-Q resources at this persistent tile's batch."""
@@ -907,7 +936,9 @@ class DecodeGenTask(TaskCacheStageInfoMixin, Task):
         Attention sinks extend correction's tail beyond the ordinary task
         graph, so every active tile ends with a barrier over the 16 task warps.
         KV256's shared-KV alias instead uses a narrow Load/Correction credit in
-        the captured schedule.
+        the captured schedule. Tasks without ``skip_if`` also visit inactive
+        packed-Q tiles, so they test the Q group themselves to match the
+        arrivals of the tasks that skip those tiles.
         """
         if cutlass.const_expr(
             self.cfg is not None
@@ -915,7 +946,11 @@ class DecodeGenTask(TaskCacheStageInfoMixin, Task):
             and self.cfg.use_attention_sinks
         ):
             if cutlass.const_expr(skip is None):
-                prims.barrier_cta_sync(12, thread_count=16 * 32)
+                if cutlass.const_expr(self.cfg.use_variable_seqlens_q):
+                    if self._q_group_has_tokens(work_tile):
+                        prims.barrier_cta_sync(12, thread_count=16 * 32)
+                else:
+                    prims.barrier_cta_sync(12, thread_count=16 * 32)
             else:
                 if not skip:
                     prims.barrier_cta_sync(12, thread_count=16 * 32)

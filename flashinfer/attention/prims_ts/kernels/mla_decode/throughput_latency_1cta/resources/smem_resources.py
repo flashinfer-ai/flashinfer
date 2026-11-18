@@ -1067,7 +1067,7 @@ class SmemPageOffsetsResource(MlaResource):
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
                 self.cfg.load_warp_idx
             )
-            row_base = self.consumer_work_stage * Int32(
+            row_base = consumer_work_stage(self) * Int32(
                 self.cfg.page_offsets_entries_per_stage
             ) + warp * Int32(4 * quads)
             for quad in cutlass.range_constexpr(quads):
