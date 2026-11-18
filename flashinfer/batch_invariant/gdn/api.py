@@ -33,7 +33,9 @@ hold the states at the last chunk boundaries.
 
 Without ``initial_state`` the call is stateless: every sequence is whole and runs from the zero state in one pinned
 launch, the rows are the ones the pool calls return for it, and no state is read, written, kept or returned (the form a
-trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it.
+trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it. With
+``train_states`` the same launch also stores every sequence's 64-token boundary states in that caller-owned buffer
+(:mod:`.train`), the one term a backward cannot recompute from a chunk's own inputs.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -180,7 +182,9 @@ def _check_output(output: Optional[torch.Tensor], v: torch.Tensor) -> None:
         raise unsupported(CLASS, "an output that requires grad", "a plain buffer")
 
 
-def _stateless(rows, scale, output, cu_seqlens, cu_seqlens_cpu, pool_args):
+def _stateless(
+    rows, scale, output, cu_seqlens, cu_seqlens_cpu, pool_args, train_states=None
+):
     """The call without a pool: whole sequences from the zero state, rows only, nothing kept."""
     v = rows[2]
     for name, value in pool_args.items():
@@ -212,7 +216,13 @@ def _stateless(rows, scale, output, cu_seqlens, cu_seqlens_cpu, pool_args):
         )
     scale_f = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(HEAD_DIM)
     out = output if output is not None else torch.empty_like(v)
-    return zero_state_prefill(tuple(x.detach() for x in rows), cu, offs, scale_f, out)
+    plain = tuple(x.detach() for x in rows)
+    if train_states is None:
+        return zero_state_prefill(plain, cu, offs, scale_f, out)
+    from .train import check_train_states, zero_state_prefill_with_states
+
+    check_train_states(train_states, int(v.shape[1]), v.device, offs)
+    return zero_state_prefill_with_states(plain, cu, offs, train_states, scale_f, out)
 
 
 def chunk_gated_delta_rule_batch_invariant(
@@ -232,6 +242,7 @@ def chunk_gated_delta_rule_batch_invariant(
     output_state: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
     prefix_lens: Optional[torch.Tensor],
+    train_states: Optional[torch.Tensor],
     gate_domain: str,
     backend: str,
     use_cp,
@@ -284,6 +295,13 @@ def chunk_gated_delta_rule_batch_invariant(
                 prefix_lens=prefix_lens,
                 output_final_state=output_final_state,
             ),
+            train_states,
+        )
+    if train_states is not None:
+        raise unsupported(
+            CLASS,
+            "train_states with initial_state",
+            "the stateless call (no initial_state), whose boundary states it stores, or a pool call",
         )
     _check_pool(initial_state, HV, dev)
     pool = initial_state

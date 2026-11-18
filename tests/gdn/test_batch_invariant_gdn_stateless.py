@@ -14,6 +14,7 @@ import torch
 import flashinfer
 from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 from flashinfer.batch_invariant.gdn import pool as gdn_pool
+from flashinfer.batch_invariant.gdn import training_state_rows, training_state_slots
 from flashinfer.batch_invariant.gdn import spec
 from flashinfer.utils import get_compute_capability
 
@@ -268,3 +269,150 @@ def test_unsupported_arguments_raise():
         with pytest.raises(BatchInvariantUnsupportedError):
             flashinfer.chunk_gated_delta_rule(*x, **_KW, **kwargs)
     assert torch.count_nonzero(pool) == 0
+
+
+def _with_states(x, lens, extra=0, **kwargs):
+    HV = x[2].shape[1]
+    states = torch.full(
+        (training_state_slots(lens) + extra, HV, D, D), 7.0, device="cuda"
+    )
+    return _stateless(x, lens, train_states=states, **kwargs), states
+
+
+def test_training_state_layout():
+    assert [training_state_slots([n]) for n in (1, 64, 65, 128, 129)] == [1, 1, 1, 1, 2]
+    assert training_state_slots([64, 65, 200, 1]) == 4
+    assert training_state_rows([64, 65, 200, 1]) == [[], [0], [1, 2, 3], []]
+
+
+@needs_device
+@pytest.mark.parametrize("heads", HEADS)
+@pytest.mark.parametrize("steep", [False, True])
+@pytest.mark.parametrize("lens", [[65], [128], [200], [7, 64, 130, 1, 129, 320]])
+def test_train_states_are_the_pool_states_at_the_boundaries(heads, steep, lens):
+    HQ, HV = heads
+    offs = _offsets(lens)
+    x = _inputs(offs[-1], HQ, HV, 21, steep)
+    out, states = _with_states(x, lens, extra=1)
+    assert torch.equal(out, _stateless(x, lens))
+    rows = training_state_rows(lens)
+    assert sum(len(r) for r in rows) == training_state_slots(lens)
+    assert bool((states[-1] == 7.0).all())
+    for i, seq_rows in enumerate(rows):
+        for j, row in enumerate(seq_rows):
+            n = CHUNK * (j + 1)
+            pool = torch.zeros(1, HV, D, D, device="cuda")
+            _infer(_cut(x, offs[i], offs[i] + n), [0], [n], pool=pool)
+            assert torch.equal(states[row], pool[0])
+
+
+@needs_device
+def test_train_states_do_not_depend_on_the_batch():
+    lens = [150, 64, 9, 257, 65, 128]
+    offs = _offsets(lens)
+    x = _inputs(offs[-1], 4, 8, 5)
+    _, states = _with_states(x, lens)
+    rows = training_state_rows(lens)
+    for order in ([5, 4, 3, 2, 1, 0], [3], [2, 0]):
+        sub = [lens[i] for i in order]
+        _, st = _with_states(_gather(x, offs, order), sub)
+        for sub_rows, i in zip(training_state_rows(sub), order, strict=True):
+            assert torch.equal(st[sub_rows], states[rows[i]])
+
+
+@needs_device
+def test_a_chunk_follows_from_its_boundary_state():
+    lens = [200, 130]
+    offs = _offsets(lens)
+    x = _inputs(offs[-1], 4, 8, 9)
+    out, states = _with_states(x, lens)
+    q, k, v, g, beta = (t.double() for t in x)
+
+    def normalize(t):
+        return t * torch.rsqrt((t * t).sum(-1, keepdim=True) + 1e-6)
+
+    qn, kn = (normalize(t).repeat_interleave(2, 1) for t in (q, k))
+    for i, seq_rows in enumerate(training_state_rows(lens)):
+        for j, row in enumerate(seq_rows):
+            S = states[row].double()
+            a = offs[i] + CHUNK * (j + 1)
+            for t in range(a, min(a + CHUNK, offs[i + 1])):
+                S = g[t].exp()[:, None, None] * S
+                err = v[t] - (S @ kn[t][:, :, None])[..., 0]
+                S = S + (beta[t][:, None] * err)[:, :, None] * kn[t][:, None, :]
+                ref = SCALE * (S @ qn[t][:, :, None])[..., 0]
+                assert (out[t].double() - ref).abs().max().item() < 1e-2
+
+
+@needs_device
+def test_train_states_single_chunk_and_version():
+    x = _inputs(40, 4, 8, 2)
+    out, states = _with_states(x, [40])
+    assert torch.equal(out, _stateless(x, [40]))
+    assert bool((states == 7.0).all())
+    x = _inputs(130, 4, 8, 2)
+    states = torch.zeros(2, 8, D, D, device="cuda")
+    before = states._version
+    _stateless(x, [130], train_states=states)
+    assert states._version > before
+
+
+@needs_device
+@pytest.mark.parametrize("lens", [[64], [64, 64], [1, 64, 3]])
+def test_sequences_without_an_inner_boundary_store_nothing(lens):
+    x = _inputs(sum(lens), 4, 8, 4)
+    out, states = _with_states(x, lens, extra=2)
+    assert torch.equal(out, _stateless(x, lens))
+    assert bool((states == 7.0).all())
+
+
+@needs_device
+def test_train_states_with_host_offsets_and_an_output_buffer():
+    lens = [130, 64, 200]
+    offs = _offsets(lens)
+    x = _inputs(offs[-1], 4, 8, 6)
+    ref, ref_states = _with_states(x, lens)
+    out = torch.empty_like(x[2])
+    states = torch.zeros_like(ref_states)
+    got = flashinfer.chunk_gated_delta_rule(
+        *x, cu_seqlens_cpu=offs, output=out, train_states=states, **_KW
+    )
+    assert got is out and torch.equal(out, ref) and torch.equal(states, ref_states)
+
+
+@needs_device
+def test_train_states_unsupported_arguments_raise():
+    x = _inputs(130, 4, 8, 1)
+    good = torch.zeros(2, 8, D, D, device="cuda")
+    for bad in (
+        torch.zeros(1, 8, D, D, device="cuda"),
+        torch.zeros(2, 4, D, D, device="cuda"),
+        torch.zeros(2, 8, D, D, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(2, 8, D, D),
+        torch.zeros(2, 8, D, D, device="cuda", requires_grad=True),
+        torch.zeros(2, 8, D, 2 * D, device="cuda")[..., ::2],
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError):
+            _stateless(x, [130], train_states=bad)
+    with pytest.raises(BatchInvariantUnsupportedError):
+        flashinfer.chunk_gated_delta_rule(
+            *x,
+            initial_state=torch.zeros(1, 8, D, D, device="cuda"),
+            state_indices=_i32([0]),
+            train_states=good,
+            **_KW,
+        )
+    with pytest.raises(ValueError):
+        flashinfer.chunk_gated_delta_rule(
+            *x, use_qk_l2norm_in_kernel=True, gate_domain="log", train_states=good
+        )
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _stateless(x, [130], train_states=[good])
+    with torch.inference_mode():
+        made_in_inference_mode = torch.zeros(2, 8, D, D, device="cuda")
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _stateless(x, [130], train_states=made_in_inference_mode)
+    pool = torch.zeros(2, 8, D, D, device="cuda")
+    _infer(x, [0], [130], pool=pool)
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _stateless(x, [130], train_states=pool)

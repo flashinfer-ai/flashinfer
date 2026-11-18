@@ -102,4 +102,6 @@ supported arguments, CUDA graphs) is in ``flashinfer/batch_invariant/README.md``
 ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")`` names the
 class. Without ``initial_state`` the call is stateless (a trainer's forward
 pass): whole sequences from the zero state, the same rows, no state kept and no
-``grad_fn``.
+``grad_fn``; ``train_states`` makes that call store the 64-token boundary
+states, the one term a backward pass cannot recompute from a chunk's own
+inputs.
