@@ -34,11 +34,12 @@ def _is_sm120_exactly():
     return torch.cuda.get_device_capability(0) == (12, 0)
 
 
-def _has_cuda_13_toolkit():
+def _has_min_toolkit():
     try:
         from flashinfer.jit.cpp_ext import get_cuda_version
 
-        return get_cuda_version().major >= 13
+        v = get_cuda_version()
+        return (v.major, v.minor) >= (12, 9)
     except Exception:
         return False
 
@@ -49,9 +50,9 @@ pytestmark = [
         reason="the specialized fp8-blockwise GEMM backend is SM120-only",
     ),
     pytest.mark.skipif(
-        not _has_cuda_13_toolkit(),
+        not _has_min_toolkit(),
         reason="the specialized backend JIT-builds an sm_120a module "
-        "(CUDA 13 toolkit required)",
+        "(CUDA >= 12.9 toolkit required, matching the dispatch guard)",
     ),
 ]
 

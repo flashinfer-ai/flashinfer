@@ -84,8 +84,12 @@ __global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
   constexpr int NR = MT * HH;            // A row slots per thread
   constexpr int ACT = HH * 2;            // accumulators per (mtile, ntile)
   constexpr int NACC = MT * NT * ACT;
-  constexpr int RSZ = (NW_K > 1) ? (W * NACC * 32) : 1;
-  __shared__ float red[RSZ];
+  // The cross-warp reduction scratch lives in DYNAMIC shared memory: the
+  // largest tilings need more than the 48 KB that ptxas allows a sm_120a
+  // kernel to declare statically (CUDA 12.9 rejects the build outright).
+  // Every launch passes red_smem_bytes<...>() and opts in through
+  // cudaFuncAttributeMaxDynamicSharedMemorySize when that exceeds 48 KB.
+  extern __shared__ float red[];
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -238,18 +242,41 @@ __global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
 }
 
 // ---------------------------------------------------------------- dispatch
+// Dynamic-smem byte count of gemm_bw's cross-warp reduction scratch (zero for
+// the NW_K == 1 forms, which never touch it).
+template <int NW_N, int NW_K, int NT, int MR>
+constexpr int red_smem_bytes() {
+  const int MT = (MR + 15) / 16;
+  const int HH = (MR <= 8) ? 1 : 2;
+  const int NACC = MT * NT * (HH * 2);
+  return (NW_K > 1) ? NW_N * NW_K * NACC * 32 * static_cast<int>(sizeof(float)) : 0;
+}
+
+template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB>
+static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
+                             __nv_bfloat16* Y, int M, int N, int K, int KB, const dim3& grid,
+                             cudaStream_t s) {
+  constexpr int TH = NW_N * NW_K * 32;
+  constexpr int SMEM = red_smem_bytes<NW_N, NW_K, NT, MR>();
+  if constexpr (SMEM > 48 * 1024) {
+    cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  }
+  gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>
+      <<<grid, TH, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+}
+
 template <int NW_N, int NW_K, int NT, int KU, int ITERS, int MINB>
 static inline void go2(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
                        __nv_bfloat16* Y, int M, int N, int K, int KB, int MR, cudaStream_t s) {
   constexpr int CN = NW_N * NT * 8;
-  constexpr int TH = NW_N * NW_K * 32;
   const dim3 grid((N + CN - 1) / CN, (unsigned)((M + MR - 1) / MR), 1);
   if (MR == 8)
-    gemm_bw<NW_N, NW_K, NT, 8, KU, ITERS, MINB><<<grid, TH, 0, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+    launch_bw<NW_N, NW_K, NT, 8, KU, ITERS, MINB>(A, B, As, Bs, Y, M, N, K, KB, grid, s);
   else if (MR == 16)
-    gemm_bw<NW_N, NW_K, NT, 16, KU, ITERS, MINB><<<grid, TH, 0, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+    launch_bw<NW_N, NW_K, NT, 16, KU, ITERS, MINB>(A, B, As, Bs, Y, M, N, K, KB, grid, s);
   else
-    gemm_bw<NW_N, NW_K, NT, 32, KU, ITERS, MINB><<<grid, TH, 0, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+    launch_bw<NW_N, NW_K, NT, 32, KU, ITERS, MINB>(A, B, As, Bs, Y, M, N, K, KB, grid, s);
 }
 
 template <int NW_N, int NW_K, int NT, int KU, int MINB>
@@ -403,7 +430,7 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
     config.blockDim = dim3(512, 1, 1);
-    config.dynamicSmemBytes = 0;
+    config.dynamicSmemBytes = red_smem_bytes<4, 4, 1, 8>();
     config.stream = stream;
     cudaLaunchAttribute attrs[2]{};
     attrs[0].id = cudaLaunchAttributeClusterDimension;
@@ -423,7 +450,7 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
     config.blockDim = dim3(512, 1, 1);
-    config.dynamicSmemBytes = 0;
+    config.dynamicSmemBytes = red_smem_bytes<4, 4, 1, 16>();
     config.stream = stream;
     cudaLaunchAttribute attrs[2]{};
     attrs[0].id = cudaLaunchAttributeClusterDimension;

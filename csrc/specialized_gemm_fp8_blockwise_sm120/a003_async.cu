@@ -45,11 +45,20 @@ __device__ __forceinline__ void cp_async_wait3() { asm volatile("cp.async.wait_g
 
 __device__ __forceinline__ void cp_async_wait4() { asm volatile("cp.async.wait_group 4;"); }
 
+// Staging bytes of fp8_block_gemm_cta_async's shared-memory pipeline. The
+// buffer lives in DYNAMIC shared memory: the three-stage form needs 54 KB,
+// above the 48 KB static-smem limit ptxas enforces for sm_120a (CUDA 12.9
+// rejects the build outright), so the launch passes this byte count and opts
+// in through cudaFuncAttributeMaxDynamicSharedMemorySize.
+template <int CTA_N, int STAGES, int CTA_M = 32>
+__host__ __device__ constexpr int cta_async_smem_bytes() {
+  return STAGES * (CTA_M + CTA_N) * 144;
+}
+
 template <int CTA_N, int STAGES, int CTA_M = 32>
 __global__ __launch_bounds__(CTA_N* CTA_M / 4) void fp8_block_gemm_cta_async(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, const float* __restrict__ As,
     const float* __restrict__ Bs, uint16_t* __restrict__ Y) {
-  constexpr int M = 32;
   constexpr int N = 12288;
   constexpr int K = 2048;
   constexpr int ROW_BYTES = 144;
@@ -57,7 +66,9 @@ __global__ __launch_bounds__(CTA_N* CTA_M / 4) void fp8_block_gemm_cta_async(
   constexpr int A_BYTES = CTA_M * ROW_BYTES;
   constexpr int B_BYTES = CTA_N * ROW_BYTES;
   constexpr int STAGE_BYTES = A_BYTES + B_BYTES;
-  __shared__ __align__(16) uint8_t sm[STAGES][STAGE_BYTES];
+  static_assert(cta_async_smem_bytes<CTA_N, STAGES, CTA_M>() == STAGES * STAGE_BYTES);
+  extern __shared__ __align__(16) uint8_t sm_dyn[];
+  const auto sm = reinterpret_cast<uint8_t(*)[STAGE_BYTES]>(sm_dyn);
 
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -216,8 +227,12 @@ __global__ __launch_bounds__(CTA_N* CTA_M / 4) void fp8_block_gemm_cta_async(
 void LaunchAsyncM32N12288(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
                           __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream) {
   dim3 grid(N / 96, 1);
+  constexpr int SMEM = cta_async_smem_bytes<96, 3>();
+  static_assert(SMEM > 48 * 1024);  // the whole reason this buffer is dynamic
+  cudaFuncSetAttribute(fp8_block_gemm_cta_async<96, 3>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   fp8_block_gemm_cta_async<96, 3>
-      <<<grid, 768, 0, stream>>>(a, b, as, bs, reinterpret_cast<uint16_t*>(y));
+      <<<grid, 768, SMEM, stream>>>(a, b, as, bs, reinterpret_cast<uint16_t*>(y));
 }
 
 // M16xN2048xK4096 specialization.  The direct-fragment kernel's NCU trace is

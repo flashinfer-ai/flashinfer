@@ -82,8 +82,9 @@ def gen_specialized_gemm_fp8_blockwise_sm120_module() -> JitSpec:
             "--allow-expensive-optimizations=true",
             # single-token form REQUIRED: cpp_ext only treats "-gencode=..."
             # as a module arch override. The sm_120f family target caps
-            # static smem at 48KB while these kernels use 64KB (sm_120a
-            # permits it), so the module must build for sm_120a exactly.
+            # static smem at 48KB while these kernels opt into 64KB of
+            # dynamic smem (sm_120a permits it), so the module must build
+            # for sm_120a exactly.
             "-gencode=arch=compute_120a,code=sm_120a",
         ],
     )
@@ -270,9 +271,11 @@ def check_specialized_requirement(
     if backend == "specialized":
         # Explicitly selected: always accepted — the dispatch body serves it
         # with the kernel when the contract guard passes, else with the
-        # composable torch fallback (never another fused backend).
+        # composable torch fallback (never another fused backend). A module
+        # build/load failure on an explicit request RAISES (an explicit
+        # backend is never silently substituted).
         return True
-    return is_specialized_supported(
+    if not is_specialized_supported(
         a,
         b,
         a_scale,
@@ -281,4 +284,17 @@ def check_specialized_requirement(
         scale_granularity_mnk,
         out,
         out_dtype,
-    )
+    ):
+        return False
+    # Auto admission additionally requires the module to actually build and
+    # load: a missing toolkit, a jit-cache install without this module, or a
+    # compile failure must not raise out of a ``backend="auto"`` call. The
+    # failure is recorded and auto resolves to the stock backend instead.
+    try:
+        get_specialized_gemm_fp8_blockwise_sm120_module()
+    except Exception as e:  # noqa: BLE001 - any build/load failure falls back
+        fallback_reasons.append(
+            ("specialized", f"module_unavailable:{type(e).__name__}")
+        )
+        return False
+    return True
