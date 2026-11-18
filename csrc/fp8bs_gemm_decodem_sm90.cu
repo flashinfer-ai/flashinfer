@@ -7,6 +7,7 @@
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
+#include <cstring>
 
 #include "fp8bs_gemm_decodem_sm90.h"
 
@@ -158,16 +159,15 @@ __global__ __launch_bounds__(64, 2) void fp8_blockscale_kernel(
   }
 }
 
-// Split-K partials traverse DSM, so pack adjacent output rows to bf16x2.
-// The final output is bf16 and the campaign tolerance already includes FP8
-// quantization noise; this halves both DSM bytes and peer load transactions.
-__device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
-  __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-  return *reinterpret_cast<uint32_t*>(&v);
-}
-
-__device__ __forceinline__ float2 unpack_bf16x2(uint32_t u) {
-  return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&u));
+// Split-K partials traverse DSM as FP32 pairs of adjacent output rows.
+// Partials MUST keep full FP32 precision through the reduction: BF16-packed
+// partials of opposite sign can cancel to a rounded residual that differs
+// from the exact sum by the partial's full BF16 rounding error.
+__device__ __forceinline__ uint64_t pack_f32x2(float a, float b) {
+  const float2 v = make_float2(a, b);
+  uint64_t u;
+  memcpy(&u, &v, sizeof(u));  // alias-safe 8-byte representation transfer
+  return u;
 }
 
 __device__ __forceinline__ uint64_t wgmma_b_desc(const uint8_t* ptr) {
@@ -555,6 +555,12 @@ __device__ __forceinline__ void dsm_st_f32(uint32_t addr, float value) {
   asm volatile("st.shared::cluster.f32 [%0], %1;" ::"r"(addr), "f"(value) : "memory");
 }
 
+// One 8-byte transaction per FP32 partial pair (same transaction count as the
+// former bf16x2 packing, twice the bytes, full precision).
+__device__ __forceinline__ void dsm_st_f32x2(uint32_t addr, float a, float b) {
+  asm volatile("st.shared::cluster.u64 [%0], %1;" ::"r"(addr), "l"(pack_f32x2(a, b)) : "memory");
+}
+
 __device__ __forceinline__ void wgmma_cluster_arrive_relaxed() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 }
@@ -610,6 +616,14 @@ __device__ __forceinline__ void dsm_st_async_u32(uint32_t addr, uint32_t value, 
       : "memory");
 }
 
+__device__ __forceinline__ void dsm_st_async_f32x2(uint32_t addr, float a, float b, uint32_t mbar) {
+  asm volatile(
+      "st.async.shared::cluster.mbarrier::complete_tx::bytes.u64 "
+      "[%0], %1, [%2];" ::"r"(addr),
+      "l"(pack_f32x2(a, b)), "r"(mbar)
+      : "memory");
+}
+
 // Flat owner-push split-K reduction.  Each source rank distributes its
 // accumulator elements across owner CTA mailboxes.  After one cluster-wide
 // rendezvous, every owner reduces only local shared memory and writes its
@@ -619,7 +633,8 @@ struct SplitkMailbox {
   static constexpr int NP = Pack ? MT / 4 : MT / 2;
   static constexpr int TOT = NP * 128;
   static constexpr int CH = (TOT + SPLIT - 1) / SPLIT;
-  static constexpr int WORDS = SPLIT * CH;
+  // Pack elements are FP32 row pairs (float2, two 32-bit words each).
+  static constexpr int WORDS = SPLIT * CH * (Pack ? 2 : 1);
 };
 
 template <int MT, int SPLIT, bool Pack, bool TwoChain = false>
@@ -629,13 +644,14 @@ __device__ __forceinline__ void splitk_flat_push_reduce(
     int N) {
   using B = SplitkMailbox<MT, SPLIT, Pack>;
   float* const fbox = reinterpret_cast<float*>(box);
+  float2* const box2 = reinterpret_cast<float2*>(box);
 #pragma unroll
   for (int p = 0; p < B::NP; ++p) {
     const int e = p * 128 + tid;
     const int owner = e / B::CH;
     const int slot = split * B::CH + (e - owner * B::CH);
     if constexpr (Pack) {
-      dsm_st_u32(dsm_addr(box + slot, owner), pack_bf16x2(accum[2 * p], accum[2 * p + 1]));
+      dsm_st_f32x2(dsm_addr(box2 + slot, owner), accum[2 * p], accum[2 * p + 1]);
     } else {
       dsm_st_f32(dsm_addr(fbox + slot, owner), accum[p]);
     }
@@ -660,15 +676,15 @@ __device__ __forceinline__ void splitk_flat_push_reduce(
         float s1_odd = 0.0f;
 #pragma unroll
         for (int r = 0; r + 1 < SPLIT; r += 2) {
-          const float2 ve = unpack_bf16x2(box[r * B::CH + j]);
-          const float2 vo = unpack_bf16x2(box[(r + 1) * B::CH + j]);
+          const float2 ve = box2[r * B::CH + j];
+          const float2 vo = box2[(r + 1) * B::CH + j];
           s0_even += ve.x;
           s1_even += ve.y;
           s0_odd += vo.x;
           s1_odd += vo.y;
         }
         if constexpr ((SPLIT & 1) != 0) {
-          const float2 v = unpack_bf16x2(box[(SPLIT - 1) * B::CH + j]);
+          const float2 v = box2[(SPLIT - 1) * B::CH + j];
           s0_even += v.x;
           s1_even += v.y;
         }
@@ -679,7 +695,7 @@ __device__ __forceinline__ void splitk_flat_push_reduce(
         s1 = 0.0f;
 #pragma unroll
         for (int r = 0; r < SPLIT; ++r) {
-          const float2 v = unpack_bf16x2(box[r * B::CH + j]);
+          const float2 v = box2[r * B::CH + j];
           s0 += v.x;
           s1 += v.y;
         }
@@ -714,16 +730,17 @@ __device__ __forceinline__ void splitk_flat_push_reduce_m12_s16(
   const int lane = tid & 31;
   const int lgrp = lane >> 2;
   const int lsub = lane & 3;
+  float2* const box2 = reinterpret_cast<float2*>(box);
 #pragma unroll
   for (int p = 0; p < 2; ++p) {
     const int slot = split * 32 + lane;
     const int owner = 4 * p + warp;
-    const uint32_t value = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
     if constexpr (Async)
-      dsm_st_async_u32(dsm_addr(box + slot, owner), value, dsm_addr(rbar, owner));
+      dsm_st_async_f32x2(dsm_addr(box2 + slot, owner), accum[2 * p], accum[2 * p + 1],
+                         dsm_addr(rbar, owner));
     else {
-      uint32_t* const remote = cluster.map_shared_rank(box, owner);
-      remote[slot] = value;
+      float2* const remote = cluster.map_shared_rank(box2, owner);
+      remote[slot] = make_float2(accum[2 * p], accum[2 * p + 1]);
     }
   }
   if (lsub < 2) {
@@ -732,12 +749,12 @@ __device__ __forceinline__ void splitk_flat_push_reduce_m12_s16(
     for (int p = 2; p < 4; ++p) {
       const int slot = split * 32 + 16 * (p - 2) + c;
       const int owner = 8 + warp;
-      const uint32_t value = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
       if constexpr (Async)
-        dsm_st_async_u32(dsm_addr(box + slot, owner), value, dsm_addr(rbar, owner));
+        dsm_st_async_f32x2(dsm_addr(box2 + slot, owner), accum[2 * p], accum[2 * p + 1],
+                           dsm_addr(rbar, owner));
       else {
-        uint32_t* const remote = cluster.map_shared_rank(box, owner);
-        remote[slot] = value;
+        float2* const remote = cluster.map_shared_rank(box2, owner);
+        remote[slot] = make_float2(accum[2 * p], accum[2 * p + 1]);
       }
     }
   }
@@ -750,16 +767,16 @@ __device__ __forceinline__ void splitk_flat_push_reduce_m12_s16(
     if (split < 12) wgmma_cluster_wait_acquire();
   }
   if (split < 12 && tid < 32) {
-    float2 sum0 = unpack_bf16x2(box[tid]);
-    float2 sum1 = unpack_bf16x2(box[32 + tid]);
-    float2 sum2 = unpack_bf16x2(box[64 + tid]);
-    float2 sum3 = unpack_bf16x2(box[96 + tid]);
+    float2 sum0 = box2[tid];
+    float2 sum1 = box2[32 + tid];
+    float2 sum2 = box2[64 + tid];
+    float2 sum3 = box2[96 + tid];
 #pragma unroll
     for (int r = 4; r < 16; r += 4) {
-      const float2 v0 = unpack_bf16x2(box[r * 32 + tid]);
-      const float2 v1 = unpack_bf16x2(box[(r + 1) * 32 + tid]);
-      const float2 v2 = unpack_bf16x2(box[(r + 2) * 32 + tid]);
-      const float2 v3 = unpack_bf16x2(box[(r + 3) * 32 + tid]);
+      const float2 v0 = box2[r * 32 + tid];
+      const float2 v1 = box2[(r + 1) * 32 + tid];
+      const float2 v2 = box2[(r + 2) * 32 + tid];
+      const float2 v3 = box2[(r + 3) * 32 + tid];
       sum0.x += v0.x;
       sum0.y += v0.y;
       sum1.x += v1.x;
@@ -806,17 +823,17 @@ __device__ __forceinline__ void splitk_flat_push_reduce_m4_s16(
   const int lane = tid & 31;
   const int lgrp = lane >> 2;
   const int lsub = lane & 3;
+  float2* const box2 = reinterpret_cast<float2*>(box);
   if (lsub < 2) {
     const int c = 2 * lgrp + lsub;
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
-      const uint32_t value = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
       if constexpr (Async) {
-        dsm_st_async_u32(dsm_addr(box + split * 16 + c, 4 * p + warp), value,
-                         dsm_addr(rbar, 4 * p + warp));
+        dsm_st_async_f32x2(dsm_addr(box2 + split * 16 + c, 4 * p + warp), accum[2 * p],
+                           accum[2 * p + 1], dsm_addr(rbar, 4 * p + warp));
       } else {
-        uint32_t* const remote = cluster.map_shared_rank(box, 4 * p + warp);
-        remote[split * 16 + c] = value;
+        float2* const remote = cluster.map_shared_rank(box2, 4 * p + warp);
+        remote[split * 16 + c] = make_float2(accum[2 * p], accum[2 * p + 1]);
       }
     }
   }
@@ -829,16 +846,16 @@ __device__ __forceinline__ void splitk_flat_push_reduce_m4_s16(
     if (split < 8) wgmma_cluster_wait_acquire();
   }
   if (split < 8 && tid < 16) {
-    float2 sum0 = unpack_bf16x2(box[tid]);
-    float2 sum1 = unpack_bf16x2(box[16 + tid]);
-    float2 sum2 = unpack_bf16x2(box[32 + tid]);
-    float2 sum3 = unpack_bf16x2(box[48 + tid]);
+    float2 sum0 = box2[tid];
+    float2 sum1 = box2[16 + tid];
+    float2 sum2 = box2[32 + tid];
+    float2 sum3 = box2[48 + tid];
 #pragma unroll
     for (int r = 4; r < 16; r += 4) {
-      const float2 v0 = unpack_bf16x2(box[r * 16 + tid]);
-      const float2 v1 = unpack_bf16x2(box[(r + 1) * 16 + tid]);
-      const float2 v2 = unpack_bf16x2(box[(r + 2) * 16 + tid]);
-      const float2 v3 = unpack_bf16x2(box[(r + 3) * 16 + tid]);
+      const float2 v0 = box2[r * 16 + tid];
+      const float2 v1 = box2[(r + 1) * 16 + tid];
+      const float2 v2 = box2[(r + 2) * 16 + tid];
+      const float2 v3 = box2[(r + 3) * 16 + tid];
       sum0.x += v0.x;
       sum0.y += v0.y;
       sum1.x += v1.x;
@@ -871,15 +888,16 @@ __device__ __forceinline__ void splitk_push_reduce_m2_s8(
   const int lane = tid & 31;
   const int lane_group = lane >> 2;
   const int lane_in_group = lane & 3;
+  float2* const box2 = reinterpret_cast<float2*>(box);
   if (lane_in_group == 0) {
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
       const int slot = split * 32 + warp * 8 + lane_group;
-      const uint32_t value = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
       if constexpr (Async)
-        dsm_st_async_u32(dsm_addr(box + slot, p), value, dsm_addr(rbar, p));
+        dsm_st_async_f32x2(dsm_addr(box2 + slot, p), accum[2 * p], accum[2 * p + 1],
+                           dsm_addr(rbar, p));
       else
-        dsm_st_u32(dsm_addr(box + slot, p), value);
+        dsm_st_f32x2(dsm_addr(box2 + slot, p), accum[2 * p], accum[2 * p + 1]);
     }
   }
   if constexpr (Async) {
@@ -889,16 +907,16 @@ __device__ __forceinline__ void splitk_push_reduce_m2_s8(
     if (split < 2) wgmma_cluster_wait_acquire();
   }
   if (split < 2 && tid < 32) {
-    float2 sum0 = unpack_bf16x2(box[tid]);
-    float2 sum1 = unpack_bf16x2(box[32 + tid]);
-    float2 sum2 = unpack_bf16x2(box[64 + tid]);
-    float2 sum3 = unpack_bf16x2(box[96 + tid]);
+    float2 sum0 = box2[tid];
+    float2 sum1 = box2[32 + tid];
+    float2 sum2 = box2[64 + tid];
+    float2 sum3 = box2[96 + tid];
 #pragma unroll
     for (int rank = 4; rank < 8; rank += 4) {
-      const float2 v0 = unpack_bf16x2(box[rank * 32 + tid]);
-      const float2 v1 = unpack_bf16x2(box[(rank + 1) * 32 + tid]);
-      const float2 v2 = unpack_bf16x2(box[(rank + 2) * 32 + tid]);
-      const float2 v3 = unpack_bf16x2(box[(rank + 3) * 32 + tid]);
+      const float2 v0 = box2[rank * 32 + tid];
+      const float2 v1 = box2[(rank + 1) * 32 + tid];
+      const float2 v2 = box2[(rank + 2) * 32 + tid];
+      const float2 v3 = box2[(rank + 3) * 32 + tid];
       sum0.x += v0.x;
       sum0.y += v0.y;
       sum1.x += v1.x;
@@ -933,27 +951,28 @@ __device__ __forceinline__ void splitk_push_reduce_m2_ku(
   const int lane = tid & 31;
   const int lane_group = lane >> 2;
   const int lane_in_group = lane & 3;
+  float2* const box2 = reinterpret_cast<float2*>(box);
   if (lane_in_group == 0) {
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
       const int slot = split * 32 + warp * 8 + lane_group;
-      dsm_st_async_u32(dsm_addr(box + slot, p), pack_bf16x2(accum[2 * p], accum[2 * p + 1]),
-                       dsm_addr(rbar, p));
+      dsm_st_async_f32x2(dsm_addr(box2 + slot, p), accum[2 * p], accum[2 * p + 1],
+                         dsm_addr(rbar, p));
     }
   }
   if (split < 2) {
     mbar_wait(smem_addr(rbar), 0);
     if (tid < 32) {
-      float2 sum0 = unpack_bf16x2(box[tid]);
-      float2 sum1 = unpack_bf16x2(box[32 + tid]);
-      float2 sum2 = unpack_bf16x2(box[64 + tid]);
-      float2 sum3 = unpack_bf16x2(box[96 + tid]);
+      float2 sum0 = box2[tid];
+      float2 sum1 = box2[32 + tid];
+      float2 sum2 = box2[64 + tid];
+      float2 sum3 = box2[96 + tid];
 #pragma unroll
       for (int rank = 4; rank + 3 < SPLIT; rank += 4) {
-        const float2 v0 = unpack_bf16x2(box[rank * 32 + tid]);
-        const float2 v1 = unpack_bf16x2(box[(rank + 1) * 32 + tid]);
-        const float2 v2 = unpack_bf16x2(box[(rank + 2) * 32 + tid]);
-        const float2 v3 = unpack_bf16x2(box[(rank + 3) * 32 + tid]);
+        const float2 v0 = box2[rank * 32 + tid];
+        const float2 v1 = box2[(rank + 1) * 32 + tid];
+        const float2 v2 = box2[(rank + 2) * 32 + tid];
+        const float2 v3 = box2[(rank + 3) * 32 + tid];
         sum0.x += v0.x;
         sum0.y += v0.y;
         sum1.x += v1.x;
@@ -964,12 +983,12 @@ __device__ __forceinline__ void splitk_push_reduce_m2_ku(
         sum3.y += v3.y;
       }
       if constexpr ((SPLIT & 3) >= 1) {
-        const float2 v = unpack_bf16x2(box[(SPLIT - (SPLIT & 3)) * 32 + tid]);
+        const float2 v = box2[(SPLIT - (SPLIT & 3)) * 32 + tid];
         sum0.x += v.x;
         sum0.y += v.y;
       }
       if constexpr ((SPLIT & 3) >= 2) {
-        const float2 v = unpack_bf16x2(box[(SPLIT - (SPLIT & 3) + 1) * 32 + tid]);
+        const float2 v = box2[(SPLIT - (SPLIT & 3) + 1) * 32 + tid];
         sum1.x += v.x;
         sum1.y += v.y;
       }
@@ -1114,10 +1133,12 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
   __shared__ __align__(1024) uint8_t bq[(MT / 8) * 1024];
   __shared__ __align__(16) uint8_t raw_async[AsyncM2 ? MT * 256 : 16];
   __shared__ float activation_scale[MT];
-  __shared__ uint32_t
+  __shared__ __align__(16) uint32_t
       split_partial[FlatPush ? SplitkMailbox<MT, SPLIT, (MT >= 16 || PackMT8 || FlatPack)>::WORDS
                              : (MT / 2) * 128];
-  __shared__ uint32_t push_partial[PushDSM ? (CompactM2 ? SPLIT * 32 : SPLIT * 128) : 1];
+  // FP32 partial pairs: two 32-bit words per packed element.
+  __shared__ __align__(16)
+      uint32_t push_partial[PushDSM ? (CompactM2 ? SPLIT * 64 : SPLIT * 256) : 1];
   __shared__ __align__(8) uint64_t rbar[1];
 
   const cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
@@ -1126,7 +1147,7 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       if (threadIdx.x == 0) {
         const uint32_t addr = smem_addr(&rbar[0]);
         mbar_init(addr, 1);
-        mbar_arrive_expect(addr, SPLIT * 32 * 4);
+        mbar_arrive_expect(addr, SPLIT * 32 * 8);
       }
       if (threadIdx.x < 32) __syncwarp();
     }
@@ -1137,7 +1158,7 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       if (threadIdx.x == 0) {
         const uint32_t addr = smem_addr(&rbar[0]);
         mbar_init(addr, 1);
-        mbar_arrive_expect(addr, SPLIT * 16 * 4);
+        mbar_arrive_expect(addr, SPLIT * 16 * 8);
       }
       if (threadIdx.x < 32) __syncwarp();
     }
@@ -1319,17 +1340,18 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
     } else if constexpr (MT >= 16 || PackMT8) {
       constexpr int NPAIR = MT / 4;
       static_assert(NPAIR <= SPLIT);
+      float2* const push2 = reinterpret_cast<float2*>(push_partial);
 #pragma unroll
       for (int p = 0; p < NPAIR; ++p) {
-        uint32_t* const remote = cluster.map_shared_rank(push_partial + split * 128 + tid, p);
-        *remote = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
+        float2* const remote = cluster.map_shared_rank(push2 + split * 128 + tid, p);
+        *remote = make_float2(accum[2 * p], accum[2 * p + 1]);
       }
       cluster.sync();
       if (split < NPAIR) {
-        float2 sum = unpack_bf16x2(push_partial[tid]);
+        float2 sum = push2[tid];
 #pragma unroll
         for (int rank = 1; rank < SPLIT; ++rank) {
-          const float2 v = unpack_bf16x2(push_partial[rank * 128 + tid]);
+          const float2 v = push2[rank * 128 + tid];
           sum.x += v.x;
           sum.y += v.y;
         }
@@ -1365,19 +1387,20 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       }
     }
   } else if constexpr (MT >= 16) {
+    float2* const split2 = reinterpret_cast<float2*>(split_partial);
 #pragma unroll
     for (int i = 0; i < MT / 4; ++i) {
-      split_partial[i * 128 + tid] = pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
+      split2[i * 128 + tid] = make_float2(accum[2 * i], accum[2 * i + 1]);
     }
     cluster.sync();
 
     for (int p = split; p < MT / 4; p += SPLIT) {
-      uint32_t* const q = split_partial + p * 128 + tid;
+      float2* const q = split2 + p * 128 + tid;
       float s0 = 0.0f;
       float s1 = 0.0f;
 #pragma unroll
       for (int rank = 0; rank < SPLIT; ++rank) {
-        const float2 v = unpack_bf16x2(*cluster.map_shared_rank(q, rank));
+        const float2 v = *cluster.map_shared_rank(q, rank);
         s0 += v.x;
         s1 += v.y;
       }
@@ -1391,16 +1414,17 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
     }
     cluster.sync();
   } else if constexpr (PackMT8) {
+    float2* const split2 = reinterpret_cast<float2*>(split_partial);
 #pragma unroll
     for (int i = 0; i < MT / 4; ++i) {
-      split_partial[i * 128 + tid] = pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
+      split2[i * 128 + tid] = make_float2(accum[2 * i], accum[2 * i + 1]);
     }
     cluster.sync();
 
-    uint32_t* remote_partial[SPLIT];
+    float2* remote_partial[SPLIT];
 #pragma unroll
     for (int rank = 0; rank < SPLIT; ++rank) {
-      remote_partial[rank] = cluster.map_shared_rank(split_partial, rank);
+      remote_partial[rank] = cluster.map_shared_rank(split2, rank);
     }
 
     for (int p = split; p < MT / 4; p += SPLIT) {
@@ -1409,7 +1433,7 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       float s1 = 0.0f;
 #pragma unroll
       for (int rank = 0; rank < SPLIT; ++rank) {
-        const float2 v = unpack_bf16x2(remote_partial[rank][index]);
+        const float2 v = remote_partial[rank][index];
         s0 += v.x;
         s1 += v.y;
       }
@@ -1646,10 +1670,11 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
   __shared__ __align__(1024) uint8_t wa[KU][64 * 128];
   __shared__ __align__(1024) uint8_t bq[KU][ATOMS * 1024];
   __shared__ float activation_scale[KU][MT];
-  __shared__ uint32_t
+  // FP32 partial pairs: two 32-bit words per packed element.
+  __shared__ __align__(16) uint32_t
       push_partial[FlatPush
                        ? SplitkMailbox<MT, SPLIT, (MT >= 16 || PackMT8)>::WORDS
-                       : ((PushDSM || AsyncPush) ? (CompactM2 ? SPLIT * 32 : SPLIT * 128) : 1)];
+                       : ((PushDSM || AsyncPush) ? (CompactM2 ? SPLIT * 64 : SPLIT * 256) : 1)];
   __shared__ __align__(8) uint64_t rbar[PerWarpMbar ? 4 : 1];
   uint32_t* const split_partial = reinterpret_cast<uint32_t*>(wa);
   uint64_t wa_desc0 = 0;
@@ -1666,7 +1691,7 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       if (threadIdx.x == 0) {
         const uint32_t addr = smem_addr(&rbar[0]);
         mbar_init(addr, 1);
-        mbar_arrive_expect(addr, SPLIT * 32 * 4);
+        mbar_arrive_expect(addr, SPLIT * 32 * 8);
       }
       __syncthreads();
     } else if (cluster.block_rank() < NOWNER) {
@@ -1676,14 +1701,14 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
           for (int w = 0; w < 4; ++w) {
             const uint32_t addr = smem_addr(&rbar[w]);
             mbar_init(addr, 1);
-            mbar_arrive_expect(addr, SPLIT * 32 * 4);
+            mbar_arrive_expect(addr, SPLIT * 32 * 8);
           }
         }
       } else {
         if (threadIdx.x == 0) {
           const uint32_t addr = smem_addr(&rbar[0]);
           mbar_init(addr, 1);
-          mbar_arrive_expect(addr, SPLIT * (SpreadOwners ? 32 : 128) * 4);
+          mbar_arrive_expect(addr, SPLIT * (SpreadOwners ? 32 : 128) * 8);
         }
       }
       if (threadIdx.x < 32) __syncwarp();
@@ -2075,22 +2100,22 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       splitk_push_reduce_m2_ku<SPLIT>(cluster, push_partial, accum, out, split, tid, tile_m, tile_n,
                                       N, &rbar[0]);
     } else {
+      float2* const push2 = reinterpret_cast<float2*>(push_partial);
 #pragma unroll
       for (int p = 0; p < NPAIR; ++p) {
-        const uint32_t value = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
         const int owner = SpreadOwners ? p + NPAIR * warp : p;
         if constexpr (AsyncPush) {
           if constexpr (PerWarpMbar)
-            dsm_st_async_u32(dsm_addr(push_partial + split * 128 + tid, owner), value,
-                             dsm_addr(&rbar[warp], owner));
+            dsm_st_async_f32x2(dsm_addr(push2 + split * 128 + tid, owner), accum[2 * p],
+                               accum[2 * p + 1], dsm_addr(&rbar[warp], owner));
           else
-            dsm_st_async_u32(dsm_addr(push_partial + split * 128 + tid, owner), value,
-                             dsm_addr(&rbar[0], owner));
+            dsm_st_async_f32x2(dsm_addr(push2 + split * 128 + tid, owner), accum[2 * p],
+                               accum[2 * p + 1], dsm_addr(&rbar[0], owner));
         } else if constexpr (ExplicitSTS) {
-          dsm_st_u32(dsm_addr(push_partial + split * 128 + tid, p), value);
+          dsm_st_f32x2(dsm_addr(push2 + split * 128 + tid, p), accum[2 * p], accum[2 * p + 1]);
         } else {
-          uint32_t* const remote = cluster.map_shared_rank(push_partial + split * 128 + tid, p);
-          *remote = value;
+          float2* const remote = cluster.map_shared_rank(push2 + split * 128 + tid, p);
+          *remote = make_float2(accum[2 * p], accum[2 * p + 1]);
         }
       }
       if constexpr (!AsyncPush) wgmma_cluster_arrive_release();
@@ -2106,16 +2131,16 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
           wgmma_cluster_wait_acquire();
         float2 sum;
         if constexpr (ExplicitSTS && SPLIT == 12) {
-          float2 sum0 = unpack_bf16x2(push_partial[tid]);
-          float2 sum1 = unpack_bf16x2(push_partial[128 + tid]);
-          float2 sum2 = unpack_bf16x2(push_partial[256 + tid]);
-          float2 sum3 = unpack_bf16x2(push_partial[384 + tid]);
+          float2 sum0 = push2[tid];
+          float2 sum1 = push2[128 + tid];
+          float2 sum2 = push2[256 + tid];
+          float2 sum3 = push2[384 + tid];
 #pragma unroll
           for (int rank = 4; rank < 12; rank += 4) {
-            const float2 v0 = unpack_bf16x2(push_partial[rank * 128 + tid]);
-            const float2 v1 = unpack_bf16x2(push_partial[(rank + 1) * 128 + tid]);
-            const float2 v2 = unpack_bf16x2(push_partial[(rank + 2) * 128 + tid]);
-            const float2 v3 = unpack_bf16x2(push_partial[(rank + 3) * 128 + tid]);
+            const float2 v0 = push2[rank * 128 + tid];
+            const float2 v1 = push2[(rank + 1) * 128 + tid];
+            const float2 v2 = push2[(rank + 2) * 128 + tid];
+            const float2 v3 = push2[(rank + 3) * 128 + tid];
             sum0.x += v0.x;
             sum0.y += v0.y;
             sum1.x += v1.x;
@@ -2128,12 +2153,12 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
           sum = make_float2((sum0.x + sum2.x) + (sum1.x + sum3.x),
                             (sum0.y + sum2.y) + (sum1.y + sum3.y));
         } else if constexpr (ExplicitSTS && (SPLIT % 2 == 0)) {
-          float2 sum0 = unpack_bf16x2(push_partial[tid]);
-          float2 sum1 = unpack_bf16x2(push_partial[128 + tid]);
+          float2 sum0 = push2[tid];
+          float2 sum1 = push2[128 + tid];
 #pragma unroll
           for (int rank = 2; rank < SPLIT; rank += 2) {
-            const float2 v0 = unpack_bf16x2(push_partial[rank * 128 + tid]);
-            const float2 v1 = unpack_bf16x2(push_partial[(rank + 1) * 128 + tid]);
+            const float2 v0 = push2[rank * 128 + tid];
+            const float2 v1 = push2[(rank + 1) * 128 + tid];
             sum0.x += v0.x;
             sum0.y += v0.y;
             sum1.x += v1.x;
@@ -2141,10 +2166,10 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
           }
           sum = make_float2(sum0.x + sum1.x, sum0.y + sum1.y);
         } else {
-          sum = unpack_bf16x2(push_partial[tid]);
+          sum = push2[tid];
 #pragma unroll
           for (int rank = 1; rank < SPLIT; ++rank) {
-            const float2 v = unpack_bf16x2(push_partial[rank * 128 + tid]);
+            const float2 v = push2[rank * 128 + tid];
             sum.x += v.x;
             sum.y += v.y;
           }
@@ -2163,18 +2188,19 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
   } else {
     if constexpr (!PairPipe) __syncthreads();
     if constexpr (MT >= 16 || PackMT8) {
+      float2* const split2 = reinterpret_cast<float2*>(split_partial);
 #pragma unroll
       for (int i = 0; i < NACC / 2; ++i) {
-        split_partial[i * 128 + tid] = pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
+        split2[i * 128 + tid] = make_float2(accum[2 * i], accum[2 * i + 1]);
       }
       cluster.sync();
       for (int p = split; p < NACC / 2; p += SPLIT) {
-        uint32_t* const q = split_partial + p * 128 + tid;
+        float2* const q = split2 + p * 128 + tid;
         float s0 = 0.0f;
         float s1 = 0.0f;
 #pragma unroll
         for (int rank = 0; rank < SPLIT; ++rank) {
-          const float2 v = unpack_bf16x2(*cluster.map_shared_rank(q, rank));
+          const float2 v = *cluster.map_shared_rank(q, rank);
           s0 += v.x;
           s1 += v.y;
         }
@@ -2343,9 +2369,10 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
   __shared__ __align__(1024) uint8_t wa[2][64 * 128];
   __shared__ __align__(1024) uint8_t bq[ATOMS * 1024];
   __shared__ float activation_scale[MT];
-  __shared__ uint32_t
-      split_partial[FlatPush ? SplitkMailbox<MT, SPLIT, (MT >= 16)>::WORDS : NACC * 128];
-  __shared__ uint32_t push_partial[PushDSM ? SPLIT * 128 : 1];
+  // FP32 partial pairs: two 32-bit words per packed element.
+  __shared__ __align__(16)
+      uint32_t split_partial[FlatPush ? SplitkMailbox<MT, SPLIT, (MT >= 16)>::WORDS : NACC * 128];
+  __shared__ __align__(16) uint32_t push_partial[PushDSM ? SPLIT * 256 : 1];
   __shared__ __align__(8) uint64_t rbar[1];
 
   const cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
@@ -2354,7 +2381,7 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       if (threadIdx.x == 0) {
         const uint32_t addr = smem_addr(&rbar[0]);
         mbar_init(addr, 1);
-        mbar_arrive_expect(addr, SPLIT * 32 * 4);
+        mbar_arrive_expect(addr, SPLIT * 32 * 8);
       }
       if (threadIdx.x < 32) __syncwarp();
     }
@@ -2559,17 +2586,18 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
     constexpr int NPAIR = NACC / 2;
     static_assert(NPAIR <= SPLIT);
     wgmma_cluster_wait_acquire();
+    float2* const push2 = reinterpret_cast<float2*>(push_partial);
 #pragma unroll
     for (int p = 0; p < NPAIR; ++p) {
-      uint32_t* const remote = cluster.map_shared_rank(push_partial + split * 128 + tid, p);
-      *remote = pack_bf16x2(accum[2 * p], accum[2 * p + 1]);
+      float2* const remote = cluster.map_shared_rank(push2 + split * 128 + tid, p);
+      *remote = make_float2(accum[2 * p], accum[2 * p + 1]);
     }
     cluster.sync();
     if (split < NPAIR) {
-      float2 sum = unpack_bf16x2(push_partial[tid]);
+      float2 sum = push2[tid];
 #pragma unroll
       for (int rank = 1; rank < SPLIT; ++rank) {
-        const float2 v = unpack_bf16x2(push_partial[rank * 128 + tid]);
+        const float2 v = push2[rank * 128 + tid];
         sum.x += v.x;
         sum.y += v.y;
       }
@@ -2582,18 +2610,19 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
       }
     }
   } else if constexpr (MT >= 16) {
+    float2* const split2 = reinterpret_cast<float2*>(split_partial);
 #pragma unroll
     for (int i = 0; i < NACC / 2; ++i) {
-      split_partial[i * 128 + tid] = pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
+      split2[i * 128 + tid] = make_float2(accum[2 * i], accum[2 * i + 1]);
     }
     cluster.sync();
     for (int p = split; p < NACC / 2; p += SPLIT) {
-      uint32_t* const q = split_partial + p * 128 + tid;
+      float2* const q = split2 + p * 128 + tid;
       float s0 = 0.0f;
       float s1 = 0.0f;
 #pragma unroll
       for (int rank = 0; rank < SPLIT; ++rank) {
-        const float2 v = unpack_bf16x2(*cluster.map_shared_rank(q, rank));
+        const float2 v = *cluster.map_shared_rank(q, rank);
         s0 += v.x;
         s1 += v.y;
       }

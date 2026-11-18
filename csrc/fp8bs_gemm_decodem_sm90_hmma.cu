@@ -56,19 +56,6 @@ __device__ __forceinline__ uint32_t q2(float a, float b) {
 __device__ __forceinline__ float blo(uint32_t v) { return __uint_as_float(v << 16); }
 __device__ __forceinline__ float bhi(uint32_t v) { return __uint_as_float(v & 0xffff0000u); }
 
-__device__ __forceinline__ uint32_t pack_partial_bf16x2(float a, float b) {
-  __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-  uint32_t u;
-  memcpy(&u, &v, sizeof(u));  // alias-safe 4-byte representation transfer
-  return u;
-}
-
-__device__ __forceinline__ float2 unpack_partial_bf16x2(uint32_t u) {
-  __nv_bfloat162 v;
-  memcpy(&v, &u, sizeof(v));  // alias-safe 4-byte representation transfer
-  return __bfloat1622float2(v);
-}
-
 template <int MT, int NWARP, int KSHIFT>
 __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* __restrict__ X,
                                                            const uint8_t* __restrict__ W,
@@ -84,7 +71,10 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
   extern __shared__ __align__(16) char smem_raw[];
   uint8_t* xqb = (uint8_t*)smem_raw;                   // [nbuf][MP][128] f16
   float* xsb = (float*)(smem_raw + nbuf * MP * XROW);  // [nbuf][MP]
-  uint32_t* rcv = (uint32_t*)(smem_raw + nbuf * MP * (XROW + 4));
+  // Split-K partials stay FP32 through the DSM reduction: BF16-packed
+  // partials of opposite sign can cancel to a rounded residual that differs
+  // from the exact sum by the partial's full rounding error.
+  float2* rcv = (float2*)(smem_raw + nbuf * MP * (XROW + 4));
 
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -270,19 +260,19 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
   const int peer = (wn * 16) >> wsh;
   const int ncol = wn * 16 - (peer << wsh);
   if constexpr (KSHIFT != 0) cluster_wait_acquire();
-  uint32_t* dstb;
+  float2* dstb;
   if constexpr (KSHIFT != 0)
     dstb = cluster.map_shared_rank(rcv, peer);
   else
     dstb = rcv;
-  uint32_t* slot = dstb + (size_t)(krank * WK + wk) * (MP / 2) * rsv;
+  float2* slot = dstb + (size_t)(krank * WK + wk) * (MP / 2) * rsv;
 #pragma unroll
   for (int j = 0; j < MT; ++j) {
     const int mr = tig * 2 + 8 * j;
     const int pr = mr >> 1;
     const int nn = ncol + gid;
-    slot[pr * rsv + nn] = pack_partial_bf16x2(acc[j][0], acc[j][1]);
-    slot[pr * rsv + nn + 8] = pack_partial_bf16x2(acc[j][2], acc[j][3]);
+    slot[pr * rsv + nn] = make_float2(acc[j][0], acc[j][1]);
+    slot[pr * rsv + nn + 8] = make_float2(acc[j][2], acc[j][3]);
   }
   if constexpr (KSHIFT != 0)
     cluster.sync();
@@ -294,10 +284,10 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
   for (int idx = tid; idx < tot; idx += NTHREAD) {
     const int mpair = idx >> wsh;
     const int nn = idx & (wdt - 1);
-    float2 sum = unpack_partial_bf16x2(rcv[mpair * rsv + nn]);
+    float2 sum = rcv[mpair * rsv + nn];
 #pragma unroll
     for (int c = 1; c < ksplit * WK; ++c) {
-      const float2 v = unpack_partial_bf16x2(rcv[(c * (MP / 2) + mpair) * rsv + nn]);
+      const float2 v = rcv[(c * (MP / 2) + mpair) * rsv + nn];
       sum.x += v.x;
       sum.y += v.y;
     }
@@ -325,7 +315,8 @@ static cudaError_t launch_mt(const void* x, const void* w, const void* ws, void*
   if (nbuf < ntotal) nbuf &= ~1;  // k-groups alternate between warp groups
   if (nbuf < 2) nbuf = 2;
   constexpr int wdt = BN >> KSHIFT;
-  size_t smem = (size_t)nbuf * MP * (XROW + 4) + (size_t)ksplit * WK * (MP / 2) * (wdt + 4) * 4;
+  size_t smem =
+      (size_t)nbuf * MP * (XROW + 4) + (size_t)ksplit * WK * (MP / 2) * (wdt + 4) * sizeof(float2);
 
   // Set per launch: cudaFuncSetAttribute applies to the current device only,
   // so a once-per-process flag would skip the opt-in on every later device.

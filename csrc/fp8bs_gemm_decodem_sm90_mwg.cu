@@ -25,19 +25,6 @@ __device__ __forceinline__ uint16_t fp8x2(float x0, float x1) {
   return result;
 }
 
-__device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
-  __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-  uint32_t u;
-  memcpy(&u, &v, sizeof(u));  // alias-safe 4-byte representation transfer
-  return u;
-}
-
-__device__ __forceinline__ float2 unpack_bf16x2(uint32_t u) {
-  __nv_bfloat162 v;
-  memcpy(&v, &u, sizeof(v));  // alias-safe 4-byte representation transfer
-  return __bfloat1622float2(v);
-}
-
 __device__ __forceinline__ uint64_t wgmma_desc(const uint8_t* ptr) {
   const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
   return ((static_cast<uint64_t>(addr) & 0x3ffffull) >> 4) |
@@ -274,7 +261,7 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
   constexpr bool PrefetchScaleW6 = MT == 16 && NWG == 8 && KU == 2 && ExactOneRound;
   constexpr int WBYTES = 64 * 128;      // one 64x128 fp8 weight tile
   constexpr int QBYTES = ATOMS * 1024;  // one MTx128 fp8 activation tile
-  constexpr int REDUCE_BYTES = (NACC / 2) * 128 * sizeof(uint32_t);
+  constexpr int REDUCE_BYTES = (NACC / 2) * 128 * sizeof(float2);
   static_assert(MT != 24 || REDUCE_BYTES <= KU * WBYTES,
                 "MT24 reduction exceeds per-warpgroup weight scratch");
 
@@ -601,10 +588,10 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
     // Only row zero is live: two fragment halves cover the 64 output columns.
     // Keep the required CTA rendezvous but reduce peer loads to the 64 lanes
     // that own observable results.
-    uint32_t* const red = reinterpret_cast<uint32_t*>(my_w);
+    float* const red = reinterpret_cast<float*>(my_w);
     if (lane_in_group == 0) {
-      red[t] = pack_bf16x2(accum[0], 0.0f);
-      red[128 + t] = pack_bf16x2(accum[2], 0.0f);
+      red[t] = accum[0];
+      red[128 + t] = accum[2];
     }
     if (wg < 2)
       asm volatile("bar.sync 15, 768;" ::: "memory");
@@ -615,17 +602,19 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
       float sum = 0.0f;
 #pragma unroll
       for (int r = 0; r < NWG; ++r) {
-        const uint32_t* const peer = reinterpret_cast<const uint32_t*>(wsmem + r * KU * WBYTES);
-        sum += unpack_bf16x2(peer[p * 128 + t]).x;
+        const float* const peer = reinterpret_cast<const float*>(wsmem + r * KU * WBYTES);
+        sum += peer[p * 128 + t];
       }
       const int n = tile_n + warp * 16 + lane_group + 8 * p;
       if (n < N) out[static_cast<int64_t>(tile_m) * N + n] = __float2bfloat16_rn(sum);
     }
     return;
   }
+  // Cross-warpgroup split-K partials stay FP32: BF16-packed partials of
+  // opposite sign can cancel to a rounded residual far from the exact sum.
 #pragma unroll
   for (int i = 0; i < NACC / 2; ++i)
-    reinterpret_cast<uint32_t*>(my_w)[i * 128 + t] = pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
+    reinterpret_cast<float2*>(my_w)[i * 128 + t] = make_float2(accum[2 * i], accum[2 * i + 1]);
   if constexpr (MT == 8 && NWG == 6 && KU == 2 && PipelineMMA) {
     if (wg < 2)
       asm volatile("bar.sync 15, 768;" ::: "memory");
@@ -637,18 +626,17 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
   for (int p = wg; p < NACC / 2; p += NWG) {
     float s0, s1;
     if constexpr (NWG == 6 && !SparseM1) {
-      const uint32_t* const peer0 = reinterpret_cast<const uint32_t*>(wsmem);
-      const uint32_t* const peer1 = reinterpret_cast<const uint32_t*>(wsmem + KU * WBYTES);
-      float2 sum0 = unpack_bf16x2(peer0[p * 128 + t]);
-      float2 sum1 = unpack_bf16x2(peer1[p * 128 + t]);
+      const float2* const peer0 = reinterpret_cast<const float2*>(wsmem);
+      const float2* const peer1 = reinterpret_cast<const float2*>(wsmem + KU * WBYTES);
+      float2 sum0 = peer0[p * 128 + t];
+      float2 sum1 = peer1[p * 128 + t];
 #pragma unroll
       for (int r = 2; r < NWG; r += 2) {
-        const uint32_t* const peer_even =
-            reinterpret_cast<const uint32_t*>(wsmem + r * KU * WBYTES);
-        const uint32_t* const peer_odd =
-            reinterpret_cast<const uint32_t*>(wsmem + (r + 1) * KU * WBYTES);
-        const float2 v0 = unpack_bf16x2(peer_even[p * 128 + t]);
-        const float2 v1 = unpack_bf16x2(peer_odd[p * 128 + t]);
+        const float2* const peer_even = reinterpret_cast<const float2*>(wsmem + r * KU * WBYTES);
+        const float2* const peer_odd =
+            reinterpret_cast<const float2*>(wsmem + (r + 1) * KU * WBYTES);
+        const float2 v0 = peer_even[p * 128 + t];
+        const float2 v1 = peer_odd[p * 128 + t];
         sum0.x += v0.x;
         sum0.y += v0.y;
         sum1.x += v1.x;
@@ -661,8 +649,8 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
       s1 = 0.0f;
 #pragma unroll
       for (int r = 0; r < NWG; ++r) {
-        const uint32_t* const peer_red = reinterpret_cast<const uint32_t*>(wsmem + r * KU * WBYTES);
-        const float2 v = unpack_bf16x2(peer_red[p * 128 + t]);
+        const float2* const peer_red = reinterpret_cast<const float2*>(wsmem + r * KU * WBYTES);
+        const float2 v = peer_red[p * 128 + t];
         s0 += v.x;
         s1 += v.y;
       }
@@ -685,7 +673,7 @@ static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x, const
   constexpr int ATOMS = MT / 8;
   constexpr int NACC = MT / 2;
   constexpr int COMPUTE = NWG * KU * (64 * 128 + ATOMS * 1024 + MT * 4);
-  constexpr int REDUCE = (NACC / 2) * NWG * 128 * 4;
+  constexpr int REDUCE = (NACC / 2) * NWG * 128 * 8;
   constexpr int SMEM = (COMPUTE > REDUCE ? COMPUTE : REDUCE) + 1024;
   // Set per launch: cudaFuncSetAttribute applies to the current device only,
   // so a once-per-process flag would skip the opt-in on every later device.
