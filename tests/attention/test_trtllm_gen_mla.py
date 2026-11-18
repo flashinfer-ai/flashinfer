@@ -2907,7 +2907,8 @@ def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
 
     Launches of more rows than one wave of clusters and at most 1024 rows are
     preceded by the order program; its order equals the host argsort of the rows'
-    KV tiles (padded rows count zero tiles, ties keep row order).
+    KV tiles (padded rows count zero tiles, ties keep row order), and its second
+    half holds the ordered rows' KV lengths clamped at zero.
     """
     _skip_unless_blackwell()
     from flashinfer.mla.cake_trtllm_mla_blackwell import (
@@ -2938,9 +2939,13 @@ def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
         _, row_seq_lens = row_metadata(
             seq_lens, None, batch_size=batch, q_len=q_len, total_q=total
         )
-        expected = longest_first_order(row_seq_lens.clamp_min(0))
+        clamped = row_seq_lens.clamp_min(0)
+        expected = longest_first_order(clamped)
         work_order = _WORK_ORDER_BUFFERS[(torch.cuda.current_device(), stream)]
         assert torch.equal(work_order[:total], expected)
+        assert torch.equal(
+            work_order[1024 : 1024 + total], clamped[expected.long()].to(torch.int32)
+        )
     rows = _query_rows(kv_lens, [q_len] * batch)
     reference = _blackwell_rows_reference(
         query.reshape(-1, 128, 576), kv_cache, block_tables, rows, 32

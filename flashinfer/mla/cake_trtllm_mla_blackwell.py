@@ -634,7 +634,9 @@ EXACT_CLC_GEOMETRY = {
 
 _WORKSPACE_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
 _WORKSPACE_CACHE_LOCK = threading.Lock()
-# int32[_MAX_ORDERED_ROWS] work-order buffer per (device index, stream handle).  It
+# int32[2 * _MAX_ORDERED_ROWS] work-order buffer per (device index, stream handle):
+# the ordered rows, then from entry _MAX_ORDERED_ROWS each ordered row's clamped KV
+# length, both written by the order program.  It
 # lives outside the LRU workspace cache, so a buffer a captured graph launches with
 # is never freed.  Graphs captured on one stream share its buffer: replay them on
 # one stream at a time, as for the split-KV workspaces.
@@ -1120,7 +1122,9 @@ def _work_order_buffer(device: torch.device, stream: int) -> torch.Tensor:
     with _WORKSPACE_CACHE_LOCK:
         buffer = _WORK_ORDER_BUFFERS.get(key)
         if buffer is None:
-            buffer = torch.empty(_MAX_ORDERED_ROWS, dtype=torch.int32, device=device)
+            buffer = torch.empty(
+                2 * _MAX_ORDERED_ROWS, dtype=torch.int32, device=device
+            )
             _WORK_ORDER_BUFFERS[key] = buffer
         return buffer
 
