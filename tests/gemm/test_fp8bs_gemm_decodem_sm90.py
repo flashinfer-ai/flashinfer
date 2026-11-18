@@ -225,9 +225,15 @@ def test_k_zero_stays_on_stock_contract():
     out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     ok, reason = _eligibility(x, wq, None, ws, out)
     assert not ok and reason == "k_zero"
-    for backend in ("auto", "specialized", "deepgemm"):
+    # auto routes around the refusal onto the stock path, which rejects
+    # K == 0 itself; explicit "deepgemm" goes there directly
+    for backend in ("auto", "deepgemm"):
         with pytest.raises(RuntimeError, match="input is null"):
             fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    # explicit "specialized" never falls back: it raises with the
+    # eligibility reason instead of reaching the stock route
+    with pytest.raises(NotImplementedError, match="k_zero"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
 
 
 @requires_sm90
