@@ -155,6 +155,16 @@ def _eligibility(
     # base pointers; a contiguous view with a storage offset can break that
     if input.data_ptr() % 16 != 0 or weight.data_ptr() % 16 != 0:
         return False, "alignment"
+    # the kernel reads its operands while CTAs write `out`; storage that
+    # overlaps an input is a data race (the stock route's aliasing behavior
+    # is its own contract)
+    out_lo = out.data_ptr()
+    out_hi = out_lo + out.numel() * out.element_size()
+    for t in (input, weight, weight_scale):
+        t_lo = t.data_ptr()
+        t_hi = t_lo + t.numel() * t.element_size()
+        if max(out_lo, t_lo) < min(out_hi, t_hi):
+            return False, "overlap"
     # device guards
     if not input.is_cuda:
         return False, "device"
@@ -209,6 +219,20 @@ def _fp8bs_decodem_try_dispatch(
                 "fp8_blockscale_gemm_sm90 backend='specialized' cannot serve "
                 f"this call ({reason}); an explicitly selected backend never "
                 "falls back — use backend='auto' or 'deepgemm'"
+            )
+        return None
+    if str(_stats["jit_build"]).startswith("failed"):
+        # a build failure is cached: `functools.cache` does not cache
+        # exceptions, and re-running Ninja on every eligible call (or during
+        # a later graph capture, where the retry would surface as a capture
+        # error instead of the warmed stock route) helps nobody
+        _fallback(f"{requested}: jit_build_failure")
+        if requested == "specialized":
+            raise NotImplementedError(
+                "fp8_blockscale_gemm_sm90 backend='specialized' JIT build "
+                f"previously failed ({_stats['jit_build']}); an explicitly "
+                "selected backend never falls back — use backend='auto' or "
+                "'deepgemm'"
             )
         return None
     try:

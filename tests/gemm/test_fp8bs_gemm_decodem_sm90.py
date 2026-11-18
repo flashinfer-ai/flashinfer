@@ -203,6 +203,23 @@ def test_misaligned_offset_views_fall_back():
 
 
 @requires_sm90
+def test_overlapping_output_falls_back():
+    # the kernel reads activations and weights while CTAs write `out`; an
+    # `out` that aliases an input is refused (auto serves via the stock
+    # route, whose aliasing behavior is its own contract)
+    M, N, K = 4, 2048, 2048
+    x, wq, ws = _make(M, N, K, seed=23)
+    ok, reason = _eligibility(x, wq, None, ws, x)
+    assert not ok and reason == "overlap"
+    with pytest.raises(NotImplementedError, match="overlap"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, out=x, backend="specialized")
+    # a distinct output buffer with the same shapes stays eligible
+    out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    ok, reason = _eligibility(x, wq, None, ws, out)
+    assert ok, reason
+
+
+@requires_sm90
 def test_cross_device_tensors_fall_back():
     x, wq, ws = _make(4, 2048, 2048, seed=15)
     out = torch.empty((4, 2048), device="cuda", dtype=torch.bfloat16)
@@ -243,7 +260,10 @@ def test_jit_build_failure_falls_back_to_stock(monkeypatch):
     x, wq, ws = _make(4, 2048, 2048, seed=13)
     ref = _reference(x, wq, ws)
 
+    calls = {"n": 0}
+
     def ninja_boom():
+        calls["n"] += 1
         raise RuntimeError("Ninja build failed.")
 
     monkeypatch.setitem(mod._stats, "jit_build", "not attempted")
@@ -261,11 +281,18 @@ def test_jit_build_failure_falls_back_to_stock(monkeypatch):
     assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
     assert st["fallback_reasons"] == {"auto: jit_build_failure": 1}, st
     assert _rel_fro(out, ref) <= 0.03
+    # the failure is cached: no rebuild on later calls, explicit calls keep
+    # raising with the recorded failure instead of re-running the compiler
+    assert calls["n"] == 1, calls
+    with pytest.raises(NotImplementedError, match="previously failed"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    assert calls["n"] == 1, calls
 
     # the capture-without-warmup error keeps surfacing instead of falling back
     def capture_boom():
         raise GraphCaptureJitError("not built yet under capture")
 
+    monkeypatch.setitem(mod._stats, "jit_build", "not attempted")
     monkeypatch.setattr(mod, "_get_module", capture_boom)
     with pytest.raises(GraphCaptureJitError):
         fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")

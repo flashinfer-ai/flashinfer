@@ -3,6 +3,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
@@ -2650,6 +2651,9 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
                     float eps, ffi::TensorView out) {
   const auto dev = x.device();
   TVM_FFI_ICHECK_EQ(dev.device_type, kDLCUDA);
+  // Every attribute set and launch below binds to the current device; run
+  // the whole dispatch on the operand's device and restore the caller's.
+  ffi::CUDADeviceGuard device_guard(dev.device_id);
   TVM_FFI_ICHECK_EQ(x.ndim(), 2);
   TVM_FFI_ICHECK_EQ(weight.ndim(), 2);
   TVM_FFI_ICHECK_EQ(weight_scale.ndim(), 2);

@@ -13133,9 +13133,11 @@ def fp8_blockscale_gemm_sm90(
         packaged allowlist
         (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``: M <= 24, the
         measured decode envelope). ``"specialized"`` selects it explicitly;
-        a call it cannot serve falls back to the stock route (this op's
-        composable path) with the reason recorded in
-        ``flashinfer.gemm.fp8bs_decodem_sm90._fp8bs_decodem_stats()``.
+        a call it cannot serve raises ``NotImplementedError`` with the
+        refusal reason (also recorded in
+        ``flashinfer.gemm.fp8bs_decodem_sm90._fp8bs_decodem_stats()``) — an
+        explicitly selected backend never falls back; only ``"auto"`` routes
+        around a refusal.
         ``"deepgemm"`` pins the stock DeepGEMM-backed route: an explicitly selected backend is
         never silently swapped. Unknown names raise ``ValueError``.
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
