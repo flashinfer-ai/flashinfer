@@ -229,6 +229,46 @@ def test_dispatch_semantics():
 
 
 @requires_sm103
+def test_auto_falls_back_when_module_unavailable():
+    # A failed specialized-module build/load (e.g. a cache-only deployment
+    # without the compiled artifact) must be a fallback reason under "auto",
+    # not an exception: the stock path serves the same call.  The failure is
+    # cached, so the build is attempted once, not per call.  An explicit
+    # backend="specialized" call still raises, with the reason included.
+    inp = _make_inputs(1, 128, 12416, 128, 12416, 0, seed=11)
+    gold_o, gold_l = _reference(inp)
+
+    def _boom():
+        raise RuntimeError("specialized module not in the JIT cache")
+
+    before = dict(spec_mod.DISPATCH_STATS)
+    saved_failure = list(spec_mod._MODULE_LOAD_FAILURE)
+    spec_mod._MODULE_LOAD_FAILURE.clear()
+    try:
+        with mock.patch.object(
+            spec_mod, "get_mla_ragged_prefill_dsr1_module", side_effect=_boom
+        ) as loader:
+            o, l = _api(inp)
+            assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+            assert any(
+                r.startswith("specialized_module_unavailable:")
+                for r in spec_mod.LAST_FALLBACK_REASONS
+            ), spec_mod.LAST_FALLBACK_REASONS
+            _check(o, l, gold_o, gold_l, 0.0048, 0.02, 0.01, 0.05)  # stock served
+            _api(inp)
+            assert loader.call_count == 1  # cached failure: one build attempt
+            with pytest.raises(ValueError, match="specialized_module_unavailable"):
+                _api(inp, backend="specialized")
+    finally:
+        spec_mod._MODULE_LOAD_FAILURE.clear()
+        spec_mod._MODULE_LOAD_FAILURE.extend(saved_failure)
+    # with the real module restored, auto serves specialized again
+    before = dict(spec_mod.DISPATCH_STATS)
+    _api(inp)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1
+
+
+@requires_sm103
 def test_deterministic():
     inp = _make_inputs(1, 256, 15872, 256, 15872, 0, seed=7)
     o1, l1 = _api(inp)

@@ -79,6 +79,29 @@ def get_mla_ragged_prefill_dsr1_module():
     return gen_mla_ragged_prefill_dsr1_module().build_and_load()
 
 
+# A failed module build/load (e.g. a cache-only deployment without the
+# compiled artifact, FLASHINFER_DISABLE_JIT=1) is cached as a fallback
+# reason so "auto" keeps the stock path without retrying the build on
+# every call.  [reason_string, exception] once populated.
+_MODULE_LOAD_FAILURE: list = []
+
+
+def _module_load_reasons():
+    """Load (and cache) the specialized module; return [] on success or the
+    cached fallback-reason list when the module cannot be built/loaded."""
+    if _MODULE_LOAD_FAILURE:
+        return [_MODULE_LOAD_FAILURE[0]]
+    try:
+        get_mla_ragged_prefill_dsr1_module()
+    except Exception as e:
+        _MODULE_LOAD_FAILURE.append(
+            "specialized_module_unavailable:" + type(e).__name__
+        )
+        _MODULE_LOAD_FAILURE.append(e)
+        return [_MODULE_LOAD_FAILURE[0]]
+    return []
+
+
 def supported_with_reasons(
     query,
     key,
@@ -240,7 +263,13 @@ def supported_with_reasons(
         return ["not_sm103"]
     # Workspace capacity, from the kernel's own host-side size model
     # (builds the module on the first on-allowlist eager call: the
-    # warm-once requirement).
+    # warm-once requirement).  A failed build/load here is a fallback
+    # reason, not an error: "auto" keeps the stock path, which serves the
+    # same call (an explicit backend="specialized" call still raises, with
+    # this reason in the message).
+    load_reasons = _module_load_reasons()
+    if load_reasons:
+        return load_reasons
     mod = get_mla_ragged_prefill_dsr1_module()
     need = int(
         mod.mla_ragged_prefill_dsr1_workspace_bytes(
@@ -318,10 +347,14 @@ def maybe_dispatch_specialized(
             bool(extras.get("is_causal")),
         )
     if backend == "specialized":
-        raise ValueError(
+        err = ValueError(
             "backend='specialized' cannot serve this call and is never "
             f"silently swapped; fallback_reasons={reasons}"
         )
+        if _MODULE_LOAD_FAILURE and _MODULE_LOAD_FAILURE[0] in reasons:
+            # Keep the original build/load failure in the chain.
+            raise err from _MODULE_LOAD_FAILURE[1]
+        raise err
     DISPATCH_STATS["fallback"] += 1
     return None
 
