@@ -204,31 +204,27 @@ def localize_gdn_decode_state(
     if arch != cake_locality.LOCALITY_ARCH:
         return state
     scale = head_k**-0.5 if scale is None else float(scale)
-    row = dict(
-        arch=arch,
-        sm_count=sm_count,
-        batch_size=batch_size,
-        num_q_heads=int(num_q_heads),
-        num_k_heads=int(num_q_heads),
-        num_v_heads=num_v_heads,
-        scale=scale,
-    )
+
+    def variant(die_class: str) -> Optional[str]:
+        return nontranspose_domain_variant(
+            arch=arch,
+            sm_count=sm_count,
+            die_class=die_class,
+            batch_size=batch_size,
+            num_q_heads=int(num_q_heads),
+            num_k_heads=int(num_q_heads),
+            num_v_heads=num_v_heads,
+            scale=scale,
+        )
+
     # Before any probe, allocation or synchronization: some die class must list
     # this row.
-    if not any(
-        nontranspose_domain_variant(die_class=die, **row) is not None
-        for die in ("even", "uneven")
-    ):
+    if not any(variant(die) is not None for die in ("even", "uneven")):
         return state
     table = cake_locality.sm_table(index)
     if table is None:
         return state
-    if (
-        nontranspose_domain_variant(
-            die_class=cake_locality.die_class(table.counts), **row
-        )
-        is None
-    ):
+    if variant(cake_locality.die_class(table.counts)) is None:
         return state
     if rows0 is None:
         rows0 = cake_locality.split_units(batch_size, (1, 1))[0]
