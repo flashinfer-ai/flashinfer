@@ -27,8 +27,21 @@ limitations under the License.
 # selects the kernel and launches it.  Route selection uses dtype, shapes, strides and cached
 # device facts; the request KV lengths are read once per input identity only for
 # the host-known geometries whose production route keys on them
-# (``exact_route_candidate``).  Per-row metadata (row -> request, causal KV
-# length, page rows, work order) is computed on the device with tensor ops.
+# (``exact_route_candidate``).
+#
+# The value-split, generic CLC and FP8 page-64 programs derive each query row's
+# request (``row // q_len``), causal KV length
+# (``max(seq_lens[b] - q_len + row % q_len + 1, 0)``) and pages from the caller's
+# ``seq_lens`` and ``block_tables`` on the device, after their programmatic
+# dependency wait, so nothing about the request values is cached on the host; a
+# generic CLC launch of ``num_sms // 2 < rows <= 1024`` rows is preceded by a small
+# program that writes its longest-first work order.  Ragged value-split calls,
+# the exact-geometry and native split-KV programs and the generic tails read
+# per-row metadata (row -> request, causal KV length, page rows, work order) that
+# the host builds on the device with tensor ops (``_row_plan``).
+#
+# A query row whose causal KV length is zero or negative (a padded request)
+# outputs exact zeros; its LSE is -inf, or the sink-only value where a sink applies.
 
 from __future__ import annotations
 
@@ -148,6 +161,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
+    "cake_trtllm_mla_blackwell_70c928af75813dc1cb03": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_70c928af75813dc1cb03_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
 }
 FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_3542f15da2f1ae0fc00c": {
@@ -175,6 +193,18 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc_exact007790",
     },
+    "cake_trtllm_mla_blackwell_family_35f852e8fbf6c5633089": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_e617239edf1dbd831030_binding.cu",
+        "binding_flags": [
+            "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_35f852e8fbf6c5633089",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_0b5328c06c5aebc8",
+            "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_70c928af75813dc1cb03_sm_103a_693954239d6e",
+        ],
+        "dependencies": ["cake_trtllm_mla_blackwell_70c928af75813dc1cb03"],
+        "compile_flags": ["-std=c++17"],
+        "domain": "mla_bf16_clc_order",
+    },
     "cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466": {
         "arch": "sm_103a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8_binding.cu",
@@ -198,7 +228,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_4bb31097f149a035c68b",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_568ab767e82408d1",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_619a0eadc032",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_6e07f00469cd68db34b5",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_fe7678aaf6597970ac2c",
         ],
         "dependencies": ["cake_trtllm_mla_blackwell_6e07f00469cd68db34b5"],
         "compile_flags": ["-std=c++17"],
@@ -222,7 +252,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_c465664ad1dad4f5",
             "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de_sm_103a_24d3bb8e20ac",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29_sm_103a_475cfbbf5b57",
-            "-DCAKE_PROGRAM_KERNEL_1=kernel_cake_trtllm_mla_blackwell_989e1e1ed03c93435753",
+            "-DCAKE_PROGRAM_KERNEL_1=kernel_cake_trtllm_mla_blackwell_af1a9fc22424703e2072",
         ],
         "dependencies": [
             "cake_trtllm_mla_blackwell_989e1e1ed03c93435753",
@@ -276,7 +306,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_964007a10127ad82351f",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_e7a3b284513206b0",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_c68808045858",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_727d8c54797965d53945",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_d0021c4f5addd97b5dd6",
         ],
         "dependencies": ["cake_trtllm_mla_blackwell_727d8c54797965d53945"],
         "compile_flags": ["-std=c++17"],
@@ -310,7 +340,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_b63c3e2976629b83c0fd",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_095cc002cd67dd9c",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_100a_7457914cd525",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_0738dc80fead18e5c948",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103",
         ],
         "dependencies": ["cake_trtllm_mla_blackwell_0738dc80fead18e5c948"],
         "compile_flags": ["-std=c++17"],
@@ -364,6 +394,13 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
+    "cake_trtllm_mla_blackwell_family_e617239edf1dbd831030": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_e617239edf1dbd831030_binding.cu",
+        "dependencies": ["cake_trtllm_mla_blackwell_70c928af75813dc1cb03"],
+        "compile_flags": ["-std=c++17"],
+        "domain": "mla_bf16_clc_order",
+    },
     "cake_trtllm_mla_blackwell_family_e958fd69e74d907885f3": {
         "arch": "sm_103a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_df17a573e48e469242d2_binding.cu",
@@ -371,7 +408,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_e958fd69e74d907885f3",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_794feb8b4ed47d5c",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4_sm_103a_e88d791b199e",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_c5ad7b615951adb801f7",
         ],
         "dependencies": ["cake_trtllm_mla_blackwell_71fdced8e63ff5ad0ba4"],
         "compile_flags": ["-std=c++17"],
@@ -403,6 +440,8 @@ ROUTES: dict[str, str] = {
     "mla_bf16_clc_exact007826__sm_103a__152": "cake_trtllm_mla_blackwell_family_964007a10127ad82351f",
     "mla_bf16_clc_one_wave__sm_100a__148": "cake_trtllm_mla_blackwell_family_b63c3e2976629b83c0fd",
     "mla_bf16_clc_one_wave__sm_103a__152": "cake_trtllm_mla_blackwell_family_4bb31097f149a035c68b",
+    "mla_bf16_clc_order__sm_100a": "cake_trtllm_mla_blackwell_family_e617239edf1dbd831030",
+    "mla_bf16_clc_order__sm_103a": "cake_trtllm_mla_blackwell_family_35f852e8fbf6c5633089",
     "mla_bf16_native_split8_pdl__sm_100a": "cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8",
     "mla_bf16_native_split8_pdl__sm_103a": "cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466",
     "mla_bf16_tail__sm_100a": "cake_trtllm_mla_blackwell_family_69765950411de111b0b4",
@@ -569,6 +608,10 @@ _MAX_SPLITS = 256
 _NATIVE_SPLIT = 8
 _P32_KV_CTAS = 2
 _P32_HEAD_GROUPS = 32
+# Rows of a generic CLC launch whose work order is written on the device, and the
+# rows each CTA of that order program ranks.
+_MAX_ORDERED_ROWS = 1024
+_ORDER_ROWS_PER_CTA = 64
 # Split-KV partials, KV-length reads and the row plans of recent request identities.
 _WORKSPACE_CACHE_CAPACITY = 32
 
@@ -580,16 +623,12 @@ DOMAIN_BF16_CLC_EXACT007790 = "mla_bf16_clc_exact007790"
 DOMAIN_BF16_CLC_EXACT007826 = "mla_bf16_clc_exact007826"
 # Route domain of the one-wave CLC programs (``launch_family``).
 DOMAIN_BF16_CLC_ONE_WAVE = "mla_bf16_clc_one_wave"
+# Route domain of the program writing a generic CLC launch's longest-first work order.
+DOMAIN_BF16_CLC_ORDER = "mla_bf16_clc_order"
 _CLC_DOMAINS = (
     DOMAIN_BF16_CLC,
     DOMAIN_BF16_CLC_EXACT007790,
     DOMAIN_BF16_CLC_EXACT007826,
-)
-_ALIGNED_BF16_DOMAINS = (
-    DOMAIN_BF16_NATIVE_SPLIT8,
-    DOMAIN_BF16_VQUARTER,
-    DOMAIN_BF16_VHALF,
-    *_CLC_DOMAINS,
 )
 DOMAIN_BF16_TAIL = "mla_bf16_tail"
 DOMAIN_FP8_P32 = "mla_fp8_p32_qk_l2"
@@ -603,6 +642,29 @@ EXACT_CLC_GEOMETRY = {
 
 _WORKSPACE_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
 _WORKSPACE_CACHE_LOCK = threading.Lock()
+# int32[_MAX_ORDERED_ROWS] work-order buffer per (device index, stream handle).  It
+# lives outside the LRU workspace cache, so a buffer a captured graph launches with
+# is never freed.  Graphs captured on one stream share its buffer: replay them on
+# one stream at a time, as for the split-KV workspaces.
+_WORK_ORDER_BUFFERS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _binding(name: str) -> str:
+    return f"{PACKAGE_DIR}/sm_100a/cake_trtllm_mla_blackwell_family_{name}_binding.cu"
+
+
+# The launched family's binding decides the row inputs (``FAMILIES[...]["binding"]``):
+# the generic CLC binding (also serving the exact-geometry routes of the sm_100a and
+# 152-SM sm_103a modules) and the FP8 page-64 binding take the caller's ``seq_lens``
+# and ``block_tables``; the value-split bindings (mapped to their value-split count)
+# take them too, plus the per-row metadata of a ragged call; every other aligned
+# binding takes the host-built row plan.
+_CLC_BINDING = _binding("df17a573e48e469242d2")
+_FP8_PAGE64_BINDING = _binding("c461bee2a4bb9454ff11")
+_VALUE_SPLIT_BINDINGS = {
+    _binding("5b3d4b45f82fac17edbd"): 4,
+    _binding("964aa840394fcd0656c0"): 2,
+}
 
 # (qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads) tuples with generated programs.
 DENSE_DIMENSION_TUPLES = frozenset(
@@ -768,7 +830,10 @@ def select_domain(
             and not skip_softmax
             and bmm2_scale == 1.0
         ):
-            if kv_lens is not None:
+            # The exact-geometry programs read the host row plan and need every
+            # row's causal KV length positive; a padded request takes the generic
+            # CLC program, which derives its rows on the device.
+            if kv_lens is not None and min(kv_lens) >= q_len:
                 max_kv = max(kv_lens)
                 for domain, (
                     batch,
@@ -924,9 +989,9 @@ def _aligned_page_table(
 ) -> torch.Tensor:
     """Row page table (page-32 halves) followed by the longest-first work permutation.
 
-    The persistent CLC kernel reads ``page_table[num_rows * width + raw_id]`` for the row
-    that raw work id ``raw_id`` processes; the other aligned kernels read only the first
-    ``num_rows`` rows.  Padding entries hold -1.
+    The exact-geometry CLC kernels read ``page_table[num_rows * width + raw_id]`` for the
+    row that raw work id ``raw_id`` processes; the native split-KV kernels read only the
+    first ``num_rows`` rows.  Padding entries hold -1.
     """
     if table.ndim == 3:
         table = table[:, 0]
@@ -969,7 +1034,7 @@ def _host_kv_lens(seq_lens: torch.Tensor) -> Optional[tuple[int, ...]]:
 
 
 def _row_plan(
-    domain: str,
+    layout: Literal["table", "rows", "tail"],
     *,
     seq_lens: torch.Tensor,
     cum_seq_lens_q: Optional[torch.Tensor],
@@ -980,7 +1045,15 @@ def _row_plan(
     page_size: int,
     topk: int,
 ) -> dict[str, torch.Tensor]:
-    """The per-row metadata a domain's kernels read, built once per input identity.
+    """The per-row metadata a binding's kernels read, built once per input identity.
+
+    ``layout`` names what the launched binding reads: ``"table"`` the row page table
+    and work order of the exact-geometry and native split-KV programs (every row's
+    KV length is positive there), ``"rows"`` the request and causal KV length of each
+    row of a ragged value-split call, ``"tail"`` those of the generic tails with
+    negative lengths clamped to zero (a padded row outputs zeros).  The value-split,
+    generic CLC and FP8 page-64 programs derive their rows on the device and take
+    no plan otherwise.
 
     As in the production path, the rows are derived when a request's tensors
     (storage address, in-place version counter, shape and strides) first appear
@@ -1000,17 +1073,21 @@ def _row_plan(
             total_q=total_q,
         )
         state = {"row_batches": row_batches, "row_seq_lens": row_seq_lens}
-        if domain in _ALIGNED_BF16_DOMAINS:
+        if layout == "table":
             state["table"] = _aligned_page_table(
                 block_tables, row_batches, row_seq_lens, page_size
             )
-        elif topk > 0:
-            state["row_seq_lens"] = torch.full_like(row_seq_lens, topk)
+        elif layout == "tail":
+            state["row_seq_lens"] = (
+                torch.full_like(row_seq_lens, topk)
+                if topk > 0
+                else row_seq_lens.clamp_min(0)
+            )
         return state
 
     key = (
         "plan",
-        domain,
+        layout,
         seq_lens.device,
         _tensor_identity(seq_lens),
         _tensor_identity(cum_seq_lens_q),
@@ -1027,6 +1104,17 @@ def _row_plan(
     if torch.cuda.is_current_stream_capturing():
         return build()
     return _workspace(key, build)
+
+
+def _work_order_buffer(device: torch.device, stream: int) -> torch.Tensor:
+    """The work-order buffer of ``stream`` on ``device``, created on first use."""
+    key = (device.index, stream)
+    with _WORKSPACE_CACHE_LOCK:
+        buffer = _WORK_ORDER_BUFFERS.get(key)
+        if buffer is None:
+            buffer = torch.empty(_MAX_ORDERED_ROWS, dtype=torch.int32, device=device)
+            _WORK_ORDER_BUFFERS[key] = buffer
+        return buffer
 
 
 def _check_tensor(
@@ -1240,26 +1328,101 @@ def trtllm_mla_blackwell_decode(
         kv_lens=_host_kv_lens(seq_lens) if candidate else None,
         num_sms=num_sms,
     )
-    plan = _row_plan(
-        domain,
-        seq_lens=seq_lens,
-        cum_seq_lens_q=cum_seq_lens_q,
-        block_tables=block_tables,
-        batch_size=batch_size,
-        q_len=q_len,
-        total_q=total_q,
-        page_size=page_size,
-        topk=topk,
-    )
-    row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
+    family = launch_family(domain, arch, num_sms, total_q)
+    # The launched binding, not the domain, decides the row inputs: the exact-geometry
+    # routes of the sm_100a and 152-SM sm_103a modules launch the generic CLC binding.
+    binding = FAMILIES[family]["binding"]
     stream = int(torch.cuda.current_stream(device).cuda_stream)
-    run = get_cake_trtllm_mla_blackwell_family(
-        launch_family(domain, arch, num_sms, total_q)
-    ).run
+    run = get_cake_trtllm_mla_blackwell_family(family).run
     softmax_scale_log2 = bmm1 * log2e
 
-    if domain == DOMAIN_BF16_NATIVE_SPLIT8:
-        table = plan["table"]
+    def row_plan(layout: Literal["table", "rows", "tail"]) -> dict[str, torch.Tensor]:
+        return _row_plan(
+            layout,
+            seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
+            block_tables=block_tables,
+            batch_size=batch_size,
+            q_len=q_len,
+            total_q=total_q,
+            page_size=page_size,
+            topk=topk,
+        )
+
+    if binding == _CLC_BINDING:
+        # One persistent work item per query row (non-ragged, page 32).  A launch of
+        # more rows than one wave of clusters and at most _MAX_ORDERED_ROWS rows takes
+        # the longest-first order the order program writes right before it on this
+        # stream; every other launch keeps the launch order (null work order).
+        use_work_order = max(1, num_sms // _CLUSTER_SIZE) < total_q <= _MAX_ORDERED_ROWS
+        work_order = seq_lens
+        if use_work_order:
+            work_order = _work_order_buffer(device, stream)
+            get_cake_trtllm_mla_blackwell_family(
+                family_for(DOMAIN_BF16_CLC_ORDER, arch, num_sms)
+            ).run(
+                seq_lens,
+                work_order,
+                q_len,
+                total_q,
+                -(-total_q // _ORDER_ROWS_PER_CTA),
+                stream,
+            )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            seq_lens,
+            block_tables,
+            sink if sink is not None else _fp8_lut(device)[:num_heads],
+            softmax_scale_log2,
+            bmm2,
+            total_q,
+            q_len,
+            table_width,
+            int(sink is not None),
+            2 * q_len,
+            batch_size,
+            work_order,
+            int(use_work_order),
+            stream,
+        )
+    elif binding in _VALUE_SPLIT_BINDINGS:
+        # A ragged call passes each row's request and causal KV length; otherwise the
+        # program derives them from seq_lens and q_len (null row arrays).  Pages are
+        # the caller's block_tables entries (page_shift: page 64 = two 32-token halves).
+        split = _VALUE_SPLIT_BINDINGS[binding]
+        work = total_q * split
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        row_batches = row_seq_lens = seq_lens
+        if ragged_query:
+            plan = row_plan("rows")
+            row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            seq_lens,
+            block_tables,
+            sink if sink is not None else _fp8_lut(device)[:num_heads],
+            softmax_scale_log2,
+            bmm2,
+            work,
+            split,
+            table_width,
+            int(sink is not None),
+            min(work, resident) * 2,
+            1,
+            row_batches,
+            row_seq_lens,
+            int(ragged_query),
+            q_len,
+            1 if page_size == 64 else 0,
+            stream,
+        )
+    elif domain == DOMAIN_BF16_NATIVE_SPLIT8:
+        plan = row_plan("table")
+        table, row_seq_lens = plan["table"], plan["row_seq_lens"]
         resident = max(1, num_sms // _CLUSTER_SIZE)
         work = total_q * _NATIVE_SPLIT
         grid_x = min(work, resident) * _CLUSTER_SIZE
@@ -1298,31 +1461,26 @@ def trtllm_mla_blackwell_decode(
             total_q,
             stream,
         )
-    elif domain in _ALIGNED_BF16_DOMAINS:
+    elif domain in _CLC_DOMAINS:
+        # Exact-geometry programs of the other bindings: host row plan (every row's
+        # KV length is positive, ``select_domain``).
+        plan = row_plan("table")
         table = plan["table"]
-        resident = max(1, num_sms // _CLUSTER_SIZE)
-        if domain in _CLC_DOMAINS:
-            split, work, grid_x, grid_z = q_len, total_q, 2 * q_len, batch_size
-        else:
-            split = 4 if domain == DOMAIN_BF16_VQUARTER else 2
-            work = total_q * split
-            grid_x, grid_z = min(work, resident) * 2, 1
-        sinks_arg = sink if sink is not None else _fp8_lut(device)[:num_heads]
         run(
             query.reshape(-1, _ALIGNED_QK_DIM),
             kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
             out.reshape(-1, _ALIGNED_VALUE_DIM),
-            row_seq_lens,
+            plan["row_seq_lens"],
             table,
-            sinks_arg,
+            sink if sink is not None else _fp8_lut(device)[:num_heads],
             softmax_scale_log2,
             bmm2,
-            work,
-            split,
+            total_q,
+            q_len,
             int(table.shape[1]),
             int(sink is not None),
-            grid_x,
-            grid_z,
+            2 * q_len,
+            batch_size,
             stream,
         )
     elif domain == DOMAIN_FP8_P32:
@@ -1364,7 +1522,9 @@ def trtllm_mla_blackwell_decode(
             bmm2,
             stream,
         )
-    elif domain == DOMAIN_FP8_PAGE64:
+    elif binding == _FP8_PAGE64_BINDING:
+        # The program derives each row's request, causal KV length and pages from
+        # seq_lens, q_len and block_tables (non-ragged).
         work_items = total_q
         num_split = plan_num_split(work_items, int(max_seq_len), num_sms)
         reduce_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
@@ -1391,8 +1551,7 @@ def trtllm_mla_blackwell_decode(
             kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
             out.reshape(-1, _ALIGNED_VALUE_DIM),
             state["lse"],
-            plan["row_seq_lens"],
-            row_batches,
+            seq_lens,
             block_tables.reshape(-1),
             state["partial_output"],
             state["partial_stats"],
@@ -1400,11 +1559,15 @@ def trtllm_mla_blackwell_decode(
             bmm2,
             num_split,
             work_items,
-            int(block_tables.shape[-1]),
+            table_width,
             reduce_ctas,
+            q_len,
             stream,
         )
     else:
+        # Generic tails: host row plan with negative causal lengths clamped to zero.
+        plan = row_plan("tail")
+        row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
         kv_stride = int(kv_cache.shape[-1])
         q_rows = query.reshape(-1, qk_dim)
         kv_rows = kv_cache.reshape(-1, kv_stride)
