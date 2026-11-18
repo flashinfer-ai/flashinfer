@@ -10418,11 +10418,9 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
         ConstraintSpec(
             2,
             0,
-            lambda shapes: (
-                shapes[0][0]
-                * _mxfp8_swizzled_scale_len(
-                    shapes[0][1], shapes[0][2], SfLayout.layout_128x4
-                )
+            lambda shapes: shapes[0][0]
+            * _mxfp8_swizzled_scale_len(
+                shapes[0][1], shapes[0][2], SfLayout.layout_128x4
             ),
         ),
         ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),

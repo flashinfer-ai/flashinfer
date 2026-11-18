@@ -1455,6 +1455,57 @@ def test_domain_twin_matches_reference(cell):
 
 
 @_packed_serving
+def test_localized_weights_homed_through_full_aliases():
+    """Every alias of the whole tensor ``localize_weights`` returns runs the twin
+    (an ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same
+    shape, and ``localize_weights`` of an ``nn.Parameter``); a view of part of it
+    runs the whole-GPU program."""
+    device, table = _require_domain()
+    cell = ((4096, 7168), 64, 1)
+    _require_routed(cell, device, table)
+    nk, groups, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    sm_count = device_sm_count(device)
+    if not domain_serving_routed("sm_107a", sm_count, table.counts, *nk, groups):
+        pytest.skip(f"localize_weights does not home {nk} B={groups} on {table.counts}")
+    homed = localize_weights(b)
+    assert homed is not b
+    parameter = localize_weights(torch.nn.Parameter(b, requires_grad=False))
+    assert isinstance(parameter, torch.nn.Parameter)
+    assert not parameter.requires_grad
+    assert cake_locality.homing(parameter) is not None
+    aliases = {
+        "returned": homed,
+        "parameter_over_it": torch.nn.Parameter(homed, requires_grad=False),
+        "detach": homed.detach(),
+        "data": homed.data,
+        "full_view": homed.view(homed.shape),
+        "localized_parameter": parameter,
+    }
+    twin_out = None
+    for name, alias in aliases.items():
+        prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, alias, a_packed, b_packed, masked_m, expected_m
+        )
+        assert prepared.route == DOMAIN_SERVING_ROUTE, name
+        public = batch_deepgemm_fp8_nt_groupwise(
+            a, alias, a_packed, b_packed, masked_m, expected_m, backend="cake"
+        )
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(public, reference, masked_m)
+        bits = _valid_bits(public, valid)
+        if twin_out is None:
+            twin_out = bits
+        assert torch.equal(bits, twin_out), name
+    half = groups // 2
+    part = homed[:half]
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a[:half], part, a_packed[:half], b_packed[:half], masked_m[:half], expected_m
+    )
+    assert prepared.route == _SERVING_ROUTE
+
+
+@_packed_serving
 def test_localize_weights_refuses_what_could_run_slower(monkeypatch):
     """``localize_weights`` returns ``b`` itself for weights of a non-serving
     shape or dtype, for a shape with an expected_m whose cell is not listed, and
@@ -1921,9 +1972,11 @@ def test_domain_public_call_reuses_counters(cell):
 
 @_host_only
 def test_domain_homing_needs_the_whole_allocation(monkeypatch):
-    """Only the very tensor of the homed allocation plans as homed, read from the
-    record it carries (no registry query): a view of all or part of it, a copy,
-    another device's tensor and a tensor whose storage moved plan as unhomed."""
+    """A tensor over the whole homed allocation plans as homed, read from the
+    record its storage carries (no registry query): the tensor itself, an
+    ``nn.Parameter`` over it, ``detach()``, ``.data`` and a view of the same
+    shape.  A view of part of it, a copy, another device's tensor and a tensor
+    whose storage moved plan as unhomed."""
     import copy
 
     import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
@@ -1933,7 +1986,7 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
     record = cake_locality.Homing(
         device_index=0, base=base, nbytes=b.numel(), size=b.numel(), cut=2 * 8 * 16
     )
-    setattr(b, cake_locality._HOMING_ATTR, record)
+    cake_locality._mark_homed(b, record)
     table = cake_locality.SmTable(device_index=0, counts=(106, 106), entries=None)
 
     def registry(tensor_or_ptr):
@@ -1948,17 +2001,32 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
     def homing(tensor, groups=4, index=0):
         return module._domain_homing(tensor, index, groups, "sm_107a", 212)
 
-    assert homing(b) == (2, table)
+    # Full aliases share the storage, and so its record.
+    parameter = torch.nn.Parameter(b, requires_grad=False)
+    for alias in (b, parameter, b.detach(), b.data, b[:], b.view(4, 8, 16)):
+        assert homing(alias) == (2, table)
+    # The storage keeps its record after every other reference to it is gone.
+    alias = b.detach()
+    del b, parameter
+    import gc
+
+    gc.collect()
+    assert homing(alias) == (2, table)
+    assert homing(alias.view(4, 8, 16)) == (2, table)
+    b = alias
+    # A view of part of it, a copy, or another device's tensor is not homed.
     assert homing(b[:2], 2) is None
     assert homing(b[1:], 3) is None
-    assert homing(b[:]) is None
-    assert homing(b.view(4, 8, 16)) is None
+    assert homing(b.view(-1)[: 4 * 8 * 8].view(4, 8, 8)) is None
     assert homing(b.clone()) is None
     assert homing(copy.deepcopy(b)) is None
     assert homing(b, index=1) is None
     moved = torch.empty((4, 8, 16), dtype=torch.uint8)
     setattr(moved, cake_locality._HOMING_ATTR, record)
     assert homing(moved) is None
+    swapped = b.detach()
+    swapped.data = torch.empty((4, 8, 16), dtype=torch.uint8)
+    assert homing(swapped) is None
     # A shape localize_weights refuses plans unhomed, however b was homed.
     monkeypatch.setattr(module, "domain_serving_routed", lambda *args: False)
     monkeypatch.setattr(module, "_PLANS", {})
@@ -2049,6 +2117,52 @@ def test_public_call_resolves_once(monkeypatch):
         is None
     )
     assert module._CHECKED.entry is None
+    # The same objects changed in place since the check are resolved again:
+    # ``b`` moved to other storage, or ``a`` of another shape.
+    out = torch.empty(
+        (a.shape[0], a.shape[1], nk[0]), dtype=torch.bfloat16, device=device
+    )
+    moved_b = b.detach().clone()
+    for change in ("b", "a"):
+        checked_b = b.detach().clone()
+        checked_a = a.detach().clone()
+        module._admit_public_call(
+            checked_a,
+            checked_b,
+            a_packed,
+            b_packed,
+            masked_m,
+            expected_m,
+            scale_granularity_mnk=(1, 128, 128),
+            out=out,
+            out_dtype=None,
+        )
+        if change == "b":
+            checked_b.data = moved_b
+        else:
+            checked_a.data = checked_a[:, : a.shape[1] // 2].contiguous()
+        assert (
+            module._take_admitted(
+                checked_a, checked_b, a_packed, b_packed, masked_m, expected_m, out=out
+            )
+            is None
+        ), change
+    # Unchanged operands still take the check's problem.
+    module._admit_public_call(
+        a,
+        b,
+        a_packed,
+        b_packed,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk=(1, 128, 128),
+        out=out,
+        out_dtype=None,
+    )
+    assert (
+        module._take_admitted(a, b, a_packed, b_packed, masked_m, expected_m, out=out)
+        is not None
+    )
 
 
 @_packed_serving

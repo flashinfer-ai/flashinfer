@@ -40,6 +40,7 @@ program.
 from __future__ import annotations
 
 import contextlib
+import operator
 import threading
 import weakref
 from dataclasses import dataclass
@@ -279,7 +280,7 @@ def serving_plan(
             workspaces={name: (PAIR_COUNTER_WORDS,) for name in DOMAIN_COUNTERS},
         )
     raw_ctas = max(2, sm_count - cta_reserve - ((sm_count - cta_reserve) % 2))
-    # The serving kernel binds its arguments by name (see ``_serving_bindings``).
+    # The serving kernel binds its arguments by name (see ``_serving_launch``).
     return RoutePlan(
         route=SERVING_ROUTE,
         parent=SERVING_ROUTE,
@@ -362,13 +363,19 @@ _PLANS: dict[tuple[Any, ...], Any] = {}
 _ENTRIES: dict[tuple[str, str], tuple[Callable[..., Any], list[list[str]]]] = {}
 
 
-def _remember_plan(key: tuple[Any, ...], plan: Any) -> None:
-    while len(_PLANS) >= PLAN_LIMIT:
+def _remember_plan(
+    key: tuple[Any, ...], plan: Any, memo: Optional[dict[Any, Any]] = None
+) -> None:
+    """Store ``plan`` under ``key`` in ``memo`` (default ``_PLANS``), dropping the
+    oldest entries past :data:`PLAN_LIMIT`."""
+    if memo is None:
+        memo = _PLANS
+    while len(memo) >= PLAN_LIMIT:
         try:
-            del _PLANS[next(iter(_PLANS))]
+            del memo[next(iter(memo))]
         except (KeyError, RuntimeError, StopIteration):  # another thread evicted it
             break
-    _PLANS[key] = plan
+    memo[key] = plan
 
 
 def _program_entry(
@@ -387,14 +394,129 @@ def _program_entry(
     return cached
 
 
+# Device index -> TVM FFI device, for the FFI stream context of a launch.
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _ffi_stream(index: int) -> Any:
+    """The FFI stream context on PyTorch's current stream of device ``index``
+    (also the capture stream under CUDA graph capture): the raw stream handle and
+    a cached FFI device, the same context as ``tvm_ffi.use_torch_stream()``
+    without building a stream object per call."""
+    ffi_device = _FFI_DEVICES.get(index)
+    if ffi_device is None:
+        ffi_device = _FFI_DEVICES.setdefault(index, tvm_ffi.device(f"cuda:{index}"))
+    return tvm_ffi.use_raw_stream(ffi_device, torch._C._cuda_getCurrentRawStream(index))
+
+
+def _run_launches(device: torch.device, launches: Any) -> None:
+    """Submit ``(FFI entry, arguments)`` launches on the current stream of
+    ``device``, making it the current device only when it is not."""
+    index = _device_index(device)
+    if torch.cuda.current_device() == index:
+        with _ffi_stream(index):
+            for entry, arguments in launches:
+                entry(*arguments)
+    else:
+        with torch.cuda.device(index), _ffi_stream(index):
+            for entry, arguments in launches:
+                entry(*arguments)
+
+
+# The per-call values of a serving program's arguments, in this order; every
+# other argument of a serving launch is fixed by its problem and route.
+_SERVING_VALUES = (
+    "A",
+    "B",
+    "C_tma",
+    "SFA_packed",
+    "SFB_packed",
+    "masked_m",
+    "counters0",
+    "counters1",
+)
+# (arch, program, grid, B, M, N, K, g_cut) -> (FFI entry, the fixed arguments,
+# a getter of the argument tuple from the per-call values followed by the fixed
+# ones, the SM table tensor bound): a serving launch's arguments without a dict
+# per call.  At most PLAN_LIMIT entries, as _PLANS.
+_SERVING_LAUNCHES: dict[tuple[Any, ...], tuple[Any, tuple[Any, ...], Any, Any]] = {}
+
+
+def _serving_launch(
+    problem: _Problem, stage: StagePlan
+) -> tuple[Any, tuple[Any, ...], Any]:
+    """``(FFI entry, fixed arguments, getter)`` of the serving launch of ``problem``:
+    ``getter(values + fixed)`` is the launch's argument tuple, where ``values``
+    are the per-call values named by ``_SERVING_VALUES``."""
+    table = None if problem.sm_table is None else problem.sm_table.entries
+    grid = _grid3(stage.grid)
+    key = (
+        problem.arch,
+        stage.program,
+        grid,
+        problem.B,
+        problem.M,
+        problem.N,
+        problem.K,
+        problem.g_cut,
+    )
+    cached = _SERVING_LAUNCHES.get(key)
+    if cached is not None and cached[3] is table:
+        return cached[0], cached[1], cached[2]
+    entry, arg_plan = _program_entry(problem.arch, stage.program)
+    domain = problem.plan.route == DOMAIN_SERVING_ROUTE
+    fixed_values: dict[str, Any] = {
+        "num_groups": problem.B,
+        "shape_m": problem.M,
+        "N": problem.N,
+        "K": problem.K,
+    }
+    if domain:
+        fixed_values.update(g_cut=problem.g_cut, sm_table=table)
+    per_call = _SERVING_VALUES if domain else _SERVING_VALUES[:6]
+    grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
+    fixed: list[Any] = []
+    picks: list[int] = []
+    for kind, name in arg_plan:
+        if kind == "grid":
+            value = grid_by_axis[name]
+        elif kind in ("tma_buffer", "buffer", "parameter", "param_array") and (
+            name in per_call
+        ):
+            picks.append(_SERVING_VALUES.index(name))
+            continue
+        elif (
+            kind in ("tma_buffer", "buffer", "parameter", "param_array")
+            and name in fixed_values
+        ):
+            value = fixed_values[name]
+        else:
+            raise RuntimeError(
+                f"generated program {stage.program} binds {kind} {name!r}, which this host does not declare"
+            )
+        picks.append(len(_SERVING_VALUES) + len(fixed))
+        fixed.append(value)
+    # itemgetter of one index returns the item, not a tuple.
+    getter: Any = (
+        operator.itemgetter(*picks)
+        if len(picks) > 1
+        else (lambda values, only=picks[0]: (values[only],))
+    )
+    built = (entry, tuple(fixed), getter, table)
+    _remember_plan(key, built, _SERVING_LAUNCHES)
+    return entry, built[1], getter
+
+
 def _domain_homing(
     b: torch.Tensor, index: int, groups: int, arch: str, sm_count: int
 ) -> Optional[tuple[int, Any]]:
-    """``(g_cut, sm_table)`` when ``b`` is the very tensor :func:`localize_weights`
-    returned (the whole allocation; not a view or a copy of it) on a device with a
-    probed SM table, else ``None``.  ``g_cut`` is the group of ``b`` nearest to its
-    die cut (the twin's result does not depend on it).  Reads the record the
-    allocation carries (:func:`flashinfer.cake_locality.tensor_homing`), not the
+    """``(g_cut, sm_table)`` when ``b`` covers the whole allocation
+    :func:`localize_weights` returned (that tensor or a full alias of it: an
+    ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same shape;
+    not a view of part of it, not a copy) on a device with a probed SM table,
+    else ``None``.  ``g_cut`` is the group of ``b`` nearest to its die cut (the
+    twin's result does not depend on it).  Reads the record the allocation's
+    storage carries (:func:`flashinfer.cake_locality.tensor_homing`), not the
     allocation registry.  A shape :func:`localize_weights` refuses
     (:func:`domain_serving_routed` is False) plans unhomed even when its ``b`` was
     homed some other way (e.g. by :func:`flashinfer.cake_locality.split_empty`)."""
@@ -668,6 +790,9 @@ def _admit_public_call(
         weakref.ref(masked_m),
         None if out is None else weakref.ref(out),
         expected_m,
+        a.shape,
+        b.shape,
+        int(b.data_ptr()),
         problem,
     )
     return True
@@ -684,12 +809,27 @@ def _take_admitted(
 ) -> Optional[_Problem]:
     """The problem :func:`_admit_public_call` resolved for exactly these operands
     (``out``: the same tensor, or a valid output when the check had none), or
-    ``None``.  Takes it at most once."""
+    ``None``.  Takes it at most once.  The operands must be the same objects and
+    ``a`` and ``b`` still of the checked shapes, ``b`` still at the checked
+    address (its homing and route depend on it): an operand changed in place
+    since the check (``set_``, ``resize_``, ``.data =``) is resolved again."""
     entry = _CHECKED.entry
     if entry is None:
         return None
     _CHECKED.entry = None
-    ref_a, ref_b, ref_as, ref_bs, ref_m, ref_out, checked_m, problem = entry
+    (
+        ref_a,
+        ref_b,
+        ref_as,
+        ref_bs,
+        ref_m,
+        ref_out,
+        checked_m,
+        a_shape,
+        b_shape,
+        b_ptr,
+        problem,
+    ) = entry
     if (
         ref_a() is not a
         or ref_b() is not b
@@ -698,6 +838,9 @@ def _take_admitted(
         or ref_m() is not masked_m
         or type(expected_m) is not int
         or expected_m != checked_m
+        or a.shape != a_shape
+        or b.shape != b_shape
+        or int(b.data_ptr()) != b_ptr
     ):
         return None
     if ref_out is None:
@@ -823,7 +966,7 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
 
     def launch(self) -> torch.Tensor:
         index = _device_index(self.out.device)
-        with torch.cuda.device(self.out.device), tvm_ffi.use_torch_stream():
+        with torch.cuda.device(index), _ffi_stream(index):
             if self.capture_only and (
                 not cake_locality._stream_capturing(index)
                 or cake_locality._capture_id(index) != self.capture_id
@@ -943,7 +1086,7 @@ def _family_bindings(
     }
 
 
-def _serving_bindings(
+def _serving_arguments(
     problem: _Problem,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -951,9 +1094,13 @@ def _serving_bindings(
     b_scale: torch.Tensor,
     masked_m: torch.Tensor,
     out: torch.Tensor,
-    workspace: dict[str, torch.Tensor],
-) -> dict[str, Any]:
-    """Kernel parameter names of the serving program -> bound values (zero-copy scale views)."""
+    counters0: Optional[torch.Tensor],
+    counters1: Optional[torch.Tensor],
+) -> tuple[Any, tuple[Any, ...]]:
+    """``(FFI entry, arguments)`` of the serving program's launch (zero-copy
+    scale views; the twin's claim counters ``counters0`` / ``counters1``)."""
+    (stage,) = problem.plan.stages
+    entry, fixed, getter = _serving_launch(problem, stage)
     cols = problem.K // PACKED_K_GRANULE
     # The logical [B, MN, K/512] int32 scales live in MN-major [B, K/512, MN] storage;
     # reinterpret that storage as the contiguous 2-D surface the scale tensor maps read.
@@ -963,26 +1110,17 @@ def _serving_bindings(
     sfb = b_scale.as_strided((problem.B * cols, problem.N), (problem.N, 1)).view(
         torch.uint32
     )
-    bindings: dict[str, Any] = {
-        "A": a.view(torch.uint8),
-        "B": b.view(torch.uint8),
-        "C_tma": out,
-        "SFA_packed": sfa,
-        "SFB_packed": sfb,
-        "masked_m": masked_m,
-        "num_groups": problem.B,
-        "shape_m": problem.M,
-        "N": problem.N,
-        "K": problem.K,
-    }
-    if problem.plan.route == DOMAIN_SERVING_ROUTE:
-        bindings.update(
-            g_cut=problem.g_cut,
-            counters0=workspace["counters0"],
-            counters1=workspace["counters1"],
-            sm_table=problem.sm_table.entries,
-        )
-    return bindings
+    values = (
+        a.view(torch.uint8),
+        b.view(torch.uint8),
+        out,
+        sfa,
+        sfb,
+        masked_m,
+        counters0,
+        counters1,
+    )
+    return entry, getter(values + fixed)
 
 
 def prepare_batch_deepgemm_fp8_nt_groupwise(
@@ -1141,17 +1279,17 @@ def _bind_launches(
     plan = problem.plan
     launches = []
     if problem.packed_scales:
-        (stage,) = plan.stages
-        entry, arg_plan = _program_entry(problem.arch, stage.program)
-        bindings = _serving_bindings(
-            problem, a, b, a_scale, b_scale, masked_m, out, workspace
-        )
         launches.append(
-            (
-                entry,
-                bind_named_arguments(
-                    arg_plan, bindings, stage.grid, program=stage.program
-                ),
+            _serving_arguments(
+                problem,
+                a,
+                b,
+                a_scale,
+                b_scale,
+                masked_m,
+                out,
+                workspace.get(DOMAIN_COUNTERS[0]),
+                workspace.get(DOMAIN_COUNTERS[1]),
             )
         )
     else:
@@ -1215,7 +1353,11 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
     after it is freed faults on replay, so keep it alive as long as such a graph.
-    A view of part of the returned tensor is not homed: pass the whole tensor.
+    For an ``nn.Parameter`` ``b`` the homed copy is returned as an
+    ``nn.Parameter`` (same ``requires_grad``).  Every alias of the whole returned
+    tensor is homed as well (an ``nn.Parameter`` over it, ``detach()``,
+    ``.data``, a view of the same shape); a view of part of it is not: pass the
+    whole tensor.
     """
     if not isinstance(b, torch.Tensor) or b.device.type != "cuda" or b.ndim != 3:
         raise ValueError("b must be a CUDA torch.Tensor of shape (B, N, K)")
@@ -1252,11 +1394,14 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     if 0 < cut < groups * group_bytes and cut % cake_locality.granularity(index):
         return b
     homed = cake_locality.split_empty(tuple(b.shape), b.dtype, cut, index)
-    homed.copy_(b)
+    with torch.no_grad():
+        homed.copy_(b)
     # A failure here does not fail the call: captured calls then zero their own
     # counters until an eager call refills the reserve.
     with contextlib.suppress(Exception):
         cake_locality.reserve_launch_counters(PAIR_COUNTER_WORDS, index)
+    if isinstance(b, torch.nn.Parameter):
+        return torch.nn.Parameter(homed, requires_grad=b.requires_grad)
     return homed
 
 
@@ -1313,11 +1458,24 @@ def run_batch_deepgemm_fp8_nt_groupwise(
             out_dtype=None,
             scale_granularity_mnk=(1, BLOCK, BLOCK),
         )
-    workspace = _allocate_workspace(problem.plan, problem.device, launch_now=True)
-    launches = _bind_launches(problem, a, b, a_scale, b_scale, masked_m, out, workspace)
-    with torch.cuda.device(problem.device), tvm_ffi.use_torch_stream():
-        for entry, arguments in launches:
-            entry(*arguments)
+    if problem.packed_scales:
+        # One serving launch; the twin takes its stream's reused counter pair.
+        counters: tuple[Any, Any] = (None, None)
+        if problem.plan.route == DOMAIN_SERVING_ROUTE:
+            counters = cake_locality.launch_counters(
+                PAIR_COUNTER_WORDS, _device_index(problem.device)
+            )
+        launches: Any = (
+            _serving_arguments(
+                problem, a, b, a_scale, b_scale, masked_m, out, *counters
+            ),
+        )
+    else:
+        workspace = _allocate_workspace(problem.plan, problem.device, launch_now=True)
+        launches = _bind_launches(
+            problem, a, b, a_scale, b_scale, masked_m, out, workspace
+        )
+    _run_launches(problem.device, launches)
     return out
 
 

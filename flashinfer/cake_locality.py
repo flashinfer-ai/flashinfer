@@ -37,9 +37,11 @@ caller then takes its whole-GPU route.
 :func:`split_empty` reserves one virtual address range and backs ``[0, cut)``
 with memory of die 0 and ``[cut, size)`` with memory of die 1. The allocation is
 in a registry keyed by its base pointer from allocation until its last tensor is
-freed; :func:`homing` reads it. The tensor :func:`split_empty` returns also
-carries its :class:`Homing` record, which :func:`tensor_homing` reads without a
-registry query; a view or a copy of it does not carry the record. Freeing it unmaps the memory, so a CUDA graph
+freed; :func:`homing` reads it. The storage of the tensor :func:`split_empty`
+returns also carries its :class:`Homing` record, which :func:`tensor_homing` reads
+without a registry query for every tensor over that storage that starts at the
+allocation's base (the tensor itself, an ``nn.Parameter`` over it, ``detach()``,
+``.data``, a view); a copy has its own storage and no record. Freeing it unmaps the memory, so a CUDA graph
 that still reads a freed allocation faults on its next replay: keep the tensor
 alive as long as any graph that reads it.
 
@@ -49,11 +51,11 @@ inside the functions that need them.
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import dataclasses
 import fractions
 import functools
+import itertools
 import threading
 from collections.abc import Sequence
 from typing import Any
@@ -490,8 +492,9 @@ def split_empty(
     Allocate and free outside CUDA graph capture; a graph that still reads the
     tensor after it is freed faults on replay.
 
-    The returned tensor carries its :class:`Homing` record (see
-    :func:`tensor_homing`); its views and copies do not."""
+    The returned tensor's storage carries its :class:`Homing` record (see
+    :func:`tensor_homing`), so every alias of the tensor sees it; a copy does
+    not."""
     import math
 
     import torch
@@ -519,22 +522,44 @@ def split_empty(
     tensor = raw.view(dtype).view(shape)
     record = homing(tensor)
     if record is not None:
-        setattr(tensor, _HOMING_ATTR, record)
+        _mark_homed(tensor, record)
     return tensor
 
 
-# The attribute of the tensor split_empty returns that holds its Homing record.
+# The attribute that holds the Homing record of a split_empty allocation: set on
+# the storage of the returned tensor (shared by every alias of it; PyTorch keeps
+# a storage's Python object, and so its attributes, alive as long as the storage)
+# and on the returned tensor itself (read first: no storage lookup).
 _HOMING_ATTR = "_flashinfer_cake_homing"
+# Whether this process ever marked an allocation: until then no tensor is homed.
+_MARKED: list[bool] = []
+
+
+def _mark_homed(tensor: Any, record: Homing) -> None:
+    """Attach ``record`` to ``tensor`` and to its storage."""
+    setattr(tensor.untyped_storage(), _HOMING_ATTR, record)
+    setattr(tensor, _HOMING_ATTR, record)
+    if not _MARKED:
+        _MARKED.append(True)
 
 
 def tensor_homing(tensor: Any) -> Homing | None:
-    """The :class:`Homing` of ``tensor`` when it is the very tensor
-    :func:`split_empty` returned (it still starts at the allocation's base), else
-    ``None``: a view, a copy, or any other tensor, even one over the same memory,
-    gives ``None``. Reads an attribute of the tensor, not the registry, so it
+    """The :class:`Homing` of the :func:`split_empty` allocation whose storage
+    ``tensor`` uses, when ``tensor`` starts at the allocation's base, else
+    ``None``. Every alias over that storage sees the record: the returned tensor,
+    an ``nn.Parameter`` over it, its ``detach()``, its ``.data`` and its views
+    (a view of part of it starting at the base too: callers that need the whole
+    allocation also compare the byte size with ``Homing.nbytes``). A copy has
+    its own storage and gives ``None``. Reads attributes, not the registry, so it
     costs no call into the locality module."""
+    if not _MARKED:
+        return None
     record = getattr(tensor, _HOMING_ATTR, None)
-    if record is None or int(tensor.data_ptr()) != record.base:
+    if record is None:
+        record = getattr(tensor.untyped_storage(), _HOMING_ATTR, None)
+        if record is None:
+            return None
+    if int(tensor.data_ptr()) != record.base:
         return None
     return record
 
@@ -709,16 +734,21 @@ class _CaptureReserve:
 
 @dataclasses.dataclass
 class _DeviceCounters:
-    """The launch counters of one device, guarded by ``lock``: the eager pairs by
-    ``(stream handle, words)`` in least recently used order, the capture reserves
-    by ``words``, and the private stream that zeroes the reserves."""
+    """The launch counters of one device, written under ``lock``: the eager pairs
+    by ``(stream handle, words)`` (read without the lock) with their last-use
+    stamps, the capture reserves by ``words``, and the private stream that zeroes
+    the reserves."""
 
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
-    stream_pairs: collections.OrderedDict[tuple[int, int], tuple[Any, Any]] = (
-        dataclasses.field(default_factory=collections.OrderedDict)
+    stream_pairs: dict[tuple[int, int], tuple[Any, Any]] = dataclasses.field(
+        default_factory=dict
     )
     reserves: dict[int, _CaptureReserve] = dataclasses.field(default_factory=dict)
     side_stream: Any = None
+    # The last use of each stream_pairs key, a stamp of ``clock``: written by
+    # cache hits without the lock; the least recently used pair is evicted.
+    used: dict[tuple[int, int], int] = dataclasses.field(default_factory=dict)
+    clock: Any = dataclasses.field(default_factory=itertools.count)
 
 
 _COUNTER_STATES: dict[int, _DeviceCounters] = {}
@@ -910,11 +940,13 @@ def launch_counters(words: int, device: Any = None) -> tuple[Any, Any]:
                 local[key] = pair
     else:
         state = _counter_state(index)
-        with state.lock:
-            pair = state.stream_pairs.get((handle, words))
-            if pair is not None:
-                state.stream_pairs.move_to_end((handle, words))
-        if pair is None:
+        stream_key = (handle, words)
+        # A hit takes no lock: one dict read and one dict store of its use stamp
+        # (each atomic in CPython); a miss evicts by the stamps under the lock.
+        pair = state.stream_pairs.get(stream_key)
+        if pair is not None:
+            state.used[stream_key] = next(state.clock)
+        else:
             # Allocated and zeroed on this stream, ahead of the launch. Another
             # thread may have cached a pair of this stream meanwhile: take that
             # one (same stream, so ordered) and drop this one.
@@ -923,10 +955,18 @@ def launch_counters(words: int, device: Any = None) -> tuple[Any, Any]:
                 tensor.zero_()
             if lasting:
                 with state.lock:
-                    pair = state.stream_pairs.setdefault((handle, words), pair)
-                    state.stream_pairs.move_to_end((handle, words))
+                    pair = state.stream_pairs.setdefault(stream_key, pair)
+                    state.used[stream_key] = next(state.clock)
                     while len(state.stream_pairs) > STREAM_PAIR_LIMIT:
-                        state.stream_pairs.popitem(last=False)
+                        oldest = min(
+                            state.stream_pairs, key=lambda k: state.used.get(k, -1)
+                        )
+                        del state.stream_pairs[oldest]
+                        state.used.pop(oldest, None)
+                    if len(state.used) > 2 * STREAM_PAIR_LIMIT:
+                        # Stamps a hit wrote for a pair evicted meanwhile.
+                        for stale in set(state.used) - set(state.stream_pairs):
+                            state.used.pop(stale, None)
     # A refill that fails does not fail the call: captures then zero their own
     # pair until a later refill works.  A full reserve needs no refill (checked
     # here first, without the lock, as in _refill_capture_reserve).
