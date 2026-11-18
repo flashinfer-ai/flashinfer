@@ -20,20 +20,6 @@
 #include "cake_stepfun_moe_device_common.cuh"
 #include <cooperative_groups.h>
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SMEM_EXPERT_COUNT_OFF 0
-#define SMEM_SMEM_EXPERT_COUNT_STAGE_BYTES 512
-#define SMEM_SMEM_EXPERT_COUNT_STRIDE 512
-#define SMEM_SMEM_EXPERT_OFFSET_OFF 512
-#define SMEM_SMEM_EXPERT_OFFSET_STAGE_BYTES 512
-#define SMEM_SMEM_EXPERT_OFFSET_STRIDE 512
-#define SMEM_WARP_TOTALS_OFF 1024
-#define SMEM_WARP_TOTALS_STAGE_BYTES 128
-#define SMEM_WARP_TOTALS_STRIDE 128
-#define SMEM_TOTAL 1152
-#define THREADS 128
-
 extern "C" {
 
 __global__ __launch_bounds__(128) void
@@ -57,7 +43,7 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* smem_expert_count = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int smem_expert_count_addr = smem + 0;
     int* smem_expert_offset = reinterpret_cast<int*>(smem_raw + 512);
@@ -99,69 +85,69 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0 << 16);
             expanded = grid_tid + grid_threads;
             int packed_word_0 = topk_packed[expanded];
-            int idx_ii_1 = packed_word_0 >> 16;
-            unsigned int word0_2 = (unsigned int)packed_word_0 & 65535;
-            exp_idx[1] = idx_ii_1;
-            int local_idx_3 = idx_ii_1 - local_experts_start_idx;
-            int extent_4 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6 = ((local_idx_3 >= 0 && local_idx_3 < extent_4 && (local_idx_3 & stride_mask_5) == 0) ? 1 : 0);
+            int idx_ii_0 = packed_word_0 >> 16;
+            unsigned int word0_0 = (unsigned int)packed_word_0 & 65535;
+            exp_idx[1] = idx_ii_0;
+            int local_idx_0 = idx_ii_0 - local_experts_start_idx;
+            int extent_0 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_0 = (1 << local_experts_stride_log2) - 1;
+            int is_local_0 = ((local_idx_0 >= 0 && local_idx_0 < extent_0 && (local_idx_0 & stride_mask_0) == 0) ? 1 : 0);
             exp_off[1] = 0;
-            if (is_local_6 != 0) {
-                unsigned int _atomic_fetch_add_1 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
+            if (is_local_0 != 0) {
+                unsigned int _atomic_fetch_add_1 = atomicAdd(&smem_expert_count[idx_ii_0], 1);
                 exp_off[1] = (int)_atomic_fetch_add_1;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_0 << 16);
             expanded = grid_tid + 2 * grid_threads;
-            int packed_word_7 = topk_packed[expanded];
-            int idx_ii_8 = packed_word_7 >> 16;
-            unsigned int word0_9 = (unsigned int)packed_word_7 & 65535;
-            exp_idx[2] = idx_ii_8;
-            int local_idx_10 = idx_ii_8 - local_experts_start_idx;
-            int extent_11 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13 = ((local_idx_10 >= 0 && local_idx_10 < extent_11 && (local_idx_10 & stride_mask_12) == 0) ? 1 : 0);
+            int packed_word_1 = topk_packed[expanded];
+            int idx_ii_1 = packed_word_1 >> 16;
+            unsigned int word0_1 = (unsigned int)packed_word_1 & 65535;
+            exp_idx[2] = idx_ii_1;
+            int local_idx_1 = idx_ii_1 - local_experts_start_idx;
+            int extent_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_2 = ((local_idx_1 >= 0 && local_idx_1 < extent_1 && (local_idx_1 & stride_mask_1) == 0) ? 1 : 0);
             exp_off[2] = 0;
-            if (is_local_13 != 0) {
-                unsigned int _atomic_fetch_add_2 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
+            if (is_local_2 != 0) {
+                unsigned int _atomic_fetch_add_2 = atomicAdd(&smem_expert_count[idx_ii_1], 1);
                 exp_off[2] = (int)_atomic_fetch_add_2;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_1 << 16);
             expanded = grid_tid + 3 * grid_threads;
-            int packed_word_14 = topk_packed[expanded];
-            int idx_ii_15 = packed_word_14 >> 16;
-            unsigned int word0_16 = (unsigned int)packed_word_14 & 65535;
-            exp_idx[3] = idx_ii_15;
-            int local_idx_17 = idx_ii_15 - local_experts_start_idx;
-            int extent_18 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20 = ((local_idx_17 >= 0 && local_idx_17 < extent_18 && (local_idx_17 & stride_mask_19) == 0) ? 1 : 0);
+            int packed_word_2 = topk_packed[expanded];
+            int idx_ii_2 = packed_word_2 >> 16;
+            unsigned int word0_2 = (unsigned int)packed_word_2 & 65535;
+            exp_idx[3] = idx_ii_2;
+            int local_idx_2 = idx_ii_2 - local_experts_start_idx;
+            int extent_2 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_2 = (1 << local_experts_stride_log2) - 1;
+            int is_local_3 = ((local_idx_2 >= 0 && local_idx_2 < extent_2 && (local_idx_2 & stride_mask_2) == 0) ? 1 : 0);
             exp_off[3] = 0;
-            if (is_local_20 != 0) {
-                unsigned int _atomic_fetch_add_3 = atomicAdd(&smem_expert_count[idx_ii_15], 1);
+            if (is_local_3 != 0) {
+                unsigned int _atomic_fetch_add_3 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
                 exp_off[3] = (int)_atomic_fetch_add_3;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_1 = topk_packed[expanded];
-                    int idx_ii_2 = packed_word_1 >> 16;
-                    unsigned int word0_1 = (unsigned int)packed_word_1 & 65535;
-                    exp_idx[0] = idx_ii_2;
-                    int local_idx_1 = idx_ii_2 - local_experts_start_idx;
-                    int extent_1 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_1 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_1 = ((local_idx_1 >= 0 && local_idx_1 < extent_1 && (local_idx_1 & stride_mask_1) == 0) ? 1 : 0);
+                    int packed_word_3 = topk_packed[expanded];
+                    int idx_ii_3 = packed_word_3 >> 16;
+                    unsigned int word0_3 = (unsigned int)packed_word_3 & 65535;
+                    exp_idx[0] = idx_ii_3;
+                    int local_idx_3 = idx_ii_3 - local_experts_start_idx;
+                    int extent_3 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_3 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_1 = ((local_idx_3 >= 0 && local_idx_3 < extent_3 && (local_idx_3 & stride_mask_3) == 0) ? 1 : 0);
                     exp_off[0] = 0;
                     if (is_local_1 != 0) {
-                        unsigned int _atomic_fetch_add_4 = atomicAdd(&smem_expert_count[idx_ii_2], 1);
+                        unsigned int _atomic_fetch_add_4 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
                         exp_off[0] = (int)_atomic_fetch_add_4;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_1 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3 << 16);
                 }
             }
             if (done == 0) {
@@ -169,20 +155,20 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_2 = topk_packed[expanded];
-                    int idx_ii_3 = packed_word_2 >> 16;
-                    unsigned int word0_3 = (unsigned int)packed_word_2 & 65535;
-                    exp_idx[1] = idx_ii_3;
-                    int local_idx_2 = idx_ii_3 - local_experts_start_idx;
-                    int extent_2 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_2 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_2 = ((local_idx_2 >= 0 && local_idx_2 < extent_2 && (local_idx_2 & stride_mask_2) == 0) ? 1 : 0);
+                    int packed_word_4 = topk_packed[expanded];
+                    int idx_ii_4 = packed_word_4 >> 16;
+                    unsigned int word0_4 = (unsigned int)packed_word_4 & 65535;
+                    exp_idx[1] = idx_ii_4;
+                    int local_idx_4 = idx_ii_4 - local_experts_start_idx;
+                    int extent_4 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_4 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_4 = ((local_idx_4 >= 0 && local_idx_4 < extent_4 && (local_idx_4 & stride_mask_4) == 0) ? 1 : 0);
                     exp_off[1] = 0;
-                    if (is_local_2 != 0) {
-                        unsigned int _atomic_fetch_add_5 = atomicAdd(&smem_expert_count[idx_ii_3], 1);
+                    if (is_local_4 != 0) {
+                        unsigned int _atomic_fetch_add_5 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
                         exp_off[1] = (int)_atomic_fetch_add_5;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4 << 16);
                 }
             }
             if (done == 0) {
@@ -190,20 +176,20 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_3 = topk_packed[expanded];
-                    int idx_ii_4 = packed_word_3 >> 16;
-                    unsigned int word0_4 = (unsigned int)packed_word_3 & 65535;
-                    exp_idx[2] = idx_ii_4;
-                    int local_idx_4 = idx_ii_4 - local_experts_start_idx;
-                    int extent_3 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_3 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_3 = ((local_idx_4 >= 0 && local_idx_4 < extent_3 && (local_idx_4 & stride_mask_3) == 0) ? 1 : 0);
+                    int packed_word_5 = topk_packed[expanded];
+                    int idx_ii_5 = packed_word_5 >> 16;
+                    unsigned int word0_5 = (unsigned int)packed_word_5 & 65535;
+                    exp_idx[2] = idx_ii_5;
+                    int local_idx_5 = idx_ii_5 - local_experts_start_idx;
+                    int extent_5 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_5 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_5 = ((local_idx_5 >= 0 && local_idx_5 < extent_5 && (local_idx_5 & stride_mask_5) == 0) ? 1 : 0);
                     exp_off[2] = 0;
-                    if (is_local_3 != 0) {
-                        unsigned int _atomic_fetch_add_6 = atomicAdd(&smem_expert_count[idx_ii_4], 1);
+                    if (is_local_5 != 0) {
+                        unsigned int _atomic_fetch_add_6 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
                         exp_off[2] = (int)_atomic_fetch_add_6;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5 << 16);
                 }
             }
             if (done == 0) {
@@ -211,20 +197,20 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_4 = topk_packed[expanded];
-                    int idx_ii_5 = packed_word_4 >> 16;
-                    unsigned int word0_5 = (unsigned int)packed_word_4 & 65535;
-                    exp_idx[3] = idx_ii_5;
-                    int local_idx_5 = idx_ii_5 - local_experts_start_idx;
-                    int extent_5 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_4 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_4 = ((local_idx_5 >= 0 && local_idx_5 < extent_5 && (local_idx_5 & stride_mask_4) == 0) ? 1 : 0);
+                    int packed_word_6 = topk_packed[expanded];
+                    int idx_ii_6 = packed_word_6 >> 16;
+                    unsigned int word0_6 = (unsigned int)packed_word_6 & 65535;
+                    exp_idx[3] = idx_ii_6;
+                    int local_idx_6 = idx_ii_6 - local_experts_start_idx;
+                    int extent_6 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_6 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_6 = ((local_idx_6 >= 0 && local_idx_6 < extent_6 && (local_idx_6 & stride_mask_6) == 0) ? 1 : 0);
                     exp_off[3] = 0;
-                    if (is_local_4 != 0) {
-                        unsigned int _atomic_fetch_add_7 = atomicAdd(&smem_expert_count[idx_ii_5], 1);
+                    if (is_local_6 != 0) {
+                        unsigned int _atomic_fetch_add_7 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
                         exp_off[3] = (int)_atomic_fetch_add_7;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_6 << 16);
                 }
             }
         }
@@ -232,85 +218,85 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
     if (done == 0) {
         if (expanded_size >= 8 * grid_threads) {
             expanded = grid_tid + 4 * grid_threads;
-            int packed_word_5 = topk_packed[expanded];
-            int idx_ii_6 = packed_word_5 >> 16;
-            unsigned int word0_6 = (unsigned int)packed_word_5 & 65535;
-            exp_idx[4] = idx_ii_6;
-            int local_idx_6 = idx_ii_6 - local_experts_start_idx;
-            int extent_6 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_6 = (1 << local_experts_stride_log2) - 1;
-            int is_local_5 = ((local_idx_6 >= 0 && local_idx_6 < extent_6 && (local_idx_6 & stride_mask_6) == 0) ? 1 : 0);
+            int packed_word_7 = topk_packed[expanded];
+            int idx_ii_7 = packed_word_7 >> 16;
+            unsigned int word0_7 = (unsigned int)packed_word_7 & 65535;
+            exp_idx[4] = idx_ii_7;
+            int local_idx_7 = idx_ii_7 - local_experts_start_idx;
+            int extent_7 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_7 = (1 << local_experts_stride_log2) - 1;
+            int is_local_7 = ((local_idx_7 >= 0 && local_idx_7 < extent_7 && (local_idx_7 & stride_mask_7) == 0) ? 1 : 0);
             exp_off[4] = 0;
-            if (is_local_5 != 0) {
-                unsigned int _atomic_fetch_add_8 = atomicAdd(&smem_expert_count[idx_ii_6], 1);
+            if (is_local_7 != 0) {
+                unsigned int _atomic_fetch_add_8 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
                 exp_off[4] = (int)_atomic_fetch_add_8;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_6 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_7 << 16);
             expanded = grid_tid + 5 * grid_threads;
-            int packed_word_0_1 = topk_packed[expanded];
-            int idx_ii_1_1 = packed_word_0_1 >> 16;
-            unsigned int word0_2_1 = (unsigned int)packed_word_0_1 & 65535;
-            exp_idx[5] = idx_ii_1_1;
-            int local_idx_3_1 = idx_ii_1_1 - local_experts_start_idx;
-            int extent_4_1 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_1 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_1 = ((local_idx_3_1 >= 0 && local_idx_3_1 < extent_4_1 && (local_idx_3_1 & stride_mask_5_1) == 0) ? 1 : 0);
+            int packed_word_3_1 = topk_packed[expanded];
+            int idx_ii_3_1 = packed_word_3_1 >> 16;
+            unsigned int word0_3_1 = (unsigned int)packed_word_3_1 & 65535;
+            exp_idx[5] = idx_ii_3_1;
+            int local_idx_3_1 = idx_ii_3_1 - local_experts_start_idx;
+            int extent_3_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_3_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_4_1 = ((local_idx_3_1 >= 0 && local_idx_3_1 < extent_3_1 && (local_idx_3_1 & stride_mask_3_1) == 0) ? 1 : 0);
             exp_off[5] = 0;
-            if (is_local_6_1 != 0) {
-                unsigned int _atomic_fetch_add_9 = atomicAdd(&smem_expert_count[idx_ii_1_1], 1);
+            if (is_local_4_1 != 0) {
+                unsigned int _atomic_fetch_add_9 = atomicAdd(&smem_expert_count[idx_ii_3_1], 1);
                 exp_off[5] = (int)_atomic_fetch_add_9;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_1 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_3_1 << 16);
             expanded = grid_tid + 6 * grid_threads;
-            int packed_word_7_1 = topk_packed[expanded];
-            int idx_ii_8_1 = packed_word_7_1 >> 16;
-            unsigned int word0_9_1 = (unsigned int)packed_word_7_1 & 65535;
-            exp_idx[6] = idx_ii_8_1;
-            int local_idx_10_1 = idx_ii_8_1 - local_experts_start_idx;
-            int extent_11_1 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_1 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_1 = ((local_idx_10_1 >= 0 && local_idx_10_1 < extent_11_1 && (local_idx_10_1 & stride_mask_12_1) == 0) ? 1 : 0);
+            int packed_word_4_1 = topk_packed[expanded];
+            int idx_ii_4_1 = packed_word_4_1 >> 16;
+            unsigned int word0_4_1 = (unsigned int)packed_word_4_1 & 65535;
+            exp_idx[6] = idx_ii_4_1;
+            int local_idx_4_1 = idx_ii_4_1 - local_experts_start_idx;
+            int extent_4_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_4_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_5_1 = ((local_idx_4_1 >= 0 && local_idx_4_1 < extent_4_1 && (local_idx_4_1 & stride_mask_4_1) == 0) ? 1 : 0);
             exp_off[6] = 0;
-            if (is_local_13_1 != 0) {
-                unsigned int _atomic_fetch_add_10 = atomicAdd(&smem_expert_count[idx_ii_8_1], 1);
+            if (is_local_5_1 != 0) {
+                unsigned int _atomic_fetch_add_10 = atomicAdd(&smem_expert_count[idx_ii_4_1], 1);
                 exp_off[6] = (int)_atomic_fetch_add_10;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_1 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_4_1 << 16);
             expanded = grid_tid + 7 * grid_threads;
-            int packed_word_14_1 = topk_packed[expanded];
-            int idx_ii_15_1 = packed_word_14_1 >> 16;
-            unsigned int word0_16_1 = (unsigned int)packed_word_14_1 & 65535;
-            exp_idx[7] = idx_ii_15_1;
-            int local_idx_17_1 = idx_ii_15_1 - local_experts_start_idx;
-            int extent_18_1 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_1 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_1 = ((local_idx_17_1 >= 0 && local_idx_17_1 < extent_18_1 && (local_idx_17_1 & stride_mask_19_1) == 0) ? 1 : 0);
+            int packed_word_5_1 = topk_packed[expanded];
+            int idx_ii_5_1 = packed_word_5_1 >> 16;
+            unsigned int word0_5_1 = (unsigned int)packed_word_5_1 & 65535;
+            exp_idx[7] = idx_ii_5_1;
+            int local_idx_5_1 = idx_ii_5_1 - local_experts_start_idx;
+            int extent_5_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_5_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_6_1 = ((local_idx_5_1 >= 0 && local_idx_5_1 < extent_5_1 && (local_idx_5_1 & stride_mask_5_1) == 0) ? 1 : 0);
             exp_off[7] = 0;
-            if (is_local_20_1 != 0) {
-                unsigned int _atomic_fetch_add_11 = atomicAdd(&smem_expert_count[idx_ii_15_1], 1);
+            if (is_local_6_1 != 0) {
+                unsigned int _atomic_fetch_add_11 = atomicAdd(&smem_expert_count[idx_ii_5_1], 1);
                 exp_off[7] = (int)_atomic_fetch_add_11;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_1 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_5_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 4 * grid_threads;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_6 = topk_packed[expanded];
-                    int idx_ii_7 = packed_word_6 >> 16;
-                    unsigned int word0_7 = (unsigned int)packed_word_6 & 65535;
-                    exp_idx[4] = idx_ii_7;
-                    int local_idx_7 = idx_ii_7 - local_experts_start_idx;
-                    int extent_7 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_7 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_7 = ((local_idx_7 >= 0 && local_idx_7 < extent_7 && (local_idx_7 & stride_mask_7) == 0) ? 1 : 0);
+                    int packed_word_8 = topk_packed[expanded];
+                    int idx_ii_8 = packed_word_8 >> 16;
+                    unsigned int word0_8 = (unsigned int)packed_word_8 & 65535;
+                    exp_idx[4] = idx_ii_8;
+                    int local_idx_8 = idx_ii_8 - local_experts_start_idx;
+                    int extent_8 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_8 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_8 = ((local_idx_8 >= 0 && local_idx_8 < extent_8 && (local_idx_8 & stride_mask_8) == 0) ? 1 : 0);
                     exp_off[4] = 0;
-                    if (is_local_7 != 0) {
-                        unsigned int _atomic_fetch_add_12 = atomicAdd(&smem_expert_count[idx_ii_7], 1);
+                    if (is_local_8 != 0) {
+                        unsigned int _atomic_fetch_add_12 = atomicAdd(&smem_expert_count[idx_ii_8], 1);
                         exp_off[4] = (int)_atomic_fetch_add_12;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_7 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_8 << 16);
                 }
             }
             if (done == 0) {
@@ -318,20 +304,20 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_8 = topk_packed[expanded];
-                    int idx_ii_9 = packed_word_8 >> 16;
-                    unsigned int word0_8 = (unsigned int)packed_word_8 & 65535;
+                    int packed_word_9 = topk_packed[expanded];
+                    int idx_ii_9 = packed_word_9 >> 16;
+                    unsigned int word0_9 = (unsigned int)packed_word_9 & 65535;
                     exp_idx[5] = idx_ii_9;
-                    int local_idx_8 = idx_ii_9 - local_experts_start_idx;
-                    int extent_8 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_8 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_8 = ((local_idx_8 >= 0 && local_idx_8 < extent_8 && (local_idx_8 & stride_mask_8) == 0) ? 1 : 0);
+                    int local_idx_9 = idx_ii_9 - local_experts_start_idx;
+                    int extent_9 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_9 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_9 = ((local_idx_9 >= 0 && local_idx_9 < extent_9 && (local_idx_9 & stride_mask_9) == 0) ? 1 : 0);
                     exp_off[5] = 0;
-                    if (is_local_8 != 0) {
+                    if (is_local_9 != 0) {
                         unsigned int _atomic_fetch_add_13 = atomicAdd(&smem_expert_count[idx_ii_9], 1);
                         exp_off[5] = (int)_atomic_fetch_add_13;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_8 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9 << 16);
                 }
             }
             if (done == 0) {
@@ -339,16 +325,16 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_9 = topk_packed[expanded];
-                    int idx_ii_10 = packed_word_9 >> 16;
-                    unsigned int word0_10 = (unsigned int)packed_word_9 & 65535;
+                    int packed_word_10 = topk_packed[expanded];
+                    int idx_ii_10 = packed_word_10 >> 16;
+                    unsigned int word0_10 = (unsigned int)packed_word_10 & 65535;
                     exp_idx[6] = idx_ii_10;
-                    int local_idx_9 = idx_ii_10 - local_experts_start_idx;
-                    int extent_9 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_9 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_9 = ((local_idx_9 >= 0 && local_idx_9 < extent_9 && (local_idx_9 & stride_mask_9) == 0) ? 1 : 0);
+                    int local_idx_10 = idx_ii_10 - local_experts_start_idx;
+                    int extent_10 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_10 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_10 = ((local_idx_10 >= 0 && local_idx_10 < extent_10 && (local_idx_10 & stride_mask_10) == 0) ? 1 : 0);
                     exp_off[6] = 0;
-                    if (is_local_9 != 0) {
+                    if (is_local_10 != 0) {
                         unsigned int _atomic_fetch_add_14 = atomicAdd(&smem_expert_count[idx_ii_10], 1);
                         exp_off[6] = (int)_atomic_fetch_add_14;
                     }
@@ -360,16 +346,16 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_10 = topk_packed[expanded];
-                    int idx_ii_11 = packed_word_10 >> 16;
-                    unsigned int word0_11 = (unsigned int)packed_word_10 & 65535;
+                    int packed_word_11 = topk_packed[expanded];
+                    int idx_ii_11 = packed_word_11 >> 16;
+                    unsigned int word0_11 = (unsigned int)packed_word_11 & 65535;
                     exp_idx[7] = idx_ii_11;
                     int local_idx_11 = idx_ii_11 - local_experts_start_idx;
-                    int extent_10 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_10 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_10 = ((local_idx_11 >= 0 && local_idx_11 < extent_10 && (local_idx_11 & stride_mask_10) == 0) ? 1 : 0);
+                    int extent_11 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_11 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_11 = ((local_idx_11 >= 0 && local_idx_11 < extent_11 && (local_idx_11 & stride_mask_11) == 0) ? 1 : 0);
                     exp_off[7] = 0;
-                    if (is_local_10 != 0) {
+                    if (is_local_11 != 0) {
                         unsigned int _atomic_fetch_add_15 = atomicAdd(&smem_expert_count[idx_ii_11], 1);
                         exp_off[7] = (int)_atomic_fetch_add_15;
                     }
@@ -381,81 +367,81 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
     if (done == 0) {
         if (expanded_size >= 12 * grid_threads) {
             expanded = grid_tid + 8 * grid_threads;
-            int packed_word_11 = topk_packed[expanded];
-            int idx_ii_12 = packed_word_11 >> 16;
-            unsigned int word0_12 = (unsigned int)packed_word_11 & 65535;
+            int packed_word_12 = topk_packed[expanded];
+            int idx_ii_12 = packed_word_12 >> 16;
+            unsigned int word0_12 = (unsigned int)packed_word_12 & 65535;
             exp_idx[8] = idx_ii_12;
             int local_idx_12 = idx_ii_12 - local_experts_start_idx;
             int extent_12 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_11 = (1 << local_experts_stride_log2) - 1;
-            int is_local_11 = ((local_idx_12 >= 0 && local_idx_12 < extent_12 && (local_idx_12 & stride_mask_11) == 0) ? 1 : 0);
+            int stride_mask_12 = (1 << local_experts_stride_log2) - 1;
+            int is_local_12 = ((local_idx_12 >= 0 && local_idx_12 < extent_12 && (local_idx_12 & stride_mask_12) == 0) ? 1 : 0);
             exp_off[8] = 0;
-            if (is_local_11 != 0) {
+            if (is_local_12 != 0) {
                 unsigned int _atomic_fetch_add_16 = atomicAdd(&smem_expert_count[idx_ii_12], 1);
                 exp_off[8] = (int)_atomic_fetch_add_16;
             }
             topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_12 << 16);
             expanded = grid_tid + 9 * grid_threads;
-            int packed_word_0_2 = topk_packed[expanded];
-            int idx_ii_1_2 = packed_word_0_2 >> 16;
-            unsigned int word0_2_2 = (unsigned int)packed_word_0_2 & 65535;
-            exp_idx[9] = idx_ii_1_2;
-            int local_idx_3_2 = idx_ii_1_2 - local_experts_start_idx;
-            int extent_4_2 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_2 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_2 = ((local_idx_3_2 >= 0 && local_idx_3_2 < extent_4_2 && (local_idx_3_2 & stride_mask_5_2) == 0) ? 1 : 0);
+            int packed_word_6_1 = topk_packed[expanded];
+            int idx_ii_6_1 = packed_word_6_1 >> 16;
+            unsigned int word0_6_1 = (unsigned int)packed_word_6_1 & 65535;
+            exp_idx[9] = idx_ii_6_1;
+            int local_idx_6_1 = idx_ii_6_1 - local_experts_start_idx;
+            int extent_6_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_6_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_7_1 = ((local_idx_6_1 >= 0 && local_idx_6_1 < extent_6_1 && (local_idx_6_1 & stride_mask_6_1) == 0) ? 1 : 0);
             exp_off[9] = 0;
-            if (is_local_6_2 != 0) {
-                unsigned int _atomic_fetch_add_17 = atomicAdd(&smem_expert_count[idx_ii_1_2], 1);
+            if (is_local_7_1 != 0) {
+                unsigned int _atomic_fetch_add_17 = atomicAdd(&smem_expert_count[idx_ii_6_1], 1);
                 exp_off[9] = (int)_atomic_fetch_add_17;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_2 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_6_1 << 16);
             expanded = grid_tid + 10 * grid_threads;
-            int packed_word_7_2 = topk_packed[expanded];
-            int idx_ii_8_2 = packed_word_7_2 >> 16;
-            unsigned int word0_9_2 = (unsigned int)packed_word_7_2 & 65535;
-            exp_idx[10] = idx_ii_8_2;
-            int local_idx_10_2 = idx_ii_8_2 - local_experts_start_idx;
-            int extent_11_2 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_2 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_2 = ((local_idx_10_2 >= 0 && local_idx_10_2 < extent_11_2 && (local_idx_10_2 & stride_mask_12_2) == 0) ? 1 : 0);
+            int packed_word_7_1 = topk_packed[expanded];
+            int idx_ii_7_1 = packed_word_7_1 >> 16;
+            unsigned int word0_7_1 = (unsigned int)packed_word_7_1 & 65535;
+            exp_idx[10] = idx_ii_7_1;
+            int local_idx_7_1 = idx_ii_7_1 - local_experts_start_idx;
+            int extent_7_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_7_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_8_1 = ((local_idx_7_1 >= 0 && local_idx_7_1 < extent_7_1 && (local_idx_7_1 & stride_mask_7_1) == 0) ? 1 : 0);
             exp_off[10] = 0;
-            if (is_local_13_2 != 0) {
-                unsigned int _atomic_fetch_add_18 = atomicAdd(&smem_expert_count[idx_ii_8_2], 1);
+            if (is_local_8_1 != 0) {
+                unsigned int _atomic_fetch_add_18 = atomicAdd(&smem_expert_count[idx_ii_7_1], 1);
                 exp_off[10] = (int)_atomic_fetch_add_18;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_2 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_7_1 << 16);
             expanded = grid_tid + 11 * grid_threads;
-            int packed_word_14_2 = topk_packed[expanded];
-            int idx_ii_15_2 = packed_word_14_2 >> 16;
-            unsigned int word0_16_2 = (unsigned int)packed_word_14_2 & 65535;
-            exp_idx[11] = idx_ii_15_2;
-            int local_idx_17_2 = idx_ii_15_2 - local_experts_start_idx;
-            int extent_18_2 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_2 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_2 = ((local_idx_17_2 >= 0 && local_idx_17_2 < extent_18_2 && (local_idx_17_2 & stride_mask_19_2) == 0) ? 1 : 0);
+            int packed_word_8_1 = topk_packed[expanded];
+            int idx_ii_8_1 = packed_word_8_1 >> 16;
+            unsigned int word0_8_1 = (unsigned int)packed_word_8_1 & 65535;
+            exp_idx[11] = idx_ii_8_1;
+            int local_idx_8_1 = idx_ii_8_1 - local_experts_start_idx;
+            int extent_8_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_8_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_9_1 = ((local_idx_8_1 >= 0 && local_idx_8_1 < extent_8_1 && (local_idx_8_1 & stride_mask_8_1) == 0) ? 1 : 0);
             exp_off[11] = 0;
-            if (is_local_20_2 != 0) {
-                unsigned int _atomic_fetch_add_19 = atomicAdd(&smem_expert_count[idx_ii_15_2], 1);
+            if (is_local_9_1 != 0) {
+                unsigned int _atomic_fetch_add_19 = atomicAdd(&smem_expert_count[idx_ii_8_1], 1);
                 exp_off[11] = (int)_atomic_fetch_add_19;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_2 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_8_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 8 * grid_threads;
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_12 = topk_packed[expanded];
-                    int idx_ii_13 = packed_word_12 >> 16;
-                    unsigned int word0_13 = (unsigned int)packed_word_12 & 65535;
+                    int packed_word_13 = topk_packed[expanded];
+                    int idx_ii_13 = packed_word_13 >> 16;
+                    unsigned int word0_13 = (unsigned int)packed_word_13 & 65535;
                     exp_idx[8] = idx_ii_13;
                     int local_idx_13 = idx_ii_13 - local_experts_start_idx;
                     int extent_13 = num_local_experts << local_experts_stride_log2;
                     int stride_mask_13 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_12 = ((local_idx_13 >= 0 && local_idx_13 < extent_13 && (local_idx_13 & stride_mask_13) == 0) ? 1 : 0);
+                    int is_local_13 = ((local_idx_13 >= 0 && local_idx_13 < extent_13 && (local_idx_13 & stride_mask_13) == 0) ? 1 : 0);
                     exp_off[8] = 0;
-                    if (is_local_12 != 0) {
+                    if (is_local_13 != 0) {
                         unsigned int _atomic_fetch_add_20 = atomicAdd(&smem_expert_count[idx_ii_13], 1);
                         exp_off[8] = (int)_atomic_fetch_add_20;
                     }
@@ -467,9 +453,9 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                 if (expanded >= expanded_size) {
                     done = 1;
                 } else {
-                    int packed_word_13 = topk_packed[expanded];
-                    int idx_ii_14 = packed_word_13 >> 16;
-                    unsigned int word0_14 = (unsigned int)packed_word_13 & 65535;
+                    int packed_word_14 = topk_packed[expanded];
+                    int idx_ii_14 = packed_word_14 >> 16;
+                    unsigned int word0_14 = (unsigned int)packed_word_14 & 65535;
                     exp_idx[9] = idx_ii_14;
                     int local_idx_14 = idx_ii_14 - local_experts_start_idx;
                     int extent_14 = num_local_experts << local_experts_stride_log2;
@@ -489,16 +475,16 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_15 = topk_packed[expanded];
-                    int idx_ii_16 = packed_word_15 >> 16;
+                    int idx_ii_15 = packed_word_15 >> 16;
                     unsigned int word0_15 = (unsigned int)packed_word_15 & 65535;
-                    exp_idx[10] = idx_ii_16;
-                    int local_idx_15 = idx_ii_16 - local_experts_start_idx;
+                    exp_idx[10] = idx_ii_15;
+                    int local_idx_15 = idx_ii_15 - local_experts_start_idx;
                     int extent_15 = num_local_experts << local_experts_stride_log2;
                     int stride_mask_15 = (1 << local_experts_stride_log2) - 1;
                     int is_local_15 = ((local_idx_15 >= 0 && local_idx_15 < extent_15 && (local_idx_15 & stride_mask_15) == 0) ? 1 : 0);
                     exp_off[10] = 0;
                     if (is_local_15 != 0) {
-                        unsigned int _atomic_fetch_add_22 = atomicAdd(&smem_expert_count[idx_ii_16], 1);
+                        unsigned int _atomic_fetch_add_22 = atomicAdd(&smem_expert_count[idx_ii_15], 1);
                         exp_off[10] = (int)_atomic_fetch_add_22;
                     }
                     topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_15 << 16);
@@ -510,19 +496,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_16 = topk_packed[expanded];
-                    int idx_ii_17 = packed_word_16 >> 16;
-                    unsigned int word0_17 = (unsigned int)packed_word_16 & 65535;
-                    exp_idx[11] = idx_ii_17;
-                    int local_idx_16 = idx_ii_17 - local_experts_start_idx;
+                    int idx_ii_16 = packed_word_16 >> 16;
+                    unsigned int word0_16 = (unsigned int)packed_word_16 & 65535;
+                    exp_idx[11] = idx_ii_16;
+                    int local_idx_16 = idx_ii_16 - local_experts_start_idx;
                     int extent_16 = num_local_experts << local_experts_stride_log2;
                     int stride_mask_16 = (1 << local_experts_stride_log2) - 1;
                     int is_local_16 = ((local_idx_16 >= 0 && local_idx_16 < extent_16 && (local_idx_16 & stride_mask_16) == 0) ? 1 : 0);
                     exp_off[11] = 0;
                     if (is_local_16 != 0) {
-                        unsigned int _atomic_fetch_add_23 = atomicAdd(&smem_expert_count[idx_ii_17], 1);
+                        unsigned int _atomic_fetch_add_23 = atomicAdd(&smem_expert_count[idx_ii_16], 1);
                         exp_off[11] = (int)_atomic_fetch_add_23;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_17 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16 << 16);
                 }
             }
         }
@@ -531,64 +517,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 16 * grid_threads) {
             expanded = grid_tid + 12 * grid_threads;
             int packed_word_17 = topk_packed[expanded];
-            int idx_ii_18 = packed_word_17 >> 16;
-            unsigned int word0_18 = (unsigned int)packed_word_17 & 65535;
-            exp_idx[12] = idx_ii_18;
-            int local_idx_18 = idx_ii_18 - local_experts_start_idx;
+            int idx_ii_17 = packed_word_17 >> 16;
+            unsigned int word0_17 = (unsigned int)packed_word_17 & 65535;
+            exp_idx[12] = idx_ii_17;
+            int local_idx_17 = idx_ii_17 - local_experts_start_idx;
             int extent_17 = num_local_experts << local_experts_stride_log2;
             int stride_mask_17 = (1 << local_experts_stride_log2) - 1;
-            int is_local_17 = ((local_idx_18 >= 0 && local_idx_18 < extent_17 && (local_idx_18 & stride_mask_17) == 0) ? 1 : 0);
+            int is_local_17 = ((local_idx_17 >= 0 && local_idx_17 < extent_17 && (local_idx_17 & stride_mask_17) == 0) ? 1 : 0);
             exp_off[12] = 0;
             if (is_local_17 != 0) {
-                unsigned int _atomic_fetch_add_24 = atomicAdd(&smem_expert_count[idx_ii_18], 1);
+                unsigned int _atomic_fetch_add_24 = atomicAdd(&smem_expert_count[idx_ii_17], 1);
                 exp_off[12] = (int)_atomic_fetch_add_24;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_18 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_17 << 16);
             expanded = grid_tid + 13 * grid_threads;
-            int packed_word_0_3 = topk_packed[expanded];
-            int idx_ii_1_3 = packed_word_0_3 >> 16;
-            unsigned int word0_2_3 = (unsigned int)packed_word_0_3 & 65535;
-            exp_idx[13] = idx_ii_1_3;
-            int local_idx_3_3 = idx_ii_1_3 - local_experts_start_idx;
-            int extent_4_3 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_3 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_3 = ((local_idx_3_3 >= 0 && local_idx_3_3 < extent_4_3 && (local_idx_3_3 & stride_mask_5_3) == 0) ? 1 : 0);
+            int packed_word_9_1 = topk_packed[expanded];
+            int idx_ii_9_1 = packed_word_9_1 >> 16;
+            unsigned int word0_9_1 = (unsigned int)packed_word_9_1 & 65535;
+            exp_idx[13] = idx_ii_9_1;
+            int local_idx_9_1 = idx_ii_9_1 - local_experts_start_idx;
+            int extent_9_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_9_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_10_1 = ((local_idx_9_1 >= 0 && local_idx_9_1 < extent_9_1 && (local_idx_9_1 & stride_mask_9_1) == 0) ? 1 : 0);
             exp_off[13] = 0;
-            if (is_local_6_3 != 0) {
-                unsigned int _atomic_fetch_add_25 = atomicAdd(&smem_expert_count[idx_ii_1_3], 1);
+            if (is_local_10_1 != 0) {
+                unsigned int _atomic_fetch_add_25 = atomicAdd(&smem_expert_count[idx_ii_9_1], 1);
                 exp_off[13] = (int)_atomic_fetch_add_25;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_3 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_1 << 16);
             expanded = grid_tid + 14 * grid_threads;
-            int packed_word_7_3 = topk_packed[expanded];
-            int idx_ii_8_3 = packed_word_7_3 >> 16;
-            unsigned int word0_9_3 = (unsigned int)packed_word_7_3 & 65535;
-            exp_idx[14] = idx_ii_8_3;
-            int local_idx_10_3 = idx_ii_8_3 - local_experts_start_idx;
-            int extent_11_3 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_3 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_3 = ((local_idx_10_3 >= 0 && local_idx_10_3 < extent_11_3 && (local_idx_10_3 & stride_mask_12_3) == 0) ? 1 : 0);
+            int packed_word_10_1 = topk_packed[expanded];
+            int idx_ii_10_1 = packed_word_10_1 >> 16;
+            unsigned int word0_10_1 = (unsigned int)packed_word_10_1 & 65535;
+            exp_idx[14] = idx_ii_10_1;
+            int local_idx_10_1 = idx_ii_10_1 - local_experts_start_idx;
+            int extent_10_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_10_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_11_1 = ((local_idx_10_1 >= 0 && local_idx_10_1 < extent_10_1 && (local_idx_10_1 & stride_mask_10_1) == 0) ? 1 : 0);
             exp_off[14] = 0;
-            if (is_local_13_3 != 0) {
-                unsigned int _atomic_fetch_add_26 = atomicAdd(&smem_expert_count[idx_ii_8_3], 1);
+            if (is_local_11_1 != 0) {
+                unsigned int _atomic_fetch_add_26 = atomicAdd(&smem_expert_count[idx_ii_10_1], 1);
                 exp_off[14] = (int)_atomic_fetch_add_26;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_3 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_10_1 << 16);
             expanded = grid_tid + 15 * grid_threads;
-            int packed_word_14_3 = topk_packed[expanded];
-            int idx_ii_15_3 = packed_word_14_3 >> 16;
-            unsigned int word0_16_3 = (unsigned int)packed_word_14_3 & 65535;
-            exp_idx[15] = idx_ii_15_3;
-            int local_idx_17_3 = idx_ii_15_3 - local_experts_start_idx;
-            int extent_18_3 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_3 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_3 = ((local_idx_17_3 >= 0 && local_idx_17_3 < extent_18_3 && (local_idx_17_3 & stride_mask_19_3) == 0) ? 1 : 0);
+            int packed_word_11_1 = topk_packed[expanded];
+            int idx_ii_11_1 = packed_word_11_1 >> 16;
+            unsigned int word0_11_1 = (unsigned int)packed_word_11_1 & 65535;
+            exp_idx[15] = idx_ii_11_1;
+            int local_idx_11_1 = idx_ii_11_1 - local_experts_start_idx;
+            int extent_11_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_11_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_12_1 = ((local_idx_11_1 >= 0 && local_idx_11_1 < extent_11_1 && (local_idx_11_1 & stride_mask_11_1) == 0) ? 1 : 0);
             exp_off[15] = 0;
-            if (is_local_20_3 != 0) {
-                unsigned int _atomic_fetch_add_27 = atomicAdd(&smem_expert_count[idx_ii_15_3], 1);
+            if (is_local_12_1 != 0) {
+                unsigned int _atomic_fetch_add_27 = atomicAdd(&smem_expert_count[idx_ii_11_1], 1);
                 exp_off[15] = (int)_atomic_fetch_add_27;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_3 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_11_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 12 * grid_threads;
@@ -596,19 +582,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_18 = topk_packed[expanded];
-                    int idx_ii_19 = packed_word_18 >> 16;
-                    unsigned int word0_19 = (unsigned int)packed_word_18 & 65535;
-                    exp_idx[12] = idx_ii_19;
-                    int local_idx_19 = idx_ii_19 - local_experts_start_idx;
-                    int extent_19 = num_local_experts << local_experts_stride_log2;
+                    int idx_ii_18 = packed_word_18 >> 16;
+                    unsigned int word0_18 = (unsigned int)packed_word_18 & 65535;
+                    exp_idx[12] = idx_ii_18;
+                    int local_idx_18 = idx_ii_18 - local_experts_start_idx;
+                    int extent_18 = num_local_experts << local_experts_stride_log2;
                     int stride_mask_18 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_18 = ((local_idx_19 >= 0 && local_idx_19 < extent_19 && (local_idx_19 & stride_mask_18) == 0) ? 1 : 0);
+                    int is_local_18 = ((local_idx_18 >= 0 && local_idx_18 < extent_18 && (local_idx_18 & stride_mask_18) == 0) ? 1 : 0);
                     exp_off[12] = 0;
                     if (is_local_18 != 0) {
-                        unsigned int _atomic_fetch_add_28 = atomicAdd(&smem_expert_count[idx_ii_19], 1);
+                        unsigned int _atomic_fetch_add_28 = atomicAdd(&smem_expert_count[idx_ii_18], 1);
                         exp_off[12] = (int)_atomic_fetch_add_28;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_19 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_18 << 16);
                 }
             }
             if (done == 0) {
@@ -617,19 +603,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_19 = topk_packed[expanded];
-                    int idx_ii_20 = packed_word_19 >> 16;
-                    unsigned int word0_20 = (unsigned int)packed_word_19 & 65535;
-                    exp_idx[13] = idx_ii_20;
-                    int local_idx_20 = idx_ii_20 - local_experts_start_idx;
-                    int extent_20 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_20 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_19 = ((local_idx_20 >= 0 && local_idx_20 < extent_20 && (local_idx_20 & stride_mask_20) == 0) ? 1 : 0);
+                    int idx_ii_19 = packed_word_19 >> 16;
+                    unsigned int word0_19 = (unsigned int)packed_word_19 & 65535;
+                    exp_idx[13] = idx_ii_19;
+                    int local_idx_19 = idx_ii_19 - local_experts_start_idx;
+                    int extent_19 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_19 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_19 = ((local_idx_19 >= 0 && local_idx_19 < extent_19 && (local_idx_19 & stride_mask_19) == 0) ? 1 : 0);
                     exp_off[13] = 0;
                     if (is_local_19 != 0) {
-                        unsigned int _atomic_fetch_add_29 = atomicAdd(&smem_expert_count[idx_ii_20], 1);
+                        unsigned int _atomic_fetch_add_29 = atomicAdd(&smem_expert_count[idx_ii_19], 1);
                         exp_off[13] = (int)_atomic_fetch_add_29;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_20 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_19 << 16);
                 }
             }
             if (done == 0) {
@@ -638,19 +624,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_20 = topk_packed[expanded];
-                    int idx_ii_21 = packed_word_20 >> 16;
-                    unsigned int word0_21 = (unsigned int)packed_word_20 & 65535;
-                    exp_idx[14] = idx_ii_21;
-                    int local_idx_21 = idx_ii_21 - local_experts_start_idx;
-                    int extent_21 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_21 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_21 = ((local_idx_21 >= 0 && local_idx_21 < extent_21 && (local_idx_21 & stride_mask_21) == 0) ? 1 : 0);
+                    int idx_ii_20 = packed_word_20 >> 16;
+                    unsigned int word0_20 = (unsigned int)packed_word_20 & 65535;
+                    exp_idx[14] = idx_ii_20;
+                    int local_idx_20 = idx_ii_20 - local_experts_start_idx;
+                    int extent_20 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_20 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_20 = ((local_idx_20 >= 0 && local_idx_20 < extent_20 && (local_idx_20 & stride_mask_20) == 0) ? 1 : 0);
                     exp_off[14] = 0;
-                    if (is_local_21 != 0) {
-                        unsigned int _atomic_fetch_add_30 = atomicAdd(&smem_expert_count[idx_ii_21], 1);
+                    if (is_local_20 != 0) {
+                        unsigned int _atomic_fetch_add_30 = atomicAdd(&smem_expert_count[idx_ii_20], 1);
                         exp_off[14] = (int)_atomic_fetch_add_30;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_21 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_20 << 16);
                 }
             }
             if (done == 0) {
@@ -659,19 +645,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_21 = topk_packed[expanded];
-                    int idx_ii_22 = packed_word_21 >> 16;
-                    unsigned int word0_22 = (unsigned int)packed_word_21 & 65535;
-                    exp_idx[15] = idx_ii_22;
-                    int local_idx_22 = idx_ii_22 - local_experts_start_idx;
-                    int extent_22 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_22 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_22 = ((local_idx_22 >= 0 && local_idx_22 < extent_22 && (local_idx_22 & stride_mask_22) == 0) ? 1 : 0);
+                    int idx_ii_21 = packed_word_21 >> 16;
+                    unsigned int word0_21 = (unsigned int)packed_word_21 & 65535;
+                    exp_idx[15] = idx_ii_21;
+                    int local_idx_21 = idx_ii_21 - local_experts_start_idx;
+                    int extent_21 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_21 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_21 = ((local_idx_21 >= 0 && local_idx_21 < extent_21 && (local_idx_21 & stride_mask_21) == 0) ? 1 : 0);
                     exp_off[15] = 0;
-                    if (is_local_22 != 0) {
-                        unsigned int _atomic_fetch_add_31 = atomicAdd(&smem_expert_count[idx_ii_22], 1);
+                    if (is_local_21 != 0) {
+                        unsigned int _atomic_fetch_add_31 = atomicAdd(&smem_expert_count[idx_ii_21], 1);
                         exp_off[15] = (int)_atomic_fetch_add_31;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_22 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_21 << 16);
                 }
             }
         }
@@ -680,64 +666,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 20 * grid_threads) {
             expanded = grid_tid + 16 * grid_threads;
             int packed_word_22 = topk_packed[expanded];
-            int idx_ii_23 = packed_word_22 >> 16;
-            unsigned int word0_23 = (unsigned int)packed_word_22 & 65535;
-            exp_idx[16] = idx_ii_23;
-            int local_idx_23 = idx_ii_23 - local_experts_start_idx;
-            int extent_23 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_23 = (1 << local_experts_stride_log2) - 1;
-            int is_local_23 = ((local_idx_23 >= 0 && local_idx_23 < extent_23 && (local_idx_23 & stride_mask_23) == 0) ? 1 : 0);
+            int idx_ii_22 = packed_word_22 >> 16;
+            unsigned int word0_22 = (unsigned int)packed_word_22 & 65535;
+            exp_idx[16] = idx_ii_22;
+            int local_idx_22 = idx_ii_22 - local_experts_start_idx;
+            int extent_22 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_22 = (1 << local_experts_stride_log2) - 1;
+            int is_local_22 = ((local_idx_22 >= 0 && local_idx_22 < extent_22 && (local_idx_22 & stride_mask_22) == 0) ? 1 : 0);
             exp_off[16] = 0;
-            if (is_local_23 != 0) {
-                unsigned int _atomic_fetch_add_32 = atomicAdd(&smem_expert_count[idx_ii_23], 1);
+            if (is_local_22 != 0) {
+                unsigned int _atomic_fetch_add_32 = atomicAdd(&smem_expert_count[idx_ii_22], 1);
                 exp_off[16] = (int)_atomic_fetch_add_32;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_23 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_22 << 16);
             expanded = grid_tid + 17 * grid_threads;
-            int packed_word_0_4 = topk_packed[expanded];
-            int idx_ii_1_4 = packed_word_0_4 >> 16;
-            unsigned int word0_2_4 = (unsigned int)packed_word_0_4 & 65535;
-            exp_idx[17] = idx_ii_1_4;
-            int local_idx_3_4 = idx_ii_1_4 - local_experts_start_idx;
-            int extent_4_4 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_4 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_4 = ((local_idx_3_4 >= 0 && local_idx_3_4 < extent_4_4 && (local_idx_3_4 & stride_mask_5_4) == 0) ? 1 : 0);
+            int packed_word_12_1 = topk_packed[expanded];
+            int idx_ii_12_1 = packed_word_12_1 >> 16;
+            unsigned int word0_12_1 = (unsigned int)packed_word_12_1 & 65535;
+            exp_idx[17] = idx_ii_12_1;
+            int local_idx_12_1 = idx_ii_12_1 - local_experts_start_idx;
+            int extent_12_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_12_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_13_1 = ((local_idx_12_1 >= 0 && local_idx_12_1 < extent_12_1 && (local_idx_12_1 & stride_mask_12_1) == 0) ? 1 : 0);
             exp_off[17] = 0;
-            if (is_local_6_4 != 0) {
-                unsigned int _atomic_fetch_add_33 = atomicAdd(&smem_expert_count[idx_ii_1_4], 1);
+            if (is_local_13_1 != 0) {
+                unsigned int _atomic_fetch_add_33 = atomicAdd(&smem_expert_count[idx_ii_12_1], 1);
                 exp_off[17] = (int)_atomic_fetch_add_33;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_4 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_12_1 << 16);
             expanded = grid_tid + 18 * grid_threads;
-            int packed_word_7_4 = topk_packed[expanded];
-            int idx_ii_8_4 = packed_word_7_4 >> 16;
-            unsigned int word0_9_4 = (unsigned int)packed_word_7_4 & 65535;
-            exp_idx[18] = idx_ii_8_4;
-            int local_idx_10_4 = idx_ii_8_4 - local_experts_start_idx;
-            int extent_11_4 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_4 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_4 = ((local_idx_10_4 >= 0 && local_idx_10_4 < extent_11_4 && (local_idx_10_4 & stride_mask_12_4) == 0) ? 1 : 0);
+            int packed_word_13_1 = topk_packed[expanded];
+            int idx_ii_13_1 = packed_word_13_1 >> 16;
+            unsigned int word0_13_1 = (unsigned int)packed_word_13_1 & 65535;
+            exp_idx[18] = idx_ii_13_1;
+            int local_idx_13_1 = idx_ii_13_1 - local_experts_start_idx;
+            int extent_13_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_13_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_14_1 = ((local_idx_13_1 >= 0 && local_idx_13_1 < extent_13_1 && (local_idx_13_1 & stride_mask_13_1) == 0) ? 1 : 0);
             exp_off[18] = 0;
-            if (is_local_13_4 != 0) {
-                unsigned int _atomic_fetch_add_34 = atomicAdd(&smem_expert_count[idx_ii_8_4], 1);
+            if (is_local_14_1 != 0) {
+                unsigned int _atomic_fetch_add_34 = atomicAdd(&smem_expert_count[idx_ii_13_1], 1);
                 exp_off[18] = (int)_atomic_fetch_add_34;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_4 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_13_1 << 16);
             expanded = grid_tid + 19 * grid_threads;
-            int packed_word_14_4 = topk_packed[expanded];
-            int idx_ii_15_4 = packed_word_14_4 >> 16;
-            unsigned int word0_16_4 = (unsigned int)packed_word_14_4 & 65535;
-            exp_idx[19] = idx_ii_15_4;
-            int local_idx_17_4 = idx_ii_15_4 - local_experts_start_idx;
-            int extent_18_4 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_4 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_4 = ((local_idx_17_4 >= 0 && local_idx_17_4 < extent_18_4 && (local_idx_17_4 & stride_mask_19_4) == 0) ? 1 : 0);
+            int packed_word_14_1 = topk_packed[expanded];
+            int idx_ii_14_1 = packed_word_14_1 >> 16;
+            unsigned int word0_14_1 = (unsigned int)packed_word_14_1 & 65535;
+            exp_idx[19] = idx_ii_14_1;
+            int local_idx_14_1 = idx_ii_14_1 - local_experts_start_idx;
+            int extent_14_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_14_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_15_1 = ((local_idx_14_1 >= 0 && local_idx_14_1 < extent_14_1 && (local_idx_14_1 & stride_mask_14_1) == 0) ? 1 : 0);
             exp_off[19] = 0;
-            if (is_local_20_4 != 0) {
-                unsigned int _atomic_fetch_add_35 = atomicAdd(&smem_expert_count[idx_ii_15_4], 1);
+            if (is_local_15_1 != 0) {
+                unsigned int _atomic_fetch_add_35 = atomicAdd(&smem_expert_count[idx_ii_14_1], 1);
                 exp_off[19] = (int)_atomic_fetch_add_35;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_4 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_14_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 16 * grid_threads;
@@ -745,19 +731,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_23 = topk_packed[expanded];
-                    int idx_ii_24 = packed_word_23 >> 16;
-                    unsigned int word0_24 = (unsigned int)packed_word_23 & 65535;
-                    exp_idx[16] = idx_ii_24;
-                    int local_idx_24 = idx_ii_24 - local_experts_start_idx;
-                    int extent_24 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_24 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_24 = ((local_idx_24 >= 0 && local_idx_24 < extent_24 && (local_idx_24 & stride_mask_24) == 0) ? 1 : 0);
+                    int idx_ii_23 = packed_word_23 >> 16;
+                    unsigned int word0_23 = (unsigned int)packed_word_23 & 65535;
+                    exp_idx[16] = idx_ii_23;
+                    int local_idx_23 = idx_ii_23 - local_experts_start_idx;
+                    int extent_23 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_23 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_23 = ((local_idx_23 >= 0 && local_idx_23 < extent_23 && (local_idx_23 & stride_mask_23) == 0) ? 1 : 0);
                     exp_off[16] = 0;
-                    if (is_local_24 != 0) {
-                        unsigned int _atomic_fetch_add_36 = atomicAdd(&smem_expert_count[idx_ii_24], 1);
+                    if (is_local_23 != 0) {
+                        unsigned int _atomic_fetch_add_36 = atomicAdd(&smem_expert_count[idx_ii_23], 1);
                         exp_off[16] = (int)_atomic_fetch_add_36;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_24 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_23 << 16);
                 }
             }
             if (done == 0) {
@@ -766,19 +752,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_24 = topk_packed[expanded];
-                    int idx_ii_25 = packed_word_24 >> 16;
-                    unsigned int word0_25 = (unsigned int)packed_word_24 & 65535;
-                    exp_idx[17] = idx_ii_25;
-                    int local_idx_25 = idx_ii_25 - local_experts_start_idx;
-                    int extent_25 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_25 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_25 = ((local_idx_25 >= 0 && local_idx_25 < extent_25 && (local_idx_25 & stride_mask_25) == 0) ? 1 : 0);
+                    int idx_ii_24 = packed_word_24 >> 16;
+                    unsigned int word0_24 = (unsigned int)packed_word_24 & 65535;
+                    exp_idx[17] = idx_ii_24;
+                    int local_idx_24 = idx_ii_24 - local_experts_start_idx;
+                    int extent_24 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_24 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_24 = ((local_idx_24 >= 0 && local_idx_24 < extent_24 && (local_idx_24 & stride_mask_24) == 0) ? 1 : 0);
                     exp_off[17] = 0;
-                    if (is_local_25 != 0) {
-                        unsigned int _atomic_fetch_add_37 = atomicAdd(&smem_expert_count[idx_ii_25], 1);
+                    if (is_local_24 != 0) {
+                        unsigned int _atomic_fetch_add_37 = atomicAdd(&smem_expert_count[idx_ii_24], 1);
                         exp_off[17] = (int)_atomic_fetch_add_37;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_25 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_24 << 16);
                 }
             }
             if (done == 0) {
@@ -787,19 +773,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_25 = topk_packed[expanded];
-                    int idx_ii_26 = packed_word_25 >> 16;
-                    unsigned int word0_26 = (unsigned int)packed_word_25 & 65535;
-                    exp_idx[18] = idx_ii_26;
-                    int local_idx_26 = idx_ii_26 - local_experts_start_idx;
-                    int extent_26 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_26 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_26 = ((local_idx_26 >= 0 && local_idx_26 < extent_26 && (local_idx_26 & stride_mask_26) == 0) ? 1 : 0);
+                    int idx_ii_25 = packed_word_25 >> 16;
+                    unsigned int word0_25 = (unsigned int)packed_word_25 & 65535;
+                    exp_idx[18] = idx_ii_25;
+                    int local_idx_25 = idx_ii_25 - local_experts_start_idx;
+                    int extent_25 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_25 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_25 = ((local_idx_25 >= 0 && local_idx_25 < extent_25 && (local_idx_25 & stride_mask_25) == 0) ? 1 : 0);
                     exp_off[18] = 0;
-                    if (is_local_26 != 0) {
-                        unsigned int _atomic_fetch_add_38 = atomicAdd(&smem_expert_count[idx_ii_26], 1);
+                    if (is_local_25 != 0) {
+                        unsigned int _atomic_fetch_add_38 = atomicAdd(&smem_expert_count[idx_ii_25], 1);
                         exp_off[18] = (int)_atomic_fetch_add_38;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_26 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_25 << 16);
                 }
             }
             if (done == 0) {
@@ -808,19 +794,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_26 = topk_packed[expanded];
-                    int idx_ii_27 = packed_word_26 >> 16;
-                    unsigned int word0_27 = (unsigned int)packed_word_26 & 65535;
-                    exp_idx[19] = idx_ii_27;
-                    int local_idx_27 = idx_ii_27 - local_experts_start_idx;
-                    int extent_27 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_27 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_27 = ((local_idx_27 >= 0 && local_idx_27 < extent_27 && (local_idx_27 & stride_mask_27) == 0) ? 1 : 0);
+                    int idx_ii_26 = packed_word_26 >> 16;
+                    unsigned int word0_26 = (unsigned int)packed_word_26 & 65535;
+                    exp_idx[19] = idx_ii_26;
+                    int local_idx_26 = idx_ii_26 - local_experts_start_idx;
+                    int extent_26 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_26 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_26 = ((local_idx_26 >= 0 && local_idx_26 < extent_26 && (local_idx_26 & stride_mask_26) == 0) ? 1 : 0);
                     exp_off[19] = 0;
-                    if (is_local_27 != 0) {
-                        unsigned int _atomic_fetch_add_39 = atomicAdd(&smem_expert_count[idx_ii_27], 1);
+                    if (is_local_26 != 0) {
+                        unsigned int _atomic_fetch_add_39 = atomicAdd(&smem_expert_count[idx_ii_26], 1);
                         exp_off[19] = (int)_atomic_fetch_add_39;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_27 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_26 << 16);
                 }
             }
         }
@@ -829,64 +815,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 24 * grid_threads) {
             expanded = grid_tid + 20 * grid_threads;
             int packed_word_27 = topk_packed[expanded];
-            int idx_ii_28 = packed_word_27 >> 16;
-            unsigned int word0_28 = (unsigned int)packed_word_27 & 65535;
-            exp_idx[20] = idx_ii_28;
-            int local_idx_28 = idx_ii_28 - local_experts_start_idx;
-            int extent_28 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_28 = (1 << local_experts_stride_log2) - 1;
-            int is_local_28 = ((local_idx_28 >= 0 && local_idx_28 < extent_28 && (local_idx_28 & stride_mask_28) == 0) ? 1 : 0);
+            int idx_ii_27 = packed_word_27 >> 16;
+            unsigned int word0_27 = (unsigned int)packed_word_27 & 65535;
+            exp_idx[20] = idx_ii_27;
+            int local_idx_27 = idx_ii_27 - local_experts_start_idx;
+            int extent_27 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_27 = (1 << local_experts_stride_log2) - 1;
+            int is_local_27 = ((local_idx_27 >= 0 && local_idx_27 < extent_27 && (local_idx_27 & stride_mask_27) == 0) ? 1 : 0);
             exp_off[20] = 0;
-            if (is_local_28 != 0) {
-                unsigned int _atomic_fetch_add_40 = atomicAdd(&smem_expert_count[idx_ii_28], 1);
+            if (is_local_27 != 0) {
+                unsigned int _atomic_fetch_add_40 = atomicAdd(&smem_expert_count[idx_ii_27], 1);
                 exp_off[20] = (int)_atomic_fetch_add_40;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_28 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_27 << 16);
             expanded = grid_tid + 21 * grid_threads;
-            int packed_word_0_5 = topk_packed[expanded];
-            int idx_ii_1_5 = packed_word_0_5 >> 16;
-            unsigned int word0_2_5 = (unsigned int)packed_word_0_5 & 65535;
-            exp_idx[21] = idx_ii_1_5;
-            int local_idx_3_5 = idx_ii_1_5 - local_experts_start_idx;
-            int extent_4_5 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_5 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_5 = ((local_idx_3_5 >= 0 && local_idx_3_5 < extent_4_5 && (local_idx_3_5 & stride_mask_5_5) == 0) ? 1 : 0);
+            int packed_word_15_1 = topk_packed[expanded];
+            int idx_ii_15_1 = packed_word_15_1 >> 16;
+            unsigned int word0_15_1 = (unsigned int)packed_word_15_1 & 65535;
+            exp_idx[21] = idx_ii_15_1;
+            int local_idx_15_1 = idx_ii_15_1 - local_experts_start_idx;
+            int extent_15_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_15_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_16_1 = ((local_idx_15_1 >= 0 && local_idx_15_1 < extent_15_1 && (local_idx_15_1 & stride_mask_15_1) == 0) ? 1 : 0);
             exp_off[21] = 0;
-            if (is_local_6_5 != 0) {
-                unsigned int _atomic_fetch_add_41 = atomicAdd(&smem_expert_count[idx_ii_1_5], 1);
+            if (is_local_16_1 != 0) {
+                unsigned int _atomic_fetch_add_41 = atomicAdd(&smem_expert_count[idx_ii_15_1], 1);
                 exp_off[21] = (int)_atomic_fetch_add_41;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_5 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_15_1 << 16);
             expanded = grid_tid + 22 * grid_threads;
-            int packed_word_7_5 = topk_packed[expanded];
-            int idx_ii_8_5 = packed_word_7_5 >> 16;
-            unsigned int word0_9_5 = (unsigned int)packed_word_7_5 & 65535;
-            exp_idx[22] = idx_ii_8_5;
-            int local_idx_10_5 = idx_ii_8_5 - local_experts_start_idx;
-            int extent_11_5 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_5 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_5 = ((local_idx_10_5 >= 0 && local_idx_10_5 < extent_11_5 && (local_idx_10_5 & stride_mask_12_5) == 0) ? 1 : 0);
+            int packed_word_16_1 = topk_packed[expanded];
+            int idx_ii_16_1 = packed_word_16_1 >> 16;
+            unsigned int word0_16_1 = (unsigned int)packed_word_16_1 & 65535;
+            exp_idx[22] = idx_ii_16_1;
+            int local_idx_16_1 = idx_ii_16_1 - local_experts_start_idx;
+            int extent_16_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_16_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_17_1 = ((local_idx_16_1 >= 0 && local_idx_16_1 < extent_16_1 && (local_idx_16_1 & stride_mask_16_1) == 0) ? 1 : 0);
             exp_off[22] = 0;
-            if (is_local_13_5 != 0) {
-                unsigned int _atomic_fetch_add_42 = atomicAdd(&smem_expert_count[idx_ii_8_5], 1);
+            if (is_local_17_1 != 0) {
+                unsigned int _atomic_fetch_add_42 = atomicAdd(&smem_expert_count[idx_ii_16_1], 1);
                 exp_off[22] = (int)_atomic_fetch_add_42;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_5 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_1 << 16);
             expanded = grid_tid + 23 * grid_threads;
-            int packed_word_14_5 = topk_packed[expanded];
-            int idx_ii_15_5 = packed_word_14_5 >> 16;
-            unsigned int word0_16_5 = (unsigned int)packed_word_14_5 & 65535;
-            exp_idx[23] = idx_ii_15_5;
-            int local_idx_17_5 = idx_ii_15_5 - local_experts_start_idx;
-            int extent_18_5 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_5 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_5 = ((local_idx_17_5 >= 0 && local_idx_17_5 < extent_18_5 && (local_idx_17_5 & stride_mask_19_5) == 0) ? 1 : 0);
+            int packed_word_17_1 = topk_packed[expanded];
+            int idx_ii_17_1 = packed_word_17_1 >> 16;
+            unsigned int word0_17_1 = (unsigned int)packed_word_17_1 & 65535;
+            exp_idx[23] = idx_ii_17_1;
+            int local_idx_17_1 = idx_ii_17_1 - local_experts_start_idx;
+            int extent_17_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_17_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_18_1 = ((local_idx_17_1 >= 0 && local_idx_17_1 < extent_17_1 && (local_idx_17_1 & stride_mask_17_1) == 0) ? 1 : 0);
             exp_off[23] = 0;
-            if (is_local_20_5 != 0) {
-                unsigned int _atomic_fetch_add_43 = atomicAdd(&smem_expert_count[idx_ii_15_5], 1);
+            if (is_local_18_1 != 0) {
+                unsigned int _atomic_fetch_add_43 = atomicAdd(&smem_expert_count[idx_ii_17_1], 1);
                 exp_off[23] = (int)_atomic_fetch_add_43;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_5 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_17_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 20 * grid_threads;
@@ -894,19 +880,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_28 = topk_packed[expanded];
-                    int idx_ii_29 = packed_word_28 >> 16;
-                    unsigned int word0_29 = (unsigned int)packed_word_28 & 65535;
-                    exp_idx[20] = idx_ii_29;
-                    int local_idx_29 = idx_ii_29 - local_experts_start_idx;
-                    int extent_29 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_29 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_29 = ((local_idx_29 >= 0 && local_idx_29 < extent_29 && (local_idx_29 & stride_mask_29) == 0) ? 1 : 0);
+                    int idx_ii_28 = packed_word_28 >> 16;
+                    unsigned int word0_28 = (unsigned int)packed_word_28 & 65535;
+                    exp_idx[20] = idx_ii_28;
+                    int local_idx_28 = idx_ii_28 - local_experts_start_idx;
+                    int extent_28 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_28 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_28 = ((local_idx_28 >= 0 && local_idx_28 < extent_28 && (local_idx_28 & stride_mask_28) == 0) ? 1 : 0);
                     exp_off[20] = 0;
-                    if (is_local_29 != 0) {
-                        unsigned int _atomic_fetch_add_44 = atomicAdd(&smem_expert_count[idx_ii_29], 1);
+                    if (is_local_28 != 0) {
+                        unsigned int _atomic_fetch_add_44 = atomicAdd(&smem_expert_count[idx_ii_28], 1);
                         exp_off[20] = (int)_atomic_fetch_add_44;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_29 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_28 << 16);
                 }
             }
             if (done == 0) {
@@ -915,19 +901,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_29 = topk_packed[expanded];
-                    int idx_ii_30 = packed_word_29 >> 16;
-                    unsigned int word0_30 = (unsigned int)packed_word_29 & 65535;
-                    exp_idx[21] = idx_ii_30;
-                    int local_idx_30 = idx_ii_30 - local_experts_start_idx;
-                    int extent_30 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_30 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_30 = ((local_idx_30 >= 0 && local_idx_30 < extent_30 && (local_idx_30 & stride_mask_30) == 0) ? 1 : 0);
+                    int idx_ii_29 = packed_word_29 >> 16;
+                    unsigned int word0_29 = (unsigned int)packed_word_29 & 65535;
+                    exp_idx[21] = idx_ii_29;
+                    int local_idx_29 = idx_ii_29 - local_experts_start_idx;
+                    int extent_29 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_29 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_29 = ((local_idx_29 >= 0 && local_idx_29 < extent_29 && (local_idx_29 & stride_mask_29) == 0) ? 1 : 0);
                     exp_off[21] = 0;
-                    if (is_local_30 != 0) {
-                        unsigned int _atomic_fetch_add_45 = atomicAdd(&smem_expert_count[idx_ii_30], 1);
+                    if (is_local_29 != 0) {
+                        unsigned int _atomic_fetch_add_45 = atomicAdd(&smem_expert_count[idx_ii_29], 1);
                         exp_off[21] = (int)_atomic_fetch_add_45;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_30 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_29 << 16);
                 }
             }
             if (done == 0) {
@@ -936,19 +922,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_30 = topk_packed[expanded];
-                    int idx_ii_31 = packed_word_30 >> 16;
-                    unsigned int word0_31 = (unsigned int)packed_word_30 & 65535;
-                    exp_idx[22] = idx_ii_31;
-                    int local_idx_31 = idx_ii_31 - local_experts_start_idx;
-                    int extent_31 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_31 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_31 = ((local_idx_31 >= 0 && local_idx_31 < extent_31 && (local_idx_31 & stride_mask_31) == 0) ? 1 : 0);
+                    int idx_ii_30 = packed_word_30 >> 16;
+                    unsigned int word0_30 = (unsigned int)packed_word_30 & 65535;
+                    exp_idx[22] = idx_ii_30;
+                    int local_idx_30 = idx_ii_30 - local_experts_start_idx;
+                    int extent_30 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_30 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_30 = ((local_idx_30 >= 0 && local_idx_30 < extent_30 && (local_idx_30 & stride_mask_30) == 0) ? 1 : 0);
                     exp_off[22] = 0;
-                    if (is_local_31 != 0) {
-                        unsigned int _atomic_fetch_add_46 = atomicAdd(&smem_expert_count[idx_ii_31], 1);
+                    if (is_local_30 != 0) {
+                        unsigned int _atomic_fetch_add_46 = atomicAdd(&smem_expert_count[idx_ii_30], 1);
                         exp_off[22] = (int)_atomic_fetch_add_46;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_31 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_30 << 16);
                 }
             }
             if (done == 0) {
@@ -957,19 +943,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_31 = topk_packed[expanded];
-                    int idx_ii_32 = packed_word_31 >> 16;
-                    unsigned int word0_32 = (unsigned int)packed_word_31 & 65535;
-                    exp_idx[23] = idx_ii_32;
-                    int local_idx_32 = idx_ii_32 - local_experts_start_idx;
-                    int extent_32 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_32 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_32 = ((local_idx_32 >= 0 && local_idx_32 < extent_32 && (local_idx_32 & stride_mask_32) == 0) ? 1 : 0);
+                    int idx_ii_31 = packed_word_31 >> 16;
+                    unsigned int word0_31 = (unsigned int)packed_word_31 & 65535;
+                    exp_idx[23] = idx_ii_31;
+                    int local_idx_31 = idx_ii_31 - local_experts_start_idx;
+                    int extent_31 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_31 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_31 = ((local_idx_31 >= 0 && local_idx_31 < extent_31 && (local_idx_31 & stride_mask_31) == 0) ? 1 : 0);
                     exp_off[23] = 0;
-                    if (is_local_32 != 0) {
-                        unsigned int _atomic_fetch_add_47 = atomicAdd(&smem_expert_count[idx_ii_32], 1);
+                    if (is_local_31 != 0) {
+                        unsigned int _atomic_fetch_add_47 = atomicAdd(&smem_expert_count[idx_ii_31], 1);
                         exp_off[23] = (int)_atomic_fetch_add_47;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_32 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_31 << 16);
                 }
             }
         }
@@ -978,64 +964,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 28 * grid_threads) {
             expanded = grid_tid + 24 * grid_threads;
             int packed_word_32 = topk_packed[expanded];
-            int idx_ii_33 = packed_word_32 >> 16;
-            unsigned int word0_33 = (unsigned int)packed_word_32 & 65535;
-            exp_idx[24] = idx_ii_33;
-            int local_idx_33 = idx_ii_33 - local_experts_start_idx;
-            int extent_33 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_33 = (1 << local_experts_stride_log2) - 1;
-            int is_local_33 = ((local_idx_33 >= 0 && local_idx_33 < extent_33 && (local_idx_33 & stride_mask_33) == 0) ? 1 : 0);
+            int idx_ii_32 = packed_word_32 >> 16;
+            unsigned int word0_32 = (unsigned int)packed_word_32 & 65535;
+            exp_idx[24] = idx_ii_32;
+            int local_idx_32 = idx_ii_32 - local_experts_start_idx;
+            int extent_32 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_32 = (1 << local_experts_stride_log2) - 1;
+            int is_local_32 = ((local_idx_32 >= 0 && local_idx_32 < extent_32 && (local_idx_32 & stride_mask_32) == 0) ? 1 : 0);
             exp_off[24] = 0;
-            if (is_local_33 != 0) {
-                unsigned int _atomic_fetch_add_48 = atomicAdd(&smem_expert_count[idx_ii_33], 1);
+            if (is_local_32 != 0) {
+                unsigned int _atomic_fetch_add_48 = atomicAdd(&smem_expert_count[idx_ii_32], 1);
                 exp_off[24] = (int)_atomic_fetch_add_48;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_33 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_32 << 16);
             expanded = grid_tid + 25 * grid_threads;
-            int packed_word_0_6 = topk_packed[expanded];
-            int idx_ii_1_6 = packed_word_0_6 >> 16;
-            unsigned int word0_2_6 = (unsigned int)packed_word_0_6 & 65535;
-            exp_idx[25] = idx_ii_1_6;
-            int local_idx_3_6 = idx_ii_1_6 - local_experts_start_idx;
-            int extent_4_6 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_6 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_6 = ((local_idx_3_6 >= 0 && local_idx_3_6 < extent_4_6 && (local_idx_3_6 & stride_mask_5_6) == 0) ? 1 : 0);
+            int packed_word_18_1 = topk_packed[expanded];
+            int idx_ii_18_1 = packed_word_18_1 >> 16;
+            unsigned int word0_18_1 = (unsigned int)packed_word_18_1 & 65535;
+            exp_idx[25] = idx_ii_18_1;
+            int local_idx_18_1 = idx_ii_18_1 - local_experts_start_idx;
+            int extent_18_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_18_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_19_1 = ((local_idx_18_1 >= 0 && local_idx_18_1 < extent_18_1 && (local_idx_18_1 & stride_mask_18_1) == 0) ? 1 : 0);
             exp_off[25] = 0;
-            if (is_local_6_6 != 0) {
-                unsigned int _atomic_fetch_add_49 = atomicAdd(&smem_expert_count[idx_ii_1_6], 1);
+            if (is_local_19_1 != 0) {
+                unsigned int _atomic_fetch_add_49 = atomicAdd(&smem_expert_count[idx_ii_18_1], 1);
                 exp_off[25] = (int)_atomic_fetch_add_49;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_6 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_18_1 << 16);
             expanded = grid_tid + 26 * grid_threads;
-            int packed_word_7_6 = topk_packed[expanded];
-            int idx_ii_8_6 = packed_word_7_6 >> 16;
-            unsigned int word0_9_6 = (unsigned int)packed_word_7_6 & 65535;
-            exp_idx[26] = idx_ii_8_6;
-            int local_idx_10_6 = idx_ii_8_6 - local_experts_start_idx;
-            int extent_11_6 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_6 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_6 = ((local_idx_10_6 >= 0 && local_idx_10_6 < extent_11_6 && (local_idx_10_6 & stride_mask_12_6) == 0) ? 1 : 0);
+            int packed_word_19_1 = topk_packed[expanded];
+            int idx_ii_19_1 = packed_word_19_1 >> 16;
+            unsigned int word0_19_1 = (unsigned int)packed_word_19_1 & 65535;
+            exp_idx[26] = idx_ii_19_1;
+            int local_idx_19_1 = idx_ii_19_1 - local_experts_start_idx;
+            int extent_19_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_19_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_20_1 = ((local_idx_19_1 >= 0 && local_idx_19_1 < extent_19_1 && (local_idx_19_1 & stride_mask_19_1) == 0) ? 1 : 0);
             exp_off[26] = 0;
-            if (is_local_13_6 != 0) {
-                unsigned int _atomic_fetch_add_50 = atomicAdd(&smem_expert_count[idx_ii_8_6], 1);
+            if (is_local_20_1 != 0) {
+                unsigned int _atomic_fetch_add_50 = atomicAdd(&smem_expert_count[idx_ii_19_1], 1);
                 exp_off[26] = (int)_atomic_fetch_add_50;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_6 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_19_1 << 16);
             expanded = grid_tid + 27 * grid_threads;
-            int packed_word_14_6 = topk_packed[expanded];
-            int idx_ii_15_6 = packed_word_14_6 >> 16;
-            unsigned int word0_16_6 = (unsigned int)packed_word_14_6 & 65535;
-            exp_idx[27] = idx_ii_15_6;
-            int local_idx_17_6 = idx_ii_15_6 - local_experts_start_idx;
-            int extent_18_6 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_6 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_6 = ((local_idx_17_6 >= 0 && local_idx_17_6 < extent_18_6 && (local_idx_17_6 & stride_mask_19_6) == 0) ? 1 : 0);
+            int packed_word_20_1 = topk_packed[expanded];
+            int idx_ii_20_1 = packed_word_20_1 >> 16;
+            unsigned int word0_20_1 = (unsigned int)packed_word_20_1 & 65535;
+            exp_idx[27] = idx_ii_20_1;
+            int local_idx_20_1 = idx_ii_20_1 - local_experts_start_idx;
+            int extent_20_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_20_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_21_1 = ((local_idx_20_1 >= 0 && local_idx_20_1 < extent_20_1 && (local_idx_20_1 & stride_mask_20_1) == 0) ? 1 : 0);
             exp_off[27] = 0;
-            if (is_local_20_6 != 0) {
-                unsigned int _atomic_fetch_add_51 = atomicAdd(&smem_expert_count[idx_ii_15_6], 1);
+            if (is_local_21_1 != 0) {
+                unsigned int _atomic_fetch_add_51 = atomicAdd(&smem_expert_count[idx_ii_20_1], 1);
                 exp_off[27] = (int)_atomic_fetch_add_51;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_6 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_20_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 24 * grid_threads;
@@ -1043,19 +1029,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_33 = topk_packed[expanded];
-                    int idx_ii_34 = packed_word_33 >> 16;
-                    unsigned int word0_34 = (unsigned int)packed_word_33 & 65535;
-                    exp_idx[24] = idx_ii_34;
-                    int local_idx_34 = idx_ii_34 - local_experts_start_idx;
-                    int extent_34 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_34 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_34 = ((local_idx_34 >= 0 && local_idx_34 < extent_34 && (local_idx_34 & stride_mask_34) == 0) ? 1 : 0);
+                    int idx_ii_33 = packed_word_33 >> 16;
+                    unsigned int word0_33 = (unsigned int)packed_word_33 & 65535;
+                    exp_idx[24] = idx_ii_33;
+                    int local_idx_33 = idx_ii_33 - local_experts_start_idx;
+                    int extent_33 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_33 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_33 = ((local_idx_33 >= 0 && local_idx_33 < extent_33 && (local_idx_33 & stride_mask_33) == 0) ? 1 : 0);
                     exp_off[24] = 0;
-                    if (is_local_34 != 0) {
-                        unsigned int _atomic_fetch_add_52 = atomicAdd(&smem_expert_count[idx_ii_34], 1);
+                    if (is_local_33 != 0) {
+                        unsigned int _atomic_fetch_add_52 = atomicAdd(&smem_expert_count[idx_ii_33], 1);
                         exp_off[24] = (int)_atomic_fetch_add_52;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_34 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_33 << 16);
                 }
             }
             if (done == 0) {
@@ -1064,19 +1050,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_34 = topk_packed[expanded];
-                    int idx_ii_35 = packed_word_34 >> 16;
-                    unsigned int word0_35 = (unsigned int)packed_word_34 & 65535;
-                    exp_idx[25] = idx_ii_35;
-                    int local_idx_35 = idx_ii_35 - local_experts_start_idx;
-                    int extent_35 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_35 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_35 = ((local_idx_35 >= 0 && local_idx_35 < extent_35 && (local_idx_35 & stride_mask_35) == 0) ? 1 : 0);
+                    int idx_ii_34 = packed_word_34 >> 16;
+                    unsigned int word0_34 = (unsigned int)packed_word_34 & 65535;
+                    exp_idx[25] = idx_ii_34;
+                    int local_idx_34 = idx_ii_34 - local_experts_start_idx;
+                    int extent_34 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_34 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_34 = ((local_idx_34 >= 0 && local_idx_34 < extent_34 && (local_idx_34 & stride_mask_34) == 0) ? 1 : 0);
                     exp_off[25] = 0;
-                    if (is_local_35 != 0) {
-                        unsigned int _atomic_fetch_add_53 = atomicAdd(&smem_expert_count[idx_ii_35], 1);
+                    if (is_local_34 != 0) {
+                        unsigned int _atomic_fetch_add_53 = atomicAdd(&smem_expert_count[idx_ii_34], 1);
                         exp_off[25] = (int)_atomic_fetch_add_53;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_35 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_34 << 16);
                 }
             }
             if (done == 0) {
@@ -1085,19 +1071,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_35 = topk_packed[expanded];
-                    int idx_ii_36 = packed_word_35 >> 16;
-                    unsigned int word0_36 = (unsigned int)packed_word_35 & 65535;
-                    exp_idx[26] = idx_ii_36;
-                    int local_idx_36 = idx_ii_36 - local_experts_start_idx;
-                    int extent_36 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_36 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_36 = ((local_idx_36 >= 0 && local_idx_36 < extent_36 && (local_idx_36 & stride_mask_36) == 0) ? 1 : 0);
+                    int idx_ii_35 = packed_word_35 >> 16;
+                    unsigned int word0_35 = (unsigned int)packed_word_35 & 65535;
+                    exp_idx[26] = idx_ii_35;
+                    int local_idx_35 = idx_ii_35 - local_experts_start_idx;
+                    int extent_35 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_35 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_35 = ((local_idx_35 >= 0 && local_idx_35 < extent_35 && (local_idx_35 & stride_mask_35) == 0) ? 1 : 0);
                     exp_off[26] = 0;
-                    if (is_local_36 != 0) {
-                        unsigned int _atomic_fetch_add_54 = atomicAdd(&smem_expert_count[idx_ii_36], 1);
+                    if (is_local_35 != 0) {
+                        unsigned int _atomic_fetch_add_54 = atomicAdd(&smem_expert_count[idx_ii_35], 1);
                         exp_off[26] = (int)_atomic_fetch_add_54;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_36 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_35 << 16);
                 }
             }
             if (done == 0) {
@@ -1106,19 +1092,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_36 = topk_packed[expanded];
-                    int idx_ii_37 = packed_word_36 >> 16;
-                    unsigned int word0_37 = (unsigned int)packed_word_36 & 65535;
-                    exp_idx[27] = idx_ii_37;
-                    int local_idx_37 = idx_ii_37 - local_experts_start_idx;
-                    int extent_37 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_37 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_37 = ((local_idx_37 >= 0 && local_idx_37 < extent_37 && (local_idx_37 & stride_mask_37) == 0) ? 1 : 0);
+                    int idx_ii_36 = packed_word_36 >> 16;
+                    unsigned int word0_36 = (unsigned int)packed_word_36 & 65535;
+                    exp_idx[27] = idx_ii_36;
+                    int local_idx_36 = idx_ii_36 - local_experts_start_idx;
+                    int extent_36 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_36 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_36 = ((local_idx_36 >= 0 && local_idx_36 < extent_36 && (local_idx_36 & stride_mask_36) == 0) ? 1 : 0);
                     exp_off[27] = 0;
-                    if (is_local_37 != 0) {
-                        unsigned int _atomic_fetch_add_55 = atomicAdd(&smem_expert_count[idx_ii_37], 1);
+                    if (is_local_36 != 0) {
+                        unsigned int _atomic_fetch_add_55 = atomicAdd(&smem_expert_count[idx_ii_36], 1);
                         exp_off[27] = (int)_atomic_fetch_add_55;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_37 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_36 << 16);
                 }
             }
         }
@@ -1127,64 +1113,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 32 * grid_threads) {
             expanded = grid_tid + 28 * grid_threads;
             int packed_word_37 = topk_packed[expanded];
-            int idx_ii_38 = packed_word_37 >> 16;
-            unsigned int word0_38 = (unsigned int)packed_word_37 & 65535;
-            exp_idx[28] = idx_ii_38;
-            int local_idx_38 = idx_ii_38 - local_experts_start_idx;
-            int extent_38 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_38 = (1 << local_experts_stride_log2) - 1;
-            int is_local_38 = ((local_idx_38 >= 0 && local_idx_38 < extent_38 && (local_idx_38 & stride_mask_38) == 0) ? 1 : 0);
+            int idx_ii_37 = packed_word_37 >> 16;
+            unsigned int word0_37 = (unsigned int)packed_word_37 & 65535;
+            exp_idx[28] = idx_ii_37;
+            int local_idx_37 = idx_ii_37 - local_experts_start_idx;
+            int extent_37 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_37 = (1 << local_experts_stride_log2) - 1;
+            int is_local_37 = ((local_idx_37 >= 0 && local_idx_37 < extent_37 && (local_idx_37 & stride_mask_37) == 0) ? 1 : 0);
             exp_off[28] = 0;
-            if (is_local_38 != 0) {
-                unsigned int _atomic_fetch_add_56 = atomicAdd(&smem_expert_count[idx_ii_38], 1);
+            if (is_local_37 != 0) {
+                unsigned int _atomic_fetch_add_56 = atomicAdd(&smem_expert_count[idx_ii_37], 1);
                 exp_off[28] = (int)_atomic_fetch_add_56;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_38 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_37 << 16);
             expanded = grid_tid + 29 * grid_threads;
-            int packed_word_0_7 = topk_packed[expanded];
-            int idx_ii_1_7 = packed_word_0_7 >> 16;
-            unsigned int word0_2_7 = (unsigned int)packed_word_0_7 & 65535;
-            exp_idx[29] = idx_ii_1_7;
-            int local_idx_3_7 = idx_ii_1_7 - local_experts_start_idx;
-            int extent_4_7 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_7 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_7 = ((local_idx_3_7 >= 0 && local_idx_3_7 < extent_4_7 && (local_idx_3_7 & stride_mask_5_7) == 0) ? 1 : 0);
+            int packed_word_21_1 = topk_packed[expanded];
+            int idx_ii_21_1 = packed_word_21_1 >> 16;
+            unsigned int word0_21_1 = (unsigned int)packed_word_21_1 & 65535;
+            exp_idx[29] = idx_ii_21_1;
+            int local_idx_21_1 = idx_ii_21_1 - local_experts_start_idx;
+            int extent_21_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_21_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_22_1 = ((local_idx_21_1 >= 0 && local_idx_21_1 < extent_21_1 && (local_idx_21_1 & stride_mask_21_1) == 0) ? 1 : 0);
             exp_off[29] = 0;
-            if (is_local_6_7 != 0) {
-                unsigned int _atomic_fetch_add_57 = atomicAdd(&smem_expert_count[idx_ii_1_7], 1);
+            if (is_local_22_1 != 0) {
+                unsigned int _atomic_fetch_add_57 = atomicAdd(&smem_expert_count[idx_ii_21_1], 1);
                 exp_off[29] = (int)_atomic_fetch_add_57;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_7 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_21_1 << 16);
             expanded = grid_tid + 30 * grid_threads;
-            int packed_word_7_7 = topk_packed[expanded];
-            int idx_ii_8_7 = packed_word_7_7 >> 16;
-            unsigned int word0_9_7 = (unsigned int)packed_word_7_7 & 65535;
-            exp_idx[30] = idx_ii_8_7;
-            int local_idx_10_7 = idx_ii_8_7 - local_experts_start_idx;
-            int extent_11_7 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_7 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_7 = ((local_idx_10_7 >= 0 && local_idx_10_7 < extent_11_7 && (local_idx_10_7 & stride_mask_12_7) == 0) ? 1 : 0);
+            int packed_word_22_1 = topk_packed[expanded];
+            int idx_ii_22_1 = packed_word_22_1 >> 16;
+            unsigned int word0_22_1 = (unsigned int)packed_word_22_1 & 65535;
+            exp_idx[30] = idx_ii_22_1;
+            int local_idx_22_1 = idx_ii_22_1 - local_experts_start_idx;
+            int extent_22_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_22_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_23_1 = ((local_idx_22_1 >= 0 && local_idx_22_1 < extent_22_1 && (local_idx_22_1 & stride_mask_22_1) == 0) ? 1 : 0);
             exp_off[30] = 0;
-            if (is_local_13_7 != 0) {
-                unsigned int _atomic_fetch_add_58 = atomicAdd(&smem_expert_count[idx_ii_8_7], 1);
+            if (is_local_23_1 != 0) {
+                unsigned int _atomic_fetch_add_58 = atomicAdd(&smem_expert_count[idx_ii_22_1], 1);
                 exp_off[30] = (int)_atomic_fetch_add_58;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_7 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_22_1 << 16);
             expanded = grid_tid + 31 * grid_threads;
-            int packed_word_14_7 = topk_packed[expanded];
-            int idx_ii_15_7 = packed_word_14_7 >> 16;
-            unsigned int word0_16_7 = (unsigned int)packed_word_14_7 & 65535;
-            exp_idx[31] = idx_ii_15_7;
-            int local_idx_17_7 = idx_ii_15_7 - local_experts_start_idx;
-            int extent_18_7 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_7 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_7 = ((local_idx_17_7 >= 0 && local_idx_17_7 < extent_18_7 && (local_idx_17_7 & stride_mask_19_7) == 0) ? 1 : 0);
+            int packed_word_23_1 = topk_packed[expanded];
+            int idx_ii_23_1 = packed_word_23_1 >> 16;
+            unsigned int word0_23_1 = (unsigned int)packed_word_23_1 & 65535;
+            exp_idx[31] = idx_ii_23_1;
+            int local_idx_23_1 = idx_ii_23_1 - local_experts_start_idx;
+            int extent_23_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_23_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_24_1 = ((local_idx_23_1 >= 0 && local_idx_23_1 < extent_23_1 && (local_idx_23_1 & stride_mask_23_1) == 0) ? 1 : 0);
             exp_off[31] = 0;
-            if (is_local_20_7 != 0) {
-                unsigned int _atomic_fetch_add_59 = atomicAdd(&smem_expert_count[idx_ii_15_7], 1);
+            if (is_local_24_1 != 0) {
+                unsigned int _atomic_fetch_add_59 = atomicAdd(&smem_expert_count[idx_ii_23_1], 1);
                 exp_off[31] = (int)_atomic_fetch_add_59;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_7 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_23_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 28 * grid_threads;
@@ -1192,19 +1178,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_38 = topk_packed[expanded];
-                    int idx_ii_39 = packed_word_38 >> 16;
-                    unsigned int word0_39 = (unsigned int)packed_word_38 & 65535;
-                    exp_idx[28] = idx_ii_39;
-                    int local_idx_39 = idx_ii_39 - local_experts_start_idx;
-                    int extent_39 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_39 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_39 = ((local_idx_39 >= 0 && local_idx_39 < extent_39 && (local_idx_39 & stride_mask_39) == 0) ? 1 : 0);
+                    int idx_ii_38 = packed_word_38 >> 16;
+                    unsigned int word0_38 = (unsigned int)packed_word_38 & 65535;
+                    exp_idx[28] = idx_ii_38;
+                    int local_idx_38 = idx_ii_38 - local_experts_start_idx;
+                    int extent_38 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_38 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_38 = ((local_idx_38 >= 0 && local_idx_38 < extent_38 && (local_idx_38 & stride_mask_38) == 0) ? 1 : 0);
                     exp_off[28] = 0;
-                    if (is_local_39 != 0) {
-                        unsigned int _atomic_fetch_add_60 = atomicAdd(&smem_expert_count[idx_ii_39], 1);
+                    if (is_local_38 != 0) {
+                        unsigned int _atomic_fetch_add_60 = atomicAdd(&smem_expert_count[idx_ii_38], 1);
                         exp_off[28] = (int)_atomic_fetch_add_60;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_39 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_38 << 16);
                 }
             }
             if (done == 0) {
@@ -1213,19 +1199,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_39 = topk_packed[expanded];
-                    int idx_ii_40 = packed_word_39 >> 16;
-                    unsigned int word0_40 = (unsigned int)packed_word_39 & 65535;
-                    exp_idx[29] = idx_ii_40;
-                    int local_idx_40 = idx_ii_40 - local_experts_start_idx;
-                    int extent_40 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_40 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_40 = ((local_idx_40 >= 0 && local_idx_40 < extent_40 && (local_idx_40 & stride_mask_40) == 0) ? 1 : 0);
+                    int idx_ii_39 = packed_word_39 >> 16;
+                    unsigned int word0_39 = (unsigned int)packed_word_39 & 65535;
+                    exp_idx[29] = idx_ii_39;
+                    int local_idx_39 = idx_ii_39 - local_experts_start_idx;
+                    int extent_39 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_39 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_39 = ((local_idx_39 >= 0 && local_idx_39 < extent_39 && (local_idx_39 & stride_mask_39) == 0) ? 1 : 0);
                     exp_off[29] = 0;
-                    if (is_local_40 != 0) {
-                        unsigned int _atomic_fetch_add_61 = atomicAdd(&smem_expert_count[idx_ii_40], 1);
+                    if (is_local_39 != 0) {
+                        unsigned int _atomic_fetch_add_61 = atomicAdd(&smem_expert_count[idx_ii_39], 1);
                         exp_off[29] = (int)_atomic_fetch_add_61;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_40 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_39 << 16);
                 }
             }
             if (done == 0) {
@@ -1234,19 +1220,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_40 = topk_packed[expanded];
-                    int idx_ii_41 = packed_word_40 >> 16;
-                    unsigned int word0_41 = (unsigned int)packed_word_40 & 65535;
-                    exp_idx[30] = idx_ii_41;
-                    int local_idx_41 = idx_ii_41 - local_experts_start_idx;
-                    int extent_41 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_41 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_41 = ((local_idx_41 >= 0 && local_idx_41 < extent_41 && (local_idx_41 & stride_mask_41) == 0) ? 1 : 0);
+                    int idx_ii_40 = packed_word_40 >> 16;
+                    unsigned int word0_40 = (unsigned int)packed_word_40 & 65535;
+                    exp_idx[30] = idx_ii_40;
+                    int local_idx_40 = idx_ii_40 - local_experts_start_idx;
+                    int extent_40 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_40 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_40 = ((local_idx_40 >= 0 && local_idx_40 < extent_40 && (local_idx_40 & stride_mask_40) == 0) ? 1 : 0);
                     exp_off[30] = 0;
-                    if (is_local_41 != 0) {
-                        unsigned int _atomic_fetch_add_62 = atomicAdd(&smem_expert_count[idx_ii_41], 1);
+                    if (is_local_40 != 0) {
+                        unsigned int _atomic_fetch_add_62 = atomicAdd(&smem_expert_count[idx_ii_40], 1);
                         exp_off[30] = (int)_atomic_fetch_add_62;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_41 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_40 << 16);
                 }
             }
             if (done == 0) {
@@ -1255,19 +1241,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_41 = topk_packed[expanded];
-                    int idx_ii_42 = packed_word_41 >> 16;
-                    unsigned int word0_42 = (unsigned int)packed_word_41 & 65535;
-                    exp_idx[31] = idx_ii_42;
-                    int local_idx_42 = idx_ii_42 - local_experts_start_idx;
-                    int extent_42 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_42 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_42 = ((local_idx_42 >= 0 && local_idx_42 < extent_42 && (local_idx_42 & stride_mask_42) == 0) ? 1 : 0);
+                    int idx_ii_41 = packed_word_41 >> 16;
+                    unsigned int word0_41 = (unsigned int)packed_word_41 & 65535;
+                    exp_idx[31] = idx_ii_41;
+                    int local_idx_41 = idx_ii_41 - local_experts_start_idx;
+                    int extent_41 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_41 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_41 = ((local_idx_41 >= 0 && local_idx_41 < extent_41 && (local_idx_41 & stride_mask_41) == 0) ? 1 : 0);
                     exp_off[31] = 0;
-                    if (is_local_42 != 0) {
-                        unsigned int _atomic_fetch_add_63 = atomicAdd(&smem_expert_count[idx_ii_42], 1);
+                    if (is_local_41 != 0) {
+                        unsigned int _atomic_fetch_add_63 = atomicAdd(&smem_expert_count[idx_ii_41], 1);
                         exp_off[31] = (int)_atomic_fetch_add_63;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_42 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_41 << 16);
                 }
             }
         }
@@ -1276,64 +1262,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 36 * grid_threads) {
             expanded = grid_tid + 32 * grid_threads;
             int packed_word_42 = topk_packed[expanded];
-            int idx_ii_43 = packed_word_42 >> 16;
-            unsigned int word0_43 = (unsigned int)packed_word_42 & 65535;
-            exp_idx[32] = idx_ii_43;
-            int local_idx_43 = idx_ii_43 - local_experts_start_idx;
-            int extent_43 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_43 = (1 << local_experts_stride_log2) - 1;
-            int is_local_43 = ((local_idx_43 >= 0 && local_idx_43 < extent_43 && (local_idx_43 & stride_mask_43) == 0) ? 1 : 0);
+            int idx_ii_42 = packed_word_42 >> 16;
+            unsigned int word0_42 = (unsigned int)packed_word_42 & 65535;
+            exp_idx[32] = idx_ii_42;
+            int local_idx_42 = idx_ii_42 - local_experts_start_idx;
+            int extent_42 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_42 = (1 << local_experts_stride_log2) - 1;
+            int is_local_42 = ((local_idx_42 >= 0 && local_idx_42 < extent_42 && (local_idx_42 & stride_mask_42) == 0) ? 1 : 0);
             exp_off[32] = 0;
-            if (is_local_43 != 0) {
-                unsigned int _atomic_fetch_add_64 = atomicAdd(&smem_expert_count[idx_ii_43], 1);
+            if (is_local_42 != 0) {
+                unsigned int _atomic_fetch_add_64 = atomicAdd(&smem_expert_count[idx_ii_42], 1);
                 exp_off[32] = (int)_atomic_fetch_add_64;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_43 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_42 << 16);
             expanded = grid_tid + 33 * grid_threads;
-            int packed_word_0_8 = topk_packed[expanded];
-            int idx_ii_1_8 = packed_word_0_8 >> 16;
-            unsigned int word0_2_8 = (unsigned int)packed_word_0_8 & 65535;
-            exp_idx[33] = idx_ii_1_8;
-            int local_idx_3_8 = idx_ii_1_8 - local_experts_start_idx;
-            int extent_4_8 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_8 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_8 = ((local_idx_3_8 >= 0 && local_idx_3_8 < extent_4_8 && (local_idx_3_8 & stride_mask_5_8) == 0) ? 1 : 0);
+            int packed_word_24_1 = topk_packed[expanded];
+            int idx_ii_24_1 = packed_word_24_1 >> 16;
+            unsigned int word0_24_1 = (unsigned int)packed_word_24_1 & 65535;
+            exp_idx[33] = idx_ii_24_1;
+            int local_idx_24_1 = idx_ii_24_1 - local_experts_start_idx;
+            int extent_24_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_24_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_25_1 = ((local_idx_24_1 >= 0 && local_idx_24_1 < extent_24_1 && (local_idx_24_1 & stride_mask_24_1) == 0) ? 1 : 0);
             exp_off[33] = 0;
-            if (is_local_6_8 != 0) {
-                unsigned int _atomic_fetch_add_65 = atomicAdd(&smem_expert_count[idx_ii_1_8], 1);
+            if (is_local_25_1 != 0) {
+                unsigned int _atomic_fetch_add_65 = atomicAdd(&smem_expert_count[idx_ii_24_1], 1);
                 exp_off[33] = (int)_atomic_fetch_add_65;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_8 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_24_1 << 16);
             expanded = grid_tid + 34 * grid_threads;
-            int packed_word_7_8 = topk_packed[expanded];
-            int idx_ii_8_8 = packed_word_7_8 >> 16;
-            unsigned int word0_9_8 = (unsigned int)packed_word_7_8 & 65535;
-            exp_idx[34] = idx_ii_8_8;
-            int local_idx_10_8 = idx_ii_8_8 - local_experts_start_idx;
-            int extent_11_8 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_8 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_8 = ((local_idx_10_8 >= 0 && local_idx_10_8 < extent_11_8 && (local_idx_10_8 & stride_mask_12_8) == 0) ? 1 : 0);
+            int packed_word_25_1 = topk_packed[expanded];
+            int idx_ii_25_1 = packed_word_25_1 >> 16;
+            unsigned int word0_25_1 = (unsigned int)packed_word_25_1 & 65535;
+            exp_idx[34] = idx_ii_25_1;
+            int local_idx_25_1 = idx_ii_25_1 - local_experts_start_idx;
+            int extent_25_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_25_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_26_1 = ((local_idx_25_1 >= 0 && local_idx_25_1 < extent_25_1 && (local_idx_25_1 & stride_mask_25_1) == 0) ? 1 : 0);
             exp_off[34] = 0;
-            if (is_local_13_8 != 0) {
-                unsigned int _atomic_fetch_add_66 = atomicAdd(&smem_expert_count[idx_ii_8_8], 1);
+            if (is_local_26_1 != 0) {
+                unsigned int _atomic_fetch_add_66 = atomicAdd(&smem_expert_count[idx_ii_25_1], 1);
                 exp_off[34] = (int)_atomic_fetch_add_66;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_8 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_25_1 << 16);
             expanded = grid_tid + 35 * grid_threads;
-            int packed_word_14_8 = topk_packed[expanded];
-            int idx_ii_15_8 = packed_word_14_8 >> 16;
-            unsigned int word0_16_8 = (unsigned int)packed_word_14_8 & 65535;
-            exp_idx[35] = idx_ii_15_8;
-            int local_idx_17_8 = idx_ii_15_8 - local_experts_start_idx;
-            int extent_18_8 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_8 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_8 = ((local_idx_17_8 >= 0 && local_idx_17_8 < extent_18_8 && (local_idx_17_8 & stride_mask_19_8) == 0) ? 1 : 0);
+            int packed_word_26_1 = topk_packed[expanded];
+            int idx_ii_26_1 = packed_word_26_1 >> 16;
+            unsigned int word0_26_1 = (unsigned int)packed_word_26_1 & 65535;
+            exp_idx[35] = idx_ii_26_1;
+            int local_idx_26_1 = idx_ii_26_1 - local_experts_start_idx;
+            int extent_26_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_26_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_27_1 = ((local_idx_26_1 >= 0 && local_idx_26_1 < extent_26_1 && (local_idx_26_1 & stride_mask_26_1) == 0) ? 1 : 0);
             exp_off[35] = 0;
-            if (is_local_20_8 != 0) {
-                unsigned int _atomic_fetch_add_67 = atomicAdd(&smem_expert_count[idx_ii_15_8], 1);
+            if (is_local_27_1 != 0) {
+                unsigned int _atomic_fetch_add_67 = atomicAdd(&smem_expert_count[idx_ii_26_1], 1);
                 exp_off[35] = (int)_atomic_fetch_add_67;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_8 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_26_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 32 * grid_threads;
@@ -1341,19 +1327,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_43 = topk_packed[expanded];
-                    int idx_ii_44 = packed_word_43 >> 16;
-                    unsigned int word0_44 = (unsigned int)packed_word_43 & 65535;
-                    exp_idx[32] = idx_ii_44;
-                    int local_idx_44 = idx_ii_44 - local_experts_start_idx;
-                    int extent_44 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_44 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_44 = ((local_idx_44 >= 0 && local_idx_44 < extent_44 && (local_idx_44 & stride_mask_44) == 0) ? 1 : 0);
+                    int idx_ii_43 = packed_word_43 >> 16;
+                    unsigned int word0_43 = (unsigned int)packed_word_43 & 65535;
+                    exp_idx[32] = idx_ii_43;
+                    int local_idx_43 = idx_ii_43 - local_experts_start_idx;
+                    int extent_43 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_43 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_43 = ((local_idx_43 >= 0 && local_idx_43 < extent_43 && (local_idx_43 & stride_mask_43) == 0) ? 1 : 0);
                     exp_off[32] = 0;
-                    if (is_local_44 != 0) {
-                        unsigned int _atomic_fetch_add_68 = atomicAdd(&smem_expert_count[idx_ii_44], 1);
+                    if (is_local_43 != 0) {
+                        unsigned int _atomic_fetch_add_68 = atomicAdd(&smem_expert_count[idx_ii_43], 1);
                         exp_off[32] = (int)_atomic_fetch_add_68;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_44 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_43 << 16);
                 }
             }
             if (done == 0) {
@@ -1362,19 +1348,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_44 = topk_packed[expanded];
-                    int idx_ii_45 = packed_word_44 >> 16;
-                    unsigned int word0_45 = (unsigned int)packed_word_44 & 65535;
-                    exp_idx[33] = idx_ii_45;
-                    int local_idx_45 = idx_ii_45 - local_experts_start_idx;
-                    int extent_45 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_45 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_45 = ((local_idx_45 >= 0 && local_idx_45 < extent_45 && (local_idx_45 & stride_mask_45) == 0) ? 1 : 0);
+                    int idx_ii_44 = packed_word_44 >> 16;
+                    unsigned int word0_44 = (unsigned int)packed_word_44 & 65535;
+                    exp_idx[33] = idx_ii_44;
+                    int local_idx_44 = idx_ii_44 - local_experts_start_idx;
+                    int extent_44 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_44 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_44 = ((local_idx_44 >= 0 && local_idx_44 < extent_44 && (local_idx_44 & stride_mask_44) == 0) ? 1 : 0);
                     exp_off[33] = 0;
-                    if (is_local_45 != 0) {
-                        unsigned int _atomic_fetch_add_69 = atomicAdd(&smem_expert_count[idx_ii_45], 1);
+                    if (is_local_44 != 0) {
+                        unsigned int _atomic_fetch_add_69 = atomicAdd(&smem_expert_count[idx_ii_44], 1);
                         exp_off[33] = (int)_atomic_fetch_add_69;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_45 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_44 << 16);
                 }
             }
             if (done == 0) {
@@ -1383,19 +1369,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_45 = topk_packed[expanded];
-                    int idx_ii_46 = packed_word_45 >> 16;
-                    unsigned int word0_46 = (unsigned int)packed_word_45 & 65535;
-                    exp_idx[34] = idx_ii_46;
-                    int local_idx_46 = idx_ii_46 - local_experts_start_idx;
-                    int extent_46 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_46 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_46 = ((local_idx_46 >= 0 && local_idx_46 < extent_46 && (local_idx_46 & stride_mask_46) == 0) ? 1 : 0);
+                    int idx_ii_45 = packed_word_45 >> 16;
+                    unsigned int word0_45 = (unsigned int)packed_word_45 & 65535;
+                    exp_idx[34] = idx_ii_45;
+                    int local_idx_45 = idx_ii_45 - local_experts_start_idx;
+                    int extent_45 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_45 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_45 = ((local_idx_45 >= 0 && local_idx_45 < extent_45 && (local_idx_45 & stride_mask_45) == 0) ? 1 : 0);
                     exp_off[34] = 0;
-                    if (is_local_46 != 0) {
-                        unsigned int _atomic_fetch_add_70 = atomicAdd(&smem_expert_count[idx_ii_46], 1);
+                    if (is_local_45 != 0) {
+                        unsigned int _atomic_fetch_add_70 = atomicAdd(&smem_expert_count[idx_ii_45], 1);
                         exp_off[34] = (int)_atomic_fetch_add_70;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_46 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_45 << 16);
                 }
             }
             if (done == 0) {
@@ -1404,19 +1390,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_46 = topk_packed[expanded];
-                    int idx_ii_47 = packed_word_46 >> 16;
-                    unsigned int word0_47 = (unsigned int)packed_word_46 & 65535;
-                    exp_idx[35] = idx_ii_47;
-                    int local_idx_47 = idx_ii_47 - local_experts_start_idx;
-                    int extent_47 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_47 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_47 = ((local_idx_47 >= 0 && local_idx_47 < extent_47 && (local_idx_47 & stride_mask_47) == 0) ? 1 : 0);
+                    int idx_ii_46 = packed_word_46 >> 16;
+                    unsigned int word0_46 = (unsigned int)packed_word_46 & 65535;
+                    exp_idx[35] = idx_ii_46;
+                    int local_idx_46 = idx_ii_46 - local_experts_start_idx;
+                    int extent_46 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_46 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_46 = ((local_idx_46 >= 0 && local_idx_46 < extent_46 && (local_idx_46 & stride_mask_46) == 0) ? 1 : 0);
                     exp_off[35] = 0;
-                    if (is_local_47 != 0) {
-                        unsigned int _atomic_fetch_add_71 = atomicAdd(&smem_expert_count[idx_ii_47], 1);
+                    if (is_local_46 != 0) {
+                        unsigned int _atomic_fetch_add_71 = atomicAdd(&smem_expert_count[idx_ii_46], 1);
                         exp_off[35] = (int)_atomic_fetch_add_71;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_47 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_46 << 16);
                 }
             }
         }
@@ -1425,64 +1411,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 40 * grid_threads) {
             expanded = grid_tid + 36 * grid_threads;
             int packed_word_47 = topk_packed[expanded];
-            int idx_ii_48 = packed_word_47 >> 16;
-            unsigned int word0_48 = (unsigned int)packed_word_47 & 65535;
-            exp_idx[36] = idx_ii_48;
-            int local_idx_48 = idx_ii_48 - local_experts_start_idx;
-            int extent_48 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_48 = (1 << local_experts_stride_log2) - 1;
-            int is_local_48 = ((local_idx_48 >= 0 && local_idx_48 < extent_48 && (local_idx_48 & stride_mask_48) == 0) ? 1 : 0);
+            int idx_ii_47 = packed_word_47 >> 16;
+            unsigned int word0_47 = (unsigned int)packed_word_47 & 65535;
+            exp_idx[36] = idx_ii_47;
+            int local_idx_47 = idx_ii_47 - local_experts_start_idx;
+            int extent_47 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_47 = (1 << local_experts_stride_log2) - 1;
+            int is_local_47 = ((local_idx_47 >= 0 && local_idx_47 < extent_47 && (local_idx_47 & stride_mask_47) == 0) ? 1 : 0);
             exp_off[36] = 0;
-            if (is_local_48 != 0) {
-                unsigned int _atomic_fetch_add_72 = atomicAdd(&smem_expert_count[idx_ii_48], 1);
+            if (is_local_47 != 0) {
+                unsigned int _atomic_fetch_add_72 = atomicAdd(&smem_expert_count[idx_ii_47], 1);
                 exp_off[36] = (int)_atomic_fetch_add_72;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_48 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_47 << 16);
             expanded = grid_tid + 37 * grid_threads;
-            int packed_word_0_9 = topk_packed[expanded];
-            int idx_ii_1_9 = packed_word_0_9 >> 16;
-            unsigned int word0_2_9 = (unsigned int)packed_word_0_9 & 65535;
-            exp_idx[37] = idx_ii_1_9;
-            int local_idx_3_9 = idx_ii_1_9 - local_experts_start_idx;
-            int extent_4_9 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_9 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_9 = ((local_idx_3_9 >= 0 && local_idx_3_9 < extent_4_9 && (local_idx_3_9 & stride_mask_5_9) == 0) ? 1 : 0);
+            int packed_word_27_1 = topk_packed[expanded];
+            int idx_ii_27_1 = packed_word_27_1 >> 16;
+            unsigned int word0_27_1 = (unsigned int)packed_word_27_1 & 65535;
+            exp_idx[37] = idx_ii_27_1;
+            int local_idx_27_1 = idx_ii_27_1 - local_experts_start_idx;
+            int extent_27_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_27_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_28_1 = ((local_idx_27_1 >= 0 && local_idx_27_1 < extent_27_1 && (local_idx_27_1 & stride_mask_27_1) == 0) ? 1 : 0);
             exp_off[37] = 0;
-            if (is_local_6_9 != 0) {
-                unsigned int _atomic_fetch_add_73 = atomicAdd(&smem_expert_count[idx_ii_1_9], 1);
+            if (is_local_28_1 != 0) {
+                unsigned int _atomic_fetch_add_73 = atomicAdd(&smem_expert_count[idx_ii_27_1], 1);
                 exp_off[37] = (int)_atomic_fetch_add_73;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_9 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_27_1 << 16);
             expanded = grid_tid + 38 * grid_threads;
-            int packed_word_7_9 = topk_packed[expanded];
-            int idx_ii_8_9 = packed_word_7_9 >> 16;
-            unsigned int word0_9_9 = (unsigned int)packed_word_7_9 & 65535;
-            exp_idx[38] = idx_ii_8_9;
-            int local_idx_10_9 = idx_ii_8_9 - local_experts_start_idx;
-            int extent_11_9 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_9 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_9 = ((local_idx_10_9 >= 0 && local_idx_10_9 < extent_11_9 && (local_idx_10_9 & stride_mask_12_9) == 0) ? 1 : 0);
+            int packed_word_28_1 = topk_packed[expanded];
+            int idx_ii_28_1 = packed_word_28_1 >> 16;
+            unsigned int word0_28_1 = (unsigned int)packed_word_28_1 & 65535;
+            exp_idx[38] = idx_ii_28_1;
+            int local_idx_28_1 = idx_ii_28_1 - local_experts_start_idx;
+            int extent_28_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_28_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_29_1 = ((local_idx_28_1 >= 0 && local_idx_28_1 < extent_28_1 && (local_idx_28_1 & stride_mask_28_1) == 0) ? 1 : 0);
             exp_off[38] = 0;
-            if (is_local_13_9 != 0) {
-                unsigned int _atomic_fetch_add_74 = atomicAdd(&smem_expert_count[idx_ii_8_9], 1);
+            if (is_local_29_1 != 0) {
+                unsigned int _atomic_fetch_add_74 = atomicAdd(&smem_expert_count[idx_ii_28_1], 1);
                 exp_off[38] = (int)_atomic_fetch_add_74;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_9 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_28_1 << 16);
             expanded = grid_tid + 39 * grid_threads;
-            int packed_word_14_9 = topk_packed[expanded];
-            int idx_ii_15_9 = packed_word_14_9 >> 16;
-            unsigned int word0_16_9 = (unsigned int)packed_word_14_9 & 65535;
-            exp_idx[39] = idx_ii_15_9;
-            int local_idx_17_9 = idx_ii_15_9 - local_experts_start_idx;
-            int extent_18_9 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_9 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_9 = ((local_idx_17_9 >= 0 && local_idx_17_9 < extent_18_9 && (local_idx_17_9 & stride_mask_19_9) == 0) ? 1 : 0);
+            int packed_word_29_1 = topk_packed[expanded];
+            int idx_ii_29_1 = packed_word_29_1 >> 16;
+            unsigned int word0_29_1 = (unsigned int)packed_word_29_1 & 65535;
+            exp_idx[39] = idx_ii_29_1;
+            int local_idx_29_1 = idx_ii_29_1 - local_experts_start_idx;
+            int extent_29_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_29_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_30_1 = ((local_idx_29_1 >= 0 && local_idx_29_1 < extent_29_1 && (local_idx_29_1 & stride_mask_29_1) == 0) ? 1 : 0);
             exp_off[39] = 0;
-            if (is_local_20_9 != 0) {
-                unsigned int _atomic_fetch_add_75 = atomicAdd(&smem_expert_count[idx_ii_15_9], 1);
+            if (is_local_30_1 != 0) {
+                unsigned int _atomic_fetch_add_75 = atomicAdd(&smem_expert_count[idx_ii_29_1], 1);
                 exp_off[39] = (int)_atomic_fetch_add_75;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_9 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_29_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 36 * grid_threads;
@@ -1490,19 +1476,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_48 = topk_packed[expanded];
-                    int idx_ii_49 = packed_word_48 >> 16;
-                    unsigned int word0_49 = (unsigned int)packed_word_48 & 65535;
-                    exp_idx[36] = idx_ii_49;
-                    int local_idx_49 = idx_ii_49 - local_experts_start_idx;
-                    int extent_49 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_49 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_49 = ((local_idx_49 >= 0 && local_idx_49 < extent_49 && (local_idx_49 & stride_mask_49) == 0) ? 1 : 0);
+                    int idx_ii_48 = packed_word_48 >> 16;
+                    unsigned int word0_48 = (unsigned int)packed_word_48 & 65535;
+                    exp_idx[36] = idx_ii_48;
+                    int local_idx_48 = idx_ii_48 - local_experts_start_idx;
+                    int extent_48 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_48 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_48 = ((local_idx_48 >= 0 && local_idx_48 < extent_48 && (local_idx_48 & stride_mask_48) == 0) ? 1 : 0);
                     exp_off[36] = 0;
-                    if (is_local_49 != 0) {
-                        unsigned int _atomic_fetch_add_76 = atomicAdd(&smem_expert_count[idx_ii_49], 1);
+                    if (is_local_48 != 0) {
+                        unsigned int _atomic_fetch_add_76 = atomicAdd(&smem_expert_count[idx_ii_48], 1);
                         exp_off[36] = (int)_atomic_fetch_add_76;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_49 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_48 << 16);
                 }
             }
             if (done == 0) {
@@ -1511,19 +1497,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_49 = topk_packed[expanded];
-                    int idx_ii_50 = packed_word_49 >> 16;
-                    unsigned int word0_50 = (unsigned int)packed_word_49 & 65535;
-                    exp_idx[37] = idx_ii_50;
-                    int local_idx_50 = idx_ii_50 - local_experts_start_idx;
-                    int extent_50 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_50 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_50 = ((local_idx_50 >= 0 && local_idx_50 < extent_50 && (local_idx_50 & stride_mask_50) == 0) ? 1 : 0);
+                    int idx_ii_49 = packed_word_49 >> 16;
+                    unsigned int word0_49 = (unsigned int)packed_word_49 & 65535;
+                    exp_idx[37] = idx_ii_49;
+                    int local_idx_49 = idx_ii_49 - local_experts_start_idx;
+                    int extent_49 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_49 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_49 = ((local_idx_49 >= 0 && local_idx_49 < extent_49 && (local_idx_49 & stride_mask_49) == 0) ? 1 : 0);
                     exp_off[37] = 0;
-                    if (is_local_50 != 0) {
-                        unsigned int _atomic_fetch_add_77 = atomicAdd(&smem_expert_count[idx_ii_50], 1);
+                    if (is_local_49 != 0) {
+                        unsigned int _atomic_fetch_add_77 = atomicAdd(&smem_expert_count[idx_ii_49], 1);
                         exp_off[37] = (int)_atomic_fetch_add_77;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_50 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_49 << 16);
                 }
             }
             if (done == 0) {
@@ -1532,19 +1518,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_50 = topk_packed[expanded];
-                    int idx_ii_51 = packed_word_50 >> 16;
-                    unsigned int word0_51 = (unsigned int)packed_word_50 & 65535;
-                    exp_idx[38] = idx_ii_51;
-                    int local_idx_51 = idx_ii_51 - local_experts_start_idx;
-                    int extent_51 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_51 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_51 = ((local_idx_51 >= 0 && local_idx_51 < extent_51 && (local_idx_51 & stride_mask_51) == 0) ? 1 : 0);
+                    int idx_ii_50 = packed_word_50 >> 16;
+                    unsigned int word0_50 = (unsigned int)packed_word_50 & 65535;
+                    exp_idx[38] = idx_ii_50;
+                    int local_idx_50 = idx_ii_50 - local_experts_start_idx;
+                    int extent_50 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_50 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_50 = ((local_idx_50 >= 0 && local_idx_50 < extent_50 && (local_idx_50 & stride_mask_50) == 0) ? 1 : 0);
                     exp_off[38] = 0;
-                    if (is_local_51 != 0) {
-                        unsigned int _atomic_fetch_add_78 = atomicAdd(&smem_expert_count[idx_ii_51], 1);
+                    if (is_local_50 != 0) {
+                        unsigned int _atomic_fetch_add_78 = atomicAdd(&smem_expert_count[idx_ii_50], 1);
                         exp_off[38] = (int)_atomic_fetch_add_78;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_51 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_50 << 16);
                 }
             }
             if (done == 0) {
@@ -1553,19 +1539,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_51 = topk_packed[expanded];
-                    int idx_ii_52 = packed_word_51 >> 16;
-                    unsigned int word0_52 = (unsigned int)packed_word_51 & 65535;
-                    exp_idx[39] = idx_ii_52;
-                    int local_idx_52 = idx_ii_52 - local_experts_start_idx;
-                    int extent_52 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_52 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_52 = ((local_idx_52 >= 0 && local_idx_52 < extent_52 && (local_idx_52 & stride_mask_52) == 0) ? 1 : 0);
+                    int idx_ii_51 = packed_word_51 >> 16;
+                    unsigned int word0_51 = (unsigned int)packed_word_51 & 65535;
+                    exp_idx[39] = idx_ii_51;
+                    int local_idx_51 = idx_ii_51 - local_experts_start_idx;
+                    int extent_51 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_51 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_51 = ((local_idx_51 >= 0 && local_idx_51 < extent_51 && (local_idx_51 & stride_mask_51) == 0) ? 1 : 0);
                     exp_off[39] = 0;
-                    if (is_local_52 != 0) {
-                        unsigned int _atomic_fetch_add_79 = atomicAdd(&smem_expert_count[idx_ii_52], 1);
+                    if (is_local_51 != 0) {
+                        unsigned int _atomic_fetch_add_79 = atomicAdd(&smem_expert_count[idx_ii_51], 1);
                         exp_off[39] = (int)_atomic_fetch_add_79;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_52 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_51 << 16);
                 }
             }
         }
@@ -1574,64 +1560,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 44 * grid_threads) {
             expanded = grid_tid + 40 * grid_threads;
             int packed_word_52 = topk_packed[expanded];
-            int idx_ii_53 = packed_word_52 >> 16;
-            unsigned int word0_53 = (unsigned int)packed_word_52 & 65535;
-            exp_idx[40] = idx_ii_53;
-            int local_idx_53 = idx_ii_53 - local_experts_start_idx;
-            int extent_53 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_53 = (1 << local_experts_stride_log2) - 1;
-            int is_local_53 = ((local_idx_53 >= 0 && local_idx_53 < extent_53 && (local_idx_53 & stride_mask_53) == 0) ? 1 : 0);
+            int idx_ii_52 = packed_word_52 >> 16;
+            unsigned int word0_52 = (unsigned int)packed_word_52 & 65535;
+            exp_idx[40] = idx_ii_52;
+            int local_idx_52 = idx_ii_52 - local_experts_start_idx;
+            int extent_52 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_52 = (1 << local_experts_stride_log2) - 1;
+            int is_local_52 = ((local_idx_52 >= 0 && local_idx_52 < extent_52 && (local_idx_52 & stride_mask_52) == 0) ? 1 : 0);
             exp_off[40] = 0;
-            if (is_local_53 != 0) {
-                unsigned int _atomic_fetch_add_80 = atomicAdd(&smem_expert_count[idx_ii_53], 1);
+            if (is_local_52 != 0) {
+                unsigned int _atomic_fetch_add_80 = atomicAdd(&smem_expert_count[idx_ii_52], 1);
                 exp_off[40] = (int)_atomic_fetch_add_80;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_53 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_52 << 16);
             expanded = grid_tid + 41 * grid_threads;
-            int packed_word_0_10 = topk_packed[expanded];
-            int idx_ii_1_10 = packed_word_0_10 >> 16;
-            unsigned int word0_2_10 = (unsigned int)packed_word_0_10 & 65535;
-            exp_idx[41] = idx_ii_1_10;
-            int local_idx_3_10 = idx_ii_1_10 - local_experts_start_idx;
-            int extent_4_10 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_10 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_10 = ((local_idx_3_10 >= 0 && local_idx_3_10 < extent_4_10 && (local_idx_3_10 & stride_mask_5_10) == 0) ? 1 : 0);
+            int packed_word_30_1 = topk_packed[expanded];
+            int idx_ii_30_1 = packed_word_30_1 >> 16;
+            unsigned int word0_30_1 = (unsigned int)packed_word_30_1 & 65535;
+            exp_idx[41] = idx_ii_30_1;
+            int local_idx_30_1 = idx_ii_30_1 - local_experts_start_idx;
+            int extent_30_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_30_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_31_1 = ((local_idx_30_1 >= 0 && local_idx_30_1 < extent_30_1 && (local_idx_30_1 & stride_mask_30_1) == 0) ? 1 : 0);
             exp_off[41] = 0;
-            if (is_local_6_10 != 0) {
-                unsigned int _atomic_fetch_add_81 = atomicAdd(&smem_expert_count[idx_ii_1_10], 1);
+            if (is_local_31_1 != 0) {
+                unsigned int _atomic_fetch_add_81 = atomicAdd(&smem_expert_count[idx_ii_30_1], 1);
                 exp_off[41] = (int)_atomic_fetch_add_81;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_10 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_30_1 << 16);
             expanded = grid_tid + 42 * grid_threads;
-            int packed_word_7_10 = topk_packed[expanded];
-            int idx_ii_8_10 = packed_word_7_10 >> 16;
-            unsigned int word0_9_10 = (unsigned int)packed_word_7_10 & 65535;
-            exp_idx[42] = idx_ii_8_10;
-            int local_idx_10_10 = idx_ii_8_10 - local_experts_start_idx;
-            int extent_11_10 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_10 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_10 = ((local_idx_10_10 >= 0 && local_idx_10_10 < extent_11_10 && (local_idx_10_10 & stride_mask_12_10) == 0) ? 1 : 0);
+            int packed_word_31_1 = topk_packed[expanded];
+            int idx_ii_31_1 = packed_word_31_1 >> 16;
+            unsigned int word0_31_1 = (unsigned int)packed_word_31_1 & 65535;
+            exp_idx[42] = idx_ii_31_1;
+            int local_idx_31_1 = idx_ii_31_1 - local_experts_start_idx;
+            int extent_31_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_31_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_32_1 = ((local_idx_31_1 >= 0 && local_idx_31_1 < extent_31_1 && (local_idx_31_1 & stride_mask_31_1) == 0) ? 1 : 0);
             exp_off[42] = 0;
-            if (is_local_13_10 != 0) {
-                unsigned int _atomic_fetch_add_82 = atomicAdd(&smem_expert_count[idx_ii_8_10], 1);
+            if (is_local_32_1 != 0) {
+                unsigned int _atomic_fetch_add_82 = atomicAdd(&smem_expert_count[idx_ii_31_1], 1);
                 exp_off[42] = (int)_atomic_fetch_add_82;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_10 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_31_1 << 16);
             expanded = grid_tid + 43 * grid_threads;
-            int packed_word_14_10 = topk_packed[expanded];
-            int idx_ii_15_10 = packed_word_14_10 >> 16;
-            unsigned int word0_16_10 = (unsigned int)packed_word_14_10 & 65535;
-            exp_idx[43] = idx_ii_15_10;
-            int local_idx_17_10 = idx_ii_15_10 - local_experts_start_idx;
-            int extent_18_10 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_10 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_10 = ((local_idx_17_10 >= 0 && local_idx_17_10 < extent_18_10 && (local_idx_17_10 & stride_mask_19_10) == 0) ? 1 : 0);
+            int packed_word_32_1 = topk_packed[expanded];
+            int idx_ii_32_1 = packed_word_32_1 >> 16;
+            unsigned int word0_32_1 = (unsigned int)packed_word_32_1 & 65535;
+            exp_idx[43] = idx_ii_32_1;
+            int local_idx_32_1 = idx_ii_32_1 - local_experts_start_idx;
+            int extent_32_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_32_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_33_1 = ((local_idx_32_1 >= 0 && local_idx_32_1 < extent_32_1 && (local_idx_32_1 & stride_mask_32_1) == 0) ? 1 : 0);
             exp_off[43] = 0;
-            if (is_local_20_10 != 0) {
-                unsigned int _atomic_fetch_add_83 = atomicAdd(&smem_expert_count[idx_ii_15_10], 1);
+            if (is_local_33_1 != 0) {
+                unsigned int _atomic_fetch_add_83 = atomicAdd(&smem_expert_count[idx_ii_32_1], 1);
                 exp_off[43] = (int)_atomic_fetch_add_83;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_10 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_32_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 40 * grid_threads;
@@ -1639,19 +1625,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_53 = topk_packed[expanded];
-                    int idx_ii_54 = packed_word_53 >> 16;
-                    unsigned int word0_54 = (unsigned int)packed_word_53 & 65535;
-                    exp_idx[40] = idx_ii_54;
-                    int local_idx_54 = idx_ii_54 - local_experts_start_idx;
-                    int extent_54 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_54 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_54 = ((local_idx_54 >= 0 && local_idx_54 < extent_54 && (local_idx_54 & stride_mask_54) == 0) ? 1 : 0);
+                    int idx_ii_53 = packed_word_53 >> 16;
+                    unsigned int word0_53 = (unsigned int)packed_word_53 & 65535;
+                    exp_idx[40] = idx_ii_53;
+                    int local_idx_53 = idx_ii_53 - local_experts_start_idx;
+                    int extent_53 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_53 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_53 = ((local_idx_53 >= 0 && local_idx_53 < extent_53 && (local_idx_53 & stride_mask_53) == 0) ? 1 : 0);
                     exp_off[40] = 0;
-                    if (is_local_54 != 0) {
-                        unsigned int _atomic_fetch_add_84 = atomicAdd(&smem_expert_count[idx_ii_54], 1);
+                    if (is_local_53 != 0) {
+                        unsigned int _atomic_fetch_add_84 = atomicAdd(&smem_expert_count[idx_ii_53], 1);
                         exp_off[40] = (int)_atomic_fetch_add_84;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_54 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_53 << 16);
                 }
             }
             if (done == 0) {
@@ -1660,19 +1646,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_54 = topk_packed[expanded];
-                    int idx_ii_55 = packed_word_54 >> 16;
-                    unsigned int word0_55 = (unsigned int)packed_word_54 & 65535;
-                    exp_idx[41] = idx_ii_55;
-                    int local_idx_55 = idx_ii_55 - local_experts_start_idx;
-                    int extent_55 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_55 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_55 = ((local_idx_55 >= 0 && local_idx_55 < extent_55 && (local_idx_55 & stride_mask_55) == 0) ? 1 : 0);
+                    int idx_ii_54 = packed_word_54 >> 16;
+                    unsigned int word0_54 = (unsigned int)packed_word_54 & 65535;
+                    exp_idx[41] = idx_ii_54;
+                    int local_idx_54 = idx_ii_54 - local_experts_start_idx;
+                    int extent_54 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_54 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_54 = ((local_idx_54 >= 0 && local_idx_54 < extent_54 && (local_idx_54 & stride_mask_54) == 0) ? 1 : 0);
                     exp_off[41] = 0;
-                    if (is_local_55 != 0) {
-                        unsigned int _atomic_fetch_add_85 = atomicAdd(&smem_expert_count[idx_ii_55], 1);
+                    if (is_local_54 != 0) {
+                        unsigned int _atomic_fetch_add_85 = atomicAdd(&smem_expert_count[idx_ii_54], 1);
                         exp_off[41] = (int)_atomic_fetch_add_85;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_55 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_54 << 16);
                 }
             }
             if (done == 0) {
@@ -1681,19 +1667,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_55 = topk_packed[expanded];
-                    int idx_ii_56 = packed_word_55 >> 16;
-                    unsigned int word0_56 = (unsigned int)packed_word_55 & 65535;
-                    exp_idx[42] = idx_ii_56;
-                    int local_idx_56 = idx_ii_56 - local_experts_start_idx;
-                    int extent_56 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_56 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_56 = ((local_idx_56 >= 0 && local_idx_56 < extent_56 && (local_idx_56 & stride_mask_56) == 0) ? 1 : 0);
+                    int idx_ii_55 = packed_word_55 >> 16;
+                    unsigned int word0_55 = (unsigned int)packed_word_55 & 65535;
+                    exp_idx[42] = idx_ii_55;
+                    int local_idx_55 = idx_ii_55 - local_experts_start_idx;
+                    int extent_55 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_55 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_55 = ((local_idx_55 >= 0 && local_idx_55 < extent_55 && (local_idx_55 & stride_mask_55) == 0) ? 1 : 0);
                     exp_off[42] = 0;
-                    if (is_local_56 != 0) {
-                        unsigned int _atomic_fetch_add_86 = atomicAdd(&smem_expert_count[idx_ii_56], 1);
+                    if (is_local_55 != 0) {
+                        unsigned int _atomic_fetch_add_86 = atomicAdd(&smem_expert_count[idx_ii_55], 1);
                         exp_off[42] = (int)_atomic_fetch_add_86;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_56 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_55 << 16);
                 }
             }
             if (done == 0) {
@@ -1702,19 +1688,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_56 = topk_packed[expanded];
-                    int idx_ii_57 = packed_word_56 >> 16;
-                    unsigned int word0_57 = (unsigned int)packed_word_56 & 65535;
-                    exp_idx[43] = idx_ii_57;
-                    int local_idx_57 = idx_ii_57 - local_experts_start_idx;
-                    int extent_57 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_57 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_57 = ((local_idx_57 >= 0 && local_idx_57 < extent_57 && (local_idx_57 & stride_mask_57) == 0) ? 1 : 0);
+                    int idx_ii_56 = packed_word_56 >> 16;
+                    unsigned int word0_56 = (unsigned int)packed_word_56 & 65535;
+                    exp_idx[43] = idx_ii_56;
+                    int local_idx_56 = idx_ii_56 - local_experts_start_idx;
+                    int extent_56 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_56 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_56 = ((local_idx_56 >= 0 && local_idx_56 < extent_56 && (local_idx_56 & stride_mask_56) == 0) ? 1 : 0);
                     exp_off[43] = 0;
-                    if (is_local_57 != 0) {
-                        unsigned int _atomic_fetch_add_87 = atomicAdd(&smem_expert_count[idx_ii_57], 1);
+                    if (is_local_56 != 0) {
+                        unsigned int _atomic_fetch_add_87 = atomicAdd(&smem_expert_count[idx_ii_56], 1);
                         exp_off[43] = (int)_atomic_fetch_add_87;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_57 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_56 << 16);
                 }
             }
         }
@@ -1723,64 +1709,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 48 * grid_threads) {
             expanded = grid_tid + 44 * grid_threads;
             int packed_word_57 = topk_packed[expanded];
-            int idx_ii_58 = packed_word_57 >> 16;
-            unsigned int word0_58 = (unsigned int)packed_word_57 & 65535;
-            exp_idx[44] = idx_ii_58;
-            int local_idx_58 = idx_ii_58 - local_experts_start_idx;
-            int extent_58 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_58 = (1 << local_experts_stride_log2) - 1;
-            int is_local_58 = ((local_idx_58 >= 0 && local_idx_58 < extent_58 && (local_idx_58 & stride_mask_58) == 0) ? 1 : 0);
+            int idx_ii_57 = packed_word_57 >> 16;
+            unsigned int word0_57 = (unsigned int)packed_word_57 & 65535;
+            exp_idx[44] = idx_ii_57;
+            int local_idx_57 = idx_ii_57 - local_experts_start_idx;
+            int extent_57 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_57 = (1 << local_experts_stride_log2) - 1;
+            int is_local_57 = ((local_idx_57 >= 0 && local_idx_57 < extent_57 && (local_idx_57 & stride_mask_57) == 0) ? 1 : 0);
             exp_off[44] = 0;
-            if (is_local_58 != 0) {
-                unsigned int _atomic_fetch_add_88 = atomicAdd(&smem_expert_count[idx_ii_58], 1);
+            if (is_local_57 != 0) {
+                unsigned int _atomic_fetch_add_88 = atomicAdd(&smem_expert_count[idx_ii_57], 1);
                 exp_off[44] = (int)_atomic_fetch_add_88;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_58 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_57 << 16);
             expanded = grid_tid + 45 * grid_threads;
-            int packed_word_0_11 = topk_packed[expanded];
-            int idx_ii_1_11 = packed_word_0_11 >> 16;
-            unsigned int word0_2_11 = (unsigned int)packed_word_0_11 & 65535;
-            exp_idx[45] = idx_ii_1_11;
-            int local_idx_3_11 = idx_ii_1_11 - local_experts_start_idx;
-            int extent_4_11 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_11 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_11 = ((local_idx_3_11 >= 0 && local_idx_3_11 < extent_4_11 && (local_idx_3_11 & stride_mask_5_11) == 0) ? 1 : 0);
+            int packed_word_33_1 = topk_packed[expanded];
+            int idx_ii_33_1 = packed_word_33_1 >> 16;
+            unsigned int word0_33_1 = (unsigned int)packed_word_33_1 & 65535;
+            exp_idx[45] = idx_ii_33_1;
+            int local_idx_33_1 = idx_ii_33_1 - local_experts_start_idx;
+            int extent_33_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_33_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_34_1 = ((local_idx_33_1 >= 0 && local_idx_33_1 < extent_33_1 && (local_idx_33_1 & stride_mask_33_1) == 0) ? 1 : 0);
             exp_off[45] = 0;
-            if (is_local_6_11 != 0) {
-                unsigned int _atomic_fetch_add_89 = atomicAdd(&smem_expert_count[idx_ii_1_11], 1);
+            if (is_local_34_1 != 0) {
+                unsigned int _atomic_fetch_add_89 = atomicAdd(&smem_expert_count[idx_ii_33_1], 1);
                 exp_off[45] = (int)_atomic_fetch_add_89;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_11 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_33_1 << 16);
             expanded = grid_tid + 46 * grid_threads;
-            int packed_word_7_11 = topk_packed[expanded];
-            int idx_ii_8_11 = packed_word_7_11 >> 16;
-            unsigned int word0_9_11 = (unsigned int)packed_word_7_11 & 65535;
-            exp_idx[46] = idx_ii_8_11;
-            int local_idx_10_11 = idx_ii_8_11 - local_experts_start_idx;
-            int extent_11_11 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_11 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_11 = ((local_idx_10_11 >= 0 && local_idx_10_11 < extent_11_11 && (local_idx_10_11 & stride_mask_12_11) == 0) ? 1 : 0);
+            int packed_word_34_1 = topk_packed[expanded];
+            int idx_ii_34_1 = packed_word_34_1 >> 16;
+            unsigned int word0_34_1 = (unsigned int)packed_word_34_1 & 65535;
+            exp_idx[46] = idx_ii_34_1;
+            int local_idx_34_1 = idx_ii_34_1 - local_experts_start_idx;
+            int extent_34_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_34_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_35_1 = ((local_idx_34_1 >= 0 && local_idx_34_1 < extent_34_1 && (local_idx_34_1 & stride_mask_34_1) == 0) ? 1 : 0);
             exp_off[46] = 0;
-            if (is_local_13_11 != 0) {
-                unsigned int _atomic_fetch_add_90 = atomicAdd(&smem_expert_count[idx_ii_8_11], 1);
+            if (is_local_35_1 != 0) {
+                unsigned int _atomic_fetch_add_90 = atomicAdd(&smem_expert_count[idx_ii_34_1], 1);
                 exp_off[46] = (int)_atomic_fetch_add_90;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_11 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_34_1 << 16);
             expanded = grid_tid + 47 * grid_threads;
-            int packed_word_14_11 = topk_packed[expanded];
-            int idx_ii_15_11 = packed_word_14_11 >> 16;
-            unsigned int word0_16_11 = (unsigned int)packed_word_14_11 & 65535;
-            exp_idx[47] = idx_ii_15_11;
-            int local_idx_17_11 = idx_ii_15_11 - local_experts_start_idx;
-            int extent_18_11 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_11 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_11 = ((local_idx_17_11 >= 0 && local_idx_17_11 < extent_18_11 && (local_idx_17_11 & stride_mask_19_11) == 0) ? 1 : 0);
+            int packed_word_35_1 = topk_packed[expanded];
+            int idx_ii_35_1 = packed_word_35_1 >> 16;
+            unsigned int word0_35_1 = (unsigned int)packed_word_35_1 & 65535;
+            exp_idx[47] = idx_ii_35_1;
+            int local_idx_35_1 = idx_ii_35_1 - local_experts_start_idx;
+            int extent_35_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_35_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_36_1 = ((local_idx_35_1 >= 0 && local_idx_35_1 < extent_35_1 && (local_idx_35_1 & stride_mask_35_1) == 0) ? 1 : 0);
             exp_off[47] = 0;
-            if (is_local_20_11 != 0) {
-                unsigned int _atomic_fetch_add_91 = atomicAdd(&smem_expert_count[idx_ii_15_11], 1);
+            if (is_local_36_1 != 0) {
+                unsigned int _atomic_fetch_add_91 = atomicAdd(&smem_expert_count[idx_ii_35_1], 1);
                 exp_off[47] = (int)_atomic_fetch_add_91;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_11 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_35_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 44 * grid_threads;
@@ -1788,19 +1774,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_58 = topk_packed[expanded];
-                    int idx_ii_59 = packed_word_58 >> 16;
-                    unsigned int word0_59 = (unsigned int)packed_word_58 & 65535;
-                    exp_idx[44] = idx_ii_59;
-                    int local_idx_59 = idx_ii_59 - local_experts_start_idx;
-                    int extent_59 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_59 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_59 = ((local_idx_59 >= 0 && local_idx_59 < extent_59 && (local_idx_59 & stride_mask_59) == 0) ? 1 : 0);
+                    int idx_ii_58 = packed_word_58 >> 16;
+                    unsigned int word0_58 = (unsigned int)packed_word_58 & 65535;
+                    exp_idx[44] = idx_ii_58;
+                    int local_idx_58 = idx_ii_58 - local_experts_start_idx;
+                    int extent_58 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_58 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_58 = ((local_idx_58 >= 0 && local_idx_58 < extent_58 && (local_idx_58 & stride_mask_58) == 0) ? 1 : 0);
                     exp_off[44] = 0;
-                    if (is_local_59 != 0) {
-                        unsigned int _atomic_fetch_add_92 = atomicAdd(&smem_expert_count[idx_ii_59], 1);
+                    if (is_local_58 != 0) {
+                        unsigned int _atomic_fetch_add_92 = atomicAdd(&smem_expert_count[idx_ii_58], 1);
                         exp_off[44] = (int)_atomic_fetch_add_92;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_59 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_58 << 16);
                 }
             }
             if (done == 0) {
@@ -1809,19 +1795,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_59 = topk_packed[expanded];
-                    int idx_ii_60 = packed_word_59 >> 16;
-                    unsigned int word0_60 = (unsigned int)packed_word_59 & 65535;
-                    exp_idx[45] = idx_ii_60;
-                    int local_idx_60 = idx_ii_60 - local_experts_start_idx;
-                    int extent_60 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_60 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_60 = ((local_idx_60 >= 0 && local_idx_60 < extent_60 && (local_idx_60 & stride_mask_60) == 0) ? 1 : 0);
+                    int idx_ii_59 = packed_word_59 >> 16;
+                    unsigned int word0_59 = (unsigned int)packed_word_59 & 65535;
+                    exp_idx[45] = idx_ii_59;
+                    int local_idx_59 = idx_ii_59 - local_experts_start_idx;
+                    int extent_59 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_59 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_59 = ((local_idx_59 >= 0 && local_idx_59 < extent_59 && (local_idx_59 & stride_mask_59) == 0) ? 1 : 0);
                     exp_off[45] = 0;
-                    if (is_local_60 != 0) {
-                        unsigned int _atomic_fetch_add_93 = atomicAdd(&smem_expert_count[idx_ii_60], 1);
+                    if (is_local_59 != 0) {
+                        unsigned int _atomic_fetch_add_93 = atomicAdd(&smem_expert_count[idx_ii_59], 1);
                         exp_off[45] = (int)_atomic_fetch_add_93;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_60 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_59 << 16);
                 }
             }
             if (done == 0) {
@@ -1830,19 +1816,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_60 = topk_packed[expanded];
-                    int idx_ii_61 = packed_word_60 >> 16;
-                    unsigned int word0_61 = (unsigned int)packed_word_60 & 65535;
-                    exp_idx[46] = idx_ii_61;
-                    int local_idx_61 = idx_ii_61 - local_experts_start_idx;
-                    int extent_61 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_61 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_61 = ((local_idx_61 >= 0 && local_idx_61 < extent_61 && (local_idx_61 & stride_mask_61) == 0) ? 1 : 0);
+                    int idx_ii_60 = packed_word_60 >> 16;
+                    unsigned int word0_60 = (unsigned int)packed_word_60 & 65535;
+                    exp_idx[46] = idx_ii_60;
+                    int local_idx_60 = idx_ii_60 - local_experts_start_idx;
+                    int extent_60 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_60 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_60 = ((local_idx_60 >= 0 && local_idx_60 < extent_60 && (local_idx_60 & stride_mask_60) == 0) ? 1 : 0);
                     exp_off[46] = 0;
-                    if (is_local_61 != 0) {
-                        unsigned int _atomic_fetch_add_94 = atomicAdd(&smem_expert_count[idx_ii_61], 1);
+                    if (is_local_60 != 0) {
+                        unsigned int _atomic_fetch_add_94 = atomicAdd(&smem_expert_count[idx_ii_60], 1);
                         exp_off[46] = (int)_atomic_fetch_add_94;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_61 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_60 << 16);
                 }
             }
             if (done == 0) {
@@ -1851,19 +1837,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_61 = topk_packed[expanded];
-                    int idx_ii_62 = packed_word_61 >> 16;
-                    unsigned int word0_62 = (unsigned int)packed_word_61 & 65535;
-                    exp_idx[47] = idx_ii_62;
-                    int local_idx_62 = idx_ii_62 - local_experts_start_idx;
-                    int extent_62 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_62 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_62 = ((local_idx_62 >= 0 && local_idx_62 < extent_62 && (local_idx_62 & stride_mask_62) == 0) ? 1 : 0);
+                    int idx_ii_61 = packed_word_61 >> 16;
+                    unsigned int word0_61 = (unsigned int)packed_word_61 & 65535;
+                    exp_idx[47] = idx_ii_61;
+                    int local_idx_61 = idx_ii_61 - local_experts_start_idx;
+                    int extent_61 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_61 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_61 = ((local_idx_61 >= 0 && local_idx_61 < extent_61 && (local_idx_61 & stride_mask_61) == 0) ? 1 : 0);
                     exp_off[47] = 0;
-                    if (is_local_62 != 0) {
-                        unsigned int _atomic_fetch_add_95 = atomicAdd(&smem_expert_count[idx_ii_62], 1);
+                    if (is_local_61 != 0) {
+                        unsigned int _atomic_fetch_add_95 = atomicAdd(&smem_expert_count[idx_ii_61], 1);
                         exp_off[47] = (int)_atomic_fetch_add_95;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_62 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_61 << 16);
                 }
             }
         }
@@ -1872,64 +1858,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 52 * grid_threads) {
             expanded = grid_tid + 48 * grid_threads;
             int packed_word_62 = topk_packed[expanded];
-            int idx_ii_63 = packed_word_62 >> 16;
-            unsigned int word0_63 = (unsigned int)packed_word_62 & 65535;
-            exp_idx[48] = idx_ii_63;
-            int local_idx_63 = idx_ii_63 - local_experts_start_idx;
-            int extent_63 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_63 = (1 << local_experts_stride_log2) - 1;
-            int is_local_63 = ((local_idx_63 >= 0 && local_idx_63 < extent_63 && (local_idx_63 & stride_mask_63) == 0) ? 1 : 0);
+            int idx_ii_62 = packed_word_62 >> 16;
+            unsigned int word0_62 = (unsigned int)packed_word_62 & 65535;
+            exp_idx[48] = idx_ii_62;
+            int local_idx_62 = idx_ii_62 - local_experts_start_idx;
+            int extent_62 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_62 = (1 << local_experts_stride_log2) - 1;
+            int is_local_62 = ((local_idx_62 >= 0 && local_idx_62 < extent_62 && (local_idx_62 & stride_mask_62) == 0) ? 1 : 0);
             exp_off[48] = 0;
-            if (is_local_63 != 0) {
-                unsigned int _atomic_fetch_add_96 = atomicAdd(&smem_expert_count[idx_ii_63], 1);
+            if (is_local_62 != 0) {
+                unsigned int _atomic_fetch_add_96 = atomicAdd(&smem_expert_count[idx_ii_62], 1);
                 exp_off[48] = (int)_atomic_fetch_add_96;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_63 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_62 << 16);
             expanded = grid_tid + 49 * grid_threads;
-            int packed_word_0_12 = topk_packed[expanded];
-            int idx_ii_1_12 = packed_word_0_12 >> 16;
-            unsigned int word0_2_12 = (unsigned int)packed_word_0_12 & 65535;
-            exp_idx[49] = idx_ii_1_12;
-            int local_idx_3_12 = idx_ii_1_12 - local_experts_start_idx;
-            int extent_4_12 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_12 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_12 = ((local_idx_3_12 >= 0 && local_idx_3_12 < extent_4_12 && (local_idx_3_12 & stride_mask_5_12) == 0) ? 1 : 0);
+            int packed_word_36_1 = topk_packed[expanded];
+            int idx_ii_36_1 = packed_word_36_1 >> 16;
+            unsigned int word0_36_1 = (unsigned int)packed_word_36_1 & 65535;
+            exp_idx[49] = idx_ii_36_1;
+            int local_idx_36_1 = idx_ii_36_1 - local_experts_start_idx;
+            int extent_36_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_36_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_37_1 = ((local_idx_36_1 >= 0 && local_idx_36_1 < extent_36_1 && (local_idx_36_1 & stride_mask_36_1) == 0) ? 1 : 0);
             exp_off[49] = 0;
-            if (is_local_6_12 != 0) {
-                unsigned int _atomic_fetch_add_97 = atomicAdd(&smem_expert_count[idx_ii_1_12], 1);
+            if (is_local_37_1 != 0) {
+                unsigned int _atomic_fetch_add_97 = atomicAdd(&smem_expert_count[idx_ii_36_1], 1);
                 exp_off[49] = (int)_atomic_fetch_add_97;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_12 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_36_1 << 16);
             expanded = grid_tid + 50 * grid_threads;
-            int packed_word_7_12 = topk_packed[expanded];
-            int idx_ii_8_12 = packed_word_7_12 >> 16;
-            unsigned int word0_9_12 = (unsigned int)packed_word_7_12 & 65535;
-            exp_idx[50] = idx_ii_8_12;
-            int local_idx_10_12 = idx_ii_8_12 - local_experts_start_idx;
-            int extent_11_12 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_12 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_12 = ((local_idx_10_12 >= 0 && local_idx_10_12 < extent_11_12 && (local_idx_10_12 & stride_mask_12_12) == 0) ? 1 : 0);
+            int packed_word_37_1 = topk_packed[expanded];
+            int idx_ii_37_1 = packed_word_37_1 >> 16;
+            unsigned int word0_37_1 = (unsigned int)packed_word_37_1 & 65535;
+            exp_idx[50] = idx_ii_37_1;
+            int local_idx_37_1 = idx_ii_37_1 - local_experts_start_idx;
+            int extent_37_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_37_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_38_1 = ((local_idx_37_1 >= 0 && local_idx_37_1 < extent_37_1 && (local_idx_37_1 & stride_mask_37_1) == 0) ? 1 : 0);
             exp_off[50] = 0;
-            if (is_local_13_12 != 0) {
-                unsigned int _atomic_fetch_add_98 = atomicAdd(&smem_expert_count[idx_ii_8_12], 1);
+            if (is_local_38_1 != 0) {
+                unsigned int _atomic_fetch_add_98 = atomicAdd(&smem_expert_count[idx_ii_37_1], 1);
                 exp_off[50] = (int)_atomic_fetch_add_98;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_12 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_37_1 << 16);
             expanded = grid_tid + 51 * grid_threads;
-            int packed_word_14_12 = topk_packed[expanded];
-            int idx_ii_15_12 = packed_word_14_12 >> 16;
-            unsigned int word0_16_12 = (unsigned int)packed_word_14_12 & 65535;
-            exp_idx[51] = idx_ii_15_12;
-            int local_idx_17_12 = idx_ii_15_12 - local_experts_start_idx;
-            int extent_18_12 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_12 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_12 = ((local_idx_17_12 >= 0 && local_idx_17_12 < extent_18_12 && (local_idx_17_12 & stride_mask_19_12) == 0) ? 1 : 0);
+            int packed_word_38_1 = topk_packed[expanded];
+            int idx_ii_38_1 = packed_word_38_1 >> 16;
+            unsigned int word0_38_1 = (unsigned int)packed_word_38_1 & 65535;
+            exp_idx[51] = idx_ii_38_1;
+            int local_idx_38_1 = idx_ii_38_1 - local_experts_start_idx;
+            int extent_38_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_38_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_39_1 = ((local_idx_38_1 >= 0 && local_idx_38_1 < extent_38_1 && (local_idx_38_1 & stride_mask_38_1) == 0) ? 1 : 0);
             exp_off[51] = 0;
-            if (is_local_20_12 != 0) {
-                unsigned int _atomic_fetch_add_99 = atomicAdd(&smem_expert_count[idx_ii_15_12], 1);
+            if (is_local_39_1 != 0) {
+                unsigned int _atomic_fetch_add_99 = atomicAdd(&smem_expert_count[idx_ii_38_1], 1);
                 exp_off[51] = (int)_atomic_fetch_add_99;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_12 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_38_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 48 * grid_threads;
@@ -1937,19 +1923,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_63 = topk_packed[expanded];
-                    int idx_ii_64 = packed_word_63 >> 16;
-                    unsigned int word0_64 = (unsigned int)packed_word_63 & 65535;
-                    exp_idx[48] = idx_ii_64;
-                    int local_idx_64 = idx_ii_64 - local_experts_start_idx;
-                    int extent_64 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_64 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_64 = ((local_idx_64 >= 0 && local_idx_64 < extent_64 && (local_idx_64 & stride_mask_64) == 0) ? 1 : 0);
+                    int idx_ii_63 = packed_word_63 >> 16;
+                    unsigned int word0_63 = (unsigned int)packed_word_63 & 65535;
+                    exp_idx[48] = idx_ii_63;
+                    int local_idx_63 = idx_ii_63 - local_experts_start_idx;
+                    int extent_63 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_63 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_63 = ((local_idx_63 >= 0 && local_idx_63 < extent_63 && (local_idx_63 & stride_mask_63) == 0) ? 1 : 0);
                     exp_off[48] = 0;
-                    if (is_local_64 != 0) {
-                        unsigned int _atomic_fetch_add_100 = atomicAdd(&smem_expert_count[idx_ii_64], 1);
+                    if (is_local_63 != 0) {
+                        unsigned int _atomic_fetch_add_100 = atomicAdd(&smem_expert_count[idx_ii_63], 1);
                         exp_off[48] = (int)_atomic_fetch_add_100;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_64 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_63 << 16);
                 }
             }
             if (done == 0) {
@@ -1958,19 +1944,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_64 = topk_packed[expanded];
-                    int idx_ii_65 = packed_word_64 >> 16;
-                    unsigned int word0_65 = (unsigned int)packed_word_64 & 65535;
-                    exp_idx[49] = idx_ii_65;
-                    int local_idx_65 = idx_ii_65 - local_experts_start_idx;
-                    int extent_65 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_65 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_65 = ((local_idx_65 >= 0 && local_idx_65 < extent_65 && (local_idx_65 & stride_mask_65) == 0) ? 1 : 0);
+                    int idx_ii_64 = packed_word_64 >> 16;
+                    unsigned int word0_64 = (unsigned int)packed_word_64 & 65535;
+                    exp_idx[49] = idx_ii_64;
+                    int local_idx_64 = idx_ii_64 - local_experts_start_idx;
+                    int extent_64 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_64 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_64 = ((local_idx_64 >= 0 && local_idx_64 < extent_64 && (local_idx_64 & stride_mask_64) == 0) ? 1 : 0);
                     exp_off[49] = 0;
-                    if (is_local_65 != 0) {
-                        unsigned int _atomic_fetch_add_101 = atomicAdd(&smem_expert_count[idx_ii_65], 1);
+                    if (is_local_64 != 0) {
+                        unsigned int _atomic_fetch_add_101 = atomicAdd(&smem_expert_count[idx_ii_64], 1);
                         exp_off[49] = (int)_atomic_fetch_add_101;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_65 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_64 << 16);
                 }
             }
             if (done == 0) {
@@ -1979,19 +1965,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_65 = topk_packed[expanded];
-                    int idx_ii_66 = packed_word_65 >> 16;
-                    unsigned int word0_66 = (unsigned int)packed_word_65 & 65535;
-                    exp_idx[50] = idx_ii_66;
-                    int local_idx_66 = idx_ii_66 - local_experts_start_idx;
-                    int extent_66 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_66 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_66 = ((local_idx_66 >= 0 && local_idx_66 < extent_66 && (local_idx_66 & stride_mask_66) == 0) ? 1 : 0);
+                    int idx_ii_65 = packed_word_65 >> 16;
+                    unsigned int word0_65 = (unsigned int)packed_word_65 & 65535;
+                    exp_idx[50] = idx_ii_65;
+                    int local_idx_65 = idx_ii_65 - local_experts_start_idx;
+                    int extent_65 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_65 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_65 = ((local_idx_65 >= 0 && local_idx_65 < extent_65 && (local_idx_65 & stride_mask_65) == 0) ? 1 : 0);
                     exp_off[50] = 0;
-                    if (is_local_66 != 0) {
-                        unsigned int _atomic_fetch_add_102 = atomicAdd(&smem_expert_count[idx_ii_66], 1);
+                    if (is_local_65 != 0) {
+                        unsigned int _atomic_fetch_add_102 = atomicAdd(&smem_expert_count[idx_ii_65], 1);
                         exp_off[50] = (int)_atomic_fetch_add_102;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_66 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_65 << 16);
                 }
             }
             if (done == 0) {
@@ -2000,19 +1986,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_66 = topk_packed[expanded];
-                    int idx_ii_67 = packed_word_66 >> 16;
-                    unsigned int word0_67 = (unsigned int)packed_word_66 & 65535;
-                    exp_idx[51] = idx_ii_67;
-                    int local_idx_67 = idx_ii_67 - local_experts_start_idx;
-                    int extent_67 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_67 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_67 = ((local_idx_67 >= 0 && local_idx_67 < extent_67 && (local_idx_67 & stride_mask_67) == 0) ? 1 : 0);
+                    int idx_ii_66 = packed_word_66 >> 16;
+                    unsigned int word0_66 = (unsigned int)packed_word_66 & 65535;
+                    exp_idx[51] = idx_ii_66;
+                    int local_idx_66 = idx_ii_66 - local_experts_start_idx;
+                    int extent_66 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_66 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_66 = ((local_idx_66 >= 0 && local_idx_66 < extent_66 && (local_idx_66 & stride_mask_66) == 0) ? 1 : 0);
                     exp_off[51] = 0;
-                    if (is_local_67 != 0) {
-                        unsigned int _atomic_fetch_add_103 = atomicAdd(&smem_expert_count[idx_ii_67], 1);
+                    if (is_local_66 != 0) {
+                        unsigned int _atomic_fetch_add_103 = atomicAdd(&smem_expert_count[idx_ii_66], 1);
                         exp_off[51] = (int)_atomic_fetch_add_103;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_67 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_66 << 16);
                 }
             }
         }
@@ -2021,64 +2007,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 56 * grid_threads) {
             expanded = grid_tid + 52 * grid_threads;
             int packed_word_67 = topk_packed[expanded];
-            int idx_ii_68 = packed_word_67 >> 16;
-            unsigned int word0_68 = (unsigned int)packed_word_67 & 65535;
-            exp_idx[52] = idx_ii_68;
-            int local_idx_68 = idx_ii_68 - local_experts_start_idx;
-            int extent_68 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_68 = (1 << local_experts_stride_log2) - 1;
-            int is_local_68 = ((local_idx_68 >= 0 && local_idx_68 < extent_68 && (local_idx_68 & stride_mask_68) == 0) ? 1 : 0);
+            int idx_ii_67 = packed_word_67 >> 16;
+            unsigned int word0_67 = (unsigned int)packed_word_67 & 65535;
+            exp_idx[52] = idx_ii_67;
+            int local_idx_67 = idx_ii_67 - local_experts_start_idx;
+            int extent_67 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_67 = (1 << local_experts_stride_log2) - 1;
+            int is_local_67 = ((local_idx_67 >= 0 && local_idx_67 < extent_67 && (local_idx_67 & stride_mask_67) == 0) ? 1 : 0);
             exp_off[52] = 0;
-            if (is_local_68 != 0) {
-                unsigned int _atomic_fetch_add_104 = atomicAdd(&smem_expert_count[idx_ii_68], 1);
+            if (is_local_67 != 0) {
+                unsigned int _atomic_fetch_add_104 = atomicAdd(&smem_expert_count[idx_ii_67], 1);
                 exp_off[52] = (int)_atomic_fetch_add_104;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_68 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_67 << 16);
             expanded = grid_tid + 53 * grid_threads;
-            int packed_word_0_13 = topk_packed[expanded];
-            int idx_ii_1_13 = packed_word_0_13 >> 16;
-            unsigned int word0_2_13 = (unsigned int)packed_word_0_13 & 65535;
-            exp_idx[53] = idx_ii_1_13;
-            int local_idx_3_13 = idx_ii_1_13 - local_experts_start_idx;
-            int extent_4_13 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_13 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_13 = ((local_idx_3_13 >= 0 && local_idx_3_13 < extent_4_13 && (local_idx_3_13 & stride_mask_5_13) == 0) ? 1 : 0);
+            int packed_word_39_1 = topk_packed[expanded];
+            int idx_ii_39_1 = packed_word_39_1 >> 16;
+            unsigned int word0_39_1 = (unsigned int)packed_word_39_1 & 65535;
+            exp_idx[53] = idx_ii_39_1;
+            int local_idx_39_1 = idx_ii_39_1 - local_experts_start_idx;
+            int extent_39_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_39_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_40_1 = ((local_idx_39_1 >= 0 && local_idx_39_1 < extent_39_1 && (local_idx_39_1 & stride_mask_39_1) == 0) ? 1 : 0);
             exp_off[53] = 0;
-            if (is_local_6_13 != 0) {
-                unsigned int _atomic_fetch_add_105 = atomicAdd(&smem_expert_count[idx_ii_1_13], 1);
+            if (is_local_40_1 != 0) {
+                unsigned int _atomic_fetch_add_105 = atomicAdd(&smem_expert_count[idx_ii_39_1], 1);
                 exp_off[53] = (int)_atomic_fetch_add_105;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_13 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_39_1 << 16);
             expanded = grid_tid + 54 * grid_threads;
-            int packed_word_7_13 = topk_packed[expanded];
-            int idx_ii_8_13 = packed_word_7_13 >> 16;
-            unsigned int word0_9_13 = (unsigned int)packed_word_7_13 & 65535;
-            exp_idx[54] = idx_ii_8_13;
-            int local_idx_10_13 = idx_ii_8_13 - local_experts_start_idx;
-            int extent_11_13 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_13 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_13 = ((local_idx_10_13 >= 0 && local_idx_10_13 < extent_11_13 && (local_idx_10_13 & stride_mask_12_13) == 0) ? 1 : 0);
+            int packed_word_40_1 = topk_packed[expanded];
+            int idx_ii_40_1 = packed_word_40_1 >> 16;
+            unsigned int word0_40_1 = (unsigned int)packed_word_40_1 & 65535;
+            exp_idx[54] = idx_ii_40_1;
+            int local_idx_40_1 = idx_ii_40_1 - local_experts_start_idx;
+            int extent_40_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_40_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_41_1 = ((local_idx_40_1 >= 0 && local_idx_40_1 < extent_40_1 && (local_idx_40_1 & stride_mask_40_1) == 0) ? 1 : 0);
             exp_off[54] = 0;
-            if (is_local_13_13 != 0) {
-                unsigned int _atomic_fetch_add_106 = atomicAdd(&smem_expert_count[idx_ii_8_13], 1);
+            if (is_local_41_1 != 0) {
+                unsigned int _atomic_fetch_add_106 = atomicAdd(&smem_expert_count[idx_ii_40_1], 1);
                 exp_off[54] = (int)_atomic_fetch_add_106;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_13 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_40_1 << 16);
             expanded = grid_tid + 55 * grid_threads;
-            int packed_word_14_13 = topk_packed[expanded];
-            int idx_ii_15_13 = packed_word_14_13 >> 16;
-            unsigned int word0_16_13 = (unsigned int)packed_word_14_13 & 65535;
-            exp_idx[55] = idx_ii_15_13;
-            int local_idx_17_13 = idx_ii_15_13 - local_experts_start_idx;
-            int extent_18_13 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_13 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_13 = ((local_idx_17_13 >= 0 && local_idx_17_13 < extent_18_13 && (local_idx_17_13 & stride_mask_19_13) == 0) ? 1 : 0);
+            int packed_word_41_1 = topk_packed[expanded];
+            int idx_ii_41_1 = packed_word_41_1 >> 16;
+            unsigned int word0_41_1 = (unsigned int)packed_word_41_1 & 65535;
+            exp_idx[55] = idx_ii_41_1;
+            int local_idx_41_1 = idx_ii_41_1 - local_experts_start_idx;
+            int extent_41_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_41_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_42_1 = ((local_idx_41_1 >= 0 && local_idx_41_1 < extent_41_1 && (local_idx_41_1 & stride_mask_41_1) == 0) ? 1 : 0);
             exp_off[55] = 0;
-            if (is_local_20_13 != 0) {
-                unsigned int _atomic_fetch_add_107 = atomicAdd(&smem_expert_count[idx_ii_15_13], 1);
+            if (is_local_42_1 != 0) {
+                unsigned int _atomic_fetch_add_107 = atomicAdd(&smem_expert_count[idx_ii_41_1], 1);
                 exp_off[55] = (int)_atomic_fetch_add_107;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_13 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_41_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 52 * grid_threads;
@@ -2086,19 +2072,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_68 = topk_packed[expanded];
-                    int idx_ii_69 = packed_word_68 >> 16;
-                    unsigned int word0_69 = (unsigned int)packed_word_68 & 65535;
-                    exp_idx[52] = idx_ii_69;
-                    int local_idx_69 = idx_ii_69 - local_experts_start_idx;
-                    int extent_69 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_69 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_69 = ((local_idx_69 >= 0 && local_idx_69 < extent_69 && (local_idx_69 & stride_mask_69) == 0) ? 1 : 0);
+                    int idx_ii_68 = packed_word_68 >> 16;
+                    unsigned int word0_68 = (unsigned int)packed_word_68 & 65535;
+                    exp_idx[52] = idx_ii_68;
+                    int local_idx_68 = idx_ii_68 - local_experts_start_idx;
+                    int extent_68 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_68 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_68 = ((local_idx_68 >= 0 && local_idx_68 < extent_68 && (local_idx_68 & stride_mask_68) == 0) ? 1 : 0);
                     exp_off[52] = 0;
-                    if (is_local_69 != 0) {
-                        unsigned int _atomic_fetch_add_108 = atomicAdd(&smem_expert_count[idx_ii_69], 1);
+                    if (is_local_68 != 0) {
+                        unsigned int _atomic_fetch_add_108 = atomicAdd(&smem_expert_count[idx_ii_68], 1);
                         exp_off[52] = (int)_atomic_fetch_add_108;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_69 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_68 << 16);
                 }
             }
             if (done == 0) {
@@ -2107,19 +2093,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_69 = topk_packed[expanded];
-                    int idx_ii_70 = packed_word_69 >> 16;
-                    unsigned int word0_70 = (unsigned int)packed_word_69 & 65535;
-                    exp_idx[53] = idx_ii_70;
-                    int local_idx_70 = idx_ii_70 - local_experts_start_idx;
-                    int extent_70 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_70 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_70 = ((local_idx_70 >= 0 && local_idx_70 < extent_70 && (local_idx_70 & stride_mask_70) == 0) ? 1 : 0);
+                    int idx_ii_69 = packed_word_69 >> 16;
+                    unsigned int word0_69 = (unsigned int)packed_word_69 & 65535;
+                    exp_idx[53] = idx_ii_69;
+                    int local_idx_69 = idx_ii_69 - local_experts_start_idx;
+                    int extent_69 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_69 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_69 = ((local_idx_69 >= 0 && local_idx_69 < extent_69 && (local_idx_69 & stride_mask_69) == 0) ? 1 : 0);
                     exp_off[53] = 0;
-                    if (is_local_70 != 0) {
-                        unsigned int _atomic_fetch_add_109 = atomicAdd(&smem_expert_count[idx_ii_70], 1);
+                    if (is_local_69 != 0) {
+                        unsigned int _atomic_fetch_add_109 = atomicAdd(&smem_expert_count[idx_ii_69], 1);
                         exp_off[53] = (int)_atomic_fetch_add_109;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_70 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_69 << 16);
                 }
             }
             if (done == 0) {
@@ -2128,19 +2114,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_70 = topk_packed[expanded];
-                    int idx_ii_71 = packed_word_70 >> 16;
-                    unsigned int word0_71 = (unsigned int)packed_word_70 & 65535;
-                    exp_idx[54] = idx_ii_71;
-                    int local_idx_71 = idx_ii_71 - local_experts_start_idx;
-                    int extent_71 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_71 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_71 = ((local_idx_71 >= 0 && local_idx_71 < extent_71 && (local_idx_71 & stride_mask_71) == 0) ? 1 : 0);
+                    int idx_ii_70 = packed_word_70 >> 16;
+                    unsigned int word0_70 = (unsigned int)packed_word_70 & 65535;
+                    exp_idx[54] = idx_ii_70;
+                    int local_idx_70 = idx_ii_70 - local_experts_start_idx;
+                    int extent_70 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_70 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_70 = ((local_idx_70 >= 0 && local_idx_70 < extent_70 && (local_idx_70 & stride_mask_70) == 0) ? 1 : 0);
                     exp_off[54] = 0;
-                    if (is_local_71 != 0) {
-                        unsigned int _atomic_fetch_add_110 = atomicAdd(&smem_expert_count[idx_ii_71], 1);
+                    if (is_local_70 != 0) {
+                        unsigned int _atomic_fetch_add_110 = atomicAdd(&smem_expert_count[idx_ii_70], 1);
                         exp_off[54] = (int)_atomic_fetch_add_110;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_71 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_70 << 16);
                 }
             }
             if (done == 0) {
@@ -2149,19 +2135,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_71 = topk_packed[expanded];
-                    int idx_ii_72 = packed_word_71 >> 16;
-                    unsigned int word0_72 = (unsigned int)packed_word_71 & 65535;
-                    exp_idx[55] = idx_ii_72;
-                    int local_idx_72 = idx_ii_72 - local_experts_start_idx;
-                    int extent_72 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_72 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_72 = ((local_idx_72 >= 0 && local_idx_72 < extent_72 && (local_idx_72 & stride_mask_72) == 0) ? 1 : 0);
+                    int idx_ii_71 = packed_word_71 >> 16;
+                    unsigned int word0_71 = (unsigned int)packed_word_71 & 65535;
+                    exp_idx[55] = idx_ii_71;
+                    int local_idx_71 = idx_ii_71 - local_experts_start_idx;
+                    int extent_71 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_71 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_71 = ((local_idx_71 >= 0 && local_idx_71 < extent_71 && (local_idx_71 & stride_mask_71) == 0) ? 1 : 0);
                     exp_off[55] = 0;
-                    if (is_local_72 != 0) {
-                        unsigned int _atomic_fetch_add_111 = atomicAdd(&smem_expert_count[idx_ii_72], 1);
+                    if (is_local_71 != 0) {
+                        unsigned int _atomic_fetch_add_111 = atomicAdd(&smem_expert_count[idx_ii_71], 1);
                         exp_off[55] = (int)_atomic_fetch_add_111;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_72 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_71 << 16);
                 }
             }
         }
@@ -2170,64 +2156,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 60 * grid_threads) {
             expanded = grid_tid + 56 * grid_threads;
             int packed_word_72 = topk_packed[expanded];
-            int idx_ii_73 = packed_word_72 >> 16;
-            unsigned int word0_73 = (unsigned int)packed_word_72 & 65535;
-            exp_idx[56] = idx_ii_73;
-            int local_idx_73 = idx_ii_73 - local_experts_start_idx;
-            int extent_73 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_73 = (1 << local_experts_stride_log2) - 1;
-            int is_local_73 = ((local_idx_73 >= 0 && local_idx_73 < extent_73 && (local_idx_73 & stride_mask_73) == 0) ? 1 : 0);
+            int idx_ii_72 = packed_word_72 >> 16;
+            unsigned int word0_72 = (unsigned int)packed_word_72 & 65535;
+            exp_idx[56] = idx_ii_72;
+            int local_idx_72 = idx_ii_72 - local_experts_start_idx;
+            int extent_72 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_72 = (1 << local_experts_stride_log2) - 1;
+            int is_local_72 = ((local_idx_72 >= 0 && local_idx_72 < extent_72 && (local_idx_72 & stride_mask_72) == 0) ? 1 : 0);
             exp_off[56] = 0;
-            if (is_local_73 != 0) {
-                unsigned int _atomic_fetch_add_112 = atomicAdd(&smem_expert_count[idx_ii_73], 1);
+            if (is_local_72 != 0) {
+                unsigned int _atomic_fetch_add_112 = atomicAdd(&smem_expert_count[idx_ii_72], 1);
                 exp_off[56] = (int)_atomic_fetch_add_112;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_73 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_72 << 16);
             expanded = grid_tid + 57 * grid_threads;
-            int packed_word_0_14 = topk_packed[expanded];
-            int idx_ii_1_14 = packed_word_0_14 >> 16;
-            unsigned int word0_2_14 = (unsigned int)packed_word_0_14 & 65535;
-            exp_idx[57] = idx_ii_1_14;
-            int local_idx_3_14 = idx_ii_1_14 - local_experts_start_idx;
-            int extent_4_14 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_14 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_14 = ((local_idx_3_14 >= 0 && local_idx_3_14 < extent_4_14 && (local_idx_3_14 & stride_mask_5_14) == 0) ? 1 : 0);
+            int packed_word_42_1 = topk_packed[expanded];
+            int idx_ii_42_1 = packed_word_42_1 >> 16;
+            unsigned int word0_42_1 = (unsigned int)packed_word_42_1 & 65535;
+            exp_idx[57] = idx_ii_42_1;
+            int local_idx_42_1 = idx_ii_42_1 - local_experts_start_idx;
+            int extent_42_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_42_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_43_1 = ((local_idx_42_1 >= 0 && local_idx_42_1 < extent_42_1 && (local_idx_42_1 & stride_mask_42_1) == 0) ? 1 : 0);
             exp_off[57] = 0;
-            if (is_local_6_14 != 0) {
-                unsigned int _atomic_fetch_add_113 = atomicAdd(&smem_expert_count[idx_ii_1_14], 1);
+            if (is_local_43_1 != 0) {
+                unsigned int _atomic_fetch_add_113 = atomicAdd(&smem_expert_count[idx_ii_42_1], 1);
                 exp_off[57] = (int)_atomic_fetch_add_113;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_14 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_42_1 << 16);
             expanded = grid_tid + 58 * grid_threads;
-            int packed_word_7_14 = topk_packed[expanded];
-            int idx_ii_8_14 = packed_word_7_14 >> 16;
-            unsigned int word0_9_14 = (unsigned int)packed_word_7_14 & 65535;
-            exp_idx[58] = idx_ii_8_14;
-            int local_idx_10_14 = idx_ii_8_14 - local_experts_start_idx;
-            int extent_11_14 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_14 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_14 = ((local_idx_10_14 >= 0 && local_idx_10_14 < extent_11_14 && (local_idx_10_14 & stride_mask_12_14) == 0) ? 1 : 0);
+            int packed_word_43_1 = topk_packed[expanded];
+            int idx_ii_43_1 = packed_word_43_1 >> 16;
+            unsigned int word0_43_1 = (unsigned int)packed_word_43_1 & 65535;
+            exp_idx[58] = idx_ii_43_1;
+            int local_idx_43_1 = idx_ii_43_1 - local_experts_start_idx;
+            int extent_43_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_43_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_44_1 = ((local_idx_43_1 >= 0 && local_idx_43_1 < extent_43_1 && (local_idx_43_1 & stride_mask_43_1) == 0) ? 1 : 0);
             exp_off[58] = 0;
-            if (is_local_13_14 != 0) {
-                unsigned int _atomic_fetch_add_114 = atomicAdd(&smem_expert_count[idx_ii_8_14], 1);
+            if (is_local_44_1 != 0) {
+                unsigned int _atomic_fetch_add_114 = atomicAdd(&smem_expert_count[idx_ii_43_1], 1);
                 exp_off[58] = (int)_atomic_fetch_add_114;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_14 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_43_1 << 16);
             expanded = grid_tid + 59 * grid_threads;
-            int packed_word_14_14 = topk_packed[expanded];
-            int idx_ii_15_14 = packed_word_14_14 >> 16;
-            unsigned int word0_16_14 = (unsigned int)packed_word_14_14 & 65535;
-            exp_idx[59] = idx_ii_15_14;
-            int local_idx_17_14 = idx_ii_15_14 - local_experts_start_idx;
-            int extent_18_14 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_14 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_14 = ((local_idx_17_14 >= 0 && local_idx_17_14 < extent_18_14 && (local_idx_17_14 & stride_mask_19_14) == 0) ? 1 : 0);
+            int packed_word_44_1 = topk_packed[expanded];
+            int idx_ii_44_1 = packed_word_44_1 >> 16;
+            unsigned int word0_44_1 = (unsigned int)packed_word_44_1 & 65535;
+            exp_idx[59] = idx_ii_44_1;
+            int local_idx_44_1 = idx_ii_44_1 - local_experts_start_idx;
+            int extent_44_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_44_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_45_1 = ((local_idx_44_1 >= 0 && local_idx_44_1 < extent_44_1 && (local_idx_44_1 & stride_mask_44_1) == 0) ? 1 : 0);
             exp_off[59] = 0;
-            if (is_local_20_14 != 0) {
-                unsigned int _atomic_fetch_add_115 = atomicAdd(&smem_expert_count[idx_ii_15_14], 1);
+            if (is_local_45_1 != 0) {
+                unsigned int _atomic_fetch_add_115 = atomicAdd(&smem_expert_count[idx_ii_44_1], 1);
                 exp_off[59] = (int)_atomic_fetch_add_115;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_14 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_44_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 56 * grid_threads;
@@ -2235,19 +2221,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_73 = topk_packed[expanded];
-                    int idx_ii_74 = packed_word_73 >> 16;
-                    unsigned int word0_74 = (unsigned int)packed_word_73 & 65535;
-                    exp_idx[56] = idx_ii_74;
-                    int local_idx_74 = idx_ii_74 - local_experts_start_idx;
-                    int extent_74 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_74 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_74 = ((local_idx_74 >= 0 && local_idx_74 < extent_74 && (local_idx_74 & stride_mask_74) == 0) ? 1 : 0);
+                    int idx_ii_73 = packed_word_73 >> 16;
+                    unsigned int word0_73 = (unsigned int)packed_word_73 & 65535;
+                    exp_idx[56] = idx_ii_73;
+                    int local_idx_73 = idx_ii_73 - local_experts_start_idx;
+                    int extent_73 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_73 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_73 = ((local_idx_73 >= 0 && local_idx_73 < extent_73 && (local_idx_73 & stride_mask_73) == 0) ? 1 : 0);
                     exp_off[56] = 0;
-                    if (is_local_74 != 0) {
-                        unsigned int _atomic_fetch_add_116 = atomicAdd(&smem_expert_count[idx_ii_74], 1);
+                    if (is_local_73 != 0) {
+                        unsigned int _atomic_fetch_add_116 = atomicAdd(&smem_expert_count[idx_ii_73], 1);
                         exp_off[56] = (int)_atomic_fetch_add_116;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_74 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_73 << 16);
                 }
             }
             if (done == 0) {
@@ -2256,19 +2242,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_74 = topk_packed[expanded];
-                    int idx_ii_75 = packed_word_74 >> 16;
-                    unsigned int word0_75 = (unsigned int)packed_word_74 & 65535;
-                    exp_idx[57] = idx_ii_75;
-                    int local_idx_75 = idx_ii_75 - local_experts_start_idx;
-                    int extent_75 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_75 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_75 = ((local_idx_75 >= 0 && local_idx_75 < extent_75 && (local_idx_75 & stride_mask_75) == 0) ? 1 : 0);
+                    int idx_ii_74 = packed_word_74 >> 16;
+                    unsigned int word0_74 = (unsigned int)packed_word_74 & 65535;
+                    exp_idx[57] = idx_ii_74;
+                    int local_idx_74 = idx_ii_74 - local_experts_start_idx;
+                    int extent_74 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_74 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_74 = ((local_idx_74 >= 0 && local_idx_74 < extent_74 && (local_idx_74 & stride_mask_74) == 0) ? 1 : 0);
                     exp_off[57] = 0;
-                    if (is_local_75 != 0) {
-                        unsigned int _atomic_fetch_add_117 = atomicAdd(&smem_expert_count[idx_ii_75], 1);
+                    if (is_local_74 != 0) {
+                        unsigned int _atomic_fetch_add_117 = atomicAdd(&smem_expert_count[idx_ii_74], 1);
                         exp_off[57] = (int)_atomic_fetch_add_117;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_75 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_74 << 16);
                 }
             }
             if (done == 0) {
@@ -2277,19 +2263,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_75 = topk_packed[expanded];
-                    int idx_ii_76 = packed_word_75 >> 16;
-                    unsigned int word0_76 = (unsigned int)packed_word_75 & 65535;
-                    exp_idx[58] = idx_ii_76;
-                    int local_idx_76 = idx_ii_76 - local_experts_start_idx;
-                    int extent_76 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_76 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_76 = ((local_idx_76 >= 0 && local_idx_76 < extent_76 && (local_idx_76 & stride_mask_76) == 0) ? 1 : 0);
+                    int idx_ii_75 = packed_word_75 >> 16;
+                    unsigned int word0_75 = (unsigned int)packed_word_75 & 65535;
+                    exp_idx[58] = idx_ii_75;
+                    int local_idx_75 = idx_ii_75 - local_experts_start_idx;
+                    int extent_75 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_75 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_75 = ((local_idx_75 >= 0 && local_idx_75 < extent_75 && (local_idx_75 & stride_mask_75) == 0) ? 1 : 0);
                     exp_off[58] = 0;
-                    if (is_local_76 != 0) {
-                        unsigned int _atomic_fetch_add_118 = atomicAdd(&smem_expert_count[idx_ii_76], 1);
+                    if (is_local_75 != 0) {
+                        unsigned int _atomic_fetch_add_118 = atomicAdd(&smem_expert_count[idx_ii_75], 1);
                         exp_off[58] = (int)_atomic_fetch_add_118;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_76 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_75 << 16);
                 }
             }
             if (done == 0) {
@@ -2298,19 +2284,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_76 = topk_packed[expanded];
-                    int idx_ii_77 = packed_word_76 >> 16;
-                    unsigned int word0_77 = (unsigned int)packed_word_76 & 65535;
-                    exp_idx[59] = idx_ii_77;
-                    int local_idx_77 = idx_ii_77 - local_experts_start_idx;
-                    int extent_77 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_77 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_77 = ((local_idx_77 >= 0 && local_idx_77 < extent_77 && (local_idx_77 & stride_mask_77) == 0) ? 1 : 0);
+                    int idx_ii_76 = packed_word_76 >> 16;
+                    unsigned int word0_76 = (unsigned int)packed_word_76 & 65535;
+                    exp_idx[59] = idx_ii_76;
+                    int local_idx_76 = idx_ii_76 - local_experts_start_idx;
+                    int extent_76 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_76 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_76 = ((local_idx_76 >= 0 && local_idx_76 < extent_76 && (local_idx_76 & stride_mask_76) == 0) ? 1 : 0);
                     exp_off[59] = 0;
-                    if (is_local_77 != 0) {
-                        unsigned int _atomic_fetch_add_119 = atomicAdd(&smem_expert_count[idx_ii_77], 1);
+                    if (is_local_76 != 0) {
+                        unsigned int _atomic_fetch_add_119 = atomicAdd(&smem_expert_count[idx_ii_76], 1);
                         exp_off[59] = (int)_atomic_fetch_add_119;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_77 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_76 << 16);
                 }
             }
         }
@@ -2319,64 +2305,64 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         if (expanded_size >= 64 * grid_threads) {
             expanded = grid_tid + 60 * grid_threads;
             int packed_word_77 = topk_packed[expanded];
-            int idx_ii_78 = packed_word_77 >> 16;
-            unsigned int word0_78 = (unsigned int)packed_word_77 & 65535;
-            exp_idx[60] = idx_ii_78;
-            int local_idx_78 = idx_ii_78 - local_experts_start_idx;
-            int extent_78 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_78 = (1 << local_experts_stride_log2) - 1;
-            int is_local_78 = ((local_idx_78 >= 0 && local_idx_78 < extent_78 && (local_idx_78 & stride_mask_78) == 0) ? 1 : 0);
+            int idx_ii_77 = packed_word_77 >> 16;
+            unsigned int word0_77 = (unsigned int)packed_word_77 & 65535;
+            exp_idx[60] = idx_ii_77;
+            int local_idx_77 = idx_ii_77 - local_experts_start_idx;
+            int extent_77 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_77 = (1 << local_experts_stride_log2) - 1;
+            int is_local_77 = ((local_idx_77 >= 0 && local_idx_77 < extent_77 && (local_idx_77 & stride_mask_77) == 0) ? 1 : 0);
             exp_off[60] = 0;
-            if (is_local_78 != 0) {
-                unsigned int _atomic_fetch_add_120 = atomicAdd(&smem_expert_count[idx_ii_78], 1);
+            if (is_local_77 != 0) {
+                unsigned int _atomic_fetch_add_120 = atomicAdd(&smem_expert_count[idx_ii_77], 1);
                 exp_off[60] = (int)_atomic_fetch_add_120;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_78 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_77 << 16);
             expanded = grid_tid + 61 * grid_threads;
-            int packed_word_0_15 = topk_packed[expanded];
-            int idx_ii_1_15 = packed_word_0_15 >> 16;
-            unsigned int word0_2_15 = (unsigned int)packed_word_0_15 & 65535;
-            exp_idx[61] = idx_ii_1_15;
-            int local_idx_3_15 = idx_ii_1_15 - local_experts_start_idx;
-            int extent_4_15 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_5_15 = (1 << local_experts_stride_log2) - 1;
-            int is_local_6_15 = ((local_idx_3_15 >= 0 && local_idx_3_15 < extent_4_15 && (local_idx_3_15 & stride_mask_5_15) == 0) ? 1 : 0);
+            int packed_word_45_1 = topk_packed[expanded];
+            int idx_ii_45_1 = packed_word_45_1 >> 16;
+            unsigned int word0_45_1 = (unsigned int)packed_word_45_1 & 65535;
+            exp_idx[61] = idx_ii_45_1;
+            int local_idx_45_1 = idx_ii_45_1 - local_experts_start_idx;
+            int extent_45_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_45_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_46_1 = ((local_idx_45_1 >= 0 && local_idx_45_1 < extent_45_1 && (local_idx_45_1 & stride_mask_45_1) == 0) ? 1 : 0);
             exp_off[61] = 0;
-            if (is_local_6_15 != 0) {
-                unsigned int _atomic_fetch_add_121 = atomicAdd(&smem_expert_count[idx_ii_1_15], 1);
+            if (is_local_46_1 != 0) {
+                unsigned int _atomic_fetch_add_121 = atomicAdd(&smem_expert_count[idx_ii_45_1], 1);
                 exp_off[61] = (int)_atomic_fetch_add_121;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_2_15 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_45_1 << 16);
             expanded = grid_tid + 62 * grid_threads;
-            int packed_word_7_15 = topk_packed[expanded];
-            int idx_ii_8_15 = packed_word_7_15 >> 16;
-            unsigned int word0_9_15 = (unsigned int)packed_word_7_15 & 65535;
-            exp_idx[62] = idx_ii_8_15;
-            int local_idx_10_15 = idx_ii_8_15 - local_experts_start_idx;
-            int extent_11_15 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_12_15 = (1 << local_experts_stride_log2) - 1;
-            int is_local_13_15 = ((local_idx_10_15 >= 0 && local_idx_10_15 < extent_11_15 && (local_idx_10_15 & stride_mask_12_15) == 0) ? 1 : 0);
+            int packed_word_46_1 = topk_packed[expanded];
+            int idx_ii_46_1 = packed_word_46_1 >> 16;
+            unsigned int word0_46_1 = (unsigned int)packed_word_46_1 & 65535;
+            exp_idx[62] = idx_ii_46_1;
+            int local_idx_46_1 = idx_ii_46_1 - local_experts_start_idx;
+            int extent_46_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_46_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_47_1 = ((local_idx_46_1 >= 0 && local_idx_46_1 < extent_46_1 && (local_idx_46_1 & stride_mask_46_1) == 0) ? 1 : 0);
             exp_off[62] = 0;
-            if (is_local_13_15 != 0) {
-                unsigned int _atomic_fetch_add_122 = atomicAdd(&smem_expert_count[idx_ii_8_15], 1);
+            if (is_local_47_1 != 0) {
+                unsigned int _atomic_fetch_add_122 = atomicAdd(&smem_expert_count[idx_ii_46_1], 1);
                 exp_off[62] = (int)_atomic_fetch_add_122;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_9_15 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_46_1 << 16);
             expanded = grid_tid + 63 * grid_threads;
-            int packed_word_14_15 = topk_packed[expanded];
-            int idx_ii_15_15 = packed_word_14_15 >> 16;
-            unsigned int word0_16_15 = (unsigned int)packed_word_14_15 & 65535;
-            exp_idx[63] = idx_ii_15_15;
-            int local_idx_17_15 = idx_ii_15_15 - local_experts_start_idx;
-            int extent_18_15 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_19_15 = (1 << local_experts_stride_log2) - 1;
-            int is_local_20_15 = ((local_idx_17_15 >= 0 && local_idx_17_15 < extent_18_15 && (local_idx_17_15 & stride_mask_19_15) == 0) ? 1 : 0);
+            int packed_word_47_1 = topk_packed[expanded];
+            int idx_ii_47_1 = packed_word_47_1 >> 16;
+            unsigned int word0_47_1 = (unsigned int)packed_word_47_1 & 65535;
+            exp_idx[63] = idx_ii_47_1;
+            int local_idx_47_1 = idx_ii_47_1 - local_experts_start_idx;
+            int extent_47_1 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_47_1 = (1 << local_experts_stride_log2) - 1;
+            int is_local_48_1 = ((local_idx_47_1 >= 0 && local_idx_47_1 < extent_47_1 && (local_idx_47_1 & stride_mask_47_1) == 0) ? 1 : 0);
             exp_off[63] = 0;
-            if (is_local_20_15 != 0) {
-                unsigned int _atomic_fetch_add_123 = atomicAdd(&smem_expert_count[idx_ii_15_15], 1);
+            if (is_local_48_1 != 0) {
+                unsigned int _atomic_fetch_add_123 = atomicAdd(&smem_expert_count[idx_ii_47_1], 1);
                 exp_off[63] = (int)_atomic_fetch_add_123;
             }
-            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_16_15 << 16);
+            topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_47_1 << 16);
         } else {
             if (done == 0) {
                 expanded = grid_tid + 60 * grid_threads;
@@ -2384,19 +2370,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_78 = topk_packed[expanded];
-                    int idx_ii_79 = packed_word_78 >> 16;
-                    unsigned int word0_79 = (unsigned int)packed_word_78 & 65535;
-                    exp_idx[60] = idx_ii_79;
-                    int local_idx_79 = idx_ii_79 - local_experts_start_idx;
-                    int extent_79 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_79 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_79 = ((local_idx_79 >= 0 && local_idx_79 < extent_79 && (local_idx_79 & stride_mask_79) == 0) ? 1 : 0);
+                    int idx_ii_78 = packed_word_78 >> 16;
+                    unsigned int word0_78 = (unsigned int)packed_word_78 & 65535;
+                    exp_idx[60] = idx_ii_78;
+                    int local_idx_78 = idx_ii_78 - local_experts_start_idx;
+                    int extent_78 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_78 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_78 = ((local_idx_78 >= 0 && local_idx_78 < extent_78 && (local_idx_78 & stride_mask_78) == 0) ? 1 : 0);
                     exp_off[60] = 0;
-                    if (is_local_79 != 0) {
-                        unsigned int _atomic_fetch_add_124 = atomicAdd(&smem_expert_count[idx_ii_79], 1);
+                    if (is_local_78 != 0) {
+                        unsigned int _atomic_fetch_add_124 = atomicAdd(&smem_expert_count[idx_ii_78], 1);
                         exp_off[60] = (int)_atomic_fetch_add_124;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_79 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_78 << 16);
                 }
             }
             if (done == 0) {
@@ -2405,19 +2391,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_79 = topk_packed[expanded];
-                    int idx_ii_80 = packed_word_79 >> 16;
-                    unsigned int word0_80 = (unsigned int)packed_word_79 & 65535;
-                    exp_idx[61] = idx_ii_80;
-                    int local_idx_80 = idx_ii_80 - local_experts_start_idx;
-                    int extent_80 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_80 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_80 = ((local_idx_80 >= 0 && local_idx_80 < extent_80 && (local_idx_80 & stride_mask_80) == 0) ? 1 : 0);
+                    int idx_ii_79 = packed_word_79 >> 16;
+                    unsigned int word0_79 = (unsigned int)packed_word_79 & 65535;
+                    exp_idx[61] = idx_ii_79;
+                    int local_idx_79 = idx_ii_79 - local_experts_start_idx;
+                    int extent_79 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_79 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_79 = ((local_idx_79 >= 0 && local_idx_79 < extent_79 && (local_idx_79 & stride_mask_79) == 0) ? 1 : 0);
                     exp_off[61] = 0;
-                    if (is_local_80 != 0) {
-                        unsigned int _atomic_fetch_add_125 = atomicAdd(&smem_expert_count[idx_ii_80], 1);
+                    if (is_local_79 != 0) {
+                        unsigned int _atomic_fetch_add_125 = atomicAdd(&smem_expert_count[idx_ii_79], 1);
                         exp_off[61] = (int)_atomic_fetch_add_125;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_80 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_79 << 16);
                 }
             }
             if (done == 0) {
@@ -2426,19 +2412,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_80 = topk_packed[expanded];
-                    int idx_ii_81 = packed_word_80 >> 16;
-                    unsigned int word0_81 = (unsigned int)packed_word_80 & 65535;
-                    exp_idx[62] = idx_ii_81;
-                    int local_idx_81 = idx_ii_81 - local_experts_start_idx;
-                    int extent_81 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_81 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_81 = ((local_idx_81 >= 0 && local_idx_81 < extent_81 && (local_idx_81 & stride_mask_81) == 0) ? 1 : 0);
+                    int idx_ii_80 = packed_word_80 >> 16;
+                    unsigned int word0_80 = (unsigned int)packed_word_80 & 65535;
+                    exp_idx[62] = idx_ii_80;
+                    int local_idx_80 = idx_ii_80 - local_experts_start_idx;
+                    int extent_80 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_80 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_80 = ((local_idx_80 >= 0 && local_idx_80 < extent_80 && (local_idx_80 & stride_mask_80) == 0) ? 1 : 0);
                     exp_off[62] = 0;
-                    if (is_local_81 != 0) {
-                        unsigned int _atomic_fetch_add_126 = atomicAdd(&smem_expert_count[idx_ii_81], 1);
+                    if (is_local_80 != 0) {
+                        unsigned int _atomic_fetch_add_126 = atomicAdd(&smem_expert_count[idx_ii_80], 1);
                         exp_off[62] = (int)_atomic_fetch_add_126;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_81 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_80 << 16);
                 }
             }
             if (done == 0) {
@@ -2447,19 +2433,19 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
                     done = 1;
                 } else {
                     int packed_word_81 = topk_packed[expanded];
-                    int idx_ii_82 = packed_word_81 >> 16;
-                    unsigned int word0_82 = (unsigned int)packed_word_81 & 65535;
-                    exp_idx[63] = idx_ii_82;
-                    int local_idx_82 = idx_ii_82 - local_experts_start_idx;
-                    int extent_82 = num_local_experts << local_experts_stride_log2;
-                    int stride_mask_82 = (1 << local_experts_stride_log2) - 1;
-                    int is_local_82 = ((local_idx_82 >= 0 && local_idx_82 < extent_82 && (local_idx_82 & stride_mask_82) == 0) ? 1 : 0);
+                    int idx_ii_81 = packed_word_81 >> 16;
+                    unsigned int word0_81 = (unsigned int)packed_word_81 & 65535;
+                    exp_idx[63] = idx_ii_81;
+                    int local_idx_81 = idx_ii_81 - local_experts_start_idx;
+                    int extent_81 = num_local_experts << local_experts_stride_log2;
+                    int stride_mask_81 = (1 << local_experts_stride_log2) - 1;
+                    int is_local_81 = ((local_idx_81 >= 0 && local_idx_81 < extent_81 && (local_idx_81 & stride_mask_81) == 0) ? 1 : 0);
                     exp_off[63] = 0;
-                    if (is_local_82 != 0) {
-                        unsigned int _atomic_fetch_add_127 = atomicAdd(&smem_expert_count[idx_ii_82], 1);
+                    if (is_local_81 != 0) {
+                        unsigned int _atomic_fetch_add_127 = atomicAdd(&smem_expert_count[idx_ii_81], 1);
                         exp_off[63] = (int)_atomic_fetch_add_127;
                     }
-                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_82 << 16);
+                    topk_weights[expanded] = (__nv_bfloat16)__uint_as_float(word0_81 << 16);
                 }
             }
         }
@@ -2481,58 +2467,47 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
         num_cta = count + (1 << padding_log2) - 1 >> padding_log2;
     }
     int inclusive = num_cta;
+    {
+        uint32_t inclusive_scan = (uint32_t)inclusive;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 1, 32); if (lane >= 1) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 2, 32); if (lane >= 2) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 4, 32); if (lane >= 4) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 8, 32); if (lane >= 8) { inclusive_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_scan, 16, 32); if (lane >= 16) { inclusive_scan += peer; } }
+        inclusive = (int)inclusive_scan;
+    }
     int lane_s = (int)lane;
-    int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32);
-    if (lane_s >= 1) {
-        inclusive = inclusive + _shfl_up_0;
-    }
-    int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32);
-    if (lane_s >= 2) {
-        inclusive = inclusive + _shfl_up_1;
-    }
-    int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32);
-    if (lane_s >= 4) {
-        inclusive = inclusive + _shfl_up_2;
-    }
-    int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32);
-    if (lane_s >= 8) {
-        inclusive = inclusive + _shfl_up_3;
-    }
-    int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32);
-    if (lane_s >= 16) {
-        inclusive = inclusive + _shfl_up_4;
-    }
     if (lane_s == 31) {
         warp_totals[warp] = inclusive;
     }
     __syncthreads();
     int warp_prefix = 0;
     int block_total = 0;
-    int wt = warp_totals[0];
+    int wt_4_0 = warp_totals[0];
     if (warp > 0) {
-        warp_prefix = warp_prefix + wt;
+        warp_prefix = warp_prefix + wt_4_0;
     }
-    block_total = block_total + wt;
-    int wt_1 = warp_totals[1];
+    block_total = block_total + wt_4_0;
+    int wt_4_1 = warp_totals[1];
     if (warp > 1) {
-        warp_prefix = warp_prefix + wt_1;
+        warp_prefix = warp_prefix + wt_4_1;
     }
-    block_total = block_total + wt_1;
-    int wt_2 = warp_totals[2];
+    block_total = block_total + wt_4_1;
+    int wt_4_2 = warp_totals[2];
     if (warp > 2) {
-        warp_prefix = warp_prefix + wt_2;
+        warp_prefix = warp_prefix + wt_4_2;
     }
-    block_total = block_total + wt_2;
-    int wt_3 = warp_totals[3];
+    block_total = block_total + wt_4_2;
+    int wt_4_3 = warp_totals[3];
     if (warp > 3) {
-        warp_prefix = warp_prefix + wt_3;
+        warp_prefix = warp_prefix + wt_4_3;
     }
-    block_total = block_total + wt_3;
+    block_total = block_total + wt_4_3;
     int exclusive = inclusive - num_cta + warp_prefix;
     __syncthreads();
-    int local_idx_83 = thread_idx - local_experts_start_idx >> local_experts_stride_log2;
+    int local_idx_82 = thread_idx - local_experts_start_idx >> local_experts_stride_log2;
     for (int cta = bid_0; cta < num_cta; cta += nbids) {
-        cta_idx_xy_to_batch_idx[exclusive + cta] = local_idx_83;
+        cta_idx_xy_to_batch_idx[exclusive + cta] = local_idx_82;
         int scaled = (exclusive + cta + 1) * tile_tokens_dim;
         if (padding_log2 > 0) {
             scaled = exclusive + cta + 1 << padding_log2;
@@ -2567,11 +2542,11 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
     if (bid_0 == 0) {
         if (warp == 3) {
             if (elect_sync()) {
-                int scaled_0_1 = block_total * tile_tokens_dim;
+                int scaled_1_1 = block_total * tile_tokens_dim;
                 if (padding_log2 > 0) {
-                    scaled_0_1 = block_total << padding_log2;
+                    scaled_1_1 = block_total << padding_log2;
                 }
-                permuted_idx_size[0] = scaled_0_1;
+                permuted_idx_size[0] = scaled_1_1;
                 num_non_exiting_ctas[0] = block_total;
             }
         }
@@ -2590,15 +2565,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[0];
-            int local_idx_0 = idx_j - local_experts_start_idx;
-            int extent_83 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_83 = (1 << local_experts_stride_log2) - 1;
-            int is_local_83 = ((local_idx_0 >= 0 && local_idx_0 < extent_83 && (local_idx_0 & stride_mask_83) == 0) ? 1 : 0);
+            int local_idx_48_1 = idx_j - local_experts_start_idx;
+            int extent_82 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_82 = (1 << local_experts_stride_log2) - 1;
+            int is_local_82 = ((local_idx_48_1 >= 0 && local_idx_48_1 < extent_82 && (local_idx_48_1 & stride_mask_82) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_83 != 0) ? slot_base + exp_off[0] : -1);
+            permuted_j = ((is_local_82 != 0) ? slot_base + exp_off[0] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_83 != 0) {
+            if (is_local_82 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2609,15 +2584,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[1];
-            int local_idx_0_1 = idx_j - local_experts_start_idx;
-            int extent_84 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_84 = (1 << local_experts_stride_log2) - 1;
-            int is_local_84 = ((local_idx_0_1 >= 0 && local_idx_0_1 < extent_84 && (local_idx_0_1 & stride_mask_84) == 0) ? 1 : 0);
+            int local_idx_49_1 = idx_j - local_experts_start_idx;
+            int extent_83 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_83 = (1 << local_experts_stride_log2) - 1;
+            int is_local_83 = ((local_idx_49_1 >= 0 && local_idx_49_1 < extent_83 && (local_idx_49_1 & stride_mask_83) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_84 != 0) ? slot_base + exp_off[1] : -1);
+            permuted_j = ((is_local_83 != 0) ? slot_base + exp_off[1] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_84 != 0) {
+            if (is_local_83 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2628,15 +2603,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[2];
-            int local_idx_0_2 = idx_j - local_experts_start_idx;
-            int extent_85 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_85 = (1 << local_experts_stride_log2) - 1;
-            int is_local_85 = ((local_idx_0_2 >= 0 && local_idx_0_2 < extent_85 && (local_idx_0_2 & stride_mask_85) == 0) ? 1 : 0);
+            int local_idx_50_1 = idx_j - local_experts_start_idx;
+            int extent_84 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_84 = (1 << local_experts_stride_log2) - 1;
+            int is_local_84 = ((local_idx_50_1 >= 0 && local_idx_50_1 < extent_84 && (local_idx_50_1 & stride_mask_84) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_85 != 0) ? slot_base + exp_off[2] : -1);
+            permuted_j = ((is_local_84 != 0) ? slot_base + exp_off[2] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_85 != 0) {
+            if (is_local_84 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2647,15 +2622,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[3];
-            int local_idx_0_3 = idx_j - local_experts_start_idx;
-            int extent_86 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_86 = (1 << local_experts_stride_log2) - 1;
-            int is_local_86 = ((local_idx_0_3 >= 0 && local_idx_0_3 < extent_86 && (local_idx_0_3 & stride_mask_86) == 0) ? 1 : 0);
+            int local_idx_51_1 = idx_j - local_experts_start_idx;
+            int extent_85 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_85 = (1 << local_experts_stride_log2) - 1;
+            int is_local_85 = ((local_idx_51_1 >= 0 && local_idx_51_1 < extent_85 && (local_idx_51_1 & stride_mask_85) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_86 != 0) ? slot_base + exp_off[3] : -1);
+            permuted_j = ((is_local_85 != 0) ? slot_base + exp_off[3] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_86 != 0) {
+            if (is_local_85 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2666,15 +2641,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[4];
-            int local_idx_0_4 = idx_j - local_experts_start_idx;
-            int extent_87 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_87 = (1 << local_experts_stride_log2) - 1;
-            int is_local_87 = ((local_idx_0_4 >= 0 && local_idx_0_4 < extent_87 && (local_idx_0_4 & stride_mask_87) == 0) ? 1 : 0);
+            int local_idx_52_1 = idx_j - local_experts_start_idx;
+            int extent_86 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_86 = (1 << local_experts_stride_log2) - 1;
+            int is_local_86 = ((local_idx_52_1 >= 0 && local_idx_52_1 < extent_86 && (local_idx_52_1 & stride_mask_86) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_87 != 0) ? slot_base + exp_off[4] : -1);
+            permuted_j = ((is_local_86 != 0) ? slot_base + exp_off[4] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_87 != 0) {
+            if (is_local_86 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2685,15 +2660,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[5];
-            int local_idx_0_5 = idx_j - local_experts_start_idx;
-            int extent_88 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_88 = (1 << local_experts_stride_log2) - 1;
-            int is_local_88 = ((local_idx_0_5 >= 0 && local_idx_0_5 < extent_88 && (local_idx_0_5 & stride_mask_88) == 0) ? 1 : 0);
+            int local_idx_53_1 = idx_j - local_experts_start_idx;
+            int extent_87 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_87 = (1 << local_experts_stride_log2) - 1;
+            int is_local_87 = ((local_idx_53_1 >= 0 && local_idx_53_1 < extent_87 && (local_idx_53_1 & stride_mask_87) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_88 != 0) ? slot_base + exp_off[5] : -1);
+            permuted_j = ((is_local_87 != 0) ? slot_base + exp_off[5] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_88 != 0) {
+            if (is_local_87 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2704,15 +2679,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[6];
-            int local_idx_0_6 = idx_j - local_experts_start_idx;
-            int extent_89 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_89 = (1 << local_experts_stride_log2) - 1;
-            int is_local_89 = ((local_idx_0_6 >= 0 && local_idx_0_6 < extent_89 && (local_idx_0_6 & stride_mask_89) == 0) ? 1 : 0);
+            int local_idx_54_1 = idx_j - local_experts_start_idx;
+            int extent_88 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_88 = (1 << local_experts_stride_log2) - 1;
+            int is_local_88 = ((local_idx_54_1 >= 0 && local_idx_54_1 < extent_88 && (local_idx_54_1 & stride_mask_88) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_89 != 0) ? slot_base + exp_off[6] : -1);
+            permuted_j = ((is_local_88 != 0) ? slot_base + exp_off[6] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_89 != 0) {
+            if (is_local_88 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2723,15 +2698,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[7];
-            int local_idx_0_7 = idx_j - local_experts_start_idx;
-            int extent_90 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_90 = (1 << local_experts_stride_log2) - 1;
-            int is_local_90 = ((local_idx_0_7 >= 0 && local_idx_0_7 < extent_90 && (local_idx_0_7 & stride_mask_90) == 0) ? 1 : 0);
+            int local_idx_55_1 = idx_j - local_experts_start_idx;
+            int extent_89 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_89 = (1 << local_experts_stride_log2) - 1;
+            int is_local_89 = ((local_idx_55_1 >= 0 && local_idx_55_1 < extent_89 && (local_idx_55_1 & stride_mask_89) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_90 != 0) ? slot_base + exp_off[7] : -1);
+            permuted_j = ((is_local_89 != 0) ? slot_base + exp_off[7] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_90 != 0) {
+            if (is_local_89 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2742,15 +2717,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[8];
-            int local_idx_0_8 = idx_j - local_experts_start_idx;
-            int extent_91 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_91 = (1 << local_experts_stride_log2) - 1;
-            int is_local_91 = ((local_idx_0_8 >= 0 && local_idx_0_8 < extent_91 && (local_idx_0_8 & stride_mask_91) == 0) ? 1 : 0);
+            int local_idx_56_1 = idx_j - local_experts_start_idx;
+            int extent_90 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_90 = (1 << local_experts_stride_log2) - 1;
+            int is_local_90 = ((local_idx_56_1 >= 0 && local_idx_56_1 < extent_90 && (local_idx_56_1 & stride_mask_90) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_91 != 0) ? slot_base + exp_off[8] : -1);
+            permuted_j = ((is_local_90 != 0) ? slot_base + exp_off[8] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_91 != 0) {
+            if (is_local_90 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2761,15 +2736,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[9];
-            int local_idx_0_9 = idx_j - local_experts_start_idx;
-            int extent_92 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_92 = (1 << local_experts_stride_log2) - 1;
-            int is_local_92 = ((local_idx_0_9 >= 0 && local_idx_0_9 < extent_92 && (local_idx_0_9 & stride_mask_92) == 0) ? 1 : 0);
+            int local_idx_57_1 = idx_j - local_experts_start_idx;
+            int extent_91 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_91 = (1 << local_experts_stride_log2) - 1;
+            int is_local_91 = ((local_idx_57_1 >= 0 && local_idx_57_1 < extent_91 && (local_idx_57_1 & stride_mask_91) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_92 != 0) ? slot_base + exp_off[9] : -1);
+            permuted_j = ((is_local_91 != 0) ? slot_base + exp_off[9] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_92 != 0) {
+            if (is_local_91 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2780,15 +2755,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[10];
-            int local_idx_0_10 = idx_j - local_experts_start_idx;
-            int extent_93 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_93 = (1 << local_experts_stride_log2) - 1;
-            int is_local_93 = ((local_idx_0_10 >= 0 && local_idx_0_10 < extent_93 && (local_idx_0_10 & stride_mask_93) == 0) ? 1 : 0);
+            int local_idx_58_1 = idx_j - local_experts_start_idx;
+            int extent_92 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_92 = (1 << local_experts_stride_log2) - 1;
+            int is_local_92 = ((local_idx_58_1 >= 0 && local_idx_58_1 < extent_92 && (local_idx_58_1 & stride_mask_92) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_93 != 0) ? slot_base + exp_off[10] : -1);
+            permuted_j = ((is_local_92 != 0) ? slot_base + exp_off[10] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_93 != 0) {
+            if (is_local_92 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2799,15 +2774,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[11];
-            int local_idx_0_11 = idx_j - local_experts_start_idx;
-            int extent_94 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_94 = (1 << local_experts_stride_log2) - 1;
-            int is_local_94 = ((local_idx_0_11 >= 0 && local_idx_0_11 < extent_94 && (local_idx_0_11 & stride_mask_94) == 0) ? 1 : 0);
+            int local_idx_59_1 = idx_j - local_experts_start_idx;
+            int extent_93 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_93 = (1 << local_experts_stride_log2) - 1;
+            int is_local_93 = ((local_idx_59_1 >= 0 && local_idx_59_1 < extent_93 && (local_idx_59_1 & stride_mask_93) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_94 != 0) ? slot_base + exp_off[11] : -1);
+            permuted_j = ((is_local_93 != 0) ? slot_base + exp_off[11] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_94 != 0) {
+            if (is_local_93 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2818,15 +2793,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[12];
-            int local_idx_0_12 = idx_j - local_experts_start_idx;
-            int extent_95 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_95 = (1 << local_experts_stride_log2) - 1;
-            int is_local_95 = ((local_idx_0_12 >= 0 && local_idx_0_12 < extent_95 && (local_idx_0_12 & stride_mask_95) == 0) ? 1 : 0);
+            int local_idx_60_1 = idx_j - local_experts_start_idx;
+            int extent_94 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_94 = (1 << local_experts_stride_log2) - 1;
+            int is_local_94 = ((local_idx_60_1 >= 0 && local_idx_60_1 < extent_94 && (local_idx_60_1 & stride_mask_94) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_95 != 0) ? slot_base + exp_off[12] : -1);
+            permuted_j = ((is_local_94 != 0) ? slot_base + exp_off[12] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_95 != 0) {
+            if (is_local_94 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2837,15 +2812,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[13];
-            int local_idx_0_13 = idx_j - local_experts_start_idx;
-            int extent_96 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_96 = (1 << local_experts_stride_log2) - 1;
-            int is_local_96 = ((local_idx_0_13 >= 0 && local_idx_0_13 < extent_96 && (local_idx_0_13 & stride_mask_96) == 0) ? 1 : 0);
+            int local_idx_61_1 = idx_j - local_experts_start_idx;
+            int extent_95 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_95 = (1 << local_experts_stride_log2) - 1;
+            int is_local_95 = ((local_idx_61_1 >= 0 && local_idx_61_1 < extent_95 && (local_idx_61_1 & stride_mask_95) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_96 != 0) ? slot_base + exp_off[13] : -1);
+            permuted_j = ((is_local_95 != 0) ? slot_base + exp_off[13] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_96 != 0) {
+            if (is_local_95 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2856,15 +2831,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[14];
-            int local_idx_0_14 = idx_j - local_experts_start_idx;
-            int extent_97 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_97 = (1 << local_experts_stride_log2) - 1;
-            int is_local_97 = ((local_idx_0_14 >= 0 && local_idx_0_14 < extent_97 && (local_idx_0_14 & stride_mask_97) == 0) ? 1 : 0);
+            int local_idx_62_1 = idx_j - local_experts_start_idx;
+            int extent_96 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_96 = (1 << local_experts_stride_log2) - 1;
+            int is_local_96 = ((local_idx_62_1 >= 0 && local_idx_62_1 < extent_96 && (local_idx_62_1 & stride_mask_96) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_97 != 0) ? slot_base + exp_off[14] : -1);
+            permuted_j = ((is_local_96 != 0) ? slot_base + exp_off[14] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_97 != 0) {
+            if (is_local_96 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2875,15 +2850,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[15];
-            int local_idx_0_15 = idx_j - local_experts_start_idx;
-            int extent_98 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_98 = (1 << local_experts_stride_log2) - 1;
-            int is_local_98 = ((local_idx_0_15 >= 0 && local_idx_0_15 < extent_98 && (local_idx_0_15 & stride_mask_98) == 0) ? 1 : 0);
+            int local_idx_63_1 = idx_j - local_experts_start_idx;
+            int extent_97 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_97 = (1 << local_experts_stride_log2) - 1;
+            int is_local_97 = ((local_idx_63_1 >= 0 && local_idx_63_1 < extent_97 && (local_idx_63_1 & stride_mask_97) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_98 != 0) ? slot_base + exp_off[15] : -1);
+            permuted_j = ((is_local_97 != 0) ? slot_base + exp_off[15] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_98 != 0) {
+            if (is_local_97 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2894,15 +2869,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[16];
-            int local_idx_0_16 = idx_j - local_experts_start_idx;
-            int extent_99 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_99 = (1 << local_experts_stride_log2) - 1;
-            int is_local_99 = ((local_idx_0_16 >= 0 && local_idx_0_16 < extent_99 && (local_idx_0_16 & stride_mask_99) == 0) ? 1 : 0);
+            int local_idx_64_1 = idx_j - local_experts_start_idx;
+            int extent_98 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_98 = (1 << local_experts_stride_log2) - 1;
+            int is_local_98 = ((local_idx_64_1 >= 0 && local_idx_64_1 < extent_98 && (local_idx_64_1 & stride_mask_98) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_99 != 0) ? slot_base + exp_off[16] : -1);
+            permuted_j = ((is_local_98 != 0) ? slot_base + exp_off[16] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_99 != 0) {
+            if (is_local_98 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2913,15 +2888,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[17];
-            int local_idx_0_17 = idx_j - local_experts_start_idx;
-            int extent_100 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_100 = (1 << local_experts_stride_log2) - 1;
-            int is_local_100 = ((local_idx_0_17 >= 0 && local_idx_0_17 < extent_100 && (local_idx_0_17 & stride_mask_100) == 0) ? 1 : 0);
+            int local_idx_65_1 = idx_j - local_experts_start_idx;
+            int extent_99 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_99 = (1 << local_experts_stride_log2) - 1;
+            int is_local_99 = ((local_idx_65_1 >= 0 && local_idx_65_1 < extent_99 && (local_idx_65_1 & stride_mask_99) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_100 != 0) ? slot_base + exp_off[17] : -1);
+            permuted_j = ((is_local_99 != 0) ? slot_base + exp_off[17] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_100 != 0) {
+            if (is_local_99 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2932,15 +2907,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[18];
-            int local_idx_0_18 = idx_j - local_experts_start_idx;
-            int extent_101 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_101 = (1 << local_experts_stride_log2) - 1;
-            int is_local_101 = ((local_idx_0_18 >= 0 && local_idx_0_18 < extent_101 && (local_idx_0_18 & stride_mask_101) == 0) ? 1 : 0);
+            int local_idx_66_1 = idx_j - local_experts_start_idx;
+            int extent_100 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_100 = (1 << local_experts_stride_log2) - 1;
+            int is_local_100 = ((local_idx_66_1 >= 0 && local_idx_66_1 < extent_100 && (local_idx_66_1 & stride_mask_100) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_101 != 0) ? slot_base + exp_off[18] : -1);
+            permuted_j = ((is_local_100 != 0) ? slot_base + exp_off[18] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_101 != 0) {
+            if (is_local_100 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2951,15 +2926,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[19];
-            int local_idx_0_19 = idx_j - local_experts_start_idx;
-            int extent_102 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_102 = (1 << local_experts_stride_log2) - 1;
-            int is_local_102 = ((local_idx_0_19 >= 0 && local_idx_0_19 < extent_102 && (local_idx_0_19 & stride_mask_102) == 0) ? 1 : 0);
+            int local_idx_67_1 = idx_j - local_experts_start_idx;
+            int extent_101 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_101 = (1 << local_experts_stride_log2) - 1;
+            int is_local_101 = ((local_idx_67_1 >= 0 && local_idx_67_1 < extent_101 && (local_idx_67_1 & stride_mask_101) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_102 != 0) ? slot_base + exp_off[19] : -1);
+            permuted_j = ((is_local_101 != 0) ? slot_base + exp_off[19] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_102 != 0) {
+            if (is_local_101 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2970,15 +2945,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[20];
-            int local_idx_0_20 = idx_j - local_experts_start_idx;
-            int extent_103 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_103 = (1 << local_experts_stride_log2) - 1;
-            int is_local_103 = ((local_idx_0_20 >= 0 && local_idx_0_20 < extent_103 && (local_idx_0_20 & stride_mask_103) == 0) ? 1 : 0);
+            int local_idx_68_1 = idx_j - local_experts_start_idx;
+            int extent_102 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_102 = (1 << local_experts_stride_log2) - 1;
+            int is_local_102 = ((local_idx_68_1 >= 0 && local_idx_68_1 < extent_102 && (local_idx_68_1 & stride_mask_102) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_103 != 0) ? slot_base + exp_off[20] : -1);
+            permuted_j = ((is_local_102 != 0) ? slot_base + exp_off[20] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_103 != 0) {
+            if (is_local_102 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -2989,15 +2964,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[21];
-            int local_idx_0_21 = idx_j - local_experts_start_idx;
-            int extent_104 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_104 = (1 << local_experts_stride_log2) - 1;
-            int is_local_104 = ((local_idx_0_21 >= 0 && local_idx_0_21 < extent_104 && (local_idx_0_21 & stride_mask_104) == 0) ? 1 : 0);
+            int local_idx_69_1 = idx_j - local_experts_start_idx;
+            int extent_103 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_103 = (1 << local_experts_stride_log2) - 1;
+            int is_local_103 = ((local_idx_69_1 >= 0 && local_idx_69_1 < extent_103 && (local_idx_69_1 & stride_mask_103) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_104 != 0) ? slot_base + exp_off[21] : -1);
+            permuted_j = ((is_local_103 != 0) ? slot_base + exp_off[21] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_104 != 0) {
+            if (is_local_103 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3008,15 +2983,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[22];
-            int local_idx_0_22 = idx_j - local_experts_start_idx;
-            int extent_105 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_105 = (1 << local_experts_stride_log2) - 1;
-            int is_local_105 = ((local_idx_0_22 >= 0 && local_idx_0_22 < extent_105 && (local_idx_0_22 & stride_mask_105) == 0) ? 1 : 0);
+            int local_idx_70_1 = idx_j - local_experts_start_idx;
+            int extent_104 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_104 = (1 << local_experts_stride_log2) - 1;
+            int is_local_104 = ((local_idx_70_1 >= 0 && local_idx_70_1 < extent_104 && (local_idx_70_1 & stride_mask_104) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_105 != 0) ? slot_base + exp_off[22] : -1);
+            permuted_j = ((is_local_104 != 0) ? slot_base + exp_off[22] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_105 != 0) {
+            if (is_local_104 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3027,15 +3002,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[23];
-            int local_idx_0_23 = idx_j - local_experts_start_idx;
-            int extent_106 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_106 = (1 << local_experts_stride_log2) - 1;
-            int is_local_106 = ((local_idx_0_23 >= 0 && local_idx_0_23 < extent_106 && (local_idx_0_23 & stride_mask_106) == 0) ? 1 : 0);
+            int local_idx_71_1 = idx_j - local_experts_start_idx;
+            int extent_105 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_105 = (1 << local_experts_stride_log2) - 1;
+            int is_local_105 = ((local_idx_71_1 >= 0 && local_idx_71_1 < extent_105 && (local_idx_71_1 & stride_mask_105) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_106 != 0) ? slot_base + exp_off[23] : -1);
+            permuted_j = ((is_local_105 != 0) ? slot_base + exp_off[23] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_106 != 0) {
+            if (is_local_105 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3046,15 +3021,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[24];
-            int local_idx_0_24 = idx_j - local_experts_start_idx;
-            int extent_107 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_107 = (1 << local_experts_stride_log2) - 1;
-            int is_local_107 = ((local_idx_0_24 >= 0 && local_idx_0_24 < extent_107 && (local_idx_0_24 & stride_mask_107) == 0) ? 1 : 0);
+            int local_idx_72_1 = idx_j - local_experts_start_idx;
+            int extent_106 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_106 = (1 << local_experts_stride_log2) - 1;
+            int is_local_106 = ((local_idx_72_1 >= 0 && local_idx_72_1 < extent_106 && (local_idx_72_1 & stride_mask_106) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_107 != 0) ? slot_base + exp_off[24] : -1);
+            permuted_j = ((is_local_106 != 0) ? slot_base + exp_off[24] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_107 != 0) {
+            if (is_local_106 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3065,15 +3040,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[25];
-            int local_idx_0_25 = idx_j - local_experts_start_idx;
-            int extent_108 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_108 = (1 << local_experts_stride_log2) - 1;
-            int is_local_108 = ((local_idx_0_25 >= 0 && local_idx_0_25 < extent_108 && (local_idx_0_25 & stride_mask_108) == 0) ? 1 : 0);
+            int local_idx_73_1 = idx_j - local_experts_start_idx;
+            int extent_107 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_107 = (1 << local_experts_stride_log2) - 1;
+            int is_local_107 = ((local_idx_73_1 >= 0 && local_idx_73_1 < extent_107 && (local_idx_73_1 & stride_mask_107) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_108 != 0) ? slot_base + exp_off[25] : -1);
+            permuted_j = ((is_local_107 != 0) ? slot_base + exp_off[25] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_108 != 0) {
+            if (is_local_107 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3084,15 +3059,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[26];
-            int local_idx_0_26 = idx_j - local_experts_start_idx;
-            int extent_109 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_109 = (1 << local_experts_stride_log2) - 1;
-            int is_local_109 = ((local_idx_0_26 >= 0 && local_idx_0_26 < extent_109 && (local_idx_0_26 & stride_mask_109) == 0) ? 1 : 0);
+            int local_idx_74_1 = idx_j - local_experts_start_idx;
+            int extent_108 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_108 = (1 << local_experts_stride_log2) - 1;
+            int is_local_108 = ((local_idx_74_1 >= 0 && local_idx_74_1 < extent_108 && (local_idx_74_1 & stride_mask_108) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_109 != 0) ? slot_base + exp_off[26] : -1);
+            permuted_j = ((is_local_108 != 0) ? slot_base + exp_off[26] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_109 != 0) {
+            if (is_local_108 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3103,15 +3078,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[27];
-            int local_idx_0_27 = idx_j - local_experts_start_idx;
-            int extent_110 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_110 = (1 << local_experts_stride_log2) - 1;
-            int is_local_110 = ((local_idx_0_27 >= 0 && local_idx_0_27 < extent_110 && (local_idx_0_27 & stride_mask_110) == 0) ? 1 : 0);
+            int local_idx_75_1 = idx_j - local_experts_start_idx;
+            int extent_109 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_109 = (1 << local_experts_stride_log2) - 1;
+            int is_local_109 = ((local_idx_75_1 >= 0 && local_idx_75_1 < extent_109 && (local_idx_75_1 & stride_mask_109) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_110 != 0) ? slot_base + exp_off[27] : -1);
+            permuted_j = ((is_local_109 != 0) ? slot_base + exp_off[27] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_110 != 0) {
+            if (is_local_109 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3122,15 +3097,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[28];
-            int local_idx_0_28 = idx_j - local_experts_start_idx;
-            int extent_111 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_111 = (1 << local_experts_stride_log2) - 1;
-            int is_local_111 = ((local_idx_0_28 >= 0 && local_idx_0_28 < extent_111 && (local_idx_0_28 & stride_mask_111) == 0) ? 1 : 0);
+            int local_idx_76_1 = idx_j - local_experts_start_idx;
+            int extent_110 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_110 = (1 << local_experts_stride_log2) - 1;
+            int is_local_110 = ((local_idx_76_1 >= 0 && local_idx_76_1 < extent_110 && (local_idx_76_1 & stride_mask_110) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_111 != 0) ? slot_base + exp_off[28] : -1);
+            permuted_j = ((is_local_110 != 0) ? slot_base + exp_off[28] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_111 != 0) {
+            if (is_local_110 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3141,15 +3116,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[29];
-            int local_idx_0_29 = idx_j - local_experts_start_idx;
-            int extent_112 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_112 = (1 << local_experts_stride_log2) - 1;
-            int is_local_112 = ((local_idx_0_29 >= 0 && local_idx_0_29 < extent_112 && (local_idx_0_29 & stride_mask_112) == 0) ? 1 : 0);
+            int local_idx_77_1 = idx_j - local_experts_start_idx;
+            int extent_111 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_111 = (1 << local_experts_stride_log2) - 1;
+            int is_local_111 = ((local_idx_77_1 >= 0 && local_idx_77_1 < extent_111 && (local_idx_77_1 & stride_mask_111) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_112 != 0) ? slot_base + exp_off[29] : -1);
+            permuted_j = ((is_local_111 != 0) ? slot_base + exp_off[29] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_112 != 0) {
+            if (is_local_111 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3160,15 +3135,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[30];
-            int local_idx_0_30 = idx_j - local_experts_start_idx;
-            int extent_113 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_113 = (1 << local_experts_stride_log2) - 1;
-            int is_local_113 = ((local_idx_0_30 >= 0 && local_idx_0_30 < extent_113 && (local_idx_0_30 & stride_mask_113) == 0) ? 1 : 0);
+            int local_idx_78_1 = idx_j - local_experts_start_idx;
+            int extent_112 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_112 = (1 << local_experts_stride_log2) - 1;
+            int is_local_112 = ((local_idx_78_1 >= 0 && local_idx_78_1 < extent_112 && (local_idx_78_1 & stride_mask_112) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_113 != 0) ? slot_base + exp_off[30] : -1);
+            permuted_j = ((is_local_112 != 0) ? slot_base + exp_off[30] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_113 != 0) {
+            if (is_local_112 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3179,15 +3154,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[31];
-            int local_idx_0_31 = idx_j - local_experts_start_idx;
-            int extent_114 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_114 = (1 << local_experts_stride_log2) - 1;
-            int is_local_114 = ((local_idx_0_31 >= 0 && local_idx_0_31 < extent_114 && (local_idx_0_31 & stride_mask_114) == 0) ? 1 : 0);
+            int local_idx_79_1 = idx_j - local_experts_start_idx;
+            int extent_113 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_113 = (1 << local_experts_stride_log2) - 1;
+            int is_local_113 = ((local_idx_79_1 >= 0 && local_idx_79_1 < extent_113 && (local_idx_79_1 & stride_mask_113) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_114 != 0) ? slot_base + exp_off[31] : -1);
+            permuted_j = ((is_local_113 != 0) ? slot_base + exp_off[31] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_114 != 0) {
+            if (is_local_113 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3198,15 +3173,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[32];
-            int local_idx_0_32 = idx_j - local_experts_start_idx;
-            int extent_115 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_115 = (1 << local_experts_stride_log2) - 1;
-            int is_local_115 = ((local_idx_0_32 >= 0 && local_idx_0_32 < extent_115 && (local_idx_0_32 & stride_mask_115) == 0) ? 1 : 0);
+            int local_idx_80_1 = idx_j - local_experts_start_idx;
+            int extent_114 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_114 = (1 << local_experts_stride_log2) - 1;
+            int is_local_114 = ((local_idx_80_1 >= 0 && local_idx_80_1 < extent_114 && (local_idx_80_1 & stride_mask_114) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_115 != 0) ? slot_base + exp_off[32] : -1);
+            permuted_j = ((is_local_114 != 0) ? slot_base + exp_off[32] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_115 != 0) {
+            if (is_local_114 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3217,15 +3192,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[33];
-            int local_idx_0_33 = idx_j - local_experts_start_idx;
-            int extent_116 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_116 = (1 << local_experts_stride_log2) - 1;
-            int is_local_116 = ((local_idx_0_33 >= 0 && local_idx_0_33 < extent_116 && (local_idx_0_33 & stride_mask_116) == 0) ? 1 : 0);
+            int local_idx_81_1 = idx_j - local_experts_start_idx;
+            int extent_115 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_115 = (1 << local_experts_stride_log2) - 1;
+            int is_local_115 = ((local_idx_81_1 >= 0 && local_idx_81_1 < extent_115 && (local_idx_81_1 & stride_mask_115) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_116 != 0) ? slot_base + exp_off[33] : -1);
+            permuted_j = ((is_local_115 != 0) ? slot_base + exp_off[33] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_116 != 0) {
+            if (is_local_115 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3236,15 +3211,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[34];
-            int local_idx_0_34 = idx_j - local_experts_start_idx;
-            int extent_117 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_117 = (1 << local_experts_stride_log2) - 1;
-            int is_local_117 = ((local_idx_0_34 >= 0 && local_idx_0_34 < extent_117 && (local_idx_0_34 & stride_mask_117) == 0) ? 1 : 0);
+            int local_idx_82_1 = idx_j - local_experts_start_idx;
+            int extent_116 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_116 = (1 << local_experts_stride_log2) - 1;
+            int is_local_116 = ((local_idx_82_1 >= 0 && local_idx_82_1 < extent_116 && (local_idx_82_1 & stride_mask_116) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_117 != 0) ? slot_base + exp_off[34] : -1);
+            permuted_j = ((is_local_116 != 0) ? slot_base + exp_off[34] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_117 != 0) {
+            if (is_local_116 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3255,15 +3230,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[35];
-            int local_idx_0_35 = idx_j - local_experts_start_idx;
-            int extent_118 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_118 = (1 << local_experts_stride_log2) - 1;
-            int is_local_118 = ((local_idx_0_35 >= 0 && local_idx_0_35 < extent_118 && (local_idx_0_35 & stride_mask_118) == 0) ? 1 : 0);
+            int local_idx_83 = idx_j - local_experts_start_idx;
+            int extent_117 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_117 = (1 << local_experts_stride_log2) - 1;
+            int is_local_117 = ((local_idx_83 >= 0 && local_idx_83 < extent_117 && (local_idx_83 & stride_mask_117) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_118 != 0) ? slot_base + exp_off[35] : -1);
+            permuted_j = ((is_local_117 != 0) ? slot_base + exp_off[35] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_118 != 0) {
+            if (is_local_117 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3274,15 +3249,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[36];
-            int local_idx_0_36 = idx_j - local_experts_start_idx;
-            int extent_119 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_119 = (1 << local_experts_stride_log2) - 1;
-            int is_local_119 = ((local_idx_0_36 >= 0 && local_idx_0_36 < extent_119 && (local_idx_0_36 & stride_mask_119) == 0) ? 1 : 0);
+            int local_idx_84 = idx_j - local_experts_start_idx;
+            int extent_118 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_118 = (1 << local_experts_stride_log2) - 1;
+            int is_local_118 = ((local_idx_84 >= 0 && local_idx_84 < extent_118 && (local_idx_84 & stride_mask_118) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_119 != 0) ? slot_base + exp_off[36] : -1);
+            permuted_j = ((is_local_118 != 0) ? slot_base + exp_off[36] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_119 != 0) {
+            if (is_local_118 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3293,15 +3268,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[37];
-            int local_idx_0_37 = idx_j - local_experts_start_idx;
-            int extent_120 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_120 = (1 << local_experts_stride_log2) - 1;
-            int is_local_120 = ((local_idx_0_37 >= 0 && local_idx_0_37 < extent_120 && (local_idx_0_37 & stride_mask_120) == 0) ? 1 : 0);
+            int local_idx_85 = idx_j - local_experts_start_idx;
+            int extent_119 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_119 = (1 << local_experts_stride_log2) - 1;
+            int is_local_119 = ((local_idx_85 >= 0 && local_idx_85 < extent_119 && (local_idx_85 & stride_mask_119) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_120 != 0) ? slot_base + exp_off[37] : -1);
+            permuted_j = ((is_local_119 != 0) ? slot_base + exp_off[37] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_120 != 0) {
+            if (is_local_119 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3312,15 +3287,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[38];
-            int local_idx_0_38 = idx_j - local_experts_start_idx;
-            int extent_121 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_121 = (1 << local_experts_stride_log2) - 1;
-            int is_local_121 = ((local_idx_0_38 >= 0 && local_idx_0_38 < extent_121 && (local_idx_0_38 & stride_mask_121) == 0) ? 1 : 0);
+            int local_idx_86 = idx_j - local_experts_start_idx;
+            int extent_120 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_120 = (1 << local_experts_stride_log2) - 1;
+            int is_local_120 = ((local_idx_86 >= 0 && local_idx_86 < extent_120 && (local_idx_86 & stride_mask_120) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_121 != 0) ? slot_base + exp_off[38] : -1);
+            permuted_j = ((is_local_120 != 0) ? slot_base + exp_off[38] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_121 != 0) {
+            if (is_local_120 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3331,15 +3306,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[39];
-            int local_idx_0_39 = idx_j - local_experts_start_idx;
-            int extent_122 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_122 = (1 << local_experts_stride_log2) - 1;
-            int is_local_122 = ((local_idx_0_39 >= 0 && local_idx_0_39 < extent_122 && (local_idx_0_39 & stride_mask_122) == 0) ? 1 : 0);
+            int local_idx_87 = idx_j - local_experts_start_idx;
+            int extent_121 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_121 = (1 << local_experts_stride_log2) - 1;
+            int is_local_121 = ((local_idx_87 >= 0 && local_idx_87 < extent_121 && (local_idx_87 & stride_mask_121) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_122 != 0) ? slot_base + exp_off[39] : -1);
+            permuted_j = ((is_local_121 != 0) ? slot_base + exp_off[39] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_122 != 0) {
+            if (is_local_121 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3350,15 +3325,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[40];
-            int local_idx_0_40 = idx_j - local_experts_start_idx;
-            int extent_123 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_123 = (1 << local_experts_stride_log2) - 1;
-            int is_local_123 = ((local_idx_0_40 >= 0 && local_idx_0_40 < extent_123 && (local_idx_0_40 & stride_mask_123) == 0) ? 1 : 0);
+            int local_idx_88 = idx_j - local_experts_start_idx;
+            int extent_122 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_122 = (1 << local_experts_stride_log2) - 1;
+            int is_local_122 = ((local_idx_88 >= 0 && local_idx_88 < extent_122 && (local_idx_88 & stride_mask_122) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_123 != 0) ? slot_base + exp_off[40] : -1);
+            permuted_j = ((is_local_122 != 0) ? slot_base + exp_off[40] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_123 != 0) {
+            if (is_local_122 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3369,15 +3344,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[41];
-            int local_idx_0_41 = idx_j - local_experts_start_idx;
-            int extent_124 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_124 = (1 << local_experts_stride_log2) - 1;
-            int is_local_124 = ((local_idx_0_41 >= 0 && local_idx_0_41 < extent_124 && (local_idx_0_41 & stride_mask_124) == 0) ? 1 : 0);
+            int local_idx_89 = idx_j - local_experts_start_idx;
+            int extent_123 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_123 = (1 << local_experts_stride_log2) - 1;
+            int is_local_123 = ((local_idx_89 >= 0 && local_idx_89 < extent_123 && (local_idx_89 & stride_mask_123) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_124 != 0) ? slot_base + exp_off[41] : -1);
+            permuted_j = ((is_local_123 != 0) ? slot_base + exp_off[41] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_124 != 0) {
+            if (is_local_123 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3388,15 +3363,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[42];
-            int local_idx_0_42 = idx_j - local_experts_start_idx;
-            int extent_125 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_125 = (1 << local_experts_stride_log2) - 1;
-            int is_local_125 = ((local_idx_0_42 >= 0 && local_idx_0_42 < extent_125 && (local_idx_0_42 & stride_mask_125) == 0) ? 1 : 0);
+            int local_idx_90 = idx_j - local_experts_start_idx;
+            int extent_124 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_124 = (1 << local_experts_stride_log2) - 1;
+            int is_local_124 = ((local_idx_90 >= 0 && local_idx_90 < extent_124 && (local_idx_90 & stride_mask_124) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_125 != 0) ? slot_base + exp_off[42] : -1);
+            permuted_j = ((is_local_124 != 0) ? slot_base + exp_off[42] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_125 != 0) {
+            if (is_local_124 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3407,15 +3382,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[43];
-            int local_idx_0_43 = idx_j - local_experts_start_idx;
-            int extent_126 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_126 = (1 << local_experts_stride_log2) - 1;
-            int is_local_126 = ((local_idx_0_43 >= 0 && local_idx_0_43 < extent_126 && (local_idx_0_43 & stride_mask_126) == 0) ? 1 : 0);
+            int local_idx_91 = idx_j - local_experts_start_idx;
+            int extent_125 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_125 = (1 << local_experts_stride_log2) - 1;
+            int is_local_125 = ((local_idx_91 >= 0 && local_idx_91 < extent_125 && (local_idx_91 & stride_mask_125) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_126 != 0) ? slot_base + exp_off[43] : -1);
+            permuted_j = ((is_local_125 != 0) ? slot_base + exp_off[43] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_126 != 0) {
+            if (is_local_125 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3426,15 +3401,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[44];
-            int local_idx_0_44 = idx_j - local_experts_start_idx;
-            int extent_127 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_127 = (1 << local_experts_stride_log2) - 1;
-            int is_local_127 = ((local_idx_0_44 >= 0 && local_idx_0_44 < extent_127 && (local_idx_0_44 & stride_mask_127) == 0) ? 1 : 0);
+            int local_idx_92 = idx_j - local_experts_start_idx;
+            int extent_126 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_126 = (1 << local_experts_stride_log2) - 1;
+            int is_local_126 = ((local_idx_92 >= 0 && local_idx_92 < extent_126 && (local_idx_92 & stride_mask_126) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_127 != 0) ? slot_base + exp_off[44] : -1);
+            permuted_j = ((is_local_126 != 0) ? slot_base + exp_off[44] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_127 != 0) {
+            if (is_local_126 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3445,15 +3420,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[45];
-            int local_idx_0_45 = idx_j - local_experts_start_idx;
-            int extent_128 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_128 = (1 << local_experts_stride_log2) - 1;
-            int is_local_128 = ((local_idx_0_45 >= 0 && local_idx_0_45 < extent_128 && (local_idx_0_45 & stride_mask_128) == 0) ? 1 : 0);
+            int local_idx_93 = idx_j - local_experts_start_idx;
+            int extent_127 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_127 = (1 << local_experts_stride_log2) - 1;
+            int is_local_127 = ((local_idx_93 >= 0 && local_idx_93 < extent_127 && (local_idx_93 & stride_mask_127) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_128 != 0) ? slot_base + exp_off[45] : -1);
+            permuted_j = ((is_local_127 != 0) ? slot_base + exp_off[45] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_128 != 0) {
+            if (is_local_127 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3464,15 +3439,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[46];
-            int local_idx_0_46 = idx_j - local_experts_start_idx;
-            int extent_129 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_129 = (1 << local_experts_stride_log2) - 1;
-            int is_local_129 = ((local_idx_0_46 >= 0 && local_idx_0_46 < extent_129 && (local_idx_0_46 & stride_mask_129) == 0) ? 1 : 0);
+            int local_idx_94 = idx_j - local_experts_start_idx;
+            int extent_128 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_128 = (1 << local_experts_stride_log2) - 1;
+            int is_local_128 = ((local_idx_94 >= 0 && local_idx_94 < extent_128 && (local_idx_94 & stride_mask_128) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_129 != 0) ? slot_base + exp_off[46] : -1);
+            permuted_j = ((is_local_128 != 0) ? slot_base + exp_off[46] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_129 != 0) {
+            if (is_local_128 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3483,15 +3458,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[47];
-            int local_idx_0_47 = idx_j - local_experts_start_idx;
-            int extent_130 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_130 = (1 << local_experts_stride_log2) - 1;
-            int is_local_130 = ((local_idx_0_47 >= 0 && local_idx_0_47 < extent_130 && (local_idx_0_47 & stride_mask_130) == 0) ? 1 : 0);
+            int local_idx_95 = idx_j - local_experts_start_idx;
+            int extent_129 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_129 = (1 << local_experts_stride_log2) - 1;
+            int is_local_129 = ((local_idx_95 >= 0 && local_idx_95 < extent_129 && (local_idx_95 & stride_mask_129) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_130 != 0) ? slot_base + exp_off[47] : -1);
+            permuted_j = ((is_local_129 != 0) ? slot_base + exp_off[47] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_130 != 0) {
+            if (is_local_129 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3502,15 +3477,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[48];
-            int local_idx_0_48 = idx_j - local_experts_start_idx;
-            int extent_131 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_131 = (1 << local_experts_stride_log2) - 1;
-            int is_local_131 = ((local_idx_0_48 >= 0 && local_idx_0_48 < extent_131 && (local_idx_0_48 & stride_mask_131) == 0) ? 1 : 0);
+            int local_idx_96 = idx_j - local_experts_start_idx;
+            int extent_130 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_130 = (1 << local_experts_stride_log2) - 1;
+            int is_local_130 = ((local_idx_96 >= 0 && local_idx_96 < extent_130 && (local_idx_96 & stride_mask_130) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_131 != 0) ? slot_base + exp_off[48] : -1);
+            permuted_j = ((is_local_130 != 0) ? slot_base + exp_off[48] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_131 != 0) {
+            if (is_local_130 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3521,15 +3496,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[49];
-            int local_idx_0_49 = idx_j - local_experts_start_idx;
-            int extent_132 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_132 = (1 << local_experts_stride_log2) - 1;
-            int is_local_132 = ((local_idx_0_49 >= 0 && local_idx_0_49 < extent_132 && (local_idx_0_49 & stride_mask_132) == 0) ? 1 : 0);
+            int local_idx_97 = idx_j - local_experts_start_idx;
+            int extent_131 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_131 = (1 << local_experts_stride_log2) - 1;
+            int is_local_131 = ((local_idx_97 >= 0 && local_idx_97 < extent_131 && (local_idx_97 & stride_mask_131) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_132 != 0) ? slot_base + exp_off[49] : -1);
+            permuted_j = ((is_local_131 != 0) ? slot_base + exp_off[49] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_132 != 0) {
+            if (is_local_131 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3540,15 +3515,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[50];
-            int local_idx_0_50 = idx_j - local_experts_start_idx;
-            int extent_133 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_133 = (1 << local_experts_stride_log2) - 1;
-            int is_local_133 = ((local_idx_0_50 >= 0 && local_idx_0_50 < extent_133 && (local_idx_0_50 & stride_mask_133) == 0) ? 1 : 0);
+            int local_idx_98 = idx_j - local_experts_start_idx;
+            int extent_132 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_132 = (1 << local_experts_stride_log2) - 1;
+            int is_local_132 = ((local_idx_98 >= 0 && local_idx_98 < extent_132 && (local_idx_98 & stride_mask_132) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_133 != 0) ? slot_base + exp_off[50] : -1);
+            permuted_j = ((is_local_132 != 0) ? slot_base + exp_off[50] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_133 != 0) {
+            if (is_local_132 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3559,15 +3534,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[51];
-            int local_idx_0_51 = idx_j - local_experts_start_idx;
-            int extent_134 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_134 = (1 << local_experts_stride_log2) - 1;
-            int is_local_134 = ((local_idx_0_51 >= 0 && local_idx_0_51 < extent_134 && (local_idx_0_51 & stride_mask_134) == 0) ? 1 : 0);
+            int local_idx_99 = idx_j - local_experts_start_idx;
+            int extent_133 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_133 = (1 << local_experts_stride_log2) - 1;
+            int is_local_133 = ((local_idx_99 >= 0 && local_idx_99 < extent_133 && (local_idx_99 & stride_mask_133) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_134 != 0) ? slot_base + exp_off[51] : -1);
+            permuted_j = ((is_local_133 != 0) ? slot_base + exp_off[51] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_134 != 0) {
+            if (is_local_133 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3578,15 +3553,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[52];
-            int local_idx_0_52 = idx_j - local_experts_start_idx;
-            int extent_135 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_135 = (1 << local_experts_stride_log2) - 1;
-            int is_local_135 = ((local_idx_0_52 >= 0 && local_idx_0_52 < extent_135 && (local_idx_0_52 & stride_mask_135) == 0) ? 1 : 0);
+            int local_idx_100 = idx_j - local_experts_start_idx;
+            int extent_134 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_134 = (1 << local_experts_stride_log2) - 1;
+            int is_local_134 = ((local_idx_100 >= 0 && local_idx_100 < extent_134 && (local_idx_100 & stride_mask_134) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_135 != 0) ? slot_base + exp_off[52] : -1);
+            permuted_j = ((is_local_134 != 0) ? slot_base + exp_off[52] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_135 != 0) {
+            if (is_local_134 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3597,15 +3572,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[53];
-            int local_idx_0_53 = idx_j - local_experts_start_idx;
-            int extent_136 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_136 = (1 << local_experts_stride_log2) - 1;
-            int is_local_136 = ((local_idx_0_53 >= 0 && local_idx_0_53 < extent_136 && (local_idx_0_53 & stride_mask_136) == 0) ? 1 : 0);
+            int local_idx_101 = idx_j - local_experts_start_idx;
+            int extent_135 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_135 = (1 << local_experts_stride_log2) - 1;
+            int is_local_135 = ((local_idx_101 >= 0 && local_idx_101 < extent_135 && (local_idx_101 & stride_mask_135) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_136 != 0) ? slot_base + exp_off[53] : -1);
+            permuted_j = ((is_local_135 != 0) ? slot_base + exp_off[53] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_136 != 0) {
+            if (is_local_135 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3616,15 +3591,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[54];
-            int local_idx_0_54 = idx_j - local_experts_start_idx;
-            int extent_137 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_137 = (1 << local_experts_stride_log2) - 1;
-            int is_local_137 = ((local_idx_0_54 >= 0 && local_idx_0_54 < extent_137 && (local_idx_0_54 & stride_mask_137) == 0) ? 1 : 0);
+            int local_idx_102 = idx_j - local_experts_start_idx;
+            int extent_136 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_136 = (1 << local_experts_stride_log2) - 1;
+            int is_local_136 = ((local_idx_102 >= 0 && local_idx_102 < extent_136 && (local_idx_102 & stride_mask_136) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_137 != 0) ? slot_base + exp_off[54] : -1);
+            permuted_j = ((is_local_136 != 0) ? slot_base + exp_off[54] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_137 != 0) {
+            if (is_local_136 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3635,15 +3610,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[55];
-            int local_idx_0_55 = idx_j - local_experts_start_idx;
-            int extent_138 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_138 = (1 << local_experts_stride_log2) - 1;
-            int is_local_138 = ((local_idx_0_55 >= 0 && local_idx_0_55 < extent_138 && (local_idx_0_55 & stride_mask_138) == 0) ? 1 : 0);
+            int local_idx_103 = idx_j - local_experts_start_idx;
+            int extent_137 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_137 = (1 << local_experts_stride_log2) - 1;
+            int is_local_137 = ((local_idx_103 >= 0 && local_idx_103 < extent_137 && (local_idx_103 & stride_mask_137) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_138 != 0) ? slot_base + exp_off[55] : -1);
+            permuted_j = ((is_local_137 != 0) ? slot_base + exp_off[55] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_138 != 0) {
+            if (is_local_137 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3654,15 +3629,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[56];
-            int local_idx_0_56 = idx_j - local_experts_start_idx;
-            int extent_139 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_139 = (1 << local_experts_stride_log2) - 1;
-            int is_local_139 = ((local_idx_0_56 >= 0 && local_idx_0_56 < extent_139 && (local_idx_0_56 & stride_mask_139) == 0) ? 1 : 0);
+            int local_idx_104 = idx_j - local_experts_start_idx;
+            int extent_138 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_138 = (1 << local_experts_stride_log2) - 1;
+            int is_local_138 = ((local_idx_104 >= 0 && local_idx_104 < extent_138 && (local_idx_104 & stride_mask_138) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_139 != 0) ? slot_base + exp_off[56] : -1);
+            permuted_j = ((is_local_138 != 0) ? slot_base + exp_off[56] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_139 != 0) {
+            if (is_local_138 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3673,15 +3648,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[57];
-            int local_idx_0_57 = idx_j - local_experts_start_idx;
-            int extent_140 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_140 = (1 << local_experts_stride_log2) - 1;
-            int is_local_140 = ((local_idx_0_57 >= 0 && local_idx_0_57 < extent_140 && (local_idx_0_57 & stride_mask_140) == 0) ? 1 : 0);
+            int local_idx_105 = idx_j - local_experts_start_idx;
+            int extent_139 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_139 = (1 << local_experts_stride_log2) - 1;
+            int is_local_139 = ((local_idx_105 >= 0 && local_idx_105 < extent_139 && (local_idx_105 & stride_mask_139) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_140 != 0) ? slot_base + exp_off[57] : -1);
+            permuted_j = ((is_local_139 != 0) ? slot_base + exp_off[57] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_140 != 0) {
+            if (is_local_139 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3692,15 +3667,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[58];
-            int local_idx_0_58 = idx_j - local_experts_start_idx;
-            int extent_141 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_141 = (1 << local_experts_stride_log2) - 1;
-            int is_local_141 = ((local_idx_0_58 >= 0 && local_idx_0_58 < extent_141 && (local_idx_0_58 & stride_mask_141) == 0) ? 1 : 0);
+            int local_idx_106 = idx_j - local_experts_start_idx;
+            int extent_140 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_140 = (1 << local_experts_stride_log2) - 1;
+            int is_local_140 = ((local_idx_106 >= 0 && local_idx_106 < extent_140 && (local_idx_106 & stride_mask_140) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_141 != 0) ? slot_base + exp_off[58] : -1);
+            permuted_j = ((is_local_140 != 0) ? slot_base + exp_off[58] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_141 != 0) {
+            if (is_local_140 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3711,15 +3686,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[59];
-            int local_idx_0_59 = idx_j - local_experts_start_idx;
-            int extent_142 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_142 = (1 << local_experts_stride_log2) - 1;
-            int is_local_142 = ((local_idx_0_59 >= 0 && local_idx_0_59 < extent_142 && (local_idx_0_59 & stride_mask_142) == 0) ? 1 : 0);
+            int local_idx_107 = idx_j - local_experts_start_idx;
+            int extent_141 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_141 = (1 << local_experts_stride_log2) - 1;
+            int is_local_141 = ((local_idx_107 >= 0 && local_idx_107 < extent_141 && (local_idx_107 & stride_mask_141) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_142 != 0) ? slot_base + exp_off[59] : -1);
+            permuted_j = ((is_local_141 != 0) ? slot_base + exp_off[59] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_142 != 0) {
+            if (is_local_141 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3730,15 +3705,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[60];
-            int local_idx_0_60 = idx_j - local_experts_start_idx;
-            int extent_143 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_143 = (1 << local_experts_stride_log2) - 1;
-            int is_local_143 = ((local_idx_0_60 >= 0 && local_idx_0_60 < extent_143 && (local_idx_0_60 & stride_mask_143) == 0) ? 1 : 0);
+            int local_idx_108 = idx_j - local_experts_start_idx;
+            int extent_142 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_142 = (1 << local_experts_stride_log2) - 1;
+            int is_local_142 = ((local_idx_108 >= 0 && local_idx_108 < extent_142 && (local_idx_108 & stride_mask_142) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_143 != 0) ? slot_base + exp_off[60] : -1);
+            permuted_j = ((is_local_142 != 0) ? slot_base + exp_off[60] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_143 != 0) {
+            if (is_local_142 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3749,15 +3724,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[61];
-            int local_idx_0_61 = idx_j - local_experts_start_idx;
-            int extent_144 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_144 = (1 << local_experts_stride_log2) - 1;
-            int is_local_144 = ((local_idx_0_61 >= 0 && local_idx_0_61 < extent_144 && (local_idx_0_61 & stride_mask_144) == 0) ? 1 : 0);
+            int local_idx_109 = idx_j - local_experts_start_idx;
+            int extent_143 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_143 = (1 << local_experts_stride_log2) - 1;
+            int is_local_143 = ((local_idx_109 >= 0 && local_idx_109 < extent_143 && (local_idx_109 & stride_mask_143) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_144 != 0) ? slot_base + exp_off[61] : -1);
+            permuted_j = ((is_local_143 != 0) ? slot_base + exp_off[61] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_144 != 0) {
+            if (is_local_143 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3768,15 +3743,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[62];
-            int local_idx_0_62 = idx_j - local_experts_start_idx;
-            int extent_145 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_145 = (1 << local_experts_stride_log2) - 1;
-            int is_local_145 = ((local_idx_0_62 >= 0 && local_idx_0_62 < extent_145 && (local_idx_0_62 & stride_mask_145) == 0) ? 1 : 0);
+            int local_idx_110 = idx_j - local_experts_start_idx;
+            int extent_144 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_144 = (1 << local_experts_stride_log2) - 1;
+            int is_local_144 = ((local_idx_110 >= 0 && local_idx_110 < extent_144 && (local_idx_110 & stride_mask_144) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_145 != 0) ? slot_base + exp_off[62] : -1);
+            permuted_j = ((is_local_144 != 0) ? slot_base + exp_off[62] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_145 != 0) {
+            if (is_local_144 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }
@@ -3787,15 +3762,15 @@ kernel_cake_stepfun_moe_85e03fcd251dde9ebf18(__nv_bfloat16* __restrict__ scores,
             done_4 = 1;
         } else {
             idx_j = exp_idx[63];
-            int local_idx_0_63 = idx_j - local_experts_start_idx;
-            int extent_146 = num_local_experts << local_experts_stride_log2;
-            int stride_mask_146 = (1 << local_experts_stride_log2) - 1;
-            int is_local_146 = ((local_idx_0_63 >= 0 && local_idx_0_63 < extent_146 && (local_idx_0_63 & stride_mask_146) == 0) ? 1 : 0);
+            int local_idx_111 = idx_j - local_experts_start_idx;
+            int extent_145 = num_local_experts << local_experts_stride_log2;
+            int stride_mask_145 = (1 << local_experts_stride_log2) - 1;
+            int is_local_145 = ((local_idx_111 >= 0 && local_idx_111 < extent_145 && (local_idx_111 & stride_mask_145) == 0) ? 1 : 0);
             token_j = expanded_j / top_k;
             slot_base = smem_expert_offset[idx_j];
-            permuted_j = ((is_local_146 != 0) ? slot_base + exp_off[63] : -1);
+            permuted_j = ((is_local_145 != 0) ? slot_base + exp_off[63] : -1);
             expanded_idx_to_permuted_idx[expanded_j] = permuted_j;
-            if (is_local_146 != 0) {
+            if (is_local_145 != 0) {
                 permuted_idx_to_token_idx[permuted_j] = token_j;
             }
         }

@@ -47,6 +47,14 @@ def is_valid_sm100_genphase_knobs(knobs: dict[str, Any], config: Any) -> bool:
         ):
             return False
     try:
+        if getattr(config, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            validate_block_scaled_batch_invariant(
+                config, knobs, implementation="genphase"
+            )
         dataclasses.replace(config, **knobs)
     except (TypeError, ValueError):
         return False
@@ -63,6 +71,14 @@ def default_sm100_genphase_knobs(
     FC1 work cannot fill one CGA4 wave. These estimates assume spread routing;
     skew and masked routes can change the best choice and should be tuned.
     """
+    if getattr(config, "batch_invariant", False):
+        _effective_sms(config, sm_count)
+        _live_tokens(config, live_tokens)
+        return dict(
+            mma_tiler_mnk=config.resolved_mma_tiler_mnk,
+            cluster_shape_mn=(4, 1),
+            schedule_policy=("grouped", None),
+        )
     sms = _effective_sms(config, sm_count)
     tokens = _live_tokens(config, live_tokens)
     if tokens == 0:
@@ -178,6 +194,14 @@ def is_valid_sm100_knobs(knobs, config):
     if unknown := set(knobs) - set(STANDARD_KNOB_KEYS):
         raise ValueError(f"unknown Blackwell standard knob keys: {sorted(unknown)}")
     try:
+        if getattr(config, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            validate_block_scaled_batch_invariant(
+                config, knobs, implementation="standard"
+            )
         dataclasses.replace(config, **knobs)
     except (TypeError, ValueError):
         return False
@@ -191,6 +215,28 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
     is opt-in and cannot replace a custom or persistent finalizer.
     """
     base = {key: getattr(config, key) for key in STANDARD_KNOB_KEYS}
+    if getattr(config, "batch_invariant", False):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.quantized_batch_invariant_tiles import (
+            quantized_batch_invariant_tiles,
+        )
+
+        tiles = quantized_batch_invariant_tiles(config.quant_kind, arch="sm_100")
+        proposed = [
+            dict(
+                base,
+                mma_tiler_mnk=tile,
+                token_back_mode=carrier,
+                schedule_policy=schedule,
+                work_id_mode=work,
+            )
+            for tile in tiles
+            for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+            for schedule, work in (
+                (("grouped", None), "grid_stride"),
+                (("phase_interleave", None), "atomic_counter"),
+            )
+        ]
+        return [knobs for knobs in proposed if is_valid_sm100_knobs(knobs, config)]
     base["mma_tiler_mnk"] = config.resolved_mma_tiler_mnk
     proposed = [base]
     reduction = (
@@ -204,7 +250,7 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
         )
         else (False,)
     )
-    for tile_n in (128, 256):
+    for tile_n in (64, 128, 256) if config.quant_kind == "nvfp4" else (128, 256):
         for cluster, fallback, schedule, work in (
             ((2, 1), None, ("grouped", None), "grid_stride"),
             ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
@@ -214,15 +260,16 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
                     for reduce in reduction:
                         proposed.append(
                             dict(
-                                # K128 admits both N tiles on Blackwell. Keep
-                                # the caller's original K depth in base above.
+                                # N64 permits one FC2 TMA stage; wider tiles use two.
                                 mma_tiler_mnk=(256, tile_n, 128),
                                 cluster_shape_mn=cluster,
                                 fallback_cluster_shape_mn=fallback,
                                 schedule_policy=schedule,
                                 work_id_mode=work,
                                 fc2_use_bulk=bulk,
-                                fc2_tma_stages=2 if bulk else None,
+                                fc2_tma_stages=(1 if tile_n == 64 else 2)
+                                if bulk
+                                else None,
                                 epi_flag_batches=epi,
                                 token_in_flag_batch=1,
                                 token_back_mode="epi_warps",

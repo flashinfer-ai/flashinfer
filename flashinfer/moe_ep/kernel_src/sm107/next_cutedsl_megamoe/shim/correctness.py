@@ -85,12 +85,18 @@ def sampled_reference(
             quant_kind=cfg.quant_kind,
             combine_dtype=cfg.combine_dtype,
             local_expert_offset=cfg.rank * cfg.experts_per_rank,
-            gate_up_clamp=cfg.gate_up_clamp,
+            gate_up_clamp=(
+                abs(cfg.gate_up_clamp)
+                if cfg.batch_invariant and cfg.gate_up_clamp is not None
+                else cfg.gate_up_clamp
+            ),
             apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
             weight_scales_are_swizzled=True,
             return_fp32=True,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
+            swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
+            swiglu_beta=getattr(cfg, "swiglu_beta", None),
             fc1_alpha=_launch_scalar(symm_buffer, "fc1_alpha"),
             fc2_alpha=_launch_scalar(symm_buffer, "fc2_alpha"),
             fc1_norm_const=_launch_scalar(symm_buffer, "fc1_norm_const"),
@@ -100,8 +106,38 @@ def sampled_reference(
                 partial, dst=global_source, op=dist.ReduceOp.SUM, group=process_group
             )
         if source_rank == cfg.rank:
-            expected = partial[:count].to(torch.bfloat16)
-    return indices, expected
+            expected = partial[:count]
+    if getattr(cfg, "shared_expert", None) is not None:
+        expected += _shared_reference(symm_buffer, indices).float()
+    return indices, expected.to(torch.bfloat16)
+
+
+def _shared_reference(symm_buffer, indices):
+    """Evaluate the replicated FFN locally on the routed oracle's sampled rows."""
+    cfg = symm_buffer.config
+    l1, l2 = symm_buffer._shared_weights
+    x = symm_buffer.shared_x
+    sf = symm_buffer.shared_x_sf_linear
+    shared_ids = torch.zeros((indices.numel(), 1), dtype=torch.int32, device=x.device)
+    return compute_megamoe_reference_sm107_block_scaled(
+        x.view(torch.uint8)[indices].view(x.dtype),
+        sf.view(torch.uint8)[indices].view(sf.dtype),
+        shared_ids,
+        torch.ones_like(shared_ids, dtype=torch.float32),
+        l1[0].permute(0, 2, 1),
+        l1[1],
+        l2[0].permute(0, 2, 1),
+        l2[1],
+        quant_kind=cfg.shared_expert.kind,
+        combine_dtype="bf16",
+        local_expert_offset=0,
+        gate_up_clamp=cfg.gate_up_clamp,
+        apply_routing_weights_before_fc2=False,
+        weight_scales_are_swizzled=True,
+        return_fp32=True,
+        situ_beta=cfg.situ_beta,
+        situ_linear_beta=cfg.situ_linear_beta,
+    ).to(torch.bfloat16)
 
 
 def output_error(output, indices, expected) -> float:

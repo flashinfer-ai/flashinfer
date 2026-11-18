@@ -11,7 +11,7 @@ the MLIR context; the results are plain attributes the kernel reads as constants
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -24,15 +24,12 @@ from flashinfer.cute_dsl.attention.fmha.helpers import (
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
-from ..spec import BLOCK_SCALED, ELEM_BITS_OF, SF_VEC
-
-
-def k_granule(in_fmt: str) -> int:
-    """K of a block-scaled operand is a whole number of block scales and of 16-byte rows: 32 elements for every format."""
-    import math
-
-    row = 128 // ELEM_BITS_OF[in_fmt]  # elements per 16-byte row
-    return SF_VEC[in_fmt] * row // math.gcd(SF_VEC[in_fmt], row)
+from ..spec import (  # noqa: F401  (k_granule re-exported: the body's K granule, also the API's)
+    BLOCK_K,
+    BLOCK_SCALED,
+    FP8_BLOCKSCALE_FMTS,
+    k_granule,
+)
 
 
 ACC_DTYPE = cutlass.Float32
@@ -46,6 +43,9 @@ IN_DT = {
     "nvfp4_k128": cutlass.Float4E2M1FN,
     "mxfp4": cutlass.Float4E2M1FN,
     "mxfp4_k128": cutlass.Float4E2M1FN,
+    "mxfp4w8a": cutlass.Float8E4M3FN,  # the mixed classes: the A (activation) operand's dtype; B is e2m1 (blocks/blockscaled_mx_mixed.py)
+    "mxfp4w8a_k64": cutlass.Float8E4M3FN,
+    "e4m3_bs": cutlass.Float8E4M3FN,  # the block-scale fp8 class: e4m3 elements, fp32 block scales applied by the epilogue (blocks/blockscale_fp8.py)
 }
 OUT_DT = {
     "bf16": cutlass.BFloat16,
@@ -63,6 +63,9 @@ ALIGN = {
     "nvfp4_k128": 32,
     "mxfp4": 32,
     "mxfp4_k128": 32,
+    "mxfp4w8a": 32,  # the mixed classes: the 4-bit weight row's alignment, the stricter of the two operands'
+    "mxfp4w8a_k64": 32,
+    "e4m3_bs": 16,
     "f32": 4,
 }  # elements per 16-byte TMA alignment
 
@@ -97,12 +100,18 @@ class StaticPlan:
         extra_smem_bytes: int = 2048,
         chunks: int = 1,
         in_fmt: str = "bf16",
+        k_blocks: Optional[int] = None,
+        acc_stages: Optional[int] = None,
+        reserve_smem_bytes: int = 0,
     ):
-        """``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
+        """``k_blocks`` overrides the instruction K-steps per smem stage (default ``MMA_K_BLOCKS``: one 128-byte swizzle atom
+        of K per row; the grouped MoE kernels take two atoms for bf16) -- the lowering's inner radix, a placement of the same
+        fold (Lean's ``kblockLoopG_eq_kfoldG`` holds for every radix). ``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
         ``extra_smem_bytes`` for a caller's own shared storage (unused by this body). ``chunks`` is the
         class's chunk count: with ``knobs.cta_chunks`` the CTA folds all of them (``cta_chunks`` below) and the
         TMEM holds the running sum next to the accumulator stages. ``in_fmt`` names the operand format whose knob
-        constraints apply."""
+        constraints apply. ``acc_stages`` overrides the accumulator ring's depth (the block-scale body: one stage per K
+        block in flight); ``reserve_smem_bytes`` is smem the caller allocates itself (its scale ring), off the A/B/C budget."""
         assert knobs.well_formed(in_fmt) and knobs.use_tma_store, (knobs, in_fmt)
         self.knobs = knobs
         self.chunks = chunks
@@ -111,6 +120,8 @@ class StaticPlan:
         )  # chunks folded inside the CTA (1: none)
         self.c_in_smem = c_in_smem
         self.extra_smem_bytes = extra_smem_bytes
+        self.acc_stages = acc_stages
+        self.reserve_smem_bytes = reserve_smem_bytes
         self.a_dtype, self.b_dtype, self.c_dtype, self.c_layout = (
             a_dtype,
             b_dtype,
@@ -131,7 +142,7 @@ class StaticPlan:
         self.mma_tiler = (
             knobs.mma_tiler_mn[0],
             knobs.mma_tiler_mn[1],
-            inst_k * MMA_K_BLOCKS,
+            inst_k * (k_blocks or MMA_K_BLOCKS),
         )
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // self.atom_thr_size,
@@ -198,7 +209,7 @@ class StaticPlan:
             self.b_dtype, b_one
         )
         c_bytes_per_stage = cute.size_in_bytes(self.c_dtype, c_one)
-        num_acc = NUM_ACC_STAGE
+        num_acc = self.acc_stages or NUM_ACC_STAGE
         if self.cta_chunks > 1:
             # accumulator stages + the running sum: 3 x tile N columns when they fit the 512-column allocation, else one stage; the
             # 64-row CTA tiles (the 16 x 4 lane split of their accumulator) take one stage too: the DSL's TMEM fragment of three
@@ -208,19 +219,16 @@ class StaticPlan:
                 if (3 * self.knobs.tile_n <= 512 and self.knobs.cta_tile_mn[0] != 64)
                 else 1
             )
+        cap = self.smem_capacity - OCCUPANCY * self.reserve_smem_bytes
         if not self.c_in_smem:
             num_ab = (
-                self.smem_capacity // OCCUPANCY
-                - MBAR_RESERVE_BYTES
-                - self.extra_smem_bytes
+                cap // OCCUPANCY - MBAR_RESERVE_BYTES - self.extra_smem_bytes
             ) // ab_bytes  # the caller's tables
             return num_acc, num_ab, 0
         c_bytes = c_bytes_per_stage * NUM_C_STAGE_MIN
-        num_ab = (
-            self.smem_capacity // OCCUPANCY - (MBAR_RESERVE_BYTES + c_bytes)
-        ) // ab_bytes
+        num_ab = (cap // OCCUPANCY - (MBAR_RESERVE_BYTES + c_bytes)) // ab_bytes
         num_c = NUM_C_STAGE_MIN + (
-            self.smem_capacity
+            cap
             - OCCUPANCY * ab_bytes * num_ab
             - OCCUPANCY * (MBAR_RESERVE_BYTES + c_bytes)
         ) // (OCCUPANCY * c_bytes_per_stage)
@@ -320,9 +328,10 @@ def can_implement(
     # the output is stored directly (no fp32 workspace) by the unsplit class and by the in-CTA chunk fold
     al_out = ALIGN["bf16"] if (chunks == 1 or knobs.cta_chunks) else ALIGN["f32"]
     if in_fmt in BLOCK_SCALED:
-        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks; a chunk is a whole
-        # number of steps AND of scale-factor atom columns (`spec.chunk_unit`: 128 elements for the MX classes)
-        from ..spec import chunk_unit
+        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks (whole 128-element
+        # runs for the sm_100 mixed class: `spec.k_granule`); a chunk is a whole number of steps AND of scale-factor atom
+        # columns (`spec.chunk_unit`: 128 elements for the MX classes)
+        from ..spec import MX_MIXED_FMTS, chunk_unit
 
         if (
             b_major != "k"
@@ -330,14 +339,22 @@ def can_implement(
             or (chunks > 1 and Kc % chunk_unit(in_fmt))
         ):
             return False
+        if chunks > 1 and knobs.k_block and Kc % knobs.k_block:
+            return False  # a chunk is whole k-tiles of the record's k-block
         if knobs.swap_ab:
             # the decode specialisation: the kernel's M is N (the weights), its N is M (the tokens), all tokens in one
-            # tile (the scale-factor atom read from its start); the M-major output needs N aligned
+            # tile (the scale-factor atom read from its start); the M-major output needs N aligned. The mixed classes'
+            # split classes take it too (one chunk's partial through the workspace like the dense record's; not the
+            # in-cluster / in-CTA folds); the other block-scaled classes keep their unsplit-only swapped records
+            split_ok = chunks == 1 or (
+                in_fmt in MX_MIXED_FMTS
+                and not (knobs.cluster_k > 1 or knobs.cta_chunks)
+            )
             return (
-                chunks == 1
+                split_ok
                 and knobs.tile_n >= M
                 and N % ALIGN["bf16"] == 0
-                and K % al_in == 0
+                and Kc % al_in == 0
             )
         if knobs.cluster_k > 1:
             # the in-cluster split computes exactly the class kchunk[cluster_k]: its chunks are whole k-tiles (one smem
@@ -346,7 +363,7 @@ def can_implement(
             # the record is not a placement of the shape and the workspace split (the same class) takes over
             from ..generator import MainloopBlock
 
-            k_tile = MainloopBlock(in_fmt).k_block
+            k_tile = MainloopBlock(in_fmt, k_block_override=knobs.k_block).k_block
             tiles = -(-M // knobs.tile_m) * -(-N // knobs.tile_n)
             return (
                 chunks == knobs.cluster_k
@@ -355,6 +372,17 @@ def can_implement(
                 and Kc % al_in == 0
                 and tiles <= MAX_GRID_Z
             )
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        # the block-scale class: a K-major weight (the NT operator), K a whole number of scale blocks (= k-tiles), no split
+        # variant, no in-CTA fold; the output is stored directly
+        return (
+            b_major == "k"
+            and chunks == 1
+            and not knobs.cta_chunks
+            and K % BLOCK_K == 0
+            and K % al_in == 0
+            and N % al_out == 0
+        )
     return (
         Kc % al_in == 0
         and (N if b_major == "n" else Kc) % al_in == 0

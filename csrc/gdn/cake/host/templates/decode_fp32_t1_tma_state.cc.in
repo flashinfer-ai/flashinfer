@@ -35,12 +35,10 @@ using cake_gdn_host::ScopedCudaDevice;
 // (`const __grid_constant__ CUtensorMap state_tma`): dims innermost first (V, K, HV, B), byte strides of
 // K, HV and B, a 32 x 128 x 1 x 1 box (one 32-wide V panel of one state head), 128-byte swizzle, no L2
 // promotion, no out-of-bounds fill.  The state is contiguous (checked), so the strides follow the shape.
-// The map holds the state's device address: it is encoded on every call from the tensor of that call
-// and passed by value as a kernel parameter.  A CUDA graph captures the parameter bytes, so a replay
-// addresses the pool the capture saw (as the pointer ABI does); a new pool pointer needs a new capture.
+// The map holds the state's device address and is passed by value as a kernel parameter.  A CUDA graph
+// captures the parameter bytes, so a replay addresses the pool the capture saw (as the pointer ABI
+// does); a new pool pointer needs a new capture.
 inline CUtensorMap EncodeStateTma4D(const TensorView& state) {
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0, ValueError)
-      << "state must be 16-byte aligned for the TMA state path";
   uint64_t global_dim[4] = {128u, 128u, (uint64_t)state.size(1), (uint64_t)state.size(0)};
   uint64_t global_strides[3] = {128u * 4u, 128u * 128u * 4u, (uint64_t)state.size(1) * 128u * 128u * 4u};
   uint32_t box_dim[4] = {32u, 128u, 1u, 1u};
@@ -53,6 +51,44 @@ inline CUtensorMap EncodeStateTma4D(const TensorView& state) {
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (4D, 'state') failed: CUresult=" << (int)r;
   return tm;
+}
+
+// The encoded map is a function of the state's base address, batch and head count alone (every other
+// argument of the encode is fixed above), so each host thread keeps the maps it encoded in a small
+// direct-mapped table keyed by (device, address, B, HV) and encodes only on a miss: a hit returns the
+// bytes the encode returned for the same key, so the launch, its output and a graph capture are the
+// same as with a fresh encode.  An entry never outlives its key: a different address, batch, head
+// count or device is a miss and overwrites the slot.
+struct StateTmaCacheEntry {
+  CUtensorMap map;
+  const void* data;
+  int64_t batch;
+  int64_t heads;
+  int device_id;
+  bool valid;
+};
+constexpr uint64_t kStateTmaCacheSlots = 64;
+
+inline CUtensorMap StateTma4D(const TensorView& state, int device_id) {
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0, ValueError)
+      << "state must be 16-byte aligned for the TMA state path";
+  thread_local StateTmaCacheEntry cache[kStateTmaCacheSlots] = {};
+  const void* data = state.data_ptr();
+  const int64_t batch = state.size(0);
+  const int64_t heads = state.size(1);
+  const uint64_t address = reinterpret_cast<uintptr_t>(data);
+  StateTmaCacheEntry& entry =
+      cache[((address >> 9) ^ (address >> 21) ^ (uint64_t)batch) % kStateTmaCacheSlots];
+  if (!(entry.valid && entry.data == data && entry.batch == batch && entry.heads == heads &&
+        entry.device_id == device_id)) {
+    entry.map = EncodeStateTma4D(state);
+    entry.data = data;
+    entry.batch = batch;
+    entry.heads = heads;
+    entry.device_id = device_id;
+    entry.valid = true;
+  }
+  return entry.map;
 }
 
 void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_state, TensorView arg_A_log, TensorView arg_a, TensorView arg_dt_bias, TensorView arg_b, TensorView arg_out, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
@@ -139,7 +175,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_st
   void* p_q = arg_q.data_ptr();
   void* p_k = arg_k.data_ptr();
   void* p_v = arg_v.data_ptr();
-  CUtensorMap p_state_tma = EncodeStateTma4D(arg_state);
+  CUtensorMap p_state_tma = StateTma4D(arg_state, (int)dev.device_id);
   void* p_A_log = arg_A_log.data_ptr();
   void* p_a = arg_a.data_ptr();
   void* p_dt_bias = arg_dt_bias.data_ptr();

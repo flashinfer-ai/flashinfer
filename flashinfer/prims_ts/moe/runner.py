@@ -51,6 +51,7 @@ from flashinfer.utils import get_compute_capability, round_up
 
 from .compile_cache import get_compiled_gemm, stable_config_hash
 from .config_mapper import (
+    apply_weight_l2_policy,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
@@ -69,6 +70,7 @@ from .config_mapper import (
 from .support import (
     is_prims_ts_bf16_supported,
     is_prims_ts_fp8_block_scale_supported,
+    deepseek_fp8_scale_block_size,
     is_prims_ts_fp8_per_tensor_supported,
     is_prims_ts_mxfp4_bf16_supported,
     is_prims_ts_mxfp4_mxfp8_supported,
@@ -1355,7 +1357,9 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return map_trtllm_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -1625,16 +1629,18 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, extras = self._tactic_common(moe_inputs, kwargs)
         uses_per_token_scaling = moe_inputs.per_token_scale is not None
-        return map_trtllm_nvfp4_moe_tactic(
-            tactic,
-            **common,
-            **bias_and_oa,
-            use_per_token_sf_b=uses_per_token_scaling,
-            per_token_sf_dtype=(
-                _per_token_sf_dtype_value(moe_inputs.per_token_scale)
-                if uses_per_token_scaling
-                else int(extras.get("per_token_sf_dtype", 1))
-            ),
+        return apply_weight_l2_policy(
+            map_trtllm_nvfp4_moe_tactic(
+                tactic,
+                **common,
+                **bias_and_oa,
+                use_per_token_sf_b=uses_per_token_scaling,
+                per_token_sf_dtype=(
+                    _per_token_sf_dtype_value(moe_inputs.per_token_scale)
+                    if uses_per_token_scaling
+                    else int(extras.get("per_token_sf_dtype", 1))
+                ),
+            )
         )
 
     def _make_tuning_config(
@@ -1969,7 +1975,9 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -2428,7 +2436,9 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return map_trtllm_mxfp4_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_mxfp4_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -2730,14 +2740,16 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             use_routing_scales_on_input=use_routing_scales,
             routing_logits=moe_inputs.routing_logits,
         )
-        return map_trtllm_fp8_per_tensor_moe_tactic(
-            tactic,
-            **common,
-            **bias_and_oa,
-            fc1_use_per_token_sf_a=use_fc1_scale,
-            fc2_use_per_token_sf_a=use_fc2_scale,
-            use_per_token_sf_b=use_routing_scales,
-            per_token_sf_dtype=per_token_sf_dtype,
+        return apply_weight_l2_policy(
+            map_trtllm_fp8_per_tensor_moe_tactic(
+                tactic,
+                **common,
+                **bias_and_oa,
+                fc1_use_per_token_sf_a=use_fc1_scale,
+                fc2_use_per_token_sf_a=use_fc2_scale,
+                use_per_token_sf_b=use_routing_scales,
+                per_token_sf_dtype=per_token_sf_dtype,
+            )
         )
 
     def _make_tuning_config(
@@ -3075,17 +3087,24 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
         if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-            return map_trtllm_deepseek_fp8_moe_tactic(
-                tactic,
-                sm_arch=common["sm_arch"],
-                num_tokens=common["num_tokens"],
-                top_k=common["top_k"],
-                num_local_experts=common["num_local_experts"],
-                num_experts=common["num_experts"],
-                weight_layout=common["weight_layout"],
-                enable_pdl=common["enable_pdl"],
+            return apply_weight_l2_policy(
+                map_trtllm_deepseek_fp8_moe_tactic(
+                    tactic,
+                    sm_arch=common["sm_arch"],
+                    num_tokens=common["num_tokens"],
+                    top_k=common["top_k"],
+                    num_local_experts=common["num_local_experts"],
+                    num_experts=common["num_experts"],
+                    weight_layout=common["weight_layout"],
+                    enable_pdl=common["enable_pdl"],
+                    deepseek_fp8_block_size=deepseek_fp8_scale_block_size(
+                        self.hidden_size, moe_inputs.hidden_states_scale
+                    ),
+                )
             )
-        return map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -3133,6 +3152,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             sm_arch,
             False,
             _gemm_config_flags_cache_key(gemm_config_flags),
+            deepseek_fp8_scale_block_size(
+                self.hidden_size, moe_inputs.hidden_states_scale
+            ),
         )
         if instance_key not in PrimsTsFp8BlockScaleMoERunner.valid_tactics_dict:
             try:
@@ -3332,6 +3354,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 self.intermediate_size,
                 int(self.activation_type),
                 kwargs["enable_pdl"],
+                fc1_cfg.deepseek_fp8_block_size,
             )
 
         fc2_io = build_fp8_block_scale_launch_io(

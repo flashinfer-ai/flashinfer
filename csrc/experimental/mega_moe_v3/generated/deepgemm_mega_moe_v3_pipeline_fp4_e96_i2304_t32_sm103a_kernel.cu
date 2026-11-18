@@ -605,7 +605,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_1[4];
                 {
-                    const int4* _ivptr_3 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 128) + 0);
+                    const int4* _ivptr_3 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 128ull) + 0);
                     int4 _ivld_3;
                     _ivld_3 = *_ivptr_3;
                     _vec_load_1[0 + 0] = _ivld_3.x;
@@ -615,7 +615,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_2[4];
                 {
-                    const int4* _ivptr_4 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 256) + 0);
+                    const int4* _ivptr_4 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 256ull) + 0);
                     int4 _ivld_4;
                     _ivld_4 = *_ivptr_4;
                     _vec_load_2[0 + 0] = _ivld_4.x;
@@ -625,7 +625,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_3[4];
                 {
-                    const int4* _ivptr_5 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 384) + 0);
+                    const int4* _ivptr_5 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 384ull) + 0);
                     int4 _ivld_5;
                     _ivld_5 = *_ivptr_5;
                     _vec_load_3[0 + 0] = _ivld_5.x;
@@ -635,7 +635,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_4[4];
                 {
-                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 512) + 0);
+                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 512ull) + 0);
                     int4 _ivld_6;
                     _ivld_6 = *_ivptr_6;
                     _vec_load_4[0 + 0] = _ivld_6.x;
@@ -645,7 +645,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_5[4];
                 {
-                    const int4* _ivptr_7 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 640) + 0);
+                    const int4* _ivptr_7 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 640ull) + 0);
                     int4 _ivld_7;
                     _ivld_7 = *_ivptr_7;
                     _vec_load_5[0 + 0] = _ivld_7.x;
@@ -655,7 +655,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_6[4];
                 {
-                    const int4* _ivptr_8 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 768) + 0);
+                    const int4* _ivptr_8 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 768ull) + 0);
                     int4 _ivld_8;
                     _ivld_8 = *_ivptr_8;
                     _vec_load_6[0 + 0] = _ivld_8.x;
@@ -665,7 +665,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_7[4];
                 {
-                    const int4* _ivptr_9 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 896) + 0);
+                    const int4* _ivptr_9 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 896ull) + 0);
                     int4 _ivld_9;
                     _ivld_9 = *_ivptr_9;
                     _vec_load_7[0 + 0] = _ivld_9.x;
@@ -675,7 +675,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_8[4];
                 {
-                    const int4* _ivptr_10 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 1024) + 0);
+                    const int4* _ivptr_10 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 1024ull) + 0);
                     int4 _ivld_10;
                     _ivld_10 = *_ivptr_10;
                     _vec_load_8[0 + 0] = _ivld_10.x;
@@ -685,7 +685,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 }
                 int _vec_load_9[4];
                 {
-                    const int4* _ivptr_11 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 1152) + 0);
+                    const int4* _ivptr_11 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 1152ull) + 0);
                     int4 _ivld_11;
                     _ivld_11 = *_ivptr_11;
                     _vec_load_9[0 + 0] = _ivld_11.x;
@@ -694,15 +694,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                     _vec_load_9[0 + 3] = _ivld_11.w;
                 }
                 reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off))[0] = reinterpret_cast<int4*>(_vec_load_0)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 128))[0] = reinterpret_cast<int4*>(_vec_load_1)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 256))[0] = reinterpret_cast<int4*>(_vec_load_2)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 384))[0] = reinterpret_cast<int4*>(_vec_load_3)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 512))[0] = reinterpret_cast<int4*>(_vec_load_4)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 640))[0] = reinterpret_cast<int4*>(_vec_load_5)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 768))[0] = reinterpret_cast<int4*>(_vec_load_6)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 896))[0] = reinterpret_cast<int4*>(_vec_load_7)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 1024))[0] = reinterpret_cast<int4*>(_vec_load_8)[0];
-                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 1152))[0] = reinterpret_cast<int4*>(_vec_load_9)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 128ull))[0] = reinterpret_cast<int4*>(_vec_load_1)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 256ull))[0] = reinterpret_cast<int4*>(_vec_load_2)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 384ull))[0] = reinterpret_cast<int4*>(_vec_load_3)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 512ull))[0] = reinterpret_cast<int4*>(_vec_load_4)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 640ull))[0] = reinterpret_cast<int4*>(_vec_load_5)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 768ull))[0] = reinterpret_cast<int4*>(_vec_load_6)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 896ull))[0] = reinterpret_cast<int4*>(_vec_load_7)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 1024ull))[0] = reinterpret_cast<int4*>(_vec_load_8)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 1152ull))[0] = reinterpret_cast<int4*>(_vec_load_9)[0];
                 unsigned long long src_sf_off = (unsigned long long)t_s * (unsigned long long)sf_words_x;
                 unsigned long long dst_sf_off = (unsigned long long)dst_row * (unsigned long long)sf_words_x;
                 unsigned int in_expert = (unsigned int)(dst_row - smem_ero[e_s]);
@@ -711,12 +711,12 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 unsigned int sfw0 = x_sf[src_sf_off + (unsigned long long)lane];
                 unsigned int sfw1 = 0;
                 if (sf_words_x > lane + 32) {
-                    sfw1 = x_sf[src_sf_off + (unsigned long long)lane + 32];
+                    sfw1 = x_sf[src_sf_off + (unsigned long long)lane + 32ull];
                 }
                 pool_sf[dst_sf_off + (unsigned long long)lane] = sfw0;
                 PrivateSF1Words[(unsigned int)(lane * 13824) + source_sf_token] = sfw0;
                 if (sf_words_x > lane + 32) {
-                    pool_sf[dst_sf_off + (unsigned long long)lane + 32] = sfw1;
+                    pool_sf[dst_sf_off + (unsigned long long)lane + 32ull] = sfw1;
                     PrivateSF1Words[(unsigned int)((lane + 32) * 13824) + source_sf_token] = sfw1;
                 }
                 __syncwarp();
@@ -787,7 +787,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 unsigned int public_m = (unsigned int)smem_ero[task[1]] + task[2] * 16;
                 unsigned int aligned_m = (task[5] + 15) / 16 * 16;
                 unsigned int token_offset = public_m + (unsigned int)cta_rank * (aligned_m / 2);
-                unsigned long long pending = 68719476735;
+                unsigned long long pending = 68719476735ll;
                 if (task[0] == 1) {
                     {
                     unsigned int _acquire_observed;
@@ -800,13 +800,13 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 for (int k = 0; k < task[7] / 128; k++) {
                     if (task[0] == 2) {
                         unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k * 2);
-                        if ((pending & k_mask) != 0) {
+                        if ((pending & k_mask) != 0ull) {
                             unsigned long long _wait_acquire_mask_0;
                             do {
                             asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_0) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
-                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)68719476735)) & static_cast<unsigned long long>(k_mask)) != 0);
+                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)68719476735ll)) & static_cast<unsigned long long>(k_mask)) != 0);
                             unsigned long long observed = _wait_acquire_mask_0;
-                            pending = observed ^ 68719476735;
+                            pending = observed ^ 68719476735ull;
                         }
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
@@ -1033,7 +1033,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                         unsigned int _shfl_sync_3 = __shfl_sync(0xFFFFFFFF, claimed_0, 0);
                         claimed = _shfl_sync_3;
                         if (claimed >= state[0] * 18) {
-                            state[1] = 4294967295;
+                            state[1] = 4294967295ll;
                         } else {
                             phase = 1;
                         }
@@ -1587,7 +1587,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                 : "r"(read_address));
-                            unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
+                            unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560ull + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
                             reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
                         }
                     }
@@ -1644,7 +1644,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                     unsigned int row_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, i_6);
                     if (elect_sync()) {
                         if ((routed >> i_6 & 1) != 0) {
-                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_6) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (((buffers + i_6 >= epi_warp_2 * 6 + 6) ? buffers + i_6 - 6 : buffers + i_6)) * 8);
+                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_6) * 2560, expert_output + ((unsigned long long)row_3 * 5120ull + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (((buffers + i_6 >= epi_warp_2 * 6 + 6) ? buffers + i_6 - 6 : buffers + i_6)) * 8);
                             mbarrier_arrive_expect_tx(combine_barriers_addr + (((buffers + i_6 >= epi_warp_2 * 6 + 6) ? buffers + i_6 - 6 : buffers + i_6)) * 8, 2560);
                         } else {
                             mbarrier_arrive(combine_barriers_addr + (((buffers + i_6 >= epi_warp_2 * 6 + 6) ? buffers + i_6 - 6 : buffers + i_6)) * 8);
@@ -1766,7 +1766,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a(int* __restrict__ 
                 __syncwarp();
                 if (elect_sync()) {
                     {
-                        void* _cpbulk_dst_23 = reinterpret_cast<void*>(y + ((unsigned long long)token * 5120 + (unsigned long long)(chunk * 1280)));
+                        void* _cpbulk_dst_23 = reinterpret_cast<void*>(y + ((unsigned long long)token * 5120ull + (unsigned long long)(chunk * 1280)));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_23), "r"(combine_smem_addr + (48 + epi_warp_2) * 2560), "r"((uint32_t)(2560))

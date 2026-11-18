@@ -70,8 +70,13 @@ metadata values back to the host. FMHA preserves initialized caller scratch
 by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
-capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch and re-zero it when workspace-layout inputs change; wrappers
+capture. Their default `validate=True` checks geometry and device support;
+FMHA also checks packed-Q offset values. For already-validated inputs,
+`validate=False` skips those repeated checks and offset readbacks while
+preserving alias resolution and the same internal policy cache. The caller
+owns hardware, geometry, dtype and metadata validity; a cold policy lookup
+may still query device properties. Zero caller-owned FMHA scratch before its
+first trusted standalone launch and re-zero it when workspace-layout inputs change; wrappers
 initialize control storage by default. Alternatively, FMHA plans for one
 device may share one buffer of at least the largest size returned for them:
 zero the whole buffer once, bind the same full tensor to every plan (not
@@ -204,6 +209,22 @@ shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime condition
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
 
+### Per-query KV prefixes for MLA decode
+
+MLA decode supports `plan(use_kv_bounds=True)` with per-run `kv_bounds`:
+contiguous CUDA int32 counts shaped `[B * SQ]` for fixed Q or `[total_q]` for
+packed Q. Counts are shared across a token's heads, replace dense/causal
+visibility, and must be nondecreasing within each request and no larger than
+that request's `seq_lens_kv`. Zero local lengths and prefixes return zero O
+and optional base-2 LSE `-inf`. Bounds are per-run metadata, not retained
+plan values. `plan(zero_empty_rows=False)` skips neutral-row initialization but
+retains prefix masking; empty-row results are then unspecified, not preserved.
+Callers must initialize those rows or exclude them from consumption/merging.
+The default is `True`; the flag is ignored without `use_kv_bounds` and does not
+change workspace sizing. One-shot MLA exposes the same flag.
+See the [MLA contract](kernels/mla_decode/README.md) for validation,
+empty-cache, and workspace details.
+
 ## QToken-KvBlock-Sparse-Attention interface
 
 QToken-KvBlock-Sparse-Attention consumes per-query indexer output directly.
@@ -264,6 +285,13 @@ kernel. Nonpositive KV lengths mark inactive requests; positive lengths must
 cover all query tokens. Packed Q and arbitrary mappings continue to accept
 explicit per-token metadata.
 
+After a successful validated `run()`, `run(..., validate=False)` skips repeated
+host tensor-metadata checks. Preserve shapes, strides, dtypes, devices and
+alignment; K/V and `qo_indptr` must retain their prepared storage. Other input
+and output tensors may use replacement storage with the same ABI, and device
+contents remain live during graph replay. Scale overrides are still validated.
+Run with the default `validate=True` after `plan()` or any binding change.
+
 Packed Q uses a bounded `[D, Hq, total_q_tokens]` TensorMap. Per-route masks
 handle tiles crossing a request boundary, and the physical token extent
 bounds the final tile. FP8 queries need no extra tail allocation or staging copy.
@@ -285,7 +313,7 @@ no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
 
-Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+Eligible prepared G2–G8/page-4 Keeps routes store query-oriented membership
 words internally, with eight query slots and complete tail tiles reserved in
 the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
 retain four membership bytes per Int32 word; the public plan/run API is unchanged.
@@ -307,7 +335,22 @@ Equal Q/K/V D192 uses the same sparse dtype contract, with native
 head-dimension staging. FP8 uses 128-wide K/V stages; Q staging rounds to
 256 elements internally, with the last 64 supplied by TMA zero fill. The D192
 BF16/FP8 paths and bounded packed-Q loads are additionally tested on GB300/SM103
-with CUDA graphs and allocation-boundary checks. Decode's
+with CUDA graphs and allocation-boundary checks.
+
+D256 also accepts packed NVFP4 K/V (`torch.uint8`) with BF16 or FP8 E4M3 Q
+and BF16 output, in two layouts: interleaved rows `[pages, Hkv, page_size,
+D/2 + D/16]` (each token's E2M1 payload, then its E4M3 block scales), or
+`[.., D/2]` payloads with `kv_scale_factors=(K_SF, V_SF)` (decode's
+`PagedKVScaleFactors`). Q's dtype selects the MMA: BF16 Q runs exact BF16
+operands, FP8 Q runs FP8 MMA on K/V rounded to E4M3. NVFP4 is a transform-KV
+storage dtype: a task converts it into Q's dtype, in TMEM for the SwapsMmaAb
+recipe (BF16 Q with interleaved rows needs a CUDA 13.2+ toolkit) or into SMEM
+K/V tiles for the KeepsMmaAb recipe, one D256 stage per KV128 tile. The shared
+sparse policy takes Keeps for BF16 Q, for groups of more than 32 Q rows per KV
+head and for FP8-Q groups of G >= 5. Its
+raw ring loads four interleaved page fragments per TMA gather4 copy from flat
+compact caches, and one tiled copy per fragment otherwise (including separate
+scale tensors and strided views). Decode's
 native logical HND cache views can use strided NHD/interleaved physical storage.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
@@ -328,8 +371,10 @@ The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
-Metadata releases at entry so the attention prologue can overlap it; the
-attention dependency wait still covers all metadata stores.
+Each metadata CTA releases attention after its last output store, so the
+attention prologue overlaps the metadata tail without leaving attention CTAs
+resident for the whole metadata grid; the attention dependency wait covers all
+metadata stores.
 Attention initializes its independent resources before acquiring immediately
 ahead of the first metadata-dependent read. Split-KV attention releases its
 reducer only after producer completion and TMEM teardown; the reducer

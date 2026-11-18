@@ -28,6 +28,7 @@ from flashinfer.batch_invariant.sampling import spec as S
 from flashinfer.batch_invariant.sampling.api import (
     LSE_ROW_ARCHS,
     log_probs_batch_invariant,
+    log_softmax_batch_invariant,
     lse_row,
     softmax_batch_invariant,
 )
@@ -155,6 +156,47 @@ def test_fingerprints_are_pinned():
     assert bi.fingerprint("log_probs", N=300, dtype="bf16", temperature=False) == (
         bi.fingerprint("softmax", N=300, dtype="bf16", temperature=False)
     )
+    # the 16-bit log-softmax output member (log_softmax(..., out_dtype=<the input dtype>)): its own receipt per input
+    # format and temperature form; the fp32 row's receipt is the class fingerprint, unchanged; at f32 the conversion is the
+    # identity and the receipt the plain one; another dtype is refused
+    assert (
+        bi.fingerprint(
+            "log_softmax", N=300, dtype="bf16", temperature=False, out_dtype="bf16"
+        )
+        == "lse-row-aaa8b78ac92ebc0f"
+    )
+    assert (
+        bi.fingerprint(
+            "log_softmax",
+            N=300,
+            dtype=torch.float16,
+            temperature=False,
+            out_dtype=torch.float16,
+        )
+        == "lse-row-743ba80ecd3dcd41"
+    )
+    assert (
+        bi.fingerprint(
+            "log_softmax", N=300, dtype="bf16", temperature=True, out_dtype="bf16"
+        )
+        == "lse-row-7c1eccd36b16bf4b"
+    )
+    assert bi.fingerprint(
+        "log_softmax", N=300, dtype="bf16", temperature=False, out_dtype="f32"
+    ) == bi.fingerprint("log_softmax", N=300, dtype="bf16", temperature=False)
+    assert bi.fingerprint(
+        "log_softmax", N=300, dtype="f32", temperature=False, out_dtype="f32"
+    ) == bi.fingerprint("softmax", N=300, dtype="f32", temperature=False)
+    assert S.spec_fingerprint(300, "f32", logprobs_cvt=True) == S.spec_fingerprint(
+        300, "f32"
+    )
+    assert S.LOG_SOFTMAX_CVT.name == "lc" and S.LOG_SOFTMAX_CVT.row_output
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "log_softmax", N=300, dtype="bf16", temperature=False, out_dtype="f16"
+        )
+    with pytest.raises(ValueError):
+        S.Mode(logprobs_cvt=True)
     assert S.spec_fingerprint(301, "bf16") != S.spec_fingerprint(300, "bf16")
     # the hash is linear in the term DAG: a production vocabulary is a receipt, not a cost
     assert (
@@ -197,10 +239,13 @@ def test_unsupported_inputs_raise_before_any_kernel():
         softmax_batch_invariant(x)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse.row"):
         log_probs_batch_invariant(x, torch.zeros(4, dtype=torch.int64))
-    with pytest.raises(ValueError, match="batch_invariant"):
+    # batch_invariant=False routes to the same entry today (no ValueError on the flag): the device check comes next
+    with pytest.raises(ValueError, match="CUDA tensor"):
         flashinfer.sampling.log_probs(
             x, torch.zeros(4, dtype=torch.int64), batch_invariant=False
         )
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        flashinfer.sampling.log_softmax(x, batch_invariant=False)
 
 
 # ----------------------------------------------------------------------------------------------- on the device
@@ -232,10 +277,15 @@ def test_symbolic_oracle(dtype, N):
         ex = R.exact_rows(x, temp, rows=range(3), token_ids=ids)
         ref = R.lse_reference(x, temp, ids)
         got = run_all(x, temp, ids)
-        for k in ("probs", "logprobs", "lse", "logp", "m", "s"):
+        for k in ("probs", "logprobs", "logprobs_cvt", "lse", "logp", "m", "s"):
             assert same(ref[k], ex[k]), f"vectorised model {k} != symbolic spec"
         assert same(got["probs"], ex["probs"]) and same(got["logp"], ex["logp"])
         assert same(got["lse2"], ex["lse"])
+        if (
+            dtype != torch.float32
+        ):  # the 16-bit log-softmax output member against the symbolic spec
+            lp16 = flashinfer.sampling.log_softmax(x, temp, out_dtype=dtype)
+            assert same(lp16, ex["logprobs_cvt"]), "GPU logprobs_cvt != symbolic spec"
 
 
 def _config_sample(N, dtype):
@@ -404,8 +454,12 @@ def test_shared_dataflow_of_the_entries():
     assert same(flashinfer.sampling.log_probs(x, ids.to(torch.int32), temps), lp)
     # the log-softmax entry is the class's row; K ids per row are the row gathered K times (one launch), NaN per id
     assert same(flashinfer.sampling.log_softmax(x, temps), lp_row)
-    with pytest.raises(ValueError):
-        flashinfer.sampling.log_softmax(x, temps, batch_invariant=False)
+    # batch_invariant=False (the default) is the operator's regular kernel for these entries, today the same class
+    assert same(
+        flashinfer.sampling.log_softmax(x, temps, batch_invariant=False), lp_row
+    )
+    assert same(flashinfer.sampling.log_probs(x, ids, temps, batch_invariant=False), lp)
+    assert same(flashinfer.sampling.log_softmax(x, temps), lp_row)
     ar = torch.arange(16, device="cuda")
     ids3 = torch.stack([ids, bad, ids.flip(0)], dim=1)
     lp3, lse3 = flashinfer.sampling.log_probs(x, ids3, temps, return_lse=True)
@@ -581,6 +635,221 @@ def test_sanity_against_torch(dtype):
         lp, lpt[torch.arange(8, device="cuda"), ids], rtol=1e-5, atol=2e-5
     )
     assert torch.allclose(lse, torch.logsumexp(xs, dim=-1), rtol=1e-6, atol=2e-5)
+    # the 16-bit output member: torch's RNE conversion of the class's fp32 row, bit for bit; close to torch's row
+    lpf = flashinfer.sampling.log_softmax(x, temps, batch_invariant=True)
+    if dtype != torch.float32:
+        lp16 = flashinfer.sampling.log_softmax(
+            x, temps, batch_invariant=True, out_dtype=dtype
+        )
+        assert lp16.dtype == dtype and same(lp16, lpf.to(dtype))
+        assert torch.allclose(lp16.float(), lpt, rtol=2e-2, atol=2e-2)
+        other = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="out_dtype"):
+            flashinfer.sampling.log_softmax(x, temps, out_dtype=other)
+    else:
+        assert same(
+            flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.float32), lpf
+        )
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="out_dtype"):
+            flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.bfloat16)
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "dtype,N",
+    [(torch.bfloat16, 1000), (torch.float16, 4097)],
+    ids=["bf16-1000", "f16-4097"],
+)
+def test_log_softmax_16bit_output_member(dtype, N):
+    """The 16-bit log-softmax output member (``out_dtype`` the input dtype): bit for bit the exact CPU model under the three
+    temperature forms, the same bits from every configuration kind (R3), a row alone equals the row inside a batch (R2),
+    and the member is torch's RNE conversion of the fp32 row (the fp32 member is untouched by it)."""
+    M = 37
+    x = logits(M, N, dtype)
+    temps = (torch.rand(M, device="cuda") * 1.5 + 0.25).to(dtype)
+    for temp in (None, 0.37, temps):
+        got = flashinfer.sampling.log_softmax(
+            x, temp, batch_invariant=True, out_dtype=dtype
+        )
+        ref = R.lse_reference(x, temp)
+        assert same(got, ref["logprobs_cvt"]), f"temperature {temp!r}"
+        assert same(
+            got,
+            flashinfer.sampling.log_softmax(x, temp, batch_invariant=True).to(dtype),
+        )
+    ref16 = flashinfer.sampling.log_softmax(
+        x, temps, batch_invariant=True, out_dtype=dtype
+    )
+    for cfg in _config_sample(4097, dtype):  # one member of each kind
+        got = log_softmax_batch_invariant(x, temps, out_dtype=dtype, config=cfg)
+        assert same(got, ref16), f"config {cfg.describe()} differs"
+    for i in (0, 17, 36):
+        one = flashinfer.sampling.log_softmax(
+            x[i : i + 1].clone(),
+            temps[i : i + 1],
+            batch_invariant=True,
+            out_dtype=dtype,
+        )
+        assert same(one[0], ref16[i]), f"row {i} differs between M=1 and M={M}"
+
+
+@needs_device
+def test_preallocated_outputs():
+    """Caller-owned output buffers (``out=``, ``lse_out=``): written in place and returned as given, bit for bit the
+    allocating call's values, for every entry and output of the class; the contract (dtype, shape, contiguity, 16-byte
+    alignment of the row outputs) refused rather than copied; the default path refuses them; a CUDA graph captured on
+    caller-owned buffers replays into them for new inputs."""
+    N, M = 4096, 5
+    x = logits(M, N, torch.bfloat16)
+    ids = ids_for(x)
+    temps = torch.rand(M, device="cuda") + 0.5
+    ref_p = flashinfer.sampling.softmax(x, temps, batch_invariant=True)
+    buf = torch.empty_like(x)
+    r = flashinfer.sampling.softmax(x, temps, batch_invariant=True, out=buf)
+    assert r is buf and same(buf, ref_p)
+    ref_l = flashinfer.sampling.log_softmax(x, temps)
+    buf32 = torch.empty(M, N, dtype=torch.float32, device="cuda")
+    assert flashinfer.sampling.log_softmax(x, temps, out=buf32) is buf32
+    assert same(buf32, ref_l)
+    ref_l16 = flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.bfloat16)
+    buf16 = torch.empty_like(x)
+    assert (
+        flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.bfloat16, out=buf16)
+        is buf16
+    )
+    assert same(buf16, ref_l16)
+    ref_t, ref_lse = flashinfer.sampling.log_probs(x, ids, temps, return_lse=True)
+    lpb = torch.empty(M, dtype=torch.float32, device="cuda")
+    lseb = torch.empty(M, dtype=torch.float32, device="cuda")
+    t2, l2 = flashinfer.sampling.log_probs(
+        x, ids, temps, return_lse=True, out=lpb, lse_out=lseb
+    )
+    assert t2 is lpb and l2 is lseb and same(lpb, ref_t) and same(lseb, ref_lse)
+    ids2 = torch.stack([ids, (ids + 1) % N], dim=-1)  # K ids per row
+    lpk = torch.empty(M, 2, dtype=torch.float32, device="cuda")
+    assert flashinfer.sampling.log_probs(x, ids2, temps, out=lpk) is lpk
+    assert same(lpk, flashinfer.sampling.log_probs(x, ids2, temps))
+    # the contract: refused, never copied
+    with pytest.raises(ValueError, match="dtype"):
+        flashinfer.sampling.softmax(x, batch_invariant=True, out=buf32)
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.log_softmax(
+            x, out=torch.empty(M + 1, N, dtype=torch.float32, device="cuda")
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        flashinfer.sampling.log_softmax(
+            x, out=torch.empty(M, 2 * N, dtype=torch.float32, device="cuda")[:, ::2]
+        )
+    with pytest.raises(ValueError, match="aligned"):
+        flashinfer.sampling.log_softmax(
+            x,
+            out=torch.empty(M * N + 1, dtype=torch.float32, device="cuda")[1:].view(
+                M, N
+            ),
+        )
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.log_probs(x, ids, temps, out=lpk)
+    with pytest.raises(ValueError, match="lse_out"):
+        flashinfer.sampling.log_probs(x, ids, temps, lse_out=lseb)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.softmax(x, temps, batch_invariant=False, out=buf)
+    # overlap: an output may not overlap an input (other than the row output aliasing the logits exactly) or another
+    # output -- a partial overlap would read another row's values after a store
+    xf = torch.randn(M, N, device="cuda")
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.log_probs(xf, ids, return_lse=True, lse_out=xf.view(-1)[:M])
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.log_probs(xf, ids, return_lse=True, out=lpb, lse_out=lpb)
+    big = torch.empty(M + 1, N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.softmax(big[:M], batch_invariant=True, out=big[1:])
+    # in place: the row output may be the logits themselves -- every configuration kind gives the out-of-place bits
+    # (each thread writes the elements it read, after reading them)
+    xb = logits(37, 4097, torch.bfloat16)
+    tb = torch.rand(37, device="cuda") * 1.5 + 0.25
+    ref_in = flashinfer.sampling.softmax(xb, tb, batch_invariant=True)
+    for cfg in _config_sample(4097, torch.bfloat16):
+        xc = xb.clone()
+        r = softmax_batch_invariant(xc, tb, config=cfg, out=xc)
+        assert r is xc and same(xc, ref_in), f"in place differs: {cfg.describe()}"
+    xc = xb.clone()
+    assert same(
+        flashinfer.sampling.log_softmax(xc, tb, out_dtype=torch.bfloat16, out=xc),
+        flashinfer.sampling.log_softmax(xb, tb, out_dtype=torch.bfloat16),
+    )
+    xf2 = xb.float()
+    xc = xf2.clone()
+    assert same(
+        flashinfer.sampling.log_softmax(xc, tb, out=xc),
+        flashinfer.sampling.log_softmax(xf2, tb),
+    )
+    # a CUDA graph on caller-owned buffers: the replay writes the new inputs' values into them
+    xin = x.clone()
+    outb = torch.empty_like(x)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flashinfer.sampling.softmax(xin, temps, batch_invariant=True, out=outb)
+        torch.cuda.current_stream().synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            flashinfer.sampling.softmax(xin, temps, batch_invariant=True, out=outb)
+    torch.cuda.synchronize()
+    x2 = logits(M, N, torch.bfloat16, seed=7)
+    xin.copy_(x2)
+    g.replay()
+    torch.cuda.synchronize()
+    assert same(outb, flashinfer.sampling.softmax(x2, temps, batch_invariant=True))
+
+
+@needs_device
+def test_in_place_row_output_at_a_large_shape():
+    """The in-place promise where a partially overlapping buffer corrupted rows in review (570 of 600 at this vocabulary,
+    by scheduling): the row output aliasing the logits exactly gives the out-of-place bits at 512 x 152064 for the softmax
+    and the 16-bit log-softmax, and the one-row-shifted buffer is refused before any launch."""
+    xb = logits(512, N_BIG, torch.bfloat16, seed=2)
+    ref = flashinfer.sampling.softmax(xb, batch_invariant=True)
+    xc = xb.clone()
+    assert flashinfer.sampling.softmax(xc, batch_invariant=True, out=xc) is xc
+    assert same(xc, ref)
+    ref16 = flashinfer.sampling.log_softmax(xb, out_dtype=torch.bfloat16)
+    xc = xb.clone()
+    assert flashinfer.sampling.log_softmax(xc, out_dtype=torch.bfloat16, out=xc) is xc
+    assert same(xc, ref16)
+    big = torch.empty(513, N_BIG, dtype=torch.bfloat16, device="cuda")
+    big[:512] = xb
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.softmax(big[:512], batch_invariant=True, out=big[1:])
+    # no in-place alias when a token gather shares the launch (the generic entry only): the token's logit may lie in a
+    # peer CTA's share that its row output already overwrote
+    x4 = logits(5, 4096, torch.bfloat16)
+    with pytest.raises(ValueError, match="overlap"):
+        lse_row(
+            S.Mode(probs=True, logp=True),
+            x4,
+            token_ids=ids_for(x4),
+            out=x4,
+        )
+
+
+def test_overlap_check_is_skipped_without_buffers():
+    """Without an output buffer the overlap check touches no input (the eager entries that allocate their outputs pay no
+    host time for it); with one, a contiguous tensor's byte range is its element count times the element size, a strided
+    view's the largest offset plus one, and the partial overlap is refused."""
+    from flashinfer.batch_invariant import support as bi_support
+
+    bi_support.check_no_overlap(
+        [("out", None), ("lse_out", None)], [("logits", object()), ("ids", object())]
+    )
+    x = torch.empty(4, 8)
+    assert bi_support.byte_range(x) == (x.data_ptr(), x.data_ptr() + 32 * 4)
+    v = x[:, ::2]
+    assert bi_support.byte_range(v) == (
+        x.data_ptr(),
+        x.data_ptr() + (3 * 8 + 3 * 2 + 1) * 4,
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        bi_support.check_no_overlap([("out", v)], [("x", x)])
+    bi_support.check_no_overlap([("out", x)], [("x", x)], in_place=(("out", "x"),))
 
 
 def test_space_members_are_bounded_in_loads_per_thread():

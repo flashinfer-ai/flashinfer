@@ -24,6 +24,7 @@ from .mxfp4_tuner import (
     _tactic,
     validate_hopper_mxfp4_tactic,
 )
+from .tuner import validate_dispatch_pull
 
 
 MXFP4_STRATEGY_FIELDS = frozenset({"fc2_tail_n8", "fc1_ready_mode", "tail_split_pairs"})
@@ -50,33 +51,15 @@ def _normalize_pull_fields(
     rotate = tactic.get("dispatch_pull_rotate", False)
     if type(compact) is not bool:
         raise ValueError("compact_pull_buffer must be a bool")
-    if type(batch) is not int or not 1 <= batch <= 4:
-        raise ValueError("dispatch_pull_batch must be an int in 1..4")
-    if type(rotate) is not bool:
-        raise ValueError("dispatch_pull_rotate must be a bool")
-    if rotate and core["token_back_mode"] != "epi_warps":
-        # Dispatch-side token-back keeps the unrotated serial pull loop.
-        raise ValueError("dispatch_pull_rotate requires token_back_mode='epi_warps'")
-    if batch > 1:
-        # The batch keeps rows in the idle slots of the 4-slot pull buffer of
-        # the serial epi_warps dispatch path.
-        if compact:
-            raise ValueError(
-                "dispatch_pull_batch > 1 requires compact_pull_buffer=False"
-            )
-        if (
-            core["token_back_mode"] != "epi_warps"
-            or core["dedup_dispatch"]
-            or core["grouped_token_back"]
-        ):
-            raise ValueError(
-                "dispatch_pull_batch > 1 requires token_back_mode='epi_warps' "
-                "without dedup_dispatch / grouped_token_back"
-            )
-        if batch * core["active_dispatch_warps"] > 4:
-            raise ValueError(
-                "dispatch_pull_batch * active_dispatch_warps must not exceed the 4 pull slots"
-            )
+    validate_dispatch_pull(
+        compact_pull_buffer=compact,
+        dispatch_pull_batch=batch,
+        dispatch_pull_rotate=rotate,
+        token_back_mode=core["token_back_mode"],
+        dedup_dispatch=core["dedup_dispatch"],
+        grouped_token_back=core["grouped_token_back"],
+        active_dispatch_warps=core["active_dispatch_warps"],
+    )
     selected = {
         "compact_pull_buffer": compact,
         "dispatch_pull_batch": batch,
