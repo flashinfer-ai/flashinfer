@@ -277,7 +277,13 @@ def test_invalid_table_entries_never_reach_a_gather():
     tbl = inp["sparse_indices"]
     tbl[1, 40:] = 2**31 - 1024  # far out of range
     tbl[9, 100:] = -(2**30)
-    gold = _reference(inp).float()
+    # the fp32 reference gathers unmasked entries clamped only at 0, so give
+    # it a SANITIZED table (masked entries -> -1; they cannot affect the
+    # defined output) while the kernel gets the poisoned one
+    clean_tbl = tbl.clone()
+    clean_tbl[1, 40:] = -1
+    clean_tbl[9, 100:] = -1
+    gold = _reference({**inp, "sparse_indices": clean_tbl}).float()
     assert torch.isfinite(gold).all()
     out = _api(inp, backend="specialized")
     torch.cuda.synchronize()
