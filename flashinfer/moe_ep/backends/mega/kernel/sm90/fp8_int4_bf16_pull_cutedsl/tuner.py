@@ -3,13 +3,13 @@
 """Offline INT4 tuning with the shared Hopper activation/routing workload."""
 
 from ...tuning import finish_sweep, run_tuning as _run_tuning
+from ......weights import MoEWeightPack
 from ..fp8_mxfp4_bf16_pull_cutedsl.tuner import _create_canonical_inputs
+from .weights import preprocess_mega_weights
 
 
 def create_tuning_weights(*, local_experts, hidden, intermediate, rank, device, seed=0):
     import torch
-
-    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import Int4WeightPack
 
     generator = torch.Generator(device=device).manual_seed(0x494E5434 + seed + rank)
 
@@ -32,7 +32,7 @@ def create_tuning_weights(*, local_experts, hidden, intermediate, rank, device, 
 
     w13, s13 = leg(2 * intermediate, hidden)
     w2, s2 = leg(hidden, intermediate)
-    return Int4WeightPack(w13, s13, w2, s2)
+    return MoEWeightPack(w13, w2, s13, s2)
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
@@ -55,7 +55,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
         max_tokens,
         candidates[0],
         create_weights=create_tuning_weights,
-        preprocess_weights=pkg.preprocess_int4_mega_weights,
+        preprocess_weights=preprocess_mega_weights,
         allocate_workspace=pkg.get_symm_buffer_for_hopper_int4_mega_moe,
     )
     try:

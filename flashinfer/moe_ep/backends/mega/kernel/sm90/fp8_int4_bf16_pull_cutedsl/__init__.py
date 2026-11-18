@@ -4,8 +4,16 @@
 
 from .backend import Sm90PullInt4MegaKernelBackend
 from .config import Sm90_Fp8_Int4_Bf16_PullCutedsl_MegaMoeConfig
+from .weights import (
+    TransformedMegaWeights,
+    preprocess_mega_weights,
+    validate_transformed_mega_weights,
+)
 
 __all__ = [
     "Sm90PullInt4MegaKernelBackend",
     "Sm90_Fp8_Int4_Bf16_PullCutedsl_MegaMoeConfig",
+    "TransformedMegaWeights",
+    "preprocess_mega_weights",
+    "validate_transformed_mega_weights",
 ]

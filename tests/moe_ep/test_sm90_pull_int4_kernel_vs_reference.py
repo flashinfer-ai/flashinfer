@@ -36,12 +36,18 @@ def _reference(buffer, legs, n, intermediate, clamp):
     )
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
+
+    def matmul(a, b):
+        return torch.cat(
+            [rs_k32_mm(a[begin : begin + 64], b) for begin in range(0, a.shape[0], 64)]
+        )
+
     try:
         for expert in range(w1.shape[0]):
             token, slot = (buffer.topk_idx[:n] == expert).nonzero(as_tuple=True)
             if token.numel() == 0:
                 continue
-            fc1 = rs_k32_mm(buffer.x[token], w1[expert].T)
+            fc1 = matmul(buffer.x[token], w1[expert].T)
             fc1 *= buffer.x_sf[token, :1]
             gate, up = fc1.split(intermediate, dim=-1)
             hidden = _swiglu_pair_hw_match_cuda(
@@ -51,7 +57,7 @@ def _reference(buffer, legs, n, intermediate, clamp):
             x2, s2 = _quantize_fc2_k64_reference(hidden)
             fc2 = torch.zeros(token.numel(), buffer.hidden, device="cuda")
             for k in range(0, intermediate, 64):
-                partial = rs_k32_mm(x2[:, k : k + 64], w2[expert, :, k : k + 64].T)
+                partial = matmul(x2[:, k : k + 64], w2[expert, :, k : k + 64].T)
                 fc2 = fma_add(fc2, partial, s2[:, k // 64, None])
             terms[token, slot] = fc2.bfloat16()
     finally:
@@ -72,9 +78,9 @@ def test_int4_full_moe_reference_reuse_and_graph(monkeypatch, tile, hidden):
         pytest.skip("requires SM90 and CUDA 12.3+")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.int4_weights import (
-        Int4WeightPack,
-        preprocess_int4_mega_weights,
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_sm90_pull_int4_mega_weights,
     )
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl.staging import (
         stage_mega_moe_inputs,
@@ -94,8 +100,8 @@ def test_int4_full_moe_reference_reuse_and_graph(monkeypatch, tile, hidden):
 
     w1, s1 = raw(2 * intermediate, hidden)
     w2, s2 = raw(hidden, intermediate)
-    transformed = preprocess_int4_mega_weights(
-        Int4WeightPack(w1, s1, w2, s2),
+    transformed = preprocess_sm90_pull_int4_mega_weights(
+        MoEWeightPack(w13=w1, w2=w2, w13_scale=s1, w2_scale=s2),
         hidden_size=hidden,
         intermediate_size=intermediate,
     )

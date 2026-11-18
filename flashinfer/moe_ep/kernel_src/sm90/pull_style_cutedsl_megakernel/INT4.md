@@ -4,6 +4,9 @@ The explicit INT4 frontend reuses the MXFP4 dispatch, scheduling, FP8 WGMMA,
 SwiGLU and BF16 combine pipeline. It accepts E4M3 activations and signed
 INT4 weights with one positive finite BF16 scale per row and K128 group.
 Dequantization is `RN_E4M3_satfinite(RN_BF16(q * scale))`, with no zero point.
+Activations use per-token E4M3 scaling, accumulation uses `1xacc`, and
+combine/output uses BF16. The gate/up clamp defaults to 10; pass
+`gate_up_clamp=None` to disable it when constructing the configuration.
 
 ## Weight contract
 
@@ -36,40 +39,61 @@ uint64 `[E,M/64,K/128,8,8]`. Within each M64 block, row `m` has table index
 The two FP32 unit tensors preserve the shared launcher ABI. Prepared weights
 are specific to this INT4 frontend.
 
-## Explicit launch
+## Public API
+
+Initialize the torch distributed process group and select each rank's CUDA
+device before constructing the layer. Given packed weights and a
+`MoEEpTensors` input bundle:
 
 ```python
-from flashinfer.moe_ep.kernel_src.sm90 import pull_style_cutedsl_megakernel as mega
-from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl.staging import (
-    stage_mega_moe_inputs,
+from flashinfer.moe_ep import (
+    BootstrapConfig,
+    FleetParams,
+    MegaConfig,
+    MoEEpLayer,
+    MoEWeightPack,
+    Sm90_Fp8_Int4_Bf16_PullCutedsl_MegaMoeConfig,
+    preprocess_sm90_pull_int4_mega_weights,
 )
 
-weights = mega.Int4WeightPack(w13, w13_scale, w2, w2_scale)
-fc1, fc2 = mega.preprocess_int4_mega_weights(
+weights = MoEWeightPack(
+    w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale,
+)
+prepared = preprocess_sm90_pull_int4_mega_weights(
     weights, hidden_size=H, intermediate_size=I,
 )
-buffer = mega.get_symm_buffer_for_hopper_int4_mega_moe(
-    E_total, capacity, topk, H, I, rank, world_size,
-    mma_tiler_mnk=(256, 64, 128),
+layer = MoEEpLayer(
+    bootstrap=BootstrapConfig(world_size=world_size, rank=rank, process_group=pg),
+    fleet_params=FleetParams(
+        num_experts=E_total, max_tokens_per_rank=capacity, token_hidden_size=H,
+    ),
+    weights=weights,
+    backend=MegaConfig(
+        megakernel=Sm90_Fp8_Int4_Bf16_PullCutedsl_MegaMoeConfig(
+            intermediate_size=I, top_k=topk,
+        ),
+        preprocess_weights=False,
+        transformed_weights=prepared,
+    ),
 )
 try:
-    stage_mega_moe_inputs(
-        hidden_states, topk_weights, topk_ids,
-        buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-        quantize_input=True,
-    )
-    y = mega.hopper_int4_mega_moe(
-        None, fc1, fc2, buffer, num_tokens=hidden_states.shape[0], sync=True,
-    ).clone()
+    layer.warmup(inputs)
+    layer.stage_inputs(inputs)
+    layer.compute_staged(output=preallocated_bf16_output)
 finally:
-    buffer.destroy()
+    layer.destroy()
 ```
 
-Initialize distributed/NVSHMEM state as for the other SM90 MegaMoE frontends;
-all ranks allocate and launch in the same order. Staging clears inactive rows
-when token counts shrink. The returned output aliases the buffer unless copied.
-For CUDA Graph, construct `hopper_int4_mega_launch_thunk(fc1, fc2, buffer)` on
-the capture stream before capture, then capture calls to that thunk.
+Alternatively, leave `MegaConfig.preprocess_weights=True` and let the layer
+prepare weights once. `layer.forward(inputs)` includes input staging. All
+ranks allocate, launch and destroy in the same order.
+
+The low-level kernel package also exposes
+`get_symm_buffer_for_hopper_int4_mega_moe`, `hopper_int4_mega_moe`, and
+`hopper_int4_mega_launch_thunk`. These use the same prepared weights and
+MXFP4 activation staging. Returned output aliases the symmetric buffer unless
+copied. Construct a launch thunk on the capture stream before CUDA Graph
+capture, and rebuild it after changing the configuration, pointers or stream.
 
 ## Tactic selection and tuning
 
@@ -92,9 +116,6 @@ torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
     --num-experts 256 --topk 8 --max-tokens 128 512 2048 8192
 ```
 
-The high-level backend accepts prequantized
-`MoEWeightPack(w13, w2, w13_scale, w2_scale)` with BF16 K128 scales;
-note its argument order differs from `Int4WeightPack` above.
 The low-level `autotune_hopper_int4_mega_moe(y, fc1, fc2, buffer)` is also
 available. Rebuild any CUDA Graph launch thunk after tuning.
 
@@ -102,3 +123,16 @@ Set `FLASHINFER_MOE_EP_KNOB_CACHE` to choose the cache file. Tune with the
 deployment's GPU, EP size, routing profile and token capacities. The supported
 candidate domain currently requires `fc1_ready_mode="tile"` and
 `fc2_tail_n8=False`.
+
+## Tests
+
+Run the Hopper tests in separate processes from SM100 kernel tests:
+
+```bash
+bash tests/moe_ep/run_tests.sh oracle_sm90_int4
+NPROC_MULTIRANK=2 bash tests/moe_ep/run_tests.sh mega_sm90_int4
+```
+
+The multi-rank suite also supports 4 and 8 ranks. It checks the public raw
+and prepared weight paths, cross-rank and masked routing, workspace reuse,
+and collective CUDA Graph replay against an independent reference.

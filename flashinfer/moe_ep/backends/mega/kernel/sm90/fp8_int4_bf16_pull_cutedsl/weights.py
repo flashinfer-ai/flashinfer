@@ -9,8 +9,9 @@ require the native fused-MoE module. The transforms work on CPU and CUDA.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     import torch
@@ -24,22 +25,6 @@ TransformedWeightLeg = tuple[
     "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"
 ]
 TransformedMegaWeights = tuple[TransformedWeightLeg, TransformedWeightLeg]
-
-
-@dataclass(frozen=True)
-class Int4WeightPack:
-    """Prequantized two's-complement INT4 weights, low nibble first.
-
-    ``w13`` has shape ``[E,2*I,H/2]`` with gate rows followed by up rows;
-    ``w2`` has shape ``[E,H,I/2]``. Both are packed int8/uint8 tensors.
-    Positive finite BF16 scales have shapes ``[E,2*I,H/128]`` and
-    ``[E,H,I/128]``. There is no zero point.
-    """
-
-    w13: "torch.Tensor"
-    w13_scale: "torch.Tensor"
-    w2: "torch.Tensor"
-    w2_scale: "torch.Tensor"
 
 
 def interleave_int4_weights(payload: "torch.Tensor") -> "torch.Tensor":
@@ -114,14 +99,19 @@ def _validate_dimensions(hidden_size: int, intermediate_size: int) -> None:
             raise ValueError(f"{name} must be a positive multiple of 128")
 
 
-def preprocess_int4_mega_weights(
-    weights: Int4WeightPack,
+def preprocess_mega_weights(
+    weights: MoEWeightPack,
     *,
     hidden_size: int,
     intermediate_size: int,
     expert_chunk_size: int = 4,
 ) -> TransformedMegaWeights:
     """Prepare canonical INT4 weights for the fused SM90 launch.
+
+    Input weights use two's-complement INT4 packed low nibble first, with
+    gate rows followed by up rows: ``w13`` is ``[E,2*I,H/2]`` and ``w2``
+    is ``[E,H,I/2]``. Their positive finite BF16 scales are ``[E,2*I,H/128]``
+    and ``[E,H,I/128]``. There is no zero point.
 
     Each returned leg is ``(packed_K_major, register_tables,
     unit_activation_scale, unit_expert_scale)``. The UINT64 tables encode
@@ -130,6 +120,8 @@ def preprocess_int4_mega_weights(
     """
     import torch
 
+    if not isinstance(weights, PrequantizedMoEWeights):
+        raise ValueError("INT4 requires prequantized weights and BF16 K128 scales")
     _validate_dimensions(hidden_size, intermediate_size)
     if expert_chunk_size <= 0:
         raise ValueError("expert_chunk_size must be positive")
@@ -194,11 +186,40 @@ def preprocess_int4_mega_weights(
     return legs[0], legs[1]
 
 
+def validate_transformed_mega_weights(
+    transformed: TransformedMegaWeights,
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    world_size: int,
+    num_experts: int,
+) -> None:
+    """Validate the INT4 packed-K payload and register-table layout."""
+    import torch
+
+    experts = num_experts // world_size
+    for leg, (rows, k) in zip(
+        transformed,
+        ((2 * intermediate_size, hidden_size), (hidden_size, intermediate_size)),
+        strict=True,
+    ):
+        payload, tables, _, _ = leg
+        if (
+            payload.dtype != torch.uint8
+            or tuple(payload.shape) != (experts, k // 2, rows)
+            or payload.stride(1) != 1
+            or tables.dtype != torch.uint64
+            or tuple(tables.shape) != (experts, rows // 64, k // 128, 8, 8)
+            or not tables.is_contiguous()
+        ):
+            raise ValueError("invalid prepared INT4 payload or register-table layout")
+
+
 __all__ = [
-    "Int4WeightPack",
     "TransformedWeightLeg",
     "TransformedMegaWeights",
-    "preprocess_int4_mega_weights",
+    "preprocess_mega_weights",
+    "validate_transformed_mega_weights",
     "interleave_int4_weights",
     "fold_int4_scales",
 ]

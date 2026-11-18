@@ -134,6 +134,7 @@ from .backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl import (
 )
 from .backends.mega.kernel.sm90.fp8_int4_bf16_pull_cutedsl import (
     Sm90_Fp8_Int4_Bf16_PullCutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_int4_mega_weights,
 )
 from .backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl import (
     Nvfp4WeightPack,
@@ -400,6 +401,7 @@ __all__ = [
     "preprocess_sm90_pull_bf16_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_pull_mxfp4_mega_weights",
+    "preprocess_sm90_pull_int4_mega_weights",
     "preprocess_sm90_pull_nvfp4_mega_weights",
     "preprocess_sm90_push_cake_bf16_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",

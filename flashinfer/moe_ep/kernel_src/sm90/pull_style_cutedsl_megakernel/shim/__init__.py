@@ -67,7 +67,6 @@ from .mxfp4_tuner import (
     require_hopper_mxfp4_fused_tuning_device,
     validate_hopper_mxfp4_tactic,
 )
-from .int4_weights import Int4WeightPack, preprocess_int4_mega_weights
 from .hopper_int4 import (
     MegaMoEHopperInt4Config,
     MegaMoEHopperInt4Frontend,
@@ -147,8 +146,6 @@ from .hopper_nvfp4 import (
 )
 
 __all__ = [
-    "Int4WeightPack",
-    "preprocess_int4_mega_weights",
     "MegaMoEHopperInt4Config",
     "MegaMoEHopperInt4Frontend",
     "MegaMoEHopperInt4Inputs",

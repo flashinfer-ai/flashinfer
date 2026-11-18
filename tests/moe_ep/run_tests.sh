@@ -11,6 +11,7 @@
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 4-GPU Hopper MXFP4 accuracy
 #   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
+#   bash tests/moe_ep/run_tests.sh mega_sm90_int4 # 4-GPU Hopper INT4 accuracy + graph replay
 #   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
@@ -22,6 +23,7 @@
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh oracle_sm90   # 1-GPU Hopper sm90 pull FP8 + BF16 vs drop reference
 #   bash tests/moe_ep/run_tests.sh oracle_sm90_mxfp4 # 1-GPU Hopper MXFP4 accuracy
+#   bash tests/moe_ep/run_tests.sh oracle_sm90_int4 # 1-GPU Hopper INT4 conversion + accuracy
 #   bash tests/moe_ep/run_tests.sh oracle_sm107  # 1-GPU Rubin sm107 block-scaled (mxfp8 + nvfp4) vs torch oracle
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #   bash tests/moe_ep/run_tests.sh ft            # 4-GPU fault tolerance (kills a rank)
@@ -138,6 +140,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_bf16_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_nvfp4_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm90_pull_int4_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
@@ -149,6 +152,8 @@ run_unit() {
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_bf16_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm90_int4_conversion.py \
+    --ignore=tests/moe_ep/test_sm90_pull_int4_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm107_kernel_boundaries.py \
     --ignore=tests/moe_ep/test_sm107_genphase_kernel.py \
@@ -335,6 +340,14 @@ run_oracle_sm90_mxfp4() {
     -m arch_hopper
 }
 
+run_oracle_sm90_int4() {
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_int4_conversion.py \
+    tests/moe_ep/test_sm90_pull_int4_kernel_vs_reference.py -v \
+    -m arch_hopper
+}
+
 run_mega() {
   local rc=0
 
@@ -450,6 +463,13 @@ run_mega_sm90_nvfp4() {
   FAIL_ON_DISTRIBUTED_SKIP=1 "${TORCHRUN}" --standalone --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm90_pull_nvfp4_mega_multirank.py -v \
+    -m arch_hopper
+}
+
+run_mega_sm90_int4() {
+  FAIL_ON_DISTRIBUTED_SKIP=1 "${TORCHRUN}" --standalone --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm90_pull_int4_mega_multirank.py -v \
     -m arch_hopper
 }
 
@@ -611,6 +631,7 @@ run_all() {
   run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht
   run_section "mega multirank (Blackwell)" run_mega
   run_section "sm90 NVFP4 accuracy + graph replay (Hopper)" run_mega_sm90_nvfp4
+  run_section "sm90 INT4 accuracy + graph replay (Hopper)" run_mega_sm90_int4
   run_section "smoke scripts" run_smoke
   print_summary
 }
@@ -623,6 +644,7 @@ case "${1:-all}" in
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
   oracle_sm90) run_section "sm90 pull FP8 + BF16 torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
   oracle_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90_mxfp4; print_summary ;;
+  oracle_sm90_int4) run_section "sm90_fp8_int4_bf16_pull_cutedsl conversion + torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90_int4; print_summary ;;
   oracle_sm107) run_section "sm107 block-scaled torch-oracle correctness (1 Rubin GPU)" run_oracle_sm107; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
   comm) run_section "MoEEpCommunication multirank" run_comm; print_summary ;;
@@ -635,6 +657,7 @@ case "${1:-all}" in
   mega_sm90) run_section "sm90 pull FP8 + BF16 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   mega_sm90_nvfp4) run_section "sm90_fp8_nvfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_nvfp4; print_summary ;;
   mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_mxfp4; print_summary ;;
+  mega_sm90_int4) run_section "sm90_fp8_int4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_int4; print_summary ;;
   mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   mega_sm107) run_section "sm107 block-scaled mega multirank (Rubin)" run_mega_sm107; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
@@ -643,7 +666,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm90_int4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm90_int4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

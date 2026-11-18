@@ -46,8 +46,6 @@ from __future__ import annotations
 # is re-exported here so callers (e.g. core runtime) reach it through this
 # public boundary.
 from .shim import (
-    Int4WeightPack,
-    preprocess_int4_mega_weights,
     MegaMoEHopperInt4Config,
     MegaMoEHopperInt4Frontend,
     MegaMoEHopperInt4Inputs,
@@ -189,8 +187,6 @@ def __getattr__(name):  # PEP 562
 
 
 __all__ = [
-    "Int4WeightPack",
-    "preprocess_int4_mega_weights",
     "MegaMoEHopperInt4Config",
     "MegaMoEHopperInt4Frontend",
     "MegaMoEHopperInt4Inputs",

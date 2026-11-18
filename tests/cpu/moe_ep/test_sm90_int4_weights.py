@@ -2,26 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU oracles for INT4 payload permutation and exact FP8 scale tables."""
 
-import importlib.util
-from pathlib import Path
 import struct
+import subprocess
 import sys
 
 import pytest
 import torch
 
+from flashinfer.moe_ep import MoEWeightPack, preprocess_sm90_pull_int4_mega_weights
+from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_int4_bf16_pull_cutedsl import (
+    weights,
+)
+
 
 pytestmark = pytest.mark.cpu_only
-# Avoid importing the mutually exclusive SM90/SM100 kernel trees during CPU CI.
-_SOURCE = (
-    Path(__file__).resolve().parents[3]
-    / "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel"
-    / "shim/int4_weights.py"
-)
-_SPEC = importlib.util.spec_from_file_location("_sm90_int4_weights_cpu", _SOURCE)
-weights = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = weights
-_SPEC.loader.exec_module(weights)
 
 
 def _native_interleave_scalar(payload):
@@ -73,7 +67,29 @@ def _pack():
 
     w13, s13 = leg(256, 256, torch.int8)
     w2, s2 = leg(256, 128, torch.uint8)
-    return weights.Int4WeightPack(w13, s13, w2, s2)
+    return MoEWeightPack(w13, w2, s13, s2)
+
+
+def test_public_preprocessing_does_not_bootstrap_kernel_tree():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "from tests.cpu.moe_ep.test_sm90_int4_weights import _pack; "
+            "from flashinfer.moe_ep import preprocess_sm90_pull_int4_mega_weights; "
+            "preprocess_sm90_pull_int4_mega_weights("
+            "_pack(), hidden_size=256, intermediate_size=128); "
+            "assert not any(n.startswith('flashinfer.moe_ep.kernel_src.sm90') "
+            "for n in sys.modules); "
+            "assert not any('pull_style_cutedsl_megakernel/src' in p "
+            "for p in sys.path)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_scale_tables_rounding_and_paired_row_layout():
@@ -108,8 +124,15 @@ def test_scale_tables_rounding_and_paired_row_layout():
 def test_preprocessing_payload_gate_up_metadata_and_chunking():
     raw = _pack()
     kwargs = dict(hidden_size=256, intermediate_size=128)
-    prepared = weights.preprocess_int4_mega_weights(raw, **kwargs, expert_chunk_size=1)
-    one_chunk = weights.preprocess_int4_mega_weights(raw, **kwargs, expert_chunk_size=4)
+    prepared = preprocess_sm90_pull_int4_mega_weights(
+        raw, **kwargs, expert_chunk_size=1
+    )
+    one_chunk = weights.preprocess_mega_weights(raw, **kwargs, expert_chunk_size=4)
+    weights.validate_transformed_mega_weights(
+        prepared, **kwargs, num_experts=3, world_size=1
+    )
+    with pytest.raises(ValueError, match="prequantized"):
+        preprocess_sm90_pull_int4_mega_weights(MoEWeightPack(raw.w13, raw.w2), **kwargs)
     gate_rows = torch.tensor(
         [
             half * 128 + block * 8 + j
@@ -153,6 +176,6 @@ def test_preprocessing_requires_positive_finite_scales(value):
     raw = _pack()
     raw.w13_scale[0, 0, 0] = value
     with pytest.raises(ValueError, match="finite and positive"):
-        weights.preprocess_int4_mega_weights(
+        preprocess_sm90_pull_int4_mega_weights(
             raw, hidden_size=256, intermediate_size=128
         )
