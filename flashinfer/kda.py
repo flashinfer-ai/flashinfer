@@ -493,7 +493,12 @@ def recurrent_kda(
             returned, and ``ssm_state_indices`` and
             ``output_final_state=True`` are refused. The rows carry no
             ``grad_fn``, also when an input requires grad: the class has no
-            backward.
+            backward. For a backward that reads the forward's states, the
+            stateless call takes ``checkpoint_every_n_tokens=16`` (with
+            optional ``state_checkpoints`` and ``checkpoint_cu_starts``) and
+            returns ``(output, None, state_checkpoints)``: the state before
+            every 16-token chunk of every sequence, bf16 or fp32, in fp32
+            bit for bit the pool's state after that many tokens.
             Requires ``backend="auto"``, bf16 activations, head dim 128,
             ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
@@ -552,6 +557,9 @@ def recurrent_kda(
             output=output,
             beta_is_logit=beta_is_logit,
             backend=backend,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             refused=dict(
                 num_spec_tokens=num_spec_tokens,
                 num_accepted_tokens=num_accepted_tokens,
@@ -559,9 +567,6 @@ def recurrent_kda(
                 initial_state_indices=initial_state_indices,
                 seq_order=seq_order,
                 prefill_workspace=prefill_workspace,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=checkpoint_cu_starts,
-                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                 checkpoint_state_indices=checkpoint_state_indices,
                 disable_state_update=disable_state_update,
                 correction_cache=correction_cache,

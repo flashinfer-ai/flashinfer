@@ -441,3 +441,236 @@ def test_stateless_call_leaves_pool_calls_alone():
     torch.cuda.synchronize()
     assert same_bits(torch.cat(rows, 0), ref)
     assert same_bits(stateless([s], p)[0], ref)
+
+
+def chunk_counts(lens):
+    return [-(-n // 16) for n in lens]
+
+
+def checkpointed(seqs, p, **kw):
+    x, cu = packed(seqs)
+    out, state, ck = recurrent_kda(
+        *x, cu_seqlens=cu, checkpoint_every_n_tokens=16, **p, **kw
+    )
+    torch.cuda.synchronize()
+    assert state is None
+    return out, ck
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "h,lens", [(96, [33, 1, 16, 49]), (12, [33, 1, 16, 250, 15, 64]), (8, [17, 130])]
+)
+def test_checkpoints_are_the_pool_state_at_every_chunk_boundary(h, lens):
+    p = params(h)
+    seqs = make_seqs(lens, h, seed=2700)
+    rows = torch.cat(stateless(seqs, p), 0)
+    total = sum(chunk_counts(lens))
+    f32 = torch.full((total, h, D, D), float("nan"), device="cuda")
+    out, ck = checkpointed(seqs, p, state_checkpoints=f32)
+    assert ck is f32 and same_bits(out[0], rows)
+    row = 0
+    for s, n in zip(seqs, lens, strict=False):
+        for j in range(-(-n // 16)):
+            pool = torch.zeros(1, h, D, D, device="cuda")
+            if j:
+                x = [s[key][None, : 16 * j].contiguous() for key in KEYS]
+                cu = torch.tensor([0, 16 * j], dtype=torch.int64, device="cuda")
+                recurrent_kda(*x, initial_state=pool, cu_seqlens=cu, **p)
+            assert torch.equal(pool[0], f32[row]), (n, j)
+            row += 1
+    out, ck = checkpointed(seqs, p)
+    assert ck.dtype == torch.bfloat16 and ck.shape == f32.shape
+    assert same_bits(out[0], rows) and same_bits(ck, f32.to(torch.bfloat16))
+
+
+@needs_device
+def test_checkpoints_do_not_depend_on_the_batch():
+    h = 8
+    p = params(h)
+    lens = [40, 7, 64, 100]
+    seqs = make_seqs(lens, h, seed=2800)
+    _, ck = checkpointed(seqs, p)
+    parts = ck.split(chunk_counts(lens))
+    for i in (0, 2, 3):
+        assert same_bits(checkpointed([seqs[i]], p)[1], parts[i])
+    _, rev = checkpointed(seqs[::-1], p)
+    for a, b in zip(rev.split(chunk_counts(lens[::-1])), parts[::-1], strict=False):
+        assert same_bits(a, b)
+    same = make_seqs([48, 48, 48], h, seed=2810)
+    x = [torch.stack([s[key] for s in same]) for key in KEYS]
+    out, state, fixed = recurrent_kda(*x, checkpoint_every_n_tokens=16, **p)
+    assert state is None and same_bits(fixed, checkpointed(same, p)[1])
+
+
+@needs_device
+def test_checkpointed_repeat_allocates_nothing_and_writes_only_its_rows():
+    h = 12
+    p = params(h)
+    lens = [100, 33, 7]
+    x, cu = packed(make_seqs(lens, h, seed=2900))
+    counts = chunk_counts(lens)
+    total = sum(counts)
+    starts = torch.tensor(
+        [0] + list(torch.tensor(counts).cumsum(0)), dtype=torch.int64, device="cuda"
+    )
+    ref_rows, _, ref = recurrent_kda(
+        *x, cu_seqlens=cu, checkpoint_every_n_tokens=16, **p
+    )
+    buf = torch.empty_like(x[2])
+    ck = torch.full((total + 2, h, D, D), 7.0, dtype=torch.bfloat16, device="cuda")
+    kw = dict(
+        cu_seqlens=cu,
+        output=buf,
+        state_checkpoints=ck,
+        checkpoint_cu_starts=starts,
+        checkpoint_every_n_tokens=16,
+    )
+    recurrent_kda(*x, **kw, **p)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    version = ck._version
+    out, state, got = recurrent_kda(*x, **kw, **p)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() == before
+    assert out is buf and state is None and got is ck and ck._version > version
+    assert same_bits(buf, ref_rows) and same_bits(ck[:total], ref)
+    assert bool((ck[total:] == 7.0).all())
+
+
+@needs_device
+def test_checkpoint_arguments_are_refused_outside_their_form():
+    h = 8
+    p = params(h)
+    lens = [40, 21]
+    x, cu = packed(make_seqs(lens, h, seed=3000))
+    total = sum(chunk_counts(lens))
+    ck = torch.empty(total, h, D, D, dtype=torch.bfloat16, device="cuda")
+    starts = torch.tensor([0, 3, 5], dtype=torch.int64, device="cuda")
+    shared = torch.empty(total * h * D * D, dtype=torch.bfloat16, device="cuda")
+    cases = [
+        (dict(checkpoint_every_n_tokens=32), "checkpoint_every_n_tokens=32"),
+        (dict(checkpoint_every_n_tokens=64), "checkpoint_every_n_tokens=64"),
+        (dict(state_checkpoints=ck), "without checkpoint_every_n_tokens"),
+        (dict(checkpoint_cu_starts=starts), "without checkpoint_every_n_tokens"),
+        (
+            dict(checkpoint_every_n_tokens=16, state_checkpoints=ck.double()),
+            "state_checkpoints of another shape",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, state_checkpoints=ck[:-1]),
+            "state_checkpoints of another shape",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, state_checkpoints=ck[:, :4]),
+            "state_checkpoints of another shape",
+        ),
+        (
+            dict(
+                checkpoint_every_n_tokens=16,
+                state_checkpoints=ck.clone().requires_grad_(True),
+            ),
+            "state_checkpoints of another shape",
+        ),
+        (
+            dict(
+                checkpoint_every_n_tokens=16,
+                state_checkpoints=shared.view(total, h, D, D),
+                output=shared[: x[2].numel()].view(x[2].shape),
+            ),
+            "state_checkpoints that share memory",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, checkpoint_cu_starts=starts + 1),
+            "checkpoint_cu_starts",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, checkpoint_cu_starts=starts.int()),
+            "checkpoint_cu_starts",
+        ),
+        (
+            dict(
+                checkpoint_every_n_tokens=16,
+                checkpoint_state_indices=torch.arange(
+                    total, dtype=torch.int32, device="cuda"
+                ),
+            ),
+            "checkpoint_state_indices",
+        ),
+    ]
+    for kw, message in cases:
+        with pytest.raises(BatchInvariantUnsupportedError, match=message):
+            recurrent_kda(*x, cu_seqlens=cu, **p, **kw)
+    pool = torch.zeros(2, h, D, D, device="cuda")
+    slots = torch.arange(2, dtype=torch.int32, device="cuda")
+    for kw in (dict(checkpoint_every_n_tokens=16), dict(state_checkpoints=ck)):
+        with pytest.raises(BatchInvariantUnsupportedError, match="with a state pool"):
+            recurrent_kda(
+                *x,
+                cu_seqlens=cu,
+                initial_state=pool,
+                ssm_state_indices=slots,
+                **p,
+                **kw,
+            )
+    torch.cuda.synchronize()
+    assert not bool(pool.any())
+
+
+@needs_device
+def test_checkpoints_feed_the_cudnn_kda_backward():
+    """The cuDNN frontend's KDA backward takes the series in place of its own forward's and returns its gradients."""
+    pytest.importorskip("cudnn")
+    try:
+        from cudnn.linear_attention.ops.kda import kimi_delta_attention
+
+        bwd_op = torch.ops.cudnn.kimi_delta_attention_bwd
+    except (ImportError, AttributeError) as e:
+        pytest.skip(f"this cuDNN frontend has no KDA backward: {e}")
+    h = 8
+    p = params(h)
+    lens = [33, 1, 16, 250, 15, 64]
+    x, cu = packed(make_seqs(lens, h, seed=3100))
+    _, _, ours = recurrent_kda(*x, cu_seqlens=cu, checkpoint_every_n_tokens=16, **p)
+    q, k, v, g, beta = (t[0] for t in x)
+    kw = dict(
+        use_qk_l2norm_in_kernel=True,
+        batch_invariant=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        gate_lower_bound=LB,
+        a_log=p["A_log"],
+        dt_bias=p["dt_bias"],
+    )
+    try:
+        rows, _, theirs = kimi_delta_attention(
+            q, k, v, g, beta, cu, scale=D**-0.5, checkpoint_every_n_tokens=16, **kw
+        )
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"the cuDNN KDA engine does not run here: {e}")
+    assert theirs.dtype == ours.dtype and theirs.shape[0] >= ours.shape[0]
+    pad = theirs.new_zeros(theirs.shape[0] - ours.shape[0], *ours.shape[1:])
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    d_out = torch.randn(rows.shape, device="cuda", generator=gen).to(rows.dtype)
+
+    def backward(checkpoints):
+        return bwd_op(
+            d_out,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            D**-0.5,
+            state_checkpoints=checkpoints,
+            checkpoint_every_n_tokens=16,
+            **kw,
+        )
+
+    for a, b in zip(backward(theirs), backward(torch.cat([ours, pad])), strict=False):
+        if a.numel():
+            a, b = a.float(), b.float()
+            assert bool(torch.isfinite(b).all())
+            assert float((a - b).norm()) <= 1e-2 * float(a.norm())

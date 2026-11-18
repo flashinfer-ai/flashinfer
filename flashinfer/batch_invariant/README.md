@@ -496,6 +496,16 @@ flashinfer.recurrent_kda(
 * One `output` buffer per layer: the next call overwrites it, so a graph that saved its contents must not outlive
   that call (the call bumps the buffer's autograd version, so such a backward raises instead of reading the new rows).
 * It cannot be captured in a CUDA graph (it raises).
+* **What a backward needs from the forward.** `checkpoint_every_n_tokens=16` also returns `state_checkpoints`, the
+  state before every 16-token chunk of every sequence, and the call then returns `(rows, None, state_checkpoints)`. Row
+  zero of a sequence is its (zero) initial state, the next rows the states before tokens 16, 32, ...; a sequence of `n`
+  tokens has `ceil(n / 16)` rows and the sequences follow each other in call order. In fp32 a row is bit for bit the
+  pool's slot after a prefill of that many tokens; in bf16 (the default, and what the cuDNN frontend's KDA backward
+  reads on its `state_checkpoints` port) it is that state rounded. The rows of the call do not change. Pass a
+  `state_checkpoints` buffer (bf16 or fp32 `[rows, HV, 128, 128]`, at least that many rows; further rows are left
+  alone) and `checkpoint_cu_starts` (int64 `[N + 1]`, the running count of rows) to keep the call allocation-free;
+  without them the call allocates both. One row is 32 KB per head in bf16, so 2 KB per head and token. Only 16, and only
+  without a pool.
 * **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
   `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
   differentiable op on the same inputs wrapped in an `autograd.Function` whose forward returns these rows. The
