@@ -444,18 +444,42 @@ def test_replayssm_commit_non_prefix_path(backend):
     )
 
 
-@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8], ids=lambda t: f"T{t}")
-@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+# (T, key heads, value heads): the 8-token tile at its usual ratio, then windows
+# up to 16 at HV/H = 1, 3, 4 and 5 (odd ratios split a key head's value heads).
+_PATH_SHAPES = [(t, 2, 8) for t in (3, 4, 5, 6, 7, 8, 9)] + [
+    (t, h, hv) for t in (12, 16) for h, hv in ((2, 8), (2, 6), (2, 10), (4, 4))
+]
+_PATH_SHAPE_IDS = [f"T{t}-H{h}-HV{hv}" for t, h, hv in _PATH_SHAPES]
+# "auto" picks tcgen05 for T=8..16, so it only adds coverage from T=8 up.
+_PATH_BACKENDS = ["simt", "tcgen05", "auto"]
+
+
+_PATH_PARAMS = [
+    pytest.param(shape, backend, id=f"{shape_id}-{backend}")
+    for shape, shape_id in zip(_PATH_SHAPES, _PATH_SHAPE_IDS, strict=True)
+    for backend in _PATH_BACKENDS
+    if backend != "auto" or shape[0] >= 8
+]
+
+
+def _path_tolerance(backend, steps):
+    """SIMT replays exactly; tcgen05 (and auto from T=8) uses TF32 operands."""
+    simt = backend == "simt" or (backend == "auto" and steps < 8)
+    return (2e-6, 1e-5) if simt else (1e-4, 1e-3)
+
+
+@pytest.mark.parametrize("shape,backend", _PATH_PARAMS)
 @pytest.mark.parametrize("track", [False, True])
-def test_replayssm_commit_path_cycles(steps, backend, track):
+def test_replayssm_commit_path_cycles(shape, backend, track):
+    steps, heads, hv = shape
     if backend == "tcgen05" and not _IS_SM100:
         pytest.skip("tcgen05 commit requires SM100")
     """Every accepted length over a non-prefix path, with null and zero rows."""
     if backend == "tcgen05" and steps < 4:
-        pytest.skip("tcgen commit requires T=4..8")
+        pytest.skip("tcgen commit requires T=4..16")
     counts = list(range(steps + 1)) + [steps, 0]
     batch = len(counts)
-    args, cache = _inputs(batch, steps)
+    args, cache = _inputs(batch, steps, heads, hv)
     # The last request is null (see _inputs); the one before it has the unsorted path.
     paths = _sample_paths(batch, steps, counts, seed=steps).cuda()
     accepts = torch.tensor(counts, device="cuda", dtype=torch.int32)
@@ -512,23 +536,19 @@ def test_replayssm_commit_path_cycles(steps, backend, track):
         backend=backend,
     )
     assert torch.isfinite(checkpoint).all(), "a rejected row reached the checkpoint"
-    torch.testing.assert_close(
-        checkpoint,
-        expected,
-        atol=2e-6 if backend == "simt" else 1e-4,
-        rtol=1e-5 if backend == "simt" else 1e-3,
-    )
+    atol, rtol = _path_tolerance(backend, steps)
+    torch.testing.assert_close(checkpoint, expected, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8], ids=lambda t: f"T{t}")
-@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+@pytest.mark.parametrize("shape,backend", _PATH_PARAMS)
 @pytest.mark.parametrize("batch", [1, 5])
-def test_replayssm_commit_identity_path_is_bitwise_identical(batch, steps, backend):
+def test_replayssm_commit_identity_path_is_bitwise_identical(batch, shape, backend):
+    steps, heads, hv = shape
     if backend == "tcgen05" and not _IS_SM100:
         pytest.skip("tcgen05 commit requires SM100")
     """The no-gather fast path and an explicit identity path must agree exactly."""
     if backend == "tcgen05" and steps < 4:
-        pytest.skip("tcgen commit requires T=4..8")
+        pytest.skip("tcgen commit requires T=4..16")
     identity = (
         torch.arange(steps, device="cuda", dtype=torch.int32)
         .repeat(batch, 1)
@@ -541,7 +561,7 @@ def test_replayssm_commit_identity_path_is_bitwise_identical(batch, steps, backe
     )
     committed = []
     for paths in (None, identity):
-        args, cache = _inputs(batch, steps)
+        args, cache = _inputs(batch, steps, heads, hv)
         gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
         _commit_single(args, cache, accepts, backend, accept_paths=paths)
         committed.append(args["initial_state"].clone())
