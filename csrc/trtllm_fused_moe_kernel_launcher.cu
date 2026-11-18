@@ -6690,10 +6690,9 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
   // driver (GitHub #5322). An explicit tactic names its tile, also one whose config is the tile's
   // default ([tile, -1]), and a DA launch's routing metadata was prepared for its tile, so both
   // keep it. A localized launch has already resolved a config that belongs to its tile.
-  std::vector<int64_t> const tile_order =
-      (config_index[0] == -1 && !is_da_launch && !localized)
-          ? tileFallbackOrder(resolved_tile_N, launchers_map)
-          : std::vector<int64_t>{resolved_tile_N};
+  std::vector<int64_t> const tile_order = (config_index[0] == -1 && !is_da_launch && !localized)
+                                              ? tileFallbackOrder(resolved_tile_N, launchers_map)
+                                              : std::vector<int64_t>{resolved_tile_N};
   for (size_t attempt = 0; attempt < tile_order.size(); ++attempt) {
     int64_t const tile_N = tile_order[attempt];
 
