@@ -29,17 +29,20 @@ key scale.
 Keys and queries are random. The select's thresholds are each row's
 ``top_k * (1 + --slack)``-th largest score, estimated from a key sample sized so
 that the threshold is the ``--sample-rank``-th largest sampled score at every
-context. A row rarely misses, so the times are of the select, not the repair.
-A context skips the select when it is too short to sample enough keys before
+context. At the defaults a row rarely misses, so the times are of the select,
+not the repair; each select line reports the share of rows that repaired. A
+context skips the select when it is too short to sample enough keys before
 the first row's end, or when the first row would expect fewer than
 ``top_k * (1 + --slack / 2)`` keys above its threshold, since the early rows
 would then repair. Each timed select call first restores the thresholds and
 zeroes the counters, and the select times include these two small copies.
 
-Times are GPU kernel times from ``bench_gpu_time`` (CUPTI, or CUDA events when
-CUPTI is missing; ``--no-cupti`` forces events), with a cold L2, after a
-warm-up call that compiles the kernels. The bandwidth column counts the key
-bytes (and NVFP4 scales) read once per request.
+Times come from ``bench_gpu_time``, with a cold L2, after a warm-up call that
+compiles the kernels. With CUPTI they span the call's GPU activity; without it,
+or with ``--no-cupti``, they are CUDA-event elapsed times, which can include
+launch overhead. The bandwidth column counts each request's key bytes (and
+NVFP4 scales) once. The select's 128-row tiles each read the keys up to their
+rows' ends, so for the select it is unique-key throughput, not bytes read.
 
 Usage::
 
@@ -134,12 +137,12 @@ def select_fits(context: int, args) -> bool:
     # The threshold admits top_k * (1 + slack) of the context's keys, and a row
     # ending at key e expects e / context of them.
     expected = args.top_k * (1 + args.slack) * first / context
-    return args.sample_rank <= sample_size(
-        context, args
-    ) <= first and expected >= args.top_k * (1 + args.slack / 2)
+    fits = args.sample_rank <= sample_size(context, args) <= first
+    return fits and expected >= args.top_k * (1 + args.slack / 2)
 
 
-def bench_select(fmt: str, context: int, args) -> float:
+def bench_select(fmt: str, context: int, args) -> tuple[float, float]:
+    """The select's time in µs, and the share of rows that repaired."""
     rows, top_k = args.select_rows, args.top_k
     key_cache, key_scales, table = paged_keys(fmt, 1, context)
     query, query_scales = make_rows(fmt, rows)
@@ -156,6 +159,7 @@ def bench_select(fmt: str, context: int, args) -> float:
     sampled = as_float(sampled, None if key_scales is None else key_scales[page, row])
     sample_scores = as_float(query, query_scales) @ sampled.T
     requested = sample_scores.topk(args.sample_rank, 1).values[:, -1]
+    del sampled, sample_scores  # 2 GiB at 1M keys; not needed while timing
     thresholds = requested.clone()
     counters = torch.zeros(rows, 2, dtype=torch.int32, device="cuda")
     # Room for twice the targeted top_k * (1 + slack) candidates, so that only
@@ -189,7 +193,10 @@ def bench_select(fmt: str, context: int, args) -> float:
             score_scale=scale,
         )
 
-    return time_us(run, args)
+    us = time_us(run, args)
+    # The repair writes a new threshold to each row it repairs.
+    repaired = (thresholds != requested).float().mean().item()
+    return us, repaired
 
 
 def main() -> None:
@@ -199,7 +206,9 @@ def main() -> None:
     )
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--batch", type=int, default=8, help="decode requests")
-    parser.add_argument("--formats", nargs="+", default=["bf16", "fp8", "nvfp4"])
+    parser.add_argument(
+        "--formats", nargs="+", choices=tuple(KEY_BYTES), default=list(KEY_BYTES)
+    )
     parser.add_argument("--select-rows", type=int, default=1024)
     parser.add_argument("--top-k", type=int, default=2048)
     parser.add_argument(
@@ -211,10 +220,14 @@ def main() -> None:
     parser.add_argument("--slack", type=float, default=0.25)
     parser.add_argument("--no-cupti", action="store_true")
     args = parser.parse_args()
-    if args.select_rows % 128:
-        parser.error("--select-rows must be a multiple of 128")
+    if args.select_rows < 128 or args.select_rows % 128:
+        parser.error("--select-rows must be a positive multiple of 128")
+    if args.top_k < 1:
+        parser.error("--top-k must be positive")
     if args.sample_rank < 1:
         parser.error("--sample-rank must be positive")
+    if not 0 <= args.slack < math.inf:
+        parser.error("--slack must be finite and nonnegative")
 
     torch.manual_seed(0)
     major, minor = torch.cuda.get_device_capability()
@@ -224,11 +237,13 @@ def main() -> None:
         formats = [f for f in formats if f != "fp8"]
         print("FP8 needs SM89 or newer: skipped")
     print(f"{torch.cuda.get_device_name()} (SM{major}{minor})")
-    print(f"{'op':<8} {'format':<6} {'rows':>5} {'context':>8} {'us':>10} {'GB/s':>8}")
+    header = f"{'op':<8} {'format':<6} {'rows':>5} {'context':>8} {'us':>10}"
+    print(f"{header} {'GB/s':>8} {'repaired':>9}")
 
-    def report(op: str, fmt: str, rows: int, context: int, us: float, reads: int):
+    def report(op, fmt, rows, context, us, reads, repaired=""):
         gbps = reads * context * KEY_BYTES[fmt] / us / 1e3
-        print(f"{op:<8} {fmt:<6} {rows:>5} {context:>8} {us:>10.1f} {gbps:>8.0f}")
+        line = f"{op:<8} {fmt:<6} {rows:>5} {context:>8} {us:>10.1f} {gbps:>8.0f}"
+        print(f"{line} {repaired:>9}")
 
     for context in args.contexts:
         for rows in args.rows:
@@ -245,8 +260,8 @@ def main() -> None:
             print(f"select at context {context}: skipped, too short")
             continue
         for fmt in formats:
-            us = bench_select(fmt, context, args)
-            report("select", fmt, args.select_rows, context, us, 1)
+            us, repaired = bench_select(fmt, context, args)
+            report("select", fmt, args.select_rows, context, us, 1, f"{repaired:.1%}")
             torch.cuda.empty_cache()
 
 
