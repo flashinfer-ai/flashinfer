@@ -278,7 +278,7 @@ _TAIL_SPLIT_P3 = {"sm_100a": (24, None), "sm_103a": (24, 64)}
 #: launches the build without PDL; otherwise it launches ``attention_sd_tsplit`` with
 #: PDL, which is then as fast or faster.  The other builds, and every build after the
 #: other quantizers, keep PDL.
-_TAIL_SPLIT_P3_SERIAL = {"sm_100a": (4, 3)}
+_TAIL_SPLIT_P3_SERIAL = {"sm_100a": (3, 3)}
 #: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
 #: next tile runs) and, per architecture, the band of selected blocks a row
 #: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
