@@ -14,6 +14,7 @@
 Q/K use packed E2M1 with four UE8M0 scales per token. Two math warp groups
 process adjacent KV blocks; UMMA owns the KV/scale pipeline. Per-row bounds
 mask the epilogue, whose output type is FP16, BF16 or FP32."""
+
 from .. import memory as indexer_memory
 from .. import tensor_utils as indexer_tensor_utils
 from ..packed import fma_packed_f32x2 as indexer_fma_packed_f32x2
@@ -21,8 +22,6 @@ from ..packed import add_packed_f32x2 as indexer_add_packed_f32x2
 from ..ordering import PipelineTmaAsync as IndexerPipelineTmaAsync
 
 from ..pdl import pdl_prologue
-import argparse
-import functools
 import math
 
 import cuda.bindings.driver as cuda
@@ -30,26 +29,21 @@ import cutlass
 from .subset_barrier import subset_barrier
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-import torch
-from cutlass import Float4E2M1FN, Float8E8M0FNU, testing
+from cutlass import Float8E8M0FNU
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ..mqa_logits_util import (
-    align,
-    calc_diff,
-    KernelLaunch,
     ld_shared_b32,
     st_shared_b32,
 )
 
 # CuTe DSL expects rounding modes as string literals.
-from .selection import emit, sample_tile, publish_private, select, select_candidates, propose
+from .selection import sample_tile, propose
 
 _RND_RN = "rn"
 
@@ -91,6 +85,8 @@ class FP4PrefillMQALogitsKernel:
     Two math warp groups share Q and process adjacent KV blocks. UMMA consumes
     UE8M0 scales through UTCCP; the epilogue uses the scaled accumulator."""
 
+    supported_splits = (1, 4, 8)
+
     def __init__(
         self,
         block_kv: int = 128,
@@ -129,9 +125,13 @@ class FP4PrefillMQALogitsKernel:
         assert input_dtype in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN)
         self.input_dtype = input_dtype
         self.native_lowp = bool(native_bf16 or native_fp16)
+        self.native_dtype = cutlass.Float16 if native_fp16 else cutlass.BFloat16
         assert not (native_bf16 and native_fp16)
-        assert not native_fp16 or output_dtype == cutlass.Float16
-        assert not self.native_lowp or (num_heads in (4, 32, 64) and output_dtype == (cutlass.Float16 if native_fp16 else cutlass.BFloat16) and epi_dtype == cutlass.Float32 and not use_relu_trick)
+        assert not self.native_lowp or (
+            num_heads in (4, 32, 64)
+            and epi_dtype == cutlass.Float32
+            and not use_relu_trick
+        )
         assert num_heads in (4, 32, 64), "prefill recovery supports H4/H64"
         assert head_dim == 128, "FP4 kernel hardcodes head_dim=128"
         assert epi_dtype in (
@@ -145,7 +145,10 @@ class FP4PrefillMQALogitsKernel:
             cutlass.Float16,
         ), f"FP4 output_dtype must be fp32/bf16/fp16; got {output_dtype}"
         assert block_kv == 128, "FP4 compute tile (block_kv) hardcoded to 128"
-        assert mode=="recover" and splits in (1,4,8) and epi_dtype==cutlass.Float32
+        if splits not in self.supported_splits:
+            raise ValueError(f"recovery splits must be one of {self.supported_splits}")
+        if mode != "recover" or epi_dtype != cutlass.Float32:
+            raise ValueError("recovery requires mode='recover' and FP32 epilogue")
         self.mode, self.top_k, self.capacity = mode, top_k, capacity
         self.splits, self.packed = splits, packed
         self.sample_size = sample_size
@@ -159,8 +162,10 @@ class FP4PrefillMQALogitsKernel:
         # Rubin (SM107/109): TMEM = 576/832 cols; N=256 fits with room to spare.
         is_rubin = _target_is_rubin()
         self.block_q = (256 if is_rubin else 128) // num_heads
-        if mode=='filter' and (self.block_q!=2 or splits!=1):
-            raise ValueError('two-warp prefill publisher requires block_q=2 and splits=1')
+        if mode == "filter" and (self.block_q != 2 or splits != 1):
+            raise ValueError(
+                "two-warp prefill publisher requires block_q=2 and splits=1"
+            )
         self.N = self.block_q * num_heads  # 128 on Blackwell, 256 on Rubin
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
@@ -329,11 +334,8 @@ class FP4PrefillMQALogitsKernel:
             f"({_mma_inst_tile_k_for_sf})"
         )
         self.sf_k_step = _sf_kmode_size // _mma_inst_tile_k_for_sf
-        # Compute the SF TMEM column count directly from the instruction layout.
-        # `cute.cosize(tmem_layout)` returns the stride span (huge), not the
-        # actual TMEM cell count, so we don't use it here.
-        # SFA cols = UMMA_M / sf_atom_mn * (head_dim / UMMA_K)
-        # SFB cols = N_padded / sf_atom_mn * (head_dim / UMMA_K)
+        # Derive SF TMEM columns from instruction dimensions;
+        # cute.cosize reports the stride span, not the occupied cell count.
         sf_atom_mn = 32  # BlockScaledBasicChunk M atom
         mma_inst_tile_k = self.head_dim // self.umma_inst_k  # 128/64 = 2
         N_padded = ((self.N + 127) // 128) * 128
@@ -550,8 +552,10 @@ class FP4PrefillMQALogitsKernel:
         )
 
         num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
-        num_ctas = min(num_q_blocks,max(1,self.num_sms//self.splits))*self.splits
-        if cutlass.const_expr(self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)):
+        num_ctas = min(num_q_blocks, max(1, self.num_sms // self.splits)) * self.splits
+        if cutlass.const_expr(
+            self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)
+        ):
             num_ctas = min(num_q_blocks, self.num_sms) * self.splits
 
         @cute.struct
@@ -580,7 +584,13 @@ class FP4PrefillMQALogitsKernel:
             logits,
             cu_seq_len_k_start,
             cu_seq_len_k_end,
-            thresholds, counts, candidates, output, recovery_counters, recovery_queue, recovery_sample_info,
+            thresholds,
+            counts,
+            candidates,
+            output,
+            recovery_counters,
+            recovery_queue,
+            recovery_sample_info,
             num_q_tokens,
             num_q_blocks,
             num_kv_tokens,
@@ -602,10 +612,11 @@ class FP4PrefillMQALogitsKernel:
         ).launch(
             grid=(1, 1, num_ctas),
             block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 8),
+            cluster=(*self.cluster_shape_mn, 16 if self.splits == 16 else 8),
             stream=stream,
             min_blocks_per_mp=1,
-        use_pdl=self.pdl)
+            use_pdl=self.pdl,
+        )
 
     @cute.kernel
     def kernel(
@@ -651,100 +662,266 @@ class FP4PrefillMQALogitsKernel:
         SharedStorage: cutlass.Constexpr,
     ):
         pdl_prologue(self.pdl)
-        task_splits=cutlass.Int32(8)
-        split_shift=cutlass.Int32(3)
-        tid=cute.arch.thread_idx()[0]
-        partition=cute.arch.block_idx()[2] & (task_splits-1)
-        slot=cute.arch.block_idx()[2]>>split_shift
-        queue_count=recovery_queue[0]
-        smem=indexer_memory.SmemAllocator()
-        hist=smem.allocate_tensor(cutlass.Int32,cute.make_layout(1538),byte_alignment=128)
-        scalar=smem.allocate_tensor(cutlass.Int32,cute.make_layout(2),byte_alignment=16)
-        recovery_samples=smem.allocate_tensor(cutlass.Float32,cute.make_layout(768),byte_alignment=128)
-        last=smem.allocate_tensor(cutlass.Int32,cute.make_layout(1),byte_alignment=16)
-        holding=smem.allocate_tensor(cutlass.Int32,cute.make_layout(1),byte_alignment=16)
-        if slot<queue_count:
-            task_allocator=indexer_memory.TmemAllocator(
+        task_splits = cutlass.Int32(8)
+        split_shift = cutlass.Int32(3)
+        tid = cute.arch.thread_idx()[0]
+        partition = cute.arch.block_idx()[2] & (task_splits - 1)
+        slot = cute.arch.block_idx()[2] >> split_shift
+        queue_count = recovery_queue[0]
+        smem = indexer_memory.SmemAllocator()
+        hist = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(1538), byte_alignment=128
+        )
+        scalar = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(2), byte_alignment=16
+        )
+        recovery_samples = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout(768), byte_alignment=128
+        )
+        last = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(1), byte_alignment=16
+        )
+        holding = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(1), byte_alignment=16
+        )
+        if slot < queue_count:
+            task_allocator = indexer_memory.TmemAllocator(
                 holding.iterator,
-                barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=15,num_threads=384),
-                allocator_warp_id=0,is_two_cta=False,arch=self.arch_str)
+                barrier_for_retrieve=pipeline.NamedBarrier(
+                    barrier_id=15, num_threads=384
+                ),
+                allocator_warp_id=0,
+                is_two_cta=False,
+                arch=self.arch_str,
+            )
             task_allocator.allocate(self.num_tmem_alloc_cols_total)
             task_allocator.wait_for_alloc()
-            task_tmem_ptr=task_allocator.retrieve_ptr(self.acc_dtype)
-            while slot<queue_count:
-                task=recovery_queue[slot+1]
-                row_base=task*self.block_q
-                delta=cutlass.Int64((cute.arch.block_idx()[2]//8)*self.block_q-row_base)
-                task_logits=cute.make_tensor(mLogits.iterator+delta*mLogits.stride[0],mLogits.layout)
-                task_candidates=cute.make_tensor(candidates.iterator+delta*candidates.stride[0],candidates.layout)
-                if tid<self.block_q:
-                    init_row=row_base+tid
-                    if init_row<num_q_tokens:
-                        for bank in cutlass.range(partition,8,task_splits):
-                            task_candidates[init_row,bank]=cutlass.Int64(0)
+            task_tmem_ptr = task_allocator.retrieve_ptr(self.acc_dtype)
+            while slot < queue_count:
+                task = recovery_queue[slot + 1]
+                row_base = task * self.block_q
+                delta = cutlass.Int64(
+                    (cute.arch.block_idx()[2] // 8) * self.block_q - row_base
+                )
+                task_logits = cute.make_tensor(
+                    mLogits.iterator + delta * mLogits.stride[0], mLogits.layout
+                )
+                task_candidates = cute.make_tensor(
+                    candidates.iterator + delta * candidates.stride[0],
+                    candidates.layout,
+                )
+                if tid < self.block_q:
+                    init_row = row_base + tid
+                    if init_row < num_q_tokens:
+                        for bank in cutlass.range(partition, 8, task_splits):
+                            task_candidates[init_row, bank] = cutlass.Int64(0)
                 cute.arch.fence_acq_rel_gpu()
-                subset_barrier(barrier_id=14,number_of_threads=384)
-                first=mCuSeqLenKStart[row_base]
-                for token in cutlass.range_constexpr(1,self.block_q):
-                    first=min(first,mCuSeqLenKStart[min(num_q_tokens-1,row_base+token)])
-                last_row=min(num_q_tokens-1,row_base+self.block_q-1)
-                lo=(first//256)*2+partition*2
-                hi=(mCuSeqLenKEnd[last_row]+127)//128
-                if lo<hi:
-                    self._gemm_body(tiled_mma, tma_atom_a, mA_mkl, tma_atom_b, mB_nkl, tma_atom_w, mW_tma, tma_atom_sf_kv, mSF_KV_tma, tma_atom_sf_q, mSF_Q_tma, task_logits, mCuSeqLenKStart, mCuSeqLenKEnd, thresholds, counts, task_candidates, output, num_q_tokens, task+1, num_kv_tokens, cluster_layout_vmnk, a_smem_layout_staged, a_tma_smem_layout, b_smem_layout_staged, w_smem_layout_staged, sf_kv_smem_layout_staged, sf_q_smem_layout_staged, sf_q_tma_smem_layout_staged, tmem_sfa_layout, tmem_sfb_layout, sfa_chunk_smem_layout, sfb_chunk_smem_layout, copy_atom_s2t, epi_tile, task,partition,task_splits,task_tmem_ptr,recovery_sample_info,SharedStorage)
+                subset_barrier(barrier_id=14, number_of_threads=384)
+                first = mCuSeqLenKStart[row_base]
+                for token in cutlass.range_constexpr(1, self.block_q):
+                    first = min(
+                        first, mCuSeqLenKStart[min(num_q_tokens - 1, row_base + token)]
+                    )
+                last_row = min(num_q_tokens - 1, row_base + self.block_q - 1)
+                lo = (first // 256) * 2 + partition * 2
+                hi = (mCuSeqLenKEnd[last_row] + 127) // 128
+                if lo < hi:
+                    self._gemm_body(
+                        tiled_mma,
+                        tma_atom_a,
+                        mA_mkl,
+                        tma_atom_b,
+                        mB_nkl,
+                        tma_atom_w,
+                        mW_tma,
+                        tma_atom_sf_kv,
+                        mSF_KV_tma,
+                        tma_atom_sf_q,
+                        mSF_Q_tma,
+                        task_logits,
+                        mCuSeqLenKStart,
+                        mCuSeqLenKEnd,
+                        thresholds,
+                        counts,
+                        task_candidates,
+                        output,
+                        num_q_tokens,
+                        task + 1,
+                        num_kv_tokens,
+                        cluster_layout_vmnk,
+                        a_smem_layout_staged,
+                        a_tma_smem_layout,
+                        b_smem_layout_staged,
+                        w_smem_layout_staged,
+                        sf_kv_smem_layout_staged,
+                        sf_q_smem_layout_staged,
+                        sf_q_tma_smem_layout_staged,
+                        tmem_sfa_layout,
+                        tmem_sfb_layout,
+                        sfa_chunk_smem_layout,
+                        sfb_chunk_smem_layout,
+                        copy_atom_s2t,
+                        epi_tile,
+                        task,
+                        partition,
+                        task_splits,
+                        task_tmem_ptr,
+                        recovery_sample_info,
+                        SharedStorage,
+                    )
                 cute.arch.fence_acq_rel_gpu()
-                subset_barrier(barrier_id=14,number_of_threads=384)
-                if tid==0:
-                    prior=cute.arch.atomic_add((recovery_counters.iterator+task).llvm_ptr,cutlass.Int32(1),sem='acq_rel',scope='gpu')
-                    cute.arch.atomic_exch(last.iterator.llvm_ptr,cutlass.Int32(prior==task_splits-1),sem='release',scope='cta')
+                subset_barrier(barrier_id=14, number_of_threads=384)
+                if tid == 0:
+                    prior = cute.arch.atomic_add(
+                        (recovery_counters.iterator + task).llvm_ptr,
+                        cutlass.Int32(1),
+                        sem="acq_rel",
+                        scope="gpu",
+                    )
+                    cute.arch.atomic_exch(
+                        last.iterator.llvm_ptr,
+                        cutlass.Int32(prior == task_splits - 1),
+                        sem="release",
+                        scope="cta",
+                    )
                 # Dedicated full-CTA publication and reader-retirement phases.
                 # Keep the shared decision immutable until every warp snapshots it.
-                cute.arch.barrier(barrier_id=4,number_of_threads=384)
+                cute.arch.barrier(barrier_id=4, number_of_threads=384)
                 cute.arch.fence_acq_rel_gpu()
-                decision=cutlass.Int32(0)
-                if cute.arch.lane_idx()==0:decision=cute.arch.atomic_add(last.iterator.llvm_ptr,cutlass.Int32(0),sem='acquire',scope='cta')
-                is_last=cute.arch.shuffle_sync(decision,0)!=0
-                cute.arch.barrier(barrier_id=4,number_of_threads=384)
+                decision = cutlass.Int32(0)
+                if cute.arch.lane_idx() == 0:
+                    decision = cute.arch.atomic_add(
+                        last.iterator.llvm_ptr,
+                        cutlass.Int32(0),
+                        sem="acquire",
+                        scope="cta",
+                    )
+                is_last = cute.arch.shuffle_sync(decision, 0) != 0
+                cute.arch.barrier(barrier_id=4, number_of_threads=384)
                 if is_last:
-                    if tid<256:
+                    if tid < 256:
                         if cutlass.const_expr(self.num_heads == 64):
                             for offset in cutlass.range_constexpr(self.block_q):
-                                row=row_base+offset
-                                if row<num_q_tokens:
-                                    required=min(self.top_k,mCuSeqLenKEnd[row]-mCuSeqLenKStart[row])
-                                    if counts[row]<required:
-                                        finish_recovery(row,tid,task_candidates,counts,mCuSeqLenKStart,mCuSeqLenKEnd,task_logits,hist,scalar,output,thresholds,self.top_k,self.capacity,self.output_dtype,self.packed,recovery_samples)
+                                row = row_base + offset
+                                if row < num_q_tokens:
+                                    required = min(
+                                        self.top_k,
+                                        mCuSeqLenKEnd[row] - mCuSeqLenKStart[row],
+                                    )
+                                    if counts[row] < required:
+                                        finish_recovery(
+                                            row,
+                                            tid,
+                                            task_candidates,
+                                            counts,
+                                            mCuSeqLenKStart,
+                                            mCuSeqLenKEnd,
+                                            task_logits,
+                                            hist,
+                                            scalar,
+                                            output,
+                                            thresholds,
+                                            self.top_k,
+                                            self.capacity,
+                                            self.output_dtype,
+                                            self.packed,
+                                            recovery_samples,
+                                        )
                         else:
                             for offset in cutlass.range(self.block_q):
-                                row=row_base+offset
-                                if row<num_q_tokens:
-                                    required=min(self.top_k,mCuSeqLenKEnd[row]-mCuSeqLenKStart[row])
-                                    if counts[row]<required:
-                                        finish_recovery(row,tid,task_candidates,counts,mCuSeqLenKStart,mCuSeqLenKEnd,task_logits,hist,scalar,output,thresholds,self.top_k,self.capacity,self.output_dtype,self.packed,recovery_samples)
-                    subset_barrier(barrier_id=14,number_of_threads=384)
-                    if tid==0:recovery_counters[task]=0
-                subset_barrier(barrier_id=14,number_of_threads=384)
+                                row = row_base + offset
+                                if row < num_q_tokens:
+                                    required = min(
+                                        self.top_k,
+                                        mCuSeqLenKEnd[row] - mCuSeqLenKStart[row],
+                                    )
+                                    if counts[row] < required:
+                                        finish_recovery(
+                                            row,
+                                            tid,
+                                            task_candidates,
+                                            counts,
+                                            mCuSeqLenKStart,
+                                            mCuSeqLenKEnd,
+                                            task_logits,
+                                            hist,
+                                            scalar,
+                                            output,
+                                            thresholds,
+                                            self.top_k,
+                                            self.capacity,
+                                            self.output_dtype,
+                                            self.packed,
+                                            recovery_samples,
+                                        )
+                    subset_barrier(barrier_id=14, number_of_threads=384)
+                    if tid == 0:
+                        recovery_counters[task] = 0
+                subset_barrier(barrier_id=14, number_of_threads=384)
                 # All eight CTAs finish consuming this task before the
                 # cluster reuses its fixed Q2 scratch for the next queued task.
                 # Hardware clusters guarantee scheduling; no software spin.
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
-                slot=slot+cute.arch.grid_dim()[2]//8
-            subset_barrier(barrier_id=14,number_of_threads=384)
+                slot = slot + cute.arch.grid_dim()[2] // 8
+            subset_barrier(barrier_id=14, number_of_threads=384)
             task_allocator.free(task_tmem_ptr)
-            subset_barrier(barrier_id=14,number_of_threads=384)
-        if cute.arch.warp_idx()==0:
+            subset_barrier(barrier_id=14, number_of_threads=384)
+        if cute.arch.warp_idx() == 0:
             cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
 
     @cute.jit
-    def _gemm_body(self, tiled_mma: cute.TiledMma, tma_atom_a: cute.CopyAtom, mA_mkl: cute.Tensor, tma_atom_b: cute.CopyAtom, mB_nkl: cute.Tensor, tma_atom_w: cute.CopyAtom, mW_tma: cute.Tensor, tma_atom_sf_kv: cute.CopyAtom, mSF_KV_tma: cute.Tensor, tma_atom_sf_q: cute.CopyAtom, mSF_Q_tma: cute.Tensor, mLogits: cute.Tensor, mCuSeqLenKStart: cute.Tensor, mCuSeqLenKEnd: cute.Tensor, thresholds: cute.Tensor, counts: cute.Tensor, candidates: cute.Tensor, output: cute.Tensor, num_q_tokens: cutlass.Int32, num_q_blocks: cutlass.Int32, num_kv_tokens: cutlass.Int32, cluster_layout_vmnk: cute.Layout, a_smem_layout_staged: cute.ComposedLayout, a_tma_smem_layout: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout, w_smem_layout_staged: cute.Layout, sf_kv_smem_layout_staged: cute.Layout, sf_q_smem_layout_staged: cute.Layout, sf_q_tma_smem_layout_staged: cute.Layout, tmem_sfa_layout: cute.Layout, tmem_sfb_layout: cute.Layout, sfa_chunk_smem_layout: cute.Layout, sfb_chunk_smem_layout: cute.Layout, copy_atom_s2t: cute.CopyAtom, epi_tile: cute.Tile, task_q_block: cutlass.Int32, task_partition: cutlass.Int32, task_splits: cutlass.Int32, task_tmem_ptr: cute.Pointer, recovery_sample_info: cute.Tensor, SharedStorage: cutlass.Constexpr):
+    def _gemm_body(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mkl: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nkl: cute.Tensor,
+        tma_atom_w: cute.CopyAtom,
+        mW_tma: cute.Tensor,
+        tma_atom_sf_kv: cute.CopyAtom,
+        mSF_KV_tma: cute.Tensor,
+        tma_atom_sf_q: cute.CopyAtom,
+        mSF_Q_tma: cute.Tensor,
+        mLogits: cute.Tensor,
+        mCuSeqLenKStart: cute.Tensor,
+        mCuSeqLenKEnd: cute.Tensor,
+        thresholds: cute.Tensor,
+        counts: cute.Tensor,
+        candidates: cute.Tensor,
+        output: cute.Tensor,
+        num_q_tokens: cutlass.Int32,
+        num_q_blocks: cutlass.Int32,
+        num_kv_tokens: cutlass.Int32,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        a_tma_smem_layout: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+        w_smem_layout_staged: cute.Layout,
+        sf_kv_smem_layout_staged: cute.Layout,
+        sf_q_smem_layout_staged: cute.Layout,
+        sf_q_tma_smem_layout_staged: cute.Layout,
+        tmem_sfa_layout: cute.Layout,
+        tmem_sfb_layout: cute.Layout,
+        sfa_chunk_smem_layout: cute.Layout,
+        sfb_chunk_smem_layout: cute.Layout,
+        copy_atom_s2t: cute.CopyAtom,
+        epi_tile: cute.Tile,
+        task_q_block: cutlass.Int32,
+        task_partition: cutlass.Int32,
+        task_splits: cutlass.Int32,
+        task_tmem_ptr: cute.Pointer,
+        recovery_sample_info: cute.Tensor,
+        SharedStorage: cutlass.Constexpr,
+    ):
         smem = indexer_memory.SmemAllocator()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        bidx, bidy, bidz = cute.arch.block_idx()
-        bidz=task_q_block*task_splits+task_partition
+        bidx, bidy, _bidz = cute.arch.block_idx()
+
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
@@ -796,7 +973,8 @@ class FP4PrefillMQALogitsKernel:
             _part=task_partition,
             _sample=self.mode == "sample",
         ):
-            if cutlass.const_expr(_sample):return cutlass.Int32(0)
+            if cutlass.const_expr(_sample):
+                return cutlass.Int32(0)
             ks_min = _ks[min(qb * _bq, _nqt - 1)]
             for t_i in cutlass.range_constexpr(1, _bq):
                 ks_min = min(ks_min, _ks[min(qb * _bq + t_i, _nqt - 1)])
@@ -804,7 +982,9 @@ class FP4PrefillMQALogitsKernel:
 
         current_kv_lo = _kv_lo_for_block(start_q_block_clamped)
         if cutlass.const_expr(self.mode == "sample"):
-            current_num_kv = runtime_samples(mCuSeqLenKEnd[q_last_token_clamped],self.top_k)//128
+            current_num_kv = (
+                runtime_samples(mCuSeqLenKEnd[q_last_token_clamped], self.top_k) // 128
+            )
             current_kv_lo = cutlass.Int32(0)
 
         if is_tma_warp:
@@ -949,21 +1129,23 @@ class FP4PrefillMQALogitsKernel:
         # Math warp 0 is the allocator (like fp16_gemm_3's epilogue warp 0),
         # because math warps are the last TMEM consumers (epilogue reads).
         tmem_alloc_num_threads = 320  # 10 warps: warp 0-7 (math) + warp 10-11 (umma)
-        tmem_alloc_barrier = pipeline.NamedBarrier(
+        _tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=tmem_alloc_num_threads
         )
         # Warp 0 copies Q scales into shared SFB TMEM; warp 1 reads that region.
         # Synchronize both UMMA warps after the copy: the Q pipeline orders TMA-to-SMEM,
         # not cross-warp TMEM visibility.
-        sfb_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
-
-
+        _sfb_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
 
         # Persistent K1 keeps per-query scratch in the math groups. TMA/UMMA
         # continue independently; barrier 12 includes only the 256 math lanes.
-        if cutlass.const_expr(self.mode == 'sample' and self.persistent_sample):
-            sample_hist=smem.allocate_tensor(cutlass.Int32,cute.make_layout(1538),byte_alignment=128)
-            sample_scalar=smem.allocate_tensor(cutlass.Int32,cute.make_layout(2),byte_alignment=16)
+        if cutlass.const_expr(self.mode == "sample" and self.persistent_sample):
+            sample_hist = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout(1538), byte_alignment=128
+            )
+            sample_scalar = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout(2), byte_alignment=16
+            )
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # SMEM allocation: per-group KV + shared Q
@@ -1130,7 +1312,7 @@ class FP4PrefillMQALogitsKernel:
 
         # TMEM layout info (allocation deferred to UMMA/Math warp branches)
         cols_per_group = cols * us * (32 // self.acc_dtype.width)
-        num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
+        _num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
 
         # Epilogue setup
         c_layout = indexer_tensor_utils.LayoutEnum.ROW_MAJOR
@@ -1160,8 +1342,7 @@ class FP4PrefillMQALogitsKernel:
         has_work = q_block_idx < num_q_blocks
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
-        subset_barrier(barrier_id=14,number_of_threads=384)
-
+        subset_barrier(barrier_id=14, number_of_threads=384)
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
@@ -1236,14 +1417,47 @@ class FP4PrefillMQALogitsKernel:
                 stage = kv_prod_state_0.index
                 cute.copy(
                     tma_atom_a,
-                    tAgA_0[(None, 0, 0, sample_tile(kv_idx, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k) if cutlass.const_expr(self.mode == "sample") else kv_idx)],
+                    tAgA_0[
+                        (
+                            None,
+                            0,
+                            0,
+                            sample_tile(
+                                kv_idx,
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                self.block_q,
+                                self.sample_size,
+                                self.top_k,
+                            )
+                            if cutlass.const_expr(self.mode == "sample")
+                            else kv_idx,
+                        )
+                    ],
                     tAsA_0[(None, stage)],
                     tma_bar_ptr=bar,
                     mcast_mask=a_mcast_mask,
                 )
                 cute.copy(
                     tma_atom_sf_kv,
-                    tSgSF_KV_0[(None, 0, sample_tile(kv_idx, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k) if cutlass.const_expr(self.mode == "sample") else kv_idx)],
+                    tSgSF_KV_0[
+                        (
+                            None,
+                            0,
+                            sample_tile(
+                                kv_idx,
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                self.block_q,
+                                self.sample_size,
+                                self.top_k,
+                            )
+                            if cutlass.const_expr(self.mode == "sample")
+                            else kv_idx,
+                        )
+                    ],
                     tSsSF_KV_0[(None, stage)],
                     tma_bar_ptr=bar,
                 )
@@ -1259,7 +1473,15 @@ class FP4PrefillMQALogitsKernel:
                             next_q_block_idx * block_q_val + block_q_val - 1,
                             num_q_tokens - 1,
                         )
-                        next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                        next_num_kv = (
+                            runtime_samples(mCuSeqLenKEnd[q_last_next], self.top_k)
+                            // 128
+                            if cutlass.const_expr(self.mode == "sample")
+                            else (
+                                (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                // block_kv_val
+                            )
+                        )
                 has_work = next_q_block_idx < num_q_blocks
 
         elif is_tma_warp_1:
@@ -1279,14 +1501,47 @@ class FP4PrefillMQALogitsKernel:
                 stage = kv_prod_state_1.index
                 cute.copy(
                     tma_atom_a,
-                    tAgA_1[(None, 0, 0, sample_tile(kv_idx_1, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k) if cutlass.const_expr(self.mode == "sample") else kv_idx_1)],
+                    tAgA_1[
+                        (
+                            None,
+                            0,
+                            0,
+                            sample_tile(
+                                kv_idx_1,
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                self.block_q,
+                                self.sample_size,
+                                self.top_k,
+                            )
+                            if cutlass.const_expr(self.mode == "sample")
+                            else kv_idx_1,
+                        )
+                    ],
                     tAsA_1[(None, stage)],
                     tma_bar_ptr=bar,
                     mcast_mask=a_mcast_mask,
                 )
                 cute.copy(
                     tma_atom_sf_kv,
-                    tSgSF_KV_1[(None, 0, sample_tile(kv_idx_1, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k) if cutlass.const_expr(self.mode == "sample") else kv_idx_1)],
+                    tSgSF_KV_1[
+                        (
+                            None,
+                            0,
+                            sample_tile(
+                                kv_idx_1,
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                self.block_q,
+                                self.sample_size,
+                                self.top_k,
+                            )
+                            if cutlass.const_expr(self.mode == "sample")
+                            else kv_idx_1,
+                        )
+                    ],
                     tSsSF_KV_1[(None, stage)],
                     tma_bar_ptr=bar,
                 )
@@ -1302,7 +1557,15 @@ class FP4PrefillMQALogitsKernel:
                             next_q_block_idx * block_q_val + block_q_val - 1,
                             num_q_tokens - 1,
                         )
-                        next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                        next_num_kv = (
+                            runtime_samples(mCuSeqLenKEnd[q_last_next], self.top_k)
+                            // 128
+                            if cutlass.const_expr(self.mode == "sample")
+                            else (
+                                (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                // block_kv_val
+                            )
+                        )
                 has_work = next_q_block_idx < num_q_blocks
 
         elif is_umma_warp_0:
@@ -1344,7 +1607,16 @@ class FP4PrefillMQALogitsKernel:
                     kv_idx = next_kv_idx
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.mode == "sample"):
-                        num_kv = block_samples(q_block_idx,mCuSeqLenKEnd,num_q_tokens,block_q_val,self.top_k)//128
+                        num_kv = (
+                            block_samples(
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                block_q_val,
+                                self.top_k,
+                            )
+                            // 128
+                        )
 
                     # Wait for Q pipeline when the Q block changes
                     if q_block_idx != q_block_idx_old:
@@ -1399,7 +1671,7 @@ class FP4PrefillMQALogitsKernel:
                         # MMA reads the same SFB region. fence orders the async
                         # s2t; barrier crosses the warp boundary.
                         cute.arch.fence_view_async_tmem_store()
-                        subset_barrier(barrier_id=2,number_of_threads=64)
+                        subset_barrier(barrier_id=2, number_of_threads=64)
 
                     # Wait for KV, then TMEM capacity. Padded iterations compute unused results.
                     kv_pipeline_0.consumer_wait(kv_cons_state_umma_0)
@@ -1468,7 +1740,7 @@ class FP4PrefillMQALogitsKernel:
 
                     # Synchronize the UMMA warps on every tile so warp 0 cannot reach the next
                     # Q-scale overwrite before warp 1 has committed its MMA.
-                    subset_barrier(barrier_id=2,number_of_threads=64)
+                    subset_barrier(barrier_id=2, number_of_threads=64)
 
                     # Scheduler advance (grid-stride)
                     next_kv_idx = kv_idx + NUM_MATH_WG * task_splits
@@ -1480,7 +1752,15 @@ class FP4PrefillMQALogitsKernel:
                                 next_q_block_idx * block_q_val + block_q_val - 1,
                                 num_q_tokens - 1,
                             )
-                            next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                            next_num_kv = (
+                                runtime_samples(mCuSeqLenKEnd[q_last_next], self.top_k)
+                                // 128
+                                if cutlass.const_expr(self.mode == "sample")
+                                else (
+                                    (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                    // block_kv_val
+                                )
+                            )
                     has_work = next_q_block_idx < num_q_blocks
 
         elif is_umma_warp_1:
@@ -1526,7 +1806,16 @@ class FP4PrefillMQALogitsKernel:
                     kv_idx = next_kv_idx
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.mode == "sample"):
-                        num_kv = block_samples(q_block_idx,mCuSeqLenKEnd,num_q_tokens,block_q_val,self.top_k)//128
+                        num_kv = (
+                            block_samples(
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                block_q_val,
+                                self.top_k,
+                            )
+                            // 128
+                        )
 
                     # Wait for Q pipeline when the Q block changes
                     if q_block_idx != q_block_idx_old:
@@ -1539,7 +1828,7 @@ class FP4PrefillMQALogitsKernel:
                         q_stage_1 = q_cons_state_umma_1.index
                         # Warp 0 owns the Q-scale copy. Warp 1 waits for cross-warp TMEM visibility
                         # before reading SFB; the Q pipeline covers only TMA-to-SMEM ordering.
-                        subset_barrier(barrier_id=2,number_of_threads=64)
+                        subset_barrier(barrier_id=2, number_of_threads=64)
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional UMMA
@@ -1614,7 +1903,7 @@ class FP4PrefillMQALogitsKernel:
                     # rationale. Lock-steps the two UMMA warps every tile so
                     # warp 0 cannot overwrite SFB while warp 1's MMA is still
                     # reading it.
-                    subset_barrier(barrier_id=2,number_of_threads=64)
+                    subset_barrier(barrier_id=2, number_of_threads=64)
 
                     # Scheduler advance (grid-stride)
                     next_kv_idx = kv_idx + NUM_MATH_WG * task_splits
@@ -1626,7 +1915,15 @@ class FP4PrefillMQALogitsKernel:
                                 next_q_block_idx * block_q_val + block_q_val - 1,
                                 num_q_tokens - 1,
                             )
-                            next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                            next_num_kv = (
+                                runtime_samples(mCuSeqLenKEnd[q_last_next], self.top_k)
+                                // 128
+                                if cutlass.const_expr(self.mode == "sample")
+                                else (
+                                    (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                    // block_kv_val
+                                )
+                            )
                     has_work = next_q_block_idx < num_q_blocks
 
         elif is_math_warp:
@@ -1675,14 +1972,16 @@ class FP4PrefillMQALogitsKernel:
                 # Batched STG: hold reduced result per t in register; the
                 # actual STG happens once after the for-t loop to land all
                 # STGs in one contiguous LSU phase.
-                result_arr = None
+
                 # Per-token KV boundary cache (loaded on Q-block change)
                 kv_start_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
                 kv_end_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
                 q_stage_local = cutlass.Int32(0)
                 if cutlass.const_expr(self.mode == "filter"):
-                    private_cursors=cute.make_rmem_tensor((block_q_val,),cutlass.Int32)
-                threshold_cache=[cutlass.Float32(0) for _ in range(block_q_val)]
+                    private_cursors = cute.make_rmem_tensor(
+                        (block_q_val,), cutlass.Int32
+                    )
+                threshold_cache = [cutlass.Float32(0) for _ in range(block_q_val)]
                 kv_lo_cur = cutlass.Int32(0)
 
                 # Carry the row offset across KV tiles and fold it into a per-Q base pointer.
@@ -1702,17 +2001,24 @@ class FP4PrefillMQALogitsKernel:
                         cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
                     )
                     out_row_off = cutlass.Int64(0)
-                else:
-                    mLogits_2d = mLogits
-
                 # Outer loop: one iteration per Q block
                 while has_work:
                     if cutlass.const_expr(self.mode == "filter"):
-                        for token in cutlass.range_constexpr(block_q_val):private_cursors[token]=0
+                        for token in cutlass.range_constexpr(block_q_val):
+                            private_cursors[token] = 0
                     q_block_idx = next_q_block_idx
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.mode == "sample"):
-                        num_kv = block_samples(q_block_idx,mCuSeqLenKEnd,num_q_tokens,block_q_val,self.top_k)//128
+                        num_kv = (
+                            block_samples(
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                block_q_val,
+                                self.top_k,
+                            )
+                            // 128
+                        )
 
                     # Q pipeline consumer: wait for Q+Weights SMEM
                     if q_block_idx != prev_q_block_idx:
@@ -1741,9 +2047,11 @@ class FP4PrefillMQALogitsKernel:
                             kv_start_cache[t_i] = mCuSeqLenKStart[token_idx]
                             kv_end_cache[t_i] = mCuSeqLenKEnd[token_idx]
                             if cutlass.const_expr(self.mode == "filter"):
-                                threshold_cache[t_i]=thresholds[token_idx]
+                                threshold_cache[t_i] = thresholds[token_idx]
                             elif cutlass.const_expr(self.mode == "recover"):
-                                threshold_cache[t_i]=prepare_threshold(token_idx,recovery_sample_info,counts,self.top_k)
+                                threshold_cache[t_i] = prepare_threshold(
+                                    token_idx, recovery_sample_info, counts, self.top_k
+                                )
                         # First KV tile of this block: min(ks) aligned down to
                         # SPLIT_KV (must match _kv_lo_for_block in the TMA/UMMA
                         # warps). Tiles below it are fully predicated away.
@@ -1760,24 +2068,40 @@ class FP4PrefillMQALogitsKernel:
                     # Fold the Int64 row offset into the base pointer once per Q block.
                     # Create this alias only when the flat view is enabled; tile indices stay Int32.
                     if cutlass.const_expr(self.use_flat_logits_view):
-                        mLogits_blk = cute.make_tensor(
+                        _mLogits_blk = cute.make_tensor(
                             mLogits_flat.iterator + out_row_off,
                             cute.make_layout(block_q_val * logits_stride0_i32),
                         )
 
-                    if cutlass.const_expr(self.mode == 'filter'):
-                        bank_span=(candidates.shape[1]-8)//8
-                        bank_id=warpgroup_idx*4+local_tidx//32
-                        bank_rows=cute.make_tensor(candidates.iterator + cutlass.Int64(q_block_idx*block_q_val)*candidates.stride[0]+8+bank_id*bank_span,cute.make_layout((block_q_val,bank_span),stride=(candidates.stride[0],1)))
+                    if cutlass.const_expr(self.mode == "filter"):
+                        bank_span = (candidates.shape[1] - 8) // 8
+                        bank_id = warpgroup_idx * 4 + local_tidx // 32
+                        bank_rows = cute.make_tensor(
+                            candidates.iterator
+                            + cutlass.Int64(q_block_idx * block_q_val)
+                            * candidates.stride[0]
+                            + 8
+                            + bank_id * bank_span,
+                            cute.make_layout(
+                                (block_q_val, bank_span),
+                                stride=(candidates.stride[0], 1),
+                            ),
+                        )
                     # Process this Q block's KV tiles before advancing the outer grid-stride loop.
                     kv_idx = kv_lo_cur + cutlass.Int32(0)
                     kv_go = cutlass.Boolean(True)
-                    if cutlass.const_expr(self.mode == 'sample' and self.persistent_sample):
+                    if cutlass.const_expr(
+                        self.mode == "sample" and self.persistent_sample
+                    ):
                         for token in cutlass.range_constexpr(block_q_val):
-                            sample_row=q_block_idx*block_q_val+token
-                            if sample_row<num_q_tokens:
-                                for col in cutlass.range(m_coord+0*128,self.sample_size,256):
-                                    mLogits[sample_row,col]=self.output_dtype(float('-inf'))
+                            sample_row = q_block_idx * block_q_val + token
+                            if sample_row < num_q_tokens:
+                                for col in cutlass.range(
+                                    m_coord + 0 * 128, self.sample_size, 256
+                                ):
+                                    mLogits[sample_row, col] = self.output_dtype(
+                                        float("-inf")
+                                    )
                     while kv_go:
                         # Process KV block for group 0 (kv_idx + 0)
                         # Unconditional Math: OOB results
@@ -1785,7 +2109,19 @@ class FP4PrefillMQALogitsKernel:
                         sample_pos = kv_idx * block_kv_val + m_coord
                         kv_pos = sample_pos
                         if cutlass.const_expr(self.mode == "sample"):
-                            kv_pos = sample_tile(kv_idx, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k) * block_kv_val + m_coord
+                            kv_pos = (
+                                sample_tile(
+                                    kv_idx,
+                                    q_block_idx,
+                                    mCuSeqLenKEnd,
+                                    num_q_tokens,
+                                    self.block_q,
+                                    self.sample_size,
+                                    self.top_k,
+                                )
+                                * block_kv_val
+                                + m_coord
+                            )
 
                         # drop kv_pipeline.consumer_wait/release and
                         # scale_val LDS — UMMA owns KV+SF pipe; SF is baked into
@@ -1823,7 +2159,7 @@ class FP4PrefillMQALogitsKernel:
                                 ps = packed_zero
                             else:
                                 if cutlass.const_expr(self.native_lowp):
-                                    s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                    s_acc = cute.make_rmem_tensor((2,), cutlass.Uint32)
                                     s_acc.fill(0)
                                 else:
                                     s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
@@ -1859,11 +2195,31 @@ class FP4PrefillMQALogitsKernel:
                                 )
                                 if cutlass.const_expr(self.native_lowp):
                                     for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                        h_g=i*subtile_n+h
-                                        x4=_subview(tTR_rAcc,h,4)
-                                        w4=_subview(w_cache, t*NUM_W_IN_REG+h_g,4)
-                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
-                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                        h_g = i * subtile_n + h
+                                        x4 = _subview(tTR_rAcc, h, 4)
+                                        w4 = _subview(
+                                            w_cache, t * NUM_W_IN_REG + h_g, 4
+                                        )
+                                        s_acc[0] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[0], x4[1]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[0], w4[1]
+                                            ),
+                                            s_acc[0],
+                                        )
+                                        s_acc[1] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[2], x4[3]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[2], w4[3]
+                                            ),
+                                            s_acc[1],
+                                        )
                                 else:
                                     for h in cutlass.range_constexpr(0, reg_h_end, 4):
                                         n0 = h
@@ -1900,12 +2256,32 @@ class FP4PrefillMQALogitsKernel:
                                 # SMEM-path: weights from shared mem
                                 smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
                                 if cutlass.const_expr(self.native_lowp):
-                                    for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
-                                        h_g=i*subtile_n+h
-                                        x4=_subview(tTR_rAcc,h,4)
-                                        w4=_subview(sw_col, t*num_heads+h_g,4)
-                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
-                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                    for h in cutlass.range_constexpr(
+                                        smem_h_start, subtile_n, 4
+                                    ):
+                                        h_g = i * subtile_n + h
+                                        x4 = _subview(tTR_rAcc, h, 4)
+                                        w4 = _subview(sw_col, t * num_heads + h_g, 4)
+                                        s_acc[0] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[0], x4[1]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[0], w4[1]
+                                            ),
+                                            s_acc[0],
+                                        )
+                                        s_acc[1] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[2], x4[3]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[2], w4[3]
+                                            ),
+                                            s_acc[1],
+                                        )
                                 else:
                                     for h in cutlass.range_constexpr(
                                         smem_h_start, subtile_n, 4
@@ -1931,7 +2307,9 @@ class FP4PrefillMQALogitsKernel:
                                                 propagate_nan=True,
                                             )
                                             w_i = t * num_heads + h_g
-                                            w4 = _subview(sw_col, w_i, 4).to(cutlass.Float32)
+                                            w4 = _subview(sw_col, w_i, 4).to(
+                                                cutlass.Float32
+                                            )
                                             s_acc = indexer_fma_packed_f32x2(
                                                 a4, w4, s_acc, rnd=_RND_RN
                                             )
@@ -1946,38 +2324,114 @@ class FP4PrefillMQALogitsKernel:
                                 # Preserve left-to-right accumulation. ReLU scaling is already folded
                                 # into the register weights; do not rescale the final sum.
                                 if cutlass.const_expr(self.native_lowp):
-                                    reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
-                                    result_t=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))
+                                    reduced = native_add(
+                                        self.native_dtype, s_acc[0], s_acc[1]
+                                    )
+                                    result_t = cutlass.Float32(
+                                        self.native_dtype(
+                                            native_lo(self.native_dtype, reduced)
+                                            + native_hi(self.native_dtype, reduced)
+                                        )
+                                    )
                                 else:
                                     result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                             # drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.mode == "filter"):
-                                outrow=q_block_idx*block_q_val+t
-                                if outrow<num_q_tokens:
-                                    private_cursors[t]=publish_bank(result_t,(kv_pos>=kv_start_cache[t])&(kv_pos<kv_end_cache[t]),threshold_cache[t],t,kv_pos,private_cursors[t],bank_rows,self.output_dtype)
+                                outrow = q_block_idx * block_q_val + t
+                                if outrow < num_q_tokens:
+                                    private_cursors[t] = publish_bank(
+                                        result_t,
+                                        (kv_pos >= kv_start_cache[t])
+                                        & (kv_pos < kv_end_cache[t]),
+                                        threshold_cache[t],
+                                        t,
+                                        kv_pos,
+                                        private_cursors[t],
+                                        bank_rows,
+                                        self.output_dtype,
+                                    )
                             else:
-                                emit(result_t, q_block_idx * block_q_val + t, kv_pos, sample_pos, (kv_pos >= kv_start_cache[t]) & (kv_pos < kv_end_cache[t]), num_q_tokens, mLogits, thresholds, counts, candidates, self.mode, self.output_dtype, self.packed, self.capacity,((task_partition+(kv_idx-kv_lo_cur)//2)&7),recovery_sample_info,self.top_k,threshold_cache[t])
+                                emit(
+                                    result_t,
+                                    q_block_idx * block_q_val + t,
+                                    kv_pos,
+                                    sample_pos,
+                                    (kv_pos >= kv_start_cache[t])
+                                    & (kv_pos < kv_end_cache[t]),
+                                    num_q_tokens,
+                                    mLogits,
+                                    thresholds,
+                                    counts,
+                                    candidates,
+                                    self.mode,
+                                    self.output_dtype,
+                                    self.packed,
+                                    self.capacity,
+                                    ((task_partition + (kv_idx - kv_lo_cur) // 2) & 7),
+                                    recovery_sample_info,
+                                    self.top_k,
+                                    threshold_cache[t],
+                                )
 
                         # Advance inner KV loop
                         kv_idx = kv_idx + NUM_MATH_WG * task_splits
                         kv_go = kv_idx < num_kv
                     if cutlass.const_expr(self.mode == "filter"):
                         for token in cutlass.range_constexpr(block_q_val):
-                            row=q_block_idx*block_q_val+token
-                            if row<num_q_tokens and cute.arch.lane_idx()==0:
-                                candidates[row,warpgroup_idx*4+local_tidx//32]=cutlass.Int64(private_cursors[token])
-                    if cutlass.const_expr(self.mode == 'sample' and self.persistent_sample):
-                        subset_barrier(barrier_id=12,number_of_threads=256)
+                            row = q_block_idx * block_q_val + token
+                            if row < num_q_tokens and cute.arch.lane_idx() == 0:
+                                candidates[
+                                    row, warpgroup_idx * 4 + local_tidx // 32
+                                ] = cutlass.Int64(private_cursors[token])
+                    if cutlass.const_expr(
+                        self.mode == "sample" and self.persistent_sample
+                    ):
+                        subset_barrier(barrier_id=12, number_of_threads=256)
                         for token in cutlass.range_constexpr(block_q_val):
-                            sample_row=q_block_idx*block_q_val+token
-                            if sample_row<num_q_tokens:
-                                if tidx==0:counts[sample_row]=0
-                                width=max(1,mCuSeqLenKEnd[sample_row]-mCuSeqLenKStart[sample_row])
-                                active_samples=block_samples(sample_row//self.block_q,mCuSeqLenKEnd,num_q_tokens,self.block_q,self.top_k)
-                                multiple=2 if active_samples==512 else (4 if active_samples<=2048 else 6)
-                                rank=min(active_samples,max(1,(multiple*self.top_k*active_samples+width-1)//width))
-                                propose(sample_row,tidx,mLogits,sample_hist,sample_scalar,thresholds,active_samples,rank)
-                        subset_barrier(barrier_id=12,number_of_threads=256)
+                            sample_row = q_block_idx * block_q_val + token
+                            if sample_row < num_q_tokens:
+                                if tidx == 0:
+                                    counts[sample_row] = 0
+                                width = max(
+                                    1,
+                                    mCuSeqLenKEnd[sample_row]
+                                    - mCuSeqLenKStart[sample_row],
+                                )
+                                active_samples = block_samples(
+                                    sample_row // self.block_q,
+                                    mCuSeqLenKEnd,
+                                    num_q_tokens,
+                                    self.block_q,
+                                    self.top_k,
+                                )
+                                multiple = (
+                                    2
+                                    if active_samples == 512
+                                    else (4 if active_samples <= 2048 else 6)
+                                )
+                                rank = min(
+                                    active_samples,
+                                    max(
+                                        1,
+                                        (
+                                            multiple * self.top_k * active_samples
+                                            + width
+                                            - 1
+                                        )
+                                        // width,
+                                    ),
+                                )
+                                propose(
+                                    sample_row,
+                                    tidx,
+                                    mLogits,
+                                    sample_hist,
+                                    sample_scalar,
+                                    thresholds,
+                                    active_samples,
+                                    rank,
+                                )
+                        subset_barrier(barrier_id=12, number_of_threads=256)
 
                     # Outer: advance to next Q block (grid-stride)
                     next_q_block_idx = q_block_idx + 1
@@ -1986,7 +2440,15 @@ class FP4PrefillMQALogitsKernel:
                             next_q_block_idx * block_q_val + block_q_val - 1,
                             num_q_tokens - 1,
                         )
-                        next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                        next_num_kv = (
+                            runtime_samples(mCuSeqLenKEnd[q_last_next], self.top_k)
+                            // 128
+                            if cutlass.const_expr(self.mode == "sample")
+                            else (
+                                (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                // block_kv_val
+                            )
+                        )
                     has_work = next_q_block_idx < num_q_blocks
 
                 # Release last Q stage (WG 0)
@@ -2024,14 +2486,16 @@ class FP4PrefillMQALogitsKernel:
                 # Batched STG: hold reduced result per t in register; the
                 # actual STG happens once after the for-t loop to land all
                 # STGs in one contiguous LSU phase.
-                result_arr = None
+
                 # Per-token KV boundary cache (loaded on Q-block change)
                 kv_start_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
                 kv_end_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
                 q_stage_local = cutlass.Int32(0)
                 if cutlass.const_expr(self.mode == "filter"):
-                    private_cursors=cute.make_rmem_tensor((block_q_val,),cutlass.Int32)
-                threshold_cache=[cutlass.Float32(0) for _ in range(block_q_val)]
+                    private_cursors = cute.make_rmem_tensor(
+                        (block_q_val,), cutlass.Int32
+                    )
+                threshold_cache = [cutlass.Float32(0) for _ in range(block_q_val)]
                 kv_lo_cur = cutlass.Int32(0)
 
                 # Carry the row offset across KV tiles and fold it into a per-Q base pointer.
@@ -2051,17 +2515,24 @@ class FP4PrefillMQALogitsKernel:
                         cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
                     )
                     out_row_off = cutlass.Int64(0)
-                else:
-                    mLogits_2d = mLogits
-
                 # Outer loop: one iteration per Q block
                 while has_work:
                     if cutlass.const_expr(self.mode == "filter"):
-                        for token in cutlass.range_constexpr(block_q_val):private_cursors[token]=0
+                        for token in cutlass.range_constexpr(block_q_val):
+                            private_cursors[token] = 0
                     q_block_idx = next_q_block_idx
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.mode == "sample"):
-                        num_kv = block_samples(q_block_idx,mCuSeqLenKEnd,num_q_tokens,block_q_val,self.top_k)//128
+                        num_kv = (
+                            block_samples(
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                block_q_val,
+                                self.top_k,
+                            )
+                            // 128
+                        )
 
                     # Q pipeline consumer: wait for Q+Weights SMEM
                     if q_block_idx != prev_q_block_idx:
@@ -2090,9 +2561,11 @@ class FP4PrefillMQALogitsKernel:
                             kv_start_cache[t_i] = mCuSeqLenKStart[token_idx]
                             kv_end_cache[t_i] = mCuSeqLenKEnd[token_idx]
                             if cutlass.const_expr(self.mode == "filter"):
-                                threshold_cache[t_i]=thresholds[token_idx]
+                                threshold_cache[t_i] = thresholds[token_idx]
                             elif cutlass.const_expr(self.mode == "recover"):
-                                threshold_cache[t_i]=prepare_threshold(token_idx,recovery_sample_info,counts,self.top_k)
+                                threshold_cache[t_i] = prepare_threshold(
+                                    token_idx, recovery_sample_info, counts, self.top_k
+                                )
                         # First KV tile of this block: min(ks) aligned down to
                         # SPLIT_KV (must match _kv_lo_for_block in the TMA/UMMA
                         # warps). Tiles below it are fully predicated away.
@@ -2109,24 +2582,40 @@ class FP4PrefillMQALogitsKernel:
                     # Fold the Int64 row offset into the base pointer once per Q block.
                     # Create this alias only when the flat view is enabled; tile indices stay Int32.
                     if cutlass.const_expr(self.use_flat_logits_view):
-                        mLogits_blk = cute.make_tensor(
+                        _mLogits_blk = cute.make_tensor(
                             mLogits_flat.iterator + out_row_off,
                             cute.make_layout(block_q_val * logits_stride0_i32),
                         )
 
-                    if cutlass.const_expr(self.mode == 'filter'):
-                        bank_span=(candidates.shape[1]-8)//8
-                        bank_id=warpgroup_idx*4+local_tidx//32
-                        bank_rows=cute.make_tensor(candidates.iterator + cutlass.Int64(q_block_idx*block_q_val)*candidates.stride[0]+8+bank_id*bank_span,cute.make_layout((block_q_val,bank_span),stride=(candidates.stride[0],1)))
+                    if cutlass.const_expr(self.mode == "filter"):
+                        bank_span = (candidates.shape[1] - 8) // 8
+                        bank_id = warpgroup_idx * 4 + local_tidx // 32
+                        bank_rows = cute.make_tensor(
+                            candidates.iterator
+                            + cutlass.Int64(q_block_idx * block_q_val)
+                            * candidates.stride[0]
+                            + 8
+                            + bank_id * bank_span,
+                            cute.make_layout(
+                                (block_q_val, bank_span),
+                                stride=(candidates.stride[0], 1),
+                            ),
+                        )
                     # Process this Q block's KV tiles before advancing the outer grid-stride loop.
                     kv_idx = kv_lo_cur + cutlass.Int32(0)
                     kv_go = cutlass.Boolean(True)
-                    if cutlass.const_expr(self.mode == 'sample' and self.persistent_sample):
+                    if cutlass.const_expr(
+                        self.mode == "sample" and self.persistent_sample
+                    ):
                         for token in cutlass.range_constexpr(block_q_val):
-                            sample_row=q_block_idx*block_q_val+token
-                            if sample_row<num_q_tokens:
-                                for col in cutlass.range(m_coord+1*128,self.sample_size,256):
-                                    mLogits[sample_row,col]=self.output_dtype(float('-inf'))
+                            sample_row = q_block_idx * block_q_val + token
+                            if sample_row < num_q_tokens:
+                                for col in cutlass.range(
+                                    m_coord + 1 * 128, self.sample_size, 256
+                                ):
+                                    mLogits[sample_row, col] = self.output_dtype(
+                                        float("-inf")
+                                    )
                     while kv_go:
                         # Process KV block for group 1 (kv_idx + 1)
                         # Unconditional Math
@@ -2137,8 +2626,19 @@ class FP4PrefillMQALogitsKernel:
                         kv_pos = sample_pos
 
                         if cutlass.const_expr(self.mode == "sample"):
-
-                            kv_pos = sample_tile(kv_idx_1, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k) * block_kv_val + m_coord
+                            kv_pos = (
+                                sample_tile(
+                                    kv_idx_1,
+                                    q_block_idx,
+                                    mCuSeqLenKEnd,
+                                    num_q_tokens,
+                                    self.block_q,
+                                    self.sample_size,
+                                    self.top_k,
+                                )
+                                * block_kv_val
+                                + m_coord
+                            )
 
                         # drop kv_pipeline.consumer_wait/release and
                         # scale_val LDS — UMMA owns KV+SF pipe.
@@ -2172,7 +2672,7 @@ class FP4PrefillMQALogitsKernel:
                                 ps = packed_zero
                             else:
                                 if cutlass.const_expr(self.native_lowp):
-                                    s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                    s_acc = cute.make_rmem_tensor((2,), cutlass.Uint32)
                                     s_acc.fill(0)
                                 else:
                                     s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
@@ -2205,11 +2705,31 @@ class FP4PrefillMQALogitsKernel:
                                 )
                                 if cutlass.const_expr(self.native_lowp):
                                     for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                        h_g=i*subtile_n+h
-                                        x4=_subview(tTR_rAcc,h,4)
-                                        w4=_subview(w_cache, t*NUM_W_IN_REG+h_g,4)
-                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
-                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                        h_g = i * subtile_n + h
+                                        x4 = _subview(tTR_rAcc, h, 4)
+                                        w4 = _subview(
+                                            w_cache, t * NUM_W_IN_REG + h_g, 4
+                                        )
+                                        s_acc[0] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[0], x4[1]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[0], w4[1]
+                                            ),
+                                            s_acc[0],
+                                        )
+                                        s_acc[1] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[2], x4[3]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[2], w4[3]
+                                            ),
+                                            s_acc[1],
+                                        )
                                 else:
                                     for h in cutlass.range_constexpr(0, reg_h_end, 4):
                                         n0 = h
@@ -2246,12 +2766,32 @@ class FP4PrefillMQALogitsKernel:
                                 # SMEM-path
                                 smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
                                 if cutlass.const_expr(self.native_lowp):
-                                    for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
-                                        h_g=i*subtile_n+h
-                                        x4=_subview(tTR_rAcc,h,4)
-                                        w4=_subview(sw_col, t*num_heads+h_g,4)
-                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
-                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                    for h in cutlass.range_constexpr(
+                                        smem_h_start, subtile_n, 4
+                                    ):
+                                        h_g = i * subtile_n + h
+                                        x4 = _subview(tTR_rAcc, h, 4)
+                                        w4 = _subview(sw_col, t * num_heads + h_g, 4)
+                                        s_acc[0] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[0], x4[1]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[0], w4[1]
+                                            ),
+                                            s_acc[0],
+                                        )
+                                        s_acc[1] = native_fma(
+                                            self.native_dtype,
+                                            native_pack_relu(
+                                                self.native_dtype, x4[2], x4[3]
+                                            ),
+                                            native_pack(
+                                                self.native_dtype, w4[2], w4[3]
+                                            ),
+                                            s_acc[1],
+                                        )
                                 else:
                                     for h in cutlass.range_constexpr(
                                         smem_h_start, subtile_n, 4
@@ -2277,7 +2817,9 @@ class FP4PrefillMQALogitsKernel:
                                                 propagate_nan=True,
                                             )
                                             w_i = t * num_heads + h_g
-                                            w4 = _subview(sw_col, w_i, 4).to(cutlass.Float32)
+                                            w4 = _subview(sw_col, w_i, 4).to(
+                                                cutlass.Float32
+                                            )
                                             s_acc = indexer_fma_packed_f32x2(
                                                 a4, w4, s_acc, rnd=_RND_RN
                                             )
@@ -2292,38 +2834,114 @@ class FP4PrefillMQALogitsKernel:
                                 # Preserve left-to-right accumulation. ReLU scaling is already folded
                                 # into the register weights; do not rescale the final sum.
                                 if cutlass.const_expr(self.native_lowp):
-                                    reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
-                                    result_t=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))
+                                    reduced = native_add(
+                                        self.native_dtype, s_acc[0], s_acc[1]
+                                    )
+                                    result_t = cutlass.Float32(
+                                        self.native_dtype(
+                                            native_lo(self.native_dtype, reduced)
+                                            + native_hi(self.native_dtype, reduced)
+                                        )
+                                    )
                                 else:
                                     result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                             # drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.mode == "filter"):
-                                outrow=q_block_idx*block_q_val+t
-                                if outrow<num_q_tokens:
-                                    private_cursors[t]=publish_bank(result_t,(kv_pos>=kv_start_cache[t])&(kv_pos<kv_end_cache[t]),threshold_cache[t],t,kv_pos,private_cursors[t],bank_rows,self.output_dtype)
+                                outrow = q_block_idx * block_q_val + t
+                                if outrow < num_q_tokens:
+                                    private_cursors[t] = publish_bank(
+                                        result_t,
+                                        (kv_pos >= kv_start_cache[t])
+                                        & (kv_pos < kv_end_cache[t]),
+                                        threshold_cache[t],
+                                        t,
+                                        kv_pos,
+                                        private_cursors[t],
+                                        bank_rows,
+                                        self.output_dtype,
+                                    )
                             else:
-                                emit(result_t, q_block_idx * block_q_val + t, kv_pos, sample_pos, (kv_pos >= kv_start_cache[t]) & (kv_pos < kv_end_cache[t]), num_q_tokens, mLogits, thresholds, counts, candidates, self.mode, self.output_dtype, self.packed, self.capacity,((task_partition+(kv_idx-kv_lo_cur)//2)&7),recovery_sample_info,self.top_k,threshold_cache[t])
+                                emit(
+                                    result_t,
+                                    q_block_idx * block_q_val + t,
+                                    kv_pos,
+                                    sample_pos,
+                                    (kv_pos >= kv_start_cache[t])
+                                    & (kv_pos < kv_end_cache[t]),
+                                    num_q_tokens,
+                                    mLogits,
+                                    thresholds,
+                                    counts,
+                                    candidates,
+                                    self.mode,
+                                    self.output_dtype,
+                                    self.packed,
+                                    self.capacity,
+                                    ((task_partition + (kv_idx - kv_lo_cur) // 2) & 7),
+                                    recovery_sample_info,
+                                    self.top_k,
+                                    threshold_cache[t],
+                                )
 
                         # Advance inner KV loop
                         kv_idx = kv_idx + NUM_MATH_WG * task_splits
                         kv_go = kv_idx < num_kv
                     if cutlass.const_expr(self.mode == "filter"):
                         for token in cutlass.range_constexpr(block_q_val):
-                            row=q_block_idx*block_q_val+token
-                            if row<num_q_tokens and cute.arch.lane_idx()==0:
-                                candidates[row,warpgroup_idx*4+local_tidx//32]=cutlass.Int64(private_cursors[token])
-                    if cutlass.const_expr(self.mode == 'sample' and self.persistent_sample):
-                        subset_barrier(barrier_id=12,number_of_threads=256)
+                            row = q_block_idx * block_q_val + token
+                            if row < num_q_tokens and cute.arch.lane_idx() == 0:
+                                candidates[
+                                    row, warpgroup_idx * 4 + local_tidx // 32
+                                ] = cutlass.Int64(private_cursors[token])
+                    if cutlass.const_expr(
+                        self.mode == "sample" and self.persistent_sample
+                    ):
+                        subset_barrier(barrier_id=12, number_of_threads=256)
                         for token in cutlass.range_constexpr(block_q_val):
-                            sample_row=q_block_idx*block_q_val+token
-                            if sample_row<num_q_tokens:
-                                if tidx==0:counts[sample_row]=0
-                                width=max(1,mCuSeqLenKEnd[sample_row]-mCuSeqLenKStart[sample_row])
-                                active_samples=block_samples(sample_row//self.block_q,mCuSeqLenKEnd,num_q_tokens,self.block_q,self.top_k)
-                                multiple=2 if active_samples==512 else (4 if active_samples<=2048 else 6)
-                                rank=min(active_samples,max(1,(multiple*self.top_k*active_samples+width-1)//width))
-                                propose(sample_row,tidx,mLogits,sample_hist,sample_scalar,thresholds,active_samples,rank)
-                        subset_barrier(barrier_id=12,number_of_threads=256)
+                            sample_row = q_block_idx * block_q_val + token
+                            if sample_row < num_q_tokens:
+                                if tidx == 0:
+                                    counts[sample_row] = 0
+                                width = max(
+                                    1,
+                                    mCuSeqLenKEnd[sample_row]
+                                    - mCuSeqLenKStart[sample_row],
+                                )
+                                active_samples = block_samples(
+                                    sample_row // self.block_q,
+                                    mCuSeqLenKEnd,
+                                    num_q_tokens,
+                                    self.block_q,
+                                    self.top_k,
+                                )
+                                multiple = (
+                                    2
+                                    if active_samples == 512
+                                    else (4 if active_samples <= 2048 else 6)
+                                )
+                                rank = min(
+                                    active_samples,
+                                    max(
+                                        1,
+                                        (
+                                            multiple * self.top_k * active_samples
+                                            + width
+                                            - 1
+                                        )
+                                        // width,
+                                    ),
+                                )
+                                propose(
+                                    sample_row,
+                                    tidx,
+                                    mLogits,
+                                    sample_hist,
+                                    sample_scalar,
+                                    thresholds,
+                                    active_samples,
+                                    rank,
+                                )
+                        subset_barrier(barrier_id=12, number_of_threads=256)
 
                     # Outer: advance to next Q block (grid-stride)
                     next_q_block_idx = q_block_idx + 1
@@ -2332,7 +2950,15 @@ class FP4PrefillMQALogitsKernel:
                             next_q_block_idx * block_q_val + block_q_val - 1,
                             num_q_tokens - 1,
                         )
-                        next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                        next_num_kv = (
+                            runtime_samples(mCuSeqLenKEnd[q_last_next], self.top_k)
+                            // 128
+                            if cutlass.const_expr(self.mode == "sample")
+                            else (
+                                (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                // block_kv_val
+                            )
+                        )
                     has_work = next_q_block_idx < num_q_blocks
 
                 # Release last Q stage (WG 1)
@@ -2352,30 +2978,41 @@ class FP4PrefillMQALogitsKernel:
             else:
                 cute.arch.warpgroup_reg_dealloc(self.store_registers)
 
+        subset_barrier(barrier_id=14, number_of_threads=384)
+        subset_barrier(barrier_id=14, number_of_threads=384)
 
-
-
-        subset_barrier(barrier_id=14,number_of_threads=384)
-        subset_barrier(barrier_id=14,number_of_threads=384)
-
-from .recovery_selection import finish_recovery, select_or_prepare_retry as select_candidates
 
 from .selection import runtime_samples, block_samples
 
 from .selection import encode
+
+
 @cute.jit
-def publish_bank(score,active,tau,row,index,cursor,bank_rows,dtype:cutlass.Constexpr):
-    value=cutlass.Float32(dtype(score));hit=active&((value>=tau)|(value!=value))
-    mask=cute.arch.vote_ballot_sync(hit);total=cutlass.Int32(cute.arch.popc(mask))
-    lane=cute.arch.lane_idx()
+def publish_bank(
+    score, active, tau, row, index, cursor, bank_rows, dtype: cutlass.Constexpr
+):
+    value = cutlass.Float32(dtype(score))
+    hit = active & ((value >= tau) | (value != value))
+    mask = cute.arch.vote_ballot_sync(hit)
+    total = cutlass.Int32(cute.arch.popc(mask))
+    lane = cute.arch.lane_idx()
     if hit:
-        pos=cursor+cutlass.Int32(cute.arch.popc(mask&((cutlass.Uint32(1)<<lane)-1)))
-        bank_rows[row,pos]=cutlass.Int64(encode(value,index,dtype,False))
-    return cursor+total
-from .fused_recovery_emit import emit,finish_recovery
+        pos = cursor + cutlass.Int32(
+            cute.arch.popc(mask & ((cutlass.Uint32(1) << lane) - 1))
+        )
+        bank_rows[row, pos] = cutlass.Int64(encode(value, index, dtype, False))
+    return cursor + total
+
+
+from .fused_recovery_emit import emit, finish_recovery
 
 from .fused_recovery_emit import prepare_threshold
 
-from .native_lowp_math import native_pack, native_pack_relu, native_fma, native_add, native_lo, native_hi
-
-from .native_heads import native_weight_pair
+from .native_lowp_math import (
+    native_pack,
+    native_pack_relu,
+    native_fma,
+    native_add,
+    native_lo,
+    native_hi,
+)

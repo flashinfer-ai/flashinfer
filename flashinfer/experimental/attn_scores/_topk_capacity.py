@@ -89,7 +89,7 @@ class _TopKCapacity:
     flooring each request separately at the selected compression ratio.
     ``max_chunk_size`` bounds supplied Q storage across the entire step, while
     ``max_batch_size`` bounds the number of requests. Fields are positive int32
-    values, with compression ratio 1/4; bools are rejected.
+    values, with compression ratio 1, 2 or 4; bools are rejected.
     Scorer specialization and device resource checks occur when building the chain.
     """
 
@@ -115,9 +115,10 @@ class _TopKCapacity:
             raise ValueError("head_dim must be divisible by 32")
         if type(self.compression_ratio) is not int or self.compression_ratio not in (
             1,
+            2,
             4,
         ):
-            raise ValueError("compression_ratio must be 1 or 4")
+            raise ValueError("compression_ratio must be 1, 2 or 4")
 
 
 class _CapacityStepInputs:

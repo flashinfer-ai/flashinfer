@@ -16,24 +16,45 @@ from ..packed import add_packed_f32x2 as indexer_add_packed_f32x2
 from ..ordering import PipelineTmaAsync as IndexerPipelineTmaAsync
 from ..pdl import pdl_prologue
 from .qsa_publish import publish as fused_publish, pack_half_index
-from .weighted_heads import weighted_heads, weighted_heads_cached
 from .half_filter_boundary import filter_boundary
 
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+
 @dsl_user_op
-def predicated_store64(ptr,value,predicate,*,loc=None,ip=None):
-    llvm.inline_asm(None,[ptr.toint(loc=loc,ip=ip).ir_value(loc=loc,ip=ip),
-        cutlass.Int64(value).ir_value(loc=loc,ip=ip),cutlass.Int32(predicate).ir_value(loc=loc,ip=ip)],
+def predicated_store64(ptr, value, predicate, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(value).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(predicate).ir_value(loc=loc, ip=ip),
+        ],
         "{ .reg .pred p; setp.ne.u32 p, $2, 0; @p st.global.b64 [$0], $1; }",
-        "l,l,r,~{memory}",has_side_effects=True,loc=loc,ip=ip)
+        "l,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
-def predicated_store32(ptr,value,predicate,*,loc=None,ip=None):
-    llvm.inline_asm(None,[ptr.toint(loc=loc,ip=ip).ir_value(loc=loc,ip=ip),
-        cutlass.Int32(value).ir_value(loc=loc,ip=ip),cutlass.Int32(predicate).ir_value(loc=loc,ip=ip)],
+def predicated_store32(ptr, value, predicate, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(value).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(predicate).ir_value(loc=loc, ip=ip),
+        ],
         "{ .reg .pred p; setp.ne.u32 p, $2, 0; @p st.global.b32 [$0], $1; }",
-        "l,r,r,~{memory}",has_side_effects=True,loc=loc,ip=ip)
+        "l,r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
 
 from .subset_barrier import subset_barrier
 
@@ -42,28 +63,22 @@ from .subset_barrier import subset_barrier
 Persistent CTAs share Q across KV tiles. TMA uses true operand extents,
 zero-filling ragged tiles; per-row visible bounds mask output stores."""
 
-import argparse
-import functools
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-import torch
-from cutlass import Float16, testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from ..mqa_logits_util import (
-    calc_diff,
-    KernelLaunch,
-)
 
-from .selection import emit, sample_tile, publish_private, select, select_candidates, propose
+from .selection import (
+    sample_tile,
+    propose,
+)
 
 from .integer_relu_fast import integer_relu4
 
@@ -148,7 +163,12 @@ class FP8PrefillMQALogitsKernel:
         assert umma_n % num_heads == 0, (
             f"num_heads must divide umma_n (UMMA N={umma_n})"
         )
-        assert mode=="filter" and (umma_n==256 or num_heads in (4,32)) and epi_dtype==cutlass.Float32 and (splits==1 or (num_heads==32 and splits==2))
+        assert (
+            mode == "filter"
+            and (umma_n == 256 or num_heads in (4, 32))
+            and epi_dtype == cutlass.Float32
+            and (splits == 1 or (num_heads == 32 and splits == 2))
+        )
         self.mode, self.top_k, self.capacity = mode, top_k, capacity
         self.splits, self.packed = splits, packed
         self.offsets32 = offsets32
@@ -164,7 +184,8 @@ class FP8PrefillMQALogitsKernel:
         assert dsv4_integer_period in (0, 32, 64)
         assert not dsv4_integer_period or (num_heads == 64 and head_dim == 128)
         self.dsv4_integer_head_mask = sum(
-            1 << h for h in range(64)
+            1 << h
+            for h in range(64)
             if dsv4_integer_period and h % dsv4_integer_period < 4
         )
         self.qsa_weights = qsa_weights
@@ -190,9 +211,15 @@ class FP8PrefillMQALogitsKernel:
         self.smem_subpartition_opt = smem_subpartition_opt
         # Pair Q columns before MMA and load 32 FP32 values per epilogue step.
         # The paired layout avoids spills while preserving four chains per query.
-        self.interleaved_queries = (num_heads == 32 and top_k == 512
-            and umma_n == 256 and not glm_two_math_wg and glm_integer_period == 0
-            and weights_prepared and use_relu_trick)
+        self.interleaved_queries = (
+            num_heads == 32
+            and top_k == 512
+            and umma_n == 256
+            and not glm_two_math_wg
+            and glm_integer_period == 0
+            and weights_prepared
+            and use_relu_trick
+        )
         if self.interleaved_queries:
             num_epi_subtiles = 1
         self.num_epi_subtiles = num_epi_subtiles
@@ -213,17 +240,23 @@ class FP8PrefillMQALogitsKernel:
 
         self.glm_full_tiles = glm_full_tiles
         self.glm_two_math_wg = glm_two_math_wg
-        assert not glm_two_math_wg or (num_heads==32 and umma_n==128)
+        assert not glm_two_math_wg or (num_heads == 32 and umma_n == 128)
         self.num_math_threads = 256 if glm_two_math_wg else 512
         self.num_specialized_threads = 128
-        self.threads_per_cta = self.num_math_threads+128
-        self.num_math_warps = self.num_math_threads//32
+        self.threads_per_cta = self.num_math_threads + 128
+        self.num_math_warps = self.num_math_threads // 32
         self.tma_warp_base = 8
         self.umma_warp_base = 10
 
         # Reload Q when the Q block changes; reuse it across KV blocks.
         self.num_q_stages = 2 if mode == "filter" else 3
-        if num_heads==32 and top_k==2048 and output_dtype in (cutlass.Float16,cutlass.BFloat16) and glm_single_q_stage:self.num_q_stages=1
+        if (
+            num_heads == 32
+            and top_k == 2048
+            and output_dtype in (cutlass.Float16, cutlass.BFloat16)
+            and glm_single_q_stage
+        ):
+            self.num_q_stages = 1
 
         arch = BaseDSL._get_dsl().get_arch_enum()
         TMEM_COLS = get_max_tmem_alloc_cols(f"sm_{arch.major}{arch.minor}")
@@ -345,8 +378,10 @@ class FP8PrefillMQALogitsKernel:
                 b.iterator,
                 cute.make_layout(
                     ((2, 32, b.shape[0] // 64), b.shape[1]),
-                    stride=((32 * b.stride[0], b.stride[0], 64 * b.stride[0]),
-                            b.stride[1]),
+                    stride=(
+                        (32 * b.stride[0], b.stride[0], 64 * b.stride[0]),
+                        b.stride[1],
+                    ),
                 ),
             )
         kv_fp8 = cute.recast_tensor(kv, cutlass.Float8E4M3FN)
@@ -425,7 +460,9 @@ class FP8PrefillMQALogitsKernel:
 
         num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
         num_ctas = num_q_blocks * self.splits
-        if cutlass.const_expr(self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)):
+        if cutlass.const_expr(
+            self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)
+        ):
             num_ctas = min(num_q_blocks, self.num_sms) * self.splits
 
         @cute.struct
@@ -452,7 +489,10 @@ class FP8PrefillMQALogitsKernel:
             logits,
             cu_seq_len_k_start,
             cu_seq_len_k_end,
-            thresholds, counts, candidates, output,
+            thresholds,
+            counts,
+            candidates,
+            output,
             num_q_tokens,
             num_q_blocks,
             num_kv_tokens,
@@ -469,9 +509,12 @@ class FP8PrefillMQALogitsKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
-            min_blocks_per_mp=(2 if self.glm_two_math_wg else 1) if self.num_heads==32 else 0,
+            min_blocks_per_mp=(2 if self.glm_two_math_wg else 1)
+            if self.num_heads == 32
+            else 0,
             preferred_smem_carveout=100,
-        use_pdl=self.pdl)
+            use_pdl=self.pdl,
+        )
 
     @cute.kernel
     def kernel(
@@ -513,32 +556,70 @@ class FP8PrefillMQALogitsKernel:
         row = cutlass.Int32(0)
         required = cutlass.Int32(0)
         smem = indexer_memory.SmemAllocator()
-        hist = smem.allocate_tensor(cutlass.Int32, cute.make_layout(1538), byte_alignment=128)
-        scalar = smem.allocate_tensor(cutlass.Int32, cute.make_layout(2), byte_alignment=16)
-        if cutlass.const_expr(self.mode == 'sample' and not self.persistent_sample):
+        hist = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(1538), byte_alignment=128
+        )
+        scalar = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(2), byte_alignment=16
+        )
+        if cutlass.const_expr(self.mode == "sample" and not self.persistent_sample):
             for offset in cutlass.range_constexpr(self.block_q):
                 row = row_base + offset
                 if row < num_q_tokens:
                     for j in cutlass.range(tid, self.sample_size, 384):
-                        mLogits[row, j] = self.output_dtype(float('-inf'))
+                        mLogits[row, j] = self.output_dtype(float("-inf"))
                     if tid == 0:
                         counts[row] = 0
                     if cutlass.const_expr(self.use_relu_trick):
                         if tid < self.num_heads:
-                            prepared_offset=(num_q_tokens+31)//32*32
-                            thresholds[prepared_offset+row*self.num_heads+tid]=mW_raw[row*self.num_heads+tid]*0.5
+                            prepared_offset = (num_q_tokens + 31) // 32 * 32
+                            thresholds[prepared_offset + row * self.num_heads + tid] = (
+                                mW_raw[row * self.num_heads + tid] * 0.5
+                            )
             cute.arch.barrier(barrier_id=14, number_of_threads=self.threads_per_cta)
         work = cutlass.Boolean(True)
-        if cutlass.const_expr(self.mode == 'recover'):
+        if cutlass.const_expr(self.mode == "recover"):
             work = cutlass.Boolean(False)
             for offset in cutlass.range_constexpr(self.block_q):
                 row = row_base + offset
                 if row < num_q_tokens:
-                    required = min(self.top_k, mCuSeqLenKEnd[row] - mCuSeqLenKStart[row])
+                    required = min(
+                        self.top_k, mCuSeqLenKEnd[row] - mCuSeqLenKStart[row]
+                    )
                     work |= counts[row] < required
         if work:
-            self._gemm_body(tiled_mma, tma_atom_a, mA_mkl, tma_atom_b, mB_nkl, tma_atom_w, mW_tma, mW_raw, tma_atom_s, mS_tma, mS_raw, mLogits, mCuSeqLenKStart, mCuSeqLenKEnd, thresholds, counts, candidates, output, num_q_tokens, num_q_blocks, num_kv_tokens, cluster_layout_vmnk, a_smem_layout_staged, a_tma_smem_layout, b_smem_layout_staged, w_smem_layout_staged, s_smem_layout_staged, epi_tile, SharedStorage)
-        if cutlass.const_expr(self.mode in ('sample', 'recover')):
+            self._gemm_body(
+                tiled_mma,
+                tma_atom_a,
+                mA_mkl,
+                tma_atom_b,
+                mB_nkl,
+                tma_atom_w,
+                mW_tma,
+                mW_raw,
+                tma_atom_s,
+                mS_tma,
+                mS_raw,
+                mLogits,
+                mCuSeqLenKStart,
+                mCuSeqLenKEnd,
+                thresholds,
+                counts,
+                candidates,
+                output,
+                num_q_tokens,
+                num_q_blocks,
+                num_kv_tokens,
+                cluster_layout_vmnk,
+                a_smem_layout_staged,
+                a_tma_smem_layout,
+                b_smem_layout_staged,
+                w_smem_layout_staged,
+                s_smem_layout_staged,
+                epi_tile,
+                SharedStorage,
+            )
+        if cutlass.const_expr(self.mode in ("sample", "recover")):
             cute.arch.barrier(barrier_id=14, number_of_threads=self.threads_per_cta)
             if tid < 256:
                 for offset in cutlass.range_constexpr(self.block_q):
@@ -547,17 +628,93 @@ class FP8PrefillMQALogitsKernel:
                         start = mCuSeqLenKStart[row]
                         end = mCuSeqLenKEnd[row]
                         required = min(self.top_k, end - start)
-                        if cutlass.const_expr(self.mode == 'sample' and not self.persistent_sample):
-                            active_samples=block_samples(row//self.block_q,mCuSeqLenKEnd,num_q_tokens,self.block_q,self.top_k, sample_factor=16)
-                            multiple=2 if active_samples==512 else 6
-                            rank = min(active_samples, max(1, (multiple * self.top_k * active_samples + max(1, end - start) - 1) // max(1, end - start)))
-                            propose(row, tid, mLogits, hist, scalar, thresholds, active_samples, rank)
-                        elif cutlass.const_expr(self.mode != 'sample'):
+                        if cutlass.const_expr(
+                            self.mode == "sample" and not self.persistent_sample
+                        ):
+                            active_samples = block_samples(
+                                row // self.block_q,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                self.block_q,
+                                self.top_k,
+                                sample_factor=16,
+                            )
+                            multiple = 2 if active_samples == 512 else 6
+                            rank = min(
+                                active_samples,
+                                max(
+                                    1,
+                                    (
+                                        multiple * self.top_k * active_samples
+                                        + max(1, end - start)
+                                        - 1
+                                    )
+                                    // max(1, end - start),
+                                ),
+                            )
+                            propose(
+                                row,
+                                tid,
+                                mLogits,
+                                hist,
+                                scalar,
+                                thresholds,
+                                active_samples,
+                                rank,
+                            )
+                        elif cutlass.const_expr(self.mode != "sample"):
                             if counts[row] < required:
-                                finish_recovery(row, tid, candidates, counts, mCuSeqLenKStart, mCuSeqLenKEnd, mLogits, hist, scalar, output, thresholds, self.top_k, self.capacity, self.output_dtype, self.packed)
+                                finish_recovery(
+                                    row,
+                                    tid,
+                                    candidates,
+                                    counts,
+                                    mCuSeqLenKStart,
+                                    mCuSeqLenKEnd,
+                                    mLogits,
+                                    hist,
+                                    scalar,
+                                    output,
+                                    thresholds,
+                                    self.top_k,
+                                    self.capacity,
+                                    self.output_dtype,
+                                    self.packed,
+                                )
 
     @cute.jit
-    def _gemm_body(self, tiled_mma: cute.TiledMma, tma_atom_a: cute.CopyAtom, mA_mkl: cute.Tensor, tma_atom_b: cute.CopyAtom, mB_nkl: cute.Tensor, tma_atom_w: cute.CopyAtom, mW_tma: cute.Tensor, mW_raw: cute.Tensor, tma_atom_s: cute.CopyAtom, mS_tma: cute.Tensor, mS_raw: cute.Tensor, mLogits: cute.Tensor, mCuSeqLenKStart: cute.Tensor, mCuSeqLenKEnd: cute.Tensor, thresholds: cute.Tensor, counts: cute.Tensor, candidates: cute.Tensor, output: cute.Tensor, num_q_tokens: cutlass.Int32, num_q_blocks: cutlass.Int32, num_kv_tokens: cutlass.Int32, cluster_layout_vmnk: cute.Layout, a_smem_layout_staged: cute.ComposedLayout, a_tma_smem_layout: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout, w_smem_layout_staged: cute.Layout, s_smem_layout_staged: cute.Layout, epi_tile: cute.Tile, SharedStorage: cutlass.Constexpr):
+    def _gemm_body(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mkl: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nkl: cute.Tensor,
+        tma_atom_w: cute.CopyAtom,
+        mW_tma: cute.Tensor,
+        mW_raw: cute.Tensor,
+        tma_atom_s: cute.CopyAtom,
+        mS_tma: cute.Tensor,
+        mS_raw: cute.Tensor,
+        mLogits: cute.Tensor,
+        mCuSeqLenKStart: cute.Tensor,
+        mCuSeqLenKEnd: cute.Tensor,
+        thresholds: cute.Tensor,
+        counts: cute.Tensor,
+        candidates: cute.Tensor,
+        output: cute.Tensor,
+        num_q_tokens: cutlass.Int32,
+        num_q_blocks: cutlass.Int32,
+        num_kv_tokens: cutlass.Int32,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        a_tma_smem_layout: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+        w_smem_layout_staged: cute.Layout,
+        s_smem_layout_staged: cute.Layout,
+        epi_tile: cute.Tile,
+        SharedStorage: cutlass.Constexpr,
+    ):
         smem = indexer_memory.SmemAllocator()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -577,10 +734,10 @@ class FP8PrefillMQALogitsKernel:
         warpgroup_idx = warp_idx // 4
         is_math_warp = warp_idx < self.num_math_warps
         is_tma_warp_0 = warp_idx == self.num_math_warps
-        is_tma_warp_1 = warp_idx == self.num_math_warps+1
+        is_tma_warp_1 = warp_idx == self.num_math_warps + 1
         is_tma_warp = is_tma_warp_0 | is_tma_warp_1
-        is_umma_warp_0 = warp_idx == self.num_math_warps+2
-        is_umma_warp_1 = warp_idx == self.num_math_warps+3
+        is_umma_warp_0 = warp_idx == self.num_math_warps + 2
+        _is_umma_warp_1 = warp_idx == self.num_math_warps + 3
 
         NUM_MATH_WG = 1
         block_kv_val = self.block_kv
@@ -604,15 +761,16 @@ class FP8PrefillMQALogitsKernel:
             _part=bidz % self.splits,
             _sample=self.mode == "sample",
         ):
-            if cutlass.const_expr(_sample):return cutlass.Int32(0)
-            qb=max(cutlass.Int32(0),qb)
+            if cutlass.const_expr(_sample):
+                return cutlass.Int32(0)
+            qb = max(cutlass.Int32(0), qb)
             ks_min = _ks[min(qb * _bq, _nqt - 1)]
             for t_i in cutlass.range_constexpr(1, _bq):
                 ks_min = min(ks_min, _ks[min(qb * _bq + t_i, _nqt - 1)])
             return (ks_min // _split) * _nwg + _part * _nwg
 
         # Early load of num_kv for the first assigned Q block (hide L2 latency)
-        start_q_block = num_q_blocks-1-sm_idx
+        start_q_block = num_q_blocks - 1 - sm_idx
         start_q_block_clamped = min(start_q_block, num_q_blocks - 1)
         q_last_token_clamped = min(
             start_q_block_clamped * block_q_val + block_q_val - 1,
@@ -623,7 +781,12 @@ class FP8PrefillMQALogitsKernel:
         ) // block_kv_val
         current_kv_lo = _kv_lo_for_block(start_q_block_clamped)
         if cutlass.const_expr(self.mode == "sample"):
-            current_num_kv = runtime_samples(mCuSeqLenKEnd[q_last_token_clamped],self.top_k, sample_factor=16)//128
+            current_num_kv = (
+                runtime_samples(
+                    mCuSeqLenKEnd[q_last_token_clamped], self.top_k, sample_factor=16
+                )
+                // 128
+            )
             current_kv_lo = cutlass.Int32(0)
 
         if is_tma_warp:
@@ -637,7 +800,9 @@ class FP8PrefillMQALogitsKernel:
         # === Pipelines ===
         prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-        q_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_math_warps)
+        q_cons_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, self.num_math_warps
+        )
         q_pipeline = IndexerPipelineTmaAsync.create(
             barrier_storage=storage.q_mbar.data_ptr(),
             num_stages=self.num_q_stages,
@@ -657,14 +822,12 @@ class FP8PrefillMQALogitsKernel:
         q_cons_state_umma_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_q_stages
         )
-        q_cons_state_umma_1 = pipeline.make_pipeline_state(
+        _q_cons_state_umma_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_q_stages
         )
 
-        math_warps_per_group = self.num_math_warps
-        kv_cons_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 1
-        )
+        _math_warps_per_group = self.num_math_warps
+        kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         kv_pipeline_0 = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.kv_mbar_0.data_ptr(),
             num_stages=self.num_kv_stages,
@@ -674,7 +837,7 @@ class FP8PrefillMQALogitsKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        kv_pipeline_1 = pipeline.PipelineTmaUmma.create(
+        _kv_pipeline_1 = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.kv_mbar_1.data_ptr(),
             num_stages=self.num_kv_stages,
             producer_group=prod_group,
@@ -686,19 +849,19 @@ class FP8PrefillMQALogitsKernel:
         kv_prod_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
-        kv_prod_state_1 = pipeline.make_pipeline_state(
+        _kv_prod_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
         kv_cons_state_umma_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_kv_stages
         )
-        kv_cons_state_umma_1 = pipeline.make_pipeline_state(
+        _kv_cons_state_umma_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_kv_stages
         )
-        kv_cons_state_math_0 = pipeline.make_pipeline_state(
+        _kv_cons_state_math_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_kv_stages
         )
-        kv_cons_state_math_1 = pipeline.make_pipeline_state(
+        _kv_cons_state_math_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_kv_stages
         )
 
@@ -713,7 +876,7 @@ class FP8PrefillMQALogitsKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        umma_pipeline_1 = pipeline.PipelineUmmaAsync.create(
+        _umma_pipeline_1 = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.umma_mbar_1.data_ptr(),
             num_stages=self.num_umma_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -726,17 +889,17 @@ class FP8PrefillMQALogitsKernel:
         umma_prod_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_umma_stages
         )
-        umma_prod_state_1 = pipeline.make_pipeline_state(
+        _umma_prod_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_umma_stages
         )
         umma_cons_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
-        umma_cons_state_1 = pipeline.make_pipeline_state(
+        _umma_cons_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
-        tmem_alloc_num_threads = self.num_math_threads+32
+        tmem_alloc_num_threads = self.num_math_threads + 32
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=tmem_alloc_num_threads
         )
@@ -747,12 +910,15 @@ class FP8PrefillMQALogitsKernel:
             is_two_cta=False,
         )
 
-
         # Persistent K1 keeps per-query scratch in the math groups. TMA/UMMA
         # continue independently; barrier 12 includes only the 256 math lanes.
-        if cutlass.const_expr(self.mode == 'sample' and self.persistent_sample):
-            sample_hist=smem.allocate_tensor(cutlass.Int32,cute.make_layout(1538),byte_alignment=128)
-            sample_scalar=smem.allocate_tensor(cutlass.Int32,cute.make_layout(2),byte_alignment=16)
+        if cutlass.const_expr(self.mode == "sample" and self.persistent_sample):
+            _sample_hist = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout(1538), byte_alignment=128
+            )
+            _sample_scalar = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout(2), byte_alignment=16
+            )
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # SMEM allocation: per-group KV + shared Q + Weights + Scales
@@ -762,7 +928,7 @@ class FP8PrefillMQALogitsKernel:
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
-        if cutlass.const_expr(self.num_heads in (4,32) or self.dsv4_alias_kv):
+        if cutlass.const_expr(self.num_heads in (4, 32) or self.dsv4_alias_kv):
             sKV_1 = sKV_0
         else:
             sKV_1 = smem.allocate_tensor(
@@ -789,7 +955,7 @@ class FP8PrefillMQALogitsKernel:
             layout=s_smem_layout_staged,
             byte_alignment=128,
         )
-        if cutlass.const_expr(self.num_heads in (4,32) or self.dsv4_alias_kv):
+        if cutlass.const_expr(self.num_heads in (4, 32) or self.dsv4_alias_kv):
             sScales_1 = sScales_0
         else:
             sScales_1 = smem.allocate_tensor(
@@ -894,7 +1060,7 @@ class FP8PrefillMQALogitsKernel:
 
         # MMA fragments
         tCrA_0 = tiled_mma.make_fragment_A(sKV_0)
-        tCrA_1 = tiled_mma.make_fragment_A(sKV_1)
+        _tCrA_1 = tiled_mma.make_fragment_A(sKV_1)
         tCrB = tiled_mma.make_fragment_B(sQ)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
@@ -907,7 +1073,12 @@ class FP8PrefillMQALogitsKernel:
         num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
 
         c_layout = indexer_tensor_utils.LayoutEnum.ROW_MAJOR
-        epi_sub_mn = (epi_tile[0], 16 if self.num_heads==4 and self.N==128 else num_heads // num_epi_subtiles)
+        epi_sub_mn = (
+            epi_tile[0],
+            16
+            if self.num_heads == 4 and self.N == 128
+            else num_heads // num_epi_subtiles,
+        )
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             c_layout,
@@ -921,7 +1092,7 @@ class FP8PrefillMQALogitsKernel:
         # Grid-stride: each SM starts at q_block_idx = sm_idx and advances by num_sms.
         # Math warp uses two-level loop: outer per-Q-block, inner per-KV-pair.
         # TMA/UMMA warps keep flat loop.
-        q_block_idx = cutlass.Int32(num_q_blocks-1-sm_idx)
+        q_block_idx = cutlass.Int32(num_q_blocks - 1 - sm_idx)
         kv_idx = cutlass.Int32(current_kv_lo)
         num_kv = current_num_kv
         # Sentinel: no previous Q block (forces initial Q load)
@@ -936,8 +1107,9 @@ class FP8PrefillMQALogitsKernel:
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
-        if cutlass.const_expr(self.num_heads==32):
-            if not is_math_warp:cute.arch.warpgroup_reg_dealloc(32)
+        if cutlass.const_expr(self.num_heads == 32):
+            if not is_math_warp:
+                cute.arch.warpgroup_reg_dealloc(32)
         if is_tma_warp_0:
             # TMA warp 0: loads Q+Weights (on Q-block change) + KV group 0
 
@@ -971,12 +1143,18 @@ class FP8PrefillMQALogitsKernel:
 
                 # On Q-block change: prefetch Q for the NEXT Q block
                 if q_block_idx != q_block_idx_old:
-                    prefetch_next_q = q_block_idx - cute.arch.grid_dim()[2] // self.splits
-                    if cutlass.const_expr(self.num_q_stages==1):
+                    prefetch_next_q = (
+                        q_block_idx - cute.arch.grid_dim()[2] // self.splits
+                    )
+                    if cutlass.const_expr(self.num_q_stages == 1):
                         # One buffer cannot prefetch the next Q before current KV:
                         # consumers release this buffer only after current KV is done.
                         # First Q was loaded above; later Q blocks load on demand.
-                        prefetch_next_q=q_block_idx if q_block_idx_old<num_q_blocks else cutlass.Int32(-1)
+                        prefetch_next_q = (
+                            q_block_idx
+                            if q_block_idx_old < num_q_blocks
+                            else cutlass.Int32(-1)
+                        )
                     if prefetch_next_q >= 0:
                         q_pipeline.producer_acquire(q_prod_state)
                         q_bar = q_pipeline.producer_get_barrier(q_prod_state)
@@ -1001,7 +1179,24 @@ class FP8PrefillMQALogitsKernel:
                 stage = kv_prod_state_0.index
                 cute.copy(
                     tma_atom_a,
-                    tAgA_0[(None, sample_tile(kv_idx, q_block_idx, mCuSeqLenKEnd, num_q_tokens, self.block_q, self.sample_size, self.top_k, sample_factor=16) if cutlass.const_expr(self.mode == "sample") else kv_idx, 0)],
+                    tAgA_0[
+                        (
+                            None,
+                            sample_tile(
+                                kv_idx,
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                self.block_q,
+                                self.sample_size,
+                                self.top_k,
+                                sample_factor=16,
+                            )
+                            if cutlass.const_expr(self.mode == "sample")
+                            else kv_idx,
+                            0,
+                        )
+                    ],
                     tAsA_0[(None, stage)],
                     tma_bar_ptr=bar,
                     mcast_mask=a_mcast_mask,
@@ -1011,21 +1206,33 @@ class FP8PrefillMQALogitsKernel:
                 # Scheduler advance
                 next_kv_idx = kv_idx + NUM_MATH_WG * self.splits
                 if next_kv_idx >= num_kv:
-                    next_q_block_idx = q_block_idx - cute.arch.grid_dim()[2] // self.splits  # grid-stride
+                    next_q_block_idx = (
+                        q_block_idx - cute.arch.grid_dim()[2] // self.splits
+                    )  # grid-stride
                     next_kv_idx = _kv_lo_for_block(next_q_block_idx)
                     if next_q_block_idx >= 0:
                         q_last_next = min(
                             next_q_block_idx * block_q_val + block_q_val - 1,
                             num_q_tokens - 1,
                         )
-                        next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k, sample_factor=16)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                        next_num_kv = (
+                            runtime_samples(
+                                mCuSeqLenKEnd[q_last_next], self.top_k, sample_factor=16
+                            )
+                            // 128
+                            if cutlass.const_expr(self.mode == "sample")
+                            else (
+                                (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                // block_kv_val
+                            )
+                        )
                 has_work = next_q_block_idx >= 0
 
         elif is_umma_warp_0:
-            subset_barrier(barrier_id=1,number_of_threads=self.num_math_threads+32)
+            subset_barrier(barrier_id=1, number_of_threads=self.num_math_threads + 32)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
-            tCtAcc_base_1 = cute.make_tensor(
+            _tCtAcc_base_1 = cute.make_tensor(
                 tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout
             )
 
@@ -1040,7 +1247,17 @@ class FP8PrefillMQALogitsKernel:
                     kv_idx = next_kv_idx
                     num_kv = next_num_kv
                     if cutlass.const_expr(self.mode == "sample"):
-                        num_kv = block_samples(q_block_idx,mCuSeqLenKEnd,num_q_tokens,block_q_val,self.top_k, sample_factor=16)//128
+                        num_kv = (
+                            block_samples(
+                                q_block_idx,
+                                mCuSeqLenKEnd,
+                                num_q_tokens,
+                                block_q_val,
+                                self.top_k,
+                                sample_factor=16,
+                            )
+                            // 128
+                        )
 
                     if q_block_idx != q_block_idx_old:
                         if q_block_idx_old < num_q_blocks:
@@ -1071,35 +1288,53 @@ class FP8PrefillMQALogitsKernel:
 
                     next_kv_idx = kv_idx + NUM_MATH_WG * self.splits
                     if next_kv_idx >= num_kv:
-                        next_q_block_idx = q_block_idx - cute.arch.grid_dim()[2] // self.splits
+                        next_q_block_idx = (
+                            q_block_idx - cute.arch.grid_dim()[2] // self.splits
+                        )
                         next_kv_idx = _kv_lo_for_block(next_q_block_idx)
                         if next_q_block_idx >= 0:
                             q_last_next = min(
                                 next_q_block_idx * block_q_val + block_q_val - 1,
                                 num_q_tokens - 1,
                             )
-                            next_num_kv = (runtime_samples(mCuSeqLenKEnd[q_last_next],self.top_k, sample_factor=16)//128 if cutlass.const_expr(self.mode=="sample") else ((mCuSeqLenKEnd[q_last_next] + block_kv_val - 1) // block_kv_val))
+                            next_num_kv = (
+                                runtime_samples(
+                                    mCuSeqLenKEnd[q_last_next],
+                                    self.top_k,
+                                    sample_factor=16,
+                                )
+                                // 128
+                                if cutlass.const_expr(self.mode == "sample")
+                                else (
+                                    (mCuSeqLenKEnd[q_last_next] + block_kv_val - 1)
+                                    // block_kv_val
+                                )
+                            )
                     has_work = next_q_block_idx >= 0
 
         elif is_math_warp:
-            if cutlass.const_expr(self.num_heads==32):cute.arch.warpgroup_reg_alloc(104 if self.glm_two_math_wg else 112)
+            if cutlass.const_expr(self.num_heads == 32):
+                cute.arch.warpgroup_reg_alloc(104 if self.glm_two_math_wg else 112)
             tmem.allocate(num_tmem_alloc_cols_total)
-            subset_barrier(barrier_id=1,number_of_threads=self.num_math_threads+32)
+            subset_barrier(barrier_id=1, number_of_threads=self.num_math_threads + 32)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            if cutlass.const_expr(self.num_heads in (4,32)):tmem.relinquish_alloc_permit()
+            if cutlass.const_expr(self.num_heads in (4, 32)):
+                tmem.relinquish_alloc_permit()
             tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
             local_tidx = tidx % 128
             query_slot = warpgroup_idx
             cC = cute.make_identity_tensor(epi_sub_mn)
-            tAcc_ref = tCtAcc_base_0[(None,None,None,0)][((None,None),0,0)]
-            tAcc_ref_epi = cute.flat_divide(tAcc_ref,epi_sub_mn)
-            tiled_copy_ref = tcgen05.make_tmem_copy(copy_atom_t2r,tAcc_ref_epi[(None,None,0,0)])
+            tAcc_ref = tCtAcc_base_0[(None, None, None, 0)][((None, None), 0, 0)]
+            tAcc_ref_epi = cute.flat_divide(tAcc_ref, epi_sub_mn)
+            tiled_copy_ref = tcgen05.make_tmem_copy(
+                copy_atom_t2r, tAcc_ref_epi[(None, None, 0, 0)]
+            )
             thr_copy_ref = tiled_copy_ref.get_slice(local_tidx)
             tTR_cC = thr_copy_ref.partition_D(cC)
             m_coord = tTR_cC[0][0]
-            tTR_rAcc = cute.make_fragment_like(tTR_cC,self.acc_dtype)
-            w_cache = cute.make_rmem_tensor((64,),cutlass.Float32)
-            zero4 = cute.full((4,),0.0,dtype=cutlass.Float32)
+            tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+            w_cache = cute.make_rmem_tensor((64,), cutlass.Float32)
+            zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
             if cutlass.const_expr(self.num_heads == 64):
                 while has_work:
                     q_block_idx = next_q_block_idx
@@ -1109,216 +1344,636 @@ class FP8PrefillMQALogitsKernel:
                     # No TMEM read or scale load is needed.
                     kv_idx = _kv_lo_for_block(q_block_idx)
                     if kv_idx >= num_kv:
-                        if cutlass.const_expr(self.num_heads == 64 and self.dsv4_direct_sync):
-                            cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
-                            cute.arch.mbarrier_arrive(storage.umma_mbar_0.data_ptr()+self.num_umma_stages+umma_cons_state_0.index)
+                        if cutlass.const_expr(
+                            self.num_heads == 64 and self.dsv4_direct_sync
+                        ):
+                            cute.arch.mbarrier_wait(
+                                storage.umma_mbar_0.data_ptr()
+                                + umma_cons_state_0.index,
+                                umma_cons_state_0.phase,
+                            )
+                            cute.arch.mbarrier_arrive(
+                                storage.umma_mbar_0.data_ptr()
+                                + self.num_umma_stages
+                                + umma_cons_state_0.index
+                            )
                         else:
                             umma_pipeline_0.consumer_wait(umma_cons_state_0)
                             umma_pipeline_0.consumer_release(umma_cons_state_0)
                         umma_cons_state_0.advance()
                     q_pipeline.consumer_wait(q_cons_state)
                     q_stage_local = q_cons_state.index
-                    outrow = q_block_idx*self.block_q+query_slot
-                    token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
+                    outrow = q_block_idx * self.block_q + query_slot
+                    token_idx = (
+                        outrow
+                        if cutlass.const_expr(self.full_q_blocks)
+                        else min(outrow, num_q_tokens - 1)
+                    )
                     kv_start = mCuSeqLenKStart[token_idx]
                     kv_end = mCuSeqLenKEnd[token_idx]
-                    tau = filter_boundary(thresholds[token_idx],self.output_dtype) if cutlass.const_expr(self.dsv4_cast) else thresholds[token_idx]
+                    tau = (
+                        filter_boundary(thresholds[token_idx], self.output_dtype)
+                        if cutlass.const_expr(self.dsv4_cast)
+                        else thresholds[token_idx]
+                    )
                     # A NaN threshold conservatively accepts the whole interval.
                     # K3/K4 still select exact top-k, including overflow recovery.
                     if cutlass.const_expr(self.dsv4_unordered):
-                        if tau!=tau:tau=cutlass.Float32(float('-inf'))
+                        if tau != tau:
+                            tau = cutlass.Float32(float("-inf"))
                     for h in cutlass.range_constexpr(64):
-                        w = sW[(query_slot*64+h,q_stage_local)]
-                        if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
-                        if cutlass.const_expr(self.use_relu_trick and ((self.dsv4_integer_head_mask >> h) & 1)):
+                        w = sW[(query_slot * 64 + h, q_stage_local)]
+                        if cutlass.const_expr(
+                            self.use_relu_trick and not self.weights_prepared
+                        ):
+                            w = w * 0.5
+                        if cutlass.const_expr(
+                            self.use_relu_trick
+                            and ((self.dsv4_integer_head_mask >> h) & 1)
+                        ):
                             w = w * 2.0
                         w_cache[h] = w
-                    bank_span = (candidates.shape[1]-8)//4
-                    bank_id = local_tidx//32
-                    bank_rows = cute.make_tensor(candidates.iterator+cutlass.Int64(outrow)*candidates.stride[0]+8+bank_id*bank_span,cute.make_layout((1,bank_span),stride=(bank_span,1)))
+                    bank_span = (candidates.shape[1] - 8) // 4
+                    bank_id = local_tidx // 32
+                    bank_rows = cute.make_tensor(
+                        candidates.iterator
+                        + cutlass.Int64(outrow) * candidates.stride[0]
+                        + 8
+                        + bank_id * bank_span,
+                        cute.make_layout((1, bank_span), stride=(bank_span, 1)),
+                    )
                     cursor_even = cutlass.Int32(0)
                     # Every producer and both math WGs traverse the same KV tiles.
-                    if (kv_idx%2!=0)&(kv_idx<num_kv):
-                        kv_pos = kv_idx*128+m_coord
+                    if (kv_idx % 2 != 0) & (kv_idx < num_kv):
+                        kv_pos = kv_idx * 128 + m_coord
                         if cutlass.const_expr(self.dsv4_direct_sync):
-                            scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                            cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
+                            scale_val = mS_raw[
+                                kv_pos
+                                if cutlass.const_expr(self.dsv4_aligned_k)
+                                else min(kv_pos, num_kv_tokens - 1)
+                            ]
+                            cute.arch.mbarrier_wait(
+                                storage.umma_mbar_0.data_ptr()
+                                + umma_cons_state_0.index,
+                                umma_cons_state_0.phase,
+                            )
                         else:
-                            umma_ready=umma_pipeline_0.consumer_try_wait(umma_cons_state_0)
-                            scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                            umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
-                        tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                        tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                        s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                            umma_ready = umma_pipeline_0.consumer_try_wait(
+                                umma_cons_state_0
+                            )
+                            scale_val = mS_raw[
+                                kv_pos
+                                if cutlass.const_expr(self.dsv4_aligned_k)
+                                else min(kv_pos, num_kv_tokens - 1)
+                            ]
+                            umma_pipeline_0.consumer_wait(umma_cons_state_0, umma_ready)
+                        tAcc = tCtAcc_base_0[
+                            (None, None, None, umma_cons_state_0.index)
+                        ][((None, None), 0, 0)]
+                        tTR = thr_copy_ref.partition_S(
+                            cute.flat_divide(tAcc, epi_sub_mn)
+                        )
+                        s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                         for i in cutlass.range_constexpr(num_epi_subtiles):
-                            cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
+                            cute.copy(
+                                tiled_copy_ref,
+                                tTR[
+                                    (
+                                        None,
+                                        None,
+                                        None,
+                                        0,
+                                        query_slot * num_epi_subtiles + i,
+                                    )
+                                ],
+                                tTR_rAcc,
+                            )
                             cute.arch.fence_view_async_tmem_load()
-                            if cutlass.const_expr(i==num_epi_subtiles-1):
+                            if cutlass.const_expr(i == num_epi_subtiles - 1):
                                 # 256 consumers release only after both query slices
                                 # are in registers. Reuse also protects staged SFA.
                                 if cutlass.const_expr(self.dsv4_direct_sync):
-                                    cute.arch.mbarrier_arrive(storage.umma_mbar_0.data_ptr()+self.num_umma_stages+umma_cons_state_0.index)
+                                    cute.arch.mbarrier_arrive(
+                                        storage.umma_mbar_0.data_ptr()
+                                        + self.num_umma_stages
+                                        + umma_cons_state_0.index
+                                    )
                                 else:
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                 umma_cons_state_0.advance()
-                            for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                x4 = _subview(tTR_rAcc,h,4)
+                            for h in cutlass.range_constexpr(
+                                0, 64 // num_epi_subtiles, 4
+                            ):
+                                x4 = _subview(tTR_rAcc, h, 4)
                                 if cutlass.const_expr(self.use_relu_trick):
-                                    if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                    if cutlass.const_expr(
+                                        (
+                                            self.dsv4_integer_head_mask
+                                            >> (i * (64 // num_epi_subtiles) + h)
+                                        )
+                                        & 1
+                                    ):
                                         a4 = integer_relu4(x4)
                                     else:
-                                        a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                        a4 = indexer_add_packed_f32x2(
+                                            x4, abs(x4), rnd=_RND_RN
+                                        )
                                 else:
-                                    a4 = cute.max(x4,zero4,propagate_nan=True)
-                                w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                        score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
-                        if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
-                            valid=(kv_pos>=kv_start)&(kv_pos<kv_end)
-                            if kv_idx%2==0:
-                                cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
+                                    a4 = cute.max(x4, zero4, propagate_nan=True)
+                                w4 = _subview(
+                                    w_cache, i * (64 // num_epi_subtiles) + h, 4
+                                )
+                                s_acc = indexer_fma_packed_f32x2(
+                                    a4, w4, s_acc, rnd=_RND_RN
+                                )
+                        score = (s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]) * scale_val
+                        if (
+                            cutlass.const_expr(self.full_q_blocks)
+                            or outrow < num_q_tokens
+                        ):
+                            valid = (kv_pos >= kv_start) & (kv_pos < kv_end)
+                            if kv_idx % 2 == 0:
+                                cursor_even = publish_bank(
+                                    score,
+                                    valid,
+                                    tau,
+                                    0,
+                                    kv_pos,
+                                    cursor_even,
+                                    bank_rows,
+                                    self.output_dtype,
+                                    pred_store=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                    raw_half=self.dsv4_cast,
+                                    unordered=self.dsv4_unordered,
+                                    pro_raw_packed=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                )
                             else:
-                                cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
-                        kv_idx=kv_idx+1
+                                cursor_even = publish_bank(
+                                    score,
+                                    valid,
+                                    tau,
+                                    0,
+                                    kv_pos,
+                                    cursor_even,
+                                    bank_rows,
+                                    self.output_dtype,
+                                    pred_store=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                    raw_half=self.dsv4_cast,
+                                    unordered=self.dsv4_unordered,
+                                    pro_raw_packed=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                )
+                        kv_idx = kv_idx + 1
                     if cutlass.const_expr(self.dsv4_full_tiles):
-                        while (kv_idx < num_kv)&(kv_idx*128<kv_start):
-                            kv_pos = kv_idx*128+m_coord
+                        while (kv_idx < num_kv) & (kv_idx * 128 < kv_start):
+                            kv_pos = kv_idx * 128 + m_coord
                             if cutlass.const_expr(self.dsv4_direct_sync):
-                                scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                                cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
+                                scale_val = mS_raw[
+                                    kv_pos
+                                    if cutlass.const_expr(self.dsv4_aligned_k)
+                                    else min(kv_pos, num_kv_tokens - 1)
+                                ]
+                                cute.arch.mbarrier_wait(
+                                    storage.umma_mbar_0.data_ptr()
+                                    + umma_cons_state_0.index,
+                                    umma_cons_state_0.phase,
+                                )
                             else:
-                                umma_ready=umma_pipeline_0.consumer_try_wait(umma_cons_state_0)
-                                scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                                umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
-                            tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                            tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                                umma_ready = umma_pipeline_0.consumer_try_wait(
+                                    umma_cons_state_0
+                                )
+                                scale_val = mS_raw[
+                                    kv_pos
+                                    if cutlass.const_expr(self.dsv4_aligned_k)
+                                    else min(kv_pos, num_kv_tokens - 1)
+                                ]
+                                umma_pipeline_0.consumer_wait(
+                                    umma_cons_state_0, umma_ready
+                                )
+                            tAcc = tCtAcc_base_0[
+                                (None, None, None, umma_cons_state_0.index)
+                            ][((None, None), 0, 0)]
+                            tTR = thr_copy_ref.partition_S(
+                                cute.flat_divide(tAcc, epi_sub_mn)
+                            )
+                            s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                             for i in cutlass.range_constexpr(num_epi_subtiles):
-                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
+                                cute.copy(
+                                    tiled_copy_ref,
+                                    tTR[
+                                        (
+                                            None,
+                                            None,
+                                            None,
+                                            0,
+                                            query_slot * num_epi_subtiles + i,
+                                        )
+                                    ],
+                                    tTR_rAcc,
+                                )
                                 cute.arch.fence_view_async_tmem_load()
-                                if cutlass.const_expr(i==num_epi_subtiles-1):
+                                if cutlass.const_expr(i == num_epi_subtiles - 1):
                                     # 256 consumers release only after both query slices
                                     # are in registers. Reuse also protects staged SFA.
                                     if cutlass.const_expr(self.dsv4_direct_sync):
-                                        cute.arch.mbarrier_arrive(storage.umma_mbar_0.data_ptr()+self.num_umma_stages+umma_cons_state_0.index)
+                                        cute.arch.mbarrier_arrive(
+                                            storage.umma_mbar_0.data_ptr()
+                                            + self.num_umma_stages
+                                            + umma_cons_state_0.index
+                                        )
                                     else:
-                                        umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                        umma_pipeline_0.consumer_release(
+                                            umma_cons_state_0
+                                        )
                                     umma_cons_state_0.advance()
-                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                    x4 = _subview(tTR_rAcc,h,4)
+                                for h in cutlass.range_constexpr(
+                                    0, 64 // num_epi_subtiles, 4
+                                ):
+                                    x4 = _subview(tTR_rAcc, h, 4)
                                     if cutlass.const_expr(self.use_relu_trick):
-                                        if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                        if cutlass.const_expr(
+                                            (
+                                                self.dsv4_integer_head_mask
+                                                >> (i * (64 // num_epi_subtiles) + h)
+                                            )
+                                            & 1
+                                        ):
                                             a4 = integer_relu4(x4)
                                         else:
-                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                            a4 = indexer_add_packed_f32x2(
+                                                x4, abs(x4), rnd=_RND_RN
+                                            )
                                     else:
-                                        a4 = cute.max(x4,zero4,propagate_nan=True)
-                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
-                            if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
-                                valid=(kv_pos>=kv_start)&(kv_pos<kv_end)
-                                if kv_idx%2==0:
-                                    cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
+                                        a4 = cute.max(x4, zero4, propagate_nan=True)
+                                    w4 = _subview(
+                                        w_cache, i * (64 // num_epi_subtiles) + h, 4
+                                    )
+                                    s_acc = indexer_fma_packed_f32x2(
+                                        a4, w4, s_acc, rnd=_RND_RN
+                                    )
+                            score = (
+                                s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
+                            ) * scale_val
+                            if (
+                                cutlass.const_expr(self.full_q_blocks)
+                                or outrow < num_q_tokens
+                            ):
+                                valid = (kv_pos >= kv_start) & (kv_pos < kv_end)
+                                if kv_idx % 2 == 0:
+                                    cursor_even = publish_bank(
+                                        score,
+                                        valid,
+                                        tau,
+                                        0,
+                                        kv_pos,
+                                        cursor_even,
+                                        bank_rows,
+                                        self.output_dtype,
+                                        pred_store=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                        raw_half=self.dsv4_cast,
+                                        unordered=self.dsv4_unordered,
+                                        pro_raw_packed=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                    )
                                 else:
-                                    cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
-                            kv_idx=kv_idx+1
-                    while kv_idx+7<(min(num_kv,kv_end//128) if cutlass.const_expr(self.dsv4_full_tiles) else num_kv):
+                                    cursor_even = publish_bank(
+                                        score,
+                                        valid,
+                                        tau,
+                                        0,
+                                        kv_pos,
+                                        cursor_even,
+                                        bank_rows,
+                                        self.output_dtype,
+                                        pred_store=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                        raw_half=self.dsv4_cast,
+                                        unordered=self.dsv4_unordered,
+                                        pro_raw_packed=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                    )
+                            kv_idx = kv_idx + 1
+                    while kv_idx + 7 < (
+                        min(num_kv, kv_end // 128)
+                        if cutlass.const_expr(self.dsv4_full_tiles)
+                        else num_kv
+                    ):
                         for kv_unroll in cutlass.range_constexpr(8):
-                            kv_pos = kv_idx*128+m_coord
+                            kv_pos = kv_idx * 128 + m_coord
                             if cutlass.const_expr(self.dsv4_direct_sync):
-                                scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                                cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
+                                scale_val = mS_raw[
+                                    kv_pos
+                                    if cutlass.const_expr(self.dsv4_aligned_k)
+                                    else min(kv_pos, num_kv_tokens - 1)
+                                ]
+                                cute.arch.mbarrier_wait(
+                                    storage.umma_mbar_0.data_ptr()
+                                    + umma_cons_state_0.index,
+                                    umma_cons_state_0.phase,
+                                )
                             else:
-                                umma_ready=umma_pipeline_0.consumer_try_wait(umma_cons_state_0)
-                                scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                                umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
-                            tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                            tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                                umma_ready = umma_pipeline_0.consumer_try_wait(
+                                    umma_cons_state_0
+                                )
+                                scale_val = mS_raw[
+                                    kv_pos
+                                    if cutlass.const_expr(self.dsv4_aligned_k)
+                                    else min(kv_pos, num_kv_tokens - 1)
+                                ]
+                                umma_pipeline_0.consumer_wait(
+                                    umma_cons_state_0, umma_ready
+                                )
+                            tAcc = tCtAcc_base_0[
+                                (None, None, None, umma_cons_state_0.index)
+                            ][((None, None), 0, 0)]
+                            tTR = thr_copy_ref.partition_S(
+                                cute.flat_divide(tAcc, epi_sub_mn)
+                            )
+                            s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                             for i in cutlass.range_constexpr(num_epi_subtiles):
-                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
+                                cute.copy(
+                                    tiled_copy_ref,
+                                    tTR[
+                                        (
+                                            None,
+                                            None,
+                                            None,
+                                            0,
+                                            query_slot * num_epi_subtiles + i,
+                                        )
+                                    ],
+                                    tTR_rAcc,
+                                )
                                 cute.arch.fence_view_async_tmem_load()
-                                if cutlass.const_expr(i==num_epi_subtiles-1):
+                                if cutlass.const_expr(i == num_epi_subtiles - 1):
                                     # 256 consumers release only after both query slices
                                     # are in registers. Reuse also protects staged SFA.
                                     if cutlass.const_expr(self.dsv4_direct_sync):
-                                        cute.arch.mbarrier_arrive(storage.umma_mbar_0.data_ptr()+self.num_umma_stages+umma_cons_state_0.index)
+                                        cute.arch.mbarrier_arrive(
+                                            storage.umma_mbar_0.data_ptr()
+                                            + self.num_umma_stages
+                                            + umma_cons_state_0.index
+                                        )
                                     else:
-                                        umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                        umma_pipeline_0.consumer_release(
+                                            umma_cons_state_0
+                                        )
                                     umma_cons_state_0.advance()
-                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                    x4 = _subview(tTR_rAcc,h,4)
+                                for h in cutlass.range_constexpr(
+                                    0, 64 // num_epi_subtiles, 4
+                                ):
+                                    x4 = _subview(tTR_rAcc, h, 4)
                                     if cutlass.const_expr(self.use_relu_trick):
-                                        if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                        if cutlass.const_expr(
+                                            (
+                                                self.dsv4_integer_head_mask
+                                                >> (i * (64 // num_epi_subtiles) + h)
+                                            )
+                                            & 1
+                                        ):
                                             a4 = integer_relu4(x4)
                                         else:
-                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                            a4 = indexer_add_packed_f32x2(
+                                                x4, abs(x4), rnd=_RND_RN
+                                            )
                                     else:
-                                        a4 = cute.max(x4,zero4,propagate_nan=True)
-                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
-                            if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
-                                valid=True if cutlass.const_expr(self.dsv4_full_tiles) else (kv_pos>=kv_start)&(kv_pos<kv_end)
-                                if cutlass.const_expr(kv_unroll%2==0):
-                                    cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
+                                        a4 = cute.max(x4, zero4, propagate_nan=True)
+                                    w4 = _subview(
+                                        w_cache, i * (64 // num_epi_subtiles) + h, 4
+                                    )
+                                    s_acc = indexer_fma_packed_f32x2(
+                                        a4, w4, s_acc, rnd=_RND_RN
+                                    )
+                            score = (
+                                s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
+                            ) * scale_val
+                            if (
+                                cutlass.const_expr(self.full_q_blocks)
+                                or outrow < num_q_tokens
+                            ):
+                                valid = (
+                                    True
+                                    if cutlass.const_expr(self.dsv4_full_tiles)
+                                    else (kv_pos >= kv_start) & (kv_pos < kv_end)
+                                )
+                                if cutlass.const_expr(kv_unroll % 2 == 0):
+                                    cursor_even = publish_bank(
+                                        score,
+                                        valid,
+                                        tau,
+                                        0,
+                                        kv_pos,
+                                        cursor_even,
+                                        bank_rows,
+                                        self.output_dtype,
+                                        pred_store=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                        raw_half=self.dsv4_cast,
+                                        unordered=self.dsv4_unordered,
+                                        pro_raw_packed=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                    )
                                 else:
-                                    cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
-                            kv_idx=kv_idx+1
+                                    cursor_even = publish_bank(
+                                        score,
+                                        valid,
+                                        tau,
+                                        0,
+                                        kv_pos,
+                                        cursor_even,
+                                        bank_rows,
+                                        self.output_dtype,
+                                        pred_store=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                        raw_half=self.dsv4_cast,
+                                        unordered=self.dsv4_unordered,
+                                        pro_raw_packed=(
+                                            self.pro_packed_store
+                                            and bank_rows.element_type == cutlass.Int32
+                                        ),
+                                    )
+                            kv_idx = kv_idx + 1
                     while kv_idx < num_kv:
-                        kv_pos = kv_idx*128+m_coord
+                        kv_pos = kv_idx * 128 + m_coord
                         if cutlass.const_expr(self.dsv4_direct_sync):
-                            scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                            cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
+                            scale_val = mS_raw[
+                                kv_pos
+                                if cutlass.const_expr(self.dsv4_aligned_k)
+                                else min(kv_pos, num_kv_tokens - 1)
+                            ]
+                            cute.arch.mbarrier_wait(
+                                storage.umma_mbar_0.data_ptr()
+                                + umma_cons_state_0.index,
+                                umma_cons_state_0.phase,
+                            )
                         else:
-                            umma_ready=umma_pipeline_0.consumer_try_wait(umma_cons_state_0)
-                            scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                            umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
-                        tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                        tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                        s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                            umma_ready = umma_pipeline_0.consumer_try_wait(
+                                umma_cons_state_0
+                            )
+                            scale_val = mS_raw[
+                                kv_pos
+                                if cutlass.const_expr(self.dsv4_aligned_k)
+                                else min(kv_pos, num_kv_tokens - 1)
+                            ]
+                            umma_pipeline_0.consumer_wait(umma_cons_state_0, umma_ready)
+                        tAcc = tCtAcc_base_0[
+                            (None, None, None, umma_cons_state_0.index)
+                        ][((None, None), 0, 0)]
+                        tTR = thr_copy_ref.partition_S(
+                            cute.flat_divide(tAcc, epi_sub_mn)
+                        )
+                        s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                         for i in cutlass.range_constexpr(num_epi_subtiles):
-                            cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
+                            cute.copy(
+                                tiled_copy_ref,
+                                tTR[
+                                    (
+                                        None,
+                                        None,
+                                        None,
+                                        0,
+                                        query_slot * num_epi_subtiles + i,
+                                    )
+                                ],
+                                tTR_rAcc,
+                            )
                             cute.arch.fence_view_async_tmem_load()
-                            if cutlass.const_expr(i==num_epi_subtiles-1):
+                            if cutlass.const_expr(i == num_epi_subtiles - 1):
                                 # 256 consumers release only after both query slices
                                 # are in registers. Reuse also protects staged SFA.
                                 if cutlass.const_expr(self.dsv4_direct_sync):
-                                    cute.arch.mbarrier_arrive(storage.umma_mbar_0.data_ptr()+self.num_umma_stages+umma_cons_state_0.index)
+                                    cute.arch.mbarrier_arrive(
+                                        storage.umma_mbar_0.data_ptr()
+                                        + self.num_umma_stages
+                                        + umma_cons_state_0.index
+                                    )
                                 else:
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                 umma_cons_state_0.advance()
-                            for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                x4 = _subview(tTR_rAcc,h,4)
+                            for h in cutlass.range_constexpr(
+                                0, 64 // num_epi_subtiles, 4
+                            ):
+                                x4 = _subview(tTR_rAcc, h, 4)
                                 if cutlass.const_expr(self.use_relu_trick):
-                                    if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                    if cutlass.const_expr(
+                                        (
+                                            self.dsv4_integer_head_mask
+                                            >> (i * (64 // num_epi_subtiles) + h)
+                                        )
+                                        & 1
+                                    ):
                                         a4 = integer_relu4(x4)
                                     else:
-                                        a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                        a4 = indexer_add_packed_f32x2(
+                                            x4, abs(x4), rnd=_RND_RN
+                                        )
                                 else:
-                                    a4 = cute.max(x4,zero4,propagate_nan=True)
-                                w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                        score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
-                        if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
-                            valid=(kv_pos>=kv_start)&(kv_pos<kv_end)
-                            if kv_idx%2==0:
-                                cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
+                                    a4 = cute.max(x4, zero4, propagate_nan=True)
+                                w4 = _subview(
+                                    w_cache, i * (64 // num_epi_subtiles) + h, 4
+                                )
+                                s_acc = indexer_fma_packed_f32x2(
+                                    a4, w4, s_acc, rnd=_RND_RN
+                                )
+                        score = (s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]) * scale_val
+                        if (
+                            cutlass.const_expr(self.full_q_blocks)
+                            or outrow < num_q_tokens
+                        ):
+                            valid = (kv_pos >= kv_start) & (kv_pos < kv_end)
+                            if kv_idx % 2 == 0:
+                                cursor_even = publish_bank(
+                                    score,
+                                    valid,
+                                    tau,
+                                    0,
+                                    kv_pos,
+                                    cursor_even,
+                                    bank_rows,
+                                    self.output_dtype,
+                                    pred_store=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                    raw_half=self.dsv4_cast,
+                                    unordered=self.dsv4_unordered,
+                                    pro_raw_packed=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                )
                             else:
-                                cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
-                        kv_idx=kv_idx+1
-                    if (cutlass.const_expr(self.full_q_blocks) or outrow<num_q_tokens) and cute.arch.lane_idx()==0:
-                        candidates[outrow,bank_id]=candidates.element_type(cursor_even)
-                        candidates[outrow,bank_id+4]=candidates.element_type(0)
-                        cute.arch.atomic_add((counts.iterator+outrow).llvm_ptr,cursor_even-cutlass.Int32(cursor_even>bank_span)*16777216,sem="relaxed",scope="gpu")
+                                cursor_even = publish_bank(
+                                    score,
+                                    valid,
+                                    tau,
+                                    0,
+                                    kv_pos,
+                                    cursor_even,
+                                    bank_rows,
+                                    self.output_dtype,
+                                    pred_store=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                    raw_half=self.dsv4_cast,
+                                    unordered=self.dsv4_unordered,
+                                    pro_raw_packed=(
+                                        self.pro_packed_store
+                                        and bank_rows.element_type == cutlass.Int32
+                                    ),
+                                )
+                        kv_idx = kv_idx + 1
+                    if (
+                        cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens
+                    ) and cute.arch.lane_idx() == 0:
+                        candidates[outrow, bank_id] = candidates.element_type(
+                            cursor_even
+                        )
+                        candidates[outrow, bank_id + 4] = candidates.element_type(0)
+                        cute.arch.atomic_add(
+                            (counts.iterator + outrow).llvm_ptr,
+                            cursor_even
+                            - cutlass.Int32(cursor_even > bank_span) * 16777216,
+                            sem="relaxed",
+                            scope="gpu",
+                        )
                     q_pipeline.consumer_release(q_cons_state)
                     q_cons_state.advance()
-                    next_q_block_idx=q_block_idx-cute.arch.grid_dim()[2]
-                    if next_q_block_idx>=0:
-                        q_last_next=min(next_q_block_idx*self.block_q+self.block_q-1,num_q_tokens-1)
-                        next_num_kv=(mCuSeqLenKEnd[q_last_next]+127)//128
-                    has_work=next_q_block_idx>=0
+                    next_q_block_idx = q_block_idx - cute.arch.grid_dim()[2]
+                    if next_q_block_idx >= 0:
+                        q_last_next = min(
+                            next_q_block_idx * self.block_q + self.block_q - 1,
+                            num_q_tokens - 1,
+                        )
+                        next_num_kv = (mCuSeqLenKEnd[q_last_next] + 127) // 128
+                    has_work = next_q_block_idx >= 0
             else:
                 while has_work:
                     q_block_idx = next_q_block_idx
@@ -1328,393 +1983,1268 @@ class FP8PrefillMQALogitsKernel:
                     # No TMEM read or scale load is needed.
                     kv_idx = _kv_lo_for_block(q_block_idx)
                     if kv_idx >= num_kv:
-                        if cutlass.const_expr(self.num_heads == 64 and self.dsv4_direct_sync):
-                            cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
-                            cute.arch.mbarrier_arrive(storage.umma_mbar_0.data_ptr()+self.num_umma_stages+umma_cons_state_0.index)
+                        if cutlass.const_expr(
+                            self.num_heads == 64 and self.dsv4_direct_sync
+                        ):
+                            cute.arch.mbarrier_wait(
+                                storage.umma_mbar_0.data_ptr()
+                                + umma_cons_state_0.index,
+                                umma_cons_state_0.phase,
+                            )
+                            cute.arch.mbarrier_arrive(
+                                storage.umma_mbar_0.data_ptr()
+                                + self.num_umma_stages
+                                + umma_cons_state_0.index
+                            )
                         else:
                             umma_pipeline_0.consumer_wait(umma_cons_state_0)
                             umma_pipeline_0.consumer_release(umma_cons_state_0)
                         umma_cons_state_0.advance()
                     q_pipeline.consumer_wait(q_cons_state)
                     q_stage_local = q_cons_state.index
-                    queries_per_wg = self.block_q // (self.num_math_threads//128)
-                    cursors = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Int32)
-                    scores = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Float32)
-                    start_cache = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Int32)
-                    end_cache = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Int32)
-                    tau_cache = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Float32)
-                    if cutlass.const_expr(self.num_heads==32):
-                        glm_weights=cute.make_rmem_tensor((queries_per_wg*32,),cutlass.Float32)
-                    if cutlass.const_expr(self.qsa_weights==1):
-                        uniform_cache = cute.make_rmem_tensor((queries_per_wg,),cutlass.Float32)
-                    for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                    queries_per_wg = self.block_q // (self.num_math_threads // 128)
+                    cursors = cute.make_rmem_tensor(
+                        (self.block_q // (self.num_math_threads // 128),), cutlass.Int32
+                    )
+                    scores = cute.make_rmem_tensor(
+                        (self.block_q // (self.num_math_threads // 128),),
+                        cutlass.Float32,
+                    )
+                    start_cache = cute.make_rmem_tensor(
+                        (self.block_q // (self.num_math_threads // 128),), cutlass.Int32
+                    )
+                    end_cache = cute.make_rmem_tensor(
+                        (self.block_q // (self.num_math_threads // 128),), cutlass.Int32
+                    )
+                    tau_cache = cute.make_rmem_tensor(
+                        (self.block_q // (self.num_math_threads // 128),),
+                        cutlass.Float32,
+                    )
+                    if cutlass.const_expr(self.num_heads == 32):
+                        glm_weights = cute.make_rmem_tensor(
+                            (queries_per_wg * 32,), cutlass.Float32
+                        )
+                    if cutlass.const_expr(self.qsa_weights == 1):
+                        uniform_cache = cute.make_rmem_tensor(
+                            (queries_per_wg,), cutlass.Float32
+                        )
+                    for local_q in cutlass.range_constexpr(
+                        self.block_q // (self.num_math_threads // 128)
+                    ):
                         cursors[local_q] = 0
                         slot = query_slot * queries_per_wg + local_q
                         outrow = q_block_idx * self.block_q + slot
-                        token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
+                        token_idx = (
+                            outrow
+                            if cutlass.const_expr(self.full_q_blocks)
+                            else min(outrow, num_q_tokens - 1)
+                        )
                         start_cache[local_q] = mCuSeqLenKStart[token_idx]
                         end_cache[local_q] = mCuSeqLenKEnd[token_idx]
-                        tau_cache[local_q] = filter_boundary(thresholds[token_idx],self.output_dtype)
-                        if cutlass.const_expr(self.num_heads==32):
-                            if tau_cache[local_q]!=tau_cache[local_q]:tau_cache[local_q]=cutlass.Float32(float("inf"))
-                        if cutlass.const_expr(self.num_heads==32):
+                        tau_cache[local_q] = filter_boundary(
+                            thresholds[token_idx], self.output_dtype
+                        )
+                        if cutlass.const_expr(self.num_heads == 32):
+                            if tau_cache[local_q] != tau_cache[local_q]:
+                                tau_cache[local_q] = cutlass.Float32(float("inf"))
+                        if cutlass.const_expr(self.num_heads == 32):
                             if cutlass.const_expr(self.interleaved_queries):
                                 for cached_h in cutlass.range_constexpr(32):
                                     # Offload the last four ReLU heads to integer ALUs.
                                     # Double their prepared half-weights to preserve the
                                     # original FP32 products and four-chain reduction.
-                                    cached_w=_uniform_weight(mW_raw.iterator+(q_block_idx*self.block_q+slot)*self.num_heads+cached_h)
-                                    if cutlass.const_expr((0xF0000000 >> cached_h) & 1):cached_w=cached_w*2.0
-                                    glm_weights[cached_h*2+local_q]=cached_w
+                                    cached_w = _uniform_weight(
+                                        mW_raw.iterator
+                                        + (q_block_idx * self.block_q + slot)
+                                        * self.num_heads
+                                        + cached_h
+                                    )
+                                    if cutlass.const_expr((0xF0000000 >> cached_h) & 1):
+                                        cached_w = cached_w * 2.0
+                                    glm_weights[cached_h * 2 + local_q] = cached_w
                             else:
-                                for cached_h in cutlass.range_constexpr(32):glm_weights[local_q*32+cached_h]=sW[(slot*self.num_heads+cached_h,q_stage_local)]
-                        if cutlass.const_expr(self.qsa_weights==1):
-                            uniform_cache[local_q] = sW[(slot*4,q_stage_local)]
+                                for cached_h in cutlass.range_constexpr(32):
+                                    glm_weights[local_q * 32 + cached_h] = sW[
+                                        (
+                                            slot * self.num_heads + cached_h,
+                                            q_stage_local,
+                                        )
+                                    ]
+                        if cutlass.const_expr(self.qsa_weights == 1):
+                            uniform_cache[local_q] = sW[(slot * 4, q_stage_local)]
                     if cutlass.const_expr(self.glm_full_tiles):
-                        while (kv_idx < num_kv)&(kv_idx*128<max(start_cache[0],start_cache[1])):
-                            kv_pos = kv_idx*128+m_coord
-                            if cutlass.const_expr(not (self.num_heads==32 and self.top_k==512)):
-                                scale_val = cutlass.Float32(1) if cutlass.const_expr(self.qsa_unit_scale) else mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
+                        while (kv_idx < num_kv) & (
+                            kv_idx * 128 < max(start_cache[0], start_cache[1])
+                        ):
+                            kv_pos = kv_idx * 128 + m_coord
+                            if cutlass.const_expr(
+                                not (self.num_heads == 32 and self.top_k == 512)
+                            ):
+                                scale_val = (
+                                    cutlass.Float32(1)
+                                    if cutlass.const_expr(self.qsa_unit_scale)
+                                    else mS_raw[
+                                        kv_pos
+                                        if cutlass.const_expr(self.dsv4_aligned_k)
+                                        else min(kv_pos, num_kv_tokens - 1)
+                                    ]
+                                )
                             umma_pipeline_0.consumer_wait(umma_cons_state_0)
-                            if cutlass.const_expr(self.num_heads==32 and self.top_k==512):
-                                scale_val = cutlass.Float32(1) if cutlass.const_expr(self.qsa_unit_scale) else mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                            tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                            tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
+                            if cutlass.const_expr(
+                                self.num_heads == 32 and self.top_k == 512
+                            ):
+                                scale_val = (
+                                    cutlass.Float32(1)
+                                    if cutlass.const_expr(self.qsa_unit_scale)
+                                    else mS_raw[
+                                        kv_pos
+                                        if cutlass.const_expr(self.dsv4_aligned_k)
+                                        else min(kv_pos, num_kv_tokens - 1)
+                                    ]
+                                )
+                            tAcc = tCtAcc_base_0[
+                                (None, None, None, umma_cons_state_0.index)
+                            ][((None, None), 0, 0)]
+                            tTR = thr_copy_ref.partition_S(
+                                cute.flat_divide(tAcc, epi_sub_mn)
+                            )
                             if cutlass.const_expr(self.interleaved_queries):
-                                slot0=query_slot*queries_per_wg
-                                pair_acc=cute.make_rmem_tensor((8,),cutlass.Float32)
+                                slot0 = query_slot * queries_per_wg
+                                pair_acc = cute.make_rmem_tensor((8,), cutlass.Float32)
                                 pair_acc.fill(0.0)
-                                for chunk in cutlass.range_constexpr(2*num_epi_subtiles):
-                                    cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+chunk)],tTR_rAcc)
+                                for chunk in cutlass.range_constexpr(
+                                    2 * num_epi_subtiles
+                                ):
+                                    cute.copy(
+                                        tiled_copy_ref,
+                                        tTR[
+                                            (
+                                                None,
+                                                None,
+                                                None,
+                                                0,
+                                                slot0 * num_epi_subtiles + chunk,
+                                            )
+                                        ],
+                                        tTR_rAcc,
+                                    )
                                     cute.arch.fence_view_async_tmem_load()
-                                    if cutlass.const_expr(chunk==2*num_epi_subtiles-1):
-                                        umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                    if cutlass.const_expr(
+                                        chunk == 2 * num_epi_subtiles - 1
+                                    ):
+                                        umma_pipeline_0.consumer_release(
+                                            umma_cons_state_0
+                                        )
                                         umma_cons_state_0.advance()
-                                    pair_acc=interleaved_partial(tTR_rAcc,glm_weights,pair_acc,chunk*(16//num_epi_subtiles),16//num_epi_subtiles,self.use_relu_trick)
-                                result=cute.make_tensor(pair_acc.iterator,cute.make_layout(2)).load()
-                                for chain in cutlass.range_constexpr(1,4):
-                                    result=indexer_add_packed_f32x2(result,cute.make_tensor(pair_acc.iterator+chain*2,cute.make_layout(2)).load(),rnd="rn")
-                                scores[0]=result[0]*scale_val
-                                scores[1]=result[1]*scale_val
+                                    pair_acc = interleaved_partial(
+                                        tTR_rAcc,
+                                        glm_weights,
+                                        pair_acc,
+                                        chunk * (16 // num_epi_subtiles),
+                                        16 // num_epi_subtiles,
+                                        self.use_relu_trick,
+                                    )
+                                result = cute.make_tensor(
+                                    pair_acc.iterator, cute.make_layout(2)
+                                ).load()
+                                for chain in cutlass.range_constexpr(1, 4):
+                                    result = indexer_add_packed_f32x2(
+                                        result,
+                                        cute.make_tensor(
+                                            pair_acc.iterator + chain * 2,
+                                            cute.make_layout(2),
+                                        ).load(),
+                                        rnd="rn",
+                                    )
+                                scores[0] = result[0] * scale_val
+                                scores[1] = result[1] * scale_val
                             else:
-                                for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                                for local_q in cutlass.range_constexpr(
+                                    self.block_q // (self.num_math_threads // 128)
+                                ):
                                     slot = query_slot * queries_per_wg + local_q
                                     outrow = q_block_idx * self.block_q + slot
-                                    token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
-                                    if cutlass.const_expr(self.num_heads==32):
-                                        head_acc=cute.full((4,),0.0,dtype=cutlass.Float32)
-                                        for epi_i in cutlass.range_constexpr(num_epi_subtiles):
-                                            cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot*num_epi_subtiles+epi_i)],tTR_rAcc)
+                                    token_idx = (
+                                        outrow
+                                        if cutlass.const_expr(self.full_q_blocks)
+                                        else min(outrow, num_q_tokens - 1)
+                                    )
+                                    if cutlass.const_expr(self.num_heads == 32):
+                                        head_acc = cute.full(
+                                            (4,), 0.0, dtype=cutlass.Float32
+                                        )
+                                        for epi_i in cutlass.range_constexpr(
+                                            num_epi_subtiles
+                                        ):
+                                            cute.copy(
+                                                tiled_copy_ref,
+                                                tTR[
+                                                    (
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        0,
+                                                        slot * num_epi_subtiles + epi_i,
+                                                    )
+                                                ],
+                                                tTR_rAcc,
+                                            )
                                             cute.arch.fence_view_async_tmem_load()
-                                            if cutlass.const_expr(local_q==queries_per_wg-1 and epi_i==num_epi_subtiles-1):
-                                                umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                            if cutlass.const_expr(
+                                                local_q == queries_per_wg - 1
+                                                and epi_i == num_epi_subtiles - 1
+                                            ):
+                                                umma_pipeline_0.consumer_release(
+                                                    umma_cons_state_0
+                                                )
                                                 umma_cons_state_0.advance()
-                                            head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period)
-                                        score=(head_acc[0]+head_acc[1]+head_acc[2]+head_acc[3])*scale_val
+                                            head_acc = weighted_partial_cached(
+                                                tTR_rAcc,
+                                                sW,
+                                                glm_weights,
+                                                slot,
+                                                local_q,
+                                                q_stage_local,
+                                                epi_i * (32 // num_epi_subtiles),
+                                                32 // num_epi_subtiles,
+                                                32,
+                                                head_acc,
+                                                self.use_relu_trick,
+                                                self.weights_prepared,
+                                                integer_period=self.glm_integer_period,
+                                            )
+                                        score = (
+                                            head_acc[0]
+                                            + head_acc[1]
+                                            + head_acc[2]
+                                            + head_acc[3]
+                                        ) * scale_val
                                     else:
-                                        if cutlass.const_expr(self.N==64):
-                                            cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot)],tTR_rAcc)
+                                        if cutlass.const_expr(self.N == 64):
+                                            cute.copy(
+                                                tiled_copy_ref,
+                                                tTR[(None, None, None, 0, slot)],
+                                                tTR_rAcc,
+                                            )
                                             cute.arch.fence_view_async_tmem_load()
                                         else:
-                                            if cutlass.const_expr(local_q%4==0):
-                                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot//4)],tTR_rAcc)
+                                            if cutlass.const_expr(local_q % 4 == 0):
+                                                cute.copy(
+                                                    tiled_copy_ref,
+                                                    tTR[
+                                                        (None, None, None, 0, slot // 4)
+                                                    ],
+                                                    tTR_rAcc,
+                                                )
                                                 cute.arch.fence_view_async_tmem_load()
-                                        x4 = _subview(tTR_rAcc,0 if self.N==64 else (local_q%4)*4,4)
+                                        x4 = _subview(
+                                            tTR_rAcc,
+                                            0 if self.N == 64 else (local_q % 4) * 4,
+                                            4,
+                                        )
                                         if cutlass.const_expr(self.use_relu_trick):
-                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                            a4 = indexer_add_packed_f32x2(
+                                                x4, abs(x4), rnd=_RND_RN
+                                            )
                                         else:
-                                            a4 = cute.max(x4,zero4,propagate_nan=True)
-                                        shared_w = cute.make_rmem_tensor((4,),cutlass.Float32)
+                                            a4 = cute.max(x4, zero4, propagate_nan=True)
+                                        shared_w = cute.make_rmem_tensor(
+                                            (4,), cutlass.Float32
+                                        )
                                         for h in cutlass.range_constexpr(4):
-                                            if cutlass.const_expr(self.qsa_weights==2):
-                                                w = cutlass.Float32(0.04419417306780815 if self.use_relu_trick else 0.0883883461356163)
-                                            elif cutlass.const_expr(self.qsa_weights==1):
+                                            if cutlass.const_expr(
+                                                self.qsa_weights == 2
+                                            ):
+                                                w = cutlass.Float32(
+                                                    0.04419417306780815
+                                                    if self.use_relu_trick
+                                                    else 0.0883883461356163
+                                                )
+                                            elif cutlass.const_expr(
+                                                self.qsa_weights == 1
+                                            ):
                                                 w = uniform_cache[local_q]
                                             else:
-                                                w = sW[(slot*4+h,q_stage_local)]
-                                            if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
+                                                w = sW[(slot * 4 + h, q_stage_local)]
+                                            if cutlass.const_expr(
+                                                self.use_relu_trick
+                                                and not self.weights_prepared
+                                            ):
+                                                w = w * 0.5
                                             shared_w[h] = w
-                                        acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
-                                        score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
+                                        acc4 = indexer_fma_packed_f32x2(
+                                            a4, shared_w.load(), zero4, rnd=_RND_RN
+                                        )
+                                        score = (
+                                            acc4[0] + acc4[1] + acc4[2] + acc4[3]
+                                        ) * scale_val
                                     scores[local_q] = score
-                            if cutlass.const_expr(self.num_heads!=32):
+                            if cutlass.const_expr(self.num_heads != 32):
                                 umma_pipeline_0.consumer_release(umma_cons_state_0)
                                 umma_cons_state_0.advance()
-                            if cutlass.const_expr(self.num_heads==32 and self.output_dtype in (cutlass.Float16,cutlass.BFloat16,cutlass.Float32)):
-                                pair_row=q_block_idx*self.block_q+query_slot*queries_per_wg
-                                bank_span=(candidates.shape[1]-8)//(4*self.splits)
-                                bank_id=(bidz%self.splits)*4+local_tidx//32
-                                pair_ptr=candidates.iterator+((pair_row*cutlass.Int32(candidates.stride[0])+8+bank_id*bank_span) if cutlass.const_expr(self.offsets32) else (cutlass.Int64(pair_row)*candidates.stride[0]+8+bank_id*bank_span))
-                                valid0=(kv_pos>=start_cache[0])&(kv_pos<end_cache[0])
-                                valid1=(kv_pos>=start_cache[1])&(kv_pos<end_cache[1])
+                            if cutlass.const_expr(
+                                self.num_heads == 32
+                                and self.output_dtype
+                                in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
+                            ):
+                                pair_row = (
+                                    q_block_idx * self.block_q
+                                    + query_slot * queries_per_wg
+                                )
+                                bank_span = (candidates.shape[1] - 8) // (
+                                    4 * self.splits
+                                )
+                                bank_id = (bidz % self.splits) * 4 + local_tidx // 32
+                                pair_ptr = candidates.iterator + (
+                                    (
+                                        pair_row * cutlass.Int32(candidates.stride[0])
+                                        + 8
+                                        + bank_id * bank_span
+                                    )
+                                    if cutlass.const_expr(self.offsets32)
+                                    else (
+                                        cutlass.Int64(pair_row) * candidates.stride[0]
+                                        + 8
+                                        + bank_id * bank_span
+                                    )
+                                )
+                                valid0 = (kv_pos >= start_cache[0]) & (
+                                    kv_pos < end_cache[0]
+                                )
+                                valid1 = (kv_pos >= start_cache[1]) & (
+                                    kv_pos < end_cache[1]
+                                )
                                 if cutlass.const_expr(not self.full_q_blocks):
-                                    valid0=valid0&(pair_row<num_q_tokens)
-                                    valid1=valid1&(pair_row+1<num_q_tokens)
-                                cursors[0],cursors[1]=fused_publish_pair(pair_ptr,pair_ptr+candidates.stride[0],scores[0],scores[1],tau_cache[0],tau_cache[1],valid0,valid1,kv_pos,cursors[0],cursors[1],bank_span,self.output_dtype,self.glm_skip_empty,packed=candidates.element_type==cutlass.Int32,ordered_threshold=self.num_heads==32)
+                                    valid0 = valid0 & (pair_row < num_q_tokens)
+                                    valid1 = valid1 & (pair_row + 1 < num_q_tokens)
+                                cursors[0], cursors[1] = fused_publish_pair(
+                                    pair_ptr,
+                                    pair_ptr + candidates.stride[0],
+                                    scores[0],
+                                    scores[1],
+                                    tau_cache[0],
+                                    tau_cache[1],
+                                    valid0,
+                                    valid1,
+                                    kv_pos,
+                                    cursors[0],
+                                    cursors[1],
+                                    bank_span,
+                                    self.output_dtype,
+                                    self.glm_skip_empty,
+                                    packed=candidates.element_type == cutlass.Int32,
+                                    ordered_threshold=self.num_heads == 32,
+                                )
                             else:
-                                for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                                for local_q in cutlass.range_constexpr(
+                                    self.block_q // (self.num_math_threads // 128)
+                                ):
                                     slot = query_slot * queries_per_wg + local_q
                                     outrow = q_block_idx * self.block_q + slot
-                                    token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
+                                    token_idx = (
+                                        outrow
+                                        if cutlass.const_expr(self.full_q_blocks)
+                                        else min(outrow, num_q_tokens - 1)
+                                    )
                                     score = scores[local_q]
-                                    if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
+                                    if (
+                                        cutlass.const_expr(self.full_q_blocks)
+                                        or outrow < num_q_tokens
+                                    ):
                                         kv_start = start_cache[local_q]
                                         kv_end = end_cache[local_q]
-                                        bank_span = (candidates.shape[1]-8)//(4*self.splits)
-                                        bank_id = (bidz%self.splits)*4+local_tidx//32
-                                        bank_rows = cute.make_tensor(candidates.iterator+((outrow*cutlass.Int32(candidates.stride[0])+8+bank_id*bank_span) if cutlass.const_expr(self.offsets32) else (cutlass.Int64(outrow)*candidates.stride[0]+8+bank_id*bank_span)),cute.make_layout((1,bank_span),stride=(bank_span,1)))
-                                        if cutlass.const_expr(self.num_heads==32 and self.output_dtype in (cutlass.Float16,cutlass.BFloat16,cutlass.Float32)):
-                                            cursors[local_q]=fused_publish(bank_rows.iterator,score,tau_cache[local_q],(kv_pos>=kv_start)&(kv_pos<kv_end),kv_pos,cursors[local_q],bank_span,self.output_dtype,False,True,packed=candidates.element_type==cutlass.Int32)
+                                        bank_span = (candidates.shape[1] - 8) // (
+                                            4 * self.splits
+                                        )
+                                        bank_id = (
+                                            bidz % self.splits
+                                        ) * 4 + local_tidx // 32
+                                        bank_rows = cute.make_tensor(
+                                            candidates.iterator
+                                            + (
+                                                (
+                                                    outrow
+                                                    * cutlass.Int32(
+                                                        candidates.stride[0]
+                                                    )
+                                                    + 8
+                                                    + bank_id * bank_span
+                                                )
+                                                if cutlass.const_expr(self.offsets32)
+                                                else (
+                                                    cutlass.Int64(outrow)
+                                                    * candidates.stride[0]
+                                                    + 8
+                                                    + bank_id * bank_span
+                                                )
+                                            ),
+                                            cute.make_layout(
+                                                (1, bank_span), stride=(bank_span, 1)
+                                            ),
+                                        )
+                                        if cutlass.const_expr(
+                                            self.num_heads == 32
+                                            and self.output_dtype
+                                            in (
+                                                cutlass.Float16,
+                                                cutlass.BFloat16,
+                                                cutlass.Float32,
+                                            )
+                                        ):
+                                            cursors[local_q] = fused_publish(
+                                                bank_rows.iterator,
+                                                score,
+                                                tau_cache[local_q],
+                                                (kv_pos >= kv_start)
+                                                & (kv_pos < kv_end),
+                                                kv_pos,
+                                                cursors[local_q],
+                                                bank_span,
+                                                self.output_dtype,
+                                                False,
+                                                True,
+                                                packed=candidates.element_type
+                                                == cutlass.Int32,
+                                            )
                                         else:
-                                            cursors[local_q] = publish_bank(score,(kv_pos>=kv_start)&(kv_pos<kv_end),tau_cache[local_q],0,kv_pos,cursors[local_q],bank_rows,self.output_dtype,True,True)
+                                            cursors[local_q] = publish_bank(
+                                                score,
+                                                (kv_pos >= kv_start)
+                                                & (kv_pos < kv_end),
+                                                tau_cache[local_q],
+                                                0,
+                                                kv_pos,
+                                                cursors[local_q],
+                                                bank_rows,
+                                                self.output_dtype,
+                                                True,
+                                                True,
+                                            )
                             kv_idx = kv_idx + self.splits
-                    if cutlass.const_expr(self.num_heads==32):
-                        while kv_idx+self.splits*3<(min(num_kv,min(end_cache[0],end_cache[1])//128) if cutlass.const_expr(self.glm_full_tiles) else num_kv):
-                            for kv_unroll in cutlass.range_constexpr(4):
-                                kv_pos = kv_idx*128+m_coord
-                                if cutlass.const_expr(not (self.num_heads==32 and self.top_k==512)):
-                                    scale_val = cutlass.Float32(1) if cutlass.const_expr(self.qsa_unit_scale) else mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
+                    if cutlass.const_expr(self.num_heads == 32):
+                        while kv_idx + self.splits * 3 < (
+                            min(num_kv, min(end_cache[0], end_cache[1]) // 128)
+                            if cutlass.const_expr(self.glm_full_tiles)
+                            else num_kv
+                        ):
+                            for _kv_unroll in cutlass.range_constexpr(4):
+                                kv_pos = kv_idx * 128 + m_coord
+                                if cutlass.const_expr(
+                                    not (self.num_heads == 32 and self.top_k == 512)
+                                ):
+                                    scale_val = (
+                                        cutlass.Float32(1)
+                                        if cutlass.const_expr(self.qsa_unit_scale)
+                                        else mS_raw[
+                                            kv_pos
+                                            if cutlass.const_expr(self.dsv4_aligned_k)
+                                            else min(kv_pos, num_kv_tokens - 1)
+                                        ]
+                                    )
                                 umma_pipeline_0.consumer_wait(umma_cons_state_0)
-                                if cutlass.const_expr(self.num_heads==32 and self.top_k==512):
-                                    scale_val = cutlass.Float32(1) if cutlass.const_expr(self.qsa_unit_scale) else mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                                tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                                tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
+                                if cutlass.const_expr(
+                                    self.num_heads == 32 and self.top_k == 512
+                                ):
+                                    scale_val = (
+                                        cutlass.Float32(1)
+                                        if cutlass.const_expr(self.qsa_unit_scale)
+                                        else mS_raw[
+                                            kv_pos
+                                            if cutlass.const_expr(self.dsv4_aligned_k)
+                                            else min(kv_pos, num_kv_tokens - 1)
+                                        ]
+                                    )
+                                tAcc = tCtAcc_base_0[
+                                    (None, None, None, umma_cons_state_0.index)
+                                ][((None, None), 0, 0)]
+                                tTR = thr_copy_ref.partition_S(
+                                    cute.flat_divide(tAcc, epi_sub_mn)
+                                )
                                 if cutlass.const_expr(self.interleaved_queries):
-                                    slot0=query_slot*queries_per_wg
-                                    pair_acc=cute.make_rmem_tensor((8,),cutlass.Float32)
+                                    slot0 = query_slot * queries_per_wg
+                                    pair_acc = cute.make_rmem_tensor(
+                                        (8,), cutlass.Float32
+                                    )
                                     pair_acc.fill(0.0)
-                                    for chunk in cutlass.range_constexpr(2*num_epi_subtiles):
-                                        cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+chunk)],tTR_rAcc)
+                                    for chunk in cutlass.range_constexpr(
+                                        2 * num_epi_subtiles
+                                    ):
+                                        cute.copy(
+                                            tiled_copy_ref,
+                                            tTR[
+                                                (
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    0,
+                                                    slot0 * num_epi_subtiles + chunk,
+                                                )
+                                            ],
+                                            tTR_rAcc,
+                                        )
                                         cute.arch.fence_view_async_tmem_load()
-                                        if cutlass.const_expr(chunk==2*num_epi_subtiles-1):
-                                            umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                        if cutlass.const_expr(
+                                            chunk == 2 * num_epi_subtiles - 1
+                                        ):
+                                            umma_pipeline_0.consumer_release(
+                                                umma_cons_state_0
+                                            )
                                             umma_cons_state_0.advance()
-                                        pair_acc=interleaved_partial(tTR_rAcc,glm_weights,pair_acc,chunk*(16//num_epi_subtiles),16//num_epi_subtiles,self.use_relu_trick)
-                                    result=cute.make_tensor(pair_acc.iterator,cute.make_layout(2)).load()
-                                    for chain in cutlass.range_constexpr(1,4):
-                                        result=indexer_add_packed_f32x2(result,cute.make_tensor(pair_acc.iterator+chain*2,cute.make_layout(2)).load(),rnd="rn")
-                                    scores[0]=result[0]*scale_val
-                                    scores[1]=result[1]*scale_val
+                                        pair_acc = interleaved_partial(
+                                            tTR_rAcc,
+                                            glm_weights,
+                                            pair_acc,
+                                            chunk * (16 // num_epi_subtiles),
+                                            16 // num_epi_subtiles,
+                                            self.use_relu_trick,
+                                        )
+                                    result = cute.make_tensor(
+                                        pair_acc.iterator, cute.make_layout(2)
+                                    ).load()
+                                    for chain in cutlass.range_constexpr(1, 4):
+                                        result = indexer_add_packed_f32x2(
+                                            result,
+                                            cute.make_tensor(
+                                                pair_acc.iterator + chain * 2,
+                                                cute.make_layout(2),
+                                            ).load(),
+                                            rnd="rn",
+                                        )
+                                    scores[0] = result[0] * scale_val
+                                    scores[1] = result[1] * scale_val
                                 else:
-                                    for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                                    for local_q in cutlass.range_constexpr(
+                                        self.block_q // (self.num_math_threads // 128)
+                                    ):
                                         slot = query_slot * queries_per_wg + local_q
                                         outrow = q_block_idx * self.block_q + slot
-                                        token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
-                                        if cutlass.const_expr(self.num_heads==32):
-                                            head_acc=cute.full((4,),0.0,dtype=cutlass.Float32)
-                                            for epi_i in cutlass.range_constexpr(num_epi_subtiles):
-                                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot*num_epi_subtiles+epi_i)],tTR_rAcc)
+                                        token_idx = (
+                                            outrow
+                                            if cutlass.const_expr(self.full_q_blocks)
+                                            else min(outrow, num_q_tokens - 1)
+                                        )
+                                        if cutlass.const_expr(self.num_heads == 32):
+                                            head_acc = cute.full(
+                                                (4,), 0.0, dtype=cutlass.Float32
+                                            )
+                                            for epi_i in cutlass.range_constexpr(
+                                                num_epi_subtiles
+                                            ):
+                                                cute.copy(
+                                                    tiled_copy_ref,
+                                                    tTR[
+                                                        (
+                                                            None,
+                                                            None,
+                                                            None,
+                                                            0,
+                                                            slot * num_epi_subtiles
+                                                            + epi_i,
+                                                        )
+                                                    ],
+                                                    tTR_rAcc,
+                                                )
                                                 cute.arch.fence_view_async_tmem_load()
-                                                if cutlass.const_expr(local_q==queries_per_wg-1 and epi_i==num_epi_subtiles-1):
-                                                    umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                                if cutlass.const_expr(
+                                                    local_q == queries_per_wg - 1
+                                                    and epi_i == num_epi_subtiles - 1
+                                                ):
+                                                    umma_pipeline_0.consumer_release(
+                                                        umma_cons_state_0
+                                                    )
                                                     umma_cons_state_0.advance()
-                                                head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period)
-                                            score=(head_acc[0]+head_acc[1]+head_acc[2]+head_acc[3])*scale_val
+                                                head_acc = weighted_partial_cached(
+                                                    tTR_rAcc,
+                                                    sW,
+                                                    glm_weights,
+                                                    slot,
+                                                    local_q,
+                                                    q_stage_local,
+                                                    epi_i * (32 // num_epi_subtiles),
+                                                    32 // num_epi_subtiles,
+                                                    32,
+                                                    head_acc,
+                                                    self.use_relu_trick,
+                                                    self.weights_prepared,
+                                                    integer_period=self.glm_integer_period,
+                                                )
+                                            score = (
+                                                head_acc[0]
+                                                + head_acc[1]
+                                                + head_acc[2]
+                                                + head_acc[3]
+                                            ) * scale_val
                                         else:
-                                            if cutlass.const_expr(self.N==64):
-                                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot)],tTR_rAcc)
+                                            if cutlass.const_expr(self.N == 64):
+                                                cute.copy(
+                                                    tiled_copy_ref,
+                                                    tTR[(None, None, None, 0, slot)],
+                                                    tTR_rAcc,
+                                                )
                                                 cute.arch.fence_view_async_tmem_load()
                                             else:
-                                                if cutlass.const_expr(local_q%4==0):
-                                                    cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot//4)],tTR_rAcc)
+                                                if cutlass.const_expr(local_q % 4 == 0):
+                                                    cute.copy(
+                                                        tiled_copy_ref,
+                                                        tTR[
+                                                            (
+                                                                None,
+                                                                None,
+                                                                None,
+                                                                0,
+                                                                slot // 4,
+                                                            )
+                                                        ],
+                                                        tTR_rAcc,
+                                                    )
                                                     cute.arch.fence_view_async_tmem_load()
-                                            x4 = _subview(tTR_rAcc,0 if self.N==64 else (local_q%4)*4,4)
+                                            x4 = _subview(
+                                                tTR_rAcc,
+                                                0
+                                                if self.N == 64
+                                                else (local_q % 4) * 4,
+                                                4,
+                                            )
                                             if cutlass.const_expr(self.use_relu_trick):
-                                                a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                                a4 = indexer_add_packed_f32x2(
+                                                    x4, abs(x4), rnd=_RND_RN
+                                                )
                                             else:
-                                                a4 = cute.max(x4,zero4,propagate_nan=True)
-                                            shared_w = cute.make_rmem_tensor((4,),cutlass.Float32)
+                                                a4 = cute.max(
+                                                    x4, zero4, propagate_nan=True
+                                                )
+                                            shared_w = cute.make_rmem_tensor(
+                                                (4,), cutlass.Float32
+                                            )
                                             for h in cutlass.range_constexpr(4):
-                                                if cutlass.const_expr(self.qsa_weights==2):
-                                                    w = cutlass.Float32(0.04419417306780815 if self.use_relu_trick else 0.0883883461356163)
-                                                elif cutlass.const_expr(self.qsa_weights==1):
+                                                if cutlass.const_expr(
+                                                    self.qsa_weights == 2
+                                                ):
+                                                    w = cutlass.Float32(
+                                                        0.04419417306780815
+                                                        if self.use_relu_trick
+                                                        else 0.0883883461356163
+                                                    )
+                                                elif cutlass.const_expr(
+                                                    self.qsa_weights == 1
+                                                ):
                                                     w = uniform_cache[local_q]
                                                 else:
-                                                    w = sW[(slot*4+h,q_stage_local)]
-                                                if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
+                                                    w = sW[
+                                                        (slot * 4 + h, q_stage_local)
+                                                    ]
+                                                if cutlass.const_expr(
+                                                    self.use_relu_trick
+                                                    and not self.weights_prepared
+                                                ):
+                                                    w = w * 0.5
                                                 shared_w[h] = w
-                                            acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
-                                            score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
+                                            acc4 = indexer_fma_packed_f32x2(
+                                                a4, shared_w.load(), zero4, rnd=_RND_RN
+                                            )
+                                            score = (
+                                                acc4[0] + acc4[1] + acc4[2] + acc4[3]
+                                            ) * scale_val
                                         scores[local_q] = score
-                                if cutlass.const_expr(self.num_heads!=32):
+                                if cutlass.const_expr(self.num_heads != 32):
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                     umma_cons_state_0.advance()
-                                if cutlass.const_expr(self.num_heads==32 and self.output_dtype in (cutlass.Float16,cutlass.BFloat16,cutlass.Float32)):
-                                    pair_row=q_block_idx*self.block_q+query_slot*queries_per_wg
-                                    bank_span=(candidates.shape[1]-8)//(4*self.splits)
-                                    bank_id=(bidz%self.splits)*4+local_tidx//32
-                                    pair_ptr=candidates.iterator+((pair_row*cutlass.Int32(candidates.stride[0])+8+bank_id*bank_span) if cutlass.const_expr(self.offsets32) else (cutlass.Int64(pair_row)*candidates.stride[0]+8+bank_id*bank_span))
-                                    valid0=True if cutlass.const_expr(self.glm_full_tiles) else (kv_pos>=start_cache[0])&(kv_pos<end_cache[0])
-                                    valid1=True if cutlass.const_expr(self.glm_full_tiles) else (kv_pos>=start_cache[1])&(kv_pos<end_cache[1])
+                                if cutlass.const_expr(
+                                    self.num_heads == 32
+                                    and self.output_dtype
+                                    in (
+                                        cutlass.Float16,
+                                        cutlass.BFloat16,
+                                        cutlass.Float32,
+                                    )
+                                ):
+                                    pair_row = (
+                                        q_block_idx * self.block_q
+                                        + query_slot * queries_per_wg
+                                    )
+                                    bank_span = (candidates.shape[1] - 8) // (
+                                        4 * self.splits
+                                    )
+                                    bank_id = (
+                                        bidz % self.splits
+                                    ) * 4 + local_tidx // 32
+                                    pair_ptr = candidates.iterator + (
+                                        (
+                                            pair_row
+                                            * cutlass.Int32(candidates.stride[0])
+                                            + 8
+                                            + bank_id * bank_span
+                                        )
+                                        if cutlass.const_expr(self.offsets32)
+                                        else (
+                                            cutlass.Int64(pair_row)
+                                            * candidates.stride[0]
+                                            + 8
+                                            + bank_id * bank_span
+                                        )
+                                    )
+                                    valid0 = (
+                                        True
+                                        if cutlass.const_expr(self.glm_full_tiles)
+                                        else (kv_pos >= start_cache[0])
+                                        & (kv_pos < end_cache[0])
+                                    )
+                                    valid1 = (
+                                        True
+                                        if cutlass.const_expr(self.glm_full_tiles)
+                                        else (kv_pos >= start_cache[1])
+                                        & (kv_pos < end_cache[1])
+                                    )
                                     if cutlass.const_expr(not self.full_q_blocks):
-                                        valid0=valid0&(pair_row<num_q_tokens)
-                                        valid1=valid1&(pair_row+1<num_q_tokens)
-                                    cursors[0],cursors[1]=fused_publish_pair(pair_ptr,pair_ptr+candidates.stride[0],scores[0],scores[1],tau_cache[0],tau_cache[1],valid0,valid1,kv_pos,cursors[0],cursors[1],bank_span,self.output_dtype,self.glm_skip_empty,packed=candidates.element_type==cutlass.Int32,ordered_threshold=self.num_heads==32)
+                                        valid0 = valid0 & (pair_row < num_q_tokens)
+                                        valid1 = valid1 & (pair_row + 1 < num_q_tokens)
+                                    cursors[0], cursors[1] = fused_publish_pair(
+                                        pair_ptr,
+                                        pair_ptr + candidates.stride[0],
+                                        scores[0],
+                                        scores[1],
+                                        tau_cache[0],
+                                        tau_cache[1],
+                                        valid0,
+                                        valid1,
+                                        kv_pos,
+                                        cursors[0],
+                                        cursors[1],
+                                        bank_span,
+                                        self.output_dtype,
+                                        self.glm_skip_empty,
+                                        packed=candidates.element_type == cutlass.Int32,
+                                        ordered_threshold=self.num_heads == 32,
+                                    )
                                 else:
-                                    for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                                    for local_q in cutlass.range_constexpr(
+                                        self.block_q // (self.num_math_threads // 128)
+                                    ):
                                         slot = query_slot * queries_per_wg + local_q
                                         outrow = q_block_idx * self.block_q + slot
-                                        token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
+                                        token_idx = (
+                                            outrow
+                                            if cutlass.const_expr(self.full_q_blocks)
+                                            else min(outrow, num_q_tokens - 1)
+                                        )
                                         score = scores[local_q]
-                                        if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
+                                        if (
+                                            cutlass.const_expr(self.full_q_blocks)
+                                            or outrow < num_q_tokens
+                                        ):
                                             kv_start = start_cache[local_q]
                                             kv_end = end_cache[local_q]
-                                            bank_span = (candidates.shape[1]-8)//(4*self.splits)
-                                            bank_id = (bidz%self.splits)*4+local_tidx//32
-                                            bank_rows = cute.make_tensor(candidates.iterator+((outrow*cutlass.Int32(candidates.stride[0])+8+bank_id*bank_span) if cutlass.const_expr(self.offsets32) else (cutlass.Int64(outrow)*candidates.stride[0]+8+bank_id*bank_span)),cute.make_layout((1,bank_span),stride=(bank_span,1)))
-                                            if cutlass.const_expr(self.num_heads==32 and self.output_dtype in (cutlass.Float16,cutlass.BFloat16,cutlass.Float32)):
-                                                cursors[local_q]=fused_publish(bank_rows.iterator,score,tau_cache[local_q],(kv_pos>=kv_start)&(kv_pos<kv_end),kv_pos,cursors[local_q],bank_span,self.output_dtype,False,True,packed=candidates.element_type==cutlass.Int32)
+                                            bank_span = (candidates.shape[1] - 8) // (
+                                                4 * self.splits
+                                            )
+                                            bank_id = (
+                                                bidz % self.splits
+                                            ) * 4 + local_tidx // 32
+                                            bank_rows = cute.make_tensor(
+                                                candidates.iterator
+                                                + (
+                                                    (
+                                                        outrow
+                                                        * cutlass.Int32(
+                                                            candidates.stride[0]
+                                                        )
+                                                        + 8
+                                                        + bank_id * bank_span
+                                                    )
+                                                    if cutlass.const_expr(
+                                                        self.offsets32
+                                                    )
+                                                    else (
+                                                        cutlass.Int64(outrow)
+                                                        * candidates.stride[0]
+                                                        + 8
+                                                        + bank_id * bank_span
+                                                    )
+                                                ),
+                                                cute.make_layout(
+                                                    (1, bank_span),
+                                                    stride=(bank_span, 1),
+                                                ),
+                                            )
+                                            if cutlass.const_expr(
+                                                self.num_heads == 32
+                                                and self.output_dtype
+                                                in (
+                                                    cutlass.Float16,
+                                                    cutlass.BFloat16,
+                                                    cutlass.Float32,
+                                                )
+                                            ):
+                                                cursors[local_q] = fused_publish(
+                                                    bank_rows.iterator,
+                                                    score,
+                                                    tau_cache[local_q],
+                                                    (kv_pos >= kv_start)
+                                                    & (kv_pos < kv_end),
+                                                    kv_pos,
+                                                    cursors[local_q],
+                                                    bank_span,
+                                                    self.output_dtype,
+                                                    False,
+                                                    True,
+                                                    packed=candidates.element_type
+                                                    == cutlass.Int32,
+                                                )
                                             else:
-                                                cursors[local_q] = publish_bank(score,(kv_pos>=kv_start)&(kv_pos<kv_end),tau_cache[local_q],0,kv_pos,cursors[local_q],bank_rows,self.output_dtype,True,True)
+                                                cursors[local_q] = publish_bank(
+                                                    score,
+                                                    (kv_pos >= kv_start)
+                                                    & (kv_pos < kv_end),
+                                                    tau_cache[local_q],
+                                                    0,
+                                                    kv_pos,
+                                                    cursors[local_q],
+                                                    bank_rows,
+                                                    self.output_dtype,
+                                                    True,
+                                                    True,
+                                                )
                                 kv_idx = kv_idx + self.splits
                     while kv_idx < num_kv:
-                        kv_pos = kv_idx*128+m_coord
-                        if cutlass.const_expr(not (self.num_heads==32 and self.top_k==512)):
-                            scale_val = cutlass.Float32(1) if cutlass.const_expr(self.qsa_unit_scale) else mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
+                        kv_pos = kv_idx * 128 + m_coord
+                        if cutlass.const_expr(
+                            not (self.num_heads == 32 and self.top_k == 512)
+                        ):
+                            scale_val = (
+                                cutlass.Float32(1)
+                                if cutlass.const_expr(self.qsa_unit_scale)
+                                else mS_raw[
+                                    kv_pos
+                                    if cutlass.const_expr(self.dsv4_aligned_k)
+                                    else min(kv_pos, num_kv_tokens - 1)
+                                ]
+                            )
                         umma_pipeline_0.consumer_wait(umma_cons_state_0)
-                        if cutlass.const_expr(self.num_heads==32 and self.top_k==512):
-                            scale_val = cutlass.Float32(1) if cutlass.const_expr(self.qsa_unit_scale) else mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
-                        tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
-                        tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
+                        if cutlass.const_expr(
+                            self.num_heads == 32 and self.top_k == 512
+                        ):
+                            scale_val = (
+                                cutlass.Float32(1)
+                                if cutlass.const_expr(self.qsa_unit_scale)
+                                else mS_raw[
+                                    kv_pos
+                                    if cutlass.const_expr(self.dsv4_aligned_k)
+                                    else min(kv_pos, num_kv_tokens - 1)
+                                ]
+                            )
+                        tAcc = tCtAcc_base_0[
+                            (None, None, None, umma_cons_state_0.index)
+                        ][((None, None), 0, 0)]
+                        tTR = thr_copy_ref.partition_S(
+                            cute.flat_divide(tAcc, epi_sub_mn)
+                        )
                         if cutlass.const_expr(self.interleaved_queries):
-                            slot0=query_slot*queries_per_wg
-                            pair_acc=cute.make_rmem_tensor((8,),cutlass.Float32)
+                            slot0 = query_slot * queries_per_wg
+                            pair_acc = cute.make_rmem_tensor((8,), cutlass.Float32)
                             pair_acc.fill(0.0)
-                            for chunk in cutlass.range_constexpr(2*num_epi_subtiles):
-                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+chunk)],tTR_rAcc)
+                            for chunk in cutlass.range_constexpr(2 * num_epi_subtiles):
+                                cute.copy(
+                                    tiled_copy_ref,
+                                    tTR[
+                                        (
+                                            None,
+                                            None,
+                                            None,
+                                            0,
+                                            slot0 * num_epi_subtiles + chunk,
+                                        )
+                                    ],
+                                    tTR_rAcc,
+                                )
                                 cute.arch.fence_view_async_tmem_load()
-                                if cutlass.const_expr(chunk==2*num_epi_subtiles-1):
+                                if cutlass.const_expr(
+                                    chunk == 2 * num_epi_subtiles - 1
+                                ):
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                     umma_cons_state_0.advance()
-                                pair_acc=interleaved_partial(tTR_rAcc,glm_weights,pair_acc,chunk*(16//num_epi_subtiles),16//num_epi_subtiles,self.use_relu_trick)
-                            result=cute.make_tensor(pair_acc.iterator,cute.make_layout(2)).load()
-                            for chain in cutlass.range_constexpr(1,4):
-                                result=indexer_add_packed_f32x2(result,cute.make_tensor(pair_acc.iterator+chain*2,cute.make_layout(2)).load(),rnd="rn")
-                            scores[0]=result[0]*scale_val
-                            scores[1]=result[1]*scale_val
+                                pair_acc = interleaved_partial(
+                                    tTR_rAcc,
+                                    glm_weights,
+                                    pair_acc,
+                                    chunk * (16 // num_epi_subtiles),
+                                    16 // num_epi_subtiles,
+                                    self.use_relu_trick,
+                                )
+                            result = cute.make_tensor(
+                                pair_acc.iterator, cute.make_layout(2)
+                            ).load()
+                            for chain in cutlass.range_constexpr(1, 4):
+                                result = indexer_add_packed_f32x2(
+                                    result,
+                                    cute.make_tensor(
+                                        pair_acc.iterator + chain * 2,
+                                        cute.make_layout(2),
+                                    ).load(),
+                                    rnd="rn",
+                                )
+                            scores[0] = result[0] * scale_val
+                            scores[1] = result[1] * scale_val
                         else:
-                            for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                            for local_q in cutlass.range_constexpr(
+                                self.block_q // (self.num_math_threads // 128)
+                            ):
                                 slot = query_slot * queries_per_wg + local_q
                                 outrow = q_block_idx * self.block_q + slot
-                                token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
-                                if cutlass.const_expr(self.num_heads==32):
-                                    head_acc=cute.full((4,),0.0,dtype=cutlass.Float32)
-                                    for epi_i in cutlass.range_constexpr(num_epi_subtiles):
-                                        cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot*num_epi_subtiles+epi_i)],tTR_rAcc)
+                                token_idx = (
+                                    outrow
+                                    if cutlass.const_expr(self.full_q_blocks)
+                                    else min(outrow, num_q_tokens - 1)
+                                )
+                                if cutlass.const_expr(self.num_heads == 32):
+                                    head_acc = cute.full(
+                                        (4,), 0.0, dtype=cutlass.Float32
+                                    )
+                                    for epi_i in cutlass.range_constexpr(
+                                        num_epi_subtiles
+                                    ):
+                                        cute.copy(
+                                            tiled_copy_ref,
+                                            tTR[
+                                                (
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    0,
+                                                    slot * num_epi_subtiles + epi_i,
+                                                )
+                                            ],
+                                            tTR_rAcc,
+                                        )
                                         cute.arch.fence_view_async_tmem_load()
-                                        if cutlass.const_expr(local_q==queries_per_wg-1 and epi_i==num_epi_subtiles-1):
-                                            umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                        if cutlass.const_expr(
+                                            local_q == queries_per_wg - 1
+                                            and epi_i == num_epi_subtiles - 1
+                                        ):
+                                            umma_pipeline_0.consumer_release(
+                                                umma_cons_state_0
+                                            )
                                             umma_cons_state_0.advance()
-                                        head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period)
-                                    score=(head_acc[0]+head_acc[1]+head_acc[2]+head_acc[3])*scale_val
+                                        head_acc = weighted_partial_cached(
+                                            tTR_rAcc,
+                                            sW,
+                                            glm_weights,
+                                            slot,
+                                            local_q,
+                                            q_stage_local,
+                                            epi_i * (32 // num_epi_subtiles),
+                                            32 // num_epi_subtiles,
+                                            32,
+                                            head_acc,
+                                            self.use_relu_trick,
+                                            self.weights_prepared,
+                                            integer_period=self.glm_integer_period,
+                                        )
+                                    score = (
+                                        head_acc[0]
+                                        + head_acc[1]
+                                        + head_acc[2]
+                                        + head_acc[3]
+                                    ) * scale_val
                                 else:
-                                    if cutlass.const_expr(self.N==64):
-                                        cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot)],tTR_rAcc)
+                                    if cutlass.const_expr(self.N == 64):
+                                        cute.copy(
+                                            tiled_copy_ref,
+                                            tTR[(None, None, None, 0, slot)],
+                                            tTR_rAcc,
+                                        )
                                         cute.arch.fence_view_async_tmem_load()
                                     else:
-                                        if cutlass.const_expr(local_q%4==0):
-                                            cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot//4)],tTR_rAcc)
+                                        if cutlass.const_expr(local_q % 4 == 0):
+                                            cute.copy(
+                                                tiled_copy_ref,
+                                                tTR[(None, None, None, 0, slot // 4)],
+                                                tTR_rAcc,
+                                            )
                                             cute.arch.fence_view_async_tmem_load()
-                                    x4 = _subview(tTR_rAcc,0 if self.N==64 else (local_q%4)*4,4)
+                                    x4 = _subview(
+                                        tTR_rAcc,
+                                        0 if self.N == 64 else (local_q % 4) * 4,
+                                        4,
+                                    )
                                     if cutlass.const_expr(self.use_relu_trick):
-                                        a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                        a4 = indexer_add_packed_f32x2(
+                                            x4, abs(x4), rnd=_RND_RN
+                                        )
                                     else:
-                                        a4 = cute.max(x4,zero4,propagate_nan=True)
-                                    shared_w = cute.make_rmem_tensor((4,),cutlass.Float32)
+                                        a4 = cute.max(x4, zero4, propagate_nan=True)
+                                    shared_w = cute.make_rmem_tensor(
+                                        (4,), cutlass.Float32
+                                    )
                                     for h in cutlass.range_constexpr(4):
-                                        if cutlass.const_expr(self.qsa_weights==2):
-                                            w = cutlass.Float32(0.04419417306780815 if self.use_relu_trick else 0.0883883461356163)
-                                        elif cutlass.const_expr(self.qsa_weights==1):
+                                        if cutlass.const_expr(self.qsa_weights == 2):
+                                            w = cutlass.Float32(
+                                                0.04419417306780815
+                                                if self.use_relu_trick
+                                                else 0.0883883461356163
+                                            )
+                                        elif cutlass.const_expr(self.qsa_weights == 1):
                                             w = uniform_cache[local_q]
                                         else:
-                                            w = sW[(slot*4+h,q_stage_local)]
-                                        if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
+                                            w = sW[(slot * 4 + h, q_stage_local)]
+                                        if cutlass.const_expr(
+                                            self.use_relu_trick
+                                            and not self.weights_prepared
+                                        ):
+                                            w = w * 0.5
                                         shared_w[h] = w
-                                    acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
-                                    score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
+                                    acc4 = indexer_fma_packed_f32x2(
+                                        a4, shared_w.load(), zero4, rnd=_RND_RN
+                                    )
+                                    score = (
+                                        acc4[0] + acc4[1] + acc4[2] + acc4[3]
+                                    ) * scale_val
                                 scores[local_q] = score
-                        if cutlass.const_expr(self.num_heads!=32):
+                        if cutlass.const_expr(self.num_heads != 32):
                             umma_pipeline_0.consumer_release(umma_cons_state_0)
                             umma_cons_state_0.advance()
-                        if cutlass.const_expr(self.num_heads==32 and self.output_dtype in (cutlass.Float16,cutlass.BFloat16,cutlass.Float32)):
-                            pair_row=q_block_idx*self.block_q+query_slot*queries_per_wg
-                            bank_span=(candidates.shape[1]-8)//(4*self.splits)
-                            bank_id=(bidz%self.splits)*4+local_tidx//32
-                            pair_ptr=candidates.iterator+((pair_row*cutlass.Int32(candidates.stride[0])+8+bank_id*bank_span) if cutlass.const_expr(self.offsets32) else (cutlass.Int64(pair_row)*candidates.stride[0]+8+bank_id*bank_span))
-                            valid0=(kv_pos>=start_cache[0])&(kv_pos<end_cache[0])
-                            valid1=(kv_pos>=start_cache[1])&(kv_pos<end_cache[1])
+                        if cutlass.const_expr(
+                            self.num_heads == 32
+                            and self.output_dtype
+                            in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
+                        ):
+                            pair_row = (
+                                q_block_idx * self.block_q + query_slot * queries_per_wg
+                            )
+                            bank_span = (candidates.shape[1] - 8) // (4 * self.splits)
+                            bank_id = (bidz % self.splits) * 4 + local_tidx // 32
+                            pair_ptr = candidates.iterator + (
+                                (
+                                    pair_row * cutlass.Int32(candidates.stride[0])
+                                    + 8
+                                    + bank_id * bank_span
+                                )
+                                if cutlass.const_expr(self.offsets32)
+                                else (
+                                    cutlass.Int64(pair_row) * candidates.stride[0]
+                                    + 8
+                                    + bank_id * bank_span
+                                )
+                            )
+                            valid0 = (kv_pos >= start_cache[0]) & (
+                                kv_pos < end_cache[0]
+                            )
+                            valid1 = (kv_pos >= start_cache[1]) & (
+                                kv_pos < end_cache[1]
+                            )
                             if cutlass.const_expr(not self.full_q_blocks):
-                                valid0=valid0&(pair_row<num_q_tokens)
-                                valid1=valid1&(pair_row+1<num_q_tokens)
-                            cursors[0],cursors[1]=fused_publish_pair(pair_ptr,pair_ptr+candidates.stride[0],scores[0],scores[1],tau_cache[0],tau_cache[1],valid0,valid1,kv_pos,cursors[0],cursors[1],bank_span,self.output_dtype,self.glm_skip_empty,packed=candidates.element_type==cutlass.Int32,ordered_threshold=self.num_heads==32)
+                                valid0 = valid0 & (pair_row < num_q_tokens)
+                                valid1 = valid1 & (pair_row + 1 < num_q_tokens)
+                            cursors[0], cursors[1] = fused_publish_pair(
+                                pair_ptr,
+                                pair_ptr + candidates.stride[0],
+                                scores[0],
+                                scores[1],
+                                tau_cache[0],
+                                tau_cache[1],
+                                valid0,
+                                valid1,
+                                kv_pos,
+                                cursors[0],
+                                cursors[1],
+                                bank_span,
+                                self.output_dtype,
+                                self.glm_skip_empty,
+                                packed=candidates.element_type == cutlass.Int32,
+                                ordered_threshold=self.num_heads == 32,
+                            )
                         else:
-                            for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
+                            for local_q in cutlass.range_constexpr(
+                                self.block_q // (self.num_math_threads // 128)
+                            ):
                                 slot = query_slot * queries_per_wg + local_q
                                 outrow = q_block_idx * self.block_q + slot
-                                token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
+                                token_idx = (
+                                    outrow
+                                    if cutlass.const_expr(self.full_q_blocks)
+                                    else min(outrow, num_q_tokens - 1)
+                                )
                                 score = scores[local_q]
-                                if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
+                                if (
+                                    cutlass.const_expr(self.full_q_blocks)
+                                    or outrow < num_q_tokens
+                                ):
                                     kv_start = start_cache[local_q]
                                     kv_end = end_cache[local_q]
-                                    bank_span = (candidates.shape[1]-8)//(4*self.splits)
-                                    bank_id = (bidz%self.splits)*4+local_tidx//32
-                                    bank_rows = cute.make_tensor(candidates.iterator+((outrow*cutlass.Int32(candidates.stride[0])+8+bank_id*bank_span) if cutlass.const_expr(self.offsets32) else (cutlass.Int64(outrow)*candidates.stride[0]+8+bank_id*bank_span)),cute.make_layout((1,bank_span),stride=(bank_span,1)))
-                                    if cutlass.const_expr(self.num_heads==32 and self.output_dtype in (cutlass.Float16,cutlass.BFloat16,cutlass.Float32)):
-                                        cursors[local_q]=fused_publish(bank_rows.iterator,score,tau_cache[local_q],(kv_pos>=kv_start)&(kv_pos<kv_end),kv_pos,cursors[local_q],bank_span,self.output_dtype,False,True,packed=candidates.element_type==cutlass.Int32)
+                                    bank_span = (candidates.shape[1] - 8) // (
+                                        4 * self.splits
+                                    )
+                                    bank_id = (
+                                        bidz % self.splits
+                                    ) * 4 + local_tidx // 32
+                                    bank_rows = cute.make_tensor(
+                                        candidates.iterator
+                                        + (
+                                            (
+                                                outrow
+                                                * cutlass.Int32(candidates.stride[0])
+                                                + 8
+                                                + bank_id * bank_span
+                                            )
+                                            if cutlass.const_expr(self.offsets32)
+                                            else (
+                                                cutlass.Int64(outrow)
+                                                * candidates.stride[0]
+                                                + 8
+                                                + bank_id * bank_span
+                                            )
+                                        ),
+                                        cute.make_layout(
+                                            (1, bank_span), stride=(bank_span, 1)
+                                        ),
+                                    )
+                                    if cutlass.const_expr(
+                                        self.num_heads == 32
+                                        and self.output_dtype
+                                        in (
+                                            cutlass.Float16,
+                                            cutlass.BFloat16,
+                                            cutlass.Float32,
+                                        )
+                                    ):
+                                        cursors[local_q] = fused_publish(
+                                            bank_rows.iterator,
+                                            score,
+                                            tau_cache[local_q],
+                                            (kv_pos >= kv_start) & (kv_pos < kv_end),
+                                            kv_pos,
+                                            cursors[local_q],
+                                            bank_span,
+                                            self.output_dtype,
+                                            False,
+                                            True,
+                                            packed=candidates.element_type
+                                            == cutlass.Int32,
+                                        )
                                     else:
-                                        cursors[local_q] = publish_bank(score,(kv_pos>=kv_start)&(kv_pos<kv_end),tau_cache[local_q],0,kv_pos,cursors[local_q],bank_rows,self.output_dtype,True,True)
+                                        cursors[local_q] = publish_bank(
+                                            score,
+                                            (kv_pos >= kv_start) & (kv_pos < kv_end),
+                                            tau_cache[local_q],
+                                            0,
+                                            kv_pos,
+                                            cursors[local_q],
+                                            bank_rows,
+                                            self.output_dtype,
+                                            True,
+                                            True,
+                                        )
                         kv_idx = kv_idx + self.splits
-                    for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
-                        outrow = q_block_idx*self.block_q+query_slot*queries_per_wg+local_q
-                        if (cutlass.const_expr(self.full_q_blocks) or outrow<num_q_tokens) and cute.arch.lane_idx()==0:
-                            bank_span = (candidates.shape[1]-8)//(4*self.splits)
-                            bank_id = (bidz%self.splits)*4+local_tidx//32
+                    for local_q in cutlass.range_constexpr(
+                        self.block_q // (self.num_math_threads // 128)
+                    ):
+                        outrow = (
+                            q_block_idx * self.block_q
+                            + query_slot * queries_per_wg
+                            + local_q
+                        )
+                        if (
+                            cutlass.const_expr(self.full_q_blocks)
+                            or outrow < num_q_tokens
+                        ) and cute.arch.lane_idx() == 0:
+                            bank_span = (candidates.shape[1] - 8) // (4 * self.splits)
+                            bank_id = (bidz % self.splits) * 4 + local_tidx // 32
                             cursor = cursors[local_q]
-                            candidates[outrow,bank_id] = candidates.element_type(cursor)
-                            if cutlass.const_expr(self.splits==1):candidates[outrow,bank_id+4] = candidates.element_type(0)
-                            cute.arch.atomic_add((counts.iterator+outrow).llvm_ptr,cursor-cutlass.Int32(cursor>bank_span)*16777216,sem="relaxed",scope="gpu")
+                            candidates[outrow, bank_id] = candidates.element_type(
+                                cursor
+                            )
+                            if cutlass.const_expr(self.splits == 1):
+                                candidates[outrow, bank_id + 4] = (
+                                    candidates.element_type(0)
+                                )
+                            cute.arch.atomic_add(
+                                (counts.iterator + outrow).llvm_ptr,
+                                cursor - cutlass.Int32(cursor > bank_span) * 16777216,
+                                sem="relaxed",
+                                scope="gpu",
+                            )
                     q_pipeline.consumer_release(q_cons_state)
                     q_cons_state.advance()
-                    next_q_block_idx = q_block_idx-cute.arch.grid_dim()[2]//self.splits
-                    if next_q_block_idx>=0:
-                        q_last_next=min(next_q_block_idx*self.block_q+self.block_q-1,num_q_tokens-1)
-                        next_num_kv=(mCuSeqLenKEnd[q_last_next]+127)//128
-                    has_work=next_q_block_idx>=0
-            subset_barrier(barrier_id=15,number_of_threads=self.num_math_threads)
-            if cutlass.const_expr(self.num_heads != 4):tmem.relinquish_alloc_permit()
+                    next_q_block_idx = (
+                        q_block_idx - cute.arch.grid_dim()[2] // self.splits
+                    )
+                    if next_q_block_idx >= 0:
+                        q_last_next = min(
+                            next_q_block_idx * self.block_q + self.block_q - 1,
+                            num_q_tokens - 1,
+                        )
+                        next_num_kv = (mCuSeqLenKEnd[q_last_next] + 127) // 128
+                    has_work = next_q_block_idx >= 0
+            subset_barrier(barrier_id=15, number_of_threads=self.num_math_threads)
+            if cutlass.const_expr(self.num_heads != 4):
+                tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
 
-
-
-from .selection import finish_recovery, select_or_prepare_retry as select_candidates
+from .selection import finish_recovery
 
 from .selection import runtime_samples, block_samples
 
 from .selection import encode
+
+
 @cute.jit
-def publish_bank(score,active,tau,row,index,cursor,bank_rows,dtype:cutlass.Constexpr,pred_store:cutlass.Constexpr=False,raw_half:cutlass.Constexpr=False,unordered:cutlass.Constexpr=False,pro_raw_packed:cutlass.Constexpr=False):
-    value=score
-    if cutlass.const_expr(not raw_half or dtype not in (cutlass.Float16,cutlass.BFloat16)):value=cutlass.Float32(dtype(score))
-    hit=active&(~(value<tau)) if cutlass.const_expr(unordered) else active&((value>=tau)|(value!=value))
-    mask=cute.arch.vote_ballot_sync(hit)
+def publish_bank(
+    score,
+    active,
+    tau,
+    row,
+    index,
+    cursor,
+    bank_rows,
+    dtype: cutlass.Constexpr,
+    pred_store: cutlass.Constexpr = False,
+    raw_half: cutlass.Constexpr = False,
+    unordered: cutlass.Constexpr = False,
+    pro_raw_packed: cutlass.Constexpr = False,
+):
+    value = score
+    if cutlass.const_expr(
+        not raw_half or dtype not in (cutlass.Float16, cutlass.BFloat16)
+    ):
+        value = cutlass.Float32(dtype(score))
+    hit = (
+        active & (~(value < tau))
+        if cutlass.const_expr(unordered)
+        else active & ((value >= tau) | (value != value))
+    )
+    mask = cute.arch.vote_ballot_sync(hit)
     # Warp-uniform empty ballots have no stores or cursor updates.
-    next_cursor=cursor
-    if mask!=0:
-        if cutlass.const_expr(raw_half and dtype in (cutlass.Float16,cutlass.BFloat16) and not pro_raw_packed):value=cutlass.Float32(dtype(score))
-        total=cutlass.Int32(cute.arch.popc(mask))
-        lane=cute.arch.lane_idx()
-        pos=cursor+cutlass.Int32(cute.arch.popc(mask&((cutlass.Uint32(1)<<lane)-1)))
-        if cutlass.const_expr(pred_store and bank_rows.element_type==cutlass.Int32):
-            predicated_store32(bank_rows.iterator+row*bank_rows.stride[0]+pos,
-                pack_half_index(value,index,dtype),hit&(pos<bank_rows.shape[1]))
+    next_cursor = cursor
+    if mask != 0:
+        if cutlass.const_expr(
+            raw_half
+            and dtype in (cutlass.Float16, cutlass.BFloat16)
+            and not pro_raw_packed
+        ):
+            value = cutlass.Float32(dtype(score))
+        total = cutlass.Int32(cute.arch.popc(mask))
+        lane = cute.arch.lane_idx()
+        pos = cursor + cutlass.Int32(
+            cute.arch.popc(mask & ((cutlass.Uint32(1) << lane) - 1))
+        )
+        if cutlass.const_expr(pred_store and bank_rows.element_type == cutlass.Int32):
+            predicated_store32(
+                bank_rows.iterator + row * bank_rows.stride[0] + pos,
+                pack_half_index(value, index, dtype),
+                hit & (pos < bank_rows.shape[1]),
+            )
         elif cutlass.const_expr(pred_store):
-            predicated_store64(bank_rows.iterator+row*bank_rows.stride[0]+pos,
-                cutlass.Int64(encode(value,index,cutlass.Float32,False)),hit&(pos<bank_rows.shape[1]))
+            predicated_store64(
+                bank_rows.iterator + row * bank_rows.stride[0] + pos,
+                cutlass.Int64(encode(value, index, cutlass.Float32, False)),
+                hit & (pos < bank_rows.shape[1]),
+            )
         else:
-            if hit&(pos<bank_rows.shape[1]):
-                bank_rows[row,pos]=bank_rows.element_type(encode(value,index,dtype,bank_rows.element_type==cutlass.Int32))
-        next_cursor=cursor+total
+            if hit & (pos < bank_rows.shape[1]):
+                bank_rows[row, pos] = bank_rows.element_type(
+                    encode(value, index, dtype, bank_rows.element_type == cutlass.Int32)
+                )
+        next_cursor = cursor + total
     return next_cursor
 
 
@@ -1723,18 +3253,36 @@ from .weighted_heads import weighted_partial_cached
 from .qsa_publish import publish_pair as fused_publish_pair
 
 from .fp4_safe_filter import _uniform_weight, finite_integer_relu
+
+
 @cute.jit
-def interleaved_partial(fragment,weights,acc,offset:cutlass.Constexpr,width:cutlass.Constexpr,relu:cutlass.Constexpr):
+def interleaved_partial(
+    fragment,
+    weights,
+    acc,
+    offset: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    relu: cutlass.Constexpr,
+):
     # Pair across queries; keep the original head order in each FP32 chain.
     for h in cutlass.range_constexpr(width):
-        x=cute.make_tensor(fragment.iterator+h*2,cute.make_layout(2)).load()
-        if cutlass.const_expr(relu and ((0xF0000000 >> (offset+h)) & 1)):
-            v=cute.make_rmem_tensor((2,),cutlass.Float32)
-            v[0]=finite_integer_relu(x[0]);v[1]=finite_integer_relu(x[1])
-            positive=v.load()
-        elif cutlass.const_expr(relu):positive=indexer_add_packed_f32x2(x,abs(x),rnd="rn")
-        else:positive=cute.max(x,cute.full((2,),0.0,dtype=cutlass.Float32),propagate_nan=True)
-        w=cute.make_tensor(weights.iterator+(offset+h)*2,cute.make_layout(2)).load()
-        chain=cute.make_tensor(acc.iterator+((offset+h)%4)*2,cute.make_layout(2))
-        chain.store(indexer_fma_packed_f32x2(positive,w,chain.load(),rnd="rn"))
+        x = cute.make_tensor(fragment.iterator + h * 2, cute.make_layout(2)).load()
+        if cutlass.const_expr(relu and ((0xF0000000 >> (offset + h)) & 1)):
+            v = cute.make_rmem_tensor((2,), cutlass.Float32)
+            v[0] = finite_integer_relu(x[0])
+            v[1] = finite_integer_relu(x[1])
+            positive = v.load()
+        elif cutlass.const_expr(relu):
+            positive = indexer_add_packed_f32x2(x, abs(x), rnd="rn")
+        else:
+            positive = cute.max(
+                x, cute.full((2,), 0.0, dtype=cutlass.Float32), propagate_nan=True
+            )
+        w = cute.make_tensor(
+            weights.iterator + (offset + h) * 2, cute.make_layout(2)
+        ).load()
+        chain = cute.make_tensor(
+            acc.iterator + ((offset + h) % 4) * 2, cute.make_layout(2)
+        )
+        chain.store(indexer_fma_packed_f32x2(positive, w, chain.load(), rnd="rn"))
     return acc

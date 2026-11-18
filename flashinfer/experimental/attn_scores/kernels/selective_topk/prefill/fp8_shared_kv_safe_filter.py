@@ -627,7 +627,7 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
         kv_prod_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
-        kv_prod_state_1 = pipeline.make_pipeline_state(
+        _kv_prod_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
         # UMMA consumer states (wait + release, owns the pipeline).
@@ -671,7 +671,7 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
         umma_cons_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
-        umma_cons_state_1 = pipeline.make_pipeline_state(
+        _umma_cons_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
@@ -688,7 +688,7 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
         # Warp 0 copies Q scales into shared SFB TMEM; warp 1 reads that region.
         # Synchronize both UMMA warps after the copy: the Q pipeline orders TMA-to-SMEM,
         # not cross-warp TMEM visibility.
-        sfb_sync_barrier = pipeline.NamedBarrier(
+        _sfb_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=32 * self.num_groups
         )
         tmem = indexer_memory.TmemAllocator(
@@ -704,10 +704,10 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
         # Persistent K1 keeps per-query scratch in the math groups. TMA/UMMA
         # continue independently; barrier 12 includes only the 256 math lanes.
         if cutlass.const_expr(self.mode == "sample" and self.persistent_sample):
-            sample_hist = smem.allocate_tensor(
+            _sample_hist = smem.allocate_tensor(
                 cutlass.Int32, cute.make_layout(1538), byte_alignment=128
             )
-            sample_scalar = smem.allocate_tensor(
+            _sample_scalar = smem.allocate_tensor(
                 cutlass.Int32, cute.make_layout(2), byte_alignment=16
             )
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -1094,10 +1094,8 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                     )
                             cute.arch.fence_view_async_shared()
                             # Wait for both UMMA commits before overwriting SFB.
-                            # The preceding SMEM transpose can overlap the MMA drain.
-                            # UTCCP atom is UE8M0-typed; the int32 SMEM (4 packed
-                            # UE8M0 per int32) needs a recast for the s2t copy +
-                            # chunk layout (which counts UE8M0 cells, 4× int32).
+                            # Recast packed int32 scales to UE8M0 for UTCCP;
+                            # each int32 contains four scale cells.
                             sSF_Q_ue8m0 = cute.recast_tensor(sSF_Q, Float8E8M0FNU)
                             stage_off_ue8m0 = q_stage_0 * sSF_Q_ue8m0.layout.stride[1]
                             sSF_Q_chunk = cute.make_tensor(
@@ -1474,7 +1472,7 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                         ):
                             wa = wa * 2.0
                             wb = wb * 2.0
-                        native_weights[h] = native_fp8_pack(self.output_dtype, wa, wb)
+                        native_weights[h] = native_fp8_pack(self.native_dtype, wa, wb)
                 else:
                     for h in cutlass.range_constexpr(self.max_w_in_reg):
                         w = sW[(query_slot * 64 + h, q_stage_local)]
@@ -1550,17 +1548,17 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                     x4 = _subview(tTR_rAcc, h, 4)
                                     woff = (i * (64 // num_epi_subtiles) + h) // 2
                                     s_acc[0] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[0], x4[1]
+                                            self.native_dtype, x4[0], x4[1]
                                         ),
                                         native_weights[woff],
                                         s_acc[0],
                                     )
                                     s_acc[1] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[2], x4[3]
+                                            self.native_dtype, x4[2], x4[3]
                                         ),
                                         native_weights[woff + 1],
                                         s_acc[1],
@@ -1638,9 +1636,9 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                         a4, w4, s_acc, rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.native_lowp):
-                            reduced = native_add(self.output_dtype, s_acc[0], s_acc[1])
+                            reduced = native_add(self.native_dtype, s_acc[0], s_acc[1])
                             score = (
-                                native_sum_fp32(self.output_dtype, reduced) * scale_val
+                                native_sum_fp32(self.native_dtype, reduced) * scale_val
                             )
                         else:
                             score = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
@@ -1668,7 +1666,7 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                     if cutlass.const_expr(self.dsv4_full_tiles)
                     else num_kv
                 ):
-                    for kv_unroll in cutlass.range_constexpr(
+                    for _kv_unroll in cutlass.range_constexpr(
                         4 if self.dsv4_unroll else 16
                     ):
                         kv_pos = kv_idx * 128 + m_coord
@@ -1719,17 +1717,17 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                     x4 = _subview(tTR_rAcc, h, 4)
                                     woff = (i * (64 // num_epi_subtiles) + h) // 2
                                     s_acc[0] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[0], x4[1]
+                                            self.native_dtype, x4[0], x4[1]
                                         ),
                                         native_weights[woff],
                                         s_acc[0],
                                     )
                                     s_acc[1] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[2], x4[3]
+                                            self.native_dtype, x4[2], x4[3]
                                         ),
                                         native_weights[woff + 1],
                                         s_acc[1],
@@ -1807,9 +1805,9 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                         a4, w4, s_acc, rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.native_lowp):
-                            reduced = native_add(self.output_dtype, s_acc[0], s_acc[1])
+                            reduced = native_add(self.native_dtype, s_acc[0], s_acc[1])
                             score = (
-                                native_sum_fp32(self.output_dtype, reduced) * scale_val
+                                native_sum_fp32(self.native_dtype, reduced) * scale_val
                             )
                         else:
                             score = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
@@ -1876,14 +1874,14 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                 x4 = _subview(tTR_rAcc, h, 4)
                                 woff = (i * (64 // num_epi_subtiles) + h) // 2
                                 s_acc[0] = native_fma(
-                                    self.output_dtype,
-                                    native_pack_relu(self.output_dtype, x4[0], x4[1]),
+                                    self.native_dtype,
+                                    native_pack_relu(self.native_dtype, x4[0], x4[1]),
                                     native_weights[woff],
                                     s_acc[0],
                                 )
                                 s_acc[1] = native_fma(
-                                    self.output_dtype,
-                                    native_pack_relu(self.output_dtype, x4[2], x4[3]),
+                                    self.native_dtype,
+                                    native_pack_relu(self.native_dtype, x4[2], x4[3]),
                                     native_weights[woff + 1],
                                     s_acc[1],
                                 )
@@ -1957,8 +1955,8 @@ class FP8PrefillMQALogitsKernel(_BaseKernel):
                                     a4, w4, s_acc, rnd=_RND_RN
                                 )
                     if cutlass.const_expr(self.native_lowp):
-                        reduced = native_add(self.output_dtype, s_acc[0], s_acc[1])
-                        score = native_sum_fp32(self.output_dtype, reduced) * scale_val
+                        reduced = native_add(self.native_dtype, s_acc[0], s_acc[1])
+                        score = native_sum_fp32(self.native_dtype, reduced) * scale_val
                     else:
                         score = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                     if outrow < num_q_tokens:

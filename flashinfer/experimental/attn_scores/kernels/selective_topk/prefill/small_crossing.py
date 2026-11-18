@@ -14,8 +14,10 @@
 PR NVIDIA/TensorRT-LLM#20106 inspires the argmax and complement paths.
 No thresholds depend on the dataset or KV length.
 """
+
 import cutlass
 import cutlass.cute as cute
+
 
 @cute.jit
 def refine(ck, ci, m, need, above, tid, out, threads: cutlass.Constexpr):
@@ -44,9 +46,11 @@ def refine(ck, ci, m, need, above, tid, out, threads: cutlass.Constexpr):
             live1 = lane + 32 < m
             key0 = cutlass.Uint32(0)
             key1 = cutlass.Uint32(0)
-            if live0: key0 = cutlass.Uint32(ck[lane])
-            if live1: key1 = cutlass.Uint32(ck[lane + 32])
-            for removed in cutlass.range(m - need):
+            if live0:
+                key0 = cutlass.Uint32(ck[lane])
+            if live1:
+                key1 = cutlass.Uint32(ck[lane + 32])
+            for _removed in cutlass.range(m - need):
                 worst = cutlass.Uint32(0)
                 slot = cutlass.Int32(-1)
                 if live0:
@@ -66,16 +70,24 @@ def refine(ck, ci, m, need, above, tid, out, threads: cutlass.Constexpr):
             mask0 = cute.arch.vote_ballot_sync(live0)
             mask1 = cute.arch.vote_ballot_sync(live1)
             lower = (cutlass.Uint32(1) << lane) - 1
-            if live0: out[above + cutlass.Int32(cute.arch.popc(mask0 & lower))] = ci[lane]
-            if live1: out[above + cutlass.Int32(cute.arch.popc(mask0)) + cutlass.Int32(cute.arch.popc(mask1 & lower))] = ci[lane + 32]
+            if live0:
+                out[above + cutlass.Int32(cute.arch.popc(mask0 & lower))] = ci[lane]
+            if live1:
+                out[
+                    above
+                    + cutlass.Int32(cute.arch.popc(mask0))
+                    + cutlass.Int32(cute.arch.popc(mask1 & lower))
+                ] = ci[lane + 32]
     elif m <= 32:
         voter = cutlass.Uint32(0xFFFFFFFF)
-        if lane < m: voter = cutlass.Uint32(ck[lane])
+        if lane < m:
+            voter = cutlass.Uint32(ck[lane])
         for item in cutlass.range(warp, m, threads // 32):
             target = cute.arch.shuffle_sync(voter, item)
             less = (lane < m) & ((voter < target) | ((voter == target) & (lane < item)))
             rank = cutlass.Int32(cute.arch.popc(cute.arch.vote_ballot_sync(less)))
-            if (lane == 0) & (rank < need): out[above + rank] = ci[item]
+            if (lane == 0) & (rank < need):
+                out[above + rank] = ci[item]
     else:
         for item in cutlass.range(warp, m, threads // 32):
             key = cutlass.Uint32(ck[item])
@@ -83,10 +95,12 @@ def refine(ck, ci, m, need, above, tid, out, threads: cutlass.Constexpr):
             for base in cutlass.range(0, m, 32):
                 j = base + lane
                 other = cutlass.Uint32(0xFFFFFFFF)
-                if j < m: other = cutlass.Uint32(ck[j])
+                if j < m:
+                    other = cutlass.Uint32(ck[j])
                 less = (j < m) & ((other < key) | ((other == key) & (j < item)))
                 rank += cutlass.Int32(cute.arch.popc(cute.arch.vote_ballot_sync(less)))
-            if (lane == 0) & (rank < need): out[above + rank] = ci[item]
+            if (lane == 0) & (rank < need):
+                out[above + rank] = ci[item]
 
 
 @cute.jit
@@ -99,9 +113,11 @@ def refine_quantized(ck, ci, m, need, above, tid, out, threads: cutlass.Constexp
     same = True
     for base in cutlass.range(0, m, 32):
         j = base + lane
-        if j < m: same = same & (cutlass.Uint32(ck[j]) == first)
+        if j < m:
+            same = same & (cutlass.Uint32(ck[j]) == first)
     uniform = cute.arch.vote_ballot_sync(same) == cutlass.Uint32(0xFFFFFFFF)
     if uniform:
-        for j in cutlass.range(tid, need, threads): out[above + j] = ci[j]
+        for j in cutlass.range(tid, need, threads):
+            out[above + j] = ci[j]
     else:
         refine(ck, ci, m, need, above, tid, out, threads)

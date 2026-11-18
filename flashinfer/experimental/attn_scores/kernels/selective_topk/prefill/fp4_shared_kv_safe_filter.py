@@ -37,7 +37,6 @@ from .fp4_safe_filter import (
     integer_relu4,
     native_add,
     native_fma,
-    native_pack,
     native_pack_relu,
     native_sum_fp32,
     pipeline,
@@ -48,6 +47,7 @@ from .fp4_safe_filter import (
     sample_tile,
     sm100_utils,
     subset_barrier,
+    tmem_thread_fence,
     tcgen05,
     utccp_interleaved_qsf,
     utccp_required_smem_warp_transpose,
@@ -494,7 +494,7 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
         kv_prod_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
-        kv_prod_state_1 = pipeline.make_pipeline_state(
+        _kv_prod_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
         # UMMA consumer states (wait + release, owns the pipeline).
@@ -558,7 +558,7 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
         umma_cons_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
-        umma_cons_state_1 = pipeline.make_pipeline_state(
+        _umma_cons_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
@@ -575,7 +575,7 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
         # Warp 0 copies Q scales into shared SFB TMEM; warp 1 reads that region.
         # Synchronize both UMMA warps after the copy: the Q pipeline orders TMA-to-SMEM,
         # not cross-warp TMEM visibility.
-        sfb_sync_barrier = pipeline.NamedBarrier(
+        _sfb_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=32 * self.num_groups
         )
         tmem = indexer_memory.TmemAllocator(
@@ -591,10 +591,10 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
         # Persistent K1 keeps per-query scratch in the math groups. TMA/UMMA
         # continue independently; barrier 12 includes only the 256 math lanes.
         if cutlass.const_expr(self.mode == "sample" and self.persistent_sample):
-            sample_hist = smem.allocate_tensor(
+            _sample_hist = smem.allocate_tensor(
                 cutlass.Int32, cute.make_layout(1538), byte_alignment=128
             )
-            sample_scalar = smem.allocate_tensor(
+            _sample_scalar = smem.allocate_tensor(
                 cutlass.Int32, cute.make_layout(2), byte_alignment=16
             )
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -1056,10 +1056,8 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                     )
                             cute.arch.fence_view_async_shared()
                             # Wait for both UMMA commits before overwriting SFB.
-                            # The preceding SMEM transpose can overlap the MMA drain.
-                            # UTCCP atom is UE8M0-typed; the int32 SMEM (4 packed
-                            # UE8M0 per int32) needs a recast for the s2t copy +
-                            # chunk layout (which counts UE8M0 cells, 4× int32).
+                            # Recast packed int32 scales to UE8M0 for UTCCP;
+                            # each int32 contains four scale cells.
                             sSF_Q_ue8m0 = cute.recast_tensor(sSF_Q, Float8E8M0FNU)
                             stage_off_ue8m0 = (
                                 q_stage_0 + q_pair * self.num_q_stages
@@ -1091,13 +1089,16 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                             )
                             tCtSFB_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
                             cute.copy(tiled_copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t)
-                        # Make both SFB writes visible before warp 1 reads the second
-                        # query pair. The fence orders async s2t; the barrier
-                        # establishes visibility across the UMMA warps.
-                        cute.arch.fence_view_async_tmem_store()
+                        # Order the Q-scale copy before either UMMA warp reads SFB.
+                        if cutlass.const_expr(self.num_groups == 2):
+                            tmem_thread_fence(before=True)
+                        else:
+                            cute.arch.fence_view_async_tmem_store()
                         subset_barrier(
                             barrier_id=2, number_of_threads=32 * self.num_groups
                         )
+                        if cutlass.const_expr(self.num_groups == 2):
+                            tmem_thread_fence(before=False)
 
                     # Wait for KV, then TMEM capacity. Padded iterations compute unused results.
                     kv_pipeline_0.consumer_wait(kv_cons_state_umma_0)
@@ -1258,11 +1259,11 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                             q_cons_state_umma_1.advance()
                         q_pipeline.consumer_wait(q_cons_state_umma_1)
                         q_stage_1 = q_cons_state_umma_1.index + self.num_q_stages
-                        # Warp 0 owns the Q-scale copy. Warp 1 waits for cross-warp TMEM visibility
-                        # before reading SFB; the Q pipeline covers only TMA-to-SMEM ordering.
+                        # Pair with warp 0's copy before reading the shared SFB.
                         subset_barrier(
                             barrier_id=2, number_of_threads=32 * self.num_groups
                         )
+                        tmem_thread_fence(before=False)
 
                     # Process the same KV block for the second query pair.
                     # Unconditional UMMA
@@ -1430,14 +1431,23 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                 if cutlass.const_expr(self.native_lowp):
                     native_weights = cute.make_rmem_tensor((32,), cutlass.Uint32)
                     for h in cutlass.range_constexpr(32):
-                        wa = cutlass.Float32(sW[(query_slot * 64 + h * 2, q_stage_local)])
-                        wb = cutlass.Float32(sW[(query_slot * 64 + h * 2 + 1, q_stage_local)])
+                        wa = cutlass.Float32(
+                            sW[(query_slot * 64 + h * 2, q_stage_local)]
+                        )
+                        wb = cutlass.Float32(
+                            sW[(query_slot * 64 + h * 2 + 1, q_stage_local)]
+                        )
                         if cutlass.const_expr(
                             self.use_relu_trick and self.weights_prepared
                         ):
                             wa = wa * 2.0
                             wb = wb * 2.0
-                        native_weights[h] = native_weight_pair(sW,query_slot*64+h*2,q_stage_local,self.output_dtype)
+                        native_weights[h] = native_weight_pair(
+                            sW,
+                            query_slot * 64 + h * 2,
+                            q_stage_local,
+                            self.native_dtype,
+                        )
                 else:
                     for h in cutlass.range_constexpr(self.max_w_in_reg):
                         w = cutlass.Float32(sW[(query_slot * 64 + h, q_stage_local)])
@@ -1512,17 +1522,17 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                     x4 = _subview(tTR_rAcc, h, 4)
                                     woff = (i * (64 // num_epi_subtiles) + h) // 2
                                     s_acc[0] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[0], x4[1]
+                                            self.native_dtype, x4[0], x4[1]
                                         ),
                                         native_weights[woff],
                                         s_acc[0],
                                     )
                                     s_acc[1] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[2], x4[3]
+                                            self.native_dtype, x4[2], x4[3]
                                         ),
                                         native_weights[woff + 1],
                                         s_acc[1],
@@ -1600,8 +1610,8 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                         a4, w4, s_acc, rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.native_lowp):
-                            reduced = native_add(self.output_dtype, s_acc[0], s_acc[1])
-                            score = native_sum_fp32(self.output_dtype, reduced)
+                            reduced = native_add(self.native_dtype, s_acc[0], s_acc[1])
+                            score = native_sum_fp32(self.native_dtype, reduced)
                         else:
                             score = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                         if outrow < num_q_tokens:
@@ -1628,7 +1638,7 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                     if cutlass.const_expr(self.dsv4_full_tiles)
                     else num_kv
                 ):
-                    for kv_unroll in cutlass.range_constexpr(
+                    for _kv_unroll in cutlass.range_constexpr(
                         4 if self.dsv4_unroll else 16
                     ):
                         kv_pos = kv_idx * 128 + m_coord
@@ -1678,17 +1688,17 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                     x4 = _subview(tTR_rAcc, h, 4)
                                     woff = (i * (64 // num_epi_subtiles) + h) // 2
                                     s_acc[0] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[0], x4[1]
+                                            self.native_dtype, x4[0], x4[1]
                                         ),
                                         native_weights[woff],
                                         s_acc[0],
                                     )
                                     s_acc[1] = native_fma(
-                                        self.output_dtype,
+                                        self.native_dtype,
                                         native_pack_relu(
-                                            self.output_dtype, x4[2], x4[3]
+                                            self.native_dtype, x4[2], x4[3]
                                         ),
                                         native_weights[woff + 1],
                                         s_acc[1],
@@ -1766,8 +1776,8 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                         a4, w4, s_acc, rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.native_lowp):
-                            reduced = native_add(self.output_dtype, s_acc[0], s_acc[1])
-                            score = native_sum_fp32(self.output_dtype, reduced)
+                            reduced = native_add(self.native_dtype, s_acc[0], s_acc[1])
+                            score = native_sum_fp32(self.native_dtype, reduced)
                         else:
                             score = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                         if outrow < num_q_tokens:
@@ -1832,14 +1842,14 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                 x4 = _subview(tTR_rAcc, h, 4)
                                 woff = (i * (64 // num_epi_subtiles) + h) // 2
                                 s_acc[0] = native_fma(
-                                    self.output_dtype,
-                                    native_pack_relu(self.output_dtype, x4[0], x4[1]),
+                                    self.native_dtype,
+                                    native_pack_relu(self.native_dtype, x4[0], x4[1]),
                                     native_weights[woff],
                                     s_acc[0],
                                 )
                                 s_acc[1] = native_fma(
-                                    self.output_dtype,
-                                    native_pack_relu(self.output_dtype, x4[2], x4[3]),
+                                    self.native_dtype,
+                                    native_pack_relu(self.native_dtype, x4[2], x4[3]),
                                     native_weights[woff + 1],
                                     s_acc[1],
                                 )
@@ -1913,8 +1923,8 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                                     a4, w4, s_acc, rnd=_RND_RN
                                 )
                     if cutlass.const_expr(self.native_lowp):
-                        reduced = native_add(self.output_dtype, s_acc[0], s_acc[1])
-                        score = native_sum_fp32(self.output_dtype, reduced)
+                        reduced = native_add(self.native_dtype, s_acc[0], s_acc[1])
+                        score = native_sum_fp32(self.native_dtype, reduced)
                     else:
                         score = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                     if outrow < num_q_tokens:
@@ -1958,6 +1968,8 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                 has_work = next_q_block_idx < num_q_blocks
             if cutlass.const_expr(self.num_heads != 32):
                 tmem.relinquish_alloc_permit()
+            # Retire every math warp before freeing shared TMEM.
+            subset_barrier(barrier_id=1, number_of_threads=self.num_math_threads)
             tmem.free(tmem_ptr)
 
         else:
@@ -1968,5 +1980,6 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                     cute.arch.warpgroup_reg_dealloc(self.store_registers)
             else:
                 cute.arch.warpgroup_reg_dealloc(self.store_registers)
+
 
 from .native_heads import native_weight_pair

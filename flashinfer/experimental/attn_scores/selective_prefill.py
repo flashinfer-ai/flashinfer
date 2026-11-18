@@ -60,7 +60,13 @@ class _CapacitySelectiveTopKPlan:
         logits_dtype=torch.float32,
         weights_dtype=torch.float32,
         model_config=None,
+        publish_candidate_blocks=False,
+        candidate_capacity=0,
     ):
+        if type(publish_candidate_blocks) is not bool:
+            raise TypeError("publish_candidate_blocks must be bool")
+        if publish_candidate_blocks and max_chunk_size > 65535:
+            raise ValueError("candidate publication supports at most 65535 query rows")
         if num_heads not in (4, 32, 64) or head_dim != 128:
             raise ValueError("backend='cutedsl' supports H4/H32/H64 and head_dim=128")
         if max_batch_size != 1:
@@ -99,10 +105,16 @@ class _CapacitySelectiveTopKPlan:
             max_chunk_size,
             max_batch_size,
         )
+        if type(candidate_capacity) is not int or candidate_capacity not in (0, 2048):
+            raise ValueError("candidate_capacity must be 0 or 2048")
+        self._candidate_capacity = candidate_capacity
+        self._candidate_supplied = False
+        # Consumer pools include both history and the current query chunk.
+        key_limit = _MAX_POOLED_KEYS + (max_chunk_size if candidate_capacity else 0)
         physical = capacity.max_context_length // compression_ratio
-        if physical > _MAX_POOLED_KEYS:
+        if physical > key_limit:
             raise ValueError(
-                f"backend='cutedsl' supports at most {_MAX_POOLED_KEYS} keys after pooling"
+                f"backend='cutedsl' supports at most {key_limit} keys after pooling"
             )
         self._qkv_dtype = qkv_dtype
         self._logits_dtype = logits_dtype
@@ -111,20 +123,50 @@ class _CapacitySelectiveTopKPlan:
         from ._selective_math_policy import validate_math_mode
 
         if math_mode is None:
-            math_mode = "relu_strict" if qkv_dtype == "mxfp8" else "relu_fast"
+            math_mode = (
+                "relu_strict"
+                if qkv_dtype == "mxfp8"
+                or publish_candidate_blocks
+                or candidate_capacity
+                else "relu_fast"
+            )
+        if (
+            publish_candidate_blocks or candidate_capacity
+        ) and math_mode == "relu_fast":
+            raise ValueError(
+                "candidate publication and consumption require relu_strict, native_bf16 or native_fp16"
+            )
         self._math_mode = validate_math_mode(
             math_mode,
             qkv_dtype=qkv_dtype,
             num_heads=num_heads,
             logits_dtype=logits_dtype,
         )
+        if publish_candidate_blocks and not (
+            model_config == "DS-V4.1-Flash"
+            and compression_ratio == 1
+            and qkv_dtype == "mxfp4"
+        ):
+            raise ValueError(
+                "candidate publication requires DS-V4.1-Flash, ratio 1, MXFP4"
+            )
+        if candidate_capacity and not (
+            model_config == "DS-V4.1-Flash"
+            and compression_ratio == 1
+            and qkv_dtype == "mxfp4"
+            and not publish_candidate_blocks
+        ):
+            raise ValueError(
+                "candidate consumption requires DS-V4.1-Flash MXFP4, ratio 1, without publication"
+            )
+        self._publish_candidate_blocks = publish_candidate_blocks
         from ._topk_runtime import _validate_topk_device
 
         _validate_topk_device(torch.device(device))
         if num_keys is None:
             num_keys = physical
-        if type(num_keys) is not int or not 0 < num_keys <= _MAX_POOLED_KEYS:
-            raise ValueError(f"cutedsl num_keys must be in 1..{_MAX_POOLED_KEYS}")
+        if type(num_keys) is not int or not 0 < num_keys <= key_limit:
+            raise ValueError(f"cutedsl num_keys must be in 1..{key_limit}")
         if qkv_dtype in ("mxfp4", "mxfp8") and num_keys % 256:
             raise ValueError(
                 "Block-scaled K storage must have a multiple of 256 rows; plan describes the live extent"
@@ -166,6 +208,16 @@ class _CapacitySelectiveTopKPlan:
         self._starts = torch.zeros(max_chunk_size, device=device, dtype=torch.int32)
         self._ends = torch.zeros_like(self._starts)
         self._score_ends = torch.zeros_like(self._starts)
+        if candidate_capacity:
+            self._candidate_input = torch.full(
+                (max_chunk_size, candidate_capacity),
+                2147483647,
+                device=device,
+                dtype=torch.int32,
+            )
+            self._candidate_ends = torch.zeros_like(self._starts)
+            self._candidate_lens = torch.zeros_like(self._starts)
+            self._candidate_starts = torch.zeros_like(self._starts)
         self._keys = None
         self._scales = None
         self._qwen = model_config == "Qwen3.8-Flash-Next"
@@ -179,7 +231,10 @@ class _CapacitySelectiveTopKPlan:
         pass
 
     def input_buffers(self):
-        return self._state.input_buffers()
+        result = self._state.input_buffers()
+        if self._candidate_capacity:
+            result["candidate_blocks"] = self._candidate_input
+        return result
 
     def _cache_protected_ranges(self):
         from ._topk_runtime import _byte_range
@@ -283,26 +338,61 @@ class _CapacitySelectiveTopKPlan:
                         self._state.q,
                         keys,
                         self._state.weights,
-                        self._starts,
-                        self._ends,
+                        self._candidate_starts
+                        if self._candidate_capacity
+                        else self._starts,
+                        self._candidate_ends
+                        if self._candidate_capacity
+                        else self._ends,
                         k_scale=self._k_scale,
                         q_scale=self._q_scale,
                         top_k=self.top_k,
                         logits_dtype=self._logits_dtype,
                         model_config=self._model_config,
+                        candidate_k_block_ids=self._candidate_input
+                        if self._candidate_capacity
+                        else None,
+                        candidate_valid_lens=self._candidate_lens
+                        if self._candidate_capacity
+                        else None,
+                        _candidate_error=self._repair_error
+                        if self._candidate_capacity
+                        else None,
                         compression_ratio=self._capacity.compression_ratio,
                         math_mode=self.math_mode,
                         out=self._selected,
-                        _score_ends=self._score_ends,
+                        # Publishers score short rows too, to select candidate blocks.
+                        _score_ends=(
+                            self._ends
+                            if self._publish_candidate_blocks
+                            else self._score_ends
+                        ),
                         # Validate live rows/scales on replay; capacity padding is inactive.
                         _validate_numerics=False,
+                        _filter_config=(
+                            dict(
+                                publish_blocks=True,
+                                prepare_kv_scales=True,
+                                shared_kv_queries=False,
+                            )
+                            if self._publish_candidate_blocks
+                            else None
+                        ),
                     )
+                    if self._candidate_capacity:
+                        engine.prepare_live_bounds(
+                            self._state.row_ends,
+                            self._state.active_shape,
+                            self._starts,
+                            self._ends,
+                            self._score_ends,
+                        )
                     self._template_engine = engine
                     self._template_keys, self._template_scales = keys, self._k_scale
                 else:
                     engine = self._bind_engine(keys, self._k_scale)
                 self._engines[key] = self._engine = engine
-                self._prepare_layer_inputs(keys)
+                self._prepare_layer_inputs(keys, warmup=True)
                 self._engine.run()
             except BaseException:
                 self._engine = previous_engine
@@ -331,26 +421,33 @@ class _CapacitySelectiveTopKPlan:
             view = target.view(arg.dtype)
             return view.as_strided(arg.shape, arg.stride(), view.storage_offset())
 
-        engine = copy.copy(self._template_engine)
-        engine.stages = []
-        for name, stage in self._template_engine.stages:
-            args = list(stage.arguments.args)
-            if name != "K3":
-                args[0] = rebind(args[0], self._template_keys, keys)
-                args[1] = rebind(args[1], self._template_scales, scales)
-            engine.stages.append(
-                (
-                    name,
-                    replace(
-                        stage,
-                        arguments=testing.JitArguments(*args, **stage.arguments.kwargs),
-                    ),
-                )
+        def bind_stage(stage):
+            args = []
+            for arg in stage.arguments.args:
+                if isinstance(arg, torch.Tensor):
+                    arg = rebind(arg, self._template_keys, keys)
+                    arg = rebind(arg, self._template_scales, scales)
+                args.append(arg)
+            return replace(
+                stage,
+                arguments=testing.JitArguments(*args, **stage.arguments.kwargs),
             )
+
+        engine = copy.copy(self._template_engine)
+        engine.stages = [(name, bind_stage(stage)) for name, stage in engine.stages]
+        if self._candidate_capacity:
+            if engine.sample_bounds is not None:
+                engine.sample_bounds = tuple(
+                    bind_stage(stage) for stage in engine.sample_bounds
+                )
+            engine._candidate_inputs = dict(
+                engine._candidate_inputs, k=keys, k_scale=scales
+            )
+
         return engine
 
     def clear_pools(self):
-        """Synchronize and discard pool bindings without reallocating scratch.
+        """Synchronize and release pool bindings and their scratch workspace.
 
         Discard caller-owned graphs using these pools before this call and
         recapture them before reuse. Pool bindings retain their tensors until
@@ -371,15 +468,25 @@ class _CapacitySelectiveTopKPlan:
             self._template_engine = self._template_keys = self._template_scales = None
             self._cache_protected_ranges()
 
-    def _prepare_layer_inputs(self, keys, key=None):
+    def _prepare_layer_inputs(self, keys, key=None, *, warmup=False):
         from ._topk_runtime import _current_stream
 
         if key is None:
             key = self._pool_key(keys)
         self._engine = self._engines[key]
-        self._metadata_compiled(
-            *self._metadata_args[key], _current_stream(self._state.device)
-        )
+        supplied = self._candidate_supplied and not warmup
+        if self._candidate_capacity and self._engine.sample_bounds is not None:
+            self._engine.stages[0] = (
+                "K1",
+                self._engine.sample_bounds[int(supplied)],
+            )
+            return
+        args = self._metadata_args[key]
+        if self._candidate_capacity:
+            import cutlass
+
+            args = (*args, cutlass.Int32(supplied))
+        self._metadata_compiled(*args, _current_stream(self._state.device))
 
     def _prepare_metadata(self, keys):
         from cutlass.cute.runtime import from_dlpack
@@ -405,8 +512,16 @@ class _CapacitySelectiveTopKPlan:
             self._metadata_flags,
             self._repair_error,
         )
+        metadata_class = SelectivePrefillMetadata
+        if self._candidate_capacity:
+            from .kernels.selective_topk.prefill.sparse.bounds import (
+                SparseSelectivePrefillMetadata,
+            )
+
+            metadata_class = SparseSelectivePrefillMetadata
+            tensors = (*tensors, self._candidate_ends, self._candidate_lens)
         args = tuple(from_dlpack(tensor, assumed_align=4) for tensor in tensors)
-        kernel = SelectivePrefillMetadata(
+        kernel = metadata_class(
             self._capacity.num_heads,
             self._qwen,
             self._fast,
@@ -415,6 +530,10 @@ class _CapacitySelectiveTopKPlan:
             top_k=self.top_k,
         )
         self._metadata_args[self._pool_key(keys)] = args
+        if self._candidate_capacity:
+            import cutlass
+
+            args = (*args, cutlass.Int32(1))
         if self._metadata_compiled is None:
             self._metadata_compiled = _bind_metadata_module_lifetime(
                 _compile_for_device(
@@ -425,8 +544,19 @@ class _CapacitySelectiveTopKPlan:
                 )
             )
 
-    def run(self, q, weights, kv_fused, *, k_scale, out=None, q_scale=None):
+    def run(
+        self,
+        q,
+        weights,
+        kv_fused,
+        *,
+        k_scale,
+        out=None,
+        q_scale=None,
+        candidate_blocks=None,
+    ):
         copies = self._state._payload_copies(q, weights)
+        direct_candidates = None
         key = self._pool_key(kv_fused, k_scale)
         if out is not None and isinstance(out, torch.Tensor):
             from ._topk_runtime import _byte_range, _overlap
@@ -463,13 +593,68 @@ class _CapacitySelectiveTopKPlan:
                 ):
                     raise ValueError("out must not overlap q_scale")
             self._state.q_scale_input = q_scale
+        if self._candidate_capacity:
+            if (
+                not isinstance(candidate_blocks, torch.Tensor)
+                or candidate_blocks.device != self._state.device
+                or candidate_blocks.dtype != torch.int32
+                or candidate_blocks.shape != (q.shape[0], self._candidate_capacity)
+                or not candidate_blocks.is_contiguous()
+            ):
+                raise ValueError(
+                    "candidate_blocks must be contiguous CUDA int32 [Q, 2048]"
+                )
+            if out is not None:
+                from ._topk_runtime import _byte_range, _overlap
+
+                if _overlap(_byte_range(out), _byte_range(candidate_blocks)):
+                    raise ValueError("out must not overlap candidate_blocks")
+            if (
+                key in self._engines
+                and getattr(self._engines[key], "direct_candidates", False)
+                and candidate_blocks.shape == self._candidate_input.shape
+                and candidate_blocks.data_ptr() % 16 == 0
+            ):
+                direct_candidates = candidate_blocks
+            elif candidate_blocks.data_ptr() != self._candidate_input.data_ptr():
+                self._candidate_input[: q.shape[0]].copy_(candidate_blocks)
+            self._candidate_supplied = True
+        elif candidate_blocks is not None:
+            raise ValueError("candidate_blocks requires candidate_capacity=2048")
         return self._run_layer(
-            q, weights, kv_fused, copies, key, k_scale=k_scale, out=out
+            q,
+            weights,
+            kv_fused,
+            copies,
+            key,
+            k_scale=k_scale,
+            out=out,
+            candidate_blocks=direct_candidates,
         )
 
     @property
     def top_k(self) -> int:
         return self._top_k
+
+    @property
+    def candidate_blocks(self):
+        if (
+            not self._publish_candidate_blocks
+            or self._engine is None
+            or not self._step_prepared
+        ):
+            raise RuntimeError("plan and prepare a candidate publisher pool first")
+        return self._engine.candidate_blocks[: self._supplied_rows]
+
+    @property
+    def candidate_valid_lens(self):
+        if (
+            not self._publish_candidate_blocks
+            or self._engine is None
+            or not self._step_prepared
+        ):
+            raise RuntimeError("plan and prepare a candidate publisher pool first")
+        return self._engine.candidate_valid_lens[: self._supplied_rows]
 
     @property
     def math_mode(self) -> str:
@@ -558,7 +743,18 @@ class _CapacitySelectiveTopKPlan:
     def active_shape(self) -> torch.Tensor:
         return self._state.active_shape
 
-    def _run_layer(self, q, weights, kv_fused, copies, key, *, k_scale, out=None):
+    def _run_layer(
+        self,
+        q,
+        weights,
+        kv_fused,
+        copies,
+        key,
+        *,
+        k_scale,
+        out=None,
+        candidate_blocks=None,
+    ):
         """Score a layer; consume/copy the shared output before the next layer."""
         from bisect import bisect_left
         from ._topk_runtime import _byte_range, _overlap
@@ -603,7 +799,10 @@ class _CapacitySelectiveTopKPlan:
             self._state.stage_payload(q, weights, copies)
             self._check_caller_capture(capturing, "layer payload copies")
             self._prepare_layer_inputs(kv_fused, key)
-            self._engine.run()
+            if candidate_blocks is None:
+                self._engine.run()
+            else:
+                self._engine.run(candidate_blocks)
             self._check_caller_capture(capturing, "layer execution")
             if out is not None and out.data_ptr() != selected.data_ptr():
                 out.copy_(selected)
