@@ -156,6 +156,22 @@ def is_specialized_supported(
         return _no("layout:operand_alignment")
     if out is not None and out.data_ptr() % 4 != 0:
         return _no("layout:out_alignment")
+    # The kernel reads its operands through raw pointers while it writes Y:
+    # an ``out`` that shares storage bytes with any input could be clobbered
+    # mid-read. The composable fallback reads inputs before writing out, so
+    # route overlapping calls there. All five tensors are contiguous here,
+    # so byte-interval overlap is exact.
+    if out is not None:
+
+        def _overlap(x, y):
+            x0, y0 = x.data_ptr(), y.data_ptr()
+            return (
+                x0 < y0 + y.numel() * y.element_size()
+                and y0 < x0 + x.numel() * x.element_size()
+            )
+
+        if any(_overlap(out, t) for t in (a, b, a_scale, b_scale)):
+            return _no("layout:out_overlaps_input")
     # 256-bit global loads need PTX ISA 8.8, first shipped with CUDA 12.9;
     # older toolkits would fail JIT compilation instead of running.
     try:
@@ -173,10 +189,12 @@ def is_specialized_supported(
             return _no("autotune_mode")
     except Exception:  # noqa: BLE001 - autotuner surface moved: be safe
         return _no("autotune_probe_failed")
-    if (
-        torch.cuda.is_current_stream_capturing()
-        and (a.device.index, M, N, K) not in _warmed
-    ):
+    # The launch happens on A's device; is_current_stream_capturing() reads
+    # the CURRENT device's stream, so query inside A's device context (a
+    # no-op context switch when A is already current).
+    with torch.cuda.device(a.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and (a.device.index, M, N, K) not in _warmed:
         return _no("capture:unwarmed")
     return True
 

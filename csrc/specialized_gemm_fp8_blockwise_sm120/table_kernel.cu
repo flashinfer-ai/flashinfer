@@ -272,6 +272,9 @@ static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As
     cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   }
+  // Clear any stale status a handled earlier error left in the per-thread
+  // slot: the post-launch check must report only THIS launch's outcome.
+  (void)cudaGetLastError();
   gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB><<<grid, TH, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
   check_launch(cudaGetLastError());
 }

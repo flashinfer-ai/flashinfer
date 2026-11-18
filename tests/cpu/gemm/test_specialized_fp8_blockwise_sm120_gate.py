@@ -25,6 +25,7 @@ toolkit floor: a toolkit below CUDA 12.9 is refused by the gate (recorded,
 never raised), instead of failing later inside the JIT build.
 """
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -115,3 +116,28 @@ def test_gate_reads_the_shipped_allowlist():
     assert expected, "shipped allowlist is empty"
     for (n, k), m_max in expected.items():
         assert n >= 1 and k % 128 == 0 and m_max >= 1
+
+
+@pytest.mark.cpu_only
+def test_gate_refuses_out_overlapping_an_input():
+    """An ``out`` sharing storage bytes with an input must be refused: the
+    kernel writes Y through raw pointers while it reads the operands, so an
+    overlapping call belongs on the composable fallback (which reads its
+    inputs before writing out)."""
+    a, b, a_scale, b_scale = _valid_cpu_contract()
+    m, n = a.shape[0], b.shape[0]
+    out = b.flatten()[: m * n * 2].view(torch.bfloat16).view(m, n)
+    assert not spec.is_specialized_supported(
+        a, b, a_scale, b_scale, "K", (1, 128, 128), out=out, out_dtype=None
+    )
+    assert _last_reason() == "layout:out_overlaps_input"
+
+    disjoint = torch.empty(m, n, dtype=torch.bfloat16)
+    spec.fallback_reasons.clear()
+    # A disjoint out passes every GPU-free check; on a CPU-only torch the
+    # gate then reaches the device guards, which cannot run here.
+    with contextlib.suppress(Exception):
+        spec.is_specialized_supported(
+            a, b, a_scale, b_scale, "K", (1, 128, 128), out=disjoint, out_dtype=None
+        )
+    assert ("specialized", "layout:out_overlaps_input") not in spec.fallback_reasons
