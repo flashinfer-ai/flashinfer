@@ -89,7 +89,7 @@ BACKENDS = ("specialized",)
 # Dispatch refuses off this list; extend it only after re-running the full
 # per-toolkit validation (reference exactness + sanitizers on the scored
 # regime).
-VALIDATED_CUDA_VERSIONS = ("13.3",)
+VALIDATED_CUDA_VERSIONS = ("13.3", "13.1",)
 
 
 @functools.cache
