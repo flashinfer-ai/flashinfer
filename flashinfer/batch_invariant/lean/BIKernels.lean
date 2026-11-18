@@ -34,3 +34,5 @@ import BIKernels.A16MegaMoECases
 import BIKernels.CombineWire
 import BIKernels.CombineWireCases
 import BIKernels.QuantizedStagePartition
+import BIKernels.Gdn
+import BIKernels.GdnCases

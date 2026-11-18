@@ -712,7 +712,7 @@ def gdn_prefill_trace(**kwargs):
     if any(
         kwargs.get(name) is not None
         for name in ("output_state_indices", "checkpoint_state_indices", "prefix_lens")
-    ):
+    ) or kwargs.get("batch_invariant", False):
         return None
     if (
         kwargs.get("gate_domain", "linear") != "linear"
