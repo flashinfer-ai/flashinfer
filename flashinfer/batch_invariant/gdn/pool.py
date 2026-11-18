@@ -143,6 +143,28 @@ def _pinned(
     return out
 
 
+_ZERO: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def zero_state_prefill(rows, cu, offs, scale, out) -> torch.Tensor:
+    """The class's term for whole sequences from the zero state: one pinned launch, no pool read or written."""
+    v = rows[2]
+    dev, HV, N = v.device, int(v.shape[1]), len(offs) - 1
+    cached = _ZERO.get((dev, HV))
+    if cached is None or cached[1].numel() < N:
+        state = (
+            cached[0]
+            if cached is not None
+            else torch.zeros(1, HV, HEAD_DIM, HEAD_DIM, device=dev)
+        )
+        skip = torch.full((max(N, 64),), -1, dtype=torch.int32, device=dev)
+        cached = _ZERO[(dev, HV)] = (state, skip)
+    state, skip = cached
+    if cu is None:
+        cu = torch.tensor(offs, dtype=torch.int32, device=dev)
+    return _pinned(rows, cu, list(offs), state, skip[:N], skip[:N], scale, output=out)
+
+
 class GdnPool:
     def __init__(self, slots: int, pool: torch.Tensor, num_q_heads: int) -> None:
         S, HV, HQ = int(slots), int(pool.shape[1]), int(num_q_heads)

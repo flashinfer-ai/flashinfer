@@ -100,4 +100,6 @@ and costs more than the regular decode kernels. The contract (fp32 pool
 addressed by ``state_indices``, the call shapes and ``prefix_lens``, the
 supported arguments, CUDA graphs) is in ``flashinfer/batch_invariant/README.md``;
 ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")`` names the
-class.
+class. Without ``initial_state`` the call is stateless (a trainer's forward
+pass): whole sequences from the zero state, the same rows, no state kept and no
+``grad_fn``.

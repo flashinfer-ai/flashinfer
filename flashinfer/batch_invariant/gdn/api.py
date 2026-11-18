@@ -31,6 +31,10 @@ taken to be ``arange(N + 1)``. The calls that bring whole chunks read the slots 
 ``output`` must not partly overlap an input (not checked). ``output_final_state=True`` returns the pool, whose slots
 hold the states at the last chunk boundaries.
 
+Without ``initial_state`` the call is stateless: every sequence is whole and runs from the zero state in one pinned
+launch, the rows are the ones the pool calls return for it, and no state is read, written, kept or returned (the form a
+trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it.
+
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
 
@@ -42,7 +46,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import torch
 
 from ..support import check_device, unsupported
-from .pool import capturing, get_pool
+from .pool import capturing, get_pool, zero_state_prefill
 from .spec import CHUNK, CLASS, GDN_ARCHS, HEAD_DIM, uses_step_kernel
 
 _IO = torch.bfloat16
@@ -89,13 +93,7 @@ def _check_inputs(q, k, v, g, beta) -> Tuple[int, int, int]:
     return T, HQ, HV
 
 
-def _check_pool(pool: Optional[torch.Tensor], HV: int, device: torch.device) -> None:
-    if pool is None:
-        raise unsupported(
-            CLASS,
-            "a call without initial_state",
-            "an fp32 state pool the caller keeps (the slot carries the sequence between calls)",
-        )
+def _check_pool(pool: torch.Tensor, HV: int, device: torch.device) -> None:
     if pool.dtype != torch.float32:
         raise unsupported(
             CLASS,
@@ -167,6 +165,56 @@ def _checked_offsets(cu: List[int], T: int) -> List[int]:
     return cu
 
 
+def _check_output(output: Optional[torch.Tensor], v: torch.Tensor) -> None:
+    if output is None:
+        return
+    if output.shape != v.shape or output.dtype != _IO or not output.is_contiguous():
+        raise unsupported(
+            CLASS,
+            "an output of another shape, dtype or layout than v",
+            f"a contiguous bf16 [T, HV, {HEAD_DIM}] output",
+        )
+    if output.device != v.device:
+        raise unsupported(CLASS, "an output on another device", "the inputs' device")
+    if output.requires_grad:
+        raise unsupported(CLASS, "an output that requires grad", "a plain buffer")
+
+
+def _stateless(rows, scale, output, cu_seqlens, cu_seqlens_cpu, pool_args):
+    """The call without a pool: whole sequences from the zero state, rows only, nothing kept."""
+    v = rows[2]
+    for name, value in pool_args.items():
+        if value is not None and value is not False:
+            raise unsupported(
+                CLASS,
+                f"{name} without initial_state",
+                "an fp32 state pool the caller keeps, or none of the state arguments "
+                "(whole sequences from the zero state, rows only)",
+            )
+    _check_output(output, v)
+    if capturing(v.device):
+        raise unsupported(
+            CLASS,
+            "a call without initial_state inside a CUDA graph capture",
+            "an eager call",
+        )
+    if cu_seqlens is not None and (cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2):
+        raise unsupported(CLASS, "a malformed cu_seqlens", "a 1-D [N + 1] tensor")
+    offs = _host_offsets(cu_seqlens, cu_seqlens_cpu, int(v.shape[0]))
+    cu = cu_seqlens
+    if cu is not None and (cu.dtype != torch.int32 or cu.device != v.device):
+        cu = None
+    if cu is not None and cu.numel() != len(offs):
+        raise unsupported(
+            CLASS,
+            "cu_seqlens and cu_seqlens_cpu of different lengths",
+            "the same offsets on the device and on the host",
+        )
+    scale_f = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(HEAD_DIM)
+    out = output if output is not None else torch.empty_like(v)
+    return zero_state_prefill(tuple(x.detach() for x in rows), cu, offs, scale_f, out)
+
+
 def chunk_gated_delta_rule_batch_invariant(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -223,6 +271,20 @@ def chunk_gated_delta_rule_batch_invariant(
     for t in (k, v, g, beta):
         if t.device != dev:
             raise unsupported(CLASS, "inputs on several devices", "one device")
+    if initial_state is None:
+        return _stateless(
+            (q, k, v, g, beta),
+            scale,
+            output,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            dict(
+                output_state=output_state,
+                state_indices=state_indices,
+                prefix_lens=prefix_lens,
+                output_final_state=output_final_state,
+            ),
+        )
     _check_pool(initial_state, HV, dev)
     pool = initial_state
     if output_state is not None and output_state is not pool:
@@ -231,17 +293,7 @@ def chunk_gated_delta_rule_batch_invariant(
             "an output_state other than the pool",
             "the pool updated in place (output_state omitted or initial_state itself)",
         )
-    if output is not None:
-        if output.shape != v.shape or output.dtype != _IO or not output.is_contiguous():
-            raise unsupported(
-                CLASS,
-                "an output of another shape, dtype or layout than v",
-                f"a contiguous bf16 [T, HV, {HEAD_DIM}] output",
-            )
-        if output.device != dev:
-            raise unsupported(
-                CLASS, "an output on another device", "the inputs' device"
-            )
+    _check_output(output, v)
     if cu_seqlens is not None and (cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2):
         raise unsupported(CLASS, "a malformed cu_seqlens", "a 1-D [N + 1] tensor")
     if cu_seqlens is not None:

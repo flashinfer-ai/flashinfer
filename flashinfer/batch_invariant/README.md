@@ -366,6 +366,9 @@ the whole remainder, so give the pool a storage of its own.
 
 What the caller owes the class:
 
+* A call that carries a sequence's state passes the pool. Without `initial_state` (and without the other state
+  arguments) the call does not raise: it is the stateless call below and returns rows from the zero state, so a decode
+  step that drops its pool returns every token as a first token.
 * A new sequence loaded into a slot starts with a prefill call (more tokens than sequences) or carries `prefix_lens`.
   A one-token call without `prefix_lens` continues what the slot holds: on a reused slot it continues the previous
   sequence, with finite rows that are not the new sequence's (nothing detects a slot whose state the caller replaced).
@@ -389,6 +392,41 @@ What the caller owes the class:
 `output_final_state` returns the pool. The decode entries (`gated_delta_rule_decode_pretranspose`,
 `gated_delta_rule_mtp`) do not take the flag: they compute the gates from the raw parameters and keep another state
 layout; a decode step of the class is a one-token call of `chunk_gated_delta_rule`.
+
+### Stateless call: a trainer's forward pass
+
+Without `initial_state` the same entry is a stateless call, the form a training forward takes: packed whole sequences,
+every one from the zero state, rows only.
+
+```python
+out = torch.empty_like(v)          # once, reused every step
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+```
+
+* The rows of a sequence are bit for bit the rows the pool calls return for it (prefill, chunked prefill and decode),
+  whatever the other sequences of the call, their order and their number. It is one launch of the class's prefill
+  kernel with every sequence reading the zero state and storing none.
+* No pool, no state next to a pool, no state returned: `state_indices`, `prefix_lens`, `output_state` and
+  `output_final_state=True` raise the typed error without `initial_state`. A sequence that has to continue later is a
+  pool call.
+* With `output=` and an int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and adds no
+  allocation of its own; `cu_seqlens_cpu` (which must hold the same offsets) spares the read of the offsets. The
+  prefill underneath allocates, as in every prefill of the class, the normalized `q` and `k` (`2 * T * HQ * 256`
+  bytes), the linear gates (`4 * T * HV` bytes) and a small kernel workspace, all freed at return. Per device and
+  v-head count the class keeps one state tensor the kernel is pointed at and never reads or writes (3.1 MB at 48 v
+  heads) and an index tensor of one int32 per sequence, allocated at the first stateless call and regrown when a call
+  brings more sequences than any before.
+* It cannot be captured in a CUDA graph (it raises).
+* **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
+  `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
+  differentiable op on the same inputs wrapped in an `autograd.Function` whose forward returns these rows. The
+  shortcut `ref + (out - ref).detach()` rounds in bf16 and does not return these bits. What that gradient is, and
+  whether it is batch-invariant, is the trainer's.
+
+Tests: `tests/gdn/test_batch_invariant_gdn_stateless.py`.
 
 `lean/BIKernels/Gdn.lean` models the two kernels as an opaque chunk step and an opaque row step and defines the
 prefill as the fold of the chunk step over 64-row chunks. Four device facts carry the model, all checked bit for bit

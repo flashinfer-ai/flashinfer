@@ -1973,7 +1973,14 @@ def chunk_gated_delta_rule(
         64 tokens per sequence. A new sequence in a slot must start with a
         prefill call or carry ``prefix_lens``. ``output_final_state=True``
         returns the pool (the states at the last chunk boundaries, not the
-        states after the last token); ``max_seqlen`` is not used. Requires ``backend="auto"``,
+        states after the last token); ``max_seqlen`` is not used. Without
+        ``initial_state`` the call is stateless (the form of a trainer's
+        forward pass): every sequence is whole and runs from the zero state,
+        its rows are bit for bit the rows the pool calls return for it, no
+        state is kept or returned, and ``state_indices``, ``prefix_lens``,
+        ``output_state`` and ``output_final_state=True`` are refused. The
+        rows carry no ``grad_fn``, also when an input requires grad: the
+        class has no backward. Requires ``backend="auto"``,
         ``use_cp="auto"``, ``gate_domain="log"`` with fp32 ``g`` and ``beta``,
         ``use_qk_l2norm_in_kernel=True``, bf16 ``q`` / ``k`` / ``v`` of head
         size 128, a v-head count that is a multiple of the q-head count and
