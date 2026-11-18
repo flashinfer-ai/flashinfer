@@ -15,12 +15,8 @@ void RunD26(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Tenso
             ffi::TensorView Y);
 void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
                  ffi::TensorView Y);
-void RunFX(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
-           ffi::TensorView Y);
 void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
               ffi::TensorView Y);
-void RunAsyncDeep(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
-                  ffi::TensorView Y);
 void RunXP(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
            ffi::TensorView Y);
 void RunG5(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
@@ -69,14 +65,13 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
       return;
     }
     if (N == 12288) {
+      // The allowlist caps this class at M=16, so M<=16 covers every call.
       if (M <= 2)
         RunD26(A, B, As, Bs, Y);
       else if (M <= 4)
         RunTuned(A, B, As, Bs, Y);
-      else if (M <= 16)
-        RunA003(A, B, As, Bs, Y);
       else
-        RunFX(A, B, As, Bs, Y);
+        RunA003(A, B, As, Bs, Y);
       return;
     }
   }

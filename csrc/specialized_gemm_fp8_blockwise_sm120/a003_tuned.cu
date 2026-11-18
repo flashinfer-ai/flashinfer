@@ -15,7 +15,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
-#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
@@ -73,7 +72,7 @@ __device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1, int
 
 // NW_N: warp groups along N.  NW_K: warps splitting K.  NT: n8 subtiles per
 // warp.  MR: compile-time row bound (8/16/32).  KU: k-groups in flight.
-template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB = 1, bool ASB = false>
+template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB = 1>
 __global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
     gemm_bw(const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
             const float* __restrict__ As, const float* __restrict__ Bs,
@@ -145,13 +144,7 @@ __global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
 #pragma unroll
       for (int q = 0; q < NR; ++q) {
         af[u][q] = ld_keep(ap[q] + u * 128);
-        if constexpr (ASB) {
-          float asv = (c == 0) ? ld_keepf(asp[q] + u) : 0.f;
-          asv = __shfl_sync(0xffffffffu, asv, g * 4);
-          sc[u][q] = asv * bsv;
-        } else {
-          sc[u][q] = ld_keepf(asp[q] + u) * bsv;
-        }
+        sc[u][q] = ld_keepf(asp[q] + u) * bsv;
       }
     }
 #pragma unroll
@@ -252,16 +245,16 @@ constexpr int red_smem_bytes() {
   return (NW_K > 1) ? NW_N * NW_K * NACC * 32 * static_cast<int>(sizeof(float)) : 0;
 }
 
-template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB, bool ASB = false>
+template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB>
 static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
                              __nv_bfloat16* Y, int M, int N, int K, int KB, const dim3& grid,
                              int threads, cudaStream_t s) {
   constexpr int SMEM = red_smem_bytes<NW_N, NW_K, NT, MR>();
   if constexpr (SMEM > 48 * 1024) {
-    cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB, ASB>,
+    cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   }
-  gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB, ASB>
+  gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>
       <<<grid, threads, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
 }
 
@@ -291,123 +284,6 @@ static inline void go(const uint8_t* A, const uint8_t* B, const float* As, const
     go2<NW_N, NW_K, NT, KU, 0, MINB>(A, B, As, Bs, Y, M, N, K, KB, MR, s);
 }
 
-//      id, NW_N, NW_K, NT, KU, MINB
-#define CFG_LIST(X)     \
-  X(0, 1, 1, 1, 1, 1)   \
-  X(1, 1, 2, 1, 1, 1)   \
-  X(2, 1, 4, 1, 1, 1)   \
-  X(3, 1, 8, 1, 1, 1)   \
-  X(4, 1, 16, 1, 1, 1)  \
-  X(5, 1, 8, 1, 2, 1)   \
-  X(8, 1, 8, 2, 1, 1)   \
-  X(9, 1, 16, 2, 1, 1)  \
-  X(12, 1, 8, 2, 2, 1)  \
-  X(16, 1, 2, 1, 2, 1)  \
-  X(17, 4, 4, 1, 1, 1)  \
-  X(19, 1, 4, 2, 1, 1)  \
-  X(20, 2, 8, 2, 1, 1)  \
-  X(21, 1, 16, 4, 1, 1) \
-  X(22, 1, 4, 4, 1, 1)  \
-  X(23, 1, 2, 2, 1, 1)  \
-  X(24, 1, 1, 2, 1, 1)  \
-  X(25, 2, 4, 2, 1, 1)  \
-  X(26, 1, 4, 1, 2, 1)  \
-  X(27, 1, 2, 4, 1, 1)  \
-  X(28, 1, 32, 1, 1, 1) \
-  X(29, 2, 16, 1, 1, 1) \
-  X(30, 1, 16, 1, 2, 1) \
-  X(32, 2, 8, 2, 2, 1)  \
-  X(33, 1, 8, 1, 4, 1)  \
-  X(34, 4, 8, 1, 1, 1)  \
-  X(35, 1, 16, 2, 2, 1) \
-  X(36, 1, 8, 2, 1, 3)  \
-  X(37, 1, 2, 1, 1, 12)
-
-#define CFG_MAX 38
-static const unsigned char CFG_NWK[CFG_MAX] = {1, 2, 4,  8,  16, 8, 0, 0, 8,  16, 0, 0, 8,
-                                               0, 0, 0,  2,  4,  0, 4, 8, 16, 4,  2, 1, 4,
-                                               4, 2, 32, 16, 16, 0, 8, 8, 8,  16, 8, 2};
-static const unsigned char CFG_KU[CFG_MAX] = {1, 1, 1, 1, 1, 2, 0, 0, 1, 1, 0, 0, 2,
-                                              0, 0, 0, 2, 1, 0, 1, 1, 1, 1, 1, 1, 1,
-                                              2, 1, 1, 1, 2, 0, 2, 4, 1, 2, 1, 1};
-
-#ifndef VARIANT
-#define VARIANT 0
-#endif
-
-struct Sel {
-  int id, mr;
-};
-
-// Best known tiling per (shape class, m class): {config id, m-split shift}.
-// A CTA owns CN = NW_N*NT*8 columns and all of K; NW_K warps split the k
-// groups with KU of them in flight.  The m-split shift halves the rows per CTA
-// to buy blocks, which only pays where the weight stream is small.
-static const signed char BEST[7][6][2] = {
-    {{4, 1}, {4, 1}, {4, 1}, {4, 1}, {5, 1}, {3, 2}},
-    {{4, 0}, {4, 2}, {9, 0}, {9, 0}, {9, 1}, {8, 1}},
-    {{17, 2}, {17, 0}, {17, 0}, {17, 0}, {17, 1}, {17, 1}},
-    {{35, 0}, {35, 0}, {20, 0}, {20, 0}, {9, 0}, {25, 0}},
-    {{0, 0}, {0, 0}, {0, 0}, {37, 0}, {12, 0}, {0, 0}},
-    {{8, 0}, {8, 0}, {8, 0}, {8, 0}, {12, 0}, {24, 0}},
-    {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}},
-};
-
-#if VARIANT > 0
-// Experiment slots: VARIANT v applies ALT[cls][v-1] to every m class.
-static const signed char ALT[7][8][2] = {
-    /* N=64    */ {{5, 1}, {4, 1}, {3, 1}, {5, 2}, {3, 2}, {3, 2}, {3, 2}, {3, 2}},
-    /* N=1024  */ {{12, 1}, {19, 0}, {23, 0}, {24, 0}, {9, 0}, {8, 0}, {4, 1}, {12, 0}},
-    /* N=2048/512 */ {{22, 1}, {19, 1}, {27, 0}, {25, 1}, {17, 0}, {2, 1}, {23, 1}, {25, 0}},
-    /* N=2048/4096*/ {{35, 0}, {30, 0}, {21, 0}, {3, 0}, {9, 0}, {12, 0}, {5, 0}, {20, 0}},
-    /* N=9216  */ {{5, 0}, {3, 0}, {16, 0}, {19, 0}, {12, 0}, {8, 0}, {1, 0}, {2, 0}},
-    /* N=12288 */ {{5, 0}, {3, 0}, {16, 0}, {19, 0}, {12, 0}, {8, 0}, {1, 0}, {2, 0}},
-    /* generic */ {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}},
-};
-#endif
-
-static inline int shape_class(int N, int K) {
-  if (K == 2048) {
-    if (N == 64) return 0;
-    if (N == 1024) return 1;
-    if (N == 9216) return 4;
-    if (N == 12288) return 5;
-  }
-  if (N == 2048) {
-    if (K == 512) return 2;
-    if (K == 4096) return 3;
-  }
-  return 6;
-}
-
-static inline Sel pick(int M, int N, int K, int KB) {
-  int mr = (M <= 8) ? 8 : ((M <= 16) ? 16 : 32);
-  const int cls = shape_class(N, K);
-  const int mc = (M <= 1) ? 0 : (M <= 2) ? 1 : (M <= 4) ? 2 : (M <= 8) ? 3 : (M <= 16) ? 4 : 5;
-  int id = BEST[cls][mc][0];
-  int shift = BEST[cls][mc][1];
-#if VARIANT > 0
-  id = ALT[cls][VARIANT - 1][0];
-  shift = ALT[cls][VARIANT - 1][1];
-#endif
-  if (cls == 6 || M > 32) {
-    int ntiles = (N + 7) / 8, nwk = 1;
-    while (nwk < 16 && ntiles * nwk * 8 < 9024) nwk <<= 1;
-    while (nwk > 1 && (nwk > KB || KB % nwk != 0)) nwk >>= 1;
-    id = (nwk == 1) ? 0 : (nwk == 2) ? 1 : (nwk == 4) ? 2 : (nwk == 8) ? 3 : 4;
-    shift = 0;
-  }
-  while (shift > 0 && mr > 8) {
-    mr >>= 1;
-    --shift;
-  }
-  const int nwk = CFG_NWK[id], ku = CFG_KU[id];
-  // The k loop runs a fixed number of KU-group steps, so the split must
-  // divide KB exactly; id 0 (one warp, one group per step) always does.
-  if (!nwk || KB % (nwk * ku) != 0) id = 0;
-  return Sel{id, mr};
-}
-
 void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
          ffi::TensorView Y) {
   const int M = static_cast<int>(A.shape()[0]);
@@ -424,39 +300,26 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
 
-  if (M == 16 && N == 12288 && K == 2048) {
-    const dim3 grid(768, 1, 1);
-    launch_bw<1, 8, 2, 16, 2, 1, 1, true>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, grid, 256, stream);
-    return;
-  }
-  if (M == 16 && N == 2048 && K == 4096) {
-    const dim3 grid(64, 1, 1);
-    launch_bw<2, 8, 2, 16, 1, 4, 1, true>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, grid, 512, stream);
+  // combo_entry routes only (N=12288, K=2048, M 3..4) here. Measured best
+  // tiling for that cell: one n-warp-group, eight k-warps, two n8 subtiles,
+  // one k-group in flight, two fixed k steps (KB=16), 8-row m tiles.
+  if (N == 12288 && K == 2048 && M <= 4) {
+    const dim3 grid(768, 1, 1);  // 16 columns per CTA
+    launch_bw<1, 8, 2, 8, 1, 2, 1>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, grid, 256, stream);
     return;
   }
 
-  const Sel s = pick(M, N, K, KB);
-  switch (s.id) {
-#define X(ID, NWN, NWK, NT, KU, MINB)                                            \
-  case ID:                                                                       \
-    go<NWN, NWK, NT, KU, MINB>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, s.mr, stream); \
-    break;
-    CFG_LIST(X)
-#undef X
-    default:
-      go<1, 1, 1, 1, 1>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, s.mr, stream);
-      break;
-  }
+  // Defensive generic path for anything else (one warp owns all of K;
+  // correct for any shape, never the measured route).
+  const int mr = (M <= 8) ? 8 : ((M <= 16) ? 16 : 32);
+  go<1, 1, 1, 1, 1>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, mr, stream);
 }
 
 }  // namespace a003_tuned_impl
 
 void RunTuned(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
               ffi::TensorView Y) {
-  // run_tuned is a separately exported FFI entry: set the device context
-  // before the impl reads its stream (combo_entry::Run guards its own path).
-  ffi::CUDADeviceGuard device_guard(A.device().device_id);
+  // Called from combo_entry::Run, which holds the CUDADeviceGuard for the
+  // whole dispatch (the separate run_tuned FFI export was unused and pruned).
   a003_tuned_impl::Run(A, B, As, Bs, Y);
 }
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_tuned, RunTuned);

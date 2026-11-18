@@ -20,11 +20,6 @@
 
 namespace ffi = tvm::ffi;
 
-void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
-                __nv_bfloat16* y, int M, int N, int K, int KB, cudaStream_t stream);
-void LaunchAsyncM32N12288(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
-                          __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream);
-
 #define MMA16832(d, a0, a1, a2, a3, b0, b1)                     \
   asm volatile(                                                 \
       "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
@@ -348,34 +343,9 @@ void RunSpecial(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::T
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
 
-  if (M == 32 && N == 12288 && K == 2048) {
-    LaunchAsyncM32N12288(Abase, Bp, Asbase, Bsp, Ybase, M, N, K, stream);
-    return;
-  }
-
-  const bool use_wide = (M <= 8 && M != 4 && N == 2048 && K == 4096) ||
-                        (M >= 2 && M <= 8 && N == 2048 && K == 512) || (M == 8 && N == 9216) ||
-                        (M == 16 && ((N == 2048 && K == 4096) || (N == 2048 && K == 512))) ||
-                        (M == 32 && (N == 1024 || N == 2048 || N == 9216));
-  if (use_wide) {
-    LaunchWide(Abase, Bp, Asbase, Bsp, Ybase, M, N, K, KB, stream);
-    return;
-  }
-
-  if (M == 8 && N == 64 && K == 2048) {
-    const dim3 grid(N / 8, M, 1u);
-    gemm_fp8_bw_kernel<16, 1, true, 1>
-        <<<grid, 512, 0, stream>>>(Abase, Bp, Asbase, Bsp, Ybase, M, N, K, KB);
-    return;
-  }
-
-  if (M == 16 && N == 64 && K == 2048) {
-    const dim3 grid(N / 8, M / 2, 1u);
-    gemm_fp8_bw_kernel<16, 2, true, 1>
-        <<<grid, 512, 0, stream>>>(Abase, Bp, Asbase, Bsp, Ybase, M, N, K, KB);
-    return;
-  }
-
+  // Reached only through a003_leader for (N=12288, M 8/16) and
+  // (N=9216, M=16); the wide/async and N=64 specials that used to live here
+  // served shapes the allowlist excludes and were pruned.
   if (M == 16 && N == 9216 && K == 2048) {
     const dim3 grid((N + 7) >> 3, 1, 1);
     gemm_fp8_bw_kernel<4, 16, false, 0, true, true>

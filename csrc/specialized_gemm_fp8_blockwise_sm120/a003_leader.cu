@@ -10,8 +10,6 @@
 
 namespace ffi = tvm::ffi;
 
-void LaunchAsyncM32N12288(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
-                          __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream);
 void RunSpecial(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
                 ffi::TensorView Y);
 
@@ -235,13 +233,9 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
 
-  if (M == 32 && N == 12288 && K == 2048) {
-    LaunchAsyncM32N12288(Ap, Bp, Asp, Bsp, Yp, M, N, K, stream);
-    return;
-  }
-
-  if ((N == 12288 && K == 2048 && (M == 4 || M == 8 || M == 16)) ||
-      (M == 16 && N == 9216 && K == 2048) || (M == 4 && N == 2048 && K == 4096)) {
+  // combo_entry routes here only (N=9216, M 9..16) and (N=12288, M 5..16);
+  // the exact-shape specials below are the ones reachable from that set.
+  if ((N == 12288 && K == 2048 && (M == 8 || M == 16)) || (M == 16 && N == 9216 && K == 2048)) {
     RunSpecial(A, B, As, Bs, Y);
     return;
   }

@@ -22,11 +22,6 @@ namespace ffi = tvm::ffi;
 
 namespace r2_narrow {
 
-void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
-                __nv_bfloat16* y, int M, int N, int K, int KB, cudaStream_t stream);
-void LaunchAsyncM32N12288(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
-                          __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream);
-
 #define MMA16832(d, a0, a1, a2, a3, b0, b1)                     \
   asm volatile(                                                 \
       "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \

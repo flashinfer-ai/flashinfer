@@ -262,8 +262,7 @@ static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As
     cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   }
-  gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>
-      <<<grid, TH, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+  gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB><<<grid, TH, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
 }
 
 template <int NW_N, int NW_K, int NT, int KU, int ITERS, int MINB>
@@ -289,124 +288,6 @@ static inline void go(const uint8_t* A, const uint8_t* B, const float* As, const
     go2<NW_N, NW_K, NT, KU, 2, MINB>(A, B, As, Bs, Y, M, N, K, KB, MR, s);
   else
     go2<NW_N, NW_K, NT, KU, 0, MINB>(A, B, As, Bs, Y, M, N, K, KB, MR, s);
-}
-
-//      id, NW_N, NW_K, NT, KU, MINB
-#define CFG_LIST(X)     \
-  X(0, 1, 1, 1, 1, 1)   \
-  X(1, 1, 2, 1, 1, 1)   \
-  X(2, 1, 4, 1, 1, 1)   \
-  X(3, 1, 8, 1, 1, 1)   \
-  X(4, 1, 16, 1, 1, 1)  \
-  X(5, 1, 8, 1, 2, 1)   \
-  X(8, 1, 8, 2, 1, 1)   \
-  X(9, 1, 16, 2, 1, 1)  \
-  X(12, 1, 8, 2, 2, 1)  \
-  X(16, 1, 2, 1, 2, 1)  \
-  X(17, 4, 4, 1, 1, 1)  \
-  X(19, 1, 4, 2, 1, 1)  \
-  X(20, 2, 8, 2, 1, 1)  \
-  X(21, 1, 16, 4, 1, 1) \
-  X(22, 1, 4, 4, 1, 1)  \
-  X(23, 1, 2, 2, 1, 1)  \
-  X(24, 1, 1, 2, 1, 1)  \
-  X(25, 2, 4, 2, 1, 1)  \
-  X(26, 1, 4, 1, 2, 1)  \
-  X(27, 1, 2, 4, 1, 1)  \
-  X(28, 1, 32, 1, 1, 1) \
-  X(29, 2, 16, 1, 1, 1) \
-  X(30, 1, 16, 1, 2, 1) \
-  X(32, 2, 8, 2, 2, 1)  \
-  X(33, 1, 8, 1, 4, 1)  \
-  X(34, 4, 8, 1, 1, 1)  \
-  X(35, 1, 16, 2, 2, 1) \
-  X(36, 1, 8, 2, 1, 3)  \
-  X(37, 1, 2, 1, 1, 12) \
-  X(38, 1, 8, 2, 1, 2)
-
-#define CFG_MAX 39
-static const unsigned char CFG_NWK[CFG_MAX] = {1, 2, 4,  8,  16, 8, 0, 0, 8,  16, 0, 0, 8,
-                                               0, 0, 0,  2,  4,  0, 4, 8, 16, 4,  2, 1, 4,
-                                               4, 2, 32, 16, 16, 0, 8, 8, 8,  16, 8, 2, 8};
-static const unsigned char CFG_KU[CFG_MAX] = {1, 1, 1, 1, 1, 2, 0, 0, 1, 1, 0, 0, 2,
-                                              0, 0, 0, 2, 1, 0, 1, 1, 1, 1, 1, 1, 1,
-                                              2, 1, 1, 1, 2, 0, 2, 4, 1, 2, 1, 1, 1};
-
-#ifndef VARIANT
-#define VARIANT 0
-#endif
-
-struct Sel {
-  int id, mr;
-};
-
-// Best known tiling per (shape class, m class): {config id, m-split shift}.
-// A CTA owns CN = NW_N*NT*8 columns and all of K; NW_K warps split the k
-// groups with KU of them in flight.  The m-split shift halves the rows per CTA
-// to buy blocks, which only pays where the weight stream is small.
-static const signed char BEST[7][6][2] = {
-    {{4, 1}, {4, 1}, {4, 1}, {5, 1}, {5, 1}, {3, 2}},
-    {{4, 0}, {4, 2}, {9, 0}, {9, 0}, {9, 1}, {8, 1}},
-    {{17, 2}, {17, 0}, {17, 0}, {17, 0}, {17, 1}, {17, 1}},
-    {{35, 0}, {35, 0}, {20, 0}, {20, 0}, {9, 0}, {25, 0}},
-    {{0, 0}, {0, 0}, {0, 0}, {38, 0}, {12, 0}, {0, 0}},
-    {{8, 0}, {8, 0}, {8, 0}, {8, 0}, {12, 0}, {24, 0}},
-    {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}},
-};
-
-#if VARIANT > 0
-// Experiment slots: VARIANT v applies ALT[cls][v-1] to every m class.
-static const signed char ALT[7][8][2] = {
-    /* N=64    */ {{5, 1}, {4, 1}, {3, 1}, {5, 2}, {3, 2}, {3, 2}, {3, 2}, {3, 2}},
-    /* N=1024  */ {{12, 1}, {19, 0}, {23, 0}, {24, 0}, {9, 0}, {8, 0}, {4, 1}, {12, 0}},
-    /* N=2048/512 */ {{22, 1}, {19, 1}, {27, 0}, {25, 1}, {17, 0}, {2, 1}, {23, 1}, {25, 0}},
-    /* N=2048/4096*/ {{35, 0}, {30, 0}, {21, 0}, {3, 0}, {9, 0}, {12, 0}, {5, 0}, {20, 0}},
-    /* N=9216  */ {{5, 0}, {3, 0}, {16, 0}, {19, 0}, {12, 0}, {8, 0}, {1, 0}, {2, 0}},
-    /* N=12288 */ {{5, 0}, {3, 0}, {16, 0}, {19, 0}, {12, 0}, {8, 0}, {1, 0}, {2, 0}},
-    /* generic */ {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}},
-};
-#endif
-
-static inline int shape_class(int N, int K) {
-  if (K == 2048) {
-    if (N == 64) return 0;
-    if (N == 1024) return 1;
-    if (N == 9216) return 4;
-    if (N == 12288) return 5;
-  }
-  if (N == 2048) {
-    if (K == 512) return 2;
-    if (K == 4096) return 3;
-  }
-  return 6;
-}
-
-static inline Sel pick(int M, int N, int K, int KB) {
-  int mr = (M <= 8) ? 8 : ((M <= 16) ? 16 : 32);
-  const int cls = shape_class(N, K);
-  const int mc = (M <= 1) ? 0 : (M <= 2) ? 1 : (M <= 4) ? 2 : (M <= 8) ? 3 : (M <= 16) ? 4 : 5;
-  int id = BEST[cls][mc][0];
-  int shift = BEST[cls][mc][1];
-#if VARIANT > 0
-  id = ALT[cls][VARIANT - 1][0];
-  shift = ALT[cls][VARIANT - 1][1];
-#endif
-  if (cls == 6 || M > 32) {
-    int ntiles = (N + 7) / 8, nwk = 1;
-    while (nwk < 16 && ntiles * nwk * 8 < 9024) nwk <<= 1;
-    while (nwk > 1 && (nwk > KB || KB % nwk != 0)) nwk >>= 1;
-    id = (nwk == 1) ? 0 : (nwk == 2) ? 1 : (nwk == 4) ? 2 : (nwk == 8) ? 3 : 4;
-    shift = 0;
-  }
-  while (shift > 0 && mr > 8) {
-    mr >>= 1;
-    --shift;
-  }
-  const int nwk = CFG_NWK[id], ku = CFG_KU[id];
-  // The k loop runs a fixed number of KU-group steps, so the split must
-  // divide KB exactly; id 0 (one warp, one group per step) always does.
-  if (!nwk || KB % (nwk * ku) != 0) id = 0;
-  return Sel{id, mr};
 }
 
 void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
@@ -445,7 +326,14 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     return;
   }
 
-  if (M == 32 && N == 2048 && K == 512) {
+  if ((M == 32 || (M >= 17 && M <= 31)) && N == 2048 && K == 512) {
+    // M=32 uses a 2-CTA cluster; M 17..31 the same tiling without one (the
+    // measured route; combo_entry sends M 9..16 of this class to c00).
+    if (M != 32) {
+      const dim3 grid(64, (unsigned)((M + 15) / 16), 1);
+      launch_bw<4, 4, 1, 16, 1, 1, 1>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, grid, stream);
+      return;
+    }
     const dim3 grid(64, 2, 1);
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
@@ -465,18 +353,18 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     return;
   }
 
-  const Sel s = pick(M, N, K, KB);
-  switch (s.id) {
-#define X(ID, NWN, NWK, NT, KU, MINB)                                            \
-  case ID:                                                                       \
-    go<NWN, NWK, NT, KU, MINB>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, s.mr, stream); \
-    break;
-    CFG_LIST(X)
-#undef X
-    default:
-      go<1, 1, 1, 1, 1>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, s.mr, stream);
-      break;
+  // combo_entry sends (N=9216, M 5..8) here; measured best is eight k-warps,
+  // two n8 subtiles, two fixed k steps, two blocks per SM.
+  if (N == 9216 && K == 2048 && M >= 5 && M <= 8) {
+    go<1, 8, 2, 1, 2>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, 8, stream);
+    return;
   }
+
+  // Remaining reachable cell (N=9216, M=1) measured best on the generic
+  // single-warp-K route; it also serves as the dispatcher's safety net
+  // (correct for any shape).
+  const int mr = (M <= 8) ? 8 : ((M <= 16) ? 16 : 32);
+  go<1, 1, 1, 1, 1>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, mr, stream);
 }
 
 }  // namespace table_impl
