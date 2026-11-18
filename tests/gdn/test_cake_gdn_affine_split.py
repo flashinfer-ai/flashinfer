@@ -7,9 +7,10 @@
 
 The split route is held to an FP64 per-token recurrence: its relative RMS
 error on the output and the final state may exceed the unsplit Cake kernel's
-by at most 10 % on realistic gates and 20 % on near-unit gates.  A call whose
-longest sequence gets one segment is bitwise equal to the unsplit kernel.
-Graph capture, replay with changed lengths, plan reuse and streams are
+by at most 10 % on realistic gates and 20 % on near-unit gates, per sequence
+of a batch.  A call whose longest sequence gets one segment is bitwise equal
+to the unsplit kernel.  A sequence's bits do not depend on the batch around
+it.  Graph capture, replay with changed lengths, plan reuse and streams are
 checked against eager calls.  SM103 only.
 """
 
@@ -22,6 +23,7 @@ import torch
 
 from flashinfer import gdn_prefill as prefill_mod
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from flashinfer.jit.cake_gdn import CakeGDNUnsupportedError
 
 D = 128
 SCALE = 1.0 / math.sqrt(D)
@@ -226,24 +228,39 @@ def test_split_is_run_to_run_deterministic():
 # --- one segment: the unsplit kernel, bitwise ----------------------------------
 
 
+@pytest.mark.parametrize("with_h0", [True, False], ids=["h0", "no_h0"])
 @pytest.mark.parametrize(
     "hq,hv,t,split_count",
     [
         (2, 4, 512, None),
-        (2, 4, 1024, None),
+        (2, 4, 960, None),
         (4, 8, 384, None),
-        (4, 8, 1024, None),
+        (4, 8, 960, None),
         (8, 16, 1024, None),
+        (8, 16, 1984, None),
         (16, 32, 4096, None),
+        (16, 32, 8192, None),
         (4, 8, 4096, 1),
         (2, 4, 2048, 1),
     ],
 )
-def test_one_segment_is_bitwise_the_unsplit_kernel(hq, hv, t, split_count):
+def test_one_segment_is_bitwise_the_unsplit_kernel(hq, hv, t, split_count, with_h0):
     assert _p_bound(hv, t, split_count) == 1
     pr = _problem(hq, hv, t, "real")
-    o_split, s_split = _call(pr, use_affine_split=True, _affine_split_count=split_count)
-    o_base, s_base = _call(pr, use_cp=False)
+    h0 = pr["h0"] if with_h0 else None
+    o_split, s_split = _call(
+        pr, initial_state=h0, use_affine_split=True, _affine_split_count=split_count
+    )
+    o_split, s_split = o_split.clone(), s_split.clone()
+    try:
+        o_base, s_base = _call(pr, initial_state=h0, use_cp=False)
+    except CakeGDNUnsupportedError:
+        # The unsplit route has no kernel without an initial state for these
+        # heads on SM103; the split route serves the call as from zeros.
+        assert not with_h0 and hv in (8, 16)
+        o_base, s_base = _call(
+            pr, initial_state=torch.zeros_like(pr["h0"]), use_cp=False
+        )
     assert torch.equal(o_split, o_base)
     assert torch.equal(s_split, s_base)
 
@@ -264,6 +281,100 @@ def test_split_launches_pass1_then_pass2_only():
     names = _kernel_names(lambda: _call(pr, use_affine_split=True))
     assert len(names) == 2, names
     assert all("cake_gdn_affine_split" in name for name in names), names
+
+
+def test_one_sequence_of_one_segment_runs_the_unsplit_kernel():
+    """One sequence in one segment from an initial state runs the unsplit
+    kernel (its DV-split variant); without an initial state it runs the
+    first kernel alone."""
+
+    pr = _problem(4, 8, 512, "real")
+    assert _p_bound(8, 512) == 1
+    _call(pr, use_affine_split=True)
+    names = _kernel_names(lambda: _call(pr, use_affine_split=True))
+    assert names == _kernel_names(lambda: _call(pr, use_cp=False)), names
+    assert not any("affine_split" in name for name in names), names
+    _call(pr, initial_state=None, use_affine_split=True)
+    names = _kernel_names(lambda: _call(pr, initial_state=None, use_affine_split=True))
+    assert len(names) == 1 and "cake_gdn_affine_split" in names[0], names
+
+
+@pytest.mark.parametrize("hq,hv,n", [(8, 16, 5), (8, 16, 6), (16, 32, 2), (16, 32, 3)])
+def test_batch_of_one_segment_uses_the_unsplit_kernel_only_where_bitwise(hq, hv, n):
+    """A batch of one-segment sequences from initial states runs the unsplit
+    kernel while it resolves the DV-split variant (2 N Hv <= 160 on SM103),
+    else the first kernel alone; either way each sequence holds the bits it
+    has alone."""
+
+    lens = [1000] * n
+    pr = _batch(hq, hv, lens)
+    _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
+    names = _kernel_names(
+        lambda: _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
+    )
+    unsplit = 2 * n * hv <= 160
+    assert any("affine_split" in name for name in names) != unsplit, names
+    o, s = _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
+    o, s = o.clone(), s.clone()
+    for i in (0, n - 1):
+        o_alone, s_alone = _call(_sequence(pr, i), use_affine_split=True)
+        a, b = pr["cu"][i], pr["cu"][i + 1]
+        assert torch.equal(o_alone, o[a:b]) and torch.equal(s_alone[0], s[i]), i
+
+
+def test_one_segment_from_initial_states_without_final_states():
+    """From initial states and without final states, a batch of one-segment
+    sequences runs the first kernel alone, as the unsplit kernel ships no
+    such variant, with the output of the call that keeps the states."""
+
+    pr = _batch(8, 16, [512, 512])
+    cu = torch.tensor(pr["cu"], dtype=torch.int32, device="cuda")
+
+    def only():
+        return chunk_gated_delta_rule(
+            pr["q"],
+            pr["k"],
+            pr["v"],
+            g=pr["g"],
+            beta=pr["beta"],
+            scale=SCALE,
+            initial_state=pr["h0"],
+            output_final_state=False,
+            cu_seqlens=cu,
+            backend="cake_gdn",
+            use_affine_split=True,
+        )
+
+    o = only().clone()
+    names = _kernel_names(only)
+    assert len(names) == 1 and "cake_gdn_affine_split" in names[0], names
+    o_ref, _ = _call_batch(pr, use_affine_split=True)
+    assert torch.equal(o, o_ref)
+
+
+def test_one_sequence_state_of_any_slot_stride():
+    """A one-sequence state is contiguous whatever its slot stride (a size-1
+    dimension, as after a DLPack round trip), so it runs with the bits of
+    the dense state."""
+
+    pr = _problem(4, 8, 2048, "real")
+    o_ref, s_ref = (x.clone() for x in _call(pr, use_affine_split=True))
+    h0 = pr["h0"].clone().as_strided((1, 8, D, D), (1, D * D, D, 1))
+    state = torch.empty(8 * D * D, device="cuda").as_strided(
+        (1, 8, D, D), (1, D * D, D, 1)
+    )
+    assert h0.is_contiguous() and h0.stride(0) == 1
+    o, s = _call(pr, initial_state=h0, output_state=state, use_affine_split=True)
+    assert torch.equal(o, o_ref) and torch.equal(s, s_ref)
+
+
+def test_batch_of_empty_sequences_keeps_the_initial_states():
+    pr = _batch(4, 8, [0, 0, 0])
+    assert pr["t"] == 0
+    o, s = _call_batch(pr, use_affine_split=True)
+    assert o.shape == (0, 8, D) and torch.equal(s, pr["h0"])
+    o, s = _call_batch(pr, initial_state=None, use_affine_split=True)
+    assert not s.any()
 
 
 @pytest.mark.parametrize("use_cp", ["auto", False])
@@ -567,15 +678,26 @@ def _unaligned_state():
     "change,reason",
     [
         (dict(heads=6), "requires Hv in (4, 8, 16, 32), Hk == Hq and Hv % Hq == 0"),
-        (dict(cu=[0, 1000, 2048]), "supports one sequence (num_seqs == 1)"),
+        (
+            dict(cu=[0, 1000, 2048]),
+            "requires contiguous FP32 states [N, H, V, K]",
+        ),
+        (
+            dict(cu=[0, 1000, 2048], h0="expanded"),
+            "requires contiguous FP32 states [N, H, V, K]",
+        ),
+        (
+            dict(cu=[0, 1000, 2048], h0="padded"),
+            "requires contiguous FP32 states [N, H, V, K]",
+        ),
         (
             dict(cu=[0, 7, 2048, 9], cu_step=2),
             "requires contiguous int32 or int64 cu_seqlens",
         ),
-        (dict(h0="bf16"), "requires FP32 states with contiguous [H, V, K] rows"),
+        (dict(h0="bf16"), "requires contiguous FP32 states [N, H, V, K]"),
         (
             dict(h0="unaligned"),
-            "requires 16-byte aligned state pointers and slot strides",
+            "requires 16-byte aligned state pointers",
         ),
         (dict(g="strided"), "requires contiguous FP32 g/beta [tokens, heads]"),
         (
@@ -602,6 +724,12 @@ def test_out_of_scope_calls_raise_before_any_launch(change, reason):
     h0 = torch.zeros(1, hv, D, D, device="cuda")
     if change.get("h0") == "bf16":
         h0 = h0.to(torch.bfloat16)
+    elif change.get("h0") == "expanded":
+        h0 = h0.expand(2, hv, D, D)
+    elif change.get("h0") == "padded":
+        # Aligned sequence slots that do not overlap, 4 floats apart.
+        slots = torch.zeros(2, hv * D * D + 4, device="cuda")
+        h0 = slots[:, : hv * D * D].view(2, hv, D, D)
     elif change.get("h0") == "unaligned":
         h0 = _unaligned_state()
     if change.get("g") == "strided":
@@ -664,7 +792,7 @@ def test_scope_is_checked_before_the_gates_are_materialized():
     def bad_call():
         with pytest.raises(
             ValueError,
-            match=r"use_affine_split=True: requires FP32 states with contiguous",
+            match=r"use_affine_split=True: requires contiguous FP32 states",
         ):
             chunk_gated_delta_rule(
                 pr["q"],
@@ -682,3 +810,350 @@ def test_scope_is_checked_before_the_gates_are_materialized():
             )
 
     assert _kernel_names(bad_call) == []
+
+
+# --- batches of several sequences ----------------------------------------------
+
+
+def _batch(hq, hv, lens, kind="real", seed=0):
+    """One problem per sequence (``_problem``), packed: ``cu`` and the initial
+    states ``h0 [N, H, V, K]``."""
+
+    parts = [
+        _problem(hq, hv, max(n, 1), kind, seed=seed + 7 * i) for i, n in enumerate(lens)
+    ]
+    cat = {
+        name: torch.cat([p[name][:n] for p, n in zip(parts, lens, strict=True)])
+        for name in ("q", "k", "v", "g", "beta")
+    }
+    cu = [0]
+    for n in lens:
+        cu.append(cu[-1] + n)
+    h0 = torch.cat([p["h0"] for p in parts]).contiguous()
+    return dict(cat, h0=h0, hq=hq, hv=hv, t=cu[-1], cu=cu)
+
+
+def _call_batch(pr, *, output=None, output_state=None, **kwargs):
+    cu = torch.tensor(pr["cu"], dtype=torch.int32, device="cuda")
+    n = len(pr["cu"]) - 1
+    if output_state is None:
+        output_state = torch.empty(
+            n, pr["hv"], D, D, dtype=torch.float32, device="cuda"
+        )
+    return _call(pr, cu=cu, output=output, output_state=output_state, **kwargs)
+
+
+def _sequence(pr, n):
+    """Sequence ``n`` of a batch as a problem of its own."""
+
+    a, b = pr["cu"][n], pr["cu"][n + 1]
+    sub = {name: pr[name][a:b].contiguous() for name in ("q", "k", "v", "g", "beta")}
+    return dict(pr, **sub, h0=pr["h0"][n : n + 1].contiguous(), t=b - a, cu=[0, b - a])
+
+
+BATCHES = [
+    pytest.param([4096, 1000, 0, 2500], id="varlen4"),
+    pytest.param([2048, 2048], id="2x2048"),
+    pytest.param([8192] * 4, id="4x8192", marks=pytest.mark.long_running),
+]
+
+
+@pytest.mark.parametrize("hq,hv", HEADS)
+@pytest.mark.parametrize("lens", BATCHES)
+@pytest.mark.parametrize("kind", ["real", "stress"])
+def test_batch_accuracy_against_fp64(hq, hv, lens, kind):
+    """Per sequence, the output rows and final state against the FP64
+    recurrence, gated on the unsplit kernel's error over the same batch."""
+
+    pr = _batch(hq, hv, lens, kind)
+    o_split, s_split = _call_batch(pr, use_affine_split=True)
+    o_split, s_split = o_split.clone(), s_split.clone()
+    o_base, s_base = _call_batch(pr, use_cp=False)
+    torch.cuda.synchronize()
+    for n in range(len(lens)):
+        a, b = pr["cu"][n], pr["cu"][n + 1]
+        if a == b:
+            assert torch.equal(s_split[n], pr["h0"][n])
+            continue
+        ref_o, ref_s = _fp64_reference(_sequence(pr, n))
+        for name, x, base, ref in (
+            ("output", o_split[a:b], o_base[a:b], ref_o),
+            ("state", s_split[n : n + 1], s_base[n : n + 1], ref_s),
+        ):
+            assert torch.isfinite(x).all(), (n, name)
+            err, err_base = _rel_rms(x, ref), _rel_rms(base, ref)
+            assert err <= GATE[kind] * err_base, (n, name, err, err_base)
+            assert err < 1e-2, (n, name, err)
+
+
+INVARIANCE = [
+    # (Hq, Hv, lens): at most 960 tokens (one segment), 961 and longer
+    # (split), an empty sequence.
+    (2, 4, [900, 4096, 512, 0, 960, 961, 1024, 2048]),
+    (4, 8, [961, 960, 3000, 1089, 64, 1]),
+    (8, 16, [1984, 2048, 300, 4096]),
+    (16, 32, [4096, 100, 2000]),
+]
+
+
+@pytest.mark.parametrize("hq,hv,lens", INVARIANCE)
+def test_batch_invariance_is_bitwise(hq, hv, lens):
+    """Each sequence alone holds the bits it has inside the batch, with and
+    without the ``max_seqlen`` / ``cu_seqlens_cpu`` hints and in another order."""
+
+    pr = _batch(hq, hv, lens)
+    longest = max(lens)
+    runs = {}
+    for name, kwargs in (
+        ("plain", {}),
+        ("max_seqlen", dict(max_seqlen=longest)),
+        ("cu_seqlens_cpu", dict(cu_seqlens_cpu=pr["cu"])),
+    ):
+        o, s = _call_batch(pr, use_affine_split=True, **kwargs)
+        runs[name] = (o.clone(), s.clone())
+    order = list(reversed(range(len(lens))))
+    rev = _batch(hq, hv, [lens[i] for i in order])
+    for name in ("q", "k", "v", "g", "beta"):
+        rev[name] = torch.cat(
+            [pr[name][pr["cu"][i] : pr["cu"][i + 1]] for i in order]
+        ).contiguous()
+    rev["h0"] = pr["h0"][order].contiguous()
+    o_rev, s_rev = _call_batch(rev, use_affine_split=True)
+    for n in range(len(lens)):
+        a, b = pr["cu"][n], pr["cu"][n + 1]
+        r = order.index(n)
+        ra, rb = rev["cu"][r], rev["cu"][r + 1]
+        o_ref, s_ref = runs["plain"]
+        for name, (o, s) in runs.items():
+            assert torch.equal(o[a:b], o_ref[a:b]) and torch.equal(s[n], s_ref[n]), (
+                name,
+                n,
+            )
+        assert torch.equal(o_rev[ra:rb], o_ref[a:b]), ("reversed", n)
+        assert torch.equal(s_rev[r], s_ref[n]), ("reversed", n)
+        if a == b:
+            continue
+        o_alone, s_alone = _call(_sequence(pr, n), use_affine_split=True)
+        assert torch.equal(o_alone, o_ref[a:b]), ("alone", n, lens[n])
+        assert torch.equal(s_alone[0], s_ref[n]), ("alone", n, lens[n])
+
+
+@pytest.mark.parametrize("hq,hv", HEADS)
+def test_batch_of_one_segment_runs_pass1_alone(hq, hv):
+    """A batch whose longest sequence gets one segment, without initial
+    states, launches the first kernel alone, at a cap of one segment, over no
+    split workspace."""
+
+    split = _split_module()
+    split.clear_affine_split_plans()
+    pr = _batch(hq, hv, [960, 700, 0, 900])
+    kwargs = dict(use_affine_split=True, cu_seqlens_cpu=pr["cu"], initial_state=None)
+    _call_batch(pr, **kwargs)
+    names = _kernel_names(lambda: _call_batch(pr, **kwargs))
+    assert len(names) == 1 and "cake_gdn_affine_split" in names[0], names
+    (entry,) = split._EAGER.values()
+    assert entry.p_cap == 1 and entry.pass2 is None
+    assert entry.o_loc.numel() == entry.c.numel() == entry.bm.numel() == 1
+    split.clear_affine_split_plans()
+
+
+def test_batch_launch_cap_follows_the_bound():
+    """The cap is the segment count of the longest sequence: the exact one of
+    ``cu_seqlens_cpu``, else the hint, else the token count."""
+
+    split = _split_module()
+    pr = _batch(4, 8, [1152, 2048, 300, 0])
+    for kwargs, cap in (
+        (dict(cu_seqlens_cpu=pr["cu"]), 4),
+        (dict(max_seqlen=2048), 4),
+        (dict(max_seqlen=1200), None),
+        ({}, 5),
+    ):
+        split.clear_affine_split_plans()
+        if cap is None:
+            with pytest.raises(ValueError, match="smaller than the longest"):
+                _call_batch(
+                    pr,
+                    use_affine_split=True,
+                    cu_seqlens_cpu=pr["cu"],
+                    **kwargs,
+                )
+            continue
+        _call_batch(pr, use_affine_split=True, **kwargs)
+        (entry,) = split._EAGER.values()
+        assert entry.p_cap == cap, (kwargs, entry.p_cap)
+    split.clear_affine_split_plans()
+
+
+def test_batch_call_forms_keep_the_bits():
+    """int64 ``cu_seqlens``, ``cu_seqlens_cpu`` as a tensor, an in-place
+    state, ``initial_state=None`` (against explicit zeros), unit gates
+    (against ones), ``output_final_state=False`` and the Q/K L2 norm (against
+    normalized inputs) hold the bits of the plain call over a batch."""
+
+    pr = _batch(4, 8, [4096, 1000, 0, 2500])
+    n = 4
+    o_ref, s_ref = (x.clone() for x in _call_batch(pr, use_affine_split=True))
+    cu64 = torch.tensor(pr["cu"], dtype=torch.int64, device="cuda")
+    o, s = _call(
+        pr,
+        cu=cu64,
+        output_state=torch.empty_like(s_ref),
+        use_affine_split=True,
+        cu_seqlens_cpu=torch.tensor(pr["cu"]),
+    )
+    assert torch.equal(o, o_ref) and torch.equal(s, s_ref)
+    state = pr["h0"].clone()
+    o, s = _call_batch(
+        pr, initial_state=state, output_state=state, use_affine_split=True
+    )
+    assert s.data_ptr() == state.data_ptr()
+    assert torch.equal(o, o_ref) and torch.equal(s, s_ref)
+    zero = dict(pr, h0=torch.zeros_like(pr["h0"]))
+    o_zero, s_zero = (x.clone() for x in _call_batch(zero, use_affine_split=True))
+    o, s = _call_batch(pr, initial_state=None, use_affine_split=True)
+    assert torch.equal(o, o_zero) and torch.equal(s, s_zero)
+    ones = dict(pr, g=torch.ones_like(pr["g"]), beta=torch.ones_like(pr["beta"]))
+    o_ones, s_ones = (x.clone() for x in _call_batch(ones, use_affine_split=True))
+    cu = torch.tensor(pr["cu"], dtype=torch.int32, device="cuda")
+    o, s = chunk_gated_delta_rule(
+        pr["q"],
+        pr["k"],
+        pr["v"],
+        g=None,
+        beta=None,
+        scale=SCALE,
+        initial_state=pr["h0"],
+        output_final_state=True,
+        cu_seqlens=cu,
+        backend="cake_gdn",
+        use_affine_split=True,
+    )
+    assert s.shape == (n, 8, D, D)
+    assert torch.equal(o, o_ones) and torch.equal(s, s_ones)
+    only = chunk_gated_delta_rule(
+        pr["q"],
+        pr["k"],
+        pr["v"],
+        g=pr["g"],
+        beta=pr["beta"],
+        scale=SCALE,
+        initial_state=pr["h0"],
+        output_final_state=False,
+        cu_seqlens=cu,
+        backend="cake_gdn",
+        use_affine_split=True,
+    )
+    assert torch.equal(only, o_ref)
+    raw = dict(
+        pr,
+        q=(pr["q"].float() * 3).to(torch.bfloat16),
+        k=(pr["k"].float() * 2).to(torch.bfloat16),
+    )
+    o_norm, s_norm = (
+        x.clone()
+        for x in _call_batch(raw, use_affine_split=True, use_qk_l2norm_in_kernel=True)
+    )
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
+    qn, kn = normalize_qk(raw["q"], raw["k"])
+    o, s = _call_batch(dict(raw, q=qn, k=kn), use_affine_split=True)
+    assert torch.equal(o, o_norm) and torch.equal(s, s_norm)
+
+
+def test_batch_over_the_tile_limit_raises_before_any_launch():
+    split = _split_module()
+    t, n = 8192, 1100  # 4 heads, P = 8: 1100 * 4 * 30 pass-1 tiles
+    assert split.pass1_grid(n, 4, 8, _sm_count())[0] > split.MAX_PASS1_TILES
+    pr = _problem(2, 4, t, "real")
+    cu = torch.linspace(0, t, n + 1, device="cuda").round().to(torch.int32)
+    output = torch.full((t, 4, D), float("nan"), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="pass-1 tiles"):
+        _call(
+            pr,
+            cu=cu,
+            output=output,
+            output_state=torch.empty(n, 4, D, D, device="cuda"),
+            initial_state=None,
+            use_affine_split=True,
+        )
+    torch.cuda.synchronize()
+    assert torch.isnan(output).all()
+
+
+@pytest.mark.parametrize("hq,hv", [(2, 4), (4, 8), (8, 16)])
+def test_batch_graph_replay_with_new_lengths(hq, hv):
+    """N = 4 fixed: a captured call replayed over lengths that move every
+    segment count (empty and one-token sequences included) equals the eager
+    call, and leaves the flags and the ticket at zero."""
+
+    split = _split_module()
+    split.clear_affine_split_plans()
+    t = 8192
+    static = _batch(hq, hv, [2048] * 4, seed=0)
+    cu = torch.tensor(static["cu"], dtype=torch.int32, device="cuda")
+    out = torch.empty(t, hv, D, dtype=torch.bfloat16, device="cuda")
+    state = torch.empty(4, hv, D, D, dtype=torch.float32, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="must be warmed"),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        _call(static, cu=cu, output=out, output_state=state, use_affine_split=True)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _call(static, cu=cu, output=out, output_state=state, use_affine_split=True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _call(static, cu=cu, output=out, output_state=state, use_affine_split=True)
+    lengths = [
+        [2048] * 4,
+        [8192, 0, 0, 0],
+        [1, 8000, 64, 127],
+        [1000, 1000, 1000, 1000],
+        [0, 0, 4096, 4000],
+        [3000, 961, 960, 2000],
+    ]
+    for replay in range(30):
+        lens = lengths[replay % len(lengths)]
+        fresh = _batch(hq, hv, [8192], seed=1 + replay % 4)
+        for name in ("q", "k", "v", "g", "beta"):
+            static[name].copy_(fresh[name])
+        static["h0"].copy_(_batch(hq, hv, [1] * 4, seed=replay)["h0"])
+        offsets = [0]
+        for n in lens:
+            offsets.append(offsets[-1] + n)
+        cu.copy_(torch.tensor(offsets, dtype=torch.int32))
+        out.fill_(float("nan"))
+        state.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert _zero_words(), replay
+        # Rows past the last offset stay untouched (NaN), as in eager calls.
+        assert torch.isfinite(out[: offsets[-1]]).all(), (replay, lens)
+        assert torch.isnan(out[offsets[-1] :]).all(), (replay, lens)
+        assert torch.isfinite(state).all(), (replay, lens)
+        for i, n in enumerate(lens):
+            if n == 0:
+                assert torch.equal(state[i], static["h0"][i]), (replay, lens, i)
+        o_eager = torch.full_like(out, float("nan"))
+        s_eager = torch.full_like(state, float("nan"))
+        _call(
+            static,
+            cu=cu.clone(),
+            output=o_eager,
+            output_state=s_eager,
+            use_affine_split=True,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), o_eager.view(torch.int16)), (
+            replay,
+            lens,
+        )
+        assert torch.equal(state.view(torch.int32), s_eager.view(torch.int32)), (
+            replay,
+            lens,
+        )
+    split.clear_affine_split_plans()

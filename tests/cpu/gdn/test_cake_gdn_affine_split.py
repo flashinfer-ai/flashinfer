@@ -244,15 +244,19 @@ def test_plan_constants_on_152_sms():
     "heads,tokens,expected",
     [
         (4, 512, 1),
-        (4, 1024, 1),
-        (4, 1025, 2),
-        (4, 1152, 2),
+        (4, 960, 1),
+        (4, 961, 2),
+        (4, 1024, 2),
+        (4, 1536, 3),
         (4, 2048, 4),
+        (4, 3072, 6),
         (4, 4096, 8),
         (4, 8192, 8),
         (8, 512, 1),
-        (8, 1024, 1),
-        (8, 1025, 2),
+        (8, 960, 1),
+        (8, 961, 2),
+        (8, 2048, 4),
+        (8, 3072, 5),
         (8, 4096, 5),
         (16, 1024, 1),
         (16, 1984, 1),
@@ -266,10 +270,23 @@ def test_segment_count_of_the_planner(heads, tokens, expected):
     assert plan.p_bound == expected
 
 
+def test_no_sequence_of_the_minimum_length_is_split():
+    """The cutoff follows from the device rule: no sequence of at most
+    ``SPLIT_MIN_TOKENS`` tokens gets two segments, whatever the batch."""
+
+    assert split.SPLIT_MIN_TOKENS == 960
+    for heads in (4, 8, 16, 32):
+        p_cap, c_min = split.plan_constants(heads, 152)
+        assert all(
+            split.segment_count(n, p_cap, c_min) == 1
+            for n in range(split.SPLIT_MIN_TOKENS + 1)
+        )
+    assert split.segment_count(961, 8, split.C_MIN[4]) == 2
+
+
 def test_forced_split_count_ignores_the_minimum_length():
-    assert split.SPLIT_MIN_TOKENS == 1024
     assert split.plan_split(
-        num_heads=4, max_seqlen=1000, sm_count=152, split_count=3
+        num_heads=4, max_seqlen=900, sm_count=152, split_count=3
     ) == (3, 1, 3)
 
 
@@ -279,6 +296,21 @@ def test_segment_count_edges():
     assert split.segment_count(65, 8, 1) == 2
     assert split.segment_count(1000, 8, 1) == 8
     assert split.segment_count(10**6, 3, 8) == 3
+
+
+@pytest.mark.parametrize("num_seqs", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("heads,p_cap", [(4, 8), (8, 5), (16, 2)])
+def test_grids_of_batches(num_seqs, heads, p_cap):
+    tiles, grid = split.pass1_grid(num_seqs, heads, p_cap, 152)
+    assert tiles == num_seqs * heads * (4 * p_cap - 2) and grid == min(tiles, 152)
+    width = split._SLICE_WIDTH[heads]
+    compose = num_seqs * heads * 128 // width
+    for tokens in (1, 1024, 4096 * num_seqs):
+        grid2 = split.pass2_grid(num_seqs, heads, tokens, p_cap, width, 152)
+        bound = compose + 2 * heads * (-(-tokens // 128) + num_seqs * p_cap)
+        assert compose < grid2 <= bound
+        if compose >= 2 * 152 - 32 and bound >= compose + 32:
+            assert grid2 == compose + 32
 
 
 def test_grids():
@@ -334,3 +366,67 @@ def test_program_table_matches_the_sources_and_the_host(monkeypatch):
         tail = [*TARGET_FLAGS["sm_103a"], "--fmad=false", *options]
         assert flags[-len(tail) :] == tail
         assert program.module_name("sm_103a").startswith(f"{program.name}_sm_103a_")
+
+
+# --- the bound a call launches with ----------------------------------------------
+
+
+def _route(monkeypatch, *, lens, heads=8, max_seqlen=None, cu_cpu=None):
+    """``_run_cake_gdn_affine_split`` on host tensors with the launch
+    recorded: returns the plan it launched with."""
+
+    seen = {}
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_affine_split_scope", lambda **_k: None)
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_sm_count", lambda _i: 152)
+    monkeypatch.setattr(gdn_prefill.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_affine_split_sm100",
+        lambda **kwargs: seen.update(kwargs),
+    )
+    cu = [0]
+    for n in lens:
+        cu.append(cu[-1] + n)
+    t = cu[-1]
+    q = torch.zeros((t, 2, 128), dtype=torch.bfloat16)
+    v = torch.zeros((t, heads, 128), dtype=torch.bfloat16)
+    gdn_prefill._run_cake_gdn_affine_split(
+        q=q,
+        k=q,
+        v=v,
+        g=None,
+        beta=None,
+        scale=1.0,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32),
+        cu_seqlens_cpu=cu if cu_cpu is True else cu_cpu,
+        max_seqlen=t if max_seqlen is None else max_seqlen,
+        use_qk_l2norm_in_kernel=False,
+        output=torch.zeros_like(v),
+        output_state=None,
+        device_capability=(10, 3),
+        cuda_major=13,
+        split_count=None,
+    )
+    assert seen["output_state"].shape == (len(lens), heads, 128, 128)
+    return seen["plan"]
+
+
+def test_launch_cap_is_the_longest_sequence_of_the_host_offsets(monkeypatch):
+    lens = [1152, 2048, 300, 0]  # P = 2, 4, 1, 1 at 8 heads
+    assert _route(monkeypatch, lens=lens) == (5, 8, 5)  # the token count
+    assert _route(monkeypatch, lens=lens, max_seqlen=2048) == (5, 8, 4)
+    assert _route(monkeypatch, lens=lens, cu_cpu=True) == (5, 8, 4)
+    assert _route(monkeypatch, lens=lens, max_seqlen=3000, cu_cpu=True) == (5, 8, 4)
+    assert _route(monkeypatch, lens=[900, 960, 64]) == (5, 8, 3)
+    assert _route(monkeypatch, lens=[900, 960, 64], max_seqlen=960) == (5, 8, 1)
+    with pytest.raises(ValueError, match="max_seqlen is smaller than the longest"):
+        _route(monkeypatch, lens=lens, max_seqlen=1500, cu_cpu=True)
+
+
+def test_tile_limit_is_rejected_on_the_host(monkeypatch):
+    lens = [8] * 1100  # one bound of 8800 tokens: P = 8 at 4 heads
+    with pytest.raises(ValueError, match="131072 pass-1 tiles"):
+        _route(monkeypatch, lens=lens, heads=4)
+    assert _route(monkeypatch, lens=lens, heads=4, cu_cpu=True).p_bound == 1
