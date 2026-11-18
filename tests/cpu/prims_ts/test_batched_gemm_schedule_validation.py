@@ -1420,7 +1420,10 @@ _TASK_LEVEL_PDL_MODES = {
         "nvfp4_swap_token_sf",
     ),
 )
-def test_task_level_pdl_wait_placement(config_name, mode):
+# The MoE runner turns on the per-expert weight L2 policy for eligible swap-AB
+# tactics; its weight loaders then read routing metadata for the cache hint.
+@pytest.mark.parametrize("weight_l2_evict_first", (0, 1))
+def test_task_level_pdl_wait_placement(config_name, mode, weight_l2_evict_first):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         _pdl_task_waits,
@@ -1433,6 +1436,13 @@ def test_task_level_pdl_wait_placement(config_name, mode):
     )
 
     kwargs = {**_pdl_schedule_kwargs(config_name), **_TASK_LEVEL_PDL_MODES[mode]}
+    if weight_l2_evict_first:
+        base = make_config(**kwargs)
+        if not base.is_swap_ab or base.token_cluster_dim != 1:
+            pytest.skip(
+                "the weight L2 policy needs swap-AB with token-cluster width one"
+            )
+        kwargs["weight_l2_evict_first"] = 1
     cfg = make_config(**kwargs)
     task_manager = build_batched_gemm_task_manager(
         num_experts=2, num_tokens=256, top_k=1, verbose=False, **kwargs

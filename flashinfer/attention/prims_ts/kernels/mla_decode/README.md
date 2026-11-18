@@ -140,7 +140,9 @@ No per-query bounds tensor or bounds-materialization launch is required.
 
 `plan(zero_empty_rows=True)` (the default) initializes empty local rows to zero
 O and optional LSE `-inf`, including requests whose ordinary main schedule
-skips all local work. `zero_empty_rows=False` omits this neutral writer.
+skips all local work. The neutral writer is a plain launch even under
+`enable_pdl`: stream order covers its reads, and the attention grid's entry
+wait covers its stores. `zero_empty_rows=False` omits this neutral writer.
 Empty-row results are then unspecified, not guaranteed preserved; initialize
 them or exclude them from merging. A rank with no local tokens does not need
 valid page IDs. Static local K/V capacity remains positive; the one-shot API
