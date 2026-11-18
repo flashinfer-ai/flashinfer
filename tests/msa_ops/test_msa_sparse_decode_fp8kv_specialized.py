@@ -223,7 +223,7 @@ def test_empty_selection_rows_produce_zero_output():
     specialized route must return ZERO for that row (the packed backend's
     empty-effective-KV convention), never 0/0 = NaN."""
     inp = _make_inputs(4, 300, seed=47)
-    inp["q2k_indices"][0, 2, :] = -1
+    inp["topk"][0, 2, :] = -1
     gold = _reference(inp)
     out = _api(inp, backend="specialized")
     torch.cuda.synchronize()
