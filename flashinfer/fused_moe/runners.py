@@ -8483,6 +8483,32 @@ class SM12xFp8Runner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
+def _specialized_jit_nvcc_release() -> Optional[tuple]:
+    """CUDA release of the compiler the JIT build will actually invoke
+    (``FLASHINFER_NVCC`` override, else ``$cuda_home/bin/nvcc``), or ``None``
+    when that compiler cannot be run. Never substitutes torch's CUDA build
+    version: this probe gates a source build, not the runtime."""
+    import re
+    import subprocess
+
+    nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    if "$cuda_home" in nvcc:
+        try:
+            from ..jit.cpp_ext import get_cuda_path
+
+            nvcc = nvcc.replace("$cuda_home", str(get_cuda_path()))
+        except Exception:
+            return None
+    try:
+        txt = subprocess.check_output([nvcc, "--version"], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.search(r"release (\d+)\.(\d+)", txt)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
 class SpecializedFp8BlockRunner(MoERunner):
     """Adapter for the specialized (agent-generated) SM120 DeepSeek FP8 kernels.
 
@@ -8586,25 +8612,31 @@ class SpecializedFp8BlockRunner(MoERunner):
                 "accumulation)."
             )
         # The JIT build happens on the dispatch path (outside check_support),
-        # so the toolkit must be rejected here: the kernels use
+        # so the toolchain must be rejected here: the kernels use
         # cvt.rn.bf16x2.e4m3x2, which needs PTX ISA 9.2 (CUDA 13.2+). CUDA
         # 13.0/13.1 would otherwise pass candidate selection and fail at the
-        # first forward's JIT build with no handler.
-        from ..jit.cpp_ext import get_cuda_version
-
-        try:
-            cuda_version = get_cuda_version()
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "the specialized SM120 FP8 block-scale backend could not "
-                f"determine the CUDA toolkit version: {exc}"
-            ) from exc
-        if (cuda_version.major, cuda_version.minor) < (13, 2):
-            raise NotImplementedError(
-                "the specialized SM120 FP8 block-scale backend JIT-builds an "
-                "sm_120a module that requires the CUDA 13.2+ toolkit (PTX ISA "
-                f"9.2 for cvt.rn.bf16x2.e4m3x2); found CUDA {cuda_version}."
-            )
+        # first forward's JIT build with no handler. A cached module artifact
+        # needs no compiler and is accepted as-is; otherwise the compiler the
+        # build will actually invoke (FLASHINFER_NVCC override, else
+        # $cuda_home/bin/nvcc) is probed directly — never torch's CUDA build
+        # version, which get_cuda_version substitutes when nvcc is missing
+        # and which says nothing about the ability to build.
+        if not spec.gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+            toolkit = _specialized_jit_nvcc_release()
+            if toolkit is None:
+                raise RuntimeError(
+                    "the specialized SM120 FP8 block-scale backend has no "
+                    "cached module artifact and the JIT compiler "
+                    "(FLASHINFER_NVCC, else $CUDA_HOME/bin/nvcc) is "
+                    "unavailable; the module cannot be built."
+                )
+            if toolkit < (13, 2):
+                raise NotImplementedError(
+                    "the specialized SM120 FP8 block-scale backend JIT-builds "
+                    "an sm_120a module that requires the CUDA 13.2+ toolkit "
+                    "(PTX ISA 9.2 for cvt.rn.bf16x2.e4m3x2); the JIT-selected "
+                    f"nvcc is CUDA {toolkit[0]}.{toolkit[1]}."
+                )
         # Device guards, mirroring the module's shipped dispatch surface.
         cc = tuple(get_compute_capability(self.device))
         if not (allow["min_cc"] <= cc <= allow["max_cc"]):

@@ -47,13 +47,21 @@ def _is_validated_sm120_device():
 
 
 def _has_min_cuda_toolkit():
+    # Shared probe with the runner's support check: a cached module artifact
+    # needs no compiler; otherwise the JIT-selected nvcc (FLASHINFER_NVCC
+    # override, else $CUDA_HOME/bin/nvcc) must be CUDA 13.2+ (ptxas accepts
+    # cvt.rn.bf16x2.e4m3x2 only from PTX ISA 9.2). torch.version.cuda is
+    # never substituted: it says nothing about the ability to build.
     try:
-        from flashinfer.jit.cpp_ext import get_cuda_version
+        from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
+        from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+            gen_specialized_fused_moe_fp8_blockscale_sm120_module,
+        )
 
-        v = get_cuda_version()
-        # The kernels use cvt.rn.bf16x2.e4m3x2, which ptxas accepts only
-        # from PTX ISA 9.2 (CUDA 13.2); CUDA 13.0/13.1 fail at JIT.
-        return (v.major, v.minor) >= (13, 2)
+        if gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+            return True
+        v = _specialized_jit_nvcc_release()
+        return v is not None and v >= (13, 2)
     except Exception:
         return False
 
@@ -212,11 +220,16 @@ def test_off_allowlist_token_count_declined(weights):
         specialized_moe_fp8_blockscale_stats,
     )
 
+    before = specialized_moe_fp8_blockscale_stats()["fallback_reasons"].get(
+        "num_tokens_off_allowlist", 0
+    )
     x, ids, tw = _routing(7, seed=1)
     out, reason = _dispatch(x, ids, tw, weights)
     assert out is None and reason == "num_tokens_off_allowlist"
     reasons = specialized_moe_fp8_blockscale_stats()["fallback_reasons"]
-    assert reasons.get("num_tokens_off_allowlist", 0) >= 1
+    # Exactly this call's refusal must be counted: an earlier off-allowlist
+    # call in the session must not satisfy the assertion for this one.
+    assert reasons.get("num_tokens_off_allowlist", 0) == before + 1
 
 
 def test_flat_entry_negative_control(weights):

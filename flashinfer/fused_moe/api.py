@@ -2693,8 +2693,16 @@ class SpecializedFp8BlockConfig:
     A DEFAULT backend candidate: ``supported()`` gates the arch (SM120) and
     the runner gates the contract and per-call token allowlist, so under
     ``backend=auto`` the ``MoELayer`` cross-backend shootout times the
-    specialized kernels directly on matching layers — FlashInfer's only
-    resident fp8-block-scale MoE path on SM120 — with no opt-in.
+    specialized kernels directly on matching layers with no opt-in. It is a
+    default candidate, not the only SM120 FP8 block-scale implementation:
+    the opt-in CuTe-DSL route (:class:`SM12xFp8Config`) also serves DeepSeek
+    FP8 on SM120.
+
+    The allowlist's largest variant (16,384 tokens) exceeds
+    ``ExecutionConfig``'s default ``tune_max_num_tokens=8192``, and
+    ``MoELayer`` rejects an over-limit call before backend eligibility is
+    checked; layers that must serve that variant need
+    ``ExecutionConfig(tune_max_num_tokens=16384)``.
     """
 
     @classmethod
@@ -2740,8 +2748,12 @@ class SpecializedFp8BlockConfig:
         return {
             "w13_weight": w13_native,
             "w13_weight_sf": w13_sf_native,
-            "w2_weight": w2_weight,
-            "w2_weight_sf": w2_weight_sf,
+            # The launch guard refuses noncontiguous operands
+            # (fc2_weights_form), so normalize storage here: a checkpoint
+            # can produce the documented [E, H, I] fc2 shape by transposing
+            # [E, I, H]. Already-contiguous tensors pass through unchanged.
+            "w2_weight": w2_weight.contiguous(),
+            "w2_weight_sf": w2_weight_sf.contiguous(),
         }
 
     def __repr__(self) -> str:

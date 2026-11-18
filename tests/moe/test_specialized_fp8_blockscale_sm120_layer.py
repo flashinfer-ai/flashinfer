@@ -71,11 +71,20 @@ def _is_validated_sm120_device():
 
 
 def _has_min_cuda_toolkit():
+    # Shared probe with the runner's support check: a cached module artifact
+    # needs no compiler; otherwise the JIT-selected nvcc (FLASHINFER_NVCC
+    # override, else $CUDA_HOME/bin/nvcc) must be CUDA 13.2+. The torch CUDA
+    # build version is never substituted.
     try:
-        from flashinfer.jit.cpp_ext import get_cuda_version
+        from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
+        from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+            gen_specialized_fused_moe_fp8_blockscale_sm120_module,
+        )
 
-        v = get_cuda_version()
-        return (v.major, v.minor) >= (13, 2)
+        if gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+            return True
+        v = _specialized_jit_nvcc_release()
+        return v is not None and v >= (13, 2)
     except Exception:
         return False
 
@@ -146,7 +155,14 @@ def test_prepare_weights_swaps_canonical_halves():
     and performs the swap to the kernels' native [gate; up] order itself, on
     the payload and its block scales together (GPU-free)."""
     e, two_i, h = 2, 2 * I, H
-    w13 = torch.arange(e * two_i * h, dtype=torch.float32).reshape(e, two_i, h)
+    # Distinct, exactly representable fp8 constants per half: large arange
+    # values (448 < v, e.g. 480) convert to NaN in e4m3fn, and torch.equal
+    # rejects matching NaNs, so arange payloads would fail the swap
+    # assertions below even for a correct swap. The scale assertions keep
+    # their arange payload, so an incorrect scale swap is still detected.
+    w13 = torch.empty(e, two_i, h, dtype=torch.float32)
+    w13[:, : two_i // 2] = 1.0  # canonical up half
+    w13[:, two_i // 2 :] = -2.0  # canonical gate half
     w13 = w13.to(torch.float8_e4m3fn)
     w13_sf = torch.arange(e * (two_i // 128) * (h // 128), dtype=torch.float32).reshape(
         e, two_i // 128, h // 128

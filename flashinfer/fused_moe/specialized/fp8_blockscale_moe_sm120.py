@@ -7,8 +7,9 @@ and benchmarked against
 the Qwen3.6-35B-A3B-FP8 serving contract (``num_experts=256, top_k=8,
 hidden=2048, intermediate=512``) with captured serving routing. FlashInfer's
 cutlass path refuses this contract on SM120 ("FP8 block scaling not yet
-implemented for Blackwell"); this backend is the first FlashInfer-resident
-path for it.
+implemented for Blackwell"); this backend serves it as a DEFAULT candidate
+(the opt-in CuTe-DSL route, ``SM12xFp8Config``, also serves DeepSeek FP8 on
+SM120).
 
 This module is the kernels' OWN dispatch surface, and its sole public home
 is the unified MoE API: ``SpecializedFp8BlockConfig`` (``api.py``, a default
@@ -21,7 +22,11 @@ cross-backend shootout times them as their own named candidate
 dispatch surface (token allowlist, device profile) lives in
 ``fp8_blockscale_moe_sm120_workload.json`` next to this module.
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) disables the
-backend entirely. Guard order: GPU-free checks (kill switch, dtype,
+backend entirely. The switch gates fresh Python dispatch only: a CUDA graph
+captured while it was unset still launches the captured specialized kernels
+on every replay (replay never re-runs the Python guard), so deterministic
+disable requires retiring those graphs and recapturing with the switch set.
+Guard order: GPU-free checks (kill switch, dtype,
 geometry, contiguity, device placement, pointer alignment, token
 allowlist) -> device guards (compute capability, SM count, CUDA-graph warm
 state). Every refusal is counted in ``fallback_reasons``.
@@ -104,10 +109,14 @@ def _load_allowlist() -> Optional[dict]:
 
 def specialized_moe_fp8_blockscale_stats() -> dict:
     """Diagnostics: dispatch counters and the dispatch surface."""
+    allow = _load_allowlist()
     return {
         **_stats,
         "fallback_reasons": dict(_stats["fallback_reasons"]),
-        "allowlist": _load_allowlist(),
+        # A shallow copy: the cached dict is what dispatch reads, so a
+        # diagnostics caller mutating the report must not change the
+        # dispatch surface (the values themselves are immutable).
+        "allowlist": dict(allow) if allow is not None else None,
         "warmed_variants": sorted(_warmed),  # (device index, num_tokens)
         "kill_switch_env": _DISABLE_ENV,
     }
@@ -345,14 +354,68 @@ def warmup(
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
+    # Validate everything BEFORE JIT-loading the module or launching: warmup
+    # takes the same dispatch surface as _guard for what it does not fabricate
+    # itself (token list, device profile, capture state, weight operands).
+    ts = sorted(t_values or allow["tokens"])
+    off = [t for t in ts if t not in allow["tokens"]]
+    if off:
+        raise ValueError(
+            f"warmup t_values {off} are off the shipped num_tokens allowlist; "
+            "ordinary dispatch would refuse these variants."
+        )
+    warm_device = torch.device("cuda", device_index)
+    cc = tuple(get_compute_capability(warm_device))
+    if not (allow["min_cc"] <= cc <= allow["max_cc"]):
+        raise RuntimeError(
+            f"warmup device compute capability {cc} is outside the validated "
+            f"range {allow['min_cc']}..{allow['max_cc']}."
+        )
+    props = torch.cuda.get_device_properties(device_index)
+    if props.multi_processor_count != allow["sm_count"]:
+        raise RuntimeError(
+            f"warmup device has {props.multi_processor_count} SMs; the "
+            f"kernels are validated only for the {allow['sm_count']}-SM "
+            "profile."
+        )
+    for name, t, shape, dtype in (
+        (
+            "fc1_expert_weights",
+            fc1_expert_weights,
+            (_E, 2 * _I, _H),
+            torch.float8_e4m3fn,
+        ),
+        ("fc2_expert_weights", fc2_expert_weights, (_E, _H, _I), torch.float8_e4m3fn),
+        (
+            "quant_scales[0]",
+            quant_scales[0],
+            (_E, (2 * _I) // 128, _H // 128),
+            torch.float32,
+        ),
+        ("quant_scales[1]", quant_scales[1], (_E, _H // 128, _I // 128), torch.float32),
+    ):
+        # The kernels dereference every pointer (scales included) on the GPU.
+        if not t.is_cuda or t.device != warm_device:
+            raise ValueError(f"{name} must live on {warm_device} for warmup.")
+        if t.shape != shape or t.dtype != dtype or not t.is_contiguous():
+            raise ValueError(
+                f"{name} must be a contiguous {dtype} tensor of shape "
+                f"{shape}; got {t.dtype} {tuple(t.shape)}."
+            )
+    with torch.cuda.device(device_index):
+        # Warmup ends with a device synchronization and exists to make
+        # capture legal later; it must itself run eagerly.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("warmup must not run under CUDA-graph capture.")
     dispatch_run = _kernel_entry()
 
+    pending = set()
     with torch.cuda.device(device_index):
-        for T in sorted(t_values or allow["tokens"]):
-            x = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
-            ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=device)
-            tw = torch.zeros((T, _TOPK), dtype=torch.float32, device=device)
-            out = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
+        for T in ts:
+            x = torch.zeros((T, _H), dtype=torch.bfloat16, device=warm_device)
+            ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=warm_device)
+            tw = torch.zeros((T, _TOPK), dtype=torch.float32, device=warm_device)
+            out = torch.zeros((T, _H), dtype=torch.bfloat16, device=warm_device)
             dispatch_run(
                 x,
                 fc1_expert_weights,
@@ -363,5 +426,10 @@ def warmup(
                 tw,
                 out,
             )
-            _warmed.add((device_index, T))
-    torch.cuda.synchronize(device)
+            pending.add((device_index, T))
+    # Publish warmup receipts only after the device work completes: if the
+    # synchronization raises, nothing is recorded, so the capture guard never
+    # treats a failed warmup as proof of preparation. Receipts from earlier
+    # successful warmups are preserved.
+    torch.cuda.synchronize(device_index)
+    _warmed.update(pending)
