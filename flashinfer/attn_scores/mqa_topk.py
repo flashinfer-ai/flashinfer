@@ -331,11 +331,16 @@ class _AutoTopKPlan:
                 "auto: cutedsl candidate failed and no further backend "
                 f"exists ({reason}; earlier: {self._demote_reason})"
             )
-        self._demote_reason = reason
-        self._cand = self._make_cutedsl()
-        self._cand_name = "cutedsl"
+        # Build and fully prepare the replacement before publishing it: a
+        # transient failure while replaying bindings must leave the router
+        # retryable (candidate unchanged), not half-demoted with a binding
+        # missing from the new candidate.
+        cand = self._make_cutedsl()
         for k, k_scale in self._bindings:
-            self._cand.prepare_pool(k, k_scale=k_scale)
+            cand.prepare_pool(k, k_scale=k_scale)
+        self._demote_reason = reason
+        self._cand = cand
+        self._cand_name = "cutedsl"
 
     def prepare_pool(self, k, *, k_scale):
         if self._active is not None:
@@ -362,6 +367,10 @@ class _AutoTopKPlan:
             out = self._cand.plan(qo_indptr, kv_indptr, **kw)
         self._active = self._cand
         self._active_name = self._cand_name
+        # the binding log exists only to replay bindings on demotion; once
+        # a backend is active no demotion can follow, so stop pinning the
+        # recorded tensors
+        self._bindings = []
         return out
 
     def _resolved(self):
@@ -373,13 +382,20 @@ class _AutoTopKPlan:
         return self._resolved().run(*args, **kw)
 
     def clear_pools(self):
-        return (
-            self._cand.clear_pools()
-            if self._active is None
-            else (self._active.clear_pools())
-        )
+        backend = self._cand if self._active is None else self._active
+        out = backend.clear_pools()
+        # cleared bindings must neither be replayed by a later demotion
+        # nor kept alive by the log after the backend dropped them
+        self._bindings = []
+        return out
 
     def input_buffers(self):
+        if self._active is None and self._cand_name == "cutedsl":
+            # the candidate is already the terminal backend (selected at
+            # construction or by an earlier demotion): its stable buffers
+            # exist before the first plan and no further demotion can
+            # invalidate them, so expose them for staging the first plan
+            return self._cand.input_buffers()
         return self._resolved().input_buffers()
 
     @property
