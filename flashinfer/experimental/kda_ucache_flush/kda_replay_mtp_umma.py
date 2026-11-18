@@ -24,9 +24,32 @@ per-channel KDA gate. Contract validation lives in the dispatcher
 (``kda_decode_bf16_wy_ucache_flush.kda_delta_rule_mtp_ucache_flush``); this
 module only builds and launches the kernel.
 
-Status: plumbing + bf16 UMMA helpers. The kernel itself is not implemented
-yet, so ``kda_umma_unavailable_reason`` always reports a reason and the
-dispatcher never selects this backend.
+Math per (request b, head h), with the live window j < P (logical slot j at
+physical ring row (base + j) & 31), G_j the window's per-channel cumulative
+log-decay, G_P = G_{P-1} (0 at P = 0), bdec = e^{G_P}, w_j = e^{G_P - G_j} <= 1:
+
+    S_h x  = S0 (bdec . x) + sum_j u_j (K~_j . x)          K~_j = bf16(w_j . k̂_j)
+    khat_t = k̂_t e^{cum_t},  ktil_s = k̂_s e^{-cum_s},  qhat_t = q̂_t e^{cum_t}
+    u_t    = beta_t (v_t - S_h khat_t - sum_{s<t} (khat_t . ktil_s) u_s)
+    y_t    = S_h qhat_t + sum_{s<=t} (qhat_t . ktil_s) u_s
+
+CTA = (head, request), grid (H, B), 192 threads, 4 CTAs / SM:
+  warp 0   : mbarrier inits, TMA of the bf16 state (two 16 KB SW128 K halves),
+             bulk copy of the P live u-window rows into SMEM.
+  warp 1   : TMEM allocation at entry (128 columns), the UMMA issuer.
+  warps 2-5: the consumers: row-layout L2 norm + k̂ ring append, channel-layout
+             gate (g ring append, X_r / X_c / Ktil tiles), K~ build, the
+             mma.sync Grams (Gq = X_c Ktil^T, C = X_c K~^T), the D tile
+             (raw u, TMEM), the per-row forward substitution epilogue.
+UMMAs (kind::f16 with BF16 A / B, fp32 accumulate in TMEM):
+  readout  H  = S0 . X_r^T   M128 N16 K128   A: state (SMEM)  B: X_r (K-major SW128)
+  history  H += D . C^T      M128 N16 K16    A: D (TMEM)      B: C (SW32)
+X_r = [khat; qhat] (.) bdec rows 0..2T-1 (zero rows after), so H holds S_h khat_t in
+column t and S_h qhat_t in column T + t.
+
+Status (stage S2): verify rows at T = 4, w_ring = 16, one head per CTA. Rows with
+hist_len >= flush_min run as verify rows (outputs and ring appends correct, the g
+append restarts at 0) but do NOT fold their ring into the state pool yet.
 """
 
 from __future__ import annotations
@@ -34,19 +57,35 @@ from __future__ import annotations
 from typing import Optional
 
 import cutlass
+import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 
 from flashinfer.gdn_kernels import _umma_helpers as U
+from flashinfer.gdn_kernels.device_target import (
+    gdn_compile_options,
+    gdn_device_target,
+)
 
 RING_SLOTS = 32
 RING_MASK = RING_SLOTS - 1
 K_DIM = 128
 V_DIM = 128
 XC_PITCH = 272  # bytes per row of the row-major X_c / Ktil tiles (136 bf16)
+LOG2_E = 1.4426950408889634
+_EPS = 1e-6  # inside the L2-norm rsqrt, as the HMMA kernel
+_TMEM_COLS = 128
+_MIN_BLOCKS_PER_SM = 4  # 128 of the 512 TMEM columns, ~54 KB SMEM, 80 registers
+# TMEM columns: H = R + Y (readout + history) at 0..15, D (raw u, bf16 pairs) at
+# 32..39 for window slots j 0..15.
+_COL_H = 0
+_COL_D = 32
+# s_coef fp32 words: A[t][s] at 0, Bq[t][s] at 64, beta[t] at 128
+_CO_A, _CO_BQ, _CO_BETA = 0, 64, 128
 
 # Test hooks (default None = automatic choice). Not part of the API.
 _FORCE_U_SRC: Optional[str] = None  # "smem" | "ldg"
@@ -55,9 +94,9 @@ _FORCE_HPC: Optional[int] = None
 _LAUNCHES = 0
 
 # Stage-supported configurations; widened as the kernel grows.
-_SUPPORTED_T: frozenset = frozenset()
-_SUPPORTED_W_RING: frozenset = frozenset()
-_KERNEL_IMPLEMENTED = False
+_SUPPORTED_T: frozenset = frozenset({4})
+_SUPPORTED_W_RING: frozenset = frozenset({16})
+_KERNEL_IMPLEMENTED = True
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -134,6 +173,11 @@ def _ex2(x: Float32, *, loc=None, ip=None) -> Float32:
     return Float32(r)
 
 
+def _exp(x):
+    """e^x as the HMMA kernel's _exp_approx_f32: ex2.approx.ftz(x * log2 e)."""
+    return _ex2(x * Float32(LOG2_E))
+
+
 @dsl_user_op
 def _rsqrt_approx(x: Float32, *, loc=None, ip=None) -> Float32:
     """rsqrt.approx.ftz.f32 (the HMMA kernel's _rsqrt_approx_f32)."""
@@ -165,6 +209,79 @@ def _bar_sync_ua(barrier_id: int, number_of_threads: int, *, loc=None, ip=None) 
     )
 
 
+@dsl_user_op
+def _sts_u32(addr: Int32, w: Uint32, *, loc=None, ip=None) -> None:
+    """st.shared.b32."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Uint32(w).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ldg_u16_if(pred: Int32, addr: Int64, *, loc=None, ip=None) -> Uint32:
+    """Predicated ld.global.u16 (zero-extended); 0 where pred == 0."""
+    r = llvm.inline_asm(
+        _T.i32(),
+        [Int32(pred).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred p;\n\t.reg .b16 h;\n\tmov.u32 $0, 0;\n\t"
+        "setp.ne.s32 p, $1, 0;\n\t@p ld.global.u16 h, [$2];\n\t"
+        "@p cvt.u32.u16 $0, h;\n\t}",
+        "=r,r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(r)
+
+
+@dsl_user_op
+def _ldg_f32x4_if(pred: Int32, addr: Int64, *, loc=None, ip=None):
+    """Predicated ld.global.v4.f32 (16 B aligned): four fp32 values, 0 where pred == 0."""
+    st = llvm.StructType.get_literal([_T.f32()] * 4)
+    r = llvm.inline_asm(
+        st,
+        [Int32(pred).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred p;\n\tmov.b32 $0, 0;\n\tmov.b32 $1, 0;\n\tmov.b32 $2, 0;\n\t"
+        "mov.b32 $3, 0;\n\tsetp.ne.s32 p, $4, 0;\n\t"
+        "@p ld.global.v4.f32 {$0,$1,$2,$3}, [$5];\n\t}",
+        "=f,=f,=f,=f,r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return [
+        Float32(llvm.extractvalue(_T.f32(), r, [i], loc=loc, ip=ip)) for i in range(4)
+    ]
+
+
+@dsl_user_op
+def _lds_f32x4(addr: Int32, *, loc=None, ip=None):
+    """ld.shared.v4.f32 -> four fp32 values."""
+    st = llvm.StructType.get_literal([_T.f32()] * 4)
+    r = llvm.inline_asm(
+        st,
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.f32 {$0,$1,$2,$3}, [$4];",
+        "=f,=f,=f,=f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return [
+        Float32(llvm.extractvalue(_T.f32(), r, [i], loc=loc, ip=ip)) for i in range(4)
+    ]
+
+
 def _x_sw128_off(row, c):
     """Byte offset of element (row, k = c) in a 16-row K-major SW128 operand tile (X_r,
     and K̃ per 16-row j-block): two 64-element K halves 2048 B apart, 128 B rows, 16 B
@@ -180,6 +297,637 @@ def _x_sw128_off(row, c):
 def _c_sw32_off(xc, j):
     """Byte offset of C[x = xc][j] (j < 16) in one SW32 [16 x][16 j] bf16 j-block."""
     return xc * 32 + (((j // 8) ^ ((xc >> 2) & 1)) * 16) + (j % 8) * 2
+
+
+def _u_window_copy(src_head, uw, mbar_addr, mbar, P, base):
+    """Bulk-copy the P live u rows (logical j = 0..P-1 at physical (base + j) & 31) of
+    one head into SMEM as [j][V]. The window wraps the ring at most once: two contiguous
+    copies, the second predicated off without a wrap. Call under elect_one, P > 0."""
+    rowb = V_DIM * 2
+    n1 = _sel(base + P <= RING_SLOTS, P, Int32(RING_SLOTS) - base, Int32)
+    n2 = P - n1
+    cute.arch.mbarrier_arrive_and_expect_tx(mbar, P * rowb)
+    U.bulk_g2s(uw, src_head + Int64(base * rowb), n1 * rowb, mbar_addr)
+    _bulk_g2s_if(Int32(n2 > 0), uw + n1 * rowb, src_head, n2 * rowb, mbar_addr)
+
+
+@dsl_user_op
+def _bulk_g2s_if(
+    pred: Int32,
+    dst_smem: Int32,
+    src_gmem: Int64,
+    nbytes: Int32,
+    mbar_smem: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Predicated ``U.bulk_g2s`` (cp.async.bulk global -> shared, complete_tx)."""
+    llvm.inline_asm(
+        _T.i32(),
+        [
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int32(dst_smem).ir_value(loc=loc, ip=ip),
+            Int64(src_gmem).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_smem).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $1, 0;\n\t"
+        "@p cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [$2], [$3], $4, [$5];\n\tmov.u32 $0, 0;\n\t}\n",
+        "=r,r,r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+# ----------------------------------------------------------------------------- kernel
+class KdaReplayMtpUmma:
+    def __init__(self, T: int, h: int, w_ring: int = 16, u_src: str = "smem"):
+        assert T in (4, 8), T
+        assert w_ring == 16, w_ring  # w_ring = 32 (NJB = 2) is stage S3
+        assert u_src in ("smem", "ldg"), u_src
+        self.T = T
+        self.h = h
+        self.w_ring = w_ring
+        self.u_src = u_src
+        self.num_threads = 192
+
+    @cute.jit
+    def _make_state_tma(self, state: cute.Tensor, op):
+        elems = 64
+        smem_layout = cute.make_composed_layout(
+            cute.make_swizzle(3, 4, 3),
+            0,
+            cute.make_layout(
+                (1, 1, V_DIM, (elems, 1), 1),
+                stride=(0, 0, elems, (1, V_DIM * elems), V_DIM * elems),
+            ),
+        )
+        return cpasync.make_tiled_tma_atom(
+            op,
+            cute.logical_divide(state, (None, None, None, elems)),
+            smem_layout,
+            cta_tiler=(1, 1, V_DIM, elems),
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        q,
+        k,
+        v,
+        g,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        state_idx,
+        k_cache,
+        u_cache,
+        g_cache,
+        hist_len,
+        cache_base,
+        out,
+        scale: Float32,
+        lower_bound: Float32,
+        flush_min: Int32,
+        stream,
+    ):
+        tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
+        self.kernel(
+            q,
+            k,
+            v,
+            g,
+            b,
+            a_log,
+            dt_bias,
+            state_idx,
+            k_cache,
+            u_cache,
+            g_cache,
+            hist_len,
+            cache_base,
+            out,
+            scale,
+            lower_bound,
+            flush_min,
+            tma_ld,
+        ).launch(
+            grid=(self.h, q.shape[0], 1),
+            block=(self.num_threads, 1, 1),
+            min_blocks_per_mp=_MIN_BLOCKS_PER_SM,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        g: cute.Tensor,
+        b: cute.Tensor,
+        a_log: cute.Tensor,
+        dt_bias: cute.Tensor,
+        state_idx_t: cute.Tensor,
+        k_cache: cute.Tensor,
+        u_cache: cute.Tensor,
+        g_cache: cute.Tensor,
+        hist_len: cute.Tensor,
+        cache_base: cute.Tensor,
+        out: cute.Tensor,
+        scale: Float32,
+        lower_bound: Float32,
+        flush_min: Int32,
+        tma_ld: cpasync.TmaInfo,
+    ):
+        T = self.T
+        T2 = 2 * T
+        NP = (T2 + 7) // 8  # row-layout passes (8 X rows per pass)
+        WR = self.w_ring
+        USE_SMEM_U = self.u_src == "smem"
+
+        tid, _, _ = cute.arch.thread_idx()
+        h, brow, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(tid // 32)
+        lane = tid % 32
+
+        # ------------------------------------------------------------------ SMEM
+        smem = cutlass.utils.SmemAllocator()
+        st_layout = cute.make_composed_layout(
+            cute.make_swizzle(3, 4, 3),
+            0,
+            cute.make_layout((V_DIM, (64, 2)), stride=(64, (1, V_DIM * 64))),
+        )
+        s_state = smem.allocate_tensor(
+            BFloat16, st_layout.outer, byte_alignment=1024, swizzle=st_layout.inner
+        )
+        # X_r: readout B operand, 16 rows x 128 k bf16, K-major SW128 (_x_sw128_off)
+        s_x = smem.allocate_tensor(
+            cutlass.Uint16, cute.make_layout(16 * K_DIM), byte_alignment=1024
+        )
+        # K~: window keys w_j . k̂_j (j < P, else 0), one 16-row j-block, same layout
+        s_kt = smem.allocate_tensor(
+            cutlass.Uint16, cute.make_layout(16 * K_DIM), byte_alignment=1024
+        )
+        # X_c (16 rows) and Ktil (8 rows), row-major, 272 B pitch (ldmatrix conflict-free)
+        s_xc = smem.allocate_tensor(
+            cutlass.Uint16, cute.make_layout(16 * XC_PITCH // 2), byte_alignment=128
+        )
+        s_ktil = smem.allocate_tensor(
+            cutlass.Uint16, cute.make_layout(8 * XC_PITCH // 2), byte_alignment=128
+        )
+        # C: history B operand, SW32 [16 x][16 j] bf16
+        s_c = smem.allocate_tensor(
+            cutlass.Uint16, cute.make_layout(16 * 16), byte_alignment=256
+        )
+        if cutlass.const_expr(USE_SMEM_U):
+            # u window [j][V] bf16, rows j < P bulk-copied by warp 0
+            s_uwin = smem.allocate_tensor(
+                cutlass.Uint16, cute.make_layout(WR * V_DIM), byte_alignment=128
+            )
+        s_gram = smem.allocate_tensor(
+            Float32, cute.make_layout(16 * 8), byte_alignment=16
+        )
+        s_coef = smem.allocate_tensor(Float32, cute.make_layout(136), byte_alignment=16)
+        s_gp = smem.allocate_tensor(Float32, cute.make_layout(K_DIM), byte_alignment=16)
+        st_full = [smem.allocate_array(cutlass.Int64, 1) for _ in range(2)]
+        u_full = smem.allocate_array(cutlass.Int64, 1)
+        x_ready = smem.allocate_array(cutlass.Int64, 1)
+        d_ready = smem.allocate_array(cutlass.Int64, 1)
+        mma_done = smem.allocate_array(cutlass.Int64, 1)
+        tmem_done = smem.allocate_array(cutlass.Int64, 1)
+        tmem_addr = smem.allocate(Int32, 4)
+
+        # TMEM first: the next CTA on this SM is not launched before this one relinquishes
+        # its TMEM allocation permit (GDN: allocating late spaced CTAs ~2.5 us apart).
+        # Named barrier 2 (warp 1 arrive + 128 consumers) publishes the address.
+        if warp == 1:
+            U.tmem_alloc(tmem_addr, _TMEM_COLS)
+            cute.arch.relinquish_tmem_alloc_permit()
+            U.fence_before_sync()
+            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=160)
+
+        # Cursors first (every thread), then the mbarrier inits while they are in flight.
+        sidx = Int32(state_idx_t[brow])
+        P = Int32(hist_len[brow])
+        base = Int32(cache_base[brow])
+        if warp == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(st_full[0], 1)
+                cute.arch.mbarrier_init(st_full[1], 1)
+                cute.arch.mbarrier_init(u_full, 1)
+                cute.arch.mbarrier_init(x_ready, 128)
+                cute.arch.mbarrier_init(d_ready, 128)
+                cute.arch.mbarrier_init(mma_done, 1)
+                cute.arch.mbarrier_init(tmem_done, 128)
+                cute.arch.mbarrier_init_fence()
+            cute.arch.fence_acq_rel_cta()
+            cute.arch.barrier_arrive(barrier_id=3, number_of_threads=64)
+            cute.arch.barrier_arrive(barrier_id=4, number_of_threads=160)
+
+        # Batch-row-only inputs, issued by EVERY thread ahead of the padded-row exit so
+        # their latency overlaps the cursors' (warps 0 / 1 load in-range dummies).
+        ct = (tid - 64) & 127  # consumer index: channel c / (row r, lane l) / TMEM lane
+        row = ((warp & 3) << 5) | lane  # V row of this consumer thread (= TMEM lane)
+        r8 = ct >> 4  # row layout: X row r8 + 8 p, 8 k values at l16 * 8
+        l16 = ct & 15
+        xw = []
+        for p in cutlass.range_constexpr(NP):
+            xr = r8 + 8 * p
+            is_q = xr >= T
+            t_k = _sel(is_q, 0, xr, Int32)
+            t_q = _sel(is_q, xr - T, 0, Int32)
+            ak = k.iterator.toint() + Int64(
+                cute.crd2idx((brow, t_k, h, l16 * 8), k.layout)
+            ) * Int64(2)
+            aq = q.iterator.toint() + Int64(
+                cute.crd2idx((brow, t_q, h, l16 * 8), q.layout)
+            ) * Int64(2)
+            xw.append(U.ldg_v4(_sel(is_q, aq, ak, Int64)))
+        graw = []
+        for t in cutlass.range_constexpr(T):
+            graw.append(g[brow, t, h, ct])
+        vv = []
+        for t in cutlass.range_constexpr(T):
+            vv.append(v[brow, t, h, row])
+        tb = _sel(ct < T, ct, 0, Int32)
+        braw = b[brow, tb, h]
+        dtb = Float32(dt_bias[h * K_DIM + ct])
+        alog = Float32(a_log[h])
+
+        if warp == 1:
+            if sidx < 0:
+                # padded row: hand the TMEM columns back before the CTA exits
+                cute.arch.sync_warp()
+                U.tmem_dealloc(tmem_addr[0], _TMEM_COLS)
+        U.exit_if_negative(sidx)
+        is_flush = flush_min <= P
+
+        st_addr = s_state.iterator.toint()
+        x_addr = s_x.iterator.toint()
+        kt_addr = s_kt.iterator.toint()
+        xc_addr = s_xc.iterator.toint()
+        ktil_addr = s_ktil.iterator.toint()
+        c_addr = s_c.iterator.toint()
+        gp_addr = s_gp.iterator.toint()
+
+        if warp == 0:
+            # ============================================================ producer
+            cpasync.prefetch_descriptor(tma_ld.atom)
+            if cutlass.const_expr(USE_SMEM_U):
+                # the P live u rows (window order) ahead of the 32 KB state: the D build
+                # needs them before the readout needs the state
+                src_head = u_cache.iterator.toint() + Int64(
+                    cute.crd2idx((sidx, h, 0, 0), u_cache.layout)
+                ) * Int64(2)
+                uw = s_uwin.iterator.toint()
+                if P > 0:
+                    with cute.arch.elect_one():
+                        _u_window_copy(src_head, uw, u_full.toint(), u_full, P, base)
+            for gk in cutlass.range_constexpr(2):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(st_full[gk], 16384)
+                U.simple_tma_copy(
+                    tma_ld.atom,
+                    tma_ld.tma_tensor[sidx, h, None, (None, gk)],
+                    s_state[None, (None, gk)],
+                    st_full[gk],
+                )
+        elif warp == 1:
+            # ============================================================ UMMA issuer
+            tbase = tmem_addr[0]
+            sd = U.sdesc_sw128(V_DIM * 128)
+            # descriptor offsets are added, not OR-ed (see the S1 notes: OR is only
+            # correct while the base address has those bits clear)
+            x_desc = sd + Uint64(x_addr >> 4)
+            stage_desc = [
+                sd + Uint64(st_addr >> 4),
+                sd + Uint64((st_addr + 16384) >> 4),
+            ]
+            c_desc = U.sdesc_sw32(Uint64(c_addr >> 4))
+            id_r = _bf16_idesc(128, 16)
+            cute.arch.barrier(barrier_id=3, number_of_threads=64)  # warp 0's inits
+            cute.arch.mbarrier_wait(x_ready, 0)
+            U.fence_after_sync()
+            # readout H = S0 . X_r^T (cols 0..15), per state K half as it lands
+            for gk in cutlass.range_constexpr(2):
+                cute.arch.mbarrier_wait(st_full[gk], 0)
+                U.fence_after_sync()
+                for ka in cutlass.range_constexpr(4):
+                    U.umma_ss(
+                        tbase + _COL_H,
+                        stage_desc[gk] + Uint64((ka * 32) >> 4),
+                        x_desc + Uint64((gk * 2048 + ka * 32) >> 4),
+                        id_r,
+                        (gk > 0) or (ka > 0),
+                    )
+            # history accumulates INTO H: H = S_h . X
+            cute.arch.mbarrier_wait(d_ready, 0)
+            U.fence_after_sync()
+            if P > 0:
+                U.umma_ts(tbase + _COL_H, tbase + _COL_D, c_desc, id_r, True)
+            U.umma_commit(mma_done)
+            cute.arch.mbarrier_wait(tmem_done, 0)
+            U.fence_after_sync()
+            U.tmem_dealloc(tbase, _TMEM_COLS)
+        else:
+            # ============================================================ consumers
+            cw = warp - 2
+            gc_row = g_cache.iterator.toint() + Int64(
+                cute.crd2idx((sidx, h, 0, 0), g_cache.layout)
+            ) * Int64(4)
+            kc_row = k_cache.iterator.toint() + Int64(
+                cute.crd2idx((sidx, h, 0, 0), k_cache.layout)
+            ) * Int64(2)
+            # G_P of channel ct (last live window row; 0 at P = 0)
+            gp_slot = (base + P - 1) & RING_MASK
+            gp = Float32(g_cache[sidx, h, gp_slot, ct])
+            gp = _sel(P > 0, gp, 0.0, Float32)
+            # K~ inputs of this thread: window slot jr, 8 channels c8 * 8 of each K half
+            jr = ct >> 3
+            c8 = ct & 7
+            kpred = Int32(jr < P)
+            kslot = (base + jr) & RING_MASK
+            ka_ = kc_row + Int64((kslot * K_DIM + c8 * 8) * 2)
+            kraw = [U.ldg_v4_if(kpred, ka_), U.ldg_v4_if(kpred, ka_ + Int64(128))]
+            ga_ = gc_row + Int64((kslot * K_DIM + c8 * 8) * 4)
+            gj = []
+            for gk in cutlass.range_constexpr(2):
+                for i4 in cutlass.range_constexpr(2):
+                    gj += _ldg_f32x4_if(kpred, ga_ + Int64(gk * 256 + i4 * 16))
+
+            # -------- P1: L2 norm (row layout) + k̂ ring append + raw k̂ / q̂ into X_c
+            for p in cutlass.range_constexpr(NP):
+                xr = r8 + 8 * p
+                ss = Float32(0.0)
+                for i in cutlass.range_constexpr(4):
+                    lo = U.bf16x2_lo_f32(xw[p][i])
+                    hi = U.bf16x2_hi_f32(xw[p][i])
+                    ss = ss + lo * lo
+                    ss = ss + hi * hi
+                for off in (8, 4, 2, 1):
+                    ss = ss + cute.arch.shuffle_sync_bfly(ss, off)
+                inv = _rsqrt_approx(ss + Float32(_EPS))
+                inv = _sel(xr >= T, inv * scale, inv, Float32)
+                nw = []
+                for i in cutlass.range_constexpr(4):
+                    nw.append(
+                        U.pack_bf16x2(
+                            U.bf16x2_lo_f32(xw[p][i]) * inv,
+                            U.bf16x2_hi_f32(xw[p][i]) * inv,
+                        )
+                    )
+                U.sts_v4(xc_addr + xr * XC_PITCH + l16 * 16, nw[0], nw[1], nw[2], nw[3])
+                if xr < T:
+                    # ring append: the L2-normed, UNDECAYED k̂ (the ring contract)
+                    kdst = kc_row + Int64(
+                        (((base + P + xr) & RING_MASK) * K_DIM + l16 * 8) * 2
+                    )
+                    U.stg_v4(kdst, nw[0], nw[1], nw[2], nw[3])
+            z = Uint32(0)
+            for p in cutlass.range_constexpr(NP, 2):
+                # X_c rows 2T..15 (T = 4: rows 8..15) are zero
+                U.sts_v4(xc_addr + (r8 + 8 * p) * XC_PITCH + l16 * 16, z, z, z, z)
+            # X_r rows 2T..15 and Ktil rows T..7 are zero
+            for p in cutlass.range_constexpr(NP, 2):
+                zr = r8 + 8 * p
+                U.sts_v4(
+                    x_addr
+                    + (l16 // 8) * 2048
+                    + zr * 128
+                    + (((l16 % 8) ^ (zr % 8)) * 16),
+                    z,
+                    z,
+                    z,
+                    z,
+                )
+            if cutlass.const_expr(T < 8):
+                if ct < (8 - T) * 16:
+                    U.sts_v4(ktil_addr + (T + r8) * XC_PITCH + l16 * 16, z, z, z, z)
+            _bar_sync_ua(1, 128)
+
+            # -------- P2: gate + operand tiles (channel layout, c = ct)
+            c = ct
+            s_gp[c] = gp
+            bdec = _sel(P > 0, _exp(gp), 1.0, Float32)
+            gbase = _sel(is_flush, 0.0, gp, Float32)
+            eA = _exp(alog)
+            cum = Float32(0.0)
+            for t in cutlass.range_constexpr(T):
+                xg = Float32(graw[t]) + dtb
+                sig = Float32(1.0) / (Float32(1.0) + _exp(Float32(0.0) - eA * xg))
+                cum = cum + lower_bound * sig
+                g_cache[sidx, h, (base + P + t) & RING_MASK, c] = gbase + cum
+                ep = _exp(cum)
+                en = _exp(Float32(0.0) - cum)
+                eb = ep * bdec
+                kh = U.u16_as_f32(U.lds_u16(xc_addr + t * XC_PITCH + c * 2), True)
+                qh = U.u16_as_f32(U.lds_u16(xc_addr + (T + t) * XC_PITCH + c * 2), True)
+                # X_c = [khat; qhat] (Gram / C A operand)
+                U.sts_u16(xc_addr + t * XC_PITCH + c * 2, U.f32_to_u16(kh * ep, True))
+                U.sts_u16(
+                    xc_addr + (T + t) * XC_PITCH + c * 2, U.f32_to_u16(qh * ep, True)
+                )
+                # Ktil = k̂ e^{-cum} (<= e^{80}: bf16 holds it)
+                U.sts_u16(ktil_addr + t * XC_PITCH + c * 2, U.f32_to_u16(kh * en, True))
+                # X_r = X_c . bdec, rounded once from fp32 (readout B operand)
+                U.sts_u16(x_addr + _x_sw128_off(t, c), U.f32_to_u16(kh * eb, True))
+                U.sts_u16(x_addr + _x_sw128_off(T + t, c), U.f32_to_u16(qh * eb, True))
+            if ct < T:
+                s_coef[_CO_BETA + ct] = Float32(1.0) / (
+                    Float32(1.0) + _exp(Float32(0.0) - Float32(braw))
+                )
+            cute.arch.barrier(barrier_id=4, number_of_threads=160)  # warp 0's inits
+            cute.arch.fence_view_async_shared()
+            cute.arch.mbarrier_arrive(x_ready)
+            _bar_sync_ua(1, 128)  # s_gp, X_c, Ktil visible to every consumer
+
+            # -------- P3: K~ = bf16(k̂_j . e^{G_P - G_j}) (j < P, else 0)
+            for gk in cutlass.range_constexpr(2):
+                gpv = _lds_f32x4(gp_addr + (gk * 64 + c8 * 8) * 4) + _lds_f32x4(
+                    gp_addr + (gk * 64 + c8 * 8 + 4) * 4
+                )
+                kw = []
+                for i in cutlass.range_constexpr(4):
+                    w0 = _exp(gpv[2 * i] - gj[gk * 8 + 2 * i])
+                    w1 = _exp(gpv[2 * i + 1] - gj[gk * 8 + 2 * i + 1])
+                    pk = U.pack_bf16x2(
+                        U.bf16x2_lo_f32(kraw[gk][i]) * w0,
+                        U.bf16x2_hi_f32(kraw[gk][i]) * w1,
+                    )
+                    kw.append(_sel(kpred != 0, pk, Uint32(0), Uint32))
+                U.sts_v4(
+                    kt_addr + gk * 2048 + jr * 128 + ((c8 ^ (jr % 8)) * 16),
+                    kw[0],
+                    kw[1],
+                    kw[2],
+                    kw[3],
+                )
+            _bar_sync_ua(1, 128)
+
+            # -------- P4: mma.sync Grams. warp cw 0: Gq = X_c . Ktil^T (fp32, s_gram);
+            # warps cw 1, 2: C n-tiles (j 0..7, 8..15) = X_c . K~^T (bf16, SW32 s_c)
+            grp = lane >> 2
+            c4 = lane & 3
+            a_ln = xc_addr + (lane % 16) * XC_PITCH + (lane // 16) * 16
+            if cw == 0:
+                acc = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                b_ln = ktil_addr + (lane % 8) * XC_PITCH + ((lane // 8) % 2) * 16
+                for ks in cutlass.range_constexpr(8):
+                    fa = _ldmatrix_x4(a_ln + ks * 32)
+                    fb = _ldmatrix_x2(b_ln + ks * 32)
+                    acc = U.mma_bf16_16816(
+                        fa[0], fa[1], fa[2], fa[3], fb[0], fb[1], acc
+                    )
+                s_gram[grp * 8 + 2 * c4] = acc[0]
+                s_gram[grp * 8 + 2 * c4 + 1] = acc[1]
+                s_gram[(grp + 8) * 8 + 2 * c4] = acc[2]
+                s_gram[(grp + 8) * 8 + 2 * c4 + 1] = acc[3]
+            elif cw < 3:
+                nt = cw - 1
+                acc = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                jl = 8 * nt + (lane % 8)
+                kt_row = kt_addr + jl * 128
+                for ks in cutlass.range_constexpr(8):
+                    fa = _ldmatrix_x4(a_ln + ks * 32)
+                    chunk = ks * 2 + ((lane // 8) % 2)
+                    fb = _ldmatrix_x2(
+                        kt_row + (chunk // 8) * 2048 + (((chunk % 8) ^ (jl % 8)) * 16)
+                    )
+                    acc = U.mma_bf16_16816(
+                        fa[0], fa[1], fa[2], fa[3], fb[0], fb[1], acc
+                    )
+                jc = 8 * nt + 2 * c4
+                _sts_u32(c_addr + _c_sw32_off(grp, jc), U.pack_bf16x2(acc[0], acc[1]))
+                _sts_u32(
+                    c_addr + _c_sw32_off(grp + 8, jc), U.pack_bf16x2(acc[2], acc[3])
+                )
+                # C is read by the history UMMA (warp 1 issues it after d_ready)
+                cute.arch.fence_view_async_shared()
+            _bar_sync_ua(1, 128)
+
+            # -------- P5: intra-step coefficient tables (fp32, masked by select)
+            NT = T * T
+            if ct < 2 * NT:
+                tab = ct // NT
+                tt = (ct // T) % T
+                ss_ = ct % T
+                gv = s_gram[(tab * T + tt) * 8 + ss_]
+                bt = s_coef[_CO_BETA + tt]
+                av = _sel(ss_ < tt, bt * gv, 0.0, Float32)
+                bq = _sel(ss_ <= tt, gv, 0.0, Float32)
+                if tab == 0:
+                    s_coef[_CO_A + tt * 8 + ss_] = av
+                else:
+                    s_coef[_CO_BQ + tt * 8 + ss_] = bq
+
+            # -------- P6: D = raw u_j (j < P, bf16 pairs) into TMEM (lane = V row)
+            uv = []
+            if cutlass.const_expr(USE_SMEM_U):
+                if P > 0:
+                    cute.arch.mbarrier_wait(u_full, 0)
+                ub = s_uwin.iterator.toint() + row * 2
+                for j in cutlass.range_constexpr(16):
+                    uv.append(U.lds_u16(ub + j * (V_DIM * 2)))
+            else:
+                ucr = u_cache.iterator.toint() + Int64(
+                    cute.crd2idx((sidx, h, 0, row), u_cache.layout)
+                ) * Int64(2)
+                for j in cutlass.range_constexpr(16):
+                    uv.append(
+                        _ldg_u16_if(
+                            Int32(j < P),
+                            ucr + Int64(((base + j) & RING_MASK) * (V_DIM * 2)),
+                        )
+                    )
+            words = []
+            for i in cutlass.range_constexpr(8):
+                lo = _sel(2 * i < P, uv[2 * i], Uint32(0), Uint32)
+                hi = _sel(2 * i + 1 < P, uv[2 * i + 1], Uint32(0), Uint32)
+                words.append(lo | (hi << Uint32(16)))
+            cute.arch.barrier(barrier_id=2, number_of_threads=160)  # TMEM address
+            U.fence_after_sync()
+            tbase = tmem_addr[0]
+            U.tmem_st_u32(ct, tbase + _COL_D, words)
+            U.tmem_wait_st()
+            U.fence_before_sync()
+            cute.arch.mbarrier_arrive(d_ready)
+            _bar_sync_ua(1, 128)  # coefficient tables
+
+            # -------- epilogue: per V row forward substitution
+            cute.arch.mbarrier_wait(mma_done, 0)
+            U.fence_after_sync()
+            hk = U.tmem_ld(ct, tbase + _COL_H, T)
+            hq = U.tmem_ld(ct, tbase + _COL_H + T, T)
+            U.tmem_wait_ld()
+            U.fence_before_sync()
+            cute.arch.mbarrier_arrive(tmem_done)
+            uu: list = []
+            for t in cutlass.range_constexpr(T):
+                bt = s_coef[_CO_BETA + t]
+                acc_u = bt * (Float32(vv[t]) - hk[t])
+                for s_ in cutlass.range_constexpr(t):
+                    acc_u = acc_u - s_coef[_CO_A + t * 8 + s_] * uu[s_]
+                uu.append(acc_u)
+            for t in cutlass.range_constexpr(T):
+                y = hq[t]
+                for s_ in cutlass.range_constexpr(t + 1):
+                    y = y + s_coef[_CO_BQ + t * 8 + s_] * uu[s_]
+                out[brow, t, h, row] = BFloat16(y)
+                u_cache[sidx, h, (base + P + t) & RING_MASK, row] = BFloat16(uu[t])
+
+    # ------------------------------------------------------------------ compile
+    @staticmethod
+    def compile(device: torch.device, T: int, h: int, w_ring: int, u_src: str):
+        """Compile one specialisation for ``device``'s architecture (callers use
+        ``_get_kernel``); batch and pool sizes are dynamic."""
+        batch = cute.sym_int()
+        pool = cute.sym_int()
+        ft = U.make_fake_tensor_lead_dyn
+        args = [
+            ft(BFloat16, (batch, T, h, K_DIM), 8),  # q
+            ft(BFloat16, (batch, T, h, K_DIM), 8),  # k
+            ft(BFloat16, (batch, T, h, V_DIM), 8),  # v
+            ft(BFloat16, (batch, T, h, K_DIM), 8),  # g (raw gate pre-activation)
+            ft(BFloat16, (batch, T, h), 1),  # b (beta logits)
+            ft(Float32, (h,), 1),  # A_log (fp32)
+            ft(Float32, (h * K_DIM,), 1),  # dt_bias (fp32, [H * K])
+            ft(BFloat16, (pool, h, V_DIM, K_DIM), 8),  # state pool (bf16)
+            ft(Int32, (batch,), 1),  # state indices
+            ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring
+            ft(BFloat16, (pool, h, RING_SLOTS, V_DIM), 8),  # u ring
+            ft(Float32, (pool, h, RING_SLOTS, K_DIM), 4),  # g ring (per channel)
+            ft(Int32, (batch,), 1),  # hist_len
+            ft(Int32, (batch,), 1),  # cache_base
+            ft(BFloat16, (batch, T, h, V_DIM), 8),  # out
+        ]
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
+            KdaReplayMtpUmma(T, h, w_ring, u_src),
+            *args,
+            Float32(1.0),
+            Float32(-5.0),
+            Int32(1),
+            stream,
+        )
+
+
+_KERNELS: dict = {}
+
+
+def _get_kernel(device: torch.device, T: int, h: int, w_ring: int, u_src: str):
+    """The compiled kernel for this specialisation on ``device``'s architecture."""
+    key = (gdn_device_target(device).compile_key, T, h, w_ring, u_src)
+    fn = _KERNELS.get(key)
+    if fn is None:
+        fn = KdaReplayMtpUmma.compile(device, T, h, w_ring, u_src)
+        _KERNELS[key] = fn
+    return fn
 
 
 def kda_umma_unavailable_reason(
@@ -198,6 +946,13 @@ def kda_umma_unavailable_reason(
     if pdl_trigger:
         return "pdl_trigger=True not supported yet"
     return None
+
+
+def _u_src(w_ring: int) -> str:
+    if _FORCE_U_SRC is not None:
+        assert _FORCE_U_SRC in ("smem", "ldg"), _FORCE_U_SRC
+        return _FORCE_U_SRC
+    return "smem" if w_ring == 16 else "ldg"
 
 
 def launch_umma(
@@ -221,8 +976,34 @@ def launch_umma(
     flush_min: int,
     w_ring: int,
 ) -> None:
-    """Launch the UMMA kernel on already-validated, contiguous inputs."""
-    raise NotImplementedError("KDA UMMA kernel not implemented yet")
+    """Launch the UMMA kernel on already-validated, contiguous inputs (the dispatcher's
+    contract: bf16 io / state / k and u rings, fp32 g ring, fp32 A_log [H] and dt_bias
+    [H * K], H == HV, K == V == 128)."""
+    global _LAUNCHES
+    T = q.shape[1]
+    H = q.shape[2]
+    fn = _get_kernel(q.device, T, H, int(w_ring), _u_src(int(w_ring)))
+    fn(
+        q,
+        k,
+        v,
+        g,
+        b,
+        A_log,
+        dt_bias,
+        h0,
+        initial_state_indices,
+        k_cache,
+        u_cache,
+        g_cache,
+        hist_len,
+        cache_base,
+        out_t,
+        float(scale),
+        float(lower_bound),
+        int(flush_min),
+    )
+    _LAUNCHES += 1
 
 
 __all__ = ["kda_umma_unavailable_reason", "launch_umma"]
