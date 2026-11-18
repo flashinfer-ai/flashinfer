@@ -36,6 +36,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import warnings
 
@@ -51,12 +52,12 @@ SCALE = 1.0 / math.sqrt(K)
 LOWER_BOUND = -5.0
 
 
-def load_ucache():
+def load_ucache(backend="auto"):
     from flashinfer.api_logging import ExperimentalWarning
     from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush
 
     warnings.filterwarnings("ignore", category=ExperimentalWarning)
-    return kda_delta_rule_mtp_ucache_flush
+    return functools.partial(kda_delta_rule_mtp_ucache_flush, backend=backend)
 
 
 def graphed(fn):
@@ -93,13 +94,20 @@ def main():
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--batches", type=int, nargs="+", default=[8, 32, 64, 128, 256])
     ap.add_argument("--t", type=int, default=4, choices=[4, 8])
+    ap.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "hmma", "umma"],
+        help="ucache kernel backend (the refcheck vs recurrent_kda covers it)",
+    )
     args = ap.parse_args()
     T = args.t
     RING = 32
 
-    uc = load_ucache()
+    uc = load_ucache(args.backend)
     print(
-        f"GPU: {torch.cuda.get_device_name(0)} | KDA ucache (verify, P=0, ring "
+        f"GPU: {torch.cuda.get_device_name(0)} | KDA ucache[{args.backend}] "
+        f"(verify, P=0, ring "
         f"appends ON) vs recurrent_kda spec verify (per-token ckpt scatter) | "
         f"T={T} H=HV={H} K=V={K} lb={LOWER_BOUND} | ucache CUDA-graph, recurrent eager, CUPTI cold-L2 "
         f"median of {args.iters}",

@@ -34,13 +34,21 @@ absolutes):
 Geometry: Kimi K3 at serving TP — H == HV == 12, K == V == 128,
 lower_bound = -5. T in {4, 8} via --t (default 8 — Kimi K3's draft length).
 
+Backends: ``--backend hmma umma`` (default) times each arm per point and,
+unless ``--no-check``, first runs every arm once on identical inputs and
+aborts if an arm drifts from the first one (y, folded pool rows, k/u/g ring
+appends). ``spd`` = first arm's cold time / this arm's cold time.
+``--w-ring 32`` benches the deep window (flush_min = min(w - T + 1, 33 - 2T)).
+
 Run:
-  python benchmarks/experimental/bench_kda_ucache_flush.py [--iters 500] [--t 8]
+  python benchmarks/experimental/bench_kda_ucache_flush.py [--iters 500] [--t 8] \
+      [--backend hmma umma] [--w-ring 16]
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import warnings
 
@@ -56,12 +64,12 @@ SCALE = 1.0 / math.sqrt(K)
 LOWER_BOUND = -5.0
 
 
-def load():
+def load(backend="hmma"):
     from flashinfer.api_logging import ExperimentalWarning
     from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush
 
     warnings.filterwarnings("ignore", category=ExperimentalWarning)
-    return kda_delta_rule_mtp_ucache_flush
+    return functools.partial(kda_delta_rule_mtp_ucache_flush, backend=backend)
 
 
 torch.manual_seed(0)
@@ -111,33 +119,76 @@ def hist_dist(B, seed, hist_max, fold_pct, fold_hist):
     return hist
 
 
-def bench_point(fn, flush_min, B, T, hist, iters, seed):
-    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, idx, hl, cb = make_case(
-        B, T, seed, hist
+def _call(fn, case, flush_min, w_ring):
+    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, idx, hl, cb = case
+    return fn(
+        A_log,
+        g,
+        dt_bias,
+        lower_bound=LOWER_BOUND,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=flush_min,
+        restart_hist_on_flush=False,
+        w_ring=w_ring,
     )
 
-    def call():
-        fn(
-            A_log,
-            g,
-            dt_bias,
-            lower_bound=LOWER_BOUND,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            initial_state_source=pool,
-            initial_state_indices=idx,
-            k_cache=kc,
-            u_cache=uc,
-            g_cache=gc,
-            hist_len=hl,
-            cache_base=cb,
-            scale=SCALE,
-            flush_min=flush_min,
-            restart_hist_on_flush=False,  # pure kernel: no cursor-commit ops
-            w_ring=16,
+
+# Cross-arm agreement bounds (the same bounds the tests use vs the oracle).
+_CHECK_TOL = {"y": 8e-3, "pool": 2e-2, "k": 5e-3, "u": 2e-2, "g": 1e-4}
+
+
+def check_arms(fns, names, flush_min, B, T, hist, seed, w_ring):
+    """One eager call per arm on identical fresh inputs; every arm must match
+    the first: output, folded pool rows, and the k/u/g ring append slots."""
+    hl = torch.tensor(hist, dtype=torch.int32, device=DEV)
+    fold = hl >= flush_min
+    # append slots (base 0): (P + s) & 31 for s < T
+    app = (hl[:, None] + torch.arange(T, device=DEV)[None, :]) & (RING - 1)
+    rows = torch.arange(B, device=DEV)[:, None]
+    outs = []
+    for fn in fns:
+        case = make_case(B, T, seed, hist)
+        y = _call(fn, case, flush_min, w_ring)
+        torch.cuda.synchronize()
+        pool, kc, uc, gc = case[7], case[8], case[9], case[10]
+        outs.append(
+            {
+                "y": y.float(),
+                "pool": pool[fold].float(),
+                "k": kc[rows, :, app].float(),
+                "u": uc[rows, :, app].float(),
+                "g": gc[rows, :, app].float(),
+            }
         )
+    ref = outs[0]
+    for name, o in zip(names[1:], outs[1:], strict=True):
+        for key, tol in _CHECK_TOL.items():
+            if ref[key].numel() == 0:
+                continue
+            err = (o[key] - ref[key]).abs().max().item()
+            if not err < tol:  # also catches NaN
+                raise SystemExit(
+                    f"refcheck FAILED: backend {name} vs {names[0]} at B={B} T={T} "
+                    f"w_ring={w_ring}: max|d{key}| = {err:.3e} >= {tol:g}"
+                )
+
+
+def bench_point(fn, flush_min, B, T, hist, iters, seed, w_ring=16):
+    case = make_case(B, T, seed, hist)
+
+    def call():
+        _call(fn, case, flush_min, w_ring)
 
     gr = graphed(call)
     times = bench_gpu_time(
@@ -175,34 +226,68 @@ def main():
         default=[0, 13, 25, 50],
         help="percent of rows that fold per step, each in [0, 100]",
     )
+    ap.add_argument(
+        "--backend",
+        nargs="+",
+        default=["hmma", "umma"],
+        choices=["hmma", "umma", "auto"],
+        help="kernel arms to time; the first one is the speed-up reference",
+    )
+    ap.add_argument("--w-ring", type=int, default=16, choices=[16, 32])
+    ap.add_argument(
+        "--check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="cross-check every arm against the first before timing",
+    )
     args = ap.parse_args()
     bad = [p for p in args.folds if not 0 <= p <= 100]
     if bad:
         ap.error(f"--folds values must be in [0, 100]; got {bad}")
 
-    fn = load()
+    names = list(args.backend)
+    fns = [load(n) for n in names]
     T = args.t
-    flush_min = 16 - T + 1  # W_RING - T + 1 (lazy flush)
+    w_ring = args.w_ring
+    # lazy flush: min(W - T + 1, RING - 2T + 1); 13/9 at w16, 25/17 at w32
+    flush_min = min(w_ring - T + 1, RING - 2 * T + 1)
     hist_max = flush_min - 1
     print(
         f"GPU: {torch.cuda.get_device_name(0)} | KDA ucache flush | T={T} "
-        f"H=HV={H} K=V={K} lb={LOWER_BOUND} flush_min={flush_min} | CUDA-graph "
-        f"replay, pure kernel (no commit), CUPTI cold-L2 median of "
-        f"{args.iters} + steady-state warm events",
+        f"w_ring={w_ring} H=HV={H} K=V={K} lb={LOWER_BOUND} "
+        f"flush_min={flush_min} | arms {names} | CUDA-graph replay, pure "
+        f"kernel (no commit), CUPTI cold-L2 median of {args.iters} + "
+        f"steady-state warm events",
         flush=True,
     )
 
-    hdr = "   B | " + " | ".join(
-        f"f{p:02d}% cold(us) | f{p:02d}% warm(us)" for p in args.folds
-    )
+    multi = len(names) > 1
+
+    def cell_hdr(p, n):
+        tag = f"f{p:02d}% {n}" if multi else f"f{p:02d}%"
+        h = f"{tag} cold(us) | {tag} warm(us)"
+        return h + (f" | {tag} spd" if multi and n != names[0] else "")
+
+    hdr = "   B | " + " | ".join(cell_hdr(p, n) for p in args.folds for n in names)
     print(hdr)
     print("-" * len(hdr))
     for B in args.batches:
         cells = []
         for p in args.folds:
             hist = hist_dist(B, 1000 + B, hist_max, p, flush_min)
-            c, w = bench_point(fn, flush_min, B, T, hist, args.iters, 1000 + B)
-            cells.append(f"{c:13.2f} | {w:13.2f}")
+            if args.check and multi:
+                check_arms(fns, names, flush_min, B, T, hist, 1000 + B, w_ring)
+            cold0 = None
+            for fn in fns:
+                c, w = bench_point(
+                    fn, flush_min, B, T, hist, args.iters, 1000 + B, w_ring
+                )
+                cell = f"{c:13.2f} | {w:13.2f}"
+                if cold0 is None:
+                    cold0 = c
+                elif multi:
+                    cell += f" | {cold0 / c:6.3f}"
+                cells.append(cell)
         print(f"{B:4d} | " + " | ".join(cells), flush=True)
 
 

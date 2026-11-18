@@ -1069,6 +1069,7 @@ def kda_delta_rule_mtp_ucache_flush(
     pdl_trigger: bool = False,
     w_ring: int = 16,
     tma_late: Optional[bool] = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""KDA (Kimi K3) speculative-decode verify with a ReplaySSM history ring.
 
@@ -1136,6 +1137,12 @@ def kda_delta_rule_mtp_ucache_flush(
     tma_late : bool, optional
         Load-schedule override; ``None`` picks by batch size. Never changes
         results.
+    backend : str
+        ``"auto"`` (default), ``"hmma"`` (mma.sync kernel, SM90+) or
+        ``"umma"`` (tcgen05 / TMEM kernel, SM10x only). ``"umma"`` raises
+        ``ValueError`` for configurations it does not support; ``"auto"``
+        currently always selects ``"hmma"``. The UMMA kernel ignores
+        ``tma_late``.
 
     Returns
     -------
@@ -1179,4 +1186,5 @@ def kda_delta_rule_mtp_ucache_flush(
         pdl_trigger=pdl_trigger,
         w_ring=w_ring,
         tma_late=tma_late,
+        backend=backend,
     )

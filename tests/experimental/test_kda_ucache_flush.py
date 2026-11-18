@@ -60,6 +60,7 @@ Run:
 
 from __future__ import annotations
 
+import functools
 import math
 import types
 
@@ -91,12 +92,18 @@ def _skip_if_not_sm90_or_later():
         pytest.skip(f"KDA ucache requires SM90+, got SM{cc[0]}{cc[1]}")
 
 
+# Backend pinned for every call made through _load_flush(): HMMA keeps its
+# coverage whatever backend="auto" resolves to. test_kda_ucache_flush_umma.py
+# re-runs this whole file with this dict patched to {"backend": "umma"}.
+_BACKEND_KW: dict = {"backend": "hmma"}
+
+
 def _load_flush():
     """Every test goes through the public experimental entry point."""
-    from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush
+    from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush as f
 
     return types.SimpleNamespace(
-        kda_delta_rule_mtp_ucache_flush=kda_delta_rule_mtp_ucache_flush
+        kda_delta_rule_mtp_ucache_flush=functools.partial(f, **_BACKEND_KW)
     )
 
 

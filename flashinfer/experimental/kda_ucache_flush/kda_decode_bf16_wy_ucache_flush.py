@@ -2560,6 +2560,37 @@ def _validate_device_ranges(
     )
 
 
+# --- tcgen05 / UMMA backend (SM10x) ----------------------------------------
+# Guarded: a failed import only disables backend="umma"; the HMMA path above
+# never depends on it.
+try:
+    from .kda_replay_mtp_umma import (
+        kda_umma_unavailable_reason as _umma_reason_impl,
+        launch_umma as _launch_umma,
+    )
+
+    _UMMA_IMPORT_ERROR: Optional[str] = None
+except (ImportError, RuntimeError) as _e:  # pragma: no cover - no tcgen05 DSL
+    _umma_reason_impl = None
+    _launch_umma = None
+    _UMMA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+# backend="auto" picks UMMA only when this is True (and the configuration is
+# supported). Off until the UMMA kernel is complete and measured.
+_AUTO_UMMA = False
+_BACKENDS = ("auto", "hmma", "umma")
+
+
+def kda_umma_unavailable_reason(
+    dev: torch.device, T: int, w_ring: int, pdl_trigger: bool
+) -> Optional[str]:
+    """``None`` when ``backend="umma"`` can run this configuration, else the
+    reason it cannot (import failure, device, T, w_ring, pdl_trigger)."""
+    if _launch_umma is None:
+        return f"UMMA module import failed ({_UMMA_IMPORT_ERROR})"
+    return _umma_reason_impl(dev, T, w_ring, pdl_trigger)
+
+
 def kda_delta_rule_mtp_ucache_flush(
     A_log: torch.Tensor,
     g: torch.Tensor,
@@ -2584,6 +2615,7 @@ def kda_delta_rule_mtp_ucache_flush(
     pdl_trigger: bool = False,
     w_ring: int = W_RING,
     tma_late: Optional[bool] = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
     """KDA decode output + u-cache append + PER-REQUEST state flush.
 
@@ -2620,6 +2652,12 @@ def kda_delta_rule_mtp_ucache_flush(
       requires flush_min > 16.
     - ``tma_late`` (None = batch heuristic) only selects the load schedule;
       it never changes results.
+    - ``backend``: ``"auto"`` (default), ``"hmma"`` (the mma.sync kernel in
+      this file) or ``"umma"`` (tcgen05 / TMEM, SM10x,
+      ``kda_replay_mtp_umma``). ``"umma"`` raises ``ValueError`` when
+      ``kda_umma_unavailable_reason`` reports a reason; ``"auto"`` uses UMMA
+      only when it is available and ``_AUTO_UMMA`` is set. The UMMA backend
+      ignores ``tma_late``.
 
     Returns ``output`` of shape ``[B, T, H, V]`` bf16.
     """
@@ -2838,45 +2876,6 @@ def kda_delta_rule_mtp_ucache_flush(
     g = g.contiguous()
     b = b.contiguous()
 
-    _num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    _total_ctas = HV * B
-    _needed = math.ceil(_total_ctas / _num_sms)
-    # Per-CTA SMEM after the g_buf diet is small enough that the register
-    # budget, not the 227 KB SMEM/SM limit, sets the achievable occupancy —
-    # see the schedule-and-w_ring-dependent CTA/SM figures just below.
-    # (tma-late) schedule choice by batch: measured crossover on B200 is
-    # between B*HV = 384 (late loses ~5-8%) and 768 (late wins 3-17%) —
-    # split at ~4 work-CTAs per SM. The tma_late argument overrides it.
-    if tma_late is None:
-        tma_late = 4 * _num_sms <= B * HV
-    tma_late = bool(tma_late)
-    # SMEM (w16): tma-late -> 7 CTAs/SM at T<=4, 6 at T=8; tma-early -> 5
-    # regardless of T. w32: tma-late -> 5, tma-early -> 4.
-    if w_ring == 32:
-        _mbp_cap = 5 if tma_late else 4
-    else:
-        _mbp_cap = (7 if T_in <= 4 else 6) if tma_late else 5
-    mbp = max(1, min(_needed + 1, _mbp_cap))
-    t_disc = 4 if T_in <= 4 else 8
-    cache_key: tuple = (
-        "kda-ucache-flush-v1",
-        str(dev),
-        mbp,
-        t_disc,
-        bool(pdl_trigger),
-        HV,
-        H,
-        V_dim,
-        w_ring,
-        tma_late,
-    )
-    mk = from_dlpack
-
-    def mk_dyn(t):
-        return mk(t, 16).mark_compact_shape_dynamic(
-            mode=0, stride_order=tuple(range(t.dim())), divisibility=1
-        )
-
     _out_aliased = False
     if (
         output is not None
@@ -2891,44 +2890,119 @@ def kda_delta_rule_mtp_ucache_flush(
         # that pad must pass a preallocated ``output``.
         out_t = torch.empty(B, T_in, HV, V_dim, dtype=IO_TORCH, device=dev)
 
-    stream = cuda.CUstream(torch.cuda.current_stream(device=dev).cuda_stream)
-    args = [
-        mk_dyn(q),
-        mk_dyn(k),
-        mk_dyn(v),
-        mk_dyn(g),
-        mk_dyn(b),
-        mk(A_log, 16),
-        mk(dt_bias, 16),
-        mk_dyn(h0),
-        mk_dyn(initial_state_indices),
-        mk_dyn(k_cache),
-        mk_dyn(u_cache),
-        mk_dyn(g_cache),
-        mk_dyn(hist_len),
-        mk_dyn(cache_base),
-        mk_dyn(out_t),
-        scale,
-        float(lower_bound),
-        HV,
-        V_dim,
-        H,
-        int(flush_min),
-        stream,
-    ]
-
-    if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile(
-            KdaDecodeUCacheFlushKernel(
-                min_blocks_per_mp=mbp,
-                t_input=t_disc,
-                pdl_trigger=pdl_trigger,
-                w_ring=w_ring,
-                tma_late=tma_late,
-            ),
-            *args,
+    if backend not in _BACKENDS:
+        raise ValueError(
+            "kda_delta_rule_mtp_ucache_flush: backend must be 'auto', 'hmma' or "
+            f"'umma'; got {backend!r}."
         )
-    _CACHE[cache_key](*args)
+    _why = kda_umma_unavailable_reason(dev, T_in, w_ring, bool(pdl_trigger))
+    if backend == "umma" and _why is not None:
+        raise ValueError(
+            f"kda_delta_rule_mtp_ucache_flush: backend='umma' unavailable: {_why}"
+        )
+    _use_umma = backend == "umma" or (backend == "auto" and _why is None and _AUTO_UMMA)
+
+    if _use_umma:
+        # tma_late only selects the HMMA load schedule; UMMA ignores it.
+        _launch_umma(
+            q,
+            k,
+            v,
+            g,
+            b,
+            A_log,
+            dt_bias,
+            h0,
+            initial_state_indices,
+            k_cache,
+            u_cache,
+            g_cache,
+            hist_len,
+            cache_base,
+            out_t,
+            float(scale),
+            float(lower_bound),
+            int(flush_min),
+            int(w_ring),
+        )
+    else:
+        _num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
+        _total_ctas = HV * B
+        _needed = math.ceil(_total_ctas / _num_sms)
+        # Per-CTA SMEM after the g_buf diet is small enough that the register
+        # budget, not the 227 KB SMEM/SM limit, sets the achievable occupancy —
+        # see the schedule-and-w_ring-dependent CTA/SM figures just below.
+        # (tma-late) schedule choice by batch: measured crossover on B200 is
+        # between B*HV = 384 (late loses ~5-8%) and 768 (late wins 3-17%) —
+        # split at ~4 work-CTAs per SM. The tma_late argument overrides it.
+        if tma_late is None:
+            tma_late = 4 * _num_sms <= B * HV
+        tma_late = bool(tma_late)
+        # SMEM (w16): tma-late -> 7 CTAs/SM at T<=4, 6 at T=8; tma-early -> 5
+        # regardless of T. w32: tma-late -> 5, tma-early -> 4.
+        if w_ring == 32:
+            _mbp_cap = 5 if tma_late else 4
+        else:
+            _mbp_cap = (7 if T_in <= 4 else 6) if tma_late else 5
+        mbp = max(1, min(_needed + 1, _mbp_cap))
+        t_disc = 4 if T_in <= 4 else 8
+        cache_key: tuple = (
+            "kda-ucache-flush-v1",
+            str(dev),
+            mbp,
+            t_disc,
+            bool(pdl_trigger),
+            HV,
+            H,
+            V_dim,
+            w_ring,
+            tma_late,
+        )
+        mk = from_dlpack
+
+        def mk_dyn(t):
+            return mk(t, 16).mark_compact_shape_dynamic(
+                mode=0, stride_order=tuple(range(t.dim())), divisibility=1
+            )
+
+        stream = cuda.CUstream(torch.cuda.current_stream(device=dev).cuda_stream)
+        args = [
+            mk_dyn(q),
+            mk_dyn(k),
+            mk_dyn(v),
+            mk_dyn(g),
+            mk_dyn(b),
+            mk(A_log, 16),
+            mk(dt_bias, 16),
+            mk_dyn(h0),
+            mk_dyn(initial_state_indices),
+            mk_dyn(k_cache),
+            mk_dyn(u_cache),
+            mk_dyn(g_cache),
+            mk_dyn(hist_len),
+            mk_dyn(cache_base),
+            mk_dyn(out_t),
+            scale,
+            float(lower_bound),
+            HV,
+            V_dim,
+            H,
+            int(flush_min),
+            stream,
+        ]
+
+        if cache_key not in _CACHE:
+            _CACHE[cache_key] = cute.compile(
+                KdaDecodeUCacheFlushKernel(
+                    min_blocks_per_mp=mbp,
+                    t_input=t_disc,
+                    pdl_trigger=pdl_trigger,
+                    w_ring=w_ring,
+                    tma_late=tma_late,
+                ),
+                *args,
+            )
+        _CACHE[cache_key](*args)
 
     # Standalone ring cursor commit (Triton commit_*_replayssm_spec
     # semantics). restart_hist_on_flush=False hands the commit to the caller
