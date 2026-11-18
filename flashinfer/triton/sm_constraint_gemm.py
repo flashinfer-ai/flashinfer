@@ -61,7 +61,8 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
     )
 
     # The kernel reads c only when beta != 0, and torch.empty does not initialize it.
-    assert c is not None or beta == 0, "c must be provided when beta != 0"
+    if c is None and beta != 0:
+        raise ValueError("c must be provided when beta != 0")
 
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=out_dtype) if c is None else c
@@ -148,7 +149,8 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
     )
 
     # The kernel reads c only when beta != 0, and torch.empty does not initialize it.
-    assert c is not None or beta == 0, "c must be provided when beta != 0"
+    if c is None and beta != 0:
+        raise ValueError("c must be provided when beta != 0")
 
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=out_dtype) if c is None else c
@@ -248,7 +250,8 @@ def gemm_descriptor_persistent(
         assert N >= 8, "Least chunk size must be 16B"
 
     # The kernel reads c only when beta != 0, and torch.empty does not initialize it.
-    assert c is not None or beta == 0, "c must be provided when beta != 0"
+    if c is None and beta != 0:
+        raise ValueError("c must be provided when beta != 0")
     c = torch.empty((M, N), device=a.device, dtype=out_dtype) if c is None else c
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count

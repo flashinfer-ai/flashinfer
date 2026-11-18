@@ -34,7 +34,9 @@ def skip_unless_shared_memory_fits(kernel, dtype):
         needed = 144 * 1024 if kernel == "persistent" else 128 * 1024
     else:
         needed = 128 * 1024 if kernel == "descriptor_persistent" else 96 * 1024
-    available = get_shared_bytes_per_block_optin(torch.device("cuda"))
+    available = get_shared_bytes_per_block_optin(
+        torch.device("cuda", torch.cuda.current_device())
+    )
     if available < needed:
         pytest.skip(
             f"{kernel} with {dtype} needs {needed // 1024} KiB of shared memory, "
@@ -194,8 +196,12 @@ def test_sm_constraint_gemm_beta_zero_does_not_read_c(
     skip_unless_shared_memory_fits(kernel, dtype)
 
     M = N = K = 256
-    a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
-    b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
+    # Entries in {-1, 0, 1}: every product and partial sum is a small integer,
+    # so alpha * (A @ B) is exact in all three dtypes and can be compared
+    # bit-for-bit against an independent reference.
+    a = torch.randint(-1, 2, (M, K), device="cuda").to(dtype)
+    b = torch.randint(-1, 2, (K, N), device="cuda").to(dtype)
+    reference = (alpha * torch.matmul(a.float(), b.float())).to(dtype)
 
     if kernel == "naive":
 
@@ -217,7 +223,7 @@ def test_sm_constraint_gemm_beta_zero_does_not_read_c(
                 a, bT, c=c, alpha=alpha
             )
 
-    reference = run(torch.zeros((M, N), device="cuda", dtype=dtype))
+    run(torch.zeros((M, N), device="cuda", dtype=dtype))  # warm up (compile)
 
     # Fill every floating-point torch.empty the wrapper makes with NaN, so the
     # output buffer is poisoned without relying on the caching allocator.
@@ -234,7 +240,7 @@ def test_sm_constraint_gemm_beta_zero_does_not_read_c(
         out = run(None)  # c=None, beta=0.0
 
     assert torch.isfinite(out).all()
-    # Nothing about the buffer may reach the result.
+    # Exactly alpha * (A @ B): nothing about the old buffer may reach the result.
     assert torch.equal(out, reference)
 
 
@@ -265,6 +271,24 @@ def test_sm_constraint_gemm_beta_nonzero_reads_c(kernel, dtype):
         )
 
     assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("kernel", ["naive", "persistent", "descriptor_persistent"])
+def test_sm_constraint_gemm_beta_nonzero_requires_c(kernel):
+    # beta != 0 without c has no defined meaning: the wrapper would otherwise
+    # fold its own uninitialized allocation into the result. The check must be
+    # a real error, not an assert that python -O strips.
+    a = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    b = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    fn = {
+        "naive": flashinfer.triton.sm_constraint_gemm.gemm,
+        "persistent": flashinfer.triton.sm_constraint_gemm.gemm_persistent,
+        "descriptor_persistent": (
+            flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent
+        ),
+    }[kernel]
+    with pytest.raises(ValueError, match="c must be provided when beta != 0"):
+        fn(a, b, beta=0.5)
 
 
 def print_all_on_failure(
