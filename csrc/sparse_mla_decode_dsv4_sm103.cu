@@ -3492,12 +3492,12 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   cfg.gridDim = dim3(nsplit, T, use_h8 ? 2 : 1);
   cfg.blockDim = dim3(use_tile16 ? 128 : 256, 1, 1);
   const bool use_b13 = use_tile16;
-  cfg.dynamicSmemBytes = use_h8       ? H8_BYTES
-                         : use_ws     ? WS_BYTES
-                         : use_tcgen  ? TC_BYTES
+  cfg.dynamicSmemBytes = use_h8                         ? H8_BYTES
+                         : use_ws                       ? WS_BYTES
+                         : use_tcgen                    ? TC_BYTES
                          : (use_fused2 && nsplit == 10) ? F2_BYTES
-                         : use_b13    ? B13_BYTES
-                                      : SM_BYTES_FOR(32);
+                         : use_b13                      ? B13_BYTES
+                                                        : SM_BYTES_FOR(32);
   if (use_b13) cfg.blockDim = dim3(128, 1, 1);
   cfg.stream = stream;
   cudaLaunchAttribute attr[2];
