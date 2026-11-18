@@ -24,6 +24,7 @@ import pickle
 import selectors
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -40,6 +41,8 @@ ENV_VAR = "FLASHINFER_CUDNN_PLAN_BUILD_WORKERS"
 _WORKER_SCRIPT = pathlib.Path(__file__).with_name("_cudnn_plan_build.py")
 # Libraries the worker's cuDNN must resolve the same way the parent's did.
 _LIB_PREFIXES = ("libcudnn", "libcublas", "libcudart", "libnvrtc", "libnvJitLink")
+# How much of a failed worker's stderr the warning carries.
+_STDERR_TAIL_BYTES = 2048
 
 
 class _WorkerFailure(Exception):
@@ -73,6 +76,15 @@ def _visible_device_entry(device_index: int) -> str:
             f"device {device_index} is not in CUDA_VISIBLE_DEVICES={visible!r}"
         )
     return entries[device_index]
+
+
+def _stderr_tail(log) -> str:
+    try:
+        size = log.seek(0, os.SEEK_END)
+        log.seek(max(0, size - _STDERR_TAIL_BYTES))
+        return log.read().decode(errors="replace").strip()
+    except (OSError, ValueError):
+        return ""
 
 
 def _read_frame(proc: subprocess.Popen, deadline: float):
@@ -115,6 +127,9 @@ class CudnnPlanBuildPool:
         self.timeout_s = timeout_s
         self._worker_cmd = worker_cmd or [sys.executable, "-I", str(_WORKER_SCRIPT)]
         self._workers: dict = {}  # device_index -> list[Popen]
+        # Worker stderr goes to a file, not a pipe: cuDNN output moved to
+        # stderr by the worker could fill an undrained pipe and block it.
+        self._stderr_logs: dict = {}  # pid -> temporary file
         self._lock = threading.Lock()
         self._broken = False
         self.last_responses: list = []
@@ -142,16 +157,33 @@ class CudnnPlanBuildPool:
             env["LD_LIBRARY_PATH"] = os.pathsep.join(
                 lib_dirs + [p for p in [env.get("LD_LIBRARY_PATH")] if p]
             )
-        return [
-            subprocess.Popen(
-                self._worker_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=env,
-            )
-            for _ in range(self.num_workers)
-        ]
+        procs = []
+        for _ in range(self.num_workers):
+            log = tempfile.TemporaryFile()
+            try:
+                proc = subprocess.Popen(
+                    self._worker_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=log,
+                    env=env,
+                )
+            except BaseException:
+                log.close()
+                raise
+            self._stderr_logs[proc.pid] = log
+            procs.append(proc)
+        return procs
+
+    def _read_reply(self, proc, deadline: float):
+        try:
+            return _read_frame(proc, deadline)
+        except _WorkerFailure as exc:
+            log = self._stderr_logs.get(proc.pid)
+            tail = _stderr_tail(log) if log is not None else ""
+            if tail:
+                raise _WorkerFailure(f"{exc}; worker stderr: ...{tail}") from None
+            raise
 
     def build(self, spec: Bf16OverrideGraphSpec, device_index: int, heur_modes):
         """Return ``(candidates, [(tactic, serialized_plan), ...])``, or ``None``.
@@ -215,7 +247,7 @@ class CudnnPlanBuildPool:
                 },
             )
         deadline = time.monotonic() + self.timeout_s
-        responses = [_read_frame(proc, deadline) for proc in procs]
+        responses = [self._read_reply(proc, deadline) for proc in procs]
         self.last_responses = responses
         if any(r.get("request_id") != request_id for r in responses):
             raise _WorkerFailure("reply for another request")
@@ -265,9 +297,10 @@ class CudnnPlanBuildPool:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            for stream in (proc.stdin, proc.stdout):
-                with contextlib.suppress(OSError):
-                    stream.close()
+            for stream in (proc.stdin, proc.stdout, self._stderr_logs.pop(proc.pid, None)):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
 
     def shutdown(self) -> None:
         with self._lock:

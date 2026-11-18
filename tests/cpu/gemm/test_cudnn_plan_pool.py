@@ -46,6 +46,10 @@ FAKE_WORKER = textwrap.dedent(
             break
         if mode == "exit":
             sys.exit(3)
+        if mode == "stderr_exit":
+            sys.stderr.write("x" * 65536 + "\\nModuleNotFoundError: No module named 'cudnn'\\n")
+            sys.stderr.flush()
+            sys.exit(1)
         if mode == "sleep":
             time.sleep(30)
         if mode == "garbage":
@@ -286,3 +290,16 @@ def test_unbuilt_plans_keep_their_candidates(fake_cmd):
         pool.shutdown()
     assert candidates == CANDIDATES
     assert built == [(CANDIDATES[i], f"blob{i}".encode()) for i in (1, 2)]
+
+
+def test_worker_stderr_tail_is_logged(fake_cmd, caplog):
+    # A worker that cannot start (e.g. cudnn not importable under ``-I``) must
+    # say why; more than a pipe buffer of output must not block it either.
+    pool = _pool(fake_cmd, "stderr_exit")
+    try:
+        with caplog.at_level("WARNING"):
+            assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
+    finally:
+        pool.shutdown()
+    assert "No module named 'cudnn'" in caplog.text
+    assert "x" * 4096 not in caplog.text
