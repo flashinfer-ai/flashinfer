@@ -35,11 +35,27 @@ class BlockScaledSwapAbFc12Extension:
     # Which expert holds each slot the scheduler enumerates. Absent when the
     # scheduler walks experts directly, in which case a slot is an expert.
     expert_remap: Optional[cute.Tensor] = None
+    # n_split: expert e's weights and scales sit at half * E + e (half = tile_m_idx // half_cta_tiles of its phase).
+    n_split: bool = False
+    local_expert_count: int = 0
+    fc1_half_cta_tiles: int = 0
+    fc2_half_cta_tiles: int = 0
+    # Shared-expert FC1 done counter (one slot per token block) and the count a shared FC2 tile waits for.
+    shared_fc1_done_counter_pointer: Optional[Pointer] = None
+    shared_fc2_spin_threshold: Optional[Int32] = None
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
             raise ValueError(f"sf_vec_size must be positive, got {self.sf_vec_size}.")
         object.__setattr__(self, "fc2_spin_threshold", Int32(self.fc2_spin_threshold))
+        if (self.shared_fc1_done_counter_pointer is None) != (self.shared_fc2_spin_threshold is None):
+            raise ValueError("shared_fc1_done_counter_pointer and shared_fc2_spin_threshold must be set together.")
+        if self.shared_fc2_spin_threshold is not None:
+            object.__setattr__(self, "shared_fc2_spin_threshold", Int32(self.shared_fc2_spin_threshold))
+
+    @property
+    def shared_enabled(self) -> bool:
+        return self.shared_fc1_done_counter_pointer is not None
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -49,6 +65,9 @@ class BlockScaledSwapAbFc12Extension:
             values.extend(extract_mlir_values(self.fc1_ready_counter_pointer))
         if self.expert_remap is not None:
             values.extend(extract_mlir_values(self.expert_remap))
+        if self.shared_fc1_done_counter_pointer is not None:
+            values.extend(extract_mlir_values(self.shared_fc1_done_counter_pointer))
+            values.extend(extract_mlir_values(self.shared_fc2_spin_threshold))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "BlockScaledSwapAbFc12Extension":
@@ -67,6 +86,11 @@ class BlockScaledSwapAbFc12Extension:
             rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
         expert_remap = rebuild(self.expert_remap) if self.expert_remap is not None else None
+        shared_fc1_done_counter_pointer = None
+        shared_fc2_spin_threshold = None
+        if self.shared_fc1_done_counter_pointer is not None:
+            shared_fc1_done_counter_pointer = rebuild(self.shared_fc1_done_counter_pointer)
+            shared_fc2_spin_threshold = rebuild(self.shared_fc2_spin_threshold)
         if value_index != len(values):
             raise ValueError(
                 f"BlockScaledSwapAbFc12Extension MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -77,7 +101,36 @@ class BlockScaledSwapAbFc12Extension:
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             expert_remap=expert_remap,
+            n_split=self.n_split,
+            local_expert_count=self.local_expert_count,
+            fc1_half_cta_tiles=self.fc1_half_cta_tiles,
+            fc2_half_cta_tiles=self.fc2_half_cta_tiles,
+            shared_fc1_done_counter_pointer=shared_fc1_done_counter_pointer,
+            shared_fc2_spin_threshold=shared_fc2_spin_threshold,
         )
+
+    @cute.jit
+    def _half_cta_tiles(self, work_tile: SwapAbFc12WorkTileInfo) -> Int32:
+        half_cta_tiles = Int32(self.fc2_half_cta_tiles)
+        if work_tile.phase == Int32(BlockPhase.Linear1):
+            half_cta_tiles = Int32(self.fc1_half_cta_tiles)
+        return half_cta_tiles
+
+    @cute.jit
+    def weight_half(self, work_tile: SwapAbFc12WorkTileInfo) -> Int32:
+        """Die-major half (0 / 1) holding this tile's weight rows; 0 unless n_split."""
+        half = Int32(0)
+        if cutlass.const_expr(self.n_split):
+            half = work_tile.tile_m_idx // self._half_cta_tiles(work_tile)
+        return half
+
+    @cute.jit
+    def local_tile_m(self, work_tile: SwapAbFc12WorkTileInfo) -> Int32:
+        """Weight-row CTA tile index inside the die-major half (== tile_m_idx unless n_split)."""
+        local = work_tile.tile_m_idx
+        if cutlass.const_expr(self.n_split):
+            local = work_tile.tile_m_idx % self._half_cta_tiles(work_tile)
+        return local
 
     @cute.jit
     def prepare_work_tile(self, work_tile: SwapAbFc12WorkTileInfo) -> SwapAbFc12WorkTileInfo:
@@ -93,12 +146,24 @@ class BlockScaledSwapAbFc12Extension:
         phase_and_flags = work_tile.phase_and_flags
         expert_idx = work_tile.expert_idx
         if work_tile.is_valid_tile:
-            # Inside the validity branch so a terminal tile keeps its sentinel.
-            if cutlass.const_expr(self.expert_remap is not None):
-                expert_idx = self.expert_remap[work_tile.expert_idx]
-            counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
             is_fc2 = work_tile.phase == Int32(BlockPhase.Linear2)
+            # Inside the validity branch so a terminal tile keeps its sentinel; shared tiles are never remapped.
+            if cutlass.const_expr(self.expert_remap is not None):
+                if cutlass.const_expr(self.shared_enabled):
+                    if is_fc1 | is_fc2:
+                        expert_idx = self.expert_remap[work_tile.expert_idx]
+                else:
+                    expert_idx = self.expert_remap[work_tile.expert_idx]
+            counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
+
+            if cutlass.const_expr(self.shared_enabled):
+                if work_tile.phase == Int32(BlockPhase.SharedLinear2):
+                    counter_pointer = self.shared_fc1_done_counter_pointer + work_tile.tile_n_idx
+                    peek_flag = Int32(0)
+                    if spin_peek(counter_pointer, lambda value: value >= self.shared_fc2_spin_threshold):
+                        peek_flag = Int32(peek_ready_bit)
+                    phase_and_flags = work_tile.phase_and_flags | peek_flag
 
             if cutlass.const_expr(self.fc1_ready_counter_pointer is not None):
                 if is_fc1:
@@ -149,9 +214,12 @@ class BlockScaledSwapAbFc12Extension:
         shape = tensor.shape
         stride = tensor.stride
         singleton = Int32(1)
+        weight_expert = expert_idx
+        if cutlass.const_expr(self.n_split):
+            weight_expert = self.weight_half(work_tile) * Int32(self.local_expert_count) + expert_idx
 
         if cutlass.const_expr(tensor_name == "a"):
-            result = cute.domain_offset((0, 0, expert_idx), tensor)
+            result = cute.domain_offset((0, 0, weight_expert), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "b"):
@@ -159,7 +227,7 @@ class BlockScaledSwapAbFc12Extension:
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "sfa"):
-            result = cute.domain_offset((0, 0, expert_idx), tensor)
+            result = cute.domain_offset((0, 0, weight_expert), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)

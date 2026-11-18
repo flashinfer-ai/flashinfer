@@ -126,14 +126,15 @@ struct SM120BlockScalingBuilder {
       sm120_common::Sm120BlockScaledR2GStoreConfig<kTileM, kTileN, ElementD>>;
   using StagedR2GStoreConfig =
       sm120_common::Sm120BlockScaledStagedR2GStoreConfig<kTileM, kTileN, ElementD, kUseStagedR2G>;
+  using SmemSFAStorage =
+      cute::ArrayEngine<ElementScale, cute::cosize_v<typename SFConfig::SmemLayoutSFA>>;
 
   struct SharedStorageLoad : cute::aligned_struct<128, _0> {
     alignas(1024)
         cute::ArrayEngine<ElementA, cute::cosize_v<typename ABLoadConfig::SmemLayoutA>> smem_A;
     alignas(1024)
         cute::ArrayEngine<ElementB, cute::cosize_v<typename ABLoadConfig::SmemLayoutB>> smem_B;
-    alignas(kUseTmaSFA ? 128 : alignof(ElementScale))
-        cute::ArrayEngine<ElementScale, cute::cosize_v<typename SFConfig::SmemLayoutSFA>> smem_SFA;
+    alignas(kUseTmaSFA ? 128 : alignof(SmemSFAStorage)) SmemSFAStorage smem_SFA;
     cute::ArrayEngine<ElementScale, cute::cosize_v<typename SFConfig::SmemLayoutSFB>> smem_SFB;
   };
 

@@ -122,3 +122,31 @@ bounds; runs bind live metadata and reuse scratch. See the shared
 [planning contract](../../README.md#reusable-plans),
 [runtime split-KV policy](../../README.md#runtime-split-kv-policy), and
 [final statistics contract](../../README.md#final-statistics-and-sink-semantics).
+
+## Per-query local-KV prefixes
+
+Dense MLA `plan(use_kv_bounds=True)` specializes a graph-live `kv_bounds` input.
+It is a contiguous, 4-byte-aligned CUDA int32 vector with one count per logical
+query token: `[B*SQ]` for fixed Q and `[total_q]` for packed Q. All heads of a
+token share its bound. Bounds must be nondecreasing within each request and
+lie in `[0, seq_lens_kv[b]]`; they replace both dense and bottom-right causal
+visibility, rather than intersecting the selected mask. The raw local-KV
+length still determines producer/reducer split partitioning, preserving FP8
+probability quantization across the same split/instance streams.
+
+Supply bounds exactly when enabled, including with `validate=False`. Validation
+checks structure and values outside capture; trusted runs perform no host
+readback. Retain the vector and mutate its contents between completed launches
+or graph replays. A zero prefix writes zero O and optional LSE `-inf`. A bounds-only neutral initialization launch also
+covers requests with zero local KV when the ordinary task schedule skips them.
+`plan(zero_empty_rows=False)` omits this initialization launch while retaining
+per-query prefix masking. In that mode empty-row results are unspecified, not
+guaranteed preserved; initialize them or exclude them from merging. The default
+is `True`, including in the one-shot API. It is ignored without bounds and
+changes the compiled launch program, not workspace size.
+Unbounded zero-KV behavior is unchanged. The static K/V capacity remains
+positive; the one-shot API defaults it to one for an all-empty bounded rank.
+
+Per-query prefixes add no scratch and do not alter the public return type.
+Sparse/NVFP4 entry points remain outside this option's scope. The bounds
+specialization is independent of optional LSE output.

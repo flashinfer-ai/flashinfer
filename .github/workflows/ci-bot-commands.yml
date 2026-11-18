@@ -25,10 +25,17 @@ jobs:
     # Cheap pre-filter only. Workflow expressions have no regex, so this cannot
     # tell a command from prose that mentions one; `Parse command` below is the
     # authoritative match and every handler step is gated on its output.
+    #
+    # Commands posted by flashinfer-bot itself (automation holding its token)
+    # must run, so the bot account is not excluded; `Check permission` admits
+    # it only for a single-line command. The notes this job posts are skipped
+    # here: each carries the marker below (NOTE_MARKER in the run step; keep the
+    # two in sync), so a note is never read back as a command and costs no job.
     if: |
       github.event.issue.pull_request &&
-      github.event.comment.user.login != 'flashinfer-bot' &&
-      contains(github.event.comment.body, '@flashinfer-bot')
+      contains(github.event.comment.body, '@flashinfer-bot') &&
+      !(github.event.comment.user.login == 'flashinfer-bot' &&
+        contains(github.event.comment.body, '<!-- flashinfer-bot:ci-bot-commands-note -->'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -48,7 +55,28 @@ jobs:
           TEAM: ci-users
           ACTOR: ${{ github.event.comment.user.login }}
           REPO: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
+          # Only holders of the bot token can post as flashinfer-bot, so a
+          # command the automation posts is authorized by that token and always
+          # runs. Other services also post as this account and echo text an
+          # outsider controls (test output in CI reports, quoted comments, model
+          # explanations), so authorize it only for a comment that is exactly one
+          # command line, the form automation posts. Never fall through to the
+          # role lookup: the account's admin role would authorize any echo.
+          if [[ "$ACTOR" == "flashinfer-bot" ]]; then
+            BODY=$(printf '%s\n' "${COMMENT_BODY-}" | tr -d '\r' | sed -E '/^[[:space:]]*$/d')
+            if [[ "$(printf '%s\n' "$BODY" | grep -c '')" == 1 ]] \
+                && printf '%s\n' "$BODY" | grep -qiE '^[[:space:]]*@flashinfer-bot[[:space:]]+(run|rerun|stop)([[:space:]]|$)'; then
+              echo "$ACTOR is authorized by its token for a single-line command"
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$ACTOR comment is not a single command line; not executed"
+              echo "authorized=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
           # Verify token is set
           if [[ -z "$GH_TOKEN" ]]; then
             echo "::error::FLASHINFER_GITHUB_TOKEN secret is not set"
@@ -182,14 +210,22 @@ jobs:
           bounded_gh() { timeout --kill-after=5s 15s gh "$@"; }
           SCOPE_RESULT="$RUNNER_TEMP/ci-bot-scope.json"
           SCOPE_NOTE="$RUNNER_TEMP/ci-bot-scope.md"
+          # Notes are posted as flashinfer-bot, whose commands this job executes.
+          # The job guard skips bot comments carrying this marker (keep in sync),
+          # so a note that quotes a command can never start another run.
+          NOTE_MARKER='<!-- flashinfer-bot:ci-bot-commands-note -->'
+          post_note() {
+            # Fail closed: never post a note without its marker.
+            printf '\n%s\n' "$NOTE_MARKER" >> "$SCOPE_NOTE" || return 1
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE"
+          }
           reject() {
             if [ "$#" -gt 0 ]; then
               printf '%s\n' "$1" > "$SCOPE_NOTE"
             elif [ ! -s "$SCOPE_NOTE" ]; then
               printf '%s\n' 'No CI pipeline was started because test targets could not be selected or validated. Review and specify paths with `run tests/<dir-or-file>` or use `run all` for the full suite.' > "$SCOPE_NOTE"
             fi
-            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
-              || echo "warning: could not post rejection note"
+            post_note || echo "warning: could not post rejection note"
             bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
               -f content=confused > /dev/null || echo "warning: could not react"
             echo "Scope rejected; run-ci not applied."
@@ -199,7 +235,7 @@ jobs:
           # Includes the initial PR lookup and cleanup around the 420-second
           # selection cap; leave time within the ten-minute job for feedback.
           if ! timeout --kill-after=5s 450s env GH_TOKEN="$STATUS_TOKEN" \
-              python3 scripts/pr_checks/ai_test_scope.py \
+              python3 scripts/infra/pr_checks/ai_test_scope.py \
               --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
               --command-file "$RUNNER_TEMP/ci-bot-run-command.txt" \
               --output "$SCOPE_RESULT" --note "$SCOPE_NOTE"; then
@@ -209,7 +245,7 @@ jobs:
           HEAD_SHA=$(jq -er '.head_sha' "$SCOPE_RESULT")
           MODE=$(jq -er '.mode' "$SCOPE_RESULT")
           if [ "$MODE" = advisory ]; then
-            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+            post_note \
               || reject "The AI recommendation could not be posted. No CI pipeline was started; retry the command."
             bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
               -f content='+1' > /dev/null || echo "warning: could not react"
@@ -303,8 +339,7 @@ jobs:
           bounded_gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "$RUN_LABEL" \
             || reject "The CI label request failed; check the PR's runs before retrying the command."
           if [ "$MODE" = automatic ]; then
-            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
-              || echo "warning: could not post the selected-target explanation"
+            post_note || echo "warning: could not post the selected-target explanation"
           fi
           bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
             -f content='+1' > /dev/null || echo "warning: could not react"

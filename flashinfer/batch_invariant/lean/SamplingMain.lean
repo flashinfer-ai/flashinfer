@@ -24,6 +24,7 @@ def main : IO Unit := do
     IO.println s!"lseout {N} {temp} probs0 {osexpr (Sampling.specProb "bf16" N kb lseRow T 0)}"
     IO.println s!"lseout {N} {temp} probsL {osexpr (Sampling.specProb "bf16" N kb lseRow T (N - 1))}"
     IO.println s!"lseout {N} {temp} logp0 {osexpr (Sampling.specLogp "bf16" N kb lseRow T 0)}"
+    IO.println s!"lseout {N} {temp} logp0c {osexpr (Sampling.specLogpCvt "bf16" N kb lseRow T 0)}"
     IO.println s!"lseout {N} {temp} lse {osexpr (Sampling.specLse "bf16" N kb lseRow T)}"
   -- the draw `sample.icdf.v1` (Draw.lean): the threshold and the inclusive prefixes of the probe elements of row 0
   for (N, kb, probe) in drawCases do
