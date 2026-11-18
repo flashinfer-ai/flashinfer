@@ -10,6 +10,7 @@ import logging
 import itertools
 import json
 import os
+import pkgutil
 import statistics
 import tempfile
 import threading
@@ -202,6 +203,67 @@ _CACHE_GENERATION_KEY = "_generation"
 # genuine environment mismatch — may be overwritten on save, so a poisoned
 # file heals on the next tuned run instead of forcing a re-tune forever.
 _INDETERMINATE_META_VALUES = (None, "unknown", "None")
+
+
+# Advanced after every mutation of a _WinnerSourceDict (the winner caches and
+# loaded configs of every AutoTuner), so AutoTuner.may_select_runner_class can
+# memoize its scan of them. Read without the lock: a reader that sees an old
+# value only rescans later.
+_winner_sources_generation = 0
+_winner_sources_generation_lock = threading.Lock()
+
+
+def _advance_winner_sources_generation() -> None:
+    global _winner_sources_generation
+    with _winner_sources_generation_lock:
+        _winner_sources_generation += 1
+
+
+class _WinnerSourceDict(dict):
+    """A ``dict`` holding cache entries that :meth:`choose_one` can serve.
+
+    Every mutating method advances ``_winner_sources_generation`` after the
+    change, so a scan memoized at a generation reflects all entries until the
+    generation moves. Reads are the plain ``dict`` methods.
+    """
+
+    __slots__ = ()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        _advance_winner_sources_generation()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _advance_winner_sources_generation()
+
+    def __ior__(self, other):  # type: ignore[misc]
+        result = super().__ior__(other)
+        _advance_winner_sources_generation()
+        return result
+
+    def clear(self):
+        super().clear()
+        _advance_winner_sources_generation()
+
+    def pop(self, *args):
+        result = super().pop(*args)
+        _advance_winner_sources_generation()
+        return result
+
+    def popitem(self):
+        result = super().popitem()
+        _advance_winner_sources_generation()
+        return result
+
+    def setdefault(self, key, default=None):
+        result = super().setdefault(key, default)
+        _advance_winner_sources_generation()
+        return result
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        _advance_winner_sources_generation()
 
 
 @functools.cache
@@ -1796,6 +1858,30 @@ def load_from_file(file_key: str) -> tuple[bool, int, Any, None]:
     return False, 0, -1, None
 
 
+@functools.cache
+def _bundled_configs_hold_runner_class(runner_class_name: str) -> bool:
+    """Whether a bundled config module that :func:`load_from_file` may read
+    holds an entry of the runner class (a file key whose runner field is its
+    name). Every module of the package is checked, so no device is queried."""
+    try:
+        package = importlib.import_module("flashinfer.tuning_configs")
+        names = [info.name for info in pkgutil.iter_modules(package.__path__)]
+    except Exception:
+        return False
+    # File keys are str((custom_op, runner_class_name, profile, extras)).
+    field = f", {runner_class_name!r}, "
+    for name in names:
+        try:
+            best_configs = importlib.import_module(
+                f"flashinfer.tuning_configs.{name}"
+            ).best_configs
+        except Exception:
+            continue
+        if any(isinstance(key, str) and field in key for key in best_configs):
+            return True
+    return False
+
+
 # A single entry pushed by the autotune() context manager onto the per-thread
 # override stack.  First element is the sorted tuple of tuning bucket values
 # (None means "inherit from enclosing context / use default"), second element
@@ -1872,7 +1958,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
-        ] = {}
+        ] = _WinnerSourceDict()
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate. Each shortlist is
@@ -1921,7 +2007,7 @@ class AutoTuner:
                 )
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
-        self._file_configs: dict[str, tuple[str, Any]] = {}
+        self._file_configs: dict[str, tuple[str, Any]] = _WinnerSourceDict()
         self._file_config_policies: dict[str, tuple[Any, ...]] = {}
         self._file_config_selections: dict[str, dict[str, Any]] = {}
         # Keep disk merges from reviving superseded runners, including when
@@ -1963,7 +2049,14 @@ class AutoTuner:
         # the default (v1) partition is `profiling_cache` itself.  Winners
         # tuned under one measurement identity must not short-circuit
         # tuning under another (they may legitimately differ).
-        self._winner_partitions: dict[tuple, dict] = {}
+        self._winner_partitions: dict[tuple, dict] = _WinnerSourceDict()
+        # (winner-source generation, runner class names of every entry in
+        # profiling_cache, _winner_partitions and _file_configs); see
+        # may_select_runner_class.
+        self._runner_class_names_memo: tuple[int, frozenset[str]] = (
+            -1,
+            frozenset(),
+        )
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: set[tuple[str, str]] = set()
         # (op, runner, source) triples whose cached tactic failed
@@ -2213,7 +2306,7 @@ class AutoTuner:
             return self.profiling_cache
         part = self._winner_partitions.get(key)
         if part is None:
-            part = self._winner_partitions[key] = {}
+            part = self._winner_partitions[key] = _WinnerSourceDict()
         return part
 
     def _winner_cache_identity(self) -> tuple | None:
@@ -2318,6 +2411,50 @@ class AutoTuner:
             if self._override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
         return tuning_config.dynamic_tensor_specs[spec_idx].map_to_tuning_buckets
+
+    def may_select_runner_class(self, runner_class_name: str) -> bool:
+        """Whether :meth:`choose_one` can now select a runner of this class
+        other than as the untuned fallback ``runners[0]``.
+
+        True in tuning mode; while a managed ``autotune_v2`` store is active
+        (its entries are read lazily from disk, so they are not scanned); and
+        when a winner source holds an entry of the class: the in-memory winners
+        of any store or policy partition, the configs of :meth:`load_configs`
+        or ``autotune(cache=...)``, or, with
+        ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``, the bundled configs.
+
+        While it is False, an op may leave an optional runner that is never
+        ``runners[0]`` out of its list: no lookup could select that runner, so
+        the call selects as if it were listed. The scan of the in-memory
+        sources is memoized per winner-source generation, so outside tuning
+        this check is a few attribute reads until a source changes.
+        """
+        if self.is_tuning_mode or self._active_managed_store is not None:
+            return True
+        generation, names = self._runner_class_names_memo
+        if generation != _winner_sources_generation:
+            with self._lock:
+                # Read the generation before the scan: a mutation the scan
+                # misses advances it afterwards, so the next call rescans.
+                generation = _winner_sources_generation
+                found: set[Any] = set()
+                for partition in (
+                    self.profiling_cache,
+                    *self._winner_partitions.values(),
+                ):
+                    found.update(
+                        getattr(key, "runner_class_name", None) for key in partition
+                    )
+                found.update(value[0] for value in self._file_configs.values())
+                names = frozenset(found)
+                self._runner_class_names_memo = (generation, names)
+        if runner_class_name in names:
+            return True
+        # The environment check first: without it the bundled configs are
+        # never read, so their modules are not imported.
+        return os.environ.get(
+            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"
+        ) == "1" and _bundled_configs_hold_runner_class(runner_class_name)
 
     def search_cache(
         self,

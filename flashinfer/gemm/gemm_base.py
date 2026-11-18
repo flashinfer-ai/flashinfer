@@ -33,7 +33,7 @@ import tvm_ffi
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
-from ..api_logging import flashinfer_api
+from ..api_logging import cake_auto_candidates_enabled, flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
@@ -56,6 +56,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    get_autotune_process_group,
     is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
@@ -1225,7 +1226,51 @@ def _heuristic_func_bmm_bf16(
         heuristic_backends.append("cutlass")
     if "tgv" in suitable_backends:
         heuristic_backends.append("tgv")
+    # CAKE joins as the last candidate only: the untuned call keeps the first
+    # backend, and a tuned call picks CAKE only when it measures faster.
+    if (
+        heuristic_backends
+        and "cake" in suitable_backends
+        and _cake_auto_candidate_open(_CAKE_BF16_BMM_RUNNER)
+    ):
+        heuristic_backends.append("cake")
     return heuristic_backends
+
+
+# Class names of the automatic Cake runners, which key their tuner entries.
+_CAKE_BF16_BMM_RUNNER = "CakeBf16BmmRunner"
+_CAKE_FP4_GEMM_RUNNER = "CakeFp4GemmRunner"
+
+
+def _cake_auto_candidate_open(runner_class_name: str) -> bool:
+    """Whether ``backend="auto"`` lists the Cake runner of this class now.
+
+    The runner is always the last candidate, so the tuner selects it only
+    while tuning or from a cache entry of its class
+    (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
+    no selection, so it is left out: the call keeps the runner list and host
+    cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
+    always leaves it out, and so does tuning under an autotune process group
+    (:func:`_cake_group_tuning`).
+    """
+    return (
+        cake_auto_candidates_enabled()
+        and not _cake_group_tuning()
+        and AutoTuner.get().may_select_runner_class(runner_class_name)
+    )
+
+
+def _cake_group_tuning() -> bool:
+    """Whether the tuner now tunes under an autotune process group
+    (:func:`~flashinfer.autotuner.set_autotune_process_group`).
+
+    Group tuning requires every rank to list the same runners for an op. The
+    automatic Cake candidates are offered per operands and per tuning bucket of
+    the rank-local M, so ranks could disagree; they are left out while a group
+    tunes, and every rank lists the other backends only. Outside tuning the
+    group checks nothing, and Cake is listed as without a group.
+    """
+    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
 
 
 @backend_requirement(
@@ -1272,8 +1317,22 @@ def bmm_bf16(
         (``flashinfer.jit.cake_bf16_bmm_swap_ab``) instead; set
         ``FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB=1`` to keep the dispatcher
         on every shape.
-        ``"cake"`` is explicit-only and is not considered by ``"auto"``;
-        ``"auto"`` continues to select from the existing autotuned backends.
+        ``"auto"`` lists ``"cake"`` as the last candidate when the call meets
+        the ``"cake"`` requirements above and at least one other backend is
+        listed and ``"cake"`` serves every M of the tuning bucket of M with
+        one program. The default buckets put each swap-AB row above together
+        with M that run the dispatcher, so ``"auto"`` lists ``"cake"`` for
+        such a row only when the effective tuning buckets give the row a
+        bucket of its own.
+        Without tuning, ``"auto"`` runs the first candidate as before, and
+        lists ``"cake"`` only while the autotuner holds a ``"cake"`` result
+        (see ``AutoTuner.may_select_runner_class``).
+        Under
+        ``flashinfer.autotune()``, ``"cake"`` is measured with the other
+        candidates and runs only when it is the fastest; tuning under
+        ``flashinfer.autotuner.set_autotune_process_group`` does not list it.
+        ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes it from
+        ``"auto"``; ``backend="cake"`` is not affected.
 
     Returns
     -------
@@ -1324,11 +1383,7 @@ def bmm_bf16(
         return bmm_bf16_cutile(A, B, out)
 
     if backend == "cake":
-        swap_ab = _cake_bf16_bmm_swap_ab_route(A, B, out)
-        if swap_ab is not None:
-            _run_cake_bf16_bmm_swap_ab(*swap_ab, A, B, out)
-        else:
-            get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
+        _run_cake_bf16_bmm(A, B, out)
         return out
 
     workspace_buffer = _get_stream_cache_buf(
@@ -2010,6 +2065,23 @@ _CAKE_BF16_BMM_SWAP_AB_ROWS = frozenset(
 )
 
 
+def _cake_bf16_bmm_swap_ab_row_route(
+    device: torch.device, row: tuple[int, int, int, int, torch.dtype]
+) -> Optional[Tuple[str, _SwapAB]]:
+    """The target and the generated swap-AB program routed for the
+    ``(batch, M, N, K, output dtype)`` row on ``device``, or ``None``; the
+    operand checks of :func:`_cake_bf16_bmm_swap_ab_route` are not applied."""
+    if row not in _CAKE_BF16_BMM_SWAP_AB_ROWS:
+        return None
+    if os.environ.get("FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB", "0") == "1":
+        return None
+    target = CAPABILITY_TARGET.get(get_compute_capability(device))
+    route = _CAKE_BF16_BMM_SWAP_AB_ROUTES.get(target, {}).get(row)
+    if route is None:
+        return None
+    return target, route
+
+
 def _cake_bf16_bmm_swap_ab_route(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
 ) -> Optional[Tuple[str, _SwapAB]]:
@@ -2018,15 +2090,10 @@ def _cake_bf16_bmm_swap_ab_route(
         return None
     batch, m, k = A.shape
     n = B.shape[2]
-    row = (batch, m, n, k, out.dtype)
-    if row not in _CAKE_BF16_BMM_SWAP_AB_ROWS:
+    routed = _cake_bf16_bmm_swap_ab_row_route(A.device, (batch, m, n, k, out.dtype))
+    if routed is None:
         return None
-    if os.environ.get("FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB", "0") == "1":
-        return None
-    target = CAPABILITY_TARGET.get(get_compute_capability(A.device))
-    route = _CAKE_BF16_BMM_SWAP_AB_ROUTES.get(target, {}).get(row)
-    if route is None:
-        return None
+    target, route = routed
     # The dispatcher's binding rejects dtypes, shapes and strides other than
     # these, a data pointer off 16 bytes and an output overlapping an input, also
     # under skip_check=True; such a call keeps the dispatcher, which raises its
@@ -2104,6 +2171,243 @@ def _run_cake_bf16_bmm_swap_ab(
             grid_y,
             grid_z,
         )
+
+
+def _run_cake_bf16_bmm(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
+    """``out[b] = A[b] @ B[b]`` by ``bmm_bf16(backend="cake")``: the generated
+    swap-AB program of the row when one serves it, else the dispatcher."""
+    swap_ab = _cake_bf16_bmm_swap_ab_route(A, B, out)
+    if swap_ab is not None:
+        _run_cake_bf16_bmm_swap_ab(*swap_ab, A, B, out)
+    else:
+        get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
+
+
+_INT32_MAX = 2**31 - 1
+
+
+@functools.lru_cache(maxsize=4096)
+def _cake_bf16_bmm_layout_serves(
+    a_shape: Tuple[int, ...],
+    a_stride: Tuple[int, ...],
+    a_dtype: torch.dtype,
+    b_shape: Tuple[int, ...],
+    b_stride: Tuple[int, ...],
+    b_dtype: torch.dtype,
+    out_shape: Tuple[int, ...],
+    out_stride: Tuple[int, ...],
+    out_dtype: torch.dtype,
+    a_device: torch.device,
+    b_device: torch.device,
+    out_device: torch.device,
+) -> bool:
+    """The checks of :func:`_cake_bf16_bmm_serves` that read no data pointer,
+    on the shapes, strides, dtypes and devices of 3D ``A``, ``B`` and ``out``;
+    memoized, since a model calls few distinct layouts."""
+    if not (a_device.type == "cuda" and a_device == b_device == out_device):
+        return False
+    if get_compute_capability(a_device) not in ((10, 0), (10, 3)):
+        return False
+    if a_dtype != torch.bfloat16 or b_dtype != torch.bfloat16:
+        return False
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    batch, m, k = a_shape
+    n = b_shape[2]
+    if min(batch, m, n, k) <= 0 or batch > 65535 or (n + 31) // 32 > 65535:
+        return False
+    if n % 8 != 0 or k not in (64, 256, 1024):
+        return False
+    if tuple(b_shape) != (batch, k, n) or tuple(out_shape) != (batch, m, n):
+        return False
+    if (
+        a_stride != (m * k, k, 1)
+        or b_stride != (k * n, 1, k)
+        or out_stride != (m * n, n, 1)
+    ):
+        return False
+    return (
+        batch * m * k <= _INT32_MAX
+        and batch * k * n <= _INT32_MAX
+        and batch * m * n * out_dtype.itemsize <= _INT32_MAX
+    )
+
+
+def _cake_bf16_bmm_serves(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> bool:
+    """Whether :func:`_run_cake_bf16_bmm` runs these operands without raising.
+
+    The checks of ``_cake_bmm_bf16_requirement`` plus those the dispatcher's
+    binding adds (exact strides, grid and int32 limits, 16-byte data pointers,
+    no output overlap), as a bool. The automatic CAKE candidate of
+    ``bmm_bf16`` is offered only where this holds, so a cached CAKE winner never
+    meets operands it rejects. A bias (``mm_bf16``) or 2D operands never qualify.
+    """
+    if bias is not None or A.dim() != 3 or B.dim() != 3 or out.dim() != 3:
+        return False
+    if not _cake_bf16_bmm_layout_serves(
+        A.shape,
+        A.stride(),
+        A.dtype,
+        B.shape,
+        B.stride(),
+        B.dtype,
+        out.shape,
+        out.stride(),
+        out.dtype,
+        A.device,
+        B.device,
+        out.device,
+    ):
+        return False
+    a, b, o = A.data_ptr(), B.data_ptr(), out.data_ptr()
+    if a % 16 != 0 or b % 16 != 0 or o % 16 != 0:
+        return False
+    a_bytes, b_bytes, o_bytes = A.nbytes, B.nbytes, out.nbytes
+    if (o < a + a_bytes and a < o + o_bytes) or (o < b + b_bytes and b < o + o_bytes):
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=4096)
+def _cake_bf16_bmm_bucket_verdict(
+    mapper: Callable[[int], int],
+    key: int,
+    target: Optional[str],
+    batch: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype,
+    out_size: int,
+) -> bool:
+    """Whether :func:`_run_cake_bf16_bmm` serves every M >= 1 that ``mapper``
+    sends to the bucket ``key``, all with one program, given that
+    :func:`_cake_bf16_bmm_serves` accepts the operands of one such M.
+
+    ``target`` is the swap-AB target of the device, ``None`` when no swap-AB
+    program can run. The checks of :func:`_cake_bf16_bmm_serves` that depend
+    on M are the int32 limits, which grow with M, and the swap-AB rows, which
+    each name one exact M. ``mapper`` is non-decreasing, so the bucket is the
+    interval [low, high] of M.
+    """
+    # The int32 limits hold for the whole bucket iff no M beyond the largest
+    # M they allow maps to the bucket (or above it).
+    m_max = min(_INT32_MAX // (batch * k), _INT32_MAX // (batch * n * out_size))
+    if mapper(m_max + 1) <= key:
+        return False
+    if target is None:
+        return True
+    # Only the swap-AB rows of these (batch, N, K, dtype) change the program.
+    rows = {
+        row[1]: route
+        for row, route in _CAKE_BF16_BMM_SWAP_AB_ROUTES.get(target, {}).items()
+        if (row[0], row[2], row[3], row[4]) == (batch, n, k, out_dtype)
+        and mapper(row[1]) == key
+    }
+    if not rows:
+        return True
+    # low: the smallest M of the bucket.
+    low, high = 1, min(rows)
+    while low < high:
+        mid = (low + high) // 2
+        if mapper(mid) < key:
+            low = mid + 1
+        else:
+            high = mid
+    # The bucket holds an M off the rows (one that runs the dispatcher) iff
+    # one of its first len(rows) + 1 values is not a row.
+    programs: set = set(rows.values())
+    for m in range(low, low + len(rows) + 1):
+        if mapper(m) != key:
+            break
+        if m not in rows:
+            programs.add(None)
+    return len(programs) == 1
+
+
+def _cake_bf16_bmm_serves_bucket(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
+) -> bool:
+    """Whether :func:`_run_cake_bf16_bmm` serves, with one program, every M of
+    the tuning bucket of these operands' M (for operands
+    :func:`_cake_bf16_bmm_serves` accepts).
+
+    The autotuner keys its result by the bucket of M and keeps one entry per
+    runner. A CAKE winner of a bucket is found only by calls that list the CAKE
+    runner, so the runner list must be the same for every M of the bucket: a
+    call that left CAKE out would miss the entry and run the untuned default.
+    A swap-AB program also serves its exact row only, so the timed program must
+    be the one that runs at every M of the bucket. Under the default buckets
+    every swap-AB row shares its bucket with M that run the dispatcher (M=8
+    with M=5..7), so a swap-AB row is an automatic candidate only where the
+    effective buckets give it a bucket of its own (the mapper of
+    ``autotune(round_up=True)`` maps each M to itself).
+    """
+    batch, m, k = A.shape
+    n = B.shape[2]
+    mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        _BF16_GEMM_SM100_TUNING_CONFIG
+    )
+    target = None
+    if os.environ.get("FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB", "0") != "1":
+        target = CAPABILITY_TARGET.get(get_compute_capability(A.device))
+    return _cake_bf16_bmm_bucket_verdict(
+        mapper, mapper(m), target, batch, n, k, out.dtype, out.element_size()
+    )
+
+
+def _cake_bf16_bmm_offered(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> bool:
+    """Whether the automatic CAKE candidate of ``bf16_gemm`` is offered for
+    these operands: :func:`_cake_bf16_bmm_serves` and
+    :func:`_cake_bf16_bmm_serves_bucket`."""
+    return _cake_bf16_bmm_serves(A, B, bias, out) and _cake_bf16_bmm_serves_bucket(
+        A, B, out
+    )
+
+
+@functools.cache
+def _cake_bf16_bmm_runner():
+    """The CAKE BF16 BMM as a ``bf16_gemm`` candidate: one configuration (the
+    dispatcher routes internally by shape), valid only for the operands
+    :func:`_cake_bf16_bmm_offered` accepts."""
+
+    class CakeBf16BmmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, bias, pdl, out, workspace_buffer.  The
+            # swap-AB rows are keyed by output dtype, so tune each dtype apart.
+            return (str(inputs[4].dtype),)
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            # The same bucket-wide check as the call site: a profiled bucket
+            # where some M leaves CAKE out never times it.
+            a, b, bias, _, out, _ = inputs
+            return [-1] if _cake_bf16_bmm_offered(a, b, bias, out) else []
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, _, _, out, _ = inputs
+            _run_cake_bf16_bmm(a, b, out)
+            return out
+
+    return CakeBf16BmmRunner()
 
 
 @functools.cache
@@ -3019,6 +3323,16 @@ def bf16_gemm_sm100(
         runners.append(_tinygemm_bf16_gemm_runner())
     if "cute-dsl" in runner_names:
         runners.extend(_cute_dsl_bf16_runners(inputs))
+    # bmm_bf16(backend="auto") lists "cake" after other backends, and only
+    # while the tuner may select it (_cake_auto_candidate_open, evaluated once
+    # per call by _heuristic_func_bmm_bf16). It is
+    # appended last, so it never becomes the untuned default runners[0]; only
+    # for operands it serves (3D, no bias), so a cached CAKE winner never meets
+    # operands it rejects; and only where it serves every M of the tuning
+    # bucket of M with one program, so every call of a bucket lists the same
+    # runners (a CAKE winner is never a cache miss for another M).
+    if "cake" in runner_names and runners and _cake_bf16_bmm_offered(a, b, bias, out):
+        runners.append(_cake_bf16_bmm_runner())
     assert runners, "No suitable runners found"
 
     # cuDNN, cuBLASLt and CUTLASS keys do not record pdl, so a pdl=False winner
@@ -10200,17 +10514,32 @@ def _heuristic_func_mm_fp4(
       - On SM103 (B300) - use cutlass (faster based on benchmarks).
       - On SM100 (B200) - use cudnn (faster based on benchmarks).
 
-    A per-token alpha overrides all of the above: of the automatically selected
-    backends only the CuTe-DSL SM100 kernel has a per-row alpha epilogue, and any
-    other backend would apply alpha[0] to every row.  The experimental ``cake``
-    backend has one too, but it is explicit opt-in only (``backend="cake"``) and
-    never auto-selected.
+    A per-token alpha overrides all of the above: of the stable backends only the
+    CuTe-DSL SM100 kernel has a per-row alpha epilogue, and any other backend
+    would apply alpha[0] to every row.  The experimental ``cake`` backend has one
+    too.  It follows ``cute-dsl`` as the last candidate when ``cute-dsl`` is
+    also suitable, the call passes its checker,
+    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` lets experimental backends
+    into ``suitable_backends``, ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES``
+    is not ``1``, and the tuner may select it (tuning without an autotune
+    process group, or a held ``cake`` result; see
+    :func:`_cake_auto_candidate_open`).  The untuned call runs
+    ``cute-dsl``; ``cake`` runs only when ``flashinfer.autotune()`` measures it
+    faster.
     """
     if batch_invariant:
         # the batch-invariant class runs in place of the backends: their availability does not decide the call
         return ["batch_invariant"]
     if _is_per_token_alpha(alpha):
-        return [c for c in ("cute-dsl",) if c in suitable_backends]
+        if "cute-dsl" not in suitable_backends:
+            return []
+        # backend_requirement has already removed "cake" (an experimental
+        # backend) unless FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1.
+        if "cake" in suitable_backends and _cake_auto_candidate_open(
+            _CAKE_FP4_GEMM_RUNNER
+        ):
+            return ["cute-dsl", "cake"]
+        return ["cute-dsl"]
 
     cuda_version = get_cuda_version()
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
@@ -10274,6 +10603,16 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
         return m * k
     else:
         raise ValueError(f"Unsupported swizzle layout: {swizzle_layout}")
+
+
+@functools.cache
+def _cake_per_token_auto_candidate():
+    """The experimental module of the automatic per-token Cake ``mm_fp4``
+    candidate (its operand check and runner), imported on first use: core
+    reaches ``flashinfer.experimental`` through deferred imports only."""
+    from ..experimental.cake_nvfp4_per_token import auto_candidate
+
+    return auto_candidate
 
 
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
@@ -10502,7 +10841,8 @@ def mm_fp4(
         quantized with a dynamic per-token NVFP4 global scale). The per-token
         form is implemented by the ``"cute-dsl"`` backend on SM100/SM103
         (``backend="auto"`` selects it) and by the experimental ``"cake"``
-        backend (explicit opt-in).
+        backend (explicit opt-in, or a tuned ``"auto"`` candidate; see
+        ``backend``).
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
@@ -10525,12 +10865,19 @@ def mm_fp4(
         different weight preparation. The ``"cutedsl_low_latency"`` backend is the last
         heuristic candidate for eligible SM100/SM103 problems and requires
         ``M <= 8``, 128x4 scale factors, and K divisible by 64 for NVFP4 or 128
-        for MXFP4. The experimental ``"cake"`` backend (SM100/SM103, never
-        auto-selected) serves the per-token alpha NVFP4 case only: ``alpha`` of
-        shape ``(m,)``, 128x4 scale factors, ``b`` the column-major view of a
-        contiguous ``(n, k)`` weight, ``N % 8 == 0``, ``K % 256 == 0``, and a
-        contiguous bf16 / fp16 output; see
-        ``flashinfer/experimental/cake_nvfp4_per_token/README.md``.
+        for MXFP4. The experimental ``"cake"`` backend (SM100/SM103) serves
+        the per-token alpha NVFP4 case only: ``alpha`` of shape ``(m,)``,
+        128x4 scale factors, ``b`` the column-major view of a contiguous
+        ``(n, k)`` weight, ``N % 8 == 0`` and ``N >= 32``, ``K % 256 == 0``,
+        ``enable_pdl``, and a contiguous bf16 / fp16 output; see
+        ``flashinfer/experimental/cake_nvfp4_per_token/README.md``. For such a
+        call ``"auto"`` adds ``"cake"`` after ``"cute-dsl"`` when
+        ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set and
+        ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` is not, and outside
+        tuning only while the autotuner holds a ``"cake"`` result. Without
+        tuning, ``"auto"`` still runs ``"cute-dsl"``. Under ``flashinfer.autotune()``,
+        ``"cake"`` is measured with ``"cute-dsl"`` and runs only when it is
+        the fastest.
         On SM120/SM121, explicit ``"cute-dsl"`` supports packed
         uint8 NVFP4 inputs with BF16 output, 128x4 scale factors, and logical
         N and K divisible by 64. Logical M may be ragged. A and B scale storage
@@ -10628,18 +10975,24 @@ def mm_fp4(
     major, minor = get_compute_capability(a.device)
 
     # For a per-token alpha the requirement functions and _heuristic_func_mm_fp4
-    # have already narrowed the candidates to the CuTe-DSL backend. A backend
-    # without the per-row epilogue would silently apply alpha[0] to every row,
-    # so keep a backstop for skip_check=True rather than trust the list.
+    # have already narrowed the candidates to the CuTe-DSL backend, followed by
+    # the cake backend when it is an automatic candidate. A backend without the
+    # per-row epilogue would silently apply alpha[0] to every row, so keep a
+    # backstop for skip_check=True rather than trust the list.
     per_token_alpha = _is_per_token_alpha(alpha)
-    if per_token_alpha and list(backends) not in (["cute-dsl"], ["cake"]):
+    if per_token_alpha and list(backends) not in (
+        ["cute-dsl"],
+        ["cake"],
+        ["cute-dsl", "cake"],
+    ):
         raise ValueError(
             "per-token alpha is only implemented by the 'cute-dsl' and 'cake' "
             f"backends (SM100/SM103), got backends {list(backends)}."
         )
     if list(backends) == ["cake"]:
         # Experimental generated-program backend: its own host dispatch, no
-        # autotuner. Explicit opt-in only (never in suitable_auto_backends).
+        # autotuner. Explicit backend="cake" only: "auto" lists cake after
+        # cute-dsl, never alone, and tunes it through cake_gemm_fp4_runner.
         from ..experimental.cake_nvfp4_per_token.cake_backend import (
             mm_fp4_per_token,
         )
@@ -10673,6 +11026,9 @@ def mm_fp4(
         "b12x": lambda: _b12x_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
+        "cake": lambda: _cake_per_token_auto_candidate().cake_gemm_fp4_runner(
+            use_8x4_sf_layout, enable_pdl
+        ),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 
@@ -10688,6 +11044,18 @@ def mm_fp4(
         use_nvfp4,
         workspace_buffer,
     ]
+    # The automatic cake candidate follows cute-dsl, listed by
+    # _heuristic_func_mm_fp4 only while the tuner may select it. Drop it when
+    # these exact operands are outside what it serves, so a cached cake winner
+    # never meets operands it rejects; the call then keeps cute-dsl.
+    if (
+        len(runners) > 1
+        and backends[-1] == "cake"
+        and not _cake_per_token_auto_candidate().cake_fp4_gemm_serves(
+            inputs, use_8x4_sf_layout, enable_pdl
+        )
+    ):
+        runners.pop()
     runner, tactic = tuner.choose_one(
         "fp4_gemm",
         runners,

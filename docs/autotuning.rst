@@ -554,6 +554,31 @@ prepared selections. Protocol records are separate from v1 JSON import/export.
 Existing ``autotune()`` controls can be nested as specified by v2; they do not
 import or export protocol records.
 
+Cake Backends as Autotuning Candidates
+--------------------------------------
+
+Some GEMM APIs append their Cake backend as the **last** runner of the
+``backend="auto"`` candidate list: ``bmm_bf16``, ``mm_nvfp4_svdquant`` (SM100/SM103)
+and the per-token-alpha path of ``mm_fp4``. The Cake runner is offered only for
+inputs it serves. Being last, it never changes the untuned default or a cache-miss
+fallback (``runners[0]``, tactic ``-1``); under ``flashinfer.autotune()`` it is
+measured with the other runners and is used only when it is the fastest.
+Tuning under an autotune process group
+(:func:`flashinfer.autotuner.set_autotune_process_group`) does not measure Cake:
+every rank of the group must list the same runners, and Cake is offered per
+rank-local operands. Outside
+tuning, the Cake runner is listed only while the autotuner can select it: it holds
+a Cake result tuned in this process or loaded from a cache file, or an
+``autotune_v2`` store is active (``AutoTuner.may_select_runner_class``). Untuned
+calls therefore keep the runner list and host cost of the other backends. Explicit
+``backend="cake"`` is unchanged. The per-token ``mm_fp4`` Cake backend is
+experimental and additionally needs ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
+To remove all automatic Cake candidates, set:
+
+.. code-block:: bash
+
+    export FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1
+
 cuTile Autotuning
 -----------------
 
