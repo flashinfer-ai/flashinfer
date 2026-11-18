@@ -1686,7 +1686,8 @@ CUtensorMap make_u8_map(const uint8_t* base, uint64_t width, uint64_t height) {
       &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
       elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  (void)status;
+  TVM_FFI_ICHECK(status == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed with status " << static_cast<int>(status);
   return map;
 }
 
@@ -1700,7 +1701,8 @@ CUtensorMap make_u8_map64(const uint8_t* base, uint64_t width, uint64_t height) 
       &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
       elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  (void)status;
+  TVM_FFI_ICHECK(status == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed with status " << static_cast<int>(status);
   return map;
 }
 
@@ -1709,16 +1711,23 @@ CUtensorMap make_u8_map64(const uint8_t* base, uint64_t width, uint64_t height) 
 // Reuse allocation capacity only; every input-dependent byte consumed by a
 // kernel is overwritten on each call.  This removes stream-ordered allocator
 // traffic from the measured path without caching routing or computed results.
-static void* g_scratch = nullptr;
-static size_t g_scratch_bytes = 0;
+// Scratch is per device, growth RETAINS the previous allocation instead of
+// freeing it (captured CUDA graphs replay with the addresses they recorded;
+// the retained total is bounded by the finite num_tokens allowlist), and
+// pointer/capacity are committed only after allocation succeeds so a failed
+// cudaMalloc leaves a retryable state.
+static constexpr int kMaxDevices = 64;
+static void* g_scratch[kMaxDevices] = {};
+static size_t g_scratch_bytes[kMaxDevices] = {};
 
-static void* get_scratch(size_t bytes) {
-  if (bytes > g_scratch_bytes) {
-    if (g_scratch) cudaFree(g_scratch);
-    cudaMalloc(&g_scratch, bytes);
-    g_scratch_bytes = bytes;
+static void* get_scratch(int dev, size_t bytes) {
+  if (bytes > g_scratch_bytes[dev]) {
+    void* fresh = nullptr;
+    if (cudaMalloc(&fresh, bytes) != cudaSuccess) return nullptr;
+    g_scratch[dev] = fresh;  // the previous allocation is intentionally retained
+    g_scratch_bytes[dev] = bytes;
   }
-  return g_scratch;
+  return g_scratch[dev];
 }
 
 void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
@@ -1726,8 +1735,9 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
              ffi::TensorView topk_weights, ffi::TensorView out) {
   const int tokens = static_cast<int>(hidden_states.size(0));
   const int routes = tokens * TOPK;
-  cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, hidden_states.device().device_id));
+  const int dev = hidden_states.device().device_id;
+  TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
+  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, dev));
   auto* xp = static_cast<const __nv_bfloat16*>(hidden_states.data_ptr());
   auto* w13p = static_cast<const uint8_t*>(w13.data_ptr());
   auto* w13sp = static_cast<const float*>(w13_scale.data_ptr());
@@ -1746,7 +1756,8 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   if (tokens <= 64) {
     const size_t zf_bytes = static_cast<size_t>(routes) * I * sizeof(float);
     uint8_t* scratch = static_cast<uint8_t*>(
-        get_scratch(xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
+        get_scratch(dev, xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
+    TVM_FFI_ICHECK(scratch != nullptr) << "prefill scratch allocation failed";
     uint8_t* xq = scratch;
     float* xs = reinterpret_cast<float*>(xq + xq_bytes);
     float* zfloat = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xs) + xs_bytes);
@@ -1758,8 +1769,10 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
     int token_arg = tokens;
     void* args[] = {&xp, &w13p, &w13sp,  &w2p, &w2sp, &idp,      &rwp,      &outp,
                     &xq, &xs,   &zfloat, &zq,  &zs,   &barriers, &token_arg};
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(fused_decode_kernel), dim3(blocks),
-                                dim3(threads), args, 0, stream);
+    const cudaError_t st = cudaLaunchCooperativeKernel(
+        reinterpret_cast<void*>(fused_decode_kernel), dim3(blocks), dim3(threads), args, 0, stream);
+    TVM_FFI_ICHECK(st == cudaSuccess)
+        << "fused decode cooperative launch failed: " << cudaGetErrorString(st);
     return;
   }
 
@@ -1778,7 +1791,8 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
       sizeof(int) + static_cast<size_t>(max_tiles2) * 3 * sizeof(int) + sizeof(int) + 256;
   const size_t scratch_bytes = xq_bytes + xs_bytes + zbf_bytes + accum_out_bytes + metadata_bytes +
                                static_cast<size_t>(routes) * sizeof(float) + 256;
-  uint8_t* scratch = static_cast<uint8_t*>(get_scratch(scratch_bytes));
+  uint8_t* scratch = static_cast<uint8_t*>(get_scratch(dev, scratch_bytes));
+  TVM_FFI_ICHECK(scratch != nullptr) << "prefill scratch allocation failed";
   uint8_t* ptr = scratch;
   uint8_t* xq = ptr;
   ptr += xq_bytes;
@@ -1833,12 +1847,18 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
                                                 tile2_valid, total_tiles2);
     prepare_scatter_kernel<<<256, 512, 0, stream>>>(idp, cursors, sorted_routes, routes);
   } else {
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefill_kernel), dim3(188),
-                                dim3(1024), prep_args, 0, stream);
+    const cudaError_t st =
+        cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefill_kernel), dim3(188),
+                                    dim3(1024), prep_args, 0, stream);
+    // A failed preparation must never continue into consumers that read the
+    // routing metadata it was meant to produce.
+    TVM_FFI_ICHECK(st == cudaSuccess)
+        << "prefill preparation launch failed: " << cudaGetErrorString(st);
   }
 
-  static bool attrs_set = false;
-  if (!attrs_set) {
+  // The shared-memory opt-in applies to the launching device only.
+  static bool attrs_set[kMaxDevices] = {};
+  if (!attrs_set[dev]) {
     cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          PREFILL_SMEM);
     cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M48>,
@@ -1859,7 +1879,7 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
                          cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
     cudaFuncSetAttribute(grouped_fc2_bf16_kernel<8, PREFILL_M, BF16_FC2_THREADS, true>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
-    attrs_set = true;
+    attrs_set[dev] = true;
   }
   if (tokens >= 8192) {
     grouped_fc1_kernel<PREFILL_FC1_BIG_M>
@@ -1906,6 +1926,9 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   }
   const int cast_blocks = (tokens * (H / 4) + 767) / 768;
   cast_output_kernel<<<cast_blocks, 768, 0, stream>>>(accum_out, outp, tokens);
+  const cudaError_t tail_status = cudaGetLastError();
+  TVM_FFI_ICHECK(tail_status == cudaSuccess)
+      << "prefill kernel launch failed: " << cudaGetErrorString(tail_status);
 }
 
 }  // namespace flat16384

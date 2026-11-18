@@ -1586,7 +1586,8 @@ CUtensorMap make_u8_map(const uint8_t* base, uint64_t width, uint64_t height) {
       &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
       elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  (void)status;
+  TVM_FFI_ICHECK(status == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed with status " << static_cast<int>(status);
   return map;
 }
 
@@ -1600,7 +1601,8 @@ CUtensorMap make_u8_map64(const uint8_t* base, uint64_t width, uint64_t height) 
       &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
       elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  (void)status;
+  TVM_FFI_ICHECK(status == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed with status " << static_cast<int>(status);
   return map;
 }
 
@@ -1616,7 +1618,8 @@ CUtensorMap make_u8_map64x256(const uint8_t* base, uint64_t width, uint64_t heig
       elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
       promote_256b ? CU_TENSOR_MAP_L2_PROMOTION_L2_256B : CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  (void)status;
+  TVM_FFI_ICHECK(status == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed with status " << static_cast<int>(status);
   return map;
 }
 
@@ -1625,16 +1628,23 @@ CUtensorMap make_u8_map64x256(const uint8_t* base, uint64_t width, uint64_t heig
 // Reuse allocation capacity only; every input-dependent byte consumed by a
 // kernel is overwritten on each call.  This removes stream-ordered allocator
 // traffic from the measured path without caching routing or computed results.
-static void* g_scratch = nullptr;
-static size_t g_scratch_bytes = 0;
+// Scratch is per device, growth RETAINS the previous allocation instead of
+// freeing it (captured CUDA graphs replay with the addresses they recorded;
+// the retained total is bounded by the finite num_tokens allowlist), and
+// pointer/capacity are committed only after allocation succeeds so a failed
+// cudaMalloc leaves a retryable state.
+static constexpr int kMaxDevices = 64;
+static void* g_scratch[kMaxDevices] = {};
+static size_t g_scratch_bytes[kMaxDevices] = {};
 
-static void* get_scratch(size_t bytes) {
-  if (bytes > g_scratch_bytes) {
-    if (g_scratch) cudaFree(g_scratch);
-    cudaMalloc(&g_scratch, bytes);
-    g_scratch_bytes = bytes;
+static void* get_scratch(int dev, size_t bytes) {
+  if (bytes > g_scratch_bytes[dev]) {
+    void* fresh = nullptr;
+    if (cudaMalloc(&fresh, bytes) != cudaSuccess) return nullptr;
+    g_scratch[dev] = fresh;  // the previous allocation is intentionally retained
+    g_scratch_bytes[dev] = bytes;
   }
-  return g_scratch;
+  return g_scratch[dev];
 }
 
 void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
@@ -1642,8 +1652,9 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
              ffi::TensorView topk_weights, ffi::TensorView out) {
   const int tokens = static_cast<int>(hidden_states.size(0));
   const int routes = tokens * TOPK;
-  cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, hidden_states.device().device_id));
+  const int dev = hidden_states.device().device_id;
+  TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
+  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, dev));
   auto* xp = static_cast<const __nv_bfloat16*>(hidden_states.data_ptr());
   auto* w13p = static_cast<const uint8_t*>(w13.data_ptr());
   auto* w13sp = static_cast<const float*>(w13_scale.data_ptr());
@@ -1662,7 +1673,8 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   if (tokens <= 64) {
     const size_t zf_bytes = static_cast<size_t>(routes) * I * sizeof(float);
     uint8_t* scratch = static_cast<uint8_t*>(
-        get_scratch(xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
+        get_scratch(dev, xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
+    TVM_FFI_ICHECK(scratch != nullptr) << "prefill scratch allocation failed";
     uint8_t* xq = scratch;
     float* xs = reinterpret_cast<float*>(xq + xq_bytes);
     float* zfloat = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xs) + xs_bytes);
@@ -1674,8 +1686,10 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
     int token_arg = tokens;
     void* args[] = {&xp, &w13p, &w13sp,  &w2p, &w2sp, &idp,      &rwp,      &outp,
                     &xq, &xs,   &zfloat, &zq,  &zs,   &barriers, &token_arg};
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(fused_decode_kernel), dim3(blocks),
-                                dim3(threads), args, 0, stream);
+    const cudaError_t st = cudaLaunchCooperativeKernel(
+        reinterpret_cast<void*>(fused_decode_kernel), dim3(blocks), dim3(threads), args, 0, stream);
+    TVM_FFI_ICHECK(st == cudaSuccess)
+        << "fused decode cooperative launch failed: " << cudaGetErrorString(st);
     return;
   }
 
@@ -1696,7 +1710,8 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
                                 (use_m96 ? sizeof(int) : 0) + 256;
   const size_t scratch_bytes = xq_bytes + xs_bytes + zbf_bytes + accum_out_bytes + metadata_bytes +
                                static_cast<size_t>(routes) * sizeof(float) + 256;
-  uint8_t* scratch = static_cast<uint8_t*>(get_scratch(scratch_bytes));
+  uint8_t* scratch = static_cast<uint8_t*>(get_scratch(dev, scratch_bytes));
+  TVM_FFI_ICHECK(scratch != nullptr) << "prefill scratch allocation failed";
   uint8_t* ptr = scratch;
   uint8_t* xq = ptr;
   ptr += xq_bytes;
@@ -1752,12 +1767,20 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
                                  &counts,     &rwp_in,        &rw_safe,     &starts,
                                  &cursors,    &sorted_routes, &tile_expert, &tile_base,
                                  &tile_valid, &total_tiles,   &fc2_counter, &token_arg};
-      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_hist_quant_m48_fused_kernel),
-                                  dim3(96), dim3(1024), hist_fused_args, 0, stream);
+      const cudaError_t st =
+          cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_hist_quant_m48_fused_kernel),
+                                      dim3(96), dim3(1024), hist_fused_args, 0, stream);
+      TVM_FFI_ICHECK(st == cudaSuccess)
+          << "prefill preparation launch failed: " << cudaGetErrorString(st);
     } else {
       void* hist_args[] = {&xp, &idp, &xq, &xs, &counts, &rwp_in, &rw_safe, &token_arg};
-      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_hist_quant_kernel), dim3(188),
-                                  dim3(1024), hist_args, 0, stream);
+      const cudaError_t st =
+          cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_hist_quant_kernel), dim3(188),
+                                      dim3(1024), hist_args, 0, stream);
+      // A failed preparation must never continue into consumers that read the
+      // routing metadata it was meant to produce.
+      TVM_FFI_ICHECK(st == cudaSuccess)
+          << "prefill preparation launch failed: " << cudaGetErrorString(st);
     }
     rwp = rw_safe;
     void* route_args[] = {
@@ -1775,9 +1798,11 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
                               &total_tiles96,
                               &fc2_counter,
                               const_cast<int*>(&routes)};
-      cudaLaunchCooperativeKernel(
+      const cudaError_t st = cudaLaunchCooperativeKernel(
           reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M96>), dim3(94), dim3(256),
           route96_args, 0, stream);
+      TVM_FFI_ICHECK(st == cudaSuccess)
+          << "prefill route-scatter launch failed: " << cudaGetErrorString(st);
       prepare_prefix_kernel<<<1, 256, 0, stream>>>(counts, starts, cursors, tile_expert, tile_base,
                                                    tile_valid, total_tiles, fc2_counter);
     } else if (use_m48) {
@@ -1785,31 +1810,41 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
         // Eight warps per CTA scatter 256 routes. Use exactly one wave over
         // the route list instead of sending idle CTAs through the grid barrier.
         const int route_blocks = tokens / 32;
-        cudaLaunchCooperativeKernel(
+        const cudaError_t st = cudaLaunchCooperativeKernel(
             reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M48>), dim3(route_blocks),
             dim3(256), route_args, 0, stream);
+        TVM_FFI_ICHECK(st == cudaSuccess)
+            << "prefill route-scatter launch failed: " << cudaGetErrorString(st);
       }
     } else {
-      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M>),
-                                  dim3(94), dim3(256), route_args, 0, stream);
+      const cudaError_t st = cudaLaunchCooperativeKernel(
+          reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M>), dim3(94), dim3(256),
+          route_args, 0, stream);
+      TVM_FFI_ICHECK(st == cudaSuccess)
+          << "prefill route-scatter launch failed: " << cudaGetErrorString(st);
     }
   } else {
     void* prep_args[] = {&xp,          &idp,       &xq,         &xs,
                          &counts,      &starts,    &cursors,    &sorted_routes,
                          &tile_expert, &tile_base, &tile_valid, &total_tiles,
                          &fc2_counter, &accum_out, &token_arg};
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefill_kernel), dim3(188),
-                                dim3(1024), prep_args, 0, stream);
+    const cudaError_t st =
+        cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefill_kernel), dim3(188),
+                                    dim3(1024), prep_args, 0, stream);
+    TVM_FFI_ICHECK(st == cudaSuccess)
+        << "prefill preparation launch failed: " << cudaGetErrorString(st);
   }
 
   if (use_m96) {
-    static bool m96_attrs_set = false;
-    if (!m96_attrs_set) {
+    // The shared-memory opt-in applies to the launching device only, so track
+    // it per device (the same holds for the M48 and M64 guards below).
+    static bool m96_attrs_set[kMaxDevices] = {};
+    if (!m96_attrs_set[dev]) {
       cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M96>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_M96_SMEM);
       cudaFuncSetAttribute(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
-      m96_attrs_set = true;
+      m96_attrs_set[dev] = true;
     }
     grouped_fc1_kernel<PREFILL_M96><<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_M96_SMEM, stream>>>(
         xq, xs, w13_map, w13sp, sorted_routes, tile96_expert, tile96_base, tile96_valid,
@@ -1817,17 +1852,18 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
     void* fc2_args[] = {&zbf,         w2_map_arg, &w2sp,       &rwp,         &sorted_routes,
                         &tile_expert, &tile_base, &tile_valid, &total_tiles, &fc2_counter,
                         &accum_out,   &outp,      &token_arg};
-    cudaLaunchCooperativeKernel(
+    const cudaError_t st = cudaLaunchCooperativeKernel(
         reinterpret_cast<void*>(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>),
         dim3(PREFILL_BLOCKS), dim3(BF16_FC2_THREADS), fc2_args, BF16_FC2_SMEM, stream);
+    TVM_FFI_ICHECK(st == cudaSuccess) << "prefill FC2 launch failed: " << cudaGetErrorString(st);
   } else if (use_m48) {
-    static bool m48_attrs_set = false;
-    if (!m48_attrs_set) {
+    static bool m48_attrs_set[kMaxDevices] = {};
+    if (!m48_attrs_set[dev]) {
       cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M48>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_M48_SMEM);
       cudaFuncSetAttribute(grouped_fc2_bf16_kernel<PREFILL_M48, BF16_FC2_M48_THREADS>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_M48_SMEM);
-      m48_attrs_set = true;
+      m48_attrs_set[dev] = true;
     }
     const int m48_blocks = tokens == 256 ? 175 : PREFILL_BLOCKS;
     grouped_fc1_kernel<PREFILL_M48><<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_M48_SMEM, stream>>>(
@@ -1836,17 +1872,18 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
     void* fc2_args[] = {&zbf,         w2_map_arg, &w2sp,       &rwp,         &sorted_routes,
                         &tile_expert, &tile_base, &tile_valid, &total_tiles, &fc2_counter,
                         &accum_out,   &outp,      &token_arg};
-    cudaLaunchCooperativeKernel(
+    const cudaError_t st = cudaLaunchCooperativeKernel(
         reinterpret_cast<void*>(grouped_fc2_bf16_kernel<PREFILL_M48, BF16_FC2_M48_THREADS>),
         dim3(m48_blocks), dim3(BF16_FC2_M48_THREADS), fc2_args, BF16_FC2_M48_SMEM, stream);
+    TVM_FFI_ICHECK(st == cudaSuccess) << "prefill FC2 launch failed: " << cudaGetErrorString(st);
   } else {
-    static bool m64_attrs_set = false;
-    if (!m64_attrs_set) {
+    static bool m64_attrs_set[kMaxDevices] = {};
+    if (!m64_attrs_set[dev]) {
       cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM);
       cudaFuncSetAttribute(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
-      m64_attrs_set = true;
+      m64_attrs_set[dev] = true;
     }
     grouped_fc1_kernel<PREFILL_M><<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_SMEM, stream>>>(
         xq, xs, w13_map, w13sp, sorted_routes, tile_expert, tile_base, tile_valid, total_tiles, zbf,
@@ -1854,8 +1891,12 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
     void* fc2_args[] = {&zbf,         w2_map_arg, &w2sp,       &rwp,         &sorted_routes,
                         &tile_expert, &tile_base, &tile_valid, &total_tiles, &fc2_counter,
                         &accum_out,   &outp,      &token_arg};
-    cudaLaunchCooperativeKernel(
+    const cudaError_t st = cudaLaunchCooperativeKernel(
         reinterpret_cast<void*>(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>),
         dim3(PREFILL_BLOCKS), dim3(BF16_FC2_THREADS), fc2_args, BF16_FC2_SMEM, stream);
+    TVM_FFI_ICHECK(st == cudaSuccess) << "prefill FC2 launch failed: " << cudaGetErrorString(st);
   }
+  const cudaError_t tail_status = cudaGetLastError();
+  TVM_FFI_ICHECK(tail_status == cudaSuccess)
+      << "prefill kernel launch failed: " << cudaGetErrorString(tail_status);
 }

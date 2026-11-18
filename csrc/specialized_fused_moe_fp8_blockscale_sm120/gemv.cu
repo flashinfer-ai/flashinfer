@@ -8,6 +8,7 @@
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
+#include <cstring>
 
 namespace ffi = tvm::ffi;
 namespace cg = cooperative_groups;
@@ -80,6 +81,15 @@ __device__ __forceinline__ float dot16(uint4 w, const X16& x) {
   return (s0 + s1) + (s2 + s3);
 }
 
+// Defined bit copy of a packed f16x2 register into __half2 (memcpy compiles
+// to a plain register move): reading the uint32_t through a __half2* would be
+// undefined behaviour under the C++ aliasing rules.
+__device__ __forceinline__ float2 t1_u32_as_half2_f2(uint32_t v) {
+  __half2 h;
+  memcpy(&h, &v, sizeof(h));
+  return __half22float2(h);
+}
+
 __device__ __forceinline__ float dot16_native_generic(uint4 w, const X16& x) {
   const uint32_t* wp = reinterpret_cast<const uint32_t*>(&w);
   float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
@@ -88,8 +98,8 @@ __device__ __forceinline__ float dot16_native_generic(uint4 w, const X16& x) {
     uint32_t h01, h23;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"(static_cast<unsigned short>(wp[j])));
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"(static_cast<unsigned short>(wp[j] >> 16)));
-    const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&h01));
-    const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&h23));
+    const float2 f01 = t1_u32_as_half2_f2(h01);
+    const float2 f23 = t1_u32_as_half2_f2(h23);
     s0 = fmaf(f01.x, x.v[4 * j], s0);
     s1 = fmaf(f01.y, x.v[4 * j + 1], s1);
     s2 = fmaf(f23.x, x.v[4 * j + 2], s2);
@@ -463,8 +473,8 @@ __device__ __forceinline__ float t1_dot16_native(uint4 w, const X16& x) {
     uint32_t h01, h23;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"(static_cast<unsigned short>(wp[j])));
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"(static_cast<unsigned short>(wp[j] >> 16)));
-    const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&h01));
-    const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&h23));
+    const float2 f01 = t1_u32_as_half2_f2(h01);
+    const float2 f23 = t1_u32_as_half2_f2(h23);
     s0 = fmaf(f01.x, x.v[4 * j], s0);
     s1 = fmaf(f01.y, x.v[4 * j + 1], s1);
     s2 = fmaf(f23.x, x.v[4 * j + 2], s2);
@@ -485,10 +495,10 @@ __device__ __forceinline__ float2 t1_dot16_native_pair(uint4 wg, uint4 wu, const
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(gh23) : "h"(static_cast<unsigned short>(gp[j] >> 16)));
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(uh01) : "h"(static_cast<unsigned short>(up[j])));
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(uh23) : "h"(static_cast<unsigned short>(up[j] >> 16)));
-    const float2 gf01 = __half22float2(*reinterpret_cast<const __half2*>(&gh01));
-    const float2 gf23 = __half22float2(*reinterpret_cast<const __half2*>(&gh23));
-    const float2 uf01 = __half22float2(*reinterpret_cast<const __half2*>(&uh01));
-    const float2 uf23 = __half22float2(*reinterpret_cast<const __half2*>(&uh23));
+    const float2 gf01 = t1_u32_as_half2_f2(gh01);
+    const float2 gf23 = t1_u32_as_half2_f2(gh23);
+    const float2 uf01 = t1_u32_as_half2_f2(uh01);
+    const float2 uf23 = t1_u32_as_half2_f2(uh23);
     g0 = fmaf(gf01.x, x.v[4 * j], g0);
     g1 = fmaf(gf01.y, x.v[4 * j + 1], g1);
     g2 = fmaf(gf23.x, x.v[4 * j + 2], g2);
@@ -920,20 +930,43 @@ __global__ __launch_bounds__(256) void f32_to_bf16(const float* __restrict__ src
 
 // ---------------------------------------------------------------- workspace
 namespace {
+constexpr int kMaxDevices = 64;
 struct Workspace {
   void* ptr = nullptr;
   size_t cap = 0;
-  void ensure(size_t bytes) {
-    if (bytes <= cap) return;
-    if (ptr) cudaFree(ptr);
-    cudaMalloc(&ptr, bytes);
-    cudaMemset(ptr, 0, 256);
+  // Growth RETAINS the previous allocation instead of freeing it: a captured
+  // CUDA graph replays with the addresses it recorded, so freeing on growth
+  // would hand replay dangling pointers. The retained total is bounded by the
+  // finite num_tokens allowlist (strictly less than 2x the largest variant's
+  // scratch). Pointer/capacity are committed only after allocation succeeds,
+  // so a failed cudaMalloc leaves a retryable state. The 256 barrier bytes at
+  // the base are zeroed on the execution stream, ordering the reset before
+  // the first cooperative kernel even on nonblocking streams.
+  cudaError_t ensure(size_t bytes, cudaStream_t stream) {
+    if (bytes <= cap) return cudaSuccess;
+    void* fresh = nullptr;
+    cudaError_t status = cudaMalloc(&fresh, bytes);
+    if (status != cudaSuccess) return status;
+    status = cudaMemsetAsync(fresh, 0, 256, stream);
+    if (status != cudaSuccess) {
+      cudaFree(fresh);
+      return status;
+    }
+    ptr = fresh;  // the previous allocation is intentionally retained
     cap = bytes;
+    return cudaSuccess;
   }
 };
-Workspace g_ws;
-int g_t1_v3_ok = -1;
-int g_t1_clu = -1;
+// All cached state is per device: scratch from one device is not usable on
+// another, and the occupancy probes answer for one device only.
+Workspace g_ws[kMaxDevices];
+int g_t1_v3_ok[kMaxDevices];
+int g_t1_clu[kMaxDevices];
+struct GemvCacheInit {
+  GemvCacheInit() {
+    for (int i = 0; i < kMaxDevices; ++i) g_t1_v3_ok[i] = g_t1_clu[i] = -1;
+  }
+} g_gemv_cache_init;
 inline size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 }  // namespace
 
@@ -964,8 +997,12 @@ void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   const bool BIG = (T >= 1024);
   size_t o_of = off;
   if (BIG) off = align_up(off + (size_t)T * HID * 4, 256);
-  g_ws.ensure(off);
-  char* base = (char*)g_ws.ptr;
+  const int dev = hidden_states.device().device_id;
+  TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
+  const cudaError_t ws_status = g_ws[dev].ensure(off, stream);
+  TVM_FFI_ICHECK(ws_status == cudaSuccess)
+      << "workspace allocation failed: " << cudaGetErrorString(ws_status);
+  char* base = (char*)g_ws[dev].ptr;
   int* pair_idx = (int*)(base + o_pair);
   int* pos_of = (int*)(base + o_pos);
   int* tile_e = (int*)(base + o_te);
@@ -985,19 +1022,18 @@ void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   __nv_bfloat16* pout = (__nv_bfloat16*)out.data_ptr();
 
   if (T == 1) {
-    if (g_t1_v3_ok < 0) {
+    if (g_t1_v3_ok[dev] < 0) {
       int coop = 0, sms = 0, occ = 0;
-      const int dev = hidden_states.device().device_id;
       cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev);
       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, t1_v3_kernel<T1NR, T1PF>, 256, 0);
-      g_t1_v3_ok = coop && occ * sms >= (2048 / T1NR);
+      g_t1_v3_ok[dev] = coop && occ * sms >= (2048 / T1NR);
     }
-    if (g_t1_v3_ok) {
+    if (g_t1_v3_ok[dev]) {
       unsigned int* bar = reinterpret_cast<unsigned int*>(base);
-      if (g_t1_clu < 0) {
+      if (g_t1_clu[dev] < 0) {
         int cl = 0;
-        cudaDeviceGetAttribute(&cl, cudaDevAttrClusterLaunch, hidden_states.device().device_id);
+        cudaDeviceGetAttribute(&cl, cudaDevAttrClusterLaunch, dev);
         int mac = 0;
         if (cl) {
           cudaLaunchConfig_t probe = {};
@@ -1013,9 +1049,9 @@ void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
           cudaOccupancyMaxActiveClusters(
               &mac, reinterpret_cast<const void*>(t1_v3_kernel<T1NR, T1PF, true>), &probe);
         }
-        g_t1_clu = (cl && mac >= (2048 / T1NR) / T1CLU) ? 1 : 0;
+        g_t1_clu[dev] = (cl && mac >= (2048 / T1NR) / T1CLU) ? 1 : 0;
       }
-      if (g_t1_clu) {
+      if (g_t1_clu[dev]) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = dim3(2048 / T1NR);
         cfg.blockDim = dim3(256);
@@ -1035,19 +1071,27 @@ void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
         if (cudaLaunchKernelEx(&cfg, t1_v3_kernel<T1NR, T1PF, true>, x, pw13, pw13s, pw2, pw2s, ids,
                                tws, inter, pout, bar) == cudaSuccess)
           return;
-        g_t1_clu = 0;
+        g_t1_clu[dev] = 0;
+        (void)cudaGetLastError();  // consume the probe failure before the fallback launch
       }
       // Keep the 512-arrival fallback on its own epoch counter: a prior
       // successful cluster launch advances the cluster counter by only 64.
       unsigned int* flat_bar = bar + 1;
       void* args[] = {&x, &pw13, &pw13s, &pw2, &pw2s, &ids, &tws, &inter, &pout, &flat_bar};
-      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(t1_v3_kernel<T1NR, T1PF>),
-                                  dim3(2048 / T1NR), dim3(256), args, 0, stream);
+      const cudaError_t st =
+          cudaLaunchCooperativeKernel(reinterpret_cast<void*>(t1_v3_kernel<T1NR, T1PF>),
+                                      dim3(2048 / T1NR), dim3(256), args, 0, stream);
+      TVM_FFI_ICHECK(st == cudaSuccess)
+          << "T=1 cooperative launch failed: " << cudaGetErrorString(st);
       return;
     }
     void* args[] = {&x, &pw13, &pw13s, &pw2, &pw2s, &ids, &tws, &inter, &pout};
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(t1_fused_kernel), dim3(512), dim3(256),
-                                args, 0, stream);
+    const cudaError_t st = cudaLaunchCooperativeKernel(reinterpret_cast<void*>(t1_fused_kernel),
+                                                       dim3(512), dim3(256), args, 0, stream);
+    // Never return silently with the output uncomputed: on the validated
+    // device profile this grid fits; anywhere else the failure must surface.
+    TVM_FFI_ICHECK(st == cudaSuccess)
+        << "T=1 fused cooperative launch failed: " << cudaGetErrorString(st);
     return;
   }
 
@@ -1091,4 +1135,7 @@ void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
     dim3 g2((unsigned)T, HID / 4);
     fc2_kernel<4, false><<<g2, 32 * TOPK, 0, stream>>>(inter, pw2, pw2s, ids, tws, pos_of, pout);
   }
+  const cudaError_t tail_status = cudaGetLastError();
+  TVM_FFI_ICHECK(tail_status == cudaSuccess)
+      << "GEMV kernel launch failed: " << cudaGetErrorString(tail_status);
 }
