@@ -9284,26 +9284,89 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
-# Backends for the generalized ragged DeepSeek-attention entry: the same
-# enum as the specific entry it connects to. New backends are added here.
-RAGGED_DEEPSEEK_BACKENDS = TRTLLM_RAGGED_DEEPSEEK_BACKENDS
+# Backends of the generalized ragged DeepSeek-attention front. Every name
+# is a real implementation ("trtllm" = the trtllm-gen cubin path behind
+# trtllm_ragged_attention_deepseek, "cute-dsl" = its CuTe-DSL path,
+# "specialized" = the agent-generated SM103 CUDA kernel, linked directly);
+# "auto" only SELECTS among the named backends and carries no behavior of
+# its own.
+RAGGED_DEEPSEEK_BACKENDS = ("auto", "specialized", "trtllm", "cute-dsl")
 
 
-def ragged_attention_deepseek(*args, **kwargs):
+def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
     """Generalized ragged (varlen, non-paged) DeepSeek MLA prefill attention.
 
     Vendor-neutral front for the ragged DeepSeek-attention contract.
-    Identical signature, defaults and semantics to
-    :func:`trtllm_ragged_attention_deepseek` — including ``return_lse=True``
-    returning the base-2 log-sum-exp with the bmm1 scale folded in — which
-    stays unchanged and is one of this entry's backends: ``backend``
-    selects among ``RAGGED_DEEPSEEK_BACKENDS`` — ``"auto"`` (default)
-    behaves as ``"trtllm-gen"`` except that strictly allowlisted calls
-    route to the agent-generated ``"specialized"`` kernel; an explicitly
-    selected backend is never silently swapped, and ``"specialized"``
-    raises a ``ValueError`` listing ``fallback_reasons`` for calls it
-    cannot serve.
+    Parameters are those of :func:`trtllm_ragged_attention_deepseek`
+    (unchanged, including ``return_lse=True`` returning the base-2
+    log-sum-exp with the bmm1 scale folded in), except ``backend``, which
+    names a real implementation from ``RAGGED_DEEPSEEK_BACKENDS``:
+
+    - ``"specialized"``: the agent-generated SM103 CUDA kernel, called
+      directly at this front (not through the trtllm-named entry). Raises
+      a ``ValueError`` listing ``fallback_reasons`` for calls outside its
+      strict allowlist — an explicitly selected backend is never silently
+      swapped.
+    - ``"trtllm"`` / ``"cute-dsl"``: the corresponding paths of the
+      trtllm-named entry.
+    - ``"auto"`` (default): selection only, no behavior of its own —
+      routes to ``"specialized"`` when its allowlist serves the call,
+      otherwise to ``"trtllm"``.
     """
+    if backend not in RAGGED_DEEPSEEK_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {RAGGED_DEEPSEEK_BACKENDS}, got {backend!r}"
+        )
+    if backend in ("auto", "specialized"):
+        import inspect as _inspect
+
+        from .mla_ragged_prefill_dsr1_cuda import (
+            maybe_dispatch_specialized as _mds,
+        )
+
+        bound = _inspect.signature(trtllm_ragged_attention_deepseek).bind(
+            *args, **kwargs
+        )
+        bound.apply_defaults()
+        a = bound.arguments
+        served = _mds(
+            backend=backend,
+            query=a["query"],
+            key=a["key"],
+            value=a["value"],
+            workspace_buffer=a["workspace_buffer"],
+            seq_lens=a["seq_lens"],
+            max_q_len=a["max_q_len"],
+            max_kv_len=a["max_kv_len"],
+            cum_seq_lens_q=a["cum_seq_lens_q"],
+            cum_seq_lens_kv=a["cum_seq_lens_kv"],
+            batch_size=a["batch_size"],
+            out=a["out"],
+            extras=dict(
+                is_causal=a["is_causal"],
+                return_lse=a["return_lse"],
+                lse=a["lse"],
+                window_left=a["window_left"],
+                attention_sinks=a["attention_sinks"],
+                skip_softmax_threshold_scale_factor=a[
+                    "skip_softmax_threshold_scale_factor"
+                ],
+                sage_attn_sfs=a["sage_attn_sfs"],
+                num_elts_per_sage_attn_blk=a["num_elts_per_sage_attn_blk"],
+                use_fp16_softmax=a["use_fp16_softmax"],
+                uses_spcompress=a["uses_spcompress"],
+                q_seq_lens_cpu=a["q_seq_lens_cpu"],
+                kv_seq_lens_cpu=a["kv_seq_lens_cpu"],
+                bmm1_scale=a["bmm1_scale"],
+                bmm2_scale=a["bmm2_scale"],
+                o_sf_scale=a["o_sf_scale"],
+            ),
+        )
+        if served is not None:
+            return served
+        # backend == "auto": the specialized allowlist cannot serve; route
+        # to the named "trtllm" backend (explicit "specialized" raised).
+    kwargs["backend"] = "cute-dsl" if backend == "cute-dsl" else "trtllm-gen"
     return trtllm_ragged_attention_deepseek(*args, **kwargs)
 
 

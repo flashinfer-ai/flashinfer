@@ -276,16 +276,16 @@ def test_graph_capture_bails_to_stock():
 
 @requires_sm103
 def test_generalized_entry_parity_and_dispatch():
-    """ragged_attention_deepseek is the vendor-neutral front: same enum,
-    same dispatch semantics, bitwise parity with the direct entry,
-    return_lse semantics preserved."""
+    """ragged_attention_deepseek is a front over NAMED real backends:
+    "specialized" links directly to the agent-generated kernel, "trtllm"/
+    "cute-dsl" are the trtllm-named entry's paths, "auto" only selects
+    among names; return_lse semantics preserved."""
     from flashinfer.prefill import (
         RAGGED_DEEPSEEK_BACKENDS,
-        TRTLLM_RAGGED_DEEPSEEK_BACKENDS,
         ragged_attention_deepseek,
     )
 
-    assert RAGGED_DEEPSEEK_BACKENDS == TRTLLM_RAGGED_DEEPSEEK_BACKENDS
+    assert RAGGED_DEEPSEEK_BACKENDS == ("auto", "specialized", "trtllm", "cute-dsl")
     inp = _make_inputs(1, 128, 12416, 128, 12416, 0, seed=17)
     kwargs = dict(
         query=inp["q"],
@@ -306,24 +306,31 @@ def test_generalized_entry_parity_and_dispatch():
         is_causal=inp["causal"],
         return_lse=True,
     )
-    # auto on the allowlist routes to specialized through the front
+    # "auto" selects "specialized" on its allowlist (dispatch stats move)
     before = dict(spec_mod.DISPATCH_STATS)
     gen_o, gen_l = ragged_attention_deepseek(**kwargs)
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1
-    direct_o, direct_l = _api(inp)
-    assert torch.equal(gen_o, direct_o) and torch.equal(gen_l, direct_l)
-    # explicit backends behave identically through the front
+    # the direct specialized name produces the same bits
     spec_o, spec_l = ragged_attention_deepseek(**{**kwargs, "backend": "specialized"})
     assert torch.equal(spec_o, gen_o) and torch.equal(spec_l, gen_l)
-    stock_o, stock_l = ragged_attention_deepseek(**{**kwargs, "backend": "trtllm-gen"})
+    # parity with the entry-level specialized route
+    direct_o, direct_l = _api(inp, backend="specialized")
+    assert torch.equal(gen_o, direct_o) and torch.equal(gen_l, direct_l)
+    # the named "trtllm" backend equals the entry's trtllm-gen path
+    stock_o, stock_l = ragged_attention_deepseek(**{**kwargs, "backend": "trtllm"})
     ds_o, ds_l = _api(inp, backend="trtllm-gen")
     assert torch.equal(stock_o, ds_o) and torch.equal(stock_l, ds_l)
-    # return_lse=False parity through the front: this call form leaves the
-    # specialized allowlist (it keeps the stock path), so compare the front
-    # against the direct entry at the SAME arguments, not against gen_o
+    # return_lse=False leaves the specialized allowlist: "auto" must select
+    # "trtllm" (no behavior of its own) and match the entry at the SAME args
+    before = dict(spec_mod.DISPATCH_STATS)
     gen_only = ragged_attention_deepseek(**{**kwargs, "return_lse": False})
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
     direct_only = _api(inp, return_lse=False)
     assert torch.equal(gen_only, direct_only)
-    # invalid backend raises through the front too
+    # explicit "specialized" off-allowlist raises; invalid name raises
+    with pytest.raises(ValueError, match="fallback_reasons"):
+        ragged_attention_deepseek(
+            **{**kwargs, "backend": "specialized", "return_lse": False}
+        )
     with pytest.raises(ValueError, match="backend must be one of"):
         ragged_attention_deepseek(**{**kwargs, "backend": "bogus"})
