@@ -73,8 +73,8 @@ def _github_path_regex(pattern: str) -> "re.Pattern[str]":
         "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_jit.py",
         "ci/docker-tags.yml",
         "ci/cuda-versions.json",
-        f"scripts/{AOT_SCRIPT}",
-        "scripts/jit_cache_build_common.sh",
+        f"scripts/infra/{AOT_SCRIPT}",
+        "scripts/infra/jit_cache_build_common.sh",
     ],
 )
 def test_seed_triggers_on_compile_inputs(path):
@@ -124,7 +124,7 @@ def test_seed_builds_with_write_credentials_and_skips_lint():
         seed["env"]["AWS_SECRET_ACCESS_KEY"]
         == "${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
     )
-    assert f"./scripts/{AOT_SCRIPT}" in seed["run"]
+    assert f"./scripts/infra/{AOT_SCRIPT}" in seed["run"]
     assert "-e AOT_SKIP_SPEC_LINT 1" in seed["run"]
     # A missing secret must fail loudly instead of seeding nothing.
     assert "credentials are missing" in seed["run"]
@@ -139,7 +139,7 @@ def test_seed_only_runs_in_the_upstream_repository():
 @pytest.mark.parametrize("skip, linted", [("", True), ("0", True), ("1", False)])
 def test_aot_script_lint_switch(skip, linted):
     """AOT_SKIP_SPEC_LINT=1 skips the lint but still prefetches its headers."""
-    text = (REPO_ROOT / "scripts" / AOT_SCRIPT).read_text(encoding="utf-8")
+    text = (REPO_ROOT / "scripts" / "infra" / AOT_SCRIPT).read_text(encoding="utf-8")
     start = text.index('if [ "${AOT_SKIP_SPEC_LINT:-0}" = "1" ]; then')
     end = text.index("\nfi\n", start) + len("\nfi\n")
     fragment = (
