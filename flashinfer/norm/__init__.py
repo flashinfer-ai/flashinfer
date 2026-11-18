@@ -1234,6 +1234,21 @@ def _rmsnorm_sigmoid_gate_fake(
     return None
 
 
+def _check_same_dtype(
+    input: torch.Tensor,
+    *,
+    weight: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> None:
+    """Reject operands the norm kernels would silently reinterpret at input.dtype()."""
+    for name, tensor in (("weight", weight), ("residual", residual), ("out", out)):
+        if tensor is not None and tensor.dtype != input.dtype:
+            raise ValueError(
+                f"{name} dtype {tensor.dtype} must match input dtype {input.dtype}"
+            )
+
+
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
@@ -1264,7 +1279,13 @@ def rmsnorm(
     -------
     output: torch.Tensor
         Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
+
+    Raises
+    ------
+    ValueError
+        If ``weight`` or a caller-supplied ``out`` does not share ``input.dtype``.
     """
+    _check_same_dtype(input, weight=weight, out=out)
     if out is None:
         out = torch.empty_like(input)
     _rmsnorm_impl(out, input, weight, eps, enable_pdl)
@@ -1336,7 +1357,12 @@ def rmsnorm_quant(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
+    Raises
+    ------
+    ValueError
+        If ``weight`` does not share ``input.dtype``.
     """
+    _check_same_dtype(input, weight=weight)
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -1390,7 +1416,13 @@ def fused_add_rmsnorm(
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
+
+    Raises
+    ------
+    ValueError
+        If ``residual`` or ``weight`` does not share ``input.dtype``.
     """
+    _check_same_dtype(input, residual=residual, weight=weight)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -1451,7 +1483,13 @@ def fused_add_rmsnorm_quant(
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
+
+    Raises
+    ------
+    ValueError
+        If ``residual`` or ``weight`` does not share ``input.dtype``.
     """
+    _check_same_dtype(input, weight=weight, residual=residual)
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -1585,7 +1623,13 @@ def gemma_rmsnorm(
     -------
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
+
+    Raises
+    ------
+    ValueError
+        If ``weight`` or a caller-supplied ``out`` does not share ``input.dtype``.
     """
+    _check_same_dtype(input, weight=weight, out=out)
     if out is None:
         out = torch.empty_like(input)
     _gemma_rmsnorm_impl(out, input, weight, eps, enable_pdl)
@@ -1658,7 +1702,13 @@ def gemma_fused_add_rmsnorm(
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
+
+    Raises
+    ------
+    ValueError
+        If ``residual`` or ``weight`` does not share ``input.dtype``.
     """
+    _check_same_dtype(input, weight=weight, residual=residual)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
