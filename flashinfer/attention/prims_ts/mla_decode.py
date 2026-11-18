@@ -68,6 +68,7 @@ from .decode import (
 
 
 from .kernels.mla_decode.sparse_policy import (
+    batch_invariant_sparse_mla_profile,
     prefer_sparse_d576_reload,
     select_sparse_mla_profile,
 )
@@ -2539,6 +2540,7 @@ def _resolve_sparse_mla_plan(
     use_attention_sinks=False,
     return_lse=False,
     assume_valid_prefix=False,
+    batch_invariant=False,
     output_quant_block_size=None,
     out_scale_format="ue8m0",
     num_output_groups=None,
@@ -2572,6 +2574,27 @@ def _resolve_sparse_mla_plan(
         raise ValueError("sparse MLA requires kv_lora_rank=512")
     if not isinstance(assume_valid_prefix, bool):
         raise TypeError("assume_valid_prefix must be bool")
+    if not isinstance(batch_invariant, bool):
+        raise TypeError("batch_invariant must be bool")
+    if batch_invariant:
+        from flashinfer.batch_invariant.mla.api import check_plan
+
+        check_plan(
+            device,
+            num_qo_heads=num_qo_heads,
+            q_dtype=q_dtype,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            refused=dict(
+                max_extra_topk=max_extra_topk,
+                kv_cache_format=kv_cache_format,
+                extra_kv_cache_format=extra_kv_cache_format,
+                use_attention_sinks=use_attention_sinks,
+                output_quant_block_size=output_quant_block_size,
+                tuning=tuning,
+                kv_cache_scale=kv_cache_scale,
+            ),
+        )
     device, _ = _resolve_cuda_device(device)
     _validate_runtime_device(device)
     for name, value in (
@@ -2626,17 +2649,23 @@ def _resolve_sparse_mla_plan(
         # SM107 schedules assume the SM107 kernel resources gated on the
         # compile target; an sm_100f build keeps the generic schedule.
         compute_capability = None
-    profile = select_sparse_mla_profile(
-        rows=max_rows,
-        heads=num_qo_heads,
-        query_length=max_q_len,
-        capacity=capacity,
-        dtype="bf16" if q_dtype == torch.bfloat16 else "fp8",
-        sm_count=sm_count,
-        rope_dim=qk_rope_head_dim,
-        kv_cache_format=kv_cache_format,
-        compute_capability=compute_capability,
-    )
+    if batch_invariant:
+        profile = batch_invariant_sparse_mla_profile(
+            dtype="bf16" if q_dtype == torch.bfloat16 else "fp8",
+            kv_cache_format=kv_cache_format,
+        )
+    else:
+        profile = select_sparse_mla_profile(
+            rows=max_rows,
+            heads=num_qo_heads,
+            query_length=max_q_len,
+            capacity=capacity,
+            dtype="bf16" if q_dtype == torch.bfloat16 else "fp8",
+            sm_count=sm_count,
+            rope_dim=qk_rope_head_dim,
+            kv_cache_format=kv_cache_format,
+            compute_capability=compute_capability,
+        )
     if (
         output_quant is not None
         and profile.family == "2cta"
@@ -2657,6 +2686,7 @@ def _resolve_sparse_mla_plan(
         and not max_extra_topk
         and not use_attention_sinks
         and not assume_valid_prefix
+        and not batch_invariant
         and prefer_sparse_d576_reload(
             rows=max_rows,
             heads=num_qo_heads,
@@ -3022,6 +3052,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         use_attention_sinks=False,
         return_lse=False,
         assume_valid_prefix=False,
+        batch_invariant=False,
         output_quant_block_size=None,
         out_scale_format="ue8m0",
         num_output_groups=None,
@@ -3097,6 +3128,20 @@ class BatchSparseMLADecodePagedTSWrapper:
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
 
+        ``batch_invariant=True`` plans one fixed schedule (two-CTA family,
+        unsplit KV) for every row count, head count and device, instead of
+        choosing one from ``batch_size * max_q_len``: a query row's output and
+        LSE bits then depend on that row's query, list, cache rows and scales
+        only, not on the batch, the row's position, the other rows or the call
+        shape (``flashinfer.batch_invariant``, classes
+        ``mla.sparse.<dtype>.d<576|512>``). It requires an explicit
+        ``softmax_scale`` and one native BF16 or E4M3 pool; sinks, an extra
+        pool, the quantized cache formats, output quantization and ``tuning``
+        raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+        as does any device other than SM100 / SM103 / SM107. Nothing falls
+        back. Lists must keep live entries before any ``-1``
+        (``run(validate=True)`` checks it); the flag is fixed for the plan.
+
         ``tuning`` (an :class:`MLAAttentionTuning`) has the meaning of
         :meth:`BatchMLADecodePagedTSWrapper.plan`; its
         ``softmax_rescale_threshold_log2`` takes 0 to 8 binades for E4M3 and
@@ -3126,11 +3171,14 @@ class BatchSparseMLADecodePagedTSWrapper:
                 use_attention_sinks=use_attention_sinks,
                 return_lse=return_lse,
                 assume_valid_prefix=assume_valid_prefix,
+                batch_invariant=batch_invariant,
                 output_quant_block_size=output_quant_block_size,
                 out_scale_format=out_scale_format,
                 num_output_groups=num_output_groups,
                 tuning=tuning,
                 kv_lora_rank=kv_lora_rank,
+                softmax_scale=softmax_scale,
+                kv_cache_scale=kv_cache_scale,
             )
         )
         softmax_scale = normalize_scale(
@@ -3214,6 +3262,8 @@ class BatchSparseMLADecodePagedTSWrapper:
             output_scale=output_scale,
             kv_cache_scale=kv_cache_scale,
             assume_valid_prefix=assume_valid_prefix,
+            batch_invariant=batch_invariant,
+            compile_spec=spec,
             requested_splits=splits,
             default_cl=torch.full(
                 (max_rows,), max_extra_topk, device=device, dtype=torch.int32
@@ -3315,6 +3365,14 @@ class BatchSparseMLADecodePagedTSWrapper:
             if state["assume_valid_prefix"] and (active & (indices < 0)).any().item():
                 raise ValueError(
                     f"{name} active prefix contains a hole with assume_valid_prefix=True"
+                )
+            if state["batch_invariant"] and (active & (indices < 0)).any().item():
+                from flashinfer.batch_invariant.support import unsupported
+
+                raise unsupported(
+                    "mla.sparse",
+                    f"a -1 hole inside the live part of the {name} list",
+                    "live entries packed before any -1 (a hole moves every later key)",
                 )
         return indices, lengths
 
@@ -3662,6 +3720,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     return_lse=False,
     workspace_buffer=None,
     assume_valid_prefix=False,
+    batch_invariant=False,
     output_quant_block_size=None,
     out_scale_format="ue8m0",
     num_output_groups=None,
@@ -3675,8 +3734,8 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     Use a planned wrapper for CUDA Graph replay. Index conversion and scale
     composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
-    Source contracts, output quantization arguments, ``tuning`` and return
-    layouts follow
+    Source contracts, output quantization arguments, ``tuning``,
+    ``batch_invariant`` and return layouts follow
     :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
     if torch.cuda.is_current_stream_capturing():
@@ -3710,6 +3769,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         use_attention_sinks=attention_sinks is not None,
         return_lse=return_lse,
         assume_valid_prefix=assume_valid_prefix,
+        batch_invariant=batch_invariant,
         output_quant_block_size=output_quant_block_size,
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,

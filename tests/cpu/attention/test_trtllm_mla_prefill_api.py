@@ -57,6 +57,7 @@ _TRTLLM_MLA_PARAMETERS = (
     "causal_seqlens_kv_global",
     "use_fp16_softmax",
     "return_lse_base",
+    "batch_invariant",
 )
 _NUM_REQUIRED_PARAMETERS = 9
 

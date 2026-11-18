@@ -976,3 +976,39 @@ def prefer_sparse_d576_reload(
         or query_length <= 16
         or (query_length <= 32 and rows <= 4 * sm_count)
     )
+
+
+BATCH_INVARIANT_SPARSE_MLA_PROFILES = {
+    "fp8": SparseMlaProfile(
+        family="2cta",
+        tile_size_q=128,
+        split_kv=1,
+        scheduler="static",
+        head_dim_ctas=1,
+        gather_issue_warps=1,
+    ),
+    "bf16": SparseMlaProfile(
+        family="2cta",
+        tile_size_q=128,
+        split_kv=1,
+        scheduler="static",
+        head_dim_ctas=1,
+        gather_issue_warps=8,
+        kv_pipeline_stages=7,
+    ),
+}
+
+
+def batch_invariant_sparse_mla_profile(*, dtype, kv_cache_format="native"):
+    """Return the one schedule of a ``batch_invariant=True`` plan.
+
+    Unsplit KV on the two-CTA family for every row count, head count and
+    architecture, so a row's arithmetic never depends on the planned extent.
+    The scheduler and the per-dtype loader settings do not enter the arithmetic.
+    """
+    if kv_cache_format != "native" or dtype not in BATCH_INVARIANT_SPARSE_MLA_PROFILES:
+        raise ValueError(
+            "the batch-invariant schedule serves native BF16 or E4M3 KV caches, got "
+            f"dtype={dtype!r}, kv_cache_format={kv_cache_format!r}"
+        )
+    return BATCH_INVARIANT_SPARSE_MLA_PROFILES[dtype]
