@@ -1917,8 +1917,8 @@ def gated_delta_rule_replayssm_commit(
         Contiguous int32 ``[B, T]`` cache rows to replay, in order. Row ``j``
         of request ``i`` is replayed only when ``j < accept_lens[i]``; later
         entries are padding and may hold any value. Lets tree speculation
-        commit a root-to-node path that is not a contiguous prefix. Rows must
-        lie in [0, T) and must not repeat within a request. Default ``None``
+        commit a root-to-node path that is not a contiguous prefix. Replayed rows
+        must lie in [0, T) and must not repeat within a request. Default ``None``
         replays rows ``0..accept_lens[i]-1`` and compiles a variant with no
         gather.
     track_state_indices : torch.Tensor, optional

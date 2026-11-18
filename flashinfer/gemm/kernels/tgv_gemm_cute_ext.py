@@ -42,13 +42,19 @@ Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
                     activations have landed).
   bar_mma_epilog    1 arrival   (MMA tcgen05.commit; "acc ready"; 2-CTA
                     multicasts to both CTAs).
-  bar_tmem_alloc    160 arrivals (32 MMA + 128 EPILOG); two-phase:
+  bar_tmem_alloc    160 arrivals (32 MMA + 128 EPILOG); two-phase (the MMA warp
+                    waits for phase 0 before its phase-1 arrival):
                       phase 0→1 = MMA finished alloc_tmem
                       phase 1→0 = EPILOG finished tcgen05.ld (safe to dealloc)
                     The handshake is within-CTA only. In 2-CTA mode, alloc,
                     relinquish and dealloc are cta_group::2 collectives (one
                     warp in each CTA of the pair); a cluster barrier at
                     kernel exit keeps both CTAs resident until both finish.
+  bar_tmem_dealloc  2-CTA only (not allocated in 1-CTA). 32 arrivals from the
+                    PEER CTA's MMA warp (remote arrive on the peer's copy);
+                    each MMA warp waits on its own copy before the collective
+                    tcgen05.dealloc.cta_group::2, for which the PTX ISA
+                    requires both CTAs to synchronize their TMEM accesses.
 
 A 1-element Int32 SMEM slot (tmem_base_ptr) is written by alloc_tmem and read
 by retrieve_tmem_ptr in MMA + EPILOG.
@@ -115,6 +121,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 
+from .dense_bf16_gemm_sm100_splitk import _tcgen05_fence
 from .dense_bf16_gemm_warp_splitk import (
     LamportPeerStoreConfig,
     bind_peer_store_args,
@@ -457,6 +464,14 @@ class TgvGemmCuteExtKernel:
         bar_tmem_alloc_arr = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
+        # 2-CTA only: rendezvous of the two MMA warps before the collective
+        # TMEM dealloc. 1-CTA passes None and never touches it.
+        bar_tmem_dealloc = None
+        if cutlass.const_expr(self.use_2cta):
+            bar_tmem_dealloc_arr = cute_ext.allocate(
+                cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+            )
+            bar_tmem_dealloc = bar_tmem_dealloc_arr.iterator  # Pointer[Int64]
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
         tmem_base_arr = cute_ext.allocate(
@@ -486,6 +501,8 @@ class TgvGemmCuteExtKernel:
                 cute.arch.mbarrier_init(
                     bar_tmem_alloc, 32 + 128
                 )  # MMA + 4 EPILOG warps
+                if cutlass.const_expr(self.use_2cta):
+                    cute.arch.mbarrier_init(bar_tmem_dealloc, 32)  # peer CTA's MMA warp
 
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.use_2cta):
@@ -584,6 +601,8 @@ class TgvGemmCuteExtKernel:
                 bar_empty,
                 bar_mma_epilog,
                 bar_tmem_alloc,
+                bar_tmem_dealloc,
+                cta_rank_in_cluster,
                 tiled_mma,
                 sA,
                 sB,
@@ -802,6 +821,8 @@ class TgvGemmCuteExtKernel:
         bar_empty,  # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,  # Pointer[Int64], 1 entry
         bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
+        bar_tmem_dealloc,  # Pointer[Int64], 1 entry, 32-arrival (2-CTA only, else None)
+        cta_rank_in_cluster: cutlass.Int32,
         tiled_mma: cute.TiledMma,
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
@@ -832,6 +853,7 @@ class TgvGemmCuteExtKernel:
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
@@ -857,6 +879,7 @@ class TgvGemmCuteExtKernel:
             for k_tile in cutlass.range(k_tile_count, unroll=1):
                 stage = k_tile % DMA_Stage
                 cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+                _tcgen05_fence(before=False)
 
                 # Inner-K loop: NumMma_K straight-line tcgen05.mma instructions.
                 # cute_ext.dot expects rank-3 operands in the MMA fragment
@@ -900,10 +923,26 @@ class TgvGemmCuteExtKernel:
         # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
         # (post fence_view_async_tmem_load). Each CTA waits only for its own
         # EPILOG. In 2-CTA mode the dealloc pairs with the peer MMA warp's
-        # (cta_group::2 collective); the exit barrier in kernel() keeps the
-        # peer resident until both are issued.
+        # (cta_group::2 collective, rendezvous below); the exit barrier in
+        # kernel() keeps the peer resident until both are issued.
+        #
+        # The phase-1 arrival must not be made while phase 0 is still open:
+        # MMA does not otherwise wait for EPILOG's phase-0 arrivals, so the
+        # arrival would count toward phase 0, and the parity-1 wait could then
+        # pass before EPILOG has read TMEM. Same fix as #7443.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        if cutlass.const_expr(self.use_2cta):
+            # tcgen05.dealloc.cta_group::2 is collective: the PTX ISA requires the
+            # issuing warp and the peer CTA's warp to synchronize their TMEM
+            # accesses first. Rendezvous with the peer MMA warp, as
+            # cutlass.utils.TmemAllocator.free does.
+            cute.arch.mbarrier_arrive(bar_tmem_dealloc, cta_rank_in_cluster ^ 1)
+            cute.arch.mbarrier_wait(bar_tmem_dealloc, 0)
+        # tcgen05.fence::after_thread_sync: order the dealloc after the tcgen05
+        # work handed off through the waits above.
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
@@ -929,6 +968,7 @@ class TgvGemmCuteExtKernel:
         # before the wait clears.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _tcgen05_fence(before=False)
 
         # Bind acc_layout to the TMEM ptr written by alloc_tmem.
         # acc_layout shape: ((Mma_M, Mma_N), NumMma_M, NumMma_N, AccStage)
@@ -1047,14 +1087,17 @@ class TgvGemmCuteExtKernel:
             rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)  # accumulator ready
+        _tcgen05_fence(before=False)
 
         # TMEM → RMEM (one tcgen05.ld for the 64×8 tile).
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
 
-        # tcgen05.ld is async — fence makes the result visible to (a) the
-        # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
-        # on bar_tmem_alloc phase 1.
+        # tcgen05.ld is async — wait for it so the rAcc.load() below sees
+        # the result. tcgen05.fence::before_thread_sync then orders the
+        # retired load before MMA's dealloc_tmem, which follows our
+        # bar_tmem_alloc phase-1 arrival.
         cute.arch.fence_view_async_tmem_load()
+        _tcgen05_fence(before=True)
 
         # Phase 1 of bar_tmem_alloc: 128 from this warp + 32 from MMA = 160.
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
