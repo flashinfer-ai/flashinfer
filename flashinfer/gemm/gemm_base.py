@@ -11001,6 +11001,15 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     if scale_major_mode is None:
         raise ValueError("scale_major_mode is required in CUTLASS")
 
+    # SM120/121: the stock CUTLASS groupwise kernel accepts 128-unaligned N
+    # but returns silently wrong output there (#9555). Reject it so the call
+    # fails loudly instead of computing garbage.
+    if is_sm12x_supported(a.device) and b.shape[0] % 128 != 0:
+        raise ValueError(
+            "N must be a multiple of 128 for the cutlass fp8 groupwise "
+            f"backend on SM120/121 (got N={b.shape[0]}); see issue #9555"
+        )
+
     return True
 
 
