@@ -52,6 +52,11 @@ from .helpers_common import (
 from .smem_resources import SmemKvResource, SmemKvTileResource
 
 
+# Probed once at import: the converters below are traced inside task bodies,
+# where CuTe DSL 4.9 rejects calls to memoized functions.
+_RUBIN_CUTE_DSL_AVAILABLE = is_rubin_cute_dsl_available()
+
+
 def _has_packed_e4m3_e2m1_mul() -> bool:
     """Whether the compile target has the packed E4M3 x E2M1 multiply.
 
@@ -60,7 +65,7 @@ def _has_packed_e4m3_e2m1_mul() -> bool:
     """
     if not cutlass.target_version(min_version="13.4"):
         return False
-    if not is_rubin_cute_dsl_available():
+    if not _RUBIN_CUTE_DSL_AVAILABLE:
         return True
     arch = BaseDSL._get_dsl().get_arch_enum()
     return not (Arch.sm_107 <= arch <= Arch.sm_107f)
