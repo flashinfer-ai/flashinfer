@@ -207,10 +207,13 @@ def test_kill_switch_blocks_warmup(monkeypatch):
 
     monkeypatch.setattr(spec, "_kernel_entry", _boom)
     warmed_before = set(spec._warmed)
-    w13 = torch.zeros(E, 2 * I, H, dtype=torch.float8_e4m3fn)
-    w2 = torch.zeros(E, H, I, dtype=torch.float8_e4m3fn)
-    w13_sf = torch.zeros(E, (2 * I) // 128, H // 128, dtype=torch.float32)
-    w2_sf = torch.zeros(E, H // 128, I // 128, dtype=torch.float32)
+    # Disabled warmup returns before reading the operands, so these are
+    # small placeholders rather than checkpoint-sized weights (full geometry
+    # stays in the tests that actually reach the kernel).
+    w13 = torch.zeros(2, 4, 4, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(2, 4, 2, dtype=torch.float8_e4m3fn)
+    w13_sf = torch.zeros(2, 1, 1, dtype=torch.float32)
+    w2_sf = torch.zeros(2, 1, 1, dtype=torch.float32)
     spec.warmup(w13, w2, [w13_sf, w2_sf], device="cpu")
     assert set(spec._warmed) == warmed_before
 
