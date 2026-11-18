@@ -197,6 +197,16 @@ def _common_supported(
     # storage views fail these, and the stock path serves them.
     if a.data_ptr() % 32 or b.data_ptr() % 32 or out.data_ptr() % 16:
         return "pointer_alignment"
+    # The kernel loads the operands and scale buffers from global memory
+    # while CTAs store `out`, with no grid-level ordering between CTAs: an
+    # output that shares storage bytes with any input is a data race (the
+    # stock route's aliasing behavior is its own contract).
+    out_lo = out.data_ptr()
+    out_hi = out_lo + out.numel() * out.element_size()
+    for t in (a, b, a_descale, b_descale):
+        t_lo = t.data_ptr()
+        if max(out_lo, t_lo) < min(out_hi, t_lo + t.numel() * t.element_size()):
+            return "overlap"
     allowlist = _load_allowlist()
     if allowlist is None:
         return "allowlist_unavailable"

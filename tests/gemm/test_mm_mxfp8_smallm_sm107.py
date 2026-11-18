@@ -52,6 +52,16 @@ requires_sm107 = pytest.mark.skipif(
 )
 
 
+def _isolate_autotuner_cache(monkeypatch):
+    """Swap in a fresh AutoTuner singleton for the test (restored by
+    monkeypatch): routing assertions that count specialized-kernel launches
+    must exercise the default (heuristic) runner, not a stock winner some
+    earlier tuned run left in the process-wide profiling cache."""
+    from flashinfer.autotuner.autotuner import AutoTuner
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+
+
 def test_allowlist_is_well_formed():
     """CPU-side invariants of the packaged dispatch allowlist."""
     allowlist = _load_allowlist()
@@ -185,6 +195,7 @@ def test_auto_routes_to_specialized_on_allowlist(m, n, k, monkeypatch):
     """backend="auto" on allowlisted shapes runs the specialized kernel and
     matches both the bf16 reference and the stock path."""
     monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    _isolate_autotuner_cache(monkeypatch)
     a_q, b_q, a_sf, b_sf, reference = _quantized_problem(m, n, k)
     calls = _count_kernel_launches(monkeypatch)
 
@@ -211,6 +222,13 @@ def test_auto_routes_to_specialized_on_allowlist(m, n, k, monkeypatch):
 def test_explicit_backend_is_never_swapped(monkeypatch):
     """Explicit backend="cute-dsl" on an allowlisted shape must get cute-dsl,
     never the specialized kernel."""
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip(
+            "explicit backend='cute-dsl' requires the optional CuTe DSL "
+            "package; the specialized-backend tests do not"
+        )
     monkeypatch.delenv(_DISABLE_ENV, raising=False)
     m, n, k = _ON_LIST_SHAPES[0]
     a_q, b_q, a_sf, b_sf, reference = _quantized_problem(m, n, k)
@@ -370,6 +388,7 @@ def test_auto_off_list_takes_stock_path(monkeypatch):
 
 @requires_sm107
 def test_kill_switch_disables_specialized(monkeypatch):
+    _isolate_autotuner_cache(monkeypatch)
     m, n, k = _ON_LIST_SHAPES[0]
     a_q, b_q, a_sf, b_sf, reference = _quantized_problem(m, n, k)
     calls = _count_kernel_launches(monkeypatch)
@@ -471,13 +490,23 @@ def test_runner_declines_ineligible_inputs_cpu():
         runner.forward(inputs, tactic=-1)
 
 
-def test_eligibility_probe_tolerates_out_none():
-    a, b, a_sf, b_sf = _cpu_mxfp8_args()
-    # CPU tensors fail the device guard, never raise.
+def test_eligibility_probe_tolerates_out_none(monkeypatch):
+    # An out=None probe whose arguments satisfy every GPU-free guard
+    # (allowlisted shape, column-major b, kill switch cleared) must reach
+    # the device guard — proving the None tolerance itself, not an earlier
+    # refusal — and must never raise.
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    m, n, k = _ON_LIST_SHAPES[0]
+    a = torch.zeros((m, k), dtype=torch.float8_e4m3fn)
+    b = torch.zeros((n, k), dtype=torch.float8_e4m3fn).t()
+    a_sf = torch.zeros(_swizzled_sf_numel(m, k), dtype=torch.uint8)
+    b_sf = torch.zeros(_swizzled_sf_numel(n, k), dtype=torch.uint8)
     reason = specialized.specialized_mm_mxfp8_eligible(
         a, b, a_sf, b_sf, None, torch.bfloat16, False
     )
-    assert isinstance(reason, str) and reason
+    assert reason == "device"
+    # The out_dtype guard still answers before the probe substitutes out.
+    a, b, a_sf, b_sf = _cpu_mxfp8_args()
     assert (
         specialized.specialized_mm_mxfp8_eligible(
             a, b, a_sf, b_sf, None, torch.float16, False
