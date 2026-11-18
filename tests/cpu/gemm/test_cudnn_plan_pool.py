@@ -63,6 +63,8 @@ FAKE_WORKER = textwrap.dedent(
         ]
         if mode == "partial" and i == 0:
             plans = plans[1:]
+        if mode == "none":
+            plans = []
         if mode == "badindex":
             plans = [(99, mine[0], b"x")]
         rid = req.get("request_id")
@@ -103,7 +105,10 @@ def test_results_are_reassembled_in_candidate_order(fake_cmd):
         result = pool.build(SPEC, device_index=0, heur_modes=[0, 2])
     finally:
         pool.shutdown()
-    assert result == [(tac, f"blob{i}".encode()) for i, tac in enumerate(CANDIDATES)]
+    assert result == (
+        CANDIDATES,
+        [(tac, f"blob{i}".encode()) for i, tac in enumerate(CANDIDATES)],
+    )
 
 
 def test_mismatched_candidates_fall_back(fake_cmd):
@@ -183,8 +188,8 @@ def test_env_parsing(monkeypatch, caplog, value, workers, warns):
             pool.shutdown()
 
 
-@pytest.mark.parametrize("mode", ["garbage", "badindex", "partial"])
-def test_malformed_or_incomplete_results_fall_back(fake_cmd, mode):
+@pytest.mark.parametrize("mode", ["garbage", "badindex", "none"])
+def test_malformed_or_empty_results_fall_back(fake_cmd, mode):
     pool = _pool(fake_cmd, mode)
     try:
         assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
@@ -268,3 +273,16 @@ def test_reply_for_another_request_falls_back(fake_cmd):
         assert pool.broken
     finally:
         pool.shutdown()
+
+
+def test_unbuilt_plans_keep_their_candidates(fake_cmd):
+    # In-process enumeration lists a candidate whose plan fails to build (it
+    # then fails at profiling); the pool must list it too, and stay on.
+    pool = _pool(fake_cmd, "partial")
+    try:
+        candidates, built = pool.build(SPEC, device_index=0, heur_modes=[0])
+        assert not pool.broken
+    finally:
+        pool.shutdown()
+    assert candidates == CANDIDATES
+    assert built == [(CANDIDATES[i], f"blob{i}".encode()) for i in (1, 2)]

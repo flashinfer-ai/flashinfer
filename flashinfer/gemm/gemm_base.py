@@ -4264,24 +4264,28 @@ def _is_cudnn_single_plan_graph(graph) -> bool:
 
 
 def _cudnn_prebuilt_tactics(key):
+    # Every candidate, including those mapped to None (no worker-built plan).
     graphs = _cudnn_override_prebuilt.get(key)
     return None if graphs is None else list(graphs)
 
 
 def _discard_cudnn_prebuilt(key) -> None:
     for graph in (_cudnn_override_prebuilt.pop(key, None) or {}).values():
-        _cudnn_single_plan_graphs.pop(id(graph), None)
+        if graph is not None:
+            _cudnn_single_plan_graphs.pop(id(graph), None)
 
 
-def _store_cudnn_prebuilt(key, built, handle) -> list:
-    graphs = {}
+def _store_cudnn_prebuilt(key, candidates, built, handle) -> list:
+    """Store worker-built plans for ``key``; a candidate without one maps to None."""
+    built_graphs = {}
     for tactic, blob in built:
         graph = cudnn.pygraph(handle=handle)
         graph.deserialize(blob)
-        graphs[tactic] = graph
+        built_graphs[tactic] = graph
+    graphs = {tactic: built_graphs.get(tactic) for tactic in candidates}
     _discard_cudnn_prebuilt(key)
     _cudnn_override_prebuilt[key] = graphs
-    _cudnn_single_plan_graphs.update((id(g), g) for g in graphs.values())
+    _cudnn_single_plan_graphs.update((id(g), g) for g in built_graphs.values())
     while len(_cudnn_override_prebuilt) > _CUDNN_PREBUILT_MAX_KEYS:
         _discard_cudnn_prebuilt(next(iter(_cudnn_override_prebuilt)))
     return list(graphs)
@@ -4294,10 +4298,11 @@ def _pool_plan_tactics(pool, key, spec, device_index, heur_modes, handle):
     pool: tuning must never fail because of it.
     """
     try:
-        built = pool.build(spec, device_index, heur_modes)
-        if built is None:
+        result = pool.build(spec, device_index, heur_modes)
+        if result is None:
             return None
-        return _store_cudnn_prebuilt(key, built, handle)
+        candidates, built = result
+        return _store_cudnn_prebuilt(key, candidates, built, handle)
     except Exception as exc:  # noqa: BLE001 - fall back to the in-process build
         _discard_cudnn_prebuilt(key)
         pool.disable(f"{type(exc).__name__}: {exc}")
@@ -4314,10 +4319,19 @@ def _get_cudnn_override_graph(builder, tactic, **kwargs):
     """
     key = _cudnn_override_key(builder, kwargs)
     if _is_cudnn_engine_knob_tactic(tactic):
-        prebuilt = (_cudnn_override_prebuilt.get(key) or {}).get(tactic)
-        if prebuilt is not None:
+        prebuilt = _cudnn_override_prebuilt.get(key)
+        if prebuilt is not None and tactic in prebuilt:
             _cudnn_override_prebuilt.move_to_end(key)
-            return prebuilt
+            if prebuilt[tactic] is not None:
+                return prebuilt[tactic]
+            # The workers could not build this candidate. In-process it would
+            # fail at profiling too, so report it as unsupported there rather
+            # than paying for another build attempt.
+            if is_in_profile_measurement():
+                raise RuntimeError(
+                    "cuDNN plan for this engine/knob tactic could not be built "
+                    "by the plan-build workers; reporting as unsupported."
+                )
         graph = _cudnn_override_all_plans.get(key)
         if graph is not None:
             return graph

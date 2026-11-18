@@ -7,9 +7,12 @@ the candidates of one graph are split across N worker processes, each of which
 loads ``_cudnn_plan_build.py`` without torch, builds its share, and returns
 serialized single-plan graphs.
 
-Any failure (spawn, crash, timeout, error, or workers disagreeing on the
-candidate list) returns ``None`` so the caller builds in-process as before, and
-turns the pool off for the rest of the process.
+A candidate whose plan a worker cannot build is still returned (without a
+plan) so the tuned tactic set matches the in-process one, where it fails at
+profiling. Any failure (spawn, crash, timeout, error, no plan built at all, or
+workers disagreeing on the candidate list) returns ``None`` so the caller
+builds in-process as before, and turns the pool off for the rest of the
+process.
 """
 
 import atexit
@@ -151,7 +154,11 @@ class CudnnPlanBuildPool:
         ]
 
     def build(self, spec: Bf16OverrideGraphSpec, device_index: int, heur_modes):
-        """Return ``[(tactic, serialized_plan), ...]`` in candidate order, or ``None``."""
+        """Return ``(candidates, [(tactic, serialized_plan), ...])``, or ``None``.
+
+        ``candidates`` is every tactic in plan-index order; the plans follow
+        that order and omit candidates that could not be built.
+        """
         with self._lock:
             if self._broken:
                 return None
@@ -226,13 +233,11 @@ class CudnnPlanBuildPool:
                 if not 0 <= index < len(candidates) or candidates[index] != tactic:
                     raise _WorkerFailure("plan does not match its candidate")
                 by_index[index] = (tactic, blob)
-        # A missing plan would silently narrow the tuned tactic set; the
-        # in-process build is the reference, so fall back to it instead.
-        if len(by_index) != len(candidates):
-            raise _WorkerFailure(
-                f"built {len(by_index)} of {len(candidates)} candidate plans"
-            )
-        return [by_index[index] for index in sorted(by_index)]
+        # No plan at all points at the workers' environment rather than at
+        # individual engines, so build in-process instead.
+        if not by_index:
+            raise _WorkerFailure(f"built none of {len(candidates)} candidate plans")
+        return candidates, [by_index[index] for index in sorted(by_index)]
 
     def _fail(self, exc) -> None:
         self._broken = True

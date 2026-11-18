@@ -173,7 +173,8 @@ def build_shard(spec: Bf16OverrideGraphSpec, handle, heur_modes, shard):
     """Enumerate all candidates; build and serialize this shard's plans.
 
     Returns ``(candidates, [(index, tactic, blob), ...])``. A candidate whose
-    plan fails to build is left out, as the all-plans build leaves it out.
+    plan fails to build has no entry in the plans; it stays in the candidates
+    so the caller can report it as failed, as the in-process path does.
     """
     shard_index, shard_count = shard
     # One graph per shard: building plans by index on it costs what
