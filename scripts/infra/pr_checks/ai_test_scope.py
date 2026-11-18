@@ -111,7 +111,9 @@ def _redact_credentials(text, secrets=()):
 def _public_prose(text, secrets=(), limit=500):
     """Sanitize untrusted explanations without changing generated command examples."""
     text = _redact_credentials(text, secrets)
-    text = re.sub(r"@flashinfer-bot", "flashinfer-bot", text, flags=re.I)
+    # Drop every "@" directly before the handle: removing a single one would turn
+    # "@@flashinfer-bot run" into a live command on the reason line of a note.
+    text = re.sub(r"@+(?=flashinfer-bot)", "", text, flags=re.I)
     return html.escape(" ".join(text.split()), quote=False)[:limit]
 
 
