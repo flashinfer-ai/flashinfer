@@ -18,6 +18,7 @@ the smallest larger bucket, then the largest smaller bucket.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
 import json
 import os
@@ -26,9 +27,10 @@ import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 from flashinfer.moe_ep._compat import deprecated_aliases
+from .shared_expert import Sm107SharedExpertConfig
 
 # Bump when kernel or knob semantics invalidate previous tuning results.
-BACKEND_REVISION = "sm107-block-scaled-1667b47a-runtime-options-v1"
+BACKEND_REVISION = "sm107-block-scaled-70a6878d-runtime-v1"
 _KEY_FIELDS = (
     "backend_revision",
     "kernel_variant",
@@ -46,7 +48,176 @@ _KEY_FIELDS = (
     "situ_beta",
     "situ_linear_beta",
     "gate_up_clamp",
+    "batch_invariant",
+    "batch_invariant_version",
+    "batch_invariant_fingerprint",
+    "use_tanh_sigmoid",
+    "epilogue_warpgroups",
+    "shared_expert",
+    "combine_dedup",
 )
+
+
+def _bi_key(
+    dtype,
+    hidden,
+    intermediate,
+    topk,
+    num_experts,
+    variant,
+    early,
+    clamp,
+    norm,
+    enabled,
+    version,
+    *,
+    activation="swiglu",
+    swiglu_alpha=None,
+    swiglu_beta=None,
+    situ_beta=None,
+    situ_linear_beta=None,
+    per_token_scale=False,
+    combine_dtype="bf16",
+):
+    if not enabled:
+        return dict(
+            batch_invariant=False,
+            batch_invariant_version=None,
+            batch_invariant_fingerprint=None,
+        )
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+        batch_invariant_variant_kwargs,
+    )
+
+    if per_token_scale:
+        raise ValueError("per-token FC1 scaling is not implemented by SM107")
+    variants = batch_invariant_variant_kwargs(
+        SimpleNamespace(
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+    )
+    if combine_dtype != "bf16":
+        variants["combine_dtype"] = combine_dtype
+    if dtype in ("mxfp4", "mxfp4_mxfp8"):
+        if isinstance(norm, bool) or norm != 1.0:
+            raise ValueError("batch_invariant MXFP4 requires input_norm_const=1.0")
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp4_batch_invariant import (
+            MXFP4_BATCH_INVARIANT_VERSION,
+        )
+        from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
+            spec_fingerprint as mxfp4_fingerprint,
+        )
+
+        return dict(
+            batch_invariant=True,
+            batch_invariant_version=MXFP4_BATCH_INVARIANT_VERSION
+            if version is None
+            else version,
+            batch_invariant_fingerprint=mxfp4_fingerprint(
+                hidden=hidden,
+                intermediate=intermediate,
+                top_k=topk,
+                num_experts=num_experts,
+                arch="sm_107",
+                quant_kind=dtype,
+                implementation="genphase" if variant == "genphase" else "standard",
+                apply_routing_weights_before_fc2=early,
+                gate_up_clamp=clamp,
+                **variants,
+            ),
+        )
+    if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        if isinstance(norm, bool) or norm != 1.0:
+            raise ValueError("batch_invariant MXFP8 requires input_norm_const=1.0")
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            MXFP8_BATCH_INVARIANT_VERSION,
+        )
+        from flashinfer.moe_ep.batch_invariant.mxfp8_spec import (
+            spec_fingerprint as mxfp8_fingerprint,
+        )
+
+        return dict(
+            batch_invariant=True,
+            batch_invariant_version=MXFP8_BATCH_INVARIANT_VERSION
+            if version is None
+            else version,
+            batch_invariant_fingerprint=mxfp8_fingerprint(
+                hidden=hidden,
+                intermediate=intermediate,
+                top_k=topk,
+                num_experts=num_experts,
+                arch="sm_107",
+                quant_kind=dtype,
+                implementation="genphase" if variant == "genphase" else "standard",
+                apply_routing_weights_before_fc2=early,
+                gate_up_clamp=clamp,
+                **variants,
+            ),
+        )
+    if dtype != "nvfp4":
+        raise ValueError("SM107 batch_invariant cache requires NVFP4 or MXFP4")
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        NVFP4_BATCH_INVARIANT_VERSION,
+    )
+    from flashinfer.moe_ep.batch_invariant.nvfp4_spec import spec_fingerprint
+
+    return dict(
+        batch_invariant=True,
+        batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
+        if version is None
+        else version,
+        batch_invariant_fingerprint=spec_fingerprint(
+            hidden=hidden,
+            intermediate=intermediate,
+            top_k=topk,
+            num_experts=num_experts,
+            arch="sm_107",
+            implementation="genphase" if variant == "genphase" else "standard",
+            apply_routing_weights_before_fc2=early,
+            gate_up_clamp=clamp,
+            input_norm_const=norm,
+            has_fc1_alpha=True,
+            has_fc2_alpha=True,
+            has_fc1_norm_const=True,
+            **variants,
+        ),
+    )
+
+
+def _bi_plan_valid(
+    knobs,
+    variant,
+    dtype="nvfp4",
+    *,
+    hidden=None,
+    intermediate=None,
+    combine_dtype="bf16",
+):
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+        validate_block_scaled_batch_invariant,
+    )
+
+    values = dict(batch_invariant=True, quant_kind=dtype, combine_dtype=combine_dtype)
+    if hidden is not None:
+        values["hidden"] = hidden
+    if intermediate is not None:
+        values["intermediate"] = intermediate
+    try:
+        validate_block_scaled_batch_invariant(
+            SimpleNamespace(**values),
+            _knobs_from_json(knobs),
+            implementation="genphase" if variant == "genphase" else "standard",
+            arch="sm_107",
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _cache_path() -> Optional[str]:
@@ -134,12 +305,42 @@ def _matching_entries(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return records with a compatible numerical and execution contract."""
     if entries is None:
         path = _cache_path()
         entries = [] if path is None else _load_entries(path)
     key = dict(
+        **_bi_key(
+            dtype,
+            hidden,
+            intermediate,
+            topk,
+            num_experts,
+            kernel_variant,
+            apply_routing_weights_before_fc2,
+            gate_up_clamp,
+            input_norm_const,
+            batch_invariant,
+            batch_invariant_version,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            per_token_scale=per_token_scale,
+            combine_dtype=combine_dtype,
+        ),
         backend_revision=BACKEND_REVISION,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
@@ -148,6 +349,12 @@ def _matching_entries(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -160,8 +367,23 @@ def _matching_entries(
     matches = [
         e
         for e in entries
-        if all(e.get(f) == key[f] for f in _KEY_FIELDS)
+        if all(
+            e.get(f, False if f in ("batch_invariant", "combine_dedup") else None)
+            == key[f]
+            for f in _KEY_FIELDS
+        )
         and isinstance(e.get("knobs"), dict)
+        and (
+            not batch_invariant
+            or _bi_plan_valid(
+                e["knobs"],
+                kernel_variant,
+                dtype,
+                hidden=hidden,
+                intermediate=intermediate,
+                combine_dtype=combine_dtype,
+            )
+        )
         and isinstance(e.get("max_tokens"), int)
         and (
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
@@ -197,6 +419,16 @@ def lookup_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
 
@@ -218,6 +450,18 @@ def lookup_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        batch_invariant=batch_invariant,
+        batch_invariant_version=batch_invariant_version,
+        input_norm_const=input_norm_const,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        per_token_scale=per_token_scale,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
@@ -259,8 +503,27 @@ def make_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
+    if batch_invariant and not _bi_plan_valid(
+        knobs,
+        kernel_variant,
+        dtype,
+        hidden=hidden,
+        intermediate=intermediate,
+        combine_dtype=combine_dtype,
+    ):
+        raise ValueError("cannot record an inadmissible batch-invariant NVFP4 plan")
     if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
         raise ValueError(
             "recording in-kernel reduction requires allow_nondeterministic=True"
@@ -270,6 +533,26 @@ def make_record(
     if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
         raise ValueError("live_tokens must be between zero and max_tokens")
     entry = dict(
+        **_bi_key(
+            dtype,
+            hidden,
+            intermediate,
+            topk,
+            num_experts,
+            kernel_variant,
+            apply_routing_weights_before_fc2,
+            gate_up_clamp,
+            input_norm_const,
+            batch_invariant,
+            batch_invariant_version,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            per_token_scale=per_token_scale,
+            combine_dtype=combine_dtype,
+        ),
         backend_revision=BACKEND_REVISION,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
@@ -278,6 +561,12 @@ def make_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -309,7 +598,13 @@ def write_record(entry: Dict[str, Any]) -> Optional[str]:
             e
             for e in entries
             if not (
-                all(e.get(f) == entry[f] for f in _KEY_FIELDS)
+                all(
+                    e.get(
+                        f, False if f in ("batch_invariant", "combine_dedup") else None
+                    )
+                    == entry[f]
+                    for f in _KEY_FIELDS
+                )
                 and e.get("max_tokens") == max_tokens
                 and e.get("live_tokens", e["max_tokens"]) == live_tokens
             )
@@ -417,6 +712,16 @@ def resolve_knobs(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    input_norm_const: float = 1.0,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -439,15 +744,45 @@ def resolve_knobs(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        batch_invariant=batch_invariant,
+        batch_invariant_version=batch_invariant_version,
+        input_norm_const=input_norm_const,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        per_token_scale=per_token_scale,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
     )
     if cached is not None:
         return cached, "cache"
-    return default_knobs(
+    if batch_invariant:
+        from types import SimpleNamespace
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_default_knobs,
+        )
+
+        return block_scaled_batch_invariant_default_knobs(
+            SimpleNamespace(quant_kind=dtype),
+            "genphase" if kernel_variant == "genphase" else "standard",
+            arch="sm_107",
+        ), "heuristic"
+    selected = default_knobs(
         max_tokens,
         quant_kind=dtype,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
-    ), "heuristic"
+    )
+    if combine_dedup:
+        selected.update(
+            fc2_use_bulk=True,
+            token_back_mode="reuse_dispatch_warps",
+            reduce_topk_in_kernel=False,
+        )
+    return selected, "heuristic"
 
 
 __all__ = [

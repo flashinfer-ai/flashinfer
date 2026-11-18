@@ -542,6 +542,171 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+@pytest.mark.parametrize("explicit_cuda_graph", [False, True])
+def test_choose_one_retunes_when_runner_candidates_expand(
+    monkeypatch, explicit_cuda_graph
+):
+    class OtherRunner(DummyRunner):
+        def __init__(self, tactic, layout):
+            super().__init__((tactic,))
+            self.layout = layout
+
+        def __hash__(self):
+            return 0
+
+        def get_cache_key_extras(self, inputs):
+            return (self.layout,)
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first = DummyRunner((0,))
+    second, third = OtherRunner(1, "a"), OtherRunner(2, "b")
+    inputs = [torch.empty(4, 8)]
+    config = TuningConfig()
+    calls = []
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        calls.append(runner)
+        return {0: 3.0, 1: 1.0, 2: 2.0}[tactic]
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+
+    with autotune():
+        assert tuner.choose_one("expand", [first], config, inputs) == (first, 0)
+    assert calls == [first]
+    calls.clear()
+
+    # The single-runner winner can still serve inference before the mixed tune.
+    assert tuner.choose_one("expand", [first, second], config, inputs) == (first, 0)
+    assert calls == []
+
+    with autotune():
+        winner = tuner.choose_one("expand", [first, second], config, inputs)
+        assert calls == [first, second]
+        assert winner == (second, 1)
+        calls.clear()
+        assert tuner.choose_one("expand", [second, first], config, inputs) == (
+            second,
+            1,
+        )
+        assert tuner.choose_one("expand", [second], config, inputs) == (second, 1)
+        assert calls == []
+
+    # The mixed tune replaced the earlier winner for this backend.
+    assert tuner.choose_one("expand", [first], config, inputs) == (first, -1)
+    assert calls == []
+
+    with autotune():
+        explicit_config = replace(config, use_cuda_graph=explicit_cuda_graph)
+        assert tuner.choose_one("expand", [first], explicit_config, inputs) == (
+            first,
+            0,
+        )
+        assert tuner.choose_one("expand", [first, second], config, inputs) == (
+            second,
+            1,
+        )
+    assert tuner.choose_one("expand", [first, second], config, inputs) == (second, 1)
+    calls.clear()
+
+    with autotune():
+        # Only cache-key extras distinguish the two OtherRunner candidates.
+        assert tuner.choose_one("expand", [first, second, third], config, inputs) == (
+            second,
+            1,
+        )
+        assert calls == [first, second, third]
+        calls.clear()
+        assert tuner.choose_one("expand", [third, second], config, inputs) == (
+            second,
+            1,
+        )
+        assert calls == []
+        assert tuner.choose_one("expand", [first, third], config, inputs) == (third, 2)
+        assert calls == [first, third]
+
+
+@pytest.mark.parametrize("buckets", [(4,), (4, 8)])
+def test_choose_one_reuses_coverage_after_runner_preparation(monkeypatch, buckets):
+    class PreparingRunner(DummyRunner):
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+            self.prepared = True
+            return True
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, second = DummyRunner((0,)), PreparingRunner((1,))
+    runners = [first, second]
+    inputs = [torch.empty(buckets[-1], 8)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=buckets,
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        )
+    )
+    calls = []
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        calls.append(tactic)
+        return 1.0 + tactic
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    with autotune():
+        assert tuner.choose_one("prepare", runners, config, inputs) == (first, 0)
+        assert calls == [0, 1] * len(buckets)
+        calls.clear()
+        assert tuner.choose_one("prepare", runners, config, inputs) == (first, 0)
+        assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["empty", "profiling"])
+def test_choose_one_retries_incomplete_runner_comparison(monkeypatch, failure):
+    class OtherRunner(DummyRunner):
+        _retry_empty_tactics = True
+
+        def get_valid_tactics(self, inputs, profile):
+            return [] if phase == "expand" and failure == "empty" else [1]
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, second = DummyRunner((0, 2)), OtherRunner()
+    inputs = [torch.empty(4, 8)]
+    config = TuningConfig()
+    profiled = []
+    phase = "initial"
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        profiled.append(tactic)
+        if tactic == 1:
+            return float("inf") if phase == "expand" else 0.5
+        return 1.0 if tactic == (0 if phase == "initial" else 2) else 2.0
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    with autotune():
+        assert tuner.choose_one("retry", [first], config, inputs) == (first, 0)
+        phase = "expand"
+        assert tuner.choose_one("retry", [first, second], config, inputs) == (first, 2)
+
+    # Inference still uses the earlier winner after a partial tune.
+    assert tuner.choose_one("retry", [first, second], config, inputs) == (first, 0)
+
+    phase = "recovered"
+    profiled.clear()
+    with autotune():
+        assert tuner.choose_one("retry", [first, second], config, inputs) == (second, 1)
+        assert profiled == [0, 2, 1]
+        profiled.clear()
+        assert tuner.choose_one("retry", [first, second], config, inputs) == (second, 1)
+        assert profiled == []
+
+
 @pytest.mark.parametrize("phase", ("forward", "precompile"))
 def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
     class PreparationMemoryErrorRunner(DummyRunner):
@@ -1813,17 +1978,15 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         use_cold_l2_cache=True,
         cuda_graph_profile_replays=2,
     )
-    allocations = []
-    original_empty = torch.empty
+    flushes = []
+    original_make_l2_flush = autotuner_module.make_l2_flush
 
-    def tracked_empty(*args, **kwargs):
-        result = original_empty(*args, **kwargs)
-        if kwargs.get("dtype") == torch.int8:
-            allocations.append((result.numel(), result.device))
-        return result
+    def tracked_make_l2_flush(num_bytes, device):
+        flushes.append((num_bytes, device))
+        return original_make_l2_flush(num_bytes, device)
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
-    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(autotuner_module, "make_l2_flush", tracked_make_l2_flush)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
@@ -1831,7 +1994,7 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
     latency = tuner._profile_single_kernel(runner, inputs, 0, config)
 
     assert latency >= 0
-    assert allocations == [(8192, inputs[0].device)]
+    assert flushes == [(8192, inputs[0].device)]
 
 
 class _CudaAddRunner(DummyRunner):
@@ -1945,7 +2108,7 @@ def test_cold_chain_profiling_policy_labels():
     assert l2_policy(replace(chain, profile_arena_input_indices=())) == "cold"
     assert l2_policy(replace(chain, use_cold_l2_cache=False)) == "hot"
     assert l2_policy(gemm_base._BF16_GEMM_SM100_TUNING_CONFIG) == "cold-chain:8"
-    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold"
+    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold-chain:16"
 
 
 def test_tuning_overrides_keep_cold_chain():

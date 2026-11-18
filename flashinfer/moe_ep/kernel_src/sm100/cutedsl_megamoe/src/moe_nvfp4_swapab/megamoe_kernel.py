@@ -1012,6 +1012,14 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         act_scale = (
             "_fc1actptscale" if self.enable_fc1_activation_per_token_scale else ""
         )
+        bi_enabled = bool(getattr(self, "batch_invariant_chain", False))
+        bi_variant = getattr(self, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             "megamoe_nvfp4"
             f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
@@ -1027,6 +1035,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
+            + bi_suffix
         )
 
     # -- AOT compile / load (TVM-FFI calling convention) ----------------------
@@ -1570,6 +1579,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
                 num_experts=self.num_total_experts,
+                batch_invariant=self.batch_invariant_chain,
                 persistent=self.topk_reduce_persistent,
                 num_sms=self.topk_reduce_num_sms,
             )
@@ -1584,7 +1594,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     num_tokens_dev=num_valid_tokens,
                     topk_indices=(
                         topk_idx
-                        if cutlass.const_expr(not self.combine_format.is_quantized)
+                        if cutlass.const_expr(not self.combine_format.is_quantized or self.batch_invariant_chain)
                         else None
                     ),
                 )
@@ -1597,7 +1607,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     stream,
                     topk_indices=(
                         topk_idx
-                        if cutlass.const_expr(not self.combine_format.is_quantized)
+                        if cutlass.const_expr(not self.combine_format.is_quantized or self.batch_invariant_chain)
                         else None
                     ),
                 )

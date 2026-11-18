@@ -4,3 +4,7 @@ csrc/kda/flashkda_generated_*.cu whitespace=-blank-at-eof
 
 # Retained static KDA device programs.
 csrc/kda/ptx/*.ptx linguist-generated=true
+
+# Sources are hashed byte for byte by the JIT (cake build.json, cuDNN Frost and
+# situ-MoE manifests); a CRLF checkout on Windows would change every digest.
+* text=auto eol=lf
