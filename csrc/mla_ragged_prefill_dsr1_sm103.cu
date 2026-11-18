@@ -2440,12 +2440,15 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
   static std::set<int> attr_done;
   int attr_dev = 0;
   cudaGetDevice(&attr_dev);
-  bool attr_needed = false;
-  {
-    std::lock_guard<std::mutex> lk(attr_mu);
-    attr_needed = attr_done.insert(attr_dev).second;
-  }
+  // Hold the lock THROUGH initialization and publish the device only after
+  // the attribute/carveout calls complete, so a concurrent first call on
+  // the same device cannot launch before the shared-memory opt-in finishes
+  // (the tvm_ffi binding releases the GIL).
+  std::unique_lock<std::mutex> attr_lk(attr_mu);
+  bool attr_needed = attr_done.count(attr_dev) == 0;
+  if (!attr_needed) attr_lk.unlock();
   if (attr_needed) {
+    (void)cudaGetLastError();  // clear stale state; checked after setup
     cudaFuncSetAttribute(mla_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     cudaFuncSetAttribute(mla_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)(smem + PSZ));
@@ -2613,6 +2616,13 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
                        false, false, true, true>));
 #undef CARVE
 #undef CARVE_LB
+    cudaError_t attr_rc = cudaGetLastError();
+    if (attr_rc != cudaSuccess) {
+      throw std::invalid_argument(std::string("shared-memory attribute/carveout setup failed: ") +
+                                  cudaGetErrorString(attr_rc));
+    }
+    attr_done.insert(attr_dev);
+    attr_lk.unlock();
   }
 
   dim3 grid(usepair ? (2 * base * NSPLIT) : (B * QT * HQ * NSPLIT));
