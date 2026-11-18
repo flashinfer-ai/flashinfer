@@ -70,6 +70,14 @@ MXFP8 GEMM
     mm_mxfp8
     bmm_mxfp8
 
+MXFP8 x MXFP4 GEMM (MXFP4 weight, MXFP8 activation)
+----------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_mxfp8_mxfp4
+
 FP8 GEMM
 --------
 
@@ -85,6 +93,17 @@ FP8 GEMM
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
+
+16-bit x FP8 GEMM (FP8 weight, bf16 / fp16 activation)
+-------------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_bf16_fp8
+    mm_bf16_fp8_workspace_bytes
+    mm_fp16_fp8
+    mm_fp16_fp8_workspace_bytes
 
 Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
 

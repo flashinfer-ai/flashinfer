@@ -1,6 +1,7 @@
 """Tuner failure policy, numerical gating, and collective latency statistics."""
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -17,6 +18,90 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     correctness,
     knob_cache,
 )
+
+
+def test_candidate_deduplication_preserves_order_and_normalizes_json():
+    grid = autotune.sm107_candidates()
+    first, second = grid[1], grid[0]
+    duplicate = dict(reversed(json.loads(json.dumps(first)).items()))
+    supplied = [first, duplicate, second, first]
+    snapshot = json.dumps(supplied)
+    assert autotune._unique_candidates(supplied) == [first, second]
+    assert json.dumps(supplied) == snapshot
+    assert autotune._unique_candidates([]) == []
+
+
+def test_default_sweep_grid_uses_dedup_return_contract(monkeypatch):
+    cfg = Sm107BlockScaledMoeConfig(
+        num_total_experts=32,
+        max_tokens_per_rank=4,
+        num_topk=4,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        combine_dedup=True,
+        fc2_use_bulk=True,
+        token_back_mode="reuse_dispatch_warps",
+    )
+    generate = autotune.sm107_candidates
+    grid = mock.Mock(wraps=generate)
+    monkeypatch.setattr(autotune, "sm107_candidates", grid)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    class OracleReached(Exception):
+        pass
+
+    def oracle(*args, **kwargs):
+        raise OracleReached
+
+    monkeypatch.setattr(correctness, "sampled_reference", oracle)
+    with pytest.raises(OracleReached):
+        autotune._sweep_sm107_block_scaled_mega_moe(
+            object(),
+            None,
+            None,
+            SimpleNamespace(config=cfg),
+            num_tokens=1,
+        )
+    grid.assert_called_once_with(
+        cfg.quant_kind,
+        kernel_variant="inference",
+        batch_invariant=False,
+        combine_dedup=True,
+        token_back_mode="reuse_dispatch_warps",
+    )
+    selected = generate(*grid.call_args.args, **grid.call_args.kwargs)
+    assert selected and all(autotune.is_valid_sm107(c, cfg) for c in selected)
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("limit", [2, 16])
+def test_cli_deduplicates_before_limiting_candidates(monkeypatch, variant, limit):
+    from flashinfer.moe_ep.backends.mega.kernel import tuning as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    first, second = autotune.sm107_candidates(kernel_variant=variant)[:2]
+    monkeypatch.setattr(
+        package,
+        "sm107_candidates",
+        lambda *a, **kw: [first, json.loads(json.dumps(first)), second],
+    )
+    args = SimpleNamespace(
+        sweep="structural",
+        allow_nondeterministic=False,
+        combine_dtype="bf16",
+        skew=None,
+        max_candidates=limit,
+        dtype="nvfp4",
+        warmup_iters=1,
+        timed_iters=2,
+    )
+    candidates = tuning._candidates(args, 0, 1, 128, "nvfp4", variant)
+    selected = mock.Mock(return_value=first)
+    shared.finish_sweep(args, 0, 128, 4, None, None, None, None, candidates, selected)
+    assert selected.call_args.kwargs["candidates"] == [first, second]
 
 
 def _load_benchmark_module(path: Path):
@@ -52,6 +137,89 @@ def test_latency_reports_primary_and_rank0_medians(benchmark_module):
         "p50_rank0_us": 50.5,
         "per_rank_samples_us": [[1, 100], [100, 3]],
     }
+
+
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"]
+)
+def test_benchmark_default_config_preserves_standard_settings(
+    benchmark_module, monkeypatch, kind
+):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, _, _, _ = benchmark_module._parse_args([])
+    cfg = benchmark_module._make_backend_config(args, None, kind)
+    assert cfg.kernel_variant == "inference"
+    assert cfg.activation == "swiglu" and cfg.gate_up_clamp is None
+    assert cfg.apply_routing_weights_before_fc2 is True
+    assert cfg.knobs is None and cfg.fc2_use_bulk is False
+    assert cfg.use_tanh_sigmoid is False and cfg.epilogue_warpgroups == 1
+
+
+def test_benchmark_selects_situ_epilogue_options(benchmark_module, monkeypatch):
+    from flashinfer.moe_ep import FleetParams
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
+        make_workspace_config,
+    )
+
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, _, _, _ = benchmark_module._parse_args(
+        [
+            "--activation",
+            "situ",
+            "--situ-beta",
+            "4",
+            "--situ-linear-beta",
+            "25",
+            "--use-tanh-sigmoid",
+            "--epilogue-warpgroups",
+            "2",
+            "--routing-weight-position",
+            "late",
+        ]
+    )
+    knobs = {"fc2_use_bulk": True, "fc2_tma_stages": 1}
+    cfg = benchmark_module._make_backend_config(args, knobs, "nvfp4")
+    assert (cfg.activation, cfg.situ_beta, cfg.situ_linear_beta) == ("situ", 4.0, 25.0)
+    assert cfg.use_tanh_sigmoid is True and cfg.epilogue_warpgroups == 2
+    assert cfg.apply_routing_weights_before_fc2 is False
+    assert cfg.knobs == knobs
+    workspace_config = make_workspace_config(
+        cfg,
+        FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=3584),
+        rank=0,
+        world_size=4,
+        quant_kind="nvfp4",
+        gate_up_clamp=cfg.gate_up_clamp,
+        overrides=cfg.knobs,
+    )
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    kernel = block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(workspace_config)
+    assert kernel.epilogue.use_tanh_sigmoid is True
+    assert kernel.epilogue.two_epilogue_warpgroups is True
+
+
+def test_benchmark_genphase_uses_admitted_launch_defaults(
+    benchmark_module, monkeypatch
+):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, tokens, _, _ = benchmark_module._parse_args(
+        ["--kernel-variant", "genphase", "--knobs", "heuristic"]
+    )
+    cfg = benchmark_module._make_backend_config(args, None, "mxfp4_mxfp8")
+    assert cfg.kernel_variant == "genphase"
+    assert cfg.cluster_shape_mn == (4, 1) and cfg.fallback_cluster_shape_mn is None
+    assert cfg.fc2_use_bulk is True
+    assert max(tokens) <= 1024
+
+
+def test_benchmark_blackwell_input_profile_keeps_default_clamp(
+    benchmark_module, monkeypatch
+):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args, _, _, _ = benchmark_module._parse_args(["--input-profile", "blackwell"])
+    assert (
+        benchmark_module._make_backend_config(args, None, "nvfp4").gate_up_clamp == 10.0
+    )
 
 
 def test_gaussian_routing_keeps_selected_scores(benchmark_module, monkeypatch):
@@ -97,7 +265,14 @@ def test_benchmark_reports_staging_and_capture_allocation(
     benchmark_module, mode, execution, no_flush, staging, ownership, allocation
 ):
     protocol = benchmark_module._timing_protocol(
-        SimpleNamespace(mode=mode, execution=execution, no_l2_flush=no_flush, warmup=20)
+        SimpleNamespace(
+            mode=mode,
+            execution=execution,
+            no_l2_flush=no_flush,
+            warmup=20,
+            eager_completed_wall=False,
+            prequantized=False,
+        )
     )
     assert protocol["input_staging_in_timed_span"] is staging
     assert protocol["output_ownership"] == ownership
@@ -241,11 +416,17 @@ def test_incorrect_candidate_cannot_enter_cache(fake_trials):
         None,
         None,
         state.source,
-        candidates=[{"fc2_use_bulk": True}, {"fc2_use_bulk": False}],
+        candidates=[
+            {"fc2_use_bulk": True},
+            {"fc2_use_bulk": True},
+            {"fc2_use_bulk": False},
+            {"fc2_use_bulk": False},
+        ],
         warmup_iters=1,
         timed_iters=2,
     )
     assert winner == {"fc2_use_bulk": False}
+    assert len(state.trials) == 3  # Source workspace and two distinct candidates.
     assert all(t.destroyed for t in state.trials[1:])
     assert state.recorded.call_args.args[0]["knobs"] == winner
 

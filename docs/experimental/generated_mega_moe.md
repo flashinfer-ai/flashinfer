@@ -16,14 +16,19 @@ repeated `run()`.
 
 The catalog (`mega_moe_v3.v3`) lists one program per schedule, compiled for
 every architecture it names from one source: the pipeline kernels read the
-SM count from the compile line (`-DNUM_CTAS=<physical SMs>`, supplied by the
+persistent grid from the compile line (`-DNUM_CTAS=<CTAs>`, supplied by the
 loader from the route), the grouped kernels carry no SM count at all. Two
 FP4 pipeline schedules (16 and 128 tokens) select different producer
 instructions per architecture and stay as per-architecture pairs. The
 routes table is keyed by architecture, so a route may ship for one
 architecture only. Every route names the SM counts it admits (one, or a
 list for a program that takes the count from its compile line; the runtime
-picks the device's count and refuses any other) and its launch grid; a
+picks the device's count and refuses any other) and its launch grid, one
+persistent CTA per SM unless its metadata states `num_ctas`: then the
+program runs that many CTAs (the grid and `-DNUM_CTAS`), fewer than the
+device's SMs, so a stream's next call starts on the free SMs while the
+previous call's last CTAs finish (the one-token rank routes of the
+384-expert I640, 96-expert and 48-expert shapes on sm_103a run 148 of 152); a
 route's metadata names the program's source-schedule form (`block_m`, the
 source tile height; `readiness`, `"block"` or `"grid"`) and whether its
 program carries the local expert filter (`local_expert_filter`). The

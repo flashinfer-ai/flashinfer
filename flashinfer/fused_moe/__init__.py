@@ -52,6 +52,8 @@ from .api import (
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
     CuteDslConfig,
+    BatchInvariantBf16Config,
+    BatchInvariantFp8PerTensorConfig,
     FrostLowLatencyConfig,
     PrimsTsConfig,
     CutlassBf16Config,
@@ -183,6 +185,7 @@ from .core import (
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
+    split_fp4_moe_weights_by_locality_domain,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_channel_scale_moe,
@@ -325,6 +328,13 @@ def __getattr__(name: str):
             stacklevel=2,
         )
         return CuteDslRunner
+    if name == "BGMVMoEBlackwellPlan":
+        warnings.warn(
+            "BGMVMoEBlackwellPlan is deprecated; use BGMVMoECakePlan instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return BGMVMoECakePlan
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -374,6 +384,8 @@ __all__ = [
     "CudnnGroupedGemmNvfp4Config",
     "CudnnGroupedGemmNvfp4Runner",
     "CuteDslConfig",
+    "BatchInvariantBf16Config",
+    "BatchInvariantFp8PerTensorConfig",
     "FrostLowLatencyConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
@@ -490,6 +502,7 @@ __all__ = [
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
+    "split_fp4_moe_weights_by_locality_domain",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_channel_scale_moe",
@@ -525,6 +538,7 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu",
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
+    "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
     "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",

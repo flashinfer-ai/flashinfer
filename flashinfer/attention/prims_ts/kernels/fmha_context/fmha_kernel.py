@@ -260,7 +260,7 @@ def _init_task_with_domain(
     """Initialize a captured Task with its static validation loop domain."""
     schedule = kwargs.get("schedule")
     if schedule is None:
-        raise ValueError("Causal domain tasks require a captured schedule.")
+        raise ValueError("Domain tasks require a captured schedule.")
     if domain is not None:
         schedule.loop_end = domain
     task_init(task, **kwargs)
@@ -337,6 +337,54 @@ def _init_causal_domain_state(
     task._offset = offset
     task._window_size_left = window_size_left
     task._packed_window = packed_window
+
+
+def _writes_empty_dense_lse(cfg: FmhaConfig) -> bool:
+    """Publish neutral O/LSE for empty ordinary contiguous dense requests."""
+    return (
+        cfg.lse_mode != "none"
+        and not cfg.is_causal
+        and not cfg.has_variable_window
+        and cfg.window_size_left == 0
+        and not cfg.use_paged_kv
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+    )
+
+
+class PackedDenseDomainTask(Task):
+    """Request-local dense KV extent with one masked tile for empty rows."""
+
+    def __init__(
+        self,
+        num_kv_tiles: int | Int32,
+        tile_size_kv: int,
+        batch_idx: int,
+        cum_seqlen_k: cute.Tensor,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Retain a static validation bound when available and clip runtime work."""
+        static_domain = (
+            max(num_kv_tiles - offset, 0) if isinstance(num_kv_tiles, int) else None
+        )
+        _init_task_with_domain(self, kwargs, static_domain)
+        self._num_kv_tiles = num_kv_tiles
+        self._tile_size_kv = tile_size_kv
+        self._batch_idx = batch_idx
+        self._cum_seqlen_k = cum_seqlen_k
+        self._offset = offset
+
+    def get_domain(self, tile_coord: cute.Coord) -> int | Int32:
+        """Use the same live KV bound for each task's N or N-1 domain."""
+        batch_coord = Int32(tile_coord[self._batch_idx])
+        k_begin = Int32(self._cum_seqlen_k[batch_coord])
+        seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
+        runtime_tiles = cute.ceil_div(seqlen_k, self._tile_size_kv)
+        # Keep the paired N/N-1 pipeline domain valid even for an empty request.
+        domain = _domain_min(self._num_kv_tiles, _domain_max(1, runtime_tiles))
+        return domain - self._offset
 
 
 class CausalDomainTask(Task):
@@ -1202,6 +1250,7 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
+                keep_empty_kv=_writes_empty_dense_lse(cfg),
                 **work_queue_kwargs,
             )
         else:
@@ -1222,6 +1271,7 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
+                keep_empty_kv=_writes_empty_dense_lse(cfg),
                 **work_queue_kwargs,
             )
         else:
@@ -2607,6 +2657,35 @@ def _causal_domain_kwargs(
     return result
 
 
+def _uses_packed_dense_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
+    """Bound ordinary query-paired dense context by each live packed KV extent."""
+    # All task roles share the same paired N/N-1 protocol and int32 offsets.
+    # Uniform packed plans omit live offsets; specialized recipes and other
+    # topologies retain their own domains and tail handling.
+    # These are the public API's paired geometries; symmetric D192/D256 use
+    # one instance, and the public context API does not admit D64.
+    return (
+        not cfg.is_causal
+        and not cfg.has_variable_window
+        and cfg.window_size_left == 0
+        and not cfg.head_paired
+        and not cfg.use_paged_kv
+        and cfg.has_varlen
+        and not cfg.has_uniform_varlen
+        and cfg.packed_dense_k_mask
+        and cfg.num_qkv_instances == 2
+        and not cfg.two_cta_umma
+        and cfg.logical_head_dim_qk in (128, 192)
+        and cfg.pv_mma_tiler[1] == 128
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype
+        and cfg.q_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN)
+        and cfg.o_dtype in (cutlass.Float16, cutlass.BFloat16)
+    )
+
+
 def _select_fmha_domain_policy(
     cfg: FmhaConfig,
     *,
@@ -2788,6 +2867,24 @@ def _select_fmha_domain_policy(
             domain_n_minus_1_kwargs=causal_n_minus_1,
             softmax0_domain_kwargs=softmax0_domain,
             softmax1_domain_kwargs=softmax1_domain,
+        )
+    if _uses_packed_dense_runtime_kv_bounds(cfg):
+        if cum_seqlen_q is None or cum_seqlen_k is None:
+            raise ValueError("Packed dense domains require runtime Q and KV offsets")
+        dense_kwargs: DomainKwargs = {
+            "task_class": PackedDenseDomainTask,
+            "num_kv_tiles": num_kv_tiles,
+            "tile_size_kv": cfg.kv_tile_n,
+            "batch_idx": batch_idx,
+            "cum_seqlen_k": cum_seqlen_k,
+        }
+        domain_n_kwargs = {**dense_kwargs, "offset": 0}
+        domain_n_minus_1_kwargs = {**dense_kwargs, "offset": 1}
+        return FmhaDomainPolicy(
+            domain_n_kwargs=domain_n_kwargs,
+            domain_n_minus_1_kwargs=domain_n_minus_1_kwargs,
+            softmax0_domain_kwargs=domain_n_kwargs,
+            softmax1_domain_kwargs=domain_n_kwargs,
         )
     # Dense query-paired fallback: no head-pairing or causal mask, so both
     # peers traverse the full static K/V domain.
@@ -3197,7 +3294,11 @@ class FmhaTs:
         # VC-Attention skips no correction. The skip keeps a stale row max,
         # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
         # the E4M3 range. The exact per-tile max keeps every code at or below it.
-        if enable_skip_correction and not cfg.vc_attention:
+        # E4M3 V skips none either. A stale row max lets P reach 2^threshold, so
+        # P can only be scaled by 1 before the E4M3 cast and every P below 2^-10
+        # rounds to zero while the row sum still counts it. The exact max keeps
+        # P at or below 1, scaled by 448, which holds P down to 2^-18.
+        if enable_skip_correction and not cfg.vc_attention and v_dtype.width == 16:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
@@ -3362,7 +3463,7 @@ class FmhaTs:
         k_cute: cute.Tensor,
         v_cute: cute.Tensor,
         o_cute: cute.Tensor,
-        scale_softmax_log2: Float32,
+        scale_softmax: Float32 | cute.Tensor,
         output_scale: Float32 | cute.Tensor,
         max_active_clusters: int,
         stream: cuda_drv.CUstream,
@@ -3397,9 +3498,10 @@ class FmhaTs:
         128x4 atom per 128-token tile and head, as ``[B, H, tiles, 512]`` byte
         tensors.
 
-        ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalar
-        operands, normally ``log2(e) / sqrt(d)`` and ``1.0``. FP8 callers fold
-        scalar Q/K/V dequantization and output quantization scales into them.
+        Each global scale independently accepts a float32 scalar or a (1,)
+        float32 device tensor. Softmax operands use natural-exponential units;
+        host scalars convert in this launcher and device tensors convert on device.
+        FP8 callers fold Q/K/V descales and output quantization into them.
 
         VC-Attention additionally binds tile means and a static repair-tile count.
         Its output_scale is a per-channel V scale table.
@@ -3407,6 +3509,9 @@ class FmhaTs:
         if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
             raise ValueError("sage_scales is required by, and only by, a Sage kernel")
         cfg = self.cfg
+        softmax_scale_operand = scale_softmax
+        if cutlass.const_expr(not isinstance(scale_softmax, cute.Tensor)):
+            softmax_scale_operand = scale_softmax * Float32(1.4426950408889634)
         if cutlass.const_expr(
             cfg.use_paged_kv
             and (
@@ -3753,7 +3858,7 @@ class FmhaTs:
                 q_scales,
                 k_scales,
                 tile_sched_params,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 num_kv_tiles,
                 num_seq_tiles,
@@ -3813,7 +3918,7 @@ class FmhaTs:
             | utils.ClcDynamicPersistentTileSchedulerParams
             | None
         ),
-        scale_softmax_log2: Float32,
+        softmax_scale_operand: Float32 | cute.Tensor,
         output_scale: Float32 | cute.Tensor,
         num_kv_tiles: Int32,
         num_seq_tiles: Int32,
@@ -3839,8 +3944,10 @@ class FmhaTs:
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
-        ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalar
-        operands passed through task-local resource dataflow.
+        Global scale operands specialize independently as floats or device
+        tensors. Device softmax scales use natural-exponential units. After
+        loading/conversion, resources carry scalar values through task dataflow.
+        VC output scales remain a per-channel table.
         ``sage_scales`` is the prepared per-block/channel scale buffer.
 
         Structure:
@@ -3860,6 +3967,16 @@ class FmhaTs:
             cfg = copy(cfg)
             cfg.fixed_dense_k_tail = dense_tail_capacity
         cfg.num_seq_tiles = num_seq_tiles
+        # Host scalars arrive in log2 units; device scalar buffers retain the
+        # public natural-exponential units until this load.
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
+        else:
+            scale_softmax_log2 = softmax_scale_operand
+        if cutlass.const_expr(
+            isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
+        ):
+            output_scale = output_scale[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # 1. Prefetch TMA descriptors on load warp
@@ -4005,7 +4122,7 @@ class FmhaTs:
 
         # 7. Execute all tasks via the TS scheduler
         active_request = cutlass.Boolean(True)
-        if cutlass.const_expr(not is_persistent):
+        if cutlass.const_expr(not is_persistent and not _writes_empty_dense_lse(cfg)):
             batch_coord = cute.arch.block_idx()[cfg.work_tile_coord_indices[2]]
             if cutlass.const_expr(seq_lens_kv is not None):
                 active_request = Int32(seq_lens_kv[batch_coord]) > Int32(0)

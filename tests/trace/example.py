@@ -31,10 +31,13 @@ Results:
 - We would get these example json files under fi_trace_out directory:
 qsa_forward_h12_kv1_d256.json
 qsa_indexed_forward_h12_kv1_d256.json
+qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
+cute_dsl_fused_moe_topk2_e3_h768.json
+decode_cp_a2a_lse_reduce_tokens_d512.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
@@ -64,7 +67,9 @@ gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 sdsa_gather_key_sample_page_size64_dim128.json
-group_union_masks_top_k2048.json
+sdsa_group_union_masks_top_k2048.json
+sdsa_gather_nvfp4_kv_cache_by_position_heads1_ps64_pd128_sd16_k512_one1_cd512_sides2.json
+sdsa_compact_nvfp4_kv_cache_heads1_ps64_pd128_sd16_k512_one1_cd512_sides2.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -73,6 +78,8 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
+mm_bf16_fp8_N4096_K4096.json
+mm_fp16_fp8_N4096_K4096.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
 group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
@@ -83,6 +90,10 @@ gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_e5m2_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_e5m2_kv2_d128_sl144_ps4.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -104,11 +115,14 @@ mla_paged_decode_h16_ckv512_kpe64_ps64.json
 mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32_scales_ft.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4_scales_tf.json
+prims_ts_decode_mla_one_shot_kv_bounds_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -142,6 +156,7 @@ pcie_ipc_all_gather_tp4_h6144.json
 pcie_ipc_reduce_scatter_tp4_h6144.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64.json
+prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64_scales_tt.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
 prims_ts_block_sparse_wrapper_dense_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
@@ -162,7 +177,7 @@ silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
 sdsa_thresholds_from_sample_counters2.json
-token_sparse_kv_indices_top_k2048_lists2.json
+sdsa_token_sparse_kv_indices_top_k2048_lists2.json
 sdsa_top_k_from_candidates_pair2_range2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -197,6 +212,7 @@ are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json requires SM80 through SM90 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 
@@ -241,6 +257,7 @@ from flashinfer.cake_minimax_h3 import (
 from flashinfer.comm import (
     PcieIpcAllGatherWorkspace,
     PcieIpcReduceScatterWorkspace,
+    decode_cp_a2a_lse_reduce,
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
@@ -282,6 +299,20 @@ batch_decode_with_kv_cache_mla_swa.fi_trace(
     sm_scale=0.0625,
 )
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# DCP schema tracing needs tensor metadata, not a collective workspace.
+fi_trace(
+    decode_cp_a2a_lse_reduce,
+    partial_o=torch.empty((4, 8, 2, 512), dtype=torch.bfloat16, device="meta"),
+    partial_lse=torch.empty((4, 8, 2), dtype=torch.float32, device="meta"),
+    workspace=torch.empty(16, dtype=torch.uint8, device="meta"),
+    cp_rank=0,
+    cp_size=8,
+    lse_mode="base2",
+    mask=torch.empty(4, dtype=torch.bool, device="meta"),
+    save_dir=SAVE_DIR,
+)
+
 
 # PCIe traces need only world_size and tensor metadata, not an IPC allocation
 # or peer GPUs. Real collective execution must construct the workspace normally.
@@ -547,6 +578,52 @@ def example_qsa():
 example_qsa()
 
 
+def example_qsa_sparse_paged_attention():
+    if torch.cuda.get_device_capability(device)[0] not in (8, 9):
+        print("Skipping QSA sparse paged attention example: requires SM80 through SM90")
+        return
+    rows, num_blocks, page_size, width = 4, 8, 16, 64
+    q = torch.randn(rows, 12, 256, dtype=torch.bfloat16, device=device)
+    # NVFP4 cache: packed E2M1 bytes and one E4M3 block scale per 16 dims.
+    k_cache = torch.randint(
+        0, 256, (num_blocks, page_size, 1, 128), dtype=torch.uint8, device=device
+    )
+    v_cache = torch.randint_like(k_cache, 0, 256)
+    k_sf, v_sf = (
+        torch.rand(num_blocks, page_size, 1, 16, device=device).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    tokens = torch.arange(width, dtype=torch.int32, device=device)
+    logical_indices = torch.cat(
+        [
+            tokens.expand(rows, width),
+            torch.full((rows, 1), width, dtype=torch.int32, device=device),
+        ],
+        dim=1,
+    ).contiguous()
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+    flashinfer.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        False,
+        k_scale=1.0,
+        v_scale=1.0,
+        output_gate=torch.randn_like(q),
+        k_sf=k_sf,
+        v_sf=v_sf,
+    )
+
+
+example_qsa_sparse_paged_attention()
+
+
 def example_dsv41_fp4_cache():
     from flashinfer.mla import (
         dsv41_fp4_quantize_append_sparse_mla_cache,
@@ -740,6 +817,19 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── W8A16 FP8 GEMM (bf16 activation, e4m3 weight [N, K], per-tensor scale) ────
+# Trace is dumped before kernel launch; suppress Hopper/Blackwell-only failures.
+with contextlib.suppress(Exception):
+    M, K, N = 128, 4096, 4096
+    b_w8a16 = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    alpha_w8a16 = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.mm_bf16_fp8(
+        torch.zeros(M, K, dtype=torch.bfloat16, device=device), b_w8a16, alpha_w8a16
+    )
+    flashinfer.gemm.mm_fp16_fp8(
+        torch.zeros(M, K, dtype=torch.float16, device=device), b_w8a16, alpha_w8a16
+    )
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.
@@ -1049,6 +1139,20 @@ block_sparse_attention.fi_trace(
     kv_block_size=bs_kv_block,
     use_block_sparse=False,
     mask_type="dense",
+    out=bs_out,
+)
+
+# Device global multipliers remain tensor inputs in the benchmark schema.
+block_sparse_attention.fi_trace(
+    save_dir=SAVE_DIR,
+    q=bs_q,
+    k=bs_k,
+    v=bs_v,
+    q_block_size=bs_q_block,
+    kv_block_size=bs_kv_block,
+    use_block_sparse=False,
+    sm_scale=torch.full((1,), bs_D**-0.5, dtype=torch.float32, device=device),
+    output_scale=torch.full((1,), 0.75, dtype=torch.float32, device=device),
     out=bs_out,
 )
 
@@ -1566,6 +1670,51 @@ with contextlib.suppress(Exception):
         top_k=8,
         scoring_func="softmax",
         renormalize=True,
+    )
+
+# ── CuTe-DSL NVFP4 routing weights before FC2 ──────────────────────────────
+# This call reuses ClampedRelu2's runtime clamp tensor and rounds each
+# activation stage to BF16 before quantizing the weighted GEMM2 input.
+with contextlib.suppress(Exception):
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.tllm_enums import ActivationType
+
+    _pre_T, _pre_H, _pre_I, _pre_E, _pre_K = 17, 768, 4096, 3, 2
+
+    def _pre_sf(rows, width):
+        scales = (
+            torch.ones((_pre_E * rows, width // 16), device=device)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        return convert_sf_to_mma_layout(scales, rows, width, num_groups=_pre_E)
+
+    _pre_output = flashinfer.cute_dsl_fused_moe(
+        x=torch.zeros((_pre_T, _pre_H // 2), dtype=torch.uint8, device=device),
+        x_sf=torch.ones((_pre_T, _pre_H // 16), device=device)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8),
+        token_selected_experts=(
+            torch.arange(_pre_T * _pre_K, device=device).reshape(_pre_T, _pre_K)
+            % _pre_E
+        ).int(),
+        token_final_scales=torch.full((_pre_T, _pre_K), 0.5, device=device),
+        w1_weight=torch.zeros(
+            (_pre_E, _pre_I, _pre_H // 2), dtype=torch.uint8, device=device
+        ),
+        w1_weight_sf=_pre_sf(_pre_I, _pre_H),
+        w1_alpha=torch.ones(_pre_E, device=device),
+        fc2_input_scale=torch.ones(1, device=device),
+        w2_weight=torch.zeros(
+            (_pre_E, _pre_H, _pre_I // 2), dtype=torch.uint8, device=device
+        ),
+        w2_weight_sf=_pre_sf(_pre_H, _pre_I),
+        w2_alpha=torch.ones(_pre_E, device=device),
+        num_experts=_pre_E,
+        top_k=_pre_K,
+        activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=torch.tensor([16.0], device=device),
+        routing_weights_before_fc2=True,
     )
 
 # ── SM90 CuTe-DSL fused MoE (Qwen3-30B-A3B: E=128, topk=8, h=2048, i=768) ───
@@ -2500,6 +2649,30 @@ with contextlib.suppress(Exception):
         _nqsm_v_scale,
     )
 
+# fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import (
+        fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
+    )
+
+    for _fpth_layout in ("NHD", "HND"):
+        for _fpth_format in ("e4m3", "e5m2"):
+            _fpth_inputs = (
+                fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping.fi_init(
+                    nnz_kv=4,
+                    num_pages=4,
+                    num_kv_heads=2,
+                    head_dim=128,
+                    page_size=4,
+                    kv_layout=_fpth_layout,
+                    kv_data_type=_fpth_format,
+                    device=device,
+                )
+            )
+            fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+                **_fpth_inputs
+            )
+
 # nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
 with contextlib.suppress(Exception):
     from flashinfer import nvfp4_quantize_append_paged_mla_kv_cache
@@ -2558,6 +2731,21 @@ _sp_probs = _sp_probs / _sp_probs.sum(dim=-1, keepdim=True)
 _sp_logits = torch.randn(64, 32000, dtype=torch.float32, device=device)
 with contextlib.suppress(Exception):
     flashinfer.softmax(_sp_logits, temperature=1.0)
+with contextlib.suppress(Exception):
+    flashinfer.softmax(
+        _sp_logits.to(torch.bfloat16),
+        temperature=1.0,
+        batch_invariant=True,
+        out_dtype=torch.float32,
+    )
+with contextlib.suppress(Exception):
+    flashinfer.log_softmax(_sp_logits, temperature=1.0)
+with contextlib.suppress(Exception):
+    _lp_ids = torch.randint(0, 32000, (64,), dtype=torch.int64, device=device)
+    flashinfer.log_probs(_sp_logits, _lp_ids, temperature=1.0)
+with contextlib.suppress(Exception):
+    _lp_ids_k = torch.randint(0, 32000, (64, 4), dtype=torch.int64, device=device)
+    flashinfer.log_probs(_sp_logits, _lp_ids_k, temperature=1.0)
 with contextlib.suppress(Exception):
     flashinfer.sampling_from_probs(_sp_probs)
 with contextlib.suppress(Exception):
@@ -2840,6 +3028,31 @@ for _pts_semantic_PS in (32, 4):
                 _pts_block_tables,
             )
 
+        if _pts_semantic_PS == 32:
+            # Mixed float/tensor ABI, with the tensor inherited from the plan.
+            _pts_output_scale = torch.full(
+                (1,), 0.75, dtype=torch.float32, device=device
+            )
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                softmax_scale=_pts_D**-0.5,
+                output_scale=_pts_output_scale,
+                workspace_buffer=_pts_workspace,
+            )
+            _pts_wrapper.run(_pts_q, _pts_cache, _pts_seq_lens, _pts_block_tables)
+
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2879,6 +3092,22 @@ with contextlib.suppress(Exception):
     ).reshape(_pmla_B, _pmla_pages_per_request)
     _pmla_seq_lens = torch.full((_pmla_B,), _pmla_SK, dtype=torch.int32, device=device)
 
+    _attention_ts_mla_decode.fi_trace(
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        max_q_len=_pmla_SQ,
+        max_kv_len=_pmla_SK,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        kv_bounds=torch.arange(
+            _pmla_SK - _pmla_SQ + 1, _pmla_SK + 1, dtype=torch.int32, device=device
+        ).repeat(_pmla_B),
+        zero_empty_rows=True,
+    )
+
     _attention_ts_mla_decode(
         _pmla_q,
         _pmla_cache,
@@ -2888,6 +3117,23 @@ with contextlib.suppress(Exception):
         qk_rope_head_dim=_pmla_KPE,
         mask_type="causal",
         max_kv_len=_pmla_SK,
+    )
+
+    # The reverse mixed ABI: device QK multiplier and host output multiplier.
+    _attention_ts_mla_decode.fi_trace(
+        save_dir=SAVE_DIR,
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        max_kv_len=_pmla_SK,
+        softmax_scale=torch.full(
+            (1,), _pmla_D**-0.5, dtype=torch.float32, device=device
+        ),
+        output_scale=0.75,
     )
 
     _pmla_workspace_size = _prims_ts_mla_ws_size(
@@ -3578,7 +3824,7 @@ finally:
         dist.destroy_process_group()
 
 # ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
-from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
+from flashinfer.sdsa.token_sparse import group_union_masks, token_sparse_kv_indices
 
 token_sparse_kv_indices.fi_trace(
     save_dir=SAVE_DIR,
@@ -3601,6 +3847,48 @@ group_union_masks.fi_trace(
     union_sizes=torch.empty(2, dtype=torch.int32),
     mask=torch.empty(8, 256, dtype=torch.int32),
     num_keys=16384,
+)
+
+# Selected NVFP4 KV tokens to FP8 for token-sparse attention, from key positions.
+from flashinfer.sdsa.token_sparse import (
+    compact_nvfp4_kv_cache,
+    gather_nvfp4_kv_cache_by_position,
+)
+
+_nvfp4_kv = dict(
+    paged_kv_cache=tuple(
+        torch.empty(4, 1, 64, 128, dtype=torch.uint8) for _ in range(2)
+    ),
+    kv_cache_sf=tuple(
+        torch.empty(4, 1, 64, 16, dtype=torch.float8_e4m3fn) for _ in range(2)
+    ),
+    positions=torch.empty(2, 512, dtype=torch.int32),
+    block_table=torch.empty(2, 4, dtype=torch.int32),
+    out=torch.empty(1025, 1, 1, 512, dtype=torch.float8_e4m3fn),
+    block_tables=torch.empty(2, 2, 512, dtype=torch.int32),
+    seq_lens=torch.empty(2, dtype=torch.int32),
+)
+
+gather_nvfp4_kv_cache_by_position.fi_trace(
+    save_dir=SAVE_DIR,
+    requests=torch.arange(2, dtype=torch.int32),
+    requests_per_row=1,
+    **_nvfp4_kv,
+)
+
+compact_nvfp4_kv_cache.fi_trace(
+    save_dir=SAVE_DIR,
+    row_groups=torch.zeros(2, dtype=torch.int32),
+    group_requests=torch.zeros(1, dtype=torch.int32),
+    group_offsets=torch.zeros(1, dtype=torch.int64),
+    scratch=torch.empty(1155, dtype=torch.int32),
+    bitmap=torch.zeros(129, dtype=torch.int32),
+    max_keys=4096,
+    max_capacity=1024,
+    zero_row=1024,
+    group_base=0,
+    requests_per_row=1,
+    **_nvfp4_kv,
 )
 
 # ── SDSA (Simplified DSA) indexer ─────────────────────────────────────────────

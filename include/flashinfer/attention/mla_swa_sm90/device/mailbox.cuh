@@ -182,6 +182,118 @@ __forceinline__ __device__ void dsm_direct_accum_m32_qk_s2(Plan& plan, int idx,
   role_barrier();
 }
 
+template <int OwnerGroup, int MaxSlices, class T, class Output, class Plan>
+__forceinline__ __device__ void m16_ready_ack_pv(Output const& outputs, int begin, int end,
+                                                 int stride, int pv_group, Plan& plan,
+                                                 typename T::InputT* out, int batch, int m_block,
+                                                 int total_rows, int heads, int64_t stride_b,
+                                                 int64_t stride_s, int64_t stride_h, int idx,
+                                                 int warp, int lane) {
+  static_assert(T::BLOCK_M == 16 && T::Config::PartialFormat == mla_swa::PartialForm::Raw);
+  using InputT = typename T::InputT;
+  cute::cluster_wait();
+  const int rank = cute::block_rank_in_cluster();
+  const int peer = rank ^ 1;
+  const int event = pv_group + 1;
+  float* mailbox = reinterpret_cast<float*>(plan.q.data());
+  cutlass::Array<float, MaxSlices * 4> local;
+#pragma unroll
+  for (int s = 0; s < MaxSlices; ++s) {
+    const int slice = begin + s * stride;
+    if (slice >= end) continue;
+    Tensor flat = outputs(_, s, _0{});
+    Tensor acc = make_tensor(flat.data(), typename T::OutputSliceFragmentLayout{});
+#pragma unroll
+    for (int i = 0; i < 4; ++i) local[s * 4 + i] = acc(OwnerGroup * 4 + i);
+    constexpr int publish = (1 - OwnerGroup) * 4;
+    fragment_store4(mailbox + (slice * 128 + idx) * 4, acc(publish), acc(publish + 1),
+                    acc(publish + 2), acc(publish + 3));
+  }
+  m16_dsm_wg_sync(event);
+  if (idx == 0) p1_release(plan.m16_ready[event], peer);
+  p1_acquire(plan.m16_weights_ready);
+  p1_acquire(plan.m16_ready[event]);
+  const int n0 = OwnerGroup * 8 + (lane % 4) * 2;
+  const int n1 = n0 + 1;
+  const float w00 = plan.row_max[n0], w10 = plan.row_sum[n0];
+  const float w01 = plan.row_max[n1], w11 = plan.row_sum[n1];
+  const uint32_t remote = cute::set_block_rank(cute::cast_smem_ptr_to_uint(mailbox), peer);
+  float a0, a1, a2, a3;
+  fragment_load4(remote + (begin * 128 + idx) * 4 * sizeof(float), a0, a1, a2, a3);
+#pragma unroll
+  for (int s = 0; s < MaxSlices; ++s) {
+    const int slice = begin + s * stride;
+    if (slice >= end) continue;
+    const float p0 = a0, p1 = a1, p2 = a2, p3 = a3;
+    if (s + 1 < MaxSlices && slice + stride < end)
+      fragment_load4(remote + ((slice + stride) * 128 + idx) * 4 * sizeof(float), a0, a1, a2, a3);
+    if (s + 1 == MaxSlices || slice + stride >= end) {
+      // Every consumer has completed its final DSM read. The peer may
+      // finish while this WG converts/stores the last output slice.
+      m16_dsm_wg_sync(event);
+      if (idx == 0) p1_release(plan.m16_ack[event], peer);
+    }
+    float y0, y1, y2, y3;
+    if constexpr (OwnerGroup == 0) {
+      y0 = w00 * local[s * 4] + w10 * p0;
+      y1 = w01 * local[s * 4 + 1] + w11 * p1;
+      y2 = w00 * local[s * 4 + 2] + w10 * p2;
+      y3 = w01 * local[s * 4 + 3] + w11 * p3;
+    } else {
+      y0 = w00 * p0 + w10 * local[s * 4];
+      y1 = w01 * p1 + w11 * local[s * 4 + 1];
+      y2 = w00 * p2 + w10 * local[s * 4 + 2];
+      y3 = w01 * p3 + w11 * local[s * 4 + 3];
+    }
+    const int row0 = m_block * 16 + n0, row1 = row0 + 1;
+    const int dim0 = slice * 64 + fragment_m0(warp, lane), dim1 = dim0 + 8;
+    if (row0 < total_rows) {
+      InputT* target = out + batch * stride_b + (row0 >> 6) * stride_s + (row0 & 63) * stride_h;
+      target[dim0] = InputT(y0);
+      target[dim1] = InputT(y2);
+    }
+    if (row1 < total_rows) {
+      InputT* target = out + batch * stride_b + (row1 >> 6) * stride_s + (row1 & 63) * stride_h;
+      target[dim0] = InputT(y1);
+      target[dim1] = InputT(y3);
+    }
+  }
+}
+
+template <int OwnerGroup, class T, class Plan>
+__forceinline__ __device__ void m16_ready_ack_qk(Plan& plan, int idx) {
+  using Layout = DsmDirectAccumLayout<T>;
+  static_assert(T::Config::PartialFormat == mla_swa::PartialForm::Raw);
+  cute::cluster_wait();
+  const int rank = cute::block_rank_in_cluster(), peer = rank ^ 1;
+  float* state = reinterpret_cast<float*>(plan.q.data()) + Layout::kMailboxWords;
+  if (idx < 8) {
+    const int row = (1 - OwnerGroup) * 8 + idx;
+    state[idx] = plan.row_max[row];
+    state[8 + idx] = plan.row_sum[row];
+  }
+  m16_dsm_wg_sync(0);
+  if (idx == 0) p1_release(plan.m16_ready[0], peer);
+  p1_acquire(plan.m16_ready[0]);
+  if (idx < 8) {
+    const int row = OwnerGroup * 8 + idx;
+    const uint32_t remote = cute::set_block_rank(cute::cast_smem_ptr_to_uint(state), peer);
+    const float peer_max = load_dsm_float(remote, idx);
+    const float peer_sum = load_dsm_float(remote, 8 + idx);
+    const float2 weights =
+        raw_pair_weights(plan.row_max[row], plan.row_sum[row], peer_max, peer_sum);
+    plan.row_max[row] = OwnerGroup == 0 ? weights.x : weights.y;
+    plan.row_sum[row] = OwnerGroup == 0 ? weights.y : weights.x;
+  }
+  m16_dsm_wg_sync(0);
+  if (idx == 0) {
+    p1_release(plan.m16_weights_ready, rank);
+    p1_release(plan.m16_ack[0], peer);
+  }
+#pragma unroll
+  for (int event = 0; event < 5; ++event) p1_acquire(plan.m16_ack[event]);
+}
+
 template <int OwnerGroup, int PublishGroup, int MaxSlices, typename T, typename TensorOutput,
           typename Plan>
 __forceinline__ __device__ void dsm_direct_accum_pv_s2(
@@ -189,6 +301,13 @@ __forceinline__ __device__ void dsm_direct_accum_pv_s2(
     int pv_group, Plan& plan, typename T::InputT* out, int batch_idx, int m_block_idx,
     int total_rows, int num_heads, int64_t out_stride_b, int64_t out_stride_s, int64_t out_stride_h,
     int idx_in_warpgroup, int warp_in_group, int lane) {
+  if constexpr (T::Config::StorageKind == 5) {
+    m16_ready_ack_pv<OwnerGroup, MaxSlices, T>(
+        output_fragment_all, slice_begin, slice_end, slice_stride, pv_group, plan, out, batch_idx,
+        m_block_idx, total_rows, num_heads, out_stride_b, out_stride_s, out_stride_h,
+        idx_in_warpgroup, warp_in_group, lane);
+    return;
+  }
   using InputT = typename T::InputT;
   using Layout = DsmDirectAccumLayout<T>;
   static_assert(OwnerGroup == 0 || OwnerGroup == 1);
@@ -427,6 +546,10 @@ __forceinline__ __device__ void dsm_direct_accum_m32_pv_s2(TensorOutput& outputs
 
 template <int OwnerGroup, typename T, typename Plan>
 __forceinline__ __device__ void dsm_direct_accum_qk_s2(Plan& plan, int idx_in_warpgroup) {
+  if constexpr (T::Config::StorageKind == 5) {
+    m16_ready_ack_qk<OwnerGroup, T>(plan, idx_in_warpgroup);
+    return;
+  }
   using Layout = DsmDirectAccumLayout<T>;
   static_assert(OwnerGroup == 0 || OwnerGroup == 1);
   static_assert(T::BLOCK_M == 16);

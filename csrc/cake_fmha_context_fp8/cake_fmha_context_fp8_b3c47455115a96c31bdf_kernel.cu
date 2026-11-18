@@ -2472,6 +2472,7 @@ kernel_cake_fmha_context_fp8_b3c47455115a96c31bdf(const __grid_constant__ CUtens
                 unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
                 unsigned int _max_0_2 = ((num_n_blocks_2) > (1) ? (num_n_blocks_2) : (1));
                 num_n_blocks_2 = _max_0_2;
+                int v_valid = seqlen_kv_bh_2 - (int)(num_n_blocks_2 - 1) * BLOCK_N;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -2531,6 +2532,19 @@ kernel_cake_fmha_context_fp8_b3c47455115a96c31bdf(const __grid_constant__ CUtens
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
                 if (mma_kv_stage == 3) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                if (v_valid < BLOCK_N) {
+                    mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, _phase_kv_full);
+                    unsigned int vz_stage = mma_kv_stage;
+                    uint32_t vz_lane;
+                    asm volatile("mov.u32 %0, %%laneid;" : "=r"(vz_lane));
+                    unsigned int vz_base = smem_kv_addr + vz_stage * 16384;
+                    #pragma unroll 1
+                    for (unsigned int vz_addr = vz_base + ((unsigned int)v_valid * 8 + vz_lane) * 16; vz_addr < vz_base + 16384; vz_addr += 512) {
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(vz_addr), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
+                }
                 unsigned int first_pv = 1;
                 #pragma unroll 1
                 for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_2 - 1; n_iter_3++) {

@@ -62,7 +62,7 @@ from flashinfer.testing.utils import bench_gpu_time
 # Add the project root to Python path to import test helpers (same as the
 # source bench_rope_quantize_fp8.py).
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from tests.test_helpers.rope_reference import RotaryEmbedding  # noqa: E402
+from tests.attention.test_helpers.rope_reference import RotaryEmbedding  # noqa: E402
 
 INPUT_DTYPE = torch.bfloat16
 QUANT_DTYPE = torch.float8_e4m3fn

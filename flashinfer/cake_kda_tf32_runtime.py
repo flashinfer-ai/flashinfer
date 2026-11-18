@@ -144,6 +144,21 @@ BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
 # per sequence lose on some shapes, so every other turnover launch keeps the
 # turnover build.
 BF16_WORK_BIN_TURN_E128_LEN = 128
+# The work-bin launches that take their module's TMEM-preload build where the
+# loader names one (``_RENDERED_WORK_BIN_PRELOAD_ROUTES``, see
+# _work_bin_preload_program): work bins from the strict bin test, an initial
+# state, every sequence between these two lengths in tokens, and more tasks
+# than SMs.  That build loads the next
+# task's entering state into tensor memory on the prep warps while the current
+# task runs (every preloading task spans at least two 32-token or four 16-token
+# chunks); its
+# bits are those of the work-bin build.  Every other work-bin launch keeps the
+# work-bin build (its loader and layout cost more than the load it hides on
+# shorter tasks, and on the bins of a bounded launch that the strict test
+# keeps one task per CTA, whose pair bins are no longer in chunks than its
+# longest task).
+BF16_WORK_BIN_PRELOAD_MIN_LEN = 64
+BF16_WORK_BIN_PRELOAD_MAX_LEN = 256
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
 # loop: a CTA of the one-task-per-CTA body pays it for every task, a bin of the
 # turnover build hides it beside the previous task's chunks.  An unbounded
@@ -244,12 +259,19 @@ M64_OWNER_HELPER_WORD_STRIDE = 3
 # The B200 row (48, 2048, 1) covers the 37 to 48 tasks whose pair-share row
 # is (48, 2048): in paired timings of 144 held-out equal-length launches of
 # 38 to 48 tasks at 2049 to 14000 tokens the hybrid ran 0.87 to 0.98 times
-# the pair-share time on two B200s, every launch faster.
+# the pair-share time on two B200s, every launch faster.  The GB300 row
+# (50, 2048, 1) covers 37 to 50 tasks, inside the pair-share row (64, 2048):
+# in paired timings of 301 equal-length launches of 38 to 50 tasks at 2048 to
+# 14000 tokens the hybrid ran 0.88 to 1.00 times the pair-share time on two
+# GB300s, no launch slower.
 M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = (
     (36, 1024),
     (48, 2048, 1),
 )
-M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
+M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = (
+    (36, 1024),
+    (50, 2048, 1),
+)
 # The bin-mix build of a work-bin turnover program (see _work_bin_mix_plan):
 # the work-bin table of a launch with more tasks than SMs leaves bins of two
 # tasks beside bins of one, and the two-task bins set the span.  Each two-task
@@ -1474,8 +1496,9 @@ def _m64_owner_helper_hybrid_program(name, *args, **kwargs):
 
 # The launches a one-helper row of the owner/helper rule takes run the loader's
 # ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` build of the module on a grid
-# (tasks, 3): the helper prepares the chunks c % 8 >= 4 of its task and the two
-# owners the others, with the same bits as the pair-share and routed programs.
+# (tasks, 3): the helper prepares the chunks c % 8 >= 4 (sm_100a) or c % 4 >= 2
+# (sm_103a) of its task and the two owners the others, with the same bits as the
+# pair-share and routed programs.
 def _m64_owner_helper_hybrid_factory(name, *args, **kwargs):
     """The hybrid owner/helper build of the factory row's M64 module, else
     ``_m64_owner_helper_factory``."""
@@ -1661,6 +1684,57 @@ def _work_bin_turn_e128_program(program, gpu_arch: str, seq_lens):
     for module, turnover in turn.items():
         if turnover == program and module in e128:
             return e128[module]
+    return None
+
+
+def _work_bin_preload_scope(
+    seq_lens,
+    num_heads: int,
+    sm_count: int,
+    use_initial_state: bool,
+    strict_bins: bool,
+) -> bool:
+    """Whether a work-bin launch of ``seq_lens`` at ``num_heads`` heads on
+    ``sm_count`` SMs takes the TMEM-preload build: work bins from the strict
+    bin test (``strict_bins``, ``_DirectWorkBinRoute.strict``), an initial
+    state, every sequence between ``BF16_WORK_BIN_PRELOAD_MIN_LEN`` and
+    ``BF16_WORK_BIN_PRELOAD_MAX_LEN`` tokens and more tasks than SMs."""
+    return (
+        strict_bins
+        and use_initial_state
+        and min(seq_lens) >= BF16_WORK_BIN_PRELOAD_MIN_LEN
+        and max(seq_lens) <= BF16_WORK_BIN_PRELOAD_MAX_LEN
+        and len(seq_lens) * num_heads > sm_count
+    )
+
+
+def _work_bin_preload_program(
+    program,
+    gpu_arch: str,
+    seq_lens,
+    num_heads: int,
+    sm_count: int,
+    use_initial_state: bool,
+    strict_bins: bool,
+):
+    """The ``_RENDERED_WORK_BIN_PRELOAD_ROUTES`` build beside the work-bin build
+    ``program`` (``_RENDERED_WORK_BIN_ROUTES``) for a launch of ``seq_lens`` at
+    ``num_heads`` heads on ``sm_count`` SMs, or ``None``: ``None`` on an
+    architecture whose table is empty (no further work) and for a launch
+    outside _work_bin_preload_scope."""
+    if program is None:
+        return None
+    preload = getattr(_kda_registry, "_RENDERED_WORK_BIN_PRELOAD_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not preload or not _work_bin_preload_scope(
+        seq_lens, num_heads, sm_count, use_initial_state, strict_bins
+    ):
+        return None
+    bins = _kda_registry._RENDERED_WORK_BIN_ROUTES.get(gpu_arch, {})
+    for module, work_bin in bins.items():
+        if work_bin == program and module in preload:
+            return preload[module]
     return None
 
 
@@ -2800,13 +2874,16 @@ class _DirectWorkBinRoute:
     ``turnover_bins_only``: it asks for them for the turnover build only
     (``_build_body`` drops them where the module has none); ``turnover``: it
     takes the module's turnover build where the loader names one;
-    ``task_cost``: the per-task chunk cost its bin table charges.
+    ``task_cost``: the per-task chunk cost its bin table charges;
+    ``strict``: its work bins come from the strict bin test (rule 1 of
+    ``_direct_work_bin_route``; never for the bins of rules 2 and 3).
     """
 
     work_bins: bool = False
     turnover_bins_only: bool = False
     turnover: bool = False
     task_cost: int = 0
+    strict: bool = False
 
 
 def _direct_work_bin_route(
@@ -2920,6 +2997,7 @@ def _direct_work_bin_route(
             if bounded_bins
             else 0
         ),
+        strict=strict,
     )
 
 
@@ -4559,6 +4637,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         num_work_bins = 0
         bin_mix_plan = None
         turn_short_program = None
+        preload_program = None
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
@@ -4649,6 +4728,22 @@ class FlashKDABlackwellBF16FusedLaunch:
                     turn_short_program = _work_bin_turn_e128_program(
                         getattr(self.module, "name", None), gpu_arch, seq_lens
                     )
+            # A work-bin launch (no turnover) whose bins come from the strict
+            # bin test, with an initial state whose sequences hold
+            # BF16_WORK_BIN_PRELOAD_MIN_LEN to BF16_WORK_BIN_PRELOAD_MAX_LEN
+            # tokens and that has more tasks than SMs takes the module's
+            # TMEM-preload build where the loader names one: the same bins,
+            # table and bits (swapped in below), on the N32 and N16 bodies alike.
+            if uses_default_fused_m128:
+                preload_program = _work_bin_preload_program(
+                    getattr(self.module, "name", None),
+                    gpu_arch,
+                    seq_lens,
+                    num_heads,
+                    sm_count,
+                    initial_state is not None,
+                    work_bin_route.strict,
+                )
             work_bin_upload = _upload_int32_batch(
                 q.device,
                 {"seq_order": list(work_bin_table) + list(bin_mix_plan or ())},
@@ -4747,6 +4842,13 @@ class FlashKDABlackwellBF16FusedLaunch:
                 )
                 self.module = turn_short_module
                 self.ir = turn_short_module.schedule
+            if preload_program is not None:
+                preload_module = _kda_registry.PreparedKernel(preload_program, gpu_arch)
+                self._qkv_carrier_names[id(preload_module)] = (
+                    self._qkv_carrier_names.get(id(self.module), ())
+                )
+                self.module = preload_module
+                self.ir = preload_module.schedule
             if bin_mix_plan is not None:
                 # The bin-mix build runs the same bins on the same grid; a
                 # refused cooperative launch takes the turnover program

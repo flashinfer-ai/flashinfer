@@ -31,7 +31,9 @@ block, head, part), so neighbouring query blocks of one KV head run together.
 The part size and the kernel are the pair of least time under the plan's cost
 model: the static grid-stride's longest virtual CTA when every one runs one
 item, else its longest SM, two virtual CTAs sharing one, plus the merge of the
-most-split row, at the kernel's rates.  Below three rows per virtual CTA, and
+most-split row, at the kernel's rates; a split part costs more once the K and
+V of all KV heads pass half the L2 (three eighths of it for a plan that may be
+packed).  Below three rows per virtual CTA, and
 while the K and V of all KV heads fit the L2 (a quarter of it below one row per
 virtual CTA), the plan may instead be packed: the items of every full wave keep
 their places and those of the last partial wave fill the virtual CTAs one after
@@ -76,6 +78,16 @@ _MIN_PART = 2
 _COST = {"vsa_sm120_blk64": (2, 6, 100), "vsa_sm120_blk64_pair": (3, 8, 94)}
 _SPLIT_COST = 2
 _MERGE_COST = 1
+# Past _SPLIT_KV_BLOCKS blocks of K and V over all KV heads (64 MB in 16 bits,
+# half of an RTX PRO 6000's L2) a split part's extra is _FAR_SPLIT_COST: the
+# blocks then come from memory, and a row split to fill the virtual CTAs gains
+# less than when they come from the L2.  For a plan that may be packed (below)
+# the limit is _PACK_SPLIT_KV_BLOCKS (48 MB, three eighths of the L2): the
+# packing fills the last partial wave itself, so splitting every row to fill
+# the virtual CTAs gains less.
+_SPLIT_KV_BLOCKS = 2048
+_PACK_SPLIT_KV_BLOCKS = 1536
+_FAR_SPLIT_COST = 4
 _PART_DIVISORS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 # Packing, when there are fewer rows than _PACK_ROWS per virtual CTA and the K
 # and V of all KV heads span at most _PACK_KV_BLOCKS blocks: the first limit
@@ -139,10 +151,16 @@ def _split(row_count: torch.Tensor, part: int):
 
 
 def _makespan(
-    sizes: torch.Tensor, rows: torch.Tensor, part: int, resident: int, kernel: str
+    sizes: torch.Tensor,
+    rows: torch.Tensor,
+    part: int,
+    resident: int,
+    kernel: str,
+    split_cost: int = _SPLIT_COST,
 ) -> int:
     """The cost model's time on ``kernel``, in thousandths, of ``rows[i]`` rows
-    of ``sizes[i]`` blocks (CPU int64) split at ``part``.  The items run
+    of ``sizes[i]`` blocks (CPU int64) split at ``part``, a split part's extra
+    ``split_cost`` when the items outnumber the virtual CTAs.  The items run
     longest first (a split part before a whole row of its size); virtual CTA c
     of G = min(items, resident) takes items c, c + G, ..., its load the sum of
     their costs.  One wave (an item per virtual CTA) takes its longest item;
@@ -168,7 +186,7 @@ def _makespan(
     items = int(end[-1])
     grid = max(1, min(items, resident))
     wave = items <= resident
-    cost = key // 2 + item_cost + (0 if wave else _SPLIT_COST) * (key % 2)
+    cost = key // 2 + item_cost + (0 if wave else split_cost) * (key % 2)
     # CTA c holds end // G - start // G items of a run, one more where
     # start % G <= c < end % G, one less where end % G <= c < start % G.
     load = (
@@ -193,10 +211,11 @@ def _choose(
     resident: int,
     part: Optional[int] = None,
     kernel: Optional[str] = None,
+    split_cost: int = _SPLIT_COST,
 ) -> tuple[int, str]:
-    """The (part size, kernel) of least _makespan, the part among the longest
-    row divided by _PART_DIVISORS (the larger part, then vsa_sm120_blk64, on a
-    tie); a given ``part`` or ``kernel`` is kept."""
+    """The (part size, kernel) of least _makespan at ``split_cost``, the part
+    among the longest row divided by _PART_DIVISORS (the larger part, then
+    vsa_sm120_blk64, on a tie); a given ``part`` or ``kernel`` is kept."""
     sizes, rows = torch.unique(row_count.cpu().long(), return_counts=True)
     longest = int(sizes[-1]) if sizes.numel() else 0
     if part is not None:
@@ -213,7 +232,7 @@ def _choose(
     return min(
         ((p, k) for p in parts for k in kernels),
         key=lambda pk: (
-            _makespan(sizes, rows, pk[0], resident, pk[1]),
+            _makespan(sizes, rows, pk[0], resident, pk[1], split_cost),
             -pk[0],
             kernels.index(pk[1]),
         ),
@@ -427,20 +446,23 @@ def build_work(
     row_head = torch.div(order, mb, rounding_mode="floor")
     row_block = order % mb
     row_data = (row_count, row_first, row_head, row_block)
-    chosen_part, chosen = _choose(row_count, resident, part, kernel)
-    work, groups, slots = _table(*row_data, chosen_part)
     packing = pack if pack is not None else part is None
-    if (
+    admitted = (
         packing
         and 0 < row_count.numel() < _PACK_ROWS * resident
         and kv_heads * num_kv_blocks <= _PACK_KV_BLOCKS[row_count.numel() >= resident]
-    ):
+    )
+    far = _PACK_SPLIT_KV_BLOCKS if admitted else _SPLIT_KV_BLOCKS
+    split_cost = _FAR_SPLIT_COST if kv_heads * num_kv_blocks > far else _SPLIT_COST
+    chosen_part, chosen = _choose(row_count, resident, part, kernel, split_cost)
+    work, groups, slots = _table(*row_data, chosen_part)
+    if admitted:
         uniform = work.tolist()
         best = None if pack else _pack_time(uniform, resident, chosen)
         for k in [kernel] if kernel is not None else list(_GROUPS):
             words = uniform
             if k != chosen:
-                k_part = _choose(row_count, resident, part, k)[0]
+                k_part = _choose(row_count, resident, part, k, split_cost)[0]
                 words = _table(*row_data, k_part)[0].tolist()
             packed = _pack(words, resident, _COST[k][0])
             if packed is None:

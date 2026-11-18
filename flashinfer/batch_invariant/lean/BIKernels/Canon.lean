@@ -41,6 +41,12 @@ inductive Term where
   | fmin (a b : Term)
   | fmaxc (a b : Term)
   | nzor (a b : Term)
+  -- the sampling class (`sampling/spec.py`): the exact negation `neg`, the opaque exponential `ex2`
+  -- (`ex2.approx.ftz.f32`) and a named opaque unary primitive `opq` (`lg2.approx.ftz.f32` is `opq "lg2"`,
+  -- printed `(op:lg2 x)` as `TermAlgebra.op` prints it)
+  | neg (a : Term)
+  | ex2 (a : Term)
+  | opq (name : String) (a : Term)
   deriving Repr, DecidableEq, Inhabited
 
 /-- Term equality up to commutativity of the commutative primitives. -/
@@ -62,6 +68,9 @@ inductive Equiv : Term → Term → Prop where
   | fmin_congr {a a' b b' : Term} : Equiv a a' → Equiv b b' → Equiv (.fmin a b) (.fmin a' b')
   | fmaxc_congr {a a' b b' : Term} : Equiv a a' → Equiv b b' → Equiv (.fmaxc a b) (.fmaxc a' b')
   | nzor_congr {a a' b b' : Term} : Equiv a a' → Equiv b b' → Equiv (.nzor a b) (.nzor a' b')
+  | neg_congr {a a' : Term} : Equiv a a' → Equiv (.neg a) (.neg a')
+  | ex2_congr {a a' : Term} : Equiv a a' → Equiv (.ex2 a) (.ex2 a')
+  | opq_congr {a a' : Term} (name : String) : Equiv a a' → Equiv (.opq name a) (.opq name a')
 
 /-- `none` is an absent leaf (dropped from the tree), as in `canon._pairwise`. -/
 def oadd : Option Term → Option Term → Option Term

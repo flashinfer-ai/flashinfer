@@ -409,7 +409,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 next_oct_index[7] = _vec_load_26[0];
             }
             if (oct_index[0] >= 0) {
-                long long expert_elem = (long long)oct_index[0] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem = (long long)oct_index[0] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int _vec_load_17[4];
                 {
                     uint4 _uv4_2 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
@@ -430,7 +430,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[0] = _vec_load_18[0];
             }
             if (oct_index[1] >= 0) {
-                long long expert_elem_0 = (long long)oct_index[1] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_0 = (long long)oct_index[1] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_0[4];
                 {
                     uint4 _uv4_4 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_0 + 0);
@@ -451,7 +451,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[1] = vec_load_r_0[0];
             }
             if (oct_index[2] >= 0) {
-                long long expert_elem_1 = (long long)oct_index[2] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_1 = (long long)oct_index[2] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_1[4];
                 {
                     uint4 _uv4_6 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
@@ -472,7 +472,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[2] = vec_load_r_1[0];
             }
             if (oct_index[3] >= 0) {
-                long long expert_elem_2 = (long long)oct_index[3] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_2 = (long long)oct_index[3] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_2[4];
                 {
                     uint4 _uv4_8 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_2 + 0);
@@ -493,7 +493,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[3] = vec_load_r_2[0];
             }
             if (oct_index[4] >= 0) {
-                long long expert_elem_3 = (long long)oct_index[4] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_3 = (long long)oct_index[4] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_3[4];
                 {
                     uint4 _uv4_10 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_3 + 0);
@@ -514,7 +514,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[4] = vec_load_r_3[0];
             }
             if (oct_index[5] >= 0) {
-                long long expert_elem_4 = (long long)oct_index[5] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_4 = (long long)oct_index[5] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_4[4];
                 {
                     uint4 _uv4_12 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_4 + 0);
@@ -535,7 +535,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[5] = vec_load_r_4[0];
             }
             if (oct_index[6] >= 0) {
-                long long expert_elem_5 = (long long)oct_index[6] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_5 = (long long)oct_index[6] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_5[4];
                 {
                     uint4 _uv4_14 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_5 + 0);
@@ -556,7 +556,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
                 oct_scales[6] = vec_load_r_5[0];
             }
             if (oct_index[7] >= 0) {
-                long long expert_elem_6 = (long long)oct_index[7] * 7168 + (long long)(cluster_thread * 8);
+                long long expert_elem_6 = (long long)oct_index[7] * 7168ll + (long long)(cluster_thread * 8);
                 unsigned int vec_load_6[4];
                 {
                     uint4 _uv4_16 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_6 + 0);
@@ -1085,10 +1085,10 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
         int publish_current = publish_current_word % 3;
         int publish_bytes_word = control_bytes_per_buffer_word;
         asm("" : "+r"(publish_bytes_word));
-        long long publish_stride = (long long)publish_bytes_word / 2;
+        long long publish_stride = (long long)publish_bytes_word / 2ll;
         long long token_data_base = (long long)publish_current * publish_stride;
         int access = token * 896 + cluster_thread;
-        long long slot = (long long)rank * (long long)total_access * 8 + (long long)access * 8;
+        long long slot = (long long)rank * (long long)total_access * 8ll + (long long)access * 8ll;
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer0 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer1 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
         asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer2 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
@@ -1116,18 +1116,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small(__nv_bfloat16* __restric
     int late_dirty = (late_current_word + 2) % 3;
     int late_bytes_word = control_bytes_per_buffer_word;
     asm("" : "+r"(late_bytes_word));
-    long long comm_stride_elems = (long long)late_bytes_word / 2;
+    long long comm_stride_elems = (long long)late_bytes_word / 2ll;
     long long data_base = (long long)late_current * comm_stride_elems;
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+        clear_words[word] = 2147516416ll;
     }
     long long clear_base = (long long)late_dirty * comm_stride_elems;
     #pragma unroll 4
     for (int clear_access = first_access; clear_access < control_clear_word / 8; clear_access += access_stride) {
         {
-            auto _gst_18 = workspace_local + (clear_base + (long long)clear_access * 8);
+            auto _gst_18 = workspace_local + (clear_base + (long long)clear_access * 8ll);
             __builtin_assume(__isGlobal(_gst_18));
             reinterpret_cast<int4*>(_gst_18)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }

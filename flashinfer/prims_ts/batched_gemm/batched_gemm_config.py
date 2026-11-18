@@ -680,6 +680,18 @@ class BatchedGemmConfig:
     :attr:`use_tile256_tmem_overlap`.
     """
 
+    weight_l2_evict_first: int = 0
+    """Load the swap-AB weight operand and its scale factors with the
+    evict-first L2 policy. ``0``/``1``.
+
+    The runtime routing map selects evict-first only for experts with one
+    token CTA. Experts with multiple token CTAs use evict-normal to preserve
+    weight reuse. CTAs along M read different weight slices. Requires
+    :attr:`is_swap_ab` and token-cluster width one (:func:`validate_config`).
+    Weight and weight-scale loaders construct the policy once per work tile
+    with PTX ``createpolicy``.
+    """
+
     use_pdl: int = 0
     """Enable programmatic dependent launch (PDL). ``0``/``1``.
 
@@ -728,12 +740,21 @@ class BatchedGemmConfig:
     has_gemm1_clamp_limit: int = 0
     """Load a per-expert float32 SwiGLU-OAI clamp-limit pointer in the epilogue."""
 
-    # DeepSeek FP8: per-128-K-chunk FP32 dequant scales loaded into SMEM via
+    # DeepSeek FP8: per-K-tile FP32 dequant scales loaded into SMEM via
     # cp.async and applied as ffma2 in the epilogue, BEFORE the FP32 output cast.
-    # Requires E4M3 MMA
-    # with tile_k=128 and is mutually exclusive with MX/NVFP4 block scaling
-    # and per-token SF.
+    # Requires E4M3 MMA with tile_k=128 (the scale block, 128 or 32, divides
+    # it) and is mutually exclusive with MX/NVFP4 block scaling and per-token SF.
     use_deepseek_fp8: int = 0
+    deepseek_fp8_block_size: int = 128
+    """Side of the square DeepSeek FP8 scale block, in elements. ``128`` or ``32``.
+
+    One FP32 weight scale covers ``block`` rows x ``block`` K elements, and one
+    activation scale covers ``block`` K elements of a token row. The K tile
+    stays 128 wide (the FP8 TMA box) and holds ``128 / block`` sub-blocks: the
+    MMA writes every sub-block to its own accumulator stage and the epilogue
+    drains and scales each one. ``32`` requires the swapAB split-M epilogue
+    (``mma_m=64``), which also keeps ``mma_k`` at 32.
+    """
     load_sfab_regs: int = 48
     use_tma_oob_opt: int = 1
     """Use TMA out-of-bounds predication for partial tiles. ``0``/``1``.
@@ -1035,23 +1056,54 @@ class BatchedGemmConfig:
         return max(1, self.tile_n // max(1, epi_cols_per_call))
 
     @property
-    def num_dsfp8_act_sfs_per_stage(self) -> int:
-        """Number of DeepSeek FP8 activation scales staged per pipeline stage."""
+    def dsfp8_k_subblocks_per_tile(self) -> int:
+        """DeepSeek scale blocks along K inside one ``tile_k`` tile (``1`` at block 128)."""
+        return self.tile_k // self.deepseek_fp8_block_size
+
+    @property
+    def num_dsfp8_act_sfs_per_subblock(self) -> int:
+        """DeepSeek FP8 activation scales staged per K sub-block."""
         token_tile_dim = self.tile_n if self.is_swap_ab else self.tile_m
         return max(token_tile_dim, 32)
+
+    @property
+    def num_dsfp8_act_sfs_per_stage(self) -> int:
+        """DeepSeek FP8 activation scales staged per pipeline stage, ``[sub-block][token]``."""
+        return self.dsfp8_k_subblocks_per_tile * self.num_dsfp8_act_sfs_per_subblock
 
     @property
     def num_bytes_dsfp8_sfab_per_stage(self) -> int:
         """SMEM bytes per DeepSeek SF stage, rounded for cp.async alignment."""
         raw = (
-            self.num_dsfp8_act_sfs_per_stage + 1  # num weight sfs per stage
+            self.num_dsfp8_act_sfs_per_stage + self.num_dsfp8_weight_sfs_per_stage
         ) * 4
         return ((raw + 15) // 16) * 16
 
     @property
-    def num_dsfp8_weight_sfs_per_stage(self) -> int:
-        """Number of DeepSeek FP8 weight scales staged per pipeline stage."""
+    def num_dsfp8_weight_sfs_per_subblock(self) -> int:
+        """DeepSeek FP8 weight scales staged per K sub-block.
+
+        SwapAB stages one scale per ``deepseek_fp8_block_size`` rows of the
+        ``tile_m`` weight tile. The non-swap path keeps one scale per
+        ``tile_n`` weight tile.
+        """
+        if self.is_swap_ab:
+            return self.dsfp8_row_groups_per_tile
         return 1
+
+    @property
+    def num_dsfp8_weight_sfs_per_stage(self) -> int:
+        """DeepSeek FP8 weight scales staged per pipeline stage, ``[sub-block][row group]``."""
+        return self.dsfp8_k_subblocks_per_tile * self.num_dsfp8_weight_sfs_per_subblock
+
+    @property
+    def dsfp8_row_groups_per_tile(self) -> int:
+        """DeepSeek scale groups along the swapAB weight rows of one ``tile_m`` tile.
+
+        Weight dequant scales and the FP32 output scales are both one value
+        per group. ``1`` at block 128.
+        """
+        return self.tile_m // self.deepseek_fp8_block_size
 
     @property
     def uses_fp4_output_quant(self) -> bool:
@@ -3543,6 +3595,13 @@ def validate_config(
     # batch_mode selects swap_ab and the expert-coordinate axis. The generated
     # transpose flag is retained but validated above against that kernel path.
 
+    _validate_binary_config_option("weight_l2_evict_first", cfg.weight_l2_evict_first)
+    if cfg.weight_l2_evict_first:
+        if not cfg.is_swap_ab:
+            raise ValueError("weight_l2_evict_first requires swap-AB (BatchN)")
+        if cfg.token_cluster_dim != 1:
+            raise ValueError("weight_l2_evict_first requires token-cluster width one")
+
     if cfg.use_max_tmem_overlap not in (0, 1):
         raise ValueError(
             f"use_max_tmem_overlap must be 0 or 1, got {cfg.use_max_tmem_overlap}"
@@ -3723,10 +3782,18 @@ def validate_config(
             raise ValueError(
                 "use_deepseek_fp8=1 requires E4M3 MMA (dtype_a=dtype_b=E4M3)"
             )
+        block = cfg.deepseek_fp8_block_size
+        if block not in (32, 128):
+            raise ValueError(f"deepseek_fp8_block_size must be 32 or 128, got {block}")
         if cfg.tile_k != 128:
             raise ValueError(
                 "use_deepseek_fp8=1 requires tile_k=128 "
                 f"for DeepSeek scale-factor blocks, got {cfg.tile_k}"
+            )
+        if block != 128 and not cfg.has_deepseek_fp8_two_epilogue:
+            raise ValueError(
+                f"deepseek_fp8_block_size={block} requires the swapAB split-M "
+                "epilogue (batch_mode=BATCH_N, mma_m=64)"
             )
         if cfg.has_gated_epilogue:
             raise ValueError(

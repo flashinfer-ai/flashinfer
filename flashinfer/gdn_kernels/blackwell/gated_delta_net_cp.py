@@ -67,7 +67,11 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                 + 2
             ),
         )
-        self.tmem_dealloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=1)
+        # All four compute-group-1 warps must have drained their tcgen05.ld
+        # before warp 4 deallocates TMEM.
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=32 * len(self.compute_group_1_warp_ids)
+        )
         self.manual_cache_key(
             "dtype",
             "cu_seqlens_dtype",
@@ -1413,6 +1417,10 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                 num_blocks,
                 gN,
             )
+            # Drain this warp's TMEM loads, then wait for all CG1 warps before
+            # warp 4 deallocates the TMEM they were reading from.
+            cute.arch.fence_view_async_tmem_load()
+            self.tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
         elif is_valid_chunk and warp_idx == self.transfer_mma_warp_id:
@@ -1532,6 +1540,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         initial_state_inner_strides: tuple[int, ...] | None = None,
         output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
+        aligned_output_state: bool = True,
     ):
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
@@ -1543,6 +1552,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.initial_state_inner_strides = initial_state_inner_strides
         self.output_state_inner_strides = output_state_inner_strides
         self.store_initial_state = store_initial_state
+        # Whether the output pool is K-contiguous with 16-byte-aligned strides and
+        # base, so every per-thread fragment of a final state starts 16-byte aligned.
+        self.aligned_output_state = aligned_output_state
         self.acc_dtype = cutlass.Float32
         self.mma_dtype = cutlass.TFloat32
         self.D = 128
@@ -1563,6 +1575,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.tmem_acc_offset = 0
         self.tmem_opd_offset = 128
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=160)
+        # All four compute warps must have drained their tcgen05.ld before
+        # warp 0 deallocates TMEM.
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
         self.manual_cache_key(
             "rows_per_cta",
             "row_ctas",
@@ -1576,6 +1591,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             "initial_state_inner_strides",
             "output_state_inner_strides",
             "store_initial_state",
+            "aligned_output_state",
             "m_stage",
             "n_stage",
             "num_regs_compute",
@@ -1749,9 +1765,13 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         tTR_rAcc = cute.make_rmem_tensor_like(tTR_cAcc, self.acc_dtype)
         if cutlass.const_expr(store_output):
             tTR_gOutputState = thr_t2r.partition_D(gOutputState)
-            tTR_gOutputState = cute.make_tensor(
-                tTR_gOutputState.iterator.align(16), tTR_gOutputState.layout
-            )
+            # Other pool layouts (inner stride > 1, a [N, H, K, V] buffer passed as
+            # its transpose) keep the iterator's own alignment, so autovec_copy
+            # falls back to the narrower stores the layout allows.
+            if cutlass.const_expr(self.aligned_output_state):
+                tTR_gOutputState = cute.make_tensor(
+                    tTR_gOutputState.iterator.align(16), tTR_gOutputState.layout
+                )
             tTR_rOutput = cute.make_rmem_tensor_like(tTR_cAcc, self.state_dtype)
         for sub in cutlass.range(cute.size(tTR_rAcc, mode=[2]), unroll_full=True):
             cute.copy(tiled_t2r, tTR_tAcc[None, 0, sub, stage], tTR_rAcc[None, 0, sub])
@@ -2193,6 +2213,10 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
                 num_chunks,
                 tidx,
             )
+            # Drain this warp's TMEM loads, then wait for all compute warps
+            # before warp 0 deallocates the TMEM they were reading from.
+            cute.arch.fence_view_async_tmem_load()
+            self.tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
         elif warp_idx == self.mma_warp_id:

@@ -195,6 +195,9 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   constexpr static int NumEpilogueWarpGroups = NumEpilogueWarpGroups_;
   static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideC, StrideC>;
   static constexpr bool UsesPrebuiltDDescriptor = UsesPrebuiltDDescriptor_ && IsGroupedGemmKernel;
+  // Kernel trait for the D descriptor acquire placement: false keeps the consumer-late acquire.
+  // Only Sm90MixedInputProducerAcquiredDEpilogue sets it.
+  static constexpr bool ProducerAcquiresPrebuiltD = false;
 
   // TMA pipeline for storing D
   using StorePipeline =
@@ -1149,18 +1152,102 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// EnableSource=false adapter around a source-capable (non-void C) epilogue. It statically removes
+// the device-side C descriptor maintenance only:
+//  - Public ElementC is void, so callers pass a null C pointer. Arguments, Params, fusion and
+//    SharedStorage stay the base types on purpose, keeping the base D store pipeline and epilogue
+//    shared memory (and therefore the mainloop carveout). A supplied C pointer is ignored.
+//  - can_implement requires beta == 0 with no beta pointer/array; alpha pointers stay legal. For
+//    these calls the unchanged base beta predicate skips every C load; the beta * C multiply-add
+//    is still compiled and runs on a cleared C fragment. The empty load-pipeline handshakes and
+//    the host placeholder C descriptor/workspace are retained.
+//  - load_init returns no C descriptor and the IsLoad (C) tensormap update/release/acquire calls
+//    compile to nothing; the D (!IsLoad) calls forward to the base.
+// Fusions without beta fields (per-token scale) only get the base checks.
+template <class EpilogueBase>
+struct Sm90MixedInputSourceDisabledEpilogue : EpilogueBase {
+  using Base = EpilogueBase;
+  using Base::Base;
+  using ElementC = void;
+
+  template <class ProblemShape>
+  static bool can_implement(ProblemShape problem_shape, typename Base::Arguments const& args) {
+    using Arguments = typename Base::Arguments;
+    bool beta_implementable = true;
+    if constexpr (detail::has_beta<Arguments>::value) {
+      beta_implementable = beta_implementable && args.thread.beta == 0.0;
+    }
+    if constexpr (detail::has_beta_ptr<Arguments>::value) {
+      beta_implementable = beta_implementable && args.thread.beta_ptr == nullptr;
+    }
+    if constexpr (detail::has_beta_ptr_array<Arguments>::value) {
+      beta_implementable = beta_implementable && args.thread.beta_ptr_array == nullptr;
+    }
+    if (!beta_implementable) {
+      CUTLASS_TRACE_HOST(
+          "  CAN IMPLEMENT: Beta/beta pointer was set, but the epilogue source is disabled.\n");
+      return false;
+    }
+    return Base::can_implement(problem_shape, args);
+  }
+
+  CUTLASS_DEVICE auto load_init(typename Base::Params const&, typename Base::TensorMapStorage&,
+                                int32_t, int32_t) {
+    return cute::make_tuple(static_cast<cute::TmaDescriptor*>(nullptr));
+  }
+
+  template <bool IsLoad, class... Args>
+  CUTLASS_DEVICE void tensormaps_perform_update(Args&&... args) {
+    if constexpr (!IsLoad) {
+      Base::template tensormaps_perform_update<false>(cute::forward<Args>(args)...);
+    }
+  }
+
+  template <bool IsLoad, class... Args>
+  CUTLASS_DEVICE void tensormaps_cp_fence_release(Args&&... args) {
+    if constexpr (!IsLoad) {
+      Base::template tensormaps_cp_fence_release<false>(cute::forward<Args>(args)...);
+    }
+  }
+
+  template <bool IsLoad, class... Args>
+  CUTLASS_DEVICE void tensormaps_fence_acquire(Args&&... args) {
+    if constexpr (!IsLoad) {
+      Base::template tensormaps_fence_acquire<false>(cute::forward<Args>(args)...);
+    }
+  }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Producer-acquire adapter: only sets the kernel trait, so the mainloop producer acquires an
+// immutable prebuilt D descriptor before its full-barrier arrive instead of each consumer WG
+// acquiring it after the mainloop. All types and methods stay the wrapped epilogue's. A mutable D
+// descriptor is rewritten by the consumer, so it keeps the consumer-late acquire.
+template <class EpilogueBase>
+struct Sm90MixedInputProducerAcquiredDEpilogue : EpilogueBase {
+  using Base = EpilogueBase;
+  using Base::Base;
+  static constexpr bool ProducerAcquiresPrebuiltD = Base::UsesPrebuiltDDescriptor;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <class ArchTag, class OpClass, class TileShape_MNK, class ClusterShape_MNK,
           class EpilogueTileType, class ElementAccumulator, class ElementCompute, class ElementC_,
           class GmemLayoutTagC_, int AlignmentC, class ElementD_, class GmemLayoutTagD,
           int AlignmentD, class Schedule,
           class FusionOpOrCallbacks = cutlass::epilogue::fusion::LinearCombination<
               ElementD_, ElementCompute, ElementC_, ElementCompute>,
-          bool UsesPrebuiltDDescriptor = false>
+          bool UsesPrebuiltDDescriptor = false, bool EnableSource = true,
+          bool ProducerAcquiresPrebuiltD = false>
 struct MixedInputSm90TmaEpilogueBuilder {
   static_assert(cute::is_same_v<ArchTag, cutlass::arch::Sm90>,
                 "Mixed-input TMA epilogue builder is SM90-only.");
   static_assert(cutlass::epilogue::collective::detail::sm90_is_ptr_array_tma_v<Schedule>,
                 "Mixed-input TMA epilogue builder expects a ptr-array TMA schedule.");
+  static_assert(EnableSource || not cute::is_void_v<ElementC_>,
+                "EnableSource=false wraps a source-capable epilogue; pass the real C type.");
 
  private:
   static_assert(detail::is_aligned<ElementC_, AlignmentC, ElementD_, AlignmentD>(),
@@ -1200,8 +1287,9 @@ struct MixedInputSm90TmaEpilogueBuilder {
       DispatchPolicy, FusionOpOrCallbacks, TileShape_MNK, EpilogueTile_MN,
       ElementAccumulator>::Callbacks;
 
- public:
-  using CollectiveOp = Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue<
+  // Every EnableSource / ProducerAcquiresPrebuiltD combination shares this source-capable
+  // epilogue, so C/D stages, shared storage and fusion types do not depend on them.
+  using SourceCapableOp = Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue<
       DispatchPolicy::StagesC, DispatchPolicy::StagesD, DispatchPolicy::FragmentSize,
       DispatchPolicy::ReuseSmemC, DispatchPolicy::DelayTmaStore,
       DispatchPolicy::NumEpilogueWarpGroups, UsesPrebuiltDDescriptor, TileShape_MNK,
@@ -1217,6 +1305,21 @@ struct MixedInputSm90TmaEpilogueBuilder {
       decltype(detail::sm90_get_smem_store_op_for_accumulator<UnderlyingGmemStrideTypeD, ElementD,
                                                               EpilogueTile_MN>()),
       CopyAtomC, void>;
+
+  using SourcePolicyOp = cute::conditional_t<EnableSource, SourceCapableOp,
+                                             Sm90MixedInputSourceDisabledEpilogue<SourceCapableOp>>;
+
+ public:
+  // Wrappers are applied only when requested: with both controls off this is SourceCapableOp.
+  using CollectiveOp =
+      cute::conditional_t<ProducerAcquiresPrebuiltD,
+                          Sm90MixedInputProducerAcquiredDEpilogue<SourcePolicyOp>, SourcePolicyOp>;
+  static_assert(
+      cute::is_same_v<typename CollectiveOp::SharedStorage,
+                      typename SourceCapableOp::SharedStorage> &&
+          cute::is_same_v<typename CollectiveOp::Params, typename SourceCapableOp::Params> &&
+          cute::is_same_v<typename CollectiveOp::Arguments, typename SourceCapableOp::Arguments>,
+      "Epilogue policies must keep the source-capable storage, params and arguments.");
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

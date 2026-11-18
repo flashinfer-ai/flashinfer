@@ -29,10 +29,26 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from build_utils import get_cuda_tile_compile_dependency_requirements, get_git_version
+from build_utils import (
+    apply_cutlass_patches,
+    get_cuda_tile_compile_dependency_requirements,
+    get_git_version,
+)
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
+
+
+def _load_spdlog_patch():
+    # The JIT and the wheel build share one definition of the spdlog rewrite; the
+    # package itself is not importable at build time, so load the module by path.
+    import importlib.util
+
+    path = _root / "flashinfer" / "jit" / "spdlog_patch.py"
+    spec = importlib.util.spec_from_file_location("flashinfer_spdlog_patch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
@@ -427,7 +443,6 @@ def _check_nccl_version_drift(wheel: Path) -> None:
     If the wheel's installed nccl.h has a different code, warn — we'll build
     against the wheel's ABI which may differ from the submodule we patched.
     """
-    import re
 
     src = _root / "3rdparty" / "nccl" / "src" / "nccl.h.in"
     wheel_h = wheel / "include" / "nccl.h"
@@ -800,6 +815,17 @@ def _system_cuda_tile_compiler_available() -> bool:
     release = _detect_cuda_release()
     if release is None or release < (13, 4):
         return False
+    if os.name == "nt":
+        # Windows has no /usr/local/cuda; the toolkit root comes from
+        # CUDA_HOME/CUDA_PATH or from the nvcc on PATH.
+        nvcc = shutil.which("nvcc")
+        root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if not root and nvcc:
+            root = str(Path(nvcc).resolve().parent.parent)
+        if not root:
+            return False
+        compiler = Path(root) / "bin" / "tileiras.exe"
+        return compiler.is_file()
     compiler = Path("/usr/local/cuda/bin/tileiras")
     return compiler.is_file() and os.access(compiler, os.X_OK)
 
@@ -1102,6 +1128,9 @@ def write_if_different(path: Path, content: str) -> None:
 
 
 def _create_data_dir(use_symlinks=True):
+    # Both source packaging and AOT use this populated CUTLASS checkout.
+    if os.name == "nt":
+        apply_cutlass_patches(_root / "3rdparty" / "cutlass")
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
@@ -1215,20 +1244,25 @@ def build_sdist(sdist_directory, config_settings=None):
 #
 # With FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1 (set by the release
 # workflow for the wheel published to PyPI, not by nightlies or source
-# installs) the experimental packages' generated kernel sources are dropped as
-# well: flashinfer/experimental/<pkg>/csrc/** and flashinfer/data/csrc/experimental/**.
+# installs) generated sources under flashinfer/experimental/<pkg>/csrc/** and
+# flashinfer/data/csrc/experimental/** are dropped, except the exact paths in
+# _EXPERIMENTAL_SOURCES_KEEP.
 # Experimental features are JIT-only and intended for main-branch users
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
-# 100 MB. The Cake training backends one level deeper,
-# flashinfer/experimental/cake/<pkg>/csrc/**, are not matched and ship in every
-# wheel: they back the stable flashinfer.cake_<op>_<det|nondet>_train[_kcp]
-# facades (#8928). The Python modules, build.json manifests and route catalogs stay, so
-# `import flashinfer` is unchanged and an experimental kernel load fails on
-# first use; the marker file below says why and where the sources are.
+# 100 MB. Python modules, build.json manifests and route catalogs stay,
+# so `import flashinfer` is unchanged. Loads requiring omitted sources fail on
+# first use; the marker file below explains how to obtain those sources.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
 _EXPERIMENTAL_SOURCES_MARKER = "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt"
 _EXPERIMENTAL_SOURCES_RE = re.compile(
     r"^(flashinfer/experimental/[^/]+/csrc/|flashinfer/data/csrc/experimental/)"
+)
+# HC needs these small sources for JIT even in release installs (#8944).
+_EXPERIMENTAL_SOURCES_KEEP = frozenset(
+    {
+        "flashinfer/experimental/hc_sum_sm100/csrc/binding.cu",
+        "flashinfer/experimental/hc_sum_sm100/csrc/kernels.cuh",
+    }
 )
 _THIRD_PARTY_ROOTS = (
     "flashinfer/data/cutlass/",
@@ -1245,11 +1279,12 @@ _THIRD_PARTY_KEEP = (
     "flashinfer/data/cccl/thrust/thrust/",
 )
 _EXPERIMENTAL_SOURCES_MARKER_TEXT = """\
-This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: the
-generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc
-and csrc/experimental) are not included, so that the release wheel stays under
-PyPI's per-file size limit. Experimental APIs import normally but raise when they
-first try to compile a kernel. To use them, install a nightly wheel from
+This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: most
+generated kernel sources under flashinfer/experimental/*/csrc and csrc/experimental
+are omitted so that the release wheel stays under PyPI's per-file size limit.
+The HC sum-state JIT sources are exempt from this filter. APIs whose required
+sources are omitted raise when they first try to compile a kernel. To use those
+backends, install a nightly wheel from
 https://flashinfer.ai/whl or install from source:
     pip install git+https://github.com/flashinfer-ai/flashinfer.git@<tag>
 See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
@@ -1260,7 +1295,7 @@ def _wheel_entry_dropped(name: str, exclude_experimental: bool) -> bool:
     if name.startswith(_THIRD_PARTY_ROOTS):
         return not name.startswith(_THIRD_PARTY_KEEP)
     if exclude_experimental and _EXPERIMENTAL_SOURCES_RE.match(name):
-        return True
+        return name not in _EXPERIMENTAL_SOURCES_KEEP
     return False
 
 
@@ -1341,8 +1376,55 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
     return stats
 
 
+@contextmanager
+def _staged_header(header: Path, patched: bytes, stage: Path):
+    """Hold ``patched`` in ``header`` for the block, then restore the original.
+
+    ``stage`` holds the backup of the original and the temporary files; it lies
+    outside the packaged ``include`` tree, so no wheel ships them.
+    """
+    backup = stage / (header.name + ".flashinfer-orig")
+    for leftover in stage.glob(f"{header.name}.*.tmp"):
+        leftover.unlink()
+    if backup.exists():
+        os.replace(backup, header)
+    original = header.read_bytes()
+    if patched == original:
+        yield
+        return
+
+    def write(path: Path, data: bytes) -> None:
+        """Write ``data`` through a temporary file in ``stage`` and ``os.replace``."""
+        temporary = stage / f"{path.name}.{os.getpid()}.tmp"
+        try:
+            temporary.write_bytes(data)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    write(backup, original)
+    try:
+        write(header, patched)
+        yield
+    finally:
+        os.replace(backup, header)
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    if os.name != "nt":
+        name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+        _slim_wheel(Path(wheel_directory) / name)
+        return name
+
+    spdlog_patch = _load_spdlog_patch()
+    spdlog = _root / "3rdparty" / "spdlog"
+    header = spdlog / "include" / spdlog_patch.SPDLOG_FORMAT_HEADER
+    original = header.read_bytes()
+    patched = spdlog_patch.patch_bundled_format_h(original.decode("utf-8")).encode(
+        "utf-8"
+    )
+    with _staged_header(header, patched, stage=spdlog):
+        name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
     _slim_wheel(Path(wheel_directory) / name)
     return name

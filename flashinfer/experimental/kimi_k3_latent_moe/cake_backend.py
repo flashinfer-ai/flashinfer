@@ -295,9 +295,11 @@ def choose_config(
 
 @_cached_plan
 def decode_front_plan(
-    num_tokens: int, i_local: int, sm_count: int = SM_COUNT
+    num_tokens: int, i_local: int, sm_count: int = SM_COUNT, arch: str = "sm_100a"
 ) -> dict[str, Any]:
-    """Instance configuration of ``front_decode`` (router + latent + shared SiTU tiles, one launch)."""
+    """Instance configuration of ``front_decode`` (router + latent + shared SiTU tiles, one launch); the TP8 token
+    counts of ``FRONT_FULL_TILE_ROUTES`` for the part (``sm_count``, ``arch``) take the split-finalize instance without
+    its guarded finalize stores (``full_tile``)."""
     if i_local % HALF_ROWS:
         raise ValueError("I_LOCAL must be a multiple of 64")
     n_pad = n_pad_for(num_tokens)
@@ -325,7 +327,7 @@ def decode_front_plan(
         i_local == i_local_for_tp(FRONT_L2_PROMOTION_TP)
         and n_pad <= FRONT_L2_PROMOTION_MAX_N_PAD
     )
-    return dict(
+    plan = dict(
         grid=grid,
         n_pad=n_pad,
         stages=stages,
@@ -365,6 +367,19 @@ def decode_front_plan(
         sb_split=False,
         tiles=tiles,
     )
+    if front_full_tile(num_tokens, i_local, sm_count, arch):
+        if (
+            n_pad != 128
+            or not plan["split_fin"]
+            or plan["grid"] != 94
+            or plan["cluster"] != 2
+            or not plan["land_alias"]
+        ):
+            raise AssertionError(
+                f"front T={num_tokens}: not the TP8 N_PAD 128 split-finalize instance"
+            )
+        plan["full_tile"] = True
+    return plan
 
 
 @_cached_plan
@@ -388,7 +403,9 @@ def decode_tail_plan(
     arithmetic (``sb_norm``), the cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` the instance the table names with the
     routed partials prefetched into L2 (``partial_prefetch``), the cells of ``TAIL_SPLIT_FIN_ROUTES`` the
     split-finalize instance of one routed partial at the table's N_PAD, and every other row its own instance
-    (``decode_tail_instance_plan``)."""
+    (``decode_tail_instance_plan``).  On top of these routes, the cells of ``TAIL_RING_ROWS_ROUTES`` for that part take
+    the TP1 resident-B instance at N_PAD 8 with the routed partials prefetched and ring rows (``partial_prefetch`` +
+    ``ring_rows``)."""
     if tail_staged_partials(num_tokens, tp, num_partials, arch, sm_count):
         plan = decode_tail_instance_plan(num_tokens, i_local, tp, 1, sm_count)
         if (
@@ -411,6 +428,22 @@ def decode_tail_plan(
             )
         plan["partial_prefetch"] = True
         plan["sb_split"] = True
+        return plan
+    if tail_ring_rows(num_tokens, tp, num_partials, arch, sm_count):
+        plan = decode_tail_instance_plan(
+            num_tokens, i_local, tp, num_partials, sm_count
+        )
+        if (
+            not plan["smem_b1"]
+            or plan["rows_smem"]
+            or plan["n_pad"] != 8
+            or plan["stages"] != 10
+        ):
+            raise AssertionError(
+                f"tp{tp} T={num_tokens} P={num_partials}: not the TP1 resident-B instance at N_PAD 8"
+            )
+        plan["partial_prefetch"] = True
+        plan["ring_rows"] = True
         return plan
     split_n_pad = tail_sb_split_n_pad(num_tokens, tp, num_partials, arch, sm_count)
     if split_n_pad:
@@ -614,6 +647,30 @@ FRONT_L2_PROMOTION_MAX_N_PAD = 64
 # N_PAD 16 the tails measured within run-to-run noise of the single finisher).
 SPLIT_FIN_MIN_N_PAD = 16
 TAIL_SPLIT_FIN_MIN_N_PAD = 32
+# Full tile (``full_tile``, symbol suffix ``_ft``): the TP8 front's split-finalize instance at N_PAD 128 without the
+# finalize stores guarded by the token count -- only the straight-line stores, at the same addresses with the same
+# values when every token of the tile exists, so its outputs are bitwise the instance's at exactly 128 tokens and it is
+# correct only there.  ``FRONT_FULL_TILE_ROUTES`` maps a part (SM count, architecture) to the TP8 token counts it
+# serves (128 only; candidate cells registered for timing on that part).
+FRONT_FULL_TILE_N_PAD = 128
+FRONT_FULL_TILE_ROUTES: dict[tuple[int, str], tuple[int, ...]] = {
+    (152, "sm_103a"): (FRONT_FULL_TILE_N_PAD,),
+}
+
+
+def front_full_tile(
+    num_tokens: int, i_local: int, sm_count: int = SM_COUNT, arch: str = "sm_100a"
+) -> bool:
+    """Whether the TP8 front of ``num_tokens`` tokens on an ``arch`` device of ``sm_count`` SMs takes the full-tile
+    split-finalize instance (``FRONT_FULL_TILE_ROUTES``; exactly ``FRONT_FULL_TILE_N_PAD`` tokens)."""
+    return (
+        int(i_local) == i_local_for_tp(8)
+        and int(num_tokens) == FRONT_FULL_TILE_N_PAD
+        and int(num_tokens)
+        in FRONT_FULL_TILE_ROUTES.get((int(sm_count), str(arch)), ())
+    )
+
+
 # With it, the TP1 tail's epilogue warp 0 arrives on the fused norm's grid counter as soon as the CTA's normalised rows
 # are written (``early_arrive``, ``_ea``) instead of its TMA warp at the first up-segment unit, and the TP8 tail's TMA
 # warp at N_PAD 32 and 64 prefetches the weight tiles of its first up-segment units into L2 while the grid's rows are
@@ -749,7 +806,8 @@ def tail_gy_split_n_pad(
 # cells where it measured faster than the route without it on that part (paired CUDA-graph timing, cold L2, both
 # passes beyond the A/A band, with and without a preceding front launch).
 TAIL_STAGED_PARTIALS_ROUTES: dict[tuple[int, str], dict[int, int]] = {
-    (152, "sm_103a"): {1: 2},
+    (152, "sm_100a"): {1: 2, 2: 3},
+    (152, "sm_103a"): {1: 2, 2: 3},
 }
 
 
@@ -813,6 +871,38 @@ def tail_partial_prefetch(
         if first <= int(num_partials) and (last is None or int(num_partials) <= last):
             return sb_norm
     return None
+
+
+# Ring rows (``ring_rows``, symbol suffix ``_ppf_rr``): the TP1 resident-B instance at N_PAD 8 with the routed partials
+# prefetched, its four epilogue warps splitting each row's chunks and passing the rows through a ring in shared memory,
+# with the resident-B arithmetic statement for statement, so ``y`` and ``out`` are bitwise those of the resident-B
+# arithmetic (the resident-B, ``_sbn`` and ``_sbs`` forms are bitwise one another) for every input.
+# ``TAIL_RING_ROWS_ROUTES`` maps a part (SM count, architecture) to the TP1 token counts it serves and, per token
+# count, the partial range ``(first, last)`` (``last`` ``None``: from ``first`` up) (candidate cells registered for
+# timing on that part).
+TAIL_RING_ROWS_ROUTES: dict[tuple[int, str], dict[int, tuple[int, Optional[int]]]] = {
+    (152, "sm_103a"): {1: (7, 16), 2: (7, 16), 3: (6, 7)},
+}
+
+
+def tail_ring_rows(
+    num_tokens: int,
+    tp: int,
+    num_partials: int,
+    arch: str = "sm_100a",
+    sm_count: int = SM_COUNT,
+) -> bool:
+    """Whether the TP1 resident-B instance at N_PAD 8 with ring rows serves the decode tail of ``num_tokens`` tokens and
+    ``num_partials`` routed partials at ``tp`` on an ``arch`` device of ``sm_count`` SMs (``TAIL_RING_ROWS_ROUTES``)."""
+    if int(tp) != 1:
+        return False
+    cells = TAIL_RING_ROWS_ROUTES.get((int(sm_count), str(arch)), {}).get(
+        int(num_tokens)
+    )
+    if cells is None:
+        return False
+    first, last = cells
+    return first <= int(num_partials) and (last is None or int(num_partials) <= last)
 
 
 # Split finalize for the multi-partial decode tails (``TAIL_SPLIT_FIN_ROUTES``).  The split-finalize instance of one
@@ -883,7 +973,9 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{'_upf' if plan.get('up_prefetch') else ''}{'_sbn' if plan.get('sb_norm') else ''}"
         f"{'_ppf' if plan.get('partial_prefetch') else ''}"
         f"{'_sbs' if plan.get('sb_split') else ''}"
+        f"{'_rr' if plan.get('ring_rows') else ''}"
         f"{'_mp' if plan.get('staged_partials') else ''}"
+        f"{'_ft' if plan.get('full_tile') else ''}"
     )
 
 
@@ -1682,7 +1774,9 @@ def route_kernel_keys(
     if stage == "front":
         if num_tokens <= DECODE_MAX_T:
             return (
-                decode_kernel_key(decode_front_plan(num_tokens, i_local, sm_count)),
+                decode_kernel_key(
+                    decode_front_plan(num_tokens, i_local, sm_count, arch)
+                ),
             )
         return (
             prefill_front_kernel_key(
@@ -2489,7 +2583,7 @@ def _prepare_front(
     plan: dict[str, Any]
     with torch.cuda.device(index):
         if T <= DECODE_MAX_T:
-            plan = decode_front_plan(T, i_local, sm_count)
+            plan = decode_front_plan(T, i_local, sm_count, arch)
             key = decode_kernel_key(plan)
             _, counters = _control_words(index, 0, DECODE_COUNTER_WORDS, lane=lane)
             _, tl = _read_never(index)
