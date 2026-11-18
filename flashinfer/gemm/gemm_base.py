@@ -593,9 +593,13 @@ def _cudnn_mm_bf16_requirement(
 
 
 def _require_tma_bf16_k_alignment(backend: str, k: int) -> None:
-    # TGV and TinyGEMM load their operands through TMA, whose global strides must
-    # be multiples of 16 bytes. With K % 8 != 0 they either return wrong values
-    # (TGV) or fail in cuTensorMapEncodeTiled (TinyGEMM), so reject such shapes.
+    """Check for those gemm BF16 backends like TGV and TTinyGEMM
+    that use TMA.
+    TMA requires that stride is multiple of 16.
+    Since we use BF16 then each element uses 2 bytes.
+    Then K * 2 must be multiple of 16 => K must be multiple of 8.
+    This is why we check here against 8.
+    """
     if k % 8 != 0:
         raise ValueError(
             f"The {backend} backend requires K divisible by 8 for bfloat16, got K={k}."
@@ -3605,6 +3609,8 @@ def tgv_gemm_sm100(
         tuning_config = TuningConfig()
         dtype_str = f"{a.dtype}_{b.dtype}_{a_descale.dtype}"
     else:
+        _require_tma_bf16_k_alignment("TGV", a.shape[1])
+
         runners = [
             get_tgv_gemm_sm10x_module(
                 a.dtype, is_sm100f_supported(a.device)
