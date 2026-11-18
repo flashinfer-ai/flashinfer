@@ -665,7 +665,10 @@ class MoERunner(TunableRunner):
                 workspace_buffer,
                 False,  # query_workspace_size
                 self.nvfp4_4over6_code,
-                [],  # fc2_input_out: autotuning profiles do not capture
+                # Honored by every launch through this runner. Autotuning never
+                # captures because the public op leaves it out of the kwargs it
+                # passes to the tuner.
+                list(kwargs.get("fc2_input_out") or ()),
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

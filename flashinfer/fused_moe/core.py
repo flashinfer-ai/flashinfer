@@ -4044,6 +4044,10 @@ def _build_trtllm_moe_namespace(module):
             "valid_hidden_size": valid_hidden_size,
             "valid_intermediate_size": valid_intermediate_size,
         }
+        # fc2_input_out is deliberately not in runner_kwargs: profiling must not
+        # capture (its batches can exceed the caller's rows, and the copy would be
+        # timed into every tactic). TrtllmMoERunner.forward() honors the argument,
+        # so a path that launches through it has to pass it explicitly.
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp4_block_scale_moe",
             [moe_runner],
@@ -7215,7 +7219,10 @@ def trtllm_fp4_block_scale_moe(
         Only rows ``[0, num_tokens)`` are written, so a buffer allocated for
         the largest batch can be reused under CUDA graphs. Slots routed to an
         expert outside ``[local_expert_offset, local_expert_offset +
-        local_num_experts)`` are zero-filled. Requires ``per_token_scale``
+        local_num_experts)`` are zero-filled. With ``valid_intermediate_size``
+        the buffers keep the padded ``intermediate_size`` width; only the
+        leading ``valid_intermediate_size`` columns are meaningful and the
+        rest must be ignored. Requires ``per_token_scale``
         (the per-token NvFP4 path, where the GEMM2 input is quantized by a
         separate kernel); not supported with fused shared experts. Autotuning
         profiles do not write it. Default ``None`` (no copy, no extra work).
@@ -7556,7 +7563,10 @@ def trtllm_fp4_block_scale_routed_moe(
         Only rows ``[0, num_tokens)`` are written, so a buffer allocated for
         the largest batch can be reused under CUDA graphs. Slots routed to an
         expert outside ``[local_expert_offset, local_expert_offset +
-        local_num_experts)`` are zero-filled. Requires ``per_token_scale``
+        local_num_experts)`` are zero-filled. With ``valid_intermediate_size``
+        the buffers keep the padded ``intermediate_size`` width; only the
+        leading ``valid_intermediate_size`` columns are meaningful and the
+        rest must be ignored. Requires ``per_token_scale``
         (the per-token NvFP4 path, where the GEMM2 input is quantized by a
         separate kernel); not supported with fused shared experts. Autotuning
         profiles do not write it. Default ``None`` (no copy, no extra work).

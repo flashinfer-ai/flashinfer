@@ -33,6 +33,7 @@ from flashinfer import (
     nvfp4_quantize,
 )
 from flashinfer.fused_moe import (
+    trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
 )
 from flashinfer.autotuner import autotune
@@ -595,6 +596,163 @@ def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
     for got, want in zip(fc2_input_out, eager, strict=True):
         assert torch.equal(got.view(torch.uint8)[:num_tokens], want[:num_tokens])
     assert torch.equal(output, plain)
+
+
+def _fc2_input_out_buffers(
+    rows: int, top_k: int, intermediate_size: int, device: torch.device
+):
+    """Poisoned ``(codes, block_scales, token_scales)`` buffers."""
+    codes = torch.full(
+        (rows, top_k, intermediate_size // 2), 0xFF, dtype=torch.uint8, device=device
+    )
+    scales = torch.full(
+        (rows, top_k, intermediate_size // 16), 0xFF, dtype=torch.uint8, device=device
+    ).view(torch.float8_e4m3fn)
+    token_scales = torch.full((rows, top_k), float("nan"), device=device)
+    return codes, scales, token_scales
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+def test_fc2_input_out_from_logits(num_tokens: int):
+    """Routing from logits fills ``fc2_input_out`` in the kernel's slot order.
+
+    The FC2 input of a (token, expert) pair does not depend on the routing
+    weights, so the copy must match, slot for slot, the one a routed call
+    writes for the expert IDs the routing kernel selected.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
+    kwargs, _reference, _parts = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    del kwargs["topk_ids"]
+    # Distinct logits per token, so the selected set has no ties.
+    routing_logits = (
+        torch.rand(num_tokens, num_experts, device=device)
+        .argsort(dim=1)
+        .to(torch.bfloat16)
+    )
+    replay_ids = torch.full((num_tokens, top_k), -1, dtype=torch.int16, device=device)
+    from_logits = _fc2_input_out_buffers(num_tokens, top_k, intermediate_size, device)
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    def run(capture: bool) -> None:
+        with autotune(False):
+            trtllm_fp4_block_scale_moe(
+                routing_logits=routing_logits,
+                **kwargs,
+                output=output,
+                routing_replay_out=replay_ids,
+                fc2_input_out=from_logits if capture else None,
+            )
+
+    run(False)
+    plain = output.clone()
+    run(True)
+    torch.cuda.synchronize()
+    assert torch.equal(output, plain)
+    want_ids = routing_logits.float().topk(top_k, dim=1).indices
+    assert torch.equal(
+        replay_ids.long().sort(dim=1).values, want_ids.sort(dim=1).values
+    )
+
+    # The weights only enter at finalize; any value gives the same FC2 input.
+    weights = torch.full((num_tokens, top_k), 1.0 / top_k, device=device)
+    packed = (replay_ids.to(torch.int32) << 16) | (
+        weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+    routed = _fc2_input_out_buffers(num_tokens, top_k, intermediate_size, device)
+    with autotune(False):
+        trtllm_fp4_block_scale_routed_moe(
+            topk_ids=packed, **kwargs, fc2_input_out=routed
+        )
+    torch.cuda.synchronize()
+    for got, want in zip(from_logits, routed, strict=True):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    assert (from_logits[2] > 0).all()
+
+
+def test_fc2_input_out_valid_intermediate_size():
+    """With ``valid_intermediate_size`` the buffers keep the padded width and
+    the leading valid columns hold the GEMM2 input."""
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k = (
+        64,
+        1024,
+        2048,
+        32,
+        4,
+    )
+    valid = 1920
+    kwargs, _reference, parts = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    codes, scales, token_scales = _fc2_input_out_buffers(
+        num_tokens, top_k, intermediate_size, device
+    )
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    def run(capture: bool) -> None:
+        with autotune(False):
+            trtllm_fp4_block_scale_routed_moe(
+                **kwargs,
+                output=output,
+                valid_intermediate_size=valid,
+                fc2_input_out=(codes, scales, token_scales) if capture else None,
+            )
+
+    run(False)
+    plain = output.clone()
+    run(True)
+    torch.cuda.synchronize()
+    assert torch.equal(output, plain)
+    assert (token_scales > 0).all()
+
+    fc2_input = e2m1_and_ufp8sf_scale_to_float(
+        codes.reshape(num_tokens * top_k, -1).cpu(),
+        scales.view(torch.uint8).reshape(-1).cpu(),
+        torch.tensor([1.0], device="cpu"),
+        16,
+        1,
+        False,
+    ).to(device)
+    fc2_input = (fc2_input * token_scales.reshape(-1, 1)).view(
+        num_tokens, top_k, intermediate_size
+    )[..., :valid]
+
+    ref = parts["intermediate"][..., :valid].float()
+    rel = (fc2_input - ref).norm() / ref.norm()
+    assert rel < 0.15, rel
+
+    # GEMM2 contracts over the valid columns only.
+    recon = torch.zeros(num_tokens, hidden_size, device=device)
+    for e in range(num_experts):
+        token, slot = (parts["topk_ids"] == e).nonzero(as_tuple=True)
+        weight = parts["expert_weights"][token, slot].float().unsqueeze(1)
+        out_e = fc2_input[token, slot] @ parts["w2_dequant"][e].float()[:, :valid].T
+        recon.index_add_(0, token, weight * out_e)
+    rel = (plain.float() - recon).norm() / recon.norm()
+    assert rel < 1e-2, rel
 
 
 def test_fc2_input_out_requires_per_token_scale():
