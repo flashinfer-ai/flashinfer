@@ -35,13 +35,15 @@ _KILL_SWITCH_ENV = "FLASHINFER_DISABLE_SPARSE_MLA_SM90"
 #                  (csrc/sparse_mla_sm90.cu).
 #   "reference":   the composable torch path (gather + dequantise the
 #                  fp8_ds_mla rows + fp32 attend) — exact-math, slow; it
-#                  serves the kill switch and every call the specialized
-#                  kernel cannot.
+#                  serves "auto" wherever the specialized kernel does not
+#                  route (kill switch included).
 #   "auto":        "specialized" on the dispatch allowlist
 #                  (sparse_mla_sm90_dispatch.json) on a supported device,
 #                  "reference" otherwise. An explicitly selected backend is
-#                  never silently swapped: "reference" never runs the fused
-#                  kernel, and an unknown backend name raises.
+#                  never silently swapped and never falls back: "reference"
+#                  never runs the fused kernel, explicit "specialized" that
+#                  cannot serve a call raises with the refusal reason, and
+#                  an unknown backend name raises.
 BACKENDS = ("auto", "specialized", "reference")
 _DISPATCH_FILE = "sparse_mla_sm90_dispatch.json"
 
@@ -161,11 +163,11 @@ def _auto_routes(query: torch.Tensor, nq: int) -> Tuple[bool, Optional[str]]:
 
 def _backend_order(requested: str, auto_routed: bool) -> Tuple[str, ...]:
     """#5667-style backend order for one call. A caller who named a backend
-    is never silently swapped: explicit "reference" never sees the fused
-    kernel, explicit "specialized" falls back to the composable reference
-    only."""
+    is never silently swapped and never falls back: explicit "reference"
+    never sees the fused kernel, explicit "specialized" runs the fused
+    kernel or raises. Only "auto" routes around a refusal."""
     if requested == "specialized":
-        return ("specialized", "reference")
+        return ("specialized",)
     if requested == "reference":
         return ("reference",)
     if requested == "auto":
@@ -310,8 +312,8 @@ def _ffi_device(index: int):
 def _device_supported(device: torch.device) -> bool:
     # HW eligibility first (no module build), then the module's own probe.
     # A failed JIT build (e.g. FLASHINFER_DISABLE_JIT=1 with no cached
-    # module) reports "unsupported" so "auto" and explicit "specialized"
-    # fall back to the composable reference path instead of hard-failing —
+    # module) reports "unsupported": "auto" then routes to the composable
+    # reference path and explicit "specialized" raises with the reason —
     # except under CUDA-graph capture, where the eager-warmup discipline
     # stays loud.
     if torch.cuda.get_device_capability(device) != (9, 0):
@@ -583,15 +585,16 @@ def sparse_mla_decode_sm90(
     backend : str
         One of ``BACKENDS = ("auto", "specialized", "reference")``.
         ``"specialized"`` selects the SM90 fused kernel explicitly; a call it
-        cannot serve (unsupported device, token-row envelope) is served by
-        the composable ``"reference"`` path — never by another fused
-        backend — with the reason recorded in the dispatch stats.
-        ``"reference"`` selects the composable torch path explicitly (exact
-        math, slow) and never runs the fused kernel. ``"auto"`` routes to
-        ``"specialized"`` only on the dispatch allowlist
+        cannot serve (unsupported device, token-row envelope, kill switch,
+        JIT failure) raises ``NotImplementedError`` with the refusal reason
+        (recorded in the dispatch stats) — an explicitly selected backend
+        never falls back. ``"reference"`` selects the composable torch path
+        explicitly (exact math, slow) and never runs the fused kernel.
+        ``"auto"`` routes to ``"specialized"`` only on the dispatch allowlist
         (``flashinfer/sparse_mla_sm90_dispatch.json``) on a supported
-        device, and to ``"reference"`` otherwise. Any other name raises:
-        an explicitly selected backend is never silently swapped.
+        device, and to ``"reference"`` otherwise — only ``"auto"`` routes
+        around a refusal. Any other name raises: an explicitly selected
+        backend is never silently swapped.
 
     Returns
     -------
@@ -616,7 +619,8 @@ def sparse_mla_decode_sm90(
 
     **Kill switch.** Set ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (the
     switch shared by FlashInfer's specialized kernels, read at call time) to
-    force the composable ``"reference"`` path;
+    disable the fused kernel: ``"auto"`` then routes to the composable
+    ``"reference"`` path and explicit ``backend="specialized"`` raises;
     :func:`is_sparse_mla_sm90_supported` then returns ``False``.
     ``FLASHINFER_DISABLE_SPARSE_MLA_SM90=1`` is a deprecated alias kept for
     one release.
@@ -641,6 +645,15 @@ def sparse_mla_decode_sm90(
     # Backend resolution (#5667 order; GPU-free checks first).
     chosen = None
     if _disabled():
+        if backend == "specialized":
+            # An explicitly selected backend never falls back: refuse loudly.
+            _fallback("specialized: kill switch")
+            raise NotImplementedError(
+                "sparse_mla_decode_sm90: backend='specialized' is disabled "
+                f"({_SPECIALIZED_KERNEL_DISABLE_ENV}, or its deprecated alias "
+                f"{_KILL_SWITCH_ENV}); an explicitly selected backend never "
+                "falls back — use backend='auto' or 'reference'"
+            )
         _fallback(f"{backend}: kill switch")
         logger.info_once(
             "sparse_mla_decode_sm90: disabled (%s, or its deprecated alias "
@@ -660,15 +673,17 @@ def sparse_mla_decode_sm90(
         ):
             chosen = "specialized"
         else:
-            # explicit "specialized" that cannot serve this call: the
-            # composable path, never another fused backend
+            # Explicit "specialized" that cannot serve this call RAISES with
+            # the refusal reason — an explicitly selected backend never
+            # falls back; only "auto" routes around a refusal.
             _fallback("specialized: device or token-row envelope")
-            logger.info_once(
+            raise NotImplementedError(
                 "sparse_mla_decode_sm90: backend='specialized' cannot serve "
-                "this call (device or token-row envelope); the composable "
-                "reference path serves it"
+                "this call (device or token-row envelope: needs SM90 with "
+                f"the 93568B smem opt-in and 1 <= B*q_len <= {_MAX_NQ}); an "
+                "explicitly selected backend never falls back — use "
+                "backend='auto' or 'reference'"
             )
-            chosen = "reference"
     else:  # "auto"
         routed, reason = _auto_routes(query, nq)
         if routed:
@@ -689,6 +704,14 @@ def sparse_mla_decode_sm90(
             if torch.cuda.is_current_stream_capturing():
                 raise  # the eager-warmup discipline stays loud under capture
             _fallback(f"specialized: JIT build failed ({type(exc).__name__})")
+            if backend == "specialized":
+                # An explicitly selected backend never falls back.
+                raise NotImplementedError(
+                    "sparse_mla_decode_sm90: backend='specialized' JIT build "
+                    f"failed ({type(exc).__name__}: {str(exc)[:300]}); an "
+                    "explicitly selected backend never falls back — use "
+                    "backend='auto' or 'reference'"
+                ) from exc
             logger.warning_once(
                 "sparse_mla_decode_sm90: JIT build failed (%s: %s); the "
                 "composable reference path serves this process",

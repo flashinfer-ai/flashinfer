@@ -232,9 +232,11 @@ Sparse MLA decode with top-k indices (SM90)
 
 Attends only the tokens named by a per-query top-k index list over an
 ``fp8_ds_mla`` paged KV cache, through the ``"specialized"`` backend
-(``backend="auto"`` routes to it on its dispatch allowlist; the composable
-``"reference"`` torch path serves everything else, including under
-``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``).
+(``backend="auto"`` routes to it on its dispatch allowlist and to the
+composable ``"reference"`` torch path everywhere else, including under
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``; explicit
+``backend="specialized"`` that cannot serve a call raises — an explicitly
+selected backend never falls back).
 
 .. autofunction:: sparse_mla_decode_sm90
 .. autofunction:: get_sparse_mla_sm90_workspace_size_bytes

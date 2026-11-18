@@ -149,8 +149,8 @@ def _resolve_backend(backend: str, device: torch.device) -> str:
             f"sparse-MLA decode route for compute capability "
             f"{cc[0]}.{cc[1]}; supported: SM90 ('specialized') and "
             "SM120/SM121 ('cuda' or 'cake'). The DeepSeek-V4 windowed "
-            "dual-pool op (trtllm_batch_decode_sparse_mla_dsv4) is a "
-            "different op and keeps its own entry"
+            "dual-pool op is a different op served by its own front, "
+            "flashinfer.mla.batch_decode_sparse_mla_dsv4"
         )
     key = f"{cc[0]}.{cc[1]}->{routed}"
     _stats["auto_routes"][key] = _stats["auto_routes"].get(key, 0) + 1
@@ -322,8 +322,9 @@ def sparse_mla_decode(
     public same-op per-arch entries and adds no kernels of its own:
 
     - ``backend="specialized"`` calls
-      :func:`sparse_mla_decode_sm90` (SM90 fused kernel, with that entry's
-      own composable-reference fallback and kill switch).
+      :func:`sparse_mla_decode_sm90` (SM90 fused kernel) pinned explicitly:
+      a call that entry cannot serve raises with the refusal reason — an
+      explicitly selected backend never falls back.
     - ``backend="cuda"`` runs a front-cached
       :class:`SparseMLASm120Wrapper` (SM120/SM121) pinned to its
       hand-written CUDA kernels, as a single call; ``backend="cake"`` the

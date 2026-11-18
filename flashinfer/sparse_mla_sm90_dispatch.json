@@ -1,5 +1,5 @@
 {
-  "comment": "Dispatch surface of the specialized SM90 sparse-MLA decode kernel (sparse_mla_decode_sm90). 'backends' lists the backend strings of this API; the op entry carries the auto-routing keys backend='auto' matches a call against (the compiled-in guards in flashinfer/mla/_sparse_mla_sm90.py stay authoritative for eligibility) plus the qualified envelope. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the composable 'reference' path regardless of this file.",
+  "comment": "Dispatch surface of the specialized SM90 sparse-MLA decode kernel (sparse_mla_decode_sm90). 'backends' lists the backend strings of this API; the op entry carries the auto-routing keys backend='auto' matches a call against (the compiled-in guards in flashinfer/mla/_sparse_mla_sm90.py stay authoritative for eligibility) plus the qualified envelope. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the specialized kernel regardless of this file: backend='auto' routes to the composable 'reference' path, explicit backend='specialized' raises.",
   "backends": ["auto", "specialized", "reference"],
   "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
   "ops": {

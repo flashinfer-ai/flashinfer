@@ -120,7 +120,9 @@ def test_auto_refuses_unrouted_capability(monkeypatch, cc):
     # SM100/SM103/SM107 deliberately have NO route: their in-tree
     # sparse-MLA decode entry is the DeepSeek-V4 op, not this one.
     monkeypatch.setattr(front, "_capability", lambda device: cc)
-    with pytest.raises(ValueError, match="no selection-only"):
+    with pytest.raises(
+        ValueError, match="no selection-only.*batch_decode_sparse_mla_dsv4"
+    ):
         front._resolve_backend("auto", torch.device("cpu"))
 
 

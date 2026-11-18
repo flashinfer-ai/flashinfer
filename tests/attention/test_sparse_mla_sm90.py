@@ -77,7 +77,9 @@ def test_dispatch_table_loads_and_matches_guard_constants():
 
 
 def test_backend_order_never_swaps_an_explicit_backend():
-    assert _backend_order("specialized", False) == ("specialized", "reference")
+    # Explicit backends never fall back: "specialized" runs the fused kernel
+    # or raises; only "auto" routes around a refusal.
+    assert _backend_order("specialized", False) == ("specialized",)
     assert _backend_order("reference", True) == ("reference",)
     assert _backend_order("auto", True) == ("specialized", "reference")
     assert _backend_order("auto", False) == ("reference",)
@@ -241,17 +243,26 @@ def test_kill_switch_forces_the_composable_path(env, monkeypatch):
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert stats["backend_dispatches"]["reference"] == 1, stats
     assert _matched(y, _ref(q, kv, idx)) >= 0.999
+    # explicit "specialized" under the kill switch raises (never falls back)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        sparse_mla_decode_sm90(
+            q, kv, idx, sl, ws, sm_scale=SM_SCALE, backend="specialized"
+        )
 
 
-def test_specialized_off_envelope_falls_back_to_reference_only():
+def test_specialized_off_envelope_raises():
     _sm90_or_skip()
-    # token rows above the qualified envelope (65 > 64)
+    # token rows above the qualified envelope (65 > 64): explicit
+    # "specialized" raises with the refusal reason — never falls back.
     q, kv, idx, sl, ws = _make_case(B=13, QL=5, kv_lens=tuple([200] * 13))
-    y = sparse_mla_decode_sm90(
-        q, kv, idx, sl, ws, sm_scale=SM_SCALE, backend="specialized"
-    )
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        sparse_mla_decode_sm90(
+            q, kv, idx, sl, ws, sm_scale=SM_SCALE, backend="specialized"
+        )
     stats = _sparse_mla_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert stats["backend_dispatches"]["reference"] == 1, stats
+    assert stats["backend_dispatches"]["reference"] == 0, stats
     assert any("specialized" in r for r in stats["fallback_reasons"]), stats
+    # "auto" routes the same call to the composable reference path instead.
+    y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=SM_SCALE, backend="auto")
     assert _matched(y, _ref(q, kv, idx)) >= 0.999
