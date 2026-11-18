@@ -937,7 +937,7 @@ def test_sf_ring_mc42_rows():
             cb.gemm_plan(2048, 8192, 8192, False, arch, sm_count, tactic=tactic)
 
 
-def test_cake_is_registered_but_never_auto_selected():
+def test_cake_is_registered_as_experimental_backend():
     assert "cake" in mm_fp4.experimental_backends
     assert mm_fp4.is_backend_supported("cake", 100)
     assert mm_fp4.is_backend_supported("cake", 103)
