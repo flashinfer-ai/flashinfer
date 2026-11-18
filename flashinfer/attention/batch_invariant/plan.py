@@ -176,13 +176,15 @@ def swaps_kind_cost(
     sm_count: int,
     D: int,
     inkernel_max_chunks: int,
+    relax_last_wave: bool = False,
 ) -> float:
     """The predicted makespan of a Swaps-body batch whose unit ``i`` -- ``units[i] = (tiles, chunk_tiles, rows)`` with ``chunk_tiles``
     the tiles of each of its chunks -- is split into one unit per chunk when ``split[i]``, walked by ``grid`` persistent CTAs. The
     walk takes the units longest first in waves of ``grid``; a wave costs its longest unit's tiles at the rate of its active CTAs (the
     HBM rate from ``STREAM_SAT_FRACTION`` of the SMs up; below it the per-CTA rate plus the unit boundary's bubble), the first wave
     adds its opening burst's contention, the split groups add the fixup kernel's cost or the in-kernel fold's per wave of folding
-    units."""
+    units. ``relax_last_wave``: a multi-wave walk's last wave is charged at the HBM rate whatever its width -- the form used off the
+    parts the per-CTA rate was fitted on, so that a part-filled last wave alone never turns a fused batch into a split one."""
     scale = D / 128
     lengths: List[int] = []
     fixup_rows = 0
@@ -202,12 +204,14 @@ def swaps_kind_cost(
     grid = max(1, min(grid, len(lengths)))
     sat = STREAM_SAT_FRACTION[D] * sm_count
     cost = 0.0
-    for w in range(0, len(lengths), grid):
+    n_waves = -(-len(lengths) // grid)
+    for i, w in enumerate(range(0, len(lengths), grid)):
         wave = lengths[w : w + grid]
-        cost += max(
-            wave[0] * scale * sat / sm_count + UNIT_BUBBLE[D],
-            wave[0] * scale * len(wave) / sm_count,
-        )
+        streamed = wave[0] * scale * len(wave) / sm_count
+        if relax_last_wave and n_waves > 1 and i == n_waves - 1:
+            cost += streamed
+        else:
+            cost += max(wave[0] * scale * sat / sm_count + UNIT_BUBBLE[D], streamed)
     cost += FIRST_WAVE_RAMP * scale * grid / sm_count
     if fixup_rows:
         cost += FIXUP_BASE_COST + FIXUP_ROW_COST * fixup_rows
@@ -257,11 +261,19 @@ def swaps_unit_kinds(
         return [], 0
     fused = [False] * n
     best_grid, best_cost = 0, float("inf")
-    grids = (
-        swaps_fused_grids(n, sm_count, D, max(u[0] for u in units))
-        if grid_search
-        else [min(n, sm_count)]
-    )
+    if grid_search:
+        grids = swaps_fused_grids(n, sm_count, D, max(u[0] for u in units))
+    else:
+        # off the fitted parts: the full grid and the even-waves grid (the units spread over the full grid's wave count: no fitted
+        # constant), so that a part-filled last wave does not stream alone
+        grids = [min(n, sm_count)]
+        waves = -(-n // sm_count)
+        even = -(-n // waves)
+        thin_tail = 3 * (n - (waves - 1) * sm_count) < sm_count
+        if even not in grids and (
+            max(u[0] for u in units) >= GRID_LONG_TILES or thin_tail
+        ):
+            grids.append(even)
     for g in grids:
         c = swaps_kind_cost(units, fused, g, sm_count, D, inkernel_max_chunks)
         if c <= best_cost:
@@ -269,7 +281,14 @@ def swaps_unit_kinds(
     split = [len(u[1]) > 1 for u in units]
     if any(split):
         c = swaps_kind_cost(units, split, sm_count, sm_count, D, inkernel_max_chunks)
-        if c < best_cost:
+        fused_cmp = (
+            best_cost
+            if grid_search
+            else swaps_kind_cost(
+                units, fused, best_grid, sm_count, D, inkernel_max_chunks, True
+            )
+        )
+        if c < fused_cmp:
             return split, 0
     return fused, best_grid
 
