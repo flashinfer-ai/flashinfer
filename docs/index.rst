@@ -33,14 +33,48 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
 
 .. toctree::
    :maxdepth: 2
-   :titlesonly:
    :caption: PyTorch API Reference
 
-   Attention <api/reference/attention>
-   Linear Attention and State-Space Models <api/reference/linear_attention>
-   Matrix Multiplication <api/reference/gemm>
-   Mixture of Experts <api/reference/moe>
-   Sampling and Logits <api/reference/sampling>
-   Tensor Operations and Quantization <api/reference/tensor_ops>
-   Backend-Specific APIs <api/reference/backends>
-   Communication, Runtime and Testing <api/reference/utilities>
+   api/attention
+   api/attn_scores
+   api/cake_fmha
+   api/cake_fused_qk_rope_append
+   api/cake_fused_qk_rope_fp8_append
+   api/cake_mxfp4_situ_moe
+   api/cake_sampling
+   api/cake_stepfun_moe
+   api/gemm
+   api/grouped_mm
+   api/fused_moe
+   api/megamoe
+   api/moe_ep_kimi_k3
+   api/moe_ep_communication
+   api/cascade
+   api/comm
+   api/sparse
+   api/qsa
+   api/pod
+   api/cudnn
+   api/cute_dsl
+   api/concat_ops
+   api/diffusion_ops
+   api/page
+   api/sampling
+   api/topk
+   api/logits_processor
+   api/norm
+   api/rope
+   api/activation
+   api/gdn_decode
+   api/gdn_fused_decode
+   api/gdn_prefill
+   api/gdn_paged
+   api/gdn2_prefill
+   api/gdp_prefill
+   api/kda
+   api/mamba
+   api/mhc
+   api/quantization
+   api/green_ctx
+   api/fp4_quantization
+   api/testing
