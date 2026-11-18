@@ -1,4 +1,16 @@
-"""Native FP4 prefill specializations through the FlashInfer execution binding."""
+"""NVFP4 prefill math, mega-fusion boundaries, and buffer-layout contracts.
+
+Use explicit prefill plans to exercise 16/32/64-head specializations, ragged
+sparse selections, and attention sinks. Check output against an independent
+reference and LSE against FP64 math with NVFP4-quantized Q. Exact agreement
+with separate RoPE/attention/output-quantization kernels checks fusion
+boundaries; that comparison is not an independent attention implementation.
+
+Replay CUDA graphs after changing positions, lengths, and invalid indices.
+Also cover infinite sinks, offset query views, and padded KV page strides.
+Decode plans must reject mega execution until decode fusion is supported;
+these tests do not establish automatic routing performance.
+"""
 
 import pytest
 import torch
@@ -145,3 +157,24 @@ def test_nvfp4_prefill_page_pitch(padding_bytes):
     fused_call(f)
     torch.testing.assert_close(f["out"].view(torch.uint8), expected, atol=0, rtol=0)
     torch.testing.assert_close(f["scales"], expected_scales, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("chunks_per_block", [2, 5, 10])
+def test_nvfp4_decode_plan_rejects_mega(chunks_per_block):
+    from tests.attention.sparse_mla_prefill_utils import fixture
+
+    f = fixture(7, 64, "nvfp4")
+    mega, baseline, _ = prefill_calls(
+        f, streaming_prefill=False, chunks_per_block=chunks_per_block
+    )
+    baseline()  # Ordinary decode remains available for every merge mode.
+    with pytest.raises(Exception, match="NVFP4 run_mega requires a prefill plan"):
+        mega()
+
+
+def test_nvfp4_public_mega_rejects_decode():
+    from tests.attention.sparse_mla_prefill_utils import fixture, fused_call
+
+    f = fixture(7, 16, "nvfp4")
+    with pytest.raises(Exception, match="NVFP4 run_mega requires a prefill plan"):
+        fused_call(f)

@@ -18,6 +18,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
                extra_page_stride_bytes, num_tokens, sm_scale, page_size, page_stride_bytes,
                lse_scale, mega] = params;
+  if (mega.output) return cudaErrorNotSupported;
   constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= STREAMING_HEADS_PER_CTA;
   constexpr int GROUPED_H_BLOCKS =
       (NUM_HEADS + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
@@ -39,7 +40,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
           q, cache, indices, output, out_lse, mid_out, mid_lse, attn_sink, topk_length, extra_cache,
           extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
           num_tokens, active_splits, chunks_per_block, sm_scale, page_size, page_stride_bytes,
-          write_direct, lse_scale, mega);
+          write_direct, lse_scale);
     }
   }
   if (!use_grouped) {
@@ -54,7 +55,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
         q, cache, indices, mid_out, mid_lse, output, out_lse, attn_sink, topk_length, extra_cache,
         extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
         num_tokens, active_splits, chunks_per_block, sm_scale, page_size, page_stride_bytes,
-        write_direct, lse_scale, mega);
+        write_direct, lse_scale);
   }
   auto status = cudaGetLastError();
   if (status != cudaSuccess || stage1_only || write_direct) return status;
@@ -62,21 +63,16 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
     constexpr int MERGE_H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
     auto kernel = sparse_mla_decode_dsv4_nvfp4_merge2_kernel<NUM_HEADS>;
     kernel<<<dim3(num_tokens, MERGE_H_BLOCKS), dim3(DECODE_MERGE2_THREADS), 0, stream>>>(
-        mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, lse_scale, mega);
+        mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, lse_scale);
     return cudaGetLastError();
   }
   constexpr int MERGE_THREADS = 64;
   constexpr int DIMS_PER_THREAD = 512 / MERGE_THREADS;
   auto kernel = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, 512, MERGE_THREADS, DIMS_PER_THREAD>;
-  size_t merge_smem = static_cast<size_t>(active_splits) * sizeof(float);
-  if (mega.output && active_splits <= 32) {
-    kernel =
-        sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, 512, MERGE_THREADS, DIMS_PER_THREAD, true>;
-    merge_smem = 0;
-  }
+  const size_t merge_smem = static_cast<size_t>(active_splits) * sizeof(float);
   kernel<<<dim3(num_tokens, NUM_HEADS), dim3(MERGE_THREADS), merge_smem, stream>>>(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, active_splits, NUM_HEADS, NUM_HEADS,
-      NUM_HEADS, lse_scale, mega);
+      NUM_HEADS, lse_scale, {});
   return cudaGetLastError();
 }
 

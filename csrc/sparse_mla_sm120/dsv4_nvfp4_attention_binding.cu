@@ -239,6 +239,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
             extra_cache, extra_indices, extra_lengths, plan.cpb,
             plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan, lse_scale);
 }
+// Fp8 names the output format; cached KV and non-RoPE MMA operands are NVFP4.
 void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorView cache,
                                  TensorView indices, Optional<TensorView> mid,
                                  Optional<TensorView> mlse, TensorView output, TensorView lse,
@@ -254,6 +255,8 @@ void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorVie
       << "DSV4 NVFP4 execution plan query mismatch";
   const auto mega =
       check_attention_rope_fp8_inputs(q, positions, cos_sin, fp8_output, output_scales);
+  TVM_FFI_ICHECK(plan.metadata.variant == 1)
+      << "NVFP4 run_mega requires a prefill plan; decode mega is not supported";
   TVM_FFI_ICHECK(plan.merge != execution::Merge::Stage1) << "mega requires a final output plan";
   attention(q, cache, indices, mid, mlse, output, lse, plan.chunk_capacity, scale, lengths, sink,
             extra_cache, extra_indices, extra_lengths, plan.cpb,
