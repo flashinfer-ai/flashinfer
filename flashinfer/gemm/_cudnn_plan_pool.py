@@ -159,7 +159,7 @@ class CudnnPlanBuildPool:
             )
         procs = []
         for _ in range(self.num_workers):
-            log = tempfile.TemporaryFile()
+            log = tempfile.TemporaryFile()  # noqa: SIM115 - closed with its worker in _stop
             try:
                 proc = subprocess.Popen(
                     self._worker_cmd,
@@ -297,7 +297,11 @@ class CudnnPlanBuildPool:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            for stream in (proc.stdin, proc.stdout, self._stderr_logs.pop(proc.pid, None)):
+            for stream in (
+                proc.stdin,
+                proc.stdout,
+                self._stderr_logs.pop(proc.pid, None),
+            ):
                 if stream is not None:
                     with contextlib.suppress(OSError):
                         stream.close()
