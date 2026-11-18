@@ -931,35 +931,16 @@ __global__ __launch_bounds__(256) void f32_to_bf16(const float* __restrict__ src
 // ---------------------------------------------------------------- workspace
 namespace {
 constexpr int kMaxDevices = 64;
-struct Workspace {
-  void* ptr = nullptr;
-  size_t cap = 0;
-  // Growth RETAINS the previous allocation instead of freeing it: a captured
-  // CUDA graph replays with the addresses it recorded, so freeing on growth
-  // would hand replay dangling pointers. The retained total is bounded by the
-  // finite num_tokens allowlist (strictly less than 2x the largest variant's
-  // scratch). Pointer/capacity are committed only after allocation succeeds,
-  // so a failed cudaMalloc leaves a retryable state. The 256 barrier bytes at
-  // the base are zeroed on the execution stream, ordering the reset before
-  // the first cooperative kernel even on nonblocking streams.
-  cudaError_t ensure(size_t bytes, cudaStream_t stream) {
-    if (bytes <= cap) return cudaSuccess;
-    void* fresh = nullptr;
-    cudaError_t status = cudaMalloc(&fresh, bytes);
-    if (status != cudaSuccess) return status;
-    status = cudaMemsetAsync(fresh, 0, 256, stream);
-    if (status != cudaSuccess) {
-      cudaFree(fresh);
-      return status;
-    }
-    ptr = fresh;  // the previous allocation is intentionally retained
-    cap = bytes;
-    return cudaSuccess;
-  }
-};
-// All cached state is per device: scratch from one device is not usable on
-// another, and the occupancy probes answer for one device only.
-Workspace g_ws[kMaxDevices];
+// All cached state is per device and READ-ONLY (occupancy/cluster probes).
+// Mutable scratch is the caller-provided per-call workspace: the Python
+// dispatch layer owns one buffer per (device, stream) for eager calls and
+// one per CUDA-graph capture, so independently executing calls never share
+// live scratch. The workspace's first kWorkspaceDataOffset bytes are the
+// shared counter region (zeroed once at allocation by the owner; see the
+// layout contract in decode_kernel.cu): the T=1 phase counters own
+// [0..256), and every path's data starts at kWorkspaceDataOffset so reuse
+// across token counts never overwrites a counter mid-epoch.
+constexpr size_t kWorkspaceDataOffset = 2048;
 int g_t1_v3_ok[kMaxDevices];
 int g_t1_clu[kMaxDevices];
 struct GemvCacheInit {
@@ -968,41 +949,61 @@ struct GemvCacheInit {
   }
 } g_gemv_cache_init;
 inline size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
+struct GemvLayout {
+  size_t o_pair, o_pos, o_te, o_tp, o_tc, o_nt, o_int, o_of, total;
+};
+
+GemvLayout gemv_layout(int T) {
+  const int P = T * TOPK;
+  const int MT = (T == 1) ? 1 : ((T <= 8) ? 2 : ((T >= 1024) ? 128 : 4));
+  long long nt_bound = (P <= NEXP) ? P : NEXP + (long long)(P - NEXP) / MT;
+  GemvLayout L{};
+  // Data begins past the reserved counter region; the T=1 phase counters
+  // live at [0..256) inside it.
+  size_t off = kWorkspaceDataOffset;
+  L.o_pair = off;
+  off = align_up(off + (size_t)P * 4, 256);
+  L.o_pos = off;
+  off = align_up(off + (size_t)P * 4, 256);
+  L.o_te = off;
+  off = align_up(off + (size_t)nt_bound * 4, 256);
+  L.o_tp = off;
+  off = align_up(off + (size_t)nt_bound * 4, 256);
+  L.o_tc = off;
+  off = align_up(off + (size_t)nt_bound * 4, 256);
+  L.o_nt = off;
+  off = align_up(off + 4, 256);
+  L.o_int = off;
+  off = align_up(off + (size_t)P * INT_ * 2, 256);
+  L.o_of = off;
+  if (T >= 1024) off = align_up(off + (size_t)T * HID * 4, 256);
+  L.total = off;
+  return L;
+}
 }  // namespace
+
+size_t GemvWorkspaceBytes(int T) { return gemv_layout(T).total; }
 
 void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-             ffi::TensorView topk_weights, ffi::TensorView out, cudaStream_t stream) {
+             ffi::TensorView topk_weights, ffi::TensorView out, cudaStream_t stream,
+             void* workspace, size_t workspace_bytes) {
   const int T = static_cast<int>(hidden_states.shape()[0]);
   const int P = T * TOPK;
 
   const int MT = (T == 1) ? 1 : ((T <= 8) ? 2 : ((T >= 1024) ? 128 : 4));
   long long nt_bound = (P <= NEXP) ? P : NEXP + (long long)(P - NEXP) / MT;
 
-  size_t off = 256;  // persistent counter used only by the T=1 phase barrier
-  size_t o_pair = off;
-  off = align_up(off + (size_t)P * 4, 256);
-  size_t o_pos = off;
-  off = align_up(off + (size_t)P * 4, 256);
-  size_t o_te = off;
-  off = align_up(off + (size_t)nt_bound * 4, 256);
-  size_t o_tp = off;
-  off = align_up(off + (size_t)nt_bound * 4, 256);
-  size_t o_tc = off;
-  off = align_up(off + (size_t)nt_bound * 4, 256);
-  size_t o_nt = off;
-  off = align_up(off + 4, 256);
-  size_t o_int = off;
-  off = align_up(off + (size_t)P * INT_ * 2, 256);
+  const GemvLayout L = gemv_layout(T);
+  const size_t o_pair = L.o_pair, o_pos = L.o_pos, o_te = L.o_te, o_tp = L.o_tp, o_tc = L.o_tc,
+               o_nt = L.o_nt, o_int = L.o_int, o_of = L.o_of;
   const bool BIG = (T >= 1024);
-  size_t o_of = off;
-  if (BIG) off = align_up(off + (size_t)T * HID * 4, 256);
   const int dev = hidden_states.device().device_id;
   TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
-  const cudaError_t ws_status = g_ws[dev].ensure(off, stream);
-  TVM_FFI_ICHECK(ws_status == cudaSuccess)
-      << "workspace allocation failed: " << cudaGetErrorString(ws_status);
-  char* base = (char*)g_ws[dev].ptr;
+  TVM_FFI_ICHECK(workspace != nullptr && workspace_bytes >= L.total)
+      << "GEMV workspace too small: " << workspace_bytes << " < " << L.total;
+  char* base = (char*)workspace;
   int* pair_idx = (int*)(base + o_pair);
   int* pos_of = (int*)(base + o_pos);
   int* tile_e = (int*)(base + o_te);

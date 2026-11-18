@@ -293,3 +293,185 @@ def test_cuda_graph_replay_matches_eager(weights):
     tol = 2.0**-5 * eager.float().abs().max().clamp(min=1e-3).item()
     max_abs = (out.float() - eager.float()).abs().max().item()
     assert max_abs <= tol, f"graphed vs eager max_abs {max_abs} > {tol}"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: independently executing calls and independently captured
+# graphs must never share live scratch, and the software-grid-barrier
+# persistent kernels must never run without a residency guarantee.
+# ---------------------------------------------------------------------------
+#
+# The analytic construction makes every intermediate an exact power of two,
+# so a correct execution is EXACT and any cross-execution scratch bleed is a
+# large, deterministic error: all-ones fp8 weights, W13 scale 2^-4 and W2
+# scale 2^-12, constant bf16 activations a, valid cycling expert ids,
+# routing weights 1/8. Then gate = up = 128a, inter = 16384a^2, and
+# out = 512 * inter * 2^-12 = 2048 a^2 in every element (a=1 -> 2048,
+# a=2 -> 8192), with silu's sigmoid factor within one bf16 ulp of 1.
+
+
+@pytest.fixture(scope="module")
+def analytic_weights():
+    w13 = torch.ones(E, 2 * I, H).to(torch.float8_e4m3fn).to(DEVICE)
+    w2 = torch.ones(E, H, I).to(torch.float8_e4m3fn).to(DEVICE)
+    w13_scale = torch.full((E, (2 * I) // 128, H // 128), 2.0**-4, device=DEVICE)
+    w2_scale = torch.full((E, H // 128, I // 128), 2.0**-12, device=DEVICE)
+    return w13, w2, w13_scale, w2_scale
+
+
+def _analytic_inputs(t, a):
+    x = torch.full((t, H), float(a), dtype=torch.bfloat16, device=DEVICE)
+    ids = (
+        (torch.arange(t * TOPK, dtype=torch.int32, device=DEVICE) % E)
+        .reshape(t, TOPK)
+        .contiguous()
+    )
+    tw = torch.full((t, TOPK), 1.0 / TOPK, dtype=torch.float32, device=DEVICE)
+    return x, ids, tw
+
+
+def _assert_exact(out, a, label):
+    expected = 2048.0 * a * a
+    bad = (out.float() != expected).sum().item()
+    mx = (out.float() - expected).abs().max().item()
+    assert bad == 0, (
+        f"{label}: {bad} wrong elements, max abs err {mx} (expected {expected})"
+    )
+
+
+def _sync_with_deadline(streams, seconds=180.0):
+    """Wait for the given streams' queued work, failing (instead of hanging
+    the suite) if the device never completes — the pre-fix deadlock
+    signature of a spin-barrier grid launched without a residency guarantee
+    or with shared barrier words. Events are recorded on the streams under
+    test: an event on the default stream would carry no dependency on them
+    and the asserts would read outputs still being written."""
+    import time
+
+    events = []
+    for s in streams:
+        ev = torch.cuda.Event()
+        ev.record(s)
+        events.append(ev)
+    t0 = time.monotonic()
+    while not all(ev.query() for ev in events):
+        if time.monotonic() - t0 > seconds:
+            raise AssertionError(
+                f"device did not complete within {seconds}s: persistent-kernel deadlock"
+            )
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("t", [4, 16, 256])
+def test_concurrent_streams_isolated_scratch(analytic_weights, t):
+    """Two independent eager calls on two streams, same device, different
+    activations: each call owns its own scratch (per device AND stream), so
+    both outputs are exact. Before the fix the per-device module scratch
+    (and, for T<=16, the module-global barrier counters and intermediate)
+    let one call consume the other's FC1 results."""
+    x1, ids, tw = _analytic_inputs(t, 1)
+    x2, _, _ = _analytic_inputs(t, 2)
+    out1 = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
+    out2 = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    for trial in range(10):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            for _ in range(4):
+                assert _dispatch(x1, ids, tw, analytic_weights, output=out1)[1] is None
+        with torch.cuda.stream(s2):
+            for _ in range(4):
+                assert _dispatch(x2, ids, tw, analytic_weights, output=out2)[1] is None
+        _sync_with_deadline([s1, s2])
+        _assert_exact(out1, 1, f"t={t} trial={trial} stream1")
+        _assert_exact(out2, 2, f"t={t} trial={trial} stream2")
+
+
+def test_independent_graph_captures_replay_concurrently(analytic_weights):
+    """Two separately captured CUDA graphs (no shared memory pool), replayed
+    concurrently on two streams: each capture owns its own scratch (keyed by
+    capture id, allocated from that graph's private pool), so both outputs
+    stay exact under concurrent replay — the reviewer's T=256 wrong-result
+    reproduction."""
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import warmup
+
+    t = 256
+    w13, w2, w13_scale, w2_scale = analytic_weights
+    warmup(w13, w2, [w13_scale, w2_scale], t_values=(t,))
+    x1, ids, tw = _analytic_inputs(t, 1)
+    x2, _, _ = _analytic_inputs(t, 2)
+    out1 = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
+    out2 = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
+
+    # eager warm runs for each layer (the torch.cuda.graph pattern)
+    assert _dispatch(x1, ids, tw, analytic_weights, output=out1)[1] is None
+    assert _dispatch(x2, ids, tw, analytic_weights, output=out2)[1] is None
+    torch.cuda.synchronize()
+
+    g1, g2 = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g1):
+        assert _dispatch(x1, ids, tw, analytic_weights, output=out1)[1] is None
+    with torch.cuda.graph(g2):
+        assert _dispatch(x2, ids, tw, analytic_weights, output=out2)[1] is None
+
+    # serial replays are correct
+    out1.zero_(), out2.zero_()
+    torch.cuda.synchronize()
+    g1.replay()
+    g2.replay()
+    torch.cuda.synchronize()
+    _assert_exact(out1, 1, "serial replay g1")
+    _assert_exact(out2, 2, "serial replay g2")
+
+    # concurrent replays on independent streams must stay correct
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    failures = 0
+    worst = 0.0
+    for _trial in range(30):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            g1.replay()
+        with torch.cuda.stream(s2):
+            g2.replay()
+        _sync_with_deadline([s1, s2])
+        for out, a in ((out1, 1), (out2, 2)):
+            err = (out.float() - 2048.0 * a * a).abs().max().item()
+            if err != 0.0:
+                failures += 1
+                worst = max(worst, err)
+    assert failures == 0, f"{failures}/60 concurrent replays wrong, max abs err {worst}"
+
+
+def test_persistent_decode_residency_fails_closed(analytic_weights):
+    """The T<=16 persistent kernels spin in software grid barriers sized for
+    a fully resident grid. On an execution context that cannot co-schedule
+    that grid (here: a green-context partition with a fraction of the SMs),
+    the cooperative launch must be REFUSED (fail closed) or complete
+    correctly — never spin forever the way an unguaranteed plain launch
+    can."""
+    pytest.importorskip("cuda")
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    try:
+        streams, resources = split_device_green_ctx_by_sm_count(dev, [16])
+    except Exception as exc:  # green contexts unavailable on this stack
+        pytest.skip(f"green context partition unavailable: {exc}")
+    if int(resources[0].sm.smCount) >= 188:
+        pytest.skip("partition does not constrain the persistent grid")
+    t = 16
+    x, ids, tw = _analytic_inputs(t, 1)
+    out = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
+    stream = streams[0]
+    stream.wait_stream(torch.cuda.current_stream())
+    refused = False
+    with torch.cuda.stream(stream):
+        try:
+            res, reason = _dispatch(x, ids, tw, analytic_weights, output=out)
+            assert reason is None
+        except Exception:
+            refused = True  # cooperative launch failed closed: acceptable
+    if not refused:
+        _sync_with_deadline([stream])
+        _assert_exact(out, 1, "constrained-context t=16")
+    torch.cuda.synchronize()

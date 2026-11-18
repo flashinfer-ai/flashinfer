@@ -30,6 +30,22 @@ Guard order: GPU-free checks (kill switch, dtype,
 geometry, contiguity, device placement, pointer alignment, token
 allowlist) -> device guards (compute capability, SM count, CUDA-graph warm
 state). Every refusal is counted in ``fallback_reasons``.
+
+Scratch ownership (same model as the SM90 small-T grouped path): the
+kernels take an explicit workspace tensor sized by the module's
+``plan_workspace_bytes``; nothing mutable is cached per device inside the
+CUDA module. Eager calls use one workspace per (device index, CUDA stream)
+— the native kernels launch on the caller's current stream, so two streams
+sharing one buffer would overwrite each other's intermediates. A CUDA-graph
+capture owns its own workspace, keyed by (device index, capture-sequence
+id): the capture stream is NOT an ownership key, because ``torch.cuda.graph``
+reuses one default capture stream across independent captures — a stream
+key would hand two independent graphs the same scratch, correct in
+isolation and corrupted under concurrent replay. Capture-time workspaces
+are allocated inside the capture (they come from that graph's private
+memory pool, which independent captures never share) and are kept
+referenced for the process lifetime, as are eager buffers replaced by
+growth, since an earlier capture may still replay into their addresses.
 """
 
 import functools
@@ -40,6 +56,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import tvm_ffi
 
 from ...jit import env as jit_env
 from ...jit.core import JitSpec, gen_jit_spec
@@ -65,7 +82,110 @@ _stats: Dict[str, Any] = {
     "specialized_dispatches": 0,
     "fallback_dispatches": 0,
     "fallback_reasons": {},
+    "workspace_allocs": 0,  # eager per-(device, stream) (re)allocations
+    "graph_workspace_allocs": 0,  # per-capture allocations
 }
+
+# Mutable kernel scratch, owned here (see the module docstring). Eager
+# workspaces are keyed by (device index, CUDA stream handle); graph
+# workspaces by (device index, capture-sequence id), one per independent
+# capture. Buffers replaced by growth are retained in _retired_workspaces
+# for the process lifetime: a CUDA graph captured earlier may still replay
+# into the old tensor's address, so releasing it to the allocator would let
+# unrelated allocations alias a buffer a replay still writes. The retained
+# total is bounded by the finite num_tokens allowlist.
+_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
+_graph_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
+_retired_workspaces: List[torch.Tensor] = []
+
+# The workspace's first bytes are the kernels' barrier/epoch counter region
+# (kWorkspaceDataOffset in the CUDA sources — keep in sync). It is zeroed
+# ONCE when a buffer is allocated: every counter is epoch-based and each
+# fixed slot is used by exactly one launch variant, so stream-ordered reuse
+# needs no per-launch reset. For a capture-owned buffer the zeroing is
+# recorded into the graph, so every replay restarts its epochs.
+_COUNTER_PREFIX_BYTES = 2048
+
+
+@functools.lru_cache(maxsize=None)
+def _ffi_device(index: int):
+    """tvm-ffi device handle, cached: building it parses a device string."""
+    return tvm_ffi.device(f"cuda:{index}")
+
+
+@functools.lru_cache(maxsize=None)
+def _plan_bytes(T: int) -> int:
+    """Workspace bytes for a token count (cached: the module's answer is a
+    pure function of T, and the FFI hop is measurable at decode sizes)."""
+    return int(_get_cuda_module().plan_workspace_bytes(T))
+
+
+def _new_workspace(need: int, device: torch.device) -> torch.Tensor:
+    ws = torch.empty(need, dtype=torch.uint8, device=device)
+    ws[:_COUNTER_PREFIX_BYTES].zero_()
+    return ws
+
+
+def _current_capture_id(device: torch.device) -> Optional[int]:
+    """Unique id of the capture sequence the current stream is recording
+    into, or ``None`` when it cannot be established. ``cudaStreamGetCaptureInfo``
+    is explicitly legal during capture; the id is unique per capture within
+    the process, which is exactly the ownership boundary graph scratch
+    needs (the capture stream is reused across independent captures)."""
+    try:
+        from ...cuda_utils import runtime
+
+        stream = torch.cuda.current_stream(device).cuda_stream
+        res = runtime.cudaStreamGetCaptureInfo(stream)
+        if int(res[0]) != 0:
+            return None
+        status, capture_id = res[1], res[2]
+        if status != runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+            return None
+        return int(capture_id)
+    except Exception:
+        return None
+
+
+def _get_workspace(
+    device: torch.device,
+    dev_index: int,
+    stream_handle: int,
+    need: int,
+    capturing: bool,
+) -> Optional[torch.Tensor]:
+    """The workspace the current call owns, or ``None`` when ownership
+    cannot be established under capture (the caller then declines)."""
+    if capturing:
+        capture_id = _current_capture_id(device)
+        if capture_id is None:
+            return None
+        graph_key = (dev_index, capture_id)
+        ws = _graph_workspaces.get(graph_key)
+        if ws is None or ws.numel() < need or ws.device != device:
+            # Allocated INSIDE the capture: the tensor comes from this
+            # graph's private memory pool, which independent captures never
+            # share, so per-capture isolation holds by construction. The
+            # reference kept here (plus the graph object itself) keeps the
+            # pool block alive for every later replay.
+            ws = _new_workspace(need, device)
+            old = _graph_workspaces.get(graph_key)
+            if old is not None:
+                _retired_workspaces.append(old)
+            _graph_workspaces[graph_key] = ws
+            _stats["graph_workspace_allocs"] += 1
+        return ws
+    ws_key = (dev_index, stream_handle)
+    ws = _workspaces.get(ws_key)
+    if ws is None or ws.numel() < need or ws.device != device:
+        old = _workspaces.get(ws_key)
+        ws = _new_workspace(need, device)
+        if old is not None:
+            # a captured graph may still replay into the old buffer
+            _retired_workspaces.append(old)
+        _workspaces[ws_key] = ws
+        _stats["workspace_allocs"] += 1
+    return ws
 
 
 def _bump_fallback(reason: str) -> str:
@@ -312,18 +432,44 @@ def maybe_run_specialized(
         # bad caller buffer must be refused here (fail closed, never write
         # through an undersized or misplaced pointer).
         return None, _bump_fallback("output_form")
-    output.zero_()  # kernels may accumulate partials into the output
     with torch.cuda.device(input.device):
-        dispatch_run(
-            input,
-            fc1_expert_weights,
-            quant_scales[0],
-            fc2_expert_weights,
-            quant_scales[1],
-            token_selected_experts,
-            token_final_scales,
-            output,
+        dev_index = (
+            input.device.index
+            if input.device.index is not None
+            else torch.cuda.current_device()
         )
+        stream = torch.cuda.current_stream()
+        need = _plan_bytes(T)
+        capturing = torch.cuda.is_current_stream_capturing()
+        ws = _get_workspace(
+            input.device, dev_index, stream.cuda_stream, need, capturing
+        )
+        if ws is None:
+            # Scratch ownership cannot be established for this capture
+            # (capture-id query failed): decline rather than share live
+            # scratch with another execution.
+            return None, _bump_fallback("capture_workspace_unavailable")
+        output.zero_()  # kernels may accumulate partials into the output
+        # StreamContext syncs the FFI environment stream to the caller's
+        # current stream for this call (what tvm_ffi.use_torch_stream does,
+        # minus its per-call device-string parse): without it the kernels
+        # launch on whatever stream the FFI environment last held (the
+        # default stream on first use), so a caller dispatching from a side
+        # stream or capturing a graph would have its kernels ESCAPE its
+        # stream — unordered against the output zeroing and against the
+        # per-stream workspace ownership established above.
+        with tvm_ffi.StreamContext(_ffi_device(dev_index), stream.cuda_stream):
+            dispatch_run(
+                input,
+                fc1_expert_weights,
+                quant_scales[0],
+                fc2_expert_weights,
+                quant_scales[1],
+                token_selected_experts,
+                token_final_scales,
+                output,
+                ws,
+            )
     _warmed.add((input.device.index, T))
     _stats["specialized_dispatches"] += 1
     return output, None
@@ -410,12 +556,21 @@ def warmup(
     dispatch_run = _kernel_entry()
 
     pending = set()
-    with torch.cuda.device(device_index):
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
         for T in ts:
             x = torch.zeros((T, _H), dtype=torch.bfloat16, device=warm_device)
             ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=warm_device)
             tw = torch.zeros((T, _TOPK), dtype=torch.float32, device=warm_device)
             out = torch.zeros((T, _H), dtype=torch.bfloat16, device=warm_device)
+            # Warmup runs eagerly (checked above), so this primes the
+            # (device, current stream) workspace at the largest warmed size.
+            ws = _get_workspace(
+                warm_device,
+                device_index,
+                torch.cuda.current_stream().cuda_stream,
+                _plan_bytes(T),
+                False,
+            )
             dispatch_run(
                 x,
                 fc1_expert_weights,
@@ -425,6 +580,7 @@ def warmup(
                 ids,
                 tw,
                 out,
+                ws,
             )
             pending.add((device_index, T))
     # Publish warmup receipts only after the device work completes: if the

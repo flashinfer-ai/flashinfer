@@ -22,13 +22,19 @@ namespace ffi = tvm::ffi;
 
 void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-             ffi::TensorView topk_weights, ffi::TensorView out);
+             ffi::TensorView topk_weights, ffi::TensorView out, void* workspace,
+             size_t workspace_bytes);
 void RunOursFlat(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
                  ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-                 ffi::TensorView topk_weights, ffi::TensorView out);
+                 ffi::TensorView topk_weights, ffi::TensorView out, void* workspace,
+                 size_t workspace_bytes);
 void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-             ffi::TensorView topk_weights, ffi::TensorView out, cudaStream_t stream);
+             ffi::TensorView topk_weights, ffi::TensorView out, cudaStream_t stream,
+             void* workspace, size_t workspace_bytes);
+size_t GemvWorkspaceBytes(int T);
+size_t PrefillWorkspaceBytes(int tokens);
+size_t PrefillFlatWorkspaceBytes(int tokens);
 
 #define H_DIM 2048
 #define I_DIM 512
@@ -263,39 +269,55 @@ __device__ __forceinline__ float p_warp_sum(float v) {
 // grid after wrapping and let early arrivals pass before the epoch completes.
 // A 64-bit counter cannot wrap in any realistic process lifetime. Counters
 // keep a 32-byte stride so no two share one L2 sector.
-__device__ unsigned long long p_bar_count[2 * 4] = {};
-__device__ unsigned long long p_t4_bar_count[4 * 4] = {};
-__device__ unsigned long long p_t16_token_bar_count[16 * 4] = {};
-__device__ unsigned long long p_t16_dep_bar_count[16 * 4] = {};
-__device__ unsigned p_t16_bar_count = 0;       // reset every epoch: cannot wrap
-__device__ unsigned p_t16_bar_generation = 0;  // equality spin: wrap-safe
-__device__ __nv_bfloat16 p_inter[16 * TOPK * I_DIM];
+//
+// Barrier counters and the FC1->FC2 intermediate live in the per-call
+// workspace, NOT in module __device__ globals: module globals are one
+// mutable allocation per device, so two persistent-decode launches running
+// concurrently (two streams, or two independently captured CUDA graphs
+// replayed together) would merge their barrier arrivals and overwrite each
+// other's intermediates. The host passes bars/inter pointers carved from the
+// call's own workspace.
+//
+// Workspace contract shared by all four translation units: the first
+// kWorkspaceDataOffset bytes are a RESERVED counter region that the Python
+// owner zeroes once when the buffer is allocated (the zeroing is captured
+// when the buffer is capture-owned, so each graph replay restarts its
+// epochs); every path's data begins at kWorkspaceDataOffset, so no path
+// ever overwrites another path's counters when the buffer is reused across
+// token counts. Counter words are at FIXED offsets, each used by exactly
+// one launch variant, and every counter is epoch-based: a completed launch
+// leaves it at a multiple of its own arrival count, so stream-ordered
+// launches over the same buffer need no per-launch reset (this is exactly
+// the zero-once lifetime the previous module globals had, made per-buffer).
+// The gemv T=1 phase counters own [0..256); persistent decode owns
+// [256..2048), laid out below in u64 units from the workspace base:
+//   [32..48)   T=4 token counters   (4 tokens x 32-byte stride)
+//   [48..112)  T=16 token counters  (16 tokens x 32-byte stride)
+//   [112..176) T=16 dependency counters
+//   [176]      release barrier: {u32 count, u32 generation}
+// The bf16 intermediate (data) starts at kWorkspaceDataOffset.
+constexpr size_t kWorkspaceDataOffset = 2048;
+constexpr int kPersistentT4Off = 32;
+constexpr int kPersistentT16TokenOff = 48;
+constexpr int kPersistentT16DepOff = 112;
+constexpr int kPersistentReleaseOff = 176;
+constexpr size_t kPersistentInterBytes = (size_t)16 * TOPK * I_DIM * sizeof(__nv_bfloat16);
+constexpr size_t kPersistentDecodeWsBytes = kWorkspaceDataOffset + kPersistentInterBytes;
 
-template <int NWARP>
-__device__ __forceinline__ void p_grid_barrier() {
+__device__ __forceinline__ void p_t16_release_barrier(unsigned long long* bars) {
+  unsigned* count = reinterpret_cast<unsigned*>(bars + kPersistentReleaseOff);
+  unsigned* generation = count + 1;
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
-    unsigned long long* counter = &p_bar_count[(NWARP == 13 ? 0 : 1) * 4];
-    const unsigned long long old = atomicAdd(counter, 1ull);
-    const unsigned long long target = (old / gridDim.x + 1ull) * gridDim.x;
-    while (__ldcg((const unsigned long long*)counter) < target) __nanosleep(32);
-  }
-  __syncthreads();
-}
-
-__device__ __forceinline__ void p_t16_release_barrier() {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    __threadfence();
-    const unsigned generation = *reinterpret_cast<volatile unsigned*>(&p_t16_bar_generation);
-    if (atomicAdd(&p_t16_bar_count, 1u) == gridDim.x - 1u) {
-      atomicAdd(&p_t16_bar_generation, 1u);
-      atomicExch(&p_t16_bar_count, 0u);
+    const unsigned gen = *reinterpret_cast<volatile unsigned*>(generation);
+    if (atomicAdd(count, 1u) == gridDim.x - 1u) {
+      atomicAdd(generation, 1u);
+      atomicExch(count, 0u);
     } else {
-      volatile unsigned* observed = &p_t16_bar_generation;
+      volatile unsigned* observed = generation;
       int spin = 0;
-      while (*observed == generation) {
+      while (*observed == gen) {
         if (++spin > 4) __nanosleep(192);
       }
     }
@@ -304,10 +326,10 @@ __device__ __forceinline__ void p_t16_release_barrier() {
 }
 
 template <unsigned ARRIVALS>
-__device__ __forceinline__ void p_t4_token_barrier(int token) {
+__device__ __forceinline__ void p_t4_token_barrier(int token, unsigned long long* bars) {
   __syncthreads();
   if (threadIdx.x == 0) {
-    unsigned long long* counter = &p_t4_bar_count[token * 4];
+    unsigned long long* counter = bars + kPersistentT4Off + token * 4;
     unsigned long long old;
     asm volatile("atom.acq_rel.gpu.global.add.u64 %0, [%1], 1;\n"
                  : "=l"(old)
@@ -328,10 +350,11 @@ __device__ __forceinline__ void p_t4_token_barrier(int token) {
   __syncthreads();
 }
 
-__device__ __forceinline__ void p_t16_token_barrier(int token, unsigned arrivals) {
+__device__ __forceinline__ void p_t16_token_barrier(int token, unsigned arrivals,
+                                                    unsigned long long* bars) {
   __syncthreads();
   if (threadIdx.x == 0) {
-    unsigned long long* counter = &p_t16_token_bar_count[token * 4];
+    unsigned long long* counter = bars + kPersistentT16TokenOff + token * 4;
     unsigned long long old;
     asm volatile("atom.acq_rel.gpu.global.add.u64 %0, [%1], 1;\n"
                  : "=l"(old)
@@ -352,7 +375,8 @@ __device__ __forceinline__ void p_t16_token_barrier(int token, unsigned arrivals
   __syncthreads();
 }
 
-__device__ __forceinline__ void p_t16_dependency_barrier(int token0, int token1) {
+__device__ __forceinline__ void p_t16_dependency_barrier(int token0, int token1,
+                                                         unsigned long long* bars) {
   __syncthreads();
   if (threadIdx.x == 0) {
     unsigned long long targets[2], old[2];
@@ -362,7 +386,7 @@ __device__ __forceinline__ void p_t16_dependency_barrier(int token0, int token1)
       if (i < nt) {
         const int token = i == 0 ? token0 : token1;
         const unsigned long long arrivals = (token == 0 || (token & 3) == 3) ? 12ull : 13ull;
-        unsigned long long* counter = &p_t16_dep_bar_count[token * 4];
+        unsigned long long* counter = bars + kPersistentT16DepOff + token * 4;
         asm volatile("atom.acq_rel.gpu.global.add.u64 %0, [%1], 1;\n"
                      : "=l"(old[i])
                      : "l"(counter)
@@ -374,7 +398,7 @@ __device__ __forceinline__ void p_t16_dependency_barrier(int token0, int token1)
     for (int i = 0; i < 2; ++i) {
       if (i < nt && old[i] + 1ull != targets[i]) {
         const int token = i == 0 ? token0 : token1;
-        const unsigned long long* counter = &p_t16_dep_bar_count[token * 4];
+        const unsigned long long* counter = bars + kPersistentT16DepOff + token * 4;
         unsigned long long observed;
         do {
           asm volatile("ld.acquire.gpu.global.u64 %0, [%1];\n"
@@ -394,7 +418,8 @@ __global__ __launch_bounds__(NWARP * 32, NWARP == 13 ? 2 : 1) void k_persistent_
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w13,
     const float* __restrict__ w13s, const uint8_t* __restrict__ w2, const float* __restrict__ w2s,
     const int* __restrict__ ids, const float* __restrict__ tws, __nv_bfloat16* __restrict__ out,
-    int T, int q1, int r1, int q2, int r2) {
+    int T, int q1, int r1, int q2, int r2, unsigned long long* bars,
+    __nv_bfloat16* __restrict__ p_inter) {
   __shared__ unsigned char s_t4_route_perm[T4_PAIR_CLUSTER ? TOPK : 1];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int P = T * TOPK;
@@ -544,13 +569,13 @@ __global__ __launch_bounds__(NWARP * 32, NWARP == 13 ? 2 : 1) void k_persistent_
   }
 
   if constexpr (TOKEN_LOCAL == 1)
-    p_t4_token_barrier<94>(token_group);
+    p_t4_token_barrier<94>(token_group, bars);
   else if constexpr (TOKEN_LOCAL == 2)
-    p_t16_token_barrier(token_group, token_blocks);
+    p_t16_token_barrier(token_group, token_blocks, bars);
   else if constexpr (TOKEN_LOCAL == 3)
-    p_t16_dependency_barrier(u10 >> 11, (u11 - 1) >> 11);
+    p_t16_dependency_barrier(u10 >> 11, (u11 - 1) >> 11, bars);
   else
-    p_t16_release_barrier();
+    p_t16_release_barrier(bars);
 
   constexpr int FC2_UNITS = TOKEN_LOCAL == 1 ? H_DIM / 4 : H_DIM / 2;
   const int fc2_base = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2) ? token_group * FC2_UNITS : 0;
@@ -1286,15 +1311,14 @@ __global__ __launch_bounds__(256) void k_gemm2_big(
 
 // ---------------------------------------------------------------- host
 
-// All cached state is per device: scratch from one device is not usable on
-// another, shared-memory opt-ins apply to the launching device only, and the
-// occupancy probes answer for one device only.
+// All cached state is per device, and READ-ONLY device answers only (device
+// probes, shared-memory opt-ins): no mutable scratch is cached at module
+// scope. Mutable scratch is the caller-provided per-call workspace, owned by
+// the Python dispatch layer per (device, stream) for eager calls and per
+// CUDA-graph capture for graphs, so independently executing calls and
+// independently captured graphs never alias live scratch.
 static constexpr int kMaxDevices = 64;
-static void* g_ptr[kMaxDevices] = {};
-static size_t g_bytes[kMaxDevices] = {};
-static int g_init[kMaxDevices] = {};
 
-static int g_fused_occ = 0;
 static int g_persistent_sms[kMaxDevices] = {};
 static int g_persistent_13_ok = -1;
 static int g_t4_pair_cluster_ok[kMaxDevices];
@@ -1304,48 +1328,48 @@ static struct DecodeCacheInit {
   }
 } g_decode_cache_init;
 
-// Growth RETAINS the previous allocation instead of freeing it (captured CUDA
-// graphs replay with the addresses they recorded), zeroes the barrier words on
-// the execution stream, and commits pointer/capacity only after the
-// allocation succeeds so a failed cudaMalloc leaves a retryable state.
-static void* get_scratch(int dev, size_t need, cudaStream_t stream) {
-  if (g_bytes[dev] < need) {
-    void* fresh = nullptr;
-    if (cudaMalloc(&fresh, need) != cudaSuccess) return nullptr;
-    if (cudaMemsetAsync(fresh, 0, 256, stream) != cudaSuccess) {
-      cudaFree(fresh);
-      return nullptr;
-    }
-    g_ptr[dev] = fresh;  // the previous allocation is intentionally retained
-    g_bytes[dev] = need;
-  }
-  return g_ptr[dev];
+// Workspace bytes the dispatch for T tokens requires. The Python layer sizes
+// the per-(device, stream) / per-capture workspace it passes to Run with
+// this; keep the two dispatch trees in exact agreement.
+int64_t PlanWorkspaceBytes(int64_t T) {
+  if (T == 1) return (int64_t)GemvWorkspaceBytes((int)T);
+  if (T <= 16) return (int64_t)kPersistentDecodeWsBytes;
+  if (T < 128) return (int64_t)GemvWorkspaceBytes((int)T);
+  if (T < 16384) return (int64_t)PrefillWorkspaceBytes((int)T);
+  return (int64_t)PrefillFlatWorkspaceBytes((int)T);
 }
 
 void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
          ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-         ffi::TensorView topk_weights, ffi::TensorView out) {
+         ffi::TensorView topk_weights, ffi::TensorView out, ffi::TensorView workspace) {
   const int dev = hidden_states.device().device_id;
   TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, dev));
-  if (!g_init[dev]) {
-    cudaFuncSetAttribute(k_gemm1, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
-    cudaFuncSetAttribute(k_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
-    g_init[dev] = 1;
-  }
   const int T = (int)hidden_states.shape()[0];
+  TVM_FFI_ICHECK(workspace.ndim() == 1) << "workspace must be a 1-D byte tensor";
+  TVM_FFI_ICHECK(workspace.device().device_id == dev)
+      << "workspace must live on the input's device";
+  const size_t ws_bytes = static_cast<size_t>(workspace.shape()[0]) * (workspace.dtype().bits / 8);
+  void* ws = workspace.data_ptr();
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(ws) % 256 == 0)
+      << "workspace must be 256-byte aligned";
+  TVM_FFI_ICHECK(ws_bytes >= static_cast<size_t>(PlanWorkspaceBytes(T)))
+      << "workspace too small: " << ws_bytes << " < " << PlanWorkspaceBytes(T)
+      << " bytes for T=" << T;
   if (T == 1) {
-    RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, stream);
+    RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, stream, ws,
+            ws_bytes);
     return;
   }
   if (T >= 128) {
     if (T >= 16384)
-      RunOursFlat(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out);
+      RunOursFlat(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, ws,
+                  ws_bytes);
     else
-      RunOurs(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out);
+      RunOurs(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, ws,
+              ws_bytes);
     return;
   }
-  const int P = T * TOPK;
   const uint8_t* pw13 = (const uint8_t*)w13.data_ptr();
   const uint8_t* pw2 = (const uint8_t*)w2.data_ptr();
   const float* ps13 = (const float*)w13_scale.data_ptr();
@@ -1367,8 +1391,25 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13
     const int work_blocks = use_two ? blocks / T : blocks;
     const int w1 = (use_two ? TOPK : T * TOPK) * (I_DIM / 2);
     const int w2n = (use_two ? 1 : T) * (H_DIM / 2);
-    const int q1 = w1 / work_blocks, r1 = w1 % work_blocks;
-    const int q2 = w2n / work_blocks, r2 = w2n % work_blocks;
+    int q1 = w1 / work_blocks, r1 = w1 % work_blocks;
+    int q2 = w2n / work_blocks, r2 = w2n % work_blocks;
+    // Per-call barrier state and intermediate, carved from the workspace.
+    // The counter region was zeroed when the workspace was allocated (see
+    // the layout contract above); the 64-bit epoch counters then stay
+    // aligned across stream-ordered launches without per-launch resets.
+    unsigned long long* bars = reinterpret_cast<unsigned long long*>(ws);
+    __nv_bfloat16* inter =
+        reinterpret_cast<__nv_bfloat16*>(static_cast<uint8_t*>(ws) + kWorkspaceDataOffset);
+    const __nv_bfloat16* px = (const __nv_bfloat16*)hidden_states.data_ptr();
+    int targ = T;
+    // The software grid barriers wait for every CTA of the grid, so each of
+    // these launches must guarantee co-residency. __launch_bounds__ only
+    // proves each CTA CAN fit; cudaLaunchCooperativeKernel (or
+    // cudaLaunchKernelEx with the cooperative attribute) makes the driver
+    // admit the grid only when all CTAs are simultaneously resident, and
+    // fails the launch otherwise. A failed cooperative launch fails CLOSED
+    // through TVM_FFI_ICHECK: there is no plain-launch fallback, because a
+    // plain launch of a spin-barrier grid without residency can deadlock.
     if (use_two) {
       if (g_t4_pair_cluster_ok[dev] < 0) {
         int cluster_launch = 0, max_active_clusters = 0;
@@ -1405,90 +1446,50 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13
         attrs[1].val.cooperative = 1;
         cfg.attrs = attrs;
         cfg.numAttrs = 2;
-        if (cudaLaunchKernelEx(&cfg, k_persistent_decode<13, true, true>,
-                               (const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13, pw2, ps2,
-                               pids, ptw, pout, T, q1, r1, q2, r2) == cudaSuccess)
+        if (cudaLaunchKernelEx(&cfg, k_persistent_decode<13, true, true>, px, pw13, ps13, pw2, ps2,
+                               pids, ptw, pout, T, q1, r1, q2, r2, bars, inter) == cudaSuccess)
           return;
         g_t4_pair_cluster_ok[dev] = 0;
         (void)cudaGetLastError();  // consume the probe failure before the fallback launch
       }
-      k_persistent_decode<13, true>
-          <<<blocks, 416, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13,
-                                       pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2);
+      // Cooperative (non-cluster) fallback: still a residency-guaranteed
+      // launch of the same barrier protocol. If even this cannot be
+      // admitted (e.g. under MPS with a reduced SM share), fail closed.
+      void* t4_args[] = {&px,   &pw13, &ps13, &pw2, &ps2, &pids, &ptw,  &pout,
+                         &targ, &q1,   &r1,   &q2,  &r2,  &bars, &inter};
+      const cudaError_t t4_status =
+          cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_persistent_decode<13, true>),
+                                      dim3(blocks), dim3(416), t4_args, 0, stream);
+      TVM_FFI_ICHECK(t4_status == cudaSuccess)
+          << "persistent decode T=4 cooperative launch failed (no residency guarantee; refusing "
+             "the unsafe plain launch): "
+          << cudaGetErrorString(t4_status);
     } else if (T == 16) {
-      k_persistent_decode<22, 2>
-          <<<blocks, 704, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13,
-                                       pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2);
+      void* t16_args[] = {&px,   &pw13, &ps13, &pw2, &ps2, &pids, &ptw,  &pout,
+                          &targ, &q1,   &r1,   &q2,  &r2,  &bars, &inter};
+      const cudaError_t t16_status =
+          cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_persistent_decode<22, 2>),
+                                      dim3(blocks), dim3(704), t16_args, 0, stream);
+      TVM_FFI_ICHECK(t16_status == cudaSuccess)
+          << "persistent decode T=16 cooperative launch failed (no residency guarantee; refusing "
+             "the unsafe plain launch): "
+          << cudaGetErrorString(t16_status);
     } else {
-      k_persistent_decode<22>
-          <<<blocks, 704, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13,
-                                       pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2);
+      void* gen_args[] = {&px,   &pw13, &ps13, &pw2, &ps2, &pids, &ptw,  &pout,
+                          &targ, &q1,   &r1,   &q2,  &r2,  &bars, &inter};
+      const cudaError_t gen_status =
+          cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_persistent_decode<22>),
+                                      dim3(blocks), dim3(704), gen_args, 0, stream);
+      TVM_FFI_ICHECK(gen_status == cudaSuccess)
+          << "persistent decode cooperative launch failed (no residency guarantee; refusing the "
+             "unsafe plain launch): "
+          << cudaGetErrorString(gen_status);
     }
-    const cudaError_t launch_status = cudaGetLastError();
-    TVM_FFI_ICHECK(launch_status == cudaSuccess)
-        << "persistent decode launch failed: " << cudaGetErrorString(launch_status);
     return;
   }
-  RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, stream);
-  return;
-
-  const int big = (T >= 128);
-  const int ntk = big ? NTOK : NT;
-  const int ub = P / ntk + E_NUM;
-  const int max_tiles = ub < P ? ub : P;
-
-  const size_t off_sorted = 256;
-  size_t off_tiles = off_sorted + (size_t)P * 4;
-  size_t off_gu = off_tiles + (size_t)max_tiles * 16 * 4;
-  off_gu = (off_gu + 255) & ~(size_t)255;
-  size_t off_inter = off_gu + (size_t)P * TWO_I * 2;
-  size_t off_hsf = off_inter + (big ? (size_t)P * I_DIM * 2 : 0);
-  size_t total = off_hsf + (big ? (size_t)T * H_DIM * 2 : 0);
-  char* sc = (char*)get_scratch(dev, total, stream);
-  TVM_FFI_ICHECK(sc != nullptr) << "decode scratch allocation failed";
-  unsigned* bar = (unsigned*)sc;
-  int* sorted = (int*)(sc + off_sorted);
-  int* tile_e = (int*)(sc + off_tiles);
-  int* tile_base = tile_e + max_tiles;
-  int* tile_n = tile_base + max_tiles;
-  __half* gu = (__half*)(sc + off_gu);
-  __half* inter = (__half*)(sc + off_inter);
-  __half* hsf = (__half*)(sc + off_hsf);
-
-  if (!big) {
-    const int nxr = T < NT ? T : NT;
-    const size_t smem1 = 2 * 16 * WPITCH + (size_t)nxr * XSTRIDE * 2;
-    const size_t xb = (size_t)nxr * XSTRIDE * 2, sb = (size_t)NT * 520 * 2;
-    const size_t smemf = 2 * 16 * WPITCH + (xb > sb ? xb : sb);
-    int nsm = 0, occ = 0;
-    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_fused, 256, smemf);
-    const int grid_f = (TWO_I / 16) * max_tiles;
-    if (occ > 0 && nsm > 0 && grid_f <= occ * nsm) {
-      k_fused<<<dim3(TWO_I / 16, max_tiles), 256, smemf, stream>>>(
-          (const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13, pw2, ps2, pids, ptw, P, gu,
-          pout, T * H_DIM / 8, bar, nxr);
-      return;
-    }
-    k_gemm1<<<dim3(TWO_I / 16, max_tiles), 256, smem1, stream>>>(
-        (const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13, pids, P, gu, pout,
-        T * H_DIM / 8, tile_e);
-    k_gemm2<<<dim3(H_DIM / 32, max_tiles), 256, 0, stream>>>(gu, pw2, ps2, ptw, tile_e, pout);
-  } else {
-    k_route<<<1, 256, 0, stream>>>(pids, P, sorted, tile_e, tile_base, tile_n, max_tiles, ntk);
-    const int nv = T * H_DIM / 8;
-    int gcv = (nv + 255) / 256;
-    if (gcv > 2048) gcv = 2048;
-    k_cvt_x<<<gcv, 256, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), hsf, pout, nv);
-    k_gemm1_big<<<dim3(TWO_I / 128, max_tiles), 256, 0, stream>>>(hsf, pw13, ps13, sorted, tile_e,
-                                                                  tile_base, tile_n, gu);
-    const int nvs = P * (I_DIM / 8);
-    int gs = (nvs + 255) / 256;
-    if (gs > 2048) gs = 2048;
-    k_silu<<<gs, 256, 0, stream>>>(gu, inter, nvs);
-    k_gemm2_big<<<dim3(H_DIM / 128, max_tiles), 256, 0, stream>>>(inter, pw2, ps2, ptw, sorted,
-                                                                  tile_e, tile_base, tile_n, pout);
-  }
+  RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, stream, ws,
+          ws_bytes);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_workspace_bytes, PlanWorkspaceBytes);

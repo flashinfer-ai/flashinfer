@@ -1625,31 +1625,49 @@ CUtensorMap make_u8_map64x256(const uint8_t* base, uint64_t width, uint64_t heig
 
 }  // namespace
 
-// Reuse allocation capacity only; every input-dependent byte consumed by a
-// kernel is overwritten on each call.  This removes stream-ordered allocator
-// traffic from the measured path without caching routing or computed results.
-// Scratch is per device, growth RETAINS the previous allocation instead of
-// freeing it (captured CUDA graphs replay with the addresses they recorded;
-// the retained total is bounded by the finite num_tokens allowlist), and
-// pointer/capacity are committed only after allocation succeeds so a failed
-// cudaMalloc leaves a retryable state.
+// Scratch is the caller-provided per-call workspace: the Python dispatch
+// layer owns one buffer per (device, stream) for eager calls and one per
+// CUDA-graph capture, so independently executing calls and independently
+// captured graphs never share live scratch (the module-global per-device
+// cache this replaced let two streams overwrite each other's FC1
+// intermediates). Every input-dependent byte a kernel consumes is written on
+// the same call (the preparation kernels zero their own counters), so
+// recycled workspace memory is safe without a bulk clear.
 static constexpr int kMaxDevices = 64;
-static void* g_scratch[kMaxDevices] = {};
-static size_t g_scratch_bytes[kMaxDevices] = {};
+// Reserved counter-region prefix shared by all paths (layout contract in
+// decode_kernel.cu): this path's data begins past it.
+static constexpr size_t kWorkspaceDataOffset = 2048;
 
-static void* get_scratch(int dev, size_t bytes) {
-  if (bytes > g_scratch_bytes[dev]) {
-    void* fresh = nullptr;
-    if (cudaMalloc(&fresh, bytes) != cudaSuccess) return nullptr;
-    g_scratch[dev] = fresh;  // the previous allocation is intentionally retained
-    g_scratch_bytes[dev] = bytes;
+size_t PrefillWorkspaceBytes(int tokens) {
+  const int routes = tokens * TOPK;
+  const size_t xq_bytes = static_cast<size_t>(tokens) * H;
+  const size_t xs_bytes = static_cast<size_t>(tokens) * 16 * sizeof(float);
+  const size_t zq_bytes = static_cast<size_t>(routes) * I;
+  const size_t zs_bytes = static_cast<size_t>(routes) * 4 * sizeof(float);
+  const size_t zbf_bytes = static_cast<size_t>(routes) * I * sizeof(__nv_bfloat16);
+  if (tokens <= 64) {
+    const size_t zf_bytes = static_cast<size_t>(routes) * I * sizeof(float);
+    return kWorkspaceDataOffset + xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8;
   }
-  return g_scratch[dev];
+  const size_t accum_out_bytes = static_cast<size_t>(tokens) * H * sizeof(float);
+  const bool use_m48 = tokens >= 256 && tokens <= 1024;
+  const bool use_m96 = tokens >= 8192;
+  const int tile_m = use_m48 ? PREFILL_M48 : PREFILL_M;
+  const int max_tiles = (routes + tile_m - 1) / tile_m + 256;
+  const int max_tiles96 = use_m96 ? (routes + PREFILL_M96 - 1) / PREFILL_M96 + 256 : 0;
+  const size_t metadata_bytes = 256 * sizeof(int) + 257 * sizeof(int) + 256 * sizeof(int) +
+                                static_cast<size_t>(routes) * sizeof(int) +
+                                static_cast<size_t>(max_tiles) * 3 * sizeof(int) + 2 * sizeof(int) +
+                                static_cast<size_t>(max_tiles96) * 3 * sizeof(int) +
+                                (use_m96 ? sizeof(int) : 0) + 256;
+  return kWorkspaceDataOffset + xq_bytes + xs_bytes + zbf_bytes + accum_out_bytes + metadata_bytes +
+         static_cast<size_t>(routes) * sizeof(float) + 256;
 }
 
 void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-             ffi::TensorView topk_weights, ffi::TensorView out) {
+             ffi::TensorView topk_weights, ffi::TensorView out, void* workspace,
+             size_t workspace_bytes) {
   const int tokens = static_cast<int>(hidden_states.size(0));
   const int routes = tokens * TOPK;
   const int dev = hidden_states.device().device_id;
@@ -1670,11 +1688,12 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   const size_t zs_bytes = static_cast<size_t>(routes) * 4 * sizeof(float);
   const size_t zbf_bytes = static_cast<size_t>(routes) * I * sizeof(__nv_bfloat16);
 
+  TVM_FFI_ICHECK(workspace != nullptr && workspace_bytes >= PrefillWorkspaceBytes(tokens))
+      << "prefill workspace too small: " << workspace_bytes << " < "
+      << PrefillWorkspaceBytes(tokens);
   if (tokens <= 64) {
     const size_t zf_bytes = static_cast<size_t>(routes) * I * sizeof(float);
-    uint8_t* scratch = static_cast<uint8_t*>(
-        get_scratch(dev, xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
-    TVM_FFI_ICHECK(scratch != nullptr) << "prefill scratch allocation failed";
+    uint8_t* scratch = static_cast<uint8_t*>(workspace) + kWorkspaceDataOffset;
     uint8_t* xq = scratch;
     float* xs = reinterpret_cast<float*>(xq + xq_bytes);
     float* zfloat = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xs) + xs_bytes);
@@ -1703,15 +1722,7 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
   const int tile_m = use_m48 ? PREFILL_M48 : PREFILL_M;
   const int max_tiles = (routes + tile_m - 1) / tile_m + 256;
   const int max_tiles96 = use_m96 ? (routes + PREFILL_M96 - 1) / PREFILL_M96 + 256 : 0;
-  const size_t metadata_bytes = 256 * sizeof(int) + 257 * sizeof(int) + 256 * sizeof(int) +
-                                static_cast<size_t>(routes) * sizeof(int) +
-                                static_cast<size_t>(max_tiles) * 3 * sizeof(int) + 2 * sizeof(int) +
-                                static_cast<size_t>(max_tiles96) * 3 * sizeof(int) +
-                                (use_m96 ? sizeof(int) : 0) + 256;
-  const size_t scratch_bytes = xq_bytes + xs_bytes + zbf_bytes + accum_out_bytes + metadata_bytes +
-                               static_cast<size_t>(routes) * sizeof(float) + 256;
-  uint8_t* scratch = static_cast<uint8_t*>(get_scratch(dev, scratch_bytes));
-  TVM_FFI_ICHECK(scratch != nullptr) << "prefill scratch allocation failed";
+  uint8_t* scratch = static_cast<uint8_t*>(workspace) + kWorkspaceDataOffset;
   uint8_t* ptr = scratch;
   uint8_t* xq = ptr;
   ptr += xq_bytes;
