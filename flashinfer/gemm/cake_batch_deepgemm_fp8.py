@@ -950,6 +950,13 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     allocation granularity of locality-domain memory.  Raises ``ValueError`` for
     a ``g_cut`` outside ``[0, B]``.
 
+    With the cells listed for 212-SM devices, only ``B=64`` weights of
+    ``(N, K) = (4096, 7168)`` are homed: at every ``expected_m`` their serving
+    program has a listed twin, including the ``expected_m >= 16`` cell listed for
+    homed weights only (see ``DOMAIN_SERVING_CELLS``).  ``B=32`` weights of
+    ``(4096, 7168)`` and ``B=32`` and ``B=64`` weights of ``(7168, 2048)`` are
+    returned unhomed: their ``expected_m <= 1`` serving program has no twin.
+
     Call it outside CUDA graph capture.  The memory is freed with the returned
     tensor; a CUDA graph that reads the tensor after it is freed faults on
     replay, so keep it alive as long as such a graph.

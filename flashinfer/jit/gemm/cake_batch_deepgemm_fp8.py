@@ -1765,6 +1765,19 @@ DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
 # serving keys of DOMAIN_SERVING_PROGRAMS.  Die class: "even" when the two dies'
 # SM counts differ by at most 4, else "uneven"; expected_m class: "em<=1", "em2-7",
 # "em8-15" or "em16+".  Every other call runs the whole program.
+#
+# A cell is listed where the twin on homed weights ran below 0.98 x the fastest
+# whole-GPU build of the same key on ordinary weights, on every timed GPU of the
+# die class, with one exception: the "em16+" cells of
+# n4096_k7168_g64_s5e2_evict_normal_l8.  Only weights homed by localize_weights
+# reach a twin, and homed weights of that shape must not fall back to the whole
+# program in any class (the whole program runs slower on homed weights than on
+# ordinary ones).  There the twin is the faster program on homed weights and
+# faster than the shipped whole program on ordinary weights (expected_m 64: 184
+# and 191 us against 196 and 198 us, even and uneven dies), though not by the
+# 0.98 margin over a full-grid whole build, which is not shipped.  The other
+# three serving shapes have an "em<=1" key without a twin, so localize_weights
+# does not home them and their em16+ cells are not listed.
 DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
     212: {
         ("even", "em8-15"): (
@@ -1781,6 +1794,20 @@ DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
         ),
         ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
         ("uneven", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
+        ("even", "em2-7"): (
+            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
+            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
+        ),
+        ("uneven", "em2-7"): (
+            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
+            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
+        ),
+        ("even", "em16+"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("uneven", "em16+"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
     },
 }
 

@@ -944,21 +944,29 @@ _RACE_PLACEMENTS = ("stream", "occupier-die0", "occupier-die1", "one-die0", "one
 # The cells of the twins' source rule, keyed by serving key: a (die class,
 # expected_m class) cell is listed where the twin ran below 0.98 x the fastest
 # whole-GPU build of the same N, K and groups on every timed 212-SM GPU of that
-# die class.  DOMAIN_SERVING_CELLS must route exactly these.
+# die class.
 _SOURCE_ROUTES = {
     "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": {
+        ("even", "em2-7"),
+        ("uneven", "em2-7"),
         ("even", "em8-15"),
         ("uneven", "em8-15"),
     },
     "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": {
+        ("even", "em2-7"),
+        ("uneven", "em2-7"),
         ("even", "em8-15"),
         ("uneven", "em8-15"),
     },
     "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8": {
+        ("even", "em2-7"),
+        ("uneven", "em2-7"),
         ("even", "em8-15"),
         ("uneven", "em8-15"),
     },
     "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": {
+        ("even", "em2-7"),
+        ("uneven", "em2-7"),
         ("even", "em8-15"),
         ("uneven", "em8-15"),
     },
@@ -967,6 +975,25 @@ _SOURCE_ROUTES = {
         ("uneven", "em<=1"),
     },
 }
+# The cells listed for homed weights only: the twin is the fastest program on
+# homed weights of the one homed shape and faster than the shipped whole program
+# on ordinary weights, without the source rule's margin.
+_HOMED_ONLY_ROUTES = {
+    "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": {
+        ("even", "em16+"),
+        ("uneven", "em16+"),
+    },
+}
+# DOMAIN_SERVING_CELLS must route exactly these.
+_ROUTES = {
+    key: _SOURCE_ROUTES.get(key, set()) | _HOMED_ONLY_ROUTES.get(key, set())
+    for key in set(_SOURCE_ROUTES) | set(_HOMED_ONLY_ROUTES)
+}
+# ((N, K), groups) of the serving shapes localize_weights homes on a 212-SM GPU
+# (every expected_m reaches a listed twin) and of those it refuses (the
+# expected_m <= 1 serving program has no twin).
+_HOMED_SHAPES = {((4096, 7168), 64)}
+_REFUSED_SHAPES = {((4096, 7168), 32), ((7168, 2048), 32), ((7168, 2048), 64)}
 _SOURCE_SM_COUNT = 212
 # Probe vectors of the source rule: die splits at both sides of the even bound
 # (a gap of 4 SMs is even), and expected_m at both sides of every class bound.
@@ -982,8 +1009,8 @@ _PROBE_DIES = (
 _PROBE_EXPECTED_M = (0, 1, 2, 7, 8, 15, 16, 64)
 
 
-def _source_twin(key, dies, expected_m):
-    """The twin the source rule launches for serving key ``key`` (qualified)."""
+def _routed_twin(key, dies, expected_m):
+    """The twin ``_ROUTES`` launch for serving key ``key`` (qualified)."""
     if expected_m <= 1:
         em = "em<=1"
     elif expected_m < 8:
@@ -993,7 +1020,7 @@ def _source_twin(key, dies, expected_m):
     else:
         em = "em16+"
     die = "even" if abs(dies[0] - dies[1]) <= 4 else "uneven"
-    if (die, em) in _SOURCE_ROUTES.get(key, ()):
+    if (die, em) in _ROUTES.get(key, ()):
         return DOMAIN_SERVING_PROGRAMS[key]
     return None
 
@@ -1121,10 +1148,16 @@ def _valid_bits(out, valid):
 
 @_host_only
 def test_domain_serving_cells_follow_the_source_rule():
-    """DOMAIN_SERVING_CELLS route exactly the source rule's cells over its probe
-    vectors, for every sm_107a serving key of the packed-scale shapes."""
+    """DOMAIN_SERVING_CELLS route exactly the source rule's cells and the cells
+    listed for homed weights only over the probe vectors, for every sm_107a
+    serving key of the packed-scale shapes."""
     assert set(DOMAIN_SERVING_CELLS) == {_SOURCE_SM_COUNT}
-    assert set(_SOURCE_ROUTES) <= set(DOMAIN_SERVING_PROGRAMS)
+    assert set(_ROUTES) <= set(DOMAIN_SERVING_PROGRAMS)
+    # A homed-only cell adds to the source rule; it routes a homed shape's key.
+    for key, cells in _HOMED_ONLY_ROUTES.items():
+        assert not cells & _SOURCE_ROUTES.get(key, set()), key
+        n, k, groups = (int(part[1:]) for part in key.split(":", 1)[1].split("_")[:3])
+        assert ((n, k), groups) in _HOMED_SHAPES, key
     assert all(_whole_program(key) for key in DOMAIN_SERVING_PROGRAMS)
     for dies, die in (((105, 109), "even"), ((104, 109), "uneven")):
         assert cake_locality.die_class(dies) == die
@@ -1145,7 +1178,7 @@ def test_domain_serving_cells_follow_the_source_rule():
                 got = domain_serving_program(
                     "sm_107a", _SOURCE_SM_COUNT, key.split(":", 1)[1], expected_m, dies
                 )
-                assert got == _source_twin(key, dies, expected_m), (
+                assert got == _routed_twin(key, dies, expected_m), (
                     key,
                     dies,
                     expected_m,
@@ -1162,16 +1195,35 @@ def test_domain_serving_cells_follow_the_source_rule():
 
 
 @_host_only
-def test_every_sm107a_serving_key_has_a_twin():
-    """Every serving program an SM107a packed-scale problem selects, at any
-    expected_m, has a locality-domain twin of the same key."""
-    keys = {
-        _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, expected_m)
-        for nk in PACKED_NK
-        for groups in PACKED_GROUPS
-        for expected_m in range(0, 70)
-    }
-    assert sorted(keys - set(DOMAIN_SERVING_PROGRAMS)) == []
+def test_every_key_of_a_homed_shape_has_a_routed_twin():
+    """Weights of a homed shape run a twin at every expected_m on both die
+    classes: every serving key such a problem selects has a twin listed in the
+    cell of that expected_m.  Every other serving shape is refused: one of its
+    keys (the expected_m <= 1 key) has no twin.  Every twin serves a key some
+    serving shape selects."""
+    shapes = {(nk, groups) for nk in PACKED_NK for groups in PACKED_GROUPS}
+    assert shapes == _HOMED_SHAPES | _REFUSED_SHAPES
+    assert not _HOMED_SHAPES & _REFUSED_SHAPES
+    keys = set()
+    untwinned = set()
+    for nk, groups in sorted(shapes):
+        for dies in _PROBE_DIES:
+            routed = domain_serving_routed(
+                "sm_107a", _SOURCE_SM_COUNT, dies, *nk, groups
+            )
+            assert routed == ((nk, groups) in _HOMED_SHAPES), (nk, groups, dies)
+            for expected_m in range(0, 70):
+                key = _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, expected_m)
+                keys.add(key)
+                twin = domain_serving_program(
+                    "sm_107a", _SOURCE_SM_COUNT, key.split(":", 1)[1], expected_m, dies
+                )
+                if (nk, groups) in _HOMED_SHAPES:
+                    assert twin == DOMAIN_SERVING_PROGRAMS[key], (key, dies, expected_m)
+                if key not in DOMAIN_SERVING_PROGRAMS:
+                    untwinned.add(((nk, groups), expected_m_class(expected_m)))
+    # The keys without a twin are the expected_m <= 1 keys of the refused shapes.
+    assert untwinned == {(shape, "em<=1") for shape in _REFUSED_SHAPES}
     assert sorted(set(DOMAIN_SERVING_PROGRAMS) - keys) == []
     for key, twin in DOMAIN_SERVING_PROGRAMS.items():
         assert PROGRAMS[twin]["arches"] == ["sm_107a"], key
@@ -1191,7 +1243,7 @@ def test_domain_serving_plan_of_listed_cells():
             plan = serving_plan(
                 "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
             )
-            twin = _source_twin(key, counts, expected_m)
+            twin = _routed_twin(key, counts, expected_m)
             whole = serving_plan(
                 "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m
             )
@@ -1229,7 +1281,7 @@ def test_domain_serving_routed_needs_every_expected_m_routed(monkeypatch):
         for nk in sorted(PACKED_NK):
             for groups in sorted(PACKED_GROUPS):
                 want = all(
-                    _source_twin(
+                    _routed_twin(
                         _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, em),
                         dies,
                         em,
@@ -1421,6 +1473,8 @@ def test_localize_weights_refuses_what_could_run_slower(monkeypatch):
         if domain_serving_routed("sm_107a", sm_count, table.counts, *nk, groups)
     ]
     shapes = {(nk, groups) for nk in PACKED_NK for groups in PACKED_GROUPS}
+    if sm_count == _SOURCE_SM_COUNT:
+        assert set(routed) == _HOMED_SHAPES
     for nk, groups in sorted(shapes - set(routed)):
         weights = torch.zeros(
             (groups, *nk), dtype=torch.float8_e4m3fn, device=f"cuda:{device}"
