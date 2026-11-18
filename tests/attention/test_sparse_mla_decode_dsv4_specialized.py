@@ -116,11 +116,27 @@ def _make_inputs(B, Q, SEQ, seed=0):
     )
 
 
+def _swa_window_ends(inp):
+    """Per-token SWA visibility bound from the public entry's contract:
+    clamp(seq_lens[b] - (q_len_b - 1 - q_off), 0, 128)."""
+    cum = inp["cum_seq_lens_q"].to("cpu", torch.int64)
+    seq = inp["seq_lens"].to("cpu", torch.int64)
+    T = inp["q"].shape[0]
+    ends = torch.empty(T, dtype=torch.int64)
+    for b in range(seq.shape[0]):
+        for t in range(int(cum[b]), int(cum[b + 1])):
+            q_off = t - int(cum[b])
+            q_len_b = int(cum[b + 1]) - int(cum[b])
+            ends[t] = max(0, min(128, int(seq[b]) - (q_len_b - 1 - q_off)))
+    return ends.to(inp["q"].device)
+
+
 def _reference(inp):
     """fp32 table-driven sparse-MLA decode: token t attends the valid
     storage offsets of its sparse_indices row (SWA cols into the SWA pool,
-    the rest into the compressed pool), softmax at 512**-0.5 with the
-    per-head sink folded into the denominator."""
+    bounded by the seq_lens-derived visibility window, the rest into the
+    compressed pool), softmax at 512**-0.5 with the per-head sink folded
+    into the denominator."""
     dev = inp["q"].device
     T = inp["q"].shape[0]
     swa_flat = inp["swa_kv_cache"].reshape(-1, D)
@@ -129,11 +145,15 @@ def _reference(inp):
     sk = inp["sinks"].to(torch.float32)
     out = torch.empty(T, H, D, dtype=torch.float32, device=dev)
     cols = torch.arange(W, device=dev)
+    swa_ends = _swa_window_ends(inp)
     for t0 in range(0, T, 8):
         tab = inp["sparse_indices"][t0 : t0 + 8].to(torch.int64)
         ln = inp["sparse_topk_lens"][t0 : t0 + 8].to(torch.int64)
         c = tab.shape[0]
         valid = (cols.unsqueeze(0) < ln.unsqueeze(1)) & (tab >= 0)
+        valid &= (cols.unsqueeze(0) >= SWA_COLS) | (
+            cols.unsqueeze(0) < swa_ends[t0 : t0 + c].unsqueeze(1)
+        )
         idx = tab.clamp_min(0)
         kv = torch.cat(
             [
@@ -302,6 +322,134 @@ def test_invalid_table_entries_never_reach_a_gather():
     out = _api(inp, backend="specialized")
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
+    _assert_close(out, gold)
+
+
+def _direct_inputs(B, seq_lens, n_ckv=0, seed=None, zero_q=True):
+    """Hand-built inputs on identity-mapped pools: SWA column c of every row
+    is storage offset c (one 256-row SWA page), compressed column 128+k is
+    offset k (eight 64-row pages, 512 rows)."""
+    dev = torch.device("cuda")
+    Q = 6
+    T = B * Q
+    swa_kv = torch.zeros(1, PS_SWA, D, dtype=torch.bfloat16, device=dev)
+    ckv_kv = torch.zeros(8, PS_CKV, D, dtype=torch.bfloat16, device=dev)
+    if seed is None:
+        q = torch.zeros(T, H, D, dtype=torch.bfloat16, device=dev)
+        sinks = torch.zeros(H, dtype=torch.float32, device=dev)
+    else:
+        g = torch.Generator(device=dev).manual_seed(seed)
+        swa_kv.copy_(
+            (torch.randn(1, PS_SWA, D, generator=g, device=dev) * 0.5).to(
+                torch.bfloat16
+            )
+        )
+        ckv_kv.copy_(
+            (torch.randn(8, PS_CKV, D, generator=g, device=dev) * 0.5).to(
+                torch.bfloat16
+            )
+        )
+        q = torch.randn(T, H, D, generator=g, device=dev).to(torch.bfloat16)
+        sinks = torch.randn(H, generator=g, device=dev, dtype=torch.float32)
+    if zero_q and seed is not None:
+        q.zero_()
+    si = torch.full((T, W), -1, dtype=torch.int32, device=dev)
+    si[:, :SWA_COLS] = torch.arange(SWA_COLS, dtype=torch.int32, device=dev)
+    if n_ckv:
+        si[:, SWA_COLS : SWA_COLS + n_ckv] = torch.arange(
+            n_ckv, dtype=torch.int32, device=dev
+        )
+    tl = torch.full((T,), SWA_COLS + n_ckv, dtype=torch.int32, device=dev)
+    return dict(
+        q=q,
+        swa_kv_cache=swa_kv,
+        compressed_kv_cache=ckv_kv,
+        sparse_indices=si,
+        sparse_topk_lens=tl,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=dev),
+        cum_seq_lens_q=torch.arange(0, T + 1, Q, dtype=torch.int32, device=dev),
+        max_q_len=Q,
+        sinks=sinks,
+    )
+
+
+@requires_sm103
+def test_swa_visibility_window_enforced():
+    """Reviewer repro: B=1, Q=6, seq_lens=[6], all 128 SWA columns active,
+    zero queries/sinks, SWA pool row i filled with i. The public entry
+    assigns seq_lens the SWA-visibility-window role, so token j attends
+    only SWA columns 0..j (window end = seq_lens[0] - (6 - 1 - j)): the
+    output must be sum(0..j) / (j + 2), not mean over all 128 columns."""
+    inp = _direct_inputs(1, [6])
+    rows = torch.arange(PS_SWA, dtype=torch.float32, device="cuda")
+    inp["swa_kv_cache"][0] = rows.unsqueeze(1).expand(PS_SWA, D).to(torch.bfloat16)
+    expected = torch.tensor(
+        [sum(range(j + 1)) / (j + 2) for j in range(6)], device="cuda"
+    )
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = _api(inp)  # auto
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    got = out.float()
+    assert torch.allclose(
+        got, expected.view(6, 1, 1).expand_as(got), atol=0.01, rtol=0.01
+    ), got[:, 0, 0]
+    _assert_close(out, _reference(inp).float())
+    out2 = _api(inp, backend="specialized")
+    assert torch.equal(out, out2)
+
+
+@requires_sm103
+@pytest.mark.parametrize("scale_div", [1, 4])
+def test_split_partial_cancellation_preserved(scale_div):
+    """Reviewer repro at T=60 (the 4-split route): 640 valid keys, zero
+    queries/sinks; keys 0-79 hold 32.25, 80-159 hold 32, 160-319 hold -32,
+    320-639 hold 0 (each value across all 512 coords). The analytic result
+    is 20/641; a merge that rounds split partials to BF16 cancels to 0."""
+    B = 10
+    inp = _direct_inputs(B, [32768] * B, n_ckv=CKV_COLS)
+    vals = torch.zeros(W, dtype=torch.float32)
+    vals[:80] = 32.25 / scale_div
+    vals[80:160] = 32.0 / scale_div
+    vals[160:320] = -32.0 / scale_div
+    swa_flat = inp["swa_kv_cache"].reshape(-1, D)
+    ckv_flat = inp["compressed_kv_cache"].reshape(-1, D)
+    for c in range(SWA_COLS):
+        swa_flat[c] = vals[c]
+    for k in range(CKV_COLS):
+        ckv_flat[k] = vals[SWA_COLS + k]
+    expected = float(vals.sum()) / (W + 1)  # 20/641 (scaled)
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = _api(inp)  # auto
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    got = out.float()
+    atol = 3e-4 / scale_div + 1e-5
+    assert torch.allclose(got, torch.full_like(got, expected), atol=atol), (
+        float(got.min()),
+        float(got.max()),
+        expected,
+    )
+    _assert_close(out, _reference(inp).float())
+
+
+@requires_sm103
+@pytest.mark.parametrize("B", [1, 2, 10, 13])
+def test_swa_window_sweep_all_routes(B):
+    """Mixed open/narrow SWA windows with random data across the batch sizes
+    that exercise each kernel route (h8 / fused2 / 4-split main / b13):
+    even requests get seq_lens < 128 (per-token narrowing windows), odd
+    requests a fully open window; auto must match the windowed reference."""
+    seq_lens = [70 if b % 2 == 0 else 4096 for b in range(B)]
+    inp = _direct_inputs(B, seq_lens, n_ckv=256, seed=101 + B, zero_q=False)
+    gold = _reference(inp).float()
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = _api(inp)  # auto
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
     _assert_close(out, gold)
 
 

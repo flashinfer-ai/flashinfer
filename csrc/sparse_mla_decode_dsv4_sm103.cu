@@ -292,6 +292,39 @@ __device__ __forceinline__ uint32_t warp_add_u32(uint32_t x) {
   }
 }
 
+// ---- SWA visibility window --------------------------------------------------
+// Public-entry contract: for token t in request b (q_off = its position among
+// that request's q_len_b query rows), only the first
+// clamp(seq_lens[b] - (q_len_b - 1 - q_off), 0, 128) SWA columns of the
+// combined table are attended.  cum_seq_lens_q is sorted, so the request is
+// found by binary search; the result masks SWA columns at index staging.
+__device__ __forceinline__ int swa_window_end(const int* __restrict__ sql,
+                                              const int* __restrict__ cql, int nreq, int t) {
+  int lo = 0, hi = nreq - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (cql[mid] <= t)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const int e = sql[lo] - (cql[lo + 1] - 1 - t);
+  return e < 0 ? 0 : (e > 128 ? 128 : e);
+}
+
+// ---- split-partial residual staging ------------------------------------------
+// Each split's fp32 partials are staged for the DSM merge as BF16 plus a BF16
+// residual plane at element offset +HEADS*DIM (recycling KV staging bytes that
+// are dead by the epilogue).  The fp32 merge accumulates both planes under one
+// weight, keeping ~16 mantissa bits of each partial so near-cancelling split
+// partials survive the merge (plain BF16 staging snaps 32.125 to 32.0 and lets
+// equal-weight +32.125/-32 splits cancel to exactly 0).
+__device__ __forceinline__ uint32_t bf16x2_residual(uint32_t hi, float x, float y) {
+  const float2 hf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&hi));
+  const __nv_bfloat162 r = __floats2bfloat162_rn(x - hf.x, y - hf.y);
+  return *reinterpret_cast<const uint32_t*>(&r);
+}
+
 __device__ __forceinline__ void ws_mbar_init(uint64_t* bar) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(sa(bar)));
 }
@@ -652,6 +685,7 @@ template <int TILE, int CSZ, bool GROUPED = false, bool OWNER = false, bool XOR_
 __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) void mla_main(
     const uint8_t* __restrict__ qp, const uint8_t* __restrict__ swap_,
     const uint8_t* __restrict__ ckvp, const int* __restrict__ sidx, const int* __restrict__ slen,
+    const int* __restrict__ sql, const int* __restrict__ cql, int nreq, int tbase,
     const float* __restrict__ sinks, __nv_bfloat16* __restrict__ out,
     int tiles_per_split G4_PARAM) {
 #ifdef ENABLE_G4
@@ -695,6 +729,7 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
   constexpr bool kC4OverlapQReload =
       TILE == 32 && (CSZ == 4 || CSZ == 5 || (CSZ == 7 && BAL7)) && !GROUPED && !OWNER && !kUseG4;
   const int len = slen[t];
+  const int swa_end = swa_window_end(sql, cql, nreq, tbase + t);
   const int* myidx = sidx + (size_t)t * WIDTH;
 
   auto issue_tile = [&](int tl) {
@@ -790,10 +825,11 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
     constexpr int FIRST_STAGED_COL = kC4DirectTile0 ? TILE : 0;
     for (int i = FIRST_STAGED_COL + tid; i < ncols; i += NTHREAD) {
       const int gcol = tile0 * TILE + i;
-      // Mask tail columns past the per-token length to -1 BEFORE staging:
-      // inactive entries carry no offset-validity contract, so they must
-      // never reach a gather (the softmax length mask still applies).
-      const int v = (gcol < len) ? myidx[gcol] : -1;
+      // Mask tail columns past the per-token length AND SWA columns outside
+      // the seq_lens-derived visibility window to -1 BEFORE staging: inactive
+      // entries carry no offset-validity contract, so they must never reach a
+      // gather (the softmax -1 mask then also drops them from the softmax).
+      const int v = (gcol < len && (gcol >= 128 || gcol < swa_end)) ? myidx[gcol] : -1;
       Idx[i] = v;
     }
   }
@@ -811,8 +847,8 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
       const int gcol = base + row;
       int valid_v = -1;
       if (lane == 0) {
-        // length-masked at staging (see the staged-Idx comment above)
-        const int v = (gcol < len) ? myidx[gcol] : -1;
+        // length- and SWA-window-masked at staging (see the staged-Idx comment)
+        const int v = (gcol < len && (gcol >= 128 || gcol < swa_end)) ? myidx[gcol] : -1;
         valid_v = v;
         Idx[row] = valid_v;
       }
@@ -1336,6 +1372,9 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
     // 16 KiB staging region for DSM partials.  This avoids aliasing the final
     // PV reads from the KV ping-pong buffer and removes the last CTA barrier.
     __nv_bfloat16* Osh = (__nv_bfloat16*)(smem + SM_Q);
+    // Residual plane: the first 16 KiB of the KV ping-pong buffer, dead once
+    // every warp has issued its final PV MMA (enforced by the barrier below).
+    constexpr int kResOff = HEADS * DIM;
     float2* MLsh = (float2*)(smem + SM_ML_FOR(TILE));
     constexpr int kDsmXor = 8;
     float2 norms[2];
@@ -1343,6 +1382,7 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
     for (int n = 0; n < 2; ++n) {
       norms[n] = *(const float2*)(Norm + 8 * n + 2 * (lane & 3));
     }
+    __syncthreads();  // all PV reads of the KV buffer precede residual stores
 
 #pragma unroll
     for (int mi = 0; mi < MIO; ++mi) {
@@ -1359,6 +1399,9 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         const __nv_bfloat162 r1 = __floats2bfloat162_rn(o[mi][n][2], o[mi][n][3]);
         stm2t(sa(Osh + hh * DIM + (d8 ^ dx)), *reinterpret_cast<const uint32_t*>(&r0),
               *reinterpret_cast<const uint32_t*>(&r1));
+        stm2t(sa(Osh + kResOff + hh * DIM + (d8 ^ dx)),
+              bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r0), o[mi][n][0], o[mi][n][1]),
+              bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r1), o[mi][n][2], o[mi][n][3]));
       }
     }
     clu.sync();
@@ -1440,7 +1483,7 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         kBalanced7 ? (b7_group0 + NWARP + b7_extra_idx) * 32 + lane : pref_c0 + CSZ * NTHREAD;
     constexpr bool kCanPrefetchSecond = !GROUPED && (TILE == 16 || CSZ * NTHREAD < HEADS * DIM / 4);
     constexpr bool kC4Wide = TILE == 32 && CSZ == 4 && !GROUPED && !OWNER;
-    uint4 wide_v[CSZ];
+    uint4 wide_v[CSZ], wide_r[CSZ];
     int wide_h = 0, wide_d8 = 0;
     if constexpr (kC4Wide) {
       const int wg = tid >> 6;
@@ -1448,10 +1491,12 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
       wide_d8 = (tid & 63) * 8;
       const int wide_sd8 = wide_d8 ^ (kDsmXor * (wide_h & 7));
 #pragma unroll
-      for (int p = 0; p < CSZ; ++p)
+      for (int p = 0; p < CSZ; ++p) {
         wide_v[p] = *(const uint4*)clu.map_shared_rank(Osh + wide_h * DIM + wide_sd8, p);
+        wide_r[p] = *(const uint4*)clu.map_shared_rank(Osh + kResOff + wide_h * DIM + wide_sd8, p);
+      }
     }
-    uint2 pref_v1[CSZ];
+    uint2 pref_v1[CSZ], pref_r1[CSZ];
     int pref_h1 = 0, pref_d41 = 0;
     bool has_pref1 = false;
     if constexpr (kCanPrefetchSecond && !kC4Wide) {
@@ -1462,14 +1507,18 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         const int pref_sd41 = pref_d41 ^ (kDsmXor * (pref_h1 & 7));
 #pragma unroll
         for (int p = 0; p < CSZ; ++p) {
-          if constexpr (TILE == 32 && CSZ == 5 && !GROUPED && !OWNER)
+          if constexpr (TILE == 32 && CSZ == 5 && !GROUPED && !OWNER) {
             pref_v1[p] = dsm_ld2_c5(Osh + pref_h1 * DIM + pref_sd41, p);
-          else
+            pref_r1[p] = dsm_ld2_c5(Osh + kResOff + pref_h1 * DIM + pref_sd41, p);
+          } else {
             pref_v1[p] = *(const uint2*)clu.map_shared_rank(Osh + pref_h1 * DIM + pref_sd41, p);
+            pref_r1[p] =
+                *(const uint2*)clu.map_shared_rank(Osh + kResOff + pref_h1 * DIM + pref_sd41, p);
+          }
         }
       }
     }
-    uint2 pref_v[CSZ];
+    uint2 pref_v[CSZ], pref_r[CSZ];
     int pref_h = 0, pref_d4 = 0;
     const bool has_pref = !GROUPED && (kBalanced7 ? (warp < b7_ngroup) : (pref_c0 < pref_nchunk));
     if (has_pref && !kC4Wide) {
@@ -1478,10 +1527,14 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
       const int pref_sd4 = pref_d4 ^ (kDsmXor * (pref_h & 7));
 #pragma unroll
       for (int p = 0; p < CSZ; ++p) {
-        if constexpr (TILE == 32 && CSZ == 5 && !GROUPED && !OWNER)
+        if constexpr (TILE == 32 && CSZ == 5 && !GROUPED && !OWNER) {
           pref_v[p] = dsm_ld2_c5(Osh + pref_h * DIM + pref_sd4, p);
-        else
+          pref_r[p] = dsm_ld2_c5(Osh + kResOff + pref_h * DIM + pref_sd4, p);
+        } else {
           pref_v[p] = *(const uint2*)clu.map_shared_rank(Osh + pref_h * DIM + pref_sd4, p);
+          pref_r[p] =
+              *(const uint2*)clu.map_shared_rank(Osh + kResOff + pref_h * DIM + pref_sd4, p);
+        }
       }
     }
     // Synchronize local weights; consume every DSM value before terminal arrival.
@@ -1497,6 +1550,10 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         a1 = merge_f32x2(wide_v[p].y, wq[p], a1);
         a2 = merge_f32x2(wide_v[p].z, wq[p], a2);
         a3 = merge_f32x2(wide_v[p].w, wq[p], a3);
+        a0 = merge_f32x2(wide_r[p].x, wq[p], a0);
+        a1 = merge_f32x2(wide_r[p].y, wq[p], a1);
+        a2 = merge_f32x2(wide_r[p].z, wq[p], a2);
+        a3 = merge_f32x2(wide_r[p].w, wq[p], a3);
       }
       *(uint4*)(out + ((size_t)t * HEADS + wide_h) * DIM + wide_d8) = make_uint4(a0, a1, a2, a3);
     } else if constexpr (TILE == 32 && CSZ == 4 && !GROUPED) {
@@ -1513,6 +1570,10 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         a10 = merge_f32x2(pref_v1[p].x, w1[p], a10);
         a01 = merge_f32x2(pref_v[p].y, w0[p], a01);
         a11 = merge_f32x2(pref_v1[p].y, w1[p], a11);
+        a00 = merge_f32x2(pref_r[p].x, w0[p], a00);
+        a10 = merge_f32x2(pref_r1[p].x, w1[p], a10);
+        a01 = merge_f32x2(pref_r[p].y, w0[p], a01);
+        a11 = merge_f32x2(pref_r1[p].y, w1[p], a11);
       }
       *(uint2*)(out + ((size_t)t * HEADS + pref_h) * DIM + pref_d4) = make_uint2(a00, a01);
       *(uint2*)(out + ((size_t)t * HEADS + pref_h1) * DIM + pref_d41) = make_uint2(a10, a11);
@@ -1531,6 +1592,10 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
           a10 = merge_f32x2(pref_v1[p].x, w1, a10);
           a01 = merge_f32x2(pref_v[p].y, w0, a01);
           a11 = merge_f32x2(pref_v1[p].y, w1, a11);
+          a00 = merge_f32x2(pref_r[p].x, w0, a00);
+          a10 = merge_f32x2(pref_r1[p].x, w1, a10);
+          a01 = merge_f32x2(pref_r[p].y, w0, a01);
+          a11 = merge_f32x2(pref_r1[p].y, w1, a11);
         }
         c5_out0 = make_uint2(a00, a01);
         c5_out1 = make_uint2(a10, a11);
@@ -1541,6 +1606,8 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
           const uint32_t w = W2sh[p * HEADS + pref_h];
           a0 = merge_f32x2(pref_v[p].x, w, a0);
           a1 = merge_f32x2(pref_v[p].y, w, a1);
+          a0 = merge_f32x2(pref_r[p].x, w, a0);
+          a1 = merge_f32x2(pref_r[p].y, w, a1);
         }
         c5_out0 = make_uint2(a0, a1);
       }
@@ -1563,6 +1630,10 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         a10 = merge_f32x2(pref_v1[p].x, w1, a10);
         a01 = merge_f32x2(pref_v[p].y, w0, a01);
         a11 = merge_f32x2(pref_v1[p].y, w1, a11);
+        a00 = merge_f32x2(pref_r[p].x, w0, a00);
+        a10 = merge_f32x2(pref_r1[p].x, w1, a10);
+        a01 = merge_f32x2(pref_r[p].y, w0, a01);
+        a11 = merge_f32x2(pref_r1[p].y, w1, a11);
       }
       *(uint2*)(out + ((size_t)t * HEADS + pref_h) * DIM + pref_d4) = make_uint2(a00, a01);
       *(uint2*)(out + ((size_t)t * HEADS + pref_h1) * DIM + pref_d41) = make_uint2(a10, a11);
@@ -1576,6 +1647,8 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
               const uint32_t wr = W2sh[p * HEADS + pref_h1];
               a0 = merge_f32x2(pref_v1[p].x, wr, a0);
               a1 = merge_f32x2(pref_v1[p].y, wr, a1);
+              a0 = merge_f32x2(pref_r1[p].x, wr, a0);
+              a1 = merge_f32x2(pref_r1[p].y, wr, a1);
             }
             const uint2 pk = make_uint2(a0, a1);
             *(uint2*)(out + ((size_t)t * HEADS + pref_h1) * DIM + pref_d41) = pk;
@@ -1586,12 +1659,16 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
               const float w = Wsh[p * HEADS + pref_h1];
               const __nv_bfloat162 b0 = *reinterpret_cast<const __nv_bfloat162*>(&pref_v1[p].x);
               const __nv_bfloat162 b1 = *reinterpret_cast<const __nv_bfloat162*>(&pref_v1[p].y);
+              const __nv_bfloat162 c0 = *reinterpret_cast<const __nv_bfloat162*>(&pref_r1[p].x);
+              const __nv_bfloat162 c1 = *reinterpret_cast<const __nv_bfloat162*>(&pref_r1[p].y);
               const float2 f0 = __bfloat1622float2(b0);
               const float2 f1 = __bfloat1622float2(b1);
-              a.x = fmaf(f0.x, w, a.x);
-              a.y = fmaf(f0.y, w, a.y);
-              a.z = fmaf(f1.x, w, a.z);
-              a.w = fmaf(f1.y, w, a.w);
+              const float2 g0 = __bfloat1622float2(c0);
+              const float2 g1 = __bfloat1622float2(c1);
+              a.x = fmaf(f0.x + g0.x, w, a.x);
+              a.y = fmaf(f0.y + g0.y, w, a.y);
+              a.z = fmaf(f1.x + g1.x, w, a.z);
+              a.w = fmaf(f1.y + g1.y, w, a.w);
             }
             const __nv_bfloat162 o0 = __floats2bfloat162_rn(a.x, a.y);
             const __nv_bfloat162 o1 = __floats2bfloat162_rn(a.z, a.w);
@@ -1608,6 +1685,8 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
             const uint32_t wr = W2sh[p * HEADS + pref_h];
             a0 = merge_f32x2(pref_v[p].x, wr, a0);
             a1 = merge_f32x2(pref_v[p].y, wr, a1);
+            a0 = merge_f32x2(pref_r[p].x, wr, a0);
+            a1 = merge_f32x2(pref_r[p].y, wr, a1);
           }
           const uint2 pk = make_uint2(a0, a1);
           *(uint2*)(out + ((size_t)t * HEADS + pref_h) * DIM + pref_d4) = pk;
@@ -1618,12 +1697,16 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
             const float w = Wsh[p * HEADS + pref_h];
             const __nv_bfloat162 b0 = *reinterpret_cast<const __nv_bfloat162*>(&pref_v[p].x);
             const __nv_bfloat162 b1 = *reinterpret_cast<const __nv_bfloat162*>(&pref_v[p].y);
+            const __nv_bfloat162 c0 = *reinterpret_cast<const __nv_bfloat162*>(&pref_r[p].x);
+            const __nv_bfloat162 c1 = *reinterpret_cast<const __nv_bfloat162*>(&pref_r[p].y);
             const float2 f0 = __bfloat1622float2(b0);
             const float2 f1 = __bfloat1622float2(b1);
-            a.x = fmaf(f0.x, w, a.x);
-            a.y = fmaf(f0.y, w, a.y);
-            a.z = fmaf(f1.x, w, a.z);
-            a.w = fmaf(f1.y, w, a.w);
+            const float2 g0 = __bfloat1622float2(c0);
+            const float2 g1 = __bfloat1622float2(c1);
+            a.x = fmaf(f0.x + g0.x, w, a.x);
+            a.y = fmaf(f0.y + g0.y, w, a.y);
+            a.z = fmaf(f1.x + g1.x, w, a.z);
+            a.w = fmaf(f1.y + g1.y, w, a.w);
           }
           const __nv_bfloat162 o0 = __floats2bfloat162_rn(a.x, a.y);
           const __nv_bfloat162 o1 = __floats2bfloat162_rn(a.z, a.w);
@@ -1638,10 +1721,12 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         const int h = c >> 6;
         const int d8 = (c & 63) * 8;
         const int sd8 = d8 ^ (kDsmXor * (h & 7));
-        uint4 v[CSZ];
+        uint4 v[CSZ], vr[CSZ];
 #pragma unroll
-        for (int p = 0; p < CSZ; ++p)
+        for (int p = 0; p < CSZ; ++p) {
           v[p] = *(const uint4*)clu.map_shared_rank(Osh + h * DIM + sd8, p);
+          vr[p] = *(const uint4*)clu.map_shared_rank(Osh + kResOff + h * DIM + sd8, p);
+        }
         float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f);
         float4 a1 = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
@@ -1651,18 +1736,26 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
           const __nv_bfloat162 b1 = *reinterpret_cast<const __nv_bfloat162*>(&v[p].y);
           const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(&v[p].z);
           const __nv_bfloat162 b3 = *reinterpret_cast<const __nv_bfloat162*>(&v[p].w);
+          const __nv_bfloat162 c0 = *reinterpret_cast<const __nv_bfloat162*>(&vr[p].x);
+          const __nv_bfloat162 c1 = *reinterpret_cast<const __nv_bfloat162*>(&vr[p].y);
+          const __nv_bfloat162 c2 = *reinterpret_cast<const __nv_bfloat162*>(&vr[p].z);
+          const __nv_bfloat162 c3 = *reinterpret_cast<const __nv_bfloat162*>(&vr[p].w);
           const float2 f0 = __bfloat1622float2(b0);
           const float2 f1 = __bfloat1622float2(b1);
           const float2 f2 = __bfloat1622float2(b2);
           const float2 f3 = __bfloat1622float2(b3);
-          a0.x = fmaf(f0.x, w, a0.x);
-          a0.y = fmaf(f0.y, w, a0.y);
-          a0.z = fmaf(f1.x, w, a0.z);
-          a0.w = fmaf(f1.y, w, a0.w);
-          a1.x = fmaf(f2.x, w, a1.x);
-          a1.y = fmaf(f2.y, w, a1.y);
-          a1.z = fmaf(f3.x, w, a1.z);
-          a1.w = fmaf(f3.y, w, a1.w);
+          const float2 g0 = __bfloat1622float2(c0);
+          const float2 g1 = __bfloat1622float2(c1);
+          const float2 g2 = __bfloat1622float2(c2);
+          const float2 g3 = __bfloat1622float2(c3);
+          a0.x = fmaf(f0.x + g0.x, w, a0.x);
+          a0.y = fmaf(f0.y + g0.y, w, a0.y);
+          a0.z = fmaf(f1.x + g1.x, w, a0.z);
+          a0.w = fmaf(f1.y + g1.y, w, a0.w);
+          a1.x = fmaf(f2.x + g2.x, w, a1.x);
+          a1.y = fmaf(f2.y + g2.y, w, a1.y);
+          a1.z = fmaf(f3.x + g3.x, w, a1.z);
+          a1.w = fmaf(f3.y + g3.y, w, a1.w);
         }
         __nv_bfloat162 o0 = __floats2bfloat162_rn(a0.x, a0.y);
         __nv_bfloat162 o1 = __floats2bfloat162_rn(a0.z, a0.w);
@@ -1680,10 +1773,12 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
         const int h = c >> 7;
         const int d4 = (c & 127) * 4;
         const int sd4 = d4 ^ (kDsmXor * (h & 7));
-        uint2 v[CSZ];
+        uint2 v[CSZ], vr[CSZ];
 #pragma unroll
-        for (int p = 0; p < CSZ; ++p)
+        for (int p = 0; p < CSZ; ++p) {
           v[p] = *(const uint2*)clu.map_shared_rank(Osh + h * DIM + sd4, p);
+          vr[p] = *(const uint2*)clu.map_shared_rank(Osh + kResOff + h * DIM + sd4, p);
+        }
         if constexpr (kPackedMerge) {
           MergePair a0 = 0, a1 = 0;
 #pragma unroll
@@ -1691,6 +1786,8 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
             const uint32_t w = W2sh[p * HEADS + h];
             a0 = merge_f32x2(v[p].x, w, a0);
             a1 = merge_f32x2(v[p].y, w, a1);
+            a0 = merge_f32x2(vr[p].x, w, a0);
+            a1 = merge_f32x2(vr[p].y, w, a1);
           }
           *(uint2*)(out + ((size_t)t * HEADS + h) * DIM + d4) = make_uint2(a0, a1);
         } else {
@@ -1700,12 +1797,16 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
             const float w = Wsh[p * HEADS + h];
             const __nv_bfloat162 b0 = *reinterpret_cast<const __nv_bfloat162*>(&v[p].x);
             const __nv_bfloat162 b1 = *reinterpret_cast<const __nv_bfloat162*>(&v[p].y);
+            const __nv_bfloat162 c0 = *reinterpret_cast<const __nv_bfloat162*>(&vr[p].x);
+            const __nv_bfloat162 c1 = *reinterpret_cast<const __nv_bfloat162*>(&vr[p].y);
             const float2 f0 = __bfloat1622float2(b0);
             const float2 f1 = __bfloat1622float2(b1);
-            a.x = fmaf(f0.x, w, a.x);
-            a.y = fmaf(f0.y, w, a.y);
-            a.z = fmaf(f1.x, w, a.z);
-            a.w = fmaf(f1.y, w, a.w);
+            const float2 g0 = __bfloat1622float2(c0);
+            const float2 g1 = __bfloat1622float2(c1);
+            a.x = fmaf(f0.x + g0.x, w, a.x);
+            a.y = fmaf(f0.y + g0.y, w, a.y);
+            a.z = fmaf(f1.x + g1.x, w, a.z);
+            a.w = fmaf(f1.y + g1.y, w, a.w);
           }
           __nv_bfloat162 o0 = __floats2bfloat162_rn(a.x, a.y);
           __nv_bfloat162 o1 = __floats2bfloat162_rn(a.z, a.w);
@@ -1754,6 +1855,7 @@ template <bool STAGE_WAIT = false, bool EARLY_ARRIVE = true, bool CONTIG_W = fal
 __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
     const uint8_t* __restrict__ qp, const uint8_t* __restrict__ swap_,
     const uint8_t* __restrict__ ckvp, const int* __restrict__ sidx, const int* __restrict__ slen,
+    const int* __restrict__ sql, const int* __restrict__ cql, int nreq,
     const float* __restrict__ sinks, __nv_bfloat16* __restrict__ out) {
   extern __shared__ __align__(16) char smem[];
   char* Qs = smem + F2_Q;
@@ -1771,6 +1873,7 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
   const int lane = tid & 31;
   const int gcol0 = sp * 64;
   const int len = slen[t];
+  const int swa_end = swa_window_end(sql, cql, nreq, t);
   const int* myidx = sidx + (size_t)t * WIDTH;
   {
     const uint8_t* src = qp + (size_t)t * (HEADS * DIM * 2);
@@ -1790,7 +1893,7 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
     // inactive tail columns carry no offset-validity contract: mask BEFORE
     // staging so they never reach a gather (softmax length mask unchanged)
     const int v = myidx[gcol];
-    Idx[tid] = (gcol < len && v >= 0) ? v : -1;
+    Idx[tid] = (gcol < len && (gcol >= 128 || gcol < swa_end) && v >= 0) ? v : -1;
   }
   __syncthreads();
 
@@ -2018,12 +2121,16 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
   cg::cluster_group clu = cg::this_cluster();
   const unsigned rank = clu.block_rank();
   __nv_bfloat16* Osh = (__nv_bfloat16*)Qs;
+  // Residual plane: the first 16 KiB of the KV staging buffer, dead once every
+  // warp has issued its final PV MMA (enforced by the barrier below).
+  constexpr int kResOff = HEADS * DIM;
   constexpr int kDsmXor = 8;
   float2 norms[2];
 #pragma unroll
   for (int n = 0; n < 2; ++n) {
     norms[n] = *(const float2*)(Norm + 8 * n + 2 * (lane & 3));
   }
+  __syncthreads();  // all PV reads of the KV buffer precede residual stores
 
 #pragma unroll
   for (int mi = 0; mi < 4; ++mi) {
@@ -2040,6 +2147,9 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
       const __nv_bfloat162 r1 = __floats2bfloat162_rn(o[mi][n][2], o[mi][n][3]);
       stm2t(sa(Osh + hh * DIM + (d8 ^ dx)), *reinterpret_cast<const uint32_t*>(&r0),
             *reinterpret_cast<const uint32_t*>(&r1));
+      stm2t(sa(Osh + kResOff + hh * DIM + (d8 ^ dx)),
+            bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r0), o[mi][n][0], o[mi][n][1]),
+            bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r1), o[mi][n][2], o[mi][n][3]));
     }
   }
   clu.sync();
@@ -2102,14 +2212,16 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
   const int c = (merge_g0 + warp) * 32 + lane;
   const bool valid_c = warp < merge_ng;
   int out_h = 0, out_d4 = 0;
-  uint2 v[10];
+  uint2 v[10], vr[10];
   if (valid_c) {
     out_h = c >> 7;
     out_d4 = (c & 127) * 4;
     const int sd4 = out_d4 ^ (kDsmXor * (out_h & 7));
 #pragma unroll
-    for (int p = 0; p < 10; ++p)
+    for (int p = 0; p < 10; ++p) {
       v[p] = *(const uint2*)clu.map_shared_rank(Osh + out_h * DIM + sd4, p);
+      vr[p] = *(const uint2*)clu.map_shared_rank(Osh + kResOff + out_h * DIM + sd4, p);
+    }
   }
   __syncthreads();
   // The terminal cluster barrier follows all uses of the remote values.
@@ -2123,8 +2235,12 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
         const uint2 w = *(const uint2*)(W2sh + out_h * 10 + 2 * wp);
         a0 = merge_f32x2(v[2 * wp].x, w.x, a0);
         a1 = merge_f32x2(v[2 * wp].y, w.x, a1);
+        a0 = merge_f32x2(vr[2 * wp].x, w.x, a0);
+        a1 = merge_f32x2(vr[2 * wp].y, w.x, a1);
         a0 = merge_f32x2(v[2 * wp + 1].x, w.y, a0);
         a1 = merge_f32x2(v[2 * wp + 1].y, w.y, a1);
+        a0 = merge_f32x2(vr[2 * wp + 1].x, w.y, a0);
+        a1 = merge_f32x2(vr[2 * wp + 1].y, w.y, a1);
       }
     } else {
 #pragma unroll
@@ -2132,6 +2248,8 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
         const uint32_t w = W2sh[p * HEADS + out_h];
         a0 = merge_f32x2(v[p].x, w, a0);
         a1 = merge_f32x2(v[p].y, w, a1);
+        a0 = merge_f32x2(vr[p].x, w, a0);
+        a1 = merge_f32x2(vr[p].y, w, a1);
       }
     }
     const uint2 pk = make_uint2(a0, a1);
@@ -2147,6 +2265,7 @@ template <bool STAGE_WAIT = false>
 __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
     const uint8_t* __restrict__ qp, const uint8_t* __restrict__ swap_,
     const uint8_t* __restrict__ ckvp, const int* __restrict__ sidx, const int* __restrict__ slen,
+    const int* __restrict__ sql, const int* __restrict__ cql, int nreq,
     const float* __restrict__ sinks, __nv_bfloat16* __restrict__ out) {
   extern __shared__ __align__(16) char smem[];
   char* Qs = smem + H8_Q;
@@ -2165,6 +2284,7 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
   const int lane = tid & 31;
   const int gcol0 = sp * 64;
   const int len = slen[t];
+  const int swa_end = swa_window_end(sql, cql, nreq, t);
   const int* myidx = sidx + (size_t)t * WIDTH;
 
   {
@@ -2186,7 +2306,7 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
     // inactive tail columns carry no offset-validity contract: mask BEFORE
     // staging so they never reach a gather (softmax length mask unchanged)
     const int v = myidx[gcol];
-    Idx[tid] = (gcol < len && v >= 0) ? v : -1;
+    Idx[tid] = (gcol < len && (gcol >= 128 || gcol < swa_end) && v >= 0) ? v : -1;
   }
   __syncthreads();
 
@@ -2356,9 +2476,13 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
   cg::cluster_group clu = cg::this_cluster();
   const unsigned rank = clu.block_rank();
   __nv_bfloat16* Osh = (__nv_bfloat16*)Qs;
+  // Residual plane: the first 8 KiB of the KV staging buffer, dead once every
+  // warp has issued its final PV MMA (enforced by the barrier below).
+  constexpr int kResOff = H8_HEADS * DIM;
   constexpr int kDsmXor = 8;
   const float2 norm = *(const float2*)(Norm + 2 * (lane & 3));
   const float inv0 = norm.x, inv1 = norm.y;
+  __syncthreads();  // all PV reads of the KV buffer precede residual stores
 
 #pragma unroll
   for (int mi = 0; mi < 4; ++mi) {
@@ -2372,6 +2496,9 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
     const __nv_bfloat162 r1 = __floats2bfloat162_rn(o[mi][2], o[mi][3]);
     stm2t(sa(Osh + hh * DIM + (d8 ^ dx)), *reinterpret_cast<const uint32_t*>(&r0),
           *reinterpret_cast<const uint32_t*>(&r1));
+    stm2t(sa(Osh + kResOff + hh * DIM + (d8 ^ dx)),
+          bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r0), o[mi][0], o[mi][1]),
+          bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r1), o[mi][2], o[mi][3]));
   }
   clu.sync();
 
@@ -2431,14 +2558,16 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
   const bool valid_c = c < H8_HEADS * DIM / 4;
   int out_h = 0;
   int out_d4 = 0;
-  uint2 v[10];
+  uint2 v[10], vres[10];
   if (valid_c) {
     out_h = c >> 7;
     out_d4 = (c & 127) * 4;
     const int sd4 = out_d4 ^ (kDsmXor * out_h);
 #pragma unroll
-    for (int p = 0; p < 10; ++p)
+    for (int p = 0; p < 10; ++p) {
       v[p] = *(const uint2*)clu.map_shared_rank(Osh + out_h * DIM + sd4, p);
+      vres[p] = *(const uint2*)clu.map_shared_rank(Osh + kResOff + out_h * DIM + sd4, p);
+    }
   }
   __syncthreads();
   // The terminal cluster barrier follows all uses of the remote values.
@@ -2452,29 +2581,49 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
                  : "memory");
     a0 = merge_f32x2(v[0].x, w0, a0);
     a1 = merge_f32x2(v[0].y, w0, a1);
+    a0 = merge_f32x2(vres[0].x, w0, a0);
+    a1 = merge_f32x2(vres[0].y, w0, a1);
     a0 = merge_f32x2(v[1].x, w1, a0);
     a1 = merge_f32x2(v[1].y, w1, a1);
+    a0 = merge_f32x2(vres[1].x, w1, a0);
+    a1 = merge_f32x2(vres[1].y, w1, a1);
     a0 = merge_f32x2(v[2].x, w2, a0);
     a1 = merge_f32x2(v[2].y, w2, a1);
+    a0 = merge_f32x2(vres[2].x, w2, a0);
+    a1 = merge_f32x2(vres[2].y, w2, a1);
     a0 = merge_f32x2(v[3].x, w3, a0);
     a1 = merge_f32x2(v[3].y, w3, a1);
+    a0 = merge_f32x2(vres[3].x, w3, a0);
+    a1 = merge_f32x2(vres[3].y, w3, a1);
     asm volatile("ld.shared::cta.v4.b32 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
                  : "r"(sa(W2sh + out_h * kH8WStride + 4))
                  : "memory");
     a0 = merge_f32x2(v[4].x, w0, a0);
     a1 = merge_f32x2(v[4].y, w0, a1);
+    a0 = merge_f32x2(vres[4].x, w0, a0);
+    a1 = merge_f32x2(vres[4].y, w0, a1);
     a0 = merge_f32x2(v[5].x, w1, a0);
     a1 = merge_f32x2(v[5].y, w1, a1);
+    a0 = merge_f32x2(vres[5].x, w1, a0);
+    a1 = merge_f32x2(vres[5].y, w1, a1);
     a0 = merge_f32x2(v[6].x, w2, a0);
     a1 = merge_f32x2(v[6].y, w2, a1);
+    a0 = merge_f32x2(vres[6].x, w2, a0);
+    a1 = merge_f32x2(vres[6].y, w2, a1);
     a0 = merge_f32x2(v[7].x, w3, a0);
     a1 = merge_f32x2(v[7].y, w3, a1);
+    a0 = merge_f32x2(vres[7].x, w3, a0);
+    a1 = merge_f32x2(vres[7].y, w3, a1);
     const uint2 wt = *(const uint2*)(W2sh + out_h * kH8WStride + 8);
     a0 = merge_f32x2(v[8].x, wt.x, a0);
     a1 = merge_f32x2(v[8].y, wt.x, a1);
+    a0 = merge_f32x2(vres[8].x, wt.x, a0);
+    a1 = merge_f32x2(vres[8].y, wt.x, a1);
     a0 = merge_f32x2(v[9].x, wt.y, a0);
     a1 = merge_f32x2(v[9].y, wt.y, a1);
+    a0 = merge_f32x2(vres[9].x, wt.y, a0);
+    a1 = merge_f32x2(vres[9].y, wt.y, a1);
     const uint2 pk = make_uint2(a0, a1);
     *(uint2*)(out + ((size_t)t * HEADS + head_base + out_h) * DIM + out_d4) = pk;
   }
@@ -2861,6 +3010,7 @@ template <int CSZ>
 __global__ __launch_bounds__(128, 3) void mla_b13(
     const uint8_t* __restrict__ qp, const uint8_t* __restrict__ swap_,
     const uint8_t* __restrict__ ckvp, const int* __restrict__ sidx, const int* __restrict__ slen,
+    const int* __restrict__ sql, const int* __restrict__ cql, int nreq,
     const float* __restrict__ sinks, __nv_bfloat16* __restrict__ out) {
   extern __shared__ __align__(16) char smem[];
   char* KVs = smem;
@@ -2889,6 +3039,7 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
   const int len = slen[t];
+  const int swa_end = swa_window_end(sql, cql, nreq, t);
   const int* myidx = sidx + (size_t)t * WIDTH;
 
   auto issue_tile = [&](int tl) {
@@ -2929,10 +3080,11 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
     const int ncols = ntile * TILE;
     for (int i = tid; i < ncols; i += NTHREAD) {
       const int gcol = tile0 * TILE + i;
-      // mask inactive tail columns and holes before staging (see sibling
+      // mask inactive tail columns, holes and SWA columns outside the
+      // seq_lens-derived visibility window before staging (see sibling
       // kernels): they carry no offset-validity contract
       const int v = myidx[gcol];
-      Idx[i] = (gcol < len && v >= 0) ? v : -1;
+      Idx[i] = (gcol < len && (gcol >= 128 || gcol < swa_end) && v >= 0) ? v : -1;
     }
   }
   __syncthreads();
@@ -3127,6 +3279,9 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
     cg::cluster_group clu = cg::this_cluster();
     const unsigned rank = clu.block_rank();
     __nv_bfloat16* Osh = (__nv_bfloat16*)smem;
+    // Residual plane: the second 16 KiB of the KV0 slot, dead by the epilogue
+    // (the pre-store __syncthreads below orders it after the final PV reads).
+    constexpr int kResOff = HEADS * DIM;
     float2* Lsh = (float2*)(smem + B13_ML);
     constexpr int kDsmXor = 8;
     float2 norms[2];
@@ -3151,6 +3306,9 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
         const __nv_bfloat162 r1 = __floats2bfloat162_rn(o[mi][n][2], o[mi][n][3]);
         stm2t(sa(Osh + hh * DIM + (d8 ^ dx)), *reinterpret_cast<const uint32_t*>(&r0),
               *reinterpret_cast<const uint32_t*>(&r1));
+        stm2t(sa(Osh + kResOff + hh * DIM + (d8 ^ dx)),
+              bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r0), o[mi][n][0], o[mi][n][1]),
+              bf16x2_residual(*reinterpret_cast<const uint32_t*>(&r1), o[mi][n][2], o[mi][n][3]));
       }
     }
     clu.sync();
@@ -3181,7 +3339,7 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
     }
     const int nchunk = HEADS * DIM / 4;
     const int c0 = static_cast<int>(rank) * NTHREAD + tid;
-    uint2 pv0[CSZ], pv1[CSZ];
+    uint2 pv0[CSZ], pv1[CSZ], pr0[CSZ], pr1[CSZ];
     int h_0 = 0, d_0 = 0, h_1 = 0, d_1 = 0;
     const int c1 = c0 + CSZ * NTHREAD;
     {
@@ -3189,14 +3347,18 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
       d_0 = (c0 & 127) * 4;
       const int sd = d_0 ^ (kDsmXor * (h_0 & 7));
 #pragma unroll
-      for (int p = 0; p < CSZ; ++p)
+      for (int p = 0; p < CSZ; ++p) {
         pv0[p] = *(const uint2*)clu.map_shared_rank(Osh + h_0 * DIM + sd, p);
+        pr0[p] = *(const uint2*)clu.map_shared_rank(Osh + kResOff + h_0 * DIM + sd, p);
+      }
       h_1 = c1 >> 7;
       d_1 = (c1 & 127) * 4;
       const int sd1 = d_1 ^ (kDsmXor * (h_1 & 7));
 #pragma unroll
-      for (int p = 0; p < CSZ; ++p)
+      for (int p = 0; p < CSZ; ++p) {
         pv1[p] = *(const uint2*)clu.map_shared_rank(Osh + h_1 * DIM + sd1, p);
+        pr1[p] = *(const uint2*)clu.map_shared_rank(Osh + kResOff + h_1 * DIM + sd1, p);
+      }
     }
     __syncthreads();
     {
@@ -3215,6 +3377,10 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
         a10 = merge_f32x2(pv1[p].x, w1[p], a10);
         a01 = merge_f32x2(pv0[p].y, w0[p], a01);
         a11 = merge_f32x2(pv1[p].y, w1[p], a11);
+        a00 = merge_f32x2(pr0[p].x, w0[p], a00);
+        a10 = merge_f32x2(pr1[p].x, w1[p], a10);
+        a01 = merge_f32x2(pr0[p].y, w0[p], a01);
+        a11 = merge_f32x2(pr1[p].y, w1[p], a11);
       }
       *(uint2*)(out + ((size_t)t * HEADS + h_0) * DIM + d_0) = make_uint2(a00, a01);
       *(uint2*)(out + ((size_t)t * HEADS + h_1) * DIM + d_1) = make_uint2(a10, a11);
@@ -3223,10 +3389,12 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
       const int h = c >> 7;
       const int d4 = (c & 127) * 4;
       const int sd4 = d4 ^ (kDsmXor * (h & 7));
-      uint2 v[CSZ];
+      uint2 v[CSZ], vr[CSZ];
 #pragma unroll
-      for (int p = 0; p < CSZ; ++p)
+      for (int p = 0; p < CSZ; ++p) {
         v[p] = *(const uint2*)clu.map_shared_rank(Osh + h * DIM + sd4, p);
+        vr[p] = *(const uint2*)clu.map_shared_rank(Osh + kResOff + h * DIM + sd4, p);
+      }
       MergePair a0 = 0, a1 = 0;
       const uint2 w0 = *(const uint2*)(W2sh + h * 6);
       const uint2 w1 = *(const uint2*)(W2sh + h * 6 + 2);
@@ -3235,6 +3403,8 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
       for (int p = 0; p < CSZ; ++p) {
         a0 = merge_f32x2(v[p].x, w[p], a0);
         a1 = merge_f32x2(v[p].y, w[p], a1);
+        a0 = merge_f32x2(vr[p].x, w[p], a0);
+        a1 = merge_f32x2(vr[p].y, w[p], a1);
       }
       *(uint2*)(out + ((size_t)t * HEADS + h) * DIM + d4) = make_uint2(a0, a1);
     }
@@ -3276,6 +3446,8 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
          ffi::TensorView cum_seq_lens_q, int64_t max_q_len, ffi::TensorView sinks,
          ffi::TensorView out) {
   if (q.shape()[0] == 0) TVM_FFI_THROW(ValueError) << "q must contain at least one token";
+  if (seq_lens.shape()[0] + 1 != cum_seq_lens_q.shape()[0])
+    TVM_FFI_THROW(ValueError) << "cum_seq_lens_q must have seq_lens.shape[0] + 1 entries";
   DLDevice dev = q.device();
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
@@ -3427,6 +3599,9 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
     const uint8_t* cp0 = (const uint8_t*)ckv.data_ptr();
     const int* ip0 = (const int*)sparse_indices.data_ptr();
     const int* lp0 = (const int*)sparse_topk_lens.data_ptr();
+    const int* sqlp0 = (const int*)seq_lens.data_ptr();
+    const int* cqlp0 = (const int*)cum_seq_lens_q.data_ptr();
+    const int nreq0 = (int)seq_lens.shape()[0];
     const float* skp0 = (const float*)sinks.data_ptr();
     __nv_bfloat16* op0 = (__nv_bfloat16*)out.data_ptr();
 
@@ -3447,9 +3622,10 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
       const int64_t rem = T64 - t0;
       const unsigned n = (unsigned)(rem > 65535 ? 65535 : rem);
       lc.gridDim = dim3(1, n, 1);
-      cudaError_t e = cudaLaunchKernelEx(&lc, mla_main<32, 1>, qp0 + (size_t)t0 * HEADS * DIM * 2,
-                                         sp0, cp0, ip0 + (size_t)t0 * WIDTH, lp0 + t0, skp0,
-                                         op0 + (size_t)t0 * HEADS * DIM, 20 G4_ARG);
+      cudaError_t e =
+          cudaLaunchKernelEx(&lc, mla_main<32, 1>, qp0 + (size_t)t0 * HEADS * DIM * 2, sp0, cp0,
+                             ip0 + (size_t)t0 * WIDTH, lp0 + t0, sqlp0, cqlp0, nreq0, (int)t0, skp0,
+                             op0 + (size_t)t0 * HEADS * DIM, 20 G4_ARG);
       if (e != cudaSuccess) {
         cudaGetLastError();
         TVM_FFI_THROW(RuntimeError) << "sparse_mla_decode_dsv4: chunked launch failed at token "
@@ -3517,17 +3693,22 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   const uint8_t* cp = (const uint8_t*)ckv.data_ptr();
   const int* ip = (const int*)sparse_indices.data_ptr();
   const int* lp = (const int*)sparse_topk_lens.data_ptr();
+  const int* sqlp = (const int*)seq_lens.data_ptr();
+  const int* cqlp = (const int*)cum_seq_lens_q.data_ptr();
+  const int nreq = (int)seq_lens.shape()[0];
   const float* skp = (const float*)sinks.data_ptr();
   __nv_bfloat16* outp = (__nv_bfloat16*)out.data_ptr();
   cudaError_t err = cudaErrorInvalidValue;
-#define LAUNCH(N)                                                                               \
-  case N:                                                                                       \
-    err = cudaLaunchKernelEx(&cfg, mla_main<32, N>, qp, sp, cp, ip, lp, skp, outp, tps G4_ARG); \
+#define LAUNCH(N)                                                                                 \
+  case N:                                                                                         \
+    err = cudaLaunchKernelEx(&cfg, mla_main<32, N>, qp, sp, cp, ip, lp, sqlp, cqlp, nreq, 0, skp, \
+                             outp, tps G4_ARG);                                                   \
     break;
   const bool use_owner = T == 18 || T == 24;
   const bool use_bal7 = (T == 30 || T == 36) && nsplit == 7;
   if (use_h8) {
-    err = cudaLaunchKernelEx(&cfg, mla_fused2_h8_c10<true>, qp, sp, cp, ip, lp, skp, outp);
+    err = cudaLaunchKernelEx(&cfg, mla_fused2_h8_c10<true>, qp, sp, cp, ip, lp, sqlp, cqlp, nreq,
+                             skp, outp);
   } else if (use_ws) {
     err = cudaLaunchKernelEx(&cfg, mla_ws_c4, qp, sp, cp, ip, lp, skp, outp);
   } else if (use_tcgen) {
@@ -3535,29 +3716,29 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   } else if (use_fused2 && nsplit == 10) {
     if (T == 12)
       err = cudaLaunchKernelEx(&cfg, mla_fused2_c10<true, true, true, true, true>, qp, sp, cp, ip,
-                               lp, skp, outp);
+                               lp, sqlp, cqlp, nreq, skp, outp);
     else if (T == 24)
       err = cudaLaunchKernelEx(&cfg, mla_fused2_c10<true, false, true, true, false, true>, qp, sp,
-                               cp, ip, lp, skp, outp);
+                               cp, ip, lp, sqlp, cqlp, nreq, skp, outp);
     else if (T == 18)
       err = cudaLaunchKernelEx(&cfg, mla_fused2_c10<true, true, true, false, false, true, true>, qp,
-                               sp, cp, ip, lp, skp, outp);
+                               sp, cp, ip, lp, sqlp, cqlp, nreq, skp, outp);
     else
-      err =
-          cudaLaunchKernelEx(&cfg, mla_fused2_c10<true, true, true>, qp, sp, cp, ip, lp, skp, outp);
+      err = cudaLaunchKernelEx(&cfg, mla_fused2_c10<true, true, true>, qp, sp, cp, ip, lp, sqlp,
+                               cqlp, nreq, skp, outp);
   } else if (use_b13) {
-    err = cudaLaunchKernelEx(&cfg, mla_b13<5>, qp, sp, cp, ip, lp, skp, outp);
+    err = cudaLaunchKernelEx(&cfg, mla_b13<5>, qp, sp, cp, ip, lp, sqlp, cqlp, nreq, skp, outp);
   } else {
     if (use_owner && nsplit == 10) {
-      err = cudaLaunchKernelEx(&cfg, mla_main<32, 10, false, true>, qp, sp, cp, ip, lp, skp, outp,
-                               tps G4_ARG);
+      err = cudaLaunchKernelEx(&cfg, mla_main<32, 10, false, true>, qp, sp, cp, ip, lp, sqlp, cqlp,
+                               nreq, 0, skp, outp, tps G4_ARG);
     } else if (nsplit == 7) {
       if (use_bal7) {
         err = cudaLaunchKernelEx(&cfg, mla_main<32, 7, false, false, false, true>, qp, sp, cp, ip,
-                                 lp, skp, outp, tps G4_ARG);
+                                 lp, sqlp, cqlp, nreq, 0, skp, outp, tps G4_ARG);
       } else {
         err = cudaLaunchKernelEx(&cfg, mla_main<32, 7, false, false, false>, qp, sp, cp, ip, lp,
-                                 skp, outp, tps G4_ARG);
+                                 sqlp, cqlp, nreq, 0, skp, outp, tps G4_ARG);
       }
     } else {
       switch (nsplit) {
@@ -3572,8 +3753,8 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
     cfg.dynamicSmemBytes = SM_BYTES_FOR(32);
     cfg.gridDim = dim3(1, T, 1);
     attr[0].val.clusterDim.x = 1;
-    const cudaError_t fallback =
-        cudaLaunchKernelEx(&cfg, mla_main<32, 1>, qp, sp, cp, ip, lp, skp, outp, 20 G4_ARG);
+    const cudaError_t fallback = cudaLaunchKernelEx(&cfg, mla_main<32, 1>, qp, sp, cp, ip, lp, sqlp,
+                                                    cqlp, nreq, 0, skp, outp, 20 G4_ARG);
     if (fallback != cudaSuccess) {
       cudaGetLastError();
       TVM_FFI_THROW(RuntimeError) << cudaGetErrorString(fallback);
