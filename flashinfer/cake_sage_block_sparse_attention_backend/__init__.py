@@ -251,10 +251,12 @@ _ATTENTION_ROUTES = {
     "sm_103a": (("attention_sd", 23),),
 }
 #: The tail-split build of ``attention_sd`` and, per architecture, the selected blocks a
-#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103): clusters
-#: of two CTAs, where the tiles of the last, partial wave of the
-#: persistent grid run as two halves of their KV blocks, one per CTA of a cluster, and
-#: the first half folds the second half's output and softmax statistics into its own.
+#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103; on SM103
+#: ``attention_sd_tsplit_p3`` below takes the split rows from 24 to 64 blocks a row once
+#: the grid holds a tile per SM): clusters of two CTAs, where the tiles of the last,
+#: partial wave of the persistent grid run as two halves of their KV blocks, one per
+#: CTA of a cluster, and the first half folds the second half's output and softmax
+#: statistics into its own.
 #: A split tile sums its softmax in another order (within the kernel's tolerances, the
 #: same bits on every run); the split depends on how the grid fills.
 _TAIL_SPLIT_ROLE = "attention_sd_tsplit"
