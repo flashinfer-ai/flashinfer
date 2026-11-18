@@ -84,3 +84,19 @@ html_theme_options = {
     "light_logo": "FlashInfer-white-background.png",
     "dark_logo": "FlashInfer-black-background.png",
 }
+
+
+def _limit_api_sidebar_depth(app, pagename, templatename, context, doctree):
+    from furo.navigation import get_navigation_tree
+
+    # Furo requests unlimited depth, overriding the root toctree's maxdepth.
+    # Keep API symbols on their topic pages instead of in the global sidebar.
+    context["furo_navigation_tree"] = get_navigation_tree(
+        context["toctree"](
+            collapse=False, titles_only=True, maxdepth=2, includehidden=True
+        )
+    )
+
+
+def setup(app):
+    app.connect("html-page-context", _limit_api_sidebar_depth, priority=800)
