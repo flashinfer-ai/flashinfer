@@ -781,7 +781,12 @@ __global__ __launch_bounds__(256, 2) void direct_fallback_kernel(
       if (seen < 15) {
         sbest[warp][seen] = bmax;
         sid[warp][seen] = block;
-        if (bmax < worst || (bmax == worst && block > worst_id)) {
+        // Seed the minimum from the first admitted candidate: with the
+        // FLT_MAX sentinel an all-+inf score set would never lower `worst`,
+        // and block 15 would displace block 0 against the lower-id tie
+        // contract. The comparison stays strict so later equal scores
+        // cannot displace lower ids.
+        if (seen == 0 || bmax < worst || (bmax == worst && block > worst_id)) {
           worst = bmax;
           worst_id = block;
           worst_pos = seen;
