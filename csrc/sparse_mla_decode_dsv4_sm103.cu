@@ -3452,7 +3452,9 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
                                          op0 + (size_t)t0 * HEADS * DIM, 20 G4_ARG);
       if (e != cudaSuccess) {
         cudaGetLastError();
-        return;
+        TVM_FFI_THROW(RuntimeError) << "sparse_mla_decode_dsv4: chunked launch failed at token "
+                                       "offset "
+                                    << t0 << " of " << T64 << ": " << cudaGetErrorString(e);
       }
     }
     return;
@@ -3493,7 +3495,7 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   cfg.dynamicSmemBytes = use_h8       ? H8_BYTES
                          : use_ws     ? WS_BYTES
                          : use_tcgen  ? TC_BYTES
-                         : use_fused2 ? F2_BYTES
+                         : (use_fused2 && nsplit == 10) ? F2_BYTES
                          : use_b13    ? B13_BYTES
                                       : SM_BYTES_FOR(32);
   if (use_b13) cfg.blockDim = dim3(128, 1, 1);
