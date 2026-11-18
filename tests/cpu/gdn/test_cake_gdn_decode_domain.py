@@ -35,7 +35,7 @@ pytestmark = pytest.mark.cpu_only
 
 _WHOLE = "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"
 _TWIN = "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
-_TEMPLATE = "host/templates/decode_fp32_t1_tma_state_domain.cc.in"
+_TEMPLATE = "host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in"
 _SCALE = 128**-0.5
 _ROW_BYTES = 32 * 128 * 128 * 4
 _BATCH_CLASSES = ("B32-63", "B64-127", "B128-255", "B>=256")

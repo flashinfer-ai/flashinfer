@@ -274,7 +274,7 @@ output and the state are the whole body's bit for bit for any `rows0` and any
 grid. Its kernel takes the whole body's arguments, the batch size, `rows0`,
 one int32 claim counter per die (zero before a launch, left zero by it) and
 the 256-word SM table by value. Its records launch through
-`host/templates/decode_fp32_t1_tma_state_domain.cc.in`, which adds those
+`host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in`, which adds those
 checks to the TMA-state template's and launches the requested grid
 (`1 .. B * HV`) capped by the resident CTAs of the kernel (an occupancy query
 after the dynamic shared-memory opt-in; 4 CTAs per SM if the query fails).

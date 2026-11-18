@@ -62,7 +62,7 @@ _RECORD_TMA_ABI_SPELLED = {
 _DECODE_TMA_TEMPLATES = frozenset(
     {
         "host/templates/decode_fp32_t1_tma_state.cc.in",
-        "host/templates/decode_fp32_t1_tma_state_domain.cc.in",
+        "host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in",
     }
 )
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
