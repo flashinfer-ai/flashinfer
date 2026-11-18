@@ -2340,13 +2340,25 @@ def _flat_u8_scales(sf: torch.Tensor, name: str, rows: int, cols: int) -> torch.
 def _stream_k_workspace(
     device: torch.device, floats: int, flags: int, slices: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP32 partial workspace and per-slice-count slot flags of the stream-K tail, owned by
-    the current CUDA stream of ``device`` (:func:`_get_stream_cache_buf`), grown on demand
-    (never shrunk).  Launches on one stream are ordered, so its stream-K launches share
-    them; launches on different streams get their own.  The flags are free-running
-    per-launch generations (every word of a tail tile advances once per launch in which the
-    tile exists, so all words of a tile share one history for a fixed slice count); grown
-    arrays restart from zero.  No per-launch initialisation and nothing is reset."""
+    """FP32 partial workspace and per-slice-count slot flags of the stream-K tail.
+
+    Eager launches take them from the current CUDA stream of ``device``
+    (:func:`_get_stream_cache_buf`), grown on demand (never shrunk): launches on one
+    stream are ordered, so its stream-K launches share them; launches on different
+    streams get their own.  The flags are free-running per-launch generations (every
+    word of a tail tile advances once per launch in which the tile exists, so all words
+    of a tile share one history for a fixed slice count); grown arrays restart from zero.
+    No per-launch initialisation and nothing is reset.
+
+    Under CUDA Graph capture each launch gets its own scratch from the graph's memory
+    pool, with the zero fill of its flags recorded in the same graph ahead of the GEMM.
+    Every replay therefore starts from zeroed flags, whatever other graphs or eager
+    launches ran before it, and graphs may replay concurrently."""
+    if torch.cuda.is_current_stream_capturing():
+        return (
+            torch.empty(max(floats, 1), dtype=torch.float32, device=device),
+            torch.zeros(max(flags, 1), dtype=torch.uint32, device=device),
+        )
     device = torch.device("cuda", _device_index(device))
     ws = _get_stream_cache_buf("cake_nvfp4_sk_partials", 4 * max(floats, 1), device)
     fl = _get_stream_cache_buf(
@@ -2373,7 +2385,10 @@ def prepare_mm_fp4_per_token(
     ``alpha [M]`` the FP32 per-token scale and ``out [M, N]`` a contiguous bf16 /
     fp16 tensor.  ``tactic`` overrides :func:`default_tactic`; without it the GEMM runs the
     program of :func:`gemm_alone_tactic` on the cells of :data:`GEMM_ALONE_EP_RULES`.  The
-    JIT module is built and loaded here, so prepare outside CUDA Graph capture."""
+    JIT module is built and loaded here, so prepare outside CUDA Graph capture.  A
+    stream-K binding holds the stream-K scratch of the stream current at prepare time
+    (:func:`_stream_k_workspace`), shared with the other stream-K bindings and eager
+    launches prepared on that stream: their launches must not run concurrently."""
     if a_fp4.dim() != 2 or a_fp4.dtype != torch.uint8 or not a_fp4.is_contiguous():
         raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
     if b_fp4.dim() != 2 or b_fp4.dtype != torch.uint8 or not b_fp4.is_contiguous():

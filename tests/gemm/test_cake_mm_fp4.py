@@ -2133,7 +2133,7 @@ def test_stream_k_launches_on_two_streams_match_serial_launches():
 
     serial = run(torch.empty((m, n), dtype=torch.bfloat16, device=device))
     again = run(torch.empty_like(serial))
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     plan = cb._gemm_prepared(m, n, k, False, device.index)[0]
     assert plan.stream_k, plan.kernel_key
     ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
@@ -2157,13 +2157,67 @@ def test_stream_k_launches_on_two_streams_match_serial_launches():
         for j, stream in enumerate(streams):
             with torch.cuda.stream(stream):
                 run(outs[2 * i + j])
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
 
     for index, out in enumerate(outs):
         if deterministic:
             assert torch.equal(out, serial), f"launch {index} (stream {index % 2})"
         else:
             _assert_matches(out, ref)
+
+
+@pytest.mark.timeout(600)
+def test_stream_k_graphs_replay_in_any_order():
+    # Graphs captured on one stream, with no eager launch on that stream before, each
+    # own zeroed stream-K flags: the graph captured second replays first and both
+    # replay concurrently on two streams, and every output equals an eager launch.
+    device = _require_program()
+    m, n, k = _stream_k_row(device)
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=701
+    )
+
+    def run(out):
+        return mm_fp4(
+            a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.bfloat16, out, backend="cake"
+        )
+
+    eager = run(torch.empty((m, n), dtype=torch.bfloat16, device=device))
+    again = run(torch.empty_like(eager))
+    torch.cuda.synchronize(device)
+    assert cb._gemm_prepared(m, n, k, False, device.index)[0].stream_k
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(eager, ref)
+    deterministic = torch.equal(eager, again)
+
+    capture_stream = torch.cuda.Stream(device)
+    outs = [torch.full_like(eager, float("nan")) for _ in range(2)]
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    for graph, out in zip(graphs, outs, strict=True):
+        with torch.cuda.graph(graph, stream=capture_stream):
+            run(out)
+    torch.cuda.synchronize(device)
+
+    def check():
+        for index, out in enumerate(outs):
+            if deterministic:
+                assert torch.equal(out, eager), f"graph {index}"
+            else:
+                _assert_matches(out, ref)
+            out.fill_(float("nan"))
+
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize(device)
+    check()
+    streams = (torch.cuda.Stream(device), torch.cuda.Stream(device))
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams, strict=True):
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize(device)
+        check()
 
 
 def test_scalar_alpha_and_bad_layouts_are_rejected():
