@@ -20,11 +20,20 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   const int q_heads = (NUM_HEADS == 0) ? p.num_heads : NUM_HEADS;
   const int smem_bytes = plan.shared_bytes;
   const int block_threads = plan.block_threads;
-  auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
-  if constexpr (MT == ModelType::DSV4 || is_dsv41(MT)) {
-    if (p.mega.output)
-      kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, true>;
-  }
+  auto kernel = [&]() {
+    if constexpr (is_dsv41(MT)) {
+      return p.mega.output
+                 ? sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Dsv41MixedCacheDecodeSchedule<MT>,
+                                                 true>
+                 : sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Dsv41MixedCacheDecodeSchedule<MT>>;
+    } else if constexpr (MT == ModelType::DSV4) {
+      return p.mega.output
+                 ? sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, true>
+                 : sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
+    } else {
+      return sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
+    }
+  }();
   // Inline-scale rows are addressed flat: the stride arguments carry the main
   // and extra row pitches.
   size_t main_stride = p.page_stride_bytes, extra_stride = p.extra_page_stride_bytes;
