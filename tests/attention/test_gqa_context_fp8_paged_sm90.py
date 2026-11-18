@@ -382,10 +382,10 @@ def test_legacy_kill_switch_alias_still_disables(monkeypatch):
     assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
     assert stats["runs_dispatched"] == 0
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
-    # explicit "specialized" raises under the alias too
-    wrapper_exp = _plan_wrapper(batch, device)
+    # explicit "specialized" raises under the alias too — at plan time: the
+    # kill switch is read at plan and run, so the explicit plan itself refuses
     with pytest.raises(NotImplementedError, match="never falls back"):
-        wrapper_exp.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+        _plan_wrapper(batch, device)
 
 
 def test_explicit_specialized_raises_for_contracts_it_has_no_kernel_for():
