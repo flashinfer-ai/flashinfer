@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -119,8 +117,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[0 + 1] = _ivld_0.y;
             }
         } else {
-            words[0] = 0u;
-            words[1] = 0u;
+            words[0] = 0;
+            words[1] = 0;
         }
         if (oks[1]) {
             {
@@ -131,8 +129,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[2 + 1] = _ivld_1.y;
             }
         } else {
-            words[2] = 0u;
-            words[3] = 0u;
+            words[2] = 0;
+            words[3] = 0;
         }
         if (oks[2]) {
             {
@@ -143,8 +141,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[4 + 1] = _ivld_2.y;
             }
         } else {
-            words[4] = 0u;
-            words[5] = 0u;
+            words[4] = 0;
+            words[5] = 0;
         }
         if (oks[3]) {
             {
@@ -155,8 +153,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[6 + 1] = _ivld_3.y;
             }
         } else {
-            words[6] = 0u;
-            words[7] = 0u;
+            words[6] = 0;
+            words[7] = 0;
         }
         if (oks[4]) {
             {
@@ -167,8 +165,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[8 + 1] = _ivld_4.y;
             }
         } else {
-            words[8] = 0u;
-            words[9] = 0u;
+            words[8] = 0;
+            words[9] = 0;
         }
         if (oks[5]) {
             {
@@ -179,8 +177,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[10 + 1] = _ivld_5.y;
             }
         } else {
-            words[10] = 0u;
-            words[11] = 0u;
+            words[10] = 0;
+            words[11] = 0;
         }
         if (oks[6]) {
             {
@@ -191,8 +189,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[12 + 1] = _ivld_6.y;
             }
         } else {
-            words[12] = 0u;
-            words[13] = 0u;
+            words[12] = 0;
+            words[13] = 0;
         }
         if (oks[7]) {
             {
@@ -203,8 +201,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[14 + 1] = _ivld_7.y;
             }
         } else {
-            words[14] = 0u;
-            words[15] = 0u;
+            words[14] = 0;
+            words[15] = 0;
         }
         if (oks[8]) {
             {
@@ -215,8 +213,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[16 + 1] = _ivld_8.y;
             }
         } else {
-            words[16] = 0u;
-            words[17] = 0u;
+            words[16] = 0;
+            words[17] = 0;
         }
         if (oks[9]) {
             {
@@ -227,8 +225,8 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
                 words[18 + 1] = _ivld_9.y;
             }
         } else {
-            words[18] = 0u;
-            words[19] = 0u;
+            words[18] = 0;
+            words[19] = 0;
         }
         float values[4];
         float partials[4];

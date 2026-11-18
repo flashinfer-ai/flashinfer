@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -92,10 +90,22 @@ kernel_cake_warp_decode_a7c926e4f62a2e693b44(__nv_bfloat16* __restrict__ route_o
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature < M && token < num_tokens) {
         __nv_bfloat16 partials[4];
-        partials[0] = ((oks[0]) ? route_outputs[rows[0] * route_stride + feature] : (__nv_bfloat16)0.0f);
-        partials[1] = ((oks[1]) ? route_outputs[rows[1] * route_stride + feature] : (__nv_bfloat16)0.0f);
-        partials[2] = ((oks[2]) ? route_outputs[rows[2] * route_stride + feature] : (__nv_bfloat16)0.0f);
-        partials[3] = ((oks[3]) ? route_outputs[rows[3] * route_stride + feature] : (__nv_bfloat16)0.0f);
+        partials[0] = 0.0f;
+        if (oks[0]) {
+            partials[0] = route_outputs[rows[0] * route_stride + feature];
+        }
+        partials[1] = 0.0f;
+        if (oks[1]) {
+            partials[1] = route_outputs[rows[1] * route_stride + feature];
+        }
+        partials[2] = 0.0f;
+        if (oks[2]) {
+            partials[2] = route_outputs[rows[2] * route_stride + feature];
+        }
+        partials[3] = 0.0f;
+        if (oks[3]) {
+            partials[3] = route_outputs[rows[3] * route_stride + feature];
+        }
         float value = 0.0f;
         value = ((oks[0]) ? __fmaf_rn((float)partials[0], weights[0], value) : value);
         value = ((oks[1]) ? __fmaf_rn((float)partials[1], weights[1], value) : value);

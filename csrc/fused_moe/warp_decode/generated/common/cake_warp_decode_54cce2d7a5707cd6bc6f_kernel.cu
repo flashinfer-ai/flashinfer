@@ -40,104 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 304
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SFA_OFFSET 16
-#define TMEM_SFB_OFFSET 160
-#define NUM_K_PIPE_STAGES 9
-#define NUM_MMA_PIPE_STAGES 2
-#define NUM_WORK_PIPE_STAGES 3
-#define NUM_THROTTLE_PIPE_STAGES 3
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 16384
-#define SMEM_SMEM_B_OFF 148480
-#define SMEM_SMEM_B_STAGE_BYTES 1024
-#define SMEM_SMEM_B_STRIDE 1024
-#define SMEM_SMEM_A_MMA_R_0_OFF 1024
-#define SMEM_SMEM_A_MMA_R_0_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_R_0_STRIDE 16384
-#define SMEM_SMEM_A_MMA_R_1_OFF 1056
-#define SMEM_SMEM_A_MMA_R_1_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_R_1_STRIDE 16384
-#define SMEM_SMEM_A_MMA_R_2_OFF 1088
-#define SMEM_SMEM_A_MMA_R_2_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_R_2_STRIDE 16384
-#define SMEM_SMEM_A_MMA_R_3_OFF 1120
-#define SMEM_SMEM_A_MMA_R_3_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_R_3_STRIDE 16384
-#define SMEM_SMEM_A_MMA_0_OFF 1024
-#define SMEM_SMEM_A_MMA_0_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_0_STRIDE 16384
-#define SMEM_SMEM_A_MMA_1_OFF 1024
-#define SMEM_SMEM_A_MMA_1_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_1_STRIDE 16384
-#define SMEM_SMEM_A_MMA_2_OFF 1024
-#define SMEM_SMEM_A_MMA_2_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_2_STRIDE 16384
-#define SMEM_SMEM_A_MMA_3_OFF 1024
-#define SMEM_SMEM_A_MMA_3_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA_3_STRIDE 16384
-#define SMEM_SMEM_B_MMA_R_0_OFF 148480
-#define SMEM_SMEM_B_MMA_R_0_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_R_0_STRIDE 1024
-#define SMEM_SMEM_B_MMA_R_1_OFF 148512
-#define SMEM_SMEM_B_MMA_R_1_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_R_1_STRIDE 1024
-#define SMEM_SMEM_B_MMA_R_2_OFF 148544
-#define SMEM_SMEM_B_MMA_R_2_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_R_2_STRIDE 1024
-#define SMEM_SMEM_B_MMA_R_3_OFF 148576
-#define SMEM_SMEM_B_MMA_R_3_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_R_3_STRIDE 1024
-#define SMEM_SMEM_B_MMA_0_OFF 148480
-#define SMEM_SMEM_B_MMA_0_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_0_STRIDE 1024
-#define SMEM_SMEM_B_MMA_1_OFF 148480
-#define SMEM_SMEM_B_MMA_1_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_1_STRIDE 1024
-#define SMEM_SMEM_B_MMA_2_OFF 148480
-#define SMEM_SMEM_B_MMA_2_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_2_STRIDE 1024
-#define SMEM_SMEM_B_MMA_3_OFF 148480
-#define SMEM_SMEM_B_MMA_3_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA_3_STRIDE 1024
-#define SMEM_SMEM_A_MMA0_NEXT_OFF 1024
-#define SMEM_SMEM_A_MMA0_NEXT_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA0_NEXT_STRIDE 16384
-#define SMEM_SMEM_B_MMA0_NEXT_OFF 148480
-#define SMEM_SMEM_B_MMA0_NEXT_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA0_NEXT_STRIDE 1024
-#define SMEM_SMEM_A_MMA2_NEXT_OFF 1024
-#define SMEM_SMEM_A_MMA2_NEXT_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA2_NEXT_STRIDE 16384
-#define SMEM_SMEM_B_MMA2_NEXT_OFF 148480
-#define SMEM_SMEM_B_MMA2_NEXT_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA2_NEXT_STRIDE 1024
-#define SMEM_SMEM_A_MMA5_NEXT_OFF 1024
-#define SMEM_SMEM_A_MMA5_NEXT_STAGE_BYTES 4096
-#define SMEM_SMEM_A_MMA5_NEXT_STRIDE 16384
-#define SMEM_SMEM_B_MMA5_NEXT_OFF 148480
-#define SMEM_SMEM_B_MMA5_NEXT_STAGE_BYTES 256
-#define SMEM_SMEM_B_MMA5_NEXT_STRIDE 1024
-#define SMEM_SMEM_SFA_OFF 157696
-#define SMEM_SMEM_SFA_STAGE_BYTES 2048
-#define SMEM_SMEM_SFA_STRIDE 2048
-#define SMEM_SMEM_SFB_OFF 176128
-#define SMEM_SMEM_SFB_STAGE_BYTES 128
-#define SMEM_SMEM_SFB_STRIDE 128
-#define SMEM_EPI_STAGING_OFF 177280
-#define SMEM_EPI_STAGING_STAGE_BYTES 2048
-#define SMEM_EPI_STAGING_STRIDE 2048
-#define SMEM_EPI_STAGING_U64_OFF 177280
-#define SMEM_EPI_STAGING_U64_STAGE_BYTES 2048
-#define SMEM_EPI_STAGING_U64_STRIDE 2048
-#define SMEM_WORK_RESPONSE_OFF 179328
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 179456
-#define THREADS 512
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 256
@@ -323,7 +225,7 @@ __device__ __forceinline__ void tma_store_4d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -368,7 +270,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 148480);
@@ -428,8 +330,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 179328);
     const int work_response_addr = smem + 179328;
 
-    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 97 barriers)
-    // Mbarriers at smem_raw[0..776)
+    // Mbarrier init (97 barriers at smem_raw[0..776))
 
     if (warp == 10) {
         // --- pipeline 'k_pipe' ---
@@ -539,12 +440,12 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_sfa = taddr + 16;
+    const unsigned int tmem_sfb = taddr + 160;
 
     // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_sfa = taddr + 16;
-    const int tmem_sfb = taddr + 160;
     if (warp >= 8 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
     }
@@ -588,13 +489,13 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3]))
-                    : "r"((unsigned int)tmem_accum + acc_stage * 8));
+                    : "r"(tmem_accum + acc_stage * 8));
                 float _tmem_load_1[4];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3]))
-                    : "r"((unsigned int)tmem_accum + (unsigned int)(16 << 16) + acc_stage * 8));
+                    : "r"(tmem_accum + (unsigned int)(16 << 16) + acc_stage * 8));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 asm volatile("cp.async.bulk.wait_group.read 0;");
                 asm volatile("barrier.sync 8, 128;" ::: "memory");
@@ -608,7 +509,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(wide_values[_lp*2 + 0], wide_values[_lp*2+1 + 0]));
                     wide_packed[_lp] = *(uint32_t*)&_bf2;
                 }
-                wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32;
+                wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32ull;
                 if (wide_feature < 64) {
                     epi_staging_u64[(token_1_0 * 64 + wide_feature) / 4] = wide_word;
                 } else {
@@ -624,7 +525,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(wide_values[_lp*2 + 0], wide_values[_lp*2+1 + 0]));
                     wide_packed[_lp] = *(uint32_t*)&_bf2;
                 }
-                wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32;
+                wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32ull;
                 if (wide_feature < 64) {
                     epi_staging_u64[(token_1_1 * 64 + wide_feature) / 4] = wide_word;
                 } else {
@@ -1223,7 +1124,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                                 uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
                                 asm volatile(
                                     "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                    :: "r"((uint32_t)((unsigned int)tmem_sfa + stage_5 * 16)), "l"(_tcgen05_cp_desc_0)
+                                    :: "r"((uint32_t)(tmem_sfa + stage_5 * 16)), "l"(_tcgen05_cp_desc_0)
                                     : "memory");
                             }
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1233,7 +1134,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                                 uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
                                 asm volatile(
                                     "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                    :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 4))), "l"(_tcgen05_cp_desc_1)
+                                    :: "r"((uint32_t)(tmem_sfa + (stage_5 * 16 + 4))), "l"(_tcgen05_cp_desc_1)
                                     : "memory");
                             }
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1243,7 +1144,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                                 uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
                                 asm volatile(
                                     "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                    :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 8))), "l"(_tcgen05_cp_desc_2)
+                                    :: "r"((uint32_t)(tmem_sfa + (stage_5 * 16 + 8))), "l"(_tcgen05_cp_desc_2)
                                     : "memory");
                             }
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1253,7 +1154,7 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                                 uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
                                 asm volatile(
                                     "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                    :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 12))), "l"(_tcgen05_cp_desc_3)
+                                    :: "r"((uint32_t)(tmem_sfa + (stage_5 * 16 + 12))), "l"(_tcgen05_cp_desc_3)
                                     : "memory");
                             }
                         }
@@ -1366,13 +1267,13 @@ kernel_cake_warp_decode_54cce2d7a5707cd6bc6f(const __grid_constant__ CUtensorMap
                             uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
 
                             tcgen05_mma_mxf4nvf4_bs((tmem_accum + ((acc_stage_1 + (unsigned int)route_slot) * 8)), a_desc + 0, b_desc + 0,
-                                0x8020480U, (unsigned int)tmem_sfa + k_stage * 16 + 0, (unsigned int)tmem_sfb + k_stage * 16 + 0, ((((route_k_4 == 0) ? 1 : 0)) ? 0 : 1));
+                                0x8020480U, tmem_sfa + k_stage * 16 + 0, tmem_sfb + k_stage * 16 + 0, ((((route_k_4 == 0) ? 1 : 0)) ? 0 : 1));
                             tcgen05_mma_mxf4nvf4_bs((tmem_accum + ((acc_stage_1 + (unsigned int)route_slot) * 8)), a_desc + 2, b_desc + 2,
-                                0x8020480U, (unsigned int)tmem_sfa + k_stage * 16 + 4, (unsigned int)tmem_sfb + k_stage * 16 + 4, 1);
+                                0x8020480U, tmem_sfa + k_stage * 16 + 4, tmem_sfb + k_stage * 16 + 4, 1);
                             tcgen05_mma_mxf4nvf4_bs((tmem_accum + ((acc_stage_1 + (unsigned int)route_slot) * 8)), a_desc + 4, b_desc + 4,
-                                0x8020480U, (unsigned int)tmem_sfa + k_stage * 16 + 8, (unsigned int)tmem_sfb + k_stage * 16 + 8, 1);
+                                0x8020480U, tmem_sfa + k_stage * 16 + 8, tmem_sfb + k_stage * 16 + 8, 1);
                             tcgen05_mma_mxf4nvf4_bs((tmem_accum + ((acc_stage_1 + (unsigned int)route_slot) * 8)), a_desc + 6, b_desc + 6,
-                                0x8020480U, (unsigned int)tmem_sfa + k_stage * 16 + 12, (unsigned int)tmem_sfb + k_stage * 16 + 12, 1);
+                                0x8020480U, tmem_sfa + k_stage * 16 + 12, tmem_sfb + k_stage * 16 + 12, 1);
                         }
                     }
                     if (route_k_4 + 1 == route_k_extent_6) {
