@@ -59,6 +59,11 @@ _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="PrimTS context attention requires SM100 or SM103",
 )
+_REQUIRES_CONTEXT_STATS_GPU = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="PrimTS context statistics require SM100, SM103, or SM107",
+)
 
 _HEAD_DIM = 128
 _FP8 = torch.float8_e4m3fn
@@ -949,6 +954,94 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
     assert context_module._ContextPlanState.__dataclass_params__.frozen is True
+
+
+def _row_strided_value(value: torch.Tensor, padding: int) -> torch.Tensor:
+    """Put V in aligned, offset storage with poisoned row/batch padding."""
+
+    row_stride = value.shape[-2] * value.shape[-1] + padding
+    strides = (row_stride, value.shape[-1], 1)
+    if value.ndim == 4:
+        strides = (value.shape[1] * row_stride + padding, *strides)
+    offset = 16 // value.element_size()
+    size = (
+        offset + sum((n - 1) * s for n, s in zip(value.shape, strides, strict=True)) + 1
+    )
+    storage = torch.full((size,), 32.0, device=value.device, dtype=value.dtype)
+    result = storage.as_strided(value.shape, strides, offset)
+    result.copy_(value)
+    return result
+
+
+@_REQUIRES_CONTEXT_STATS_GPU
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+def test_attention_ts_context_strided_v_reuse_and_graph(packed):
+    """Compact/padded V reuse one kernel and replay reloads the captured view."""
+
+    qk_dtype = v_dtype = torch.bfloat16
+    head_dim, head_dim_vo, heads = 192, 128, 6
+    case = _make_context_case(
+        q_lengths=(33, 17) if packed else (33, 33),
+        k_lengths=(257, 129) if packed else (257, 257),
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        qkv_dtype=qk_dtype,
+        packed_query=packed,
+        mask_type="causal",
+        head_dim=head_dim,
+        out_dtype=torch.bfloat16,
+        seed=20261105,
+    )
+    case = replace(case, v=case.v[..., :head_dim_vo].to(v_dtype).contiguous())
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=case.q.device,
+        batch_size=2,
+        max_q_len=max(case.q_lengths),
+        max_kv_len=max(case.k_lengths),
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        head_dim_vo=head_dim_vo,
+        q_dtype=qk_dtype,
+        k_dtype=qk_dtype,
+        v_dtype=v_dtype,
+        out_dtype=case.out_dtype,
+        packed_query=packed,
+        mask_type=case.mask_type,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+    )
+    compact_out = _run_wrapper(wrapper, case)
+    expected = _context_reference(case)
+    atol, rtol = 0.01, 0.02
+    torch.testing.assert_close(compact_out.float(), expected, atol=atol, rtol=rtol)
+    state = wrapper._plan_state
+    cache_before = context_module._get_compiled_context.cache_info()
+    for padding in (64, 192):
+        padded_case = replace(case, v=_row_strided_value(case.v, padding))
+        actual = _run_wrapper(wrapper, padded_case)
+        torch.testing.assert_close(actual, compact_out, atol=0, rtol=0)
+        assert wrapper._plan_state is state
+    assert context_module._get_compiled_context.cache_info() == cache_before
+    # The one-shot adapter has its own geometry validation and must accept V.
+    torch.testing.assert_close(
+        _run_one_shot(padded_case).float(), expected, atol=atol, rtol=rtol
+    )
+    graph = _capture_context_graph(
+        wrapper,
+        padded_case.q,
+        padded_case.k,
+        padded_case.v,
+        actual,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+    )
+    padded_case.v.copy_((padded_case.v.float() + 0.25).to(v_dtype))
+    expected = _context_reference(padded_case)
+    actual.zero_()
+    graph.replay()
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
 
 
 def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> None:
@@ -5029,7 +5122,55 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(graph_out, second)
 
 
-# Non-absorbed MLA: separate compact Q/K=192, V/O=128.
+@pytest.mark.parametrize("heads", [6, 96])
+@_REQUIRES_CONTEXT_STATS_GPU
+def test_attention_ts_context_mla_chunk_merge(heads):
+    """Merge a dense cached prefix with a causal suffix, for TP16 and DP heads."""
+    dtype = torch.bfloat16
+    torch.manual_seed(314)
+    q = torch.randn(1, 129, heads, 192, device="cuda").to(dtype)
+    k = torch.randn(1, 385, heads, 192, device="cuda").to(dtype)
+    v = torch.randn(1, 385, heads, 128, device="cuda").to(dtype)
+    pieces = []
+    for start, end, mask in ((0, 128, "dense"), (128, 385, "causal")):
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            device=q.device,
+            batch_size=1,
+            max_q_len=129,
+            max_kv_len=end - start,
+            num_qo_heads=heads,
+            num_kv_heads=heads,
+            head_dim=192,
+            head_dim_vo=128,
+            q_dtype=dtype,
+            k_dtype=dtype,
+            out_dtype=torch.bfloat16,
+            mask_type=mask,
+            lse_mode="base2",
+        )
+        stats = torch.empty(q.shape[:-1], device="cuda")
+        out = wrapper.run(
+            q,
+            k[0, start:end].unsqueeze(0),
+            v[0, start:end].unsqueeze(0),
+            lse=stats,
+        )
+        pieces.append((out.float(), stats))
+    (o0, s0), (o1, s1) = pieces
+    maximum = torch.maximum(s0, s1)
+    w0 = (s0 - maximum).exp2()
+    w1 = (s1 - maximum).exp2()
+    merged = (o0 * w0[..., None] + o1 * w1[..., None]) / (w0 + w1)[..., None]
+    scores = torch.einsum("bqhd,bkhd->bqhk", q.float(), k.float()) / math.sqrt(192)
+    mask = torch.arange(385, device="cuda")[None, :] > (
+        256 + torch.arange(129, device="cuda")[:, None]
+    )
+    scores.masked_fill_(mask[None, :, None, :], -torch.inf)
+    expected = torch.einsum("bqhk,bkhd->bqhd", scores.softmax(-1), v.float())
+    torch.testing.assert_close(merged, expected, atol=0.01, rtol=0.02)
+    relative_rms = (merged - expected).square().mean() / expected.square().mean()
+    assert relative_rms.sqrt() < 0.01
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
