@@ -318,13 +318,19 @@ def test_generalized_entry_parity_and_dispatch():
     # the direct specialized name produces the same bits
     spec_o, spec_l = ragged_attention_deepseek(**{**kwargs, "backend": "specialized"})
     assert torch.equal(spec_o, gen_o) and torch.equal(spec_l, gen_l)
-    # the vendor-named entry stays STOCK: it has no specialized backend
-    with pytest.raises(ValueError, match="trtllm-gen"):
-        trtllm_ragged_attention_deepseek(**{**kwargs, "backend": "specialized"})
     # the named "trtllm" backend equals the entry's trtllm-gen path
     stock_o, stock_l = ragged_attention_deepseek(**{**kwargs, "backend": "trtllm"})
     ds_o, ds_l = _api(inp, backend="trtllm")
     assert torch.equal(stock_o, ds_o) and torch.equal(stock_l, ds_l)
+    # the vendor-named entry stays STOCK: it never routes to the
+    # specialized kernel. (Stock behavior treats any non-"cute-dsl" name
+    # as the trtllm-gen path — unchanged by this PR.)
+    before = dict(spec_mod.DISPATCH_STATS)
+    ev_o, ev_l = trtllm_ragged_attention_deepseek(
+        **{**kwargs, "backend": "specialized"}
+    )
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+    assert torch.equal(ev_o, ds_o) and torch.equal(ev_l, ds_l)
     # return_lse=False leaves the specialized allowlist: "auto" must select
     # "trtllm" (no behavior of its own) and match the entry at the SAME args
     before = dict(spec_mod.DISPATCH_STATS)
