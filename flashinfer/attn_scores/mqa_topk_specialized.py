@@ -274,7 +274,10 @@ class SpecializedTopKPlan:
                 self._pool_src == k.data_ptr(),
                 "run must use the prepared K binding",
             )
-            _require(bool(torch.all(k_scale == 1.0).item()), "k_scale must stay unit")
+            _require(
+                bool(torch.all(k_scale == 1.0).item()),
+                "backend='specialized' requires unit k_scale at run as well",
+            )
             _require(
                 weights.is_cuda
                 and weights.dtype == torch.float32
