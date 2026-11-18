@@ -1073,9 +1073,14 @@ def test_registry_records_reference_the_build_manifest() -> None:
                     ),
                 ]
             else:
+                # An architecture whose build launches with other dynamic shared memory
+                # than the record's first architecture compiles its own binding.
+                own = f"csrc/{record['library']}_{arch}_binding.cu"
                 assert entry["sources"] == [
                     f"csrc/{record['library']}_kernel.cu",
-                    f"csrc/{record['library']}_binding.cu",
+                    own
+                    if (package / own).is_file()
+                    else f"csrc/{record['library']}_binding.cu",
                 ]
                 assert entry["nvcc_flags"] == ["--use_fast_math"]
             assert set(entry["sha256"]) == set(entry["sources"])
@@ -1083,6 +1088,25 @@ def test_registry_records_reference_the_build_manifest() -> None:
                 assert (package / source).is_file(), source
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
     assert referenced == set(libraries)
+    # The SM103 double-S and p3 builds keep eight K/V stages (six on SM100): their
+    # SM103 libraries compile their own binding with the larger dynamic shared memory.
+    assert sorted(
+        path.name for path in (package / "csrc").glob("*_sm_10*_binding.cu")
+    ) == sorted(
+        f"{loader.MODULES[name]['library']}_sm_103a_binding.cu"
+        for name in (
+            "attention_sd",
+            "attention_sd_pdl",
+            "attention_sd_tsplit",
+            "attention_sd_tsplit_pdl",
+            "attention_p3",
+            "attention_p3_pdl",
+            "attention_sdp3",
+            "attention_sdp3_pdl",
+            "attention_sd_tsplit_p3",
+            "attention_sd_tsplit_p3_pdl",
+        )
+    )
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
     sm120 = loader.records_of_role("attention_sm120")
     assert len(sm120) == 20 and len(loader.SM120_RECORDS) == 20
@@ -1100,7 +1124,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
     # The default attention build (and its PDL build) ships on both architectures; the
     # second build of each architecture (split QK on SM100, per tile on SM103) on its own;
-    # the double-S build, its tail-split build and the p3 build on both.
+    # the double-S build, its tail-split build, the p3 build and the double-S build with
+    # the p3 epilogue and its tail-split build on both.
     assert {
         name: loader.MODULES[name]["arches"]
         for name in loader.records_of_role("attention")
@@ -1117,9 +1142,18 @@ def test_registry_records_reference_the_build_manifest() -> None:
         "attention_sd_tsplit_pdl": ["sm_100a", "sm_103a"],
         "attention_p3": ["sm_100a", "sm_103a"],
         "attention_p3_pdl": ["sm_100a", "sm_103a"],
+        "attention_sdp3": ["sm_100a", "sm_103a"],
+        "attention_sdp3_pdl": ["sm_100a", "sm_103a"],
+        "attention_sd_tsplit_p3": ["sm_100a", "sm_103a"],
+        "attention_sd_tsplit_p3_pdl": ["sm_100a", "sm_103a"],
     }
     assert all(
         loader.MODULES[name]["launch"]["cluster"] == (2, 1, 1)
         and loader.MODULES[name]["grid_rule"] == {"kind": "tail_split_clusters"}
-        for name in ("attention_sd_tsplit", "attention_sd_tsplit_pdl")
+        for name in (
+            "attention_sd_tsplit",
+            "attention_sd_tsplit_pdl",
+            "attention_sd_tsplit_p3",
+            "attention_sd_tsplit_p3_pdl",
+        )
     )
