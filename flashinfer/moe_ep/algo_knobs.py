@@ -49,6 +49,20 @@ class FleetAlgoKnobNcclEpConfig(AlgoKnob):
     ``None`` leaves selection to the provider. ``eager_recv`` sizes HT receive
     arrays from the actual row count. It synchronizes that count to the host
     and does not support dispatch capture.
+
+    ``dispatch_zero_copy`` registers persistent receive windows outside capture
+    on EP 0.3. It requires LL rank-major layout and fixed receive geometry.
+    The provider uses the direct path on NVLink-only groups. This does not
+    elide its internal staging reservation or change combine. Later captures
+    on this Fleet share its receive window and must execute serially.
+
+    ``dispatch_quantization="forward"`` sends separate quantized value/scale
+    rows with EP 0.3. The split layer supports MXFP8 activations with its legacy
+    ``mxfp8_dispatch`` carrier packing disabled. ``combine_quantization="nvfp4"``
+    selects experimental LL rank-major NVFP4 return communication from BF16
+    expert outputs. FI computes per-row scales; NCCL compresses and combines
+    the outputs. Both choices default to ``"none"``. NVFP4 changes numerical
+    results and does not imply a change to the expert weight format.
     """
 
     num_topk: int | None = None
@@ -58,8 +72,17 @@ class FleetAlgoKnobNcclEpConfig(AlgoKnob):
     ht_flow: Literal["auto", "push_pull", "pull_push"] | None = None
     meta_exchange_policy: Literal["auto", "require_fused", "force_scan"] | None = None
     eager_recv: bool = False
+    dispatch_zero_copy: bool = False
+    dispatch_quantization: Literal["none", "forward"] = "none"
+    combine_quantization: Literal["none", "nvfp4"] = "none"
 
     def __post_init__(self) -> None:
+        if self.dispatch_quantization not in ("none", "forward"):
+            raise ValueError("dispatch_quantization must be none or forward")
+        if self.combine_quantization not in ("none", "nvfp4"):
+            raise ValueError("combine_quantization must be none or nvfp4")
+        if type(self.dispatch_zero_copy) is not bool:
+            raise ValueError("dispatch_zero_copy must be a bool")
         if type(self.eager_recv) is not bool:
             raise ValueError("eager_recv must be a bool")
         for name in ("num_topk", "max_num_sms", "dispatch_num_sms", "combine_num_sms"):

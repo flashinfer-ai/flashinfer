@@ -8,6 +8,7 @@ be exercised without a GPU, RDMA fabric, or the nccl-extensions wheel.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import enum
 import sys
@@ -189,6 +190,7 @@ def fake_nccl_ep():
 def bypass_build_checks():
     """Bypass build/arch checks and distributed comm resolution."""
     from flashinfer.moe_ep.backends.split.comm.nccl_ep import fleet as nccl_fleet
+    import torch
 
     with (
         mock.patch.object(nccl_fleet, "_require_built", return_value=None),
@@ -196,8 +198,18 @@ def bypass_build_checks():
         mock.patch.object(
             nccl_fleet, "validate_bootstrap_world_size", return_value=None
         ),
-        mock.patch.object(nccl_fleet, "_resolve_comm", return_value=object()),
-        mock.patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        mock.patch.object(
+            nccl_fleet,
+            "_resolve_comm",
+            return_value=types.SimpleNamespace(destroy=mock.Mock()),
+        ),
+        (
+            contextlib.nullcontext()
+            if torch.cuda.is_available()
+            else mock.patch(
+                "torch.cuda.is_current_stream_capturing", return_value=False
+            )
+        ),
         mock.patch.object(nccl_fleet.NcclEpFleet, "_current_stream", return_value=0),
     ):
         yield

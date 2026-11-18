@@ -14,6 +14,7 @@ import torch.nn as nn
 from ..algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobFaultTolerance,
+    FleetAlgoKnobNcclEpConfig,
     FleetAlgoKnobQuantization,
     FleetAlgoKnobTopologyCapacity,
     HandleAlgoKnobTopKWeights,
@@ -379,6 +380,11 @@ class MoEEpSplitLayer(nn.Module):
         self._fleet_params = fleet_params
         self._weights: Optional[MoEWeightPack] = weights
         self._fleet_knobs = list(fleet_knobs)
+        nccl_options = _index_knobs(self._fleet_knobs).get(FleetAlgoKnobNcclEpConfig)
+        self._forward_scales = (
+            isinstance(nccl_options, FleetAlgoKnobNcclEpConfig)
+            and nccl_options.dispatch_quantization == "forward"
+        )
         if isinstance(backend, SplitConfig):
             self._comm_backend = backend.comm
             self._kernel_config = backend.kernel
@@ -771,10 +777,27 @@ class MoEEpSplitLayer(nn.Module):
         # torch.distributed is initialized, and NixlEpFleet._resolve_store
         # raises the same actionable error when neither tcp_store nor an
         # initialized default group is available.
+        fleet_knobs = _index_knobs(self._fleet_knobs)
+        nccl_options = fleet_knobs.get(FleetAlgoKnobNcclEpConfig)
+        if (
+            isinstance(nccl_options, FleetAlgoKnobNcclEpConfig)
+            and (
+                nccl_options.dispatch_quantization != "none"
+                or nccl_options.combine_quantization != "none"
+            )
+            and backend_name != "nccl_ep"
+        ):
+            raise MoEEpConfigError("native communication quantization requires nccl_ep")
         if backend_name not in ("nccl_ep", "nixl_ep"):
             return
         validate_arch_for_backend(backend_name)
-        fleet_knobs = _index_knobs(self._fleet_knobs)
+        if self._forward_scales:
+            from ...fused_moe.api import QuantFormat
+
+            if self._kernel.dispatch_format() is not QuantFormat.MXFP8:
+                raise MoEEpConfigError(
+                    "native scale forwarding currently requires an MXFP8 dispatch format"
+                )
         cap_knob = fleet_knobs.get(FleetAlgoKnobTopologyCapacity)
         topology_capacity = (
             int(cap_knob.n) if cap_knob is not None else None  # type: ignore[attr-defined]
@@ -892,9 +915,13 @@ class MoEEpSplitLayer(nn.Module):
         """Dispatch, run the inner kernel and combine on a bound handle."""
         timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
         with self._stage(timings, "quantize"):
-            payload = self._kernel.pack_dispatch_payload(t.hidden_states)
+            if self._forward_scales:
+                values, scales = self._kernel.quantize_for_dispatch(t.hidden_states)
+                payload = [values.view(torch.float8_e4m3fn), scales]
+            else:
+                payload = [self._kernel.pack_dispatch_payload(t.hidden_states)]
         with self._stage(timings, "dispatch"):
-            dispatched = handle.dispatch(DispatchInputParams(x=[payload]))
+            dispatched = handle.dispatch(DispatchInputParams(x=payload))
         with self._stage(timings, "compute"):
             expert_out = (compute or self._kernel.compute)(
                 self._fleet_kernel_context(dispatched)
@@ -914,6 +941,9 @@ class MoEEpSplitLayer(nn.Module):
             recv_topk_idx=dispatched.recv_topk_idx,
             recv_topk_weights=dispatched.recv_topk_weights,
             recv_count=dispatched.expert_counts,
+            expert_tensors_scale=dispatched.expert_scales
+            if self._forward_scales
+            else None,
         )
 
     # ------------------------------------------ MoEEpCommunication path

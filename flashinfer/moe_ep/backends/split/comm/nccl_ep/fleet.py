@@ -113,7 +113,7 @@ def _resolve_comm(bootstrap: "BootstrapConfig"):
     1. ``bootstrap.nccl_comm`` set — *adopt* that existing ``ncclComm_t``.
        We wrap it with ``nccl.core.Communicator(ptr=...)``, which does NOT
        register a finalizer, and the Fleet only ever destroys the *group*
-       (never the comm), so the adopted communicator's lifetime stays with
+       (never the adopted comm), so the adopted communicator's lifetime stays with
        its real owner (e.g. vLLM's process group). This lets a host share
        the exact communicator it already owns instead of paying for a second
        NCCL bootstrap.
@@ -198,34 +198,60 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         # the Fleet because callers (e.g. vLLM) create a fresh Handle every
         # forward while the Fleet persists — per-handle caches never hit.
         self._hot_cache: dict = {}
+        self._dispatch_windows: dict = {}
 
         config = self._build_group_config()
-        self._comm = _resolve_comm(bootstrap)
-        self._group = self._nccl_ep.Group.create(self._comm, config)
+        self._destroyed = True
+        self._group = self._create_group(bootstrap, config)
         self._destroyed = False
 
-    def _knob_or_auto(self, knob_cls: type, field: str) -> int:
-        k = self._fleet_knobs.get(knob_cls)
+    def _create_group(self, bootstrap, config):
+        self._comm = _resolve_comm(bootstrap)
+        self._owns_comm = bootstrap.nccl_comm is None
+        try:
+            return self._nccl_ep.Group.create(self._comm, config)
+        except Exception:
+            self._destroy_owned_comm()
+            raise
+
+    def _destroy_owned_comm(self):
+        # NCCL4Py communicators require explicit destruction. An adopted pointer
+        # remains the caller's responsibility, including after group replacement.
+        if self._owns_comm:
+            self._comm.destroy()
+            self._owns_comm = False
+
+    def _knob_or_auto(self, knob_cls: type, field: str, fleet_knobs=None) -> int:
+        knobs = self._fleet_knobs if fleet_knobs is None else fleet_knobs
+        k = knobs.get(knob_cls)
         return int(getattr(k, field)) if k is not None else NCCL_EP_AUTO
 
-    def _build_group_config(self):
+    def _build_group_config(self, *, bootstrap=None, fleet_knobs=None):
         """Build :class:`nccl.ep.GroupConfig` from params + fleet knobs."""
         p = self._params
+        bootstrap = self._bootstrap if bootstrap is None else bootstrap
+        knobs = self._fleet_knobs if fleet_knobs is None else fleet_knobs
+        options = self._nccl_options(knobs)
         kwargs = dict(
             algorithm=_map_algorithm(p.algorithm),
             num_experts=p.num_experts,
             max_dispatch_tokens_per_rank=p.max_tokens_per_rank,
             max_token_bytes=p.token_hidden_size * p.dtype_bytes,
-            rdma_buffer_size=self._knob_or_auto(FleetAlgoKnobRdmaBufferSize, "bytes_"),
-            num_qp_per_rank=self._knob_or_auto(FleetAlgoKnobNumQpsPerRank, "n"),
-            num_channels=self._knob_or_auto(FleetAlgoKnobNumChannelsPerRank, "n"),
+            rdma_buffer_size=self._knob_or_auto(
+                FleetAlgoKnobRdmaBufferSize, "bytes_", knobs
+            ),
+            num_qp_per_rank=self._knob_or_auto(FleetAlgoKnobNumQpsPerRank, "n", knobs),
+            num_channels=self._knob_or_auto(
+                FleetAlgoKnobNumChannelsPerRank, "n", knobs
+            ),
         )
         if p.algorithm == EpAlgorithm.HIGH_THROUGHPUT:
-            world = self._bootstrap.world_size
+            world = bootstrap.world_size
             kwargs["max_recv_tokens_per_rank"] = (
-                0 if self._nccl_options().eager_recv else p.max_tokens_per_rank * world
+                0 if options.eager_recv else p.max_tokens_per_rank * world
             )
-        alloc = self._build_alloc_config()
+        kwargs.update(self._release_group_config(options))
+        alloc = self._build_alloc_config(knobs)
         if alloc is not None:
             kwargs["alloc"] = alloc
         if self._ft is not None:
@@ -234,21 +260,40 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             kwargs["enable_mask"] = True
             if self._ft.timeout_ms:  # type: ignore[attr-defined]
                 kwargs["timeout_ns"] = int(self._ft.timeout_ms) * 1_000_000  # type: ignore[attr-defined]
-        kwargs.update(self._release_group_config())
         return self._nccl_ep.GroupConfig(**kwargs)
 
-    def _nccl_options(self) -> FleetAlgoKnobNcclEpConfig:
-        knob = self._fleet_knobs.get(FleetAlgoKnobNcclEpConfig)
+    def _nccl_options(self, fleet_knobs=None) -> FleetAlgoKnobNcclEpConfig:
+        knobs = self._fleet_knobs if fleet_knobs is None else fleet_knobs
+        knob = knobs.get(FleetAlgoKnobNcclEpConfig)
         return (
             knob
             if isinstance(knob, FleetAlgoKnobNcclEpConfig)
             else FleetAlgoKnobNcclEpConfig()
         )
 
-    def _release_group_config(self) -> dict:
-        options = self._nccl_options()
+    def _release_group_config(self, options=None) -> dict:
+        options = self._nccl_options() if options is None else options
         modern = self._ep_version is not None and self._ep_version >= Version("0.3.0")
         kwargs = {}
+        if (
+            options.dispatch_quantization != "none"
+            or options.combine_quantization != "none"
+        ) and not modern:
+            raise MoEEpConfigError("native quantization requires EP 0.3")
+        if options.combine_quantization == "nvfp4":
+            if self._params.algorithm is not EpAlgorithm.LOW_LATENCY:
+                raise MoEEpConfigError("NVFP4 combine requires LOW_LATENCY")
+            if self._params.layout is not EpLayout.RANK_MAJOR:
+                raise MoEEpConfigError("NVFP4 combine currently requires RANK_MAJOR")
+            if self._params.token_hidden_size % 512:
+                raise MoEEpConfigError("NVFP4 combine requires hidden divisible by 512")
+        if options.dispatch_zero_copy:
+            if not modern:
+                raise MoEEpConfigError("dispatch windows require EP 0.3")
+            if self._params.algorithm is not EpAlgorithm.LOW_LATENCY:
+                raise MoEEpConfigError("dispatch windows require LOW_LATENCY")
+            if self._params.layout is not EpLayout.RANK_MAJOR:
+                raise MoEEpConfigError("dispatch windows require RANK_MAJOR layout")
         if options.eager_recv:
             if not modern:
                 raise MoEEpConfigError(
@@ -290,12 +335,56 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             )
         return kwargs
 
-    def _build_alloc_config(self):
+    @staticmethod
+    def _allocate_window_tensor(shape, dtype, device):
+        from nccl.core.interop.torch import empty
+
+        return empty(*shape, dtype=dtype, device=device)
+
+    def _dispatch_window(self, name, shape, dtype, device):
+        """Keep one registered receive allocation per payload for this group."""
+        import torch
+
+        signature = (tuple(shape), dtype, device)
+        cached = self._dispatch_windows.get(name)
+        if cached is not None:
+            if cached[0] != signature:
+                raise MoEEpConfigError(
+                    "dispatch window geometry changed; create a new Fleet"
+                )
+            return cached[1], cached[3]
+        if torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError(
+                "warm up dispatch windows outside CUDA graph capture"
+            )
+        from nccl.core import WindowFlag
+
+        tensor = self._allocate_window_tensor(shape, dtype, device)
+        window = self._comm.register_window(tensor, flags=WindowFlag.COLL_SYMMETRIC)
+        if window is None or not window.handle:
+            if window is not None:
+                window.close()
+            raise MoEEpConfigError("NCCL did not register the dispatch window")
+        try:
+            descriptor = self._nccl_ep.Tensor(tensor, window=window, window_offset=0)
+        except Exception:
+            window.close()
+            raise
+        self._dispatch_windows[name] = (signature, tensor, window, descriptor)
+        return tensor, descriptor
+
+    def _release_dispatch_windows(self):
+        for _, _, window, _ in self._dispatch_windows.values():
+            window.close()
+        self._dispatch_windows.clear()
+
+    def _build_alloc_config(self, fleet_knobs=None):
         """Build an ``nccl.ep.AllocConfig`` from FleetAlgoKnobAllocator, or None.
 
         None → leave ``GroupConfig.alloc`` at its default (cudaMalloc/cudaFree).
         """
-        knob = self._fleet_knobs.get(FleetAlgoKnobAllocator)
+        knobs = self._fleet_knobs if fleet_knobs is None else fleet_knobs
+        knob = knobs.get(FleetAlgoKnobAllocator)
         if knob is None:
             return None
         if knob.torch_caching:  # type: ignore[attr-defined]
@@ -322,6 +411,14 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
 
         import torch
         from nccl.ep import AllocFn, FreeFn  # type: ignore[import-not-found]
+
+        cached = getattr(self, "_alloc_trampolines", None)
+        if cached is not None:
+            # Candidate configuration must not release the live group's callbacks.
+            return (
+                ctypes.cast(cached[0], ctypes.c_void_p).value,
+                ctypes.cast(cached[1], ctypes.c_void_p).value,
+            )
 
         _CUDA_SUCCESS = 0
         _CUDA_ERROR_MEMORY_ALLOCATION = 2
@@ -560,19 +657,22 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         algo_knobs: Sequence[AlgoKnob] = (),
     ) -> None:
         """Re-create the EP group over a fresh communicator (grow/shrink)."""
+        knobs = _index_knobs(algo_knobs) if algo_knobs else self._fleet_knobs
+        validate_bootstrap_world_size(bootstrap)
+        config = self._build_group_config(bootstrap=bootstrap, fleet_knobs=knobs)
         self._wait_mask_update()
         if not self._destroyed:
             self._group.destroy()
-        self._fleet_knobs = (
-            _index_knobs(algo_knobs) if algo_knobs else self._fleet_knobs
-        )
+        self._release_dispatch_windows()
+        self._destroy_owned_comm()
+        self._destroyed = True
+        self._fleet_knobs = knobs
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
-        self._comm = _resolve_comm(bootstrap)
         # Topology (world size) changed — drop the cross-handle host caches so
         # recv buffers / counters / FFI descriptors are rebuilt at the new sizes.
         self._hot_cache.clear()
-        self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
+        self._group = self._create_group(bootstrap, config)
         self._any_handle_created = False
         self._destroyed = False
 
@@ -581,6 +681,8 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             return
         self._wait_mask_update()
         self._group.destroy()
+        self._release_dispatch_windows()
+        self._destroy_owned_comm()
         self._destroyed = True
 
     def __del__(self) -> None:

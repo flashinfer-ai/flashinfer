@@ -29,14 +29,47 @@ capture in this mode. The default fixed-capacity mode supports capture and
 avoids the host count read. Eager sizing is HT-only and cannot use
 `require_fused`. It does not reduce the provider's internal staging reservation.
 
-HT Expert-Major and quantized combine require a separate compute-layout
-integration; they are not exposed by this Flat adapter.
-The adapter also does not expose native dispatch-quantization recipes or
-window-backed zero-copy tensors, experimental LL NVFP4 combine, AFD role APIs,
-prepared-handle import, or an overflow-policy selector. The provider's default
-overflow policy still applies. CUDA 12, other LL JIT sizes, and the provider's
-opt-in CFT and NUCS paths are outside this qualification. These limits concern
-the split NCCL backend; native MegaMoE uses its own communication path.
+Set `dispatch_zero_copy=True` to register a persistent receive window for LL
+Rank-Major dispatch on EP0.3. Warm up outside CUDA graph capture; registration
+is collective and the payload shape, dtype and device must stay fixed for the
+Fleet. All handles on that Fleet share the receive allocation, so finish using
+one dispatch's output before issuing another. Destroy captured graphs and
+synchronize before destroying the Fleet. Its teardown closes the registrations.
+It also destroys communicators FI created itself. A communicator supplied
+through `BootstrapConfig.nccl_comm` remains caller-owned and usable afterward;
+NCCL can retain registration overhead until its owner destroys it.
+
+The provider selects direct dispatch on NVLink-only groups. This option keeps
+its internal staging reservation and does not alter combine. Receive tensors
+use the NCCL allocator, whose physical reservation is not included in PyTorch's
+allocated-memory counter. This is an opt-in path; its latency and memory cost
+depend on the workload.
+
+Set `dispatch_quantization="forward"` to forward quantized values and their
+scale rows separately using NCCL's FWD recipe. Through `MoEEpSplitLayer`, this
+requires MXFP8 activation dispatch and `FusedMoeKernelConfig.mxfp8_dispatch=False`;
+FI quantizes before dispatch and supplies the received scales to expert compute.
+The low-level handle takes `DispatchInputParams(x=[values, scales])`, with
+contiguous, matching row counts and 16-byte-aligned rows. LL Expert-Major,
+LL Rank-Major and HT Flat support forwarding; existing HT eager sizing also
+applies. Window-backed forwarding retains the LL Rank-Major restriction above.
+Fused provider DeepSeek FP8 dispatch quantization remains unwrapped.
+
+Set `combine_quantization="nvfp4"` to use experimental NVFP4 return communication
+on EP 0.3 with LL Rank-Major layout and hidden size divisible by 512. Expert
+outputs must be contiguous 3D BF16 tensors. FI computes FP32 per-row scales, including zero
+rows, and NCCL quantizes, transfers and combines those outputs into BF16 token
+results. This option changes communication precision independently of expert
+weight precision. Quantization error is expected; downstream model quality and
+performance depend on the workload. It supports capture after ordinary warmup.
+
+Both quantization fields default to `"none"`. Their availability does not
+change the existing BF16 path or select them automatically. HT Expert-Major,
+HT MXFP8 combine, HT window paths, AFD roles, prepared-handle import and an
+overflow-policy selector remain outside the adapter. The provider's default
+overflow policy still applies. CUDA 12, other LL JIT sizes, and opt-in CFT/NUCS
+remain outside qualification. These limits concern the split NCCL backend;
+native MegaMoE uses its own communication path.
 
 Fault-tolerance query/update use the C ABI because their Python counterparts
 take an EP Tensor and a host NumPy array rather than pointers. Mask updates keep

@@ -25,15 +25,19 @@ from flashinfer.moe_ep import (
 pytestmark = [pytest.mark.nvep, pytest.mark.gpu_4]
 
 
+def _assert_collective(condition, message):
+    failed = torch.tensor(int(not condition), device="cuda", dtype=torch.int32)
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    assert not failed.item(), message
+
+
 def _assert_collective_close(actual, expected):
     failure = None
     try:
         torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
     except AssertionError as error:
         failure = str(error)
-    failed = torch.tensor(int(failure is not None), device="cuda", dtype=torch.int32)
-    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-    assert not failed.item(), failure or "reference failed on another rank"
+    _assert_collective(failure is None, failure or "reference failed on another rank")
 
 
 def _identity_expected(inputs, *, weighted_combine):
@@ -47,6 +51,13 @@ def _identity_expected(inputs, *, weighted_combine):
     return (inputs.hidden_states.float() * gain[:, None]).to(inputs.hidden_states.dtype)
 
 
+def test_collective_assertion_reports_remote_failure(released_runtime):
+    rank, _ = released_runtime
+    with pytest.raises(AssertionError, match="injected rank-zero failure"):
+        _assert_collective(rank != 0, "injected rank-zero failure")
+    dist.barrier()
+
+
 @pytest.fixture(scope="module")
 def released_runtime():
     if int(os.environ.get("WORLD_SIZE", "1")) < 4 or not torch.cuda.is_available():
@@ -55,18 +66,15 @@ def released_runtime():
     if ep.get_lib_version() < Version("0.3.0"):
         pytest.skip("requires nccl-extensions 0.2 (EP 0.3)")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    owned = not dist.is_initialized()
-    if owned:
+    if not dist.is_initialized():
         dist.init_process_group(
             "nccl",
             device_id=torch.device("cuda", torch.cuda.current_device()),
             timeout=timedelta(minutes=60),
         )
-    try:
-        yield dist.get_rank(), dist.get_world_size()
-    finally:
-        if owned:
-            dist.destroy_process_group()
+    # The shared session hook owns teardown; NCCL cannot be reinitialized
+    # between test modules in the same workers.
+    yield dist.get_rank(), dist.get_world_size()
 
 
 def _layer_and_inputs(
@@ -148,10 +156,18 @@ def test_release_ht_eager_receive_arrays(released_runtime, flow):
             )
             received = 16 if owner is None else (8 * world if rank == owner else 0)
             handle = state._handle
-            assert handle._dispatch_output_t.shape == (max(1, received), 4096)
-            assert int(handle._recv_total_target.item()) == received
-            if received == 0:
-                assert handle._dispatch_out_idx.eq(-1).all()
+            _assert_collective(
+                handle._dispatch_output_t.shape == (max(1, received), 4096),
+                "receive-array shape mismatch",
+            )
+            _assert_collective(
+                int(handle._recv_total_target.item()) == received,
+                "received-token counter mismatch",
+            )
+            _assert_collective(
+                received != 0 or handle._dispatch_out_idx.eq(-1).all().item(),
+                "empty receive row contains active expert IDs",
+            )
         allocated = []
         for _ in range(3):
             cycle = []
@@ -165,7 +181,10 @@ def test_release_ht_eager_receive_arrays(released_runtime, flow):
                 gc.collect()
                 cycle.append(torch.cuda.memory_allocated())
             allocated.append(cycle)
-        assert max(allocated[2]) <= max(allocated[1]) + 64 * 1024
+        _assert_collective(
+            max(allocated[2]) <= max(allocated[1]) + 64 * 1024,
+            "receive-array retention grew after warmup",
+        )
         print(
             "EAGER_RECV_RETENTION "
             + json.dumps(dict(rank=rank, flow=flow, allocated_bytes=allocated))
@@ -240,12 +259,16 @@ def test_release_mask_api_and_readmission(released_runtime):
         mixed = [1] * world
         mixed[(rank + 1) % world] = 0
         fleet.set_active_mask(mixed)
-        assert fleet.query_active_mask().cpu().tolist() == mixed
+        observed_mask = fleet.query_active_mask().cpu().tolist()
         # Restore before collective work: each rank used a different local mask.
         fleet.set_active_mask([1] * world)
         fleet.set_active_mask([1] * world)
-        assert fleet.query_active_mask().cpu().tolist() == [1] * world
-        assert not fleet.query_fault()
+        _assert_collective(observed_mask == mixed, "mask query did not match update")
+        _assert_collective(
+            fleet.query_active_mask().cpu().tolist() == [1] * world,
+            "mask restoration failed",
+        )
+        _assert_collective(not fleet.query_fault(), "unexpected fault flag")
         dist.barrier()
         fleet.clear_faults(readmit=True)
         output = layer.forward(inputs)

@@ -108,6 +108,76 @@ def test_eager_ht_capture_fails_before_provider_calls(
     assert handle._handle.calls == []
 
 
+@pytest.mark.parametrize("forward", [False, True])
+def test_empty_ht_rows_use_the_operation_stream(
+    fake_nccl_ep, bypass_build_checks, monkeypatch, forward
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    from flashinfer.moe_ep import (
+        DispatchInputParams,
+        EpAlgorithm,
+        FleetAlgoKnobNcclEpConfig,
+        HandleAlgoKnobUserStream,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA streams")
+    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
+    fake_nccl_ep.DispatchQuantizationRecipe = SimpleNamespace(FWD=1)
+    operation, caller = torch.cuda.Stream(), torch.cuda.Stream()
+    fleet = _make_fleet(
+        fake_nccl_ep,
+        algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+        knobs=[
+            FleetAlgoKnobNcclEpConfig(
+                eager_recv=True, dispatch_quantization="forward" if forward else "none"
+            )
+        ],
+    )
+    handle = _make_handle(
+        fleet, extra_knobs=[HandleAlgoKnobUserStream(operation.cuda_stream)]
+    )
+    handle._recv_total_target.zero_()
+    values = torch.ones(16, 2048, device="cuda", dtype=torch.bfloat16)
+    payload = (
+        [values.to(torch.float8_e4m3fn), torch.empty(16, 16, device="cuda")]
+        if forward
+        else [values]
+    )
+    streams = []
+    original_zero, original_fill = torch.Tensor.zero_, torch.Tensor.fill_
+
+    def zero(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            streams.append(torch.cuda.current_stream().cuda_stream)
+        return original_zero(tensor, *args, **kwargs)
+
+    def fill(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            streams.append(torch.cuda.current_stream().cuda_stream)
+        return original_fill(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "zero_", zero)
+    monkeypatch.setattr(torch.Tensor, "fill_", fill)
+    try:
+        with torch.cuda.stream(caller):
+            handle.dispatch(DispatchInputParams(x=payload))
+            assert torch.cuda.current_stream() == caller
+        torch.cuda.synchronize()
+        assert streams == [operation.cuda_stream] * (4 if forward else 3)
+        assert handle._dispatch_output_t.eq(0).all()
+        assert handle._dispatch_out_w.eq(0).all()
+        assert handle._dispatch_out_idx.eq(-1).all()
+        if forward:
+            assert handle._dispatch_scale_t.eq(0).all()
+    finally:
+        handle.destroy()
+        fleet.destroy()
+
+
 # -------------------------------------------------------------------- _wrap
 
 

@@ -766,3 +766,12 @@ def test_capture_guard_reason_is_per_operation(
             fleet.set_active_mask([1, 1, 0, 1])
         with pytest.raises(RuntimeError, match="consumed on the host"):
             fleet.query_active_mask()
+
+
+def test_build_fixture_preserves_cuda_capture_detection(monkeypatch, request):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    request.getfixturevalue("bypass_build_checks")
+    assert torch.cuda.is_current_stream_capturing()
