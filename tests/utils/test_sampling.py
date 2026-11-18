@@ -3350,6 +3350,74 @@ def test_top_p_renorm_probs_specialized_non_unit_mass_rows_match_air(
     assert int((out[2] > 0).sum()) == vocab_size // 2
 
 
+def _top_p_specialized_vanishing_rows(vocab_size, g):
+    """Rows whose positive entries all lie below the head paths' 2^-57 resolution, with their
+    top_p (float32): the radix path's fixed point follows the row's own mass."""
+    v = vocab_size
+    rows, top_ps = [], []
+    # the review's row: 2^-60 alone reaches top_p * mass, left unnormalised
+    row = torch.zeros(v, dtype=torch.float64)
+    row[0], row[1] = 2.0**-60, 2.0**-61
+    rows.append(row)
+    top_ps.append(0.5)
+    # the same values spread over every CTA's slice
+    row = torch.zeros(v, dtype=torch.float64)
+    row[::150] = 2.0**-60
+    row[75::150] = 2.0**-61
+    rows.append(row)
+    top_ps.append(0.5)
+    # vanishing everywhere
+    rows.append(
+        torch.where(torch.arange(v) % 2 == 0, 2.0**-70, 2.0**-71).to(torch.float64)
+    )
+    top_ps.append(0.5)
+    # a wide serving-like row scaled to mass 1e-25 (a nucleus deep in the tail)
+    rows.append(_top_p_specialized_row(2, v, g) * 1e-25)
+    top_ps.append(0.8)
+    # subnormal entries (AIR's -use_fast_math build flushes them: compared with float64 only)
+    row = torch.zeros(v, dtype=torch.float64)
+    row[3], row[v - 5] = 2.0**-140, 2.0**-141
+    rows.append(row)
+    top_ps.append(0.5)
+    # all zero: stays all zero
+    rows.append(torch.zeros(v, dtype=torch.float64))
+    top_ps.append(0.5)
+    return torch.stack(rows).float(), torch.tensor(top_ps, dtype=torch.float32)
+
+
+def test_top_p_renorm_probs_specialized_vanishing_rows_match_air(
+    top_p_specialized_enabled, monkeypatch
+):
+    # Positive entries too small for the head paths' 2^-56 fixed point still carry mass: the
+    # radix path selects in a per-row power-of-two fixed point (the row's mass in [2^58, 2^61)
+    # units), so these rows keep the same entries as AIR and the float64 reference, left
+    # unnormalised (kept mass <= 1e-8).
+    _skip_unless_sm103()
+    batch_size, vocab_size = 6, 154880
+    probs, tp = _top_p_specialized_vanishing_rows(
+        vocab_size, torch.Generator().manual_seed(21)
+    )
+    assert probs.shape[0] == batch_size
+    assert (probs[4] > 0).sum() == 2 and float(probs[4].max()) < 2.0**-126
+    tp = _top_p_specialized_robust_top_p(probs, tp)
+    probs, tp = probs.cuda(), tp.cuda()
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    ref = _top_p_specialized_reference(probs, tp).to(out.device)
+    assert torch.isfinite(out).all()
+    air_rows = [0, 1, 2, 3, 5]
+    torch.testing.assert_close(out[air_rows], stock[air_rows], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
+    assert out[0, 0].item() == 2.0**-60 and int((out[0] > 0).sum()) == 1
+    assert int((out[1] > 0).sum()) == int((probs[1] == 2.0**-60).sum())
+    assert int((out[2] > 0).sum()) == vocab_size // 2
+    assert out[4, 3].item() == 2.0**-140 and int((out[4] > 0).sum()) == 1
+    assert not out[5].any()
+
+
 def test_top_p_renorm_probs_specialized_launch_plan_matches_the_kernel(
     top_p_specialized_enabled,
 ):

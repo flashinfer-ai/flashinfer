@@ -45,13 +45,15 @@
 //
 // Compared with the AIR radix top-p (air_top_p.cuh: five kernels, one 1024-thread CTA per row in
 // the apply pass), this keeps the whole GPU busy for small batches (16 CTAs per row) and reads
-// the row once on the fast path. Accumulation is 64-bit fixed point (2^-56): each entry is
-// rounded to 2^-57 at most, so for rows that sum to ~1 it is at least as precise as the float32
-// accumulation it replaces; the one discontinuous decision on the mass (a kept mass <= 1e-8 is
-// left unnormalised) is re-checked in float64 near its cutoff. A row of mass 64 or more (never a
-// probability row; the 2^-56 accumulator overflows at 256) takes the radix path in a coarser
-// power-of-two fixed point that keeps its mass below 2^61 units. No fast-math is used (the JIT
-// module is built without -use_fast_math, so the renormalising division is the IEEE division).
+// the row once on the fast path. Accumulation is 64-bit fixed point: 2^-56 on the head paths
+// (exact for their entries, >= 2^-8), and 2^-q on the radix path, q chosen per row from its
+// float32 mass so that the mass lies in [2^58, 2^61) units: every entry above 2^-61 of the row's
+// mass is resolved, whatever the row's scale, so a vanishing row (entries below 2^-57, down to
+// subnormals) or a heavy one (mass 64 or more; the head paths are off for it) is selected like a
+// probability row. For rows that sum to ~1 this is at least as precise as float64. The one
+// discontinuous decision on the mass (a kept mass <= 1e-8 is left unnormalised) is re-checked in
+// float64 near its cutoff. No fast-math is used (the JIT module is built without
+// -use_fast_math, so the renormalising division is the IEEE division).
 //
 // Requires sm_90+ (thread-block clusters, distributed shared memory).
 
@@ -70,14 +72,19 @@ constexpr int LBITS = 0x37800000;  // bits of 2^-16: fallback level-0 filter
 constexpr int CBITS = 0x3B800000;  // bits of 2^-8: fast-path head-entry cutoff
 constexpr int CAP = 256;           // head entries per row (mass <= 1 => at most 256)
 constexpr float FIX_SCALE = 72057594037927936.0f;  // 2^56
-constexpr float BIG_MASS = 64.0f;  // a row this heavy is selected in a coarser fixed point
+constexpr float BIG_MASS = 64.0f;                  // a row this heavy never takes the head paths
 
 typedef unsigned long long u64;
 
-// Fixed-point mass of p; 0 for p <= 0 and NaN (the conversion saturates at 0).
-__device__ __forceinline__ u64 to_fix(float p, float scale = FIX_SCALE) {
-  return __float2ull_rn(p * scale);
+// Fixed-point mass of p in units of 2^-q, 2^q = scale * scale2 (two factors, so that q can exceed
+// a float's exponent range for a row of tiny entries; each product is exact); 0 for p <= 0 and
+// NaN (the conversion saturates at 0).
+__device__ __forceinline__ u64 to_fix(float p, float scale = FIX_SCALE, float scale2 = 1.f) {
+  return __float2ull_rn(p * scale * scale2);
 }
+
+// 2^k as a float, for k in [-126, 127].
+__device__ __forceinline__ float exp2i(int k) { return __int_as_float((k + 127) << 23); }
 
 // max(1, round(top_p * mass)) in exact integer arithmetic: AIR's target blockSum * p for a
 // fixed-point row mass (top_p >= 1 gives the whole mass). The minimum of one unit (top_p <= 0 or
@@ -119,8 +126,8 @@ __device__ __forceinline__ void cl_wait() {
 
 // mode 0: p >= 2^-16, key bits>>20      mode 1: 0 < p < 2^-16, key bits>>20
 // mode 2: bits>>20 == prefix, key (bits>>9)&0x7FF     mode 3: bits>>9 == prefix, key bits&0x1FF
-__device__ __forceinline__ void hist_add(float x, int mode, int prefix, float scale, u64* lmass,
-                                         unsigned* lcnt) {
+__device__ __forceinline__ void hist_add(float x, int mode, int prefix, float scale, float scale2,
+                                         u64* lmass, unsigned* lcnt) {
   int bits = __float_as_int(x);
   if (bits <= 0) return;
   bool f;
@@ -139,7 +146,7 @@ __device__ __forceinline__ void hist_add(float x, int mode, int prefix, float sc
     key = bits & 0x1FF;
   }
   if (f) {
-    atomicAdd(&lmass[key], to_fix(x, scale));
+    atomicAdd(&lmass[key], to_fix(x, scale, scale2));
     atomicAdd(&lcnt[key], 1u);
   }
 }
@@ -151,8 +158,8 @@ __device__ __forceinline__ double kept_f64(float x, int kshift, int kprefix) {
 }
 
 // Fixed-point mass of an entry below the fallback's level-0 range (0 for p >= 2^-16 and p <= 0).
-__device__ __forceinline__ u64 tail_fix(float x, float scale) {
-  return (__float_as_int(x) < LBITS) ? to_fix(x, scale) : 0ULL;
+__device__ __forceinline__ u64 tail_fix(float x, float scale, float scale2) {
+  return (__float_as_int(x) < LBITS) ? to_fix(x, scale, scale2) : 0ULL;
 }
 
 __device__ __forceinline__ void cand_add(float x, int gi, int* s_n, float* s_cv, int* s_ci) {
@@ -439,14 +446,23 @@ __global__ void __launch_bounds__(NT, MINB)
   int mode = 0, prefix = 0, kshift = 0, kprefix = 0;
   const float4* sd4 = reinterpret_cast<const float4*>(psrc);
   const int len4 = len >> 2;
-  // The fixed point: 2^-56, or for a heavy row 2^-q with q chosen from its float32 mass f so that
-  // the mass stays below 2^61 units (it is below 2^(e+2) allowing for f's rounding).
-  float scale = FIX_SCALE, inv_scale = 1.0f / FIX_SCALE;
-  if (big) {
-    const int e = min(max(ilogbf(s_fmass), 6), 185);
-    const int q = 59 - e;  // in [-126, 53]
-    scale = __int_as_float((q + 127) << 23);
-    inv_scale = __int_as_float((127 - q) << 23);
+  // The radix path's fixed point is 2^-q per row, q chosen from the row's float32 mass f = 2^e *
+  // [1, 2) so that its exact mass lies in [2^58, 2^61) units (below 2^(e+2) allowing for f's
+  // rounding): every entry above 2^-61 of the row's mass is resolved (finer than float64), whatever
+  // the row's scale, so a vanishing row (all entries below 2^-57) is selected like any other
+  // instead of having zero mass. A row the head paths may resolve (mass < 64) keeps q >= 56, their
+  // fixed point, so both paths resolve the same target. An all-zero row (f = 0, ilogbf = INT_MIN)
+  // has no mass at any scale. (A row of mass in [8, 64) keeps 2^-56; computing the scale only in
+  // the branch below keeps ptxas from spilling more in the streaming loop of the 40-register
+  // launch configurations.)
+  int q = 56;
+  float scale = FIX_SCALE, scale2 = 1.f;  // 2^q = scale * scale2, each factor a normal float
+  if (big || s_fmass < 8.f) {
+    const int e = min(max(ilogbf(s_fmass), -149), 185);
+    q = 59 - e;  // in [-126, 53] for a heavy row, [57, 208] otherwise
+    const int q1 = min(q, 127);
+    scale = exp2i(q1);
+    scale2 = exp2i(q - q1);
   }
   u64 target = 1;  // the exact target, set on level 0
   for (int lvl = 0; lvl < 4; ++lvl) {
@@ -463,20 +479,20 @@ __global__ void __launch_bounds__(NT, MINB)
     if (VEC) {
       for (int i = t; i < len4; i += NT) {
         float4 x = sd4[i];
-        hist_add(x.x, mode, prefix, scale, lmass, lcnt);
-        hist_add(x.y, mode, prefix, scale, lmass, lcnt);
-        hist_add(x.z, mode, prefix, scale, lmass, lcnt);
-        hist_add(x.w, mode, prefix, scale, lmass, lcnt);
+        hist_add(x.x, mode, prefix, scale, scale2, lmass, lcnt);
+        hist_add(x.y, mode, prefix, scale, scale2, lmass, lcnt);
+        hist_add(x.z, mode, prefix, scale, scale2, lmass, lcnt);
+        hist_add(x.w, mode, prefix, scale, scale2, lmass, lcnt);
         if (lvl == 0) {
-          tail += tail_fix(x.x, scale) + tail_fix(x.y, scale) + tail_fix(x.z, scale) +
-                  tail_fix(x.w, scale);
+          tail += tail_fix(x.x, scale, scale2) + tail_fix(x.y, scale, scale2) +
+                  tail_fix(x.z, scale, scale2) + tail_fix(x.w, scale, scale2);
         }
       }
     } else {
       for (int i = t; i < len; i += NT) {
         const float x = psrc[i];
-        hist_add(x, mode, prefix, scale, lmass, lcnt);
-        if (lvl == 0) tail += tail_fix(x, scale);
+        hist_add(x, mode, prefix, scale, scale2, lmass, lcnt);
+        if (lvl == 0) tail += tail_fix(x, scale, scale2);
       }
     }
     if (lvl == 0) {
@@ -589,17 +605,23 @@ __global__ void __launch_bounds__(NT, MINB)
   // Like the stock AIR apply pass, a row whose kept mass is <= 1e-8 is left unnormalised (norm
   // 1.0): an all-zero (or vanishing) row stays as it is instead of becoming 0/0 = NaN or x/0 = inf.
   // The head paths above never get here with such a row (their entries are >= 2^-8).
-  // The cutoff 1e-8f is exactly KEEP_CUT units of 2^-56. sumfix carries up to 1/2 unit of rounding
-  // per kept entry (at most V of them), so a sum within V units of the cutoff can land on the
-  // wrong side of it: such a row re-sums its kept entries in float64 (relative error below
-  // V * 2^-53, in a fixed order) and decides on that. A probability row never gets here (its kept
-  // mass is at least its maximum, >= 1/V), so the served rows pay one integer comparison; nor
-  // does a heavy row (its kept mass is at least its maximum, >= 64/V).
+  // The cutoff 1e-8f is exactly KEEP_CUT units of 2^-56, a multiple of 2^6, so exactly
+  // KEEP_CUT * 2^(q - 56) units of 2^-q for q in [50, 90]. A row with q < 50 has a mass of at least
+  // 2^9 (kept mass >= its maximum >= 2^9 / V: always normalised), one with q > 90 a mass below
+  // 2^-29 (never normalised). sumfix carries up to 1/2 unit of rounding per kept entry (at most V
+  // of them), so a sum within V units of the cutoff can land on the wrong side of it: such a row
+  // re-sums its kept entries in float64 (relative error below V * 2^-53, in a fixed order) and
+  // decides on that. A probability row never gets here (its kept mass is at least its maximum,
+  // >= 1/V), so the served rows pay one integer comparison.
   constexpr u64 KEEP_CUT = 720575936ULL;
-  bool normalise = big || sumfix > KEEP_CUT;
-  float sumf = __ull2float_rn(sumfix) * inv_scale;
-  // sumfix is identical in every CTA of the cluster, so this branch (and its barrier) is uniform.
-  if (!big && (sumfix > KEEP_CUT ? sumfix - KEEP_CUT : KEEP_CUT - sumfix) < (u64)V) {
+  const u64 cut = (q < 50 || q > 90) ? 0ULL
+                  : (q >= 56)        ? (KEEP_CUT << (q - 56))
+                                     : (KEEP_CUT >> (56 - q));
+  bool normalise = (q < 50) || (q <= 90 && sumfix > cut);
+  float sumf = (q <= 90) ? __ull2float_rn(sumfix) * exp2i(-q) : 1.0f;
+  // q and sumfix are identical in every CTA of the cluster, so this branch (and its barrier) is
+  // uniform.
+  if (q >= 50 && q <= 90 && (sumfix > cut ? sumfix - cut : cut - sumfix) < (u64)V) {
     double part = 0.0;
     if (VEC) {
       for (int i = t; i < len4; i += NT) {
