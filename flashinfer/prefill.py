@@ -9221,6 +9221,22 @@ def trtllm_ragged_attention_deepseek(
 # its own.
 RAGGED_DEEPSEEK_BACKENDS = ("auto", "specialized", "trtllm", "cute-dsl")
 
+# Defaults of trtllm_ragged_attention_deepseek's optional parameters, for the
+# front's keyword fast path (kept in sync with the entry's signature; the
+# positional slow path binds the real signature).
+_RAGGED_DEEPSEEK_DEFAULTS = dict(
+    attention_sinks=None,
+    skip_softmax_threshold_scale_factor=None,
+    out=None,
+    lse=None,
+    sage_attn_sfs=(None, None, None, None),
+    num_elts_per_sage_attn_blk=(0, 0, 0, 0),
+    q_seq_lens_cpu=None,
+    kv_seq_lens_cpu=None,
+    use_fp16_softmax=None,
+    uses_spcompress=None,
+)
+
 
 def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
     """Generalized ragged (varlen, non-paged) DeepSeek MLA prefill attention.
@@ -9247,17 +9263,24 @@ def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
             f"backend must be one of {RAGGED_DEEPSEEK_BACKENDS}, got {backend!r}"
         )
     if backend in ("auto", "specialized"):
-        import inspect as _inspect
-
         from .mla_ragged_prefill_dsr1_cuda import (
             maybe_dispatch_specialized as _mds,
         )
 
-        bound = _inspect.signature(trtllm_ragged_attention_deepseek).bind(
-            *args, **kwargs
-        )
-        bound.apply_defaults()
-        a = bound.arguments
+        if args:
+            # positional usage: full signature bind (slow path)
+            import inspect as _inspect
+
+            bound = _inspect.signature(trtllm_ragged_attention_deepseek).bind(
+                *args, **kwargs
+            )
+            bound.apply_defaults()
+            a = dict(bound.arguments)
+        else:
+            # keyword usage (the serving call form): defaults + kwargs,
+            # no inspect machinery on the hot path
+            a = dict(_RAGGED_DEEPSEEK_DEFAULTS)
+            a.update(kwargs)
         served = _mds(
             backend=backend,
             query=a["query"],
