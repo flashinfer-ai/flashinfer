@@ -471,6 +471,161 @@ def test_fc1_half_chunk_headroom_with_activation_outliers(T):
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
 
+@pytest.mark.parametrize("T", [1, 4, 16, 256, 2048])
+@pytest.mark.parametrize(
+    "w2_value,expected",
+    [(2.0**-12, 1024.0), (2.0**-18, 16.0), (0.125, 524288.0)],
+)
+def test_block_peak_uniform_weights_match_analytic(T, w2_value, expected):
+    # Regression (Codex, H100-reproduced): uniform BF16 weights through the
+    # PUBLIC preparer put every e4m3 mantissa at the block peak (448) with an
+    # ordinary fp32 block scale, and three fp16-range defects then produced
+    # Inf/0 where the analytic (and stock-CUTLASS) result is exact and
+    # finite: (1) the small-T fc2 inner product accumulated raw-mantissa
+    # products in half and overflowed before the fp32 block scale was
+    # applied; (2) the grouped dequant narrowed the fp32 scale to half
+    # before the multiply, flushing small scales (e.g. 2**-18/448) to zero;
+    # (3) the grouped per-slot partial buffer was half, overflowing at
+    # 65504 while the BF16 output range is far larger.
+    # With x = 1, W13 = 0.25 (H=512): up = gate = 128, h = silu(128)*128 =
+    # 16384, out = 16384 * w2 * I. All three expectations are exact BF16.
+    _sm90_or_skip()
+    from flashinfer.fused_moe.prepare import prepare_cutlass_fp8_block_weights
+
+    device = torch.device("cuda:0")
+    w13 = torch.full((E, 2 * I, H), 0.25, dtype=torch.bfloat16, device=device)
+    w2 = torch.full((E, H, I), w2_value, dtype=torch.bfloat16, device=device)
+    view = prepare_cutlass_fp8_block_weights(
+        w13, w2, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    g = torch.Generator(device=device)
+    g.manual_seed(0)
+    ids = torch.stack(
+        [torch.randperm(E, generator=g, device=device)[:K] for _ in range(T)]
+    ).to(torch.int32)
+    b = dict(
+        x=torch.ones((T, H), dtype=torch.bfloat16, device=device),
+        w13=view["fc1_expert_weights"],
+        s13=view["fc1_block_scale"],
+        w2=view["fc2_expert_weights"],
+        s2=view["fc2_block_scale"],
+        ids=ids,
+        tw=torch.full((T, K), 1.0 / K, dtype=torch.float32, device=device),
+    )
+    out = _dispatch(b)
+    assert out is not None
+    assert torch.isfinite(out.float()).all(), (
+        float(out.float().min()),
+        float(out.float().max()),
+    )
+    exp = torch.full((T, H), expected, dtype=torch.bfloat16, device=device)
+    assert torch.equal(out, exp), (
+        float(out.float().min()),
+        float(out.float().max()),
+        expected,
+    )
+
+
+def test_independent_graph_captures_get_distinct_scratch():
+    # Regression (Codex, H100-reproduced): torch.cuda.graph reuses one
+    # default capture stream for every capture in the process, so keying
+    # graph scratch by (device, capture stream) handed two INDEPENDENT
+    # graphs the same buffer — each correct in isolation, 42-58/100 trials
+    # corrupted under concurrent replay. Ownership is per capture now
+    # (CUDA capture-sequence id); sharing is only by explicit opt-in
+    # (FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE=1).
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    device = torch.device("cuda:0")
+    T = 16
+    b1, b2 = _make(T, device, seed=11), _make(T, device, seed=22)
+    ref1 = _dispatch(b1).clone()
+    ref2 = _dispatch(b2).clone()
+    out1 = torch.empty((T, H), dtype=torch.bfloat16, device=device)
+    out2 = torch.empty_like(out1)
+
+    def capture(b, out):
+        g = torch.cuda.CUDAGraph()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            assert _dispatch(b, output=out) is not None  # primes a workspace
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(g):  # the shared default capture stream
+            assert _dispatch(b, output=out) is not None
+        return g
+
+    before = set(smallt._graph_workspaces)
+    g1 = capture(b1, out1)
+    g2 = capture(b2, out2)
+    new_ws = [v for k, v in smallt._graph_workspaces.items() if k not in before]
+    assert len(new_ws) == 2, "each independent capture must own its scratch"
+    assert new_ws[0].data_ptr() != new_ws[1].data_ptr()
+
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    for _ in range(100):
+        out1.zero_()
+        out2.zero_()
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            g1.replay()
+        with torch.cuda.stream(s2):
+            g2.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out1, ref1)
+        assert torch.equal(out2, ref2)
+
+
+def test_two_moe_layers_concurrent_graph_replay():
+    # The public form of the same regression: two independent MoELayer
+    # instances, distinct weights/activations, no shared graph pool, each
+    # captured via torch.cuda.graph (shared default capture stream) and
+    # replayed concurrently, must match their eager outputs bitwise.
+    _sm90_or_skip()
+    layer1, act1, weights1, _b1 = _unified_layer(16, None, seed=31)
+    layer2, act2, weights2, _b2 = _unified_layer(16, None, seed=32)
+    ref1 = layer1(act1, weights1).clone()
+    ref2 = layer2(act2, weights2).clone()
+    # torch.cuda.graph's priming pattern: eager warmup on a side stream
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        layer1(act1, weights1)
+        layer2(act2, weights2)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g1, g2 = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g1):
+        out1 = layer1(act1, weights1)
+    with torch.cuda.graph(g2):
+        out2 = layer2(act2, weights2)
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    for _ in range(100):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            g1.replay()
+        with torch.cuda.stream(s2):
+            g2.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out1, ref1)
+        assert torch.equal(out2, ref2)
+
+
+def test_pack_inputs_binds_no_cutlass_workspace():
+    # The specialized runner never consumes the CUTLASS workspace, so
+    # neither packing path (pack_inputs or the tuning-input hook) may load
+    # the stock CUTLASS module or retain its workspace allocation.
+    _sm90_or_skip()
+    layer, act, weights, _ = _unified_layer(4, None)
+    (runner,) = layer.runners
+    inputs = runner.pack_inputs(act, weights)
+    runner._prepare_tuning_inputs(list(inputs))
+    assert runner._workspace is None
+    assert not runner._workspace_cache
+
+
 def test_nvfp4_4over6_pinned_recipe_rejects_at_config_time():
     # A pinned nvfp4_4over6 recipe can never reach the specialized dsfp8
     # backend: the unified QuantConfig rejects it on a non-NVFP4 activation
