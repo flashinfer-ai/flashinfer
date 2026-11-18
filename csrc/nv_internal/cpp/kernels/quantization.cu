@@ -35,6 +35,17 @@ using namespace tensorrt_llm::common;
 
 namespace tensorrt_llm {
 namespace kernels {
+namespace {
+// A failed launch leaves the sticky CUDA error pending; consume it before
+// throwing so a later cudaGetLastError() cannot inherit this launch's status.
+inline void checkAndClearStatus(cudaError_t status, char const* func, char const* file, int line) {
+  if (status != cudaSuccess) {
+    (void)cudaGetLastError();
+    tensorrt_llm::common::check(status, func, file, line);
+  }
+}
+}  // namespace
+#define TLLM_CUDA_CHECK_CLEAR(stat) checkAndClearStatus((stat), #stat, __FILE__, __LINE__)
 
 template <typename T>
 void invokeQuantization(int8_t* dst, T const* src, int64_t const size, float const* scalePtr,
@@ -255,7 +266,7 @@ template <typename T>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
                              int32_t* SFOutput, QuantizationSFLayout layout,
                              int multiProcessorCount, bool enable_pdl, cudaStream_t stream) {
-  if (b == 0 || m == 0 || n == 0) {
+  if (b <= 0 || m <= 0 || n <= 0) {
     return;  // a zero-sized grid or block is a launch error, not a no-op
   }
   // Fixed SF_VEC_SIZE as 32
@@ -286,9 +297,9 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   config.numAttrs = 1;
   config.attrs = attrs;
   auto launch = [&](auto kernel) {
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, b, m, n, padded_n, input, nullptr,
-                                       reinterpret_cast<uint32_t*>(output),
-                                       reinterpret_cast<uint32_t*>(SFOutput), layout));
+    TLLM_CUDA_CHECK_CLEAR(cudaLaunchKernelEx(&config, kernel, b, m, n, padded_n, input, nullptr,
+                                             reinterpret_cast<uint32_t*>(output),
+                                             reinterpret_cast<uint32_t*>(SFOutput), layout));
   };
   if (twoLoads) {
     launch(quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true,
@@ -721,10 +732,11 @@ struct FP4QuantizationTmaLauncher {
         &quantize_with_block_size_tma<QUANTIZATION_TYPE, T, SF_VEC_SIZE, UseUE8M0Tag::value,
                                       UseRowWiseScaleTag::value, UseInverseScaleTag::value,
                                       DisableFP4QuantFastMathTag::value, NVFP4ConfigTag>;
-    cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
-                                       reinterpret_cast<uint32_t*>(output),
-                                       reinterpret_cast<uint32_t*>(SFOutput), layout, tensor_map));
+    TLLM_CUDA_CHECK_CLEAR(cudaFuncSetAttribute(
+        kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    TLLM_CUDA_CHECK_CLEAR(cudaLaunchKernelEx(
+        config, kernel_instance, b, m, n, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+        reinterpret_cast<uint32_t*>(SFOutput), layout, tensor_map));
   }
 };
 
@@ -761,13 +773,18 @@ struct FP4QuantizationLauncher {
                                         DisableFP4QuantFastMathTag::value, NVFP4ConfigTag, 2>;
         }
       }
-      TLLM_CUDA_CHECK(cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
-                                         reinterpret_cast<uint32_t*>(output),
-                                         reinterpret_cast<uint32_t*>(SFOutput), layout));
+      TLLM_CUDA_CHECK_CLEAR(cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
+                                               reinterpret_cast<uint32_t*>(output),
+                                               reinterpret_cast<uint32_t*>(SFOutput), layout));
     } else {
-      kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
-                                                  reinterpret_cast<uint32_t*>(output),
-                                                  reinterpret_cast<uint32_t*>(SFOutput), layout);
+      cudaLaunchConfig_t launch_config = {};
+      launch_config.gridDim = grid;
+      launch_config.blockDim = block;
+      launch_config.dynamicSmemBytes = 0;
+      launch_config.stream = stream;
+      TLLM_CUDA_CHECK_CLEAR(cudaLaunchKernelEx(&launch_config, kernel_instance, b, m, n, n, input,
+                                               SFScale, reinterpret_cast<uint32_t*>(output),
+                                               reinterpret_cast<uint32_t*>(SFOutput), layout));
     }
   }
 };
@@ -850,7 +867,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
                            QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
                            bool use_row_wise_scale, bool inverse_scale,
                            NVFP4RecipeSpec const& recipe, cudaStream_t stream) {
-  if (b == 0 || m == 0 || n == 0) {
+  if (b <= 0 || m <= 0 || n <= 0) {
     return;  // a zero-sized grid or block is a launch error, not a no-op
   }
   // The FP8 branch ignores `recipe`: FP8->FP4 has no 4over6 kernel, and an env-driven
