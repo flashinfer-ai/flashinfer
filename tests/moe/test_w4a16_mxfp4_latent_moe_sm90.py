@@ -473,6 +473,54 @@ def test_unified_runner_dispatch_monkeypatched_launch(monkeypatch):
     assert out.shape == x.shape
 
 
+def test_unified_runner_binds_weights_per_call(monkeypatch):
+    """pack A, pack B, then forward(A) must use A's weights: the view is
+    bound to the packed-inputs object, not exchanged through shared runner
+    state. A plain tensor list (the autotuner's profiling ABI) falls back
+    to the last packed view, which that path pairs correctly."""
+    _fake_sm90(monkeypatch)
+    layer = MoELayer(_unified_config(), device=torch.device("cpu"))
+    runner = layer.runners[0]
+    xa, w13p_a, w13s_a, w2p_a, w2s_a, ids_a, wa = _cpu_case(T=4, seed=31)
+    xb, w13p_b, w13s_b, w2p_b, w2s_b, ids_b, wb = _cpu_case(T=4, seed=32)
+    pack_a = _weight_pack(w13p_a, w13s_a, w2p_a, w2s_a)
+    pack_b = _weight_pack(w13p_b, w13s_b, w2p_b, w2s_b)
+    view_a = pack_a.get_view("w4a16_mxfp4_latent")
+    view_b = pack_b.get_view("w4a16_mxfp4_latent")
+
+    seen = {}
+
+    def _fake_flat(x_, w13p_, w13s_, w2p_, w2s_, ids_, w_, *, out=None, backend):
+        seen["w13_packed"] = w13p_
+        return torch.zeros_like(x_)
+
+    monkeypatch.setattr(runner._flat, "w4a16_mxfp4_latent_routed_moe", _fake_flat)
+    inputs_a = runner.pack_inputs(_act_pack(xa, ids_a, wa), pack_a)
+    inputs_b = runner.pack_inputs(_act_pack(xb, ids_b, wb), pack_b)
+    runner.forward(inputs_a, tactic=-1)
+    assert seen["w13_packed"] is view_a["w13_packed"]
+    runner.forward(inputs_b, tactic=-1)
+    assert seen["w13_packed"] is view_b["w13_packed"]
+    runner.forward(list(inputs_b), tactic=-1)
+    assert seen["w13_packed"] is view_b["w13_packed"]
+
+
+def test_unified_runner_kill_switch_ineligible_cpu(monkeypatch):
+    """A kill-switched runner reports itself ineligible instead of raising
+    (or timing the reference path) inside winner selection."""
+    _fake_sm90(monkeypatch)
+    layer = MoELayer(_unified_config(), device=torch.device("cpu"))
+    runner = layer.runners[0]
+    x, w13p, w13s, w2p, w2s, ids, w = _cpu_case(T=4)
+    act = _act_pack(x, ids, w)
+    assert runner._accepts_shape(act)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    assert not runner._accepts_shape(act)
+    monkeypatch.delenv(DISABLE_ENV)
+    monkeypatch.setenv(DISABLE_ENV_LEGACY, "0")
+    assert not runner._accepts_shape(act)
+
+
 def test_unified_runner_pack_rejections(monkeypatch):
     _fake_sm90(monkeypatch)
     layer = MoELayer(_unified_config(), device=torch.device("cpu"))
@@ -584,9 +632,13 @@ def test_unified_layer_prefill_path_matches_flat():
     assert m_layer >= m_flat - 5e-3, (m_layer, m_flat)
 
 
-def test_unified_layer_kill_switch_serves_reference(monkeypatch):
-    """The flat op's kill switch is honored identically through the layer:
-    the dispatch lands on the composable reference path."""
+def test_unified_layer_kill_switch_excludes_backend(monkeypatch):
+    """The kill switch disables the specialized kernel everywhere. Through
+    the layer a disabled backend is INELIGIBLE (never a winner-selection
+    candidate, whose timing runs under CUDA-graph capture where the
+    composable reference's host-synchronizing ops cannot run): with no other
+    runner the layer raises. The composable reference stays reachable
+    through the flat op, whose "auto" routes around the refusal."""
     _sm90_or_skip()
     x, w13p, w13s, w2p, w2s, _ids, w = _case(T=4, seed=25)
     g = torch.Generator(device="cuda").manual_seed(26)
@@ -597,7 +649,11 @@ def test_unified_layer_kill_switch_serves_reference(monkeypatch):
     weight_pack = _weight_pack(w13p, w13s, w2p, w2s)
     monkeypatch.setenv(DISABLE_ENV, "1")
     _reset_w4a16_mxfp4_latent_moe_stats()
-    y_layer = layer(_act_pack(x, ids, w), weight_pack)
+    with pytest.raises(NotImplementedError, match="none of the usable backends"):
+        layer(_act_pack(x, ids, w), weight_pack)
+    y_auto = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="auto"
+    )
     stats = _w4a16_mxfp4_latent_moe_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert stats["backend_dispatches"]["reference"] >= 1, stats
@@ -605,4 +661,4 @@ def test_unified_layer_kill_switch_serves_reference(monkeypatch):
     y_ref = w4a16_mxfp4_latent_routed_moe(
         x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
     )
-    assert torch.equal(y_layer, y_ref)
+    assert torch.equal(y_auto, y_ref)

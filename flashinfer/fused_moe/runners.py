@@ -9604,6 +9604,21 @@ class B12xW4A16Runner(_B12xRunner):
     )
 
 
+class _W4A16LatentPackedInputs(list):
+    """Tensor-list ABI plus the weight view local to one latent-MoE call.
+
+    ``pack_inputs`` binds the prepared weight view to the object it returns
+    (the ``MoERunner`` per-call metadata convention), so interleaved
+    ``pack_inputs -> forward`` pairs cannot exchange weights. The autotuner's
+    profiling path synthesizes plain tensor lists; ``forward`` then falls
+    back to the runner's last packed view, which that path pairs correctly.
+    """
+
+    def __init__(self, inputs: List[torch.Tensor], *, weight_view) -> None:
+        super().__init__(inputs)
+        self.w4a16_latent_weight_view = weight_view
+
+
 class W4A16MxFp4LatentRunner(MoERunner):
     """Unified SM90 adapter for the specialized W4A16 mxfp4 latent-MoE kernel.
 
@@ -9614,8 +9629,11 @@ class W4A16MxFp4LatentRunner(MoERunner):
     alignment, CUDA-graph rules, the
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` kill switch, dispatch stats)
     stay the single source of truth; this adapter re-encodes none of them.
-    Under the kill switch the flat op serves its composable reference path,
-    exactly as it does for flat callers.
+    Under the kill switch this runner reports itself ineligible
+    (``accepts`` → False) so the layer's winner selection never times a
+    disabled backend: explicit ``backend="specialized"`` raises when killed,
+    and the composable reference path belongs to the flat op (where killed
+    ``backend="auto"`` callers are still served), not to the layer.
 
     The kernel is a fixed-geometry specialist; ``check_support`` pins the
     config to it (``num_experts`` = E_local, ``top_k``, ``intermediate_size``
@@ -9714,6 +9732,11 @@ class W4A16MxFp4LatentRunner(MoERunner):
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         if self._flat is None:
             return False
+        if self._flat._killed():
+            # the kill switch disables the specialized kernel; a disabled
+            # backend is ineligible rather than a winner-selection candidate
+            # that raises (or, worse, times the composable reference path)
+            return False
         hidden = act.hidden_states_q
         return (
             hidden.ndim == 2
@@ -9775,7 +9798,9 @@ class W4A16MxFp4LatentRunner(MoERunner):
             require_contiguous=True,
         )
         self._view = view
-        return [hidden_states, act.topk_ids, act.topk_weights]
+        return _W4A16LatentPackedInputs(
+            [hidden_states, act.topk_ids, act.topk_weights], weight_view=view
+        )
 
     def forward(
         self,
@@ -9787,15 +9812,20 @@ class W4A16MxFp4LatentRunner(MoERunner):
         self._require_built()
         if tactic != -1:
             raise ValueError(f"{self.backend_key} supports only tactic -1.")
-        if self._view is None:
-            raise RuntimeError(
-                "pack_inputs must be called before w4a16_mxfp4_latent forward."
-            )
         if len(inputs) != 3:
             raise ValueError(
                 f"{self.backend_key} expects [hidden, topk_ids, topk_weights]."
             )
-        view = self._view
+        # The weight view is bound to the packed-inputs object, so interleaved
+        # pack_inputs -> forward pairs use their own weights; profiling's
+        # synthesized plain lists fall back to the runner's last packed view.
+        view = getattr(inputs, "w4a16_latent_weight_view", None)
+        if view is None:
+            view = self._view
+        if view is None:
+            raise RuntimeError(
+                "pack_inputs must be called before w4a16_mxfp4_latent forward."
+            )
         # The kernel module's own entry, with the backend named explicitly:
         # only the flat "auto" form refuses tuning-mode calls (it has no
         # tactic space to enumerate), so this runner needs no tuner-state

@@ -76,6 +76,12 @@ CUDA-graph rules
   eager call.  Capture therefore requires a prior eager warm-up call on the
   capture stream with a token count >= the captured one (tracked per stream;
   violating calls raise instead of allocating under capture).
+- Graphs capture the workspace POINTER of their capture stream's slot:
+  graphs captured on the same (device, stream) — and replays of one graph —
+  share that workspace, so their replays must be ordered with respect to
+  each other (any stream may replay; it is concurrency between replays that
+  is forbidden).  Graphs that must replay concurrently must be captured on
+  distinct streams, whose slots hold distinct workspaces.
 - Autotune tuning mode raises on ``backend="auto"`` only: the flat auto form
   has a single fixed tactic and must not be enumerated into flat-path tactic
   tables. An explicitly selected backend runs regardless — the unified
@@ -395,6 +401,10 @@ def w4a16_mxfp4_latent_routed_moe(
         w2_packed.shape[2] * 2 == w2_scale.shape[2] * _GROUP,
         "w2 packing/scales must agree on the reduction width",
     )
+    _check(
+        w2_packed.shape[2] * 2 * 2 == w13_packed.shape[1],
+        "w2's reduction width must match w13's intermediate size (w13 stacks gate|up)",
+    )
     # fixed-geometry ELIGIBILITY of the specialized kernel (a miss is a
     # fallback reason, not an error — the reference serves any consistent
     # geometry)
@@ -474,6 +484,18 @@ def w4a16_mxfp4_latent_routed_moe(
         (x.data_ptr() | out.data_ptr()) % 16 == 0,
         "x and out must be 16-byte aligned",
     )
+    # the specialized prefill host clears `out` before FC1 reads `x`, so an
+    # `out` that shares storage with any input is a refusal (the reference
+    # path reads every input before its single write to `out`)
+    if _spec_reason is None:
+        out_lo = out.data_ptr()
+        out_hi = out_lo + out.numel() * out.element_size()
+        for t in tensors[:-1]:
+            t_lo = t.data_ptr()
+            t_hi = t_lo + t.numel() * t.element_size()
+            if max(out_lo, t_lo) < min(out_hi, t_hi):
+                _spec_reason = "out overlaps an input"
+                break
 
     # ---- backend resolution (#5667 order) -----------------------------------
     chosen = None
@@ -520,35 +542,50 @@ def w4a16_mxfp4_latent_routed_moe(
         _stats["backend_dispatches"]["reference"] += 1
         return out
 
-    capturing = torch.cuda.is_current_stream_capturing()
-    stream_key = (x.device.index, torch.cuda.current_stream(x.device).cuda_stream)
-    if capturing:
-        if _module is None:
-            raise RuntimeError(
-                "w4a16_mxfp4_latent_routed_moe: the JIT module is not built; "
-                "never built under CUDA-graph capture — run one eager call "
-                "first"
+    # capture state is a property of the CURRENT device's current stream, so
+    # inspect it (and run the kernel) with x's device current
+    with torch.cuda.device(x.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+        stream_key = (
+            x.device.index,
+            torch.cuda.current_stream(x.device).cuda_stream,
+        )
+        if capturing:
+            if _module is None:
+                raise RuntimeError(
+                    "w4a16_mxfp4_latent_routed_moe: the JIT module is not "
+                    "built; never built under CUDA-graph capture — run one "
+                    "eager call first"
+                )
+            if _warmed_tokens.get(stream_key, 0) < tokens:
+                raise RuntimeError(
+                    "w4a16_mxfp4_latent_routed_moe: workspace for this stream "
+                    f"is sized for <= {_warmed_tokens.get(stream_key, 0)} "
+                    f"tokens; capture at T={tokens} would allocate under "
+                    "capture.  Run one eager call with at least this token "
+                    "count on the capture stream first (and do not run a "
+                    "larger eager call on the same stream afterwards while "
+                    "the graph is in use)."
+                )
+        module = _get_module()
+        try:
+            module.w4a16_mxfp4_latent_routed_moe(
+                x,
+                w13_packed,
+                w13_scale,
+                w2_packed,
+                w2_scale,
+                topk_ids,
+                topk_weights,
+                out,
             )
-        if _warmed_tokens.get(stream_key, 0) < tokens:
-            raise RuntimeError(
-                "w4a16_mxfp4_latent_routed_moe: workspace for this stream is "
-                f"sized for <= {_warmed_tokens.get(stream_key, 0)} tokens; "
-                f"capture at T={tokens} would allocate under capture.  Run "
-                "one eager call with at least this token count on the "
-                "capture stream first (and do not run a larger eager call on "
-                "the same stream afterwards while the graph is in use)."
-            )
-    module = _get_module()
-    module.w4a16_mxfp4_latent_routed_moe(
-        x,
-        w13_packed,
-        w13_scale,
-        w2_packed,
-        w2_scale,
-        topk_ids,
-        topk_weights,
-        out,
-    )
+        except Exception:
+            # a failed eager call can leave the native slot without the
+            # workspace this record promises; drop the record so the next
+            # capture guard re-warms instead of trusting stale capacity
+            if not capturing:
+                _warmed_tokens.pop(stream_key, None)
+            raise
     _stats["backend_dispatches"]["specialized"] += 1
     if not capturing and _warmed_tokens.get(stream_key, 0) < tokens:
         _warmed_tokens[stream_key] = tokens
