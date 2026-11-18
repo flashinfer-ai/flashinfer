@@ -176,12 +176,11 @@ def _row(
         if not stats_only:
             pb = [fp.cvt_out(p, "bf16") for p in probs]
             for d in cols:
-                o_t[d] = pv_fold(
-                    fp,
-                    fp.const(0.0),
-                    pb,
-                    lambda j, d=d: fp.op("v_slice", t * (TILE_KEYS // MMA_K) + j, d),
-                )
+
+                def v_at(j: int, d: int = d, t: int = t) -> tuple:
+                    return fp.op("v_slice", t * (TILE_KEYS // MMA_K) + j, d)
+
+                o_t[d] = pv_fold(fp, fp.const(0.0), pb, v_at)
         res.tiles.append((m, l, o_t))
         for d in cols:
             prev = spec.init_state(fp) if states[d] is None else states[d]
