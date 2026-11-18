@@ -763,18 +763,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_107a"],
     },
-    "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_ab6c89e07571f01aee29",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ab6c89e07571f01aee29_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ab6c89e07571f01aee29_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan8",
-        "arches": ["sm_107a"],
-    },
     "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc",
         "sources": [
@@ -822,18 +810,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-    },
-    "cake_batch_deepgemm_fp8_b441a90659c1399a88eb": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_b441a90659c1399a88eb",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b441a90659c1399a88eb_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b441a90659c1399a88eb_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan8",
-        "arches": ["sm_107a"],
     },
     "cake_batch_deepgemm_fp8_b82c4e12c443e4ba3850": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_b82c4e12c443e4ba3850",
@@ -894,18 +870,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_c576a29e5579b897f827": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_c576a29e5579b897f827",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c576a29e5579b897f827_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c576a29e5579b897f827_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan8",
-        "arches": ["sm_107a"],
     },
     "cake_batch_deepgemm_fp8_c580972984193a63c3c2": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_c580972984193a63c3c2",
@@ -1506,10 +1470,6 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_aaa43b818034beed6ed4",
     },
-    "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29",
-    },
     "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc",
@@ -1538,10 +1498,6 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b",
     },
-    "cake_batch_deepgemm_fp8_b441a90659c1399a88eb_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_batch_deepgemm_fp8_b441a90659c1399a88eb",
-    },
     "cake_batch_deepgemm_fp8_b82c4e12c443e4ba3850_sm_107a": {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_b82c4e12c443e4ba3850",
@@ -1569,10 +1525,6 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_c1541da977c9a379e49b_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
-    },
-    "cake_batch_deepgemm_fp8_c576a29e5579b897f827_sm_107a": {
-        "arch": "sm_107a",
-        "program": "cake_batch_deepgemm_fp8_c576a29e5579b897f827",
     },
     "cake_batch_deepgemm_fp8_c580972984193a63c3c2_sm_100a": {
         "arch": "sm_100a",
@@ -1755,10 +1707,7 @@ SERVING_PROGRAMS: dict[str, str] = {
 # whole-GPU build of the same source for any cut, and equal within the family's
 # tolerance to the whole-GPU program of SERVING_PROGRAMS (an older build).
 DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
-    "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29",
     "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",
-    "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_c576a29e5579b897f827",
-    "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_b441a90659c1399a88eb",
     "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f",
 }
 # The cells routed to a twin: SM count -> (die class, expected_m class) -> the
@@ -1766,46 +1715,28 @@ DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
 # SM counts differ by at most 4, else "uneven"; expected_m class: "em<=1", "em2-7",
 # "em8-15" or "em16+".  Every other call runs the whole program.
 #
+# Only weights homed by localize_weights reach a twin, and it homes one serving
+# shape, n4096_k7168_g64, whose twins cover every expected_m class.  The other
+# three serving shapes have an "em<=1" key without a twin, so localize_weights
+# does not home them and they ship no twin.
+#
 # A cell is listed where the twin on homed weights ran below 0.98 x the fastest
 # whole-GPU build of the same key on ordinary weights, on every timed GPU of the
 # die class, with one exception: the "em16+" cells of
-# n4096_k7168_g64_s5e2_evict_normal_l8.  Only weights homed by localize_weights
-# reach a twin, and homed weights of that shape must not fall back to the whole
-# program in any class (the whole program runs slower on homed weights than on
-# ordinary ones).  There the twin is the faster program on homed weights and
-# faster than the shipped whole program on ordinary weights on both die
-# classes, though not by the 0.98 margin over a full-grid whole build, which is
-# not shipped.  The other
-# three serving shapes have an "em<=1" key without a twin, so localize_weights
-# does not home them and their em16+ cells are not listed.
+# n4096_k7168_g64_s5e2_evict_normal_l8.  Homed weights must not fall back to the
+# whole program in any class (the whole program runs slower on homed weights than
+# on ordinary ones).  There the twin is the faster program on homed weights and
+# faster than the shipped whole program on ordinary weights on both die classes,
+# though not by the 0.98 margin over a full-grid whole build, which is not
+# shipped.
 DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
     212: {
         ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
         ("uneven", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
-        ("even", "em2-7"): (
-            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
-            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
-        ),
-        ("uneven", "em2-7"): (
-            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
-            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
-        ),
-        ("even", "em8-15"): (
-            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
-            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
-        ),
-        ("uneven", "em8-15"): (
-            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
-            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
-            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
-        ),
+        ("even", "em2-7"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("uneven", "em2-7"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("even", "em8-15"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("uneven", "em8-15"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
         ("even", "em16+"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
         ("uneven", "em16+"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
     },
