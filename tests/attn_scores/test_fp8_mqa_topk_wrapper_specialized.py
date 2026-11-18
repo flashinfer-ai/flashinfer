@@ -200,3 +200,47 @@ def test_unvalidated_toolkit_refusal():
             num_heads=H,
             compression_ratio=4,
         )
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_auto_routes_to_specialized_for_multi_request_full_prefill():
+    """backend='auto' is a router: it selects the specialized backend for
+    the multi-request full-prefill class it serves (default-visible, no
+    opt-in), and reports the resolution."""
+    inp = _mk([512, 2816], [512, 2816], seed=41)
+    w = FP8MQATopKWrapper(
+        max_context_length=1 << 15,
+        max_chunk_size=1 << 14,
+        max_batch_size=2,
+        device="cuda",
+        backend="auto",
+        num_heads=H,
+        compression_ratio=RATIO,
+        num_keys=inp["k"].shape[0],
+    )
+    w.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    w.plan(inp["qo"], inp["kv"])
+    assert w.resolved_backend == "specialized"
+    out = w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
+    assert torch.equal(out, _reference_rows(inp))
+
+
+@requires_sm103
+def test_auto_exhausted_configuration_raises():
+    """auto with a configuration neither backend can serve raises, naming
+    both reasons (specialized: wrong head count; cutedsl: multi-request)."""
+    if torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS):
+        match = "single-request|auto: no backend"
+    else:
+        match = "auto: no backend|single-request"
+    with pytest.raises(ValueError, match=match):
+        FP8MQATopKWrapper(
+            max_context_length=4096,
+            max_chunk_size=64,
+            max_batch_size=6,
+            device="cuda",
+            backend="auto",
+            num_heads=32,
+            compression_ratio=4,
+        )

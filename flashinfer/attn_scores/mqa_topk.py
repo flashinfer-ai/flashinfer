@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -85,7 +85,7 @@ class FP8MQATopKWrapper:
         max_batch_size: int,
         device,
         strategy: Literal["selective"] = "selective",
-        backend: Literal["cutedsl", "specialized"] = "cutedsl",
+        backend: Literal["auto", "cutedsl", "specialized"] = "cutedsl",
         num_heads: int,
         head_dim=128,
         top_k=512,
@@ -99,8 +99,8 @@ class FP8MQATopKWrapper:
     ):
         if strategy != "selective":
             raise ValueError("continuous TopK supports selective only")
-        if backend not in ("cutedsl", "specialized"):
-            raise ValueError("backend must be 'cutedsl' or 'specialized'")
+        if backend not in ("auto", "cutedsl", "specialized"):
+            raise ValueError("backend must be 'auto', 'cutedsl' or 'specialized'")
 
         options = dict(
             max_context_length=max_context_length,
@@ -120,6 +120,7 @@ class FP8MQATopKWrapper:
             weights_dtype=weights_dtype,
             model_config=model_config,
         )
+        self._capacity_plan: Any
         if backend == "specialized":
             # Agent-generated SM103 kernel; adds multi-request support
             # (qo/kv_indptr of shape [B + 1]). Inherits the functional
@@ -129,6 +130,12 @@ class FP8MQATopKWrapper:
             from .mqa_topk_specialized import SpecializedTopKPlan
 
             self._capacity_plan = SpecializedTopKPlan(**options)
+        elif backend == "auto":
+            # "auto" is purely a router over the named backends (cutedsl,
+            # specialized): it prefers "specialized" when the static
+            # configuration and toolkit allow and demotes to "cutedsl" on
+            # the first rejected prepare/plan, replaying prepared bindings.
+            self._capacity_plan = _AutoTopKPlan(options)
         else:
             from ..experimental.attn_scores import _continuous_plan_type
 
@@ -136,6 +143,13 @@ class FP8MQATopKWrapper:
         self._compression_ratio = compression_ratio
         self._backend = backend
         self._strategy = strategy
+
+    @property
+    def resolved_backend(self):
+        """The named backend serving this wrapper ("auto" resolves lazily)."""
+        if self._backend != "auto":
+            return self._backend
+        return self._capacity_plan.resolved_backend
 
     @flashinfer_api
     def plan(
@@ -269,6 +283,116 @@ class FP8MQATopKWrapper:
     @property
     def active_shape(self):
         return self._capacity_plan.active_shape
+
+
+class _AutoTopKPlan:
+    """Router plan for ``backend="auto"``: prefers the "specialized"
+    backend when the static configuration and CUDA toolkit allow, and
+    demotes to "cutedsl" on the first rejected ``prepare_pool``/``plan``
+    (replaying already-prepared bindings). Once a plan succeeds the
+    resolution is sticky for the wrapper's lifetime (capture safety).
+    "auto" carries no behavior of its own — every call is served by one of
+    the named backends."""
+
+    def __init__(self, options):
+        self._options = dict(options)
+        self._bindings = []
+        self._active = None
+        self._cand = None
+        self._demote_reason = None
+        try:
+            from .mqa_topk_specialized import SpecializedTopKPlan
+
+            self._cand = SpecializedTopKPlan(**self._options)
+            self._cand_name = "specialized"
+        except ValueError as e:
+            self._demote_reason = str(e)
+            try:
+                self._cand = self._make_cutedsl()
+            except ValueError as e2:
+                raise ValueError(
+                    "auto: no backend can serve this configuration "
+                    f"(specialized: {e}; cutedsl: {e2})"
+                ) from e2
+            self._cand_name = "cutedsl"
+
+    def _make_cutedsl(self):
+        from ..experimental.attn_scores import _continuous_plan_type
+
+        return _continuous_plan_type("cutedsl")(**self._options)
+
+    @property
+    def resolved_backend(self):
+        return self._cand_name if self._active is None else self._active_name
+
+    def _demote(self, reason):
+        if self._cand_name != "specialized":
+            raise RuntimeError(
+                "auto: cutedsl candidate failed and no further backend "
+                f"exists ({reason}; earlier: {self._demote_reason})"
+            )
+        self._demote_reason = reason
+        self._cand = self._make_cutedsl()
+        self._cand_name = "cutedsl"
+        for k, k_scale in self._bindings:
+            self._cand.prepare_pool(k, k_scale=k_scale)
+
+    def prepare_pool(self, k, *, k_scale):
+        if self._active is not None:
+            return self._active.prepare_pool(k, k_scale=k_scale)
+        try:
+            out = self._cand.prepare_pool(k, k_scale=k_scale)
+        except ValueError as e:
+            self._demote(str(e))
+            out = None
+        self._bindings.append((k, k_scale))
+        return out
+
+    def plan(self, qo_indptr, kv_indptr, **kw):
+        if self._active is not None:
+            return self._active.plan(qo_indptr, kv_indptr, **kw)
+        try:
+            out = self._cand.plan(qo_indptr, kv_indptr, **kw)
+        except ValueError as e:
+            self._demote(str(e))
+            out = self._cand.plan(qo_indptr, kv_indptr, **kw)
+        self._active = self._cand
+        self._active_name = self._cand_name
+        return out
+
+    def _resolved(self):
+        if self._active is None:
+            raise RuntimeError("auto: plan must run before this call")
+        return self._active
+
+    def run(self, *args, **kw):
+        return self._resolved().run(*args, **kw)
+
+    def clear_pools(self):
+        return (
+            self._cand.clear_pools()
+            if self._active is None
+            else (self._active.clear_pools())
+        )
+
+    def input_buffers(self):
+        return self._resolved().input_buffers()
+
+    @property
+    def math_mode(self):
+        return (self._active or self._cand).math_mode
+
+    @property
+    def error(self):
+        return (self._active or self._cand).error
+
+    @property
+    def repair_error(self):
+        return (self._active or self._cand).repair_error
+
+    @property
+    def active_shape(self):
+        return (self._active or self._cand).active_shape
 
 
 __all__ = ["FP8MQATopKWrapper"]
