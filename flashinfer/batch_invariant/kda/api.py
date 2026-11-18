@@ -30,6 +30,12 @@ Every slot index must be unique and in range: a prefill checks it, a decode step
 host) does not: its kernel returns NaN rows for a sequence whose slot is outside the pool and writes nothing else for
 it, two sequences that name one slot in a step share its state (undefined rows for both), and its ``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
 
+Without ``initial_state`` the call is stateless (the form a trainer's forward pass takes): every sequence is whole and
+runs from the zero state through the pinned prefill kernel alone, also a sequence of one token, so no call shape is a
+decode step. The rows are the ones the pool calls return for the sequence (prefill, chunked prefill, decode); no state
+is read, written, kept or returned, and the rows carry no ``grad_fn``. ``ssm_state_indices`` and
+``output_final_state=True`` are refused with it.
+
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
 
@@ -192,6 +198,110 @@ def _pack(q, k, v, g, beta, H: int, HV: int) -> Tuple[torch.Tensor, ...]:
     return tuple(t if t.data_ptr() % 16 == 0 else t.clone() for t in rows)
 
 
+def _check_output(output: torch.Tensor, v: torch.Tensor) -> None:
+    if output.shape != v.shape or output.dtype != _IO or not output.is_contiguous():
+        raise unsupported(
+            CLASS,
+            "an output of another shape, dtype or layout than v",
+            "a contiguous bf16 [B, T, HV, 128] output",
+        )
+    if output.device != v.device:
+        raise unsupported(CLASS, "an output on another device", "the inputs' device")
+
+
+def _stateless(
+    rows, A_log, dt_bias, lower_bound, scale_f, cu_seqlens, output, pool_args
+) -> torch.Tensor:
+    """The call without a pool: whole sequences from the zero state through the pinned prefill kernel, which then reads
+    and stores no state; rows only, written into ``output`` when given. A packed call is preceded by the kernel's own
+    launch that orders the sequences on the device, as in a pool prefill."""
+    from ... import kda_prefill_cute
+    from ...kda_prefill import _check_output_does_not_overlap_inputs
+
+    q, k, v, g, beta = (t.detach() for t in rows)
+    dev = v.device
+    B, T, HV = v.shape[:3]
+    for name, value in pool_args.items():
+        if value is not None and not (isinstance(value, bool) and not value):
+            raise unsupported(
+                CLASS,
+                f"{name} without initial_state",
+                "an fp32 state pool the caller keeps, or none of the state arguments "
+                "(whole sequences from the zero state, rows only)",
+            )
+    if output is not None:
+        _check_output(output, v)
+        if output.requires_grad:
+            raise unsupported(CLASS, "an output that requires grad", "a plain buffer")
+        try:
+            _check_output_does_not_overlap_inputs(
+                output, q=q, k=k, v=v, g=g, beta=beta, initial_state=None
+            )
+        except ValueError as e:
+            raise unsupported(
+                CLASS,
+                "an output that shares memory with an input",
+                "an output buffer of its own",
+            ) from e
+    if torch.cuda.is_current_stream_capturing():
+        raise unsupported(
+            CLASS,
+            "a call without initial_state inside a CUDA graph capture",
+            "an eager call",
+        )
+    cu = None
+    if cu_seqlens is not None:
+        offs = cu_seqlens.tolist()
+        if (
+            offs[0] != 0
+            or offs[-1] != T
+            or any(a >= b for a, b in zip(offs, offs[1:], strict=False))
+        ):
+            raise unsupported(
+                CLASS,
+                "cu_seqlens that are not increasing from 0 to the token count",
+                "nonempty sequences tiling the tokens",
+            )
+        cu = cu_seqlens.to(torch.int64).contiguous()
+    q, k, v, g, beta = (
+        t.view(B, T, *t.shape[1:]) for t in _pack(q, k, v, g, beta, HV, HV)
+    )
+    aligned = output is not None and output.data_ptr() % 16 == 0
+    out = output if aligned else torch.empty_like(v)
+    kernel = kda_prefill_cute._get_compiled_cute_dsl_kda(
+        mode=ROUTE,
+        lower_bound=float(lower_bound),
+        state_dtype=torch.float32,
+        has_state_in=False,
+        has_state_out=False,
+        has_state_ckpt=False,
+        has_state_indices=False,
+        has_checkpoint_state_indices=False,
+    )
+    kernel(
+        q,
+        k,
+        v,
+        g,
+        A_log.detach().contiguous(),
+        dt_bias.detach().reshape(HV, HEAD_DIM).contiguous(),
+        beta,
+        cu,
+        None,
+        out,
+        None,
+        None,
+        torch.cuda.current_stream(dev).cuda_stream,
+        scale_f,
+    )
+    if output is not None and out is not output:
+        output.copy_(out)
+    elif output is not None and not output.is_inference():
+        # the kernel wrote the buffer behind autograd's back
+        torch.autograd.graph.increment_version(output)
+    return out if output is None else output
+
+
 def recurrent_kda_batch_invariant(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -242,6 +352,8 @@ def recurrent_kda_batch_invariant(
         if t.device != dev:
             raise unsupported(CLASS, "inputs on several devices", "one device")
     scale_f = HEAD_DIM**-0.5 if scale is None else float(scale)
+    if not math.isfinite(scale_f):
+        raise unsupported(CLASS, f"scale={scale!r}", "a finite scale")
 
     B, T = q.shape[:2]
     if B == 0 or T == 0:
@@ -269,24 +381,24 @@ def recurrent_kda_batch_invariant(
         decode = T == 1
 
     if initial_state is None:
-        raise unsupported(
-            CLASS,
-            "a call without initial_state",
-            "an fp32 state pool the caller keeps (the slot carries the sequence between calls)",
+        out = _stateless(
+            (q, k, v, g, beta),
+            A_log,
+            dt_bias,
+            lower_bound,
+            scale_f,
+            cu_seqlens,
+            output,
+            dict(
+                ssm_state_indices=ssm_state_indices,
+                output_final_state=output_final_state,
+            ),
         )
+        return out, None
     _check_pool(initial_state, HV, dev)
     slot_ids = _slot_ids(ssm_state_indices, N, dev, int(initial_state.shape[0]))
     if output is not None:
-        if output.shape != v.shape or output.dtype != _IO or not output.is_contiguous():
-            raise unsupported(
-                CLASS,
-                "an output of another shape, dtype or layout than v",
-                "a contiguous bf16 [B, T, HV, 128] output",
-            )
-        if output.device != dev:
-            raise unsupported(
-                CLASS, "an output on another device", "the inputs' device"
-            )
+        _check_output(output, v)
         lo, hi = output.data_ptr(), initial_state.data_ptr()
         if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
             raise unsupported(

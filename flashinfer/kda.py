@@ -486,6 +486,14 @@ def recurrent_kda(
             guarantee is stated for finite inputs: a non-finite value inside
             a 16-token chunk shows from the chunk's first row in a prefill
             and from its own row in a decode step.
+            Without ``initial_state`` the call is stateless (the form of a
+            trainer's forward pass): every sequence is whole and runs from the
+            zero state, also a sequence of one token, its rows are bit for
+            bit the rows the pool calls return for it, no state is kept or
+            returned, and ``ssm_state_indices`` and
+            ``output_final_state=True`` are refused. The rows carry no
+            ``grad_fn``, also when an input requires grad: the class has no
+            backward.
             Requires ``backend="auto"``, bf16 activations, head dim 128,
             ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
