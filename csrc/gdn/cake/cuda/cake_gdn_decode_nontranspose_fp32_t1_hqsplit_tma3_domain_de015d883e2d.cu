@@ -13,39 +13,17 @@
 // limitations under the License.
 
 // clang-format off
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_gdn_device_common.cuh"
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
+__device__ __forceinline__ int make_warp_uniform_local(int x) {
     int result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
                  : "=r"(result) : "r"(x));
     return result;
 }
-
 template <typename T, int N>
 struct CakeParamArray {
     T v[N];
@@ -66,65 +44,6 @@ struct CakeParamArray {
 #error "SCALE is a downstream specialization of this program; define it on the compile line"
 #endif
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-__device__ __forceinline__ float approx_rcp(float x) {
-    float y;
-    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-
-
-
 __device__ __forceinline__ void tma_4d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
     asm volatile(
@@ -135,7 +54,6 @@ __device__ __forceinline__ void tma_4d_gmem2smem(
            "r"(mbar_addr) : "memory");
 }
 
-
 __device__ __forceinline__ void tma_store_4d(
     const void *tmap, int x, int y, int z, int w, unsigned smem_addr) {
     asm volatile(
@@ -144,131 +62,20 @@ __device__ __forceinline__ void tma_store_4d(
         :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
 }
 
-
-// Reference form of the product below: the same expression the generated
-// source spells on other targets, kept out of line so its FP64 instructions sit
-// behind a call the normal-input path never takes (an if-converted block would
-// still issue them).  Every rounding and flush-to-zero policy of the compile line
-// applies to it unchanged, so the callers below are exact for every input.
-__device__ __noinline__ float cake_f32_mul_f64const_rn_reference(float f64c_x, double f64c_c) {
-    return (float)((double)f64c_x * f64c_c);
-}
-
-// Bitwise (float)((double)x * c) without FP64 arithmetic on the common path.
-//
-// The double multiply rounds the exact 76/77-bit significand product to 53 bits
-// (round to nearest even), the float conversion rounds that to 24 bits (round to
-// nearest even again: the result is NOT always the correctly rounded f32 of the
-// exact product).  Both roundings and both carry-outs are emulated with integer
-// arithmetic.  `c` is a literal at every call site (a kernel #define), so its
-// sign, exponent and significand halves fold to immediates: the hot path is two
-// 32x32 -> 64-bit multiplies, shifts, masks and compares.
-//
-// Exactness argument (x normal, c normal, result a normal f32):
-//   P = Mx * Mc with Mx in [2^23, 2^24), Mc in [2^52, 2^53)  =>  P in [2^75, 2^77).
-//   The double result D is P rounded to 53 significant bits; D's magnitude lies
-//   within one rounding of the f32 result, so D is a normal double whenever the
-//   f32 result is normal (|D| in [2^-128, 2^129) is far inside the double range)
-//   and the 53-bit rounding position is exactly the one the hardware uses.
-//   The float result is D rounded to 24 significant bits; a result whose final
-//   biased exponent leaves [1, 254] (subnormal, zero after rounding, overflow)
-//   is not produced here but by the reference form.  A carry out of either
-//   rounding (2^53 -> 2^52, 2^24 -> 2^23) increments the exponent before the
-//   range check, so a value that rounds up into the normal range is handled by
-//   the integer path only when the hardware also rounds it to that normal.
-// Fast path, folded at compile time: c exactly representable in f32 (every power
-// of two of the f32 range, 1.0, 0.125, 0.0625, 2^-15, +-0, +-inf, ...).  The
-// double product of two f32 values is exact (24 + 24 < 53 significant bits), so
-// its one f32 rounding equals the double-then-float rounding for every finite x
-// with a normal result; and the compiler already folds the incumbent text
-// `(float)((double)x * C)` to this very f32 multiply when C shrinks to f32 exactly
-// (fptrunc(fmul(fpext x, C)) -> fmul x, (float)C), so NaN payloads and the compile
-// line's flush-to-zero treatment of subnormal inputs/results follow the f32
-// multiply exactly as the folded incumbent does (1.0 folds further to x itself).
-// Cases routed to the reference form: x subnormal/inf/NaN, c subnormal/NaN
-// (compile-time folded), a result outside the normal range.
-__device__ __forceinline__ float cake_f32_mul_f64const_rn(float f64c_x, double f64c_c) {
-    if ((double)(float)f64c_c == f64c_c) {
-        return f64c_x * (float)f64c_c;
-    }
-    const unsigned long long f64c_cb = (unsigned long long)__double_as_longlong(f64c_c);
-    const unsigned int f64c_ce = (unsigned int)((f64c_cb >> 52) & 0x7FFull);
-    const unsigned int f64c_xb = __float_as_uint(f64c_x);
-    const unsigned int f64c_xe = (f64c_xb >> 23) & 0xFFu;
-    const unsigned int f64c_sign = (f64c_xb ^ (unsigned int)(f64c_cb >> 32)) & 0x80000000u;
-    if (f64c_ce == 0u || f64c_ce == 0x7FFu) {
-        return cake_f32_mul_f64const_rn_reference(f64c_x, f64c_c);  // subnormal or NaN c
-    }
-    if (f64c_xe == 0u) {
-        if ((f64c_xb & 0x7FFFFFu) == 0u) {
-            return __uint_as_float(f64c_sign);  // (+-0) * finite nonzero c = +-0 (sign xor), exactly
-        }
-        return cake_f32_mul_f64const_rn_reference(f64c_x, f64c_c);  // subnormal x
-    }
-    if (__builtin_expect(f64c_xe == 0xFFu, 0)) {
-        return cake_f32_mul_f64const_rn_reference(f64c_x, f64c_c);
-    }
-    const unsigned int f64c_xm = (f64c_xb & 0x7FFFFFu) | 0x800000u;                   // 24-bit significand of x
-    const unsigned long long f64c_cm = (f64c_cb & 0xFFFFFFFFFFFFFull) | (1ull << 52);  // 53-bit significand of c
-    const unsigned int f64c_cm_lo = (unsigned int)(f64c_cm & 0xFFFFFFFFull);
-    const unsigned int f64c_cm_hi = (unsigned int)(f64c_cm >> 32);
-    // Exact product P = xm * cm (< 2^77) as (P >> 24, P & 0xFFFFFF).
-    const unsigned long long f64c_p_lo = (unsigned long long)f64c_xm * f64c_cm_lo;
-    const unsigned long long f64c_p_hi = (unsigned long long)f64c_xm * f64c_cm_hi;
-    const unsigned long long f64c_q = (f64c_p_hi << 8) + (f64c_p_lo >> 24);  // P >> 24, in [2^51, 2^53)
-    const unsigned int f64c_low = (unsigned int)(f64c_p_lo & 0xFFFFFFu);      // P & 0xFFFFFF
-    // Biased f32 exponent of the result when P < 2^76; one more when P >= 2^76.
-    int f64c_exp = (int)f64c_xe + (int)f64c_ce - 1023;
-    unsigned long long f64c_m53;
-    unsigned int f64c_round;
-    unsigned int f64c_sticky;
-    if (f64c_q >> 52) {
-        // 77 significant bits: m53 = P >> 24, round bit 23, sticky bits 0..22.
-        f64c_m53 = f64c_q;
-        f64c_round = (f64c_low >> 23) & 1u;
-        f64c_sticky = (f64c_low & 0x7FFFFFu) != 0u;
-        f64c_exp += 1;
-    } else {
-        // 76 significant bits: m53 = P >> 23, round bit 22, sticky bits 0..21.
-        f64c_m53 = (f64c_q << 1) | (unsigned long long)((f64c_low >> 23) & 1u);
-        f64c_round = (f64c_low >> 22) & 1u;
-        f64c_sticky = (f64c_low & 0x3FFFFFu) != 0u;
-    }
-    // Rounding 1 (the double multiply): exact product -> 53 bits, nearest even.
-    f64c_m53 += (unsigned long long)(f64c_round & (f64c_sticky | (unsigned int)(f64c_m53 & 1ull)));
-    if (f64c_m53 >> 53) {
-        f64c_m53 >>= 1;  // 2^53 -> 2^52
-        f64c_exp += 1;
-    }
-    // Rounding 2 (the float conversion): 53 bits -> 24 bits, nearest even.
-    unsigned int f64c_m24 = (unsigned int)(f64c_m53 >> 29);
-    const unsigned int f64c_round2 = (unsigned int)(f64c_m53 >> 28) & 1u;
-    const unsigned int f64c_sticky2 = (f64c_m53 & 0xFFFFFFFull) != 0ull;
-    f64c_m24 += f64c_round2 & (f64c_sticky2 | (f64c_m24 & 1u));
-    if (f64c_m24 >> 24) {
-        f64c_m24 >>= 1;  // 2^24 -> 2^23
-        f64c_exp += 1;
-    }
-    if (__builtin_expect((unsigned int)(f64c_exp - 1) >= 254u, 0)) {
-        return cake_f32_mul_f64const_rn_reference(f64c_x, f64c_c);  // not a normal f32 result
-    }
-    return __uint_as_float(f64c_sign | ((unsigned int)f64c_exp << 23) | (f64c_m24 & 0x7FFFFFu));
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(256) void
 kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, const __grid_constant__ CUtensorMap state_tma, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, long long q_stride_p0, long long k_stride_p0, long long v_stride_p0, long long a_stride_p0, long long b_stride_p0, long long q_size_p0, int rows0, int* __restrict__ counters0, int* __restrict__ counters1, const CakeParamArray<int, 256> sm_table)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
+    const int warp = make_warp_uniform_local(tid / 32);
     const int lane = tid % 32;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
 #if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = make_warp_uniform_local(smem);
 #else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
