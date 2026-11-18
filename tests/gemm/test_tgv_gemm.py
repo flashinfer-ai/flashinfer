@@ -136,7 +136,7 @@ def test_tgv_gemm_sm100_rejects_k_not_multiple_of_8(dtype):
     A = torch.randn(m, k, device=device, dtype=dtype)
     B = torch.randn(n, k, device=device, dtype=dtype).t()  # column major
     with pytest.raises(ValueError, match="K divisible by 8"):
-        tgv_gemm_sm100(A, B)
+        tgv_gemm_sm100(A, B, bias=None)
 
 
 if __name__ == "__main__":

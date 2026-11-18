@@ -602,7 +602,7 @@ def _require_tma_bf16_k_alignment(backend: str, k: int) -> None:
     """
     if k % 8 != 0:
         raise ValueError(
-            f"The {backend} backend requires K divisible by 8 for bfloat16, got K={k}."
+            f"The {backend} backend requires K divisible by 8 for 16-bit operands, got K={k}."
         )
 
 
