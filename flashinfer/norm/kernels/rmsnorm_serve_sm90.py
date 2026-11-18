@@ -21,9 +21,9 @@ decode-serve envelope on SM90, served through the ``"specialized"`` backend
 of :func:`flashinfer.norm.rmsnorm` (#5667 pattern):
 
 - ``backend="specialized"`` selects it explicitly; a call it cannot serve
-  falls back to the incumbent rmsnorm dispatch (this op's composable path) —
-  never to another fused backend — with the reason recorded in the dispatch
-  stats.
+  raises ``NotImplementedError`` with the refusal reason (also recorded in
+  the dispatch stats) — an explicitly selected backend never falls back;
+  only ``"auto"`` routes around a refusal.
 - ``backend="auto"`` (the default) routes to ``"specialized"`` only on the
   dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``), and
   otherwise among the named incumbents; auto is purely a router and carries
@@ -47,18 +47,21 @@ backend string, per #5667, which also shipped multiple sources):
   fallback is correct but slower than the incumbent paths off-list).
 
 Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (checked per call;
-shared by FlashInfer's specialized kernels) forces the incumbent path.
-``FLASHINFER_SM90_SERVE_RMSNORM=0`` remains a deprecated kill alias for one
-release.  Any call outside the guard (shape, dtype, layout, architecture,
-token count, CUDA-graph or autotune constraints below) also falls back to
-the incumbent path.
+shared by FlashInfer's specialized kernels) disables these kernels:
+``backend="auto"`` keeps the incumbent path, explicit
+``backend="specialized"`` raises. ``FLASHINFER_SM90_SERVE_RMSNORM=0``
+remains a deprecated kill alias for one release.  Any call outside the guard
+(shape, dtype, layout, architecture, token count, CUDA-graph or autotune
+constraints below) is likewise declined: ``"auto"`` routes it to the
+incumbent path, explicit ``"specialized"`` raises with the reason.
 
 CUDA-graph rules: the compiled kernels take their stream from the caller's
 current stream on every call (TVM-FFI env stream / per-call stream query), so
 capture goes to the capture stream; no variant is JIT-compiled under capture
-(an uncompiled (H, dtype) during capture falls back to the incumbent path, which
-has the same no-JIT-under-capture discipline once warmed); autotune tuning
-mode bails to the incumbent path so tuning measures incumbent tactics only.
+(an uncompiled (H, dtype) during capture is declined — under ``"auto"`` the
+incumbent path, which has the same no-JIT-under-capture discipline once
+warmed, serves the call); autotune tuning mode is likewise declined so
+tuning measures incumbent tactics only.
 """
 
 import os
@@ -100,10 +103,18 @@ _stats: dict = {
 
 
 def _fallback(reason):
-    # The call will be served by an incumbent backend; the dispatcher
-    # attributes it ("cuda"/"cutedsl") via record_incumbent_dispatch once it
-    # knows which implementation ran. Record the reason here.
+    # Record the decline reason. Under backend="auto" the call will be served
+    # by an incumbent backend (the dispatcher attributes it, "cuda"/"cutedsl",
+    # via record_incumbent_dispatch once it knows which implementation ran).
+    # Explicit backend="specialized" never falls back: every decline site
+    # prefixes the reason with the requested backend, so refuse loudly here.
     _stats["fallback_reasons"][reason] = _stats["fallback_reasons"].get(reason, 0) + 1
+    if reason.startswith("specialized:"):
+        raise NotImplementedError(
+            f"rmsnorm backend='specialized' cannot serve this call "
+            f"({reason.split(': ', 1)[1]}); an explicitly selected backend "
+            "never falls back — use backend='auto', 'cuda' or 'cutedsl'"
+        )
 
 
 def record_incumbent_dispatch(impl: str, *, count_call: bool = False) -> None:
@@ -442,14 +453,15 @@ def try_rmsnorm_serve_sm90(
 ) -> bool:
     """Run the SM90 serve-shape RMSNorm when the call is inside the measured
     envelope.  Returns ``True`` when the output has been produced; ``False``
-    means the caller must run an incumbent backend (this op's composable
+    means the caller must run an incumbent backend (auto routing's composable
     path: guard miss, kill switch, explicit backend="cuda"/"cutedsl", off
     the auto allowlist, missing runtime, uncompiled variant under
     CUDA-graph capture, or autotune tuning mode).  ``requested`` is the
     public backend kwarg: "cuda" and "cutedsl" never reach these kernels;
-    "specialized" is explicit (guards still apply, with the miss reason
-    recorded); "auto" additionally requires the dispatch allowlist to be
-    loaded. Incumbent-backend attribution is the caller's
+    "specialized" is explicit (guards still apply, and a guard miss RAISES
+    ``NotImplementedError`` with the reason — an explicitly selected
+    backend never falls back); "auto" additionally requires the dispatch
+    allowlist to be loaded. Incumbent-backend attribution is the caller's
     (record_incumbent_dispatch), since only the caller knows which
     implementation ran."""
     _stats["calls"] += 1

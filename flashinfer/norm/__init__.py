@@ -1305,9 +1305,9 @@ def rmsnorm(
     backend: str
         One of ``("auto", "specialized", "cuda", "cutedsl")``.
         ``"specialized"`` selects the specialized SM90 serve-shape kernels
-        explicitly (a call they cannot serve falls back to the incumbent
-        dispatch — this op's composable path — never to another fused
-        backend, with the reason recorded in the dispatch stats). The
+        explicitly (a call they cannot serve raises ``NotImplementedError``
+        with the refusal reason, also recorded in the dispatch stats — an
+        explicitly selected backend never falls back). The
         incumbent implementations are named by nature: ``"cuda"`` pins the
         legacy CUDA JIT norm kernel, ``"cutedsl"`` pins the CuTe DSL
         kernels (raising ``NotImplementedError`` when the installed DSL
@@ -1318,8 +1318,9 @@ def rmsnorm(
         between ``"cuda"`` and ``"cutedsl"`` by device/runtime support — an
         explicitly selected backend is never silently swapped, and unknown
         names raise.
-        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) forces
-        the incumbent path; ``FLASHINFER_SM90_SERVE_RMSNORM=0`` is a
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) disables
+        the specialized kernels (``"auto"`` keeps the incumbent path,
+        explicit ``"specialized"`` raises); ``FLASHINFER_SM90_SERVE_RMSNORM=0`` is a
         deprecated kill alias kept for one release (its ``=cuda`` value
         still selects the CUDA kernel variant behind ``"specialized"``,
         a namespace distinct from the ``backend="cuda"`` incumbent).
@@ -1352,11 +1353,13 @@ def _rmsnorm_impl(
 ) -> None:
     # SM90 serve-shape "specialized" backend: 2D bf16 at the measured
     # decode-serve envelope (see kernels/rmsnorm_serve_sm90.py for the guard
-    # and the #5667 semantics).  A False return falls through to the
-    # incumbent dispatch unchanged (the composable path); the incumbent
-    # implementations are the nature-named backends "cuda" (legacy CUDA JIT
-    # norm kernel) and "cutedsl" (CuTe DSL kernels), and "auto" is purely a
-    # router over the named backends.
+    # and the #5667 semantics).  Under backend="auto" a False return falls
+    # through to the incumbent dispatch unchanged; under explicit
+    # backend="specialized" a call the kernels cannot serve RAISES with the
+    # refusal reason (an explicitly selected backend never falls back). The
+    # incumbent implementations are the nature-named backends "cuda" (legacy
+    # CUDA JIT norm kernel) and "cutedsl" (CuTe DSL kernels), and "auto" is
+    # purely a router over the named backends.
     # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 is the kill switch
     # (FLASHINFER_SM90_SERVE_RMSNORM=0 a deprecated alias).
     # FLASHINFER_USE_CUDA_NORM=1 keeps its pre-existing meaning: under the
@@ -1365,11 +1368,23 @@ def _rmsnorm_impl(
     # never silently swapped: "cuda"/"cutedsl" pin their implementation and
     # never consult the specialized kernels.
     consulted = False
-    if backend in ("auto", "specialized"):
+    if backend == "specialized":
+        if _try_rmsnorm_serve_sm90 is None:
+            raise NotImplementedError(
+                "rmsnorm backend='specialized' is unavailable (the serve "
+                "kernel module failed to import); an explicitly selected "
+                "backend never falls back — use backend='auto', 'cuda' or "
+                "'cutedsl'"
+            )
+        # Serves the call or raises with the refusal reason (the dim guard
+        # included): explicit selection never falls back.
+        _try_rmsnorm_serve_sm90(out, input, weight, eps, backend)
+        return
+    if backend == "auto":
         if (
             _try_rmsnorm_serve_sm90 is not None
             and input.dim() == 2
-            and not (backend == "auto" and _USE_CUDA_NORM)
+            and not _USE_CUDA_NORM
         ):
             consulted = True
             if _try_rmsnorm_serve_sm90(out, input, weight, eps, backend):

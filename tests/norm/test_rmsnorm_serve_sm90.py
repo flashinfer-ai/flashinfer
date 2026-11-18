@@ -165,14 +165,16 @@ def test_auto_routes_on_allowlist_only():
     assert _matched(y2, _ref(x2, w2)) >= 0.999
 
 
-def test_explicit_specialized_off_envelope_falls_back_to_incumbent_only():
+def test_explicit_specialized_off_envelope_raises():
     _sm90_or_skip()
     x, w = _case(tokens=4, hidden=516)  # H off both variants' envelopes
-    y = flashinfer.norm.rmsnorm(x, w, backend="specialized")
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        flashinfer.norm.rmsnorm(x, w, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert any("off the allowlist" in r for r in stats["fallback_reasons"]), stats
-    assert _matched(y, _ref(x, w)) >= 0.999
+    # the same call under auto is served by the incumbent path
+    assert _matched(flashinfer.norm.rmsnorm(x, w), _ref(x, w)) >= 0.999
 
 
 @pytest.mark.parametrize("env,value", [(DISABLE_ENV, "1"), (VARIANT_ENV, "0")])
@@ -185,6 +187,9 @@ def test_kill_switch_and_deprecated_alias_force_incumbent(env, value, monkeypatc
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert any("kill switch" in r for r in stats["fallback_reasons"]), stats
     assert _matched(y, _ref(x, w)) >= 0.999
+    # explicit "specialized" under the kill switch raises (never falls back)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        flashinfer.norm.rmsnorm(x, w, backend="specialized")
 
 
 # Shape grid: every launch regime of the cuda specialist — H=512
@@ -206,31 +211,37 @@ def test_cuda_variant_behind_the_one_specialized_backend(tokens, hidden, monkeyp
     assert _matched(y, _ref(x, w)) >= 0.999
 
 
-def test_cuda_variant_off_exact_list_falls_back_to_incumbent(monkeypatch):
-    # off the cuda exact list, the specialized backend serves via fallback
-    # to the stock path (never a silent variant swap)
+def test_cuda_variant_off_exact_list_raises_explicit_serves_auto(monkeypatch):
+    # off the cuda exact list, explicit "specialized" raises (never a silent
+    # variant swap or fallback); auto routes the call to the stock path
     _sm90_or_skip()
     monkeypatch.setenv(VARIANT_ENV, "cuda")
     x, w = _case(tokens=8, hidden=1024)
-    y = flashinfer.norm.rmsnorm(x, w, backend="specialized")
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        flashinfer.norm.rmsnorm(x, w, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["variant_dispatches"]["cuda"] == 0, stats
     assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert _matched(y, _ref(x, w)) >= 0.999
+    assert _matched(flashinfer.norm.rmsnorm(x, w), _ref(x, w)) >= 0.999
 
 
 @pytest.mark.parametrize("tokens,hidden", [(2, 2048), (64, 6144)])
-def test_cuda_variant_in_place_falls_back_to_incumbent(tokens, hidden, monkeypatch):
+def test_cuda_variant_in_place_declined(tokens, hidden, monkeypatch):
     """out aliasing input must not reach the cuda variant's split kernels
-    (several CTAs per row: a write could land before another CTA's read)."""
+    (several CTAs per row: a write could land before another CTA's read):
+    explicit "specialized" raises, auto serves via the incumbent path."""
     _sm90_or_skip()
     monkeypatch.setenv(VARIANT_ENV, "cuda")
     x, w = _case(tokens=tokens, hidden=hidden)
     ref = _ref(x, w)
-    y = flashinfer.norm.rmsnorm(x, w, out=x, backend="specialized")
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        flashinfer.norm.rmsnorm(x, w, out=x, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["variant_dispatches"]["cuda"] == 0, stats
     assert any("in-place" in r for r in stats["fallback_reasons"]), stats
+    y = flashinfer.norm.rmsnorm(x, w, out=x, backend="auto")
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["variant_dispatches"]["cuda"] == 0, stats
     assert y.data_ptr() == x.data_ptr()
     assert _matched(y, ref) >= 0.999
 
