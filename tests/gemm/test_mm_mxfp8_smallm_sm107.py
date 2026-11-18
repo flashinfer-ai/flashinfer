@@ -235,6 +235,84 @@ def test_explicit_specialized_serves_allowlist(monkeypatch):
     _assert_close_to_reference(reference, res, "explicit specialized")
 
 
+def _exact_dequant_reference(a_q, b_q, a_sf, b_sf):
+    """Exact fp32 dequant + torch.mm on the quantized operands: the composable
+    reference the kernel must reproduce up to fp32 accumulation order and the
+    final bf16 rounding of the output."""
+    m, k = a_q.shape
+    n = b_q.shape[0]
+    a_lin = specialized._unswizzle_sf(a_sf, m, k)
+    b_lin = specialized._unswizzle_sf(b_sf, n, k)
+    a_f = specialized._dequant(a_q, a_lin)
+    b_f = specialized._dequant(b_q, b_lin)
+    return torch.mm(a_f, b_f.T)
+
+
+def _assert_matches_exact_reference(reference, result, context):
+    """Tight acceptance against the exact-dequant reference: both sides
+    consume identical quantized operands, so the only admissible differences
+    are fp32 accumulation order and the bf16 output rounding."""
+    assert torch.isfinite(result).all(), f"{context}: output contains NaN/Inf"
+    ref = reference.float()
+    res = result.float()
+    denom = ref.abs().max().clamp_min(1e-30)
+    rel_err = ((res - ref).abs().max() / denom).item()
+    assert rel_err < 1e-2, f"{context}: max relative error {rel_err:.2e}"
+
+
+@requires_sm107
+def test_specialized_matches_exact_reference_on_every_allowlisted_shape(
+    monkeypatch,
+):
+    """Every shipped allowlist shape runs the kernel numerically (each exact-M
+    route, including the partial-tile M=2 / M=12 routes, is its own
+    compile-time instantiation) and matches the exact fp32 dequant reference
+    with a tight tolerance."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    allowlist = _load_allowlist()
+    assert allowlist is not None
+    calls = _count_kernel_launches(monkeypatch)
+    served = 0
+    for m, n, k in sorted(allowlist["shapes"]):
+        a_q, b_q, a_sf, b_sf, _ = _quantized_problem(m, n, k)
+        reference = _exact_dequant_reference(a_q, b_q, a_sf, b_sf)
+        res = mm_mxfp8(
+            a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+        )
+        served += 1
+        assert len(calls) == served, (
+            f"({m},{n},{k}): allowlisted explicit call must run the kernel"
+        )
+        _assert_matches_exact_reference(reference, res, f"allowlist ({m},{n},{k})")
+
+
+@requires_sm107
+def test_specialized_small_scale_precise_path(monkeypatch):
+    """UE8M0 scale bytes below 3 switch the kernel to its precise-dot
+    (exact-dequant) path: drive one allowlisted shape with tiny magnitudes so
+    the quantizer emits such scales, and hold the same tight tolerance."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    m, n, k = (4, 5120, 576)
+    torch.manual_seed(7)
+    # Only A is tiny: its UE8M0 scale bytes land below 3 (the precise-dot
+    # trigger) while the products stay far above the fp32 underflow floor.
+    tiny = 2.0**-120
+    a_bf16 = torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * tiny
+    b_bf16 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * 0.25
+    a_q, a_sf = mxfp8_quantize(a_bf16, sf_swizzle_layout=SfLayout.layout_128x4)
+    b_q, b_sf = mxfp8_quantize(b_bf16, sf_swizzle_layout=SfLayout.layout_128x4)
+    # The scenario must actually exercise the small-scale class.
+    a_lin = specialized._unswizzle_sf(a_sf, m, k)
+    assert (a_lin < 3).any(), "test setup must produce UE8M0 scales below 3"
+    reference = _exact_dequant_reference(a_q, b_q, a_sf, b_sf)
+    calls = _count_kernel_launches(monkeypatch)
+    res = mm_mxfp8(
+        a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+    )
+    assert len(calls) == 1
+    _assert_matches_exact_reference(reference, res, "small-scale precise path")
+
+
 @requires_sm107
 def test_explicit_specialized_off_list_raises(monkeypatch):
     """Explicit "specialized" off the allowlist raises NotImplementedError
