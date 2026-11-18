@@ -94,16 +94,32 @@ HW_ROW_MAX_MAX_D = 128  # the hardware row maximum serves the one-stage TMEM pla
 # its exponentials off the slice copies and gains nothing from it
 
 
-@functools.cache
+def _resolve_device(device: torch.device) -> torch.device:
+    """Resolve the current CUDA device before it becomes a cache key."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def device_sm_count(device: torch.device) -> int:
     """The device's SM count (a launch parameter: it steers the unit kinds and the grid, never the bits); cached per device."""
+    return _device_sm_count(_resolve_device(device))
+
+
+@functools.cache
+def _device_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-@functools.cache
 def planner_grid_search(device: torch.device) -> bool:
     """Whether the planner may shrink a fused walk's launch grid on ``device``: only on the parts the launch-grid model was fitted on
     (``plan.GRID_SEARCH_ARCHES``); elsewhere the fused walk keeps the full grid and the model decides only fuse-or-split."""
+    return _planner_grid_search(_resolve_device(device))
+
+
+@functools.cache
+def _planner_grid_search(device: torch.device) -> bool:
     from ...utils import get_compute_capability
 
     if device.type != "cuda":
@@ -124,7 +140,7 @@ def hw_row_max_enabled(device=None, D: int = 128) -> bool:
         if not torch.cuda.is_available():
             return False
         device = torch.device("cuda", torch.cuda.current_device())
-    return _part_has_hw_row_max(torch.device(device))
+    return _part_has_hw_row_max(_resolve_device(device))
 
 
 @functools.cache
@@ -732,10 +748,10 @@ def _run_attention_validated(
             int(grid),
         )
     else:
-        from .blocks.operands import arch_smem_cap
+        from .blocks.operands import arch_smem_cap as row_arch_smem_cap
 
         # the smem plan is sized for the execution device's shared memory: part of the kernel's identity, in-process and on disk
-        cap = arch_smem_cap(q.device)
+        cap = row_arch_smem_cap(q.device)
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
         hwm = hw_row_max_enabled(
             q.device, D
