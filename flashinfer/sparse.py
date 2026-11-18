@@ -2708,16 +2708,20 @@ def _qsa_sparse_paged_attention_specialized(
     cu_seqlens = torch.searchsorted(token_to_req, bounds, out_int32=True)
     from .triton.kernels import qsa_sparse_attention as _specialized_impl
 
-    _specialized_impl.run(
-        q,
-        output_gate,
-        k_cache,
-        v_cache,
-        logical_indices,
-        cu_seqlens,
-        page_base,
-        out,
-    )
+    # Triton launches on the *current* device (and the TMA scratch allocator
+    # keys on it): enter q's device so a caller holding another current device
+    # cannot launch the kernels across devices.
+    with torch.cuda.device(device):
+        _specialized_impl.run(
+            q,
+            output_gate,
+            k_cache,
+            v_cache,
+            logical_indices,
+            cu_seqlens,
+            page_base,
+            out,
+        )
     qsa_sparse_paged_attention_dispatch_stats["specialized"] += 1
     return out
 
