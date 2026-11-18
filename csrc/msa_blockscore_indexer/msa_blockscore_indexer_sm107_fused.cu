@@ -662,11 +662,14 @@ __global__ __launch_bounds__(NTHR, 1) void score_kernel(const __grid_constant__ 
       int slots = cta_of(s_cum[g + 1] - 1, total, NCTA) - cta_of(s_cum[g], total, NCTA) + 1;
       const int iters = s_cum[g + 1] - s_cum[g];
       if (iters < slots) slots = iters;
-      // One release-ordered arrival is enough to publish this chunk's
-      // list; a full threadfence would drain far more than needed.
+      // One acq_rel-ordered arrival publishes this chunk's list (release
+      // half) and, for the last-arriving CTA, acquires every earlier
+      // contributor's partial list (acquire half) *before* the CTA barrier
+      // below, so the barrier distributes that visibility to the merger
+      // threads; a full threadfence would drain far more than needed.
       int old;
       int* const counts = count_workspace<GUARDED>();
-      asm volatile("atom.release.gpu.global.add.s32 %0, [%1], 1;"
+      asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
                    : "=r"(old)
                    : "l"(&counts[g])
                    : "memory");

@@ -1294,7 +1294,11 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
         __syncthreads();
         if (tid == 0) {
           int old;
-          asm volatile("atom.release.gpu.global.add.s32 %0, [%1], 1;"
+          // acq_rel: the release half publishes this CTA's partial list; the
+          // acquire half makes earlier contributors' lists visible to this
+          // thread *before* the CTA barrier below, which then distributes
+          // that visibility to every merger thread.
+          asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
                        : "=r"(old)
                        : "l"(&tile_counts<GUARDED>()[tg])
                        : "memory");
@@ -1577,11 +1581,15 @@ __device__ __forceinline__ bool pick_store_fast_v2(const float* __restrict__ sro
                                                    uint64_t* __restrict__ pool,
                                                    int* __restrict__ out, int own) {
   float v[NPL];
-  float lmax = -FLT_MAX;
+  // -inf (not -FLT_MAX) for the init and the padding, and an explicit j < n
+  // in the candidate passes: with all-(-inf) scores a -FLT_MAX pad would set
+  // T = -FLT_MAX, admit only the 32 padded lanes and emit out-of-range ids.
+  const float NEG_INF = __int_as_float(0xff800000);
+  float lmax = NEG_INF;
 #pragma unroll
   for (int i = 0; i < NPL; ++i) {
     int j = lane + i * 32;
-    float x = (j < n) ? srow[j] : -FLT_MAX;
+    float x = (j < n) ? srow[j] : NEG_INF;
     v[i] = x;
     lmax = fmaxf(lmax, x);
   }
@@ -1589,7 +1597,7 @@ __device__ __forceinline__ bool pick_store_fast_v2(const float* __restrict__ sro
 
   int cnt = 0;
 #pragma unroll
-  for (int i = 0; i < NPL; ++i) cnt += (v[i] >= T) ? 1 : 0;
+  for (int i = 0; i < NPL; ++i) cnt += (lane + i * 32 < n && v[i] >= T) ? 1 : 0;
   int pfx = cnt;
 #pragma unroll
   for (int d = 1; d < 32; d <<= 1) {
@@ -1612,7 +1620,7 @@ __device__ __forceinline__ bool pick_store_fast_v2(const float* __restrict__ sro
   int p = pfx;
 #pragma unroll
   for (int i = 0; i < NPL; ++i) {
-    if (v[i] >= T) {
+    if (lane + i * 32 < n && v[i] >= T) {
       pool[p] = ((uint64_t)__float_as_uint(v[i]) << 32) | (uint32_t)(lane + i * 32);
       ++p;
     }

@@ -86,10 +86,15 @@ def _get_module():
 
 def is_msa_blockscore_indexer_supported(device: torch.device) -> bool:
     """Whether :func:`msa_blockscore_topk_indexer` runs on ``device``."""
-    return device.type == "cuda" and get_compute_capability(torch.device(device)) == (
-        10,
-        7,
-    )
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    if device.index is None:
+        # get_compute_capability caches on the device object, and an
+        # index-less "cuda" device would pin the answer to whichever device
+        # was current on the first call: resolve it to the current device.
+        device = torch.device("cuda", torch.cuda.current_device())
+    return get_compute_capability(device) == (10, 7)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -281,6 +286,23 @@ def msa_blockscore_topk_indexer(
         # storage-offset views whose address they cannot serve.
         if output.data_ptr() % 16:
             raise ValueError("output must be 16-byte aligned (storage-offset view)")
+        # The kernels write output rows while other CTAs may still be reading
+        # the inputs: an output that aliases any input would race. Disjoint
+        # views of one allocation are fine, so compare byte ranges.
+        out_lo = output.data_ptr()
+        out_hi = out_lo + output.numel() * output.element_size()
+        for name, t in (
+            ("qi", qi),
+            ("ki", ki),
+            ("cu_seqlens", cu_seqlens),
+            ("kv_base", kv_base),
+            ("seq_lens", seq_lens),
+            ("prefix_lens", prefix_lens),
+        ):
+            t_lo = t.data_ptr()
+            t_hi = t_lo + t.numel() * t.element_size()
+            if out_lo < t_hi and t_lo < out_hi:
+                raise ValueError(f"output must not overlap input {name}")
 
     try:
         module = _get_module()
