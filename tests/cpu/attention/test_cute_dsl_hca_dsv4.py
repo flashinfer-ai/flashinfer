@@ -97,7 +97,18 @@ def test_non_trtllm_dsv4_backends_reject_index_remapping_args(
 
 @pytest.mark.cpu_only
 def test_dsv4_backend_neutral_alias_is_backward_compatible():
-    assert batch_decode_sparse_mla_dsv4 is trtllm_batch_decode_sparse_mla_dsv4
+    # The backend-neutral name is no longer a bare alias: it is the generic
+    # front for this op (specialized backend + router "auto"), and the
+    # compatibility contract it pins is BEHAVIORAL — every pre-existing
+    # backend value keeps working, forwarded verbatim to the unchanged
+    # vendor entry (asserted in
+    # tests/attention/test_sparse_mla_decode_dsv4_specialized.py). Identity
+    # with the vendor entry is intentionally no longer asserted.
+    from flashinfer.mla import BATCH_DECODE_SPARSE_MLA_DSV4_BACKENDS
+
+    for value in ("auto", "trtllm-gen", "cute-dsl", "sparse", "cake"):
+        assert value in BATCH_DECODE_SPARSE_MLA_DSV4_BACKENDS
+    assert callable(batch_decode_sparse_mla_dsv4)
     assert (
         trtllm_batch_decode_sparse_mla_dsv4.__name__
         == "trtllm_batch_decode_sparse_mla_dsv4"
