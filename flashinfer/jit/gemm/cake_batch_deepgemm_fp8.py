@@ -1751,7 +1751,8 @@ SERVING_PROGRAMS: dict[str, str] = {
 }
 
 # The locality-domain twins of sm_107a serving programs: one launch over both dies
-# of a dual-die GPU with B homed by groups (bitwise equal to the whole program).
+# of a dual-die GPU with B homed by groups (the result does not depend on where B
+# is homed).
 DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
     "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29",
     "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",
@@ -1777,12 +1778,8 @@ DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
             "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
             "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
         ),
-        ("even", "em<=1"): (
-            "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",
-        ),
-        ("uneven", "em<=1"): (
-            "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",
-        ),
+        ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
+        ("uneven", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
     },
 }
 

@@ -13002,6 +13002,12 @@ def batch_deepgemm_fp8_nt_groupwise(
         shape ``(batch_size, n, k // 512)``) for ``(n, k)`` in
         ``{(4096, 7168), (7168, 2048)}`` and ``batch_size`` 32 or 64 on
         SM100a, SM103a and SM107a, consumed without conversion.
+        On a dual-die SM107a GPU, packed-scale problems whose ``b`` was homed per
+        die by
+        :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.localize_weights` run, in
+        the listed cells, a locality-domain form of the serving program: one
+        launch over both dies, each die reading first the expert weights homed
+        in its own memory.
         Every launch of the Cake backend, including the first, may be captured
         into a CUDA graph; see
         :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`

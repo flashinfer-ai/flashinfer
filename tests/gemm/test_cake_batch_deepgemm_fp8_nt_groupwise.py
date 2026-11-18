@@ -2,21 +2,38 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests of the generated Cake programs behind ``batch_deepgemm_fp8_nt_groupwise(backend="cake")``."""
 
+import ctypes
+import functools
+import gc
+import os
+import time
+
 import pytest
 import torch
 
+from flashinfer import cake_locality
 from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
 from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
+    DOMAIN_SERVING_ROUTE,
     PACKED_ARCHS,
     PACKED_GROUPS,
     PACKED_NK,
+    PAIR_COUNTER_WORDS,
     SUPPORTED_NK,
+    expected_m_class,
     is_batch_deepgemm_fp8_nt_groupwise_cake_available,
+    localize_weights,
     prepare_batch_deepgemm_fp8_nt_groupwise,
     select_route,
+    serving_config,
+    serving_plan,
+    serving_program_key,
     supported_nk,
 )
 from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
+    DOMAIN_SERVING_CELLS,
+    DOMAIN_SERVING_PROGRAMS,
+    SERVING_PROGRAMS,
     _SM100A_SM103A_MMSETUP_TWINS,
     _SM107A_CELLS,
     _SM107A_MMSETUP_TWINS,
@@ -48,8 +65,15 @@ def _require_packed():
         pytest.skip(f"no packed-scale serving program ships for {_arch()}")
 
 
+def _packed_serving(test):
+    """A test of the packed-scale serving routes alone: they take their grid from
+    the SM count, so they run on every SM count of a packed-scale architecture."""
+    test.packed_serving = True
+    return test
+
+
 @pytest.fixture(autouse=True)
-def _require_generated_program():
+def _require_generated_program(request):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
@@ -57,7 +81,9 @@ def _require_generated_program():
         pytest.skip(
             "generated Cake batch DeepGEMM FP8 programs target SM100a, SM103a and SM107a"
         )
-    if not is_batch_deepgemm_fp8_nt_groupwise_cake_available(device):
+    if getattr(request.function, "packed_serving", False):
+        _require_packed()
+    elif not is_batch_deepgemm_fp8_nt_groupwise_cake_available(device):
         pytest.skip(
             "no generated Cake batch DeepGEMM FP8 program is registered for this device"
         )
@@ -260,6 +286,7 @@ def test_launch_allocates_nothing(nk):
     assert after["allocation.all.freed"] == before["allocation.all.freed"]
 
 
+@_packed_serving
 def test_packed_ue8m0_scales_match_reference():
     _require_packed()
     device = torch.device("cuda")
@@ -288,6 +315,7 @@ def test_packed_ue8m0_scales_match_reference():
     )
 
 
+@_packed_serving
 @pytest.mark.parametrize("groups", sorted(PACKED_GROUPS))
 @pytest.mark.parametrize("nk", sorted(PACKED_NK))
 def test_packed_serving_expected_m_one_with_multi_block_groups(nk, groups):
@@ -889,3 +917,622 @@ def test_sm100a_sm103a_masked_m_once_bn32_matches_reference(groups, m, expected_
     )
     del a, b, out
     torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# The locality-domain twins of the SM107a serving programs (dual-die GPUs).
+
+_SERVING_ROUTE = "seed_serving_m32_packed"
+_SERVING_M = 256
+# ((N, K), groups, expected_m) of every cell routed to a twin, and of boundary
+# rows that stay on the whole program.
+_DOMAIN_CELLS = [
+    ((4096, 7168), 32, 8),
+    ((4096, 7168), 64, 8),
+    ((7168, 2048), 32, 8),
+    ((7168, 2048), 64, 8),
+    ((4096, 7168), 64, 1),
+]
+_WHOLE_CELLS = [
+    ((4096, 7168), 32, 1),
+    ((4096, 7168), 64, 4),
+    ((4096, 7168), 64, 16),
+    ((7168, 2048), 32, 1),
+    ((7168, 2048), 64, 2),
+    ((7168, 2048), 64, 16),
+]
+_RACE_ENV = "FLASHINFER_CAKE_DOMAIN_RACE_LAUNCHES"
+_RACE_PLACEMENTS = ("stream", "occupier-die0", "occupier-die1", "one-die0", "one-die1")
+
+
+def _cell_id(cell):
+    (n, k), groups, expected_m = cell
+    return f"n{n}_k{k}_g{groups}_em{expected_m}"
+
+
+def _serving_key(arch, sm_count, nk, groups, expected_m):
+    n, k = nk
+    stages, epi, hint, _, l2 = serving_config(_SERVING_M, k, expected_m, sm_count, arch)
+    return f"{arch}:{serving_program_key(n, k, groups, stages, epi, hint, l2)}"
+
+
+def _whole_program(key):
+    """The whole serving program of an architecture-qualified key (an unqualified
+    key serves every architecture)."""
+    return SERVING_PROGRAMS.get(key, SERVING_PROGRAMS.get(key.split(":", 1)[1]))
+
+
+def _require_domain():
+    """The device and its SM table: a dual-die SM107a GPU, a CUDA 13.5 toolkit and
+    driver, and an SM count with listed cells; past the skips, a build or probe
+    failure is a test failure."""
+    device = torch.cuda.current_device()
+    if _arch() != "sm_107a":
+        pytest.skip("the locality-domain twins run on SM107a")
+    from flashinfer.jit.cpp_ext import get_cuda_version
+    from flashinfer.locality_domain import locality_domain_unsupported_reason
+
+    version = get_cuda_version()
+    if (version.major, version.minor) < cake_locality.LOCALITY_CUDA:
+        pytest.skip(f"the twins need a CUDA 13.5 toolkit, found {version}")
+    reason = locality_domain_unsupported_reason(device)
+    if reason is not None:
+        pytest.skip(f"CUDA locality domains are unavailable: {reason}")
+    driver = int(cake_locality._module().driver_version())
+    if (driver // 1000, driver % 1000 // 10) < cake_locality.LOCALITY_CUDA:
+        pytest.skip(f"the twins need a CUDA 13.5 driver, found {driver}")
+    sm_count = device_sm_count(device)
+    if sm_count not in DOMAIN_SERVING_CELLS:
+        pytest.skip(f"no locality-domain cell is listed for {sm_count} SMs")
+    table = cake_locality.sm_table(device)
+    assert table is not None, "the SM table probe failed on a dual-die SM107a GPU"
+    assert sum(table.counts) == sm_count
+    return device, table
+
+
+@functools.lru_cache(maxsize=1)
+def _serving_problem(nk, groups, expected_m):
+    """Packed-scale serving inputs of one cell (masks around ``expected_m``, an
+    empty, a full and multi-block groups) and their float32 reference."""
+    n, k = nk
+    m = _SERVING_M
+    if expected_m <= 1:
+        masked = [g % 2 for g in range(groups)]
+    else:
+        masked = [(g * 7) % (2 * expected_m + 1) for g in range(groups)]
+    masked[3], masked[5], masked[9], masked[20] = m, 0, 40, 33
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=941, device=torch.device("cuda"), masked=masked
+    )
+    a_packed = _pack_ue8m0(a_scale)
+    b_packed = _pack_ue8m0(b_scale.repeat_interleave(128, dim=1))
+    reference = _reference(a, b, a_scale, b_scale, masked_m)
+    valid = torch.arange(m, device=a.device)[None, :] < masked_m[:, None]
+    return a, b, a_scale, b_scale, a_packed, b_packed, masked_m, reference, valid
+
+
+def _valid_bits(out, valid):
+    return out.view(torch.int16)[valid].clone()
+
+
+@_packed_serving
+def test_domain_serving_cells_rule():
+    """The twin cells: listed SM counts, both die classes, the expected_m classes."""
+    assert expected_m_class(0) == expected_m_class(1) == "em<=1"
+    assert expected_m_class(2) == expected_m_class(7) == "em2-7"
+    assert expected_m_class(8) == expected_m_class(15) == "em8-15"
+    assert expected_m_class(16) == "em16+"
+    assert all(_whole_program(key) for key in DOMAIN_SERVING_PROGRAMS)
+    for counts in ((104, 108), (108, 104), (102, 110), (112, 100)):
+        sm_count = sum(counts)
+        for cell in _DOMAIN_CELLS:
+            nk, groups, expected_m = cell
+            plan = serving_plan(
+                "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
+            )
+            key = _serving_key("sm_107a", sm_count, nk, groups, expected_m)
+            assert plan.route == DOMAIN_SERVING_ROUTE
+            assert plan.parent == _SERVING_ROUTE
+            assert [stage.program for stage in plan.stages] == [
+                DOMAIN_SERVING_PROGRAMS[key]
+            ]
+            assert plan.stages[0].grid == (sm_count, 1, 1)
+            assert plan.workspaces == {
+                "counters0": (PAIR_COUNTER_WORDS,),
+                "counters1": (PAIR_COUNTER_WORDS,),
+            }
+            whole = serving_plan(
+                "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m
+            )
+            assert whole.route == _SERVING_ROUTE and whole.workspaces == {}
+            assert whole.stages[0].program == _whole_program(key)
+        for cell in _WHOLE_CELLS:
+            nk, groups, expected_m = cell
+            plan = serving_plan(
+                "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
+            )
+            assert plan.route == _SERVING_ROUTE, cell
+    # No cell is listed for an unmeasured SM count, nor off SM107a.
+    for arch, sm_count, counts in (
+        ("sm_107a", 216, (108, 108)),
+        ("sm_100a", 148, (74, 74)),
+    ):
+        nk, groups, expected_m = _DOMAIN_CELLS[0]
+        plan = serving_plan(
+            arch, sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
+        )
+        assert plan.route == _SERVING_ROUTE
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS, ids=_cell_id)
+def test_domain_twin_matches_reference(cell):
+    """(a) The twin over the shape list: the reference within the family tolerance,
+    the public API the same bits; the whole program is checked the same way."""
+    device, table = _require_domain()
+    nk, groups, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    sm_count = device_sm_count(device)
+    key = _serving_key("sm_107a", sm_count, nk, groups, expected_m)
+    whole = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, expected_m
+    )
+    assert whole.route == _SERVING_ROUTE
+    assert whole.programs == (_whole_program(key),)
+    whole_out = whole.launch()
+    homed = localize_weights(b)
+    assert homed is not b and torch.equal(homed.view(torch.uint8), b.view(torch.uint8))
+    twin = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m
+    )
+    assert twin.route == DOMAIN_SERVING_ROUTE
+    assert twin.programs == (DOMAIN_SERVING_PROGRAMS[key],)
+    assert twin.grids == ((sm_count // 2 * 2, 1, 1),)
+    assert twin.g_cut == cake_locality.split_units(groups, table.counts)[0]
+    twin_out = twin.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(twin_out, reference, masked_m)
+    _assert_valid_rows_close(whole_out, reference, masked_m)
+    public = batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m, backend="cake"
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(public, valid), _valid_bits(twin_out, valid))
+    same = torch.equal(_valid_bits(whole_out, valid), _valid_bits(twin_out, valid))
+    print(
+        f"TWIN {_cell_id(cell)} counts={table.counts} g_cut={twin.g_cut} "
+        f"bitwise_equal_to_whole_program={same}"
+    )
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS, ids=_cell_id)
+def test_domain_twin_bits_do_not_depend_on_the_cut(cell):
+    """(b) Empty-die cuts both ways, an uneven cut and the SM-proportional cuts of
+    both die orders give the same bits."""
+    device, table = _require_domain()
+    _, groups, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    cuts = sorted(
+        {
+            0,
+            groups,
+            groups // 4,
+            cake_locality.split_units(groups, table.counts)[0],
+            cake_locality.split_units(groups, table.counts[::-1])[0],
+        }
+    )
+    first = None
+    for g_cut in cuts:
+        homed = localize_weights(b, g_cut)
+        prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, expected_m
+        )
+        assert prepared.route == DOMAIN_SERVING_ROUTE
+        assert prepared.g_cut == g_cut
+        out = prepared.launch()
+        torch.cuda.synchronize()
+        bits = _valid_bits(out, valid)
+        if first is None:
+            _assert_valid_rows_close(out, reference, masked_m)
+            first = bits
+        else:
+            assert torch.equal(bits, first), f"g_cut={g_cut} changed the result"
+        del prepared, homed, out
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", [_DOMAIN_CELLS[1], _DOMAIN_CELLS[4]], ids=_cell_id)
+def test_domain_twin_counters_zero_and_reused(cell):
+    """(c) The claim counters are zero after every launch and reused by the next;
+    a launch allocates nothing; a caller-owned counter pair is bound as given."""
+    _require_domain()
+    _, _, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    homed = localize_weights(b)
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == DOMAIN_SERVING_ROUTE
+    counters = (prepared.workspace["counters0"], prepared.workspace["counters1"])
+    for tensor in counters:
+        assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (
+            PAIR_COUNTER_WORDS,
+        )
+    prepared.launch()
+    torch.cuda.synchronize()
+    first = _valid_bits(prepared.out, valid)
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    before = torch.cuda.memory_stats()
+    for _ in range(3):
+        assert all(int(t.abs().sum()) == 0 for t in counters)
+        prepared.out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(_valid_bits(prepared.out, valid), first)
+    assert all(int(t.abs().sum()) == 0 for t in counters)
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    owned = dict(
+        zip(
+            ("counters0", "counters1"),
+            cake_locality.counters(PAIR_COUNTER_WORDS),
+            strict=True,
+        )
+    )
+    given = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m, workspace=owned
+    )
+    assert given.workspace["counters0"] is owned["counters0"]
+    given.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(given.out, valid), first)
+    assert all(int(t.abs().sum()) == 0 for t in owned.values())
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", [_DOMAIN_CELLS[0], _DOMAIN_CELLS[3]], ids=_cell_id)
+def test_domain_weights_and_counters_homed_per_die(cell):
+    """(d) ``pointer_domain`` of the first and last bytes of each die's groups of
+    ``b``, and of each die's counters."""
+    device, table = _require_domain()
+    nk, groups, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, _, _ = _serving_problem(*cell)
+    group_bytes = nk[0] * nk[1]
+    for g_cut in sorted(
+        {cake_locality.split_units(groups, table.counts)[0], 0, groups, groups // 4}
+    ):
+        homed = localize_weights(b, g_cut)
+        record = cake_locality.homing(homed)
+        assert record is not None and record.cut == g_cut * group_bytes
+        base = homed.data_ptr()
+        if g_cut > 0:
+            assert cake_locality.pointer_domain(base) == 0
+            assert cake_locality.pointer_domain(base + g_cut * group_bytes - 1) == 0
+        if g_cut < groups:
+            assert cake_locality.pointer_domain(base + g_cut * group_bytes) == 1
+            assert cake_locality.pointer_domain(base + groups * group_bytes - 1) == 1
+        assert torch.equal(homed.view(torch.uint8), b.view(torch.uint8))
+        del homed
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, localize_weights(b), a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == DOMAIN_SERVING_ROUTE
+    for die in range(2):
+        counter = prepared.workspace[f"counters{die}"]
+        assert cake_locality.pointer_domain(counter.data_ptr()) == die
+
+
+@_packed_serving
+def test_domain_fallbacks_take_the_whole_route(monkeypatch):
+    """(e) An unhomed ``b``, no SM table and an unlisted cell take the whole program."""
+    _require_domain()
+    cell = _DOMAIN_CELLS[2]
+    nk, groups, expected_m = cell
+    a, b, a_scale, b_scale, a_packed, b_packed, masked_m, reference, _ = (
+        _serving_problem(*cell)
+    )
+    homed = localize_weights(b)
+    unhomed = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, expected_m
+    )
+    assert unhomed.route == _SERVING_ROUTE and unhomed.g_cut is None
+    # A copy of homed weights is not homed.
+    copied = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed.clone(), a_packed, b_packed, masked_m, expected_m
+    )
+    assert copied.route == _SERVING_ROUTE
+    # No unlisted cell on the homed weights: expected_m classes em<=1 (no twin of
+    # the K=2048 key), em2-7 and em16+.
+    for hint in (1, 4, 16):
+        prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, hint
+        )
+        assert prepared.route == _SERVING_ROUTE, hint
+        out = prepared.launch()
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(out, reference, masked_m)
+    with monkeypatch.context() as patch:
+        patch.setattr(cake_locality, "sm_table", lambda device=None: None)
+        assert localize_weights(b) is b
+        no_table = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, expected_m
+        )
+        assert no_table.route == _SERVING_ROUTE
+        out = no_table.launch()
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(out, reference, masked_m)
+    # Float32 scales on a device without a route chain still raise.
+    if device_sm_count(torch.cuda.current_device()) not in (216,):
+        with pytest.raises(ValueError, match="SMs"):
+            prepare_batch_deepgemm_fp8_nt_groupwise(
+                a, homed, a_scale, b_scale, masked_m, expected_m
+            )
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", [_DOMAIN_CELLS[0], _DOMAIN_CELLS[4]], ids=_cell_id)
+def test_domain_twin_cuda_graph_capture_and_replay(cell):
+    """(f) The first launch of a prepared twin is captured and replayed; replays
+    follow new activations and leave the counters zero; the public API's call is
+    capturable too."""
+    _require_domain()
+    _, _, expected_m = cell
+    a0, b, a_scale, b_scale, a_packed, b_packed, masked_m, reference, valid = (
+        _serving_problem(*cell)
+    )
+    device = a0.device
+    a = a0.clone()
+    homed = localize_weights(b)
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == DOMAIN_SERVING_ROUTE
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch()
+    prepared.out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    first = _valid_bits(prepared.out, valid)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(prepared.out, valid), first)
+    counters = (prepared.workspace["counters0"], prepared.workspace["counters1"])
+    assert all(int(t.abs().sum()) == 0 for t in counters)
+    a.copy_(torch.randn(a.shape, device=device).to(torch.float8_e4m3fn))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        prepared.out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+    assert all(int(t.abs().sum()) == 0 for t in counters)
+    out = torch.empty_like(prepared.out)
+    public_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(public_graph, stream=stream):
+        batch_deepgemm_fp8_nt_groupwise(
+            a0, homed, a_packed, b_packed, masked_m, expected_m, out=out, backend="cake"
+        )
+    out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    public_graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(out, valid), first)
+
+
+# The race's occupier: one 1024-thread block per SM (its whole opt-in shared
+# memory, so no two share an SM), each spinning until released (or its cycle
+# budget runs out); every block records its SM and counts itself in.
+_OCCUPIER = "cake_domain_race_occupier"
+_OCCUPIER_SOURCE = f"""\
+extern "C" __global__ void __launch_bounds__(1024, 1) {_OCCUPIER}(const int* release, int* state, int* smids,
+                                                                 long long budget) {{
+    extern __shared__ int pad[];
+    if (threadIdx.x == 0) {{
+        unsigned sm;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+        smids[blockIdx.x] = (int)sm;
+        pad[0] = (int)sm;
+        atomicAdd(state, 1);
+        long long start = clock64();
+        while (*((volatile const int*)release) == 0) {{
+            if (clock64() - start > budget) {{ atomicAdd(state + 1, 1); break; }}
+            __nanosleep(1000);
+        }}
+    }}
+    __syncthreads();
+}}
+"""
+_OCCUPIER_BUDGET_CYCLES = 50_000_000_000
+_OCCUPIER_WAIT_S = 10.0
+
+
+def _checked(result, what):
+    error, *values = result
+    if int(error) != 0:
+        raise RuntimeError(f"{what} failed: {error}")
+    return values[0] if len(values) == 1 else tuple(values)
+
+
+@functools.cache
+def _occupier(device):
+    from cuda.bindings import driver, nvrtc
+
+    program = _checked(
+        nvrtc.nvrtcCreateProgram(
+            _OCCUPIER_SOURCE.encode(), f"{_OCCUPIER}.cu".encode(), 0, [], []
+        ),
+        "nvrtcCreateProgram",
+    )
+    error = nvrtc.nvrtcCompileProgram(program, 1, [b"--gpu-architecture=sm_107a"])[0]
+    if int(error) != 0:
+        size = _checked(nvrtc.nvrtcGetProgramLogSize(program), "nvrtcGetProgramLogSize")
+        log = b" " * size
+        nvrtc.nvrtcGetProgramLog(program, log)
+        raise RuntimeError(f"occupier build failed: {log.decode(errors='replace')}")
+    size = _checked(nvrtc.nvrtcGetCUBINSize(program), "nvrtcGetCUBINSize")
+    image = b" " * size
+    _checked(nvrtc.nvrtcGetCUBIN(program, image), "nvrtcGetCUBIN")
+    smem = int(torch.cuda.get_device_properties(device).shared_memory_per_block_optin)
+    with torch.cuda.device(device):
+        torch.cuda.current_stream().synchronize()
+        module = _checked(driver.cuModuleLoadData(image), "cuModuleLoadData")
+        function = _checked(
+            driver.cuModuleGetFunction(module, _OCCUPIER.encode()),
+            "cuModuleGetFunction",
+        )
+        attribute = (
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+        )
+        _checked(
+            driver.cuFuncSetAttribute(function, attribute, smem), "cuFuncSetAttribute"
+        )
+    return module, function, smem
+
+
+def _die_of(table, sm):
+    word = int(table.entries[sm])
+    return (word >> cake_locality.ENTRY_DOMAIN_SHIFT) & (
+        (1 << cake_locality.ENTRY_DOMAIN_BITS) - 1
+    )
+
+
+def _run_beside_occupier(device, die, domains, table, launch):
+    """``launch()`` on the current stream while the occupier holds half of die
+    ``die``'s SMs on that die's green context; returns why the run does not prove
+    that the whole launch ran beside it."""
+    from cuda.bindings import driver
+
+    _, function, smem = _occupier(device)
+    blocks = domains.sm_counts[die] // 2
+    release = torch.zeros(1, dtype=torch.int32, device=f"cuda:{device}")
+    state = torch.zeros(2, dtype=torch.int32, device=f"cuda:{device}")
+    smids = torch.full((blocks,), -1, dtype=torch.int32, device=f"cuda:{device}")
+    torch.cuda.synchronize()
+    # No garbage collection while the occupier holds SMs: freeing a split
+    # allocation synchronizes the device, which waits for the occupier.
+    gc.collect()
+    gc.disable()
+    try:
+        occupier_stream = driver.CUstream(domains.streams[die].cuda_stream)
+        args = (
+            (
+                release.data_ptr(),
+                state.data_ptr(),
+                smids.data_ptr(),
+                _OCCUPIER_BUDGET_CYCLES,
+            ),
+            (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong),
+        )
+        _checked(
+            driver.cuLaunchKernel(
+                function, blocks, 1, 1, 1024, 1, 1, smem, occupier_stream, args, 0
+            ),
+            "cuLaunchKernel(occupier)",
+        )
+        reader = torch.cuda.Stream(device=device)
+        started = time.monotonic()
+        resident = 0
+        while time.monotonic() - started < _OCCUPIER_WAIT_S:
+            with torch.cuda.stream(reader):
+                seen = state.to("cpu", non_blocking=False)
+            resident = int(seen[0])
+            if resident >= blocks:
+                break
+            time.sleep(1e-3)
+        launch()
+        release.fill_(1)
+        _checked(driver.cuStreamSynchronize(occupier_stream), "cuStreamSynchronize")
+        torch.cuda.synchronize()
+    finally:
+        gc.enable()
+    held, timed_out = smids.tolist(), int(state[1])
+    failures = []
+    if resident != blocks:
+        failures.append(f"only {resident} of {blocks} occupier blocks were resident")
+    if timed_out:
+        failures.append(f"{timed_out} occupier blocks ran out of their budget")
+    if len(set(held)) != blocks or {_die_of(table, sm) for sm in held} != {die}:
+        failures.append(
+            f"the occupier held SMs {sorted(held)}, not {blocks} of die {die}"
+        )
+    return failures
+
+
+def _run_on_die(domains, die, launch):
+    """``launch()`` on die ``die``'s green-context stream, ordered after and before
+    the current stream."""
+    current = torch.cuda.current_stream()
+    stream = domains.streams[die]
+    stream.wait_stream(current)
+    with torch.cuda.stream(stream):
+        launch()
+    current.wait_stream(stream)
+
+
+@_packed_serving
+@pytest.mark.parametrize(
+    "cell,placement",
+    [(cell, placement) for cell in _DOMAIN_CELLS for placement in _RACE_PLACEMENTS],
+    ids=[
+        f"{_cell_id(cell)}-{placement}"
+        for cell in _DOMAIN_CELLS
+        for placement in _RACE_PLACEMENTS
+    ],
+)
+def test_domain_twin_race(cell, placement):
+    """(g) A stress gate (``FLASHINFER_CAKE_DOMAIN_RACE_LAUNCHES`` launches per
+    placement): on the test's stream, beside an occupier on each die, and on each
+    die's green context.  The output is poisoned before every launch and must
+    equal the first launch's bits; the counters must be zero after every launch."""
+    launches = os.environ.get(_RACE_ENV)
+    if not launches:
+        pytest.skip(f"a stress gate: set {_RACE_ENV} to the launches per placement")
+    device, table = _require_domain()
+    from flashinfer.locality_domain import get_localized_domains
+
+    _, _, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    homed = localize_weights(b)
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == DOMAIN_SERVING_ROUTE
+    counters = (prepared.workspace["counters0"], prepared.workspace["counters1"])
+    domains = get_localized_domains(device, sm_split="strict")
+    if placement.startswith("occupier"):
+        _occupier(device)
+    prepared.out.fill_(float("nan"))
+    prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    first = _valid_bits(prepared.out, valid)
+    failures, wrong = [], 0
+    for index in range(int(launches)):
+        prepared.out.fill_(float("nan"))
+        if placement.startswith("occupier"):
+            found = _run_beside_occupier(
+                device, int(placement[-1]), domains, table, prepared.launch
+            )
+        elif placement.startswith("one-die"):
+            _run_on_die(domains, int(placement[-1]), prepared.launch)
+            found = []
+        else:
+            prepared.launch()
+            found = []
+        torch.cuda.synchronize()
+        if not torch.equal(_valid_bits(prepared.out, valid), first):
+            found.append("the output differs bitwise from the first launch")
+        if any(int(t.abs().sum()) != 0 for t in counters):
+            found.append(f"counters left {[t.tolist() for t in counters]}")
+        wrong += bool(found)
+        if found and len(failures) < 20:
+            failures += [f"launch {index + 1}: {failure}" for failure in found]
+    print(
+        f"RACE {_cell_id(cell)} {placement} counts={table.counts} "
+        f"launches={launches} wrong={wrong}"
+    )
+    assert not wrong, "\n".join(failures)

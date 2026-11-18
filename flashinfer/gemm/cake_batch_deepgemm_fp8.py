@@ -22,6 +22,14 @@ into a CUDA graph.
 
 Selection reads host scalars and tensor metadata only; it never reads a CUDA
 tensor's contents.
+
+On a dual-die SM107a device (two locality domains) whose weights ``b`` were
+allocated by :func:`localize_weights`, a packed-scale serving problem in a
+listed cell runs the serving program's locality-domain twin: one launch over
+both dies, each die claiming first the groups of ``b`` homed in its memory,
+through a pair of per-die claim counters owned by the prepared launch.  The
+twin's result does not depend on where ``b`` is homed; every other call runs the
+whole-GPU program.
 """
 
 from __future__ import annotations
@@ -32,8 +40,11 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
+from .. import cake_locality
 from ..jit.gemm.cake_batch_deepgemm_fp8 import (
     ARG_PLANS,
+    DOMAIN_SERVING_CELLS,
+    DOMAIN_SERVING_PROGRAMS,
     PROGRAMS,
     SERVING_PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
@@ -72,11 +83,20 @@ PACKED_ARCHS = frozenset({"sm_100a", "sm_103a", "sm_107a"})
 PACKED_GROUPS = frozenset({32, 64})
 PACKED_K_GRANULE = 512
 SERVING_ROUTE = "seed_serving_m32_packed"
+# The locality-domain twin of the serving route (dual-die SM107a, ``b`` homed by
+# groups): its claim counters, PAIR_COUNTER_WORDS int32 words per die, are the
+# route's workspaces.
+DOMAIN_SERVING_ROUTE = "seed_serving_m32_packed_domain"
+PAIR_COUNTER_WORDS = 2
+DOMAIN_ARCH = "sm_107a"
+DOMAIN_COUNTERS = ("counters0", "counters1")
 WORKSPACE_DTYPES = {
     "sfa_packed": torch.int32,
     "sfb_packed": torch.int32,
     "sfa_m32_packed": torch.uint32,
     "sfb_m32_packed": torch.uint32,
+    "counters0": torch.int32,
+    "counters1": torch.int32,
 }
 
 
@@ -129,10 +149,53 @@ def serving_program_key(
     return f"n{n}_k{k}_g{groups}_s{num_stages}e{num_epi_stages}_{a_cache_hint}_l{n_l2_group}"
 
 
+def expected_m_class(expected_m: int) -> str:
+    """The expected_m class of a locality-domain serving cell."""
+    if expected_m <= 1:
+        return "em<=1"
+    if expected_m < 8:
+        return "em2-7"
+    if expected_m < 16:
+        return "em8-15"
+    return "em16+"
+
+
+def domain_serving_program(
+    arch: str,
+    sm_count: int,
+    key: str,
+    expected_m: int,
+    counts: tuple[int, int],
+) -> Optional[str]:
+    """The locality-domain twin of serving configuration ``key`` for a device of
+    ``sm_count`` SMs split ``counts`` over its two dies, or ``None`` when the cell
+    ``(sm_count, die class, expected_m class)`` is not routed to a twin."""
+    qualified = f"{arch}:{key}"
+    if arch != DOMAIN_ARCH or qualified not in DOMAIN_SERVING_PROGRAMS:
+        return None
+    cell = (cake_locality.die_class(counts), expected_m_class(expected_m))
+    if qualified not in DOMAIN_SERVING_CELLS.get(sm_count, {}).get(cell, ()):
+        return None
+    return DOMAIN_SERVING_PROGRAMS[qualified]
+
+
 def serving_plan(
-    arch: str, sm_count: int, groups: int, m: int, n: int, k: int, expected_m: int
+    arch: str,
+    sm_count: int,
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    expected_m: int,
+    *,
+    counts: Optional[tuple[int, int]] = None,
 ) -> RoutePlan:
-    """The packed-scale serving route: one specialised program, grid from the SM count."""
+    """The packed-scale serving route: one specialised program, grid from the SM count.
+
+    ``counts`` (the SMs of each die of a dual-die device whose ``b`` is homed by
+    groups) selects the locality-domain twin of the program when the cell is
+    listed in ``DOMAIN_SERVING_CELLS``; the twin's grid is one CTA per SM and it
+    binds a pair of per-die claim counters."""
     num_stages, num_epi_stages, a_cache_hint, cta_reserve, n_l2_group = serving_config(
         m, k, expected_m, sm_count, arch
     )
@@ -144,6 +207,18 @@ def serving_plan(
         raise NotImplementedError(
             f"no generated packed-scale serving program for N={n}, K={k}, B={groups}, "
             f"expected_m={expected_m} (configuration {key})"
+        )
+    twin = (
+        None
+        if counts is None
+        else domain_serving_program(arch, sm_count, key, expected_m, counts)
+    )
+    if twin is not None:
+        return RoutePlan(
+            route=DOMAIN_SERVING_ROUTE,
+            parent=SERVING_ROUTE,
+            stages=(StagePlan(program=twin, grid=(sm_count // 2 * 2, 1, 1), args=()),),
+            workspaces={name: (PAIR_COUNTER_WORDS,) for name in DOMAIN_COUNTERS},
         )
     raw_ctas = max(2, sm_count - cta_reserve - ((sm_count - cta_reserve) % 2))
     # The serving kernel binds its arguments by name (see ``_serving_bindings``).
@@ -212,6 +287,29 @@ class _Problem:
     expected_m: int
     packed_scales: bool
     plan: RoutePlan
+    # The locality-domain twin's first group of ``b`` homed on die 1 and the SM
+    # table it takes by value (``None`` on every other route).
+    g_cut: Optional[int] = None
+    sm_table: Any = None
+
+
+def _domain_homing(
+    b: torch.Tensor, index: int, groups: int
+) -> Optional[tuple[int, Any]]:
+    """``(g_cut, sm_table)`` when ``b`` is a :func:`localize_weights` allocation on a
+    device with a probed SM table, else ``None``.  ``g_cut`` is the group of ``b``
+    nearest to its die cut (the twin's result does not depend on it)."""
+    # The registry first: it builds nothing when no split allocation was made.
+    homed = cake_locality.homing(b)
+    if homed is None or homed.device_index != index:
+        return None
+    table = cake_locality.sm_table(index)
+    if table is None:
+        return None
+    group_bytes = b.stride(0) * b.element_size()
+    cut = homed.cut - (int(b.data_ptr()) - homed.base)
+    g_cut = min(groups, max(0, (2 * cut + group_bytes) // (2 * group_bytes)))
+    return g_cut, table
 
 
 def _resolve(
@@ -239,11 +337,6 @@ def _resolve(
             f"got {torch.cuda.get_device_capability(index)}"
         )
     sm_count = device_sm_count(index)
-    if route_chain(arch, sm_count) is None:
-        raise ValueError(
-            f"the Cake batch DeepGEMM FP8 backend is exported for {arch} devices with "
-            f"{sorted(_exported_sm_counts(arch))} SMs; this device has {sm_count}"
-        )
     if tuple(int(v) for v in scale_granularity_mnk) != (1, BLOCK, BLOCK):
         raise ValueError(
             f"the Cake batch DeepGEMM FP8 backend requires scale_granularity_mnk=(1, {BLOCK}, {BLOCK})"
@@ -281,6 +374,8 @@ def _resolve(
     if not isinstance(a_scale, torch.Tensor) or not isinstance(b_scale, torch.Tensor):
         raise TypeError("a_scale and b_scale must be torch.Tensors")
     packed = a_scale.dtype == torch.int32 or b_scale.dtype == torch.int32
+    g_cut: Optional[int] = None
+    table: Any = None
     if packed:
         if a_scale.dtype != torch.int32 or b_scale.dtype != torch.int32:
             raise ValueError(
@@ -313,8 +408,29 @@ def _resolve(
             device=device,
             strides=(N * cols, 1, N),
         )
-        plan = serving_plan(arch, sm_count, B, M, N, K, expected_m)
+        # The serving programs take their grid from the SM count: they run on
+        # every SM count of a packed-scale architecture.
+        domain = _domain_homing(b, index, B) if arch == DOMAIN_ARCH else None
+        plan = serving_plan(
+            arch,
+            sm_count,
+            B,
+            M,
+            N,
+            K,
+            expected_m,
+            counts=None if domain is None else domain[1].counts,
+        )
+        if plan.route == DOMAIN_SERVING_ROUTE:
+            assert domain is not None
+            g_cut, table = domain
     else:
+        if route_chain(arch, sm_count) is None:
+            raise ValueError(
+                f"the Cake batch DeepGEMM FP8 backend is exported for {arch} devices with "
+                f"{sorted(_exported_sm_counts(arch))} SMs (packed UE8M0 scales: any SM "
+                f"count); this device has {sm_count}"
+            )
         _require_tensor(
             a_scale,
             "a_scale",
@@ -337,7 +453,20 @@ def _resolve(
             )
     for stage in plan.stages:
         module_name(arch, stage.program)
-    return _Problem(arch, sm_count, device, B, M, N, K, int(expected_m), packed, plan)
+    return _Problem(
+        arch,
+        sm_count,
+        device,
+        B,
+        M,
+        N,
+        K,
+        int(expected_m),
+        packed,
+        plan,
+        g_cut=g_cut,
+        sm_table=table,
+    )
 
 
 def _exported_sm_counts(arch: str) -> set[int]:
@@ -422,7 +551,10 @@ def bind_named_arguments(
     for kind, name in arg_plan:
         if kind == "grid":
             arguments.append(grid_by_axis[name])
-        elif kind in ("tma_buffer", "buffer", "parameter") and name in bindings:
+        elif (
+            kind in ("tma_buffer", "buffer", "parameter", "param_array")
+            and name in bindings
+        ):
             arguments.append(bindings[name])
         else:
             raise RuntimeError(
@@ -440,6 +572,12 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     or scale-pack + GEMM) on PyTorch's current stream for the bound device and
     returns the output.  Every launch, including the first, may be captured into a
     CUDA graph; ``launch()`` allocates nothing.
+
+    The locality-domain twin route binds the claim counters ``workspace["counters0"]``
+    and ``workspace["counters1"]``: zero before the first launch, left zero by
+    every launch.  Launches of one prepared launch must therefore not overlap
+    (successive launches on one stream, or graph replays on one stream, never
+    do); prepare one launch per concurrent stream.
     """
 
     route: str
@@ -451,6 +589,9 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     out: torch.Tensor
     workspace: dict[str, torch.Tensor]
     _launches: tuple[tuple[Callable[..., Any], tuple[Any, ...]], ...]
+    # The locality-domain twin's first group of ``b`` homed on die 1 (``None`` on
+    # every other route).
+    g_cut: Optional[int] = None
 
     def launch(self) -> torch.Tensor:
         with torch.cuda.device(self.out.device), tvm_ffi.use_torch_stream():
@@ -468,10 +609,25 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
 def _allocate_workspace(
     plan: RoutePlan, device: torch.device
 ) -> dict[str, torch.Tensor]:
-    return {
+    workspace = {
         key: torch.empty(shape, dtype=WORKSPACE_DTYPES[key], device=device)
         for key, shape in plan.workspaces.items()
+        if key not in DOMAIN_COUNTERS
     }
+    if DOMAIN_COUNTERS[0] in plan.workspaces:
+        if torch.cuda.is_current_stream_capturing():
+            # Locality-domain memory is not allocated under capture: zeroed
+            # counters from the capture's pool (same bits, unhomed claims).
+            pair = tuple(
+                torch.zeros(
+                    plan.workspaces[name], dtype=WORKSPACE_DTYPES[name], device=device
+                )
+                for name in DOMAIN_COUNTERS
+            )
+        else:
+            pair = cake_locality.counters(PAIR_COUNTER_WORDS, device)
+        workspace.update(zip(DOMAIN_COUNTERS, pair, strict=True))
+    return workspace
 
 
 def _check_workspace(
@@ -523,6 +679,7 @@ def _serving_bindings(
     b_scale: torch.Tensor,
     masked_m: torch.Tensor,
     out: torch.Tensor,
+    workspace: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
     """Kernel parameter names of the serving program -> bound values (zero-copy scale views)."""
     cols = problem.K // PACKED_K_GRANULE
@@ -534,7 +691,7 @@ def _serving_bindings(
     sfb = b_scale.as_strided((problem.B * cols, problem.N), (problem.N, 1)).view(
         torch.uint32
     )
-    return {
+    bindings: dict[str, Any] = {
         "A": a.view(torch.uint8),
         "B": b.view(torch.uint8),
         "C_tma": out,
@@ -546,6 +703,14 @@ def _serving_bindings(
         "N": problem.N,
         "K": problem.K,
     }
+    if problem.plan.route == DOMAIN_SERVING_ROUTE:
+        bindings.update(
+            g_cut=problem.g_cut,
+            counters0=workspace["counters0"],
+            counters1=workspace["counters1"],
+            sm_table=problem.sm_table.entries,
+        )
+    return bindings
 
 
 def prepare_batch_deepgemm_fp8_nt_groupwise(
@@ -582,8 +747,12 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
     out : Optional[torch.Tensor]
         Contiguous bfloat16 output of shape ``(B, M, N)``.  Allocated if omitted.
     workspace : Optional[dict[str, torch.Tensor]]
-        Caller-owned packed-scale workspace of the selected route (see
-        ``RoutePlan.workspaces``); allocated at preparation if omitted.
+        Caller-owned workspace of the selected route (see
+        ``RoutePlan.workspaces``): the packed-scale workspace of a swap-AB route,
+        or the zeroed int32 claim counters ``counters0`` / ``counters1`` of the
+        locality-domain twin route (homed on die 0 / die 1 by
+        :func:`flashinfer.cake_locality.counters`).  Allocated at preparation if
+        omitted.
 
     Returns
     -------
@@ -596,6 +765,9 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
     exported geometries; a problem outside the band raises ``ValueError``.
     Preparation performs no device work beyond the optional workspace
     allocation; the device's architecture and SM count are read once per process.
+    On a dual-die SM107a device, packed-scale problems whose ``b`` comes from
+    :func:`localize_weights` run the locality-domain twin route in the listed
+    cells (``route == "seed_serving_m32_packed_domain"``).
     """
     problem = _resolve(
         a,
@@ -628,7 +800,9 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
             ),
             program["ffi_entry"],
         )
-        bindings = _serving_bindings(problem, a, b, a_scale, b_scale, masked_m, out)
+        bindings = _serving_bindings(
+            problem, a, b, a_scale, b_scale, masked_m, out, workspace
+        )
         launches.append(
             (
                 entry,
@@ -677,7 +851,42 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
         out=out,
         workspace=workspace,
         _launches=tuple(launches),
+        g_cut=problem.g_cut,
     )
+
+
+def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tensor:
+    """A copy of the expert weights ``b`` (``(B, N, K)``, contiguous) homed by groups
+    on the two dies of a dual-die SM107a device: groups ``[0, g_cut)`` in die 0's
+    memory, the rest in die 1's, in one virtual address range.
+
+    ``g_cut`` defaults to the SM-proportional share of die 0,
+    ``split_units(B, counts)[0]`` over the device's probed SM table.  Passing the
+    copy as ``b`` lets the packed-scale serving problems of the listed cells run
+    the locality-domain twin route; the result does not depend on ``g_cut``.
+    Returns ``b`` itself when the device has no SM table
+    (:func:`flashinfer.cake_locality.sm_table` is ``None``).  Call it outside CUDA
+    graph capture; the memory is freed with the returned tensor.
+    """
+    if not isinstance(b, torch.Tensor) or b.device.type != "cuda" or b.ndim != 3:
+        raise ValueError("b must be a CUDA torch.Tensor of shape (B, N, K)")
+    if not b.is_contiguous():
+        raise ValueError("b must be contiguous")
+    index = _device_index(b.device)
+    table = cake_locality.sm_table(index)
+    if table is None:
+        return b
+    groups = int(b.shape[0])
+    if g_cut is None:
+        g_cut = cake_locality.split_units(groups, table.counts)[0]
+    if not 0 <= int(g_cut) <= groups:
+        raise ValueError(f"g_cut must be in [0, {groups}], got {g_cut}")
+    group_bytes = b[0].numel() * b.element_size()
+    homed = cake_locality.split_empty(
+        tuple(b.shape), b.dtype, int(g_cut) * group_bytes, index
+    )
+    homed.copy_(b)
+    return homed
 
 
 def run_batch_deepgemm_fp8_nt_groupwise(
@@ -694,7 +903,9 @@ def run_batch_deepgemm_fp8_nt_groupwise(
 
     The route's packed-scale workspace, when it needs one, is a per-call
     ``torch.empty`` released when the call returns: nothing is cached across calls
-    and the call may be captured into a CUDA graph.
+    and the call may be captured into a CUDA graph.  The locality-domain twin's
+    claim counters are allocated per call the same way (die-homed outside
+    capture, from the capture's pool under capture).
     """
     return prepare_batch_deepgemm_fp8_nt_groupwise(
         a, b, a_scale, b_scale, masked_m, expected_m, out=out
@@ -706,13 +917,18 @@ __all__ = [
     "PACKED_ARCHS",
     "PACKED_GROUPS",
     "PACKED_NK",
+    "DOMAIN_SERVING_ROUTE",
+    "PAIR_COUNTER_WORDS",
     "PreparedBatchDeepGemmFp8NtGroupwise",
     "SUPPORTED_NK",
     "WORKSPACE_DTYPES",
     "bind_arguments",
     "bind_named_arguments",
     "check_batch_deepgemm_fp8_nt_groupwise_cake",
+    "domain_serving_program",
+    "expected_m_class",
     "is_batch_deepgemm_fp8_nt_groupwise_cake_available",
+    "localize_weights",
     "prepare_batch_deepgemm_fp8_nt_groupwise",
     "run_batch_deepgemm_fp8_nt_groupwise",
     "select_route",
