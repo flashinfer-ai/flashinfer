@@ -100,7 +100,14 @@ _stats: Dict[str, Any] = {
 
 
 def _sparse_mla_decode_stats() -> dict:
-    """Diagnostics: per-backend dispatch counts and auto-routing census."""
+    """Diagnostics: per-backend dispatch counts and auto-routing census.
+
+    ``backend_dispatches`` counts front-level routing: calls handed to each
+    routed underlying public entry, not which implementation that entry then
+    ran. An SM90 ``"specialized"`` dispatch under the kill switch runs that
+    entry's composable reference path; the fused-vs-reference split lives in
+    ``_sparse_mla_sm90._sparse_mla_sm90_stats()``.
+    """
     return {
         "calls": _stats["calls"],
         "backend_dispatches": dict(_stats["backend_dispatches"]),
@@ -118,7 +125,24 @@ def _reset_sparse_mla_decode_stats() -> None:
 
 @flashinfer_api
 def is_sparse_mla_decode_supported(device: torch.device) -> bool:
-    """Whether ``backend="auto"`` has a route for ``device``."""
+    """Whether ``backend="auto"`` has a route for ``device``.
+
+    Parameters
+    ----------
+    device : torch.device
+        The device to probe (a ``torch.device`` or anything ``torch.device``
+        accepts, e.g. ``"cuda"`` or ``"cuda:1"``). Non-CUDA devices report
+        ``False``.
+
+    Returns
+    -------
+    bool
+        True only when CUDA is available and the device's compute capability
+        has a ``backend="auto"`` route: SM90 (``"specialized"``) or
+        SM120/SM121 (``"cuda"``). This probes routing existence only; the
+        routed entry's own support probe (e.g.
+        :func:`is_sparse_mla_sm90_supported`) owns per-call eligibility.
+    """
     device = torch.device(device)
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
@@ -151,7 +175,7 @@ def _resolve_backend(backend: str, device: torch.device) -> str:
             f"{cc[0]}.{cc[1]}; supported: SM90 ('specialized') and "
             "SM120/SM121 ('cuda' or 'cake'). The DeepSeek-V4 windowed "
             "dual-pool op is a different op served by its own front, "
-            "flashinfer.mla.batch_decode_sparse_mla_dsv4"
+            "flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4"
         )
     key = f"{cc[0]}.{cc[1]}->{routed}"
     _stats["auto_routes"][key] = _stats["auto_routes"].get(key, 0) + 1
@@ -203,6 +227,18 @@ _SM120_RUN_KEYS = (
 # runner is never shared between CUDA streams that could execute
 # concurrently: each stream gets its own runner, while same-stream calls
 # (which the stream orders) keep full reuse.
+#
+# CUDA-graph discipline for the wrapper backends: warm up eagerly on the
+# SAME stream you will capture on (the key includes the capture stream, so
+# a cold capture stream would construct and plan a runner under capture),
+# and graphs captured from one stream record that runner's pinned scratch
+# addresses — replay such graphs only in an order the caller serializes.
+# Captures that must replay concurrently take per-capture caller-owned
+# scratch via backend_args['mid_out'] / 'mid_lse' (and 'out_lse'). Cached
+# runners are retained for the process lifetime: a live graph may replay
+# against a runner's buffers at any time, so the front never evicts;
+# callers bound the footprint by pinning max_num_tokens at the largest
+# capacity they will use instead of growing it per batch.
 _sm120_runners: Dict[Tuple[Any, ...], Any] = {}
 
 
@@ -414,8 +450,23 @@ def sparse_mla_decode(
     contract, not a different ABI for this one. The experimental
     ``flashinfer.attention.prims_ts`` sparse-MLA decode entry is same-op but
     not wired (experimental namespace, plan/run lifecycle); use it directly.
+
+    **CUDA graphs (wrapper backends).** The front caches one wrapper runner
+    per (device, current stream, constructor knobs). Warm up eagerly on the
+    stream you will capture on: a cold capture stream would construct and
+    plan a runner under capture. Graphs captured from the same stream share
+    that runner's split-K scratch, so replay them only in a caller-serialized
+    order; give each independently replayed capture its own scratch via
+    ``backend_args['mid_out']`` / ``'mid_lse'`` (and ``'out_lse'``). Cached
+    runners are never evicted while the process lives (a live graph may
+    replay against their buffers); pin ``max_num_tokens`` at the largest
+    capacity you will use rather than growing it per batch.
+
     Per-backend dispatch counts are visible through
-    ``flashinfer.mla._sparse_decode._sparse_mla_decode_stats()``.
+    ``flashinfer.mla._sparse_decode._sparse_mla_decode_stats()``;
+    ``backend_dispatches`` counts front-level routing to each underlying
+    entry, while the SM90 entry's own stats distinguish its fused vs
+    reference execution (e.g. under the kill switch).
     """
     args = dict(backend_args) if backend_args else {}
     resolved = _resolve_backend(backend, query.device)
