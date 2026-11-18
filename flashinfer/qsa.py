@@ -321,8 +321,8 @@ def qsa_topk_indexer(
     backend: str = "auto",
 ) -> torch.Tensor:
     r"""Select the top-scoring key blocks for each packed query token (QSA
-    stage 1) and expand them to packed token indices for
-    :func:`qsa_indexed_forward`.
+    stage 1) and expand them to the packed request-local token indices the
+    SM107 QSA stage-2 sparse-attention path consumes.
 
     For every query token, each visible compressed block is scored as
     ``sum_h relu(qi[t, h] . ck[block])`` over the ``4`` index heads, the top
@@ -369,7 +369,14 @@ def qsa_topk_indexer(
         (``cu_seqlens[-1] == T``). Values are read on the device only.
     cpage_base : torch.Tensor
         int32 ``[batch]`` first page of each request's contiguous page range
-        in ``ck_cache``.
+        in ``ck_cache``. The range must hold every compressed block the
+        request's tokens can see: with ``len_r = cu_seqlens[r + 1] -
+        cu_seqlens[r]``, pages ``cpage_base[r]`` through ``cpage_base[r] +
+        ceil(len_r / 256) - 1`` must exist in ``ck_cache``. Like the
+        ``cu_seqlens`` values themselves (read on the device only), this is a
+        device-value caller contract — the host cannot see the lengths to
+        check it, and the kernels read keys without re-checking the cache
+        extent, so a violating call reads out of bounds.
     out : Optional[torch.Tensor]
         Caller-owned int32 ``[T, 2052]`` output; allocated when omitted.
     backend : str
@@ -389,7 +396,10 @@ def qsa_topk_indexer(
         :func:`qsa_indexed_forward` is NOT a direct consumer: it takes
         absolute packed token ids and no count column, so feeding it requires
         adding each row's request start (``cu_seqlens[req]``) to the valid
-        ids and overwriting the final count column with ``-1``.
+        ids and overwriting the final count column with ``-1`` — and it has
+        its own support matrix (SM100/SM103 at the supported cuDNN Frontend),
+        which does not include this kernel's SM107 target, so that pairing
+        also requires moving the indices to a supported device.
     """
     if backend not in QSA_TOPK_INDEXER_BACKENDS:
         raise ValueError(
