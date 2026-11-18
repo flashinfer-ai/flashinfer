@@ -97,11 +97,19 @@ def test_forwarded_scales_graph_and_empty_receivers(
             HandleAlgoKnobUserStream(torch.cuda.current_stream().cuda_stream),
         ],
     )
+    ht_indices = None
+    if algorithm is EpAlgorithm.HIGH_THROUGHPUT and not eager:
+        ht_indices, _ = handle._native_receive(
+            "indices", (world * capacity, ids.shape[1]), torch.int64, values.device
+        )
 
     received = None
 
     def step():
         nonlocal received
+        if ht_indices is not None:
+            # HT leaves rows past its live prefix untouched. Count fresh writes.
+            ht_indices.fill_(-1)
         handle.update(HandleParams(ids))
         received = handle.dispatch(DispatchInputParams(x=[values, scales]))
         local = (
