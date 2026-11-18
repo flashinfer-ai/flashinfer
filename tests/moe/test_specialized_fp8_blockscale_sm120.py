@@ -35,9 +35,11 @@ import torch
 
 
 def _is_validated_sm120_device():
+    # Gate on the CURRENT device: DEVICE = "cuda" resolves to it, so checking
+    # device 0 would mis-gate on multi-GPU hosts.
     if not torch.cuda.is_available():
         return False
-    props = torch.cuda.get_device_properties(0)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
     # The backend's dispatch surface requires the validated device profile
     # (CC 12.0 and the exact SM count its cooperative grids are sized for),
     # so other SM120 parts skip rather than exercise the stock refusal.

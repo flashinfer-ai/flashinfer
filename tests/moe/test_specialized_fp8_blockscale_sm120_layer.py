@@ -62,9 +62,11 @@ def _contract_config(**overrides):
 
 
 def _is_validated_sm120_device():
+    # Gate on the CURRENT device: DEVICE = "cuda" and MoELayer() both resolve
+    # to it, so checking device 0 would mis-gate on multi-GPU hosts.
     if not torch.cuda.is_available():
         return False
-    props = torch.cuda.get_device_properties(0)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return (props.major, props.minor) == (12, 0) and props.multi_processor_count == 188
 
 
@@ -139,6 +141,34 @@ def test_runner_quant_and_routing_declarations():
     assert not SpecializedFp8BlockRunner.supports_expert_parallelism
 
 
+def test_prepare_weights_swaps_canonical_halves():
+    """MoEWeightPack rule: prepare_weights takes canonical [up, gate] fc1 rows
+    and performs the swap to the kernels' native [gate; up] order itself, on
+    the payload and its block scales together (GPU-free)."""
+    e, two_i, h = 2, 2 * I, H
+    w13 = torch.arange(e * two_i * h, dtype=torch.float32).reshape(e, two_i, h)
+    w13 = w13.to(torch.float8_e4m3fn)
+    w13_sf = torch.arange(e * (two_i // 128) * (h // 128), dtype=torch.float32).reshape(
+        e, two_i // 128, h // 128
+    )
+    w2 = torch.zeros(e, h, I, dtype=torch.float8_e4m3fn)
+    w2_sf = torch.zeros(e, h // 128, I // 128, dtype=torch.float32)
+    view = SpecializedFp8BlockConfig.prepare_weights(w13, w13_sf, w2, w2_sf)
+    native, native_sf = view["w13_weight"], view["w13_weight_sf"]
+    assert native.is_contiguous() and native_sf.is_contiguous()
+    # native first half (kernel's gate) == canonical second half (gate)
+    assert torch.equal(native[:, :I].to(torch.float32), w13[:, I:].to(torch.float32))
+    assert torch.equal(native[:, I:].to(torch.float32), w13[:, :I].to(torch.float32))
+    assert torch.equal(native_sf[:, : I // 128], w13_sf[:, I // 128 :])
+    assert torch.equal(native_sf[:, I // 128 :], w13_sf[:, : I // 128])
+    # fc2 passes through untouched
+    assert view["w2_weight"] is w2 and view["w2_weight_sf"] is w2_sf
+    with pytest.raises(ValueError, match=r"\[up, gate\]"):
+        SpecializedFp8BlockConfig.prepare_weights(
+            w13[:, : two_i - 1], w13_sf, w2, w2_sf
+        )
+
+
 def test_kill_switch_rejects_at_check_support(monkeypatch):
     """The GPU-free kill-switch check rejects the runner before any device
     query, so it runs on any host."""
@@ -146,6 +176,27 @@ def test_kill_switch_rejects_at_check_support(monkeypatch):
     runner = SpecializedFp8BlockRunner(_contract_config(), torch.device("cuda", 0))
     with pytest.raises(RuntimeError, match=_KILL_SWITCH):
         runner.check_support()
+
+
+def test_kill_switch_blocks_warmup(monkeypatch):
+    """The kill switch disables the backend ENTIRELY: warmup must return
+    before JIT-loading the module or launching anything, and must not record
+    warmed variants (GPU-free: the switch is checked before any device work)."""
+    import flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 as spec
+
+    monkeypatch.setenv(_KILL_SWITCH, "1")
+
+    def _boom():
+        raise AssertionError("warmup must not touch the kernel module while disabled")
+
+    monkeypatch.setattr(spec, "_kernel_entry", _boom)
+    warmed_before = set(spec._warmed)
+    w13 = torch.zeros(E, 2 * I, H, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(E, H, I, dtype=torch.float8_e4m3fn)
+    w13_sf = torch.zeros(E, (2 * I) // 128, H // 128, dtype=torch.float32)
+    w2_sf = torch.zeros(E, H // 128, I // 128, dtype=torch.float32)
+    spec.warmup(w13, w2, [w13_sf, w2_sf], device="cpu")
+    assert set(spec._warmed) == warmed_before
 
 
 def test_off_contract_rejected_at_check_support(monkeypatch):
@@ -165,6 +216,7 @@ DEVICE = "cuda"
 
 @pytest.fixture(scope="module")
 def weights():
+    """Canonical MoEWeightPack weights: fc1 rows in [up, gate] order."""
     gen = torch.Generator(device="cpu").manual_seed(20260102)
     w13 = torch.randn(E, 2 * I, H, generator=gen).to(torch.float8_e4m3fn)
     w2 = torch.randn(E, H, I, generator=gen).to(torch.float8_e4m3fn)
@@ -221,8 +273,9 @@ def _reference(x, ids, tw, weights):
         tok, slot = (ids64 == e).nonzero(as_tuple=True)
         w13_e = _dequant_block(w13[e], w13_scale[e])
         w2_e = _dequant_block(w2[e], w2_scale[e])
-        gate_up = x32[tok] @ w13_e.T
-        gate, up = gate_up[:, :I], gate_up[:, I:]
+        up_gate = x32[tok] @ w13_e.T
+        # Canonical [up, gate] rows: first half up, second half gate.
+        up, gate = up_gate[:, :I], up_gate[:, I:]
         inter = (gate * torch.sigmoid(gate)) * up
         out.index_add_(0, tok, (inter @ w2_e.T) * tw[tok, slot].unsqueeze(1))
     return out.to(torch.bfloat16)
@@ -314,13 +367,16 @@ def test_layer_matches_module_dispatch(weights, t):
     layer = MoELayer(_contract_config())
     act = MoEActivationPack(x, None, ids, tw)
     out_layer = layer(act, _weight_pack(weights))
+    # The module's own entry takes the kernels' native [gate; up] layout;
+    # prepare_weights performs the canonical->native swap.
+    native = SpecializedFp8BlockConfig.prepare_weights(w13, w13_scale, w2, w2_scale)
     direct, reason = maybe_run_specialized(
         x,
         ids,
         tw,
-        w13,
-        w2,
-        [w13_scale, w2_scale],
+        native["w13_weight"],
+        native["w2_weight"],
+        [native["w13_weight_sf"], native["w2_weight_sf"]],
         None,
         context_ok=True,
     )

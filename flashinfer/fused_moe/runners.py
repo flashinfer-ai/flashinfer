@@ -8583,6 +8583,26 @@ class SpecializedFp8BlockRunner(MoERunner):
                 "use_fused_finalize=True (finalize is fused into its FC2 "
                 "accumulation)."
             )
+        # The JIT build happens on the dispatch path (outside check_support),
+        # so the toolkit must be rejected here: the kernels use
+        # cvt.rn.bf16x2.e4m3x2, which needs PTX ISA 9.2 (CUDA 13.2+). CUDA
+        # 13.0/13.1 would otherwise pass candidate selection and fail at the
+        # first forward's JIT build with no handler.
+        from ..jit.cpp_ext import get_cuda_version
+
+        try:
+            cuda_version = get_cuda_version()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "the specialized SM120 FP8 block-scale backend could not "
+                f"determine the CUDA toolkit version: {exc}"
+            ) from exc
+        if (cuda_version.major, cuda_version.minor) < (13, 2):
+            raise NotImplementedError(
+                "the specialized SM120 FP8 block-scale backend JIT-builds an "
+                "sm_120a module that requires the CUDA 13.2+ toolkit (PTX ISA "
+                f"9.2 for cvt.rn.bf16x2.e4m3x2); found CUDA {cuda_version}."
+            )
         # Device guards, mirroring the module's shipped dispatch surface.
         cc = tuple(get_compute_capability(self.device))
         if not (allow["min_cc"] <= cc <= allow["max_cc"]):

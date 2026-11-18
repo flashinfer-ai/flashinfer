@@ -2708,18 +2708,38 @@ class SpecializedFp8BlockConfig:
     def prepare_weights(w13_weight, w13_weight_sf, w2_weight, w2_weight_sf):
         """Build the native weight view in the kernels' own layout.
 
-        ``w13_weight`` is the fp8 ``[E, 2I, H]`` fc1 stack in the serving
-        engines' ``[gate; up]`` row order (NOTE: the canonical
-        ``MoEWeightPack`` source convention is ``[up, gate]`` — swap halves
-        before calling this when starting from canonical weights);
+        ``w13_weight`` is the fp8 ``[E, 2I, H]`` fc1 stack in the canonical
+        ``MoEWeightPack`` ``[up, gate]`` row order; the kernels read the
+        first fc1 half as gate, so this helper swaps the halves of the
+        payload and of its block scales together (``MoEWeightPack`` rule:
+        backends that want ``[gate, up]`` swap inside their prepare helper).
         ``w13_weight_sf`` is fp32 ``[E, 2I/128, H/128]``; ``w2_weight`` is
         fp8 ``[E, H, I]`` with ``w2_weight_sf`` fp32 ``[E, H/128, I/128]``.
         Register the result with
         ``MoEWeightPack.prepare_for("specialized_fp8_block", ...)``.
         """
+        if w13_weight.ndim != 3 or w13_weight.shape[1] % 2:
+            raise ValueError(
+                "w13_weight must be [E, 2I, H] with rows in canonical "
+                f"[up, gate] order; got shape {tuple(w13_weight.shape)}."
+            )
+        if w13_weight_sf.ndim != 3 or w13_weight_sf.shape[1] % 2:
+            raise ValueError(
+                "w13_weight_sf must be [E, 2I/128, H/128] block scales for "
+                "canonical [up, gate] rows; got shape "
+                f"{tuple(w13_weight_sf.shape)}."
+            )
+        half = w13_weight.shape[1] // 2
+        sf_half = w13_weight_sf.shape[1] // 2
+        w13_native = torch.cat(
+            (w13_weight[:, half:], w13_weight[:, :half]), dim=1
+        ).contiguous()
+        w13_sf_native = torch.cat(
+            (w13_weight_sf[:, sf_half:], w13_weight_sf[:, :sf_half]), dim=1
+        ).contiguous()
         return {
-            "w13_weight": w13_weight,
-            "w13_weight_sf": w13_weight_sf,
+            "w13_weight": w13_native,
+            "w13_weight_sf": w13_sf_native,
             "w2_weight": w2_weight,
             "w2_weight_sf": w2_weight_sf,
         }

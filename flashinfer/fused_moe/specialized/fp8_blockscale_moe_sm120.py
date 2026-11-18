@@ -328,6 +328,16 @@ def warmup(
     t_values=None,
 ) -> None:
     """Pre-compile the allowlisted token-count variants (CUDA-graph rule)."""
+    # The kill switch disables the backend ENTIRELY: warmup must not JIT-load
+    # the module or launch anything while it is set (and nothing is recorded
+    # as warmed, so a later capture without the switch still requires a real
+    # eager warmup).
+    if os.environ.get(_DISABLE_ENV, "0") == "1":
+        logger.debug(
+            "flashinfer.fused_moe specialized fp8-block-scale: warmup skipped, %s=1",
+            _DISABLE_ENV,
+        )
+        return
     allow = _load_allowlist()
     if allow is None:
         return
