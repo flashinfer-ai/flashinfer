@@ -1796,6 +1796,8 @@ def cutlass_fused_moe(
 
     Raises
     ------
+    ValueError:
+        If the input, routing tensors, expert weights/biases, or output are not contiguous.
     NotImplementedError:
         If any of the following features are requested but not implemented:
             - Minimum Latency Mode
@@ -1837,6 +1839,19 @@ def cutlass_fused_moe(
         return _cake_situ_fused_moe(locals())
     if backend != "cutlass":
         raise ValueError(f"unsupported fused MoE backend: {backend!r}")
+    # Reject packed-layout violations before autotuning can read the operands.
+    for name, tensor in (
+        ("input", input),
+        ("token_selected_experts", token_selected_experts),
+        ("token_final_scales", token_final_scales),
+        ("fc1_expert_weights", fc1_expert_weights),
+        ("fc2_expert_weights", fc2_expert_weights),
+        ("fc1_expert_biases", fc1_expert_biases),
+        ("fc2_expert_biases", fc2_expert_biases),
+        ("output", output),
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     major, minor = get_compute_capability(input.device)
     if int(activation_type) == int(ActivationType.ClampedRelu2):
         if clamped_relu2_limit is None:
