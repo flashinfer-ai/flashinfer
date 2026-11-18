@@ -606,6 +606,12 @@ def test_unified_layer_matches_flat_specialized():
     )
     m_layer, m_flat = _matched(y_layer, y_ref), _matched(y_flat, y_ref)
     assert m_layer >= m_flat - 5e-3, (m_layer, m_flat)
+    # Absolute floor against a shared defect: the relative checks above pass
+    # when both paths are equally wrong (even all-zero outputs). 0.97 is a
+    # catastrophic-failure floor for the denser all-local accumulation (the
+    # flat suite's half-local band is 0.99), not a tuned accuracy band; the
+    # relative assertion remains the precise gate.
+    assert m_flat >= 0.97 and m_layer >= 0.97, (m_layer, m_flat)
 
 
 def test_unified_layer_prefill_path_matches_flat():
@@ -630,6 +636,8 @@ def test_unified_layer_prefill_path_matches_flat():
     assert _matched(y_layer, y_flat) >= 0.99
     m_layer, m_flat = _matched(y_layer, y_ref), _matched(y_flat, y_ref)
     assert m_layer >= m_flat - 5e-3, (m_layer, m_flat)
+    # Absolute floor against a shared defect (see the decode test above).
+    assert m_flat >= 0.97 and m_layer >= 0.97, (m_layer, m_flat)
 
 
 def test_unified_layer_kill_switch_excludes_backend(monkeypatch):
