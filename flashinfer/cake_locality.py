@@ -493,9 +493,9 @@ def split_empty(
     tensor and all its views are freed: the context that made the allocation and,
     when it is on the allocation's device, the context that frees it are
     synchronized, both parts are unmapped and released, and the allocation leaves
-    the :func:`homing` registry. Work of any other context that reads the tensor
-    must be complete before then (only contexts of the allocation's device can
-    access it).
+    the :func:`homing` registry. Work of any other context that reads or writes
+    the tensor must be complete before then (only contexts of the allocation's
+    device can access it).
     Allocate and free outside CUDA graph capture; a graph that still reads the
     tensor after it is freed faults on replay.
 

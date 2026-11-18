@@ -375,9 +375,9 @@ class ContextScope {
 // stale context handle (which may name another context now) is never made
 // current. The registry lock is not held while the contexts synchronize. Work of
 // any other context (neither the one that made the allocation nor the one that
-// frees it) that reads the allocation must be complete before its last tensor
-// is freed. A CUDA graph that still reads the allocation faults on its next
-// replay, as the range is unmapped.
+// frees it) that reads or writes the allocation must be complete before its
+// last tensor is freed. A CUDA graph that still reads the allocation faults on
+// its next replay, as the range is unmapped.
 void SplitFree(CUdeviceptr address) noexcept {
   try {
     Split split{};
