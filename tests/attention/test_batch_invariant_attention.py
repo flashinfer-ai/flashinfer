@@ -613,7 +613,7 @@ def test_planner_swaps_unit_kinds():
     # the fused grids: the default and every integral-wave grid above the floor, longest-first waves; the chosen one is the cheapest
     assert P.swaps_fused_grids(512, SM, 128) == [212, 171, 128, 103]
     assert P.swaps_fused_grids(128, SM, 128) == [128]
-    units = [(64, [4] * 16, 4)] * 512
+    units = [(64, (16, 4, 4), 4)] * 512
     costs = {
         g: P.swaps_kind_cost(units, [False] * 512, g, SM, 128, 2)
         for g in P.swaps_fused_grids(512, SM, 128)
