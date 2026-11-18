@@ -32,10 +32,12 @@ Supported contract (fails closed to the dequant + stock path otherwise):
 page size 64, causal, UNIFORM per-request q_len <= 6 (the measured
 spec/MTP-decode widths; the serve contract is q_len 6), fp8e4m3 packed (or
 zero-copy adjacent split) query and KV cache, bf16 out, per-tensor float
-Q/KV descales, and the measured envelope (batch <= 128, kv_len <= 262144).
-The guard is an UNSCOPED configuration guard: no per-shape competitive
-carve-outs — backend choice between engines is per-deployment, not
-per-shape.
+Q/KV descales, and the measured envelope (batch <= 128, kv_len <= 262144,
+and every request's kv_len >= its q_len — a shorter context leaves causal
+query rows with EMPTY key windows, whose zero-output empty-row semantics
+belong to the stock path). The guard is an UNSCOPED configuration guard: no
+per-shape competitive carve-outs — backend choice between engines is
+per-deployment, not per-shape.
 
 PRECISION (part of the API contract): this kernel computes all-fp8
 (fp8 q x fp8 KV end-to-end, the FlashMLA dense-fp8 arithmetic class), NOT
@@ -49,6 +51,25 @@ CUDA-graph capture; run() only launches on the current stream. The scalar
 Q/KV descales are written into plan-owned device buffers at run time; under
 CUDA-graph capture the values present at capture are baked into the graph
 (the same semantics as the baked sm_scale).
+
+CUDA-graph replan semantics (part of the API contract): on a
+``use_cuda_graph=True`` wrapper the prepared metadata (block table,
+sequence lengths) lives in wrapper-owned buffers whose ADDRESSES never
+change, and a successful replan at the prepared buffer geometry (same
+batch, q_len and table width) refreshes their CONTENTS in place — for BOTH
+metadata forms, including a caller-provided dense ``block_tables`` tensor,
+whose contents are copied through the stable buffer rather than rebound —
+so a graph captured earlier replays the NEW plan, never a stale mix of old
+page IDs with new lengths. A successful replan whose metadata CANNOT be
+refreshed through the captured buffers (different geometry, or a plan
+outside the fast-path contract, both of which leave the fast path and the
+buffer contents untouched) INVALIDATES previously captured graphs: discard
+them and capture anew — their replays keep computing the previous plan's
+values, never a mix. A FAILED (backend-rejected) replan restores the
+buffer contents, so existing captures stay valid — see the wrapper's
+plan(). The kill-switch env vars are an operator override: they tear down
+the fast path for eager calls while existing captures keep replaying their
+captured plan.
 """
 
 import math
@@ -93,6 +114,7 @@ _counters: Dict[str, int] = {
     "plans_disabled": 0,
     "plans_ineligible": 0,
     "plans_prepared": 0,
+    "replans_refreshed_captured": 0,
     "build_failed": 0,
     "workspace_allocs": 0,
     "runs_dispatched": 0,
@@ -216,6 +238,15 @@ def _mla_dec_fp8q_sm90_prepare(
         )
         return
     device = wrapper.device if hasattr(wrapper, "device") else None
+    # Under a CUDA-graph wrapper an already-captured graph binds the prepared
+    # buffers' ADDRESSES, so a replan never reallocates or rebinds them: a
+    # refreshable replan rewrites their CONTENTS in place (replays then
+    # compute the NEW plan), and a replan that cannot be refreshed through
+    # them leaves the buffers untouched and — by the documented contract —
+    # INVALIDATES previously captured graphs (their replays keep computing
+    # the previous plan's values, never a mix; callers re-capture).
+    use_graph = bool(getattr(wrapper, "_use_cuda_graph", False))
+    captured = bool(getattr(wrapper, "_mla_dec_fp8q_sm90_scales_captured", False))
     try:
         reason = None
         if explicit_output_dtype not in (None, torch.bfloat16):
@@ -297,12 +328,35 @@ def _mla_dec_fp8q_sm90_prepare(
                 reason = "kv-length metadata shorter than batch"
             elif int(kv_lens_host[:B].max()) > _MAX_KV_LEN:
                 reason = f"kv_len={int(kv_lens_host[:B].max())} above measured envelope"
-            elif int(kv_lens_host[:B].min()) < 1:
-                reason = "kv_len < 1"
+            elif int(kv_lens_host[:B].min()) < QL:
+                # A request with kv_len < q_len has causal query rows whose
+                # visible-key window is EMPTY. The kernels clamp every row's
+                # key limit to >= 1 (they would attend such rows to key 0 and
+                # emit a value), while the contract's empty-row semantics are
+                # zero output rows — which the stock path implements — so
+                # these plans decline to the exact dequant + stock path.
+                reason = (
+                    "kv_len=%d < q_len=%d leaves causal rows with zero "
+                    "visible keys (empty-row semantics belong to the stock "
+                    "path)" % (int(kv_lens_host[:B].min()), QL)
+                )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         counters["plans_ineligible"] += 1
+        if captured:
+            # The captured buffers stay untouched (this return precedes every
+            # buffer write), so existing captures keep replaying the PREVIOUS
+            # plan's values intact; by the documented contract this replan
+            # invalidates them and callers must re-capture.
+            logger.warning(
+                "mla_decode_fp8_paged_sm90: this replan is outside the "
+                "fast-path contract (%s) and cannot refresh the metadata "
+                "buffers a captured graph reads; previously captured graphs "
+                "are invalidated (they keep computing the previous plan) — "
+                "discard them and capture anew",
+                reason,
+            )
         if selector == "specialized":
             counters["specialized_raises"] += 1
             raise RuntimeError(
@@ -355,10 +409,6 @@ def _mla_dec_fp8q_sm90_prepare(
     if bufs is None:
         bufs = {}
         wrapper._mla_dec_fp8q_sm90_bufs = bufs
-    # Under a CUDA-graph wrapper an already-captured graph may hold the
-    # addresses of the prepared buffers, so a replan must never reallocate
-    # them: a replan whose geometry outgrows them is ineligible instead.
-    use_graph = bool(getattr(wrapper, "_use_cuda_graph", False))
 
     def _buf(name, numel, dtype):
         t = bufs.get(name)
@@ -386,14 +436,32 @@ def _mla_dec_fp8q_sm90_prepare(
                     tuple(bt_src.shape),
                 )
                 return
-            if use_graph and bt_src.device != device:
-                raise _GraphRealloc(
-                    "dense block_tables must already live on the wrapper "
-                    "device (a plan-time copy would not be seen by a "
-                    "captured graph)"
-                )
-            block_table = bt_src[:B].to(device=device, dtype=torch.int32)
-            pps = int(block_table.shape[1])
+            pps = int(bt_src.shape[1])
+            if use_graph:
+                # The captured graph binds the stable wrapper-owned buffer's
+                # address, so the new table's CONTENTS are copied through it
+                # (never rebind the state to the caller's tensor: a replay
+                # would keep reading the previous plan's page IDs while the
+                # refreshed sequence lengths change under it).
+                bt = bufs.get("block_table")
+                if (
+                    bt is None
+                    or bt.shape[0] < B
+                    or bt.shape[1] != pps
+                    or bt.device != device
+                ):
+                    if bt is not None:
+                        raise _GraphRealloc(
+                            "block_table geometry changed "
+                            f"({tuple(bt.shape)} -> ({B}, {pps}))"
+                        )
+                    bt = torch.zeros((B, pps), dtype=torch.int32, device=device)
+                    bufs["block_table"] = bt
+                    _counters["workspace_allocs"] += 1
+                bt[:B].copy_(bt_src[:B])
+                block_table = bt[:B]
+            else:
+                block_table = bt_src[:B].to(device=device, dtype=torch.int32)
         else:
             indptr = md.kv_indptr.cpu().to(torch.int64)
             indices = md.kv_indices
@@ -449,6 +517,14 @@ def _mla_dec_fp8q_sm90_prepare(
         k_descale = _buf("k_descale", 1, torch.float32)
     except _GraphRealloc as exc:
         counters["plans_ineligible"] += 1
+        if captured:
+            logger.warning(
+                "mla_decode_fp8_paged_sm90: this CUDA-graph replan cannot be "
+                "refreshed through the prepared buffers (%s); previously "
+                "captured graphs are invalidated (they keep computing the "
+                "previous plan) — discard them and capture anew",
+                exc,
+            )
         if selector == "specialized":
             counters["specialized_raises"] += 1
             raise RuntimeError(
@@ -490,6 +566,10 @@ def _mla_dec_fp8q_sm90_prepare(
             getattr(wrapper, "_mla_dec_fp8q_sm90_scales_captured", False)
         ),
     )
+    if captured and use_graph:
+        # The stable buffers' contents were refreshed in place, so replays of
+        # earlier captures now compute THIS plan.
+        counters["replans_refreshed_captured"] += 1
     counters["plans_prepared"] += 1
 
 

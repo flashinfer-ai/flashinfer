@@ -495,6 +495,20 @@ class BatchMLAPagedAttentionWrapper:
         modifying caller metadata does not update that plan. Replan eagerly,
         or create a new wrapper for a different CUDA graph workload.
 
+        SM90 fp8-query fast path under CUDA graphs: on a
+        ``use_cuda_graph=True`` wrapper the fast path's prepared metadata
+        (block table, sequence lengths) lives in wrapper-owned buffers whose
+        addresses never change. A successful replan at the prepared buffer
+        geometry (same batch size, query length, and table width) refreshes
+        those buffers' contents in place, so previously captured graphs
+        replay the NEW plan. A successful replan that cannot be refreshed
+        through those buffers — a different geometry, or a plan outside the
+        fast-path contract — leaves their contents untouched and INVALIDATES
+        previously captured graphs: their replays keep computing the
+        previous plan's values, so discard them and capture anew. A FAILED
+        (backend-rejected) replan restores the buffer contents, and existing
+        captures stay valid.
+
         The plan also declares the later :meth:`run` contract. In particular,
         ``query_layout``, ``kv_cache_layout``, ``lse_mode``, ``output_dtype``,
         ``output_scale``, ``scale_mode``, ``skip_softmax``, and ``use_sinks``

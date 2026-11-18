@@ -147,9 +147,14 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
         vis = (kvl - ql) + torch.arange(ql, device=device) + 1
         mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(ql, 1, 1)
         sc = sc.masked_fill(mask, float("-inf"))
-        out[r * ql : (r + 1) * ql] = torch.einsum(
-            "qhl,ld->qhd", torch.softmax(sc, -1), v
-        ).to(torch.bfloat16)
+        p = torch.softmax(sc, -1)
+        # A row whose causal window holds zero keys (kvl < ql) is all -inf
+        # and softmaxes to NaN; the contract's empty-row semantics (and the
+        # stock path's behavior) are exact-zero output rows.
+        p = torch.nan_to_num(p, nan=0.0)
+        out[r * ql : (r + 1) * ql] = torch.einsum("qhl,ld->qhd", p, v).to(
+            torch.bfloat16
+        )
     return out
 
 
@@ -717,6 +722,196 @@ def test_captured_scales_survive_later_eager_scale_changes():
     torch.cuda.synchronize()
     assert torch.equal(eager2, eager)
     assert _matched_ratio(eager2, _reference(batch)) >= MATCHED
+
+
+@pytest.mark.parametrize("ql", [2, 4, 6])
+def test_keyless_causal_rows_match_stock(ql):
+    """kv_len < q_len leaves causal query rows with ZERO visible keys. The
+    kernels clamp each row's key limit to >= 1 (they would attend such rows
+    to key 0 and emit a value), so these plans must decline to the stock
+    path, whose empty-row semantics are exact-zero output rows: with a zero
+    fp8 query and unit fp8 KV, kv_len=1 must produce [0, ..., 0, 1] per
+    channel, never all ones."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([1], device, ql=ql)
+    batch["q"] = torch.zeros_like(batch["q"].float()).to(torch.float8_e4m3fn)
+    batch["kv"] = torch.ones_like(batch["kv"].float()).to(torch.float8_e4m3fn)
+    w = _plan_wrapper(batch, device)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0 and stats["plans_ineligible"] == 1, stats
+
+    out = _run(w, batch)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0 and stats["runs_dequant_fallback"] >= 1
+    out = out.float()
+    # rows 0..ql-2 have empty causal windows: exact zeros, like stock
+    assert torch.all(out[: ql - 1] == 0.0), out[:, 0, 0]
+    # the final row sees exactly key 0: uniform softmax over the unit value
+    assert torch.all(out[ql - 1 :] == 1.0), out[:, 0, 0]
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_kv_len_equal_to_q_len_stays_on_fast_path():
+    """The keyless-row guard declines only kv_len < q_len; the kv_len == q_len
+    boundary (every row has >= 1 visible key) stays specialized and exact."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([QL], device)
+    w = _plan_wrapper(batch, device)
+    assert _mla_dec_fp8q_sm90_stats()["plans_prepared"] == 1
+    out = _run(w, batch)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def _graph_wrapper_and_capture(batch, device):
+    """Plan a use_cuda_graph wrapper on `batch`, capture one run into a
+    caller-owned output buffer, and return (wrapper, graph, out)."""
+    ws = torch.zeros(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    B = batch["kv_len_arr"].numel()
+    w = BatchMLAPagedAttentionWrapper(
+        float_workspace_buffer=ws,
+        use_cuda_graph=True,
+        qo_indptr=batch["qo_indptr"].clone(),
+        kv_indptr=batch["kv_indptr"].clone(),
+        kv_indices=batch["kv_indices"].clone(),
+        kv_len_arr=batch["kv_len_arr"].clone(),
+        backend="auto",
+        fp8q_backend="auto",
+    )
+    w.plan(
+        qo_indptr=batch["qo_indptr"],
+        kv_indptr=batch["kv_indptr"],
+        kv_indices=batch["kv_indices"],
+        kv_len_arr=batch["kv_len_arr"],
+        num_heads=NH,
+        head_dim_ckv=CKV,
+        head_dim_kpe=KPE,
+        page_size=PAGE,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    out = torch.empty((B * QL, NH, CKV), dtype=torch.bfloat16, device=device)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run(w, batch, out=out)  # warmup on the side stream
+    torch.cuda.current_stream().wait_stream(stream)
+    with torch.cuda.graph(graph):
+        _run(w, batch, out=out)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == 1
+    return w, graph, out
+
+
+def test_successful_replan_refreshes_captured_metadata():
+    """A successful replan at the captured geometry must refresh the SAME
+    buffers the capture reads (contents in place, never a rebinding the
+    capture cannot see): after replanning with permuted page IDs and a
+    shorter kv_len through the same four-page table width, a replay of the
+    old capture must compute the NEW plan, bitwise equal to an eager call."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([250], device)  # four pages, identity page order
+    w, graph, out = _graph_wrapper_and_capture(batch, device)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+    # successful replan: same B/QL/table width, permuted pages, shorter kv
+    new_indices = torch.tensor([3, 2, 1, 0], dtype=torch.int32, device=device)
+    new_len = torch.tensor([200], dtype=torch.int32, device=device)
+    w.plan(
+        qo_indptr=batch["qo_indptr"],
+        kv_indptr=batch["kv_indptr"],
+        kv_indices=new_indices,
+        kv_len_arr=new_len,
+        num_heads=NH,
+        head_dim_ckv=CKV,
+        head_dim_kpe=KPE,
+        page_size=PAGE,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["replans_refreshed_captured"] == 1, stats
+
+    batch2 = dict(batch)
+    batch2["kv_len_arr"] = new_len
+    batch2["block_table"] = new_indices.view(1, 4)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _matched_ratio(out, _reference(batch2)) >= MATCHED
+    eager = _run(w, batch)  # same metadata buffers: bitwise-equal kernel run
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+def test_unrefreshable_replan_leaves_captured_plan_intact():
+    """A replan the captured buffers cannot serve (outside the fast-path
+    contract at unchanged geometry) leaves their contents untouched: by the
+    documented contract it INVALIDATES prior captures, whose replays keep
+    computing the PREVIOUS plan's values intact — never a silent mix of old
+    page IDs with new lengths."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([250], device)
+    w, graph, out = _graph_wrapper_and_capture(batch, device)
+    eager_before = _run(w, batch).clone()
+
+    # replan outside the fast-path contract (lse_mode, the route-switch
+    # probe) at the captured geometry: not prepared, buffers untouched
+    w.plan(
+        qo_indptr=batch["qo_indptr"],
+        kv_indptr=batch["kv_indptr"],
+        kv_indices=batch["kv_indices"],
+        kv_len_arr=batch["kv_len_arr"],
+        num_heads=NH,
+        head_dim_ckv=CKV,
+        head_dim_kpe=KPE,
+        page_size=PAGE,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        lse_mode="basee",
+    )
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["replans_refreshed_captured"] == 0, stats
+    assert w._mla_dec_fp8q_sm90_state is None
+
+    # the (contract-invalidated) capture still computes its own plan's
+    # values bitwise, not a mix with the rejected-route replan
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager_before)
+
+
+def test_dual_device_smoke():
+    """Each device arms its own dynamic-smem opt-in (per-device
+    std::call_once): the same warp-group launch class must run correctly on
+    a second device, not inherit the first device's one-time opt-in."""
+    _sm90_or_skip()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("two GPUs required")
+    if torch.cuda.get_device_capability(1) != (9, 0):
+        pytest.skip("second SM90 device required")
+    for dev in ("cuda:0", "cuda:1"):
+        device = torch.device(dev)
+        batch = _make_batch([2983], device)
+        w = _plan_wrapper(batch, device)
+        out = _run(w, batch)
+        torch.cuda.synchronize(device)
+        assert _matched_ratio(out, _reference(batch)) >= MATCHED
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 2
 
 
 @pytest.mark.parametrize(

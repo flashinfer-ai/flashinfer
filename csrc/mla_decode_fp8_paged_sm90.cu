@@ -44,10 +44,13 @@
 // `init` must run once per device before the first `run` (SM-count query +
 // dynamic smem opt-in for the MT<=2 kernels), outside CUDA-graph capture.
 // `run` performs no allocation and no synchronisation; the warp-group/dual
-// kernel variants arm their dynamic-smem attribute once on their first
-// EAGER call (std::call_once, carried from the measured launcher), so each
-// launch class needs one eager warm-up call before CUDA-graph capture —
-// the same documented contract as the dispatcher enforces. The dual TMA
+// kernel variants arm their dynamic-smem attribute once PER DEVICE on their
+// first EAGER call on that device (per-device std::call_once — the attribute
+// binds to the current device's function image, so one process-wide opt-in
+// would leave every other device at the 48 KiB default and fail its first
+// launch with cudaErrorInvalidValue), so each launch class needs one eager
+// warm-up call per device before CUDA-graph capture — the same documented
+// contract as the dispatcher enforces. The dual TMA
 // descriptors are host-encoded and cached per thread by (base, rows,
 // promotion); steady-state calls re-encode nothing.
 
@@ -261,6 +264,12 @@ __device__ __noinline__ void repair_split(
   const int rB = rA + 8;
   const int gA = q0 * NH + rA, gB = q0 * NH + rB;
   const int ptop = pg1 * PAGE;
+  // L >= QL is part of the planned contract (the dispatcher declines shorter
+  // contexts, whose leading causal rows would have EMPTY key windows and
+  // zero-output empty-row semantics that these kernels do not implement), so
+  // every row's true limit is already >= 1; the max(1, ...) below is a
+  // defensive clamp, never a substitute for empty-row handling. The same
+  // holds at every other lim computation in this file.
   const int limA = min(max(1, L - QL + (gA / NH) + 1), ptop);
   const int limB = min(max(1, L - QL + (gB / NH) + 1), ptop);
 
@@ -2420,7 +2429,7 @@ size_t mla_decode_fp8_ws_bytes(const MlaSplitPlan& P, int B) {
 // One-time per-device SM-count query + dynamic shared memory opt-in for the
 // MT<=2 kernel instantiations. Outside CUDA-graph capture, before the first
 // `run` on the device. (The warp-group/dual/ring variants arm their own
-// attribute on first eager call — see the header note.)
+// attribute on the first eager call PER DEVICE — see the header note.)
 void mla_decode_fp8_paged_sm90_init(int64_t device_id) {
   TVM_FFI_ICHECK_GE(device_id, 0);
   TVM_FFI_ICHECK_LT(device_id, kMaxDevices);
@@ -2614,13 +2623,25 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
   const CUtensorMap& kv_map = g_tmap.kv;
   const CUtensorMap& pe_map = g_tmap.pe;
 
+// The dynamic-smem opt-in binds to the CURRENT device's function image, so
+// each launch class keeps one once_flag PER DEVICE (device_id is bounded by
+// kMaxDevices above); a process-wide flag would arm only the first device and
+// every other device's first launch would fail with cudaErrorInvalidValue.
+// The cudaFuncSetAttribute status is checked inside the callback so a failed
+// opt-in surfaces at the launch site; TVM_FFI_ICHECK throws, which leaves the
+// once_flag unset for a clean retry.
+#define ARM_SMEM(FLAGS, KERNEL, BYTES)                                                           \
+  std::call_once((FLAGS)[device_id], [&] {                                                       \
+    cudaError_t attr_status =                                                                    \
+        cudaFuncSetAttribute(KERNEL, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(BYTES)); \
+    TVM_FFI_ICHECK(attr_status == cudaSuccess)                                                   \
+        << "mla_decode_fp8_paged_sm90: cudaFuncSetAttribute(" << (int)(BYTES)                    \
+        << ") failed on device " << device_id << ": " << cudaGetErrorString(attr_status);        \
+  })
 #define LAUNCH(M, H, TAG)                                                                       \
   do {                                                                                          \
-    static std::once_flag init_##TAG;                                                           \
-    std::call_once(init_##TAG, [&] {                                                            \
-      cudaFuncSetAttribute(mla_kernel<M, H>, cudaFuncAttributeMaxDynamicSharedMemorySize,       \
-                           (int)smem);                                                          \
-    });                                                                                         \
+    static std::once_flag init_##TAG[kMaxDevices];                                              \
+    ARM_SMEM(init_##TAG, (mla_kernel<M, H>), smem);                                             \
     mla_kernel<M, H><<<grid, nthr, smem, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, \
                                                Opp, Mpp, Lpp, B, QL, pps, ns, pps_split, QPC);  \
   } while (0)
@@ -2634,55 +2655,40 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
       (size_t)Q_STORAGE_SZ + (size_t)D_NSLOT * PAGE_SZ + (size_t)PSZ + 512 + (size_t)MAXPG * 4;
 #define LAUNCHW(H, F, O, Q6, R, TAG)                                                             \
   do {                                                                                           \
-    static std::once_flag initw_##TAG;                                                           \
-    std::call_once(initw_##TAG, [&] {                                                            \
-      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R>,                               \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw);               \
-    });                                                                                          \
+    static std::once_flag initw_##TAG[kMaxDevices];                                              \
+    ARM_SMEM(initw_##TAG, (mla_kernel_tmaproducer<H, F, O, Q6, R>), smw);                        \
     mla_kernel_tmaproducer<H, F, O, Q6, R>                                                       \
         <<<grid, 288, smw, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
                                  kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
 #define LAUNCHD(H, Q6, TAG)                                                                      \
   do {                                                                                           \
-    static std::once_flag initd_##TAG;                                                           \
-    std::call_once(initd_##TAG, [&] {                                                            \
-      cudaFuncSetAttribute(mla_kernel_dual<H, Q6>, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
-                           (int)smw_dual);                                                       \
-    });                                                                                          \
+    static std::once_flag initd_##TAG[kMaxDevices];                                              \
+    ARM_SMEM(initd_##TAG, (mla_kernel_dual<H, Q6>), smw_dual);                                   \
     mla_kernel_dual<H, Q6>                                                                       \
         <<<grid, 160, smw_dual, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, \
                                       Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC);      \
   } while (0)
 #define LAUNCHW_NOCAP(H, F, O, Q6, R, TAG)                                                       \
   do {                                                                                           \
-    static std::once_flag initw_##TAG;                                                           \
-    std::call_once(initw_##TAG, [&] {                                                            \
-      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false>,                        \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw);               \
-    });                                                                                          \
+    static std::once_flag initw_##TAG[kMaxDevices];                                              \
+    ARM_SMEM(initw_##TAG, (mla_kernel_tmaproducer<H, F, O, Q6, R, false>), smw);                 \
     mla_kernel_tmaproducer<H, F, O, Q6, R, false>                                                \
         <<<grid, 288, smw, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
                                  kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
 #define LAUNCHW4_NOCAP(H, F, O, Q6, R, TAG)                                                       \
   do {                                                                                            \
-    static std::once_flag initw_##TAG;                                                            \
-    std::call_once(initw_##TAG, [&] {                                                             \
-      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4>,                \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw4);               \
-    });                                                                                           \
+    static std::once_flag initw_##TAG[kMaxDevices];                                               \
+    ARM_SMEM(initw_##TAG, (mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4>), smw4);        \
     mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4>                                        \
         <<<grid, 288, smw4, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
                                   kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
 #define LAUNCHD_NOCAP(H, Q6, TAG)                                                                \
   do {                                                                                           \
-    static std::once_flag initd_##TAG;                                                           \
-    std::call_once(initd_##TAG, [&] {                                                            \
-      cudaFuncSetAttribute(mla_kernel_dual<H, Q6, false>,                                        \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw_dual);          \
-    });                                                                                          \
+    static std::once_flag initd_##TAG[kMaxDevices];                                              \
+    ARM_SMEM(initd_##TAG, (mla_kernel_dual<H, Q6, false>), smw_dual);                            \
     mla_kernel_dual<H, Q6, false>                                                                \
         <<<grid, 160, smw_dual, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, \
                                       Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC);      \
@@ -2791,6 +2797,7 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
 #undef LAUNCHW_NOCAP
 #undef LAUNCHW4_NOCAP
 #undef LAUNCH
+#undef ARM_SMEM
 
   if (ns > 1) {
     const int nrows = B * rows_tot;
