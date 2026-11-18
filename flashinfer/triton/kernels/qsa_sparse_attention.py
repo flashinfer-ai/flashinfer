@@ -21,7 +21,11 @@ Launch-state notes (kept out of import time on purpose):
   pre-sizes them; CUDA-graph capture requires one same-shape eager warmup
   call first so that no allocation happens during capture (replay then reuses
   stable pointers). Retention is bounded by the largest shape seen
-  (roughly ``4 * T * 6 * 256`` BF16 + ``8 * T * 6`` FP32 elements + 256 KiB).
+  (roughly ``4 * T * 6 * 256`` BF16 + ``8 * T * 6`` FP32 elements + 256 KiB),
+  plus one pinned copy of each buffer that was live during a CUDA-graph
+  capture (``_GRAPH_HELD``): a captured graph bakes in those addresses, so a
+  later, larger call may grow the caches but never frees memory an existing
+  graph still replays into.
 - The scratch caches are shared process-wide, not per stream: concurrent
   calls of this op on different CUDA streams are not supported (documented in
   the public docstring); all calls, captures and replays included, must be
@@ -48,6 +52,22 @@ except Exception:  # pragma: no cover - very old Triton without the error class
 
 _TMA_SCRATCH: dict = {}
 
+# Scratch buffers that were live during a CUDA-graph capture. A captured
+# graph bakes raw device pointers into its launch nodes, and PyTorch requires
+# the allocations behind them to stay reserved for the graph's lifetime; a
+# later, larger call grows a cache by REPLACING its entry, so the replaced
+# buffer would otherwise be freed and its memory reused while an old graph
+# still reads and writes it on replay. Pinning every captured buffer here
+# keeps those addresses reserved; retention is bounded by the shapes that
+# were actually captured.
+_GRAPH_HELD: dict = {}
+
+
+def _hold_for_graph(buf):
+    if torch.cuda.is_current_stream_capturing():
+        _GRAPH_HELD[id(buf)] = buf
+    return buf
+
 
 def _tma_alloc(size, alignment, stream):
     """Reusable device scratch for Triton's device-side TMA descriptors."""
@@ -55,7 +75,7 @@ def _tma_alloc(size, alignment, stream):
     if buf is None or buf.numel() < size:
         buf = torch.empty(max(size, 1 << 18), dtype=torch.int8, device="cuda")
         _TMA_SCRATCH["b"] = buf
-    return buf
+    return _hold_for_graph(buf)
 
 
 _LAUNCH_STATE_READY = False
@@ -2129,22 +2149,30 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
         for kw in tl.range(0, nfull, warp_specialize=True):
             acc, mx, li = _tpd_step(
                 q8, q8, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
-                mr, mx, li, acc, False, DC, 0, FASTEX2, False, True, False,
+                mr, mx, li, acc, False, DC, 0, FASTEX2, False, True, True,
                 DEN16, True)
         for kw in tl.range(nfull, nw, warp_specialize=True):
             acc, mx, li = _tpd_step(
                 q8, q8, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
-                mr, mx, li, acc, False, DC, 0, FASTEX2, False, False, False,
+                mr, mx, li, acc, False, DC, 0, FASTEX2, False, False, True,
                 DEN16, True)
     else:
         for kw in tl.range(0, nw, warp_specialize=True):
             acc, mx, li = _tpd_step(
                 q8, q8, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
-                mr, mx, li, acc, False, DC, 0, FASTEX2, False, False, False,
+                mr, mx, li, acc, False, DC, 0, FASTEX2, False, False, True,
                 DEN16, True)
     den_ok = (li <= 1.0e30) & ((rcnt <= 0) | (
         li >= rcnt.to(tl.float32) * 3.0e-4))
-    bad = tl.min(den_ok.to(tl.int32), 0) == 0
+    # The denominator-range check alone cannot see E4M3 saturation: with the
+    # fixed zero reference the FP8 PV probability operands are 2**(s * cc),
+    # and E4M3 tops out near 448 (~2**8.8) while an FP32 li built from the
+    # same uniformly large logits stays finite and self-consistent.  Track the
+    # maximum selected logit and route rows whose exponents leave the FP8
+    # window to the exact retry, like the w7 and general sweeps do.
+    dlt = tl.where(rcnt > 0, mx * cc, 0.0)
+    bad = (tl.min(den_ok.to(tl.int32), 0) == 0) | (
+        tl.max(tl.abs(dlt)) > 8.0)
     if bad:
         _qsa_w6_redo(Q, G, KC, VC, O, t0, s0, s1, base, NSLOT,
                      BT, NHC, DC, PWC, SC)
@@ -2207,7 +2235,7 @@ def _ws(key, nelem, dtype, device):
     if buf is None or buf.numel() < nelem or buf.device != device:
         buf = torch.empty(nelem, dtype=dtype, device=device)
         _SCRATCH[key] = buf
-    return buf
+    return _hold_for_graph(buf)
 
 
 def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):

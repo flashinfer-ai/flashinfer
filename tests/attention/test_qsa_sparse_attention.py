@@ -236,6 +236,72 @@ def test_exact_capacity_cache(lengths):
     assert_close_at_gate(out, ref)
 
 
+def make_uniform_dense_prefix_inputs(lengths):
+    """Full causal-prefix selections over all-ones Q/K/V and a zero gate.
+
+    The softmax is exactly uniform and V is constant, so every output element
+    is ``bf16(1.0) * sigmoid(0) = 0.5`` regardless of row length. The uniform
+    logits of ``256 * 256**-0.5 = 16`` put the FP8 sweep's fixed-reference
+    probabilities near ``exp(16)``: far beyond an E4M3 PV operand's range
+    (~448) while the FP32 denominator stays finite and self-consistent — the
+    case the probability-range guard must route to the exact retry."""
+    dev = "cuda"
+    cu = torch.tensor([0] + list(itertools.accumulate(lengths)), dtype=torch.int32)
+    T = int(cu[-1])
+    npages = [(length + PAGE - 1) // PAGE for length in lengths]
+    page_base = torch.tensor(
+        [0] + list(itertools.accumulate(npages))[:-1], dtype=torch.int32
+    )
+    num_pages = sum(npages)
+    max_blocks = max(npages)
+    block_table = torch.zeros((len(lengths), max_blocks), dtype=torch.int32)
+    for r, (base, n) in enumerate(zip(page_base.tolist(), npages, strict=True)):
+        block_table[r, :n] = torch.arange(base, base + n, dtype=torch.int32)
+    token_to_req = torch.repeat_interleave(
+        torch.arange(len(lengths), dtype=torch.int32),
+        torch.tensor(lengths, dtype=torch.int64),
+    ).int()
+    pos = torch.cat([torch.arange(length) for length in lengths]).to(dev)
+    cols = torch.arange(WIDTH, device=dev, dtype=torch.int32)
+    sel = torch.where(
+        cols.unsqueeze(0) <= pos.unsqueeze(1),
+        cols.unsqueeze(0).expand(T, WIDTH),
+        torch.full((T, WIDTH), -1, dtype=torch.int32, device=dev),
+    )
+    packed = torch.cat([sel, (pos + 1).to(torch.int32).unsqueeze(1)], dim=1)
+    ones = torch.ones(T, HQ, D, dtype=torch.bfloat16, device=dev)
+    kv_ones = torch.ones(num_pages, PAGE, KV, D, device=dev)
+    return {
+        "q": ones,
+        "k_cache": kv_ones.to(torch.float8_e4m3fn),
+        "v_cache": kv_ones.to(torch.float8_e4m3fn),
+        "logical_indices": packed,
+        "block_table": block_table.to(dev),
+        "token_to_req": token_to_req.to(dev),
+        "output_gate": torch.zeros_like(ones),
+        "cu_seqlens": cu.to(dev),
+        "page_base": page_base.to(dev),
+    }
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        (2029, 2028),  # T=4057, B=2 dedicated descriptor route
+        (2046, 2045, 2045, 2045),  # T=8181, B=4 dedicated descriptor route
+    ],
+)
+def test_uniform_logits_stay_in_fp8_probability_range(lengths):
+    """Uniformly large logits must not silently saturate the FP8 probability
+    operands: the dedicated descriptor routes' range guard has to hand such
+    tiles to the exact retry (the denominator check alone cannot see it)."""
+    inputs = make_uniform_dense_prefix_inputs(lengths)
+    out = run_api(inputs)
+    ref = run_ref(inputs)
+    assert_close_at_gate(out, ref)
+    assert float((out.float() - 0.5).abs().max()) <= MAX_ABS_ERR
+
+
 def test_auto_reaches_specialized_by_default(monkeypatch):
     """The specialized backend is a DEFAULT auto candidate: backend="auto"
     routes to it with FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS unset or 0
@@ -305,6 +371,25 @@ def test_warmup_then_graph_capture():
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         run_api(inputs, out=out)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+def test_graph_replay_survives_larger_eager_call():
+    """A graph captured at one shape must still replay correctly after a
+    LARGER eager call grows the persistent scratch: every buffer a capture
+    recorded is retained for the process lifetime (the graph baked in its
+    addresses), so growth replaces cache entries without freeing them."""
+    small = make_inputs((512,), seed=11)
+    big = make_inputs((1024,), seed=12)
+    out = torch.empty_like(small["q"])
+    eager = run_api(small).clone()  # same-shape warmup pre-sizes scratch
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run_api(small, out=out)
+    run_api(big)  # grows the split-K scratch after the capture
     out.zero_()
     g.replay()
     torch.cuda.synchronize()
