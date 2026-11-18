@@ -153,8 +153,6 @@ It is what applies the `run-ci` label that starts CI, not the label sitting on t
 | `@flashinfer-bot rerun failed` | Can label the PR, or `ci-users` | Rerun only failed/cancelled jobs |
 | `@flashinfer-bot stop` | Can label the PR, or `ci-users` | Cancel all in-progress workflows |
 
-Commands posted by the `flashinfer-bot` account itself, for example by maintainer automation holding its token, are always authorized and run like a maintainer's.
-
 Bare `run` asks NVIDIA Inference Hub to recommend a scope. It prefers changed
 or existing tests that exercise the changed behavior, using an isolated merge of
 the current target-branch tip and PR head, complete inspected test bodies, and

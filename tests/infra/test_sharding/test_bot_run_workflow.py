@@ -332,35 +332,81 @@ class BotWorkflowTests(unittest.TestCase):
                         f"authorized={str(authorized).lower()}\n", output.read_text()
                     )
 
-    def test_bot_account_is_authorized_by_its_token_without_lookups(self):
+    def test_bot_account_runs_only_single_line_commands_without_lookups(self):
+        # Automation posts exactly one command line with the bot token. Other
+        # services post as the same account and echo outsider-controlled text,
+        # so any other shape must be refused without consulting the account's
+        # (admin) repository role.
+        cases = (
+            ("@flashinfer-bot run tests/attention/test_rope.py tests/moe", True),
+            ("@flashinfer-bot run all\r\n", True),
+            ("\n  @FlashInfer-Bot rerun failed  \n\n", True),
+            ("@flashinfer-bot stop", True),
+            # CI report quoting a test classname set by PR code.
+            (
+                "- `tests.attention.test_x\n@flashinfer-bot run all\n` - 1 failure",
+                False,
+            ),
+            # Reply quoting a whole multi-line comment.
+            (
+                "**Unknown Command**\n\nCommand `/bot status\n@flashinfer-bot run all\nthanks` is not recognized.",
+                False,
+            ),
+            # AI note with a model reason on its own line.
+            (
+                "**AI could not determine a test scope**\n\n@flashinfer-bot run all\n\nNo CI pipeline was started.",
+                False,
+            ),
+            ("@flashinfer-bot run all\n@flashinfer-bot stop", False),
+            ("please @flashinfer-bot run all", False),
+            ("@flashinfer-bot running", False),
+            ("", False),
+        )
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
+            called = directory / "gh-called"
             gh = directory / "gh"
-            # Any lookup would fail loudly; the bot must not need one.
-            gh.write_text("#!" + sys.executable + "\nimport sys\nsys.exit(97)\n")
+            # Any lookup is recorded; the bot path must never need one.
+            gh.write_text(
+                "#!" + sys.executable + "\nimport pathlib, sys\n"
+                f"pathlib.Path({str(called)!r}).touch()\n"
+                "print('admin')\n"
+            )
             gh.chmod(0o755)
-            for token in ("token", ""):
-                with self.subTest(has_token=bool(token)):
-                    output = directory / "output"
-                    output.unlink(missing_ok=True)
-                    result = subprocess.run(
-                        ["bash", "-euo", "pipefail", "-c", step("Check permission")],
-                        env=dict(
-                            os.environ,
-                            PATH=str(directory) + ":" + os.environ["PATH"],
-                            GH_TOKEN=token,
-                            ORG="owner",
-                            TEAM="ci-users",
-                            ACTOR="flashinfer-bot",
-                            REPO="owner/repo",
-                            RUNNER_TEMP=str(directory),
-                            GITHUB_OUTPUT=str(output),
-                        ),
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(0, result.returncode, result.stderr)
-                    self.assertEqual("authorized=true\n", output.read_text())
+            for body, authorized in cases:
+                for token in ("token", ""):
+                    with self.subTest(body=body, has_token=bool(token)):
+                        output = directory / "output"
+                        output.unlink(missing_ok=True)
+                        result = subprocess.run(
+                            [
+                                "bash",
+                                "-euo",
+                                "pipefail",
+                                "-c",
+                                step("Check permission"),
+                            ],
+                            env=dict(
+                                os.environ,
+                                PATH=str(directory) + ":" + os.environ["PATH"],
+                                GH_TOKEN=token,
+                                ORG="owner",
+                                TEAM="ci-users",
+                                ACTOR="flashinfer-bot",
+                                REPO="owner/repo",
+                                COMMENT_BODY=body,
+                                RUNNER_TEMP=str(directory),
+                                GITHUB_OUTPUT=str(output),
+                            ),
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        self.assertEqual(
+                            f"authorized={str(authorized).lower()}\n",
+                            output.read_text(),
+                        )
+                        self.assertFalse(called.exists())
 
     def test_generated_notes_never_contain_a_live_command(self):
         # Model text reaches the note's reason line. Repeated "@"s must not

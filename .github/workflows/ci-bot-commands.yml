@@ -27,9 +27,10 @@ jobs:
     # authoritative match and every handler step is gated on its output.
     #
     # Commands posted by flashinfer-bot itself (automation holding its token)
-    # must run, so the bot account is not excluded. Only the notes this job
-    # posts are skipped: each carries the marker below (NOTE_MARKER in the run
-    # step; keep the two in sync), so a note can never be read back as a command.
+    # must run, so the bot account is not excluded; `Check permission` admits
+    # it only for a single-line command. The notes this job posts are skipped
+    # here: each carries the marker below (NOTE_MARKER in the run step; keep the
+    # two in sync), so a note is never read back as a command and costs no job.
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@flashinfer-bot') &&
@@ -54,13 +55,25 @@ jobs:
           TEAM: ci-users
           ACTOR: ${{ github.event.comment.user.login }}
           REPO: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          # Only holders of the bot token can post as flashinfer-bot, so its
-          # commands are authorized by that token and always run. This needs no
-          # API lookup and does not depend on the account's repository role.
+          # Only holders of the bot token can post as flashinfer-bot, so a
+          # command the automation posts is authorized by that token and always
+          # runs. Other services also post as this account and echo text an
+          # outsider controls (test output in CI reports, quoted comments, model
+          # explanations), so authorize it only for a comment that is exactly one
+          # command line, the form automation posts. Never fall through to the
+          # role lookup: the account's admin role would authorize any echo.
           if [[ "$ACTOR" == "flashinfer-bot" ]]; then
-            echo "$ACTOR is authorized by its token"
-            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            BODY=$(printf '%s\n' "${COMMENT_BODY-}" | tr -d '\r' | sed -E '/^[[:space:]]*$/d')
+            if [[ "$(printf '%s\n' "$BODY" | grep -c '')" == 1 ]] \
+                && printf '%s\n' "$BODY" | grep -qiE '^[[:space:]]*@flashinfer-bot[[:space:]]+(run|rerun|stop)([[:space:]]|$)'; then
+              echo "$ACTOR is authorized by its token for a single-line command"
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$ACTOR comment is not a single command line; not executed"
+              echo "authorized=false" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
 
