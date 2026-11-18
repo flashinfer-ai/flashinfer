@@ -301,7 +301,10 @@ DEVI float dequant_f32(unsigned v, unsigned scale) {
   else
     q = float(x & 7u) * 0x1p-9f;
   if (v & 128u) q = -q;
-  float sc = __uint_as_float(scale ? scale << 23 : 0x00400000u);
+  // UE8M0 byte 255 encodes NaN (not 2^128): the tensor-core path propagates
+  // it as NaN, so the precise path must too instead of scaling by +inf.
+  float sc = (scale == 255u) ? __uint_as_float(0x7fc00000u)
+                             : __uint_as_float(scale ? scale << 23 : 0x00400000u);
   float r;
   // Explicit non-FTZ instructions preserve the reference's FP32 subnormals,
   // independently of the translation unit's --use_fast_math option.

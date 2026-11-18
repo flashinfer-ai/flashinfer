@@ -255,7 +255,14 @@ def _assert_matches_exact_reference(reference, result, context):
     assert torch.isfinite(result).all(), f"{context}: output contains NaN/Inf"
     ref = reference.float()
     res = result.float()
-    denom = ref.abs().max().clamp_min(1e-30)
+    denom = ref.abs().max().item()
+    if denom == 0.0:
+        # An exactly-zero reference admits only an exactly-zero result; a
+        # floor on the denominator would instead accept anything small.
+        assert res.abs().max().item() == 0.0, (
+            f"{context}: nonzero result for an all-zero reference"
+        )
+        return
     rel_err = ((res - ref).abs().max() / denom).item()
     assert rel_err < 1e-2, f"{context}: max relative error {rel_err:.2e}"
 
@@ -309,6 +316,12 @@ def test_specialized_small_scale_precise_path(monkeypatch):
     )
     assert len(calls) == 1
     _assert_matches_exact_reference(reference, res, "small-scale precise path")
+    # The check must stay effective at this magnitude: an all-zero result
+    # (reference max is ~1e-34 here, far below any fixed floor) must fail.
+    with pytest.raises(AssertionError):
+        _assert_matches_exact_reference(
+            reference, torch.zeros_like(res), "small-scale all-zero guard"
+        )
 
 
 @requires_sm107
