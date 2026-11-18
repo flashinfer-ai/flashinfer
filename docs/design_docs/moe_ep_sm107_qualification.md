@@ -313,15 +313,19 @@ Engine integration and whole-model serving benchmarks are separate follow-ups.
 Device-kernel fixes belong in the upstream kernel repository. Re-export them
 and update `VENDOR.md`; keep `kernel_src/**/src/` byte-identical to that export.
 
-## EP16/32 and caller-managed expert placement
+## Distributed tests and caller-managed expert placement
 
-The optional `tests/moe_ep/test_sm107_wide_ep_multirank.py` suite requires a
-dedicated EP16 or EP32 invocation and skips other world sizes. Use multi-host
-`torchrun` with one process per GPU, matching the total EP width. Every GPU must
-belong to one verified NVLink direct-access domain. The suite covers changing
-live counts, empty ranks, pooled graphs, masked routing, and captured expert
-updates. Existing graph/epoch tests in `test_sm107_routing_graph_multirank.py`
-also accept these widths. These tests do not add a mandatory 32-GPU CI job.
+`tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py` runs the same
+format and configuration matrix at EP2, EP4, EP8, EP16 and EP32. Its expert bank
+grows when needed to give every rank physical expert slots. The suite covers
+changing live counts, empty ranks, pooled graphs, masked routing and captured
+expert updates. The expert-update test uses the same 64-slot bank at every
+width and checks both standard and GenPhase kernels.
+
+Use `torchrun` with one process per GPU, matching the total EP width. Every GPU
+must belong to one verified NVLink direct-access domain. The graph/epoch suite
+in `test_sm107_routing_graph_multirank.py` also accepts these widths. EP16/32
+runs remain optional and do not add a mandatory 32-GPU CI job.
 
 Expert placement and replication policy belong to the caller. Route IDs name
 physical slots, with the same contiguous number of slots owned by each rank;
