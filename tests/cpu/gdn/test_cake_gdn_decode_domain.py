@@ -1,0 +1,761 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Host-only tests of the locality-domain twin of the Cake nontranspose FP32 T=1
+decode on a dual-die SM107a GPU: its records and host template, its route table,
+the dispatch of the public nontranspose path (twin or whole-GPU launch, with fake
+CUDA tensors and kernel entries) and the refusals of
+``localize_gdn_decode_state``."""
+
+from __future__ import annotations
+
+import re
+import types
+
+import pytest
+import torch
+
+import flashinfer.cake_gdn_decode_locality as locality
+import flashinfer.gdn_decode as gdn_decode
+from flashinfer import cake_locality
+from flashinfer.jit import cake_gdn
+
+pytestmark = pytest.mark.cpu_only
+
+_WHOLE = "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"
+_TWIN = "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+_TEMPLATE = "host/templates/decode_fp32_t1_tma_state_domain.cc.in"
+_SCALE = 128**-0.5
+_ROW_BYTES = 32 * 128 * 128 * 4
+_BATCH_CLASSES = ("B32-63", "B64-127", "B128-255", "B>=256")
+
+
+def _records(schedule: str) -> list[dict]:
+    return [
+        record
+        for record in cake_gdn._manifest()["variants"]
+        if record["source_schedule"]
+        == f"flashinfer.cake_gdn.generated.decode:{schedule}"
+    ]
+
+
+def _twin_name(scale: float) -> str:
+    (record,) = [
+        record
+        for record in _records(_TWIN)
+        if record["specializations"]["SCALE"] == scale
+    ]
+    return record["name"]
+
+
+def _whole_name(scale: float) -> str:
+    (record,) = [
+        record
+        for record in _records(_WHOLE)
+        if record["specializations"]["SCALE"] == scale
+    ]
+    return record["name"]
+
+
+def _kernel_params(source: str, symbol: str) -> list[str]:
+    """The parameter names of ``symbol`` in a kernel unit, in order."""
+    match = re.search(rf"\b{symbol}\(([^)]*)\)", source)
+    assert match is not None, symbol
+    flat = re.sub(r"<[^<>]*>", "<>", match.group(1))
+    return [re.findall(r"(\w+)\s*$", param.strip())[0] for param in flat.split(",")]
+
+
+def _shim_kargs(text: str) -> list[str]:
+    """The kernel argument names of a rendered host shim's ``kargs`` list, in order."""
+    match = re.search(r"void\* kargs\[\] = \{([^}]*)\};", text)
+    assert match is not None
+    names = []
+    for item in match.group(1).split(","):
+        item = item.strip()
+        assert item.startswith("&"), item
+        names.append(re.sub(r"^(p|v)_", "", item[1:]))
+    return names
+
+
+# --------------------------------------------------------------------------- records
+
+
+def test_twin_records_launch_through_the_domain_template() -> None:
+    # Two records (H16 / HV32 at both scales) share one sm_107a unit, spell the
+    # grid-constant tensor-map ABI and launch through the twin's TMA-state template
+    # with the whole body's dynamic shared memory; the twin is a TMA-state schedule
+    # and not a per-state-head grid (no CTAS_PER_STATE entry).
+    twins = _records(_TWIN)
+    assert len(twins) == 2
+    assert {record["specializations"]["SCALE"] for record in twins} == {_SCALE, 1.0}
+    assert len({record["outputs"][0]["path"] for record in twins}) == 1
+    for record in twins:
+        assert record["domain"] == "decode"
+        assert record["tma_abi"] == "grid_constant"
+        assert record["architectures"] == ["sm_107a"]
+        assert len(record["outputs"]) == 1
+        assert record["specializations"]["H"] == 16
+        assert record["specializations"]["HV"] == 32
+        assert "defines" not in record
+        assert record.get("compile_options", ["--use_fast_math"]) == ["--use_fast_math"]
+        host = record["host_binding"]
+        assert host["template"] == _TEMPLATE
+        assert host["cuda_symbol"] == f"kernel_{_TWIN}"
+        assert host["params"] == {
+            "DYNAMIC_SMEM_BYTES": 51328,
+            "H": 16,
+            "HV": 32,
+            "HV_MINUS_1": 31,
+        }
+    assert _TWIN in cake_gdn.CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
+    assert _TWIN not in cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE
+    assert _TEMPLATE in cake_gdn._DECODE_TMA_TEMPLATES
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="not an fp32-state"):
+        cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(_twin_name(_SCALE))
+    # The twin's records keep the whole body's specializations, so each whole record
+    # has exactly one twin.
+    assert sorted(r["specializations"]["SCALE"] for r in _records(_WHOLE)) == sorted(
+        r["specializations"]["SCALE"] for r in twins
+    )
+
+
+def test_twin_shim_passes_the_kernel_arguments_in_the_kernel_order() -> None:
+    # The rendered shim's kernel arguments are the twin kernel's parameters in order:
+    # the whole body's, then the batch size, rows0, the two claim counters and the SM
+    # table (by value).  The whole body's shim passes the whole kernel's parameters.
+    root = cake_gdn._source_dir()
+    twin_extra = ["q_size_p0", "rows0", "counters0", "counters1", "sm_table"]
+    for schedule in (_WHOLE, _TWIN):
+        for record in _records(schedule):
+            source = (root / record["outputs"][0]["path"]).read_text(encoding="utf-8")
+            params = _kernel_params(source, record["host_binding"]["cuda_symbol"])
+            text = cake_gdn.render_cake_gdn_host_shim(record)
+            assert _shim_kargs(text) == params, record["name"]
+            if schedule == _TWIN:
+                assert params[-len(twin_extra) :] == twin_extra
+            else:
+                assert not set(twin_extra) & set(params)
+    record = _records(_TWIN)[0]
+    source = (root / record["outputs"][0]["path"]).read_text(encoding="utf-8")
+    assert re.search(
+        r"long long q_size_p0, int rows0, int\* __restrict__ counters0, "
+        r"int\* __restrict__ counters1, const CakeParamArray<int, 256> sm_table\)",
+        source,
+    )
+
+
+def test_twin_shim_checks_its_arguments_and_caps_the_grid_by_residency() -> None:
+    # The twin's shim keeps the TMA-state checks and map cache, checks rows0, the
+    # counters and the SM table, accepts any grid of 1 .. B * HV CTAs and launches at
+    # most the resident CTAs, from an occupancy query made after the dynamic
+    # shared-memory opt-in (4 CTAs per SM without one).
+    for record in _records(_TWIN):
+        text = cake_gdn.render_cake_gdn_host_shim(record)
+        assert "@" not in text
+        assert "thread_local StateTmaCacheEntry cache[kStateTmaCacheSlots]" in text
+        assert "StateTma4D(arg_state, (int)dev.device_id)" in text
+        assert "16-byte aligned for the TMA state path" in text
+        assert (
+            "int64_t rows0, TensorView arg_counters0, TensorView arg_counters1, "
+            "TensorView arg_sm_table, int64_t grid_x, int64_t grid_y, int64_t grid_z)"
+        ) in text
+        assert "rows0 >= 0 && rows0 <= arg_q.size(0)" in text
+        assert "grid_x > 0 && grid_x <= arg_q.size(0) * 32LL" in text
+        assert "arg_q.size(0) <= 2147483647LL / 32LL" in text
+        for name in ("counters0", "counters1"):
+            assert f'CheckCudaTensor(arg_{name}, "{name}");' in text
+            assert f'CheckDtype(arg_{name}, "{name}", 0, 32, 1);' in text
+            assert f'CheckContiguous(arg_{name}, "{name}");' in text
+            assert f'CheckSameCudaDevice(arg_{name}, arg_q, "{name}", "q");' in text
+        assert "arg_sm_table.device().device_type == kDLCPU" in text
+        assert 'CheckDtype(arg_sm_table, "sm_table", 0, 32, 1);' in text
+        assert "arg_sm_table.numel() == kSmTableLength" in text
+        assert "std::memcpy(v_sm_table.v, DataPtr(arg_sm_table)" in text
+        assert "int32_t v_rows0 = (int32_t)rows0;" in text
+        assert "int64_t v_q_size_p0 = arg_q.size(0);" in text
+        opt_in = text.index(
+            "CakeGDNSetMaxDynamicSmem(kernel, (int)dev.device_id, 51328,"
+        )
+        resident = text.index(
+            "ResidentCtas(kernel, (int)dev.device_id, 51328, cake_gdn_resident_cache"
+        )
+        assert opt_in < resident
+        assert (
+            "cuOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, function, 256, "
+            "(size_t)smem_bytes)"
+        ) in text
+        assert "per_sm = 4;" in text
+        assert "grid_x < resident ? grid_x : resident" in text
+        assert (
+            "dim3 grid((uint32_t)launch_x, (uint32_t)grid_y, (uint32_t)grid_z)" in text
+        )
+        assert "kernel.Launch(kargs, grid, block, stream, 51328u)" in text
+        assert "CTAS_PER_BATCH_ROW" not in text
+
+
+# --------------------------------------------------------------------------- routes
+
+
+def test_twin_routes_mirror_the_cake_program_cells() -> None:
+    # 212-SM sm_107a devices route hqsplit_tma3 to its twin in both die classes for
+    # every batch class from 32 rows on; no other architecture, SM count, schedule or
+    # batch class is listed.
+    cells = {
+        (_WHOLE, die, batch_class): _TWIN
+        for die in ("even", "uneven")
+        for batch_class in _BATCH_CLASSES
+    }
+    routes = cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES
+    assert routes == {("sm_107a", 212): cells}
+    batch_class = cake_gdn.cake_gdn_nontranspose_fp32_t1_domain_batch_class
+    for batch_size, expected in (
+        (1, "B<32"),
+        (9, "B<32"),
+        (10, "B<32"),
+        (31, "B<32"),
+        (32, "B32-63"),
+        (36, "B32-63"),
+        (37, "B32-63"),
+        (63, "B32-63"),
+        (64, "B64-127"),
+        (127, "B64-127"),
+        (128, "B128-255"),
+        (255, "B128-255"),
+        (256, "B>=256"),
+        (512, "B>=256"),
+        (1024, "B>=256"),
+    ):
+        assert batch_class(batch_size) == expected, batch_size
+    # The die class: even up to a gap of 4 SMs between the dies.
+    for counts, expected in (
+        ((106, 106), "even"),
+        ((108, 104), "even"),
+        ((104, 108), "even"),
+        ((109, 104), "uneven"),
+        ((100, 112), "uneven"),
+        ((112, 100), "uneven"),
+    ):
+        assert cake_locality.die_class(counts) == expected, counts
+
+
+@pytest.mark.parametrize("scale", [_SCALE, 1.0])
+def test_twin_selector_names_the_twin_of_the_listed_cells_only(scale: float) -> None:
+    def twin(arch="sm_107a", sm_count=212, die="even", batch_size=64, whole=None):
+        return cake_gdn.select_cake_gdn_decode_domain_variant(
+            arch=arch,
+            whole_variant=whole or _whole_name(scale),
+            sm_count=sm_count,
+            die_class=die,
+            batch_size=batch_size,
+        )
+
+    for die in ("even", "uneven"):
+        for batch_size in (32, 36, 37, 48, 63, 64, 127, 128, 255, 256, 512, 1024):
+            assert twin(die=die, batch_size=batch_size) == _twin_name(scale)
+        for batch_size in (1, 9, 10, 21, 31):
+            assert twin(die=die, batch_size=batch_size) is None
+    # Unlisted SM counts (216-SM boards are untimed) and architectures.
+    for sm_count in (216, 211, 213, 148, 160):
+        assert twin(sm_count=sm_count) is None
+    for arch in ("sm_100a", "sm_103a"):
+        assert twin(arch=arch, sm_count=212) is None
+    # Only hqsplit_tma3 has a twin: no other nontranspose fp32 T=1 record maps to one.
+    for record in cake_gdn._manifest()["variants"]:
+        schedule = record["source_schedule"].rsplit(":", 1)[-1]
+        if (
+            record["domain"] != "decode"
+            or not schedule.startswith("gdn_decode_nontranspose_fp32_t1")
+            or schedule == _WHOLE
+        ):
+            continue
+        assert twin(whole=record["name"]) is None, record["name"]
+
+
+def test_nontranspose_domain_variant_follows_the_whole_route() -> None:
+    # The row's whole route decides: the twin of hqsplit_tma3 from 32 rows on for
+    # H16 / HV32 at the two shipped scales; every other row (another head geometry or
+    # scale, no l2norm, the small bands, B200 / B300, 216 SMs) has none.
+    def variant(**overrides):
+        row = dict(
+            arch="sm_107a",
+            sm_count=212,
+            die_class="uneven",
+            batch_size=64,
+            num_q_heads=16,
+            num_k_heads=16,
+            num_v_heads=32,
+            scale=_SCALE,
+        )
+        row.update(overrides)
+        return locality.nontranspose_domain_variant(**row)
+
+    assert variant() == _twin_name(_SCALE)
+    assert variant(scale=1.0) == _twin_name(1.0)
+    assert variant(batch_size=32, die_class="even") == _twin_name(_SCALE)
+    assert variant(batch_size=1024) == _twin_name(_SCALE)
+    for overrides in (
+        dict(batch_size=31),
+        dict(batch_size=9),
+        dict(scale=0.5),
+        dict(num_q_heads=4, num_k_heads=4),
+        dict(num_q_heads=4, num_k_heads=4, num_v_heads=8),
+        dict(num_k_heads=8),
+        dict(use_qk_l2norm=False),
+        dict(sm_count=216),
+        dict(arch="sm_100a", sm_count=148),
+        dict(arch="sm_103a", sm_count=160),
+    ):
+        assert variant(**overrides) is None, overrides
+
+
+# --------------------------------------------------------------------------- dispatch
+
+
+class _FakeCuda(torch.Tensor):
+    """A meta tensor that the nontranspose host checks take for a tensor of cuda:0."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+    @property
+    def device(self):
+        return torch.device("cuda", 0)
+
+    def get_device(self):
+        return 0
+
+
+def _fake(shape, dtype) -> torch.Tensor:
+    return torch.Tensor._make_subclass(
+        _FakeCuda, torch.empty(shape, dtype=dtype, device="meta")
+    )
+
+
+def _decode_inputs(batch_size: int) -> dict[str, torch.Tensor]:
+    bf16, fp32 = torch.bfloat16, torch.float32
+    return {
+        "q": _fake((batch_size, 1, 16, 128), bf16),
+        "k": _fake((batch_size, 1, 16, 128), bf16),
+        "v": _fake((batch_size, 1, 32, 128), bf16),
+        "state": _fake((batch_size, 32, 128, 128), fp32),
+        "A_log": _fake((32,), fp32),
+        "a": _fake((batch_size, 1, 32), bf16),
+        "dt_bias": _fake((32,), fp32),
+        "b": _fake((batch_size, 1, 32), bf16),
+        "output": _fake((batch_size, 1, 32, 128), bf16),
+    }
+
+
+class _Device:
+    """Fakes for one device: its capability and SM count, its SM table, the state
+    homing records, the claim counters and the kernel entries (each records its
+    calls)."""
+
+    def __init__(
+        self, monkeypatch, *, capability=(10, 7), sm_count=212, counts=(106, 106)
+    ):
+        self.calls: list[tuple[str, tuple]] = []
+        self.loads: list[str] = []
+        self.counter_calls: list[tuple[int, int]] = []
+        self.homings: dict[int, cake_locality.Homing] = {}
+        self.failing: set[str] = set()
+        self.table = self.make_table(counts)
+        self.counters = (object(), object())
+        properties = types.SimpleNamespace(
+            major=capability[0], minor=capability[1], multi_processor_count=sm_count
+        )
+        monkeypatch.setattr(gdn_decode, "get_compute_capability", lambda _d: capability)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _i: properties)
+        monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", self.load)
+        monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: self.table)
+        monkeypatch.setattr(cake_locality, "tensor_homing", self.tensor_homing)
+        monkeypatch.setattr(cake_locality, "launch_counters", self.launch_counters)
+        monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
+        monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
+
+    @staticmethod
+    def make_table(counts):
+        if counts is None:
+            return None
+        return cake_locality.SmTable(
+            device_index=0,
+            counts=tuple(counts),
+            entries=torch.zeros(cake_locality.SM_TABLE_LENGTH, dtype=torch.int32),
+        )
+
+    def load(self, name, arch, **kwargs):
+        assert not kwargs
+        self.loads.append(name)
+        if name in self.failing:
+            raise RuntimeError(f"failed to compile {name}")
+
+        def entry(*args):
+            self.calls.append((name, args))
+
+        return entry
+
+    def tensor_homing(self, tensor):
+        return self.homings.get(id(tensor))
+
+    def launch_counters(self, words, device=None):
+        self.counter_calls.append((words, device))
+        return self.counters
+
+    def home(self, state, *, rows0=None, nbytes=None, device_index=0):
+        rows = state.shape[0]
+        rows0 = (rows + 1) // 2 if rows0 is None else rows0
+        nbytes = state.numel() * 4 if nbytes is None else nbytes
+        self.homings[id(state)] = cake_locality.Homing(
+            device_index=device_index,
+            base=0,
+            nbytes=nbytes,
+            size=nbytes,
+            cut=rows0 * _ROW_BYTES,
+        )
+
+
+def _run(inputs, scale=_SCALE):
+    return gdn_decode._run_cake_gdn_decode_nontranspose(
+        **inputs, scale=scale, use_qk_l2norm=True
+    )
+
+
+def _whole_args(inputs, grid_x):
+    return tuple(
+        inputs[name]
+        for name in ("q", "k", "v", "state", "A_log", "a", "dt_bias", "b", "output")
+    ) + (grid_x, 1, 1)
+
+
+def _twin_args(inputs, device, rows0):
+    batch_size = inputs["q"].shape[0]
+    return _whole_args(inputs, 0)[:9] + (
+        rows0,
+        *device.counters,
+        device.table.entries,
+        batch_size * 32,
+        1,
+        1,
+    )
+
+
+def test_unhomed_state_launches_the_whole_route_as_before(monkeypatch) -> None:
+    # An unhomed state runs the row's whole launch with its whole grid and takes no
+    # counters and no twin launch table entry, on every architecture and batch.
+    for capability, sm_count in (
+        ((10, 7), 212),
+        ((10, 7), 216),
+        ((10, 0), 148),
+        ((10, 3), 160),
+    ):
+        device = _Device(monkeypatch, capability=capability, sm_count=sm_count)
+        for batch_size in (9, 16, 32, 64, 256):
+            inputs = _decode_inputs(batch_size)
+            for _ in range(2):
+                assert _run(inputs) is inputs["output"]
+            (route,) = {name for name, _ in device.calls if name.startswith("decode_")}
+            assert _TWIN not in route
+            whole = cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(route)
+            expected = _whole_args(inputs, batch_size * 32 * whole)
+            assert device.calls == [(route, expected)] * 2
+            device.calls.clear()
+        assert device.counter_calls == []
+        assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
+        assert not any(_TWIN in name for name in device.loads)
+
+
+@pytest.mark.parametrize("scale", [_SCALE, 1.0])
+@pytest.mark.parametrize("counts", [(106, 106), (100, 112)])
+def test_homed_state_launches_the_twin_in_a_listed_cell(
+    monkeypatch, scale, counts
+) -> None:
+    # A whole homed allocation on a 212-SM sm_107a device with an SM table runs the
+    # twin of its row: rows0 at the state's die cut, the call's counter pair, the SM
+    # table by value and a B * HV grid.  The whole launch table keeps its value; the
+    # twin is loaded once and the counters are taken per call.
+    device = _Device(monkeypatch, counts=counts)
+    for batch_size, rows0 in ((32, 16), (37, 19), (64, 13), (512, 256)):
+        inputs = _decode_inputs(batch_size)
+        device.home(inputs["state"], rows0=rows0)
+        loads = device.loads.count(_twin_name(scale))
+        for _ in range(3):
+            assert _run(inputs, scale) is inputs["output"]
+        expected = _twin_args(inputs, device, rows0)
+        assert device.calls == [(_twin_name(scale), expected)] * 3
+        # one resolution of the row's twin launch for the three calls
+        assert device.loads.count(_twin_name(scale)) == loads + 1
+        key = (0, batch_size, 16, 16, 32, scale, True)
+        whole = gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES[key]
+        assert len(whole) == 2 and whole[1] == batch_size * 32
+        twin = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES[
+            key + (tuple(counts), rows0 * _ROW_BYTES)
+        ]
+        assert twin[1:] == (batch_size * 32, rows0, device.table)
+        device.calls.clear()
+    assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)] * 12
+    assert locality.DOMAIN_COUNTER_WORDS == 1
+
+
+def test_homed_state_rows0_is_the_row_nearest_the_cut(monkeypatch) -> None:
+    device = _Device(monkeypatch)
+    inputs = _decode_inputs(64)
+    state = inputs["state"]
+    for cut, rows0 in (
+        (0, 0),
+        (13 * _ROW_BYTES, 13),
+        (13 * _ROW_BYTES + _ROW_BYTES // 2 - 1, 13),
+        (13 * _ROW_BYTES + _ROW_BYTES // 2, 14),
+        (64 * _ROW_BYTES, 64),
+    ):
+        device.homings[id(state)] = cake_locality.Homing(
+            device_index=0,
+            base=0,
+            nbytes=64 * _ROW_BYTES,
+            size=64 * _ROW_BYTES,
+            cut=cut,
+        )
+        _run(inputs)
+        name, args = device.calls.pop()
+        assert name == _twin_name(_SCALE) and args[9] == rows0, cut
+
+
+def test_homed_state_falls_back_to_the_whole_launch(monkeypatch) -> None:
+    # A part of a homed allocation, a homing record of another device, no SM table, a
+    # row below 32, an untimed SM count and B200 run the whole launch, bit for bit the
+    # unhomed call's; a row without a twin is remembered as such (not resolved again).
+    def whole_call(device, inputs):
+        _run(inputs)
+        ((name, args),) = device.calls
+        device.calls.clear()
+        assert _TWIN not in name
+        return args
+
+    device = _Device(monkeypatch)
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"], nbytes=2 * 64 * _ROW_BYTES)  # a prefix view
+    assert whole_call(device, inputs) == _whole_args(inputs, 64 * 32)
+    device.home(inputs["state"], device_index=1)
+    assert whole_call(device, inputs) == _whole_args(inputs, 64 * 32)
+    assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
+    device.home(inputs["state"])
+    device.table = None
+    assert whole_call(device, inputs) == _whole_args(inputs, 64 * 32)
+    assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
+    device.table = device.make_table((106, 106))
+    small = _decode_inputs(16)
+    device.home(small["state"])
+    for _ in range(2):
+        assert whole_call(device, small) == _whole_args(small, 16 * 32)
+    (launch,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.values()
+    assert launch[0] is None
+    assert device.counter_calls == []
+    for capability, sm_count in (((10, 7), 216), ((10, 0), 148)):
+        device = _Device(monkeypatch, capability=capability, sm_count=sm_count)
+        inputs = _decode_inputs(64)
+        device.home(inputs["state"])
+        for _ in range(2):
+            args = whole_call(device, inputs)
+        assert args[:9] == _whole_args(inputs, 0)[:9]
+        assert not any(_TWIN in name for name in device.loads)
+        assert device.counter_calls == []
+
+
+def test_twin_build_failure_is_remembered_and_runs_whole(monkeypatch) -> None:
+    device = _Device(monkeypatch)
+    device.failing.add(_twin_name(_SCALE))
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+    for _ in range(3):
+        _run(inputs)
+    assert device.loads.count(_twin_name(_SCALE)) == 1
+    assert [name for name, _ in device.calls] == [_whole_name(_SCALE)] * 3
+    assert device.counter_calls == []
+
+
+def test_twin_launch_follows_the_sm_table_and_the_cut(monkeypatch) -> None:
+    # A launch is reused only for the SM table object it was resolved with, and the
+    # dies' SM counts and the die cut are part of its key.
+    device = _Device(monkeypatch)
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"], rows0=32)
+    _run(inputs)
+    _run(inputs)
+    assert device.loads.count(_twin_name(_SCALE)) == 1
+    first = device.table
+    device.table = device.make_table((106, 106))
+    _run(inputs)
+    assert device.loads.count(_twin_name(_SCALE)) == 2
+    assert device.calls[-1][1][12] is device.table.entries
+    assert device.calls[0][1][12] is first.entries
+    device.home(inputs["state"], rows0=20)
+    _run(inputs)
+    device.table = device.make_table((100, 112))
+    _run(inputs)
+    assert [args[9] for _, args in device.calls] == [32, 32, 32, 20, 20]
+    keys = sorted(key[-2:] for key in gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES)
+    assert keys == [
+        ((100, 112), 20 * _ROW_BYTES),
+        ((106, 106), 20 * _ROW_BYTES),
+        ((106, 106), 32 * _ROW_BYTES),
+    ]
+
+
+def test_twin_launch_table_is_cleared_at_its_limit(monkeypatch) -> None:
+    device = _Device(monkeypatch)
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT", 3)
+    inputs = _decode_inputs(64)
+    for rows0 in (1, 2, 3, 4):
+        device.home(inputs["state"], rows0=rows0)
+        _run(inputs)
+    assert len(gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES) == 1
+    assert [args[9] for _, args in device.calls] == [1, 2, 3, 4]
+
+
+# --------------------------------------------------------------------------- helper
+
+
+class _Helper:
+    """Fakes for ``localize_gdn_decode_state`` on cuda:0: refusals before the probe
+    raise from the probe and the allocator."""
+
+    def __init__(self, monkeypatch, *, arch="sm_107a", sm_count=212, counts=(106, 106)):
+        self.probed = False
+        self.allow_probe = False
+        self.table = _Device.make_table(counts)
+        self.allocations: list[tuple] = []
+        self.reserves: list[tuple[int, int]] = []
+        self.granule = 2 << 20
+        self.capturing = False
+        self.reserve_error = False
+        monkeypatch.setattr(locality, "_device_info", lambda _i: (arch, sm_count))
+        monkeypatch.setattr(
+            cake_locality, "_stream_capturing", lambda _i: self.capturing
+        )
+        monkeypatch.setattr(cake_locality, "sm_table", self.sm_table)
+        monkeypatch.setattr(cake_locality, "split_empty", self.split_empty)
+        monkeypatch.setattr(cake_locality, "granularity", lambda _d=None: self.granule)
+        monkeypatch.setattr(cake_locality, "reserve_launch_counters", self.reserve)
+
+    def sm_table(self, device=None):
+        assert self.allow_probe, "probed the SM table for a refused state"
+        self.probed = True
+        return self.table
+
+    def split_empty(self, shape, dtype, cut, device=None):
+        self.allocations.append((tuple(shape), dtype, cut, device))
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    def reserve(self, words, device=None):
+        self.reserves.append((words, device))
+        if self.reserve_error:
+            raise RuntimeError("no memory")
+
+
+def test_localize_refuses_bad_arguments() -> None:
+    with pytest.raises(ValueError, match="CUDA torch.Tensor"):
+        locality.localize_gdn_decode_state(torch.zeros(1, 32, 128, 128), 16)
+    with pytest.raises(ValueError, match="CUDA torch.Tensor"):
+        locality.localize_gdn_decode_state(_fake((32, 128, 128), torch.float32), 16)
+    transposed = torch.Tensor._make_subclass(
+        _FakeCuda,
+        torch.empty((64, 32, 128, 128), device="meta").transpose(2, 3),
+    )
+    with pytest.raises(ValueError, match="contiguous"):
+        locality.localize_gdn_decode_state(transposed, 16)
+    state = _fake((64, 32, 128, 128), torch.float32)
+    with pytest.raises(ValueError, match="num_q_heads"):
+        locality.localize_gdn_decode_state(state, 0)
+    for rows0 in (-1, 65):
+        with pytest.raises(ValueError, match=r"rows0 must be in \[0, 64\]"):
+            locality.localize_gdn_decode_state(state, 16, rows0=rows0)
+
+
+def test_localize_refuses_before_probing(monkeypatch) -> None:
+    # Rows no die class routes, another dtype or head size, capture and another
+    # architecture are returned unhomed before the SM table is probed.
+    def refused(helper, state, *args, **kwargs):
+        assert locality.localize_gdn_decode_state(state, *args, **kwargs) is state
+        assert not helper.probed and helper.allocations == [] and helper.reserves == []
+
+    helper = _Helper(monkeypatch)
+    refused(helper, _fake((64, 32, 128, 128), torch.float16), 16)
+    refused(helper, _fake((64, 32, 64, 64), torch.float32), 16)
+    for batch_size in (1, 9, 16, 31):
+        refused(helper, _fake((batch_size, 32, 128, 128), torch.float32), 16)
+    state = _fake((64, 32, 128, 128), torch.float32)
+    refused(helper, state, 4)
+    refused(helper, state, 16, scale=0.5)
+    refused(helper, _fake((64, 16, 128, 128), torch.float32), 16)
+    helper.capturing = True
+    refused(helper, state, 16)
+    for arch, sm_count in (
+        ("sm_107a", 216),
+        ("sm_100a", 148),
+        ("sm_103a", 160),
+        (None, 132),
+    ):
+        refused(_Helper(monkeypatch, arch=arch, sm_count=sm_count), state, 16)
+
+
+def test_localize_refuses_after_probing(monkeypatch) -> None:
+    # No SM table, or a cut off the allocation granularity: the state comes back
+    # unhomed and nothing is allocated.
+    state = _fake((64, 32, 128, 128), torch.float32)
+    helper = _Helper(monkeypatch, counts=None)
+    helper.allow_probe = True
+    assert locality.localize_gdn_decode_state(state, 16) is state
+    assert helper.probed and helper.allocations == []
+    helper = _Helper(monkeypatch)
+    helper.allow_probe = True
+    helper.granule = 4 << 20
+    assert locality.localize_gdn_decode_state(state, 16, rows0=13) is state
+    assert helper.allocations == [] and helper.reserves == []
+
+
+@pytest.mark.parametrize("counts", [(106, 106), (100, 112), (112, 100)])
+def test_localize_homes_by_the_byte_cut(monkeypatch, counts) -> None:
+    # The default cut is half the rows on each die (die 0 the odd row), whatever the
+    # dies' SM counts; an explicit rows0 (0 and B included) is the cut; homing fills
+    # the capture reserve of one-word counter pairs, and a failing refill does not
+    # fail the call.
+    helper = _Helper(monkeypatch, counts=counts)
+    helper.allow_probe = True
+    for batch_size, scale, rows0, expected in (
+        (64, None, None, 32),
+        (37, None, None, 19),
+        (512, 1.0, None, 256),
+        (64, _SCALE, 13, 13),
+        (64, None, 0, 0),
+        (64, None, 64, 64),
+    ):
+        state = _fake((batch_size, 32, 128, 128), torch.float32)
+        homed = locality.localize_gdn_decode_state(state, 16, scale, rows0)
+        assert homed is not state
+        assert tuple(homed.shape) == tuple(state.shape)
+        assert helper.allocations[-1] == (
+            tuple(state.shape),
+            torch.float32,
+            expected * _ROW_BYTES,
+            0,
+        )
+        assert helper.reserves[-1] == (1, 0)
+    helper.reserve_error = True
+    state = _fake((64, 32, 128, 128), torch.float32)
+    assert locality.localize_gdn_decode_state(state, 16) is not state
+
+
+def test_localize_is_exported_next_to_the_state_pool() -> None:
+    assert gdn_decode.localize_gdn_decode_state is locality.localize_gdn_decode_state
+    assert callable(gdn_decode.ugpu_state_pool)
