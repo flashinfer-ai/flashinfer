@@ -131,6 +131,18 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool usePerChannelScaling{false};
 };
 
+// One launch's share of a GEMM that is split across a GPU's locality domains (uGPU
+// localization). The launch writes its output columns into a slice of a wider shared buffer and
+// sizes its grid for the SMs of one domain. The default value is an ordinary launch.
+struct TrtllmGenBatchedGemmPartition {
+  // Full width of each output row, in post-activation elements; 0 keeps the contiguous layout.
+  int32_t outputRowWidth{0};
+  // First output column this launch writes, in post-activation elements.
+  int32_t outputColumnOffset{0};
+  // SMs available to the launch's stream; 0 uses the whole device.
+  int32_t smCount{0};
+};
+
 class TrtllmGenBatchedGemmRunner {
  public:
   explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
@@ -157,7 +169,7 @@ class TrtllmGenBatchedGemmRunner {
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
            int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
            int32_t configIndex, bool enable_pdl, int32_t validM = -1, int32_t validN = -1,
-           int32_t validK = -1);
+           int32_t validK = -1, TrtllmGenBatchedGemmPartition const& partition = {});
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
@@ -196,6 +208,10 @@ class TrtllmGenBatchedGemmRunner {
                                         std::vector<int32_t> const& batchedTokens,
                                         int32_t numTokens, int32_t numBatches,
                                         int32_t maxNumCtasInBatchDim) const;
+
+  // Whether the config can write a slice of a shared output (TMA stores, no output multicast or
+  // DeepSeek FP8) and fits a stream limited to smCount SMs.
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const;
 
  private:
   void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
