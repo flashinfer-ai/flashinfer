@@ -262,6 +262,31 @@ entry and grid it resolved per (device, B, H, HK, HV, scale, l2norm)
 eager call resolves its route and loads its module only on the first call of
 a row.
 
+On a dual-die SM107a GPU the `hqsplit_tma3` row also has a locality-domain
+twin, `gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain` (H=16 / HV=32, both
+scales, `sm_107a` only). It runs only on a state that
+`flashinfer.gdn_decode.localize_gdn_decode_state` homed: one allocation whose
+batch rows `[0, rows0)` are memory of die 0 and the rest memory of die 1. The
+twin is one launch over both dies. Each CTA claims (batch row, value head)
+items from its own die's rows first (its die comes from the SM table), then
+from the other die's, and runs each item as the whole body's CTA does, so the
+output and the state are the whole body's bit for bit for any `rows0` and any
+grid. Its kernel takes the whole body's arguments, the batch size, `rows0`,
+one int32 claim counter per die (zero before a launch, left zero by it) and
+the 256-word SM table by value. Its records launch through
+`host/templates/decode_fp32_t1_tma_state_domain.cc.in`, which adds those
+checks to the TMA-state template's and launches the requested grid
+(`1 .. B * HV`) capped by the resident CTAs of the kernel (an occupancy query
+after the dynamic shared-memory opt-in; 4 CTAs per SM if the query fails).
+`CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES` lists the cells by architecture
+and SM count, die class (even when the dies' SM counts differ by at most 4)
+and batch class: on 212-SM devices both die classes from B = 32 on. The
+public nontranspose decode runs the twin only for a state that is the whole
+homed allocation on a device with an SM table, in a listed cell; it keeps
+those launches in `gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`, keyed
+by the row, the dies' SM counts and the die cut, and every other call runs
+the launch it runs without the twin.
+
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)
 and 8/32, 4/16, 2/8 (Qwen3.5-397B-A17B TP2/TP4/TP8). The resolver picks the

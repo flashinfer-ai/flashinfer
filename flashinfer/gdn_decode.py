@@ -1346,7 +1346,9 @@ def gated_delta_rule_decode(
         Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
     state : torch.Tensor
         Current state of shape ``[B, HV, K, V]`` (k-major layout).  Must be
-        float32.  Updated in-place.
+        float32.  Updated in-place.  On a dual-die SM107a GPU, a state from
+        :func:`localize_gdn_decode_state` runs the Cake locality-domain twin
+        where it is listed (bitwise equal to the whole-GPU kernel).
     A_log : torch.Tensor
         Log decay parameter of shape ``[HV]``.  Must be float32.
     a : torch.Tensor
