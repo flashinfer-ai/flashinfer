@@ -51,7 +51,23 @@ def _split_module():
 
 
 def _sm_count() -> int:
-    return torch.cuda.get_device_properties(0).multi_processor_count
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+def _require_qk_norm():
+    """``use_qk_l2norm_in_kernel=True`` needs the Q/K normalization kernel
+    (CUDA 13 and a CuTe DSL architecture)."""
+
+    from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
+
+    cuda_major = int((torch.version.cuda or "0").split(".")[0])
+    if not (
+        cuda_major >= 13
+        and is_cute_dsl_arch_supported(*torch.cuda.get_device_capability())
+    ):
+        pytest.skip("use_qk_l2norm_in_kernel needs the Q/K normalization kernel")
 
 
 def _target() -> str:
@@ -346,6 +362,36 @@ def test_batch_of_one_segment_uses_the_unsplit_kernel_only_where_bitwise(hq, hv,
         assert torch.equal(o_alone, o[a:b]) and torch.equal(s_alone[0], s[i]), i
 
 
+@pytest.mark.parametrize("hq,hv", [(1, 4), (1, 32), (2, 32)])
+def test_one_segment_batch_of_any_head_group(hq, hv):
+    """A one-segment batch from initial states runs for every admitted head
+    group: through the unsplit kernel where it ships the record, else
+    through the first kernel alone. Each sequence holds the bits it has
+    alone, and the unsplit kernel's accuracy where it runs."""
+
+    pr = _batch(hq, hv, [512, 512])
+    o, s = (
+        x.clone()
+        for x in _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
+    )
+    for i in range(2):
+        seq = _sequence(pr, i)
+        o_alone, s_alone = _call(seq, use_affine_split=True)
+        a, b = pr["cu"][i], pr["cu"][i + 1]
+        assert torch.equal(o_alone, o[a:b]) and torch.equal(s_alone[0], s[i]), i
+        ref_o, ref_s = _fp64_reference(seq, 0, seq["t"])
+        try:
+            o_base, s_base = _call(seq, use_cp=False)
+        except CakeGDNUnsupportedError:
+            # No unsplit record for this head group. Observed on B200, GB300
+            # and VR200: at most 0.0039 (output) and 0.0032 (state), as for
+            # the head groups the unsplit kernel serves.
+            assert _rel_rms(o[a:b], ref_o) <= 1e-2 and _rel_rms(s[i], ref_s) <= 1e-2
+            continue
+        assert _rel_rms(o[a:b], ref_o) <= GATE["real"] * _rel_rms(o_base, ref_o)
+        assert _rel_rms(s[i], ref_s) <= GATE["real"] * _rel_rms(s_base, ref_s)
+
+
 def test_one_segment_from_initial_states_without_final_states():
     """From initial states and without final states, a batch of one-segment
     sequences runs the first kernel alone, as the unsplit kernel ships no
@@ -482,7 +528,7 @@ def test_no_initial_state_unit_gates_and_no_final_state():
         assert torch.equal(only, o)
 
 
-def test_in_place_state_and_qk_l2norm():
+def test_in_place_state():
     pr = _problem(4, 8, 2048, "real")
     state = pr["h0"].clone()
     o_inplace, s_inplace = _call(
@@ -491,6 +537,11 @@ def test_in_place_state_and_qk_l2norm():
     o_ref, s_ref = _call(pr, use_affine_split=True)
     assert s_inplace.data_ptr() == state.data_ptr()
     assert torch.equal(o_inplace, o_ref) and torch.equal(s_inplace, s_ref)
+
+
+def test_qk_l2norm():
+    _require_qk_norm()
+    pr = _problem(4, 8, 2048, "real")
     raw = dict(
         pr,
         q=(pr["q"].float() * 3).to(torch.bfloat16),
@@ -1012,8 +1063,8 @@ def test_batch_launch_cap_follows_the_bound():
 def test_batch_call_forms_keep_the_bits():
     """int64 ``cu_seqlens``, ``cu_seqlens_cpu`` as a tensor, an in-place
     state, ``initial_state=None`` (against explicit zeros), unit gates
-    (against ones), ``output_final_state=False`` and the Q/K L2 norm (against
-    normalized inputs) hold the bits of the plain call over a batch."""
+    (against ones) and ``output_final_state=False`` hold the bits of the
+    plain call over a batch."""
 
     pr = _batch(4, 8, [4096, 1000, 0, 2500])
     n = 4
@@ -1069,6 +1120,13 @@ def test_batch_call_forms_keep_the_bits():
         use_affine_split=True,
     )
     assert torch.equal(only, o_ref)
+
+
+def test_batch_qk_l2norm_keeps_the_bits():
+    """The Q/K L2 norm holds the bits of normalized inputs over a batch."""
+
+    _require_qk_norm()
+    pr = _batch(4, 8, [4096, 1000, 0, 2500])
     raw = dict(
         pr,
         q=(pr["q"].float() * 3).to(torch.bfloat16),
