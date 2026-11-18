@@ -966,7 +966,9 @@ _COMPACT_LAUNCHERS_REQUIRED = (
     "compact W4A8 micro execution with N64-packed weights requires the "
     "prepared launchers from fused_moe.plan_execution(); pass that plan to "
     "fused_moe.bind() and fused_moe.run(). Sparse bindings, direct bindings "
-    "and fused_moe.plan() scratch plans do not carry these launchers."
+    "and fused_moe.plan() scratch plans do not carry these launchers. For "
+    "weights with an intermediate size that is a multiple of 128, set "
+    "B12X_W4A8_CSF_INLINE=0 before preparation to keep the N128 layout."
 )
 
 

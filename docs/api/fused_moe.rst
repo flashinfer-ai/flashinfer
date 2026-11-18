@@ -852,6 +852,13 @@ on SM121. On other GPUs, and when ``B12X_W4A8_CSF_INLINE=0``, these full
 N128-tile weights keep the native N128 layout and expand scales before each
 invocation.
 
+N64-packed weights need the prepared launchers from
+``fused_moe.plan_execution()`` for micro plans (up to four tokens). Sparse
+bindings, direct bindings and ``fused_moe.plan()`` scratch plans do not carry
+these launchers and raise ``ValueError`` at decode sizes. To bind full
+N128-tile weights in these ways on SM121, set ``B12X_W4A8_CSF_INLINE=0`` before
+preparation.
+
 The default limit is 1,536 planned tokens. On SM121, full N128-tile weights
 repacked for N64 execution can use inline decoding through 2,048 tokens when the
 selected dynamic tile has 64 rows and the estimated routed rows per expert do
