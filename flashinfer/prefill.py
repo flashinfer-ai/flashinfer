@@ -3209,6 +3209,12 @@ def _gqa_ctx_fp8q_sm90_run_eligibility(
             != _GQA_CTX_FP8Q_SM90_PAGE_SIZE * _GQA_CTX_FP8Q_SM90_HEAD_DIM
         ):
             return f"{name} strides {tuple(cache.stride())}"
+    # the kernel reads K and V at the same physical page ids, so both caches
+    # must hold every page the plan references (vt_pages = max page id + 1)
+    if k_cache.shape[0] < state.vt_pages:
+        return (
+            f"k_cache pages {k_cache.shape[0]} < planned page coverage {state.vt_pages}"
+        )
     if v_cache.shape[0] < state.vt_pages:
         return (
             f"v_cache pages {v_cache.shape[0]} < planned V^T coverage {state.vt_pages}"
@@ -5074,12 +5080,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # exactly) on the stock fa2 route — the composable path run() falls
         # back to.
         #
-        # The dormant path must not write any wrapper state before
-        # _validate_paged_query_lengths rejects an incompatible plan, so the
-        # arming decision is tracked in a local and only committed to the
-        # wrapper after validation (or immediately on the armed SM90 fp8-Q
-        # path, which the validated contract below explicitly requested).
+        # No path — armed or dormant — may write any wrapper state before
+        # _validate_paged_query_lengths rejects an incompatible plan: the
+        # arming decision is tracked in locals and only committed to the
+        # wrapper after validation, so a rejected replan leaves the
+        # previously accepted plan's state and run() behavior unchanged.
         _gqa_ctx_fp8q_sm90_armed = False
+        _gqa_ctx_fp8q_sm90_armed_explicit = False
+        _gqa_ctx_fp8q_sm90_armed_q_dtype = None
         _gqa_fp8q_contract_ok = (
             q_data_type == torch.float8_e4m3fn
             and kv_data_type == torch.float8_e4m3fn
@@ -5103,12 +5111,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "backend='auto' or a stock backend for other contracts."
                 )
             _gqa_ctx_fp8q_sm90_armed = True
-            self._gqa_ctx_fp8q_sm90_requested = True
-            self._gqa_ctx_fp8q_sm90_explicit = True
-            self._gqa_ctx_fp8q_sm90_q_data_type = q_data_type
+            _gqa_ctx_fp8q_sm90_armed_explicit = True
+            _gqa_ctx_fp8q_sm90_armed_q_dtype = q_data_type
+            # the underlying plan is made on the stock fa2 route (committed
+            # to the wrapper only after validation, below)
             q_data_type = torch.bfloat16
-            # the underlying plan is made on the stock fa2 route
-            self._backend = "fa2"
         elif self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
             _auto_routed, _auto_reason = _gqa_ctx_fp8q_sm90_auto_routes(
                 num_qo_heads,
@@ -5132,11 +5139,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             if _auto_routed:
                 _gqa_ctx_fp8q_sm90_armed = True
-                self._gqa_ctx_fp8q_sm90_requested = True
-                self._gqa_ctx_fp8q_sm90_explicit = False
-                self._gqa_ctx_fp8q_sm90_q_data_type = q_data_type
+                _gqa_ctx_fp8q_sm90_armed_explicit = False
+                _gqa_ctx_fp8q_sm90_armed_q_dtype = q_data_type
                 q_data_type = torch.bfloat16
-                self._backend = "fa2"
             else:
                 _gqa_ctx_fp8q_sm90_fallback(f"auto: {_auto_reason}")
                 logger.info_once(
@@ -5199,7 +5204,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # Reject this during planning so an unsupported request cannot reach the
         # lower-level trtllm-gen launcher if wrapper setup changes later.
-        if self._backend == "trtllm-gen" and not causal and window_left >= 0:
+        if (
+            not _gqa_ctx_fp8q_sm90_armed
+            and self._backend == "trtllm-gen"
+            and not causal
+            and window_left >= 0
+        ):
             raise NotImplementedError(
                 "Sliding-window non-causal attention is not supported for trtllm-gen "
                 "paged KV cache. Use window_left=-1 for dense bidirectional attention."
@@ -5216,8 +5226,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr = qo_indptr.contiguous()
         qo_indptr_host = qo_indptr.to("cpu")
         auto_backend = None
-        # an armed specialized fp8-Q plan already fixed the stock fa2 route
-        # for its composable fallback; auto resolution must not override it
+        # an armed specialized fp8-Q plan plans on the stock fa2 route for
+        # its composable fallback; auto resolution must not override it
         if self._requested_backend == "auto" and not _gqa_ctx_fp8q_sm90_armed:
             if use_token_head_sf:
                 if self._cuda_graph_backend == "fa3":
@@ -5259,7 +5269,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             max_kv_len = max_sequence_kv
 
-        planned_backend = "fa2" if use_token_head_sf else self._backend
+        # an armed specialized fp8-Q plan is planned on the stock fa2 route
+        planned_backend = (
+            "fa2" if (use_token_head_sf or _gqa_ctx_fp8q_sm90_armed) else self._backend
+        )
         # Per-token/head scales pin FA2; resolve auto without modifying plan state.
         if auto_backend is not None:
             planned_backend = auto_backend
@@ -5317,8 +5330,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
 
-        # Reset the specialized kernels only after checking backend compatibility.
-        if not _gqa_ctx_fp8q_sm90_armed:
+        # Commit the specialized arming decision (set or clear) only after the
+        # plan passed backend validation: a rejected replan leaves the
+        # previously accepted plan's flags and run() behavior unchanged.
+        if _gqa_ctx_fp8q_sm90_armed:
+            self._gqa_ctx_fp8q_sm90_requested = True
+            self._gqa_ctx_fp8q_sm90_explicit = _gqa_ctx_fp8q_sm90_armed_explicit
+            self._gqa_ctx_fp8q_sm90_q_data_type = _gqa_ctx_fp8q_sm90_armed_q_dtype
+            # the underlying plan is made on the stock fa2 route
+            self._backend = "fa2"
+        else:
             self._gqa_ctx_fp8q_sm90_requested = False
             self._gqa_ctx_fp8q_sm90_explicit = False
         self._eagle_verify_fp8kv_sm90_state = None
@@ -6340,6 +6361,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl=enable_pdl,
                 use_fp16_softmax=use_fp16_softmax,
                 uses_spcompress=uses_spcompress,
+            )
+        if (
+            getattr(self, "_gqa_ctx_fp8q_sm90_requested", False)
+            and getattr(self, "_gqa_ctx_fp8q_sm90_explicit", False)
+            and not is_float8(q)
+        ):
+            # the explicit plan was made for an fp8 (e4m3) query; its cached
+            # composable plan is bf16 only because the dequant fallback feeds
+            # it. Accepting a caller-supplied bf16/fp16 query here would be a
+            # silent fallback of an explicitly selected backend.
+            raise NotImplementedError(
+                "backend='specialized' (SM90 fp8-Q paged context kernel) was "
+                f"planned for a {self._gqa_ctx_fp8q_sm90_q_data_type} query, "
+                f"got {q.dtype}; an explicitly selected backend never falls "
+                "back — replan, or use backend='auto' for guarded routing"
             )
         if getattr(self, "_gqa_ctx_fp8q_sm90_requested", False) and is_float8(q):
             if args:

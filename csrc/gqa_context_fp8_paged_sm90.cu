@@ -960,6 +960,8 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   TVM_FFI_ICHECK_GT(vt_pages, 0);
   TVM_FFI_ICHECK_GE(v_cache.size(0), vt_pages)
       << "V cache must hold every page covered by the plan-sized V^T scratch";
+  TVM_FFI_ICHECK_GE(k_cache.size(0), vt_pages)
+      << "K cache must hold every page covered by the planned block table";
   int npt = (TQ + (BQ - 1) * B) / BQ;
   if (npt < 1) npt = 1;
   TVM_FFI_ICHECK_GE(tasks.numel(), 2 * (int64_t)npt) << "task buffer too small";

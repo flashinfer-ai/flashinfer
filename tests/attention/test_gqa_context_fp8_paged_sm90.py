@@ -805,3 +805,91 @@ def test_positional_fp8_scale_args_are_rejected_loudly():
     with pytest.raises(NotImplementedError, match="positional"):
         wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), ones, ones, ones)
     assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
+
+
+def test_rejected_replan_does_not_arm_the_wrapper():
+    """A replan that would arm the specialized kernel but is rejected by the
+    seq_lens_q validation must leave the previously accepted (unarmed) plan's
+    state and run() behavior unchanged: the arming decision is committed to
+    the wrapper only after validation."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="auto"
+    )
+    plan_args = (
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+    )
+    # accepted plan: bf16 query and KV on the stock route — never armed
+    wrapper.plan(
+        *plan_args,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+    )
+    assert not wrapper._gqa_ctx_fp8q_sm90_requested
+    # an fp8-Q replan that would arm, rejected by the seq_lens_q validation
+    bad_lens = torch.tensor([6, 90, 7], dtype=torch.int32)  # != qo_indptr diffs
+    with pytest.raises(ValueError, match="seq_lens_q"):
+        wrapper.plan(
+            *plan_args,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+            seq_lens_q=bad_lens,
+        )
+    # the rejected replan left the accepted plan unarmed: a bf16 run still
+    # takes the stock path (a leaked armed flag would send it down the fp8-Q
+    # branch and fail the cached-dtype check after dequantisation)
+    assert not wrapper._gqa_ctx_fp8q_sm90_requested
+    q_bf16 = batch["q"].float().to(torch.bfloat16)
+    k_bf16 = batch["k_cache"].float().to(torch.bfloat16)
+    v_bf16 = batch["v_cache"].float().to(torch.bfloat16)
+    out = wrapper.run(q_bf16, (k_bf16, v_bf16))
+    assert out.shape == batch["q"].shape
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
+
+
+def test_explicit_plan_rejects_non_fp8_query_at_run():
+    """run(q.bfloat16()) on an explicit 'specialized' plan must raise: the
+    cached composable plan is bf16 only because the dequant fallback feeds it,
+    and an explicitly selected backend never falls back."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    q_bf16 = batch["q"].float().to(torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        wrapper.run(q_bf16, (batch["k_cache"], batch["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
+    # valid e4m3 input still dispatches the specialized kernel
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_run_guard_requires_k_cache_page_coverage():
+    """The kernel reads K and V at the same physical page ids: a K cache with
+    fewer pages than the planned coverage is declined (explicit raises), the
+    same rule the V^T coverage check applies to v_cache."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    short_k = batch["k_cache"][:-1].clone()
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        wrapper.run(batch["q"], (short_k, batch["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    assert any("k_cache pages" in r for r in stats["fallback_reasons"]), stats
