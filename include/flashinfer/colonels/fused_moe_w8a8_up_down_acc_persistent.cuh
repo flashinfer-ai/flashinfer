@@ -15,7 +15,6 @@
 
 #include "fused_moe_helpers.cuh"
 namespace cg = cooperative_groups;
-#define NUM_SM 132
 
 namespace w8a8_persistent {
 
@@ -918,9 +917,12 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
   constexpr int BK = 128;
   constexpr int PRODUCER_THREADS = 128;
   if (K <= 0 || K % (2 * BK) || N <= 0 || N % 256 || N % (BN * WN)) return false;
+  int device, num_sms;
+  gpuErrchk(cudaGetDevice(&device));
+  gpuErrchk(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
   dim3 dimBlock(32 * WN + PRODUCER_THREADS, 1, 1);
   const int SPLIT_K = N / (BN * WN) == 0 ? 1 : N / (BN * WN);
-  const int block_count = std::min(NUM_SM / SPLIT_K, (int)std::ceil((float)sorted_num / block_m));
+  const int block_count = std::min(num_sms / SPLIT_K, (int)std::ceil((float)sorted_num / block_m));
   if (block_count == 0) return false;
   dim3 dimGrid(1, block_count * SPLIT_K, 1);
 
@@ -942,8 +944,6 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
   }
   if (sMemSize <= SM90_MAX_SMEM && BN * WN <= N && N % (BN * WN) == 0) {
     int max_smem_real;
-    int device;
-    cudaGetDevice(&device);
     cudaDeviceGetAttribute(&max_smem_real, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     assert(max_smem_real == SM90_MAX_SMEM);
 

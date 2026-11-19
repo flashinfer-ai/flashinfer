@@ -343,6 +343,7 @@ bool launch_fused_moe_kernel_up_down_acc_gemv(
     return false;
   }
   if (K > 0 && K % 256 == 0 && BN <= N && N % BN == 0 && K % (Z_SPLIT * SMEM_ROWS) == 0) {
+    if (int64_t(M) * top_k > 65535) return false;
     dim3 dimBlock(32 * WARPS, 1, 1);
     dim3 dimGrid(std::ceil((float)N / (BN)), M * top_k, Z_SPLIT);
     auto kernel = fused_moe_bf16_wgmma_up_down_acc_gemv_kernel<BN, WARPS, Z_SPLIT, ACTIVATION,
@@ -367,6 +368,7 @@ bool launch_fused_moe_kernel_up_down_acc_gemv(
     kernel<<<dimGrid, dimBlock, smem_size, stream>>>(x, w, w2, out, topk_ids, topk_weights, top_k,
                                                      M, N, K, num_experts, scaling_factor,
                                                      activation_params);
+    gpuErrchk(cudaGetLastError());
     return true;
   }
   return false;
