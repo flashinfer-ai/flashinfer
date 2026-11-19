@@ -10,8 +10,10 @@ replacing them.
 No GPU is required -- profiling is monkeypatched and inputs are CPU tensors.
 """
 
+import asyncio
 import json
 
+import pytest
 import torch
 
 import flashinfer.autotuner.autotuner as autotuner_module
@@ -21,6 +23,61 @@ from .utils import DummyRunner, reset_autotuner
 
 _CONFIG = TuningConfig()  # no dynamic specs -> a single static profile
 _METADATA = {"gpu": "test-gpu"}
+
+
+@pytest.mark.parametrize("inner_tune", [False, True])
+def test_same_cache_reentry_keeps_pending_namespaced_records(
+    monkeypatch, tmp_path, inner_tune
+):
+    monkeypatch.setattr(autotuner_module, "_collect_metadata", lambda: dict(_METADATA))
+    monkeypatch.chdir(tmp_path)
+    tuner = reset_autotuner()
+    path = tmp_path / "cache.json"
+    records = {"shape": {"tactic": 7}}
+
+    with autotune(True, cache=str(path)):
+        tuner.publish_namespaced_records("trtllm_moe_da", records)
+        with autotune(inner_tune, cache="cache.json"):
+            assert tuner.get_namespaced_records("trtllm_moe_da") == records
+        assert tuner.get_namespaced_records("trtllm_moe_da") == records
+
+    assert json.loads(path.read_text())["_records"]["trtllm_moe_da"] == records
+
+
+@pytest.mark.parametrize("keep_parent_open", [False, True])
+def test_task_cache_reentry_uses_live_cache_state(
+    monkeypatch, tmp_path, keep_parent_open
+):
+    monkeypatch.setattr(autotuner_module, "_collect_metadata", lambda: dict(_METADATA))
+    tuner = reset_autotuner()
+    paths = [str(tmp_path / name) for name in ("a.json", "b.json")]
+    namespace = "trtllm_moe_da"
+    for path, model in zip(paths, ("A", "B"), strict=True):
+        with autotune(True, cache=path):
+            tuner.publish_namespaced_records(namespace, {"model": model})
+
+    async def exercise():
+        resume = asyncio.Event()
+
+        async def reload_a():
+            await resume.wait()
+            with autotune(False, cache=paths[0]):
+                return tuner.get_namespaced_records(namespace)
+
+        with autotune(keep_parent_open, cache=paths[0]):
+            with autotune(False, cache=paths[0]):
+                child = asyncio.create_task(reload_a())
+            if keep_parent_open:
+                tuner.publish_namespaced_records(namespace, {"pending": "A"})
+                resume.set()
+                return await child
+        with autotune(False, cache=paths[1]):
+            assert tuner.get_namespaced_records(namespace) == {"model": "B"}
+        resume.set()
+        return await child
+
+    expected = {"pending": "A"} if keep_parent_open else {"model": "A"}
+    assert asyncio.run(exercise()) == expected
 
 
 def _file_key(custom_op, runner, shapes):
