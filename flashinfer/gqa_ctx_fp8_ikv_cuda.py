@@ -14,6 +14,7 @@ trtllm-gen incumbent.
 """
 
 import functools
+import threading
 
 import torch
 
@@ -28,6 +29,35 @@ def get_gqa_ctx_fp8_ikv_module():
     mod = gen_gqa_ctx_fp8_ikv_module().build_and_load()
     _BUILT["ready"] = True
     return mod
+
+
+# A failed module build/load (e.g. a cache-only deployment without the
+# compiled artifact) is cached -- functools.cache does not cache exceptions,
+# so without this every allowlisted "auto" call would retry the build before
+# falling back.  Published atomically as one (reason_string, exception)
+# tuple under _MODULE_LOAD_LOCK, which also serializes the first load.
+_MODULE_LOAD_FAILURE: "tuple | None" = None
+_MODULE_LOAD_LOCK = threading.Lock()
+
+
+def _load_module_or_failure():
+    """Load (and cache) the specialized module; return None on success or
+    the cached (reason, exception) tuple when it cannot be built/loaded."""
+    global _MODULE_LOAD_FAILURE
+    failure = _MODULE_LOAD_FAILURE
+    if failure is not None:
+        return failure
+    with _MODULE_LOAD_LOCK:
+        failure = _MODULE_LOAD_FAILURE
+        if failure is not None:
+            return failure
+        try:
+            get_gqa_ctx_fp8_ikv_module()
+        except Exception as e:  # pragma: no cover - environment-dependent
+            failure = ("specialized_module_unavailable:" + type(e).__name__, e)
+            _MODULE_LOAD_FAILURE = failure
+            return failure
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -211,16 +241,14 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
-        try:
-            get_gqa_ctx_fp8_ikv_module()
-        except Exception as e:  # pragma: no cover - environment-dependent
+        failure = _load_module_or_failure()
+        if failure is not None:  # pragma: no cover - environment-dependent
             # A missing prebuilt JIT artifact (or a build failure) must not
-            # take down "auto": record the reason and keep the stock path.
+            # take down "auto": the first failure is cached (one build
+            # attempt, not one per call) and kept as a fallback reason.
             if backend == "specialized":
-                raise
-            LAST_FALLBACK_REASONS[:] = [
-                "specialized_module_unavailable:" + type(e).__name__
-            ]
+                raise failure[1]
+            LAST_FALLBACK_REASONS[:] = [failure[0]]
             DISPATCH_STATS["fallback"] += 1
             return None
         DISPATCH_STATS["specialized"] += 1
