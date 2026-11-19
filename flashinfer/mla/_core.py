@@ -3322,7 +3322,6 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             self._qk_rope_head_dim,
             self._page_size,
             _round_to_seq_len_bucket(self._max_seq_len),
-            self._bmm2_scale == 1.0,
             self.sinks is not None,
         )
 
@@ -4676,13 +4675,16 @@ def _mla_with_kv_cache_impl(
                 tuning_config,
                 inputs,
             )
-            if isinstance(
-                runner, _CakeTrtllmMlaBlackwellRunner
-            ) and not runner.validate_tactic(inputs, tactic):
+            if isinstance(runner, _CakeTrtllmMlaBlackwellRunner):
                 # The tuner already turns such a cache hit into a miss; this
                 # keeps every Cake launch within its domains and row cap, and
                 # out of program builds during stream capture.
-                runner, tactic = runners[0], -1
+                try:
+                    cake_ok = runner.validate_tactic(inputs, tactic)
+                except Exception:
+                    cake_ok = False
+                if not cake_ok:
+                    runner, tactic = runners[0], -1
         if isinstance(runner, _BatchMLAPagedAttentionTrtllmGenBackend):
             runner(
                 inputs=inputs,

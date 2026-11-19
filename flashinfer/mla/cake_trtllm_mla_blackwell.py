@@ -1251,7 +1251,11 @@ def trtllm_mla_blackwell_decode(
     CLC launch on the current stream per call, so graphs it is captured into
     own their buffers.  On the value-split, generic CLC and FP8 page-64 programs
     it launches the same kernels as the default mode, so in-place input updates
-    and CUDA-graph replay with updated inputs stay correct.
+    and CUDA-graph replay with updated inputs stay correct.  Where
+    ``exact_route_candidate`` holds and the KV lengths select an exact-length
+    program in the default mode, the stateless mode launches the value-split or
+    generic CLC program instead, so the two modes can run different kernels on
+    the same inputs.
     """
     if backend != "cake":
         raise ValueError(f"backend must be 'cake', got {backend!r}")
