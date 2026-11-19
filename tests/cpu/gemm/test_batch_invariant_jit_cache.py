@@ -191,3 +191,68 @@ def test_key_hash_is_computed_once_per_process(monkeypatch):
         assert len(calls) == 2
     finally:
         J.module_source_sha256.cache_clear()
+
+
+#: The other kernel modules the walk keys (their keys shrink with the same resolution rule): the compile roots and bodies
+#: that must stay in the key, and the surfaces of the mode that must not be in it.
+OTHER_MODULES = {
+    "batch_invariant_attention": (
+        {
+            "attention/batch_invariant/blocks/compile.py",
+            "attention/batch_invariant/blocks/kernel.py",
+            "attention/batch_invariant/blocks/producer.py",
+            "attention/batch_invariant/blocks/mma.py",
+            "attention/batch_invariant/blocks/softmax.py",
+            "attention/batch_invariant/blocks/correction.py",
+            "attention/batch_invariant/swaps/compile.py",
+            "attention/batch_invariant/swaps/kernel.py",
+            "attention/batch_invariant/fixup.py",
+            "attention/batch_invariant/plan.py",
+            "attention/batch_invariant/spec.py",
+            "batch_invariant/canon.py",
+            "batch_invariant/fp_interface/cute.py",
+            "batch_invariant/jit.py",
+        },
+        (
+            "batch_invariant/sampling/",
+            "batch_invariant/gdn/",
+            "batch_invariant/kda/",
+            "batch_invariant/quantization/",
+            "fused_moe/",
+        ),
+    ),
+    "batch_invariant_moe": (
+        {
+            "fused_moe/batch_invariant/blocks/compile.py",
+            "fused_moe/batch_invariant/blocks/kernel.py",
+            "fused_moe/batch_invariant/blocks/epilogue.py",
+            "fused_moe/batch_invariant/blocks/scheduler.py",
+            "fused_moe/batch_invariant/blocks/swap.py",
+            "fused_moe/batch_invariant/route.py",
+            "fused_moe/batch_invariant/route_plan.py",
+            "fused_moe/batch_invariant/permute.py",
+            "fused_moe/batch_invariant/combine.py",
+            "fused_moe/batch_invariant/spec.py",
+            "fused_moe/batch_invariant/spec_fp8.py",
+            "gemm/batch_invariant/blocks/mainloop.py",
+            "gemm/batch_invariant/blocks/operands.py",
+            "batch_invariant/canon.py",
+            "batch_invariant/fp_interface/cute.py",
+            "batch_invariant/jit.py",
+        },
+        ("batch_invariant/gdn/", "batch_invariant/kda/", "attention/"),
+    ),
+}
+
+
+@pytest.mark.parametrize("module", sorted(OTHER_MODULES))
+def test_other_kernel_modules_keep_their_sources_and_drop_the_surfaces(module):
+    """The attention and MoE keys shrink under the same rule: their kernel sources stay, the mode's other surfaces go."""
+    required, forbidden = OTHER_MODULES[module]
+    srcs = set(J.relative_sources(module))
+    missing = required - srcs
+    assert not missing, missing
+    outside = sorted(s for s in srcs if s.startswith(forbidden))
+    assert not outside, outside
+    host = [s for s in srcs if s in GEMM_HOST_SOURCES]
+    assert not host, host
