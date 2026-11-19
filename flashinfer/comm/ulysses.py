@@ -312,6 +312,8 @@ class UlyssesQKVWorkspace:
     _send_buffer: torch.Tensor
     _recv_buffer: torch.Tensor
     _stats_gather: torch.Tensor
+    _exchange_vote: Optional[torch.Tensor]
+    _vote_stream: Optional[torch.cuda.Stream]
 
     def __init__(self):
         raise TypeError("use UlyssesCommunicator.prepare_qkv() to create a workspace")
@@ -391,6 +393,14 @@ class UlyssesQKVWorkspace:
                 values["_recv_buffer"] = recv.view(wire_shape)
             values["_stats_gather"] = torch.empty(
                 world * stats_numel, dtype=torch.float32, device=owner.device
+            )
+            # Preallocated so a failing rank can still vote without allocating.
+            rdma = owner.backend == "pcie" and owner.transport in _PCIE_RDMA_TRANSPORTS
+            values["_exchange_vote"] = (
+                torch.zeros(1, dtype=torch.int32, device=owner.device) if rdma else None
+            )
+            values["_vote_stream"] = (
+                torch.cuda.Stream(device=owner.device) if rdma else None
             )
         for name, value in values.items():
             object.__setattr__(workspace, name, value)
@@ -2358,10 +2368,14 @@ class UlyssesCommunicator:
         On PCIe the call follows the backend's collective contract. It runs on
         the stream the communicator's first PCIe collective bound; the hybrid
         and all-RDMA routes refuse CUDA graph capture and block the host in
-        the exchange. Both rules are checked before any work is enqueued. A
-        rejection or failure before this rank enqueues its exchange is an
-        ordinary error on the RDMA routes and leaves an all-P2P communicator
-        BROKEN, as for the backend's other collectives.
+        the exchange. Both rules are checked before any work is enqueued, and
+        a rejection there is an ordinary error on the RDMA routes. Because
+        those routes wait for every peer in an unbounded barrier, they also
+        vote over NCCL just before the exchange: a failure on any rank after
+        admission raises on every rank before any of them enters it, and the
+        communicator stays OPEN. On the all-P2P route, a rejection or failure
+        before this rank enqueues its exchange leaves the communicator BROKEN,
+        as for the backend's other collectives.
 
         Parameters
         ----------
@@ -2476,48 +2490,103 @@ class UlyssesCommunicator:
     def _quantize_and_exchange_qkv(self, q, k, v, workspace, lowp):
         """Statistics, quantization and the payload exchange; returns stats."""
         layout = workspace._layout_impl
+        vote = workspace._exchange_vote
+        stage = "stats"
+        failure: Optional[Exception] = None
+        stats = None
         with torch.cuda.device(self.device):
-            with torch.cuda.nvtx.range("lowp_local_stats"):
-                send, ctx = lowp._local_stats_impl(
-                    q,
-                    k,
-                    v,
-                    self.rank,
-                    self.world_size,
-                    workspace.used_sequence,
-                    layout.Q_GROUP,
-                    layout.K_GROUP,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
-            with torch.cuda.nvtx.range("lowp_stats_allgather"):
-                dist.all_gather_into_tensor(
-                    workspace._stats_gather, send, group=self.group
-                )
-            with torch.cuda.nvtx.range("lowp_finalize_stats"):
-                stats = lowp._finalize_stats_impl(
-                    workspace._stats_gather,
-                    ctx,
-                    k,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
-            with torch.cuda.nvtx.range("lowp_quant_pack"):
-                lowp._quant_and_pack_impl(
-                    q,
-                    k,
-                    v,
-                    stats,
-                    workspace._send_buffer,
-                    workspace._q_scale_offset,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
+            try:
+                with torch.cuda.nvtx.range("lowp_local_stats"):
+                    send, ctx = lowp._local_stats_impl(
+                        q,
+                        k,
+                        v,
+                        self.rank,
+                        self.world_size,
+                        workspace.used_sequence,
+                        layout.Q_GROUP,
+                        layout.K_GROUP,
+                        workspace._enable_pdl,
+                        workspace._module,
+                    )
+                stage = "gather"
+                with torch.cuda.nvtx.range("lowp_stats_allgather"):
+                    dist.all_gather_into_tensor(
+                        workspace._stats_gather, send, group=self.group
+                    )
+                stage = "pack"
+                with torch.cuda.nvtx.range("lowp_finalize_stats"):
+                    stats = lowp._finalize_stats_impl(
+                        workspace._stats_gather,
+                        ctx,
+                        k,
+                        workspace._enable_pdl,
+                        workspace._module,
+                    )
+                with torch.cuda.nvtx.range("lowp_quant_pack"):
+                    lowp._quant_and_pack_impl(
+                        q,
+                        k,
+                        v,
+                        stats,
+                        workspace._send_buffer,
+                        workspace._q_scale_offset,
+                        workspace._enable_pdl,
+                        workspace._module,
+                    )
+            except Exception as e:  # noqa: BLE001 — a rank-local failure joins the vote
+                # A failure inside the AllGather itself is a process-group
+                # failure, which this protocol cannot recover.
+                if vote is None or stage == "gather":
+                    raise
+                failure = e
+                if stage == "stats":
+                    # Peers are already in the statistics AllGather: join it in
+                    # place so this rank's vote pairs with theirs.
+                    chunk = workspace._stats_numel
+                    dist.all_gather_into_tensor(
+                        workspace._stats_gather,
+                        workspace._stats_gather.narrow(0, self.rank * chunk, chunk),
+                        group=self.group,
+                    )
+            if vote is not None:
+                self._vote_before_rdma_exchange(workspace, failure)
             with torch.cuda.nvtx.range("lowp_input_a2a"):
                 self._exchange_qkv_payload(
                     workspace._send_buffer, workspace._recv_buffer
                 )
         return stats
+
+    def _vote_before_rdma_exchange(
+        self, workspace: UlyssesQKVWorkspace, failure: Optional[Exception]
+    ) -> None:
+        """Agree on success before any rank enters the RDMA opening barrier.
+
+        That barrier waits for every peer without a deadline, while a failure
+        between admission and the exchange (an allocation in the statistics
+        or quantizer, say) is rank-local. Every rank therefore raises here,
+        before entering it, so no peer is left waiting and the communicator
+        stays OPEN.
+
+        Every failure the vote reports is raised on the host while the
+        statistics and quantizer kernels are enqueued, so the vote need not
+        wait for them: on its own stream it overlaps finalization and packing
+        instead of following them, and the exchange still orders after them
+        on the caller's stream.
+        """
+        vote = workspace._exchange_vote
+        with torch.cuda.stream(workspace._vote_stream):
+            vote.fill_(0 if failure is None else 1)
+            dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=self.group)
+            failed = vote.item()
+        if not failed:
+            return
+        if failure is not None:
+            raise failure
+        raise RuntimeError(
+            "scatter_qkv failed on a peer rank before the PCIe exchange; "
+            "no rank entered it"
+        )
 
     def _exchange_qkv_payload(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         # The two-dimensional kernel payload is already destination-major.
