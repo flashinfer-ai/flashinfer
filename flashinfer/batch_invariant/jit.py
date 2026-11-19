@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import ast
 import functools
+import inspect
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel, sanitize_symbol_name
 
@@ -95,6 +96,7 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
 }
+
 
 def _in_mode(path: Path) -> bool:
     return any(path == d or d in path.parents for d in MODE_DIRS)
@@ -177,11 +179,30 @@ def relative_sources(module: str) -> list:
     return [str(p.relative_to(_FI_DIR)) for p in module_sources(module)]
 
 
-def build_and_load(module: str, kernel: str, compile_fn: Callable[[], Any]) -> Any:
-    """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss."""
+def _export_compile_fn(
+    compile_fn: Callable[..., Any],
+) -> Optional[Callable[[], Any]]:
+    """``compile_fn`` with the DSL's ``no_jit_engine`` option when it forwards keyword options to ``cute.compile``
+    (``def compile_fn(**compile_options)``), else None. The disk-cache path exports the compiled object and reloads it:
+    the in-process execution engine, its entry lookup and the TVM-FFI link are work such a kernel never uses, and the
+    exported object is the same without them."""
+    try:
+        params = inspect.signature(compile_fn).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+        return functools.partial(compile_fn, no_jit_engine=True)
+    return None
+
+
+def build_and_load(module: str, kernel: str, compile_fn: Callable[..., Any]) -> Any:
+    """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss. A ``compile_fn`` that
+    forwards ``**compile_options`` to ``cute.compile`` is compiled without the execution engine for the exported object
+    (:func:`_export_compile_fn`); one without them keeps the engine."""
     return build_and_load_cute_dsl_kernel(
         module,
         kernel,
         compile_fn,
         extra_key_files=[str(p) for p in module_sources(module)],
+        export_compile_fn=_export_compile_fn(compile_fn),
     )

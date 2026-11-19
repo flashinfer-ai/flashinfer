@@ -87,7 +87,9 @@ def test_key_closure_is_the_kernel_sources(module):
         print(f"  {s}")
     assert GEMM_MODULES[module] | SHARED_KERNEL_SOURCES <= set(srcs)
     outside = [s for s in srcs if not s.startswith(KEY_PREFIXES)]
-    assert not outside, outside  # no sampling / GDN / KDA / quantization / attention / MoE file
+    assert not outside, (
+        outside
+    )  # no sampling / GDN / KDA / quantization / attention / MoE file
     host = [s for s in srcs if s in GEMM_HOST_SOURCES]
     assert not host, host
 
@@ -124,9 +126,42 @@ def test_import_resolution_names_the_file(tmp_path, monkeypatch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     monkeypatch.setattr(J, "MODE_DIRS", (pkg.resolve(),))
-    got = {str(p.relative_to(pkg.resolve())) for p in J._relative_imports(pkg / "kernel.py")}
+    got = {
+        str(p.relative_to(pkg.resolve()))
+        for p in J._relative_imports(pkg / "kernel.py")
+    }
     assert got == {"defined.py", "sub/leaf.py", "sub/__init__.py"}
     # the package __init__ was named for THING, so its own imports are followed from it; the mode's top-level __init__
     # is only on the way and its surface import stays out
-    got = {str(p.relative_to(pkg.resolve())) for p in J._relative_imports(pkg / "sub" / "__init__.py")}
+    got = {
+        str(p.relative_to(pkg.resolve()))
+        for p in J._relative_imports(pkg / "sub" / "__init__.py")
+    }
     assert got == {"sub/impl.py", "surface.py"}
+
+
+def test_build_and_load_compiles_the_exported_object_without_the_engine(monkeypatch):
+    """A compile closure forwarding the DSL's keyword options gets the engine-less compile for the exported object; one
+    without them keeps the engine (today's path)."""
+    got = {}
+
+    def fake_build_and_load(module, kernel, compile_fn, extra_key_files=(), **kw):
+        got.update(kw, module=module, kernel=kernel, files=tuple(extra_key_files))
+        return "loaded"
+
+    monkeypatch.setattr(J, "build_and_load_cute_dsl_kernel", fake_build_and_load)
+    seen = []
+
+    def compile_fn(**compile_options):
+        seen.append(compile_options)
+        return "compiled"
+
+    assert J.build_and_load("batch_invariant_gemm", "k", compile_fn) == "loaded"
+    assert got["files"] == tuple(
+        str(p) for p in J.module_sources("batch_invariant_gemm")
+    )
+    assert got["export_compile_fn"]() == "compiled" and seen == [
+        {"no_jit_engine": True}
+    ]
+    assert J.build_and_load("batch_invariant_gemm", "k", lambda: "compiled") == "loaded"
+    assert got["export_compile_fn"] is None

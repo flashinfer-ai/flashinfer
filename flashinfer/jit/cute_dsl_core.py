@@ -115,6 +115,14 @@ class JitSpecCuteDsl(JitSpec):
     reloaded as a TVM-FFI function; False for a kernel compiled without it,
     exported as a plain object file and reloaded as a CuTe-DSL compiled
     function that takes the same arguments as the in-process one.
+
+    ``export_compile_fn``, when given, compiles the same kernel without the
+    DSL's execution engine (``cute.compile(..., no_jit_engine=True)``). The
+    disk-cache path exports the compiled object and reloads it, so the
+    engine, its entry lookup and the TVM-FFI link of the in-process kernel
+    are work it never uses; the exported object is the same. ``compile_fn``
+    still runs when the export fails (an engine-less kernel cannot run) and
+    when the cache is disabled.
     """
 
     toolchain = "cute_dsl"
@@ -127,10 +135,12 @@ class JitSpecCuteDsl(JitSpec):
         source_sha256: str,
         *,
         enable_tvm_ffi: bool = True,
+        export_compile_fn: Optional[Callable[[], Any]] = None,
     ):
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
+        self.export_compile_fn = export_compile_fn
         self.enable_tvm_ffi = enable_tvm_ffi
         self.module_dir_name = sanitize_symbol_name(
             f"{module_name}_{_get_compile_arch()}_cute_dsl"
@@ -204,14 +214,30 @@ class JitSpecCuteDsl(JitSpec):
             shutil.rmtree(self.module_dir, ignore_errors=True)
 
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
-        self._compiled_kernel = self.compile_fn()
+        if self.export_compile_fn is None:
+            self._compiled_kernel = self.compile_fn()
+            try:
+                self._export()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to persist CuTe-DSL kernel {self.name} to "
+                    f"{self.object_path}: {e}. The kernel will be recompiled next run."
+                )
+            return
+        # The exported object is what load() hands back: compile without the
+        # execution engine, and again with one only if the export fails.
+        self._compiled_kernel = self.export_compile_fn()
         try:
             self._export()
         except Exception as e:
             logger.warning(
                 f"Failed to persist CuTe-DSL kernel {self.name} to "
-                f"{self.object_path}: {e}. The kernel will be recompiled next run."
+                f"{self.object_path}: {e}. Compiling it again with an execution "
+                "engine; the kernel will be recompiled next run."
             )
+            self._compiled_kernel = self.compile_fn()
+            return
+        self._compiled_kernel = None
 
     def compile_and_persist(self) -> None:
         """Compile outside the module lock; commit the artifact under it.
@@ -225,7 +251,9 @@ class JitSpecCuteDsl(JitSpec):
         from filelock import FileLock
 
         started = time.perf_counter()
-        self._compiled_kernel = self.compile_fn()
+        # Only the export is wanted here: no execution engine when the
+        # caller provides the engine-less compile.
+        self._compiled_kernel = (self.export_compile_fn or self.compile_fn)()
         _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
         with FileLock(self.lock_path, thread_local=False):
             if (
@@ -244,6 +272,8 @@ class JitSpecCuteDsl(JitSpec):
                     f"{self.object_path}: {e}. The kernel will be recompiled "
                     f"next run."
                 )
+        if self.export_compile_fn is not None:
+            self._compiled_kernel = None
 
     def load(self) -> Any:
         """The kernel to hand back: the exported artifact whenever one exists.
@@ -327,6 +357,7 @@ def build_and_load_cute_dsl_kernel(
     extra_key_files: Sequence[str] = (),
     *,
     enable_tvm_ffi: bool = True,
+    export_compile_fn: Optional[Callable[[], Any]] = None,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -351,6 +382,9 @@ def build_and_load_cute_dsl_kernel(
     enable_tvm_ffi : bool
         Whether ``compile_fn`` compiles with TVM-FFI (see
         :class:`JitSpecCuteDsl`).
+    export_compile_fn : Optional[Callable[[], Any]]
+        ``compile_fn`` without the DSL's execution engine, for the exported
+        object (see :class:`JitSpecCuteDsl`).
 
     Returns
     -------
@@ -379,5 +413,6 @@ def build_and_load_cute_dsl_kernel(
         compile_fn,
         source_sha256,
         enable_tvm_ffi=enable_tvm_ffi,
+        export_compile_fn=export_compile_fn,
     )
     return spec.build_and_load()
