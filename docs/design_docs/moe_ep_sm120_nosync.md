@@ -10,8 +10,9 @@ wait on a barrier: each producer writes an epoch-tagged flag into the consumer's
 memory after its data, and the consumer polls its own memory.
 
 It is normally used as a small-batch option of a layer that runs the cake or
-cutedsl SM120 MXFP4 backend: calls up to `max_tokens_per_rank` tokens per rank
-run this kernel, larger calls run the configured backend unchanged. Sources:
+cutedsl SM120 MXFP4 backend: calls within `max_tokens_per_rank` tokens per rank
+and `max_tokens_per_expert` tokens per expert run this kernel, larger calls run
+the configured backend unchanged. Sources:
 
 | Part | Path |
 | --- | --- |
@@ -29,7 +30,7 @@ layer = MoEEpLayer(
     bootstrap, fleet_params,
     PrequantizedMoEWeights(w13=..., w2=..., w13_scale=..., w2_scale=...),
     backend=MegaConfig(megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(...), ...),
-    nosync=NosyncOptions(),  # max_tokens_per_rank=128, transport=None (cake's table), tokens_per_item=None
+    nosync=NosyncOptions(),  # max_tokens_per_rank=128, max_tokens_per_expert=16, transport=None (cake's table)
 )
 ```
 
@@ -48,7 +49,17 @@ layer = MoEEpLayer(
   (`shared_expert="fp8_in_kernel"`; the nosync kernel computes the routed experts
   only), an unsupported geometry) the option warns once and every call runs the
   configured backend.
-- `NosyncOptions` fields: `max_tokens_per_rank` (1–128, same on every rank),
+- A call runs the nosync kernel when its bound is at most `max_tokens_per_rank`
+  and the routes it bounds average at most `max_tokens_per_expert` per expert:
+  `bound * ep_size * top_k / num_experts <= max_tokens_per_expert`. The per-expert
+  load, not the per-rank count, decides where the kernel stops winning: at
+  128 tokens per rank and EP8 over the NIC, DeepSeek-V4.1-Flash (16 tokens per
+  expert) is faster than cake, DeepSeek-V4-Flash (24) and GLM-5.3-Flash (28) are
+  slower. With the default 16, EP8 switches at 85 tokens per rank for
+  DeepSeek-V4-Flash, 72 for GLM-5.3-Flash and 128 for DeepSeek-V4.1-Flash; EP4
+  and EP2 keep 128.
+- `NosyncOptions` fields: `max_tokens_per_rank` (1–128) and
+  `max_tokens_per_expert` (default 16), both the same on every rank;
   `transport` and `tokens_per_item` (below), and `top_k` / `swiglu_limit`, which
   default to the configured cake or cutedsl backend's and must be set for any
   other backend.
@@ -203,5 +214,7 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
   0.87× for DeepSeek-V4-Flash and 0.81× for GLM-5.3-Flash). Phase stamps place
   the extra time in the GIN path: on the ConnectX-8 host in receiving the
   dispatched tokens (the per-token puts queue behind each other), on RTX PRO 6000
-  in waiting for the pushed-back partials. On such hosts
-  `NosyncOptions(max_tokens_per_rank=64)` hands 128-token calls to cake.
+  in waiting for the pushed-back partials. The default `max_tokens_per_expert=16`
+  hands these calls to cake. Hosts where every pair is P2P (the Broadcom RTX 6000D
+  host) stay faster up to 28 tokens per expert; a higher `max_tokens_per_expert`
+  keeps them on the kernel.
