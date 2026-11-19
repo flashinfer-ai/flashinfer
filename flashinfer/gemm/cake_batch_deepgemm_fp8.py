@@ -1559,6 +1559,13 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     of 4752 MHz) the twin route took 0.99-1.06x the time of plain weights at
     ``expected_m <= 64``; keep plain weights on such a device.
 
+    On 212-SM devices, plain weights run their serving program on the full grid
+    from ``expected_m`` 36; the homed twin is unchanged.  For ``B=64`` weights of
+    ``(4096, 7168)``, plain weights then took 0.95x the time of homed weights at
+    ``expected_m`` 64 and 512 and 0.97x at 4096.  Homed weights stay faster at
+    smaller ``expected_m``: plain weights took 1.04x their time at 36 and
+    1.10-1.35x at 1-32.
+
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
     after it is freed faults on replay, so keep it alive as long as such a graph.
