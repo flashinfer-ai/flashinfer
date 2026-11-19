@@ -104,10 +104,14 @@ def _load_allowlist() -> Optional[dict]:
 
 def specialized_ssd_prefill_stats() -> dict:
     """Diagnostics: dispatch counters and the dispatch surface."""
+    allow = _load_allowlist()
     return {
         **_stats,
         "fallback_reasons": dict(_stats["fallback_reasons"]),
-        "allowlist": _load_allowlist(),
+        # Shallow copy: handing out the live dict would let a diagnostics
+        # consumer mutate the dispatch surface the guards read (its values
+        # are immutable, so a shallow copy suffices).
+        "allowlist": dict(allow) if allow is not None else None,
         "warmed": sorted(_warmed),
         "kill_switch_env": _DISABLE_ENV,
     }
@@ -227,8 +231,19 @@ def _guard_call(
         return "batch_form"
     if num_seqs not in (None, 1):
         return "multi_sequence"
-    if cu_seqlens is not None and cu_seqlens.numel() != 2:
-        return "multi_sequence"
+    if cu_seqlens is not None:
+        if cu_seqlens.numel() != 2:
+            return "multi_sequence"
+        # Metadata-only checks (never a device sync): require the documented
+        # device int32 offset-vector form.  The two offset values themselves
+        # are trusted as [0, T] — the single-sequence caller precondition of
+        # ``SSDCombined.run`` — because validating them would synchronize.
+        if (
+            cu_seqlens.dim() != 1
+            or cu_seqlens.dtype != torch.int32
+            or cu_seqlens.device != x.device
+        ):
+            return "cu_seqlens_form"
     T = x.shape[1]
     if T < 1:
         return "empty_sequence"
@@ -298,14 +313,27 @@ def _guard_call(
     cc = tuple(get_compute_capability(x.device))
     if not (allow["min_cc"] <= cc <= allow["max_cc"]):
         return "compute_capability"
+    # The NH128 path is one cooperative launch of ``nheads + 8`` CTAs whose
+    # shared-memory footprint caps residency at one CTA per SM, so a device
+    # with fewer SMs can never hold the whole grid: refuse here instead of
+    # letting the native residency check raise on every call.  (The NH64
+    # path is a plain launch with no residency requirement.)  The native
+    # kernel still enforces the exact occupancy envelope at first launch.
+    if (
+        nheads >= 96
+        and torch.cuda.get_device_properties(x.device).multi_processor_count
+        < nheads + 8
+    ):
+        return "insufficient_sm_count"
     if _native_device is not None and x.device.index != _native_device:
         return "native_state_other_device"
     # CUDA-graph rule: the first call JIT-compiles and initializes the
-    # cooperative-launch state on the host — never under capture.
-    if (
-        torch.cuda.is_current_stream_capturing()
-        and (x.device.index or 0, nheads) not in _warmed
-    ):
+    # cooperative-launch state on the host — never under capture.  Query the
+    # capture state on the operand's device: the launch runs on that
+    # device's current stream, not on the host-current device's.
+    with torch.cuda.device(x.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and (x.device.index or 0, nheads) not in _warmed:
         return "capture_unwarmed"
     return None
 
@@ -404,6 +432,14 @@ def warmup(nheads: int, device=None) -> None:
         return
     cc = tuple(get_compute_capability(device))
     if not (allow["min_cc"] <= cc <= allow["max_cc"]):
+        return
+    # Mirror the dispatch guard's cooperative-residency refusal: warming the
+    # NH128 variant on a device that cannot hold the whole grid would raise.
+    if (
+        nheads >= 96
+        and torch.cuda.get_device_properties(device).multi_processor_count
+        < nheads + 8
+    ):
         return
     run = _kernel_entry()
     hd, ds, ng = allow["headdim"], allow["dstate"], allow["ngroups"]
