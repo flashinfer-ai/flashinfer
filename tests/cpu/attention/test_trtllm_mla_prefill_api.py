@@ -57,6 +57,7 @@ _TRTLLM_MLA_PARAMETERS = (
     "causal_seqlens_kv_global",
     "use_fp16_softmax",
     "return_lse_base",
+    "batch_invariant",
 )
 _NUM_REQUIRED_PARAMETERS = 9
 
@@ -120,9 +121,14 @@ def test_trtllm_mla_forwards_every_argument_to_shared_impl(monkeypatch, api_name
     api = getattr(flashinfer.mla, api_name)
     signature = inspect.signature(api)
     values = tuple(object() for _ in _TRTLLM_MLA_PARAMETERS)
+    keyword_only = {
+        name: value
+        for name, value in zip(_TRTLLM_MLA_PARAMETERS, values, strict=True)
+        if signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    }
     calls, expected_result = _patch_shared_impl_and_forbid_decode_routing(monkeypatch)
 
-    actual_result = api(*values)
+    actual_result = api(*values[: len(values) - len(keyword_only)], **keyword_only)
 
     assert actual_result is expected_result
     assert len(calls) == 1
