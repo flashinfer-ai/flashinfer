@@ -1116,10 +1116,15 @@ def test_prefill_divisors_are_the_sm107a_bf16_stage4_programs(arch: str) -> None
     names = sorted(k for k in gdn_cp_jit.KERNELS[arch] if k.startswith("cp_prefill"))
     assert {"cp_prefill", "cp_prefill_bf16", "cp_prefill_generic_bf16"} <= set(names)
     for name in names:
+        # The paged programs are rendered from flour on every architecture,
+        # so they take the fast divisors everywhere.
         expected = (
             ("cp_chunk_len_fdd", "num_sab_heads_fdd")
-            if arch == "sm_107a"
-            and name in ("cp_prefill_bf16", "cp_prefill_generic_bf16")
+            if name.endswith("_paged")
+            or (
+                arch == "sm_107a"
+                and name in ("cp_prefill_bf16", "cp_prefill_generic_bf16")
+            )
             else ()
         )
         assert gdn_cp._prefill_divisors(name, arch) == expected, (arch, name)

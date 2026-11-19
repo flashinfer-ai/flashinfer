@@ -26,7 +26,11 @@ end.
 from __future__ import annotations
 
 import math
+import os
 import random
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -258,6 +262,8 @@ def _run_paged_prefill_case(
     state_dtype,
     index_dtype=torch.int32,
     row_pad=0,
+    backend="flashinfer",
+    max_seqlen=None,
 ):
     num_q_heads, num_k_heads, num_v_heads = heads
     totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
@@ -296,6 +302,8 @@ def _run_paged_prefill_case(
         page_size=page_size,
         last_page_len=last,
         output=out,
+        backend=backend,
+        max_seqlen=max_seqlen,
     )
     torch.cuda.synchronize()
     _assert_output_guard(guard)
@@ -348,6 +356,787 @@ def test_paged_prefill_ragged(page_size, state_dtype, dtype, heads):
     prefix_lens = [0, 0, L, 2 * L, CHUNK, L + 2 * CHUNK, 37, L + 5, 3 * L - 1, L - 1]
     new_lens = [1, 3 * L + 17, L, 5, 2 * L, L + 7, L - 37, 2 * L + 63, 1, 1]
     _run_paged_prefill_case(prefix_lens, new_lens, L, heads, dtype, state_dtype)
+
+
+def _skip_unless_cake_cp():
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the Cake GDN CP route needs SM100, SM103 or SM107")
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if cuda_major < 13:
+        pytest.skip("the Cake GDN CP route needs CUDA 13+")
+
+
+@pytest.mark.parametrize("page_size", [64, 128, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("heads", [(4, 4, 4), (2, 2, 4), (4, 1, 1), (2, 2, 8)])
+@pytest.mark.parametrize("max_seqlen_hint", [False, True])
+def test_paged_prefill_cake_cp_ragged(page_size, dtype, heads, max_seqlen_hint):
+    """backend="cake_gdn": a ragged batch with 64-aligned prefixes (none,
+    page-aligned, chunk-aligned) and spans that stop short of, on and past
+    page boundaries, long enough to split across CP chunks."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    random.seed(page_size)
+    torch.manual_seed(page_size)
+    L = page_size
+    prefix_lens = [0, 0, L, 2 * L, CHUNK, L + 2 * CHUNK, 3 * CHUNK, 0]
+    new_lens = [1, 3 * L + 17, L, 5, 2 * L, L + 7, 4096 + 37, 0]
+    _run_paged_prefill_case(
+        prefix_lens,
+        new_lens,
+        L,
+        heads,
+        dtype,
+        torch.float32,
+        backend="cake_gdn",
+        max_seqlen=max(new_lens) if max_seqlen_hint else None,
+    )
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("prefix", [0, 64, 1024, 1088])
+def test_paged_prefill_cake_cp_long_padded_pool(index_dtype, prefix):
+    """One long sequence whose CP chunks end on and between page boundaries,
+    over a pool with padded rows."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    random.seed(prefix)
+    torch.manual_seed(prefix)
+    _run_paged_prefill_case(
+        [prefix],
+        [16384 - 64],
+        1024,
+        (2, 2, 4),
+        torch.bfloat16,
+        torch.float32,
+        index_dtype=index_dtype,
+        row_pad=4,
+        backend="cake_gdn",
+        max_seqlen=16384,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_prefill_cake_cp_qk_l2norm_in_kernel(dtype):
+    """use_qk_l2norm_in_kernel=True normalizes q and k before the split; the
+    output and every written page match the serial route."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    torch.manual_seed(5)
+    random.seed(5)
+    L = 256
+    prefix_lens, new_lens = [0, L, 3 * CHUNK], [3 * L + 17, 2 * L, 1000]
+    totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
+    streams = Streams(totals, 2, 2, 4, dtype)
+    batch = PagedBatch(totals, L, streams.num_sab_heads, torch.float32)
+    q, k, v, g, beta = streams.slices(prefix_lens, totals)
+    q = q * 3.0
+    k = k * 0.5
+    indices, indptr, last = batch.tables()
+    results = []
+    for backend in ("flashinfer", "cake_gdn"):
+        pool = batch.pool.clone()
+        out = chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            cu_seqlens=_cu(new_lens, "cuda"),
+            state_pool=pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_size=L,
+            last_page_len=last,
+            use_qk_l2norm_in_kernel=True,
+            backend=backend,
+            max_seqlen=max(new_lens),
+        )
+        results.append((out, pool))
+    torch.testing.assert_close(
+        results[1][0].float(), results[0][0].float(), atol=1e-2, rtol=1e-2
+    )
+    _assert_state(results[1][1], results[0][1], msg="pool")
+
+
+def test_paged_prefill_cake_cp_all_empty_spans():
+    """A batch whose sequences have no new token leaves the pool unchanged."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    L = 128
+    pool = torch.randn(6, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    before = pool.clone()
+    q = torch.zeros(0, 4, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    out = chunk_gated_delta_rule_paged(
+        q,
+        q,
+        q,
+        torch.zeros(0, 4, device="cuda"),
+        torch.zeros(0, 4, device="cuda"),
+        cu_seqlens=torch.zeros(3, dtype=torch.int32, device="cuda"),
+        state_pool=pool,
+        page_indices=torch.tensor([0, 3, 4], dtype=torch.int32, device="cuda"),
+        page_indptr=torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda"),
+        page_size=L,
+        last_page_len=torch.tensor([64, L], dtype=torch.int32, device="cuda"),
+        backend="cake_gdn",
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (0, 4, HEAD_SIZE)
+    assert torch.equal(pool, before)
+
+
+def test_paged_prefill_cake_cp_rejects_unsupported_pools():
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    q = torch.zeros(64, 2, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    pool = torch.zeros(4, 2, HEAD_SIZE, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    one = torch.ones(1, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="float32 state pool"):
+        chunk_gated_delta_rule_paged(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 64], dtype=torch.int32, device="cuda"),
+            state_pool=pool,
+            page_indices=one,
+            page_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            page_size=64,
+            last_page_len=torch.tensor([64], dtype=torch.int32, device="cuda"),
+            backend="cake_gdn",
+        )
+
+
+def _cake_cp_backend():
+    from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend
+
+    return cake_gdn_cp_backend
+
+
+def _record_cake_cp_plans(monkeypatch):
+    """The paged plans of the Cake CP calls of the test, in call order."""
+    gdn_cp = _cake_cp_backend()
+    plans = []
+    paged_plan = gdn_cp._paged_plan
+
+    def recording_plan(*args, **kwargs):
+        plans.append(paged_plan(*args, **kwargs))
+        return plans[-1]
+
+    monkeypatch.setattr(gdn_cp, "_paged_plan", recording_plan)
+    return plans
+
+
+def _skip_unless_cake_cp_kernels(*names):
+    gdn_cp = _cake_cp_backend()
+    arch = gdn_cp._arch_for(torch.device("cuda"))
+    for name in names:
+        if not gdn_cp.has_gdn_cp_kernel(name, arch):
+            pytest.skip(f"{arch} ships no {name}")
+    return arch
+
+
+def _run_cake_cp_against_flashinfer(
+    prefix_lens,
+    new_lens,
+    page_size,
+    heads,
+    dtype,
+    *,
+    max_seqlen=None,
+    gates=None,
+    seed=0,
+):
+    """Run both backends from one pool: the Cake CP output and every pool row
+    match the serial route, and the Cake call writes no guard."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    num_q_heads, num_k_heads, num_v_heads = heads
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    total = sum(new_lens)
+    totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
+
+    def uniform(num_heads):
+        return (0.5 * torch.rand(total, num_heads, HEAD_SIZE, device="cuda") - 0.25).to(
+            dtype
+        )
+
+    q, v = uniform(num_q_heads), uniform(num_v_heads)
+    k = F.normalize(uniform(num_k_heads).float(), p=2.0, dim=-1).to(dtype)
+    g = 0.9 + 0.1 * torch.rand(total, num_sab_heads, device="cuda")
+    beta = torch.rand(total, num_sab_heads, device="cuda")
+    kwargs = {}
+    if gates is not None:
+        g, beta, kwargs = gates(g, beta)
+    batch = PagedBatch(totals, page_size, num_sab_heads, torch.float32)
+    # Page-distinct initial states of the scale of real ones: ungated, the
+    # filler's page-id offsets would persist and dominate the outputs.
+    num_pages = batch.pool.size(0)
+    batch.pool.copy_(
+        0.1 * torch.randn_like(batch.pool)
+        + torch.arange(num_pages, device="cuda").view(-1, 1, 1, 1) / num_pages
+    )
+    indices, indptr, last = batch.tables()
+    reference_pool = batch.pool.clone()
+    outputs = {}
+    for backend, pool in (("flashinfer", reference_pool), ("cake_gdn", batch.pool)):
+        guard, out = _guarded_output(total, num_sab_heads, dtype)
+        chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            cu_seqlens=_cu(new_lens, "cuda"),
+            state_pool=pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_size=page_size,
+            last_page_len=last,
+            output=out,
+            backend=backend,
+            max_seqlen=max_seqlen,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        _assert_output_guard(guard)
+        outputs[backend] = out
+    batch.guarded.assert_guards()
+    torch.testing.assert_close(
+        outputs["cake_gdn"].float(),
+        outputs["flashinfer"].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    _assert_state(batch.pool, reference_pool, msg="pool")
+
+
+def _fp64_gates(g, beta, total, num_heads, kwargs):
+    """The alpha and beta a gate convention means, in float64."""
+    ones = torch.ones(total, num_heads, dtype=torch.float64, device="cuda")
+    if kwargs.get("use_gate_in_kernel"):
+        A_log = kwargs["A_log"].double()
+        dt_bias = kwargs["dt_bias"].double()
+        alpha = torch.exp(-A_log.exp() * F.softplus(g.double() + dt_bias))
+    elif g is None:
+        alpha = ones
+    elif kwargs.get("gate_domain") == "log":
+        alpha = g.double().exp()
+    else:
+        alpha = g.double()
+    if beta is None:
+        beta = ones
+    elif kwargs.get("beta_is_logit"):
+        beta = torch.sigmoid(beta.double())
+    else:
+        beta = beta.double()
+    return alpha, beta
+
+
+def _fp64_paged_reference(
+    q, k, v, alpha, beta, scale, prefix_lens, new_lens, batch, initial_pool
+):
+    """Serial float64 recurrence of every sequence from its initial pool row
+    (the zero state without a prefix). Returns the output and the state of
+    every pool row the call writes: each page boundary it crosses and the
+    last page."""
+    num_heads = alpha.size(1)
+    page_size = batch.page_size
+    out = torch.zeros(
+        q.size(0), num_heads, HEAD_SIZE, dtype=torch.float64, device="cuda"
+    )
+    rows = {}
+    start = 0
+    for b, (prefix, num_new) in enumerate(zip(prefix_lens, new_lens, strict=True)):
+        if prefix:
+            row = initial_pool[batch.page_of(b, prefix - 1)]
+            state = row.double().transpose(-1, -2).clone()  # [H, K, V]
+        else:
+            state = torch.zeros(
+                num_heads, HEAD_SIZE, HEAD_SIZE, dtype=torch.float64, device="cuda"
+            )
+        tokens = slice(start, start + num_new)
+        qs, ks, vs = (
+            x[tokens].double().repeat_interleave(num_heads // x.size(1), dim=1)
+            for x in (q, k, v)
+        )
+        for i in range(num_new):
+            end = prefix + i + 1
+            state = alpha[start + i].view(-1, 1, 1) * state
+            delta = beta[start + i].view(-1, 1) * (
+                vs[i] - torch.einsum("hk,hkv->hv", ks[i], state)
+            )
+            state = state + ks[i].unsqueeze(-1) * delta.unsqueeze(-2)
+            out[start + i] = scale * torch.einsum("hk,hkv->hv", qs[i], state)
+            if end % page_size == 0 or i == num_new - 1:
+                rows[batch.page_of(b, end - 1)] = state.transpose(-1, -2).clone()
+        start += num_new
+    return out, rows
+
+
+def _run_cake_cp_and_flashinfer_against_fp64(
+    prefix_lens, new_lens, page_size, heads, dtype, *, gates=None, seed=0
+):
+    """Run both backends from one pool against a float64 reference: the
+    output and every pool row each call writes match it, each call leaves the
+    other rows and the guards untouched."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    num_q_heads, num_k_heads, num_v_heads = heads
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    total = sum(new_lens)
+    totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
+
+    def uniform(num_heads):
+        return (0.5 * torch.rand(total, num_heads, HEAD_SIZE, device="cuda") - 0.25).to(
+            dtype
+        )
+
+    q, v = uniform(num_q_heads), uniform(num_v_heads)
+    k = F.normalize(uniform(num_k_heads).float(), p=2.0, dim=-1).to(dtype)
+    g = 0.9 + 0.1 * torch.rand(total, num_sab_heads, device="cuda")
+    beta = torch.rand(total, num_sab_heads, device="cuda")
+    kwargs = {}
+    if gates is not None:
+        g, beta, kwargs = gates(g, beta)
+    batch = PagedBatch(totals, page_size, num_sab_heads, torch.float32)
+    num_pages = batch.pool.size(0)
+    batch.pool.copy_(
+        0.1 * torch.randn_like(batch.pool)
+        + torch.arange(num_pages, device="cuda").view(-1, 1, 1, 1) / num_pages
+    )
+    initial_pool = batch.pool.clone()
+    indices, indptr, last = batch.tables()
+    scale = 1.0 / math.sqrt(HEAD_SIZE)
+    alpha, beta_fp64 = _fp64_gates(g, beta, total, num_sab_heads, kwargs)
+    reference_out, reference_rows = _fp64_paged_reference(
+        q, k, v, alpha, beta_fp64, scale, prefix_lens, new_lens, batch, initial_pool
+    )
+    written = sorted(reference_rows)
+    untouched = [r for r in range(num_pages) if r not in reference_rows]
+    reference_pool = torch.stack([reference_rows[r] for r in written])
+    flashinfer_pool = GuardedPool(num_pages, num_sab_heads, torch.float32)
+    flashinfer_pool.pool.copy_(initial_pool)
+    for backend, guarded in (
+        ("flashinfer", flashinfer_pool),
+        ("cake_gdn", batch.guarded),
+    ):
+        guard, out = _guarded_output(total, num_sab_heads, dtype)
+        chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            cu_seqlens=_cu(new_lens, "cuda"),
+            state_pool=guarded.pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_size=page_size,
+            last_page_len=last,
+            output=out,
+            backend=backend,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        _assert_output_guard(guard)
+        guarded.assert_guards()
+        assert torch.equal(guarded.pool[untouched], initial_pool[untouched]), backend
+        torch.testing.assert_close(
+            out.double(),
+            reference_out,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=lambda m, backend=backend: f"{backend} output: {m}",
+        )
+        _assert_state(guarded.pool[written], reference_pool, msg=f"{backend} pool")
+
+
+def _log_gates(g, beta):
+    return g.log(), beta, {"gate_domain": "log"}
+
+
+def _gates_in_kernel(g, beta):
+    heads = g.size(1)
+    A_log = -3.0 + 0.1 * torch.randn(heads, device="cuda")
+    dt_bias = 0.1 * torch.randn(heads, device="cuda")
+    kwargs = {"use_gate_in_kernel": True, "A_log": A_log, "dt_bias": dt_bias}
+    return torch.randn_like(g), beta, kwargs
+
+
+def _beta_logits(g, beta):
+    return g, torch.logit(beta.clamp(1e-3, 1 - 1e-3)), {"beta_is_logit": True}
+
+
+@pytest.mark.parametrize(
+    "gates",
+    [
+        _log_gates,
+        _gates_in_kernel,
+        _beta_logits,
+        lambda g, beta: (None, beta, {}),
+        lambda g, beta: (g, None, {}),
+        lambda g, beta: (None, None, {}),
+    ],
+    ids=["log_g", "gate_in_kernel", "beta_logit", "no_g", "no_beta", "no_gates"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_prefill_cake_cp_gate_conventions(gates, dtype):
+    """Every gate convention of the paged API gives the output and pages of
+    the recurrence it means, on both backends."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    # Against float64, not each other: without gates the states do not
+    # contract, so the two backends' independent rounding errors add.
+    _run_cake_cp_and_flashinfer_against_fp64(
+        [0, 128, 64], [300, 273, 129], 128, (2, 2, 4), dtype, gates=gates
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"gate_domain": "exp"}, "gate_domain must be"),
+        ({"A_log": "heads"}, "A_log and dt_bias require use_gate_in_kernel"),
+        ({"use_gate_in_kernel": True, "g": None}, "requires g, A_log and dt_bias"),
+        ({"beta_is_logit": True, "beta": None}, "beta_is_logit requires beta"),
+        ({"gate_domain": "log", "g": "short"}, "g must have shape"),
+    ],
+    ids=["domain", "A_log_alone", "gate_in_kernel_no_g", "logit_no_beta", "g_shape"],
+)
+def test_paged_prefill_cake_cp_validates_gates(kwargs, match):
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    heads = 4
+    q = torch.zeros(64, heads, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    pool = torch.zeros(2, heads, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    args = {
+        "g": torch.ones(64, heads, device="cuda"),
+        "beta": torch.ones(64, heads, device="cuda"),
+        **kwargs,
+    }
+    if args.get("A_log") == "heads":
+        args["A_log"] = torch.zeros(heads, device="cuda")
+    if isinstance(args.get("g"), str):
+        args["g"] = torch.zeros(32, heads, device="cuda")
+    if args.get("use_gate_in_kernel"):
+        args.update(
+            A_log=torch.zeros(heads, device="cuda"),
+            dt_bias=torch.zeros(heads, device="cuda"),
+        )
+    with pytest.raises(ValueError, match=match):
+        chunk_gated_delta_rule_paged(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 64], dtype=torch.int32, device="cuda"),
+            state_pool=pool,
+            page_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            page_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            page_size=64,
+            last_page_len=torch.tensor([64], dtype=torch.int32, device="cuda"),
+            backend="cake_gdn",
+            **args,
+        )
+
+
+@pytest.mark.parametrize("page_size", [128, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("heads", [(4, 4, 4), (2, 2, 4)])
+def test_paged_prefill_cake_cp_equal_lengths_full_block(
+    monkeypatch, page_size, dtype, heads
+):
+    """Equal 128-aligned spans under the host bound run the full-block stage-4
+    program; the fp16 equal-head plan maps to it too."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    kernel = f"cp_prefill{'_bf16' if dtype == torch.bfloat16 else ''}_paged"
+    _skip_unless_cake_cp_kernels(kernel)
+    gdn_cp = _cake_cp_backend()
+    q = torch.empty(2048, heads[0], HEAD_SIZE, dtype=dtype, device="cuda")
+    k = torch.empty(2048, heads[1], HEAD_SIZE, dtype=dtype, device="cuda")
+    v = torch.empty(2048, heads[2], HEAD_SIZE, dtype=dtype, device="cuda")
+    unpaged = gdn_cp._build_plan(
+        q, k, v, num_seqs=2, max_seqlen=1024, cu_seqlens_dtype=torch.int32
+    )
+    if dtype == torch.float16 and heads[0] == heads[2]:
+        assert unpaged.prefill_kernel.startswith("cp_prefill_equal_head")
+    else:
+        assert unpaged.prefill_kernel == kernel.removesuffix("_paged")
+    plans = _record_cake_cp_plans(monkeypatch)
+    _run_cake_cp_against_flashinfer(
+        [64, page_size], [1024, 1024], page_size, heads, dtype, max_seqlen=1024
+    )
+    assert [plan.prefill_kernel for plan in plans] == [kernel]
+
+
+@pytest.mark.parametrize(
+    "heads, prefix_lens, new_lens, page_size, fixup, cp_chunk_len",
+    [
+        ((4, 4, 16), [64], [8128], 1024, "state_fixup_utcmma64_paged", None),
+        (
+            (16, 16, 64),
+            [64, 1024],
+            [2048, 2048],
+            1024,
+            "state_fixup_utcmma128_paged",
+            None,
+        ),
+        ((16, 16, 64), [64], [65536], 4096, "state_fixup_utcmma64_paged", 4096),
+    ],
+    ids=["utcmma64", "utcmma128", "utcmma64_chunk4096"],
+)
+def test_paged_prefill_cake_cp_utcmma_fixups(
+    monkeypatch, heads, prefix_lens, new_lens, page_size, fixup, cp_chunk_len
+):
+    """Batches with more parallel states than the SIMT fixup fills run the
+    paged UTCMMA fixups; the one long GB300 sequence takes the 4096-token CP
+    chunk."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    arch = _skip_unless_cake_cp_kernels(fixup)
+    if arch == "sm_107a":
+        pytest.skip("sm_107a runs the SIMT fixups only")
+    if cp_chunk_len is not None and arch != "sm_103a":
+        pytest.skip("the 4096-token CP chunk override is sm_103a only")
+    plans = _record_cake_cp_plans(monkeypatch)
+    _run_cake_cp_against_flashinfer(
+        prefix_lens,
+        new_lens,
+        page_size,
+        heads,
+        torch.bfloat16,
+        max_seqlen=max(new_lens),
+    )
+    assert [plan.fixup_kernel for plan in plans] == [fixup]
+    if cp_chunk_len is not None:
+        assert plans[0].cp_chunk_len == cp_chunk_len
+
+
+@pytest.mark.parametrize(
+    "prefix_lens, new_lens",
+    [([32, 0], [96, 128]), ([0, 32], [128, 100])],
+    ids=["page_end", "mid_page"],
+)
+def test_paged_prefill_cake_cp_misaligned_prefix_poisons_its_rows(
+    prefix_lens, new_lens
+):
+    """A prefix that is not 64-aligned fills every row its sequence writes
+    with NaN; the aligned sequence of the batch is unaffected."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    torch.manual_seed(11)
+    random.seed(11)
+    L = 64
+    dtype = torch.bfloat16
+    totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
+    streams = Streams(totals, 2, 2, 4, dtype)
+    batch = PagedBatch(totals, L, streams.num_sab_heads, torch.float32)
+    _, prefix_final, _ = _oracle(streams, prefix_lens)
+    for b, p in enumerate(prefix_lens):
+        if p:
+            batch.pool[batch.page_of(b, p - 1)] = prefix_final[b]
+    pool_before = batch.pool.clone()
+    q, k, v, g, beta = streams.slices(prefix_lens, totals)
+    indices, indptr, last = batch.tables()
+    guard, out = _guarded_output(sum(new_lens), streams.num_sab_heads, dtype)
+    chunk_gated_delta_rule_paged(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        1.0 / math.sqrt(HEAD_SIZE),
+        cu_seqlens=_cu(new_lens, "cuda"),
+        state_pool=batch.pool,
+        page_indices=indices,
+        page_indptr=indptr,
+        page_size=L,
+        last_page_len=last,
+        output=out,
+        backend="cake_gdn",
+    )
+    torch.cuda.synchronize()
+    _assert_output_guard(guard)
+    batch.guarded.assert_guards()
+
+    ref_out, ref_final, ref_ckpts = _oracle(streams, totals)
+    good = next(b for b, p in enumerate(prefix_lens) if p % CHUNK == 0)
+    new_start = _cu(new_lens, "cpu").tolist()[good]
+    ref_start = _cu(totals, "cpu").tolist()[good] + prefix_lens[good]
+    torch.testing.assert_close(
+        out[new_start : new_start + new_lens[good]].float(),
+        ref_out[ref_start : ref_start + new_lens[good]].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    written = set()
+    for b, (p, t) in enumerate(zip(prefix_lens, totals, strict=True)):
+        for j in range(p // L, batch.num_pages[b]):
+            page = batch.pages[b][j]
+            written.add(page)
+            if b != good:
+                assert torch.isnan(batch.pool[page]).all(), f"seq {b} page {j}"
+                continue
+            end = min((j + 1) * L, t)
+            expected = ref_final[b] if end == t else ref_ckpts[b][end // CHUNK - 1]
+            _assert_state(batch.pool[page], expected, msg=f"seq {b} page {j}")
+    for page in range(batch.pool.size(0)):
+        if page not in written:
+            assert torch.equal(batch.pool[page], pool_before[page]), page
+
+
+def _unaligned_pool(case, heads):
+    row = heads * HEAD_SIZE * HEAD_SIZE
+    if case == "row_pad_1":
+        return GuardedPool(4, heads, torch.float32, row_pad=1).pool
+    if case == "row_pad_6":
+        return GuardedPool(4, heads, torch.float32, row_pad=6).pool
+    flat = torch.zeros(4 * row + 1, device="cuda")
+    return flat[1:].view(4, heads, HEAD_SIZE, HEAD_SIZE)
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("row_pad_1", "row stride of whole 16-byte groups"),
+        ("row_pad_6", "row stride of whole 16-byte groups"),
+        ("base_plus_one_float", "16-byte aligned"),
+    ],
+)
+def test_paged_prefill_cake_cp_rejects_unaligned_pools(case, match):
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    q = torch.zeros(64, 2, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match=match):
+        chunk_gated_delta_rule_paged(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 64], dtype=torch.int32, device="cuda"),
+            state_pool=_unaligned_pool(case, 2),
+            page_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            page_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            page_size=64,
+            last_page_len=torch.tensor([64], dtype=torch.int32, device="cuda"),
+            backend="cake_gdn",
+        )
+
+
+@pytest.mark.parametrize("page_size", [96, 0])
+def test_paged_prefill_cake_cp_rejects_page_size(page_size):
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    q = torch.zeros(64, 2, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    pool = torch.zeros(4, 2, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    reason = _cake_cp_backend().gdn_cp_paged_rejection_reason(
+        q, q, q, pool, page_size=page_size
+    )
+    assert reason is not None and "positive multiple of 64" in reason
+    with pytest.raises(ValueError, match="positive multiple of 64"):
+        chunk_gated_delta_rule_paged(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 64], dtype=torch.int32, device="cuda"),
+            state_pool=pool,
+            page_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            page_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            page_size=page_size,
+            last_page_len=torch.tensor([64], dtype=torch.int32, device="cuda"),
+            backend="cake_gdn",
+        )
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("k_tokens", "same token count"),
+        ("v_tokens", "same token count"),
+        ("k_head_size", "head size 128"),
+        ("v_head_size", "head size 128"),
+        ("pool_on_cpu", "on one device"),
+    ],
+)
+def test_cake_cp_paged_rejection_reason(case, match):
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+
+    def tokens(n, size=HEAD_SIZE):
+        return torch.zeros(n, 2, size, dtype=torch.bfloat16, device="cuda")
+
+    q, k, v = tokens(128), tokens(128), tokens(128)
+    pool = torch.zeros(4, 2, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    if case == "k_tokens":
+        k = tokens(64)
+    elif case == "v_tokens":
+        v = tokens(192)
+    elif case == "k_head_size":
+        k = tokens(128, 64)
+    elif case == "v_head_size":
+        v = tokens(128, 256)
+    else:
+        pool = pool.cpu()
+    reason = _cake_cp_backend().gdn_cp_paged_rejection_reason(
+        q, k, v, pool, page_size=64
+    )
+    assert reason is not None and match in reason, reason
+
+
+_INVALID_ROW_CHILD = """
+import sys
+import torch
+from flashinfer.gdn_paged import chunk_gated_delta_rule_paged
+
+pool = torch.zeros(4, 4, 128, 128, device="cuda")
+q = torch.zeros(128, 4, 128, dtype=torch.bfloat16, device="cuda")
+pages = {"valid": [0, 1], "duplicate": [0, 0], "out_of_pool": [0, 4]}[sys.argv[1]]
+chunk_gated_delta_rule_paged(
+    q,
+    q,
+    q,
+    cu_seqlens=torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda"),
+    state_pool=pool,
+    page_indices=torch.tensor(pages, dtype=torch.int32, device="cuda"),
+    page_indptr=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+    page_size=64,
+    last_page_len=torch.tensor([64, 64], dtype=torch.int32, device="cuda"),
+    backend="cake_gdn",
+)
+torch.cuda.synchronize()
+"""
+
+
+@pytest.mark.parametrize("case", ["valid", "duplicate", "out_of_pool"])
+def test_paged_prefill_cake_cp_invalid_rows_fail_in_isolated_process(case):
+    """With FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1 a row written by two sequences
+    or past the pool fails a device assert (in a child: it poisons CUDA), and
+    distinct rows pass."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
+    )
+    env["FLASHINFER_CAKE_GDN_VALIDATE_SLOTS"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", _INVALID_ROW_CHILD, case],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    combined = completed.stdout + completed.stderr
+    if case == "valid":
+        assert completed.returncode == 0, combined
+        return
+    assert completed.returncode != 0, combined
+    assert "_assert_async_cuda_kernel" in combined, combined
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
@@ -1390,11 +2179,15 @@ def _capture(fn):
     return graph
 
 
-def test_paged_prefill_cuda_graph_reads_live_page_tables():
+@pytest.mark.parametrize("backend", ["flashinfer", "cake_gdn"])
+def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
     """A captured paged prefill derives its rows from the page table at replay
     (no host synchronization): the same graph serves different prefixes,
-    including an unaligned one, and different page ids."""
+    including an unaligned one (64-aligned for the Cake CP route), and
+    different page ids."""
     _skip_if_unsupported()
+    if backend == "cake_gdn":
+        _skip_unless_cake_cp()
     torch.manual_seed(9)
     random.seed(9)
     L = 128
@@ -1411,7 +2204,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables():
     # (page ids, page counts, last_page_len): prefixes 0 / 256, then 100 / 0.
     steps = [
         ([4, 7, 1, 12, 3], [1, 4], [70, 2]),
-        ([6, 9, 2, 11, 15], [2, 2], [42, 2]),
+        ([6, 9, 2, 11, 15], [2, 2], [42 if backend == "flashinfer" else 70, 2]),
     ]
 
     def call(state_pool):
@@ -1429,6 +2222,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables():
             page_size=L,
             last_page_len=last,
             output=out,
+            backend=backend,
         )
 
     def set_tables(step):

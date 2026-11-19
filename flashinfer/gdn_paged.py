@@ -27,6 +27,7 @@ layer of a step can share) and run the existing kernels with separate read
 and write rows; nothing synchronizes with the host.
 """
 
+import math
 from typing import Literal, NamedTuple, Optional
 
 import torch
@@ -230,6 +231,102 @@ def gdn_paged_decode_slots(
     return slots
 
 
+def _chunk_gated_delta_rule_paged_cake_cp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    scale: Optional[float],
+    *,
+    cu_seqlens: torch.Tensor,
+    state_pool: torch.Tensor,
+    page_indices: torch.Tensor,
+    page_size: int,
+    slots: GDNPagedPrefillSlots,
+    use_qk_l2norm_in_kernel: bool,
+    output: Optional[torch.Tensor],
+    gate_domain: str,
+    use_gate_in_kernel: bool,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    beta_is_logit: bool,
+    max_seqlen: Optional[int],
+) -> torch.Tensor:
+    from .gdn_kernels.blackwell import (
+        _chunk_gated_delta_rule_gdn_cp_paged_sm100,
+        _gdn_cp_paged_rejection_reason,
+    )
+    from .gdn_kernels.gates import materialize_gates, validate_gate_inputs
+
+    if _chunk_gated_delta_rule_gdn_cp_paged_sm100 is None:
+        raise ValueError('backend="cake_gdn" needs the Cake GDN CP programs')
+    reason = _gdn_cp_paged_rejection_reason(q, k, v, state_pool, page_size=page_size)
+    if reason is not None:
+        raise ValueError(f'backend="cake_gdn": {reason}')
+    if (
+        gate_domain != "linear"
+        or use_gate_in_kernel
+        or beta_is_logit
+        or A_log is not None
+        or dt_bias is not None
+    ):
+        validate_gate_inputs(
+            q,
+            v,
+            g,
+            beta,
+            gate_domain,
+            use_gate_in_kernel,
+            A_log,
+            dt_bias,
+            beta_is_logit,
+        )
+    if g is not None and (gate_domain != "linear" or use_gate_in_kernel):
+        g, _ = materialize_gates(
+            g, None, gate_domain, use_gate_in_kernel, A_log, dt_bias, False
+        )
+    if beta is not None and beta_is_logit:
+        _, beta = materialize_gates(None, beta, "linear", False, None, None, True)
+    total = q.size(0)
+    num_sab_heads = max(q.size(1), v.size(1))
+    gate_shape = (total, num_sab_heads)
+    alpha = (
+        torch.ones(gate_shape, dtype=torch.float32, device=q.device)
+        if g is None
+        else g.float().contiguous()
+    )
+    beta = (
+        torch.ones(gate_shape, dtype=torch.float32, device=q.device)
+        if beta is None
+        else beta.float().contiguous()
+    )
+    if output is None:
+        output = torch.empty(
+            (total, num_sab_heads, q.size(2)), dtype=q.dtype, device=q.device
+        )
+    _chunk_gated_delta_rule_gdn_cp_paged_sm100(
+        output,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        cu_seqlens,
+        float(scale) if scale else 1.0 / math.sqrt(q.size(2)),
+        state_pool=state_pool,
+        state_indices=slots.state_indices,
+        output_state_indices=slots.output_state_indices,
+        checkpoint_state_indices=page_indices,
+        checkpoint_cu_starts=slots.checkpoint_cu_starts,
+        prefix_lens=slots.prefix_lens,
+        page_size=page_size,
+        max_seqlen=max_seqlen,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    return output
+
+
 @flashinfer_api(trace=gdn_prefill_paged_trace)
 def chunk_gated_delta_rule_paged(
     q: torch.Tensor,
@@ -253,6 +350,8 @@ def chunk_gated_delta_rule_paged(
     dt_bias: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
     slots: Optional[GDNPagedPrefillSlots] = None,
+    backend: Literal["flashinfer", "cake_gdn"] = "flashinfer",
+    max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Chunked GDN prefill that reads and writes a paged recurrent-state pool.
 
@@ -302,6 +401,23 @@ def chunk_gated_delta_rule_paged(
         and page table, typically shared by every layer of a step. Without
         them the call computes them (one extra launch). They are not checked
         against the page table.
+    backend : str
+        ``"flashinfer"`` (default) runs the serial chunked kernel.
+        ``"cake_gdn"`` runs the Cake four-stage context-parallel prefill,
+        which splits each sequence across SMs and writes the page states from
+        inside the split; it needs SM100, SM103 or SM107, a float32
+        ``state_pool`` whose row stride is a multiple of 4 elements, and every
+        prefix length (the tokens before ``cu_seqlens[b]``) a multiple of 64.
+        The caller must keep the prefixes 64-aligned; they are not checked.
+        For a sequence whose prefix is not, every page row it would write (the
+        page of each page boundary it crosses and its last page) is filled
+        with NaN instead of a state; the other sequences are unaffected. Its
+        results are not bitwise those of
+        ``"flashinfer"`` (about 4e-3 relative on the states), and its
+        checkpoint bits depend on the batch shape.
+    max_seqlen : int, optional
+        With ``backend="cake_gdn"``, an upper bound of the new tokens of any
+        sequence; it sizes the split. Without it the bound is the total.
 
     Returns
     -------
@@ -323,12 +439,37 @@ def chunk_gated_delta_rule_paged(
             "state_pool must be [num_pages, num_sab_heads, head_size, head_size], "
             f"got shape {tuple(state_pool.shape)}"
         )
+    if backend not in ("flashinfer", "cake_gdn"):
+        raise ValueError(f'backend must be "flashinfer" or "cake_gdn", got {backend!r}')
     if slots is None:
         slots = gdn_paged_prefill_slots(
             cu_seqlens, page_indices, page_indptr, page_size, last_page_len
         )
     else:
         _check_slots(slots, num_seqs, q.device)
+
+    if backend == "cake_gdn":
+        return _chunk_gated_delta_rule_paged_cake_cp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            cu_seqlens=cu_seqlens,
+            state_pool=state_pool,
+            page_indices=page_indices,
+            page_size=page_size,
+            slots=slots,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            gate_domain=gate_domain,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+            max_seqlen=max_seqlen,
+        )
 
     output, _ = chunk_gated_delta_rule(
         q,
