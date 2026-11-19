@@ -6,6 +6,7 @@ prefill, more head counts and the remaining dtype / layout pairs. The device-fre
 arithmetic, Lean cases) run everywhere.
 """
 
+import gc
 import hashlib
 import json
 import os
@@ -556,22 +557,20 @@ def test_inputs_at_storage_offsets_and_strided_lists():
     q[2:] = rows.q
     wide = torch.full((4, TOPK + 8), -1, dtype=torch.int32, device="cuda")
     wide[:, 4 : 4 + TOPK] = rows.indices
-    out = torch.zeros(7, heads, 512, dtype=torch.bfloat16, device="cuda")
-    lse = torch.zeros(4 + 4, heads, dtype=torch.float32, device="cuda")
-    shift = 16 // heads if heads <= 16 else 1
+    out = torch.full((9, heads, 512), 7.0, dtype=torch.bfloat16, device="cuda")
+    lse = torch.full((10, heads), 7.0, dtype=torch.float32, device="cuda")
     got = plan.run(
         q[2:],
         flat,
         wide[:, 4 : 4 + TOPK],
         rows.lengths,
-        out=out[3:],
-        lse=lse[4:] if (4 * heads * 4) % 16 == 0 else lse[:4],
+        out=out[3:7],
+        lse=lse[4:8],
         return_lse=True,
     )
-    assert (
-        shift >= 1 and same_bits(got[0], ref_out[:4]) and same_bits(got[1], ref_lse[:4])
-    )
-    assert not out[:3].float().any()
+    assert same_bits(got[0], ref_out[:4]) and same_bits(got[1], ref_lse[:4])
+    assert bool((out[:3] == 7).all() and (out[7:] == 7).all())
+    assert bool((lse[:4] == 7).all() and (lse[8:] == 7).all())
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse"):
         plan.run(
             rows.q,
@@ -1210,7 +1209,8 @@ def test_stable_function_scales_and_graph_replay():
     out.zero_()
     graph.replay()
     torch.cuda.synchronize()
-    assert same_bits(out.view(n, heads, 512), ref_out[order]) and len(junk) == 64
+    assert same_bits(out.view(n, heads, 512), ref_out[order])
+    del junk
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -1320,10 +1320,151 @@ def test_scales_are_row_inputs(cfg):
         assert same_bits(out2, out)
 
 
+def _carve(arena, offset, shape, dtype):
+    count = int(numpy.prod(shape)) * torch.empty((), dtype=dtype).element_size()
+    return arena[offset : offset + count].view(dtype).view(shape)
+
+
+@needs_device
+@pytest.mark.parametrize("cfg", [CONFIGS[1], CONFIGS[4]], ids=["e4m3", "bf16"])
+def test_outputs_sharing_memory_with_an_argument_are_refused(cfg):
+    """``out`` or ``lse`` over the query, the cache, the list, the lengths, a tensor scale or each other: refused
+    before launch (on the device such a call returns wrong rows or faults)."""
+    dtype, head_dim, heads = cfg
+    pool, targets, (ref_out, ref_lse) = shared(cfg)
+    n = 4
+    rows = targets.take(range(n))
+    scale = torch.zeros(4, dtype=torch.float32, device="cuda") + SCALE
+    plan = make_wrapper(cfg, softmax_scale=scale[:1]).plan
+    size = rows.q.element_size()
+    sizes = [n * heads * head_dim * size, 4096 * head_dim * size, n * TOPK * 4, n * 4]
+    step = (max(sizes) + n * heads * 1024 + 255) // 64 * 64
+    arena = torch.zeros(6 * step, dtype=torch.uint8, device="cuda")
+    q = _carve(arena, 0, (n, heads, head_dim), rows.q.dtype)
+    kv = _carve(arena, step, (4096, head_dim), rows.q.dtype)
+    indices = _carve(arena, 2 * step, (n, TOPK), torch.int32)
+    lengths = _carve(arena, 3 * step, (n,), torch.int32)
+    q.copy_(rows.q), kv.copy_(pool.kv.view(-1, head_dim)[:4096])
+    indices.copy_(rows.indices.clamp(max=4095)), lengths.copy_(rows.lengths)
+
+    def run(out_at, lse_at, **kw):
+        out = _carve(arena, out_at, (n, heads, 512), torch.bfloat16)
+        lse = _carve(arena, lse_at, (n, heads), torch.float32)
+        return plan.run(
+            q, kv, indices, lengths, out=out, lse=lse, return_lse=True, **kw
+        )
+
+    clean = run(4 * step, 5 * step)
+    clean = (clean[0].clone(), clean[1].clone())
+    for at in (0, 64, step, step + 4096, 2 * step, 3 * step):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="sharing memory"):
+            run(at, 5 * step)
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="sharing memory"):
+            run(4 * step, at)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="sharing memory"):
+        run(4 * step, 4 * step + 128)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="sharing memory"):
+        plan.run(
+            q,
+            kv,
+            indices,
+            lengths,
+            out=_carve(arena, 4 * step, (n, heads, 512), torch.bfloat16),
+            softmax_scale=_carve(arena, 4 * step + 64, (1,), torch.float32),
+        )
+    again = run(4 * step, 5 * step)
+    assert same_bits(again[0], clean[0]) and same_bits(again[1], clean[1])
+    # adjacent buffers are not overlap
+    out = _carve(
+        arena,
+        n * heads * head_dim * size // 64 * 64 + 64,
+        (n, heads, 512),
+        torch.bfloat16,
+    )
+    assert same_bits(plan.run(q, kv, indices, lengths, out=out), clean[0])
+
+
+@needs_device
+def test_calls_past_the_row_limit_and_empty_first_calls():
+    """The bf16 classes take at most 65,535 rows per call (typed refusal, not a launch error); an empty call with
+    default lengths works as the first call of its width."""
+    from flashinfer.batch_invariant import mla
+    from flashinfer.batch_invariant.mla import engine
+
+    plan = mla.plan(
+        torch.device("cuda"),
+        1,
+        q_dtype=torch.bfloat16,
+        qk_rope_head_dim=64,
+        softmax_scale=SCALE,
+    )
+    rows = 65536
+    q = torch.zeros(rows, 1, 576, dtype=torch.bfloat16, device="cuda")
+    kv = torch.zeros(8, 576, dtype=torch.bfloat16, device="cuda")
+    indices = torch.zeros(rows, 1, dtype=torch.int32, device="cuda")
+    lengths = torch.ones(rows, dtype=torch.int32, device="cuda")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="65535 rows"):
+        plan.run(q, kv, indices, lengths, validate=False)
+    out = plan.run(q[:-1], kv, indices[:-1], lengths[:-1], validate=False)
+    assert same_bits(out[:1], out[-1:])
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert engine.full_lengths(device, 0, 1777).shape == (0,)
+    assert int(engine.full_lengths(device, 3, 1777).sum()) == 3 * 1777
+
+
+@needs_device
+def test_list_validation_during_capture_and_arrays_in_refused_slots():
+    cfg = CONFIGS[1]
+    pool, targets, (ref_out, _) = shared(cfg)
+    rows = targets.take(range(3))
+    plan = make_wrapper(cfg).plan
+    out = torch.empty(3, cfg[2], 512, dtype=torch.bfloat16, device="cuda")
+    flat = pool.kv.view(-1, cfg[1])
+    plan.run(rows.q, flat, rows.indices, rows.lengths, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="cannot run during CUDA graph capture"),
+        torch.cuda.graph(graph),
+    ):
+        plan.run(rows.q, flat, rows.indices, rows.lengths, out=out, validate=True)
+    torch.cuda.synchronize()
+    assert same_bits(plan.run(rows.q, flat, rows.indices, rows.lengths), ref_out[:3])
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="sinks"):
+        stable(rows, sinks=numpy.zeros(4, dtype=numpy.float32))
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="qk_rope_head_dim"):
+        stable(rows, qk_rope_head_dim=False)
+
+
+@needs_device
+def test_kept_buffers_are_filled_before_another_stream_reads_them():
+    """A row count first used on a busy stream: its kept buffers are complete when a second stream uses them."""
+    from flashinfer.batch_invariant.mla import engine
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    junk = [
+        torch.full((1 << k,), 0x7F7F7F7F, dtype=torch.int32, device="cuda")
+        for k in (8, 10, 12, 14)
+        for _ in range(64)
+    ]
+    torch.cuda.synchronize()
+    del junk
+    busy, other = torch.cuda.Stream(), torch.cuda.Stream()
+    load = torch.randn(4000, 4000, device="cuda")
+    with torch.cuda.stream(busy):
+        for _ in range(30):
+            load = (load @ load).clamp_(-1, 1)
+        engine.full_lengths(device, 911, 1999)
+    with torch.cuda.stream(other):
+        seen = engine.full_lengths(device, 911, 1999).clone()
+        other.synchronize()
+        assert bool((seen == 1999).all())
+    torch.cuda.synchronize()
+
+
 @needs_device
 def test_buffers_do_not_grow_with_the_number_of_row_counts():
-    """Every row count of a prefill reuses a few kept buffers; ``clear_plans`` drops plans and buffers. Kept last:
-    it empties the plan cache."""
+    """Every row count of a prefill reuses a few kept buffers; ``clear_plans`` forgets plans and buffers, and a graph
+    captured before it still replays. Kept last: it empties the plan cache."""
     from flashinfer.batch_invariant import mla
     from flashinfer.batch_invariant.mla import engine
 
@@ -1343,8 +1484,25 @@ def test_buffers_do_not_grow_with_the_number_of_row_counts():
     assert torch.cuda.memory_allocated() - before < 64 * 1024
     plan = make_wrapper(cfg).plan
     assert len(plan._rows.backing) == 1 and plan._rows.capacity == 64
+    kept = torch.empty(1, 1, cfg[2], 512, dtype=torch.bfloat16, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        stable(one, out=kept)
+    del plan
     mla.clear_plans()
     assert not engine._plans and not engine._full and not engine._full_views
+    gc.collect()
+    torch.cuda.empty_cache()
+    junk = [
+        torch.full((1 << k,), 0x7F7F7F7F, dtype=torch.int32, device="cuda")
+        for k in (6, 8, 10, 12)
+        for _ in range(100)
+    ]
+    kept.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert same_bits(kept.view(1, cfg[2], 512), ref_out[3:4])
+    del junk
     assert same_bits(stable(one).view(1, cfg[2], 512), ref_out[3:4])
 
 

@@ -33,14 +33,27 @@ _full: Dict[tuple, tuple] = {}
 _full_views: Dict[tuple, torch.Tensor] = {}
 _lock = threading.Lock()
 _build_locks: Dict[tuple, threading.Lock] = {}
+#: Plans and buffers set aside by :func:`clear_plans`: captured CUDA graphs still launch and read them.
+_retired: list = []
+#: The bf16 classes launch one grid slot per row.
+_MAX_ROWS = {torch.bfloat16: 65535}
 
 
 def clear_plans() -> None:
-    """Drop every cached plan and buffer. CUDA graphs captured through one must not be replayed afterwards."""
+    """Forget every cached plan and buffer; the next call of a shape builds it again.
+
+    The forgotten plans stay loaded and their buffers stay allocated for the life of the process, so a CUDA graph
+    captured through one keeps replaying."""
     with _lock:
+        _retired.append((dict(_plans), dict(_full), dict(_full_views)))
         _plans.clear()
         _full.clear()
         _full_views.clear()
+
+
+def _settle(device) -> None:
+    # A kept buffer is filled on the creating stream; other streams read it from the cache.
+    torch.cuda.current_stream(device).synchronize()
 
 
 def _capacity(rows: int) -> int:
@@ -61,11 +74,12 @@ def full_lengths(device, rows: int, top_k: int) -> torch.Tensor:
         _not_capturing(spec.FAMILY)
         with _lock:
             capacity, backing = _full.get((device, top_k), (0, None))
-            if rows > capacity:
+            if backing is None or rows > capacity:
                 capacity = _capacity(rows)
                 backing = torch.full(
                     (capacity,), top_k, dtype=torch.int32, device=device
                 )
+                _settle(device)
                 # Earlier backings stay alive through the views that captured graphs hold.
                 _full[(device, top_k)] = (capacity, backing)
             view = _full_views.setdefault((device, rows, top_k), backing[:rows])
@@ -99,6 +113,7 @@ class _RowBuffers:
                             ),
                         )
                     )
+                    _settle(dev)
                     self.capacity = capacity
                 no_list, no_lengths, scratch = self.backing[-1]
                 found = self.views.setdefault(
@@ -324,6 +339,8 @@ class SparseMLAPlan:
         self.q_dtype = q_dtype
         self.rope_dim = rope_dim
         self.query_dim = spec.LATENT_DIM + rope_dim
+        self._element_size = 2 if q_dtype == torch.bfloat16 else 1
+        self._device_index = device.index
         self.class_name = spec.class_name(q_dtype, self.query_dim)
         self.softmax_scale = softmax_scale
         self.output_scale = output_scale
@@ -331,6 +348,7 @@ class SparseMLAPlan:
             isinstance(softmax_scale, torch.Tensor),
             isinstance(output_scale, torch.Tensor),
         )
+        self._tensor_scales = self.scale_is_tensor != (False, False)
         self.kernel = build_kernel(device, num_qo_heads, _DTYPE_KEYS[q_dtype], rope_dim)
         self._compiled = _compile(
             self.kernel, device, num_qo_heads, q_dtype, rope_dim, self.scale_is_tensor
@@ -341,18 +359,23 @@ class SparseMLAPlan:
         extra = torch.zeros(
             (1, 1, self.query_dim), device=device, dtype=q_dtype
         ).permute(1, 2, 0)
+        _settle(device)
         self._sinks, self._extra = _ffi(sinks), _ffi(extra)
         self._rows = _RowBuffers(device, num_qo_heads, self.class_name)
 
-    def check(self, query, kv_cache, indices, lengths, out, lse, contents: bool):
-        """Layout checks of one launch (element counts, trailing dimensions, dtype, device, contiguity, alignment);
+    def check(
+        self, query, kv_cache, indices, lengths, out, lse, contents: bool, scales=()
+    ):
+        """Layout checks of one launch (element counts, trailing dimensions, dtype, device, contiguity, alignment, and
+        that ``out`` and ``lse`` share no memory with an input, a tensor scale in ``scales`` or each other);
         ``contents`` also reads the list on the host (bounds, and the packed-list contract)."""
         name, dev, heads = self.class_name, self.device, self.num_qo_heads
+        index = self._device_index
         dim = self.query_dim
         if (
             lengths.ndim != 1
             or lengths.dtype != torch.int32
-            or lengths.device != dev
+            or lengths.get_device() != index
             or not lengths.is_contiguous()
         ):
             raise unsupported(
@@ -361,6 +384,12 @@ class SparseMLAPlan:
                 f"contiguous int32 [rows] on {dev}",
             )
         rows = lengths.shape[0]
+        if rows > _MAX_ROWS.get(self.q_dtype, rows):
+            raise unsupported(
+                name,
+                f"{rows} query rows in one call",
+                f"at most {_MAX_ROWS[self.q_dtype]} rows per call (split the call; rows do not depend on the split)",
+            )
         shape = query.shape
         if (
             len(shape) < 2
@@ -368,9 +397,9 @@ class SparseMLAPlan:
             or shape[-2] != heads
             or query.numel() != rows * heads * dim
             or query.dtype != self.q_dtype
-            or query.device != dev
+            or query.get_device() != index
             or not query.is_contiguous()
-            or query.data_ptr() % 16
+            or (q0 := query.data_ptr()) % 16
         ):
             raise unsupported(
                 name,
@@ -380,11 +409,11 @@ class SparseMLAPlan:
         if (
             kv_cache.ndim < 2
             or kv_cache.shape[-1] != dim
-            or not 0 < kv_cache.numel() < 0x7FFFFFFF * dim
+            or not 0 < (kv_elements := kv_cache.numel()) < 0x7FFFFFFF * dim
             or kv_cache.dtype != self.q_dtype
-            or kv_cache.device != dev
+            or kv_cache.get_device() != index
             or not kv_cache.is_contiguous()
-            or kv_cache.data_ptr() % 16
+            or (k0 := kv_cache.data_ptr()) % 16
         ):
             raise unsupported(
                 name,
@@ -397,7 +426,7 @@ class SparseMLAPlan:
             or shape[0] != rows
             or shape[1] <= 0
             or indices.dtype != torch.int32
-            or indices.device != dev
+            or indices.get_device() != index
             or indices.stride(1) != 1
         ):
             raise unsupported(
@@ -410,9 +439,9 @@ class SparseMLAPlan:
             or out.shape[-1] != spec.LATENT_DIM
             or out.numel() != rows * heads * spec.LATENT_DIM
             or out.dtype != torch.bfloat16
-            or out.device != dev
+            or out.get_device() != index
             or not out.is_contiguous()
-            or out.data_ptr() % 16
+            or (o0 := out.data_ptr()) % 16
         ):
             raise unsupported(
                 name,
@@ -424,16 +453,58 @@ class SparseMLAPlan:
             or lse.shape[-1] != heads
             or lse.numel() != rows * heads
             or lse.dtype != torch.float32
-            or lse.device != dev
+            or lse.get_device() != index
             or not lse.is_contiguous()
-            or lse.data_ptr() % 4
+            or (s0 := lse.data_ptr()) % 4
         ):
             raise unsupported(
                 name,
                 f"lse of shape {tuple(lse.shape)}, dtype {lse.dtype}",
                 f"a contiguous fp32 [{rows}, {heads}] on {dev}",
             )
+        if rows:
+            size = self._element_size
+            q1 = q0 + rows * heads * dim * size
+            k1 = k0 + kv_elements * size
+            o1 = o0 + rows * heads * (2 * spec.LATENT_DIM)
+            l0 = lengths.data_ptr()
+            l1 = l0 + rows * 4
+            i0 = indices.data_ptr()
+            i1 = i0 + ((rows - 1) * indices.stride(0) + shape[1]) * 4
+            shared = (
+                (q0 < o1 and o0 < q1)
+                or (k0 < o1 and o0 < k1)
+                or (l0 < o1 and o0 < l1)
+                or (i0 < o1 and o0 < i1)
+            )
+            if lse is not None:
+                s1 = s0 + rows * heads * 4
+                shared = (
+                    shared
+                    or (q0 < s1 and s0 < q1)
+                    or (k0 < s1 and s0 < k1)
+                    or (l0 < s1 and s0 < l1)
+                    or (i0 < s1 and s0 < i1)
+                    or (o0 < s1 and s0 < o1)
+                )
+            for scale in scales:
+                if isinstance(scale, torch.Tensor):
+                    a = scale.data_ptr()
+                    shared = shared or (a < o1 and o0 < a + 4)
+                    if lse is not None:
+                        shared = shared or (a < s1 and s0 < a + 4)
+            if shared:
+                raise unsupported(
+                    name,
+                    "out or lse sharing memory with an input or with each other",
+                    "out and lse in memory no other argument of the call occupies",
+                )
         if contents and rows:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{name}: list validation reads the list on the host and cannot run during CUDA graph capture "
+                    "(validate=False, or FLASHINFER_VALIDATE_INPUTS unset)"
+                )
             width = indices.shape[1]
             if ((lengths < 0) | (lengths > width)).any().item():
                 raise ValueError(f"{name}: a list length is outside [0, {width}]")
@@ -530,9 +601,48 @@ class SparseMLAPlan:
         output_scale: Optional[Scale] = None,
         validate: bool = True,
     ):
-        """Checked launch; returns ``out`` ``[rows, heads, 512]``, or ``(out, lse)`` with ``return_lse``.
-        ``validate=True`` also reads the list on the host (bounds, no live entry after a ``-1``), which
-        synchronizes; serving passes ``validate=False`` and keeps the layout checks, or calls :meth:`launch`."""
+        """Checked launch of the plan for any row count and list width.
+
+        Parameters
+        ----------
+        query : torch.Tensor
+            ``[rows, heads, 576 | 512]`` in the plan's dtype (bf16 or e4m3), contiguous and 16-byte aligned. Other
+            leading dimensions are accepted when the element count is the same.
+        kv_cache : torch.Tensor
+            ``[storage_rows, 576 | 512]`` cache rows in the plan's dtype, contiguous and 16-byte aligned.
+        indices : torch.Tensor
+            int32 ``[rows, top_k]``: each row's selected cache rows, live entries first, ``-1`` after them.
+        lengths : torch.Tensor
+            int32 ``[rows]``: each row's live count, ``0 <= lengths <= top_k``. The bf16 classes take at most
+            65,535 rows per call.
+        out : Optional[torch.Tensor]
+            bf16 ``[rows, heads, 512]`` to write; allocated when ``None``. Must not share memory with an input.
+        lse : Optional[torch.Tensor]
+            fp32 ``[rows, heads]`` to write the natural-log LSE; must not share memory with an input or ``out``.
+        return_lse : bool
+            Return ``(out, lse)``; ``lse`` is allocated when not given.
+        softmax_scale, output_scale : Optional[Union[float, torch.Tensor]]
+            Scales of this launch, of the kind the plan was made with (host float, or a one-element fp32 device
+            tensor whose contents are not read on the host). ``None`` uses the plan's own.
+        validate : bool
+            Also read the list on the host: lengths in range, live indices inside the cache, no live entry after a
+            ``-1``. This synchronizes and cannot run during CUDA graph capture. With ``validate=False`` those three
+            rules are the caller's contract; see the README for what a row computes when they are broken.
+
+        Returns
+        -------
+        torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
+            ``out``, or ``(out, lse)`` with ``return_lse``.
+
+        Raises
+        ------
+        BatchInvariantUnsupportedError
+            A layout, dtype, device, alignment, overlap or row count outside the class, or a ``-1`` hole.
+        ValueError
+            Under ``validate``: a length or a live index out of range.
+        RuntimeError
+            A row count's first call, or ``validate=True``, during CUDA graph capture.
+        """
         rows = lengths.shape[0] if lengths.ndim == 1 else 0
         if out is None:
             out = torch.empty(
@@ -544,9 +654,23 @@ class SparseMLAPlan:
             lse = torch.empty(
                 (rows, self.num_qo_heads), device=self.device, dtype=torch.float32
             )
-        self.check(query, kv_cache, indices, lengths, out, lse, validate)
         softmax_scale = self.scale(softmax_scale, 0, "softmax_scale")
         output_scale = self.scale(output_scale, 1, "output_scale")
+        self.check(
+            query,
+            kv_cache,
+            indices,
+            lengths,
+            out,
+            lse,
+            validate,
+            (
+                self.softmax_scale if softmax_scale is None else softmax_scale,
+                self.output_scale if output_scale is None else output_scale,
+            )
+            if self._tensor_scales
+            else (),
+        )
         self.launch(
             query, kv_cache, indices, lengths, out, lse, softmax_scale, output_scale
         )
@@ -615,9 +739,36 @@ def plan(
     softmax_scale: Scale,
     output_scale: Scale = 1.0,
 ) -> SparseMLAPlan:
-    """The plan of one compiled shape, built once per process and kept. ``softmax_scale`` is required: the scale is an
-    input of the row term. Scales passed here are the defaults of the plan's launches; only their kind (host float or
-    device tensor) is part of the compiled shape."""
+    """The plan of one compiled shape, built once per process and kept.
+
+    Parameters
+    ----------
+    device : torch.device or str
+        A CUDA device of architecture SM100, SM103 or SM107.
+    num_qo_heads : int
+        Query heads, 1 to 128.
+    q_dtype : torch.dtype
+        ``torch.float8_e4m3fn`` or ``torch.bfloat16``: the dtype of the query and of the cache rows.
+    qk_rope_head_dim : int
+        64 for 576-wide rows (512 latent + 64 RoPE), 0 for 512-wide rows.
+    softmax_scale : Union[float, torch.Tensor]
+        Required: the scale is an input of the row term. A positive finite host float, or a one-element fp32 tensor
+        on ``device``. It is the default of the plan's launches; only its kind is part of the compiled shape.
+    output_scale : Union[float, torch.Tensor]
+        Same rules; default ``1.0``.
+
+    Returns
+    -------
+    SparseMLAPlan
+        The plan; :meth:`SparseMLAPlan.run` checks every argument, :meth:`SparseMLAPlan.launch` checks nothing.
+
+    Raises
+    ------
+    BatchInvariantUnsupportedError
+        A device, dtype, width, head count or scale outside the classes.
+    RuntimeError
+        The first plan of a shape requested during CUDA graph capture.
+    """
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())

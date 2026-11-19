@@ -3871,9 +3871,10 @@ def _mla_with_kv_cache_impl(
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`;
         nothing falls back. CUDA graphs: run one call of the shape before
         capture and pass ``out``; the graph reads the plan cached for that
-        shape, which is kept until
-        ``flashinfer.batch_invariant.mla.clear_plans()``. Set
-        ``FLASHINFER_VALIDATE_INPUTS=1`` to check the list contract on the
+        shape. ``out`` and ``lse`` must not share memory with an input.
+        The list is the caller's contract (``0 <= live count <= top_k``,
+        live indices inside the cache); set
+        ``FLASHINFER_VALIDATE_INPUTS=1`` to check it on the
         host (synchronizes; a ``-1`` tail passes, a live entry after a
         ``-1`` is refused). Callers that plan once can use
         ``flashinfer.batch_invariant.mla.plan`` directly. A flagged call is

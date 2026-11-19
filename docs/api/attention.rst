@@ -277,9 +277,22 @@ back. ``flashinfer.batch_invariant.mla.plan(device, num_qo_heads, q_dtype=...,
 qk_rope_head_dim=..., softmax_scale=...)`` returns the same class as a
 ``SparseMLAPlan`` for callers that plan once: ``plan.run(query, kv_cache, indices,
 lengths)`` checks its arguments, ``plan.launch(...)`` does not, and
-``flashinfer.batch_invariant.mla.clear_plans()`` drops the cached plans. The contract
-(list layout, live counts, scales, CUDA graphs, refused arguments) is in
+``flashinfer.batch_invariant.mla.clear_plans()`` forgets the cached plans (captured
+graphs keep replaying). ``out`` and ``lse`` must not share memory with an input. The
+contract (list layout, live counts, scales, CUDA graphs, refused arguments, and what a
+row computes when an unvalidated list breaks it) is in
 ``flashinfer/batch_invariant/README.md``.
+
+.. currentmodule:: flashinfer.batch_invariant.mla
+
+.. autosummary::
+    :toctree: ../generated
+
+    plan
+    SparseMLAPlan
+    clear_plans
+
+.. currentmodule:: flashinfer.mla
 
 .. note::
 

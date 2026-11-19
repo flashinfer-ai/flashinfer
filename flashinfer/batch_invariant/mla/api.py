@@ -92,14 +92,21 @@ def sparse_mla_batch_invariant(
             and type(sparse_mla_top_k) is int
             and sparse_mla_top_k > 0
             and kv_lora_rank == spec.LATENT_DIM
+            and type(qk_rope_head_dim) is int
             and refused == _NOT_REFUSED
             and bmm1_scale is not None
             and bmm2_scale is not None
             and (return_lse_base is None or return_lse_base == "basee")
         )
-    except RuntimeError:  # a tensor in a slot that takes none
+    except (RuntimeError, ValueError):  # a tensor or an array in a slot that takes none
         plain = False
     if not plain:
+        if type(qk_rope_head_dim) is not int:
+            raise unsupported(
+                spec.FAMILY,
+                f"qk_rope_head_dim={qk_rope_head_dim!r}",
+                "0 (512-wide) or 64 (576-wide)",
+            )
         error = _refusal(
             _family_name(query.dtype, qk_rope_head_dim),
             backend,
@@ -192,16 +199,20 @@ def sparse_mla_batch_invariant(
         )
     if want_lse and lse is None:
         lse = torch.empty((rows, heads), dtype=torch.float32, device=device)
-    plan.check(query, kv_cache, indices, lengths, out, lse, validate)
-    plan.launch(
+    softmax_scale = plan.scale(bmm1_scale, 0, "bmm1_scale")
+    output_scale = plan.scale(bmm2_scale, 1, "bmm2_scale")
+    plan.check(
         query,
         kv_cache,
         indices,
         lengths,
         out,
         lse,
-        plan.scale(bmm1_scale, 0, "bmm1_scale"),
-        plan.scale(bmm2_scale, 1, "bmm2_scale"),
+        validate,
+        (bmm1_scale, bmm2_scale) if plan._tensor_scales else (),
+    )
+    plan.launch(
+        query, kv_cache, indices, lengths, out, lse, softmax_scale, output_scale
     )
     return (out, lse) if return_lse else out
 
@@ -222,7 +233,7 @@ def _refusal(
     if kv_lora_rank != spec.LATENT_DIM:
         return unsupported(name, f"kv_lora_rank={kv_lora_rank!r}", "kv_lora_rank=512")
     for arg, value, default in zip(REFUSED, refused, _NOT_REFUSED, strict=True):
-        if isinstance(value, torch.Tensor):
+        if isinstance(value, torch.Tensor) or getattr(value, "ndim", 0):
             used = True
         elif default is None or default is False or default == 0:
             used = not (value is None or value is False or value == 0)
