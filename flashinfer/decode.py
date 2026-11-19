@@ -5734,6 +5734,14 @@ def fast_decode_plan(
     device; a ``ValueError`` is raised otherwise. Use
     :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
+    if getattr(self, "_batch_invariant", None) is not None:
+        from .batch_invariant.support import unsupported
+
+        raise unsupported(
+            self._batch_invariant.CLASS,
+            "fast_decode_plan on a batch_invariant=True wrapper",
+            "BatchDecodeWithPagedKVCacheWrapper.plan() before every run()",
+        )
     # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
     indptr = indptr.contiguous()
     indices = indices.contiguous()

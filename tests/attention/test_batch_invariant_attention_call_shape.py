@@ -465,6 +465,18 @@ def test_run_neutral_arguments_reach_the_same_launch(delegates, kind):
         assert named in str(e.value) and not delegates.calls, extra
 
 
+def test_fast_decode_plan_raises_the_typed_error():
+    """The replan shortcut of the graph-mode decode wrappers has no batch-invariant path: the typed error, before any
+    argument is read."""
+    from types import SimpleNamespace
+
+    from flashinfer.decode import fast_decode_plan
+
+    wrapper = SimpleNamespace(_batch_invariant=SimpleNamespace(CLASS=CLASS))
+    with pytest.raises(Unsupported, match="fast_decode_plan"):
+        fast_decode_plan(wrapper, None, None, None, 8, 8, 128, 16)
+
+
 # ------------------------------------------------------------------------------------------------------ on the device
 def _vllm_layer_cache(pr):
     """A vLLM layer cache: K and V packed in the content dimension of one tensor, handed to FlashInfer as the two views of
