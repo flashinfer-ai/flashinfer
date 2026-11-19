@@ -5336,6 +5336,8 @@ def trtllm_batch_decode_with_kv_cache(
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 enable_pdl=enable_pdl,
                 length_aware_schedule=length_aware_schedule,
+                max_q_len=max_q_len,
+                mask=mask,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route

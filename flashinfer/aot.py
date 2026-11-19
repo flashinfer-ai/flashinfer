@@ -50,6 +50,7 @@ from .jit.attention.modules import (
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
+from .jit.cake_fmha_super_nvfp4 import gen_cake_fmha_super_nvfp4_module
 from .jit.cake_fp4_allreduce import gen_cake_fp4_allreduce_aot_modules
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
@@ -749,6 +750,9 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
+    # Cake FMHA super_nvfp4 routes: sm_100a only, CUDA 13.0 or newer.
+    if has_sm100a_exact and get_cuda_version() >= Version("13.0"):
+        jit_specs.append(gen_cake_fmha_super_nvfp4_module())
     # Fused MLA context K/V pack (attention side, not MoE), two backends behind
     # concat_mla_kv_quant_fp8: the Cake programs, one per head group, one
     # library each per exact target (the loader spells the targets "sm_100a" /
