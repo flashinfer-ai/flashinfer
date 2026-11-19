@@ -671,6 +671,14 @@ def k_slots_for(K: int) -> int:
     return 1 if K <= 1 else LANES * (-(-int(K) // LANES))
 
 
+def _key(dtype_str, N, cfg, mode, temp_rows, enable_pdl, k_slots=1):
+    """The compile key of the kernel serving ``N``: the Kp bucket, the config, the mode, the temperature form, the id slots
+    (PDL is a runtime launch argument: ``enable_pdl`` is accepted and ignored)."""
+    from .schedule import padded_blocks
+
+    return (dtype_str, padded_blocks(N), cfg, mode, bool(temp_rows), False, k_slots)
+
+
 def get_compiled_kernel(
     dtype_str: str,
     N: int,
@@ -682,15 +690,31 @@ def get_compiled_kernel(
 ):
     """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, mode, temperature form, id slots);
     ``N``, ``M``, ``K``, the row stride and PDL are runtime arguments (``enable_pdl`` is accepted and ignored)."""
-    from .schedule import padded_blocks
-
     return _compile_bucket(
-        dtype_str, padded_blocks(N), cfg, mode, bool(temp_rows), False, k_slots
+        *_key(dtype_str, N, cfg, mode, temp_rows, enable_pdl, k_slots)
     )
 
 
-@functools.cache
-def _compile_bucket(
+def precompile(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    mode: Mode,
+    temp_rows: bool,
+    enable_pdl: bool,
+    k_slots: int = 1,
+) -> None:
+    """Compile the kernel serving ``N`` into the on-disk cache without loading it, outside the op family's module lock
+    (:func:`jit.precompile`): what a precompile pool's worker calls. ``get_compiled_kernel`` holds the lock for the whole build
+    (concurrent processes missing the same kernel compile it once), so workers compiling different kernels of one family
+    through it would run serially."""
+    jit.precompile(
+        LSE_MODULE,
+        *_spec(*_key(dtype_str, N, cfg, mode, temp_rows, enable_pdl, k_slots)),
+    )
+
+
+def _spec(
     dtype_str: str,
     Kp: int,
     cfg: LSEConfig,
@@ -699,6 +723,7 @@ def _compile_bucket(
     enable_pdl: bool,
     k_slots: int = 1,
 ):
+    """The cache object's name and the compile function of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
@@ -758,4 +783,11 @@ def _compile_bucket(
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(LSE_MODULE, name, compile_fn)
+    return name, compile_fn
+
+
+@functools.cache
+def _compile_bucket(*key):
+    """Compile, or load from the cache, the kernel of one compile key (the serving path: the module lock is held for the
+    whole build)."""
+    return jit.build_and_load(LSE_MODULE, *_spec(*key))

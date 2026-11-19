@@ -909,13 +909,48 @@ def get_compiled_kernel(
     score: bool = False,
     count_list: Optional[bool] = None,
 ):
-    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set,
-    temperature form, gather, the two log-probabilities, pdl, the placements, the score form); ``N``, ``M`` and the row
-    strides are runtime arguments."""
+    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set, the full
+    log-probability output, the placements, the score form); ``N``, ``M``, the row strides, the temperature form, the gather,
+    the kept log-probability output and PDL are runtime arguments (those four are accepted and ignored here)."""
+    return _compile_bucket(
+        *_key(
+            dtype_str,
+            N,
+            cfg,
+            from_logits,
+            filters,
+            temp_rows,
+            has_indices,
+            return_logprob,
+            enable_pdl,
+            early_finish,
+            return_kept_logprob,
+            score,
+            count_list,
+        )
+    )
+
+
+def _key(
+    dtype_str,
+    N,
+    cfg,
+    from_logits,
+    filters,
+    temp_rows,
+    has_indices,
+    return_logprob,
+    enable_pdl,
+    early_finish="mass",
+    return_kept_logprob=False,
+    score=False,
+    count_list=None,
+):
+    """The compile key of the kernel serving ``N``; temp_rows / has_indices / enable_pdl / return_kept_logprob are runtime
+    arguments and leave it."""
     from .schedule import padded_blocks
 
-    # temp_rows / has_indices / enable_pdl / return_kept_logprob are runtime arguments: they leave the bucket's key
-    return _compile_bucket(
+    return (
         dtype_str,
         padded_blocks(N),
         cfg,
@@ -932,8 +967,48 @@ def get_compiled_kernel(
     )
 
 
-@functools.cache
-def _compile_bucket(
+def precompile(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    from_logits: bool,
+    filters: Filters,
+    temp_rows: bool,
+    has_indices: bool,
+    return_logprob: bool,
+    enable_pdl: bool,
+    early_finish: str = "mass",
+    return_kept_logprob: bool = False,
+    score: bool = False,
+    count_list: Optional[bool] = None,
+) -> None:
+    """Compile the kernel serving ``N`` into the on-disk cache without loading it, outside the op family's module lock
+    (:func:`jit.precompile`): what a precompile pool's worker calls. ``get_compiled_kernel`` holds the lock for the whole build
+    (concurrent processes missing the same kernel compile it once), so workers compiling different kernels of one family
+    through it would run serially."""
+    jit.precompile(
+        DRAW_SUPPORT_MODULE,
+        *_spec(
+            *_key(
+                dtype_str,
+                N,
+                cfg,
+                from_logits,
+                filters,
+                temp_rows,
+                has_indices,
+                return_logprob,
+                enable_pdl,
+                early_finish,
+                return_kept_logprob,
+                score,
+                count_list,
+            )
+        ),
+    )
+
+
+def _spec(
     dtype_str,
     Kp,
     cfg,
@@ -948,7 +1023,7 @@ def _compile_bucket(
     score=False,
     count_list=None,
 ):
-    """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
+    """The cache object's name and the compile function of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
@@ -1029,4 +1104,11 @@ def _compile_bucket(
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(DRAW_SUPPORT_MODULE, name, compile_fn)
+    return name, compile_fn
+
+
+@functools.cache
+def _compile_bucket(*key):
+    """Compile, or load from the cache, the kernel of one compile key (the serving path: the module lock is held for the
+    whole build)."""
+    return jit.build_and_load(DRAW_SUPPORT_MODULE, *_spec(*key))

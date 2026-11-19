@@ -655,13 +655,13 @@ def test_draw_support_ir_uses_only_declared_forms(
 _WORKER_CODE = r"""
 import ast, sys
 from flashinfer.batch_invariant.sampling.schedule import LSEConfig
-from flashinfer.batch_invariant.sampling.draw_support_kernel import get_compiled_kernel
+from flashinfer.batch_invariant.sampling.draw_support_kernel import precompile
 from flashinfer.batch_invariant.sampling.support_spec import Filters
 bad = []
 for s in ast.literal_eval(sys.argv[1]):
     try:
         ds, N, cfg, from_logits, fset, trow, idx, lp, pdl, *rest = s
-        get_compiled_kernel(ds, N, LSEConfig(*cfg), from_logits, Filters(**dict(fset)), trow, idx, lp, pdl, *rest)
+        precompile(ds, N, LSEConfig(*cfg), from_logits, Filters(**dict(fset)), trow, idx, lp, pdl, *rest)   # outside the module lock
     except Exception as e:  # noqa: BLE001
         bad.append((s, repr(e)[:300]))
 print("BAD", repr(bad))

@@ -677,6 +677,25 @@ def kernel_name(
     )
 
 
+def _key(
+    dtype_str, N, cfg, from_logits, temp_rows, has_indices, return_logprob, enable_pdl
+):
+    """The compile key of the kernel serving ``N``: the Kp bucket, the config, the input kind, the temperature form, the
+    gather, the log-probability output (PDL is a runtime launch argument: ``enable_pdl`` is accepted and ignored)."""
+    from .schedule import padded_blocks
+
+    return (
+        dtype_str,
+        padded_blocks(N),
+        cfg,
+        from_logits,
+        bool(temp_rows),
+        bool(has_indices),
+        bool(return_logprob),
+        False,
+    )
+
+
 def get_compiled_kernel(
     dtype_str: str,
     N: int,
@@ -690,25 +709,55 @@ def get_compiled_kernel(
     """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, temperature form,
     index gather, log-probability output); ``N``, ``M``, the row stride and PDL are runtime arguments (``enable_pdl`` is
     accepted and ignored)."""
-    from .schedule import padded_blocks
-
     return _compile_bucket(
-        dtype_str,
-        padded_blocks(N),
-        cfg,
-        from_logits,
-        bool(temp_rows),
-        bool(has_indices),
-        bool(return_logprob),
-        False,
+        *_key(
+            dtype_str,
+            N,
+            cfg,
+            from_logits,
+            temp_rows,
+            has_indices,
+            return_logprob,
+            enable_pdl,
+        )
     )
 
 
-@functools.cache
-def _compile_bucket(
+def precompile(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    from_logits: bool,
+    temp_rows: bool,
+    has_indices: bool,
+    return_logprob: bool,
+    enable_pdl: bool,
+) -> None:
+    """Compile the kernel serving ``N`` into the on-disk cache without loading it, outside the op family's module lock
+    (:func:`jit.precompile`): what a precompile pool's worker calls. ``get_compiled_kernel`` holds the lock for the whole build
+    (concurrent processes missing the same kernel compile it once), so workers compiling different kernels of one family
+    through it would run serially."""
+    jit.precompile(
+        DRAW_MODULE,
+        *_spec(
+            *_key(
+                dtype_str,
+                N,
+                cfg,
+                from_logits,
+                temp_rows,
+                has_indices,
+                return_logprob,
+                enable_pdl,
+            )
+        ),
+    )
+
+
+def _spec(
     dtype_str, Kp, cfg, from_logits, temp_rows, has_indices, return_logprob, enable_pdl
 ):
-    """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
+    """The cache object's name and the compile function of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
@@ -766,4 +815,11 @@ def _compile_bucket(
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(DRAW_MODULE, name, compile_fn)
+    return name, compile_fn
+
+
+@functools.cache
+def _compile_bucket(*key):
+    """Compile, or load from the cache, the kernel of one compile key (the serving path: the module lock is held for the
+    whole build)."""
+    return jit.build_and_load(DRAW_MODULE, *_spec(*key))
