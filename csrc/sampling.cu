@@ -101,7 +101,7 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(output.dtype(), IdType, [&] {
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(logits.dtype(), LogitsT, [&] {
-      cudaError_t status = sampling::SamplingFromLogits<float, IdType, LogitsT>(
+      cudaError_t status = sampling::SamplingFromLogits<LogitsT, IdType, float>(
           static_cast<LogitsT*>(logits.data_ptr()), static_cast<IdType*>(output.data_ptr()),
           maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
                                     : nullptr,

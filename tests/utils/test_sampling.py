@@ -3179,10 +3179,20 @@ def test_sampling_from_logits_half_precision_matches_float32(
     strided = logits.repeat_interleave(2, dim=1)[:, ::2]
     assert not strided.is_contiguous() or vocab_size == 1
 
+    # contiguous views that start 1, 2 and 3 elements into a buffer, so that the data
+    # pointer is not aligned for the kernel's widest half-precision load
+    shifted = []
+    for shift in (1, 2, 3):
+        buffer = torch.empty(shift + logits.numel(), device="cuda:0", dtype=dtype)
+        buffer[shift:] = logits.flatten()
+        shifted.append(buffer[shift:].view(batch_size, vocab_size))
+        assert shifted[-1].is_contiguous()
+
     for half, kwargs in [
         (logits, {}),
         (logits, {"indices": indices}),
         (strided, {}),
+        *[(view, {}) for view in shifted],
     ]:
         sample = partial(
             flashinfer.sampling.sampling_from_logits,
