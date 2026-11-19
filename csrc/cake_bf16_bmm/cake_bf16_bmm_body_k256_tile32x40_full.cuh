@@ -27,12 +27,12 @@
 
 typedef unsigned char      uint8_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_WIN32)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Cake requires a 64-bit uint64_t");
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

@@ -18,12 +18,12 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_WIN32)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Cake requires a 64-bit uint64_t");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
@@ -205,7 +205,7 @@ kernel_cake_kimi_k3_tp12_tail_1889392bd00ac94f4e7c(__nv_bfloat16* __restrict__ s
                 unsigned int boundary = (clear[0] + 15) / 16;
                 for (unsigned int packed = thread; packed < boundary; packed += threads) {
                     {
-                        auto _gst_5 = reinterpret_cast<unsigned __int128*>(bytes_base + stage_offset) + packed;
+                        auto _gst_5 = reinterpret_cast<uint4*>(bytes_base + stage_offset) + packed;
                         __builtin_assume(__isGlobal(_gst_5));
                         reinterpret_cast<int4*>(_gst_5)[0] = reinterpret_cast<int4*>(sentinel)[0];
                     }
@@ -790,7 +790,7 @@ kernel_cake_kimi_k3_tp12_tail_1889392bd00ac94f4e7c(__nv_bfloat16* __restrict__ s
         unsigned int boundary_1 = (clear_1[1] + 15) / 16;
         for (unsigned int packed_1 = thread_1; packed_1 < boundary_1; packed_1 += threads_1) {
             {
-                auto _gst_9 = reinterpret_cast<unsigned __int128*>(bytes_base_1 + stage_offset_1) + packed_1;
+                auto _gst_9 = reinterpret_cast<uint4*>(bytes_base_1 + stage_offset_1) + packed_1;
                 __builtin_assume(__isGlobal(_gst_9));
                 reinterpret_cast<int4*>(_gst_9)[0] = reinterpret_cast<int4*>(sentinel_1)[0];
             }

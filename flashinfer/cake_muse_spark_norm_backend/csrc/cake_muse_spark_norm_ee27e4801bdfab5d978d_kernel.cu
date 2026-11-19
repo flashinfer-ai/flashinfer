@@ -18,12 +18,12 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_WIN32)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Cake requires a 64-bit uint64_t");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
@@ -280,26 +280,26 @@ kernel_cake_muse_spark_norm_ee27e4801bdfab5d978d(__nv_bfloat16* __restrict__ bra
         }
         __syncthreads();
         unsigned int pbyte = (unsigned int)((it & 1) * 64);
-        __int128_t _smem_raw_6;
-        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(partials_addr + pbyte));
+        uint64_t _smem_raw_6[2];
+        asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_6[0]), "=l"(_smem_raw_6[1]) : "r"(partials_addr + pbyte));
         *reinterpret_cast<uint32_t*>(&pv[0]) = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
         *reinterpret_cast<uint32_t*>(&pv[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
         *reinterpret_cast<uint32_t*>(&pv[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
         *reinterpret_cast<uint32_t*>(&pv[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[3];
-        __int128_t _smem_raw_7;
-        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(partials_addr + pbyte + 16));
+        uint64_t _smem_raw_7[2];
+        asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_7[0]), "=l"(_smem_raw_7[1]) : "r"(partials_addr + pbyte + 16));
         *reinterpret_cast<uint32_t*>(&pv[4]) = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
         *reinterpret_cast<uint32_t*>(&pv[(4) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
         *reinterpret_cast<uint32_t*>(&pv[(4) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
         *reinterpret_cast<uint32_t*>(&pv[(4) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
-        __int128_t _smem_raw_8;
-        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_8) : "r"(partials_addr + pbyte + 32));
+        uint64_t _smem_raw_8[2];
+        asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_8[0]), "=l"(_smem_raw_8[1]) : "r"(partials_addr + pbyte + 32));
         *reinterpret_cast<uint32_t*>(&pv[8]) = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[0];
         *reinterpret_cast<uint32_t*>(&pv[(8) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[1];
         *reinterpret_cast<uint32_t*>(&pv[(8) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[2];
         *reinterpret_cast<uint32_t*>(&pv[(8) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[3];
-        __int128_t _smem_raw_9;
-        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_9) : "r"(partials_addr + pbyte + 48));
+        uint64_t _smem_raw_9[2];
+        asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_9[0]), "=l"(_smem_raw_9[1]) : "r"(partials_addr + pbyte + 48));
         *reinterpret_cast<uint32_t*>(&pv[12]) = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[0];
         *reinterpret_cast<uint32_t*>(&pv[(12) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[1];
         *reinterpret_cast<uint32_t*>(&pv[(12) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[2];
