@@ -3,6 +3,7 @@
 import BIKernels.GEMM
 import BIKernels.GEMMConfig
 import BIKernels.Attention
+import BIKernels.AttentionMaskCases
 import BIKernels.Export
 import BIKernels.Cases
 import BIKernels.Canon
