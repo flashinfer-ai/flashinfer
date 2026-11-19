@@ -43,6 +43,29 @@ and run the two halves back to back on the current stream.
 
     ugpu_state_pool
 
+Locality-domain FP32 decode state (SM107a)
+------------------------------------------
+
+The K-major FP32 decode state of ``gated_delta_rule_decode`` can be homed on
+the two dies of a Rubin GPU: :func:`localize_gdn_decode_state` copies a
+``[B, HV, K, V]`` state into one allocation whose batch rows ``[0, rows0)`` are
+in die 0's memory and the rest in die 1's (by default half the rows on each
+die). Pass the returned tensor as ``state`` from then on. A T=1 call on it with
+``backend="auto"`` or ``backend="cake_gdn"`` runs the locality-domain twin of
+the Cake nontranspose kernel: one launch over both dies whose CTAs take the
+batch rows of their own die first. The output and the updated state are bitwise
+equal to the whole-GPU kernel's. The twin covers H=16 / HV=32 from B=48 on
+(scale ``K ** -0.5`` or 1.0) on 212-SM devices and needs a CUDA 13.5 toolkit
+and driver; other calls, a view of part of the state and a copy of it run the
+whole-GPU kernel. The helper returns the state unhomed where no call of its row
+would run the twin. Make one eager call before a CUDA graph capture, and keep
+the state alive as long as a graph that reads it.
+
+.. autosummary::
+    :toctree: ../generated
+
+    localize_gdn_decode_state
+
 ReplaySSM speculative verification (SM100/SM103, SM120)
 -------------------------------------------------------
 

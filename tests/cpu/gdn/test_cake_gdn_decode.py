@@ -1064,9 +1064,10 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
         "gdn_decode_nontranspose_fp32_t1_hqsplit": 1,
         "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3": 1,
     }
-    assert {"gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"} == (
-        cake_gdn.CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
-    )
+    assert {
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain",
+    } == cake_gdn.CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
     rule_band = cake_gdn.cake_gdn_nontranspose_fp32_t1_rule_band
     for batch_size, expected in (
         (1, "small"),
@@ -1237,15 +1238,23 @@ def test_tma_state_decode_records_spell_their_abi_and_encode_the_state_map() -> 
     # The TMA-state decode records (sm_107a only) spell tma_abi grid_constant and launch
     # through the TMA-state host template, which encodes the state's 4D tensor map (reused
     # for the same state per host thread) and opts in to the kernel's dynamic shared memory; every other decode
-    # record derives the pointer ABI.
+    # record derives the pointer ABI.  The two records of the locality-domain twin launch
+    # through their own TMA-state template (test_cake_gdn_decode_domain.py).
     variants = cake_gdn._manifest()["variants"]
     tma = [
         record
         for record in variants
         if record["domain"] == "decode" and record["tma_abi"] == "grid_constant"
     ]
-    assert len(tma) == 2
-    for record in tma:
+    whole = [
+        record
+        for record in tma
+        if record["host_binding"]["template"]
+        == "host/templates/decode_fp32_t1_tma_state.cc.in"
+    ]
+    assert len(whole) == 2
+    assert len(tma) == 4
+    for record in whole:
         schedule = record["source_schedule"].rsplit(":", 1)[-1]
         assert schedule in cake_gdn.CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
         assert record["architectures"] == ["sm_107a"]
@@ -1265,7 +1274,10 @@ def test_tma_state_decode_records_spell_their_abi_and_encode_the_state_map() -> 
         # the kernel takes any batch (one CTA per state head): no batch floor in the
         # shim, the rule routes the record from 10 rows on
         assert "arg_q.size(0) > 0 && grid_y == 1" in text
-    assert {record["specializations"]["SCALE"] for record in tma} == {128**-0.5, 1.0}
+    assert {record["specializations"]["SCALE"] for record in whole} == {
+        128**-0.5,
+        1.0,
+    }
     for record in variants:
         if record["domain"] == "decode" and record not in tma:
             assert record["tma_abi"] == "pointer", record["name"]
@@ -1284,7 +1296,7 @@ def test_tma_state_decode_records_spell_their_abi_and_encode_the_state_map() -> 
         spelled[field] = value
         with pytest.raises(RuntimeError, match=message):
             cake_gdn._derive_record_fields(spelled)
-    pointer = json.loads(json.dumps(tma[0]))
+    pointer = json.loads(json.dumps(whole[0]))
     pointer["tma_abi"] = "pointer"
     with pytest.raises(RuntimeError, match="does not match its host template"):
         cake_gdn._derive_record_fields(pointer)
