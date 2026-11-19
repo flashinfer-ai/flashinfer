@@ -2832,7 +2832,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             and not isinstance(output_scale, cute.Tensor)
             and not (cfg.sparse_direct and isinstance(sparse_inputs[5], cute.Tensor))
         )
-        if cutlass.const_expr((cfg.use_pdl or acc_o is not None) and not wait_after_prologue):
+        if cutlass.const_expr(
+            (cfg.use_pdl or acc_o is not None) and not wait_after_prologue
+        ):
             # A PDL launch can start before the preceding grid completes, so
             # every input read below (metadata, Q, KV, sinks) waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)

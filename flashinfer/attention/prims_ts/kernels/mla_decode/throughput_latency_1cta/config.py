@@ -351,7 +351,11 @@ class MlaConfig(Nvfp4KVConfig):
         extra pool's NVFP4 records size it.
         """
         if self.tma_fp8_primary_tiles:
-            return (cache_record_size(self.extra_kv_cache_format, self.rope_dim) + 31) // 32 * 32
+            return (
+                (cache_record_size(self.extra_kv_cache_format, self.rope_dim) + 31)
+                // 32
+                * 32
+            )
         return Nvfp4KVConfig.raw_record_stride.fget(self)
 
     def raw_record_ring_fits(self) -> bool:
@@ -2216,7 +2220,10 @@ def configure_sparse_mla(
     raw_record_ring = (
         2
         if retained_nvfp4_kv
-        and (fp8_primary_tiles or (cfg.raw_record_ring_fits() and cfg.kv_cache_format != "fp8"))
+        and (
+            fp8_primary_tiles
+            or (cfg.raw_record_ring_fits() and cfg.kv_cache_format != "fp8")
+        )
         and cfg.use_persistent_scheduler
         else 1
     )

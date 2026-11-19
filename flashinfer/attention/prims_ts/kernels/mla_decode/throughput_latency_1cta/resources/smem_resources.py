@@ -1636,7 +1636,11 @@ class SmemKvResource(MlaResource):
                     # this tile's raw slot before the KV acquire.
                     if self._tma_fp8_tile(cached_page_ids, page_id_slot):
                         self._gather_fp8_tile(
-                            destinations[0], stage_info, cached_page_ids, page_id_slot, warp
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
                         )
                     else:
                         store_nvfp4_record(
@@ -1663,7 +1667,11 @@ class SmemKvResource(MlaResource):
                         # The raw slot carried no bytes for this tile.
                         release_raw_record(raw_empty)
                         self._gather_fp8_tile(
-                            destinations[0], stage_info, cached_page_ids, page_id_slot, warp
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
                         )
                     elif source_is_fp8(
                         cfg,

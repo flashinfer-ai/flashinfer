@@ -891,7 +891,9 @@ def convert_nvfp4_record(
 
 
 @cute.jit
-def gather_fp8_tile(dst, panel_map, barrier, cached, base, warp, *, rows: cutlass.Constexpr[int]):
+def gather_fp8_tile(
+    dst, panel_map, barrier, cached, base, warp, *, rows: cutlass.Constexpr[int]
+):
     """TMA-gather this warp's rows of unchanged FP8 primary bytes into four retained panels.
 
     Warp ``warp`` owns rows ``[warp * rows, (warp + 1) * rows)`` of the tile, whose
