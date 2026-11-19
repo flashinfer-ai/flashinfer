@@ -183,10 +183,10 @@ __device__ __forceinline__ uint64_t wgmma_desc(const void* p) {
       "wgmma.mma_async.sync.aligned.m64n48k32.f32.e4m3.e4m3 "                                     \
       "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23}, " \
       "%24, %25, 0, 1, 1;"                                                                        \
-      : "+f"(D[0][0]), "+f"(D[0][1]), "+f"(D[0][2]), "+f"(D[0][3]), "+f"(D[1][0]), "+f"(D[1][1]), \
-        "+f"(D[1][2]), "+f"(D[1][3]), "+f"(D[2][0]), "+f"(D[2][1]), "+f"(D[2][2]), "+f"(D[2][3]), \
-        "+f"(D[3][0]), "+f"(D[3][1]), "+f"(D[3][2]), "+f"(D[3][3]), "+f"(D[4][0]), "+f"(D[4][1]), \
-        "+f"(D[4][2]), "+f"(D[4][3]), "+f"(D[5][0]), "+f"(D[5][1]), "+f"(D[5][2]), "+f"(D[5][3])  \
+      : "=f"(D[0][0]), "=f"(D[0][1]), "=f"(D[0][2]), "=f"(D[0][3]), "=f"(D[1][0]), "=f"(D[1][1]), \
+        "=f"(D[1][2]), "=f"(D[1][3]), "=f"(D[2][0]), "=f"(D[2][1]), "=f"(D[2][2]), "=f"(D[2][3]), \
+        "=f"(D[3][0]), "=f"(D[3][1]), "=f"(D[3][2]), "=f"(D[3][3]), "=f"(D[4][0]), "=f"(D[4][1]), \
+        "=f"(D[4][2]), "=f"(D[4][3]), "=f"(D[5][0]), "=f"(D[5][1]), "=f"(D[5][2]), "=f"(D[5][3])  \
       : "l"(A), "l"(B))
 
 __device__ __forceinline__ uint32_t hmul2_bits(uint32_t x, __half2 y) {
@@ -245,11 +245,14 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
     const int* __restrict__ bt, const int* __restrict__ sl, const float* __restrict__ qd,
     const float* __restrict__ kd, __half* __restrict__ po, float* __restrict__ plse,
     int2* __restrict__ pmeta, float2* __restrict__ carry, int B, int NB, int GSTRIDE) {
-  __shared__ __align__(128) uint8_t qs[64 * 128];
+  // 1024-byte alignment: wgmma_desc encodes a zero matrix base offset, and
+  // the 128-byte swizzle written by sw8/sw16 matches the hardware pattern
+  // only when each matrix base is aligned to the 1024-byte swizzle repeat.
+  __shared__ __align__(1024) uint8_t qs[64 * 128];
   // Each stage's raw K/V pair is contiguous.  Once QK has consumed K and
   // the V bytes have been loaded into registers, reuse the same 12 KiB as
   // the two f16 V halves for PV and, finally, as the partial-output tile.
-  __shared__ __align__(128) uint8_t kv[2][2][BN * 128];
+  __shared__ __align__(1024) uint8_t kv[2][2][BN * 128];
 
   const int tid = threadIdx.x;
   const int w = tid >> 5, lane = tid & 31;
@@ -1001,6 +1004,10 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   // score units, which bounds the scaled logits only for a non-negative
   // q_descale*k_descale product. Values live on device and this entry point
   // is sync-free / capture-safe, so they are not read back and validated.
+  // The -1e20 running-max floor (the fully-masked-split sentinel) further
+  // assumes scaled logits stay above -1e20: with |raw| <= 448*448*128 that
+  // holds for any q_descale*k_descale below ~3e13, many orders of magnitude
+  // past every quantization scale regime.
   CHECK_INPUT_AND_TYPE(q_descale, dl_float32);
   CHECK_INPUT_AND_TYPE(k_descale, dl_float32);
   CHECK_INPUT_AND_TYPE(v_descale, dl_float32);
