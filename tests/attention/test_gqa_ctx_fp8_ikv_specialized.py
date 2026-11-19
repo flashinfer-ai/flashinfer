@@ -39,20 +39,34 @@ SCALE = 0.08838834764831845  # 128 ** -0.5
 PAGE, HQ, D = 128, 16, 128
 
 
-def _make_inputs(q_lens, kv_lens, seed=0):
+def _make_inputs(q_lens, kv_lens, seed=0, btw_pad=0, shuffle_pages=False):
+    """btw_pad widens the block table past the pages any request needs, with
+    arbitrary (valid-pool) ids in the unused columns, and shuffle_pages
+    scatters the real page ids -- the serving call form, where tables are as
+    wide as the engine's maximum pages per sequence."""
     dev = torch.device("cuda")
     g = torch.Generator(device=dev).manual_seed(seed)
     tq = sum(q_lens)
     pprs = [(k + PAGE - 1) // PAGE for k in kv_lens]
-    np_, btw = sum(pprs), max(pprs)
+    np_, btw = sum(pprs), max(pprs) + btw_pad
     q = (torch.randn(tq, HQ, D, generator=g, device=dev) * 0.5).to(torch.float8_e4m3fn)
     kv_buf = (torch.randn(np_, PAGE, 2, D, generator=g, device=dev) * 0.5).to(
         torch.float8_e4m3fn
     )
-    bt = torch.zeros(len(q_lens), btw, dtype=torch.int32, device=dev)
+    if btw_pad:
+        # garbage ids (any pool slot) where serving engines leave stale columns
+        bt = torch.randint(
+            0, np_, (len(q_lens), btw), generator=g, dtype=torch.int32, device=dev
+        )
+    else:
+        bt = torch.zeros(len(q_lens), btw, dtype=torch.int32, device=dev)
+    if shuffle_pages:
+        page_ids = torch.randperm(np_, generator=g, device=dev).to(torch.int32)
+    else:
+        page_ids = torch.arange(np_, dtype=torch.int32, device=dev)
     s = 0
     for i, ppr in enumerate(pprs):
-        bt[i, :ppr] = torch.arange(s, s + ppr, dtype=torch.int32, device=dev)
+        bt[i, :ppr] = page_ids[s : s + ppr]
         s += ppr
     cu_q = torch.tensor(
         [0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32, device=dev
@@ -159,6 +173,48 @@ def test_specialized_correct_and_routed(q_lens, kv_lens):
     # explicit specialized produces the same bits as auto
     out2 = _out_like(inp)
     _api(inp, out2, backend="specialized")
+    assert torch.equal(out, out2)
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [
+        ([2] * 8, [2] * 8),  # tiny q2/kv2, B<=16: attn_tiny_async<BTW1=false>
+        ([2] * 64, [2] * 64),  # tiny q2/kv2, large B, BTW1=false
+        ([3] * 4, [3] * 4),  # q3 route
+        ([4] * 4, [4] * 4),  # q4 route
+        ([6] * 4, [6] * 4),  # q6 route
+        ([8] * 4, [8] * 4),  # q8 route
+        ([2, 1, 1, 1], [100, 1, 1, 1]),  # ragged deep-context causal row
+        ([1], [3]),  # tiny-cap route
+        ([128], [128]),  # B=1 q128 (attn_split; table width immaterial but covered)
+        ([128] * 7, [128] * 7),  # B>1 uniform q128, wide table: attn_fast U128
+        ([128] * 10, [128] * 10),  # B>1 uniform q128, wide table: generic U128
+        ([128] * 15, [128] * 15),  # census-row B15 q128 in the serving form
+    ],
+)
+def test_specialized_wide_block_table(q_lens, kv_lens):
+    """Serving engines pass block tables as wide as the engine's maximum pages
+    per sequence, with arbitrary ids in the unused columns and non-contiguous
+    page placement.  That call form selects the BTW1=false tiny variants and
+    the wide-table U128 kernels (attn_fast / the generic U128 launch) that a
+    minimum-width contiguous table never reaches."""
+    inp = _make_inputs(q_lens, kv_lens, seed=29, btw_pad=7, shuffle_pages=True)
+    assert inp["bt"].shape[1] >= 8
+    gold = _reference(inp).float()
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = _out_like(inp)
+    _api(inp, out)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    diff = (out.float() - gold).abs()
+    tol = 0.005 + 0.05 * gold.abs()
+    assert float((diff <= tol).float().mean()) == 1.0
+    # the serving form must be bitwise repeatable too
+    out2 = _out_like(inp)
+    _api(inp, out2)
     assert torch.equal(out, out2)
 
 
