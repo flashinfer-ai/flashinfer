@@ -2467,10 +2467,11 @@ def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
 # float32 ``top_p`` tensor and ``is_deterministic=False`` are served by a thread-block-cluster
 # kernel (``flashinfer/_top_p_renorm_specialized.py``) for the exact (batch_size, vocab_size)
 # rows of ``flashinfer/top_p_renorm_probs_specialized_workloads.json``; every other call keeps
-# the AIR top-p path. Its kill-switch / fallback lines reach stderr only for calls on an SM103
-# device. The guard and marker tests use CPU tensors; the shape and fallback-line tests run on
-# every GPU (off SM103 they check that the call stays on the AIR path and off stderr); the
-# remaining tests need SM103.
+# the AIR top-p path. The calls it can never serve return before any counter or diagnostics; the
+# kill-switch / fallback lines of the others reach stderr only for calls on an SM103 device. The
+# guard and marker tests use CPU tensors (some reporting a fake CUDA device); the shape and
+# never-served-call tests run on every GPU (off SM103 they check that the call stays on the AIR
+# path and off stderr); the remaining tests need SM103.
 
 _TOP_P_SPECIALIZED_KILL_SWITCH = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 _TOP_P_SPECIALIZED_SHAPES = [
@@ -2742,6 +2743,7 @@ def test_top_p_renorm_probs_specialized_kill_switch_is_read_at_call_time(
 def test_top_p_renorm_probs_specialized_ineligible_call_returns_none(
     top_p_specialized_cpu_call, top_p_specialized_enabled
 ):
+    # A call the kernel can never serve (here: CPU tensors) is not counted.
     probs, top_p = top_p_specialized_cpu_call
     before = _top_p_specialized_stats()
     assert (
@@ -2749,11 +2751,9 @@ def test_top_p_renorm_probs_specialized_ineligible_call_returns_none(
         is None
     )
     after = _top_p_specialized_stats()
-    assert after["dispatch_count"] == before["dispatch_count"]
-    assert (
-        after["fallback_reasons"]["device"]
-        == before["fallback_reasons"].get("device", 0) + 1
-    )
+    for key in ("calls", "dispatch_count", "fallbacks"):
+        assert after[key] == before[key]
+    assert after["fallback_reasons"] == before["fallback_reasons"]
 
 
 class _TopPSpecializedLogRecorder:
@@ -2783,14 +2783,6 @@ def top_p_specialized_markers(monkeypatch):
     recorder = _TopPSpecializedLogRecorder()
     monkeypatch.setattr(_top_p_renorm_specialized, "logger", recorder)
     return recorder
-
-
-@pytest.fixture
-def top_p_specialized_on_target(monkeypatch):
-    """Report markers as for a call on a compute capability 10.3 device."""
-    monkeypatch.setattr(
-        _top_p_renorm_specialized, "_is_target_device", lambda device: True
-    )
 
 
 class _TopPSpecializedFakeCudaDevices:
@@ -2824,21 +2816,43 @@ class _TopPSpecializedFakeCudaDevices:
 
 
 class _TopPSpecializedFakeCudaTensor(torch.Tensor):
-    """A CPU tensor that reports a CUDA device, for the guard's device gates without a GPU."""
+    """A CPU tensor that reports a CUDA device, for the guard's device gates without a GPU (the
+    device is a class attribute, so tensors derived from it report it too)."""
+
+    _fake_device = torch.device("cuda", 0)
 
     @property
     def device(self):
         return self._fake_device
 
 
-def _top_p_specialized_fake_cuda_call(index):
-    batch_size, vocab_size = _TOP_P_SPECIALIZED_SHAPES[0]
-    probs = torch.rand(batch_size, vocab_size).as_subclass(
-        _TopPSpecializedFakeCudaTensor
+def _top_p_specialized_fake_cuda_call(index, shape=None):
+    batch_size, vocab_size = shape or _TOP_P_SPECIALIZED_SHAPES[0]
+    fake = type(
+        f"_TopPSpecializedFakeCuda{index}Tensor",
+        (_TopPSpecializedFakeCudaTensor,),
+        {"_fake_device": torch.device("cuda", index)},
     )
-    top_p = torch.full((batch_size,), 0.95).as_subclass(_TopPSpecializedFakeCudaTensor)
-    probs._fake_device = top_p._fake_device = torch.device("cuda", index)
+    probs = torch.rand(batch_size, vocab_size).as_subclass(fake)
+    top_p = torch.full((batch_size,), 0.95).as_subclass(fake)
     return probs, top_p
+
+
+@pytest.fixture
+def top_p_specialized_fake_devices(monkeypatch):
+    """Fake CUDA devices for fake-CUDA tensors: cuda:0 and cuda:2 of compute capability 10.3,
+    cuda:1 of 10.0, none capturing; fresh per-device caches."""
+    devices = _TopPSpecializedFakeCudaDevices(monkeypatch, current=0)
+    capabilities = {0: (10, 3), 1: (10, 0), 2: (10, 3)}
+    monkeypatch.setattr(
+        _top_p_renorm_specialized,
+        "get_compute_capability",
+        lambda device: capabilities[device.index],
+    )
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_supported", {})
+    monkeypatch.setattr(_top_p_renorm_specialized, "_launch_failed_devices", set())
+    return devices
 
 
 def test_top_p_renorm_probs_specialized_target_device_gate(monkeypatch):
@@ -2907,8 +2921,10 @@ def test_top_p_renorm_probs_specialized_fallback_lines_are_silent_off_target(
     monkeypatch,
     capsys,
 ):
-    # Off a compute capability 10.3 device (here: CPU tensors) nothing reaches stderr: each
-    # kill-switch / fallback line goes once to the flashinfer.jit logger at DEBUG level.
+    # Calls the kernel can never serve (here: CPU tensors, a scalar top_p), also with the kill
+    # switch set, write nothing at all. The only lines off a compute capability 10.3 device are
+    # those of calls whose arguments the first checks cannot read: once each, at DEBUG level on
+    # the flashinfer.jit logger, never on stderr.
     probs, top_p = top_p_specialized_cpu_call
     specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
     for _ in range(2):
@@ -2921,46 +2937,134 @@ def test_top_p_renorm_probs_specialized_fallback_lines_are_silent_off_target(
     assert capsys.readouterr().err == ""
     assert _top_p_renorm_specialized._markers_emitted == set()
     records = top_p_specialized_markers.records
-    assert [level for level, _ in records] == ["debug"] * 4
+    assert [level for level, _ in records] == ["debug"]
     marker = _top_p_renorm_specialized.FALLBACK_MARKER
-    lines = [line for _, line in records]
-    assert lines[0].startswith(f"{marker}: device (shape={tuple(probs.shape)}")
-    assert lines[1].startswith(f"{marker}: scalar_top_p")
-    assert lines[2].startswith(f"{marker}: guard_error")
-    assert lines[3] == _top_p_renorm_specialized.KILL_SWITCH_MARKER
+    assert records[0][1].startswith(f"{marker}: guard_error")
+
+
+def test_top_p_renorm_probs_specialized_never_served_calls_skip_the_guard(
+    top_p_specialized_enabled,
+    top_p_specialized_markers,
+    top_p_specialized_fake_devices,
+    monkeypatch,
+    capsys,
+):
+    # The calls the kernel can never serve (is_deterministic, a scalar top_p, other dtypes, a
+    # device other than compute capability 10.3, a shape off the allowlist) return before the
+    # environment, the counters and the diagnostics; all but the last also before the
+    # torch.compile check, which the allowlist check follows (dynamo would specialize the batch
+    # size on it). The capability is read once per device.
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+    probs, top_p = _top_p_specialized_fake_cuda_call(0)
+    other_probs, other_top_p = _top_p_specialized_fake_cuda_call(1)
+    vocab_size = probs.shape[1]
+    unlisted_batch = _top_p_specialized_unlisted_batch(vocab_size)
+    unlisted_probs, unlisted_top_p = _top_p_specialized_fake_cuda_call(
+        0, (unlisted_batch, vocab_size)
+    )
+    # the first call on each device that passes the device-independent checks records its
+    # capability (a scalar top_p does not get that far)
+    assert specialized(probs, 0.95, False) is None
+    assert _top_p_renorm_specialized._device_supported == {}
+    assert specialized(unlisted_probs, unlisted_top_p, False) is None
+    assert specialized(other_probs, other_top_p, False) is None
+    cpu_probs, cpu_top_p = torch.rand(probs.shape), torch.full((probs.shape[0],), 0.95)
+    assert specialized(cpu_probs, cpu_top_p, False) is None
+    assert _top_p_renorm_specialized._device_supported == {
+        torch.device("cuda", 0): True,
+        torch.device("cuda", 1): False,
+        torch.device("cpu"): False,
+    }
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("a call the kernel never serves reached the guard")
+
+    for name in (
+        "_reject_reason",
+        "_bump_fallback",
+        "_report_once",
+        "_emit_once",
+        "get_compute_capability",
+    ):
+        monkeypatch.setattr(_top_p_renorm_specialized, name, must_not_run)
+    compile_checks = []
+    monkeypatch.setattr(
+        torch.compiler, "is_compiling", lambda: bool(compile_checks.append(1))
+    )
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    before = _top_p_specialized_stats()
+    for args in [
+        (probs, top_p, True),
+        (probs, 0.95, False),
+        (probs.double(), top_p, False),
+        (probs, top_p.double(), False),
+        (probs.bfloat16(), top_p, False),
+        (other_probs, other_top_p, False),
+        (cpu_probs, cpu_top_p, False),
+    ]:
+        assert specialized(*args) is None
+    assert compile_checks == []
+    assert specialized(unlisted_probs, unlisted_top_p, False) is None
+    assert compile_checks == [1]
+    after = _top_p_specialized_stats()
+    for key in ("calls", "dispatch_count", "fallbacks"):
+        assert after[key] == before[key]
+    assert after["fallback_reasons"] == before["fallback_reasons"]
+    assert top_p_specialized_markers.records == []
+    assert capsys.readouterr().err == ""
+
+
+def test_top_p_renorm_probs_specialized_never_served_checks_trace_under_torch_compile(
+    top_p_specialized_cpu_call,
+):
+    # The first checks run before the torch.compile check, so dynamo traces them: no graph break
+    # (fullgraph), and a call it can never serve keeps the stock path.
+    probs, top_p = top_p_specialized_cpu_call
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+
+    def call(p, t):
+        out = specialized(p, t, False)
+        return p * 2 if out is None else out
+
+    compiled = torch.compile(call, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(compiled(probs, top_p), probs * 2)
+    torch.testing.assert_close(compiled(probs[:3], top_p[:3]), probs[:3] * 2)
 
 
 def test_top_p_renorm_probs_specialized_fallback_reason_is_written_once(
-    top_p_specialized_cpu_call,
     top_p_specialized_enabled,
     top_p_specialized_markers,
-    top_p_specialized_on_target,
+    top_p_specialized_fake_devices,
     capsys,
 ):
-    # On a compute capability 10.3 device the first fallback of each reason is one stderr line
-    # (whatever the host's logging configuration), later ones are silent.
-    probs, top_p = top_p_specialized_cpu_call
+    # On a compute capability 10.3 device the first fallback of each reason of a call the kernel
+    # would serve is one stderr line (whatever the host's logging configuration), later ones are
+    # silent.
+    probs, top_p = _top_p_specialized_fake_cuda_call(0)
+    strided = probs.t().contiguous().t()
     specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
-    assert specialized(probs, top_p, False) is None
-    assert specialized(probs, top_p, False) is None
-    assert specialized(probs, 0.95, False) is None
+    assert specialized(strided, top_p, False) is None
+    assert specialized(strided, top_p, False) is None
+    assert specialized(probs, top_p[1:], False) is None
     marker = _top_p_renorm_specialized.FALLBACK_MARKER
     lines = [line for line in capsys.readouterr().err.splitlines() if marker in line]
     assert len(lines) == 2
-    assert lines[0].startswith(f"{marker}: device (shape={tuple(probs.shape)}")
-    assert lines[1].startswith(f"{marker}: scalar_top_p")
+    assert lines[0].startswith(
+        f"{marker}: non_contiguous (shape={tuple(probs.shape)}, dtype=torch.float32, "
+        "device=cuda:0"
+    )
+    assert lines[1].startswith(f"{marker}: shape")
     assert top_p_specialized_markers.records == [("info", line) for line in lines]
 
 
 def test_top_p_renorm_probs_specialized_kill_switch_marker_is_written_once(
-    top_p_specialized_cpu_call,
     top_p_specialized_markers,
-    top_p_specialized_on_target,
+    top_p_specialized_fake_devices,
     monkeypatch,
     capsys,
 ):
     monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
-    probs, top_p = top_p_specialized_cpu_call
+    probs, top_p = _top_p_specialized_fake_cuda_call(0)
     _top_p_renorm_specialized.top_p_renorm_probs_specialized(probs, top_p, False)
     _top_p_renorm_specialized.top_p_renorm_probs_specialized(probs, top_p, False)
     err = capsys.readouterr().err
@@ -2981,44 +3085,38 @@ def top_p_specialized_missing_allowlist(monkeypatch):
     assert _top_p_renorm_specialized._allowlist_error is None
 
 
-@pytest.mark.parametrize("on_target", [False, True])
+@pytest.mark.parametrize("device_index", [0, 1])
 def test_top_p_renorm_probs_specialized_missing_allowlist_is_reported(
-    on_target,
-    top_p_specialized_cpu_call,
+    device_index,
     top_p_specialized_enabled,
     top_p_specialized_markers,
+    top_p_specialized_fake_devices,
     top_p_specialized_missing_allowlist,
-    monkeypatch,
     capsys,
 ):
-    # Without its allowlist the path falls back on every call; the load error is reported with
-    # the first fallback: stderr on a compute capability 10.3 device, DEBUG level elsewhere.
-    if on_target:
-        monkeypatch.setattr(
-            _top_p_renorm_specialized, "_is_target_device", lambda device: True
-        )
-    probs, top_p = top_p_specialized_cpu_call
+    # Without its allowlist no call is served; the load error is reported once, on stderr (after
+    # a warning), by the first call the kernel would otherwise serve: a call on a compute
+    # capability 10.3 device (cuda:0). A call on another device (cuda:1) never reads the
+    # allowlist and writes nothing.
+    probs, top_p = _top_p_specialized_fake_cuda_call(device_index)
     specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
     assert specialized(probs, top_p, False) is None
     assert specialized(probs, top_p, False) is None
     assert _top_p_specialized_stats()["allowlist_error"].startswith("FileNotFoundError")
     marker = _top_p_renorm_specialized.FALLBACK_MARKER
-    expected = [
-        f"{marker}: allowlist_unavailable (FileNotFoundError",
-        f"{marker}: shape_not_allowlisted (shape={tuple(probs.shape)}",
-    ]
     err = capsys.readouterr().err
     records = top_p_specialized_markers.records
-    if on_target:
+    if device_index == 0:
         lines = [line for line in err.splitlines() if marker in line]
-        assert [level for level, _ in records] == ["warning", "info", "info"]
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            f"{marker}: allowlist_unavailable (FileNotFoundError"
+        )
+        assert [level for level, _ in records] == ["warning", "info"]
         assert "allowlist unavailable (FileNotFoundError" in records[0][1]
     else:
         assert err == ""
-        assert [level for level, _ in records] == ["debug", "debug"]
-        lines = [line for _, line in records]
-    assert len(lines) == 2
-    assert lines[0].startswith(expected[0]) and lines[1].startswith(expected[1])
+        assert records == []
 
 
 def test_top_p_renorm_probs_specialized_guard_exception_keeps_the_stock_path(
@@ -3065,24 +3163,24 @@ def test_top_p_renorm_probs_specialized_launch_plan_mirror():
     assert plan(4, 32000) == (8, 256, 6, 8, True)
 
 
-def test_top_p_renorm_probs_specialized_fallback_line_only_on_sm103(
+def test_top_p_renorm_probs_specialized_never_served_calls_are_silent(
     top_p_specialized_enabled, top_p_specialized_markers, capsys
 ):
-    # A call the kernel does not serve (scalar top_p) writes its fallback line to stderr on
-    # SM103 only; any other GPU logs it at DEBUG level and writes nothing to stderr.
+    # Calls the kernel never serves (a scalar top_p, a shape off the allowlist, bfloat16 rows)
+    # take the AIR path on every GPU without a counter, a marker or a log line.
     probs = torch.rand(4, 1024, device="cuda:0")
     probs = probs / probs.sum(dim=-1, keepdim=True)
-    flashinfer.sampling.top_p_renorm_probs(probs, 0.95)
-    flashinfer.sampling.top_p_renorm_probs(probs, 0.95)
-    marker = _top_p_renorm_specialized.FALLBACK_MARKER
-    err = capsys.readouterr().err
-    lines = [line for line in err.splitlines() if marker in line]
-    assert len(lines) == int(_is_sm103())
-    assert all(
-        line.startswith(f"{marker}: scalar_top_p (shape=(4, 1024)") for line in lines
-    )
-    levels = [level for level, _ in top_p_specialized_markers.records]
-    assert levels == (["info"] if _is_sm103() else ["debug"])
+    top_p = torch.full((4,), 0.95, device="cuda:0")
+    before = _top_p_specialized_stats()
+    for _ in range(2):
+        flashinfer.sampling.top_p_renorm_probs(probs, 0.95)
+        flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        flashinfer.sampling.top_p_renorm_probs(probs.bfloat16(), top_p)
+    after = _top_p_specialized_stats()
+    for key in ("calls", "dispatch_count", "fallbacks"):
+        assert after[key] == before[key]
+    assert _top_p_renorm_specialized.FALLBACK_MARKER not in capsys.readouterr().err
+    assert top_p_specialized_markers.records == []
 
 
 @pytest.mark.parametrize("batch_size,vocab_size", _TOP_P_SPECIALIZED_SHAPES)

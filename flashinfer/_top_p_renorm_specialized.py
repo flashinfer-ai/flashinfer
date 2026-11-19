@@ -33,16 +33,22 @@ on a summation order; AIR sums in float32 in an order that depends on its launch
 mass lies within that rounding of the target (e.g. float32 ``[0.5, 0.3, 0.2]`` at ``top_p=0.5``,
 whose exact mass is ``1 + 2**-26``) the two can keep different entries.
 
-The decision is made at call time, in this order (semantics, then shape/layout, device last, so
-the correctness gates are exercisable without a GPU):
+The decision is made at call time. The calls the kernel can never serve return ``None`` first,
+before the compile check, the environment, any counter or any diagnostics, so the stock path's
+host cost is unchanged for them: ``is_deterministic=True``, a scalar ``top_p``, non-float32
+inputs, a device other than a CUDA device of compute capability exactly 10.3 (a flag cached per
+device on its first call) and, after the ``torch.compile`` check below, a ``(batch_size,
+vocab_size)`` off the allowlist (checked after it because under dynamo tracing that check would
+specialize the batch size: one recompile per batch size). These calls are not counted and write
+nothing. The other calls are checked in this order (semantics, then shape/layout, device last, so
+the correctness gates are exercisable without a GPU; :func:`_reject_reason` repeats the checks
+above):
 
 - inside ``torch.compile`` tracing the stock (registered custom op) path is kept, and nothing
   else of this module is traced;
 - ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the stock path (read on every call);
-- ``is_deterministic=True``, a scalar ``top_p`` or non-float32 inputs take the stock path;
-- 2-D ``probs`` / 1-D ``top_p`` of matching length, both contiguous, an allowlisted
-  ``(batch_size, vocab_size)``, 16-byte aligned ``probs``;
-- CUDA tensors on one device of compute capability exactly 10.3;
+- 2-D ``probs`` / 1-D ``top_p`` of matching length, both contiguous, 16-byte aligned ``probs``;
+- ``top_p`` on the device of ``probs``;
 - never built inside a CUDA-graph capture: a capture before the first eager dispatch takes the
   (capture-safe) stock path. The capture state is read for the current stream of ``probs``'s
   device (the stream the kernel launches on), not of the current device, which may differ.
@@ -54,15 +60,17 @@ disables the kernel on that device for the process) and is reported by
 :func:`_top_p_renorm_probs_specialized_stats`.
 
 Markers, once per process each: :data:`DISPATCH_MARKER` on the first specialized dispatch,
-:data:`KILL_SWITCH_MARKER` on the first kill-switched call, and
-``<FALLBACK_MARKER>: <reason> (<context>)`` on the first fallback for each reason (shape, device
-capability, build or launch error), so a silent non-dispatch is visible in serving logs. They are
-written directly to ``sys.stderr`` (serving frameworks may route or drop library loggers) and to
-the ``flashinfer.jit`` logger only for calls whose ``probs`` live on a compute capability 10.3
-device (the dispatch marker always does). Calls on any other device write nothing to stderr: their
-kill-switch and fallback lines go once each to the ``flashinfer.jit`` logger at DEBUG level. The
-capability comes from a per-device cache that is never filled inside a CUDA-graph capture (a
-device not seen before the capture counts as another device).
+:data:`KILL_SWITCH_MARKER` on the first kill-switched call the kernel would have served, and
+``<FALLBACK_MARKER>: <reason> (<context>)`` on the first fallback for each reason of such a call
+(layout, alignment, capture before the build, build or launch error, an unavailable allowlist),
+so a silent non-dispatch of a served shape is visible in serving logs. They are written directly
+to ``sys.stderr`` (serving frameworks may route or drop library loggers) and to the
+``flashinfer.jit`` logger only for calls whose ``probs`` live on a compute capability 10.3 device
+(the dispatch marker always does). Calls on any other device write nothing to stderr: the lines
+of the few that reach the full guard (one whose arguments the first checks cannot read) go once
+each to the ``flashinfer.jit`` logger at DEBUG level. That gate's capability comes from a
+per-device cache that it never fills inside a CUDA-graph capture (a device not seen before the
+capture counts as another device).
 """
 
 import functools
@@ -136,6 +144,9 @@ _markers_logged_debug: Set[str] = set()
 # Compute capability per CUDA device index, recorded by the guard and by the marker gate; the
 # marker gate never queries a device inside a CUDA-graph capture.
 _device_capability: Dict[int, Tuple[int, int]] = {}
+# Whether the kernel can run on a device (CUDA, compute capability 10.3), per ``torch.device``:
+# recorded on the first call on that device, read before any other work of the call.
+_device_supported: Dict[torch.device, bool] = {}
 # Error of a failed allowlist load (every call then falls back as ``shape_not_allowlisted``);
 # reported with the first such fallback.
 _allowlist_error: Optional[str] = None
@@ -323,19 +334,36 @@ def _bump_fallback(reason: str, probs: Any) -> None:
     if reason == "kill_switch":
         _report_once("kill_switch", lambda: KILL_SWITCH_MARKER, device)
         return
-    error = _allowlist_error
-    if reason == "shape_not_allowlisted" and error is not None:
-        _report_once(
-            "allowlist",
-            lambda: f"{FALLBACK_MARKER}: allowlist_unavailable ({error})",
-            device,
-            warning="top_p_renorm_probs: specialized kernel allowlist unavailable "
-            f"({error}); using the AIR top-p path",
-        )
     _report_once(
         f"fallback:{reason}",
         lambda: f"{FALLBACK_MARKER}: {reason} ({_fallback_context(reason, probs)})",
         device,
+    )
+
+
+def _probe_device(device: torch.device) -> bool:
+    """Record whether the kernel can run on ``device`` (first call on it); never raises."""
+    supported = False
+    try:
+        if device.type == "cuda" and device.index is not None:
+            capability = get_compute_capability(device)
+            _device_capability[device.index] = capability
+            supported = capability == _COMPUTE_CAPABILITY
+    except Exception:  # noqa: BLE001 - an unreadable device keeps the stock path
+        supported = False
+    _device_supported[device] = supported
+    return supported
+
+
+def _report_allowlist_unavailable(probs: torch.Tensor) -> None:
+    """Once per process: the allowlist failed to load, so no call is served."""
+    error = _allowlist_error
+    _report_once(
+        "allowlist",
+        lambda: f"{FALLBACK_MARKER}: allowlist_unavailable ({error})",
+        probs.device,
+        warning="top_p_renorm_probs: specialized kernel allowlist unavailable "
+        f"({error}); using the AIR top-p path",
     )
 
 
@@ -347,9 +375,37 @@ def top_p_renorm_probs_specialized(
     """Renormalised probabilities from the specialized kernel, or ``None`` when the call must
     take the stock path (any guard fails, the module cannot be built, or the launch is
     rejected). Never raises for an ineligible call."""
-    # Under torch.compile (dynamo) tracing keep the registered custom op of the stock path: this
-    # check folds to a constant, so none of the host-side dispatch below is traced.
-    if torch.compiler.is_compiling():
+    # The calls the kernel can never serve return here, before the compile check, the
+    # environment, the counters and the diagnostics below, so that the stock path's host cost is
+    # unchanged for them (a few attribute reads and one dict lookup).
+    try:
+        if (
+            is_deterministic
+            or not isinstance(top_p, torch.Tensor)
+            or probs.dtype is not torch.float32
+            or top_p.dtype is not torch.float32
+        ):
+            return None
+        supported = _device_supported.get(probs.device)
+        if supported is None:  # the first call on this device
+            if torch.compiler.is_compiling():
+                return None
+            supported = _probe_device(probs.device)
+        if not supported:
+            return None
+        # Under torch.compile (dynamo) tracing keep the registered custom op of the stock path:
+        # this check folds to a constant, so none of the host-side dispatch below is traced. It
+        # precedes the allowlist check, which dynamo would specialize the batch size on.
+        if torch.compiler.is_compiling():
+            return None
+        listed = probs.shape in _load_allowlist()
+    except Exception:  # noqa: BLE001 - arguments these checks cannot read: the guard reports them
+        if torch.compiler.is_compiling():
+            return None
+        listed = True
+    if not listed:
+        if _allowlist_error is not None:
+            _report_allowlist_unavailable(probs)
         return None
     _stats["calls"] += 1
     try:
@@ -418,6 +474,10 @@ def _plan_config(batch_size: int, vocab_size: int) -> Tuple[int, int, int, int, 
 
 def _top_p_renorm_probs_specialized_stats() -> Dict[str, Any]:
     """Diagnostics: dispatch counters, JIT state and the compile footprint.
+
+    ``calls`` and the fallback counters cover the calls that pass the first checks (float32
+    inputs, a ``top_p`` tensor, ``is_deterministic=False``, a compute capability 10.3 device, an
+    allowlisted shape); the calls the kernel can never serve return before any counter.
 
     One JIT module (``compiled_variants`` is 0 or 1) holds every kernel instantiation the host
     plan can pick; batch size and vocabulary size are runtime launch arguments, so no call shape
