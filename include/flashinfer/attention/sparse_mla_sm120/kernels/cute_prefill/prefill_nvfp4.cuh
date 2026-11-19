@@ -490,44 +490,50 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     Barrier::arrive(sm.mbar_vt_empty(vt_slot));
     vt_ready_phase[vt_slot] ^= 1;
 
-    const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
+    {
+      using namespace cute;
+      using Bf16 = cute::bfloat16_t;
+      const auto mma = make_tiled_mma(RopeMma{});
+      const auto thr_mma = mma.get_slice(lane);
+      const auto copy_p = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, Bf16>{}, mma);
+      const auto copy_v = make_tiled_copy_B(Copy_Atom<UniversalCopy<Bf16>, Bf16>{}, mma);
+      const auto thr_copy_p = copy_p.get_slice(lane);
+      const auto thr_copy_v = copy_v.get_slice(lane);
+
+      // A=(head, candidate, head group), B=(feature, candidate),
+      // C=(head, feature). V stays candidate-major in the raw KV slot.
+      auto sP = recast<Bf16>(make_tensor(
+          make_smem_ptr(sm.p_full(0)),
+          make_layout(Shape<_16, Int<STREAMING_CAND_WINDOW>, Int<VALID_HEAD_GROUPS>>{},
+                      Stride<Int<STREAMING_P_STRIDE>, _1, Int<HPB * STREAMING_P_STRIDE>>{})));
+      auto sV = recast<Bf16>(make_tensor(
+          make_smem_ptr(sm_kv_rope), make_layout(Shape<Int<D_ROPE>, Int<STREAMING_CAND_WINDOW>>{},
+                                                 Stride<_1, Int<D_ROPE>>{})));
+      auto sVWarp = local_tile(sV, Shape<Int<ROPE_DIMS_PER_WARP>, Int<STREAMING_CAND_WINDOW>>{},
+                               make_coord(warp_id, _0{}));
+      auto tPsP = thr_copy_p.partition_S(sP);
+      auto tVsV = thr_copy_v.partition_S(sVWarp);
+
+      // Allocate one K=16 fragment per head group so the same V fragment
+      // can feed all groups before advancing to the next candidate tile.
+      auto p_shape = shape(thr_mma.partition_A(make_identity_tensor(Shape<_16, _16>{})));
+      auto tPrP = make_tensor<Bf16>(append(p_shape, Int<VALID_HEAD_GROUPS>{}));
+      auto tVrV =
+          thr_mma.partition_fragment_B(make_identity_tensor(Shape<Int<ROPE_DIMS_PER_WARP>, _16>{}));
+      auto tPrP_copy = thr_copy_p.retile_D(tPrP);
+      auto tVrV_copy = thr_copy_v.retile_D(tVrV);
+      auto c_shape =
+          shape(thr_mma.partition_C(make_identity_tensor(Shape<_16, Int<ROPE_DIMS_PER_WARP>>{})));
+      auto tOrO =
+          make_tensor(&acc_rope[0][0][0], make_layout(append(c_shape, Int<VALID_HEAD_GROUPS>{})));
+
 #pragma unroll
-    for (int ks = 0; ks < ROPE_K_ITERS; ++ks) {
-      auto rA = cute::make_tensor<uint32_t>(
-          cute::make_layout(cute::make_shape(cute::_4{}, cute::Int<STREAMING_HEAD_GROUPS>{})));
-#pragma unroll
-      for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-        auto rAg = rA(cute::_, group);
-        auto sP = cute::make_tensor(
-            cute::make_smem_ptr(sm.p_full(group) + ks * 16),
-            cute::Layout<cute::Shape<cute::_16, cute::_16>,
-                         cute::Stride<cute::Int<STREAMING_P_STRIDE>, cute::_1>>{});
-        copy_mma_operand<uint16_t, 8>(copy_rope_a, cute::recast<uint16_t>(sP), rAg, lane);
-      }
-#pragma unroll
-      for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
-        const int n_col = rope_dim_base + nt * 8;
-        const int k_base = ks * 16;
-        const int ent0 = k_base + tid * 2;
-        const int ent1 = ent0 + 1;
-        const int ent8 = ent0 + 8;
-        const int ent9 = ent0 + 9;
-        const int col = n_col + gid;
-        const uint16_t v0 =
-            *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent0 * D_ROPE + col);
-        const uint16_t v1 =
-            *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent1 * D_ROPE + col);
-        const uint16_t v8 =
-            *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent8 * D_ROPE + col);
-        const uint16_t v9 =
-            *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent9 * D_ROPE + col);
-        auto rB = cute::make_tensor<uint32_t>(cute::make_layout(cute::_2{}));
-        rB(0) = (uint32_t)v0 | ((uint32_t)v1 << 16);
-        rB(1) = (uint32_t)v8 | ((uint32_t)v9 << 16);
+      for (int k = 0; k < ROPE_K_ITERS; ++k) {
+        copy(copy_p, tPsP(_, _, k, _), tPrP_copy(_, _, _0{}, _));
+        copy(copy_v, tVsV(_, _, k), tVrV_copy(_, _, _0{}));
 #pragma unroll
         for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-          auto rC = cute::make_tensor(&acc_rope[group][nt][0], cute::make_layout(cute::_4{}));
-          cute::MMA_Atom<RopeMma>{}.call(rA(cute::_, group), rB, rC);
+          gemm(mma, tPrP(_, _, _, group), tVrV, tOrO(_, _, _, group));
         }
       }
     }
