@@ -529,6 +529,15 @@ struct SM120BlockScalingGemmKernel {
 
     sf_full_mbar[read_stage].wait(sf_phase);
     copy_scale_s2r(read_stage);
+    asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+        "fence.proxy.async.shared::cta;"
+#endif
+        ::
+            : "memory");
     sf_empty_mbar[read_stage].arrive();
 
     ab_full_mbar[read_stage].wait(ab_phase);
@@ -538,6 +547,15 @@ struct SM120BlockScalingGemmKernel {
       cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
         auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
         if (k_block == K_BLOCK_MAX - 1) {
+          asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+              "fence.proxy.async.shared::cta;"
+#endif
+              ::
+                  : "memory");
           ab_empty_mbar[read_stage].arrive();
           advance_read_stage();
           tXsA_stage = tXsA(_, _, _, read_stage);
@@ -550,6 +568,15 @@ struct SM120BlockScalingGemmKernel {
           rescale();
           sf_full_mbar[read_stage].wait(sf_phase);
           copy_scale_s2r(read_stage);
+          asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+              "fence.proxy.async.shared::cta;"
+#endif
+              ::
+                  : "memory");
           sf_empty_mbar[read_stage].arrive();
         }
       });
@@ -561,6 +588,15 @@ struct SM120BlockScalingGemmKernel {
         copy_ab_s2r(k_block_next);
       }
       if (k_block == K_BLOCK_MAX - 1) {
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         ab_empty_mbar[read_stage].arrive();
         if constexpr (KT::kUnionSmem) {
           cutlass::arch::NamedBarrier::sync(KT::MMAConfig::kNumMathThreads, 0);

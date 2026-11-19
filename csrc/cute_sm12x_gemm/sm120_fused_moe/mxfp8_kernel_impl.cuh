@@ -495,6 +495,15 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
         cute::copy(s2r_copy_SFA, tXsSFA_up(_, _, _, Int<0>{}), tXrSFA_up);
         cute::copy(s2r_copy_SFA, tXsSFA_gate(_, _, _, Int<0>{}), tXrSFA_gate);
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         sf_empty_mbar[0].arrive();
         sf_phase ^= 1;
       } else {
@@ -502,6 +511,15 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
         cute::copy(s2r_copy_SFA, tXsSFA_up(_, _, _, sf_read_stage), tXrSFA_up);
         cute::copy(s2r_copy_SFA, tXsSFA_gate(_, _, _, sf_read_stage), tXrSFA_gate);
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, sf_read_stage), tXrSFB);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         sf_empty_mbar[sf_read_stage].arrive();
         sf_read_stage = (sf_read_stage + 1) % KT::SFConfig::SF_Stages;
         sf_phase ^= uint32_t(sf_read_stage == 0);
@@ -514,30 +532,36 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
 
     int32_t sf_pack_count = num_sf_cycles * KT::SFConfig::SF_Stages;
     for (int32_t sf_pack_idx = 0; sf_pack_idx < sf_pack_count - 1; ++sf_pack_idx) {
-      cute::for_each(
-          cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{}, [&](auto k_in_sf) {
-            cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-              constexpr int k_block_idx = decltype(k_block)::value;
-              if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
-                copy_ab_s2r(Int<k_block_idx + 1>{});
-              } else {
-                ab_empty_mbar[ab_read_stage].arrive();
-                advance_ab_read_stage();
-                ab_full_mbar[ab_read_stage].wait(ab_phase);
-                copy_ab_s2r(Int<0>{});
-              }
-              cute::gemm(
-                  mma,
-                  make_zip_tensor(tCrA_up(_, _, k_block), tCrSFA_up_frg(_, _, k_block, k_in_sf)),
-                  make_zip_tensor(tCrB(_, _, k_block), tCrSFB_frg(_, _, k_block, k_in_sf)),
-                  accum_up);
-              cute::gemm(mma,
-                         make_zip_tensor(tCrA_gate(_, _, k_block),
-                                         tCrSFA_gate_frg(_, _, k_block, k_in_sf)),
-                         make_zip_tensor(tCrB(_, _, k_block), tCrSFB_frg(_, _, k_block, k_in_sf)),
-                         accum_gate);
-            });
-          });
+      cute::for_each(cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{}, [&](auto
+                                                                                          k_in_sf) {
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+          constexpr int k_block_idx = decltype(k_block)::value;
+          if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
+            copy_ab_s2r(Int<k_block_idx + 1>{});
+          } else {
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                    "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
+            ab_empty_mbar[ab_read_stage].arrive();
+            advance_ab_read_stage();
+            ab_full_mbar[ab_read_stage].wait(ab_phase);
+            copy_ab_s2r(Int<0>{});
+          }
+          cute::gemm(
+              mma, make_zip_tensor(tCrA_up(_, _, k_block), tCrSFA_up_frg(_, _, k_block, k_in_sf)),
+              make_zip_tensor(tCrB(_, _, k_block), tCrSFB_frg(_, _, k_block, k_in_sf)), accum_up);
+          cute::gemm(
+              mma,
+              make_zip_tensor(tCrA_gate(_, _, k_block), tCrSFA_gate_frg(_, _, k_block, k_in_sf)),
+              make_zip_tensor(tCrB(_, _, k_block), tCrSFB_frg(_, _, k_block, k_in_sf)), accum_gate);
+        });
+      });
 
       copy_sf_s2r();
     }
@@ -550,6 +574,15 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
         if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
           copy_ab_s2r(Int<k_block_idx + 1>{});
         } else {
+          asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+              "fence.proxy.async.shared::cta;"
+#endif
+              ::
+                  : "memory");
           ab_empty_mbar[ab_read_stage].arrive();
           advance_ab_read_stage();
           if constexpr (!is_last_k_tile) {
@@ -668,6 +701,15 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
         cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
         cute::copy(s2r_copy_SFB, tXsSFB_up(_, _, _, Int<0>{}), tXrSFB_up);
         cute::copy(s2r_copy_SFB, tXsSFB_gate(_, _, _, Int<0>{}), tXrSFB_gate);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         sf_empty_mbar[0].arrive();
         sf_phase ^= 1;
       } else {
@@ -675,6 +717,15 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
         cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, sf_read_stage), tXrSFA);
         cute::copy(s2r_copy_SFB, tXsSFB_up(_, _, _, sf_read_stage), tXrSFB_up);
         cute::copy(s2r_copy_SFB, tXsSFB_gate(_, _, _, sf_read_stage), tXrSFB_gate);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         sf_empty_mbar[sf_read_stage].arrive();
         sf_read_stage = (sf_read_stage + 1) % KT::SFConfig::SF_Stages;
         sf_phase ^= uint32_t(sf_read_stage == 0);
@@ -687,29 +738,36 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
 
     int32_t sf_pack_count = num_sf_cycles * KT::SFConfig::SF_Stages;
     for (int32_t sf_pack_idx = 0; sf_pack_idx < sf_pack_count - 1; ++sf_pack_idx) {
-      cute::for_each(
-          cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{}, [&](auto k_in_sf) {
-            cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-              constexpr int k_block_idx = decltype(k_block)::value;
-              if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
-                copy_ab_s2r(Int<k_block_idx + 1>{});
-              } else {
-                ab_empty_mbar[ab_read_stage].arrive();
-                advance_ab_read_stage();
-                ab_full_mbar[ab_read_stage].wait(ab_phase);
-                copy_ab_s2r(Int<0>{});
-              }
-              cute::gemm(
-                  mma, make_zip_tensor(tCrA(_, _, k_block), tCrSFA_frg(_, _, k_block, k_in_sf)),
-                  make_zip_tensor(tCrB_up(_, _, k_block), tCrSFB_up_frg(_, _, k_block, k_in_sf)),
-                  accum_up);
-              cute::gemm(mma,
-                         make_zip_tensor(tCrA(_, _, k_block), tCrSFA_frg(_, _, k_block, k_in_sf)),
-                         make_zip_tensor(tCrB_gate(_, _, k_block),
-                                         tCrSFB_gate_frg(_, _, k_block, k_in_sf)),
-                         accum_gate);
-            });
-          });
+      cute::for_each(cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{}, [&](auto
+                                                                                          k_in_sf) {
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+          constexpr int k_block_idx = decltype(k_block)::value;
+          if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
+            copy_ab_s2r(Int<k_block_idx + 1>{});
+          } else {
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                    "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
+            ab_empty_mbar[ab_read_stage].arrive();
+            advance_ab_read_stage();
+            ab_full_mbar[ab_read_stage].wait(ab_phase);
+            copy_ab_s2r(Int<0>{});
+          }
+          cute::gemm(mma, make_zip_tensor(tCrA(_, _, k_block), tCrSFA_frg(_, _, k_block, k_in_sf)),
+                     make_zip_tensor(tCrB_up(_, _, k_block), tCrSFB_up_frg(_, _, k_block, k_in_sf)),
+                     accum_up);
+          cute::gemm(
+              mma, make_zip_tensor(tCrA(_, _, k_block), tCrSFA_frg(_, _, k_block, k_in_sf)),
+              make_zip_tensor(tCrB_gate(_, _, k_block), tCrSFB_gate_frg(_, _, k_block, k_in_sf)),
+              accum_gate);
+        });
+      });
 
       copy_sf_s2r();
     }
@@ -722,6 +780,15 @@ struct SM120BlockScaledFusedMoeGemmKernel : SM120BlockScaledGemmKernel<KT> {
         if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
           copy_ab_s2r(Int<k_block_idx + 1>{});
         } else {
+          asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+              "fence.proxy.async.shared::cta;"
+#endif
+              ::
+                  : "memory");
           ab_empty_mbar[ab_read_stage].arrive();
           advance_ab_read_stage();
           if constexpr (!is_last_k_tile) {
