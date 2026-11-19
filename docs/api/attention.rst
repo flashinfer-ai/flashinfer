@@ -290,7 +290,6 @@ row computes when an unvalidated list breaks it) is in
 
     plan
     SparseMLAPlan
-    clear_plans
 
 .. currentmodule:: flashinfer.mla
 
