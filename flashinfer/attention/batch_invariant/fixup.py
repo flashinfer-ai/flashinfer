@@ -1,9 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Split-KV fixup: fold the chunk partials of a row in chunk order with the spec's ``merge`` from the
-init state ``(-inf, +0, +0)`` and apply the epilogue (``cvt_bf16(add(mul(O, div(1, l)), +0))``; under attention sinks the
-sink step on the folded ``(m, l)`` first (``lse.row_normaliser``): the partials carry no sink, the fold takes the step once
-per row; when asked, the LSE member, stored once per row by the thread of output column 0): the
+init state ``(-inf, +0, +0)`` and apply the epilogue (``cvt_bf16(add(mul(O, div(1, l)), +0))``; in a kernel compiled for attention
+sinks the sink step on the folded ``(m, l)`` first (``lse.row_normaliser``): the partials carry no sink, the fold takes the step
+once per row; when asked, the LSE member, stored once per row by the thread of output column 0): the
 ``chunk`` fold digit of the class, ONE implementation (``fold_row``) executed either by the fixup kernel
 (one thread per (row, 4 output columns), a second graph node) or in-kernel by the correction warpgroup of
 the unit that completes a group (the "last arriver": ``blocks/correction.py``, a placement chosen by the
@@ -197,7 +197,7 @@ def fold_row(
     mLse: cute.Tensor,
     mSink: cute.Tensor,
     lse_mode: Int32,
-    sink_mode: Int32,
+    sinks: cutlass.Constexpr = False,
 ):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
     init state (``fold_row_state``, the single implementation), then the epilogue to the output row and, from the thread of
@@ -224,14 +224,14 @@ def fold_row(
         PF,
         WS,
     )
-    inv, m, l = row_normaliser(mSink, kv_head * g + r % g, m, l, c, sink_mode > 0)
+    inv, m, l = row_normaliser(mSink, kv_head * g + r % g, m, l, c, sinks)
     out_row = (q_base + token) * Hq + kv_head * g + r % g
     for e in cutlass.range_constexpr(VEC):
         mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
             CuteF32.mul(o[e], inv), Float32(0.0)
         ).to(mO.element_type)
     if (lse_mode > 0) & (d0 == 0):
-        store_lse(mLse, out_row, m, l, c, lse_mode, sink_mode > 0)
+        store_lse(mLse, out_row, m, l, c, lse_mode, sinks)
 
 
 WIDE_PF = 32  # the fixup kernel's batch of chunks loaded before their merges (the wide thread mapping below)
@@ -436,8 +436,9 @@ def fold_row_coop(
 
 
 class SplitKVFixup:
-    def __init__(self, D: int, g: int, pdl: bool = PDL):
+    def __init__(self, D: int, g: int, pdl: bool = PDL, sinks: bool = False):
         self.D, self.g, self.pdl = D, g, pdl
+        self.sinks = sinks  # the sink step after the fold: a kernel of its own
         self.C = chunk_len(D)
         self.WS = ws_row(D)
 
@@ -457,7 +458,6 @@ class SplitKVFixup:
         grid_y: Int32,
         max_rows: Int32,
         lse_mode: Int32,
-        sink_mode: Int32,
         stream,
     ):
         # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows (2 / 2 / 1 at D = 64 / 128 / 256),
@@ -475,7 +475,6 @@ class SplitKVFixup:
             Hq,
             num_groups,
             lse_mode,
-            sink_mode,
         ).launch(
             grid=[cute.ceil_div(max_rows, rows_per_block), grid_y, 1],
             block=[THREADS, 1, 1],
@@ -497,7 +496,6 @@ class SplitKVFixup:
         Hq: Int32,
         num_groups: Int32,
         lse_mode: Int32,
-        sink_mode: Int32,
     ):
         D, g, C = self.D, self.g, self.C
         tidx, _, _ = cute.arch.thread_idx()
@@ -515,12 +513,13 @@ class SplitKVFixup:
         is_scan_warp = (tidx % thr_per_row) < 32
         smem = cutlass.utils.SmemAllocator()
         sbuf = smem.allocate_tensor(
-            Float32, cute.make_layout((4, rows_per_block, COOP_NCB)), byte_alignment=16
+            Float32,
+            cute.make_layout((4 if self.sinks else 3, rows_per_block, COOP_NCB)),
+            byte_alignment=16,
         )
         sA1 = sbuf[0, ri, None]
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
-        sM = sbuf[3, ri, None]
         for grp in cutlass.range(grp0, num_groups, grid_y):
             rows = mGroups[(grp, G_ROWS)]
             # every thread of the block reaches the fold's barriers: a row past the group's rows folds a clamped (valid) row and stores nothing
@@ -569,21 +568,22 @@ class SplitKVFixup:
                 self.WS,
                 V,
             )
-            if sink_mode > 0:
+            if cutlass.const_expr(self.sinks):
                 # the sink step reads the row's maximum, which the scan warp alone holds
+                sM = sbuf[3, ri, None]
                 if tidx % thr_per_row == 0:
                     sM[0] = m
                 cute.arch.sync_threads()
                 m = sM[0]
             if live:
                 head = mGroups[(grp, G_KVHEAD)] * g + rr % g
-                inv, m, l = row_normaliser(mSink, head, m, l, c, sink_mode > 0)
+                inv, m, l = row_normaliser(mSink, head, m, l, c, self.sinks)
                 for e in cutlass.range_constexpr(V):
                     mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
                         CuteF32.mul(o[e], inv), Float32(0.0)
                     ).to(mO.element_type)
                 if (lse_mode > 0) & (tidx % thr_per_row == 0):
-                    store_lse(mLse, out_row, m, l, c, lse_mode, sink_mode > 0)
+                    store_lse(mLse, out_row, m, l, c, lse_mode, self.sinks)
             cute.arch.sync_threads()  # the block's smem rows are reused by the next group
 
 
@@ -593,8 +593,11 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int):
-    name = jit.sanitize_symbol_name(f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}")
+def get_fixup(D: int, g: int, sinks: bool = False):
+    """``sinks``: the kernel that takes the sink step after the fold (its own name)."""
+    name = jit.sanitize_symbol_name(
+        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("_sink" if sinks else "")
+    )
 
     def compile_fn():
         f32, i32, bf16 = cutlass.Float32, cutlass.Int32, cutlass.BFloat16
@@ -618,7 +621,7 @@ def get_fixup(D: int, g: int):
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            SplitKVFixup(D, g),
+            SplitKVFixup(D, g, sinks=sinks),
             ws_fake,
             o_fake,
             lse_fake,
@@ -631,7 +634,6 @@ def get_fixup(D: int, g: int):
             Int32(1),
             Int32(1),
             Int32(1),
-            Int32(0),
             Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",

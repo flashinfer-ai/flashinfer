@@ -74,7 +74,11 @@ class SwapsKernel:
         ragged: bool = False,
         cap: int = 0,
         pdl: bool = False,
+        sinks: bool = False,
     ):
+        self.sinks = (
+            sinks  # the sink step where a row is completed: a kernel of its own
+        )
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
@@ -100,10 +104,10 @@ class SwapsKernel:
         num_units: Int32,
         grid: Int32,
         lse_mode: Int32,
-        sink_mode: Int32,
         stream: cuda.CUstream,
     ):
         st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
+        st.sinks = self.sinks
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
@@ -137,7 +141,6 @@ class SwapsKernel:
             window_left,
             num_units,
             lse_mode,
-            sink_mode,
             st.qk_tiled_mma,
             st.pv_tiled_mma,
             st.q_smem_layout,
@@ -178,7 +181,6 @@ class SwapsKernel:
         window_left: Int32,
         num_units: Int32,
         lse_mode: Int32,
-        sink_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
         q_smem_layout: cute.ComposedLayout,
@@ -479,7 +481,6 @@ class SwapsKernel:
                     mLse,
                     mSink,
                     lse_mode,
-                    sink_mode,
                 )
                 fold_group(
                     st,
@@ -496,7 +497,6 @@ class SwapsKernel:
                     mLse,
                     mSink,
                     lse_mode,
-                    sink_mode,
                 )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()

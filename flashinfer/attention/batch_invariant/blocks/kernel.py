@@ -103,7 +103,11 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        sinks: bool = False,
     ):
+        self.sinks = (
+            sinks  # the sink step where a row is completed: a kernel of its own
+        )
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
             g,
@@ -139,7 +143,6 @@ class AttentionKernel:
         num_units: Int32,
         grid: Int32,
         lse_mode: Int32,
-        sink_mode: Int32,
         stream: cuda.CUstream,
     ):
         """``grid`` CTAs walk the ``num_units`` work units persistently (unit ``u`` on CTA ``u % grid``): a launch
@@ -156,6 +159,7 @@ class AttentionKernel:
             self.hw_rowmax,
             self.cap,
         )
+        st.sinks = self.sinks
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
         self.shared_storage = shared_storage_struct(st)
@@ -183,7 +187,6 @@ class AttentionKernel:
             window_left,
             num_units,
             lse_mode,
-            sink_mode,
             st.qk_tiled_mma,
             st.qks_tiled_mma,
             st.pv_tiled_mma,
@@ -229,7 +232,6 @@ class AttentionKernel:
         window_left: Int32,
         num_units: Int32,
         lse_mode: Int32,
-        sink_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         qks_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
@@ -671,7 +673,6 @@ class AttentionKernel:
                         mLse,
                         mSink,
                         lse_mode,
-                        sink_mode,
                     )
                     fold_group(
                         st,
@@ -688,7 +689,6 @@ class AttentionKernel:
                         mLse,
                         mSink,
                         lse_mode,
-                        sink_mode,
                     )
                     if mDesc[(ub, F_TILE_HI)] > mDesc[(ub, F_TILE_LO)]:
                         fold_group(
@@ -706,7 +706,6 @@ class AttentionKernel:
                             mLse,
                             mSink,
                             lse_mode,
-                            sink_mode,
                         )
             if cutlass.const_expr(not st.q2):
                 for u in range(bidx, num_units, grid_size):
@@ -740,7 +739,6 @@ class AttentionKernel:
                         mLse,
                         mSink,
                         lse_mode,
-                        sink_mode,
                     )
                     fold_group(
                         st,
@@ -757,7 +755,6 @@ class AttentionKernel:
                         mLse,
                         mSink,
                         lse_mode,
-                        sink_mode,
                     )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()

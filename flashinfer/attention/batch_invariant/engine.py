@@ -771,8 +771,9 @@ def _run_attention_validated(
     attention kernel as a programmatic dependent of the preceding kernel (None: the device's default, ``device_support_pdl``).
     ``lse_mode`` 1 / 2 stores the base-2 / base-e LSE member of every row into ``lse`` (contiguous fp32, ``total_q * Hq``
     elements); every kernel takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0.
-    ``sinks`` (validated fp32 ``(Hq,)``) switches the kernels' run-time ``sink_mode`` on: the row's final fold takes the sink
-    step; without it the launch and every bit are those of the class without sinks."""
+    ``sinks`` (validated fp32 ``(Hq,)``) selects the kernels compiled for the sink member (their own names): the fold that
+    completes a row takes the sink step. Without it the kernels, the launch and every bit are those of the class without
+    sinks."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -796,8 +797,8 @@ def _run_attention_validated(
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     lse_view = lse.view(-1) if lse_mode else planned.lse_unused
-    sink_mode = 0 if sinks is None else 1
-    sink_view = planned.lse_unused if sinks is None else sinks
+    with_sinks = sinks is not None
+    sink_view = sinks if with_sinks else planned.lse_unused
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
     sm = device_sm_count(q.device)
     grid = (
@@ -820,7 +821,7 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, with_sinks
         )
         kernel(
             q_view,
@@ -841,7 +842,6 @@ def _run_attention_validated(
             int(plan.num_units),
             int(grid),
             int(lse_mode),
-            int(sink_mode),
         )
     else:
         from .blocks.operands import arch_smem_cap as row_arch_smem_cap
@@ -856,7 +856,7 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap
+                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, with_sinks
             )
         else:
             kernel = get_compiled_attention(
@@ -869,6 +869,7 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
+                with_sinks,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -903,12 +904,11 @@ def _run_attention_validated(
             int(n_launch if n_launch is not None else plan.num_units),
             int(grid),
             int(lse_mode),
-            int(sink_mode),
         )
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(
+        get_fixup(D, g, with_sinks)(
             planned.ws,
             o_view,
             lse_view,
@@ -922,7 +922,6 @@ def _run_attention_validated(
             int(min(len(fx), MAX_GRID_Y)),
             int(max_rows),
             int(lse_mode),
-            int(sink_mode),
         )
     return out
 
