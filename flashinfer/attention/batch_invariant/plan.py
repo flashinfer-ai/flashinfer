@@ -676,7 +676,9 @@ class ArrayPlan:
     ``groups_array`` and ``fixup_array`` ``(groups, GROUP_FIELDS)`` -- ready to be copied to the device; ``desc`` / ``groups`` /
     ``fixup_groups`` / ``group_inkernel`` give ``Plan``'s lists."""
 
-    num_launch = None
+    num_launch: Optional[int] = (
+        None  # the pairs of the paired placement's table, set by the launch that builds it
+    )
 
     def __init__(
         self,
@@ -742,6 +744,33 @@ def build_decode_plan(
     window_left: int = -1,
     split_policy: str = "auto",
     sm_count: int = 204,
+    **kw,
+) -> "ArrayPlan":
+    """``build_array_plan`` for a decode batch: ``q_len`` query tokens per request, a request without keys a null request."""
+    kv_lens = np.asarray(kv_lens, dtype=np.int64)
+    return build_array_plan(
+        np.full(kv_lens.size, q_len, dtype=np.int64),
+        kv_lens,
+        Hq,
+        Hkv,
+        D,
+        window_left,
+        split_policy,
+        sm_count,
+        null_requests=True,
+        **kw,
+    )
+
+
+def build_array_plan(
+    q_lens: np.ndarray,
+    kv_lens: np.ndarray,
+    Hq: int,
+    Hkv: int,
+    D: int,
+    window_left: int = -1,
+    split_policy: str = "auto",
+    sm_count: int = 204,
     q_rows: int = 128,
     merge: str = "auto",
     small_swap: bool = False,
@@ -750,11 +779,12 @@ def build_decode_plan(
     grid_search: bool = True,
     unit_budget: int = 0,
     row_budget: int = -1,
+    null_requests: bool = False,
 ) -> ArrayPlan:
-    """``build_plan`` for a decode batch, computed over arrays: request ``b`` has ``q_len`` query tokens over ``kv_lens[b]`` keys
-    (0: a null request, no unit), ``qo_indptr[b] = b * q_len``. The tables and the grid are those of
-    ``build_plan(..., null_requests=True)`` with the same arguments, entry for entry (the planner a replan of every decode
-    step runs: its cost must not grow with a Python loop over the units)."""
+    """``build_plan`` computed over arrays: request ``b`` has ``q_lens[b]`` query tokens over ``kv_lens[b]`` keys and its packed
+    rows start at ``sum(q_lens[:b])``. The tables and the grid are those of ``build_plan`` with the same arguments, entry for
+    entry (the planner a replan before every replay of a captured graph runs: its cost must not grow with a Python loop over
+    the units). A request without query tokens gets no unit; under ``null_requests`` neither does one without keys."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -762,42 +792,44 @@ def build_decode_plan(
     tpt = q_rows // g
     T, C = TILE_KEYS, chunk_len(D)
     tpc = C // T
+    q_lens = np.asarray(q_lens, dtype=np.int64)
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
-    live = np.flatnonzero(kv_lens > 0)
-    kv = kv_lens[live]
-    assert not kv.size or int(kv.min()) >= q_len, (
-        f"a request of kv_len {int(kv.min()) if kv.size else 0} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
+    q_base = np.cumsum(q_lens) - q_lens
+    keep = q_lens > 0
+    if null_requests:
+        keep &= kv_lens > 0
+    live = np.flatnonzero(keep)
+    short = live[kv_lens[live] < q_lens[live]]
+    assert not short.size, (
+        f"request {int(short[0]) if short.size else 0}: kv_len < q_len (bottom-right causal needs kv_len >= q_len)"
     )
     # the Q tiles in the planner's order: request, first token, KV head
-    tok0 = np.arange(0, q_len, tpt, dtype=np.int64)
-    shape = (live.size, tok0.size, Hkv)
-    n_tiles = live.size * tok0.size * Hkv
-
-    def tiles(a: np.ndarray, axis: int) -> np.ndarray:
-        dims = [1, 1, 1]
-        dims[axis] = -1
-        return np.broadcast_to(a.reshape(dims), shape).reshape(-1)
-
-    def per_token(a: np.ndarray) -> np.ndarray:
-        return np.broadcast_to(a[:, :, None], shape).reshape(-1)
-
-    ntok = np.minimum(tpt, q_len - tok0)
-    p_first = kv[:, None] - q_len + tok0[None, :]
-    l_max = p_first + ntok[None, :]
+    tiles_r = -(-q_lens[live] // tpt)
+    req = np.repeat(np.arange(live.size), tiles_r)  # per (request, Q tile)
+    tok0 = (np.arange(req.size) - (np.cumsum(tiles_r) - tiles_r)[req]) * tpt
+    ntok = np.minimum(tpt, q_lens[live][req] - tok0)
+    p_first = kv_lens[live][req] - q_lens[live][req] + tok0
+    l_max = p_first + ntok
     lo_min = (
         np.maximum(0, p_first - window_left)
         if window_left >= 0
         else np.zeros_like(p_first)
     )
-    b_t, tok_t, h_t = (
-        tiles(live, 0),
-        tiles(tok0, 1),
-        tiles(np.arange(Hkv, dtype=np.int64), 2),
+    n_tiles = req.size * Hkv
+
+    def tiles(a: np.ndarray) -> np.ndarray:
+        return np.repeat(a, Hkv)
+
+    b_t, tok_t = tiles(live[req]), tiles(tok0)
+    h_t = np.tile(np.arange(Hkv, dtype=np.int64), req.size)
+    kv_t, qlen_t, qbase_t = (
+        tiles(kv_lens[live][req]),
+        tiles(q_lens[live][req]),
+        tiles(q_base[live][req]),
     )
-    kv_t = tiles(kv, 0)
-    rows_t = tiles(ntok, 1) * g
-    clo_t, chi_t = per_token(lo_min // C), per_token(-(-l_max // C))
-    tlo_t, thi_t = per_token(lo_min // T), per_token(-(-l_max // T))
+    rows_t = tiles(ntok) * g
+    clo_t, chi_t = tiles(lo_min // C), tiles(-(-l_max // C))
+    tlo_t, thi_t = tiles(lo_min // T), tiles(-(-l_max // T))
     n_t = chi_t - clo_t
     len_t = thi_t - tlo_t
     multi = n_t > 1
@@ -889,8 +921,8 @@ def build_decode_plan(
     groups[:, G_QTOK0] = tok_t[group_tiles]
     groups[:, G_KVHEAD] = h_t[group_tiles]
     groups[:, G_KVLEN] = kv_t[group_tiles]
-    groups[:, G_QLEN] = q_len
-    groups[:, G_QBASE] = b_t[group_tiles] * q_len
+    groups[:, G_QLEN] = qlen_t[group_tiles]
+    groups[:, G_QBASE] = qbase_t[group_tiles]
     groups[:, G_REQ] = b_t[group_tiles]
     base_t = np.zeros(n_tiles, dtype=np.int64)
     base_t[group_tiles] = g_base
@@ -915,10 +947,10 @@ def build_decode_plan(
         split_u, base_t[tile] + (chunk - clo_t[tile]) * rows_t[tile], 0
     )
     desc[:, F_KVLEN] = kv_t[tile]
-    desc[:, F_QLEN] = q_len
+    desc[:, F_QLEN] = qlen_t[tile]
     desc[:, F_TILE_LO] = tile_lo
     desc[:, F_TILE_HI] = tile_hi
-    desc[:, F_QBASE] = b_t[tile] * q_len
+    desc[:, F_QBASE] = qbase_t[tile]
     desc[:, F_GROUP] = np.where(split_u, grp_t[tile], -1)
     # longest first (stable), then the waves of the launch grid in alternating direction: build_plan's order
     if num_units:
@@ -931,3 +963,65 @@ def build_decode_plan(
     return ArrayPlan(
         desc, groups, inkernel, int(g_size.sum()), tpt, g, ws_row(D), plan_grid
     )
+
+
+def _empty_partner(units: np.ndarray) -> np.ndarray:
+    """The empty B of a unit alone in its pair: no rows, an empty tile range, no group."""
+    empty = units.copy()
+    empty[:, F_ROWS] = 0
+    empty[:, F_TILE_HI] = empty[:, F_TILE_LO]
+    empty[:, F_GROUP] = -1
+    return empty
+
+
+def lone_units_array(desc: np.ndarray) -> np.ndarray:
+    """The paired placement's table (rows ``2 u`` and ``2 u + 1`` of pair ``u``) with every unit of ``desc`` alone in its pair,
+    in ``desc``'s order: what the paired kernel walks when the batch is not worth pairing."""
+    table = np.empty((2 * desc.shape[0], DESC_FIELDS), dtype=np.int32)
+    table[0::2] = desc
+    table[1::2] = _empty_partner(desc)
+    return table
+
+
+def pair_units_array(desc: np.ndarray, grid: int = 0) -> np.ndarray:
+    """``engine.pair_units`` over arrays, row for row: two units pair when they share the request, the KV head, the chunk
+    range and the kind -- consecutive Q tiles in token order; an odd one out gets an empty B; the pairs longest first in
+    waves of ``grid`` of alternating direction."""
+    n = desc.shape[0]
+    if n == 0:
+        return np.empty((0, DESC_FIELDS), dtype=np.int32)
+    keys = [desc[:, f] for f in (F_MODE, F_CHUNK_HI, F_CHUNK_LO, F_KVHEAD, F_REQ)]
+    by_key = np.lexsort(keys)
+    new = np.zeros(n, dtype=bool)
+    new[0] = True
+    for key in keys:
+        new[1:] |= key[by_key][1:] != key[by_key][:-1]
+    # buckets in the order of their first unit, a bucket's units in token order
+    first = np.empty(n, dtype=np.int64)
+    first[by_key] = np.minimum.reduceat(by_key, np.flatnonzero(new))[np.cumsum(new) - 1]
+    bucket = first
+    order = np.lexsort((desc[:, F_QTOK0], first))
+    sorted_bucket = bucket[order]
+    start = np.flatnonzero(np.r_[True, sorted_bucket[1:] != sorted_bucket[:-1]])
+    run = np.cumsum(np.r_[True, sorted_bucket[1:] != sorted_bucket[:-1]]) - 1
+    is_a = (np.arange(n) - start[run]) % 2 == 0
+    a_pos = np.flatnonzero(is_a)
+    has_b = (a_pos + 1 < n) & ~is_a[np.minimum(a_pos + 1, n - 1)]
+    a = desc[order[a_pos]]
+    b = _empty_partner(a)
+    b[has_b] = desc[order[a_pos[has_b] + 1]]
+    length = np.maximum(
+        a[:, F_TILE_HI] - a[:, F_TILE_LO], b[:, F_TILE_HI] - b[:, F_TILE_LO]
+    )
+    rank = np.argsort(-length, kind="stable")
+    pairs = rank.size
+    waves = min(pairs, grid)
+    if waves > 0:
+        pos = np.arange(pairs)
+        begin = pos // waves * waves
+        back = begin + np.minimum(waves, pairs - begin) - 1 - (pos - begin)
+        rank = rank[np.where(pos // waves % 2 == 1, back, pos)]
+    table = np.empty((2 * pairs, DESC_FIELDS), dtype=np.int32)
+    table[0::2] = a[rank]
+    table[1::2] = b[rank]
+    return table
