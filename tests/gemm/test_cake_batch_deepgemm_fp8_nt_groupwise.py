@@ -1075,6 +1075,11 @@ def _require_domain():
     if sm_count not in DOMAIN_SERVING_CELLS:
         pytest.skip(f"no locality-domain cell is listed for {sm_count} SMs")
     table = cake_locality.sm_table(device)
+    if table is None and device in cake_locality._MEMORY_CLOCKS:
+        pytest.skip(
+            f"memory clock {cake_locality._MEMORY_CLOCKS[device]} (current, max "
+            "MHz) is below the full clock: the device routes nothing"
+        )
     assert table is not None, "the SM table probe failed on a dual-die SM107a GPU"
     assert sum(table.counts) == sm_count
     return device, table
@@ -1923,6 +1928,35 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
         out = no_table.launch()
         torch.cuda.synchronize()
         _assert_valid_rows_close(out, reference, masked_m)
+    # The memory clock check, probed again: below the full clock the device has
+    # no SM table and takes the whole program; at the full clock the route is
+    # the same as before.
+    routed = domain_serving_routed(
+        "sm_107a", device_sm_count(device), table.counts, *nk, groups
+    )
+    for clocks, routes in (((3186, 4752), False), ((4752, 4752), True)):
+        with monkeypatch.context() as patch:
+            patch.setattr(cake_locality, "_memory_clocks", lambda index, c=clocks: c)
+            cake_locality._forget()
+            try:
+                probed = cake_locality.sm_table(device)
+                assert (probed is not None) == routes
+                if routes:
+                    assert probed.counts == table.counts
+                    assert torch.equal(probed.entries, table.entries)
+                localized = localize_weights(b)
+                assert (localized is not b) == (routes and routed)
+                public = prepare_batch_deepgemm_fp8_nt_groupwise(
+                    a, homed, a_packed, b_packed, masked_m, expected_m
+                )
+                assert public.route == (
+                    DOMAIN_SERVING_ROUTE if routes and routed else _SERVING_ROUTE
+                )
+                out = public.launch()
+                torch.cuda.synchronize()
+                _assert_valid_rows_close(out, reference, masked_m)
+            finally:
+                cake_locality._forget()
     # Float32 scales on a device without a route chain still raise.
     if device_sm_count(torch.cuda.current_device()) not in (216,):
         with pytest.raises(ValueError, match="SMs"):

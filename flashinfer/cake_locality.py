@@ -34,6 +34,21 @@ FlashInfer JIT build of :data:`PROBE_SOURCE`, and caches only the outcomes that 
 later probe would repeat. Every condition it cannot meet gives ``None``, and a
 caller then takes its whole-GPU route.
 
+A twin gains from die-local memory reads only with the memory at its full clock.
+Some boards keep their memory at a lower clock under load (driver 620.43: 3186 of
+4752 MHz). There, for B=64 weights of (4096, 7168), the twin route took
+1.01-1.08x the time of the whole-GPU route at expected_m <= 64 and 0.92-0.95x at
+512 and 4096 while the whole-GPU route kept its CTA reserve; with the whole-GPU
+route on the full grid from expected_m 36 (212-SM devices), the twin took
+1.01-1.14x its time at every measured expected_m from 1 to 4096. At 4752 MHz the
+twin was faster at every measured expected_m than the reserved grid, and, with
+the full grid from expected_m 36, at expected_m <= 36. Neither the CUDA driver
+API version (cuDriverGetVersion) nor the CUDA memory-clock attribute tells the
+two apart, while NVML's current memory clock does. So :func:`sm_table` also
+reads that clock once per device, after its probe ran: below
+:data:`MEMORY_CLOCK_FRACTION` of the maximum, or when NVML cannot read it, the
+device has no table and routes nothing.
+
 :func:`split_empty` reserves one virtual address range and backs ``[0, cut)``
 with memory of die 0 and ``[cut, size)`` with memory of die 1. The allocation is
 in a registry keyed by its base pointer from allocation until its last tensor is
@@ -73,6 +88,7 @@ __all__ = [
     "EVEN_GAP",
     "LOCALITY_ARCH",
     "LOCALITY_CUDA",
+    "MEMORY_CLOCK_FRACTION",
     "PROBE_ATTEMPTS",
     "PROBE_SOURCE",
     "SM_TABLE_LENGTH",
@@ -112,6 +128,9 @@ LOCALITY_CUDA = (13, 5)
 PROBE_ATTEMPTS = 4
 # Two dies whose SM counts differ by at most this many SMs are "even".
 EVEN_GAP = 4
+# A device routes twins only while NVML reads its memory clock at no less than
+# this fraction of the maximum memory clock (see the module docstring).
+MEMORY_CLOCK_FRACTION = 0.95
 
 # One 1-thread CTA per SM (each asks for an SM's whole opt-in shared memory, so no
 # two share an SM) stores its SM's id, locality domain, supplemental flag and the
@@ -252,6 +271,9 @@ _LOCK = threading.Lock()
 _TABLES: dict[int, SmTable | None] = {}
 _PROBE_MODULE: list[Any] = []  # the loaded module, or None for an old toolkit
 _PROBE_LOCKS: dict[int, threading.Lock] = {}  # one per device: one probe at a time
+# The (current, max) memory clock in MHz NVML read after a device's probe, or None
+# when it could not read them; only devices whose probe gave a table are listed.
+_MEMORY_CLOCKS: dict[int, tuple[int, int] | None] = {}
 
 
 def _device_index(device: Any) -> int:
@@ -338,6 +360,9 @@ def sm_table(device: Any = None) -> SmTable | None:
     toolkit before :data:`LOCALITY_CUDA`                    None (yes)
     driver before :data:`LOCALITY_CUDA`                     None (yes)
     the dies are not exactly 0 and 1, or a row is invalid  None (yes)
+    NVML reads the memory clock below
+    :data:`MEMORY_CLOCK_FRACTION` of its maximum, or
+    cannot read it                                          None (yes)
     no such CUDA device, the call is under CUDA graph
     capture, or torch cannot tell whether it is             None (no)
     the probe library does not build or load, the probe
@@ -347,8 +372,9 @@ def sm_table(device: Any = None) -> SmTable | None:
 
     An outcome that is not cached is probed again by the next call. One probe of a
     device runs at a time. The probe synchronizes the device and runs on a private
-    stream; call this eagerly before a graph capture, so a captured call and an
-    eager call see the same table."""
+    stream; the memory clock is read right after it, through NVML by the device's
+    UUID. Call this eagerly before a graph capture, so a captured call and an
+    eager call see the same table. A cached outcome costs a dictionary lookup."""
     import torch
 
     try:
@@ -379,7 +405,7 @@ def sm_table(device: Any = None) -> SmTable | None:
             return _remember(index, None, True)
         compiler = getattr(torch, "compiler", None)
         disable = getattr(compiler, "disable", None)
-        probe = disable(_probe) if disable is not None else _probe
+        probe = disable(_routable_probe) if disable is not None else _routable_probe
         table, cacheable = probe(index)
         return _remember(index, table, cacheable)
 
@@ -389,6 +415,52 @@ def _remember(index: int, table: SmTable | None, cacheable: bool) -> SmTable | N
         return table
     with _LOCK:
         return _TABLES.setdefault(index, table)
+
+
+def _routable_probe(device_index: int) -> tuple[SmTable | None, bool]:
+    """:func:`_probe`, then the memory clock check: a table of a device whose
+    memory is not at its full clock is dropped, and that outcome is cached."""
+    table, cacheable = _probe(device_index)
+    if table is None:
+        return table, cacheable
+    clocks = _memory_clocks(device_index)
+    with _LOCK:
+        _MEMORY_CLOCKS[device_index] = clocks
+    if clocks is None:
+        return None, True
+    current, peak = clocks
+    if peak <= 0 or current < MEMORY_CLOCK_FRACTION * peak:
+        return None, True
+    return table, True
+
+
+def _nvml_uuid(device_index: int) -> str:
+    """The NVML UUID (``GPU-...``) of CUDA device ``device_index``."""
+    import torch
+
+    uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+    return uuid if uuid.startswith(("GPU-", "MIG-")) else f"GPU-{uuid}"
+
+
+def _memory_clocks(device_index: int) -> tuple[int, int] | None:
+    """The current and maximum memory clock in MHz of CUDA device
+    ``device_index`` read through NVML (the device is found by its UUID, so a
+    ``CUDA_VISIBLE_DEVICES`` order does not matter), or ``None`` when NVML cannot
+    read them."""
+    try:
+        import pynvml
+
+        uuid = _nvml_uuid(device_index)
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            current = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+            peak = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        finally:
+            pynvml.nvmlShutdown()
+        return int(current), int(peak)
+    except Exception:  # noqa: BLE001 - an unreadable clock routes nothing
+        return None
 
 
 def _probe(device_index: int) -> tuple[SmTable | None, bool]:
@@ -456,6 +528,7 @@ def _forget() -> None:
     with _LOCK:
         _TABLES.clear()
         _PROBE_MODULE.clear()
+        _MEMORY_CLOCKS.clear()
 
 
 # --------------------------------------------------------------------------- memory

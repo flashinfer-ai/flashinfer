@@ -119,12 +119,20 @@ class _Probes:
         return self.outcomes.pop(0)
 
 
-def _fake_device(monkeypatch, probe):
+def _fake_device(monkeypatch, probe, clocks=(4752, 4752)):
     # Capture detection is stubbed at the module level: the real one selects the
     # (fake) device first when more than one GPU is visible.
     monkeypatch.setattr(cl, "_is_locality_arch", lambda index: True)
     monkeypatch.setattr(cl, "_stream_capturing", lambda device_index: False)
     monkeypatch.setattr(cl, "_probe", lambda device_index: probe(device_index))
+    reads = []
+
+    def memory_clocks(device_index):
+        reads.append(device_index)
+        return clocks
+
+    monkeypatch.setattr(cl, "_memory_clocks", memory_clocks)
+    return reads
 
 
 @pytest.mark.parametrize("cached", [False, True])
@@ -175,6 +183,169 @@ def test_sm_table_one_probe_per_device(monkeypatch):
         assert results == [table] * 4
     finally:
         cl._forget()
+
+
+@pytest.mark.parametrize(
+    "clocks, routes",
+    [
+        ((4752, 4752), True),
+        ((4515, 4752), True),  # 0.95 x 4752 = 4514.4
+        ((4514, 4752), False),
+        ((3996, 4752), False),
+        ((3186, 4752), False),
+        ((0, 0), False),
+        (None, False),  # NVML could not read the clocks
+    ],
+)
+def test_sm_table_memory_clock_guard(monkeypatch, clocks, routes):
+    """A device whose memory runs below MEMORY_CLOCK_FRACTION of its maximum
+    clock, or whose clock NVML cannot read, has no table; the clock is read once,
+    after the probe, and the outcome is cached either way."""
+    table = cl.SmTable(device_index=5, counts=(106, 106), entries=None)
+    probe = _Probes((table, True))
+    reads = _fake_device(monkeypatch, probe, clocks)
+    try:
+        expected = table if routes else None
+        assert cl.sm_table(5) is expected
+        assert cl._TABLES[5] is expected
+        assert cl._MEMORY_CLOCKS[5] == clocks
+        assert cl.sm_table(5) is expected
+        assert cl.sm_table(5) is expected
+        assert probe.calls == 1 and reads == [5]
+    finally:
+        cl._forget()
+    assert not cl._MEMORY_CLOCKS
+
+
+@pytest.mark.parametrize("outcome", [(None, True), (None, False)])
+def test_memory_clock_not_read_without_a_table(monkeypatch, outcome):
+    """No NVML read for a device whose probe gave no table."""
+    probe = _Probes(outcome, outcome)
+    reads = _fake_device(monkeypatch, probe, (3186, 4752))
+    try:
+        assert cl.sm_table(5) is None
+        assert reads == [] and 5 not in cl._MEMORY_CLOCKS
+    finally:
+        cl._forget()
+
+
+class _FakeNvml:
+    """A stand-in ``pynvml`` module: ``fail`` names the call that raises."""
+
+    NVML_CLOCK_MEM = 2
+
+    class NVMLError(Exception):
+        pass
+
+    def __init__(self, current=3186, peak=4752, fail=None):
+        self.current, self.peak, self.fail = current, peak, fail
+        self.calls: list[Any] = []
+
+    def _call(self, name, *args):
+        self.calls.append((name, *args))
+        if name == self.fail:
+            raise self.NVMLError(name)
+
+    def nvmlInit(self):
+        self._call("init")
+
+    def nvmlShutdown(self):
+        self._call("shutdown")
+
+    def nvmlDeviceGetHandleByUUID(self, uuid):
+        self._call("handle", uuid)
+        return ("handle", uuid)
+
+    def nvmlDeviceGetClockInfo(self, handle, clock):
+        self._call("clock", handle, clock)
+        return self.current
+
+    def nvmlDeviceGetMaxClockInfo(self, handle, clock):
+        self._call("max_clock", handle, clock)
+        return self.peak
+
+
+def test_memory_clocks_from_nvml(monkeypatch):
+    """The device is found by its UUID; NVML is shut down after the reads."""
+    nvml = _FakeNvml(current=3186, peak=4752)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setattr(cl, "_nvml_uuid", lambda index: f"GPU-uuid-{index}")
+    assert cl._memory_clocks(3) == (3186, 4752)
+    handle = ("handle", "GPU-uuid-3")
+    assert nvml.calls == [
+        ("init",),
+        ("handle", "GPU-uuid-3"),
+        ("clock", handle, nvml.NVML_CLOCK_MEM),
+        ("max_clock", handle, nvml.NVML_CLOCK_MEM),
+        ("shutdown",),
+    ]
+
+
+@pytest.mark.parametrize("fail", ["init", "handle", "clock", "max_clock", "uuid"])
+def test_memory_clocks_nvml_error(monkeypatch, fail):
+    """Any NVML failure reads as no clocks (the device then routes nothing);
+    NVML is shut down when it was initialized."""
+    nvml = _FakeNvml(fail=fail)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+
+    def uuid(index):
+        if fail == "uuid":
+            raise RuntimeError("no device properties")
+        return "GPU-uuid"
+
+    monkeypatch.setattr(cl, "_nvml_uuid", uuid)
+    assert cl._memory_clocks(0) is None
+    names = [call[0] for call in nvml.calls]
+    initialized = fail not in ("init", "uuid")
+    assert ("shutdown" in names) == initialized
+
+
+def test_memory_clocks_without_pynvml(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", None)  # import raises ImportError
+    assert cl._memory_clocks(0) is None
+
+
+def test_sm_table_memory_clock_guard_through_nvml(monkeypatch):
+    """End to end over a stand-in NVML: below the full clock the table is
+    dropped and cached; NVML is read once."""
+    table = cl.SmTable(device_index=5, counts=(106, 106), entries=None)
+    probe = _Probes((table, True))
+    # The stubs of _fake_device without its stand-in clock reader.
+    monkeypatch.setattr(cl, "_is_locality_arch", lambda index: True)
+    monkeypatch.setattr(cl, "_stream_capturing", lambda device_index: False)
+    monkeypatch.setattr(cl, "_probe", lambda device_index: probe(device_index))
+    nvml = _FakeNvml(current=3186, peak=4752)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setattr(cl, "_nvml_uuid", lambda index: "GPU-uuid")
+    try:
+        assert cl.sm_table(5) is None
+        assert cl.sm_table(5) is None
+        assert probe.calls == 1
+        assert [call[0] for call in nvml.calls].count("clock") == 1
+        assert cl._MEMORY_CLOCKS[5] == (3186, 4752)
+    finally:
+        cl._forget()
+
+
+@pytest.mark.parametrize(
+    "uuid, expected",
+    [
+        (
+            "1c2d3e4f-0000-1111-2222-333344445555",
+            "GPU-1c2d3e4f-0000-1111-2222-333344445555",
+        ),
+        ("GPU-1c2d3e4f", "GPU-1c2d3e4f"),
+        ("MIG-1c2d3e4f", "MIG-1c2d3e4f"),
+    ],
+)
+def test_nvml_uuid(monkeypatch, uuid, expected):
+    class Properties:
+        pass
+
+    properties = Properties()
+    properties.uuid = uuid
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: properties)
+    assert cl._nvml_uuid(0) == expected
 
 
 def test_probe_module_failure_is_not_cached(monkeypatch):
@@ -228,8 +399,7 @@ def test_sm_table_on_the_cpu_under_a_cuda_default_device():
             torch.set_default_device(previous)
             device = _require_locality()
             torch.set_default_device("cuda")
-            table = cl.sm_table(device)
-            assert table is not None
+            table = _require_table(device)
             assert table.entries.device.type == "cpu"
             assert table.entries.dtype == torch.int32 and table.entries.is_contiguous()
             unit = cl.granularity(device)
@@ -295,11 +465,22 @@ def _require_locality() -> int:
     return device
 
 
+def _require_table(device: int) -> Any:
+    """The SM table of ``device``; skips when its memory clock check refused it."""
+    table = cl.sm_table(device)
+    if table is None and device in cl._MEMORY_CLOCKS:
+        pytest.skip(
+            f"memory clock {cl._MEMORY_CLOCKS[device]} (current, max MHz) is "
+            "below the full clock: the device routes nothing"
+        )
+    assert table is not None
+    return table
+
+
 def test_sm_table_probe():
     device = _require_locality()
     cl._forget()
-    table = cl.sm_table(device)
-    assert table is not None
+    table = _require_table(device)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     assert table.device_index == device
     assert min(table.counts) > 0
@@ -312,6 +493,27 @@ def test_sm_table_probe():
     assert sum(word != 0 for word in words) == sm_count
     assert cl.sm_table(device) is table  # cached
     assert cl.sm_table(torch.device("cuda", device)) is table
+
+
+def test_sm_table_reads_the_memory_clock():
+    """On the device: NVML reads the memory clock right after the probe, and the
+    table exists exactly when that clock is at least MEMORY_CLOCK_FRACTION of
+    the maximum."""
+    device = _require_locality()
+    cl._forget()
+    try:
+        table = cl.sm_table(device)
+        clocks = cl._MEMORY_CLOCKS.get(device)
+        print(
+            f"MEMORY_CLOCKS device={device} clocks={clocks} table={table is not None}"
+        )
+        assert clocks is not None, "NVML could not read the memory clock"
+        current, peak = clocks
+        assert peak > 0
+        assert (table is not None) == (current >= cl.MEMORY_CLOCK_FRACTION * peak)
+        assert cl.sm_table(device) is table
+    finally:
+        cl._forget()
 
 
 def test_sm_table_not_probed_under_graph_capture():
@@ -328,8 +530,7 @@ def test_sm_table_not_probed_under_graph_capture():
     graph.replay()
     torch.cuda.synchronize(device)
     assert torch.equal(x, torch.ones_like(x))
-    table = cl.sm_table(device)
-    assert table is not None
+    table = _require_table(device)
     # A cached table is returned under capture too.
     graph2 = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph2, stream=stream):

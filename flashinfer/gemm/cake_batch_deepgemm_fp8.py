@@ -1556,8 +1556,15 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     the time of plain weights at ``expected_m`` 2-64.  The twin's gain comes
     from die-local memory reads and was measured with the memory at its full
     clock.  On a device whose memory ran at a lower clock (driver 620.43, 3186
-    of 4752 MHz) the twin route took 0.99-1.06x the time of plain weights at
-    ``expected_m <= 64``; keep plain weights on such a device.
+    of 4752 MHz) the twin route took 1.01-1.08x the time of plain weights at
+    ``expected_m <= 64`` and 0.92-0.95x at 512 and 4096 with plain weights on
+    the reserved grid, and 1.01-1.14x at every measured ``expected_m`` (1 to
+    4096) with plain weights on the full grid from ``expected_m`` 36.  Such a
+    device has no SM table
+    (:func:`flashinfer.cake_locality.sm_table` reads the memory clock through
+    NVML and gives ``None`` below
+    :data:`flashinfer.cake_locality.MEMORY_CLOCK_FRACTION` of its maximum), so
+    this returns ``b`` unhomed there.
 
     On 212-SM devices, plain weights run their serving program on the full grid
     from ``expected_m`` 36; the homed twin is unchanged.  For ``B=64`` weights of
