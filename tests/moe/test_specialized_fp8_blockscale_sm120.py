@@ -551,7 +551,14 @@ def test_persistent_decode_residency_fails_closed(analytic_weights):
             message = str(exc).lower()
             if not (
                 "persistent decode t=16 cooperative launch failed" in message
-                and "too large" in message
+                and any(
+                    text in message
+                    for text in (
+                        "too large",
+                        "too many blocks in cooperative launch",
+                        "cooperativelaunchtoolarge",
+                    )
+                )
             ):
                 raise
         else:
