@@ -119,7 +119,9 @@ class SchedParams:
 class TileScheduler:
     """The persistent scheduler over :class:`SchedParams`: cluster ``z`` of the grid takes the linear indices ``z, z + G,
     z + 2 G, ...`` (``G`` the launched cluster count) until the valid-work bound; ``create / initial_work_tile_info /
-    get_current_work / advance_to_next_work / num_tiles_executed`` as the role loops expect."""
+    get_current_work / advance_to_next_work / num_tiles_executed`` as the role loops expect. The current tile is decoded
+    when the scheduler is created and on every advance (not on every read), so a scheduler created before the barrier
+    init has its first tile ready when the role loop starts."""
 
     def __init__(
         self,
@@ -128,29 +130,37 @@ class TileScheduler:
         current_work_linear_idx: Int32,
         cta_id_in_cluster,
         num_tiles_executed: Int32,
+        current_work: Optional[WorkTileInfo] = None,
     ):
         self.params = params
         self.num_persistent_clusters = num_persistent_clusters
         self._current_work_linear_idx = current_work_linear_idx
         self.cta_id_in_cluster = cta_id_in_cluster
         self._num_tiles_executed = num_tiles_executed
+        self._current_work = (
+            current_work
+            if current_work is not None
+            else self._work_for(current_work_linear_idx)
+        )
 
     def __extract_mlir_values__(self) -> list:
         values = extract_mlir_values(self.num_persistent_clusters)
         values.extend(extract_mlir_values(self._current_work_linear_idx))
         values.extend(extract_mlir_values(self.cta_id_in_cluster))
         values.extend(extract_mlir_values(self._num_tiles_executed))
+        values.extend(extract_mlir_values(self._current_work))
         values.extend(extract_mlir_values(self.params))
         return values
 
     def __new_from_mlir_values__(self, values: list) -> "TileScheduler":
-        assert len(values) >= 6
+        assert len(values) >= 10
         return TileScheduler(
-            new_from_mlir_values(self.params, values[6:]),
+            new_from_mlir_values(self.params, values[10:]),
             new_from_mlir_values(self.num_persistent_clusters, [values[0]]),
             new_from_mlir_values(self._current_work_linear_idx, [values[1]]),
             new_from_mlir_values(self.cta_id_in_cluster, values[2:5]),
             new_from_mlir_values(self._num_tiles_executed, [values[5]]),
+            new_from_mlir_values(self._current_work, values[6:10]),
         )
 
     @staticmethod
@@ -223,15 +233,11 @@ class TileScheduler:
         )
         return WorkTileInfo(coord, cute.arch.make_warp_uniform(is_valid))
 
-    @dsl_user_op
-    @cute.jit
-    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        return self._work_for(self._current_work_linear_idx, loc=loc, ip=ip)
+    def get_current_work(self) -> WorkTileInfo:
+        return self._current_work
 
-    @dsl_user_op
-    @cute.jit
-    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
-        return self.get_current_work(loc=loc, ip=ip)
+    def initial_work_tile_info(self) -> WorkTileInfo:
+        return self._current_work
 
     @dsl_user_op
     @cute.jit
@@ -242,6 +248,9 @@ class TileScheduler:
             self.num_persistent_clusters
         )
         self._num_tiles_executed += Int32(1)
+        self._current_work = self._work_for(
+            self._current_work_linear_idx, loc=loc, ip=ip
+        )
 
     @property
     @cute.jit

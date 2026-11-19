@@ -1649,18 +1649,18 @@ class BlockScaledGemm:
             st.sf_vec,
             cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
         )
-        pipeline_init_wait(cluster_shape_mn=sync_shape)
-
         # the scheduler: the persistent one; for the in-cluster split the K group is folded out of the block index (one tile
-        # per cluster, the tile sequence shared by the C ranks)
+        # per cluster, the tile sequence shared by the C ranks); created (its first tile decoded) before the barrier init
+        # completes, so the decode overlaps the wait
         sched_bidx, sched_grid = cute.arch.block_idx(), cute.arch.grid_dim()
         if cutlass.const_expr(C > 1):
             sched_bidx = (Int32(0), Int32(0), sched_bidx[2])
             sched_grid = (Int32(1), Int32(1), sched_grid[2])
+        tile_sched = TileScheduler.create(tile_sched_params, sched_bidx, sched_grid)
+        pipeline_init_wait(cluster_shape_mn=sync_shape)
 
         # --- roles
         if warp_idx == TMA_WARP:
-            tile_sched = TileScheduler.create(tile_sched_params, sched_bidx, sched_grid)
             blockscaled_producer_loop(
                 st,
                 k_tile_cnt,
@@ -1703,7 +1703,6 @@ class BlockScaledGemm:
                 ),
                 tCtSFB_layout,
             )
-            tile_sched = TileScheduler.create(tile_sched_params, sched_bidx, sched_grid)
             blockscaled_mma_loop(
                 self.lowering,
                 st,
@@ -1737,7 +1736,6 @@ class BlockScaledGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = TileScheduler.create(tile_sched_params, sched_bidx, sched_grid)
             if cutlass.const_expr(C > 1):
                 blockscaled_cluster_epilogue_loop(
                     st,

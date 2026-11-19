@@ -319,13 +319,14 @@ class BlockGemm:
         tCtAcc_fake = tiled_mma.make_fragment_C(
             cute.append(acc_shape, st.num_tmem_stages)
         )  # + the running sum of the in-CTA chunk fold
+        # the scheduler (its first tile decoded here) before the barrier init completes: the decode overlaps the wait
+        tile_sched = TileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         # --- roles
         if warp_idx == TMA_WARP:
-            tile_sched = TileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             tma_producer_loop(
                 atom_thr_size,
                 k_tile_cnt,
@@ -346,9 +347,6 @@ class BlockGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = TileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             mma_loop(
                 self.lowering,
                 st.num_acc_stage,
@@ -375,9 +373,6 @@ class BlockGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = TileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             epilogue_loop(
                 st,
                 self.chain,
