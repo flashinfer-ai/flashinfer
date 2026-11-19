@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,11 @@ def test_install_cutlass_dsl_from_outside_checkout(tmp_path):
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "python").symlink_to(sys.executable)
+    # CuTe DSL's installed .pth loader can override PYTHONPATH. Disable site
+    # initialization so the subprocess consistently uses the test modules.
+    python = bin_dir / "python"
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+    python.chmod(0o755)
     env = {
         **os.environ,
         "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
