@@ -740,6 +740,11 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
   // fp32 chunk formula.  Both half-head CTAs trip on the same dt stream, so
   // the whole head is rewritten consistently, each block within its own
   // disjoint columns (no cross-CTA write ordering is needed).
+  // Drain this thread's outstanding cp.async groups first: the final
+  // iteration's dummy C/X/B copies may still be in flight, and __syncthreads
+  // alone does not order cp.async completion against the replay's reuse of
+  // the same shared memory.
+  cpa_wait<0>();
   __syncthreads();
   if (*sPrec) {
     precise_head(xg, dtg, Ag, Bg, Cg, Dg, dtbg, yg, T, NH, h, pslot * HD_BLK, HD_BLK, smem);
@@ -1102,7 +1107,7 @@ static constexpr int GWIN = 256;      // ring depth, in 64-row windows
 // before any producer or consumer can enter the pipeline.  The producer's MMA
 // accumulates in fp32, then publishes bf16 operands for the consumer's fp32
 // score accumulation, matching the kernel's existing bf16 score/state staging.
-__device__ __nv_bfloat16 g_gram[GWIN * NGR * GTILES * GTILE_BF];
+__device__ __align__(16) __nv_bfloat16 g_gram[GWIN * NGR * GTILES * GTILE_BF];
 __device__ unsigned int g_gflag[NGR * 32];        // one 128B publication line per group
 __device__ unsigned long long g_gprog[NGR * 16];  // windows retired, per consumer
 __device__ unsigned int g_gdone[NGR];             // consumers finished, per group
@@ -1395,9 +1400,12 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
         // running prefixes cancels catastrophically once one step dominates
         // the fp32 mantissa (e.g. dt ~ 2^30): later prefixes all round to
         // the same value and the pair decay collapses to exp(0) = 1.
+        // Accumulate the already-scaled A*step increments: a raw step sum
+        // can overflow fp32 (steps near 2^127) even when the scaled
+        // exponent is small and the decay finite.
         float e = 0.f;
-        for (int k = j + 1; k <= i; ++k) e = __fadd_rn(e, steps[k]);
-        s = __fmul_rn(s, __nv_expf(__fmul_rn(ah, e)));
+        for (int k = j + 1; k <= i; ++k) e = __fadd_rn(e, __fmul_rn(ah, steps[k]));
+        s = __fmul_rn(s, __nv_expf(e));
       }
       score[i * 128 + j] = s;
     }
@@ -1419,15 +1427,17 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
     }
     __syncthreads();
     float total = prefix[count - 1], decay = __nv_expf(total);
-    // Rewrite prefix[] as the suffix step sums over (j, count-1]: additions
-    // of same-sign terms only, so the state-update weights never subtract
-    // two large prefixes (same cancellation as the score decay above).
+    // Rewrite prefix[] as the suffix sums of A*step over (j, count-1]:
+    // additions of same-sign terms only, so the state-update weights never
+    // subtract two large prefixes (same cancellation as the score decay
+    // above), and scaling each increment before the sum keeps the exponent
+    // finite when a raw step sum would overflow fp32.
     __syncthreads();
     if (tid == 0) {
       float tail = 0.f;
       for (int j = count - 1; j >= 0; --j) {
-        prefix[j] = __fmul_rn(ah, tail);
-        tail = __fadd_rn(tail, steps[j]);
+        prefix[j] = tail;
+        tail = __fadd_rn(tail, __fmul_rn(ah, steps[j]));
       }
     }
     __syncthreads();
@@ -1762,8 +1772,12 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
       // retirement store entirely.  Longer launches retain the exact coarse
       // watermark protocol: one relaxed store every 8 windows.
       if constexpr (TRACK_PROGRESS) {
+        // GPU-scope release: the producer recycles a ring slot after an
+        // ld.acquire.gpu of this counter, so the store must order this CTA's
+        // earlier Gram reads (CTA-scoped by the barrier below) before it at
+        // GPU scope; a relaxed store gives the producer no such guarantee.
         if (tid == 0 && (c & 7) == 0)
-          gst_relaxed(g_gprog + g * 16 + ((h % HEADS_PER_GROUP) * NSPL + ps),
+          gst_release(g_gprog + g * 16 + ((h % HEADS_PER_GROUP) * NSPL + ps),
                       (unsigned long long)c);
       }
       if constexpr (FULL_T) {
