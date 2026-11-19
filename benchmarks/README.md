@@ -38,7 +38,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
     - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
     - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
-    - `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper` accept `--backends cake-nvfp4` on SM100: `trtllm_batch_decode_with_kv_cache` / `trtllm_batch_context_with_kv_cache` with `backend="cake-nvfp4"`, the Nemotron 3.5 Super kernels for FP8 E4M3 Q/O and NVFP4 K/V (`--q_dtype fp8_e4m3 --kv_dtype nvfp4 --out_dtype fp8_e4m3`, 32 query heads, 2 KV heads, head dimension 128, `--page_size 128`). Shapes the backend routes to trtllm-gen report `cake-nvfp4(trtllm-gen)`.
+    - `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper` accept `--backends cake-nvfp4` on SM100: `trtllm_batch_decode_with_kv_cache` / `trtllm_batch_context_with_kv_cache` with `backend="cake-nvfp4"`, the experimental Nemotron 3.5 Super kernels for FP8 E4M3 Q/O and NVFP4 K/V (`--q_dtype fp8_e4m3 --kv_dtype nvfp4 --out_dtype fp8_e4m3`, 32 query heads, 2 KV heads, head dimension 128, `--page_size 128`). Shapes the backend routes to trtllm-gen report `cake-nvfp4(trtllm-gen)`.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
@@ -539,7 +539,7 @@ Legend:
 - trtllm-gen: TensorRT-LLM (generic wrapper)
 - trtllm-native: TensorRT-LLM (native API)
 - prims-ts: Experimental task-scheduled attention (SM100/SM103)
-- cake-nvfp4: Nemotron 3.5 Super NVFP4-KV attention (SM100)
+- cake-nvfp4: Nemotron 3.5 Super NVFP4-KV attention (SM100, experimental)
 -->
 | Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
 |---------|-----|-----|-----|-----|-----|-------|-------|-------|
@@ -619,7 +619,7 @@ Backend Legend:
 - trtllm-gen: TensorRT-LLM
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
-- cake-nvfp4: Nemotron 3.5 Super NVFP4-KV attention kernels (Blackwell SM100; trtllm-gen outside their shapes)
+- cake-nvfp4: Nemotron 3.5 Super NVFP4-KV attention kernels (Blackwell SM100, experimental; trtllm-gen outside their shapes)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
 - batch_invariant: FlashInfer's batch-invariant kernels (`batch_invariant=True`: a row's bits depend only on its own

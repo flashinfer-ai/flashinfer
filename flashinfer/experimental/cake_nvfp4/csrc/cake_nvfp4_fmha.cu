@@ -26,8 +26,8 @@
 #include <cstdint>
 #include <string>
 
-#include "flashinfer/attention/cake_nvfp4/fp4_mul.cuh"
-#include "flashinfer/attention/cake_nvfp4/host.h"
+#include "cake_nvfp4/fp4_mul.cuh"
+#include "cake_nvfp4/host.h"
 #include "flashinfer/math.cuh"
 #include "tvm_ffi_utils.h"
 

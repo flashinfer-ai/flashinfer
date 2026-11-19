@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 // Nemotron 3.5 Super NVFP4-KV decode, "mtp" kernel: 2, 4, 6 or 8 query tokens per request.
-#include "flashinfer/attention/cake_nvfp4/decode_mtp_kernel.cuh"
-#include "flashinfer/attention/cake_nvfp4/host_cuda.cuh"
+#include "cake_nvfp4/decode_mtp_kernel.cuh"
+#include "cake_nvfp4/host_cuda.cuh"
 
 namespace flashinfer {
 namespace cake_nvfp4 {

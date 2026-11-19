@@ -17,7 +17,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer import cake_nvfp4
+from flashinfer.experimental.cake_nvfp4 import cake_backend as cake_nvfp4
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import get_device_sm_count
@@ -46,7 +46,7 @@ MAX_MEAN_ROW_ERROR = 0.06
 def cake_nvfp4_kernels():
     """Build the kernels. Skips only where they cannot be built at all: a build
     that was attempted and failed is an error."""
-    from flashinfer.jit.cake_nvfp4 import load_cake_nvfp4_fmha_module
+    from flashinfer.experimental.cake_nvfp4.cake_jit import load_cake_nvfp4_fmha_module
 
     blocker = cake_nvfp4._build_blocker()
     if blocker is not None:
@@ -68,7 +68,7 @@ def fused_routing(monkeypatch):
 def test_dequantization_path_follows_the_toolkit():
     # The fused NVFP4 multiply needs the CUDA 13.4 assembler; older toolkits
     # build the FP16 path, which every other test here then runs.
-    from flashinfer.jit.cake_nvfp4 import gen_cake_nvfp4_fmha_module
+    from flashinfer.experimental.cake_nvfp4.cake_jit import gen_cake_nvfp4_fmha_module
 
     if gen_cake_nvfp4_fmha_module().is_aot or "FLASHINFER_NVCC" in os.environ:
         pytest.skip("the module was not built by this toolkit's compiler")

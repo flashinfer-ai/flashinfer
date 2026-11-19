@@ -15,8 +15,8 @@
  */
 // Nemotron 3.5 Super NVFP4-KV decode, "base" kernel: 1, 3 or 5 query tokens per request, or
 // requests of different query lengths.
-#include "flashinfer/attention/cake_nvfp4/decode_base_kernel.cuh"
-#include "flashinfer/attention/cake_nvfp4/host_cuda.cuh"
+#include "cake_nvfp4/decode_base_kernel.cuh"
+#include "cake_nvfp4/host_cuda.cuh"
 
 namespace flashinfer {
 namespace cake_nvfp4 {

@@ -21,7 +21,7 @@ import threading
 import pytest
 import torch
 
-from flashinfer import cake_nvfp4
+from flashinfer.experimental.cake_nvfp4 import cake_backend as cake_nvfp4
 
 MTP, BASE = cake_nvfp4.DECODE_MTP, cake_nvfp4.DECODE_BASE
 MIB = 1 << 20
@@ -317,7 +317,7 @@ class _Spec:
 
 def _patch_toolkit(monkeypatch, is_compiled, new_enough):
     import flashinfer.jit.cpp_ext as cpp_ext
-    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
+    import flashinfer.experimental.cake_nvfp4.cake_jit as jit_cake_nvfp4
 
     monkeypatch.setattr(
         jit_cake_nvfp4, "gen_cake_nvfp4_fmha_module", lambda: _Spec(is_compiled)
@@ -344,8 +344,33 @@ def test_build_is_blocked_only_by_an_old_toolkit(monkeypatch):
     assert blocker() is None
 
 
+def test_build_is_blocked_without_kernel_sources(monkeypatch, tmp_path):
+    # Release wheels omit experimental kernel sources: the backend must then
+    # decline every call instead of failing in its first one.
+    import flashinfer.experimental.cake_nvfp4.cake_jit as jit_cake_nvfp4
+
+    _patch_toolkit(monkeypatch, is_compiled=True, new_enough=True)
+    monkeypatch.setattr(jit_cake_nvfp4, "CSRC_DIR", tmp_path)
+    assert "kernel sources" in cake_nvfp4._build_blocker.__wrapped__()
+
+
+def test_package_import_is_lightweight():
+    # Importing the package (as a server does to size its workspace) must not
+    # import the JIT spec module.
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "from flashinfer.experimental.cake_nvfp4 import prefill_workspace_bytes\n"
+        "assert prefill_workspace_bytes(1) > 0\n"
+        "assert 'flashinfer.experimental.cake_nvfp4.cake_jit' not in sys.modules\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
 def test_blocked_build_is_not_started(monkeypatch):
-    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
+    import flashinfer.experimental.cake_nvfp4.cake_jit as jit_cake_nvfp4
 
     def unexpected():
         raise AssertionError("a build that cannot succeed must not start")
@@ -356,7 +381,7 @@ def test_blocked_build_is_not_started(monkeypatch):
 
 
 def test_failed_build_falls_back(monkeypatch):
-    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
+    import flashinfer.experimental.cake_nvfp4.cake_jit as jit_cake_nvfp4
 
     def failing():
         raise RuntimeError("nvcc failed")
@@ -368,7 +393,7 @@ def test_failed_build_falls_back(monkeypatch):
 
 @pytest.mark.parametrize("fused", [True, False])
 def test_slower_dequantization_path_is_logged(monkeypatch, caplog, fused):
-    import flashinfer.jit.cake_nvfp4 as jit_cake_nvfp4
+    import flashinfer.experimental.cake_nvfp4.cake_jit as jit_cake_nvfp4
 
     class Module:
         @staticmethod
@@ -377,7 +402,7 @@ def test_slower_dequantization_path_is_logged(monkeypatch, caplog, fused):
 
     monkeypatch.setattr(jit_cake_nvfp4, "load_cake_nvfp4_fmha_module", Module)
     monkeypatch.setattr(cake_nvfp4, "_build_blocker", lambda: None)
-    with caplog.at_level(logging.INFO, logger="flashinfer.cake_nvfp4"):
+    with caplog.at_level(logging.INFO, logger=cake_nvfp4.__name__):
         assert cake_nvfp4._module.__wrapped__() is not None
     logged = any("slower NVFP4 dequantization" in m for m in caplog.messages)
     assert logged == (not fused)

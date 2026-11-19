@@ -15,13 +15,15 @@ limitations under the License.
 """
 
 import functools
+from pathlib import Path
 
-from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
+from ...jit.core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
 
+# Experimental: JIT-only, never registered in flashinfer/aot.py.
+CSRC_DIR = Path(__file__).resolve().parent / "csrc"
 # The kernels use tcgen05 and are tuned for sm_100a only, so the module is built
 # for that target whatever else the compilation context lists.
-_SOURCES = (
+SOURCES = (
     "cake_nvfp4_fmha.cu",
     "cake_nvfp4_decode_mtp.cu",
     "cake_nvfp4_decode_base.cu",
@@ -35,8 +37,9 @@ def gen_cake_nvfp4_fmha_module() -> JitSpec:
 
     return gen_jit_spec(
         "cake_nvfp4_fmha_sm100a",
-        [jit_env.FLASHINFER_CSRC_DIR / source for source in _SOURCES],
+        [CSRC_DIR / source for source in SOURCES],
         extra_cuda_cflags=sm100a_nvcc_flags + ["--expt-relaxed-constexpr"],
+        extra_include_paths=[CSRC_DIR],
     )
 
 
@@ -45,9 +48,3 @@ def load_cake_nvfp4_fmha_module():
     """Build or load the module."""
 
     return gen_cake_nvfp4_fmha_module().build_and_load()
-
-
-__all__ = [
-    "gen_cake_nvfp4_fmha_module",
-    "load_cake_nvfp4_fmha_module",
-]

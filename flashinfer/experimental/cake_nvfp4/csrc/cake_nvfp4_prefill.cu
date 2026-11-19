@@ -18,12 +18,12 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "flashinfer/attention/cake_nvfp4/host_cuda.cuh"
-#include "flashinfer/attention/cake_nvfp4/prefill/attn.cuh"
-#include "flashinfer/attention/cake_nvfp4/prefill/attnp.cuh"
-#include "flashinfer/attention/cake_nvfp4/prefill/comb.cuh"
-#include "flashinfer/attention/cake_nvfp4/prefill/conv.cuh"
-#include "flashinfer/attention/cake_nvfp4/prefill/pmax.cuh"
+#include "cake_nvfp4/host_cuda.cuh"
+#include "cake_nvfp4/prefill/attn.cuh"
+#include "cake_nvfp4/prefill/attnp.cuh"
+#include "cake_nvfp4/prefill/comb.cuh"
+#include "cake_nvfp4/prefill/conv.cuh"
+#include "cake_nvfp4/prefill/pmax.cuh"
 
 namespace flashinfer {
 namespace cake_nvfp4 {

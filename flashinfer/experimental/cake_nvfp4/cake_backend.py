@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Attention kernels for Nemotron 3.5 Super with an NVFP4 KV cache (``sm_100a``).
+Experimental backend: attention kernels for Nemotron 3.5 Super with an NVFP4
+KV cache (``sm_100a``). See README.md in this directory.
 
 ``backend="cake-nvfp4"`` of
 :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` and
@@ -25,7 +26,8 @@ one of three kernels written for this model's attention geometry, or on
 * 32 query heads, 2 KV heads, head dimension 128;
 * 128-token pages.
 
-This module holds the routing rules. They are functions of the call's shape,
+The backend is experimental and JIT-only. Naming it is the opt-in; it never
+takes part in ``backend="auto"``. This module holds the routing rules. They are functions of the call's shape,
 of whether it passes ``cum_seq_lens_q`` and, for decode, of whether the kernels
 were built with the fused NVFP4 multiply (CUDA 13.4 or newer). A selected kernel
 can still decline a call it cannot serve, such as a too-small workspace; that
@@ -41,13 +43,12 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from .api_logging import flashinfer_api
-from .utils import get_compute_capability
+from ...utils import get_compute_capability
 
 logger = logging.getLogger(__name__)
 
 BACKEND = "cake-nvfp4"
-# Oldest toolkit the kernels are built and tested with. A prebuilt module runs on
+# Oldest toolkit the kernels are built and tested with. A built module runs on
 # any driver that serves sm_100a.
 MIN_CUDA_TOOLKIT = "13.0"
 # From this toolkit on the decode kernels dequantize NVFP4 with one PTX
@@ -100,7 +101,7 @@ NON_FUSED_DECODE_ROUTES: Dict[int, Tuple[int, Optional[int]]] = {
 PREFILL_MAX_BATCH_SIZE = 1
 PREFILL_MAX_Q_LEN = 32768
 # Mirror kPrefillFp8PageBytes and kPrefillSplitReserveBytes of
-# include/flashinfer/attention/cake_nvfp4/host.h, whose gate is the one
+# csrc/cake_nvfp4/host.h in this package, whose gate is the one
 # that decides. The formula is repeated here because a server sizes its
 # workspace before the kernel module is loaded.
 _PREFILL_FP8_PAGE_BYTES = NUM_KV_HEADS * PAGE_SIZE * HEAD_DIM
@@ -117,7 +118,6 @@ def _count_route(stage: str, kernel: str) -> None:
         _route_counts[(stage, kernel)] += 1
 
 
-@flashinfer_api
 def route_counts() -> Dict[Tuple[str, str], int]:
     """Return how many calls each ``(stage, kernel)`` pair served in this process.
 
@@ -128,14 +128,12 @@ def route_counts() -> Dict[Tuple[str, str], int]:
         return dict(_route_counts)
 
 
-@flashinfer_api
 def reset_route_counts() -> None:
     """Clear the counters returned by :func:`route_counts`."""
     with _route_lock:
         _route_counts.clear()
 
 
-@flashinfer_api
 def select_decode_kernel(
     batch_size: int,
     q_len: int,
@@ -200,7 +198,6 @@ def select_decode_kernel(
     return DECODE_BASE  # 1, 3 or 5 query tokens
 
 
-@flashinfer_api
 def select_prefill_kernel(batch_size: int, max_q_len: int, max_kv_len: int) -> bool:
     """Return whether a prefill call inside the supported geometry runs on the
     Nemotron kernel (``True``) or on trtllm-gen (``False``).
@@ -221,7 +218,6 @@ def select_prefill_kernel(batch_size: int, max_q_len: int, max_kv_len: int) -> b
     )
 
 
-@flashinfer_api
 def prefill_workspace_bytes(max_kv_len: int) -> int:
     """Return the ``workspace_buffer`` size the prefill kernel needs, in bytes.
 
@@ -243,7 +239,6 @@ def prefill_workspace_bytes(max_kv_len: int) -> int:
     return 2 * pages * _PREFILL_FP8_PAGE_BYTES + _PREFILL_SPLIT_RESERVE_BYTES
 
 
-@flashinfer_api
 def is_supported_device(device: torch.device) -> bool:
     """Return whether the kernels run on ``device`` (compute capability 10.0).
 
@@ -280,12 +275,23 @@ def _has_geometry(
 @functools.cache
 def _build_blocker() -> Optional[str]:
     """Return why the kernel module cannot be built here, or ``None`` when it
-    is prebuilt or its build can be attempted."""
-    from .jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
-    from .jit.cake_nvfp4 import gen_cake_nvfp4_fmha_module
+    is already built or its build can be attempted."""
+    from ...jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
+    from .cake_jit import CSRC_DIR, SOURCES, gen_cake_nvfp4_fmha_module
 
-    # FLASHINFER_NVCC names another compiler than the toolkit's, so the toolkit
-    # version says nothing about it.
+    # Release wheels on PyPI omit experimental kernel sources (see
+    # flashinfer/experimental/README.md); nightly wheels and source installs
+    # keep them.
+    if not all((CSRC_DIR / source).is_file() for source in SOURCES):
+        return (
+            "its kernel sources are not part of this FlashInfer installation "
+            "(release wheels omit experimental sources; use a nightly wheel or a "
+            "source install)"
+        )
+
+    # A module already in the JIT cache needs no toolkit. FLASHINFER_NVCC names
+    # another compiler than the toolkit's, so the toolkit version says nothing
+    # about it.
     if gen_cake_nvfp4_fmha_module().is_compiled or "FLASHINFER_NVCC" in os.environ:
         return None
     try:
@@ -295,7 +301,7 @@ def _build_blocker() -> Optional[str]:
     except RuntimeError:
         found = "none"
     return (
-        "its kernels are not prebuilt and compiling them needs the CUDA "
+        "its kernels are not built yet and compiling them needs the CUDA "
         f"{MIN_CUDA_TOOLKIT} toolkit or newer (found {found})"
     )
 
@@ -303,7 +309,7 @@ def _build_blocker() -> Optional[str]:
 @functools.cache
 def _module():
     """Return the kernel module, or ``None`` when it cannot be built here."""
-    from .jit.cake_nvfp4 import load_cake_nvfp4_fmha_module
+    from .cake_jit import load_cake_nvfp4_fmha_module
 
     # Do not start a build that cannot succeed: it would run inside the first
     # routed call and only then fail.
@@ -462,18 +468,3 @@ def try_prefill(
         served = not declined
     _count_route("prefill", "prefill" if served else "trtllm-gen")
     return served
-
-
-__all__ = [
-    "BACKEND",
-    "MIN_CUDA_TOOLKIT",
-    "FUSED_DEQUANT_CUDA_TOOLKIT",
-    "DECODE_BASE",
-    "DECODE_MTP",
-    "is_supported_device",
-    "prefill_workspace_bytes",
-    "reset_route_counts",
-    "route_counts",
-    "select_decode_kernel",
-    "select_prefill_kernel",
-]

@@ -111,7 +111,7 @@ def _get_prims_ts_module():
 
 def _get_cake_nvfp4_module():
     """Import the backend's routing module only when a benchmark requests it."""
-    from flashinfer import cake_nvfp4
+    from flashinfer.experimental.cake_nvfp4 import cake_backend as cake_nvfp4
 
     return cake_nvfp4
 

@@ -23,7 +23,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api, flashinfer_experimental_api
+from .api_logging import (
+    flashinfer_api,
+    flashinfer_experimental_api,
+    warn_experimental_backend_once,
+)
 from .trace.templates.attention import (
     gqa_paged_decode_trace,
     gqa_paged_decode_plan_trace,
@@ -4544,12 +4548,13 @@ def trtllm_batch_decode_with_kv_cache(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
-        ``cake-nvfp4`` is an explicit backend for Nemotron 3.5 Super with an
+        ``cake-nvfp4`` is an experimental backend for Nemotron 3.5 Super with an
         NVFP4 KV cache on sm_100: FP8 query and output, 32 query heads, 2 KV heads,
         head dimension 128 and 128-token pages. It runs each call on a kernel
         written for that geometry, or on ``trtllm-gen`` where that is faster or the
-        call is outside the geometry. It never participates in automatic backend
-        selection. See :mod:`flashinfer.cake_nvfp4`.
+        call is outside the geometry. Naming it is the opt-in (it warns once); it
+        never participates in automatic backend selection. See
+        ``flashinfer/experimental/cake_nvfp4/README.md``.
 
     q_len_per_req : Optional[int] = 1
         Number of query tokens per request (i.e. speculative-decoding / MTP depth).
@@ -4719,6 +4724,9 @@ def trtllm_batch_decode_with_kv_cache(
     # other call, and every shape where trtllm-gen is faster, runs on trtllm-gen.
     use_cake_nvfp4 = backend == "cake-nvfp4"
     if use_cake_nvfp4:
+        warn_experimental_backend_once(
+            "trtllm_batch_decode_with_kv_cache", "cake-nvfp4"
+        )
         backend = "trtllm-gen"
     if request_order is not None and backend != "cake":
         raise ValueError("request_order requires the explicit backend='cake'")
@@ -5478,7 +5486,9 @@ def trtllm_batch_decode_with_kv_cache(
             )
         ran_cake_nvfp4 = False
         if use_cake_nvfp4:
-            from .cake_nvfp4 import try_decode as try_cake_nvfp4_decode
+            from .experimental.cake_nvfp4.cake_backend import (
+                try_decode as try_cake_nvfp4_decode,
+            )
 
             ran_cake_nvfp4 = try_cake_nvfp4_decode(
                 out=out,

@@ -39,7 +39,11 @@ import torch
 if TYPE_CHECKING:
     from .attention.cute_dsl.rubin import RubinPrefillPlan
 
-from .api_logging import flashinfer_api, flashinfer_experimental_api
+from .api_logging import (
+    flashinfer_api,
+    flashinfer_experimental_api,
+    warn_experimental_backend_once,
+)
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .cudnn.prefill import (
     CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE,
@@ -9442,12 +9446,14 @@ def trtllm_batch_context_with_kv_cache(
         The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
         selects the separately versioned Cake FMHA product. The default remains
         the conventional TRTLLM implementation. ``cake-nvfp4`` is an
-        explicit backend for Nemotron 3.5 Super with an NVFP4 KV cache on sm_100
+        experimental backend for Nemotron 3.5 Super with an NVFP4 KV cache on sm_100
         (FP8 query and output, 32 query heads, 2 KV heads, head dimension 128,
         128-token pages): a single-request call with a KV longer than 8192 tokens
         and a large enough ``workspace_buffer`` runs on a kernel written for that
         geometry, and every other call on ``trtllm-gen``. Size the workspace with
-        :func:`flashinfer.cake_nvfp4.prefill_workspace_bytes`.
+        ``flashinfer.experimental.cake_nvfp4.prefill_workspace_bytes``. Naming
+        it is the opt-in (it warns once); it never participates in automatic
+        backend selection.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -9469,6 +9475,9 @@ def trtllm_batch_context_with_kv_cache(
     # other call runs on trtllm-gen.
     use_cake_nvfp4 = backend == "cake-nvfp4"
     if use_cake_nvfp4:
+        warn_experimental_backend_once(
+            "trtllm_batch_context_with_kv_cache", "cake-nvfp4"
+        )
         backend = "trtllm-gen"
     if backend not in ("trtllm-gen", "cake"):
         raise ValueError(
@@ -9815,7 +9824,9 @@ def trtllm_batch_context_with_kv_cache(
     run_args.extend((lse_stride_tokens, lse_stride_heads))
     ran_cake_nvfp4 = False
     if use_cake_nvfp4:
-        from .cake_nvfp4 import try_prefill as try_cake_nvfp4_prefill
+        from .experimental.cake_nvfp4.cake_backend import (
+            try_prefill as try_cake_nvfp4_prefill,
+        )
 
         ran_cake_nvfp4 = try_cake_nvfp4_prefill(
             out=out,
