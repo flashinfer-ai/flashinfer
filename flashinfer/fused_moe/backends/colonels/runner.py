@@ -147,8 +147,10 @@ class ColonelsRunner(MoERunner):
         return super()._cache_key_extras() + (self.arch, tuple(self.tactics))
 
     def _workspace(self, num_tokens, hidden_size):
+        # The sorter uses the current batch size, independently of buffer capacity.
+        capacity = self.config.execution.tune_max_num_tokens
         key = (
-            num_tokens,
+            capacity,
             hidden_size,
             torch.cuda.current_stream(self.device).cuda_stream,
         )
@@ -164,7 +166,7 @@ class ColonelsRunner(MoERunner):
                     device=self.device,
                 )
             self._workspaces[key] = self.runtime.Workspace(
-                num_tokens,
+                capacity,
                 hidden_size,
                 self.config.experts.intermediate_size,
                 self.total_experts,

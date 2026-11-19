@@ -4,7 +4,11 @@ import os
 
 import torch
 
-from ...cute_dsl.moe_utils import allocate_moe_sort_buffers, moe_sort
+from ...cute_dsl.moe_utils import (
+    allocate_moe_sort_buffers,
+    get_max_num_tiles,
+    moe_sort,
+)
 from ....jit.colonels import gen_colonels_module
 
 
@@ -85,7 +89,9 @@ class Workspace:
             padding=ids.numel(),
             **buffers,
         )
-        return result[3], result[0], result[4]
+        # Launch grids use the tensor length, not the backing allocation's capacity.
+        tiles = get_max_num_tiles(ids.shape[0], ids.shape[1], num_experts, block_m)
+        return result[3][: tiles * block_m], result[0][:tiles], result[4]
 
 
 def launch(
