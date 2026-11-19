@@ -74,7 +74,8 @@ def test_clamped_relu2_layer_ep4():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             y = layer.forward(t)
-        for iteration in range(3):
+        original_ids, original_scores = ids.clone(), scores.clone()
+        for iteration in range(5):
             if iteration == 1:
                 ids[:, :4] = torch.arange(
                     4, device="cuda"
@@ -82,6 +83,13 @@ def test_clamped_relu2_layer_ep4():
                 ids[::3, 0] = -1
                 scores[:, 1] = 0
             if iteration == 2:
+                layer._workspace.output_activation.fill_(float("nan"))
+                ids.fill_(-1)
+                scores.zero_()
+            if iteration == 3:
+                ids.copy_(original_ids)
+                scores.copy_(original_scores)
+            if iteration == 4:
                 x.zero_()
             graph.replay()
             torch.cuda.synchronize()
