@@ -12,7 +12,11 @@ does not allow. Which of the two kinds a Q tile gets is the planner's choice (it
 count); every choice computes the same bits (R3).
 
 Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_len``) sits at
-``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``.
+``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. Under the explicit-key-set class (``masked``) a row's
+keys are data inside ``[0, kv_len)``: a row block's range is the tiles between the first and the last tile in which one of its
+rows has a visible key (``key_tiles``, a summary of the sets; the request's whole key range without it), and the unit and
+group construction is otherwise the same. The tiles a block skips hold no visible key of its rows -- absent leaves either way,
+so the summary only saves null steps (R3).
 """
 
 from __future__ import annotations
@@ -41,9 +45,12 @@ DESC_FIELDS = 16
     F_TILE_HI,
     F_QBASE,
     F_GROUP,
-) = range(14)
+    F_MASK,
+) = range(15)
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
+# F_MASK (the explicit-key-set class): the table row (16 int32) at which the key-set words of the unit's request start
+# (``engine.plan_attention`` appends them to the table and fills the field); 0 otherwise
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
 INKERNEL_MAX_CHUNKS = 2  # in-kernel (measured faster for small decode batches, within noise at B = 1); wider groups (prefill split
 FUSE2_MIN_ROWS = 8  # D = 256 two-chunk rule (build_plan): fused decode-sized units only from this many live rows (g x q_len) per unit
@@ -379,6 +386,8 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
     grid_search: bool = True,
+    masked: bool = False,
+    key_tiles: Optional[tuple] = None,
 ) -> Plan:
     """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
     live rows) takes the kinds and the launch grid of ``swaps_unit_kinds`` (a makespan model over the SM count: every unit fused on
@@ -394,7 +403,13 @@ def build_plan(
     ``INKERNEL_MAX_ROWS`` rows, the fixup kernel otherwise), ``"fixup"`` (always the kernel), ``"inkernel"``
     (always in-kernel); the same fold in the same order either way (R3: same bits).
     ``grid``: the persistent grid the launch will use (0: the planner's ``Plan.grid`` if it chose one, else ``min(units, sm_count)``),
-    so that the unit order's waves (``snake_order``) are the waves the CTAs actually walk."""
+    so that the unit order's waves (``snake_order``) are the waves the CTAs actually walk.
+    ``masked``: the explicit-key-set class -- a row block spans its request's tiles ``[0, ceil(kv_len / T))``, or with
+    ``key_tiles = (first, last)`` (per query token of the batch, in packed order: the first and the last tile holding a visible
+    key of the token, ``first > last`` for a token without one) the tiles from the block's smallest ``first`` to its largest
+    ``last``; a block without a visible key walks one tile (its rows end with ``l = +0`` and store ``+0``). ``window_left`` is not
+    read (the caller folds the window into the key sets); a request may have more query tokens than keys, and needs at least one
+    key."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -409,9 +424,14 @@ def build_plan(
         kv_len = kv_lens[b]
         if q_len == 0:
             continue
-        assert kv_len >= q_len, (
-            f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
-        )
+        if masked:
+            assert kv_len >= 1, (
+                f"request {b}: {q_len} query tokens over no key (a key set needs a key range)"
+            )
+        else:
+            assert kv_len >= q_len, (
+                f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
+            )
         for tok0 in range(0, q_len, tpt):
             ntok = min(tpt, q_len - tok0)
             p_first = kv_len - q_len + tok0
@@ -420,6 +440,14 @@ def build_plan(
             lo_min = max(0, p_first - window_left) if window_left >= 0 else 0
             chunk_lo, chunk_hi = lo_min // C, -(-L_max // C)
             tile_lo, tile_hi = lo_min // T, -(-L_max // T)
+            if masked:
+                tile_lo, tile_hi = 0, -(-kv_len // T)
+                if key_tiles is not None:
+                    a = qo_indptr[b] + tok0
+                    first = min(key_tiles[0][a : a + ntok])
+                    last = max(key_tiles[1][a : a + ntok])
+                    tile_lo, tile_hi = (first, last + 1) if last >= first else (0, 1)
+                chunk_lo, chunk_hi = tile_lo // (C // T), -(-tile_hi // (C // T))
             for h in range(Hkv):
                 tiles.append(
                     (
