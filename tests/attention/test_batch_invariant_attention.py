@@ -2714,7 +2714,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ws, "NHD", backend="cute-dsl", batch_invariant=True
         )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             ws, "NHD", use_cuda_graph=True, batch_invariant=True
         )
     # plan() arguments outside the class: typed errors before any plan
@@ -3296,9 +3296,10 @@ def test_planner_fixed_capacity_budget():
 
 
 def test_planner_decode_arrays_equal_the_reference():
-    """``plan.build_decode_plan`` (the array planner a ``use_cuda_graph=True`` replan runs) gives the tables of
-    ``plan.build_plan`` entry for entry: random decode batches over head dims, GQA groups, tokens per request, windows, unit
-    kinds, fold placements, SM counts, grids, the grid search, budgets and null requests."""
+    """``plan.build_array_plan`` / ``build_decode_plan`` (the array planner a ``use_cuda_graph=True`` replan runs) give the
+    tables of ``plan.build_plan`` entry for entry: random decode and prefill batches over head dims, GQA groups, tokens per
+    request, windows, unit kinds, fold placements, SM counts, grids, the grid search, budgets, null requests and requests
+    without query tokens; ``plan.pair_units_array`` gives ``engine.pair_units``'s table."""
     import random
 
     import numpy as np
@@ -3319,6 +3320,16 @@ def test_planner_decode_arrays_equal_the_reference():
         ]
         if rng.random() < 0.3:
             kv_lens = [kv_lens[0]] * batch
+        # a decode batch (one query length, requests without keys null) or a prefill batch (a query length per request,
+        # zero included)
+        q_lens = [q_len] * batch
+        null = True
+        if case % 2:
+            null = False
+            q_lens = [
+                0 if L == 0 or rng.random() < 0.2 else rng.randint(1, min(L, 3 * q_len))
+                for L in kv_lens
+            ]
         sm = rng.choice([1, 8, 148, 224])
         opts = dict(
             window_left=rng.choice([-1, -1, 0, 100, 3000]),
@@ -3340,11 +3351,31 @@ def test_planner_decode_arrays_equal_the_reference():
         last = [
             L - (n - 1) * page if n else 0 for L, n in zip(kv_lens, pages, strict=True)
         ]
-        qo = [b * q_len for b in range(batch + 1)]
+        qo = [0]
+        for n in q_lens:
+            qo.append(qo[-1] + n)
         ref = P.build_plan(
-            qo, indptr, last, Hq, Hkv, D, page, null_requests=True, **opts
+            qo, indptr, last, Hq, Hkv, D, page, null_requests=null, **opts
         )
-        got = P.build_decode_plan(np.array(kv_lens), q_len, Hq, Hkv, D, **opts)
+        if null:
+            got = P.build_decode_plan(np.array(kv_lens), q_len, Hq, Hkv, D, **opts)
+        else:
+            got = P.build_array_plan(
+                np.array(q_lens), np.array(kv_lens), Hq, Hkv, D, **opts
+            )
+        # the paired placement's table over arrays, and the table of units alone in their pairs
+        from flashinfer.attention.batch_invariant import engine
+
+        for grid in (0, 3, sm):
+            assert P.pair_units_array(got.desc_array, grid).tolist() == (
+                engine.pair_units(ref.desc, grid)
+            ), (case, grid)
+        lone = P.lone_units_array(got.desc_array).tolist()
+        assert lone[0::2] == ref.desc
+        assert all(
+            b[P.F_ROWS] == 0 and b[P.F_TILE_LO] == b[P.F_TILE_HI] and b[P.F_GROUP] == -1
+            for b in lone[1::2]
+        )
         assert got.desc == ref.desc, (case, kv_lens, opts)
         assert got.groups == ref.groups and got.group_inkernel == ref.group_inkernel
         assert got.fixup_groups == ref.fixup_groups and got.ws_rows == ref.ws_rows
@@ -3801,7 +3832,7 @@ def test_cuda_graph_frozen_shape_violations():
     """What a ``use_cuda_graph=True`` wrapper fixes for its lifetime: the batch size, ``q_len_per_req`` and the size of the
     page-index buffer raise ``ValueError`` as on the other backends; the head counts, head dim, page size, window, ``sm_scale``
     and -- from the first ``run()`` -- the LSE mode and the presence of sinks raise the class's typed error. A refused plan
-    leaves the wrapper on its last plan. The prefill wrappers still refuse the flag."""
+    leaves the wrapper on its last plan. The ragged prefill wrapper still refuses the flag."""
     pr = Problem([1] * 3, [3000, 3000, 3000], 32, 8, 128, 16, seed=17)
     dev = pr.device
     gd = _GraphDecode(pr, 1)
@@ -3865,12 +3896,10 @@ def test_cuda_graph_frozen_shape_violations():
                 batch_invariant=True,
                 **dict(bufs, **{name: other}),
             )
-    for wrapper in (
-        flashinfer.BatchPrefillWithPagedKVCacheWrapper,
-        flashinfer.BatchPrefillWithRaggedKVCacheWrapper,
-    ):
-        with pytest.raises(bi.BatchInvariantUnsupportedError):
-            wrapper(ws, "NHD", use_cuda_graph=True, batch_invariant=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            ws, "NHD", use_cuda_graph=True, batch_invariant=True
+        )
 
 
 @needs_device
@@ -3901,3 +3930,535 @@ def test_cuda_graph_replans_without_synchronization(D, q_len):
         null[rows] = False
         assert torch.equal(bits(out[rows]), bits(ref)), kv_lens
         assert not bits(out[null]).any(), kv_lens
+
+
+def test_fixed_launch_prefill_capacity_rule():
+    """The unit capacity of a prefill wrapper's fixed launch comes from its request slots and its row capacity alone: any
+    split of at most ``max_rows`` query tokens over the slots has at most ``ceil(max_rows / tokens per tile) + slots - 1``
+    Q tiles per KV head (every request rounds up at most once)."""
+    import random
+
+    from flashinfer.attention.batch_invariant import plan as P
+
+    rng = random.Random(3)
+    for Hq, Hkv in ((32, 8), (8, 8), (64, 8), (24, 2)):
+        tpt = 128 // (Hq // Hkv)
+        for slots, max_rows in ((1, 700), (4, 700), (8, 4096), (16, 33)):
+            bound = Hkv * (-(-max_rows // tpt) + slots - 1)
+            for trial in range(40):
+                cuts = sorted(rng.randint(0, max_rows) for _ in range(slots - 1))
+                q_lens = [
+                    b - a for a, b in zip([0] + cuts, cuts + [max_rows], strict=False)
+                ]
+                if trial == 0 and max_rows > (slots - 1) * (tpt + 1):
+                    # every request but one a tile and a token: each of them rounds up
+                    q_lens = [tpt + 1] * (slots - 1)
+                    q_lens.append(max_rows - sum(q_lens))
+                if trial % 5 == 4:
+                    q_lens[rng.randrange(slots)] = 0
+                qo = [0]
+                for n in q_lens:
+                    qo.append(qo[-1] + n)
+                plan = P.build_plan(
+                    qo,
+                    [4800 * i for i in range(slots + 1)],
+                    [16] * slots,
+                    Hq,
+                    Hkv,
+                    128,
+                    16,
+                    split_policy="fused",
+                )
+                assert plan.num_units <= bound, (Hq, Hkv, slots, max_rows, q_lens)
+                if trial == 0 and slots > 1 and max_rows > (slots - 1) * (tpt + 1):
+                    assert plan.num_units >= Hkv * 2 * (slots - 1)
+
+
+def _eager_prefill(pr: Problem, q, q_lens, kv_lens, window_left=-1, run_kw=None):
+    """An eager batch-invariant paged prefill of the first ``sum(q_lens)`` rows of ``q`` over the first ``kv_lens[b]`` keys
+    of every request of ``pr``; ``None`` when no request has a query token."""
+    total = sum(q_lens)
+    if not total:
+        return None
+    indptr, idx, last = _prefix_tables(pr, kv_lens)
+    qo = torch.tensor(
+        [sum(q_lens[:b]) for b in range(len(q_lens) + 1)],
+        dtype=torch.int32,
+        device=pr.device,
+    )
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        qo,
+        indptr,
+        idx,
+        last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    return w.run(q[:total].contiguous(), pr.cache("NHD"), **(run_kw or {}))
+
+
+class _GraphPrefill:
+    """A ``use_cuda_graph=True`` batch-invariant paged prefill wrapper over persistent buffers with ``max_rows`` query rows
+    of capacity: ``run()`` is captured once on capacity-shaped ``q`` / ``out`` (/ ``lse``), and every later step is a
+    ``plan()`` with its own query and KV lengths per request slot followed by a replay of that one graph."""
+
+    JUNK = 3.0
+
+    def __init__(
+        self, pr: Problem, max_rows, window_left=-1, lse=None, sinks=None, declare=True
+    ):
+        dev = pr.device
+        self.pr, self.max_rows, self.window_left = pr, max_rows, window_left
+        slots = len(pr.kv_lens)
+        mk = lambda n: torch.zeros(n, dtype=torch.int32, device=dev)  # noqa: E731
+        self.qo_buf, self.indptr_buf, self.last_buf = (
+            mk(slots + 1),
+            mk(slots + 1),
+            mk(slots),
+        )
+        self.indices_buf = mk(pr.kv_indices.numel() + 5)
+        self.w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace(dev),
+            "NHD",
+            use_cuda_graph=True,
+            qo_indptr_buf=self.qo_buf,
+            paged_kv_indptr_buf=self.indptr_buf,
+            paged_kv_indices_buf=self.indices_buf,
+            paged_kv_last_page_len_buf=self.last_buf,
+            max_total_num_rows=max_rows if declare else None,
+            batch_invariant=True,
+        )
+        g = torch.Generator(device="cpu").manual_seed(78)
+        self.q = (
+            (torch.randn(max_rows, pr.Hq, pr.D, generator=g) * 1.5)
+            .to(torch.bfloat16)
+            .to(dev)
+        )
+        self.out = torch.empty_like(self.q)
+        self.run_kw = dict(out=self.out)
+        self.lse = None
+        self.hn = False
+        if lse is not None:
+            self.hn = lse.get("lse_layout") == "HN"
+            shape = (pr.Hq, max_rows) if self.hn else (max_rows, pr.Hq)
+            self.lse = torch.empty(shape, dtype=torch.float32, device=dev)
+            self.run_kw.update(lse=self.lse, return_lse=True, **lse)
+        if sinks is not None:
+            self.run_kw.update(sinks=sinks)
+        self.graph = None
+
+    def plan(self, q_lens, kv_lens, **kw):
+        pr = self.pr
+        indptr, idx, last = _prefix_tables(pr, kv_lens)
+        qo = torch.tensor(
+            [sum(q_lens[:b]) for b in range(len(q_lens) + 1)],
+            dtype=torch.int32,
+            device=pr.device,
+        )
+        opts = dict(
+            causal=True,
+            window_left=self.window_left,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+        opts.update(kw)
+        self.w.plan(qo, indptr, idx, last, pr.Hq, pr.Hkv, pr.D, pr.page, **opts)
+
+    def launch(self):
+        cache = self.pr.cache("NHD")
+        if self.graph is None:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                self.w.run(self.q, cache, **self.run_kw)
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph, stream=s):
+                    self.w.run(self.q, cache, **self.run_kw)
+            torch.cuda.synchronize()
+        self.out.fill_(self.JUNK)
+        if self.lse is not None:
+            self.lse.fill_(self.JUNK)
+        self.graph.replay()
+
+    def check(self, q_lens, kv_lens, run_kw=None, **kw):
+        """Replan, replay, and compare with an eager wrapper: the planned rows bit for bit, the rows beyond untouched."""
+        self.plan(q_lens, kv_lens, **kw)
+        self.launch()
+        torch.cuda.synchronize()
+        total = sum(q_lens)
+        ref = _eager_prefill(self.pr, self.q, q_lens, kv_lens, self.window_left, run_kw)
+        ref_out, ref_lse = ref if isinstance(ref, tuple) else (ref, None)
+        if ref is not None:
+            assert torch.equal(bits(self.out[:total]), bits(ref_out)), (q_lens, kv_lens)
+        assert bool((self.out[total:] == self.JUNK).all()), (q_lens, kv_lens)
+        if self.lse is not None:
+            live = self.lse[:, :total] if self.hn else self.lse[:total]
+            if ref is not None:
+                assert torch.equal(bits(live), bits(ref_lse)), (q_lens, kv_lens)
+            if not self.hn:
+                assert bool((self.lse[total:] == self.JUNK).all()), (q_lens, kv_lens)
+        return self.w._batch_invariant._planned.plan
+
+
+PREFILL_GRAPH_STEPS = (
+    # (query lengths, KV lengths) per request slot: a full bucket, slots without rows, prefixes growing across 512-key
+    # chunks, Q tiles of 128 rows and more, a nearly empty batch, an empty one, the full bucket again
+    ([300, 200, 150, 50], [300, 1200, 150, 2600]),
+    ([5, 0, 130, 0], [600, 0, 2900, 0]),
+    ([129, 1, 0, 33], [129, 3000, 77, 545]),
+    ([0, 0, 1, 0], [0, 0, 1, 0]),
+    ([0, 700, 0, 0], [0, 3000, 0, 0]),
+    ([0, 0, 0, 0], [0, 40, 0, 0]),
+    ([257, 64, 250, 129], [1025, 512, 3000, 513]),
+    ([300, 200, 150, 50], [300, 1200, 150, 2600]),
+)
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "D,Hq,Hkv,page",
+    [
+        (64, 32, 8, 16),
+        (128, 32, 8, 16),
+        (256, 32, 8, 16),
+        (128, 8, 8, 1),
+        (64, 8, 8, 16),
+        (128, 64, 8, 16),
+    ],
+)
+def test_cuda_graph_prefill_replan_equals_eager(D, Hq, Hkv, page):
+    """``use_cuda_graph=True`` on the paged prefill wrapper: one capture of ``run()`` over capacity-shaped ``q`` / ``out``,
+    then plans that change every slot's query and KV lengths (zero-length slots, prefixes growing across chunks, Q tiles
+    of 128 rows and more, a full and a nearly empty bucket) each followed by a replay, give the bits of an eager wrapper
+    on the same batch in the planned rows and leave the rows beyond untouched."""
+    pr = Problem([1] * 4, [3000] * 4, Hq, Hkv, D, page, seed=21)
+    gp = _GraphPrefill(pr, 700)
+    for q_lens, kv_lens in PREFILL_GRAPH_STEPS:
+        plan = gp.check(q_lens, kv_lens)
+        fixed = gp.w._batch_invariant._fixed
+        assert plan.num_units <= fixed.unit_cap and plan.num_groups <= fixed.group_cap
+        assert plan.num_fixup_groups <= fixed.fixup_cap
+    assert fixed.n_pad == 0 and gp.w.is_cuda_graph_enabled
+
+
+@needs_device
+def test_cuda_graph_prefill_paired_placement():
+    """A prefill wrapper whose default is the paired placement (D = 64, GQA group 4) keeps the paired kernel for its
+    lifetime under ``use_cuda_graph=True``: a batch with the units for it runs real pairs, a smaller one every unit alone in
+    its pair, on the one captured graph, with the bits of the eager wrapper (which switches kernels instead)."""
+    from flashinfer.attention.batch_invariant import engine
+
+    pr = Problem([1, 1], [5000, 5000], 32, 8, 64, 16, seed=22)
+    gp = _GraphPrefill(pr, 4096)
+    fixed = None
+    seen = set()
+    for q_lens, kv_lens in (
+        ([4000, 96], [4100, 600]),
+        ([40, 0], [40, 0]),
+        ([2048, 2048], [5000, 2048]),
+        ([300, 7], [1300, 4000]),
+        ([4096, 0], [5000, 0]),
+    ):
+        plan = gp.check(q_lens, kv_lens)
+        fixed = gp.w._batch_invariant._fixed
+        if not fixed.config.q2:
+            pytest.skip("the paired placement is not this part's default")
+        paired = plan.num_units >= engine.Q2_MIN_UNITS_PER_SM[64] * fixed.sm_count
+        assert paired == (plan.num_launch < plan.num_units)
+        assert paired or plan.num_launch == plan.num_units
+        seen.add(paired)
+    assert seen == {True, False}
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_cuda_graph_prefill_fixed_launch_unit_kinds_and_budget(D):
+    """The fixed launch of a prefill geometry under every unit kind and fold placement, plan after plan on one captured
+    graph: fused, split with in-kernel folds and with the fixup kernel (more groups than its fixed grid holds: the blocks
+    stride), the planner's choice, a capacity the split plan exhausts, and fewer walking CTAs than the launch grid."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant import plan as P
+
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, D, 16, seed=23)
+    dev = pr.device
+    k, v = pr.cache("NHD")
+    max_rows = 400
+    g = torch.Generator(device="cpu").manual_seed(5)
+    q = (torch.randn(max_rows, 32, D, generator=g) * 1.5).to(torch.bfloat16).to(dev)
+    sm_scale = 1.0 / math.sqrt(D)
+    cfg = engine.default_config(D=D)
+    steps = (
+        ([200, 100, 100], [3000, 1500, 700], "split", "auto"),
+        ([40, 0, 9], [300, 0, 129], "split", "fixup"),
+        ([100, 200, 100], [3000, 3000, 3000], "fused", "auto"),
+        ([3, 300, 1], [513, 2049, 64], "split", "inkernel"),
+        ([64, 65, 0], [1024, 512, 0], "auto", "auto"),
+        ([200, 100, 100], [3000, 1500, 700], "split", "fixup"),
+        ([1, 1, 1], [8, 4, 77], "auto", "auto"),
+    )
+    for unit_cap, walkers in ((None, None), (150, None), (None, 7)):
+        fixed = engine.FixedLaunch(
+            3,
+            None,
+            32,
+            8,
+            D,
+            16,
+            cfg,
+            workspace(dev),
+            dev,
+            unit_cap=unit_cap,
+            max_rows=max_rows,
+        )
+        if walkers:
+            assert fixed.grid > walkers
+            fixed.sm_count = walkers
+        indptr_buf = torch.zeros(4, dtype=torch.int32, device=dev)
+        indices_buf = torch.zeros(pr.kv_indices.numel(), dtype=torch.int32, device=dev)
+        out = torch.empty_like(q)
+        graph = None
+        kinds = set()
+        for q_lens, kv_lens, policy, merge in steps:
+            step_cfg = replace(cfg, split_policy=policy, merge=merge)
+            indptr, idx, last = _prefix_tables(pr, kv_lens)
+            qo = torch.tensor(
+                [sum(q_lens[:b]) for b in range(4)], dtype=torch.int32, device=dev
+            )
+            planned = engine.plan_attention(
+                qo, indptr, last, 32, 8, D, 16, config=step_cfg, fixed=fixed
+            )
+            indptr_buf.copy_(indptr)
+            indices_buf[: idx.numel()].copy_(idx)
+            plan = planned.plan
+            assert plan.num_units <= fixed.unit_cap
+            kinds.add(
+                (
+                    any(d[P.F_MODE] == 1 for d in plan.desc),
+                    plan.num_fixup_groups > fixed.fixup_grid_y,
+                    any(plan.group_inkernel),
+                )
+            )
+            run = lambda: engine.run_attention(  # noqa: E731
+                planned, q, k, v, indptr_buf, indices_buf, sm_scale, out=out
+            )
+            if graph is None:
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    run()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=s):
+                        run()
+                torch.cuda.synchronize()
+            out.fill_(3.0)
+            graph.replay()
+            torch.cuda.synchronize()
+            total = sum(q_lens)
+            ref = engine.attention_paged(
+                q[:total].contiguous(), k, v, qo, indptr, idx, last, config=step_cfg
+            )
+            assert torch.equal(bits(out[:total]), bits(ref)), (
+                unit_cap,
+                q_lens,
+                policy,
+                merge,
+            )
+            assert bool((out[total:] == 3.0).all())
+        if unit_cap is None:
+            assert {kd[0] for kd in kinds} == {True, False}
+            assert any(kd[1] for kd in kinds) and any(kd[2] for kd in kinds)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NH", "HN"])
+def test_cuda_graph_prefill_lse_and_sinks_replay(D, layout):
+    """The LSE member (base e, both layouts) and the sink member of a prefill wrapper under replan and replay: the caller's
+    LSE buffer and sinks tensor are captured by address, the sinks are read in place, and the planned rows equal the eager
+    wrapper's ``(out, lse)``."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, D, 16, seed=24)
+    first, second = sink_logits(pr, seed=5), sink_logits(pr, seed=6)
+    sinks = first.clone()
+    lse = dict(lse_base="ln", lse_layout=layout)
+    gp = _GraphPrefill(pr, 500, lse=lse, sinks=sinks)
+    for q_lens, kv_lens, values in (
+        ([200, 250, 50], [300, 1200, 150], first),
+        ([5, 0, 130], [600, 0, 2900], first),
+        ([5, 0, 130], [600, 0, 2900], second),
+        ([129, 1, 33], [129, 3000, 545], second),
+        ([200, 250, 50], [3000, 2600, 150], first),
+    ):
+        sinks.copy_(values)
+        gp.check(q_lens, kv_lens, run_kw=dict(LSE, sinks=values, **lse))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_cuda_graph_prefill_uniform_window_and_chunked(D):
+    """Verify-style batches (the same query length in every slot) with a sliding window, and a prefill fed in pieces
+    through one captured graph: the pieces' rows, replay after replay, are the rows of the one-shot eager prefill."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, D, 16, seed=25)
+    gp = _GraphPrefill(pr, 24, window_left=700)
+    for kv_lens in ([300, 40, 129], [3000, 1500, 700], [513, 2049, 64], [8, 3000, 77]):
+        gp.check([8, 8, 8], kv_lens, uniform_q_len=8)
+    one = Problem([600], [600], 32, 8, D, 16, seed=26)
+    ref = bits(run_paged_prefill(one)).clone()
+    chunked = _GraphPrefill(one, 200)
+    for piece in range(3):
+        chunked.q.copy_(one.q[200 * piece : 200 * (piece + 1)])
+        chunked.plan([200], [200 * (piece + 1)])
+        chunked.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(chunked.out), ref[200 * piece : 200 * (piece + 1)])
+
+
+@needs_device
+def test_cuda_graph_prefill_replans_without_synchronization():
+    """A sequence of prefill plans and replays with no synchronisation in between: every step's planned rows, cloned on the
+    stream, equal the eager wrapper's."""
+    pr = Problem([1] * 4, [3000] * 4, 32, 8, 128, 16, seed=27)
+    gp = _GraphPrefill(pr, 600)
+    gp.check([300, 100, 150, 50], [300, 1200, 150, 2600])
+    rng = torch.Generator(device="cpu").manual_seed(9)
+    steps = []
+    for _ in range(16):
+        kv = [int(x) for x in torch.randint(0, 3000, (4,), generator=rng)]
+        ql = [
+            min(L, int(x))
+            for L, x in zip(
+                kv, torch.randint(0, 150, (4,), generator=rng), strict=False
+            )
+        ]
+        steps.append((ql, kv))
+    outs = []
+    for q_lens, kv_lens in steps:
+        gp.plan(q_lens, kv_lens)
+        gp.launch()
+        outs.append(gp.out.clone())
+    torch.cuda.synchronize()
+    for (q_lens, kv_lens), out in zip(steps, outs, strict=True):
+        total = sum(q_lens)
+        ref = _eager_prefill(pr, gp.q, q_lens, kv_lens)
+        if ref is not None:
+            assert torch.equal(bits(out[:total]), bits(ref)), (q_lens, kv_lens)
+        assert bool((out[total:] == gp.JUNK).all())
+
+
+@needs_device
+def test_cuda_graph_prefill_frozen_shape_violations():
+    """What a ``use_cuda_graph=True`` prefill wrapper fixes: the request slots, the row capacity (``max_total_num_rows``, or
+    the first plan's rows) and the size of the page-index buffer raise ``ValueError`` as on the other backends; head counts,
+    head dim, page size, window, ``sm_scale`` and the LSE / sinks of the first ``run()`` raise the class's typed error, as
+    do a request with fewer keys than query tokens (with no key at all, too) and the plan arguments outside the class. A
+    refused plan leaves the wrapper on its last plan."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, 128, 16, seed=28)
+    dev = pr.device
+    gp = _GraphPrefill(pr, 400)
+    gp.check([200, 100, 100], [300, 1200, 150])
+    ref = bits(gp.out).clone()
+    indptr, idx, last = _prefix_tables(pr, [3000, 1500, 700])
+    mk = lambda x: torch.tensor(x, dtype=torch.int32, device=dev)  # noqa: E731
+    qo = mk([0, 100, 200, 300])
+    kw = dict(causal=True, q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    too_many = torch.zeros(gp.indices_buf.numel() + 1, dtype=torch.int32, device=dev)
+    for bad_args in (
+        (qo[:3], indptr[:3], idx, last[:2], 32, 8, 128, 16),  # request slots
+        (
+            mk([0, 200, 300, 401]),
+            indptr,
+            idx,
+            last,
+            32,
+            8,
+            128,
+            16,
+        ),  # rows over capacity
+        (qo, indptr, too_many, last, 32, 8, 128, 16),  # more indices than the buffer
+    ):
+        with pytest.raises(ValueError) as err:
+            gp.w.plan(*bad_args, **kw)
+        assert not isinstance(err.value, bi.BatchInvariantUnsupportedError)
+    short = _prefix_tables(pr, [3000, 99, 700])
+    nokeys = _prefix_tables(pr, [3000, 0, 700])
+    for bad_args, bad_kw in (
+        ((qo, indptr, idx, last, 32, 8, 128, 16), dict(window_left=64)),
+        ((qo, indptr, idx, last, 32, 8, 128, 16), dict(sm_scale=0.5)),
+        ((qo, indptr, idx, last, 16, 8, 128, 16), {}),
+        ((qo, indptr, idx, last, 32, 8, 64, 16), {}),
+        ((qo, *short, 32, 8, 128, 16), {}),
+        ((qo, *nokeys, 32, 8, 128, 16), {}),
+        ((qo, indptr, idx, last, 32, 8, 128, 16), dict(causal=False)),
+        ((qo, indptr, idx, last, 32, 8, 128, 16), dict(logits_soft_cap=30.0)),
+        (
+            (qo, indptr, idx, last, 32, 8, 128, 16),
+            dict(custom_mask=torch.ones(10, dtype=torch.bool, device=dev)),
+        ),
+        (
+            (qo, indptr, idx, last, 32, 8, 128, 16),
+            dict(prefix_len_ptr=torch.zeros(1, dtype=torch.int32, device=dev)),
+        ),
+    ):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            gp.w.plan(*bad_args, **dict(kw, **bad_kw))
+    gp.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(gp.out), ref)  # the refused plans changed nothing
+    # the arguments serving engines pass on every plan
+    gp.check(
+        [100, 100, 100],
+        [3000, 1500, 700],
+        fixed_split_size=4096,
+        non_blocking=True,
+        custom_mask=None,
+        prefix_len_ptr=None,
+        token_pos_in_items_ptr=None,
+        token_pos_in_items_len=0,
+        max_item_len_ptr=None,
+    )
+    fused = gp.check([100, 100, 100], [3000, 1500, 700], disable_split_kv=True)
+    assert not fused.num_groups
+    cache = pr.cache("NHD")
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gp.w.run(gp.q, cache, return_lse=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gp.w.run(gp.q, cache, sinks=sink_logits(pr))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gp.w.run(gp.q[:299], cache)  # fewer rows than planned
+    # without max_total_num_rows the first plan's rows are the capacity
+    first = _GraphPrefill(pr, 400, declare=False)
+    first.check([100, 100, 50], [300, 1200, 150])
+    first.check([250, 0, 0], [3000, 0, 0])
+    with pytest.raises(ValueError):
+        first.plan([251, 0, 0], [3000, 0, 0])
+    # the constructor: the buffers are required, int32 and on the device
+    ws = workspace(dev)
+    bufs = dict(
+        qo_indptr_buf=gp.qo_buf,
+        paged_kv_indptr_buf=gp.indptr_buf,
+        paged_kv_indices_buf=gp.indices_buf,
+        paged_kv_last_page_len_buf=gp.last_buf,
+    )
+    for name, other in (
+        ("qo_indptr_buf", None),
+        ("paged_kv_indices_buf", gp.indices_buf.to(torch.int64)),
+        ("qo_indptr_buf", gp.qo_buf.cpu()),
+    ):
+        with pytest.raises(ValueError):
+            flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                ws,
+                "NHD",
+                use_cuda_graph=True,
+                batch_invariant=True,
+                **dict(bufs, **{name: other}),
+            )
