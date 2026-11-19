@@ -515,8 +515,10 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
     // Scores stay in RAW (unscaled) units through the max reduction:
-    // scale2 > 0 so the argmax is unchanged, and folding the scale into
-    // the exp2 argument turns FMUL+FSUB into a single FFMA per element.
+    // scale2 > 0 (descales are positive quantization scale factors, a
+    // documented contract of the exported `run`) so the argmax is unchanged,
+    // and folding the scale into the exp2 argument turns FMUL+FSUB into a
+    // single FFMA per element.
     // The causal/chunk mask is only live in the final tiles, so the
     // interior fast path drops 8 compare+select ops per key pair.
     if (w < 3) {
@@ -550,11 +552,16 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
         float ca = exp2f(m_a - mna), cb = exp2f(m_b - mnb);
         l_a *= ca;
         l_b *= cb;
-        __half2 ca2 = __float2half2_rn(ca), cb2 = __float2half2_rn(cb);
+        // Rescale the PV subtotal in FP32: an FP16 rescale factor flushes to
+        // zero once the running max rises by ~25 log2 units, zeroing the old
+        // subtotal while l_a keeps its FP32 mass. The FP32 product still
+        // lands in FP16 range whenever the rescaled value itself does.
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-          __half2 ra2 = __hmul2(*reinterpret_cast<__half2*>(&oa[2 * i]), ca2);
-          __half2 rb2 = __hmul2(*reinterpret_cast<__half2*>(&oa[2 * i + 1]), cb2);
+          float2 va = __half22float2(*reinterpret_cast<__half2*>(&oa[2 * i]));
+          float2 vb = __half22float2(*reinterpret_cast<__half2*>(&oa[2 * i + 1]));
+          __half2 ra2 = __floats2half2_rn(va.x * ca, va.y * ca);
+          __half2 rb2 = __floats2half2_rn(vb.x * cb, vb.y * cb);
           oa[2 * i] = *reinterpret_cast<uint32_t*>(&ra2);
           oa[2 * i + 1] = *reinterpret_cast<uint32_t*>(&rb2);
         }
@@ -675,13 +682,17 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
       STM4(ad, oa[2 * dt], oa[2 * dt + 1], oa[2 * dt + 2], oa[2 * dt + 3]);
     }
   }
+  // Every warp that staged partials above publishes its own generic-proxy
+  // stores to the async proxy BEFORE the CTA barrier (the documented
+  // bulk-copy pattern): a single thread's fence after the barrier would not
+  // order the other warps' stmatrix stores against thread 0's bulk copy.
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   __syncthreads();
   if (tid == 0) {
     // The online-softmax fragments are already staged in a complete
     // 12 KiB shared tile.  Store that tile with Hopper bulk copy and
     // retain its XOR swizzle in scratch; the reducer addresses the same
     // logical 8-half chunks through sw16().
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], 12288;" ::"l"(pob),
                  "r"(smaddr(ob))
                  : "memory");
@@ -937,14 +948,15 @@ int64_t gqa_decode_fp8_paged_sm90_plan_workspace_bytes(int64_t batch_size,
 
 // Launch the measured two-kernel sequence on the caller's current stream:
 // attn_kernel (split-KV fp8 attention over the proportional whole-tile
-// partition) then reduce_u4 (split merge + V descale) under programmatic
-// stream serialization. No allocation, no sync, no attribute queries:
-// CUDA-graph capturable. The workspace is plan-allocated by the Python
-// dispatcher.
+// partition) then reduce_u4 (split merge + V descale) — under programmatic
+// stream serialization when the caller resolved enable_pdl=true, ordinary
+// same-stream ordering otherwise. No allocation, no sync, no attribute
+// queries: CUDA-graph capturable. The workspace is plan-allocated by the
+// Python dispatcher.
 void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView v_cache,
                                    TensorView block_table, TensorView seq_lens,
                                    TensorView q_descale, TensorView k_descale, TensorView v_descale,
-                                   TensorView out, TensorView workspace) {
+                                   TensorView out, TensorView workspace, bool enable_pdl) {
   const int B = static_cast<int>(block_table.size(0));
   const int NB = static_cast<int>(block_table.size(1));
   const int TQ = static_cast<int>(q.size(0));
@@ -984,6 +996,11 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   }
   CHECK_INPUT_AND_TYPE(block_table, dl_int32);
   CHECK_INPUT_AND_TYPE(seq_lens, dl_int32);
+  // Contract: the per-sequence descales are quantization scale factors —
+  // finite and positive. The kernel keeps the softmax running max in raw
+  // score units, which bounds the scaled logits only for a non-negative
+  // q_descale*k_descale product. Values live on device and this entry point
+  // is sync-free / capture-safe, so they are not read back and validated.
   CHECK_INPUT_AND_TYPE(q_descale, dl_float32);
   CHECK_INPUT_AND_TYPE(k_descale, dl_float32);
   CHECK_INPUT_AND_TYPE(v_descale, dl_float32);
@@ -997,6 +1014,11 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   const GqaDecodeWsLayout L = gqa_decode_fp8_paged_sm90_ws_layout(B, NB);
   TVM_FFI_ICHECK_GE((size_t)workspace.numel(), L.total_bytes)
       << "workspace too small: plan with plan_workspace_bytes(" << B << ", " << NB << ")";
+  // The attention kernel stores split partials into the workspace with
+  // cp.async.bulk and the reducer re-reads them as uint4: both need a
+  // 16-byte-aligned base, and a contiguous uint8 view can start mid-storage.
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 16, 0)
+      << "workspace base pointer must be 16-byte aligned";
 
   CHECK_DEVICE(q, k_cache);
   CHECK_DEVICE(q, v_cache);
@@ -1040,8 +1062,13 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   cudaLaunchConfig_t config = {};
   config.dynamicSmemBytes = 0;
   config.stream = stream;
-  config.attrs = attribute;
-  config.numAttrs = 1;
+  // enable_pdl=false keeps ordinary same-stream ordering: the producer's
+  // cudaTriggerProgrammaticLaunchCompletion and the reducer's
+  // cudaGridDependencySynchronize are no-ops without this attribute.
+  if (enable_pdl) {
+    config.attrs = attribute;
+    config.numAttrs = 1;
+  }
   cudaError_t launch_status;
   if (B >= 6) {
     config.gridDim = B * MROWS;
