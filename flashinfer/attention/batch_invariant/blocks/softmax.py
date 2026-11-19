@@ -43,7 +43,7 @@ from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
 from .. import spec
-from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
+from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, Q_ROWS
 
 _NEG_INF = float("-inf")
 
@@ -262,7 +262,8 @@ def unit_loop(
             "P store fragment: register i must be column i (keys 2i, 2i+1 of the slice)"
         )
     rP_e = cute.make_tensor(
-        cute.recast_ptr(rP.iterator, dtype=IN_DTYPE), cute.make_layout((2 * p_words,))
+        cute.recast_ptr(rP.iterator, dtype=st.in_dtype),
+        cute.make_layout((2 * p_words,)),
     )
     # the static column of every register and the key -> register maps (the engine's leaf order)
     cols_f = []
@@ -401,10 +402,11 @@ def unit_loop(
         if cutlass.const_expr(rep):
             rPq = cute.make_rmem_tensor(cute.make_layout((kpt // 2,)), ACC_DTYPE)
             rPq_e = cute.make_tensor(
-                cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
+                cute.recast_ptr(rPq.iterator, dtype=st.in_dtype),
+                cute.make_layout((kpt,)),
             )
         if cutlass.const_expr(not rep and not st.q2):
-            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
+            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, st.in_dtype)
         else:
             ps = [None] * kpt
             for i in cutlass.range_constexpr(0, kpt, 2):
@@ -414,10 +416,10 @@ def unit_loop(
             r_s = packed_pairwise_add(ps, CuteF32)
             if cutlass.const_expr(rep):
                 for i in cutlass.range_constexpr(kpt):
-                    rPq_e[i] = ps[i].to(IN_DTYPE)
+                    rPq_e[i] = ps[i].to(st.in_dtype)
             else:
                 for i in cutlass.range_constexpr(kpt):
-                    rP_e[i] = ps[i].to(IN_DTYPE)
+                    rP_e[i] = ps[i].to(st.in_dtype)
         # ---- (m', r_slice) to the correction warpgroup, which owns the l chain and the merges
         sth = stats_prod.acquire_and_advance()
         s_m[(sth.index, row)] = m_new

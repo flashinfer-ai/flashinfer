@@ -36,7 +36,15 @@ from ..plan import ws_row
 from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
+# the bf16 class's operand type (``in_dtype_of``: the type per operand format)
 IN_DTYPE = cutlass.BFloat16
+
+
+def in_dtype_of(fmt: str = "bf16"):
+    """The CuTe type of the class's 16-bit operands (Q, K, V, P and the output): bf16, or IEEE binary16 for the fp16 class."""
+    return {"bf16": cutlass.BFloat16, "f16": cutlass.Float16}[fmt]
+
+
 HALF = 64  # d elements per TMA box / per SW128 half of a tile (128 bytes of bf16)
 Q_ROWS = 128  # query rows per CTA tile (the MMA M)
 TMEM_COLS = 512
@@ -186,10 +194,16 @@ class StaticPlan:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        fmt: str = "bf16",
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
         self.hw_rowmax = hw_rowmax
+        # the operand format of the class (``spec.OPERAND_FMTS``): Q, K, V, the P the softmax writes back and the output row are all
+        # this 16-bit type, so both MMAs are the ``kind::f16`` instruction with this operand format (an fp16 class's instruction is a
+        # different primitive from the bf16 class's); every budget below counts 2-byte elements either way
+        self.fmt = fmt
+        self.in_dtype = in_dtype_of(fmt)
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
@@ -283,8 +297,8 @@ class StaticPlan:
         cta_group = tcgen05.CtaGroup.ONE
         # QK^T: A = Q (K-major, smem), B = K (K-major, smem), (M, N) = (128, T), K = D -- the S accumulator's (128, T) shape
         self.qk_tiled_mma = utils.sm100.make_trivial_tiled_mma(
-            IN_DTYPE,
-            IN_DTYPE,
+            self.in_dtype,
+            self.in_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
             ACC_DTYPE,
@@ -296,8 +310,8 @@ class StaticPlan:
             self.qk_tiled_mma
             if self.slots_per_tile == 1
             else utils.sm100.make_trivial_tiled_mma(
-                IN_DTYPE,
-                IN_DTYPE,
+                self.in_dtype,
+                self.in_dtype,
                 OperandMajorMode.K,
                 OperandMajorMode.K,
                 ACC_DTYPE,
@@ -307,8 +321,8 @@ class StaticPlan:
         )
         # PV: A = P (K-major, TMEM), B = V (MN-major, smem), (M, N) = (128, D), K = T
         self.pv_tiled_mma = utils.sm100.make_trivial_tiled_mma(
-            IN_DTYPE,
-            IN_DTYPE,
+            self.in_dtype,
+            self.in_dtype,
             OperandMajorMode.K,
             OperandMajorMode.MN,
             ACC_DTYPE,
@@ -326,16 +340,16 @@ class StaticPlan:
         )  # Q tiles in smem: stage s holds tiles n_q s .. n_q s + n_q - 1
         self.ws_row = ws_row(D)  # fp32 per partial row of the split workspace
         self.q_smem_layout = utils.sm100.make_smem_layout_a(
-            self.qks_tiled_mma, self.qks_tiler, IN_DTYPE, self.q_tiles
+            self.qks_tiled_mma, self.qks_tiler, self.in_dtype, self.q_tiles
         )
         self.k_smem_layout = utils.sm100.make_smem_layout_b(
-            self.qks_tiled_mma, self.qks_tiler, IN_DTYPE, self.n_slots
+            self.qks_tiled_mma, self.qks_tiler, self.in_dtype, self.n_slots
         )  # (slot_keys x D) per slot
         self.v_smem_layout = utils.sm100.make_smem_layout_b(
-            self.pv_tiled_mma, self.pvs_tiler, IN_DTYPE, self.n_slots
+            self.pv_tiled_mma, self.pvs_tiler, self.in_dtype, self.n_slots
         )  # (D x slot_keys) per slot
         self.p_tmem_layout = utils.sm100.make_smem_layout_a(
-            self.pv_tiled_mma, self.pv_tiler, IN_DTYPE, 1
+            self.pv_tiled_mma, self.pv_tiler, self.in_dtype, 1
         )
         k_one = cute.select(self.k_smem_layout, mode=[0, 1, 2])
         v_one = cute.select(self.v_smem_layout, mode=[0, 1, 2])
@@ -482,7 +496,7 @@ class StaticPlan:
             == self.q_tile_elems
         )
         self.q_bytes = cute.size_in_bytes(
-            IN_DTYPE, cute.select(self.q_smem_layout, mode=[0, 1, 2])
+            self.in_dtype, cute.select(self.q_smem_layout, mode=[0, 1, 2])
         )  # the whole stage (128 rows)
         self.q_bytes_full = (
             self.rows_per_tile * D * 2
@@ -537,8 +551,8 @@ def shared_storage_struct(st: StaticPlan):
         s_p=cute.struct.Align[mr[f32, st.s_p_elems], 16],
         s_mx=mr[f32, 2 * st.n_slices * Q_ROWS],
         sOm=cute.struct.Align[mr[f32, st.n_q * Q_ROWS * st.D if st.om_smem else 4], 16],
-        sQ=cute.struct.Align[mr[IN_DTYPE, st.q_tiles * st.q_tile_elems], 1024],
-        sKV=cute.struct.Align[mr[IN_DTYPE, st.n_slots * st.kv_slot_elems], 1024],
+        sQ=cute.struct.Align[mr[st.in_dtype, st.q_tiles * st.q_tile_elems], 1024],
+        sKV=cute.struct.Align[mr[st.in_dtype, st.n_slots * st.kv_slot_elems], 1024],
     )
     return cute.struct(type("SharedStorage", (), {"__annotations__": fields}))
 

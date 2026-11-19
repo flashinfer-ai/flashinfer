@@ -551,16 +551,21 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int):
-    name = jit.sanitize_symbol_name(f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}")
+def get_fixup(D: int, g: int, fmt: str = "bf16"):
+    """``fmt``: the output format the epilogue rounds to (the class's operand format: bf16, or f16 for the fp16 class)."""
+    from .blocks.operands import in_dtype_of
+
+    name = jit.sanitize_symbol_name(
+        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("" if fmt == "bf16" else f"_{fmt}")
+    )
 
     def compile_fn():
-        f32, i32, bf16 = cutlass.Float32, cutlass.Int32, cutlass.BFloat16
+        f32, i32, op16 = cutlass.Float32, cutlass.Int32, in_dtype_of(fmt)
         ws_fake = cute.runtime.make_fake_tensor(
             f32, (cute.sym_int(64),), (1,), assumed_align=16
         )  # > 2^31 fp32 of partials is legal
         o_fake = cute.runtime.make_fake_tensor(
-            bf16,
+            op16,
             (cute.sym_int(32), D),
             (cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
