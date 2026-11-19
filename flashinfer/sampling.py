@@ -387,7 +387,9 @@ def get_sampling_module():
         device = probs.device
         probs = probs.float()
         maybe_top_p_arr = (
-            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+            maybe_top_p_arr.float().contiguous()
+            if maybe_top_p_arr is not None
+            else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
@@ -523,7 +525,9 @@ def get_sampling_module():
         device = probs.device
         probs = probs.float()
         maybe_min_p_arr = (
-            maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
+            maybe_min_p_arr.float().contiguous()
+            if maybe_min_p_arr is not None
+            else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
@@ -590,7 +594,9 @@ def get_sampling_module():
         device = probs.device
         probs = probs.float()
         maybe_top_p_arr = (
-            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+            maybe_top_p_arr.float().contiguous()
+            if maybe_top_p_arr is not None
+            else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
@@ -659,7 +665,9 @@ def get_sampling_module():
     ) -> torch.Tensor:
         probs = probs.float()
         maybe_top_p_arr = (
-            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+            maybe_top_p_arr.float().contiguous()
+            if maybe_top_p_arr is not None
+            else None
         )
         renorm_probs = torch.empty_like(probs)
         module.top_p_renorm_probs(
