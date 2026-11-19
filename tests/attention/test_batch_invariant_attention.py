@@ -1980,3 +1980,759 @@ def test_hardware_row_max_is_a_head_dim_placement():
         == engine.hw_row_max_enabled(dev)
     )
     assert engine.hw_row_max_enabled(torch.device("cpu"), 64) is False
+
+
+# ------------------------------------------------------------------------------------------------------ custom masks
+# The explicit-key-set class behind ``custom_mask`` / ``packed_custom_mask`` on the two prefill wrappers.
+def _random_masks(pr: Problem, seed=0, density=0.5):
+    """One boolean ``(q_len, kv_len)`` mask per request (CPU), with the structures the class must get right: rows without a
+    visible key, a tile and a chunk without one inside the range, and rows whose only key sits on a tile or chunk boundary."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    masks = []
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        m = torch.rand(ql, kl, generator=g) < density
+        if ql >= 8:
+            m[1] = False  # no visible key
+            m[2] = False
+            m[2, kl - 1] = True  # the last key alone
+            m[3] = False
+            m[3, 0] = True  # the first key alone
+            for i, k in ((4, 127), (5, 128), (6, 511), (7, 512)):
+                m[i] = False
+                m[i, min(k, kl - 1)] = True
+        if kl > 300:
+            m[: ql // 2, 128:256] = (
+                False  # tile 1 absent for the first half of the rows
+            )
+        if kl > 1100:
+            m[ql // 3 :, 512:1024] = False  # chunk 1 absent for the later rows
+        if ql > 140:
+            m[130:140] = True  # rows of the second Q tile that see every key
+        masks.append(m)
+    return masks
+
+
+def _flat(masks, device):
+    return torch.cat([m.reshape(-1) for m in masks]).to(device)
+
+
+def _packed(masks, device):
+    """Every request's bits from a byte boundary, little-endian: the layout of ``segment_packbits(..., bitorder="little")``."""
+    import numpy as np
+
+    return torch.cat(
+        [
+            torch.from_numpy(np.packbits(m.reshape(-1).numpy(), bitorder="little"))
+            for m in masks
+        ]
+    ).to(device)
+
+
+def run_masked(
+    pr: Problem,
+    masks,
+    kind="paged",
+    layout="NHD",
+    window_left=-1,
+    packed=False,
+    causal=False,
+    ws=None,
+):
+    kw = dict(
+        causal=causal,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    if packed:
+        kw["packed_custom_mask"] = _packed(masks, pr.device)
+    else:
+        kw["custom_mask"] = _flat(masks, pr.device)
+    ws = ws if ws is not None else workspace(pr.device)
+    if kind == "paged":
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, layout, batch_invariant=True
+        )
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            pr.Hq,
+            pr.Hkv,
+            pr.D,
+            pr.page,
+            **kw,
+        )
+        return w.run(pr.q, pr.cache(layout))
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, layout, batch_invariant=True
+    )
+    w.plan(pr.qo_indptr, pr.kv_indptr_rag, pr.Hq, pr.Hkv, pr.D, **kw)
+    k, v = pr.ragged(layout)
+    return w.run(pr.q, k, v)
+
+
+def _apply_window(masks, pr: Problem, window_left):
+    """The regular kernels' AND of the window: token ``i`` keeps key ``k`` when ``k >= kv_len - q_len + i - window_left``."""
+    out = []
+    for m, ql, kl in zip(masks, pr.q_lens, pr.kv_lens, strict=True):
+        pos = (kl - ql) + torch.arange(ql)[:, None]
+        out.append(m & (torch.arange(kl)[None, :] >= pos - window_left))
+    return out
+
+
+def masked_reference(pr: Problem, masks):
+    """fp32 attention over each row's visible keys (zeros for a row without one): the accuracy yardstick."""
+    outs = []
+    tok_q = tok_kv = 0
+    g = pr.Hq // pr.Hkv
+    for (ql, kl), m in zip(zip(pr.q_lens, pr.kv_lens, strict=True), masks, strict=True):
+        q = pr.q[tok_q : tok_q + ql].float()
+        k = pr.k_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
+        v = pr.v_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
+        s = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(pr.D)
+        m = m.to(pr.device)
+        s = s.masked_fill(~m[None], float("-inf"))
+        p = torch.softmax(s, dim=-1)
+        p = torch.where(m.any(-1)[None, :, None], p, torch.zeros_like(p))
+        outs.append(torch.einsum("hqk,khd->qhd", p, v))
+        tok_q += ql
+        tok_kv += kl
+    return torch.cat(outs)
+
+
+def _causal_masks(pr: Problem):
+    out = []
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        pos = (kl - ql) + torch.arange(ql)[:, None]
+        out.append(torch.arange(kl)[None, :] <= pos)
+    return out
+
+
+def test_mask_fingerprint_names_one_class_for_every_mask():
+    """The explicit-key-set class has its own receipt per head dim (the mask is data: no mask value enters it), on the two
+    prefill wrappers only; the causal receipts are unchanged."""
+    from flashinfer.attention.batch_invariant import spec
+
+    for D, pinned in spec.FINGERPRINTS.items():
+        assert bi.fingerprint(WRAPPERS[1], head_dim=D) == pinned
+        fp = bi.fingerprint(WRAPPERS[1], head_dim=D, custom_mask=True)
+        assert fp.startswith(f"attn-bf16-d{D}-mask-") and fp != pinned
+        assert fp == spec.MASK_FINGERPRINTS[D] == spec.mask_fingerprint(D)
+        assert fp == bi.fingerprint(WRAPPERS[2], head_dim=D, custom_mask=True)
+        assert bi.fingerprint(WRAPPERS[1], head_dim=D, custom_mask=False) == pinned
+    assert len({spec.mask_fingerprint(D) for D in spec.HEAD_DIMS}) == 3
+    with pytest.raises(TypeError):
+        bi.fingerprint(WRAPPERS[0], head_dim=128, custom_mask=True)  # decode: no mask
+
+
+def test_mask_term_is_a_function_of_the_row_key_set():
+    """The term of a row of the explicit-key-set class: a key outside the set is an absent leaf, a tile or chunk without a
+    visible key is dropped, a row without one is ``cvt(+0)``; a key set equal to a causal range gives the causal row's term
+    (the same object), with and without a window, whatever the request's key count beyond the range."""
+    from flashinfer.attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from flashinfer.batch_invariant.fp_interface.term import sexpr
+
+    S = AttentionSpec(64, T=16, C=32)
+    for p, win in ((40, -1), (40, 20), (7, -1), (100, 0), (33, 5)):
+        causal = RowSpec(p=p, window_left=win, row=2)
+        keys = frozenset(k for k in range(p + 1) if causal.visible(k))
+        for kv_len in (p + 1, p + 50):
+            assert S.output(RowSpec(p=0, row=2, kv_len=kv_len, keys=keys), 1) is (
+                S.output(causal, 1)
+            ), (p, win, kv_len)
+    empty = S.output(RowSpec(p=0, kv_len=70, keys=frozenset()), 0)
+    assert sexpr(empty) == "(cvt bf16 (const 0.0))"
+    # the term reads the row's own key set: other rows are other RowSpecs and never enter it; a different set, a different term
+    a = S.output(RowSpec(p=0, kv_len=70, keys=frozenset({3, 17, 40, 69})), 0)
+    b = S.output(RowSpec(p=0, kv_len=70, keys=frozenset({3, 17, 41, 69})), 0)
+    assert a is not b and a is S.output(
+        RowSpec(p=5, window_left=9, kv_len=70, keys=frozenset({3, 17, 40, 69})), 0
+    )
+    # a key set confined to chunk 1 drops chunk 0: the row's first present chunk merges with the init state
+    only1 = S.output(RowSpec(p=0, kv_len=70, keys=frozenset({33, 47})), 0)
+    assert "(score 0 33" in sexpr(only1) or "33" in sexpr(only1)
+
+
+def test_mask_key_set_words():
+    """``pack_key_sets``: bit ``k % 32`` of word ``k // 32`` of a row is the row's mask bit of key ``k`` (zero past ``kv_len``), the
+    packed input gives the same words, the window is ANDed in, and a row's words depend on that row's mask bits alone."""
+    from flashinfer.attention.batch_invariant import engine
+
+    g = torch.Generator().manual_seed(0)
+    q_lens, kv_lens = [3, 0, 5, 2], [200, 7, 130, 1]
+    masks = [
+        torch.rand(ql, kl, generator=g) < 0.5
+        for ql, kl in zip(q_lens, kv_lens, strict=True)
+    ]
+
+    def rows(ks):
+        out = []
+        for b, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
+            W = -(-kl // 128) * 4
+            w = ks.words[ks.row_start[b] * 16 :][: ql * W].view(ql, W)
+            bits_ = (w[:, :, None] >> torch.arange(32)) & 1
+            out.append(bits_.reshape(ql, W * 32).bool())
+        return out
+
+    ks = engine.pack_key_sets(q_lens, kv_lens, _flat(masks, "cpu"))
+    assert ks.words.dtype == torch.int32 and ks.words.numel() == 16 * ks.rows
+    for m, r, kl in zip(masks, rows(ks), kv_lens, strict=True):
+        assert torch.equal(r[:, :kl], m) and not r[:, kl:].any()
+    kp = engine.pack_key_sets(q_lens, kv_lens, None, _packed(masks, "cpu"))
+    assert torch.equal(kp.words, ks.words) and kp.row_start == ks.row_start
+    # both given: the packed mask wins, as in the regular wrappers
+    other = _flat([~m for m in masks], "cpu")
+    assert torch.equal(
+        engine.pack_key_sets(q_lens, kv_lens, other, _packed(masks, "cpu")).words,
+        ks.words,
+    )
+
+    class _P:  # the lengths ``_apply_window`` reads
+        pass
+
+    pr = _P()
+    pr.q_lens, pr.kv_lens = q_lens, kv_lens
+    kw = engine.pack_key_sets(q_lens, kv_lens, _flat(masks, "cpu"), window_left=40)
+    for m, r, kl in zip(_apply_window(masks, pr, 40), rows(kw), kv_lens, strict=True):
+        assert torch.equal(r[:, :kl], m)
+    # row locality: flipping every bit of one row leaves every other row's words unchanged
+    flipped = [m.clone() for m in masks]
+    flipped[2][3] = ~flipped[2][3]
+    kf = engine.pack_key_sets(q_lens, kv_lens, _flat(flipped, "cpu"))
+    for b, (ra, rb) in enumerate(zip(rows(ks), rows(kf), strict=True)):
+        diff = (ra != rb).any(-1)
+        assert diff.tolist() == [b == 2 and i == 3 for i in range(q_lens[b])]
+    with pytest.raises(ValueError):
+        engine.pack_key_sets(q_lens, kv_lens, _flat(masks, "cpu")[:-1])
+    with pytest.raises(ValueError):
+        engine.pack_key_sets(q_lens, kv_lens, None, _packed(masks, "cpu")[:-1])
+
+
+def test_mask_planner_geometry():
+    """The explicit-key-set plan: a row block walks the tiles between its rows' first and last visible key (the request's whole
+    key range without the summary), one tile when none of its rows has a key; more query tokens than keys are allowed; the
+    window is not read (it is folded into the sets)."""
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant import plan as P
+
+    def ranges(p):
+        return sorted(
+            {
+                (
+                    d[P.F_QTOK0],
+                    d[P.F_TILE_LO],
+                    d[P.F_TILE_HI],
+                    d[P.F_CHUNK_LO],
+                    d[P.F_CHUNK_HI],
+                )
+                for d in p.desc
+            }
+        )
+
+    kw = dict(split_policy="fused", masked=True)
+    p = P.build_plan([0, 300], [0, 1500], [1], 32, 8, 128, 1, **kw)
+    assert ranges(p) == [
+        (t, 0, 12, 0, 3) for t in (0, 32, 64, 96, 128, 160, 192, 224, 256, 288)
+    ]
+    p = P.build_plan([0, 300], [0, 100], [1], 32, 8, 128, 1, **kw)
+    assert {r[1:] for r in ranges(p)} == {(0, 1, 0, 1)}
+    p = P.build_plan([0, 8], [0, 1500], [1], 32, 8, 128, 1, 200, **kw)
+    assert ranges(p) == [(0, 0, 12, 0, 3)]  # the window is not read
+    with pytest.raises(AssertionError):
+        P.build_plan([0, 4], [0, 0], [0], 32, 8, 128, 1, masked=True)
+    # the summary of the key sets: 70 tokens over 1500 keys (12 tiles), three row blocks of 32 tokens
+    m = torch.zeros(70, 1500, dtype=torch.bool)
+    m[0, 700] = True  # block 0: tiles 5 .. 9
+    m[31, 1200] = True
+    m[40, 3] = True  # block 1: tile 0 alone (the other rows have no key)
+    ks = engine.pack_key_sets([70], [1500], m.reshape(-1))
+    assert ks.tile_first[0] == 5 and ks.tile_last[0] == 5
+    assert ks.tile_first[31] == ks.tile_last[31] == 9
+    assert ks.tile_first[1] > ks.tile_last[1]  # no visible key
+    p = P.build_plan(
+        [0, 70],
+        [0, 1500],
+        [1],
+        32,
+        8,
+        128,
+        1,
+        key_tiles=(ks.tile_first, ks.tile_last),
+        **kw,
+    )
+    assert ranges(p) == [(0, 5, 10, 1, 3), (32, 0, 1, 0, 1), (64, 0, 1, 0, 1)]
+    # a window folded into the sets trims the leading tiles through the summary
+    ones = torch.ones(8 * 1500, dtype=torch.bool)
+    kw_ = engine.pack_key_sets([8], [1500], ones, window_left=200)
+    p = P.build_plan(
+        [0, 8],
+        [0, 1500],
+        [1],
+        32,
+        8,
+        128,
+        1,
+        key_tiles=(kw_.tile_first, kw_.tile_last),
+        **kw,
+    )
+    assert ranges(p) == [
+        (0, 10, 12, 2, 3)
+    ]  # the first token sits at 1492: key 1292 on, tile 10
+    # a plan takes the lengths its key sets were packed for
+    qo, kv, last = (
+        torch.tensor(x, dtype=torch.int32) for x in ([0, 8], [0, 1500], [1])
+    )
+    with pytest.raises(ValueError):
+        engine.plan_attention(
+            qo, kv + kv, last, 32, 8, 128, 1, -1, ragged=True, key_sets=kw_
+        )
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_mask_matches_reference_and_paged_equals_ragged(D):
+    """Random masks with rows, tiles and chunks without a visible key, over requests with fewer and with more query tokens
+    than keys: the fp32 reference within tolerance, zeros for the rows without a key, the paged and the ragged wrappers and
+    both KV layouts the same bits, the packed input the same bits as the unpacked one."""
+    pr = Problem([300, 5, 130, 40], [1500, 700, 100, 2500], 32, 8, D, 16, seed=21)
+    masks = _random_masks(pr, seed=1)
+    out = run_masked(pr, masks)
+    ref = masked_reference(pr, masks)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    off = 0
+    for m, ql in zip(masks, pr.q_lens, strict=True):
+        empty = ~m.any(-1)
+        if empty.any():
+            rows = out[off : off + ql][empty.to(pr.device)]
+            assert (bits(rows) == 0).all()  # +0, never NaN
+        off += ql
+    assert not torch.isnan(out.float()).any()
+    ref_bits = bits(out)
+    assert torch.equal(bits(run_masked(pr, masks, "ragged")), ref_bits)
+    assert torch.equal(bits(run_masked(pr, masks, "paged", "HND")), ref_bits)
+    assert torch.equal(bits(run_masked(pr, masks, "ragged", "HND")), ref_bits)
+    assert torch.equal(bits(run_masked(pr, masks, packed=True)), ref_bits)
+    assert torch.equal(bits(run_masked(pr, masks, "ragged", packed=True)), ref_bits)
+    # the mask replaces the causal mask: ``causal`` is not read with one
+    assert torch.equal(bits(run_masked(pr, masks, causal=True)), ref_bits)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 256])
+def test_mask_blocks_and_requests_without_a_visible_key(D):
+    """Whole Q tiles and a whole request without a visible key (the planner walks one tile for such a block), next to row blocks
+    whose keys start late or end early (trimmed tile ranges): ``+0`` rows, the reference elsewhere, paged == ragged, and the
+    split kind with both fold placements the same bits."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    pr = Problem([200, 40, 100], [1500, 900, 2600], 32, 8, D, 16, seed=32)
+    masks = _random_masks(pr, seed=11)
+    masks[0][:64] = False  # two Q tiles (32 tokens each) of request 0
+    masks[0][64:96, :1100] = False  # a block whose keys start in chunk 2
+    masks[0][96:128, 300:] = False  # a block whose keys end in chunk 0
+    masks[1][:] = False  # request 1
+    masks[2][:, 600:2000] = (
+        False  # chunks 2 and 3 hold no key; chunks 1 and 3 hold a few
+    )
+    out = run_masked(pr, masks)
+    ref = masked_reference(pr, masks)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    assert (bits(out[:64]) == 0).all() and (bits(out[200:240]) == 0).all()
+    assert torch.equal(bits(run_masked(pr, masks, "ragged")), bits(out))
+    base = engine.default_config(D=D)
+    for cfg in (
+        replace(base, split_policy="split", merge="fixup"),
+        replace(base, split_policy="split", merge="inkernel"),
+        replace(base, split_policy="fused"),
+    ):
+        got, _ = _run_masked_engine(pr, masks, cfg)
+        assert torch.equal(bits(got), bits(out)), cfg
+    got, _ = _run_masked_engine(pr, masks, base, summary=False)
+    assert torch.equal(bits(got), bits(out))
+
+
+@needs_device
+@pytest.mark.parametrize("Hq,Hkv", [(24, 4), (8, 8), (64, 1)])
+def test_mask_gqa_groups(Hq, Hkv):
+    """GQA groups that do not divide the 128-row Q tile (g = 6: 126 live rows and two padding rows per tile), g = 1 and g = 64:
+    the reference within tolerance and paged == ragged; every head of a token takes the token's mask row."""
+    pr = Problem([300, 5, 40], [1500, 700, 2500], Hq, Hkv, 128, 16, seed=31)
+    masks = _random_masks(pr, seed=10)
+    out = run_masked(pr, masks)
+    ref = masked_reference(pr, masks)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    assert torch.equal(bits(run_masked(pr, masks, "ragged")), bits(out))
+    # a mask given on the host, in another dtype (nonzero = visible)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr.cpu(),
+        pr.kv_indptr_rag.cpu(),
+        Hq,
+        Hkv,
+        128,
+        custom_mask=_flat(masks, "cpu").to(torch.uint8) * 3,
+        **kw,
+    )
+    assert torch.equal(bits(w.run(pr.q, *pr.ragged("NHD"))), bits(out))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_mask_causal_range_equals_the_causal_class(D):
+    """A mask whose rows are causal ranges gives the causal class's bits (the terms coincide: ``test_mask_term_is_a_function_of_
+    the_row_key_set``), with the window ANDed in by ``window_left`` or written into the mask; hence also the decode step's."""
+    pr = Problem([256, 1, 1000, 33], [1500, 2500, 1000, 4096], 32, 8, D, 16, seed=22)
+    tri = _causal_masks(pr)
+    causal = bits(run_paged_prefill(pr))
+    assert torch.equal(bits(run_masked(pr, tri)), causal)
+    assert torch.equal(bits(run_masked(pr, tri, "ragged")), causal)
+    dec, last = run_decode(pr)
+    assert torch.equal(bits(run_masked(pr, tri))[last], bits(dec))
+    win = bits(run_paged_prefill(pr, window_left=600))
+    assert torch.equal(bits(run_masked(pr, tri, window_left=600)), win)
+    assert torch.equal(bits(run_masked(pr, _apply_window(tri, pr, 600))), win)
+
+
+@needs_device
+def test_mask_window_is_anded():
+    """``window_left`` with a custom mask: the bits of the mask ANDed with the window and no ``window_left``."""
+    pr = Problem([300, 64, 200], [1500, 3000, 150], 32, 8, 128, 16, seed=23)
+    masks = _random_masks(pr, seed=2, density=0.7)
+    for w in (0, 100, 700):
+        a = bits(run_masked(pr, masks, window_left=w))
+        b = bits(run_masked(pr, _apply_window(masks, pr, w)))
+        assert torch.equal(a, b), w
+        assert torch.equal(bits(run_masked(pr, masks, "ragged", window_left=w)), a), w
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_mask_batch_permutation_and_subbatch_invariance(D):
+    """R2 with per-request masks: a request's bits do not depend on its neighbours (or their masks), its position in the batch
+    or the batch size."""
+    q_lens, kv_lens = [300, 1000, 64, 700, 1], [700, 2500, 3000, 600, 5000]
+    pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=24)
+    masks = _random_masks(pr, seed=3)
+    full = bits(run_masked(pr, masks, "ragged"))
+    assert torch.equal(bits(run_masked(pr, masks)), full)
+    rows = [
+        slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1]))
+        for i in range(len(q_lens))
+    ]
+
+    def sub(idx):
+        p = Problem(
+            [q_lens[i] for i in idx], [kv_lens[i] for i in idx], 32, 8, D, 16, seed=5
+        )
+        p.q = torch.cat([pr.q[rows[i]] for i in idx]).contiguous()
+        for name in ("k_rag", "v_rag"):
+            src = getattr(pr, name)
+            setattr(
+                p,
+                name,
+                torch.cat(
+                    [
+                        src[int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])]
+                        for i in idx
+                    ]
+                ).contiguous(),
+            )
+        return p, [masks[i] for i in idx]
+
+    for idx in ([0], [2], [4], [3, 0, 4, 1, 2], [1, 3]):
+        p, ms = sub(idx)
+        got = bits(run_masked(p, ms, "ragged"))
+        off = 0
+        for i in idx:
+            assert torch.equal(got[off : off + q_lens[i]], full[rows[i]]), (idx, i)
+            off += q_lens[i]
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_mask_row_bits_depend_on_the_row_mask_alone(D):
+    """A row's bits are unchanged when other requests' masks change and when other rows' masks of its own request (of its own Q
+    tile, and so of its own warp) change: all-visible, all-masked and random neighbours."""
+    pr = Problem([300, 200, 16], [1500, 900, 700], 32, 8, D, 16, seed=25)
+    masks = _random_masks(pr, seed=4)
+    base = bits(run_masked(pr, masks))
+    g = torch.Generator().manual_seed(9)
+    keep = [torch.rand(ql, generator=g) < 0.3 for ql in pr.q_lens]
+    keep[2][:] = (
+        True  # request 2 keeps every row; the other requests' masks change around it
+    )
+    for variant in ("ones", "zeros", "random"):
+        changed = []
+        for m, kp in zip(masks, keep, strict=True):
+            n = m.clone()
+            if variant == "ones":
+                n[~kp] = True
+            elif variant == "zeros":
+                n[~kp] = False
+            else:
+                n[~kp] = torch.rand(int((~kp).sum()), m.shape[1], generator=g) < 0.5
+            changed.append(n)
+        got = bits(run_masked(pr, changed))
+        off = 0
+        for kp, ql in zip(keep, pr.q_lens, strict=True):
+            sel = kp.to(pr.device)
+            assert torch.equal(got[off : off + ql][sel], base[off : off + ql][sel]), (
+                variant
+            )
+            off += ql
+
+
+@needs_device
+def test_mask_snapshot_at_plan():
+    """The masks are snapshotted at ``plan()``: a later in-place change by the caller does not reach the plan."""
+    pr = Problem([200], [900], 32, 8, 128, 16, seed=26)
+    masks = _random_masks(pr, seed=5)
+    flat = _flat(masks, pr.device)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        custom_mask=flat,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    a = bits(w.run(pr.q, pr.cache("NHD"))).clone()
+    flat.zero_()
+    assert torch.equal(bits(w.run(pr.q, pr.cache("NHD"))), a)
+    assert torch.equal(a, bits(run_masked(pr, masks)))
+
+
+def _run_masked_engine(
+    pr: Problem, masks, cfg, sm_count=None, window_left=-1, summary=True
+):
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    ks = engine.pack_key_sets(
+        pr.q_lens, pr.kv_lens, _flat(masks, pr.device), window_left=window_left
+    )
+    if not summary:
+        ks = replace(ks, tile_first=None, tile_last=None)
+    planned = engine.plan_attention(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        window_left,
+        cfg,
+        None,
+        pr.device,
+        sm_count=sm_count,
+        key_sets=ks,
+    )
+    out = engine.run_attention(
+        planned,
+        pr.q,
+        pr.k_nhd,
+        pr.v_nhd,
+        pr.kv_indptr,
+        pr.kv_indices,
+        1.0 / math.sqrt(pr.D),
+        window_left,
+        "NHD",
+        None,
+        cfg,
+    )
+    return out, planned
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_mask_config_agreement(D):
+    """R3 for the explicit-key-set class: the unit kinds (fused, split with the fixup kernel's and the in-kernel fold), the
+    softmax warpgroups, ring depths, the SM count and the launch grid give the wrapper's bits; at D = 64 the paired placement
+    too, and at D = 128 on the parts it fits. The problem mixes full Q tiles with units of at most 32 live rows (the
+    replicated-row placement: the small-unit body of this class under either ``small`` setting) and multi-chunk requests with
+    rows, tiles and chunks without a visible key."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    pr = Problem(
+        [300, 1, 1000, 2, 600], [3000, 2500, 1000, 5000, 700], 32, 8, D, 16, seed=27
+    )
+    masks = _random_masks(pr, seed=6)
+    ref = bits(run_masked(pr, masks))
+    base = engine.default_config(D=D)
+    cfgs = [
+        replace(base, split_policy=p, merge=m, softmax_wgs=w, small=s)
+        for p, m in (
+            ("fused", "auto"),
+            ("split", "fixup"),
+            ("split", "inkernel"),
+            ("auto", "auto"),
+        )
+        for w in (1, 2)
+        for s in ("swap", "rep")
+        if not (w == 2 and s == "rep" and p != "split")
+    ]
+    cfgs += [replace(base, kv_slots=s) for s in engine.valid_kv_slots(D)[:1]]
+    for cfg in cfgs:
+        out, planned = _run_masked_engine(pr, masks, cfg)
+        assert planned.masked
+        assert torch.equal(bits(out), ref), cfg
+    for sm in (1, 8, 1000):
+        out, _ = _run_masked_engine(pr, masks, base, sm_count=sm)
+        assert torch.equal(bits(out), ref), sm
+    # without the planner's summary of the key sets every block walks its request's whole key range: the same bits
+    out, planned = _run_masked_engine(pr, masks, base, summary=False)
+    assert torch.equal(bits(out), ref)
+    for grid in (1, 3):
+        out, _ = _run_masked_engine(pr, masks, replace(base, grid=grid))
+        assert torch.equal(bits(out), ref), grid
+    big = arch_smem_cap(pr.device) >= (300 << 10)
+    if D == 64 or (D == 128 and big):
+        two = replace(base, softmax_wgs=2, q2=True)
+        rings = (2, 3) + ((4,) if big else ()) if D == 64 else (2, 3)
+        for s in rings:
+            for p, m in (("auto", "auto"), ("split", "auto"), ("split", "inkernel")):
+                cfg = replace(two, kv_slots=s, split_policy=p, merge=m)
+                out, planned = _run_masked_engine(pr, masks, cfg, sm_count=1)
+                assert planned.plan.num_launch is not None, cfg
+                assert torch.equal(bits(out), ref), cfg
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_mask_hardware_row_max_equals_the_register_tree(D, monkeypatch):
+    """A tile every live row of a warp sees whole takes the hardware row maximum where the part has it; the register-tree kernel
+    gives the same bits on fully visible, partly masked and empty tiles."""
+    from flashinfer.attention.batch_invariant import engine
+
+    dev = torch.device("cuda")
+    if not engine.hw_row_max_enabled(dev):
+        pytest.skip("this part has no hardware row maximum")
+    pr = Problem([300, 64], [1500, 3000], 32, 8, D, 16, seed=28)
+    masks = _random_masks(pr, seed=7)
+    masks[1][:] = True
+    masks[1][:, 1024:1536] = False
+    hw = bits(run_masked(pr, masks))
+    monkeypatch.setattr(engine, "hw_row_max_enabled", lambda device=None, D=128: False)
+    assert torch.equal(bits(run_masked(pr, masks)), hw)
+
+
+@needs_device
+def test_mask_refusals():
+    pr = Problem([63, 3], [701, 41], 32, 8, 128, 16, seed=29)
+    masks = _random_masks(pr, seed=8)
+    flat = _flat(masks, pr.device)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    paged = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+
+    def wrapper():
+        return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace(pr.device, mb=8), "NHD", batch_invariant=True
+        )
+
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        wrapper().plan(*paged, custom_mask=flat[:-1], **kw)  # not sum(q_len * kv_len)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        wrapper().plan(*paged, packed_custom_mask=_packed(masks, pr.device)[:-1], **kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        # the flat ``packbits`` of the whole batch is another layout: the second request's bits do not start at a byte
+        import numpy as np
+
+        whole = torch.from_numpy(np.packbits(flat.cpu().numpy(), bitorder="little")).to(
+            pr.device
+        )
+        assert whole.numel() != _packed(masks, pr.device).numel()
+        wrapper().plan(*paged, packed_custom_mask=whole, **kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        wrapper().plan(*paged, causal=False, **kw)  # non-causal without a mask
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        wrapper().plan(*paged, custom_mask=flat, logits_soft_cap=30.0, **kw)
+    # a request with query tokens and no key
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+            torch.tensor([0, 0, 10], dtype=torch.int32),
+            32,
+            8,
+            128,
+            custom_mask=torch.ones(40, dtype=torch.bool),
+            **kw,
+        )
+    # a refused plan leaves the previous plan in place
+    good = wrapper()
+    good.plan(*paged, custom_mask=flat, **kw)
+    a = bits(good.run(pr.q, pr.cache("NHD"))).clone()
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        good.plan(*paged, custom_mask=flat[:-1], **kw)
+    assert torch.equal(bits(good.run(pr.q, pr.cache("NHD"))), a)
+    # the delegate of the decode wrapper refuses a mask (its plan() has no mask argument)
+    from flashinfer.attention.batch_invariant.wrappers import BatchInvariantAttention
+
+    dec = BatchInvariantAttention(
+        workspace(pr.device, mb=8), "NHD", "decode", "auto", None
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        dec.plan(
+            qo_indptr=None,
+            kv_indptr=pr.kv_indptr,
+            kv_indices=pr.kv_indices,
+            kv_last_page_len=pr.kv_last,
+            num_qo_heads=32,
+            num_kv_heads=8,
+            head_dim_qk=128,
+            head_dim_vo=None,
+            page_size=16,
+            causal=True,
+            window_left=-1,
+            logits_soft_cap=None,
+            pos_encoding_mode="NONE",
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            sm_scale=None,
+            custom_mask=torch.ones(2, dtype=torch.bool),
+        )
+
+
+@needs_device
+def test_mask_workspace_size_and_small_workspace():
+    """``workspace_size`` with a mask sizes the explicit-key-set plan; a workspace too small for the split partials plans
+    fused units (the same bits)."""
+    pr = Problem([4, 2], [6000, 9000], 32, 8, 128, 16, seed=30)
+    masks = _random_masks(pr, seed=9)
+    flat = _flat(masks, pr.device)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    paged = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+    need, _ = w.workspace_size(*paged, custom_mask=flat)
+    assert need > 0
+    ref = bits(run_masked(pr, masks))
+    small = torch.empty(4096, dtype=torch.uint8, device=pr.device)
+    assert small.numel() < need
+    assert torch.equal(bits(run_masked(pr, masks, ws=small)), ref)
