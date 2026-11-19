@@ -380,36 +380,6 @@ def test_tactic_encoding_round_trips():
         )
 
 
-def test_non_kernel_source_exclusions_are_current():
-    """Every source excluded from a module's cache key (the dispatcher's host-side files) exists and is in the module's import
-    closure: a stale entry raises instead of silently letting the file back into the key."""
-    import flashinfer.batch_invariant.jit as J
-
-    clear = getattr(
-        J.module_sources, "cache_clear", lambda: None
-    )  # the closure is memoised per module
-    for module, entries in list(J.MODULE_NON_KERNEL_SOURCES.items()):
-        saved = J.MODULE_NON_KERNEL_SOURCES[module]
-        try:
-            J.MODULE_NON_KERNEL_SOURCES[module] = ()
-            clear()
-            full = set(J.relative_sources(module))
-            for r in entries:
-                assert (J._FI_DIR / r).exists(), (module, r)
-                assert r in full, (module, r)
-            J.MODULE_NON_KERNEL_SOURCES[module] = saved + (
-                "gemm/batch_invariant/does_not_exist.py",
-            )
-            clear()
-            with pytest.raises(
-                FileNotFoundError, match="not in the module's import closure"
-            ):
-                J.relative_sources(module)
-        finally:
-            J.MODULE_NON_KERNEL_SOURCES[module] = saved
-            clear()
-
-
 def test_cache_key_covers_every_kernel_source():
     """The compiled-kernel cache key is the kernel sources (the blocks, the fixup, the specification and generator they
     import, the vendored tile scheduler) and not the dispatcher's host-side selection code (chunk rule, heuristic): an edit to

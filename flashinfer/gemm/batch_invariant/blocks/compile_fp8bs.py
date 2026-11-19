@@ -54,7 +54,7 @@ def get_compiled_fp8bs(
     assert grid > 0, (cfg, clusters)
     name = kernel_name(cfg, grid, out_fmt, native_k)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         # K a multiple of 128 (one whole scale block per smem stage), the operand rows 16-byte aligned; the scale tensors
         # with free strides (the kernel's producer warp gathers them element by element, or four at a time from a
         # 16-byte-aligned base with the K-native staging)
@@ -104,6 +104,7 @@ def get_compiled_fp8bs(
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)

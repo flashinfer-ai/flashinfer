@@ -114,7 +114,7 @@ def compile_blockscaled(
     assert grid > 0, (cfg, clusters)
     name = kernel_name(cfg, chunks, grid, in_fmt, out_fmt, enable_pdl)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         # K elements per row, a multiple of 16 (K is a multiple of 32: one whole scale block); the row and chunk strides
         # are 16-byte multiples too. The kernel's N extent is the output's contiguous extent (aligned), except under the
         # swapped record, where it is the token count (any value) and the kernel's M extent (the weights' N) is the aligned one.
@@ -180,6 +180,7 @@ def compile_blockscaled(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         return cute.compile(
             BlockScaledGemm(
@@ -193,6 +194,7 @@ def compile_blockscaled(
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(module, name, compile_fn)
