@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake Gated DeltaProduct (GDP)
-decode kernels (SM90 / SM100 / SM103): the ``flashinfer.cake_gdp``
+decode kernels (SM90 / SM100 / SM103; FP16 state pool on SM100 / SM103): the ``flashinfer.cake_gdp``
 facade and its re-export from the ``flashinfer`` top-level package.  The
 facade's entry point is a pass-through to ``flashinfer.cake_gdp_backend``;
 this module checks that identity (same objects at the top level, the
-``gated_delta_rule_mtp`` parameter list, same bits as the backend) and leaves
+``gated_delta_rule_mtp`` parameter list and the trailing stochastic-rounding
+parameters, same bits as the backend) and leaves
 the numerical contract to ``test_cake_gdp_decode.py``, which imports only the
 backend package.
 """
@@ -57,6 +58,8 @@ PARAMETERS = (
     "disable_state_update",
     "use_qk_l2norm",
     "output_state_indices",
+    "rand_seed",
+    "philox_rounds",
 )
 
 
@@ -95,7 +98,8 @@ def test_function_is_exported() -> None:
 
 def test_signature_follows_gated_delta_rule_mtp() -> None:
     """The facade takes the parameters of ``flashinfer.gated_delta_rule_mtp`` in its order and with its
-    defaults (``k`` / ``v`` / ``b`` carry the Householder axis)."""
+    defaults (``k`` / ``v`` / ``b`` carry the Householder axis), then the stochastic rounding of an FP16 pool
+    (``rand_seed`` None: round to nearest even; ``philox_rounds`` 10, as FlashInfer's Mamba kernels)."""
     signature = inspect.signature(cake_gated_delta_product_mtp)
     assert tuple(signature.parameters) == PARAMETERS
     defaults = {
@@ -110,8 +114,13 @@ def test_signature_follows_gated_delta_rule_mtp() -> None:
         "disable_state_update": None,
         "use_qk_l2norm": True,
         "output_state_indices": None,
+        "rand_seed": None,
+        "philox_rounds": 10,
     }
     assert inspect.signature(backend.cake_gated_delta_product_mtp) == signature
+    supported = inspect.signature(is_cake_gdp_supported).parameters["state_dtype"]
+    assert supported.kind is inspect.Parameter.KEYWORD_ONLY
+    assert supported.default is torch.float32
 
 
 def _inputs(n: int, T: int, generator: torch.Generator) -> dict:
@@ -167,6 +176,49 @@ def test_facade_matches_the_backend(n: int, T: int) -> None:
     assert torch.equal(pool_facade, inputs["initial_state"])
     assert torch.equal(pool_facade[7], pool_before[7]) and torch.equal(
         pool_facade[5], pool_before[5]
+    )
+
+
+@pytest.mark.parametrize("seeded", (False, True))
+def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
+    """Over an FP16 pool (SM100 / SM103), to nearest or with stochastic rounding: the facade forwards the seed and
+    the round count, so output and pool bits equal the backend's."""
+    if not loader.route_applies(
+        device_capability=get_compute_capability(_device()),
+        num_householder=3,
+        num_tokens=4,
+        state_dtype=torch.float16,
+    ):
+        pytest.skip("no FP16-pool program on this device")
+    inputs = _inputs(3, 4, torch.Generator(device=_device()).manual_seed(SEED + 7))
+    inputs["initial_state"] = inputs["initial_state"].half()
+    if seeded:
+        inputs["rand_seed"] = torch.tensor(
+            [-12345], dtype=torch.int64, device=_device()
+        )
+        inputs["philox_rounds"] = 7
+    pool_before = inputs["initial_state"].clone()
+    out, pool = cake_gated_delta_product_mtp(**inputs)
+    assert pool is inputs["initial_state"] and pool.dtype == torch.float16
+    pool_facade = pool.clone()
+    inputs["initial_state"].copy_(pool_before)
+    out_backend, _ = backend.cake_gated_delta_product_mtp(**inputs)
+    assert torch.equal(out, out_backend)
+    assert torch.equal(pool_facade, inputs["initial_state"])
+    assert not torch.equal(pool_facade, pool_before)
+
+
+def test_unsupported_state_dtype_is_reported() -> None:
+    """A state pool dtype outside float32 / float16 is refused by both predicates with ``False`` (no raise)."""
+    assert is_cake_gdp_supported(_device(), state_dtype=torch.bfloat16) is False
+    assert (
+        loader.route_applies(
+            device_capability=get_compute_capability(_device()),
+            num_householder=3,
+            num_tokens=1,
+            state_dtype=torch.bfloat16,
+        )
+        is False
     )
 
 
