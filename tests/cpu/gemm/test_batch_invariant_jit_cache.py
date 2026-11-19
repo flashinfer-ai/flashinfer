@@ -160,8 +160,30 @@ def test_build_and_load_compiles_the_exported_object_without_the_engine(monkeypa
     assert got["files"] == tuple(
         str(p) for p in J.module_sources("batch_invariant_gemm")
     )
+    assert got["source_sha256"] == J.module_source_sha256("batch_invariant_gemm")
     assert got["export_compile_fn"]() == "compiled" and seen == [
         {"no_jit_engine": True}
     ]
     assert J.build_and_load("batch_invariant_gemm", "k", lambda: "compiled") == "loaded"
     assert got["export_compile_fn"] is None
+
+
+def test_key_hash_is_computed_once_per_process(monkeypatch):
+    """The key files are read and hashed once per module and process, not once per kernel; a different file list is a
+    different hash."""
+    calls = []
+    real = J._hash_source_files
+
+    def counting(paths):
+        calls.append(paths)
+        return real(paths)
+
+    monkeypatch.setattr(J, "_hash_source_files", counting)
+    J.module_source_sha256.cache_clear()
+    try:
+        hashes = {J.module_source_sha256("batch_invariant_gemm") for _ in range(8)}
+        assert len(hashes) == 1 and len(calls) == 1
+        assert J.module_source_sha256("batch_invariant_gemm_blockscaled") not in hashes
+        assert len(calls) == 2
+    finally:
+        J.module_source_sha256.cache_clear()

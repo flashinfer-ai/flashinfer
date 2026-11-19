@@ -358,6 +358,7 @@ def build_and_load_cute_dsl_kernel(
     *,
     enable_tvm_ffi: bool = True,
     export_compile_fn: Optional[Callable[[], Any]] = None,
+    source_sha256: Optional[str] = None,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -385,6 +386,10 @@ def build_and_load_cute_dsl_kernel(
     export_compile_fn : Optional[Callable[[], Any]]
         ``compile_fn`` without the DSL's execution engine, for the exported
         object (see :class:`JitSpecCuteDsl`).
+    source_sha256 : Optional[str]
+        The hash of ``extra_key_files`` when the caller keeps it across the
+        kernels of a module (``_hash_source_files(extra_key_files)``);
+        computed here when None.
 
     Returns
     -------
@@ -398,14 +403,15 @@ def build_and_load_cute_dsl_kernel(
     # If any key source is unreadable (missing file, __file__ unavailable
     # under exotic packaging), bypass the disk cache rather than skipping the
     # file from the hash: a weakened key could serve stale artifacts.
-    try:
-        source_sha256 = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError, SyntaxError, ValueError) as e:
-        logger.warning(
-            f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
-            f"({e}); bypassing the disk cache for this kernel."
-        )
-        return compile_fn()
+    if source_sha256 is None:
+        try:
+            source_sha256 = _hash_source_files(tuple(extra_key_files))
+        except (OSError, TypeError, SyntaxError, ValueError) as e:
+            logger.warning(
+                f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
+                f"({e}); bypassing the disk cache for this kernel."
+            )
+            return compile_fn()
 
     spec = JitSpecCuteDsl(
         module_name,

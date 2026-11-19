@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``JitSpecCuteDsl`` with an export-only compile closure, without a device: the disk-cache path compiles the kernel
 without the DSL's execution engine and hands back the exported object; a failed export compiles again with the engine;
-``compile_and_persist`` exports the engine-less kernel; a disabled cache or a spec without the closure keep today's path.
-The compiles are stubs: what is tested is which closure runs and what ``load()`` returns."""
+``compile_and_persist`` exports the engine-less kernel; a disabled cache or a spec without the closure keep today's path;
+a key hash the caller passes is used as given. The compiles are stubs: what is tested is which closure runs and what
+``load()`` returns."""
 
 import json
 from pathlib import Path
@@ -120,3 +121,17 @@ def test_disabled_cache_runs_the_engine_compile(jit_dir, monkeypatch):
     )
     assert isinstance(kernel, _Kernel) and kernel.tag == "engine"
     assert c.calls == ["engine"] and not jit_dir.exists()
+
+
+def test_given_source_hash_is_used_without_hashing(jit_dir, monkeypatch):
+    def refuse(paths):
+        raise AssertionError("the key files were hashed although the hash was given")
+
+    monkeypatch.setattr(cute_dsl_core, "_hash_source_files", refuse)
+    c = _Closures()
+    kernel = cute_dsl_core.build_and_load_cute_dsl_kernel(
+        "mod", "k", c.engine, extra_key_files=["/nowhere.py"], source_sha256="given"
+    )
+    assert kernel == b"mod_k:engine"
+    meta = json.loads((jit_dir / "mod_sm100a_cute_dsl" / "meta.json").read_text())
+    assert meta["source_sha256"] == "given"

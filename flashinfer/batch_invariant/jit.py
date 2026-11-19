@@ -21,10 +21,12 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from ..jit._cute_dsl_source import _hash_source_files
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel, sanitize_symbol_name
 
 __all__ = [
     "build_and_load",
+    "module_source_sha256",
     "module_sources",
     "relative_sources",
     "sanitize_symbol_name",
@@ -179,6 +181,13 @@ def relative_sources(module: str) -> list:
     return [str(p.relative_to(_FI_DIR)) for p in module_sources(module)]
 
 
+@functools.cache
+def module_source_sha256(module: str) -> str:
+    """The hash of the module's key files (:func:`module_sources`), computed once per process: every kernel of the module
+    shares it, and an edit to a key file is seen by the next process."""
+    return _hash_source_files(tuple(str(p) for p in module_sources(module)))
+
+
 def _export_compile_fn(
     compile_fn: Callable[..., Any],
 ) -> Optional[Callable[[], Any]]:
@@ -199,10 +208,16 @@ def build_and_load(module: str, kernel: str, compile_fn: Callable[..., Any]) -> 
     """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss. A ``compile_fn`` that
     forwards ``**compile_options`` to ``cute.compile`` is compiled without the execution engine for the exported object
     (:func:`_export_compile_fn`); one without them keeps the engine."""
+    try:
+        source_sha256: Optional[str] = module_source_sha256(module)
+    except (OSError, TypeError, SyntaxError, ValueError):
+        # FlashInfer's path hashes again, warns and bypasses the disk cache
+        source_sha256 = None
     return build_and_load_cute_dsl_kernel(
         module,
         kernel,
         compile_fn,
         extra_key_files=[str(p) for p in module_sources(module)],
+        source_sha256=source_sha256,
         export_compile_fn=_export_compile_fn(compile_fn),
     )
