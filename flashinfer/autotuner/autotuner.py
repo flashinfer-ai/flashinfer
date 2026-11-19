@@ -2090,6 +2090,10 @@ class AutoTuner:
         # (custom_op, requested profile) pairs already logged as served from
         # the largest tuned bucket (see _top_tuned_profile).
         self._logged_top_bucket: set[tuple[str, tuple[tuple[int, ...], ...]]] = set()
+        # Per-op memo of _has_tune_data's in-memory scan, valid for one value of
+        # _dirty_seq (every winner publication bumps it; clear_cache resets it
+        # and empties this memo).
+        self._tune_data_memo: dict[str, tuple[int, bool]] = {}
         # Set when new profiling results are added; cleared on save.
         self._dirty = False
         self._dirty_seq = 0
@@ -2279,6 +2283,41 @@ class AutoTuner:
         if local.active:
             return local.store
         return self._managed_cache
+
+    def _has_tune_data(self, custom_op: str) -> bool:
+        """Whether ``choose_one`` could return anything but the fallback for ``custom_op``.
+
+        A conservative precondition for callers that would otherwise pay the
+        lookup for an op nothing tuned: True in tuning mode, under replay
+        diagnostics, with a managed store attached, with bundled configs
+        enabled, with user-loaded configs present, or when an in-memory winner
+        partition holds an entry of the op.  False means every source
+        :meth:`search_cache` consults is empty for the op, so the lookup would
+        fall back to ``(runners[0], -1)``.  The in-memory scan is memoised per
+        op for the current ``_dirty_seq`` (every publication bumps it).
+        """
+        local = self._v2_local
+        if (
+            self.is_tuning_mode
+            or local.replay_report is not None
+            or local.strict_replay
+            or self._active_managed_store is not None
+            or self._file_configs
+            or os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+        ):
+            return True
+        seq = self._dirty_seq
+        memo = self._tune_data_memo.get(custom_op)
+        if memo is not None and memo[0] == seq:
+            return memo[1]
+        with self._lock:
+            found = any(k.custom_op == custom_op for k in self.profiling_cache) or any(
+                k.custom_op == custom_op
+                for part in self._winner_partitions.values()
+                for k in part
+            )
+            self._tune_data_memo[custom_op] = (seq, found)
+        return found
 
     @property
     def _in_v2_context(self) -> bool:
@@ -5662,6 +5701,7 @@ class AutoTuner:
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
             self._logged_top_bucket.clear()
+            self._tune_data_memo.clear()
             self._dirty = False
             self._dirty_seq = 0
             self._winner_partitions.clear()
