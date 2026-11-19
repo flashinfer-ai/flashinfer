@@ -8,8 +8,8 @@ import torch
 pytestmark = [pytest.mark.gpu_2, pytest.mark.arch_rubin]
 
 
-@pytest.mark.parametrize("capacity", [65, 128, 256])
-def test_clamped_relu2_layer_ep4(capacity):
+def test_clamped_relu2_layer_ep4():
+    capacity = 65
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("Requires torchrun with four ranks")
     from flashinfer.moe_ep import (

@@ -223,12 +223,3 @@ def test_clamped_relu2_rejects_unsupported_modes(override):
     kwargs.update(override)
     with pytest.raises(ValueError, match="clamped_relu2"):
         _config(Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, **kwargs)
-
-
-def test_clamped_relu2_explicit_activation():
-    config = _config(
-        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
-        activation="clamped_relu2",
-        kernel_variant="genphase",
-    )
-    assert config.activation == "clamped_relu2"

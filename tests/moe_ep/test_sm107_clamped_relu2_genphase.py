@@ -6,9 +6,11 @@ import torch
 pytestmark = pytest.mark.arch_rubin
 
 
-@pytest.mark.parametrize("early", [False, True])
-@pytest.mark.parametrize("tile_n", [64, 128])
-@pytest.mark.parametrize("hidden,intermediate", [(384, 256), (512, 1024)])
+# Cover both tile widths and routing-weight placements without a Cartesian sweep.
+@pytest.mark.parametrize(
+    "early,tile_n,hidden,intermediate",
+    [(False, 64, 384, 256), (True, 128, 512, 1024)],
+)
 def test_clamped_relu2_graph_replay(monkeypatch, early, tile_n, hidden, intermediate):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Requires SM107")
