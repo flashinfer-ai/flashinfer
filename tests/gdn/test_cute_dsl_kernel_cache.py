@@ -463,6 +463,7 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
         ("num_sm", 132),
         ("target_key", (0, "sm90a")),
         ("kernel_variant", "sm107"),
+        ("v_split", 2),
     ],
 )
 def test_prefill_name_varies_with_every_argument(param, alternate):
@@ -471,6 +472,13 @@ def test_prefill_name_varies_with_every_argument(param, alternate):
     kwargs[param] = alternate
     assert _prefill_kernel_name(**kwargs) != baseline, (
         f"_prefill_kernel_name ignores {param!r}"
+    )
+
+
+def test_prefill_name_unchanged_for_stock_v_split():
+    # v_split=1 is the stock kernel: its on-disk artifact keeps the old name.
+    assert _prefill_kernel_name(**PREFILL_BASELINE, v_split=1) == _prefill_kernel_name(
+        **PREFILL_BASELINE
     )
 
 

@@ -105,13 +105,15 @@ def _prefill_kernel_name(
     output_state_inner_strides,
     state_stride_divisibility: int,
     slot_key: tuple | None = None,
+    v_split: int = 1,
 ) -> str:
     """Specialization name within the gdn_blackwell_prefill module.
 
     Encodes every ``_get_compiled_cache`` key component, including ``num_sm``,
     which the compile below bakes in as ``max_active_clusters``. ``slot_key``
-    (see :func:`_slot_key`) is appended only for slot-addressed calls, so the
-    names of all other specializations are unchanged.
+    (see :func:`_slot_key`) is appended only for slot-addressed calls and
+    ``v_split`` only when it is not 1, so the names of all other
+    specializations are unchanged.
     """
     return make_kernel_name(
         target_arch(target_key)
@@ -133,6 +135,7 @@ def _prefill_kernel_name(
         output_state_inner_strides,
         state_stride_divisibility,
         *(() if slot_key is None else ("slot", slot_key)),
+        *(() if v_split == 1 else ("v_split", v_split)),
     )
 
 
@@ -157,6 +160,7 @@ def _get_compiled_cache(
     output_state_inner_strides: tuple[int, ...] | None,
     state_stride_divisibility: int,
     slot_key: tuple | None = None,
+    v_split: int = 1,
 ):
     """Return a mutable dict that lazily stores the compiled kernel.
 
@@ -301,6 +305,7 @@ def chunk_gated_delta_rule_sm100(
     output_state_indices: Optional[torch.Tensor] = None,
     checkpoint_state_indices: Optional[torch.Tensor] = None,
     prefix_lens: Optional[torch.Tensor] = None,
+    v_split: int = 1,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
@@ -329,13 +334,19 @@ def chunk_gated_delta_rule_sm100(
         checkpoint_state_indices: int32/int64 ``output_checkpoints`` pool row of each
             checkpoint entry (``cu_checkpoints[b] + j``)
         prefix_lens: ``(num_seqs,)`` int32/int64 tokens processed before this call
+        v_split: 1 or 2. With 2, each (sequence, head) pair runs as two CTAs
+            that own half of the value rows of the state and of the output;
+            results are bitwise identical to 1.
 
-    With any of the last three (slot mode), a negative read row starts from the
-    zero state, and a negative final-state or checkpoint row skips that store.
+    With any of the last three slot arguments (slot mode), a negative read row
+    starts from the zero state, and a negative final-state or checkpoint row
+    skips that store.
     ``prefix_lens`` places checkpoints at absolute positions; a sequence whose
     prefix is not a multiple of 64 is chunked from its aligned absolute position
     with leading identity rows (gate 1, beta 0), so checkpoints land on chunk ends.
     """
+    if v_split not in (1, 2):
+        raise ValueError(f"v_split must be 1 or 2, got {v_split!r}")
     HQ = q.size(1)
     HV = v.size(1)
     DK = q.size(2)
@@ -436,13 +447,20 @@ def chunk_gated_delta_rule_sm100(
         ),
         state_stride_divisibility,
     )
-    if slot_key is not None:
+    # Trailing key components only for slot calls and V-split, so every other
+    # call keeps the stock key.
+    if v_split != 1:
+        cache_key += (slot_key, v_split)
+    elif slot_key is not None:
         cache_key += (slot_key,)
     cache = _get_compiled_cache(*cache_key)
 
     if "compiled" not in cache:
         # --- First call: compile the kernel ---
         max_active_clusters = num_sm
+        mma_tiler_qk, mma_tiler_qs, mma_tiler_qkv, mma_tiler_kv = (
+            GatedDeltaNetChunkedKernel.mma_tilers(v_split)
+        )
 
         gdn = kernel_cls(
             io_dtype=io_dtype,
@@ -452,10 +470,10 @@ def chunk_gated_delta_rule_sm100(
             inverse_dtype=io_dtype,
             acc_dtype=cutlass.Float32,
             state_dtype=state_dtype,
-            mma_tiler_qk=(64, 64, 128),
-            mma_tiler_qs=(128, 64, 128),
-            mma_tiler_qkv=(128, 64, 64),
-            mma_tiler_kv=(128, 128, 64),
+            mma_tiler_qk=mma_tiler_qk,
+            mma_tiler_qs=mma_tiler_qs,
+            mma_tiler_qkv=mma_tiler_qkv,
+            mma_tiler_kv=mma_tiler_kv,
             max_active_clusters=max_active_clusters,
             num_sm=num_sm,
             is_GQA=is_GQA,
@@ -467,6 +485,7 @@ def chunk_gated_delta_rule_sm100(
             use_output_state_indices=use_output_state_indices,
             use_checkpoint_state_indices=use_checkpoint_state_indices,
             use_prefix_lens=use_prefix_lens,
+            v_split=v_split,
         )
 
         # Convert PyTorch tensors to CuTe tensors for compilation.

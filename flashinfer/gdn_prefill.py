@@ -1326,6 +1326,24 @@ def _cake_gdn_cp_sm100_band(
     )
 
 
+def _gdn_prefill_sm100_v_split(
+    v_split: Union[int, str], *, num_parallel_states: int, num_sms: int
+) -> int:
+    """V-split factor of the SM100-family non-CP prefill kernel.
+
+    ``num_parallel_states`` is ``num_seqs * max(num_q_heads, num_v_heads)``,
+    the CTA count of the stock (``v_split=1``) persistent grid. ``"auto"``
+    splits the value rows in two only when the split grid still fits on the
+    SMs, so an under-filled stock grid gains CTAs. A split pair costs about
+    1.76x the SM time of one stock tile (each half repeats the K-side work),
+    so once the split grid would exceed one wave the stock kernel is faster
+    (measured on B200). Every choice computes bitwise identical results.
+    """
+    if v_split != "auto":
+        return int(v_split)
+    return 2 if 2 * num_parallel_states <= num_sms else 1
+
+
 def _use_gdn_cp_sm100(
     *,
     initial_state: Optional[torch.Tensor],
@@ -1600,6 +1618,7 @@ def chunk_gated_delta_rule(
     use_affine_split: bool = False,
     _affine_split_count: Optional[int] = None,
     batch_invariant: bool = False,
+    v_split: Literal[1, 2, "auto"] = 1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1984,6 +2003,22 @@ def chunk_gated_delta_rule(
         instead of falling back.
         ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")``
         names the class; see ``flashinfer/batch_invariant/README.md``.
+    v_split : {1, 2, "auto"}
+        Value-row split of the SM100/SM103/SM107 non-CP kernel
+        (``backend="auto"`` or ``"flashinfer"``). With ``2`` each (sequence,
+        head) pair runs as two CTAs that each own half of the value rows of
+        the state and of the output, so batches with few sequences fill more
+        SMs; the K-side work of a chunk is repeated in both CTAs. ``"auto"``
+        picks ``2`` only when ``2 * num_seqs * num_sab_heads`` CTAs fit on
+        the SMs, else ``1``.
+        Output, final state and checkpoints are bitwise identical for every
+        value; ``2`` is one more compiled kernel variant. ``"auto"`` applies
+        only when the call reaches that kernel (CP, cuDNN, ``batch_invariant``
+        and other architectures ignore it). An explicit ``2`` keeps
+        ``use_cp="auto"`` on the non-CP kernel and raises with
+        ``backend="cake_gdn"``, ``"cudnn"`` or ``"sm120_cute"``, with
+        ``use_cp=True`` or ``batch_invariant=True``, and outside compute
+        capability 10.x.
 
     Returns
     -------
@@ -2026,6 +2061,18 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if v_split != "auto" and (type(v_split) is not int or v_split not in (1, 2)):
+        raise ValueError(f'v_split must be 1, 2 or "auto", got {v_split!r}')
+    if v_split == 2 and (
+        backend in ("cake_gdn", "cudnn", "sm120_cute")
+        or use_cp is True
+        or batch_invariant
+    ):
+        raise ValueError(
+            "v_split=2 runs on the native SM100-family non-CP kernel; it cannot be "
+            f"combined with backend={backend!r}, use_cp={use_cp!r}, "
+            f"batch_invariant={batch_invariant!r}"
+        )
     if batch_invariant:
         from .batch_invariant.gdn.api import chunk_gated_delta_rule_batch_invariant
 
@@ -2208,6 +2255,10 @@ def chunk_gated_delta_rule(
     if slot_args:
         # The native non-CP kernels serve these arguments; never auto-route
         # the call to CP or cuDNN, which would drop them.
+        use_cp = False
+    if v_split == 2:
+        # An explicit split asks for the native non-CP kernel; never auto-route
+        # the call to CP or cuDNN.
         use_cp = False
 
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
@@ -2437,6 +2488,11 @@ def chunk_gated_delta_rule(
     _cuda_major = _cuda_version[0]
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
+    if v_split == 2 and _arch_major != 10:
+        raise ValueError(
+            "v_split=2 requires the SM100/SM103/SM107 prefill kernel, got compute "
+            f"capability {_device_capability}"
+        )
     _device_name = get_device_name(device)
     if use_affine_split:
         return _run_cake_gdn_affine_split(
@@ -2924,6 +2980,12 @@ def chunk_gated_delta_rule(
             cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
             state_indices=state_indices,
+            # SM110 shares this kernel but the split is measured on SM10x only.
+            v_split=_gdn_prefill_sm100_v_split(
+                v_split, num_parallel_states=_parallel_work, num_sms=_sm_count
+            )
+            if _arch_major == 10
+            else 1,
             **slot_kwargs,
         )
     elif _arch_major == 8:
