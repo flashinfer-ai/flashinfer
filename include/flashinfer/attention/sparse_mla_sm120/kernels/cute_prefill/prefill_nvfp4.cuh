@@ -120,9 +120,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   const int num_chunks = num_main_chunks + num_extra_chunks;
   constexpr int chunk_lo = 0;
   const int chunk_hi = num_chunks;
-  const int warp_id = threadIdx.x / 32;
-  const int lane = threadIdx.x & 31;
-  const bool is_io = warp_id >= STREAMING_N_WARPS;
+  const bool is_io = threadIdx.x >= STREAMING_MATH_THREADS;
 
   extern __shared__ __align__(16) char smem_raw[];
   auto sm = StreamingNVFP4Smem::init(smem_raw);
@@ -191,10 +189,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     cute_gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE,
                      STREAMING_GATHER_WARPS * 32>(
         kv_cache, raw_pointer_cast(gIndexRow.data()), chunk, topk_len, false, page_block_size,
-        page_stride_bytes, (warp_id - STREAMING_N_WARPS) * 32 + lane, sm.kv_fp4(buf),
-        sm.kv_rope(buf), sm.kv_sc(buf), sm.mbar_full(buf), num_main_chunks, extra_topk_len,
-        extra_kv_cache, DUAL_CACHE ? raw_pointer_cast(extra_index_row().data()) : nullptr,
-        extra_page_block_size, extra_page_stride_bytes);
+        page_stride_bytes, threadIdx.x - STREAMING_MATH_THREADS, sm.kv_fp4(buf), sm.kv_rope(buf),
+        sm.kv_sc(buf), sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
+        DUAL_CACHE ? raw_pointer_cast(extra_index_row().data()) : nullptr, extra_page_block_size,
+        extra_page_stride_bytes);
   };
 
   // Phase 1 — IO role: WG2/WG3. Only WG2 warps 0/1 issue the gather;
@@ -239,6 +237,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   // Reserve registers for FP32 O and online max/sum across every KV tile.
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(STREAMING_MATH_MAX_REGS));
 
+  // Derive the CTA-local warp ID after the role split so it need not
+  // survive the producer's register deallocation.
+  const int warp_id = threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
   const int gid = lane >> 2;
   const int tid = lane & 3;
 #pragma unroll
