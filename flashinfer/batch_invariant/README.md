@@ -466,7 +466,7 @@ Without `initial_state` the same entry is a stateless call, the form a training 
 one from the zero state, rows only.
 
 ```python
-out = torch.empty_like(v)          # once, reused every step
+out = torch.empty_like(v, memory_format=torch.contiguous_format)  # once, reused every step
 flashinfer.recurrent_kda(
     q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0, cu_seqlens=cu, output=out,
     use_gate_in_kernel=True, use_qk_l2norm_in_kernel=True, beta_is_logit=True, batch_invariant=True,
@@ -496,6 +496,7 @@ flashinfer.recurrent_kda(
 * One `output` buffer per layer: the next call overwrites it, so a graph that saved its contents must not outlive
   that call (the call bumps the buffer's autograd version, so such a backward raises instead of reading the new rows).
 * It cannot be captured in a CUDA graph (it raises).
+* One call takes at most 65535 sequences (more raises).
 * **What a backward needs from the forward.** `checkpoint_every_n_tokens=16` also returns `state_checkpoints`, the
   state before every 16-token chunk of every sequence, and the call then returns `(rows, None, state_checkpoints)`. Row
   zero of a sequence is its (zero) initial state, the next rows the states before tokens 16, 32, ...; a sequence of `n`
@@ -504,7 +505,7 @@ flashinfer.recurrent_kda(
   reads on its `state_checkpoints` port) it is that state rounded. The rows of the call do not change. Pass a
   `state_checkpoints` buffer (bf16 or fp32 `[rows, HV, 128, 128]`, at least that many rows; further rows are left
   alone) and `checkpoint_cu_starts` (int64 `[N + 1]`, the running count of rows) to keep the call allocation-free
-  (the call reads `checkpoint_cu_starts` back to check it once per tensor and in-place change, not on every call);
+  (the call reads `checkpoint_cu_starts` back on the host to check it);
   without them the call allocates both. One row is 32 KB per head in bf16, so 2 KB per head and token. Only 16, and only
   without a pool.
 * **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
