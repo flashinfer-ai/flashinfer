@@ -66,7 +66,7 @@ LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
 
 # attention toy cases: (name, D, T, C, p, window_left, row id, d) -- T = 16 (one PV step per tile) and C = 32 keep the printed
-# terms small; D = 64 / 128 / 256 are the three classes (4 / 8 / 16 MMA steps per score)
+# terms small; D = 64 / 128 / 256 / 512 are the four classes (4 / 8 / 16 / 32 MMA steps per score)
 ATTN_CASES = [
     ("a0", 64, 16, 32, 40, -1, 0, 0),
     ("a1", 64, 16, 32, 40, 20, 0, 1),
@@ -87,8 +87,12 @@ ATTN_CASES = [
         0,
     ),  # the window starts past the first chunks: chunks 0-2 absent, key 100 alone visible
     ("a9", 64, 32, 64, 40, -1, 0, 0),  # two PV slices per tile (T = 2 x MMA_K)
+    # D = 512 (32 MMA steps per score): short rows keep the printed terms small -- a windowed row over two chunks (the merge) and
+    # a row of two tiles in one chunk (the tile fold)
+    ("a10", 512, 16, 32, 33, 5, 1, 2),
+    ("a11", 512, 16, 32, 18, 3, 0, 300),
 ]
-ATTN_HEAD_DIMS = (64, 128, 256)
+ATTN_HEAD_DIMS = (64, 128, 256, 512)
 
 GEMM_CASES = [
     (64, 1),
@@ -552,6 +556,7 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_C",
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
+    "Attn.output_depends_on_D_512",
 )
 
 
@@ -1132,7 +1137,7 @@ def _render_attention(L: List[str]) -> None:
     """The attention class: the toy-case spec terms and the per-head-dim configuration spaces."""
     mk = MMA_K_OF["bf16"]
     L.append(
-        "/-! The attention class on toy sizes (T = 16: one PV step per tile; C = 32; D = 64 / 128 / 256 = 4 / 8 / 16 MMA steps per "
+        "/-! The attention class on toy sizes (T = 16: one PV step per tile; C = 32; D = 64 / 128 / 256 / 512 = 4 / 8 / 16 / 32 MMA steps per "
         "score): the Python spec's output element (`attention/batch_invariant/spec.py`) reproduced by `Attention.lean` node for node, "
         "and the split kernel's equality to it instantiated on every case. -/"
     )

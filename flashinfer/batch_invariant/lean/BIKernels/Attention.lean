@@ -257,12 +257,15 @@ theorem output_depends_on_C :
 
 /-- **One class per head dim**: the same position under `D = 128` (8 MMA K-steps per score) and `D = 256` (16 steps) is a
 different term (the score fold differs; everything else -- `T`, `C`, the folds, the merge, the epilogue -- is shared). Stated
-on a concrete toy row, decided. The classes at D = 64 / 128 / 256 are therefore three fingerprints. -/
+on a concrete toy row, decided. The classes at D = 64 / 128 / 256 / 512 are therefore four fingerprints. -/
 theorem output_depends_on_D :
     output ⟨8, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨16, 2, 8, 9, -1, 0, 0⟩ := by native_decide
 
 theorem output_depends_on_D_64 :
     output ⟨4, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0⟩ := by native_decide
+
+theorem output_depends_on_D_512 :
+    output ⟨16, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨32, 2, 8, 9, -1, 0, 0⟩ := by native_decide
 
 /-- The visible keys, the tiles and the chunks of a row depend on `(p, win, T, C)` only: the page
 table, the batch and the configuration do not appear. -/
@@ -299,9 +302,12 @@ structure Config where
   deriving DecidableEq, Repr
 
 /-- The knob constraints at head dim `D`: a KV ring slot is `128 x D` bf16 and the ring holds 128 KB of K/V at every head dim,
-so `kvSlots * D ≤ 512` (2..8 slots at D = 64, 2..4 at D = 128, exactly 2 at D = 256); the other knobs do not depend on `D`. -/
+so `kvSlots * D ≤ 512` (2..8 slots at D = 64, 2..4 at D = 128, exactly 2 at D = 256). At D = 512 the body splits the head dim
+(a ring slot holds part of the head dims of a tile, a CTA one 256-column half of the accumulator): exactly 2 ring slots and one softmax
+warpgroup. The other knobs do not depend on `D`. -/
 def ConfigOKD (D : Nat) (c : Config) : Bool :=
-  (2 ≤ c.kvSlots && c.kvSlots * D ≤ 512) && c.policy ≤ 2 && (c.softmaxWgs == 1 || c.softmaxWgs == 2) && c.merge ≤ 2 && c.small ≤ 1
+  (2 ≤ c.kvSlots && (c.kvSlots * D ≤ 512 || (D == 512 && c.kvSlots == 2 && c.softmaxWgs == 1))) && c.policy ≤ 2 &&
+    (c.softmaxWgs == 1 || c.softmaxWgs == 2) && c.merge ≤ 2 && c.small ≤ 1
 
 /-- A row's output under a configuration: the fused fold when the planner keeps all chunks in one unit (policy 2, or policy 0
 when its SM-count rule `fusedAuto` says so), the split kernel under the assignment `σ` otherwise. Ring depth, warpgroups
