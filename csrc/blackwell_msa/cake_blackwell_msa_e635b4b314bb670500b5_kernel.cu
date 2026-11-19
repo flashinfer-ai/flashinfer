@@ -91,22 +91,35 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_TOTAL 216704
 #define THREADS 512
 
-__device__ __forceinline__ uint32_t cvt_bf16x2_e4m3x2_v(uint16_t src) {
+__device__ __forceinline__ uint32_t cvt_bf16x2_e4m3x2(uint16_t src) {
     uint32_t dst;
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(dst) : "h"(src));
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(dst) : "h"(src));
 #else
     uint32_t _f16x2;
-    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2) : "h"(src));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2) : "h"(src));
     uint16_t _h0 = (uint16_t)(_f16x2 & 0xFFFFu);
     uint16_t _h1 = (uint16_t)((_f16x2 >> 16) & 0xFFFFu);
     float _f0;
     float _f1;
-    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_f0) : "h"(_h0));
-    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_f1) : "h"(_h1));
-    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(dst) : "f"(_f1), "f"(_f0));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(_f0) : "h"(_h0));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(_f1) : "h"(_h1));
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(dst) : "f"(_f1), "f"(_f0));
 #endif
     return dst;
+}
+
+__device__ __forceinline__ void cvt_bf16x4_e4m3x4(uint32_t src, uint32_t& lo, uint32_t& hi) {
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    asm("{ .reg .b16 _p0, _p1;                   \n\t"
+        "  mov.b32 {_p0, _p1}, %2;                \n\t"
+        "  cvt.rn.bf16x2.e4m3x2 %0, _p0;          \n\t"
+        "  cvt.rn.bf16x2.e4m3x2 %1, _p1;          }"
+        : "=r"(lo), "=r"(hi) : "r"(src));
+#else
+    lo = cvt_bf16x2_e4m3x2((uint16_t)src);
+    hi = cvt_bf16x2_e4m3x2((uint16_t)(src >> 16));
+#endif
 }
 
 #include <math_constants.h>
@@ -1425,11 +1438,8 @@ kernel_cake_blackwell_msa_e635b4b314bb670500b5(const __grid_constant__ CUtensorM
                             int _off = _base + _tid;
                             uint64_t _src64 = _src_buf[(_base / 64) % 16];
                             uint32_t _out_x16x2[4];
-                            #pragma unroll
-                            for (int _cv = 0; _cv < 4; ++_cv) {
-                                uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
-                                _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
-                            }
+                            cvt_bf16x4_e4m3x4((uint32_t)(_src64), _out_x16x2[0], _out_x16x2[1]);
+                            cvt_bf16x4_e4m3x4((uint32_t)(_src64 >> 32), _out_x16x2[2], _out_x16x2[3]);
                             uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
                             int _elt = _off * 8;
                             int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
@@ -1475,11 +1485,8 @@ kernel_cake_blackwell_msa_e635b4b314bb670500b5(const __grid_constant__ CUtensorM
                             int _off = _base + _tid;
                             uint64_t _src64 = _src_buf[(_base / 64) % 16];
                             uint32_t _out_x16x2[4];
-                            #pragma unroll
-                            for (int _cv = 0; _cv < 4; ++_cv) {
-                                uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
-                                _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
-                            }
+                            cvt_bf16x4_e4m3x4((uint32_t)(_src64), _out_x16x2[0], _out_x16x2[1]);
+                            cvt_bf16x4_e4m3x4((uint32_t)(_src64 >> 32), _out_x16x2[2], _out_x16x2[3]);
                             uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
                             int _elt = _off * 8;
                             int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
@@ -1519,11 +1526,8 @@ kernel_cake_blackwell_msa_e635b4b314bb670500b5(const __grid_constant__ CUtensorM
                                 int _off = _base + _tid;
                                 uint64_t _src64 = _src_buf[(_base / 64) % 16];
                                 uint32_t _out_x16x2[4];
-                                #pragma unroll
-                                for (int _cv = 0; _cv < 4; ++_cv) {
-                                    uint16_t _e4m3x2 = (uint16_t)((_src64 >> (_cv * 16)) & 0xFFFFull);
-                                    _out_x16x2[_cv] = cvt_bf16x2_e4m3x2_v(_e4m3x2);
-                                }
+                                cvt_bf16x4_e4m3x4((uint32_t)(_src64), _out_x16x2[0], _out_x16x2[1]);
+                                cvt_bf16x4_e4m3x4((uint32_t)(_src64 >> 32), _out_x16x2[2], _out_x16x2[3]);
                                 uint4 _dst4 = make_uint4(_out_x16x2[0], _out_x16x2[1], _out_x16x2[2], _out_x16x2[3]);
                                 int _elt = _off * 8;
                                 int _row = (((_elt % 128) / 64) * 128) + (_elt / 128);
