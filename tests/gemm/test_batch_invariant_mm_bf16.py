@@ -978,8 +978,21 @@ def test_launch_placements_share_one_compiled_object(monkeypatch):
         and "_sw" not in gemm_names[0]
         and "_g" not in gemm_names[0]
     ), names
-    keys = [k for k in bi_api._KERNELS if k[1] == object_record(base)]
-    assert len(keys) == 1, keys
+    # one launch handle per record (its own trailing arguments), all holding the same compiled kernel
+    handles = {
+        k: v
+        for k, v in bi_api._KERNELS.items()
+        if object_record(k[1]) == object_record(base)
+    }
+    assert len(handles) == len(variants), handles.keys()
+    assert len({id(v[0]) for v in handles.values()}) == 1, handles.keys()
+    clusters = bi_api.persistent_clusters(a.device, base)
+    assert {v[1] for v in handles.values()} == {
+        (g or clusters, s, 1 if r == "m" else 0)
+        for r in ("m", "n")
+        for s in (1, 2, 4, 8)
+        for g in (0, 9)
+    }
     # the split class: C = 2 and C = 8 (two weight shapes) share the partial kernel; the fixup is per chunk count
     del names[:]
     cfg = Knobs((64, 32), (1, 4), False, True, "m", 1)
@@ -1000,12 +1013,13 @@ def test_launch_placements_share_one_compiled_object(monkeypatch):
     assert sum("_cc" in n for n in gemm_names) == 1, names
     fixups = sorted(n for n in names if n.startswith("splitk_fixup"))
     assert fixups == ["splitk_fixup_C2_bf16", "splitk_fixup_C8_bf16"], names
-    handles = {
-        k[2:]: v for k, v in bi_api._KERNELS.items() if k[1] == object_record(cfg)
+    # one partial kernel for both chunk counts and the raster / swizzle variant (the in-CTA fold is its own object)
+    kernels = {
+        id(v[0])
+        for k, v in bi_api._KERNELS.items()
+        if object_record(k[1]) == object_record(cfg) and not k[1].cta_chunks
     }
-    assert len(handles) == 1, (
-        handles
-    )  # one handle for both chunk counts (the object's record and "split")
+    assert len(kernels) == 1, kernels
 
 
 @needs_device
