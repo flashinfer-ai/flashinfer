@@ -744,7 +744,7 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
   gpuErrchk(cudaGetDevice(&device));
   // Each cluster processes one token tile from the full work grid.
   const int block_count = (sorted_num + block_m - 1) / block_m;
-  if (block_count == 0) return false;
+  if (block_count <= 0) return false;
   dim3 dimGrid(block_count * C::CLUSTERS, 1, 1);
 
   if constexpr (launch_smem > C::SM100_MAX_SMEM) {

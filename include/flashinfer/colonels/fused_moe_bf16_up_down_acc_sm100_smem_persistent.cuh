@@ -590,6 +590,7 @@ bool launch_fused_moe_kernel_up_down_acc(
   gpuErrchk(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
   const int block_count =
       std::min(num_sms / (SPLIT_K * C::CTA_GROUP), (sorted_num + block_m - 1) / block_m);
+  if (block_count <= 0) return false;
   dim3 dimGrid(block_count * SPLIT_K * C::CTA_GROUP, 1, 1);
 
   if constexpr (C::sMemSize > C::SM100_MAX_SMEM) {

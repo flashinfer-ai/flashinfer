@@ -658,7 +658,7 @@ bool launch_fused_moe_kernel_up_down_acc(
   dim3 dimBlock(32 * WN + PRODUCER_THREADS, 1, 1);
   const int SPLIT_K = N / (BN * WN) == 0 ? 1 : N / (BN * WN);
   const int block_count = std::min(NUM_SM / SPLIT_K, (int)std::ceil((float)sorted_num / block_m));
-  if (block_count == 0) return false;
+  if (block_count <= 0) return false;
   dim3 dimGrid(1, block_count * SPLIT_K, 1);
 
   constexpr size_t OVERLAY_OFF = smem_overlay_offset<STAGES, BM, BK, BN, WN>();

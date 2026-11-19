@@ -516,7 +516,7 @@ bool launch_fused_moe_kernel_up_down_acc(
     gpuErrchk(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
     const int block_count =
         std::min(std::max(1, num_sms / SPLIT_K), (sorted_num + block_m - 1) / block_m);
-    if (block_count == 0) return true;
+    if (block_count <= 0) return false;
     dim3 dimGrid(block_count * SPLIT_K, 1, 1);
 
     auto kernel = fused_moe_bf16_wgmma_up_down_acc_kernel<C>;
