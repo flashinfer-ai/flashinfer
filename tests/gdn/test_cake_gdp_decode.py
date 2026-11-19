@@ -15,20 +15,46 @@ limitations under the License.
 
 Tests for the Cake Gated DeltaProduct (GDP) decode / MTP-verification kernels
 (``K = 128``, ``V = 64``, one to four Householder updates per
-token, FP32 state pool; SM90 / SM100 / SM103).
+token, FP32 state pool; SM90 / SM100 / SM103; FP16 state pool on SM100 / SM103).
 
 Every output row and every pool slot the call may touch is compared with an
 FP64 token-serial reference of the same math (inputs at their BF16 values,
 the state rounded to FP32 after each real token) at ``atol = 1e-2``,
 ``rtol = 5e-3`` with no mismatch allowed; every slot the call must not touch
 is checked bitwise.  The matrix covers ``num_householder`` 1 to 4, the head
-counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 decode shapes
+counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 144 decode shapes
 of record among them), distinct write slots, padding rows (negative read
 slots, whose output rows keep the caller's values), rows without writeback,
 per-token state scatter with holes, ``disable_state_update``, the scale
 values, a padded pool, strided inputs and outputs, FP16 I/O, int64 indices,
 the rejected arguments, batch-row independence, bitwise reproducibility and
 one launch of every exported program.
+
+An FP16 pool runs the twin of the FP32 program with the same arithmetic, so each
+FP16 case also runs the same call over an FP32 pool holding the FP16 pool's
+values: the output must equal it bit for bit, and every stored FP16 element must
+be a rounding of the FP32 twin's stored element -- equal to its round to nearest
+even without a seed, one of its two FP16 neighbours with one (itself when it is
+exact).  The stored elements of at most ``MODEL_MAX_HEADS`` state heads per call
+(all of them in smaller calls, a deterministic sample in larger ones) must also
+equal the rounding of an independent model: round to nearest even, or
+Philox-4x32 random bits added below the FP16 precision and truncated, as PTX
+``cvt.rs`` does (key = the seed; one draw per eight elements of a state row,
+words 0 / 1 for columns k .. k + 3 and words 2 / 3 for k + 64 .. k + 67, k a
+multiple of 4 below 64, 13 bits per element; counter = the element offset, from
+the pool view's base, of column k of the state row in the batch row's read
+slot).  Every FP16 program runs three calls in each rounding, at its own token
+count and again at ``T = 1`` when one-token calls select it: a writeback to the
+read slot; a writeback to distinct write slots with one row skipping it (``-1``);
+and per-token snapshots with a ``-1`` before the last token (from ``T = 2``), a
+``-1`` at the last token and a snapshot into the row's own read slot.  The test
+records the program each call launches and the store paths it takes, and fails
+unless every program took every path.  These calls use an FP16 pool with one
+guard slot on each side; after each call the slots it must not touch and both
+guard slots must be unchanged bit for bit.  The FP16-pool tests skip on SM90,
+which has no FP16-pool programs; there
+``test_fp16_pool_is_refused_without_fp16_programs`` checks that an FP16 pool is
+refused.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
@@ -45,6 +71,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -66,12 +93,27 @@ SEED = 760
 NUM_HOUSEHOLDER = (1, 2, 3, 4)
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
 BATCHES = (1, 2, 3, 7, 16, 64, 257)
-TOKENS = (1, 2, 3, 4, 5, 8, 16)
-# The 48 decode shapes of record (num_householder = 3): every performance row is a correctness case.
+TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 16)
+# The 144 decode shapes of record (num_householder = 3): every performance row is a correctness case.
 PERF_HEADS = (80, 20, 10, 24)
 PERF_BATCHES = (1, 16, 64, 256)
-PERF_TOKENS = (1, 4, 8)
+PERF_TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
 SENTINEL = 7.5
+# Stochastic rounding of an FP16 pool: a seed above 2^32 (both key words count), the default round count.
+SR_SEED = 0x1234_5678_9ABC_DEF0
+SR_ROUNDS = 10
+MASK32 = 0xFFFF_FFFF
+PHILOX_M0, PHILOX_M1 = 0xD2511F53, 0xCD9E8D57
+PHILOX_W0, PHILOX_W1 = 0x9E3779B9, 0xBB67AE85
+# Random123's known answer of Philox-4x32-10 at the zero key and counter.
+PHILOX_KAT = (0x6627E8D5, 0xE169C58D, 0xBC57AC4C, 0x9B00DBD8)
+# At most this many stored state heads of one call are compared with the rounding model (a deterministic sample of
+# larger calls); every stored element is still checked against the FP32 twin and every untouched slot bitwise.
+MODEL_MAX_HEADS = 4096
+# State heads per evaluation of the rounding model (bounds its host memory; the sample and the result are unchanged).
+MODEL_CHUNK_HEADS = 512
+# Stored slots per gather of the all-slot rounding check (bounds its device memory).
+CHECK_SLOTS = 64
 
 
 def _device() -> torch.device:
@@ -120,15 +162,22 @@ def _generator(*keys: int) -> torch.Generator:
     return torch.Generator(device=_device()).manual_seed(seed)
 
 
-def _skip_unless_route(n: int, T: int, use_qk_l2norm: bool = True) -> None:
+def _skip_unless_route(
+    n: int,
+    T: int,
+    use_qk_l2norm: bool = True,
+    state_dtype: torch.dtype = torch.float32,
+) -> None:
     if not loader.route_applies(
         device_capability=_capability(),
         num_householder=n,
         num_tokens=T,
         use_qk_l2norm=use_qk_l2norm,
+        state_dtype=state_dtype,
     ):
         pytest.skip(
-            f"num_householder={n}, T={T}, use_qk_l2norm={use_qk_l2norm} has no exported program on this device"
+            f"num_householder={n}, T={T}, use_qk_l2norm={use_qk_l2norm} has no exported program for a "
+            f"{state_dtype} state pool on this device"
         )
 
 
@@ -144,6 +193,16 @@ class Case:
         self.__dict__.update(fields)
 
     def arguments(self) -> tuple[tuple, dict]:
+        kwargs = dict(
+            scale=self.scale,
+            output=self.output,
+            ssm_state_indices=self.ssm,
+            disable_state_update=self.disable_state_update,
+            use_qk_l2norm=self.use_qk_l2norm,
+            output_state_indices=self.write,
+        )
+        if getattr(self, "rand_seed", None) is not None:
+            kwargs.update(rand_seed=self.rand_seed, philox_rounds=self.philox_rounds)
         return (
             (
                 self.q,
@@ -156,14 +215,7 @@ class Case:
                 self.dt_bias,
                 self.b,
             ),
-            dict(
-                scale=self.scale,
-                output=self.output,
-                ssm_state_indices=self.ssm,
-                disable_state_update=self.disable_state_update,
-                use_qk_l2norm=self.use_qk_l2norm,
-                output_state_indices=self.write,
-            ),
+            kwargs,
         )
 
 
@@ -201,9 +253,11 @@ def _make(
     disable_state_update: bool = False,
     use_qk_l2norm: bool = True,
     scatter_tokens: bool = False,
+    guard_slots: bool = False,
 ) -> Case:
     """Random inputs at the scale of the kernel's own tests: q / k / v ~ N(0, 1), ``a``, ``b``, ``A_log``,
-    ``dt_bias`` and the pool at ``0.1 x N(0, 1)``; the pool holds unused slots and the read slots are distinct."""
+    ``dt_bias`` and the pool at ``0.1 x N(0, 1)``; the pool holds unused slots and the read slots are distinct.
+    ``guard_slots``: the FP16 pool of the call gets a guard slot on each side (:func:`_fp16_twins`)."""
 
     device = _device()
 
@@ -271,6 +325,7 @@ def _make(
         output=None,
         disable_state_update=disable_state_update,
         use_qk_l2norm=use_qk_l2norm,
+        guard_slots=guard_slots,
     )
 
 
@@ -389,6 +444,301 @@ def _check(c: Case, out: torch.Tensor, *, what: str = "") -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# FP16 pool: the rounding model and the twin check
+# ---------------------------------------------------------------------------
+
+
+def _philox4x32(seed: int, counters: np.ndarray, rounds: int) -> np.ndarray:
+    """``[len(counters), 4]`` uint32 words of Philox-4x32 of ``rounds`` rounds at the counters ``(lo32(c), hi32(c),
+    0, 0)`` under the key ``(lo32(seed), hi32(seed))`` of the int64 seed's two's-complement bits."""
+
+    bits = int(seed) & 0xFFFF_FFFF_FFFF_FFFF
+    m32 = np.uint64(MASK32)
+    k0, k1 = np.uint64(bits & MASK32), np.uint64(bits >> 32)
+    c = np.asarray(counters, dtype=np.uint64).reshape(-1)
+    c0, c1 = c & m32, c >> np.uint64(32)
+    c2, c3 = np.zeros_like(c0), np.zeros_like(c0)
+    for _ in range(rounds):
+        p0, p1 = c0 * np.uint64(PHILOX_M0), c2 * np.uint64(PHILOX_M1)
+        c0, c1, c2, c3 = (
+            ((p1 >> np.uint64(32)) ^ c1 ^ k0) & m32,
+            p1 & m32,
+            ((p0 >> np.uint64(32)) ^ c3 ^ k1) & m32,
+            p0 & m32,
+        )
+        k0 = (k0 + np.uint64(PHILOX_W0)) & m32
+        k1 = (k1 + np.uint64(PHILOX_W1)) & m32
+    return np.stack([c0, c1, c2, c3], axis=-1).astype(np.uint32)
+
+
+def _row_noise13(seed: int, rounds: int, row_offsets: np.ndarray) -> np.ndarray:
+    """``[len(row_offsets), K]`` 13-bit random values of the stores of whole state rows whose first elements sit at
+    the element offsets ``row_offsets`` (from the pool view's base) in the read slot: column ``k`` takes word
+    ``(k % 4) // 2 + 2 (k // 64)`` of the draw at ``row_offset + (k % 64 & ~3)``, bits 12:0 for an even ``k`` and
+    28:16 for an odd one."""
+
+    rows = np.asarray(row_offsets, dtype=np.uint64).reshape(-1)
+    columns = np.arange(0, K // 2, 4, dtype=np.uint64)
+    words = _philox4x32(seed, rows[:, None] + columns[None, :], rounds).reshape(
+        len(rows), len(columns), 4
+    )
+    k = np.arange(K)
+    picked = words[:, (k % 64) // 4, (k % 4) // 2 + 2 * (k // 64)]
+    odd = (k % 2 == 1)[None, :]
+    return np.where(odd, picked >> np.uint32(16), picked) & np.uint32(0x1FFF)
+
+
+def _cvt_rs_f16(x: np.ndarray, r13: np.ndarray) -> np.ndarray:
+    """FP16 bits (uint16) of PTX ``cvt.rs.f16x2.f32`` on finite FP32 elements with the 13 random bits ``r13``: the
+    magnitude in units of 2^-13 FP16 ulp (the exponent rebased for a normal FP16; for a subnormal the significand
+    shifted to the 2^-37 grid, lower bits dropped), plus the random bits, truncated to the FP16 grid; a sum past the
+    largest finite value is an infinity."""
+
+    a = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    sign, a = a & np.uint64(0x8000_0000), a & np.uint64(0x7FFF_FFFF)
+    e = a >> np.uint64(23)
+    m = (a & np.uint64(0x7F_FFFF)) | np.uint64(0x80_0000)
+    shift = np.clip(np.int64(113) - e.astype(np.int64), 0, 63).astype(np.uint64)
+    scaled = np.where(
+        e >= np.uint64(113),
+        a - np.uint64(112 << 23),
+        np.where(e >= np.uint64(90), m >> shift, np.uint64(0)),
+    )
+    h = np.minimum(
+        (scaled + np.asarray(r13, dtype=np.uint64)) >> np.uint64(13), np.uint64(0x7C00)
+    )
+    return ((sign >> np.uint64(16)) | h).astype(np.uint16)
+
+
+def _fp16_twins(c: Case) -> tuple[Case, Case]:
+    """``(c16, c32)``: the call of ``c`` over an FP16 pool (``c``'s own when it is FP16, else ``c``'s pool rounded
+    to nearest in the same layout) and the same call over an FP32 pool holding exactly the FP16 pool's values.
+    With ``c.guard_slots`` (``_make(guard_slots=True)``, :func:`_holes`) the rounded FP16 pool is the view
+    ``[1:-1]`` of a buffer with one guard slot on each side, filled with ``+-SENTINEL``: its base stays 8-byte
+    aligned (one slot is a multiple of 8 bytes) and its strides stay those of a contiguous pool (multiples of four
+    elements); ``c16.guards`` is the buffer and ``c16.guards_before`` its two guard slots before the call."""
+
+    guarded = getattr(c, "guard_slots", False)
+    guards = None
+    if c.pool.dtype == torch.float16:
+        assert not guarded
+        pools = ((c.backing, c.pool), (None, c.pool.float()))
+    elif c.backing is not None:
+        assert not guarded
+        backing16 = c.backing.half()
+        backing32 = backing16.float()
+        pools = ((backing16, backing16[:, ::2]), (backing32, backing32[:, ::2]))
+    else:
+        pool16 = c.pool.half()
+        if guarded:
+            guards = torch.empty(
+                (pool16.shape[0] + 2, *pool16.shape[1:]),
+                dtype=torch.float16,
+                device=pool16.device,
+            )
+            guards[0].fill_(SENTINEL)
+            guards[-1].fill_(-SENTINEL)
+            guards[1:-1].copy_(pool16)
+            pool16 = guards[1:-1]
+            assert pool16.is_contiguous() and pool16.data_ptr() % 8 == 0
+        pools = ((None, pool16), (None, pool16.float()))
+    twins = []
+    for backing, pool in pools:
+        twins.append(
+            Case(
+                **{
+                    **c.__dict__,
+                    "pool": pool,
+                    "pool_before": pool.clone(),
+                    "backing": backing,
+                    "backing_before": backing.clone() if backing is not None else None,
+                    "guards": None,
+                    "guards_before": None,
+                }
+            )
+        )
+    if guards is not None:
+        twins[0].guards = guards
+        twins[0].guards_before = guards[[0, -1]].clone()
+    return twins[0], twins[1]
+
+
+def _stores(c: Case) -> list[tuple[int, int]]:
+    """``(slot, batch row)`` of every state head row the call stores: the writeback of each active row to its write
+    slot, or its per-token snapshots; none with ``disable_state_update``."""
+
+    read = c.read.tolist()
+    stores = []
+    if c.ssm is not None:
+        for b, row in enumerate(c.ssm.tolist()):
+            if read[b] >= 0:
+                stores.extend((slot, b) for slot in row if slot >= 0)
+    elif not c.disable_state_update:
+        write = read if c.write is None else c.write.tolist()
+        stores.extend(
+            (write[b], b) for b in range(len(read)) if read[b] >= 0 and write[b] >= 0
+        )
+    return stores
+
+
+def _expected_fp16_bits(
+    c16: Case,
+    c32: Case,
+    slots: list[int],
+    rows: list[int],
+    seed: Optional[int],
+    rounds: int,
+) -> np.ndarray:
+    """The model of the FP16 bits the call stores in ``slots`` (written by batch ``rows``): the FP32 twin's stored
+    state, rounded to nearest even (``seed`` None) or by :func:`_cvt_rs_f16` with the Philox bits of the row's read
+    slot."""
+
+    x32 = c32.pool[torch.tensor(slots, device=c32.pool.device)].float()
+    if seed is None:
+        return x32.half().view(torch.int16).cpu().numpy().view(np.uint16)
+    s0, s1, s2, _ = c16.pool.stride()
+    H = c16.pool.shape[1]
+    read = np.asarray([int(c16.read[b]) for b in rows], dtype=np.int64)
+    offsets = (
+        read[:, None, None] * s0
+        + np.arange(H)[None, :, None] * s1
+        + np.arange(V)[None, None, :] * s2
+    )
+    noise = _row_noise13(seed, rounds, offsets.reshape(-1))
+    bits = _cvt_rs_f16(x32.cpu().numpy().reshape(-1, K), noise)
+    return bits.reshape(len(slots), H, V, K)
+
+
+_SAME_WIDTH_INT = {2: torch.int16, 4: torch.int32}
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Bitwise equality of two tensors of the same dtype and shape (compared as same-width integers): a signed zero
+    differs from the other zero, a NaN equals the same NaN bits."""
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    width = _SAME_WIDTH_INT[a.element_size()]
+    return torch.equal(a.view(width), b.view(width))
+
+
+def _check_stored_roundings(
+    c16: Case, c32: Case, slots: list[int], *, stochastic: bool, what: str
+) -> None:
+    """Every element the call stored in ``slots`` is a float16 rounding of the FP32 twin's stored element: its round
+    to nearest even (``torch`` ``.half()``) without a seed; with one, one of its two float16 neighbours, or the
+    element itself when it is exact (an infinity is the neighbour of 65504 for an element past it)."""
+
+    bad = 0
+    for start in range(0, len(slots), CHECK_SLOTS):
+        index = torch.tensor(slots[start : start + CHECK_SLOTS], device=_device())
+        got = c16.pool[index].view(torch.int16).int() & 0xFFFF
+        x32 = c32.pool[index]
+        nearest = x32.half()
+        near = nearest.view(torch.int16).int() & 0xFFFF
+        if not stochastic:
+            bad += int((got != near).sum())
+            continue
+        # The other neighbour is one float16 step from the nearest value towards x32 (sign bit untouched).
+        widened = nearest.float()
+        toward = (widened.abs() < x32.abs()).int() * 2 - 1
+        other = torch.where(widened == x32, near, near + toward)
+        bad += int(((got != near) & (got != other)).sum())
+    assert bad == 0, (
+        f"{what}: {bad} stored FP16 elements are not a rounding of the FP32 twin's element"
+    )
+
+
+def _holes(c: Case) -> list[int]:
+    """Put holes into the slot tables of ``c`` (``B >= 2``), name the slots the call must then leave untouched and
+    give the call's FP16 pool a guard slot on each side (:func:`_fp16_twins`), so a store through a ``-1`` entry (or
+    past the end) is caught.  With ``ssm_state_indices`` and ``T >= 2``: row 0 skips the snapshot of token 0 (a
+    ``-1`` before the last token) and stores the snapshot of its last token in its own read slot; row 1 skips the
+    snapshot of its last token (a ``-1`` at the last token).  With ``ssm_state_indices`` and ``T = 1``: row 0 stores
+    its snapshot in its own read slot and row 1 skips it (``-1``).  Without: row 1 skips its writeback
+    (``output_state_indices`` ``-1``)."""
+
+    assert c.B >= 2, "holes in two rows"
+    c.guard_slots = True
+    if c.ssm is not None:
+        ssm = c.ssm.clone()
+        last = c.T - 1
+        if c.T >= 2:
+            skipped = [int(ssm[0, 0]), int(ssm[0, last]), int(ssm[1, last])]
+            ssm[0, 0] = -1
+        else:
+            skipped = [int(ssm[0, 0]), int(ssm[1, 0])]
+        ssm[0, last] = c.read[0]
+        ssm[1, last] = -1
+        c.ssm = ssm
+        return skipped
+    write = (c.read if c.write is None else c.write).clone()
+    skipped = [int(write[1]), int(c.read[1])]
+    write[1] = -1
+    c.write = write
+    return skipped
+
+
+def _run_fp16(
+    c: Case, *, seed: Optional[int], rounds: int = SR_ROUNDS, what: str = ""
+) -> tuple[Case, torch.Tensor, Case, torch.Tensor]:
+    """Run the call of ``c`` over an FP16 pool (stochastic rounding with ``seed`` and ``rounds``, round to nearest
+    without a seed) and over its FP32 twin; check the FP32 twin against the FP64 reference, the FP16 call's output
+    against the twin's bit for bit, the FP16 pool's untouched slots, padding and guard slots bitwise, every stored
+    FP16 element against the twin's stored element (:func:`_check_stored_roundings`) and the stored elements of at
+    most ``MODEL_MAX_HEADS`` state heads (a deterministic sample of larger calls, evaluated ``MODEL_CHUNK_HEADS`` at a
+    time) bitwise against the rounding model of the twin's stored state.  Bitwise checks compare same-width integer
+    views (:func:`_same_bits`)."""
+
+    what = what or f"B={c.B} T={c.T} H={c.H} n={c.n} seed={seed} rounds={rounds}"
+    c16, c32 = _fp16_twins(c)
+    if seed is not None:
+        c16.rand_seed = torch.tensor([seed], dtype=torch.int64, device=_device())
+        c16.philox_rounds = rounds
+    out16, _ = _run(c16)
+    out32, _ = _run(c32)
+    _check(c32, out32, what=f"{what}: FP32 twin")
+    assert _same_bits(out16, out32), f"{what}: the output differs from the FP32 twin's"
+    stores = _stores(c16)
+    stored = sorted({slot for slot, _ in stores})
+    untouched = torch.ones(c16.pool.shape[0], dtype=torch.bool, device=_device())
+    untouched[stored] = False
+    assert _same_bits(c16.pool[untouched], c16.pool_before[untouched]), (
+        f"{what}: untouched slots changed"
+    )
+    if c16.backing is not None:
+        assert _same_bits(c16.backing[:, 1::2], c16.backing_before[:, 1::2]), (
+            f"{what}: pool padding changed"
+        )
+    if c16.guards is not None:
+        assert _same_bits(c16.guards[[0, -1]], c16.guards_before), (
+            f"{what}: a guard slot around the FP16 pool changed"
+        )
+    _check_stored_roundings(c16, c32, stored, stochastic=seed is not None, what=what)
+    if len(stores) > MODEL_MAX_HEADS // c.H:
+        step = len(stores) / (MODEL_MAX_HEADS // c.H)
+        stores = [stores[int(i * step)] for i in range(MODEL_MAX_HEADS // c.H)]
+    mismatched = modelled = 0
+    per_chunk = max(1, MODEL_CHUNK_HEADS // c.H)
+    for start in range(0, len(stores), per_chunk):
+        part = stores[start : start + per_chunk]
+        slots, rows = [slot for slot, _ in part], [b for _, b in part]
+        expected = _expected_fp16_bits(c16, c32, slots, rows, seed, rounds)
+        got = (
+            c16.pool[torch.tensor(slots, device=_device())]
+            .view(torch.int16)
+            .cpu()
+            .numpy()
+            .view(np.uint16)
+        )
+        mismatched += int((got != expected).sum())
+        modelled += got.size
+    assert mismatched == 0, (
+        f"{what}: {mismatched} of {modelled} stored FP16 elements differ from the rounding model"
+    )
+    return c16, out16, c32, out32
+
+
 def _matrix() -> list:
     pairs = tuple(itertools.product(HEADS, BATCHES))
     cases = []
@@ -442,7 +792,7 @@ def test_batch_sizes(B: int) -> None:
     ],
 )
 def test_decode_rows_of_record(H: int, B: int, T: int) -> None:
-    """The 48 decode shapes of record (num_householder = 3), each a full correctness case."""
+    """The 144 decode shapes of record (num_householder = 3), each a full correctness case."""
     _skip_unless_route(3, T)
     c = _make(B, T, H, 3, generator=_generator(4, H, B, T))
     out, _ = _run(c)
@@ -760,8 +1110,190 @@ def test_launches_are_bitwise_reproducible() -> None:
         assert torch.equal(out, results[0][0]) and torch.equal(pool, results[0][1])
 
 
+_POOL_DTYPES = {"f32": torch.float32, "f16": torch.float16}
+# The (B, H) shapes the program cases try, in order.  27 x 24 = 648 lies in the T = 1 tail-wave rows
+# (4 x sm, 5 x sm] of SM100 / SM103 on 132-160 SMs (l8r4 since the band rule change); 257 x 80 covers the
+# many-wave rows.
+PROGRAM_SHAPES = tuple(
+    itertools.product((1, 3, 7, 16, 64, 257, 27), (6, 12, 20, 24, 80))
+)
+
+
+def _shape_selecting(
+    name: str,
+    n: int,
+    T: int,
+    use_qk_l2norm: bool,
+    state_dtype: torch.dtype,
+    *,
+    min_batch: int = 1,
+) -> Optional[tuple[int, int]]:
+    """The first ``(B, H)`` of :data:`PROGRAM_SHAPES` with ``B >= min_batch`` whose ``T``-token call selects program
+    ``name`` on this device (``None`` when none does)."""
+    sms = loader.sm_count(_device().index or 0)
+    for B, H in PROGRAM_SHAPES:
+        if min_batch > B:
+            continue
+        selected = loader.selected_module(
+            _arch(),
+            n,
+            T,
+            B * H,
+            sm_count=sms,
+            use_qk_l2norm=use_qk_l2norm,
+            state_dtype=state_dtype,
+        )
+        if selected == name:
+            return B, H
+    return None
+
+
+def _record_fp16_launches(monkeypatch) -> list[str]:
+    """Record the name of every FP16-pool program the package launches from now on (the FP32 launches are not
+    recorded)."""
+    launched: list[str] = []
+    original = loader.run_module
+
+    def recording(name, values, **kwargs):
+        if loader.MODULES[name]["build"].get("state_dtype", "f32") == "f16":
+            launched.append(name)
+        return original(name, values, **kwargs)
+
+    monkeypatch.setattr(loader, "run_module", recording)
+    return launched
+
+
+# The store paths of one FP16 call (:func:`_store_paths`): its writeback to the read slot, to another slot or skipped
+# (``-1``), and its snapshots skipped before the last token, skipped at the last token or stored in the row's read slot.
+STORE_PATHS = (
+    "writeback_read_slot",
+    "distinct_write",
+    "write_minus1",
+    "ssm_minus1_nonlast",
+    "ssm_minus1_last",
+    "ssm_to_read_slot",
+)
+
+
+def _required_store_paths(T: int) -> set[str]:
+    """The store paths every FP16 program must take at ``T`` tokens: all of :data:`STORE_PATHS` (at ``T = 1`` the only
+    token is the last, so there is no skipped snapshot before it)."""
+    return set(STORE_PATHS) - ({"ssm_minus1_nonlast"} if T == 1 else set())
+
+
+def _store_paths(c: Case) -> set[str]:
+    """The store paths the slot tables of ``c`` take in its active rows (none with ``disable_state_update``)."""
+    read = c.read.tolist()
+    active = [b for b, slot in enumerate(read) if slot >= 0]
+    paths = set()
+    if c.ssm is not None:
+        for b in active:
+            row = c.ssm[b].tolist()
+            if any(slot < 0 for slot in row[:-1]):
+                paths.add("ssm_minus1_nonlast")
+            if row[-1] < 0:
+                paths.add("ssm_minus1_last")
+            if read[b] in row:
+                paths.add("ssm_to_read_slot")
+    elif not c.disable_state_update:
+        write = read if c.write is None else c.write.tolist()
+        for b in active:
+            if write[b] == read[b]:
+                paths.add("writeback_read_slot")
+            elif write[b] < 0:
+                paths.add("write_minus1")
+            else:
+                paths.add("distinct_write")
+    return paths
+
+
+def _fp16_store_paths(
+    name: str, n: int, T: int, use_qk_l2norm: bool, launched: list[str]
+) -> tuple[list[int], list[dict]]:
+    """Run every store path of FP16 program ``name`` (``launched`` records the FP16 launches, see
+    :func:`_record_fp16_launches`): at its ``T``, and at ``T = 1`` when one-token calls select it too, rounding to
+    nearest even and stochastically, three calls over a guarded FP16 pool, each on the first shape of
+    :data:`PROGRAM_SHAPES` that selects the program: (a) the writeback to the read slot; (b) distinct write slots
+    with row 1 skipping its writeback (``B >= 2``, :func:`_holes`); (c) per-token snapshots with the holes of
+    :func:`_holes` (``B >= 2``).  Each call is checked by :func:`_run_fp16` (FP32 twin, rounding model with the read
+    slot's counter, every stored slot, untouched slots, guard slots), must launch ``name`` and leave the slots its
+    holes skip unchanged.  Returns the token counts run and one record per call: program launched, call kind, ``T``,
+    ``B``, ``H``, rounding and the store paths of its slot tables (:func:`_store_paths`)."""
+    tokens = [T]
+    if T != 1 and _shape_selecting(name, n, 1, use_qk_l2norm, torch.float16):
+        tokens.append(1)
+    keys = {"writeback": 22, "distinct write": 48, "snapshots": 47}
+    records = []
+    for t, kind in itertools.product(tokens, keys):
+        shape = _shape_selecting(
+            name,
+            n,
+            t,
+            use_qk_l2norm,
+            torch.float16,
+            min_batch=1 if kind == "writeback" else 2,
+        )
+        assert shape is not None, (
+            f"no (B, H) of the domain selects {name} for {kind} at T={t}"
+        )
+        Bc, Hc = shape
+        call = _make(
+            Bc,
+            t,
+            Hc,
+            n,
+            generator=_generator(keys[kind], n, t, Bc, Hc),
+            use_qk_l2norm=use_qk_l2norm,
+            distinct_write=kind == "distinct write",
+            scatter_tokens=kind == "snapshots",
+            guard_slots=True,
+        )
+        skipped = [] if kind == "writeback" else _holes(call)
+        for seed in (None, SR_SEED):
+            what = f"{name} {kind} T={t} B={Bc} H={Hc} seed={seed}"
+            launched.clear()
+            c16, _, _, _ = _run_fp16(call, seed=seed, what=what)
+            assert launched == [name], (what, launched)
+            assert c16.guards is not None, what
+            if skipped:
+                assert _same_bits(c16.pool[skipped], c16.pool_before[skipped]), (
+                    what,
+                    skipped,
+                )
+            records.append(
+                dict(
+                    program=launched[0],
+                    kind=kind,
+                    T=t,
+                    B=Bc,
+                    H=Hc,
+                    rounding="rne" if seed is None else "sr",
+                    paths=_store_paths(c16),
+                )
+            )
+    return tokens, records
+
+
+def _missing_store_paths(
+    name: str, tokens: list[int], records: list[dict]
+) -> dict[tuple[str, int], list[str]]:
+    """The store paths of :func:`_required_store_paths` that no recorded call launching ``name`` took, per rounding
+    and token count (empty when the program took every path in both roundings at every token count it ran)."""
+    missing = {}
+    for rounding, t in itertools.product(("rne", "sr"), tokens):
+        key = (name, rounding, t)
+        seen = set()
+        for record in records:
+            if (record["program"], record["rounding"], record["T"]) == key:
+                seen |= record["paths"]
+        if _required_store_paths(t) - seen:
+            missing[rounding, t] = sorted(_required_store_paths(t) - seen)
+    return missing
+
+
 def _program_cases() -> list:
-    """One (n, T, B, H) selecting each exported program of the local architecture, from the registry alone."""
+    """One (n, T, B, H) selecting each exported program of the local architecture, from the registry alone; an
+    FP16-pool program is selected and launched over an FP16 pool."""
     if not _supported():
         return []
     arch = _arch()
@@ -771,17 +1303,14 @@ def _program_cases() -> list:
         if arch not in record["arches"] or record["role"] != "decode":
             continue  # the prefill records: tests/gdp/test_cake_gdp_prefill.py
         build = record["build"]
+        dtype = _POOL_DTYPES[build.get("state_dtype", "f32")]
         n = build["num_householder"]
         T = build["t_steps"] if build["t_steps"] is not None else build["max_t_steps"]
         use_qk_l2norm = build.get("use_qk_l2norm", True)
-        if (
-            build["t_steps"] is None
-            and loader.max_num_tokens(arch, n, use_qk_l2norm) > T
-        ):
-            T = loader.max_num_tokens(arch, n, use_qk_l2norm)
-        # 27 x 24 = 648 lies in the T = 1 tail-wave rows (4 x sm, 5 x sm] of SM100 / SM103 on
-        # 132-160 SMs (l8r4 since the band rule change); 257 x 80 covers the many-wave rows.
-        for B, H in itertools.product((1, 3, 7, 16, 64, 257, 27), (6, 12, 20, 24, 80)):
+        bound = loader.max_num_tokens(arch, n, use_qk_l2norm, state_dtype=dtype)
+        if build["t_steps"] is None and bound > T:
+            T = bound
+        for B, H in PROGRAM_SHAPES:
             if build["t_steps"] is None:
                 # The runtime program is the fallback: a T no static program owns selects it.
                 static = {
@@ -790,33 +1319,464 @@ def _program_cases() -> list:
                 }
                 T = next(
                     t
-                    for t in (T, 16, 2, 3, 5, 6, 7)
+                    for t in (T, *range(2, build["max_t_steps"] + 1))
                     if t not in static and t <= build["max_t_steps"]
                 )
             if (
                 loader.selected_module(
-                    arch, n, T, B * H, sm_count=sms, use_qk_l2norm=use_qk_l2norm
+                    arch,
+                    n,
+                    T,
+                    B * H,
+                    sm_count=sms,
+                    use_qk_l2norm=use_qk_l2norm,
+                    state_dtype=dtype,
                 )
                 == name
             ):
-                cases.append(pytest.param(name, n, T, B, H, use_qk_l2norm, id=name))
+                cases.append(
+                    pytest.param(name, n, T, B, H, use_qk_l2norm, dtype, id=name)
+                )
                 break
         else:
-            cases.append(pytest.param(name, n, T, 0, 0, use_qk_l2norm, id=name))
+            cases.append(pytest.param(name, n, T, 0, 0, use_qk_l2norm, dtype, id=name))
     return cases
 
 
-@pytest.mark.parametrize("name,n,T,B,H,use_qk_l2norm", _program_cases())
+@pytest.mark.parametrize("name,n,T,B,H,use_qk_l2norm,state_dtype", _program_cases())
 def test_every_program_is_launched(
-    name: str, n: int, T: int, B: int, H: int, use_qk_l2norm: bool
+    name: str,
+    n: int,
+    T: int,
+    B: int,
+    H: int,
+    use_qk_l2norm: bool,
+    state_dtype: torch.dtype,
+    monkeypatch,
 ) -> None:
-    """Every exported program of the local architecture is selected by some call of the domain and is correct."""
+    """Every exported program of the local architecture is selected by some call of the domain and is correct.  An
+    FP16-pool program runs every store path (:func:`_fp16_store_paths`) in both roundings, at its ``T`` and at
+    ``T = 1`` when one-token calls select it too; the test records the program each call launches and the store
+    paths of its slot tables, prints the coverage and fails unless the program took every path of
+    :func:`_required_store_paths` in both roundings at each of those token counts."""
     assert B > 0, f"no (B, H) of the domain selects {name}"
-    c = _make(
-        B, T, H, n, generator=_generator(22, n, T, B, H), use_qk_l2norm=use_qk_l2norm
+    if state_dtype != torch.float16:
+        c = _make(
+            B,
+            T,
+            H,
+            n,
+            generator=_generator(22, n, T, B, H),
+            use_qk_l2norm=use_qk_l2norm,
+        )
+        out, _ = _run(c)
+        _check(c, out, what=name)
+        return
+    launched = _record_fp16_launches(monkeypatch)
+    tokens, records = _fp16_store_paths(name, n, T, use_qk_l2norm, launched)
+    for r in records:
+        paths = " ".join(sorted(r["paths"]))
+        print(
+            f"FP16_STORE_PATHS {r['program']} {r['rounding']} T={r['T']} "
+            f"{r['kind']} B={r['B']} H={r['H']}: {paths}"
+        )
+    missing = _missing_store_paths(name, tokens, records)
+    assert not missing, f"{name} missed store paths: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# FP16 state pool
+# ---------------------------------------------------------------------------
+
+
+def test_rounding_model_self_checks() -> None:
+    """The test's own model: Philox-4x32-10 gives Random123's known answer at the zero key and counter, and the
+    ``cvt.rs`` model equals ``floor(|x| / ulp + r / 8192) * ulp`` (FP64, the binade's FP16 ulp, Inf from 2^16)
+    on normal and subnormal FP16 magnitudes, both signs and random 13-bit values."""
+    words = _philox4x32(0, np.zeros(1, dtype=np.uint64), 10)
+    assert tuple(int(w) for w in words[0]) == PHILOX_KAT
+    rng = np.random.default_rng(SEED)
+    exponents = rng.integers(-30, 17, size=200_000)
+    x = (rng.random(200_000) + 0.5) * np.exp2(exponents)
+    x = np.where(rng.random(200_000) < 0.5, -x, x).astype(np.float32)
+    r13 = rng.integers(0, 8192, size=x.size).astype(np.uint32)
+    v = np.abs(x.astype(np.float64))
+    _, exponent = np.frexp(v)
+    ulp = np.ldexp(1.0, np.maximum(exponent - 1, -14) - 10)
+    magnitude = np.floor(v / ulp + r13 / 8192.0) * ulp
+    magnitude = np.where(magnitude >= 65536.0, np.inf, magnitude)
+    want = (
+        np.where(np.signbit(x), -magnitude, magnitude)
+        .astype(np.float16)
+        .view(np.uint16)
     )
-    out, _ = _run(c)
-    _check(c, out, what=name)
+    assert np.array_equal(_cvt_rs_f16(x, r13), want)
+
+
+def _fp16_matrix() -> list:
+    """Calls over an FP16 pool covering every FP16 body: the T = 1 bands (row partition, one-wave preload, l8r4,
+    the many-wave program), static T = 4, 8 and 16 with writeback, distinct write slots, snapshots, holes (skipped
+    snapshots, a skipped writeback: :func:`_holes`), the runtime programs of n = 1, 2, 3 and 4, a padded pool,
+    padding rows and ``disable_state_update``."""
+    rows = [
+        # (n, T, H, B, options)
+        (3, 1, 10, 16, {}),  # 160 state heads: the row partition
+        (3, 1, 24, 7, {"padding_row": True}),  # 168: the one-wave preload program
+        (3, 1, 20, 64, {"distinct_write": True}),  # 1280: l8r4
+        (3, 1, 40, 257, {}),  # 10280: the many-wave program
+        (3, 4, 12, 16, {"scatter_tokens": True}),
+        (3, 4, 12, 16, {"scatter_tokens": True, "holes": True}),
+        (3, 8, 10, 7, {"distinct_write": True}),
+        (3, 8, 10, 7, {"distinct_write": True, "holes": True}),
+        # 320 > 2 x SM: l8r4, a draw at each snapshot
+        (3, 16, 20, 16, {"scatter_tokens": True}),
+        (3, 16, 20, 16, {"scatter_tokens": True, "holes": True}),
+        (3, 16, 10, 3, {"scatter_tokens": True}),  # l8r2: the shared snapshot noise
+        (3, 5, 12, 7, {"padded_pool": True}),
+        (3, 2, 6, 5, {"disable_state_update": True}),
+        (1, 3, 6, 5, {}),
+        (2, 9, 6, 3, {"scatter_tokens": True}),
+        (3, 10, 6, 3, {"scatter_tokens": True}),
+        (4, 2, 6, 4, {"padding_row": True}),
+    ]
+    return [
+        pytest.param(
+            n,
+            T,
+            H,
+            B,
+            options,
+            id=f"n{n}-T{T}-H{H}-B{B}-{'-'.join(options) or 'plain'}",
+        )
+        for n, T, H, B, options in rows
+    ]
+
+
+@pytest.mark.parametrize("rounding", ("rne", "sr10", "sr5", "sr16"))
+@pytest.mark.parametrize("n,T,H,B,options", _fp16_matrix())
+def test_fp16_pool_rounds_the_fp32_state(
+    n: int, T: int, H: int, B: int, options: dict, rounding: str
+) -> None:
+    """An FP16 pool, rounding to nearest even without a seed or stochastically with 10 (the default), 5 or 16
+    Philox rounds: the output equals the FP32 twin's bit for bit, every stored element is a rounding of the twin's
+    stored FP32 element, and the stored elements of up to ``MODEL_MAX_HEADS`` state heads (all of them below that)
+    equal the model's rounding of it; the slots a hole skips stay untouched."""
+    _skip_unless_route(n, T, state_dtype=torch.float16)
+    options = dict(options)
+    padding_row = options.pop("padding_row", False)
+    holes = options.pop("holes", False)
+    c = _make(B, T, H, n, generator=_generator(40, n, T, H, B), **options)
+    if padding_row:
+        c.read[1] = -1
+    skipped = _holes(c) if holes else []
+    seed = None if rounding == "rne" else SR_SEED - 3 * T
+    rounds = SR_ROUNDS if rounding in ("rne", "sr10") else int(rounding[2:])
+    c16, _, _, _ = _run_fp16(c, seed=seed, rounds=rounds)
+    if holes:
+        assert _same_bits(c16.pool[skipped], c16.pool_before[skipped]), skipped
+
+
+@pytest.mark.parametrize("rounding", ("rne", "sr10"))
+@pytest.mark.parametrize("n,H,B", ((1, 6, 3), (3, 10, 4)))
+def test_fp16_pool_overflow_is_stored_as_infinity(
+    n: int, H: int, B: int, rounding: str
+) -> None:
+    """A state that rounds past the largest float16 (65504) is stored as an infinity of its sign, exactly where the
+    rounding model puts one (every element of these calls is modelled), and the output is unaffected: bit for bit
+    the FP32 twin's.  ``T = 1``; the first sub-step's values are scaled by 2^20, so the state after it is about
+    ``beta v k^T``, past 65504 for a share of the elements; later sub-steps get ``beta = sigmoid(-30)`` and leave
+    it.  (n = 1: the runtime program; n = 3 with 40 state heads: the row partition.)"""
+    _skip_unless_route(n, 1, state_dtype=torch.float16)
+    c = _make(B, 1, H, n, generator=_generator(46, n, H, B))
+    c.v[:, :, 0] *= 2.0**20
+    c.b[:, :, 1:] = -30.0
+    seed = None if rounding == "rne" else SR_SEED
+    c16, out16, c32, _ = _run_fp16(c, seed=seed, what=f"overflow n={n} {rounding}")
+    assert B * H <= MODEL_MAX_HEADS  # the model compared every stored element
+    slots = c16.read.long()
+    stored, x32 = c16.pool[slots].float(), c32.pool[slots]
+    assert torch.isfinite(x32).all() and torch.isfinite(out16.float()).all()
+    big = x32.abs() >= 2.0**16  # past 65504 for either rounding
+    assert big.any() and (x32.abs() < 65504).any()
+    assert torch.equal(stored[big], torch.where(x32[big] > 0, torch.inf, -torch.inf))
+    assert (stored[big] > 0).any() and (stored[big] < 0).any()
+    assert torch.isfinite(stored[x32.abs() < 65504]).all()
+
+
+def test_fp16_seed_contract() -> None:
+    """A fixed seed gives bitwise reproducible stores; another seed (a negative one), or 5 rounds instead of 10,
+    gives other stores; without a seed the stores round to nearest even, and the stochastic stores differ from
+    them in a share of the elements close to the expected one (a rounding is not a no-op)."""
+    _skip_unless_route(3, 4, state_dtype=torch.float16)
+    c = _make(16, 4, 20, 3, generator=_generator(41))
+    pools = {}
+    for label, seed, rounds in (
+        ("a", SR_SEED, 10),
+        ("a_again", SR_SEED, 10),
+        ("b", -(2**40) - 7, 10),
+        ("a_r5", SR_SEED, 5),
+        ("rne", None, 10),
+    ):
+        c16, _, _, _ = _run_fp16(c, seed=seed, rounds=rounds, what=label)
+        pools[label] = c16.pool.clone()
+    assert _same_bits(pools["a"], pools["a_again"])
+    for other in ("b", "a_r5", "rne"):
+        assert not torch.equal(pools["a"], pools[other]), other
+    written = c.read.long()
+    flips = (pools["a"][written] != pools["rne"][written]).float().mean().item()
+    assert 0.15 < flips < 0.35, flips
+
+
+def test_fp16_graph_replay_reads_the_seed_on_the_device() -> None:
+    """A captured call reads the seed tensor on the device: after an in-place update of the seed, a replay stores
+    the rounding of the new seed (and the first seed's bits again after it is restored)."""
+    _skip_unless_route(3, 2, state_dtype=torch.float16)
+    c = _make(7, 2, 12, 3, generator=_generator(42))
+    c16, _ = _fp16_twins(c)
+    c16.rand_seed = torch.tensor([SR_SEED], dtype=torch.int64, device=_device())
+    c16.philox_rounds = SR_ROUNDS
+    c16.output = torch.zeros(7, 2, 12, V, device=_device(), dtype=torch.bfloat16)
+    expected = {}
+    for seed in (SR_SEED, SR_SEED + 1):
+        c16.pool.copy_(c16.pool_before)
+        c16.rand_seed.fill_(seed)
+        _run(c16)
+        torch.cuda.synchronize(_device())
+        expected[seed] = c16.pool.clone()
+    assert not torch.equal(expected[SR_SEED], expected[SR_SEED + 1])
+    c16.rand_seed.fill_(SR_SEED)
+    c16.pool.copy_(c16.pool_before)
+    stream = torch.cuda.Stream(device=_device())
+    stream.wait_stream(torch.cuda.current_stream(_device()))
+    with torch.cuda.stream(stream):
+        _run(c16)  # warm-up on the capture stream
+    torch.cuda.current_stream(_device()).wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(c16)
+    for seed in (SR_SEED + 1, SR_SEED):
+        c16.pool.copy_(c16.pool_before)
+        c16.rand_seed.fill_(seed)
+        graph.replay()
+        torch.cuda.synchronize(_device())
+        assert _same_bits(c16.pool, expected[seed]), seed
+
+
+def test_fp16_pool_layout() -> None:
+    """An FP16 pool view whose base is 8-byte aligned and whose strides are multiples of four elements is used in
+    place (the Philox counter is an element offset from the view's base, not from its storage); a 4-byte aligned
+    base or strides that are not multiples of four elements are refused before anything is launched."""
+    _skip_unless_route(3, 4, state_dtype=torch.float16)
+    c = _make(5, 4, 6, 3, generator=_generator(43), pool_size=9)
+    c16, _ = _fp16_twins(c)
+    numel = c16.pool.numel()
+    flat = torch.zeros(numel + 8, dtype=torch.float16, device=_device())
+    shifted = flat[4 : 4 + numel].view(c16.pool.shape)  # an 8-byte offset
+    shifted.copy_(c16.pool_before)
+    c.pool, c.pool_before = shifted, shifted.clone()
+    _run_fp16(c, seed=SR_SEED, what="8-byte aligned FP16 pool view")
+    assert _same_bits(flat[:4], torch.zeros_like(flat[:4]))
+    assert _same_bits(flat[4 + numel :], torch.zeros_like(flat[4 + numel :]))
+    misaligned = flat[2 : 2 + numel].view(c16.pool.shape)  # a 4-byte offset
+    with pytest.raises(ValueError, match="aligned"):
+        _run(Case(**{**c16.__dict__, "pool": misaligned}))
+    wide = torch.zeros(9, 6, V, K + 2, dtype=torch.float16, device=_device())
+    with pytest.raises(ValueError, match="multiples"):
+        _run(Case(**{**c16.__dict__, "pool": wide[..., :K]}))
+
+
+def test_fp16_pool_on_an_unaligned_storage_base() -> None:
+    """An FP16 pool whose storage base is 2 bytes past an 8-byte boundary (an ``UntypedStorage`` slice) and whose view
+    starts 3 elements into it, so the view's base is 8-byte aligned again: its storage offset admits no int64 view of
+    its first elements, so the round-to-nearest call passes a one-element placeholder as the never-read seed (the
+    helper checked directly; an ordinary pool keeps the zero-copy view).  The call runs, and its output and stored
+    state equal bit for bit those of the same call on an ordinary pool holding the same values; the bytes around
+    the view stay untouched."""
+    _skip_unless_route(3, 4, state_dtype=torch.float16)
+    c = _make(5, 4, 6, 3, generator=_generator(49), pool_size=9)
+    c16, _ = _fp16_twins(c)
+    shape, numel = c16.pool.shape, c16.pool.numel()
+    buffer = torch.zeros(numel + 8, dtype=torch.float16, device=_device())
+    storage = buffer.untyped_storage()[2:]  # base 2 bytes past the buffer's
+    pool = torch.empty(0, dtype=torch.float16, device=_device())
+    pool.set_(storage, 3, shape)
+    assert storage.data_ptr() % 8 == 2 and pool.storage_offset() == 3
+    assert pool.data_ptr() == buffer[4:].data_ptr() and pool.is_contiguous()
+    pool.copy_(c16.pool_before)
+    seed, rounds = pkg._rounding(pool, None, SR_ROUNDS)
+    assert rounds == 0 and seed.dtype == torch.int64 and seed.numel() == 1
+    assert seed.data_ptr() != pool.data_ptr()
+    seed, rounds = pkg._rounding(c16.pool, None, SR_ROUNDS)
+    assert rounds == 0 and seed.data_ptr() == c16.pool.data_ptr()
+    shifted = Case(**{**c16.__dict__, "pool": pool, "pool_before": pool.clone()})
+    out, _ = _run(shifted)
+    out_ordinary, _ = _run(c16)
+    assert not _same_bits(c16.pool, c16.pool_before)
+    assert _same_bits(out, out_ordinary) and _same_bits(pool, c16.pool)
+    assert _same_bits(buffer[:4], torch.zeros_like(buffer[:4]))
+    assert _same_bits(buffer[4 + numel :], torch.zeros_like(buffer[4 + numel :]))
+
+
+def test_fp16_rejects_invalid_rounding_arguments() -> None:
+    """The seed is a one-element int64 tensor on the pool's device and the round count an int (not a bool) from 5
+    to 16; anything else is refused before anything is launched."""
+    _skip_unless_route(3, 2, state_dtype=torch.float16)
+    c = _make(3, 2, 6, 3, generator=_generator(44), pool_size=8)
+    c16, _ = _fp16_twins(c)
+    seed = torch.tensor([SR_SEED], dtype=torch.int64, device=_device())
+    bad = [
+        (ValueError, dict(rand_seed=seed.to(torch.int32))),
+        (
+            ValueError,
+            dict(rand_seed=torch.tensor([1, 2], dtype=torch.int64, device=_device())),
+        ),
+        (ValueError, dict(rand_seed=seed.cpu())),
+        (TypeError, dict(rand_seed=5)),
+        (ValueError, dict(rand_seed=seed, philox_rounds=4)),
+        (ValueError, dict(rand_seed=seed, philox_rounds=17)),
+        (ValueError, dict(rand_seed=seed, philox_rounds=0)),
+        (TypeError, dict(rand_seed=seed, philox_rounds=True)),
+        (TypeError, dict(rand_seed=seed, philox_rounds=10.0)),
+    ]
+    for error, changes in bad:
+        args, kwargs = c16.arguments()
+        with pytest.raises(error):
+            cake_gated_delta_product_mtp(*args, **{**kwargs, **changes})
+        assert _same_bits(c16.pool, c16.pool_before), changes
+    args, kwargs = c16.arguments()  # a zero-dimensional seed is one element too
+    cake_gated_delta_product_mtp(*args, **kwargs, rand_seed=seed.reshape(()))
+
+
+def test_fp16_pool_is_refused_without_fp16_programs() -> None:
+    """On an architecture without FP16-pool programs (SM90: no hardware ``cvt.rs``) an FP16 pool is refused."""
+    if loader.supported_num_householder(_arch(), state_dtype=torch.float16):
+        pytest.skip("this device has FP16-pool programs")
+    _skip_unless_route(3, 2)
+    c = _make(3, 2, 6, 3, generator=_generator(45), pool_size=8)
+    c16, _ = _fp16_twins(c)
+    with pytest.raises(ValueError, match="float16"):
+        _run(c16)
+    c16.rand_seed = torch.tensor([SR_SEED], dtype=torch.int64, device=_device())
+    c16.philox_rounds = SR_ROUNDS
+    with pytest.raises(ValueError, match="float16"):
+        _run(c16)
+    assert _same_bits(c16.pool, c16.pool_before)
+
+
+def _twin_key(record: dict) -> tuple:
+    build = {k: v for k, v in record["build"].items() if k != "state_dtype"}
+    return (record["body"], tuple(sorted(build.items())))
+
+
+def _restricted(rule, arches: list) -> object:
+    """``rule`` as it applies on ``arches``: cells naming none of them dropped, ``arches`` leaves narrowed (dropped
+    when they name every one), a one-cell list unwrapped."""
+    if rule is None:
+        return None
+    kept = []
+    for cell in rule if isinstance(rule, list) else [rule]:
+        cell = dict(cell)
+        if "arches" in cell:
+            named = [arch for arch in cell["arches"] if arch in arches]
+            if not named:
+                continue
+            if sorted(named) == sorted(arches):
+                del cell["arches"]
+            else:
+                cell["arches"] = named
+        kept.append(cell)
+    return kept[0] if len(kept) == 1 else kept
+
+
+def test_fp16_records_are_twins_of_the_fp32_records() -> None:
+    """Every FP16-pool record ships on SM100 / SM103 only, in the routes of its FP32 twin (same body and build
+    keywords but ``state_dtype``), with the twin's band on its architectures, the twin's grid rule and the seed
+    and round-count arguments.  On each of SM100 and SM103, every FP32 decode record of a route has its FP16 twin in
+    that route, delivered for that architecture, so an FP16 pool has a route wherever an FP32 pool has one; and for
+    every probe the FP16 dispatch selects the twin of the FP32 dispatch's program."""
+    fp32 = {
+        _twin_key(r): name
+        for name, r in loader.MODULES.items()
+        if r["role"] == "decode" and "state_dtype" not in r["build"]
+    }
+    twins = {}
+    for name, record in loader.MODULES.items():
+        if record["role"] != "decode" or "state_dtype" not in record["build"]:
+            continue
+        assert record["build"]["state_dtype"] == "f16", name
+        assert set(record["arches"]) <= {"sm_100a", "sm_103a"}, name
+        other = fp32[_twin_key(record)]
+        twins[other] = name
+        twin = loader.MODULES[other]
+        assert set(record["arches"]) <= set(twin["arches"]), name
+        assert record["select_rule"] == _restricted(
+            twin["select_rule"], record["arches"]
+        ), name
+        assert record["grid_rule"] == twin["grid_rule"], name
+        assert record["logical"]["rand_seed"] == "rand_seed", name
+        assert record["logical"]["philox_rounds"] == "philox_rounds", name
+        plan = [tuple(entry) for entry in record["arg_plan"]]
+        assert ("buffer", "rand_seed") in plan and (
+            "parameter",
+            "philox_rounds",
+        ) in plan, name
+        for arch in record["arches"]:
+            for key, names in loader.ROUTES[arch].items():
+                assert (name in names) == (other in names), (arch, key, name)
+    for arch in ("sm_100a", "sm_103a"):
+        for key, names in loader.ROUTES[arch].items():
+            if key.startswith("decode_nh"):
+                for name in names:
+                    if "state_dtype" not in loader.MODULES[name]["build"]:
+                        assert name in twins, (arch, key, name)
+                        assert twins[name] in names, (arch, key, name)
+                        assert arch in loader.MODULES[twins[name]]["arches"], (
+                            arch,
+                            key,
+                            name,
+                        )
+        for l2 in (True, False):
+            assert loader.supported_num_householder(
+                arch, l2, state_dtype=torch.float16
+            ) == loader.supported_num_householder(arch, l2), (arch, l2)
+    for arch, routes in loader.ROUTES.items():
+        for key in routes:
+            if not key.startswith("decode_nh"):
+                continue
+            n = int(key[len("decode_nh")])
+            l2 = not key.endswith("_raw")
+            if not loader.supported_num_householder(
+                arch, l2, state_dtype=torch.float16
+            ):
+                continue
+            for T in range(1, loader.max_num_tokens(arch, n, l2) + 1):
+                for sms in (132, 148, 152, 160):
+                    for state_heads in _STATE_HEAD_PROBES:
+                        picked = loader.selected_module(
+                            arch, n, T, state_heads, sm_count=sms, use_qk_l2norm=l2
+                        )
+                        assert twins[picked] == loader.selected_module(
+                            arch,
+                            n,
+                            T,
+                            state_heads,
+                            sm_count=sms,
+                            use_qk_l2norm=l2,
+                            state_dtype=torch.float16,
+                        ), (arch, key, T, state_heads, sms)
+
+
+def test_every_record_binds_the_logical_vocabulary() -> None:
+    """Every decode record maps its buffers onto ``LOGICAL_TENSORS`` and its scalars onto ``LOGICAL_SCALARS``."""
+    assert set(loader.LOGICAL_TENSORS).isdisjoint(loader.LOGICAL_SCALARS)
+    for name, record in loader.MODULES.items():
+        if record["role"] != "decode":
+            continue
+        for kind, key in record["arg_plan"]:
+            if kind == "buffer":
+                assert record["logical"][key] in loader.LOGICAL_TENSORS, (name, key)
+            elif kind == "parameter":
+                assert record["logical"][key] in loader.LOGICAL_SCALARS, (name, key)
 
 
 # ---------------------------------------------------------------------------
@@ -855,8 +1815,10 @@ def test_rejects_invalid_arguments() -> None:
         call(k=c.k.float())
     with pytest.raises(ValueError):  # last dimension not dense
         call(q=c.q.transpose(2, 3).contiguous().transpose(2, 3))
-    with pytest.raises(ValueError):  # pool dtype
-        call(pool=c.pool.half())
+    with pytest.raises(ValueError):  # pool dtype (float16 has its own tests)
+        call(pool=c.pool.bfloat16())
+    with pytest.raises(ValueError):  # a seed with a float32 pool
+        call(rand_seed=torch.tensor([7], dtype=torch.int64, device=device))
     with pytest.raises(ValueError):  # pool head count
         call(pool=c.pool[:, :5])
     with pytest.raises(ValueError):  # pool rows not dense
@@ -901,6 +1863,76 @@ def test_is_supported_reports_the_routes() -> None:
             assert not is_cake_gdp_supported(_device(), n, bound + 1)
             assert not is_cake_gdp_supported(_device(), n, 0)
     assert is_cake_gdp_supported(_device(), 5) is False
+    f16 = loader.supported_num_householder(arch, state_dtype=torch.float16)
+    assert is_cake_gdp_supported(_device(), state_dtype=torch.float16) == bool(f16)
+    assert set(f16) <= set(loader.supported_num_householder(arch))
+    for n in f16:
+        bound = loader.max_num_tokens(arch, n, state_dtype=torch.float16)
+        assert bound == loader.max_num_tokens(arch, n)
+        assert is_cake_gdp_supported(_device(), n, bound, state_dtype=torch.float16)
+        assert not is_cake_gdp_supported(
+            _device(), n, bound + 1, state_dtype=torch.float16
+        )
+    assert not is_cake_gdp_supported(_device(), state_dtype=torch.bfloat16)
+
+
+def test_route_names_by_state_dtype_are_cached() -> None:
+    """The dispatch's records of one route and pool dtype (``_route_names``, cached) equal a fresh filter of
+    ``ROUTES`` by ``build["state_dtype"]`` for every architecture (and one without routes), route and pool dtype,
+    and a repeated query returns the cached tuple.  A NumPy or torch scalar ``num_householder`` / ``num_tokens`` /
+    ``use_qk_l2norm`` (``np.int64(3)``, ``np.array(3)``, ``torch.tensor(3)``) gives the answers of the ``int`` /
+    ``bool`` through ``_route_names``, ``route_applies`` and ``is_cake_gdp_supported``, and adds no cache entry."""
+    for arch in (*loader.ROUTES, "sm_80"):
+        for n, l2 in itertools.product(NUM_HOUSEHOLDER, (True, False)):
+            names = loader.ROUTES.get(arch, {}).get(loader.route_key(n, l2), [])
+            for dtype, key in loader.STATE_DTYPES.items():
+                want = tuple(
+                    name
+                    for name in names
+                    if loader.MODULES[name]["build"].get("state_dtype", "f32") == key
+                )
+                got = loader._route_names(arch, n, l2, dtype)
+                assert got == want, (arch, n, l2, dtype)
+                assert loader._route_names(arch, n, l2, dtype) is got
+    arch, capability = _arch(), _capability()
+    want = {}
+    for l2, dtype in itertools.product((True, False), loader.STATE_DTYPES):
+        want[l2, dtype] = (
+            loader._route_names(arch, 3, l2, dtype),
+            loader.route_applies(
+                device_capability=capability,
+                num_householder=3,
+                num_tokens=3,
+                use_qk_l2norm=l2,
+                state_dtype=dtype,
+            ),
+            is_cake_gdp_supported(_device(), 3, use_qk_l2norm=l2, state_dtype=dtype),
+            is_cake_gdp_supported(_device(), 3, 3, use_qk_l2norm=l2, state_dtype=dtype),
+        )
+    entries = loader._route_names_cached.cache_info().currsize
+    scalars = (np.int64(3), np.array(3), torch.tensor(3))
+    flags = {l2: (np.bool_(l2), torch.tensor(l2)) for l2 in (True, False)}
+    for value, ((l2, dtype), answers) in itertools.product(scalars, want.items()):
+        for flag in (l2, *flags[l2]):
+            got = (
+                loader._route_names(arch, value, flag, dtype),
+                loader.route_applies(
+                    device_capability=capability,
+                    num_householder=value,
+                    num_tokens=value,
+                    use_qk_l2norm=flag,
+                    state_dtype=dtype,
+                ),
+                is_cake_gdp_supported(
+                    _device(), value, use_qk_l2norm=flag, state_dtype=dtype
+                ),
+                is_cake_gdp_supported(
+                    _device(), value, value, use_qk_l2norm=flag, state_dtype=dtype
+                ),
+            )
+            assert got == answers, (repr(value), repr(flag), dtype)
+            assert got[0] is answers[0]
+    assert loader._route_names_cached.cache_info().currsize == entries
 
 
 # ---------------------------------------------------------------------------
@@ -1035,19 +2067,27 @@ def test_route_tables_are_consistent() -> None:
                     key,
                     name,
                 )
-            for T in range(
-                1, loader.max_num_tokens(arch, n, not key.endswith("_raw")) + 1
-            ):
-                for sms in (132, 148, 152, 160):
-                    for state_heads in _STATE_HEAD_PROBES:
-                        loader.selected_module(
-                            arch,
-                            n,
-                            T,
-                            state_heads,
-                            sm_count=sms,
-                            use_qk_l2norm=not key.endswith("_raw"),
-                        )
+            dtypes = {
+                loader.MODULES[name]["build"].get("state_dtype", "f32")
+                for name in names
+            }
+            assert dtypes <= set(_POOL_DTYPES), (key, dtypes)
+            for dtype in (_POOL_DTYPES[d] for d in sorted(dtypes)):
+                bound = loader.max_num_tokens(
+                    arch, n, not key.endswith("_raw"), state_dtype=dtype
+                )
+                for T in range(1, bound + 1):
+                    for sms in (132, 148, 152, 160):
+                        for state_heads in _STATE_HEAD_PROBES:
+                            loader.selected_module(
+                                arch,
+                                n,
+                                T,
+                                state_heads,
+                                sm_count=sms,
+                                use_qk_l2norm=not key.endswith("_raw"),
+                                state_dtype=dtype,
+                            )
 
 
 @pytest.mark.parametrize("field", ("q", "k"))
@@ -1122,6 +2162,28 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
     assert widest["q"] == widest["k"] == backend._QK_ALIGNMENT_BYTES == 8
     assert widest["out"] == backend._OUTPUT_ALIGNMENT_BYTES == 8
     assert all(widest.get(name, 0) <= 2 for name in ("v", "a", "b")), widest
+    # FP16-pool kernels: every state access (vector casts and the snapshot stores' inline
+    # PTX) is at most F16_STATE_ALIGNMENT_BYTES wide, with no asynchronous copies.
+    state_cast = re.compile(r"reinterpret_cast<(?:const )?(\w+)\s*\*>\(state\b")
+    state_asm = re.compile(
+        r'st\.global\.v(\d)\.b(\d+) \[%0\][^"]*"\s*::\s*"l"\(state\b'
+    )
+    f16_widest = 0
+    f16_kernels = [k for k in kernels if "__half* __restrict__ state" in k.read_text()]
+    assert len(f16_kernels) == sum(
+        1
+        for record in loader.MODULES.values()
+        if record["build"].get("state_dtype") == "f16"
+    )
+    for kernel in f16_kernels:
+        text = kernel.read_text()
+        assert "cp.async" not in text, kernel.name
+        sizes = [widths[cast] for cast in state_cast.findall(text)]
+        sizes += [int(n) * int(bits) // 8 for n, bits in state_asm.findall(text)]
+        assert sizes, kernel.name
+        f16_widest = max(f16_widest, *sizes)
+    if f16_kernels:
+        assert f16_widest == backend.F16_STATE_ALIGNMENT_BYTES == 8
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
@@ -1244,6 +2306,46 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
             arch,
             sorted(variants),
         )  # the two-heads-per-CTA program ships nowhere
+
+
+# From T = 5 on, l8r2 serves up to k x SM state heads (one wave of k CTAs per SM).
+L8R2_CTAS_PER_SM = {
+    "sm_90a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 1},
+    "sm_100a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+    "sm_103a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+}
+
+
+@pytest.mark.parametrize("sm", (132, 148, 152, 160))
+def test_multi_token_bands_follow_the_architecture(sm: int) -> None:
+    """Three Householder steps at T = 2, 3, 5, 6, 7, 8 and 16: l8r4 serves every
+    state-head count at T = 2 and 3; from T = 5 on, l8r2 serves up to k x `sm` state
+    heads (``L8R2_CTAS_PER_SM``) and l8r4 the counts above."""
+    for arch in loader.ROUTES:
+        for T in (2, 3, 5, 6, 7, 8, 16):
+            k = L8R2_CTAS_PER_SM[arch][T] if T >= 5 else 0
+            for state_heads in (1, 24, k * sm, k * sm + 1, 4 * sm, 20480):
+                if state_heads < 1:
+                    continue
+                want = ("lanerow", "l8r2" if state_heads <= k * sm else "l8r4")
+                assert _static_pick(arch, 3, T, state_heads, sm) == want, (
+                    arch,
+                    T,
+                    state_heads,
+                    sm,
+                )
+
+
+@pytest.mark.parametrize("T", (2, 3, 4, 5, 6, 7, 8, 16))
+def test_static_programs_partition_every_token_count(T: int) -> None:
+    """For every static token count above one, exactly one static program of three
+    Householder steps admits every state-head count on every SM count the kernel may
+    meet, so the runtime program never serves these token counts."""
+    for arch in loader.ROUTES:
+        for sm in (132, 148, 152, 160):
+            for state_heads in (*range(1, 1300), 1536, 4096, 20480):
+                body, variant = _static_pick(arch, 3, T, state_heads, sm)
+                assert body == "lanerow", (arch, T, state_heads, sm, body, variant)
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:

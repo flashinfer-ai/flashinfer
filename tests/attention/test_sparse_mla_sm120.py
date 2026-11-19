@@ -2054,9 +2054,15 @@ def test_sparse_mla_sm120_prefill_dsv4_1_dual_replay(
             activities=[torch.profiler.ProfilerActivity.CUDA]
         ) as prof:
             run()
-        schedule = "Dsv41MixedCache" if extra_fp4 else ("Fp8" if nt <= 64 else "Dsv41")
-        kind = "Decode" if nt <= 64 else "Prefill"
-        assert any(schedule + kind in event.name for event in prof.events())
+        if not extra_fp4 and nt <= 64:
+            names = [event.name for event in prof.events()]
+            assert any("dsv4_fp8_splitkv_decode::decode" in name for name in names)
+            assert any("dsv4_fp8_splitkv_decode::merge" in name for name in names)
+            assert not any("Fp8DecodeGatherSchedule" in name for name in names)
+        else:
+            schedule = "Dsv41MixedCache" if extra_fp4 else "Dsv41"
+            kind = "Decode" if nt <= 64 else "Prefill"
+            assert any(schedule + kind in event.name for event in prof.events())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()

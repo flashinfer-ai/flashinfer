@@ -4,8 +4,9 @@ __forceinline__ __device__ void bootstrap_regular_kv(KV& sKV, Plan& plan, int ph
                                                      TMA const& tma_params) {
   if (threadIdx.x == 128 && physical_page >= 0) {
     Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
-    launch_kv_tma<16, T::NUM_K_TILES>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
-    launch_kv_tma<0, 16>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
+    launch_kv_tma<16, T::NUM_K_TILES, kv_cache_hint<T>()>(gkv, sKV, tma_params.tma_k,
+                                                          plan.kv_barriers, 0);
+    launch_kv_tma<0, 16, kv_cache_hint<T>()>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
 #pragma unroll
     for (int tile = 0; tile < T::NUM_K_TILES; ++tile)
       plan.kv_barriers[tile].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K *
@@ -39,7 +40,7 @@ __forceinline__ __device__ void attention_body(
     int64_t out_stride_s, int64_t out_stride_h, TMA const& tma_params) {
   using C = typename T::Config;
   using InputT = typename T::InputT;
-  extern __shared__ char shared_raw[];
+  extern __shared__ __align__(128) char shared_raw[];
   auto& plan = *reinterpret_cast<typename T::SharedMemoryPlan*>(shared_raw);
   Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), typename T::SmemLayoutQ{});
   Tensor sKV = make_tensor(make_smem_ptr(plan.kv.data()), typename T::SmemLayoutKV{});
@@ -77,6 +78,14 @@ __forceinline__ __device__ void attention_body(
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       }
+      if constexpr (C::StorageKind == 5) {
+        for (int event = 0; event < 5; ++event) {
+          plan.m16_ready[event].init(1);
+          plan.m16_ack[event].init(1);
+        }
+        plan.m16_weights_ready.init(1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+      }
 #pragma unroll
       for (int tile = 0; tile < T::NUM_K_TILES; ++tile) plan.kv_barriers[tile].init(1);
       if constexpr (C::LookAhead > 0) {
@@ -84,28 +93,36 @@ __forceinline__ __device__ void attention_body(
         for (int slot = 0; slot < T::LOOKAHEAD_K + T::AUX_GUARD_SLICES; ++slot)
           plan.aux_kv_barriers[slot].init(1);
       }
+      if constexpr (C::TmaProducer == mla_swa::Producer::QKWarpStreams && C::S != 9) {
 #pragma unroll
-      for (int tile = 0; tile < T::NUM_V_TILES; ++tile) plan.kv_free_barriers[tile].init(1);
+        for (int tile = 0; tile < T::NUM_V_TILES; ++tile) plan.kv_free_barriers[tile].init(1);
+      }
       cutlass::arch::fence_view_async_shared();
     }
     role_barrier();
-    if constexpr (C::M == 32 && C::Backend == mla_swa::Reduce::DSM) cute::cluster_arrive();
+    if constexpr ((C::M == 32 && C::Backend == mla_swa::Reduce::DSM) || C::StorageKind == 5)
+      cute::cluster_arrive();
     // Preserve original prologue order: M16 issues Q before reading scheduler
     // metadata; the other protocols compute their first page before issuing Q.
     if constexpr (C::LookAhead > 0) bootstrap_q<T>(sQ, plan, batch_idx, m_block_idx, tma_params);
     const int cache_len = cache_seqlens[batch_idx];
-    const int union_left = max(cache_len - window_size - s_q + 1, 0);
-    const int full_start_page = union_left / T::BLOCK_N;
+    // Hq=64 and M divides Hq: all rows in this CTA belong to one query
+    // token. Partition that token's pages rather than the request-wide union.
+    // For s_q>1 the union can include a tenth, entirely masked page.
+    static_assert(64 % C::M == 0);
+    const int query_pos = cache_len - s_q + m_block_idx / (64 / C::M);
+    const int query_left = max(query_pos - window_size + 1, 0);
+    const int full_start_page = query_left / T::BLOCK_N;
     // Graph padding may have length zero and an entirely sentinel page table.
     // Do not run masked PV against uninitialized KV: 0 * NaN is still NaN.
-    const int full_end_page = (max(cache_len, 0) + T::BLOCK_N - 1) / T::BLOCK_N;
+    const int query_end = max(query_pos + 1, 0);
+    const int full_end_page = query_end / T::BLOCK_N + (query_end % T::BLOCK_N != 0);
     const int total_pages = full_end_page - full_start_page;
-    const int start_page =
-        full_start_page +
-        static_cast<int>((static_cast<int64_t>(total_pages) * split_idx) / num_splits);
-    const int end_page =
-        full_start_page +
-        static_cast<int>((static_cast<int64_t>(total_pages) * (split_idx + 1)) / num_splits);
+    // Every launcher passes Config::S. Page64 and at most nine splits also
+    // keep these products within int32 for an int32 cache length.
+    static_assert(C::S >= 1 && C::S <= 9);
+    const int start_page = full_start_page + total_pages * split_idx / C::S;
+    const int end_page = full_start_page + total_pages * (split_idx + 1) / C::S;
     InputT* role_out = out;
     if constexpr (C::Backend == mla_swa::Reduce::GlobalFP32)
       role_out += split_idx * out_stride_split;
@@ -116,6 +133,25 @@ __forceinline__ __device__ void attention_body(
               : -1;
       bootstrap_q<T>(sQ, plan, batch_idx, m_block_idx, tma_params);
       bootstrap_regular_kv<T>(sKV, plan, first_physical_page, tma_params);
+    }
+    if constexpr (C::LookAhead > 0) {
+      // Q and the initial KV banks are disjoint. Issue KV before waiting for
+      // Q or initializing row state, so their transfers can overlap.
+      if (warpgroup == 0) {
+        const int first_physical_page =
+            start_page < end_page && start_page < max_pages
+                ? block_table[batch_idx * block_table_stride_b + start_page]
+                : -1;
+        if (first_physical_page >= 0) {
+          const int second_page = start_page + 1;
+          const int second_physical_page =
+              second_page < end_page && second_page < max_pages
+                  ? block_table[batch_idx * block_table_stride_b + second_page]
+                  : -1;
+          issue_lookahead_prologue<T>(sKV, plan, first_physical_page, second_physical_page,
+                                      idx_in_warpgroup, tma_params);
+        }
+      }
     }
     if constexpr (C::LookAhead > 0) {
       plan.q_barrier.wait(0);
@@ -140,7 +176,7 @@ __forceinline__ __device__ void attention_body(
                               end_page, window_size, softmax_scale, block_table_stride_b,
                               out_stride_b, out_stride_s, out_stride_h, idx_in_warpgroup,
                               warp_in_group, lane, tma_params);
-      if constexpr (C::M == 16) {
+      if constexpr (C::M == 16 && C::Backend == mla_swa::Reduce::DSM) {
         if (split_idx == 0)
           dsm_direct_accum_qk_s2<0, T>(plan, idx_in_warpgroup);
         else

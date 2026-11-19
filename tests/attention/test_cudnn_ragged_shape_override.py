@@ -779,8 +779,22 @@ def test_bounded_ragged_older_frontend_keeps_broad_graph(head_dim_qk, monkeypatc
         observed.append(True)
         return original(self, *args, **kwargs)
 
+    # Capability flags, not the FE version string, determine this contract.
+    # Preserve the real constructor and unrelated flags for graph execution.
+    native_binder = cudnn._pybind_module._SdpaThdBinder
+
+    class LegacyBinder:
+        supports_nonpaged_packed_split = False
+        supports_nonpaged_d128_packed_split = False
+
+        def __getattr__(self, name):
+            return getattr(native_binder, name)
+
+        def __call__(self, *args, **kwargs):
+            return native_binder(*args, **kwargs)
+
     with monkeypatch.context() as m:
-        m.setattr(cudnn, "__version__", "1.30.0")
+        m.setattr(cudnn._pybind_module, "_SdpaThdBinder", LegacyBinder())
         m.setattr(cudnn.pygraph, "sdpa", old_sdpa)
         cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
         try:
