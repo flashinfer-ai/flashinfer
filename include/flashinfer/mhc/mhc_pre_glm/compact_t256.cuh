@@ -97,11 +97,16 @@ __device__ __forceinline__ void cluster_bar() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
 }
-__device__ __forceinline__ void cluster_bar_publish(int writer_threads) {
-  if (static_cast<int>(threadIdx.x) < writer_threads) {
-    asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n" ::: "memory");
-  }
-  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+// Publish the per-CTA records to the whole cluster.  The owner-push
+// st.shared::cluster stores land in peer CTA windows, which the restricted
+// shared::cta release fence does not cover; the release arrival orders every
+// prior shared-memory access of the arriving thread at cluster scope, and
+// the paired barrier.cluster.wait below is an acquire.  (This candidate is
+// not routed by the dispatcher; the fix keeps the compiled module free of
+// the CTA-restricted publication pattern until the provenance kernels are
+// dropped.)
+__device__ __forceinline__ void cluster_bar_publish() {
+  asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void cluster_arrive_relaxed() {
@@ -510,7 +515,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(NTH, 2)
         st_cluster(peer_addr(acct + rank * ACCW + 24, tid), v);
       }
     }
-    cluster_bar_publish(active * ntcount * 8);
+    cluster_bar_publish();
 
     // --------- epilogue on the owning CTA --------------------------------
     {
@@ -546,7 +551,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(NTH, 2)
       }
       if (g < T && do_comb) ++cnt;
     }
-    if (do_gate) cluster_bar_publish(4);
+    if (do_gate) cluster_bar_publish();
 
     // --------- pre-gated layer input -------------------------------------
     if (do_gate) {
