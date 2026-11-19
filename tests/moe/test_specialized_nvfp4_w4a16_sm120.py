@@ -429,6 +429,10 @@ def test_public_independent_graph_replays(weights, t):
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
     outs = []
+    from flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120 import warmup
+
+    with torch.cuda.stream(streams[0]):
+        warmup(*weights, token_counts=(t,), device=buffers[0][0].device)
     # Capture on the SAME stream: keying capture scratch by stream alone
     # would pass a different-stream capture test but fail these replays.
     for graph, act in zip(graphs, acts, strict=True):
