@@ -31,7 +31,7 @@ MMA_TILER_MNK = (128, 32, 128)
 def _sm90_tree():
     """Import only FlashInfer's public SM90 package boundary."""
     try:
-        import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
+        import flashinfer.moe_ep.shims.sm90.cutedsl_megamoe as pkg
     except RuntimeError as error:
         pytest.skip(f"SM90 kernel tree unavailable in this process: {error}")
     return pkg

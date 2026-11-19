@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
+``flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -34,9 +34,9 @@ import pytest
 from flashinfer.moe_ep import FinalizeMode
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
 
 def _require_cuda():
@@ -82,7 +82,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         make_dummy_epilogue_params,
     )
 
@@ -245,7 +245,7 @@ def _reference_nvfp4_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -327,7 +327,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -511,7 +511,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
                 get_symm_buffer_for_mega_moe,
             )
 
@@ -699,8 +699,16 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("num_tokens", [64, 1024])
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "sm100_nvfp4_nvfp4_bf16_cutedsl",
+        "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
+    ],
+)
 def test_moe_ep_nvfp4_cutedsl_mega_layer_per_token_scale_matches_reference(
     num_tokens,
+    kernel_name,
 ):
     """Layer forward with ``enable_fc1_activation_per_token_scale`` + a per-token
     ``MoEEpTensors.fc1_activation_per_token_scale`` is bit-exact vs the
@@ -719,9 +727,10 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_per_token_scale_matches_reference(
         per_token_scale=True,
         num_tokens=num_tokens,
         max_tokens=num_tokens,
+        config_extra={"kernel_name": kernel_name},
     )
     print(
-        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (per-token fc1 "
+        f"rank {rank}: {kernel_name} mega layer (per-token fc1 "
         f"activation scale, {num_tokens} tokens) matches reference"
     )
 
@@ -866,7 +875,7 @@ def _run_mega_layer_zero_token_ikr_regression(
     occupancy, never from num_tokens), so the same fix -- fall through to the
     same full-buffer frontend.run() call every nonzero num_tokens already
     takes -- applies unchanged. See
-    kernel_src/sm100/cutedsl_megamoe/shim/nvfp4.py::nvfp4_mega_moe.
+    shims/sm100/cutedsl_megamoe/pre_unification/nvfp4.py::nvfp4_mega_moe.
 
     Shapes/scale intentionally match the real repro (hidden=2048,
     intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384),
@@ -1144,7 +1153,7 @@ def _run_mega_torch_oracle(
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -1283,7 +1292,7 @@ def _run_mega_torch_oracle(
             # combine encoder + topk_reduce do.
             term_transform = None
             if combine_dtype != "bf16":
-                from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+                from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
                     CombineFormat,
                     combine_roundtrip_to_fp32,
                 )
@@ -1470,7 +1479,7 @@ def _run_nvfp4_routing_rounds(
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         ensure_moe_ep_cuda_device,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_quantize_per_block_16,
     )
     from .test_nvfp4_cutedsl_kernel_vs_reference import (
@@ -2153,7 +2162,7 @@ def test_nvfp4_deferred_output_rejects_quantized_combine():
 def test_w4a16_deferred_frontend_preserves_mode_when_applying_knobs():
     import dataclasses
 
-    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+    from flashinfer.moe_ep.kernels.flashinfer import bf16_nvfp4 as bf16_nvfp4
 
     config = bf16_nvfp4.MegaMoEBf16Nvfp4Config(
         rank=0,
@@ -2211,7 +2220,7 @@ def test_nvfp4_cutedsl_config_exposes_per_token_scale():
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         MegaMoENvfp4Config,
         MegaMoENvfp4Inputs,
     )
@@ -2243,7 +2252,7 @@ def test_nvfp4_cutedsl_config_exposes_per_token_scale():
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         MegaMoENvfp4Config,
     )
 
@@ -2284,7 +2293,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
 
 
 def test_tuner_is_valid_quantized_combine_rules():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import tuner
 
     # quantized combine excludes the in-kernel REDG reduce ...
     assert not tuner.is_valid(
@@ -2307,7 +2316,7 @@ def test_tuner_is_valid_quantized_combine_rules():
 
 
 def test_autotune_nvfp4_candidates_cover_ikr():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_candidates,
     )
 
@@ -2334,11 +2343,11 @@ def test_autotune_nvfp4_candidates_cover_ikr():
 
 def test_bf16_nvfp4_ikr_permission_and_candidates():
     from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
-    from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+    from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4 import (
         MegaMoEBf16Nvfp4Config,
         bf16_nvfp4_candidates,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import tuner
 
     assert not Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=256, top_k=2

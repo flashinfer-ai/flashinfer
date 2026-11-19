@@ -1374,7 +1374,7 @@ def _benchmark_distributed_megamoe(
         layer.warmup(tensors)
         if args.megamoe_knobs == "auto":
             if variant.use_nvfp4_activations:
-                from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+                from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.autotune import (
                     nvfp4_candidates,
                 )
 

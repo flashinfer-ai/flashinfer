@@ -7,9 +7,9 @@ backends, and fused kernels.
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md)
+> [shims/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md)
 > (SM100) and
-> [kernel_src/sm107/next_cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
+> [shims/sm107/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/shims/sm107/cutedsl_megamoe/TUNING.md)
 > (SM107).
 
 Expert-Parallel MoE with two execution modes:
@@ -34,11 +34,12 @@ Selected via `MegaConfig(megakernel=<config>)`. One symmetric-memory kernel
 owns dispatch, expert compute, and combine; output is always BF16
 `[num_tokens, hidden]`.
 
-| Backend (alias) | Activation | Weight | Output | Arch | Tuning |
+| Backend | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
 | `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16) | BF16 | SM100/SM103 | same `knobs` surface as the NVFP4 backend |
-| `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
-| `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
+| `sm100_nvfp4_nvfp4_bf16_cutedsl` | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `sources/` standard or GenPhase; `knobs=None` uses the default, a dictionary pins controls, and `knobs="auto"` tunes inside `autotune_v2()` before capture |
+| `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | retained implementation; token-count heuristic, pinned knobs or first-forward collective tuning; `FLASHINFER_MOE_EP_KNOB_CACHE` |
+| `sm100_mxfp8_mxfp8_bf16_cutedsl` | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
 | `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | same `knobs` surface as the SM100 backends (heuristic table / knob cache / `knobs="auto"`) |
 | `sm90_bf16_bf16_bf16_pull_cutedsl` | BF16 | BF16 | BF16 | SM90 exactly | same `knobs` surface as the FP8 pull backend, shared knob cache |
@@ -53,8 +54,8 @@ the FC1-to-FC2 handoff. For more on this backend's design and performance, see
 [Faster-than-light NVFP4 decode—with precision](https://humansand.ai/blog/faster-than-light-nvfp4-decode)
 by Ziang Li at humans& ai.
 
-The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
-tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
+The exported SM90 and SM100 implementations use package-qualified imports
+and can coexist in one process. Weight inputs are canonical BF16 `MoEWeightPack`
 by default (the FP8 backend quantizes at `preprocess_weights`, the BF16 twin
 only re-lays them out); kernel-ready pre-quantized (FP8) or pre-laid-out
 (BF16) weights can be supplied instead.
@@ -144,9 +145,14 @@ Two independent tuning systems, matching the two execution modes:
   and every measurement is a **collective** — the fused kernel spans all EP
   ranks, so candidates must compile and launch in lockstep on every rank.
 
-### Knob resolution (mega CuTeDSL)
+### Retained NVFP4 knob resolution
 
-`Sm100_*_Cutedsl_MegaMoeConfig.knobs` accepts three values; resolution happens
+This section describes `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy`. The
+sources-backed standard and GenPhase adapters use managed autotune v2; see
+[their tuning notes](../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md)
+and [the managed tuner](autotuner_v2.md).
+
+The retained implementation's `knobs` accepts three values; resolution happens
 when the symmetric-memory session is created (and, for `"auto"`, at the first
 `compute()`):
 
@@ -168,7 +174,7 @@ flowchart TD
     F --> M
 ```
 
-The knobs split into two classes (`kernel_src/sm100/cutedsl_megamoe/shim/tuner.py`):
+The knobs split into two classes (`shims/sm100/cutedsl_megamoe/pre_unification/tuner.py`):
 
 - **correctness knobs** change a code path or the output and must be kept at
 the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
@@ -184,7 +190,7 @@ A validity predicate (`tuner.is_valid`) mirrors the kernel team's
 `inference_solver.filter_invalid` rules, so sweeps only enumerate
 compilable combinations.
 
-### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl`
+### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy`
 
 **1. Default (**`knobs=None`**).** The session resolves the knob cache first;
 on a miss it falls back to four measured token-count profiles keyed on the
@@ -205,6 +211,7 @@ sweep:
 ```python
 Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
     intermediate_size=2048, top_k=8,
+    kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
     knobs={"mma_tiler_mnk": (256, 128, 256), "cluster_shape_mnk": (2, 1, 1),
            "token_back_mode": "reuse_dispatch_warps", "flag_batch": 8,
            "group_hint": 512, "epi_flag_batch": (2, 4),
@@ -243,51 +250,67 @@ candidates are excluded from the CLI sweep unless
 `--allow-nondeterministic` is passed.
 
 Measured results, methodology, and the full knob reference live in
-[kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
+[shims/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md).
 
 ## Layout
 
 ```text
 moe_ep/
   config.py, tensors.py, weights.py, layer.py, algo_knobs.py, errors.py
-  core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
-  backends/split/comm/{nccl_ep,nixl_ep}
-  backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
-  backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,bf16_bf16_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
-  backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, mxfp8_mxfp4_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
-  kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
-    src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
-    __init__.py                ← public API consumed by the sm100 cutedsl backends
-    shim/                      ← thin adapters over src/ (_paths, comm, bf16, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
-    SKILL.md                   ← how to resync src/ when kernel team drops a new version
-    TUNING.md                  ← tuning surface, measured perf, benchmark methodology
-    ACKNOWLEDGEMENT.md         ← kernel authors
-  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 and BF16 kernel src + FI shim
-    src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8, moe_hopper_bf16)
-    shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
-  kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
-    src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
-    shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
-  kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin block-scaled inference
-    src/{common,sources}/      ← upstream exporter output; see VENDOR.md
-    shim/, __init__.py          ← FlashInfer adapters and public package API
-    VENDOR.md, SKILL.md, TUNING.md  ← provenance, update procedure, and measurements
+  core/{comm,kernel,runtime,validation}/
   modes/{split_layer,mega_layer,config}.py
+  backends/split/{comm,kernel}/
+  backends/mega/kernel/<sm>/<dtype_backend>/
+  shims/<sm>/<implementation>/
+  kernels/{cutedsl_megamoe,kimi_k3,cake,flashinfer}/
+  batch_invariant/
 ```
 
-Layout rule — taxonomy vs provenance:
+Backends retain SM and datatype dispatch. Shims own provider adaptation,
+workspace preparation, compilation and tuning. Kernels are grouped by their
+source/update owner. The CuTe DSL provider export mirrors `sources/` and
+`pre_unification/`, with one copy of their shared dependencies. Its combined
+vendoring record and manifest distinguish component pins from shared runtime
+provenance. Independently maintained SM120 drops keep their own records.
 
-- `backends/mega/kernel/` is organized by **taxonomy** (the user view):
-  `sm<arch>/<act_dtype>_<weight_dtype>_<out_dtype>_<kernel_style>/`. Backends are
-  thin adapters; several may wrap kernels from the same vendored repo.
-- `kernel_src/` is organized by **provenance** (the kernel-dev view): one
-  directory per upstream kernel repo snapshot, mirroring the vendor repo, with
-  `src/` verbatim, all adaptation in `shim/`, and a `VENDOR.md` recording the
-  upstream repo, pinned commit, sync date, and any pending local diffs. Never
-  hand-merge two upstream states into one directory. (`kernel_src/sm90/…` is a
-  separate snapshot of a fork and keeps its current path for now; fold it into
-  `cutedsl_megamoe/` if upstream merges the SM90 kernel.)
+See [the source layout](../../flashinfer/moe_ep/kernels/README.md) for the
+provider and native implementation directories.
+
+### Import path changes
+
+The old `kernel_src/` and `cute_dsl/megamoe/` packages have been removed.
+Update direct imports and `python -m` commands using the following mapping.
+Paths are relative to `flashinfer/moe_ep/`; each former provider package and
+its `shim/` subpackage map to the same adapter package.
+
+| Old package | New package |
+|---|---|
+| `kernel_src/sm100/cutedsl_megamoe/` | `shims/sm100/cutedsl_megamoe/pre_unification/` |
+| `kernel_src/sm100/next_cutedsl_megamoe/` | `shims/sm100/cutedsl_megamoe/sources/` |
+| `kernel_src/sm107/next_cutedsl_megamoe/` | `shims/sm107/cutedsl_megamoe/` |
+| `kernel_src/sm90/pull_style_cutedsl_megakernel/` | `shims/sm90/cutedsl_megamoe/` |
+| `kernel_src/sm120/split_cutedsl_megakernel/` | `shims/sm120/split_cutedsl/` |
+| `kernel_src/sm120/swapab_cutedsl_megakernel/` | `shims/sm120/swapab_cutedsl/` |
+| `kernel_src/sm100/kimi-k3-megamoe/` | `shims/sm100/kimi_k3/` |
+| `kernel_src/sm100/_kimi_k3_megamoe.py` | `shims/sm100/kimi_k3/` |
+| `kernel_src/sm90/cake_bf16_megamoe/` | `shims/sm90/cake_bf16/` |
+| `kernel_src/sm120/cake_mxfp4_megamoe/` | `shims/sm120/cake_mxfp4/` |
+| `kernel_src/sm90/push_style_megamoe/` | `shims/sm90/push_style_megamoe/` |
+| `kernel_src/blackwell_bf16_rank_major/` | `kernels/flashinfer/bf16_rank_major/` |
+| `cute_dsl/megamoe/bf16_nvfp4/` | `kernels/flashinfer/bf16_nvfp4/` |
+
+For example, `kernel_src.sm100.cutedsl_megamoe.shim.nvfp4` becomes
+`shims.sm100.cutedsl_megamoe.pre_unification.nvfp4`, with the common
+`flashinfer.moe_ep.` prefix. Raw source imports use the corresponding
+`kernels/` tree.
+
+Public `flashinfer.moe_ep` imports remain available. Unsuffixed SM100 NVFP4
+and MXFP8 selectors now select `sources/`; retained NVFP4 has the `_legacy`
+suffix. The `_next` selectors and deprecated `nvfp4_cutedsl` / `mxfp8_cutedsl`
+aliases are removed. Former `_next` tuning records retain their compatible
+identities through the rename. Records for the removed legacy MXFP8
+implementation do not apply to its replacement. Layout changes alone do
+not invalidate the unchanged implementations' tuning records.
 
 Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `backends` is imported; communication backends and comm fleets register when their `communication.py` / `fleet.py` is imported from `__init__.py`.
 
@@ -1009,7 +1032,7 @@ classDiagram
     SplitKernelBackend <|-- IdentitySplitKernelBackend
     MegaKernelBackend <|-- DeepGemmMegaKernelBackend
     MegaKernelBackend <|-- Nvfp4CutedslMegaKernelBackend
-    MegaKernelBackend <|-- Mxfp8CutedslMegaKernelBackend
+    MegaKernelBackend <|-- StandardMxfp8Backend
 ```
 
 ## Built-in plugins
@@ -1119,7 +1142,7 @@ See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environ
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
-- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl (FP8) + sm90_bf16_bf16_bf16_pull_cutedsl (BF16) mega parity + multi-rank torch oracles; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl (FP8) + sm90_bf16_bf16_bf16_pull_cutedsl (BF16) mega parity + multi-rank torch oracles; own torchrun process for its distributed tests
 - **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
 - **mega_sm120_cake** — 4-GPU (SM120) sm120_mxfp4_mxfp8_bf16_cake backend vs a multirank torch oracle (V4-Flash, DeepSeek-V3, Qwen3 geometries, unclamped SwiGLU, odd local expert counts), EPLB physical experts == logical (bitwise), transport-table bit-identity; `NPROC_CAKE_SM120=8` (one host) or a two-node torchrun for 16 ranks; own torchrun processes
 - **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process

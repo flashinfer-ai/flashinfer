@@ -19,13 +19,13 @@ def tune_one(args, rank, world_size, max_tokens):
     """
     import torch
 
-    from .....kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
     from .....tensors import MoEEpTensors
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.kernel_helpers import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
         concatenate_block_scaled_weights,
     )
     from .mxfp8_mxfp8_bf16_cutedsl.staging import stage_genphase_inputs
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
         sm100_standard_candidates,
         sm100_schedule_candidates,
     )
@@ -67,7 +67,9 @@ def tune_one(args, rank, world_size, max_tokens):
     sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.knob_cache import resolve_knobs
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.knob_cache import (
+        resolve_knobs,
+    )
 
     constraints = None
     if args.sweep == "schedule":
@@ -208,7 +210,7 @@ def run_tuning(args):
         mxfp8_cutedsl_runtime_requirements,
         nvfp4_cutedsl_runtime_requirements,
     )
-    from .....kernel_src.sm100.next_cutedsl_megamoe import knob_cache_path
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import knob_cache_path
 
     from flashinfer import autotune_v2
     from flashinfer.autotuner import AutoTuner

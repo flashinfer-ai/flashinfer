@@ -2417,7 +2417,7 @@ def _oracle(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
         weights as wh,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         compute_megamoe_reference_mxfp8,
         mxfp8_quantize_per_block_32,
     )

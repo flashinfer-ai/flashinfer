@@ -90,9 +90,12 @@ def test_batch_invariant_ordered_masked_fold(id_dtype, top_k):
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    import flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe  # noqa: F401
-    from moe_nvfp4_swapab.topk_reduce import TopkReduce
-    from src.token_comm import CombineFormat
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.token_comm import (
+        CombineFormat,
+    )
 
     # Every BF16 code appears, including +/-0, subnormals, infinities and all
     # NaN encodings. Other slots expose cancellation and stale masked cells.

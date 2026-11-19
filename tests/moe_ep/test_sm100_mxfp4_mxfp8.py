@@ -9,11 +9,11 @@ import torch.distributed as dist
 
 from flashinfer import moe_ep
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
 
 def test_mixed_config_and_candidates(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
         sm100_standard_candidates,
         is_valid_sm100_knobs,
     )
@@ -46,7 +46,10 @@ def test_mixed_config_and_candidates(monkeypatch):
             dataclasses.replace(native, **changes)
     with pytest.raises(ValueError, match="standard provider"):
         moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=256, top_k=3, kind="mxfp4_mxfp8"
+            intermediate_size=256,
+            top_k=3,
+            kind="mxfp4_mxfp8",
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
         )
 
 
@@ -74,13 +77,14 @@ def test_mixed_cli_dispatch(monkeypatch):
         "--max-tokens",
         "129",
     ]
-    assert tune.main(args) == 2
-    args += ["--implementation", "next"]
     assert tune.main(args) == 0
     assert called[0].dtype == "mxfp4_mxfp8"
+    args += ["--implementation", "next"]
+    assert tune.main(args) == 0
+    assert called[1].dtype == "mxfp4_mxfp8"
     assert tune.main(args + ["--kernel-variant", "genphase"]) == 0
-    assert called[1].kernel_variant == "genphase"
-    assert len(called) == 2
+    assert called[2].kernel_variant == "genphase"
+    assert len(called) == 3
 
 
 @pytest.mark.arch_blackwell
@@ -101,10 +105,10 @@ def test_mixed_layer_replay(quantize_input, fused, early, monkeypatch):
     if world == 1:
         monkeypatch.setenv("MEGA_NO_DIST", "1")
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1" if fused else "0")
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
-        kernel_helpers,
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import kernel_helpers
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import (
+        pre_unification as staging_pkg,
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as staging_pkg
     from flashinfer.moe_ep.backends.mega.kernel import routing_staging
 
     calls = []

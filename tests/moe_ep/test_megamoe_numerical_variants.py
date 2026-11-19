@@ -281,6 +281,7 @@ def _single(monkeypatch, kind, provider, early, recipe, request):
         ("mxfp4", True, "minimax"),
         ("mxfp8_e4m3", True, "minimax"),
         ("mxfp8_e5m2", False, "situ_linear"),
+        ("mxfp8_e5m2", True, "situ_linear"),
     ),
 )
 def test_numerical_activation_standard(kind, early, recipe, monkeypatch, request):
@@ -292,8 +293,6 @@ def test_numerical_activation_standard(kind, early, recipe, monkeypatch, request
     (
         ("nvfp4", False, "situ"),
         ("nvfp4", True, "minimax"),
-        ("mxfp8_e4m3", True, "minimax"),
-        ("mxfp8_e5m2", True, "situ_linear"),
     ),
 )
 def test_numerical_activation_blackwell_only_legacy(
@@ -323,7 +322,7 @@ def test_numerical_per_token_blackwell_only_nvfp4(
     provider, recipe, monkeypatch, request
 ):
     import torch
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_quantize_per_block_16,
     )
     from .test_nvfp4_megamoe_batch_invariant import _plain_quantized_weights
@@ -383,15 +382,13 @@ def test_numerical_per_token_blackwell_only_nvfp4(
         return
 
     from flashinfer import moe_ep
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
         autotune_sm100_block_scaled_mega_moe,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.correctness import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.correctness import (
         sampled_reference,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
-        knob_keys,
-    )
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import knob_keys
 
     # Both scales are finite, normal FP32 values. Their product is 2, while
     # multiplying the accumulator by expert alpha first would overflow.
@@ -517,7 +514,7 @@ def test_numerical_quantized_combine_blackwell_only_legacy_nvfp4(
 @pytest.mark.parametrize(
     "kind,recipe", (("mxfp8_e4m3", "minimax"), ("mxfp8_e5m2", "situ_linear"))
 )
-def test_numerical_quantized_combine_blackwell_only_legacy_mxfp8(
+def test_numerical_quantized_combine_blackwell_only_mxfp8(
     kind, recipe, monkeypatch, request
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
@@ -526,10 +523,10 @@ def test_numerical_quantized_combine_blackwell_only_legacy_mxfp8(
 
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("single-rank test")
-    _require(kind, "legacy", blackwell_only=True)
+    _require(kind, "standard", blackwell_only=True)
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     x, scores, ids, weights = _problem(0, 1, HIDDEN, INTERMEDIATE)
-    config = _config(kind, "legacy", True, recipe, combine_dtype="mxfp8")
+    config = _config(kind, "standard", True, recipe, combine_dtype="mxfp8")
     wire_receipt = mxfp8_batch_invariant_fingerprint(
         config, hidden=HIDDEN, num_experts=4
     )
@@ -539,30 +536,27 @@ def test_numerical_quantized_combine_blackwell_only_legacy_mxfp8(
     _exercise(
         config,
         kind,
-        "legacy",
+        "standard",
         x,
         ids,
         scores,
         weights,
         full=request.config.getoption("--full"),
-        plans=_plans(kind, "legacy", True),
+        plans=_plans(kind, "standard", True),
     )
 
 
-def test_numerical_quantized_combine_blackwell_only_legacy_mxfp8_autotune_disk_reload(
+def test_numerical_quantized_combine_blackwell_only_mxfp8_autotune_disk_reload(
     monkeypatch, tmp_path
 ):
     from ._megamoe_bi_helpers import autotune_disk_reload
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
 
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("single-rank test")
-    _require("mxfp8_e5m2", "legacy", blackwell_only=True)
+    _require("mxfp8_e5m2", "standard", blackwell_only=True)
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    candidates = autotune.mxfp8_candidates(batch_invariant=True)[:2]
-    monkeypatch.setattr(autotune, "mxfp8_candidates", lambda **kwargs: candidates)
     x, scores, ids, weights = _problem(0, 1, HIDDEN, INTERMEDIATE)
-    config = _config("mxfp8_e5m2", "legacy", True, "minimax", combine_dtype="mxfp8")
+    config = _config("mxfp8_e5m2", "standard", True, "minimax", combine_dtype="mxfp8")
     autotune_disk_reload(
         make_config=lambda knobs: replace(config, knobs=knobs),
         weights=weights,
@@ -570,7 +564,7 @@ def test_numerical_quantized_combine_blackwell_only_legacy_mxfp8_autotune_disk_r
         ids=ids,
         scores=scores,
         layer_factory=_layer,
-        provider="legacy",
+        provider="standard",
         directory=tmp_path,
         monkeypatch=monkeypatch,
     )
@@ -659,13 +653,11 @@ def test_numerical_deferred_bf16(early, monkeypatch):
         ("nvfp4", "legacy", True),
         ("nvfp4", "standard", False),
         ("mxfp4_mxfp8", "standard", False),
-        ("mxfp8_e4m3", "legacy", True),
+        ("mxfp8_e4m3", "standard", True),
         ("mxfp8_e4m3", "standard", False),
     ),
 )
 def test_numerical_deferred_blackwell_only(kind, provider, early, monkeypatch):
-    if kind.startswith("mxfp8") and provider == "legacy" and not early:
-        pytest.skip("legacy MXFP8 is early-only")
     _deferred(kind, provider, early, monkeypatch)
 
 
@@ -886,7 +878,7 @@ def test_numerical_expert_parallel_per_token_blackwell_only(provider, request):
     import torch
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_quantize_per_block_16,
     )
     from ._megamoe_bi_helpers import (
@@ -1030,8 +1022,8 @@ def test_numerical_expert_parallel_per_token_blackwell_only(provider, request):
 
 @pytest.mark.gpu_2
 @pytest.mark.parametrize("kind", ("mxfp8_e4m3", "mxfp8_e5m2"))
-def test_numerical_expert_parallel_blackwell_only_legacy_mxfp8_wire(kind, request):
-    """Both legacy quantized return carriers publish the remote SF sideband."""
+def test_numerical_expert_parallel_blackwell_only_mxfp8_wire(kind, request):
+    """Quantized return carriers publish the remote scale factors."""
     import torch
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -1049,8 +1041,8 @@ def test_numerical_expert_parallel_blackwell_only_legacy_mxfp8_wire(kind, reques
         pytest.skip("requires torchrun")
     bootstrap = moe_ep.BootstrapConfig(rank=rank, world_size=world)
     moe_ep.ensure_moe_ep_cuda_device(bootstrap)
-    _require(kind, "legacy", blackwell_only=True)
-    config = _config(kind, "legacy", True, "minimax", combine_dtype="mxfp8")
+    _require(kind, "standard", blackwell_only=True)
+    config = _config(kind, "standard", True, "minimax", combine_dtype="mxfp8")
     runtime = moe_ep.bootstrap_moe_ep_runtime(
         bootstrap, create_mega_kernel(config).runtime_requirements(bootstrap)
     )
@@ -1060,7 +1052,7 @@ def test_numerical_expert_parallel_blackwell_only_legacy_mxfp8_wire(kind, reques
         _exercise(
             config,
             kind,
-            "legacy",
+            "standard",
             x,
             ids,
             scores,
@@ -1068,7 +1060,7 @@ def test_numerical_expert_parallel_blackwell_only_legacy_mxfp8_wire(kind, reques
             rank=rank,
             world=world,
             full=request.config.getoption("--full"),
-            plans=_plans(kind, "legacy", True),
+            plans=_plans(kind, "standard", True),
         )
         with _layer(config, weights, rank, world, 17, HIDDEN) as layer:
             args = moe_ep.MoEEpTensors(
@@ -1080,7 +1072,7 @@ def test_numerical_expert_parallel_blackwell_only_legacy_mxfp8_wire(kind, reques
                     continue
                 mask = ids[:17].div(4, rounding_mode="floor") == peer
                 assert_collectively(
-                    mask.any(), x.device, "missing legacy MXFP8 remote traffic"
+                    mask.any(), x.device, "missing MXFP8 remote traffic"
                 )
                 args.topk_ids.copy_(ids[:17].masked_fill(mask, -1))
                 args.topk_weights.copy_(scores[:17].masked_fill(mask, float("nan")))
@@ -1089,13 +1081,11 @@ def test_numerical_expert_parallel_blackwell_only_legacy_mxfp8_wire(kind, reques
                     torch.isfinite(masked).all()
                     and (masked.view(torch.int16) != baseline.view(torch.int16)).any(),
                     x.device,
-                    "removing legacy MXFP8 peer had no observable contribution",
+                    "removing MXFP8 peer had no observable contribution",
                 )
                 args.topk_ids.copy_(ids[:17])
                 args.topk_weights.copy_(scores[:17])
-                assert_bits(
-                    layer.forward(args), baseline, "legacy quantized peer restore"
-                )
+                assert_bits(layer.forward(args), baseline, "quantized peer restore")
     except BaseException as error:
         fail_stop_distributed(error, world)
         raise

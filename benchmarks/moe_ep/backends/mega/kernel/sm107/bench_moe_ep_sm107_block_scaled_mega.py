@@ -15,7 +15,7 @@ Example (four GPUs in one NVLink domain, CUTE_DSL_ARCH=sm_107a exported):
     torchrun --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py \\
         --quant-kind all --routing both --mode forward --execution graph --no-l2-flush
 
-See kernel_src/sm107/next_cutedsl_megamoe/TUNING.md for the complete
+See shims/sm107/cutedsl_megamoe/TUNING.md for the complete
 qualification matrix and the distinction between default, heuristic,
 cached, and historically reported knob profiles.
 """
@@ -136,7 +136,7 @@ def _local_transformed_weights(
 ):
     """Random local expert slice, quantized chunk-wise to bound peak memory."""
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         concatenate_block_scaled_weights,
     )
 
@@ -403,7 +403,7 @@ def _make_backend_config(args, selection, quant_kind):
 def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_kind):
     import dataclasses
 
-    import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
+    import flashinfer.moe_ep.shims.sm107.cutedsl_megamoe as pkg
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -892,9 +892,7 @@ def main():
         finalize_moe_ep_runtime,
     )
     from flashinfer.moe_ep.core.runtime import sm107_block_scaled_runtime_requirements
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        require_sm107_dsl,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import require_sm107_dsl
 
     bootstrap = BootstrapConfig(world_size=world, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
