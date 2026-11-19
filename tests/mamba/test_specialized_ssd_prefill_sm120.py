@@ -272,6 +272,28 @@ def test_nh128_score_cancellation(record_property):
     assert rel <= REL_TOL, (actual, expected, rel)
 
 
+@requires_toolkit
+@pytest.mark.parametrize("row", [15, 29, 56])
+def test_nh128_weighted_score_cancellation(row):
+    # An exactly representable raw Gram does not suffice: the two steps
+    # below differ by less than one BF16 spacing. Exercise both diagonal
+    # halves and the off-diagonal tile loads on the full-window route.
+    t, nh = 64, 128
+    _skip_unless_resident(nh)
+    p = _make_inputs(t, nh, seed=1)
+    for value in p.values():
+        value.zero_()
+    p["B"][:, :, 0] = 1
+    p["C"][row, :, 0] = 1
+    p["x"][1].fill_(1)
+    p["x"][row].fill_(-1)
+    p["dt"][row].fill_(2.0**-10)
+    out = _run(_make_ssd(nh), p, t, nh)
+    ref = _reference(p, t, nh)
+    assert ref[row, 0, 0].abs().item() > 4e-4
+    assert _rel_max(out, ref) <= REL_TOL
+
+
 def test_backends_declared_and_bogus_backend_raises():
     from flashinfer.mamba import SSD_BACKENDS
 

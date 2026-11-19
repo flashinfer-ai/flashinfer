@@ -1,6 +1,7 @@
 // Mamba2 SSD chunk-scan prefill (SSM stage), sm_120.
 // One block owns one head (and optionally half of HD); persistent over chunks,
 // SSM state kept in registers. bf16 mma.sync m16n8k16 with fp32 accumulation.
+#include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -12,6 +13,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 extern "C" __device__ float __nv_expf(float);
 extern "C" __device__ float __nv_log1pf(float);
@@ -832,7 +834,17 @@ static constexpr int DSN = 128;  // state dim
 static constexpr int HDP = 64;   // head dim
 static constexpr int NGR = 8;    // groups
 static constexpr int LDN = 136;  // padded stride for 128-col rows
-static constexpr int LDS = 72;   // padded stride for 64-col score rows
+// Ten causal tiles, each with two row-major 16x16 BF16 planes.
+static constexpr int SCORE_WORDS = 10 * 2 * 16 * 16;
+DI int score_tile(int mi, int kj) { return (mi * (mi + 1) / 2 + kj) * 512; }
+DI int score_index(int i, int j) { return score_tile(i >> 4, j >> 4) + (i & 15) * 16 + (j & 15); }
+DI void stage_pair(bf16* dst, float a, float b) {
+  const __nv_bfloat162 hi = __floats2bfloat162_rn(a, b);
+  const float2 f = __bfloat1622float2(hi);
+  *reinterpret_cast<__nv_bfloat162*>(dst) = hi;
+  *reinterpret_cast<__nv_bfloat162*>(dst + 256) =
+      __floats2bfloat162_rn(__fsub_rn(a, f.x), __fsub_rn(b, f.y));
+}
 
 DI uint32_t sptr(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 
@@ -1112,12 +1124,10 @@ DI void update_state_tile2(float (&accSt)[2][NSN][4], const __nv_bfloat16* sX,
 static constexpr int GTILES = 10;     // causal 16x16 tiles of a 64x64 block
 static constexpr int GTILE_BF = 256;  // bf16 values per tile (32 lanes x 8)
 static constexpr int GWIN = 256;      // ring depth, in 64-row windows
-// Device-resident bf16 ring (10 MiB, L2-sized on purpose) plus publication and
-// per-consumer retirement counters.  The cooperative grid resets the counters
-// before any producer or consumer can enter the pipeline.  The producer's MMA
-// accumulates in fp32, then publishes bf16 operands for the consumer's fp32
-// score accumulation, matching the kernel's existing bf16 score/state staging.
-__device__ __align__(16) __nv_bfloat16 g_gram[GWIN * NGR * GTILES * GTILE_BF];
+// Publish the producer accumulator without a BF16 round trip: a residual
+// computed from an already rounded raw Gram cannot recover that first loss.
+// Same slots, watermarks and lifetime, now 20 MiB rather than 10 MiB.
+__device__ __align__(16) float g_gram[GWIN * NGR * GTILES * GTILE_BF];
 __device__ unsigned int g_gflag[NGR * 32];        // one 128B publication line per group
 __device__ unsigned long long g_gprog[NGR * 16];  // windows retired, per consumer
 __device__ unsigned int g_gdone[NGR];             // consumers finished, per group
@@ -1284,25 +1294,16 @@ __device__ __forceinline__ void gram_producer(const CUtensorMap* tmaB, const CUt
       GP_MMA()
 #undef GP_STEP
 #undef GP_MMA
-      __nv_bfloat162 w0 = __floats2bfloat162_rn(accS[0][0], accS[0][1]);
-      __nv_bfloat162 w1 = __floats2bfloat162_rn(accS[0][2], accS[0][3]);
-      __nv_bfloat162 w2 = __floats2bfloat162_rn(accS[1][0], accS[1][1]);
-      __nv_bfloat162 w3 = __floats2bfloat162_rn(accS[1][2], accS[1][3]);
-      uint4 v = {punned<uint32_t>(w0), punned<uint32_t>(w1), punned<uint32_t>(w2),
-                 punned<uint32_t>(w3)};
-      __nv_bfloat16* gout =
+      const float4 lo = make_float4(accS[0][0], accS[0][1], accS[0][2], accS[0][3]);
+      const float4 hi = make_float4(accS[1][0], accS[1][1], accS[1][2], accS[1][3]);
+      float* gout =
           g_gram +
           ((((size_t)g * GTILES + (size_t)tw) * GWIN + (size_t)(c & (GWIN - 1))) * GTILE_BF);
       // The first two diagonal tiles are consumed as independent low/high
-      // halves.  Store each half densely so its consumer reads 256 contiguous
-      // bytes instead of touching every sector of the 512-byte full tile.
-      if (SPLIT_DIAG && (tw == 0 || tw == 2)) {
-        uint2 lo = {v.x, v.y}, hi = {v.z, v.w};
-        *(uint2*)(gout + lane * 4) = lo;
-        *(uint2*)(gout + 128 + lane * 4) = hi;
-      } else {
-        *(uint4*)(gout + lane * 8) = v;
-      }
+      // halves. Store all tiles as two dense half tiles so each 16B lane
+      // transaction coalesces, whether the reader needs one half or both.
+      *(float4*)(gout + lane * 4) = lo;
+      *(float4*)(gout + 128 + lane * 4) = hi;
     }
     __threadfence();
     __syncthreads();
@@ -1548,7 +1549,7 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
     // and lets the epilogue write somewhere no MMA phase is reading.
     __nv_bfloat16* sY = sX + QT * LDX;
     __nv_bfloat16* sSc = sY + QT * LDX;
-    float* sScan = (float*)(sSc + QT * LDS);  // [2][4][QT]
+    float* sScan = (float*)(sSc + SCORE_WORDS);  // [2][4][QT]
     uint64_t* sTmaBar = (uint64_t*)(sScan + 8 * QT);
     uint64_t* sPhaseBar = sTmaBar + 1;
     float* sDtTotals = (float*)(sTmaBar + (FULL_T ? 2 : 1));
@@ -1699,8 +1700,8 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
     // gives L2 a sequential 512-byte window-to-window access pattern.
     bool precise_output = false;
     float peak_x = 0.f, peak_y = 0.f, peak_row_sum = 0.f;
-    const __nv_bfloat16* gpWalk = nullptr;
-    const __nv_bfloat16* gpWalk1 = nullptr;
+    const float* gpWalk = nullptr;
+    const float* gpWalk1 = nullptr;
     if constexpr (!TRACK_PROGRESS && FULL_T) {
       if (hasG) {
         gpWalk = g_gram + (((size_t)g * GTILES + (size_t)gti) * GWIN * GTILE_BF);
@@ -1708,13 +1709,24 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
       }
     }
 
-    uint4 gfrag, gfrag1;
-    uint2 ghalf;
+    struct GramFrag {
+      float4 lo, hi;
+    };
+    GramFrag gfrag, gfrag1;
+    float4 ghalf;
+    auto load_half = [&](const float* p) {
+      uint4 bits;
+      if constexpr (FULL_T && PT == 64)
+        gld_cg128_l2(bits, p);
+      else
+        gld_cg128(bits, p);
+      return punned<float4>(bits);
+    };
     auto load_gram = [&](int gc) {
       if (hasG) {
         unsigned int want = (unsigned int)(gc + 1);
         while (gready < want) gready = gld_acquire(g_gflag + g * 32);
-        const __nv_bfloat16* gp;
+        const float* gp;
         if constexpr (TRACK_PROGRESS || !FULL_T) {
           gp = g_gram +
                ((((size_t)g * GTILES + (size_t)gti) * GWIN + (size_t)(gc & (GWIN - 1))) * GTILE_BF);
@@ -1722,20 +1734,15 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
           gp = gpWalk;
           gpWalk += GTILE_BF;
         }
-        if constexpr (FULL_T && PT == 64) {
-          if (gFull)
-            gld_cg128_l2(gfrag, gp + lane * 8);
-          else
-            gld_cg64_l2(ghalf, gp + ((gk == 3) ? 128 : 0) + lane * 4);
+        if (gFull) {
+          gfrag.lo = load_half(gp + lane * 4);
+          gfrag.hi = load_half(gp + 128 + lane * 4);
         } else {
-          if (gFull)
-            gld_cg128(gfrag, gp + lane * 8);
-          else
-            gld_cg64(ghalf, gp + ((gk == 3) ? 128 : 0) + lane * 4);
+          ghalf = load_half(gp + ((gk == 3) ? 128 : 0) + lane * 4);
         }
         if constexpr (NW == 8) {
           if (gn > 1) {
-            const __nv_bfloat16* gq;
+            const float* gq;
             if constexpr (TRACK_PROGRESS || !FULL_T) {
               gq = g_gram +
                    ((((size_t)g * GTILES + (size_t)gti1) * GWIN + (size_t)(gc & (GWIN - 1))) *
@@ -1744,10 +1751,8 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
               gq = gpWalk1;
               gpWalk1 += GTILE_BF;
             }
-            if constexpr (FULL_T && PT == 64)
-              gld_cg128_l2(gfrag1, gq + lane * 8);
-            else
-              gld_cg128(gfrag1, gq + lane * 8);
+            gfrag1.lo = load_half(gq + lane * 4);
+            gfrag1.hi = load_half(gq + 128 + lane * 4);
           }
         }
       }
@@ -2025,66 +2030,55 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
         int ib0 = ia0 + 8;
         float ca = sCum[ia0], cb = sCum[ib0];
         const float row_rel = exp2f(cb - ca);
-        // Unpack a published tile.  Its eight bf16 values per lane are already
-        // in mma accumulator order, so they drop straight into the slots the
-        // in-register C.B^T used to fill: regs x/y are score columns 0-7 and
-        // regs z/w columns 8-15 of the 16x16 block.
-#define SCORE_UNPACK_FULL(FR, AS)                     \
-  {                                                   \
-    AS[0][0] = __uint_as_float((FR).x << 16);         \
-    AS[0][1] = __uint_as_float((FR).x & 0xffff0000u); \
-    AS[0][2] = __uint_as_float((FR).y << 16);         \
-    AS[0][3] = __uint_as_float((FR).y & 0xffff0000u); \
-    AS[1][0] = __uint_as_float((FR).z << 16);         \
-    AS[1][1] = __uint_as_float((FR).z & 0xffff0000u); \
-    AS[1][2] = __uint_as_float((FR).w << 16);         \
-    AS[1][3] = __uint_as_float((FR).w & 0xffff0000u); \
+        // Each float4 is a producer lane's m16n8 accumulator.
+#define SCORE_UNPACK_FULL(FR, AS)          \
+  memcpy(AS[0], &(FR).lo, sizeof(float4)); \
+  memcpy(AS[1], &(FR).hi, sizeof(float4));
+#define SCORE_EMIT_OFF(JJ, JT, AS)                  \
+  {                                                 \
+    int j0 = 16 * (JJ) + 8 * (JT) + 2 * (lane & 3); \
+    float2 cjv = *(const float2*)(sCum + j0);       \
+    float2 wvv = *(const float2*)(sDtf + j0);       \
+    float cj0 = cjv.x, cj1 = cjv.y;                 \
+    float w0 = wvv.x, w1 = wvv.y;                   \
+    float q0 = exp2f(ca - cj0) * w0;                \
+    float q1 = exp2f(ca - cj1) * w1;                \
+    float v0 = AS[JT][0] * q0;                      \
+    float v1 = AS[JT][1] * q1;                      \
+    float v2 = AS[JT][2] * (row_rel * q0);          \
+    float v3 = AS[JT][3] * (row_rel * q1);          \
+    stage_pair(sSc + score_index(ia0, j0), v0, v1); \
+    stage_pair(sSc + score_index(ib0, j0), v2, v3); \
   }
-#define SCORE_EMIT_OFF(JJ, JT, AS)                                            \
-  {                                                                           \
-    int j0 = 16 * (JJ) + 8 * (JT) + 2 * (lane & 3);                           \
-    float2 cjv = *(const float2*)(sCum + j0);                                 \
-    float2 wvv = *(const float2*)(sDtf + j0);                                 \
-    float cj0 = cjv.x, cj1 = cjv.y;                                           \
-    float w0 = wvv.x, w1 = wvv.y;                                             \
-    float q0 = exp2f(ca - cj0) * w0;                                          \
-    float q1 = exp2f(ca - cj1) * w1;                                          \
-    float v0 = AS[JT][0] * q0;                                                \
-    float v1 = AS[JT][1] * q1;                                                \
-    float v2 = AS[JT][2] * (row_rel * q0);                                    \
-    float v3 = AS[JT][3] * (row_rel * q1);                                    \
-    *(__nv_bfloat162*)(sSc + ia0 * LDS + j0) = __floats2bfloat162_rn(v0, v1); \
-    *(__nv_bfloat162*)(sSc + ib0 * LDS + j0) = __floats2bfloat162_rn(v2, v3); \
+#define SCORE_EMIT_DIAG_LOW(JJ, AS, SLOT)                                   \
+  {                                                                         \
+    int jr = 2 * (lane & 3);                                                \
+    int ir = lane >> 2;                                                     \
+    int j0 = 16 * (JJ) + jr;                                                \
+    float2 cjv = *(const float2*)(sCum + j0);                               \
+    float2 wvv = *(const float2*)(sDtf + j0);                               \
+    float cj0 = cjv.x, cj1 = cjv.y;                                         \
+    float w0 = wvv.x, w1 = wvv.y;                                           \
+    float v0 = (jr <= ir) ? AS[SLOT][0] * (exp2f(ca - cj0) * w0) : 0.f;     \
+    float v1 = (jr + 1 <= ir) ? AS[SLOT][1] * (exp2f(ca - cj1) * w1) : 0.f; \
+    float v2 = AS[SLOT][2] * (exp2f(cb - cj0) * w0);                        \
+    float v3 = AS[SLOT][3] * (exp2f(cb - cj1) * w1);                        \
+    stage_pair(sSc + score_index(ia0, j0), v0, v1);                         \
+    stage_pair(sSc + score_index(ib0, j0), v2, v3);                         \
   }
-#define SCORE_EMIT_DIAG_LOW(JJ, AS, SLOT)                                     \
-  {                                                                           \
-    int jr = 2 * (lane & 3);                                                  \
-    int ir = lane >> 2;                                                       \
-    int j0 = 16 * (JJ) + jr;                                                  \
-    float2 cjv = *(const float2*)(sCum + j0);                                 \
-    float2 wvv = *(const float2*)(sDtf + j0);                                 \
-    float cj0 = cjv.x, cj1 = cjv.y;                                           \
-    float w0 = wvv.x, w1 = wvv.y;                                             \
-    float v0 = (jr <= ir) ? AS[SLOT][0] * (exp2f(ca - cj0) * w0) : 0.f;       \
-    float v1 = (jr + 1 <= ir) ? AS[SLOT][1] * (exp2f(ca - cj1) * w1) : 0.f;   \
-    float v2 = AS[SLOT][2] * (exp2f(cb - cj0) * w0);                          \
-    float v3 = AS[SLOT][3] * (exp2f(cb - cj1) * w1);                          \
-    *(__nv_bfloat162*)(sSc + ia0 * LDS + j0) = __floats2bfloat162_rn(v0, v1); \
-    *(__nv_bfloat162*)(sSc + ib0 * LDS + j0) = __floats2bfloat162_rn(v2, v3); \
-  }
-#define SCORE_EMIT_DIAG_HIGH(JJ, AS, SLOT)                                      \
-  {                                                                             \
-    int jr = 2 * (lane & 3);                                                    \
-    int ir = lane >> 2;                                                         \
-    int j0 = 16 * (JJ) + 8 + jr;                                                \
-    float2 cjv = *(const float2*)(sCum + j0);                                   \
-    float2 wvv = *(const float2*)(sDtf + j0);                                   \
-    float cj0 = cjv.x, cj1 = cjv.y;                                             \
-    float w0 = wvv.x, w1 = wvv.y;                                               \
-    float v2 = (jr <= ir) ? AS[SLOT][2] * (exp2f(cb - cj0) * w0) : 0.f;         \
-    float v3 = (jr + 1 <= ir) ? AS[SLOT][3] * (exp2f(cb - cj1) * w1) : 0.f;     \
-    *(__nv_bfloat162*)(sSc + ia0 * LDS + j0) = __floats2bfloat162_rn(0.f, 0.f); \
-    *(__nv_bfloat162*)(sSc + ib0 * LDS + j0) = __floats2bfloat162_rn(v2, v3);   \
+#define SCORE_EMIT_DIAG_HIGH(JJ, AS, SLOT)                                  \
+  {                                                                         \
+    int jr = 2 * (lane & 3);                                                \
+    int ir = lane >> 2;                                                     \
+    int j0 = 16 * (JJ) + 8 + jr;                                            \
+    float2 cjv = *(const float2*)(sCum + j0);                               \
+    float2 wvv = *(const float2*)(sDtf + j0);                               \
+    float cj0 = cjv.x, cj1 = cjv.y;                                         \
+    float w0 = wvv.x, w1 = wvv.y;                                           \
+    float v2 = (jr <= ir) ? AS[SLOT][2] * (exp2f(cb - cj0) * w0) : 0.f;     \
+    float v3 = (jr + 1 <= ir) ? AS[SLOT][3] * (exp2f(cb - cj1) * w1) : 0.f; \
+    stage_pair(sSc + score_index(ia0, j0), 0.f, 0.f);                       \
+    stage_pair(sSc + score_index(ib0, j0), v2, v3);                         \
   }
 #define SCORE_EMIT_TILE(JJ, FR)                                          \
   {                                                                      \
@@ -2101,10 +2095,7 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
             SCORE_EMIT_TILE(gj, gfrag)
           } else {
             float accS[1][4];
-            accS[0][0] = __uint_as_float(ghalf.x << 16);
-            accS[0][1] = __uint_as_float(ghalf.x & 0xffff0000u);
-            accS[0][2] = __uint_as_float(ghalf.y << 16);
-            accS[0][3] = __uint_as_float(ghalf.y & 0xffff0000u);
+            memcpy(accS[0], &ghalf, sizeof(ghalf));
             if (gk == 3) {
               SCORE_EMIT_DIAG_HIGH(gj, accS, 0)
             } else {
@@ -2201,38 +2192,44 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
         const int rows = min(QT, T - c * QT);
         for (int i = warp; i < rows; i += NW) {
           float s = 0.f;
-          for (int j = lane; j <= i; j += 32) s += fabsf(__bfloat162float(sSc[i * LDS + j]));
+          for (int j = lane; j <= i; j += 32) s += fabsf(__bfloat162float(sSc[score_index(i, j)]));
 #pragma unroll
           for (int d = 16; d; d >>= 1) s += __shfl_down_sync(0xffffffffu, s, d);
           if (lane == 0) peak_row_sum = fmaxf(peak_row_sum, isfinite(s) ? s : CUDART_INF_F);
         }
       }
 
+      // Reuse the X fragment for both score planes. Offsets are in bytes
+      // for ldmatrix; adjacent tiles are 512 BF16, adjacent planes 256.
+      auto score_mma = [&](float* y0, float* y1, uint32_t tile_addr, const uint32_t* x0,
+                           const uint32_t* x1) {
+        uint32_t hi[4], lo[4];
+        ldm4(hi, tile_addr);
+        ldm4o<512>(lo, tile_addr);
+        mma_f32(y0, hi, x0);
+        mma_f32(y1, hi, x1);
+        mma_f32(y0, lo, x0);
+        mma_f32(y1, lo, x1);
+      };
       // ---------------- y_diag = scores . x -----------------------------
       if constexpr (SPEC) {
         if (yrole) {
-          const uint32_t aSb0 = addr4<LDS>(sSc, 16 * myi, 0, lane);
-          const uint32_t aSb1 = aSb0 + (uint32_t)(16 * LDS * 2);
+          const uint32_t aSb0 = addr4<16>(sSc + score_tile(myi, 0), 0, 0, lane);
+          const uint32_t aSb1 = addr4<16>(sSc + score_tile(myi + 1, 0), 0, 0, lane);
           const uint32_t bXb = addr4bt<LDX>(sX, 16 * ng, 0, lane);
           // One x fragment per k step feeds both row blocks; the upper block has
           // one extra causal k step.
-#define YDIAG2_BODY(kt, BOTH)                                \
-  {                                                          \
-    uint32_t bX[4];                                          \
-    ldm4to<32 * (kt) * LDX>(bX, bXb);                        \
-    uint32_t g0[2] = {bX[0], bX[1]}, g1[2] = {bX[2], bX[3]}; \
-    if (BOTH) {                                              \
-      uint32_t aS0[4];                                       \
-      ldm4o<32 * (kt)>(aS0, aSb0);                           \
-      mma_f32(accY[0][0], aS0, g0);                          \
-      mma_f32(accY[0][1], aS0, g1);                          \
-    }                                                        \
-    {                                                        \
-      uint32_t aS1[4];                                       \
-      ldm4o<32 * (kt)>(aS1, aSb1);                           \
-      mma_f32(accY[1][0], aS1, g0);                          \
-      mma_f32(accY[1][1], aS1, g1);                          \
-    }                                                        \
+#define YDIAG2_BODY(kt, BOTH)                                        \
+  {                                                                  \
+    uint32_t bX[4];                                                  \
+    ldm4to<32 * (kt) * LDX>(bX, bXb);                                \
+    uint32_t g0[2] = {bX[0], bX[1]}, g1[2] = {bX[2], bX[3]};         \
+    if (BOTH) {                                                      \
+      score_mma(accY[0][0], accY[0][1], aSb0 + 1024 * (kt), g0, g1); \
+    }                                                                \
+    {                                                                \
+      score_mma(accY[1][0], accY[1][1], aSb1 + 1024 * (kt), g0, g1); \
+    }                                                                \
   }
           if (myi == 2) {
             YDIAG2_BODY(0, true) YDIAG2_BODY(1, true) YDIAG2_BODY(2, true) YDIAG2_BODY(3, false)
@@ -2242,23 +2239,15 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
 #undef YDIAG2_BODY
         }
       } else {
-        const uint32_t aSb = addr4<LDS>(sSc, 16 * mi, 0, lane);
+        const uint32_t aSb = addr4<16>(sSc + score_tile(mi, 0), 0, 0, lane);
         const uint32_t bXb = addr4bt<LDX>(sX, 16 * ng, 0, lane);
-#define YDIAG_BODY(kt)                                         \
-  {                                                            \
-    uint32_t aS[4];                                            \
-    ldm4o<32 * (kt)>(aS, aSb);                                 \
-    if constexpr (NPY == 2) {                                  \
-      uint32_t bX[4];                                          \
-      ldm4to<32 * (kt) * LDX>(bX, bXb);                        \
-      uint32_t g0[2] = {bX[0], bX[1]}, g1[2] = {bX[2], bX[3]}; \
-      mma_f32(accY[0][0], aS, g0);                             \
-      mma_f32(accY[0][1], aS, g1);                             \
-    } else {                                                   \
-      uint32_t bX[2];                                          \
-      ldm2t(bX, addr2t<LDX>(sX, 8 * (ng), 16 * (kt), lane));   \
-      mma_f32(accY[0][0], aS, bX);                             \
-    }                                                          \
+#define YDIAG_BODY(kt)                                            \
+  {                                                               \
+    static_assert(NPY == 2);                                      \
+    uint32_t bX[4];                                               \
+    ldm4to<32 * (kt) * LDX>(bX, bXb);                             \
+    uint32_t g0[2] = {bX[0], bX[1]}, g1[2] = {bX[2], bX[3]};      \
+    score_mma(accY[0][0], accY[0][1], aSb + 1024 * (kt), g0, g1); \
   }
         // Score blocks with k>mi are identically zero (causal).  One uniform
         // branch chain, each arm fully unrolled, keeps the k loop branch-free.
@@ -2448,11 +2437,12 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
           peak_row_sum = fmaxf(peak_row_sum, __shfl_down_sync(0xffffffffu, peak_row_sum, d));
         }
         if (lane == 0) {
-          // Raw Gram and then weighted score each round once. Relative to
-          // the staged score their combined coefficient is < .008. Allow
-          // an absolute floor for flushed tiny operands (decay <= 1 and
-          // step <= 4096 on the non-escalated path). Use double only here.
-          double err = (0.008 * peak_row_sum + QT * 4098.0 * 0x1p-126) * peak_x;
+          // Bound loss from staging the FP32 weighted score, not loss
+          // from approximating the recurrence itself. For normal operands
+          // |v-hi| <= u/(1-u)*|hi|, u=2^-8. Rounding that residual costs
+          // at most u times its magnitude. Keep slack for the row-sum
+          // reduction and the old absolute floor for tiny operands.
+          double err = (0.000016 * peak_row_sum + QT * 4098.0 * 0x1p-126) * peak_x;
           precise_output |=
               Ah > 0.f || !isfinite(err) || !isfinite(peak_y) || err > 0.015 * (peak_y + 1.e-9);
         }
@@ -2523,9 +2513,9 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
   TVM_FFI_ICHECK_EQ(make_bc_tma(&tmaB, pB, T), CUDA_SUCCESS) << "failed to encode B tensor map";
   TVM_FFI_ICHECK_EQ(make_bc_tma(&tmaC, pC, T), CUDA_SUCCESS) << "failed to encode C tensor map";
 
-  const int smem64 = (int)((3 * QT * LDN + 64 * LDN + 2 * QT * (64 + 8) + QT * LDS) * 2 +
+  const int smem64 = (int)((3 * QT * LDN + 64 * LDN + 2 * QT * (64 + 8) + SCORE_WORDS) * 2 +
                            8 * QT * (int)sizeof(float) + 2 * sizeof(uint64_t) + 2 * sizeof(float));
-  const int smem32 = (int)((3 * QT * LDN + 32 * LDN + 2 * QT * (32 + 8) + QT * LDS) * 2 +
+  const int smem32 = (int)((3 * QT * LDN + 32 * LDN + 2 * QT * (32 + 8) + SCORE_WORDS) * 2 +
                            8 * QT * (int)sizeof(float) + 2 * sizeof(uint64_t) + 2 * sizeof(float));
 
   // cudaLaunchCooperativeKernel is a stream operation and is captured as a
