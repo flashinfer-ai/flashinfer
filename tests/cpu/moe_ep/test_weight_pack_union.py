@@ -19,6 +19,7 @@ import torch  # noqa: E402
 from flashinfer.moe_ep.weights import (  # noqa: E402
     MoEWeightPack,
     PrequantizedMoEWeights,
+    PrequantizedMoEWeightsWithSharedExpert,
     UnquantizedMoEWeights,
     dummy_moe_weights,
 )
@@ -111,6 +112,59 @@ def test_direct_variant_construction():
     assert pre.w13_scale is s13
     with pytest.raises(TypeError):
         PrequantizedMoEWeights(w13=pw13, w2=pw2)  # scales are required fields
+
+
+def _shared_tensors():
+    shared_w13 = torch.zeros(2 * INTER, HIDDEN, dtype=torch.float8_e4m3fn)
+    shared_w2 = torch.zeros(HIDDEN, INTER, dtype=torch.float8_e4m3fn)
+    shared_w13_scale = torch.zeros(2 * INTER, HIDDEN // 32, dtype=torch.uint8)
+    shared_w2_scale = torch.zeros(HIDDEN, INTER // 32, dtype=torch.uint8)
+    return shared_w13, shared_w2, shared_w13_scale, shared_w2_scale
+
+
+@pytest.mark.cpu_only
+def test_prequantized_with_shared_expert():
+    w13, w2, s13, s2 = _packed_tensors()
+    sw13, sw2, ss13, ss2 = _shared_tensors()
+    for pack in (
+        PrequantizedMoEWeightsWithSharedExpert(w13, w2, s13, s2, sw13, sw2, ss13, ss2),
+        PrequantizedMoEWeightsWithSharedExpert(
+            w13=w13,
+            w2=w2,
+            w13_scale=s13,
+            w2_scale=s2,
+            shared_w13=sw13,
+            shared_w2=sw2,
+            shared_w13_scale=ss13,
+            shared_w2_scale=ss2,
+        ),
+    ):
+        # A prequantized pack to every backend that ignores the shared expert.
+        assert isinstance(pack, PrequantizedMoEWeights)
+        assert isinstance(pack, MoEWeightPack)
+        assert pack.w13 is w13 and pack.w2_scale is s2
+        assert pack.shared_w13 is sw13 and pack.shared_w2_scale is ss2
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            pack.shared_w13 = sw13
+    with pytest.raises(TypeError):
+        PrequantizedMoEWeightsWithSharedExpert(
+            w13=w13, w2=w2, w13_scale=s13, w2_scale=s2
+        )  # the shared expert's tensors are required fields
+
+
+@pytest.mark.cpu_only
+def test_cake_shared_expert_pack_is_the_neutral_pack():
+    import flashinfer.moe_ep as moe_ep
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_weights import (
+        CakePrequantizedMoEWeightsWithSharedExpert,
+    )
+
+    assert CakePrequantizedMoEWeightsWithSharedExpert is (
+        PrequantizedMoEWeightsWithSharedExpert
+    )
+    assert moe_ep.CakePrequantizedMoEWeightsWithSharedExpert is (
+        moe_ep.PrequantizedMoEWeightsWithSharedExpert
+    )
 
 
 @pytest.mark.cpu_only

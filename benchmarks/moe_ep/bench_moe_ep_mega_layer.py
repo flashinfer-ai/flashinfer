@@ -31,14 +31,23 @@ offers one. Other options:
 - ``--kernel_breakdown``: also every kernel's time inside the window.
 - ``--backend_config``: further fields of the selected backend's kernel
   config, as a JSON object.
+- ``--shared_expert``: one MXFP8 shared expert fused into the layer, on
+  backends whose config has a ``shared_expert`` field (the NVLinkOneSided
+  MegaMoE). FlashInfer's DeepGEMM backend (``sm100_fp8_fp4_bf16_deepgemm``)
+  does not expose DeepGEMM's fused shared expert, so it rejects the option.
 
 Profiles with MXFP4 weights give every backend the same packed MXFP4 weights;
 the others give BF16 weights for the backend to quantize.
 
 Launch on one node, for example (B300; ``sm_100a`` on B200):
 
-    # DeepSeek-V4.1-Flash routed experts, local batches 1, 4, ..., 4096, on
-    # DeepGEMM's MegaMoE.
+    # DeepSeek-V4.1-Flash routed experts, local batches 1, 4, ..., 4096, on the
+    # NVLinkOneSided MegaMoE and then on DeepGEMM's.
+    CUTE_DSL_ARCH=sm_103a torchrun --standalone --nproc-per-node=8 \\
+        benchmarks/moe_ep/bench_moe_ep_mega_layer.py \\
+        --kernel_name sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl \\
+        --profile deepseek_v4_1_flash --activation_clamp 10 --perfect_router \\
+        -b 1 -e 4096 -f 4 --kernel_breakdown --output_file ours.json
     CUTE_DSL_ARCH=sm_103a torchrun --standalone --nproc-per-node=8 \\
         benchmarks/moe_ep/bench_moe_ep_mega_layer.py \\
         --kernel_name sm100_fp8_fp4_bf16_deepgemm \\
@@ -122,6 +131,12 @@ def _kernel_config(args: argparse.Namespace, shape: Dict[str, Any]):
     }
     if args.activation_clamp is not None:
         kwargs["activation_clamp"] = args.activation_clamp
+    if args.shared_expert:
+        if "shared_expert" not in fields:
+            raise ValueError(f"{args.kernel_name} has no fused shared expert")
+        kwargs["shared_expert"] = "fp8_in_kernel"
+        if args.activation_clamp is not None and "shared_gate_up_clamp" in fields:
+            kwargs["shared_gate_up_clamp"] = args.activation_clamp
     extra = json.loads(args.backend_config)
     if not isinstance(extra, dict):
         raise ValueError("--backend_config must be a JSON object")
@@ -178,20 +193,42 @@ def _quantize_mx(x: torch.Tensor, fp4: bool) -> Tuple[torch.Tensor, torch.Tensor
 
 def _weights(args: argparse.Namespace, shape: Dict[str, Any], ep_size: int, device):
     """This rank's expert weights as the layer takes them."""
-    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep import MoEWeightPack, PrequantizedMoEWeightsWithSharedExpert
 
     hidden, intermediate = shape["hidden_size"], shape["intermediate_size"]
     w13, w2 = random_expert_weights(
         shape["num_experts"] // ep_size, hidden, intermediate, device
     )
     if shape["weight_quant"] != "mxfp4":
+        if args.shared_expert:
+            raise ValueError("--shared_expert needs a profile with MXFP4 weights")
         return MoEWeightPack(w13=w13, w2=w2)
     # One expert at a time bounds the quantization's scratch memory.
     w13_q, w13_sf = zip(*(_quantize_mx(w, fp4=True) for w in w13), strict=True)
     w2_q, w2_sf = zip(*(_quantize_mx(w, fp4=True) for w in w2), strict=True)
     routed = [torch.stack(leg) for leg in (w13_q, w2_q, w13_sf, w2_sf)]
     del w13, w2
-    return MoEWeightPack(*routed)
+    if not args.shared_expert:
+        return MoEWeightPack(*routed)
+    # The shared expert is the same on every rank.
+    generator = torch.Generator(device=device).manual_seed(int(args.random_seed))
+    shared_w13, shared_w13_sf = _quantize_mx(
+        torch.randn(2 * intermediate, hidden, device=device, generator=generator)
+        * hidden**-0.5,
+        fp4=False,
+    )
+    shared_w2, shared_w2_sf = _quantize_mx(
+        torch.randn(hidden, intermediate, device=device, generator=generator)
+        * intermediate**-0.5,
+        fp4=False,
+    )
+    return PrequantizedMoEWeightsWithSharedExpert(
+        *routed,
+        shared_w13=shared_w13,
+        shared_w2=shared_w2,
+        shared_w13_scale=shared_w13_sf,
+        shared_w2_scale=shared_w2_sf,
+    )
 
 
 def _build_layer(
@@ -293,6 +330,11 @@ def parse_args() -> argparse.Namespace:
         help="Further kernel-config fields as a JSON object.",
     )
     parser.add_argument(
+        "--shared_expert",
+        action="store_true",
+        help="Fuse one MXFP8 shared expert of the routed experts' shape.",
+    )
+    parser.add_argument(
         "--timing_scope",
         choices=TIMING_SCOPES,
         default="mega",
@@ -345,6 +387,7 @@ def main() -> None:
             "kernel_config": json.loads(
                 json.dumps(dataclasses.asdict(kernel_config), default=str)
             ),
+            "shared_expert": bool(args.shared_expert),
             "timing_scope": scope,
             "reported": [scope],
         }

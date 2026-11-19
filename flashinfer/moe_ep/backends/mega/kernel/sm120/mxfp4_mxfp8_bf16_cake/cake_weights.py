@@ -48,15 +48,19 @@ These helpers are pure PyTorch and importable without a GPU.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
 try:  # imported as part of flashinfer
-    from ......weights import MoEWeightPack, PrequantizedMoEWeights
+    from ......weights import (
+        MoEWeightPack,
+        PrequantizedMoEWeights,
+        PrequantizedMoEWeightsWithSharedExpert,
+    )
 except ImportError:  # host-only unit tests import this module standalone
     MoEWeightPack = object  # type: ignore[assignment,misc]
     PrequantizedMoEWeights = None  # type: ignore[assignment,misc]
+    PrequantizedMoEWeightsWithSharedExpert = None  # type: ignore[assignment,misc]
 
 FP4_PACKED_DTYPES = (torch.uint8, torch.int8, torch.float4_e2m1fn_x2)
 FP8_DTYPES = (torch.uint8, torch.float8_e4m3fn)
@@ -69,25 +73,9 @@ NOSHARED_FP8_FILL = 0x38  # e4m3 1.0
 NOSHARED_SCALE_FILL_WORD = 0x7F7F7F7F  # four UE8M0 2^0 exponents
 
 
-if PrequantizedMoEWeights is not None:
-
-    @dataclass(frozen=True)
-    class CakePrequantizedMoEWeightsWithSharedExpert(PrequantizedMoEWeights):
-        """Routed MXFP4 experts plus one FP8 e4m3 shared expert (fp8shared variant)."""
-
-        shared_w13: torch.Tensor  # e4m3 [2I, H], gate rows then up rows
-        shared_w2: torch.Tensor  # e4m3 [H, I]
-        shared_w13_scale: torch.Tensor  # UE8M0 [2I, H // 32]
-        shared_w2_scale: torch.Tensor  # UE8M0 [H, I // 32]
-
-        def __new__(cls, *args: Any, **kwargs: Any):
-            # MoEWeightPack.__new__ has the fixed four-tensor signature and
-            # would reject the shared_* keywords; this variant constructs
-            # directly and its dataclass __init__ checks the field set.
-            return object.__new__(cls)
-
-else:  # pragma: no cover - standalone host tests
-    CakePrequantizedMoEWeightsWithSharedExpert = None  # type: ignore[assignment,misc]
+# Routed MXFP4 experts plus one FP8 e4m3 shared expert (fp8shared variant): the
+# backend-neutral pack under the name this backend introduced.
+CakePrequantizedMoEWeightsWithSharedExpert = PrequantizedMoEWeightsWithSharedExpert
 
 
 @dataclass(frozen=True)
