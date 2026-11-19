@@ -52,18 +52,17 @@ def _has_min_cuda_toolkit():
     # override, else $CUDA_HOME/bin/nvcc) must be CUDA 13.2+ (ptxas accepts
     # cvt.rn.bf16x2.e4m3x2 only from PTX ISA 9.2). torch.version.cuda is
     # never substituted: it says nothing about the ability to build.
-    try:
-        from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
-        from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
-            gen_specialized_fused_moe_fp8_blockscale_sm120_module,
-        )
-
-        if gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
-            return True
-        v = _specialized_jit_nvcc_release()
-        return v is not None and v >= (13, 2)
-    except Exception:
+    if not _is_validated_sm120_device():
         return False
+    from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+        gen_specialized_fused_moe_fp8_blockscale_sm120_module,
+    )
+
+    if gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+        return True
+    v = _specialized_jit_nvcc_release()
+    return v is not None and v >= (13, 2)
 
 
 pytestmark = [
@@ -263,30 +262,18 @@ def test_kill_switch_declines(weights, monkeypatch):
     assert out is None and reason == "kill_switch"
 
 
-@pytest.mark.parametrize(
-    "case", ["weight_offset", "scale_offset", "short", "long", "cpu"]
-)
+@pytest.mark.parametrize("case", ["short", "long", "cpu"])
 def test_bad_warmup_never_enters_kernel(weights, monkeypatch, case):
     from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
 
     monkeypatch.setattr(mod, "_kernel_entry", lambda: pytest.fail("entered kernel"))
     monkeypatch.delenv(mod._DISABLE_ENV, raising=False)
-    receipts = set(mod._warmed)
+    receipts = {(torch.cuda.current_device(), 4)}
+    monkeypatch.setattr(mod, "_warmed", receipts.copy())
     w13, w2, s13, s2 = weights
     scales = [s13, s2]
     device = w13.device
-    if case in ("weight_offset", "scale_offset"):
-        src = w2 if case == "weight_offset" else s2
-        offset = torch.empty(src.numel() + 1, dtype=src.dtype, device=device)[
-            1:
-        ].view_as(src)
-        assert offset.is_contiguous() and offset.data_ptr() % 16
-        if case == "weight_offset":
-            w2 = offset
-        else:
-            scales[1] = offset
-        reason = "operand_alignment"
-    elif case == "cpu":
+    if case == "cpu":
         device = "cpu"
         reason = "CUDA device"
     else:
@@ -297,36 +284,129 @@ def test_bad_warmup_never_enters_kernel(weights, monkeypatch, case):
     assert mod._warmed == receipts
 
 
-def test_cuda_graph_replay_matches_eager(weights):
-    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
-        warmup,
-    )
+@pytest.mark.parametrize(
+    "slot,reason",
+    enumerate(
+        ("fc1_weights_form", "fc2_weights_form", "fc1_scales_form", "fc2_scales_form")
+    ),
+)
+@pytest.mark.parametrize("fault", ["shape", "dtype", "layout", "device", "alignment"])
+def test_warmup_operand_contract(weights, monkeypatch, slot, reason, fault):
+    from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
 
-    w13, w2, w13_scale, w2_scale = weights
-    warmup(w13, w2, [w13_scale, w2_scale], t_values=(16,))
-    t = 16
-    x, ids, tw = _routing(t, seed=6)
-    out = torch.zeros(t, H, dtype=torch.bfloat16, device=DEVICE)
-    assert _dispatch(x, ids, tw, weights, output=out)[1] is None
-    torch.cuda.synchronize()
-    eager = out.clone()
+    operands = list(weights)
+    src = operands[slot]
+    if fault == "shape":
+        bad = src[:-1]
+    elif fault == "dtype":
+        bad = src.view(torch.uint8 if slot < 2 else torch.int32)
+    elif fault == "layout":
+        bad = src[:1].expand_as(src)
+    elif fault == "device":
+        bad = torch.empty(1, dtype=src.dtype, device="cpu").expand(src.shape)
+        reason = "operand_device"
+    else:
+        bad = torch.empty(src.numel() + 1, dtype=src.dtype, device=src.device)[
+            1:
+        ].view_as(src)
+        reason = "operand_alignment"
+    operands[slot] = bad
+    monkeypatch.delenv(mod._DISABLE_ENV, raising=False)
+    monkeypatch.setattr(mod, "_warmed", {(src.device.index, 1)})
+    monkeypatch.setattr(mod, "_kernel_entry", lambda: pytest.fail("entered kernel"))
+    with pytest.raises(ValueError, match=reason):
+        mod.warmup(*operands[:2], operands[2:], device=src.device, t_values=(4,))
+    assert mod._warmed == {(src.device.index, 1)}
+
+
+def test_warmup_refuses_capture(weights, monkeypatch):
+    from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
+
+    monkeypatch.delenv(mod._DISABLE_ENV, raising=False)
+    monkeypatch.setattr(mod, "_kernel_entry", lambda: pytest.fail("entered kernel"))
+    monkeypatch.setattr(mod, "_warmed", set())
     graph = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        assert _dispatch(x, ids, tw, weights, output=out)[1] is None
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
+    with (
+        torch.cuda.graph(graph),
+        pytest.raises(
+            RuntimeError, match="warmup must not run under CUDA-graph capture"
+        ),
+    ):
+        mod.warmup(*weights[:2], weights[2:], t_values=(4,))
+    assert not mod._warmed
+
+
+def test_failed_warmup_sync_preserves_previous_receipts(weights, monkeypatch):
+    from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
+
+    monkeypatch.delenv(mod._DISABLE_ENV, raising=False)
+    monkeypatch.setattr(mod, "_warmed", set())
+    mod.warmup(*weights[:2], weights[2:], t_values=(1,))
+    previous = {(weights[0].device.index, 1)}
+    assert mod._warmed == previous
+    sync = torch.cuda.synchronize
+
+    def fail_sync(device):
+        sync(device)  # surface real CUDA failures before injecting ours
+        assert mod._warmed == previous
+        raise RuntimeError("injected warmup sync failure")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_sync)
+    with pytest.raises(RuntimeError, match="^injected warmup sync failure$"):
+        mod.warmup(*weights[:2], weights[2:], t_values=(4, 16))
+    assert mod._warmed == previous
+
+
+@pytest.mark.parametrize("t", [1, 4, 16, 64, 256, 1024, 4096, 16384])
+def test_warmup_then_graph_matches_reference_and_eager(
+    analytic_weights, monkeypatch, t
+):
+    from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
+
+    w13, w2, s13, s2 = analytic_weights
+    # All payloads are one. With input row a, each FC1 row sums H*a.
+    # Native gate and up halves use different scales; the down projection
+    # varies by output block. Only the scales are private to this test.
+    expert = torch.arange(E, device=w13.device)
+    gain = ((expert % 7) - 3).float() / 2
+    down = 1 + torch.arange(H // 128, device=w13.device).float() / 16
+    s13 = torch.full_like(s13, 2 / H)
+    s13[:, : I // 128] = gain[:, None, None] / H
+    s2 = (down[None, :, None] / I).expand_as(s2).contiguous()
+    native = (w13, w2, s13, s2)
+
+    x = torch.empty((t, H), device=w13.device, dtype=torch.bfloat16)
+    ids = torch.empty((t, TOPK), device=x.device, dtype=torch.int32)
+    tw = torch.empty_like(ids, dtype=torch.float32)
+    out = torch.empty_like(x)
+    graph = torch.cuda.CUDAGraph()
+    monkeypatch.setattr(mod, "_warmed", set())
+    mod.warmup(w13, w2, [s13, s2], t_values=(t,))
+    assert mod._warmed == {(x.device.index, t)}
     with torch.cuda.graph(graph):
-        assert _dispatch(x, ids, tw, weights, output=out)[1] is None
-    out.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    # a few bf16 ulp at the output magnitude: accumulation order may
-    # differ between eager and replay (bf16-atomics class)
-    tol = 2.0**-5 * eager.float().abs().max().clamp(min=1e-3).item()
-    max_abs = (out.float() - eager.float()).abs().max().item()
-    assert max_abs <= tol, f"graphed vs eager max_abs {max_abs} > {tol}"
+        captured, reason = _dispatch(x, ids, tw, native, output=out)
+        assert reason is None and captured is out
+
+    for phase in (0, 1):
+        rng = torch.Generator(device=x.device).manual_seed(9573 + phase)
+        logits = torch.randn(t, E, device=x.device, generator=rng)
+        values, selected = logits.topk(TOPK)
+        ids.copy_(selected)
+        tw.copy_(values.softmax(dim=1))
+        a = (1 + torch.arange(t, device=x.device) % 4).float()[:, None] / 4
+        if phase:
+            a = -a
+        x.copy_(a)
+        # Closed-form FP32 oracle, O(T*top_k) before expanding output rows.
+        inter = torch.nn.functional.silu(a * gain[selected]) * (2 * a)
+        ref = ((tw * inter).sum(1, keepdim=True) * down).repeat_interleave(128, dim=1)
+        out.fill_(float("nan"))
+        graph.replay()
+        _assert_close_to_reference(out, ref)
+        eager, reason = _dispatch(x, ids, tw, native)
+        assert reason is None and eager is not None
+        _assert_close_to_reference(eager, ref)
+        _assert_close_to_reference(out, eager)
 
 
 # ---------------------------------------------------------------------------

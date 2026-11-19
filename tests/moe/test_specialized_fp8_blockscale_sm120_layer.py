@@ -75,18 +75,17 @@ def _has_min_cuda_toolkit():
     # needs no compiler; otherwise the JIT-selected nvcc (FLASHINFER_NVCC
     # override, else $CUDA_HOME/bin/nvcc) must be CUDA 13.2+. The torch CUDA
     # build version is never substituted.
-    try:
-        from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
-        from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
-            gen_specialized_fused_moe_fp8_blockscale_sm120_module,
-        )
-
-        if gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
-            return True
-        v = _specialized_jit_nvcc_release()
-        return v is not None and v >= (13, 2)
-    except Exception:
+    if not _is_validated_sm120_device():
         return False
+    from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+        gen_specialized_fused_moe_fp8_blockscale_sm120_module,
+    )
+
+    if gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+        return True
+    v = _specialized_jit_nvcc_release()
+    return v is not None and v >= (13, 2)
 
 
 requires_sm120 = pytest.mark.skipif(
@@ -216,6 +215,35 @@ def test_kill_switch_blocks_warmup(monkeypatch):
     w2_sf = torch.zeros(2, 1, 1, dtype=torch.float32)
     spec.warmup(w13, w2, [w13_sf, w2_sf], device="cpu")
     assert set(spec._warmed) == warmed_before
+
+
+@pytest.mark.parametrize("case", ["off_list", "wrong_cc", "wrong_sms"])
+def test_warmup_refuses_before_operands_or_jit(monkeypatch, case):
+    from types import SimpleNamespace
+    from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
+
+    monkeypatch.delenv(_KILL_SWITCH, raising=False)
+    monkeypatch.setattr(mod, "_warmed", {(0, 1)})
+    monkeypatch.setattr(mod, "_kernel_entry", lambda: pytest.fail("entered kernel"))
+    monkeypatch.setattr(
+        mod,
+        "get_compute_capability",
+        lambda _: (12, 1) if case == "wrong_cc" else (12, 0),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=170),
+    )
+    ts = (4, 7) if case == "off_list" else (4,)
+    error, message = {
+        "off_list": (ValueError, "off the shipped"),
+        "wrong_cc": (RuntimeError, "compute capability"),
+        "wrong_sms": (RuntimeError, "170 SMs"),
+    }[case]
+    with pytest.raises(error, match=message):
+        mod.warmup(None, None, [], device="cuda:0", t_values=ts)
+    assert mod._warmed == {(0, 1)}
 
 
 def test_off_contract_rejected_at_check_support(monkeypatch):

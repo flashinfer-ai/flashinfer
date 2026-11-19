@@ -2698,6 +2698,14 @@ class SpecializedFp8BlockConfig:
     the opt-in CuTe-DSL route (:class:`SM12xFp8Config`) also serves DeepSeek
     FP8 on SM120.
 
+    This backend does not guarantee bitwise repeatability. Some variants
+    combine expert contributions with floating-point atomic adds; their
+    arrival order can change the rounded result even for identical inputs,
+    including on graph replay. If bitwise repeatability is required,
+    exclude this candidate before capture and use only an implementation
+    verified for that requirement on the deployment, or refuse the call.
+    Disabling the backend does not change graphs already captured with it.
+
     The allowlist's largest variant (16,384 tokens) exceeds
     ``ExecutionConfig``'s default ``tune_max_num_tokens=8192``, and
     ``MoELayer`` rejects an over-limit call before backend eligibility is
