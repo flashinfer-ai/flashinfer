@@ -249,6 +249,8 @@ exclude = [
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
   "flashinfer/attention/prims_ts/kernels/",
+  # The batch-invariant sparse MLA classes keep a frozen copy of those kernel bodies.
+  "flashinfer/batch_invariant/mla/kernel/",
   # Imported CuTe DSL kernels are kept byte-faithful to their source.
   "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "3rdparty/",

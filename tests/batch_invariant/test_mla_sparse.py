@@ -88,23 +88,59 @@ def same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
     )
 
 
-def make_wrapper(cfg, rows, width=TOPK, **plan):
+class Planned:
+    """A plan of the class behind the argument form of these tests: any query shape ``[..., H, D]``."""
+
+    def __init__(self, cfg, **plan):
+        from flashinfer.batch_invariant import mla
+
+        dtype, head_dim, heads = cfg
+        plan.setdefault("softmax_scale", SCALE)
+        self.cfg = cfg
+        self.plan = mla.plan(
+            torch.device("cuda"),
+            heads,
+            q_dtype=cases.torch_dtype(dtype),
+            qk_rope_head_dim=head_dim - 512,
+            **plan,
+        )
+
+    def run(self, query, kv, indices, lengths, **run):
+        _, head_dim, heads = self.cfg
+        prefix = query.shape[:-2]
+        out, lse = run.pop("out", None), run.pop("lse", None)
+        got = self.plan.run(
+            query.reshape(-1, heads, head_dim),
+            kv.reshape(-1, head_dim),
+            indices,
+            lengths,
+            out=None if out is None else out.view(-1, heads, 512),
+            lse=None if lse is None else lse.view(-1, heads),
+            return_lse=True,
+            **run,
+        )
+        return got[0].view(*prefix, heads, 512), got[1].view(*prefix, heads)
+
+
+def make_wrapper(cfg, rows=None, width=TOPK, **plan):
+    return Planned(cfg, **plan)
+
+
+def default_wrapper(cfg, rows, width=TOPK):
+    """The default (not batch-invariant) ``prims_ts`` schedule, for the negative control."""
     from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
 
     dtype, head_dim, heads = cfg
     wrapper = BatchSparseMLADecodePagedTSWrapper()
-    plan.setdefault("softmax_scale", SCALE)
-    plan.setdefault("batch_invariant", True)
-    plan.setdefault("return_lse", True)
-    batch_size = plan.pop("batch_size", rows)
     wrapper.plan(
         torch.device("cuda"),
-        batch_size,
+        rows,
         heads,
         max_topk=width,
         q_dtype=cases.torch_dtype(dtype),
         qk_rope_head_dim=head_dim - 512,
-        **plan,
+        softmax_scale=SCALE,
+        return_lse=True,
     )
     return wrapper
 
@@ -139,7 +175,7 @@ def run_batch(rows, wrapper=None, **run):
     """One fixed-query call with one query token per request: ``(out [n, H, 512], lse [n, H])``."""
     _, head_dim, heads = rows.cfg
     n = len(rows)
-    wrapper = wrapper or make_wrapper(rows.cfg, n, rows.width)
+    wrapper = wrapper or make_wrapper(rows.cfg)
     out, lse = wrapper.run(
         rows.q.view(n, 1, heads, head_dim),
         rows.pool.kv,
@@ -152,7 +188,7 @@ def run_batch(rows, wrapper=None, **run):
 
 def run_alone(rows):
     """Every row as its own one-row decode call: the reference of every comparison."""
-    wrapper = make_wrapper(rows.cfg, 1, rows.width)
+    wrapper = make_wrapper(rows.cfg)
     outs = [run_batch(rows.take([i]), wrapper) for i in range(len(rows))]
     return torch.cat([o for o, _ in outs]), torch.cat([l for _, l in outs])
 
@@ -225,35 +261,42 @@ def test_classes_are_registered():
 def test_fingerprint_covers_the_kernel_sources():
     files = spec.term_source_files()
     for needed in (
-        "mla_decode/sparse_policy.py",
         "mla_decode/throughput_2cta/kernel.py",
         "mla_decode/throughput_2cta/resources.py",
+        "mla_decode/throughput_2cta/tasks.py",
         "mla_decode/helpers/sparse_indices.py",
         "mla_decode/helpers/math.py",
     ):
         assert needed in files
     assert len(set(files)) == len(files)
-
-
-def test_pinned_profile_is_the_policy_profile():
-    policy = pytest.importorskip(
-        "flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy"
+    assert not any(
+        "sparse_policy" in f or "throughput_latency_1cta" in f for f in files
     )
-    default = policy.SparseMlaProfile(family="2cta")
-    for dtype, key in (("e4m3", "fp8"), ("bf16", "bf16")):
-        profile = policy.batch_invariant_sparse_mla_profile(dtype=key)
-        changed = {
-            f: getattr(profile, f)
-            for f in profile.__dataclass_fields__
-            if f == "family" or getattr(profile, f) != getattr(default, f)
-        }
-        expected = dict(spec.PROFILES[dtype])
-        for field in ("split_kv", "head_dim_ctas"):
-            assert getattr(profile, field) == expected.pop(field) == 1
-        assert changed == expected
-        assert not profile.defer_max_update
-    with pytest.raises(ValueError):
-        policy.batch_invariant_sparse_mla_profile(dtype="fp8", kv_cache_format="nvfp4")
+    root = os.path.dirname(spec.__file__)
+    assert all(os.path.isfile(os.path.join(root, "kernel", f)) for f in files)
+
+
+def test_kernel_copy_is_self_contained():
+    """The class owns its kernel sources: no file of the package names the ``prims_ts`` attention tree in code."""
+    import ast
+
+    root = os.path.dirname(spec.__file__)
+    for base, _, names in os.walk(root):
+        for name in names:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(base, name)
+            with open(path) as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                modules = []
+                if isinstance(node, ast.ImportFrom):
+                    modules.append(node.module or "")
+                elif isinstance(node, ast.Import):
+                    modules += [a.name for a in node.names]
+                for module in modules:
+                    assert "attention" not in module.split("."), (path, module)
+                    assert not module.startswith("flashinfer.prims_ts"), (path, module)
 
 
 def test_list_arithmetic():
@@ -312,16 +355,15 @@ def test_placement_mirror_matches_the_lean_statements():
 
 
 def test_unsupported_device_raises_before_any_kernel():
-    from flashinfer.batch_invariant.mla import api
+    from flashinfer.batch_invariant import mla
 
     with pytest.raises(bi.BatchInvariantUnsupportedError):
-        api.check_plan(
+        mla.plan(
             torch.device("cpu"),
-            num_qo_heads=8,
+            8,
             q_dtype=torch.bfloat16,
             qk_rope_head_dim=64,
             softmax_scale=SCALE,
-            refused={},
         )
 
 
@@ -358,74 +400,98 @@ def test_lean_model_matches_python_spec():
 # --------------------------------------------------------------------------------------------------------------------
 
 
-@needs_device
-def test_flag_selects_one_schedule_for_every_plan():
-    from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode import sparse_policy
+_ISOLATION = """
+import sys, torch
+import flashinfer
+from flashinfer.batch_invariant.mla import cases, spec
+dev = torch.device("cuda")
+for name, dtype, head_dim, heads in cases.DIGEST_CASES[:2] + cases.DIGEST_CASES[-2:]:
+    dt = cases.torch_dtype(dtype)
+    q = torch.zeros(3, 2, heads, head_dim, dtype=dt, device=dev)
+    kv = torch.zeros(64, 16, head_dim, dtype=dt, device=dev)
+    tables = torch.arange(6 * 300, dtype=torch.int32, device=dev).view(3, 2, 300) % 1024
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=q, kv_cache=kv, workspace_buffer=torch.zeros(8, dtype=torch.int8, device=dev), qk_nope_head_dim=192,
+        kv_lora_rank=512, qk_rope_head_dim=head_dim - 512, block_tables=tables,
+        seq_lens=torch.ones(3, dtype=torch.int32, device=dev), max_seq_len=1, sparse_mla_top_k=300,
+        bmm1_scale=0.0625, bmm2_scale=1.0, batch_invariant=True,
+    )
+torch.cuda.synchronize()
+loaded = sorted(m for m in sys.modules if m.startswith("flashinfer.attention.prims_ts"))
+print("LOADED", loaded)
+"""
 
-    for dtype, key in ((torch.float8_e4m3fn, "fp8"), (torch.bfloat16, "bf16")):
-        pinned = sparse_policy.batch_invariant_sparse_mla_profile(dtype=key)
-        seen_default = set()
-        for rope in (64, 0):
-            for heads in (8, 16, 64, 128):
-                for rows, q_len in (
-                    (1, 1),
-                    (8, 1),
-                    (64, 1),
-                    (512, 1),
-                    (1, 4096),
-                    (4, 8),
-                ):
-                    kw = dict(
-                        max_topk=TOPK,
-                        max_q_len=q_len,
-                        q_dtype=dtype,
-                        qk_rope_head_dim=rope,
-                    )
-                    plan = mla_decode._resolve_sparse_mla_plan(
-                        "cuda",
-                        rows,
-                        heads,
-                        softmax_scale=SCALE,
-                        batch_invariant=True,
-                        **kw,
-                    )
-                    assert plan[1] == pinned and plan[2].split_kv == 1
-                    seen_default.add(
-                        mla_decode._resolve_sparse_mla_plan("cuda", rows, heads, **kw)[
-                            1
-                        ]
-                    )
-        assert len(seen_default) > 1, "the default path still plans by extent"
+
+@needs_device
+def test_flagged_path_does_not_load_the_default_kernel_or_policy():
+    """A fresh process that plans, compiles and runs the classes through the stable function never imports
+    ``flashinfer.attention.prims_ts``: neither its kernels nor its schedule policy can reach the classes."""
+    env = dict(os.environ, FLASHINFER_CUTE_DSL_DISABLE_CACHE="1")
+    run = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", _ISOLATION],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert run.stdout.strip().splitlines()[-1] == "LOADED []", run.stdout[-2000:]
 
 
 @needs_device
 def test_planned_kernel_state_is_the_recorded_state():
-    for cfg in (("e4m3", 576, 64), ("bf16", 512, 16)):
-        kernel = make_wrapper(cfg, 3)._state["compile_spec"].kernel
-        got = {name: getattr(kernel, name) for name in spec.KERNEL_STATE}
-        assert got == spec.KERNEL_STATE, cfg
-        assert kernel.assume_valid_prefix is False
-        assert (
-            make_wrapper(cfg, 3, assume_valid_prefix=True)
-            ._state["compile_spec"]
-            .kernel.assume_valid_prefix
-        )
+    from flashinfer.batch_invariant.mla import engine
+
+    state = {}
+    for dtype in spec.DTYPES:
+        for rope in (64, 0):
+            for heads in (1, 8, 16, 64, 128):
+                kernel = engine.build_kernel(torch.device("cuda"), heads, dtype, rope)
+                got = {name: getattr(kernel, name) for name in spec.KERNEL_STATE}
+                assert got == spec.KERNEL_STATE, (dtype, rope, heads)
+                profile = spec.PROFILES[dtype]
+                assert kernel.sparse_gather_warps == profile["gather_issue_warps"]
+                assert kernel.sparse_kv_stages == profile.get("kv_pipeline_stages", 0)
+                state[dtype, rope, heads] = kernel.compile_signature()
+    cfg = ("e4m3", 576, 64)
+    planned = make_wrapper(cfg).plan
+    assert planned.kernel.compile_signature() == state["e4m3", 64, 64]
+    assert make_wrapper(cfg).plan is planned
+
+
+@needs_device
+def test_one_plan_serves_every_row_count_and_width():
+    """The row count and the list width are launch-time extents: no schedule is chosen from them."""
+    from flashinfer.batch_invariant.mla import engine
+
+    cfg = CONFIGS[1]
+    pool, targets, (ref_out, _) = shared(cfg)
+    before = len(engine._plans)
+    for n in (1, 3, 12):
+        assert same_bits(run_batch(targets.take(range(n)))[0], ref_out[:n])
+    wide = Rows(cfg, pool, TARGETS, width=2051)
+    assert same_bits(run_batch(wide)[0], ref_out)
+    assert len(engine._plans) == before
 
 
 @needs_device
 def test_default_schedule_is_not_batch_invariant():
-    """Negative control: without the flag the same comparison fails, so the invariance tests can fail."""
+    """Negative control: on the default ``prims_ts`` schedule the same comparison fails, so the invariance tests can
+    fail."""
     cfg = ("e4m3", 576, 64)
+    _, head_dim, heads = cfg
     pool, targets, _ = shared(cfg)
     full = targets.take([10, 11])
-    alone = [
-        run_batch(full.take([i]), make_wrapper(cfg, 1, batch_invariant=False))[0]
-        for i in range(2)
-    ]
+
+    def default(rows):
+        n = len(rows)
+        out, _ = default_wrapper(cfg, n).run(
+            rows.q.view(n, 1, heads, head_dim), pool.kv, rows.indices, rows.lengths
+        )
+        return out.view(n, heads, 512)
+
+    alone = [default(full.take([i])) for i in range(2)]
     batch = join(full, mates(cfg, pool, 62, "long"))
-    out = run_batch(batch, make_wrapper(cfg, 64, batch_invariant=False))[0]
-    assert not same_bits(out[:2], torch.cat(alone))
+    assert not same_bits(default(batch)[:2], torch.cat(alone))
 
 
 @needs_device
@@ -458,7 +524,7 @@ def test_matches_float64_reference(cfg):
 def test_reruns_and_replans_repeat(cfg):
     pool, targets, (ref_out, ref_lse) = shared(cfg)
     batch = join(targets, mates(cfg, pool, 5, "mixed"))
-    wrapper = make_wrapper(cfg, len(batch))
+    wrapper = make_wrapper(cfg)
     first = run_batch(batch, wrapper)
     for _ in range(3):
         again = run_batch(batch, wrapper)
@@ -503,7 +569,7 @@ def test_graph_replay_equals_eager(cfg):
     pool, targets, (ref_out, ref_lse) = shared(cfg)
     n = 8
     batch = targets.take(range(n))
-    wrapper = make_wrapper(cfg, n)
+    wrapper = make_wrapper(cfg)
     q = batch.q.view(n, 1, heads, head_dim).clone()
     indices, lengths = batch.indices.clone(), batch.lengths.clone()
     out = torch.empty(n, 1, heads, 512, dtype=torch.bfloat16, device="cuda")
@@ -622,45 +688,52 @@ def test_prefill_chunked_decode_and_multi_token_rows_agree(cfg):
         ref_out, ref_lse = run_alone(rows)
     kv = pool.kv
 
-    fixed = make_wrapper(cfg, count, batch_size=1, max_q_len=count)
-    out, lse = fixed.run(
-        rows.q.view(1, count, heads, head_dim), kv, rows.indices, rows.lengths
-    )
-    assert same_bits(out.view(count, heads, 512), ref_out)
-    assert same_bits(lse.view(count, heads), ref_lse)
-
-    packed = make_wrapper(cfg, count, batch_size=1, max_q_len=count, packed_query=True)
-    ptr = torch.tensor([0, count], dtype=torch.int32, device="cuda")
-    out, lse = packed.run(rows.q, kv, rows.indices, rows.lengths, qo_indptr=ptr)
+    plan = make_wrapper(cfg)
+    out, lse = plan.run(rows.q, kv, rows.indices, rows.lengths)
     assert same_bits(out, ref_out) and same_bits(lse, ref_lse)
 
     start = 0
     for piece in (count // 3, 1, count - count // 3 - 1):
         chunk = rows.take(range(start, start + piece))
-        ptr = torch.tensor([0, piece], dtype=torch.int32, device="cuda")
-        out, lse = packed.run(chunk.q, kv, chunk.indices, chunk.lengths, qo_indptr=ptr)
+        out, lse = plan.run(chunk.q, kv, chunk.indices, chunk.lengths)
         assert same_bits(out, ref_out[start : start + piece])
         assert same_bits(lse, ref_lse[start : start + piece])
         start += piece
 
+    lse_kw = dict(return_lse=True, return_lse_base="basee")
+    out, lse = stable(
+        rows,
+        query=rows.q.view(1, count, heads, head_dim),
+        block_tables=rows.indices.view(1, count, TOPK),
+        sparse_mla_top_k_lens=rows.lengths,
+        **lse_kw,
+    )
+    assert same_bits(out.view(count, heads, 512), ref_out)
+    assert same_bits(lse.view(count, heads), ref_lse)
     for tokens in (2, 4, 8):
         requests = count // tokens
         used = requests * tokens
-        mtp = make_wrapper(cfg, used, batch_size=requests, max_q_len=tokens)
-        out, lse = mtp.run(
-            rows.q[:used].view(requests, tokens, heads, head_dim),
-            kv,
-            rows.indices[:used],
-            rows.lengths[:used],
+        out, lse = stable(
+            rows,
+            query=rows.q[:used].view(requests, tokens, heads, head_dim),
+            block_tables=rows.indices[:used].view(requests, tokens, TOPK),
+            sparse_mla_top_k_lens=rows.lengths[:used],
+            **lse_kw,
         )
         assert same_bits(out.view(used, heads, 512), ref_out[:used])
         assert same_bits(lse.view(used, heads), ref_lse[:used])
-
-    ragged = make_wrapper(cfg, 12, batch_size=3, max_q_len=4, packed_query=True)
-    ptr = torch.tensor([0, 1, 5, 8], dtype=torch.int32, device="cuda")
     part = rows.take(range(8))
-    out, lse = ragged.run(part.q, kv, part.indices, part.lengths, qo_indptr=ptr)
-    assert same_bits(out, ref_out[:8]) and same_bits(lse, ref_lse[:8])
+    ptr = torch.tensor([0, 1, 5, 8], dtype=torch.int32, device="cuda")
+    out, lse = stable(
+        part,
+        query=part.q,
+        block_tables=part.indices,
+        cum_seq_lens_q=ptr,
+        max_q_len=4,
+        sparse_mla_top_k_lens=part.lengths,
+        **lse_kw,
+    )
+    assert same_bits(out, ref_out[:8]) and same_bits(lse.view(8, heads), ref_lse[:8])
 
 
 @needs_device
@@ -677,9 +750,6 @@ def test_list_width_and_tail_padding_do_not_change_bits(cfg):
         rows.lengths.fill_(width)
         got = run_batch(rows, validate=False)
         assert same_bits(got[0], ref[0]) and same_bits(got[1], ref[1]), width
-    rows = Rows(cfg, pool, spans)
-    promised = run_batch(rows, make_wrapper(cfg, len(rows), assume_valid_prefix=True))
-    assert same_bits(promised[0], ref[0]) and same_bits(promised[1], ref[1])
     tails = [(3, 2049), (3, 2050), (3, 2051), (0, 6000)]
     wide = {w: Rows(cfg, pool, tails, width=w, topk=2051) for w in (2051, 2052)}
     ref = run_alone(wide[2051])
@@ -932,15 +1002,13 @@ def test_stable_function_scales_and_graph_replay():
     for softmax_scale, output_scale in ((0.03125, 1.0), (SCALE, 0.5), (0.03125, 0.25)):
         want = run_batch(
             rows,
-            make_wrapper(
-                cfg, n, softmax_scale=softmax_scale, output_scale=output_scale
-            ),
+            make_wrapper(cfg, softmax_scale=softmax_scale, output_scale=output_scale),
         )[0]
         got = stable(rows, bmm1_scale=softmax_scale, bmm2_scale=output_scale)
         assert same_bits(got.view(n, heads, 512), want)
     planned = torch.tensor([SCALE], dtype=torch.float32, device="cuda")
     other = torch.tensor([0.03125], dtype=torch.float32, device="cuda")
-    want = run_batch(rows, make_wrapper(cfg, n, softmax_scale=0.03125))[0]
+    want = run_batch(rows, make_wrapper(cfg, softmax_scale=0.03125))[0]
     assert same_bits(stable(rows, bmm1_scale=planned).view(n, heads, 512), ref_out[:n])
     assert same_bits(stable(rows, bmm1_scale=other).view(n, heads, 512), want)
     planned.fill_(0.03125)
@@ -977,63 +1045,87 @@ def test_stable_function_scales_and_graph_replay():
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# Refusals of the wrapper
+# Refusals of the plan
 # --------------------------------------------------------------------------------------------------------------------
 
 
 @needs_device
-def test_wrapper_refuses_inputs_outside_the_class():
-    from flashinfer.attention.prims_ts import (
-        MLAAttentionTuning,
-        batch_sparse_mla_decode_with_paged_kv_cache,
-    )
+def test_plan_refuses_inputs_outside_the_class():
+    from flashinfer.batch_invariant import mla
 
     cfg = CONFIGS[2]
+    dtype, head_dim, heads = cfg
+    good = dict(
+        q_dtype=cases.torch_dtype(dtype),
+        qk_rope_head_dim=head_dim - 512,
+        softmax_scale=SCALE,
+    )
     refused = [
-        dict(softmax_scale=None),
-        dict(use_attention_sinks=True),
-        dict(max_extra_topk=128),
-        dict(output_quant_block_size=32, num_output_groups=1),
-        dict(tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=0.0)),
-        dict(kv_cache_format="nvfp4"),
-        dict(kv_cache_format="fp8"),
-        dict(kv_cache_scale=0.5),
-        dict(extra_kv_cache_format="nvfp4"),
+        (heads, dict(softmax_scale=None), "softmax_scale"),
+        (heads, dict(softmax_scale=-1.0), "softmax_scale"),
+        (heads, dict(softmax_scale=float("inf")), "softmax_scale"),
+        (heads, dict(output_scale=0.0), "output_scale"),
+        (heads, dict(q_dtype=torch.float16), "q_dtype"),
+        (heads, dict(qk_rope_head_dim=32), "qk_rope_head_dim"),
+        (129, {}, "heads"),
+        (0, {}, "heads"),
     ]
-    for kw in refused:
-        with pytest.raises(bi.BatchInvariantUnsupportedError):
-            make_wrapper(cfg, 2, **kw)
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        make_wrapper(("e4m3", 576, 8), 2, kv_cache_format="nvfp4.fp8rope")
-    with pytest.raises(TypeError):
-        make_wrapper(cfg, 2, batch_invariant=1)
+    for count, kw, fragment in refused:
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match=fragment):
+            mla.plan("cuda", count, **{**good, **kw})
 
     pool, targets, (ref_out, _) = shared(cfg)
     rows = targets.take([5, 6])
+    plan = make_wrapper(cfg)
     holes = rows.take([0, 1])
     holes.indices[1, 7] = -1
-    wrapper = make_wrapper(cfg, 2)
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        run_batch(holes, wrapper)
-    assert same_bits(run_batch(rows, wrapper)[0], ref_out[[5, 6]])
-    _, head_dim, heads = cfg
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        batch_sparse_mla_decode_with_paged_kv_cache(
-            rows.q.view(2, 1, heads, head_dim),
-            pool.kv,
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="hole"):
+        run_batch(holes, plan)
+    far = rows.take([0, 1])
+    far.indices[0, 3] = pool.kv.shape[0] * pool.kv.shape[1]
+    with pytest.raises(ValueError, match="outside the cache"):
+        run_batch(far, plan)
+    long = rows.take([0, 1])
+    long.lengths[1] = rows.width + 1
+    with pytest.raises(ValueError, match="length"):
+        run_batch(long, plan)
+    flat = pool.kv.view(-1, head_dim)
+    layouts = [
+        dict(query=rows.q[:, :, :-1]),
+        dict(query=rows.q.to(torch.float16)),
+        dict(kv=flat[:, :-1]),
+        dict(kv=flat[::2]),
+        dict(kv=pool.kv),
+        dict(indices=rows.indices.long()),
+        dict(indices=rows.indices[:1]),
+        dict(lengths=rows.lengths[:1]),
+        dict(lengths=rows.lengths.long()),
+        dict(out=torch.empty(2, heads, 256, dtype=torch.bfloat16, device="cuda")),
+        dict(out=torch.empty(2, heads, 512, dtype=torch.float16, device="cuda")),
+        dict(lse=torch.empty(2, heads + 1, dtype=torch.float32, device="cuda")),
+    ]
+    for kw in layouts:
+        args = dict(query=rows.q, kv=flat, indices=rows.indices, lengths=rows.lengths)
+        args.update(kw)
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            plan.plan.run(
+                args["query"],
+                args["kv"],
+                args["indices"],
+                args["lengths"],
+                out=args.get("out"),
+                lse=args.get("lse"),
+                validate=False,
+            )
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="kind"):
+        plan.plan.run(
+            rows.q,
+            flat,
             rows.indices,
             rows.lengths,
-            batch_invariant=True,
+            softmax_scale=torch.tensor([SCALE], device="cuda"),
         )
-    out = batch_sparse_mla_decode_with_paged_kv_cache(
-        rows.q.view(2, 1, heads, head_dim),
-        pool.kv,
-        rows.indices,
-        rows.lengths,
-        softmax_scale=SCALE,
-        batch_invariant=True,
-    )
-    assert same_bits(out.view(2, heads, 512), ref_out[[5, 6]])
+    assert same_bits(run_batch(rows, plan)[0], ref_out[[5, 6]])
 
 
 @needs_device
@@ -1046,13 +1138,9 @@ def test_scales_are_row_inputs(cfg):
     batch = join(targets, mates(cfg, pool, 20, "mixed"))
     n = len(targets)
     for softmax_scale, output_scale in ((0.03125, 1.0), (0.0625, 0.5)):
-        one = make_wrapper(
-            cfg, 1, softmax_scale=softmax_scale, output_scale=output_scale
-        )
+        one = make_wrapper(cfg, softmax_scale=softmax_scale, output_scale=output_scale)
         ref = [run_batch(targets.take([i]), one) for i in range(n)]
-        many = make_wrapper(
-            cfg, len(batch), softmax_scale=softmax_scale, output_scale=output_scale
-        )
+        many = make_wrapper(cfg, softmax_scale=softmax_scale, output_scale=output_scale)
         out, lse = run_batch(batch, many)
         assert same_bits(out[:n], torch.cat([o for o, _ in ref]))
         assert same_bits(lse[:n], torch.cat([l for _, l in ref]))
@@ -1060,7 +1148,7 @@ def test_scales_are_row_inputs(cfg):
             softmax_scale=torch.tensor(softmax_scale, device="cuda"),
             output_scale=torch.tensor(output_scale, device="cuda"),
         )
-        out2, _ = run_batch(batch, make_wrapper(cfg, len(batch), **tensors))
+        out2, _ = run_batch(batch, make_wrapper(cfg, **tensors))
         assert same_bits(out2, out)
 
 

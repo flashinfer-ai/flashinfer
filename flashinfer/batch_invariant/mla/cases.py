@@ -162,35 +162,33 @@ def digest(out: torch.Tensor, lse: torch.Tensor) -> str:
 
 
 def run_digest_cases(device="cuda") -> Dict[str, str]:
-    """Run every digest case on ``device`` as one-row calls of the flagged wrapper."""
-    from ...attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
+    """Run every digest case on ``device`` as one-row launches of the class's plan."""
+    from . import engine
 
     device = torch.device(device)
     result = {}
     for name, dtype, head_dim, heads in DIGEST_CASES:
         pool = Pool([DIGEST_REQUEST], head_dim, dtype, device)
+        plan = engine.plan(
+            device,
+            heads,
+            q_dtype=pool.dtype,
+            qk_rope_head_dim=head_dim - spec.LATENT_DIM,
+            softmax_scale=SOFTMAX_SCALE,
+        )
         for visible, width in DIGEST_ROWS:
             topk = min(width, 2051) if width > 2048 else 2048
             index_row, live = pool.row(0, visible, topk, width)
-            wrapper = BatchSparseMLADecodePagedTSWrapper()
-            wrapper.plan(
-                device,
-                1,
-                heads,
-                max_topk=width,
-                q_dtype=pool.dtype,
-                qk_rope_head_dim=head_dim - spec.LATENT_DIM,
-                softmax_scale=SOFTMAX_SCALE,
-                batch_invariant=True,
-                return_lse=True,
-            )
-            out, lse = wrapper.run(
-                pool.query(0, visible - 1, heads).view(1, 1, heads, head_dim),
-                pool.kv,
+            out, lse = plan.run(
+                pool.query(0, visible - 1, heads).view(1, heads, head_dim),
+                pool.kv.view(-1, head_dim),
                 index_row.view(1, width).to(device),
                 torch.tensor([live], dtype=torch.int32, device=device),
+                return_lse=True,
             )
-            result[f"{name}.v{visible}.w{width}"] = digest(out, lse)
+            result[f"{name}.v{visible}.w{width}"] = digest(
+                out.view(1, 1, heads, spec.LATENT_DIM), lse.view(1, 1, heads)
+            )
     return result
 
 

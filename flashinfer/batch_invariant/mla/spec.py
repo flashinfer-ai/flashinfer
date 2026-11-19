@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """The sparse MLA classes ``mla.sparse.<dtype>.d<576|512>``: constants, list contract and fingerprint.
 
-The term is a kernel FlashInfer already ships: the ``prims_ts`` sparse MLA decode kernel on one pinned schedule
-(two-CTA family, one 128-row query tile per query row, KV never split, the 512 output columns never split). A query
-row's output is a function of that row alone: its query, its selected-key list in list order, the cache bytes at those
-indices and the two scales. The row is folded over its own list in whole 128-key tiles in list order; the two CTAs of
-its cluster each take 64 of the tile's query rows, and no partial result is rounded and merged, which is what the
-planned-extent schedules of the default path do. Prefill, chunked prefill, decode and multi-token (MTP) rows are
-placements of the same row term (``lean/BIKernels/MlaSparse.lean``); ``README.md`` gives the term in order.
+The term is the kernel under :mod:`.kernel`, a frozen copy of the sparse MLA decode kernel of
+``flashinfer.attention.prims_ts`` (two-CTA family) that this package owns, built on one pinned schedule: one 128-row
+query tile per query row, KV never split, the 512 output columns never split. A query row's output is a function of
+that row alone: its query, its selected-key list in list order, the cache bytes at those indices and the two scales.
+The row is folded over its own list in whole 128-key tiles in list order; the two CTAs of its cluster each take 64 of
+the tile's query rows, and no partial result is rounded and merged, which is what the planned-extent schedules of the
+default path do. Prefill, chunked prefill, decode and multi-token (MTP) rows are placements of the same row term
+(``lean/BIKernels/MlaSparse.lean``); ``README.md`` gives the term in order.
 """
 
 from __future__ import annotations
@@ -36,29 +37,16 @@ CTAS_PER_ROW = 2
 SPLIT_KV = 1
 HEAD_DIM_CTAS = 1
 
-#: Pinned ``SparseMlaProfile`` fields per Q / KV dtype; scheduler and loader fields do not enter the arithmetic.
-PROFILES: Dict[str, Dict[str, object]] = {
-    "e4m3": dict(
-        family="2cta",
-        tile_size_q=QUERY_TILE,
-        split_kv=SPLIT_KV,
-        scheduler="static",
-        head_dim_ctas=HEAD_DIM_CTAS,
-        gather_issue_warps=1,
-    ),
-    "bf16": dict(
-        family="2cta",
-        tile_size_q=QUERY_TILE,
-        split_kv=SPLIT_KV,
-        scheduler="static",
-        head_dim_ctas=HEAD_DIM_CTAS,
-        gather_issue_warps=8,
-        kv_pipeline_stages=7,
-    ),
+#: Loader settings per Q / KV dtype (issue warps of the list gather, KV pipeline depth; 0 keeps the kernel's own
+#: depth). They move no arithmetic. The schedule itself is fixed in :func:`.engine.build_kernel`.
+PROFILES: Dict[str, Dict[str, int]] = {
+    "e4m3": dict(gather_issue_warps=1),
+    "bf16": dict(gather_issue_warps=8, kv_pipeline_stages=7),
 }
 
-#: Static state the planner sets on the kernel object; a device test compares it with the planned kernel.
+#: Static state of the kernel object; a device test compares it with the kernel a plan builds.
 KERNEL_STATE: Dict[str, object] = dict(
+    is_persistent=True,
     static_split_kv=SPLIT_KV,
     is_var_split_kv=False,
     is_var_seq=False,
@@ -67,27 +55,14 @@ KERNEL_STATE: Dict[str, object] = dict(
     fuse_sparse_epilogue=True,
     fuse_sparse_reduction=False,
     direct_sparse=True,
+    assume_valid_prefix=False,
     output_quant=None,
     kv_cache_format="native",
     extra_kv_cache_format="native",
 )
 
-#: Term sources under ``flashinfer/attention/prims_ts/kernels``; a directory counts its ``.py`` files.
-TERM_SOURCES = (
-    "mla_decode/sparse_policy.py",
-    "mla_decode/parallel_reduction_topology.py",
-    "mla_decode/throughput_2cta",
-    "mla_decode/helpers",
-    "mla_decode/throughput_latency_1cta/config.py",
-    "fmha_decode/fmha_decode_resources/smem_transformed_kv.py",
-    "fmha_decode/fmha_decode_resources/tmem_transformed_kv.py",
-    "mask.py",
-    "separate_reduction.py",
-    "stage.py",
-    "task_compat.py",
-    "tcgen05_compat.py",
-    "tensor_map.py",
-)
+#: The ``prims_ts`` commit the kernel copy was taken from.
+KERNEL_BASE = "25bc267eb84dd1b28997f62aa4c282a09184c952"
 
 
 def dtype_name(dtype) -> str:
@@ -131,32 +106,28 @@ def tile_bounds(length: int) -> List[Tuple[int, int]]:
     return [(t * KEY_TILE, (t + 1) * KEY_TILE) for t in range(key_tiles(length))]
 
 
-def _kernels_dir() -> str:
-    package = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    return os.path.join(package, "attention", "prims_ts", "kernels")
+def _kernel_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel")
 
 
 def term_source_files() -> List[str]:
-    root = _kernels_dir()
-    files = []
-    for rel in TERM_SOURCES:
-        path = os.path.join(root, rel)
-        if os.path.isdir(path):
-            files += [
-                f"{rel}/{n}" for n in sorted(os.listdir(path)) if n.endswith(".py")
-            ]
-        else:
-            files.append(rel)
-    return files
+    """The kernel sources of the classes, relative to :mod:`.kernel`, in a fixed order."""
+    root = _kernel_dir()
+    found = []
+    for base, _, names in os.walk(root):
+        found += [
+            os.path.relpath(os.path.join(base, n), root).replace(os.sep, "/")
+            for n in names
+            if n.endswith(".py")
+        ]
+    return sorted(found)
 
 
 @functools.lru_cache(maxsize=None)
 def source_digest() -> str:
     h = hashlib.sha256()
     for rel in term_source_files():
-        with open(os.path.join(_kernels_dir(), rel), "rb") as f:
+        with open(os.path.join(_kernel_dir(), rel), "rb") as f:
             h.update(rel.encode())
             h.update(f.read())
     return h.hexdigest()
@@ -173,9 +144,10 @@ def _dsl_version() -> str:
 
 @functools.lru_cache(maxsize=None)
 def spec_fingerprint(dtype, head_dim: int) -> str:
-    """Identifier of one class: its constants, the pinned schedule, the digest of the kernel sources (hand-written, so
-    their source is the dataflow and an edit renames the class) and the installed ``nvidia-cutlass-dsl`` version that
-    compiles them. The identifier therefore differs between environments with different DSL builds."""
+    """Identifier of one class: its constants, the pinned schedule, the digest of the class's own kernel sources
+    (hand-written, so their source is the dataflow and an edit renames the class) and the installed
+    ``nvidia-cutlass-dsl`` version that compiles them. The identifier therefore differs between environments with
+    different DSL builds, and does not move when ``flashinfer.attention.prims_ts`` changes."""
     name = class_name(dtype, head_dim)
     profile = PROFILES[dtype_name(dtype)]
     parts = [

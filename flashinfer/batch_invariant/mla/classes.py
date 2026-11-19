@@ -8,8 +8,6 @@ from typing import Any, Dict
 
 #: The APIs that run the classes under ``batch_invariant=True``.
 OPERATORS = (
-    "BatchSparseMLADecodePagedTSWrapper",
-    "batch_sparse_mla_decode_with_paged_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",
     "trtllm_prefill_with_kv_cache_mla",
 )

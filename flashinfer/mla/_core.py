@@ -3874,19 +3874,22 @@ def _mla_with_kv_cache_impl(
 
         if batch_invariant is not True:
             raise TypeError("batch_invariant must be bool")
-        refused = {
-            "sinks": sinks,
-            "skip_softmax_threshold_scale_factor": skip_softmax_threshold_scale_factor,
-            "enable_dcp": enable_dcp,
-            "cp_world": None if cp_world == 1 else cp_world,
-            "cp_rank": cp_rank,
-            "causal_seqlens_kv_global": causal_seqlens_kv_global,
-            "use_fp16_softmax": use_fp16_softmax,
-            "multi_ctas_kv_counter_buffer": multi_ctas_kv_counter_buffer,
-            "uses_shared_paged_kv_idx=False": not uses_shared_paged_kv_idx,
-            "cute_dsl_impl": None if cute_dsl_impl == "auto" else cute_dsl_impl,
-            "kv_scale_format": None if kv_scale_format == "auto" else kv_scale_format,
-        }
+        refused = (
+            ("sinks", sinks),
+            (
+                "skip_softmax_threshold_scale_factor",
+                skip_softmax_threshold_scale_factor,
+            ),
+            ("enable_dcp", enable_dcp),
+            ("cp_world", None if cp_world == 1 else cp_world),
+            ("cp_rank", cp_rank),
+            ("causal_seqlens_kv_global", causal_seqlens_kv_global),
+            ("use_fp16_softmax", use_fp16_softmax),
+            ("multi_ctas_kv_counter_buffer", multi_ctas_kv_counter_buffer),
+            ("uses_shared_paged_kv_idx=False", not uses_shared_paged_kv_idx),
+            ("cute_dsl_impl", None if cute_dsl_impl == "auto" else cute_dsl_impl),
+            ("kv_scale_format", None if kv_scale_format == "auto" else kv_scale_format),
+        )
         return sparse_mla_batch_invariant(
             query,
             kv_cache,

@@ -1,0 +1,580 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""Plan and launch of the sparse MLA classes on their own kernel sources (:mod:`.kernel`).
+
+A plan is one compiled shape: device, head count, Q / KV dtype, query width and whether each scale is a host float or
+a device tensor. The row count and the list width are launch-time extents, so one plan serves every batch size and
+every ``top_k``. Nothing here reads ``flashinfer.attention.prims_ts``."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from typing import Dict, Optional, Union
+
+import torch
+
+from ..support import check_device, unsupported
+from . import spec
+
+Scale = Union[float, torch.Tensor]
+_COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+_JIT_MODULE = "batch_invariant_mla_sparse"
+_DTYPE_KEYS = {torch.bfloat16: "bf16", torch.float8_e4m3fn: "e4m3"}
+#: Host scales that round to a positive finite fp32.
+_MIN_SCALE, _MAX_SCALE = 1e-45, 3.4028234663852886e38
+
+#: Plans per compiled shape. Never evicted: a captured CUDA graph reads its plan's buffers.
+_plans: Dict[tuple, "SparseMLAPlan"] = {}
+
+
+def clear_plans() -> None:
+    """Drop every cached plan. CUDA graphs captured through one must not be replayed afterwards."""
+    _plans.clear()
+
+
+def _stable(value) -> object:
+    import dataclasses
+    import enum
+
+    if isinstance(value, enum.Enum):
+        return (type(value).__qualname__, value.name)
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, type):
+        return (value.__module__, value.__qualname__)
+    if dataclasses.is_dataclass(value):
+        return (
+            type(value).__qualname__,
+            tuple(
+                (f.name, _stable(getattr(value, f.name)))
+                for f in dataclasses.fields(value)
+                if f.compare
+            ),
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_stable(v) for v in value)
+    raise TypeError(f"no stable encoding for {type(value).__name__}")
+
+
+def _fake_scale(is_tensor: bool):
+    import cutlass
+    import cutlass.cute as cute
+
+    if is_tensor:
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
+        )
+    return cutlass.Float32(1.0)
+
+
+def build_kernel(device: torch.device, num_qo_heads: int, dtype: str, rope_dim: int):
+    """The kernel object of one class on its pinned schedule (:data:`.spec.PROFILES`, :data:`.spec.KERNEL_STATE`)."""
+    from .kernel.mla_decode.throughput_2cta.kernel import MlaDecodeTs
+
+    profile = spec.PROFILES[dtype]
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    kernel = MlaDecodeTs(
+        page_size=1,
+        max_active_clusters=sm_count // spec.CTAS_PER_ROW,
+        is_persistent=True,
+        is_var_seq=False,
+        is_var_split_kv=False,
+        static_split_kv=spec.SPLIT_KV,
+        qkv_dtype=dtype,
+        out_dtype="bf16",
+        rope_dim=rope_dim,
+        num_heads=num_qo_heads,
+        seq_len_q=1,
+        batch_size=1,
+        mask_type="dense",
+        softmax_rescale_threshold_log2=0.0,
+        fixed_seqlen=True,
+    )
+    kernel.kv_cache_format = "native"
+    kernel.extra_kv_cache_format = "native"
+    kernel.sparse_gather_warps = profile["gather_issue_warps"]
+    kernel.sparse_kv_stages = profile.get("kv_pipeline_stages", 0)
+    kernel.sparse_uniform_pages = False
+    kernel.sparse_balanced_registers = False
+    kernel.lse_base_on_e = False
+    kernel.runtime_kv_lengths = False
+    kernel.use_kv_bounds = False
+    kernel.zero_empty_rows = False
+    kernel.output_quant = None
+    kernel.assume_valid_prefix = False
+    kernel.fuse_sparse_epilogue = True
+    kernel.fuse_sparse_reduction = False
+    kernel.direct_sparse = True
+    kernel.direct_sparse_capacities = (1, 0)
+    return kernel
+
+
+def _compile(kernel, device, num_qo_heads, q_dtype, rope_dim, scale_is_tensor):
+    import cutlass
+    import cutlass.cute as cute
+
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from .kernel.mla_decode.helpers.diagnostics import mla_build_diagnostics
+
+    latent = spec.LATENT_DIM
+    query_dim = latent + rope_dim
+    rope_view = rope_dim or latent
+    qkv = {torch.bfloat16: cutlass.BFloat16, torch.float8_e4m3fn: cutlass.Float8E4M3FN}[
+        q_dtype
+    ]
+    pages = cute.sym_int()
+    batch = cute.sym_int()
+    q_stride = (query_dim, 1, num_qo_heads * query_dim, num_qo_heads * query_dim)
+    q_latent = cute.runtime.make_fake_tensor(
+        qkv, (num_qo_heads, latent, 1, batch), stride=q_stride, assumed_align=16
+    )
+    q_rope = cute.runtime.make_fake_tensor(
+        qkv, (num_qo_heads, rope_view, 1, batch), stride=q_stride, assumed_align=16
+    )
+    c_latent = cute.runtime.make_fake_tensor(
+        qkv, (1, latent, pages), stride=(query_dim, 1, query_dim), assumed_align=16
+    )
+    c_extra = cute.runtime.make_fake_tensor(
+        qkv,
+        (1, query_dim, cute.sym_int()),
+        stride=(query_dim, 1, query_dim),
+        assumed_align=16,
+    )
+    page_offsets = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (cute.sym_int(), batch),
+        stride=(1, cute.sym_int64(divisibility=1)),
+        assumed_align=4,
+    )
+    out_row = num_qo_heads * latent
+    out = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (num_qo_heads, latent, 1, batch),
+        stride=(latent, 1, out_row, out_row),
+        assumed_align=16,
+    )
+    lse = cute.runtime.make_fake_tensor(
+        cutlass.Float32,
+        (num_qo_heads, 1, batch),
+        stride=(1, num_qo_heads, num_qo_heads),
+        assumed_align=4,
+    )
+    lengths = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (batch,), stride_order=(0,), assumed_align=4
+    )
+
+    def indices():
+        return cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (batch, cute.sym_int()),
+            stride=(cute.sym_int64(), 1),
+            assumed_align=4,
+        )
+
+    sinks = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (num_qo_heads,), stride_order=(0,), assumed_align=4
+    )
+    sparse_inputs = (indices(), indices(), lengths, lengths, sinks, _fake_scale(False))
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_kernel():
+        with mla_build_diagnostics():
+            return cute.compile[cute.FrontendNext](
+                kernel,
+                q_latent,
+                q_rope,
+                c_latent,
+                c_extra,
+                page_offsets,
+                out,
+                lse,
+                None,
+                cutlass.Int32(spec.SPLIT_KV),
+                lengths,
+                None,
+                sparse_inputs,
+                _fake_scale(scale_is_tensor[0]),
+                _fake_scale(scale_is_tensor[1]),
+                stream,
+                None,
+                cutlass.Int32(0),
+                None,
+                options=_COMPILE_OPTIONS,
+            )
+
+    identity = (
+        _stable(kernel.compile_signature()),
+        num_qo_heads,
+        _DTYPE_KEYS[q_dtype],
+        rope_dim,
+        tuple(scale_is_tensor),
+        _COMPILE_OPTIONS,
+    )
+    key = hashlib.sha256(repr(identity).encode()).hexdigest()
+    root = spec._kernel_dir()
+    with torch.cuda.device(device):
+        major, minor = torch.cuda.get_device_capability()
+        return build_and_load_cute_dsl_kernel(
+            _JIT_MODULE,
+            f"sm{major}{minor}_{key}",
+            compile_kernel,
+            extra_key_files=[os.path.join(root, f) for f in spec.term_source_files()],
+        )
+
+
+class SparseMLAPlan:
+    """One compiled shape of a sparse MLA class; :meth:`run` launches it for any row count and list width."""
+
+    def __init__(
+        self, device, num_qo_heads, q_dtype, rope_dim, softmax_scale, output_scale
+    ):
+        self.device = device
+        self.num_qo_heads = num_qo_heads
+        self.q_dtype = q_dtype
+        self.rope_dim = rope_dim
+        self.query_dim = spec.LATENT_DIM + rope_dim
+        self.class_name = spec.class_name(q_dtype, self.query_dim)
+        self.softmax_scale = softmax_scale
+        self.output_scale = output_scale
+        self.scale_is_tensor = (
+            isinstance(softmax_scale, torch.Tensor),
+            isinstance(output_scale, torch.Tensor),
+        )
+        self.kernel = build_kernel(device, num_qo_heads, _DTYPE_KEYS[q_dtype], rope_dim)
+        self._compiled = _compile(
+            self.kernel, device, num_qo_heads, q_dtype, rope_dim, self.scale_is_tensor
+        )
+        self._sinks = torch.full(
+            (num_qo_heads,), -torch.inf, device=device, dtype=torch.float32
+        )
+        self._extra = torch.zeros(
+            (1, 1, self.query_dim), device=device, dtype=q_dtype
+        ).permute(1, 2, 0)
+        #: Per row count: the unused second list, its zero lengths and the LSE scratch. Never freed (CUDA graphs).
+        self._rows: Dict[int, tuple] = {}
+
+    def _row_buffers(self, rows: int) -> tuple:
+        buffers = self._rows.get(rows)
+        if buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{self.class_name}: run one call of {rows} rows before CUDA graph capture"
+                )
+            dev = self.device
+            buffers = (
+                torch.zeros((rows, 1), device=dev, dtype=torch.int32),
+                torch.zeros((rows,), device=dev, dtype=torch.int32),
+                torch.empty(
+                    (rows, 1, self.num_qo_heads), device=dev, dtype=torch.float32
+                ).permute(2, 1, 0),
+            )
+            self._rows[rows] = buffers
+        return buffers
+
+    def check(self, query, kv_cache, indices, lengths, out, lse, contents: bool):
+        """Shape, dtype, device, stride and alignment checks of one launch; ``contents`` also reads the list on the
+        host (bounds, and the packed-list contract)."""
+        name, dev, heads = self.class_name, self.device, self.num_qo_heads
+        dim = self.query_dim
+        if (
+            query.ndim != 3
+            or query.shape[1] != heads
+            or query.shape[2] != dim
+            or query.dtype != self.q_dtype
+            or query.device != dev
+            or not query.is_contiguous()
+            or query.data_ptr() % 16
+        ):
+            raise unsupported(
+                name,
+                f"a query of shape {tuple(query.shape)}, dtype {query.dtype}",
+                f"a contiguous 16-byte-aligned {self.q_dtype} [rows, {heads}, {dim}] on {dev}",
+            )
+        rows = query.shape[0]
+        if (
+            kv_cache.ndim != 2
+            or kv_cache.shape[1] != dim
+            or kv_cache.shape[0] <= 0
+            or kv_cache.shape[0] >= 0x7FFFFFFF
+            or kv_cache.dtype != self.q_dtype
+            or kv_cache.device != dev
+            or kv_cache.stride(1) != 1
+            or kv_cache.stride(0) != dim
+            or kv_cache.data_ptr() % 16
+        ):
+            raise unsupported(
+                name,
+                f"a KV cache of shape {tuple(kv_cache.shape)}, dtype {kv_cache.dtype}",
+                f"compact 16-byte-aligned {self.q_dtype} rows [storage_rows, {dim}] on {dev}",
+            )
+        if (
+            indices.ndim != 2
+            or indices.shape[0] != rows
+            or indices.shape[1] <= 0
+            or indices.dtype != torch.int32
+            or indices.device != dev
+            or indices.stride(1) != 1
+        ):
+            raise unsupported(
+                name,
+                f"indices of shape {tuple(indices.shape)}, dtype {indices.dtype}",
+                f"int32 [{rows}, top_k] on {dev} with a contiguous last dimension",
+            )
+        if (
+            lengths.shape != (rows,)
+            or lengths.dtype != torch.int32
+            or lengths.device != dev
+            or not lengths.is_contiguous()
+        ):
+            raise unsupported(
+                name,
+                f"lengths of shape {tuple(lengths.shape)}, dtype {lengths.dtype}",
+                f"contiguous int32 [{rows}] on {dev}",
+            )
+        if (
+            out.shape != (rows, heads, spec.LATENT_DIM)
+            or out.dtype != torch.bfloat16
+            or out.device != dev
+            or not out.is_contiguous()
+            or out.data_ptr() % 16
+        ):
+            raise unsupported(
+                name,
+                f"out of shape {tuple(out.shape)}, dtype {out.dtype}",
+                f"a contiguous 16-byte-aligned bf16 [{rows}, {heads}, {spec.LATENT_DIM}] on {dev}",
+            )
+        if lse is not None and (
+            lse.shape != (rows, heads)
+            or lse.dtype != torch.float32
+            or lse.device != dev
+            or not lse.is_contiguous()
+            or lse.data_ptr() % 16
+        ):
+            raise unsupported(
+                name,
+                f"lse of shape {tuple(lse.shape)}, dtype {lse.dtype}",
+                f"a contiguous 16-byte-aligned fp32 [{rows}, {heads}] on {dev}",
+            )
+        if contents and rows:
+            width = indices.shape[1]
+            if ((lengths < 0) | (lengths > width)).any().item():
+                raise ValueError(f"{name}: a list length is outside [0, {width}]")
+            live = torch.arange(width, device=dev)[None, :] < lengths[:, None]
+            if (live & ((indices < -1) | (indices >= kv_cache.shape[0]))).any().item():
+                raise ValueError(f"{name}: a live index is outside the cache")
+            if (live & (indices < 0)).any().item():
+                raise unsupported(
+                    name,
+                    "a -1 hole inside the live part of the list",
+                    "live entries packed before any -1 (a hole moves every later key)",
+                )
+
+    def launch(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+        out: torch.Tensor,
+        lse: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[Scale] = None,
+        output_scale: Optional[Scale] = None,
+    ) -> None:
+        """Launch on trusted arguments: ``query`` ``[rows, heads, 576|512]``, ``kv_cache`` ``[storage_rows, 576|512]``,
+        ``indices`` int32 ``[rows, top_k]``, ``lengths`` int32 ``[rows]``, ``out`` bf16 ``[rows, heads, 512]``, ``lse``
+        fp32 ``[rows, heads]`` or ``None``. Nothing is checked and nothing is read on the host; :meth:`check` holds the
+        layout rules. A scale override keeps the plan's kind (host float or device tensor)."""
+        rows = query.shape[0]
+        if rows == 0:
+            return
+        latent = spec.LATENT_DIM
+        heads = self.num_qo_heads
+        no_list, no_lengths, scratch = self._rows.get(rows) or self._row_buffers(rows)
+        q4 = query.view(rows, 1, heads, self.query_dim)
+        q_latent = q4[..., :latent].permute(2, 3, 1, 0)
+        self._compiled(
+            q_latent,
+            q4[..., latent:].permute(2, 3, 1, 0) if self.rope_dim else q_latent,
+            kv_cache.view(-1, 1, self.query_dim)[..., :latent].permute(1, 2, 0),
+            self._extra,
+            indices.transpose(0, 1),
+            out.view(rows, 1, heads, latent).permute(2, 3, 1, 0),
+            scratch if lse is None else lse.view(rows, 1, heads).permute(2, 1, 0),
+            None,
+            spec.SPLIT_KV,
+            lengths,
+            None,
+            (indices, no_list, lengths, no_lengths, self._sinks, 1.0),
+            self.softmax_scale if softmax_scale is None else softmax_scale,
+            self.output_scale if output_scale is None else output_scale,
+            None,
+            1,
+            None,
+        )
+
+    def run(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        softmax_scale: Optional[Scale] = None,
+        output_scale: Optional[Scale] = None,
+        validate: bool = True,
+    ):
+        """Checked launch. ``validate=True`` also reads the list on the host (bounds, no ``-1`` inside the live part),
+        which synchronizes; serving passes ``validate=False`` and keeps the layout checks, or calls :meth:`launch`."""
+        rows = query.shape[0] if query.ndim == 3 else -1
+        if out is None and rows >= 0:
+            out = torch.empty(
+                (rows, self.num_qo_heads, spec.LATENT_DIM),
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+        if lse is None and return_lse and rows >= 0:
+            lse = torch.empty(
+                (rows, self.num_qo_heads), device=self.device, dtype=torch.float32
+            )
+        self.check(query, kv_cache, indices, lengths, out, lse, validate)
+        softmax_scale = self.scale(softmax_scale, 0, "softmax_scale")
+        output_scale = self.scale(output_scale, 1, "output_scale")
+        self.launch(
+            query, kv_cache, indices, lengths, out, lse, softmax_scale, output_scale
+        )
+        return (out, lse) if return_lse else out
+
+    def scale(self, value, which: int, name: str):
+        """A launch-time scale: ``None`` (the plan's own), or a checked value of the plan's kind. A host float equal to
+        the plan's is passed through unchecked."""
+        if value is None:
+            return None
+        planned = self.output_scale if which else self.softmax_scale
+        if value is planned or (type(value) is float and value == planned):
+            return None
+        return check_scale(
+            value, name, self.device, self.class_name, self.scale_is_tensor[which]
+        )
+
+
+def check_scale(
+    value, name: str, device, class_name: str, want_tensor: Optional[bool] = None
+):
+    """A positive host float, or a contiguous one-element fp32 tensor on ``device`` (its contents are not read)."""
+    is_tensor = isinstance(value, torch.Tensor)
+    if want_tensor is not None and is_tensor != want_tensor:
+        raise unsupported(
+            class_name,
+            f"{name} as a {'tensor' if is_tensor else 'host float'}",
+            "the kind the plan was made with (host float or device tensor)",
+        )
+    if is_tensor:
+        if (
+            value.device != device
+            or value.dtype != torch.float32
+            or value.numel() != 1
+            or value.ndim > 1
+            or not value.is_contiguous()
+        ):
+            raise unsupported(
+                class_name,
+                f"{name} of shape {tuple(value.shape)}, dtype {value.dtype}",
+                f"a contiguous fp32 tensor of one element on {device}",
+            )
+        return value.view(1) if value.ndim == 0 else value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise unsupported(class_name, f"{name}={value!r}", "a positive scale")
+    value = float(value)
+    if not _MIN_SCALE <= value <= _MAX_SCALE:
+        raise unsupported(
+            class_name, f"{name}={value!r}", "a positive finite fp32 scale"
+        )
+    return value
+
+
+def plan(
+    device,
+    num_qo_heads: int,
+    *,
+    q_dtype: torch.dtype,
+    qk_rope_head_dim: int,
+    softmax_scale: Scale,
+    output_scale: Scale = 1.0,
+) -> SparseMLAPlan:
+    """The plan of one compiled shape, built once per process and kept. ``softmax_scale`` is required: the scale is an
+    input of the row term. Scales passed here are the defaults of the plan's launches; only their kind (host float or
+    device tensor) is part of the compiled shape."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        name = spec.class_name(q_dtype, spec.LATENT_DIM + qk_rope_head_dim)
+    except (ValueError, TypeError):
+        name = spec.FAMILY
+    check_device(device, name, spec.MLA_ARCHS)
+    if q_dtype not in _DTYPE_KEYS:
+        raise unsupported(name, f"q_dtype {q_dtype}", "bf16 or e4m3 Q / KV")
+    if isinstance(qk_rope_head_dim, bool) or qk_rope_head_dim not in (0, spec.ROPE_DIM):
+        raise unsupported(
+            name,
+            f"qk_rope_head_dim={qk_rope_head_dim!r}",
+            "0 (512-wide) or 64 (576-wide)",
+        )
+    if (
+        isinstance(num_qo_heads, bool)
+        or not isinstance(num_qo_heads, int)
+        or not 1 <= num_qo_heads <= spec.MAX_HEADS
+    ):
+        raise unsupported(name, f"{num_qo_heads!r} query heads", "1 to 128 heads")
+    if softmax_scale is None:
+        raise unsupported(
+            name,
+            "the default softmax_scale ((512 + qk_rope_head_dim) ** -0.5)",
+            "an explicit softmax_scale (the scale is an input of the row term)",
+        )
+    softmax_scale = check_scale(softmax_scale, "softmax_scale", device, name)
+    output_scale = check_scale(output_scale, "output_scale", device, name)
+    key = (
+        device,
+        num_qo_heads,
+        q_dtype,
+        qk_rope_head_dim,
+        isinstance(softmax_scale, torch.Tensor),
+        isinstance(output_scale, torch.Tensor),
+    )
+    found = _plans.get(key)
+    if found is not None:
+        if _same_scale(softmax_scale, found.softmax_scale) and _same_scale(
+            output_scale, found.output_scale
+        ):
+            return found
+        twin = SparseMLAPlan.__new__(SparseMLAPlan)
+        twin.__dict__.update(found.__dict__)
+        twin.softmax_scale, twin.output_scale = softmax_scale, output_scale
+        return twin
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(f"{name}: make the plan before CUDA graph capture")
+    if check_device(device, name, spec.MLA_ARCHS) == (10, 7):
+        from ...cute_dsl.utils import require_cute_dsl_arch
+
+        require_cute_dsl_arch(device.index)
+    made = SparseMLAPlan(
+        device, num_qo_heads, q_dtype, qk_rope_head_dim, softmax_scale, output_scale
+    )
+    _plans[key] = made
+    return made
+
+
+def _same_scale(a, b) -> bool:
+    return a is b or (not isinstance(a, torch.Tensor) and a == b)
+
+
+def planned(device, num_qo_heads, q_dtype, qk_rope_head_dim, soft_tensor, out_tensor):
+    """The cached plan of a compiled shape, or ``None``."""
+    return _plans.get(
+        (device, num_qo_heads, q_dtype, qk_rope_head_dim, soft_tensor, out_tensor)
+    )
