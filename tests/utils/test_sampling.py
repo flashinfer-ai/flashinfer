@@ -2483,7 +2483,6 @@ _TOP_P_SPECIALIZED_SHAPES = [
     (24, 154880),
     (30, 154880),
     (36, 154880),
-    (54, 154880),
     (4, 248320),
     (7, 248320),
     (12, 248320),
@@ -3237,14 +3236,19 @@ def test_top_p_renorm_probs_specialized_kill_switch_takes_the_stock_path(monkeyp
     )
 
 
+# Unlisted shapes keep the stock path.
+@pytest.mark.parametrize("batch_size,vocab_size", [(8, 248320), (54, 154880)])
 def test_top_p_renorm_probs_specialized_unlisted_shape_takes_the_stock_path(
-    top_p_specialized_enabled,
+    batch_size, vocab_size, top_p_specialized_enabled
 ):
     _skip_unless_sm103()
-    probs, top_p = _top_p_specialized_inputs(8, 248320, seed=2)
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=2)
     before = _top_p_specialized_stats()["dispatch_count"]
-    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
     assert _top_p_specialized_stats()["dispatch_count"] == before
+    torch.testing.assert_close(
+        out, _top_p_specialized_reference(probs, top_p).cuda(), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize("batch_size,vocab_size", [(7, 248320), (54, 154880)])
