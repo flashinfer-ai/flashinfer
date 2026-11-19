@@ -2533,6 +2533,20 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # record (bit-determinism, fresh-seed matched-ratio, x4/heavy-tail
 # perturbation) is carried in the PR's verification report.
 #
+# OPERAND RANGE (part of the same contract; see the kernel header's OPERAND
+# RANGE section): the QK^T scores and unnormalised P.V partial sums accumulate
+# in packed f16, so raw per-row dot products (before the descales fold in) and
+# per-split P.V sums must stay inside f16 range (|x| <= 65504). Calibrated
+# fp8 attention inputs (the serving contract this kernel was measured on, with
+# O(1)-magnitude quantised operands and per-sequence descales) sit well inside
+# the bound; operands quantised to exploit the full e4m3 range (|values| up to
+# 448) can push a 128-dim dot product past it and saturate. The guards check
+# shapes, dtypes, strides and descale plumbing — they cannot check tensor
+# VALUES without a device sync on every call, which would defeat the
+# dispatch-overhead contract, so staying inside the documented range is the
+# caller's side of the contract (as it is for the stock fp8 paths' own
+# quantisation envelopes).
+#
 # All allocation, compilation and device queries happen at plan time, outside
 # CUDA-graph capture; run() only launches on the current stream (re-queried
 # per call), so plan/capture/replay works like any other fa2 plan.
@@ -2603,12 +2617,16 @@ class _GqaCtxFp8qSm90Capacity(Exception):
     retained one a capture may already hold a pointer to; the plan declines
     the specialized kernel instead of swapping the pointer.
 
-    Contract: such a capacity-declined replan INVALIDATES any CUDA graph
-    captured against the earlier plan. ``graph.replay()`` never re-enters
+    Contract: ANY graph-mode replan that does not arm the specialized state
+    — a capacity decline, a launch-schedule decline, the kill switch, or any
+    other plan-time ineligibility — INVALIDATES every CUDA graph captured
+    against an earlier specialized plan. ``graph.replay()`` never re-enters
     Python, so no runtime guard can stop a stale capture from replaying the
-    old metadata; callers that replan past the retained capacity must discard
-    and re-capture their graphs, mirroring the invalidation rule stock
-    FlashInfer wrappers document for geometry-growing replans."""
+    old metadata (a declined replan deliberately mutates none of it, so the
+    capture keeps computing the LAST ACCEPTED plan, not the new one); callers
+    whose replan declines must discard and re-capture their graphs, mirroring
+    the invalidation rule stock FlashInfer wrappers document for
+    geometry-growing replans."""
 
 
 def _gqa_ctx_fp8q_sm90_disabled() -> bool:
@@ -2851,6 +2869,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
     has_custom_mask: bool,
     prefix_len_ptr: Optional[torch.Tensor],
     token_pos_in_items_len: int,
+    disable_split_kv: bool = False,
 ) -> None:
     """Plan-time half of the dispatch: decide eligibility, JIT-build the
     module (first time in the process), opt the kernels into their dynamic
@@ -2864,6 +2883,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
     counters = _gqa_ctx_fp8q_sm90_counters
     wrapper._gqa_ctx_fp8q_sm90_state = None
     wrapper._gqa_ctx_fp8q_sm90_row_seq = None
+    wrapper._gqa_ctx_fp8q_sm90_row_seq_batch = None
     counters["plans_seen"] += 1
     # The composable dequant fallback needs the row -> request map whenever a
     # per-sequence q_scale tensor arrives at run time, including when this
@@ -2881,10 +2901,26 @@ def _gqa_ctx_fp8q_sm90_prepare(
                 wrapper._gqa_ctx_fp8q_sm90_row_seq = torch.repeat_interleave(
                     torch.arange(batch_size, device=wrapper.device),
                     row_lens.to(device=wrapper.device, dtype=torch.int64),
+                    # the host row lengths already carry the total: passing it
+                    # keeps repeat_interleave from synchronizing on the device
+                    # repeat counts to size its output
+                    output_size=int(row_lens.sum()),
                 )
+                # retained beside the map: the planned batch size, including
+                # requests with zero query rows (which the map alone cannot
+                # recover), for validating per-sequence q_scale tensors when
+                # the specialized state never arms
+                wrapper._gqa_ctx_fp8q_sm90_row_seq_batch = batch_size
     except Exception:  # the map must never break planning
         wrapper._gqa_ctx_fp8q_sm90_row_seq = None
+        wrapper._gqa_ctx_fp8q_sm90_row_seq_batch = None
     if _gqa_ctx_fp8q_sm90_disabled():
+        # A kill-switch replan is a declined replan: nothing below runs, so
+        # the retained specialized metadata is NOT refreshed and any CUDA
+        # graph captured against an earlier plan keeps replaying that plan's
+        # page table and lengths. _GqaCtxFp8qSm90Capacity's contract applies:
+        # the caller must re-capture (replay never re-enters Python, so the
+        # switch cannot be honored or the stale capture guarded at replay).
         counters["plans_disabled"] += 1
         _gqa_ctx_fp8q_sm90_fallback("plan: kill switch")
         logger.info_once(
@@ -2918,6 +2954,12 @@ def _gqa_ctx_fp8q_sm90_prepare(
                 reason = "prefix_len_ptr"
             elif token_pos_in_items_len:
                 reason = f"token_pos_in_items_len={token_pos_in_items_len}"
+            elif disable_split_kv:
+                # the caller asked for split-free execution (fa2's
+                # batch-invariance control); the specialized kernel splits KV
+                # for short-query rows and plan-time psplit prefill tiles, so
+                # it cannot honor the flag — the stock path does
+                reason = "disable_split_kv"
             elif getattr(wrapper, "_jit_module", None) is not None:
                 reason = "jit_module"
         if reason is None:
@@ -2935,6 +2977,20 @@ def _gqa_ctx_fp8q_sm90_prepare(
                 reason = f"kv_len={int(kv_lens.max())} above measured envelope"
             elif int(kv_lens.min()) < 1:
                 reason = "kv_len < 1"
+            elif bool(
+                (
+                    (kv_lens.to(torch.int64) + page_size - 1) // page_size
+                    > (
+                        paged_kv_indptr_host[1 : batch_size + 1]
+                        - paged_kv_indptr_host[:batch_size]
+                    ).to(torch.int64)
+                ).any()
+            ):
+                # an explicit seq_lens can promise more tokens than the
+                # request's listed pages hold; the kernel derives its page
+                # count from the kv length and would walk the block-table
+                # row's zero-padded tail (reading page 0) past the staged span
+                reason = "kv_len exceeds its listed page span"
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
@@ -2963,7 +3019,25 @@ def _gqa_ctx_fp8q_sm90_prepare(
     )
     init_key = (id(module), device_index)
     if init_key not in _gqa_ctx_fp8q_sm90_init_devices:
-        module.init(device_index)
+        try:
+            module.init(device_index)
+        except Exception as exc:
+            # a recoverable per-device init fault (e.g. cudaFuncSetAttribute)
+            # declines the specialized route for this plan instead of
+            # aborting a plan the already-complete FA2 fallback can serve;
+            # the key stays unrecorded so a later plan retries, and an
+            # explicit backend="specialized" plan still raises through the
+            # fail-closed gate with this reason
+            counters["plans_ineligible"] += 1
+            _gqa_ctx_fp8q_sm90_fallback(
+                f"plan: device init failed: {type(exc).__name__}: {exc}"[:300]
+            )
+            logger.info_once(
+                "gqa_context_fp8_paged_sm90: not dispatched for this plan "
+                "(device init failed: %s); the stock path serves it",
+                exc,
+            )
+            return
         _gqa_ctx_fp8q_sm90_init_devices.add(init_key)
 
     q_lens = qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
@@ -3004,6 +3078,31 @@ def _gqa_ctx_fp8q_sm90_prepare(
         wrapper._gqa_ctx_fp8q_sm90_bufs = bufs
 
     graph_mode = bool(getattr(wrapper, "is_cuda_graph_enabled", False))
+
+    # Launch-schedule coverage under CUDA graphs: a capture bakes the kernel
+    # LAUNCHES of its plan, not only their buffer pointers. The launcher skips
+    # the split-KV decode kernels and their merge on a pure single-request
+    # prefill step (batch 1, q_len > 16), so a replan that crosses that
+    # boundary in either direction would replay a capture whose launch set
+    # cannot cover the new rows (e.g. 32 captured prefill rows replanned to 16
+    # decode-class rows emit no prefill tasks and no decode kernels: nothing
+    # writes the output). Decline the crossing replan; per the documented
+    # declined-replan contract the caller re-captures.
+    if graph_mode:
+        sched_all_prefill = (
+            batch_size == 1 and int(total_num_rows) > _GQA_CTX_FP8Q_SM90_BQ
+        )
+        prev_sched = getattr(wrapper, "_gqa_ctx_fp8q_sm90_sched", None)
+        if prev_sched is not None and prev_sched != sched_all_prefill:
+            counters["plans_ineligible"] += 1
+            _gqa_ctx_fp8q_sm90_fallback("plan: graph-retained launch schedule")
+            logger.info_once(
+                "gqa_context_fp8_paged_sm90: not dispatched for this plan (a "
+                "CUDA-graph replan crossed the single-request prefill "
+                "boundary, which changes the captured kernel launch set); "
+                "the stock path serves it — re-capture to use the kernel"
+            )
+            return
 
     def _buf(name, numel, dtype):
         t = bufs.get(name)
@@ -3089,6 +3188,21 @@ def _gqa_ctx_fp8q_sm90_prepare(
             exc,
         )
         return
+    except torch.cuda.OutOfMemoryError as exc:
+        # the specialized scratch is optional: an OOM here declines the
+        # specialized route and lets the already-complete FA2 plan serve the
+        # call instead of aborting plan(). Buffers earlier _buf calls grew
+        # stay retained (monotone workspace; captures may hold them), and an
+        # explicit backend="specialized" plan raises through the fail-closed
+        # gate with this reason.
+        counters["plans_ineligible"] += 1
+        _gqa_ctx_fp8q_sm90_fallback(f"plan: workspace allocation failed: {exc}"[:300])
+        logger.info_once(
+            "gqa_context_fp8_paged_sm90: not dispatched for this plan "
+            "(workspace allocation failed: %s); the stock path serves it",
+            exc,
+        )
+        return
 
     # Every capacity check passed: only now mutate the retained buffers in
     # place. A refused replan above mutates nothing, so a capture made by the
@@ -3122,6 +3236,11 @@ def _gqa_ctx_fp8q_sm90_prepare(
         tasks=tasks,
         device_index=device_index,
     )
+    if graph_mode:
+        # record the armed plan's launch-schedule class: a capture made now
+        # bakes this launch set, and the guard above declines any replan that
+        # would cross it
+        wrapper._gqa_ctx_fp8q_sm90_sched = sched_all_prefill
     counters["plans_prepared"] += 1
 
 
@@ -3427,11 +3546,20 @@ def _gqa_ctx_fp8q_sm90_dequant_q(
             scale_rows = flat.view(1, 1, 1)
         else:
             state = getattr(wrapper, "_gqa_ctx_fp8q_sm90_state", None)
-            batch_size = (
-                int(state.batch_size)
-                if state is not None
-                else int(row_seq.max().item()) + 1
-            )
+            if state is not None:
+                batch_size = int(state.batch_size)
+            else:
+                # the planned batch size is retained beside the row map (a
+                # trailing zero-row request never appears in the map, so
+                # row_seq.max() would undercount it and reject a valid
+                # per-sequence tensor); the map-derived bound stays as the
+                # last-resort fallback
+                planned = getattr(wrapper, "_gqa_ctx_fp8q_sm90_row_seq_batch", None)
+                batch_size = (
+                    int(planned)
+                    if planned is not None
+                    else int(row_seq.max().item()) + 1
+                )
             if flat.numel() != batch_size:
                 # indexing a short tensor with row_seq would be an
                 # out-of-bounds CUDA gather (device-side assert, context
@@ -5029,6 +5157,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             scales with input magnitude, and its measured verification record
             (bit-determinism rerun, fresh-seed matched-ratio, x4/heavy-tail
             perturbation above the 0.98 gate) accompanies the change.
+            Its QK^T scores and unnormalised P.V partial sums accumulate in
+            packed f16: raw 128-dim dot products (before descales fold in)
+            and per-split P.V sums must stay inside f16 range (|x| <= 65504),
+            which calibrated fp8 attention inputs satisfy by construction;
+            operands quantised to exploit the full e4m3 range can exceed it
+            and saturate (the guards check shapes and plumbing, not tensor
+            values — a value scan per call would cost a device sync).
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
@@ -5916,6 +6051,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         or self._custom_mask_buf is not None,
                         prefix_len_ptr,
                         token_pos_in_items_len,
+                        disable_split_kv=disable_split_kv,
                     )
         if (
             getattr(self, "_gqa_ctx_fp8q_sm90_explicit", False)
@@ -6424,6 +6560,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "back — replan, or use backend='auto' for guarded routing"
             )
         if getattr(self, "_gqa_ctx_fp8q_sm90_requested", False) and is_float8(q):
+            planned_q_dtype = getattr(self, "_gqa_ctx_fp8q_sm90_q_data_type", None)
+            if planned_q_dtype is not None and q.dtype != planned_q_dtype:
+                # mirror the stock wrappers' cached-dtype check, which the
+                # dequant fallback would otherwise bypass by casting to bf16
+                # first: an e5m2 query on an e4m3-planned wrapper must not be
+                # served silently (explicit or auto-armed alike)
+                raise ValueError(
+                    "gqa_context_fp8_paged_sm90: this plan was made for "
+                    f"q_data_type={planned_q_dtype}, got a {q.dtype} query; "
+                    "replan with the matching q_data_type"
+                )
             if args:
                 # the stock fp8 kernels read positional *args as
                 # (q_scale, k_scale, v_scale) tensors, but this wrapper's

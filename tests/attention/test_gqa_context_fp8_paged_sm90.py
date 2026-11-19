@@ -908,3 +908,180 @@ def test_run_guard_requires_k_cache_page_coverage():
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0, stats
     assert any("k_cache pages" in r for r in stats["fallback_reasons"]), stats
+
+
+def test_extreme_descales_match_reference():
+    """Per-sequence descale products large enough that |max_score * scale|
+    crosses any f16-budget clamp still return the exact softmax value: the
+    renormaliser subtracts the raw-domain maximum before the scale folds in.
+    (Formerly returned 0: the clamped scaled reference left the exponent
+    centered thousands of log2 units above zero.)"""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([16], [16], device)
+    for name in ("q", "k_cache", "v_cache"):
+        batch[name].view(torch.uint8).fill_(0x38)  # e4m3 1.0
+    wrapper = _plan_wrapper(batch, device)
+    q_scale = torch.full((1,), 256.0, dtype=torch.float32, device=device)
+    k_scale = torch.full((1,), 8.0, dtype=torch.float32, device=device)
+    out = wrapper.run(
+        batch["q"],
+        (batch["k_cache"], batch["v_cache"]),
+        q_scale=q_scale,
+        k_scale=k_scale,
+    )
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out, _reference(batch, qk_descale=[2048.0])) >= MATCHED
+    # a descale product beyond f16 range saturates to the one-hot argmax
+    # limit of softmax: finite output, never NaN/inf
+    huge = torch.full((1,), 1e6, dtype=torch.float32, device=device)
+    out2 = wrapper.run(
+        batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=huge, k_scale=huge
+    )
+    assert bool(out2.float().isfinite().all())
+
+
+def test_seq_lens_past_page_span_declines():
+    """An explicit seq_lens that implies more pages than the request's listed
+    span is refused at plan time: the kernel derives its page count from the
+    kv length and would otherwise walk the block-table row's zero-padded tail
+    (attending to page 0's data)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([16], [16], device)  # one listed page
+    too_long = torch.tensor([32], dtype=torch.int32, device=device)
+    with pytest.raises(NotImplementedError, match="page span"):
+        ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, kv_layout="NHD", backend="specialized"
+        )
+        wrapper.plan(
+            batch["qo_indptr"],
+            batch["kv_indptr"],
+            batch["kv_indices"],
+            batch["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+            seq_lens=too_long,
+        )
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert any("page span" in r for r in stats["fallback_reasons"]), stats
+
+
+def test_disable_split_kv_declines_specialized():
+    """disable_split_kv asks for split-free execution; the specialized kernel
+    splits KV for short-query rows (and psplit prefill tiles), so it must not
+    run: auto falls back to the FA2 plan (which honors the flag), explicit
+    raises."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="specialized"
+    )
+    with pytest.raises(NotImplementedError, match="disable_split_kv"):
+        wrapper.plan(
+            batch["qo_indptr"],
+            batch["kv_indptr"],
+            batch["kv_indices"],
+            batch["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+            disable_split_kv=True,
+        )
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+    assert any("disable_split_kv" in r for r in stats["fallback_reasons"]), stats
+
+
+def test_graph_replan_across_prefill_boundary_declines():
+    """A CUDA graph bakes its plan's kernel LAUNCH SET, not only buffer
+    pointers: the launcher skips the split-KV decode kernels on a pure
+    single-request prefill step (batch 1, q_len > 16). A graph-mode replan
+    that crosses that boundary is declined (the capture could not cover the
+    new rows); a same-class replan still arms."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    big = _make_batch([32], [64], device)
+    wrapper = _plan_wrapper(big, device, use_cuda_graph=True)
+    out = wrapper.run(big["q"], (big["k_cache"], big["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out, _reference(big)) >= MATCHED
+
+    def _replan(b):
+        wrapper.plan(
+            b["qo_indptr"],
+            b["kv_indptr"],
+            b["kv_indices"],
+            b["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+
+    # same class (single-request prefill, fits retained buffers): arms
+    mid = _make_batch([24], [64], device)
+    _replan(mid)
+    assert wrapper._gqa_ctx_fp8q_sm90_state is not None
+    out = wrapper.run(mid["q"], (big["k_cache"], big["v_cache"]))
+    assert _matched_ratio(out, _reference(mid)) >= MATCHED
+
+    # crossing to decode-class rows: declined (explicit backend raises; an
+    # auto-armed plan would fall back to the stock path), and the wrapper is
+    # left unarmed
+    short = _make_batch([16], [64], device)
+    with pytest.raises(NotImplementedError, match="launch schedule"):
+        _replan(short)
+    assert wrapper._gqa_ctx_fp8q_sm90_state is None
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert any("launch schedule" in r for r in stats["fallback_reasons"]), stats
+
+
+def test_fp8_query_flavor_mismatch_raises():
+    """An e5m2 query on an e4m3-planned wrapper must not be served silently:
+    the dequant fallback would cast it to bf16 before the stock cached-dtype
+    check could see it."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    q_e5m2 = batch["q"].view(torch.float8_e5m2)
+    with pytest.raises(ValueError, match="q_data_type"):
+        wrapper.run(q_e5m2, (batch["k_cache"], batch["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
+
+
+def test_one_element_q_scale_broadcasts_in_dequant_fallback(monkeypatch):
+    """The dequant fallback treats a 1-element q_scale tensor as the
+    per-tensor convention and broadcasts it; any other size that is not the
+    planned batch size raises instead of gathering out of bounds. The planned
+    batch size counts zero-row requests the row map cannot recover."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
+    one = torch.tensor([2.0], dtype=torch.float32, device=device)
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=one)
+    assert _matched_ratio(out, _reference(batch, qk_descale=[2.0, 2.0, 2.0])) >= MATCHED
+    bad = torch.tensor([1.0, 1.0], dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="batch_size=3"):
+        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=bad)
