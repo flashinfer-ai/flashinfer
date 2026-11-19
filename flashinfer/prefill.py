@@ -3619,8 +3619,8 @@ def _build_block_tables_from_paged_kv_indices(
 
 
 def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
-    indptr_host = indptr.to("cpu")
-    last_host = last_page_len.to("cpu")
+    indptr_host = indptr.to("cpu").contiguous()
+    last_host = last_page_len.to("cpu").contiguous()
     lengths = (
         get_seq_lens(indptr_host, last_host, page_size)
         if seq_lens is None
@@ -6118,6 +6118,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
         if self._cached_module is not None:
+            if _gqa_dec_fp8q_sm90_armed:
+                # Both generated planners read all three host arrays as
+                # IdType*, selected by paged_kv_indptr.dtype.
+                qo_indptr_host = qo_indptr_host.to(paged_kv_indptr.dtype).contiguous()
+                kv_lens_arr_host = kv_lens_arr_host.to(
+                    paged_kv_indptr.dtype
+                ).contiguous()
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -6156,9 +6163,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
                 args.append(forwarded_uniform_q_len)
                 args.append(False)  # fixed_uniform_q_len
-            self._plan_info = self._cached_module.plan(
-                *args,
-            )
+            try:
+                self._plan_info = self._cached_module.plan(*args)
+            finally:
+                if accepted is not None:
+                    # A later builder may fail and discard this staged pinned
+                    # buffer while the planner's H2D copy is still in flight.
+                    torch.cuda.current_stream(self.device).synchronize()
+            if getattr(self, "_verify_fa2_capture", False) and (
+                accepted._cached_module is not self._cached_module
+                or list(accepted._plan_info) != list(self._plan_info)
+            ):
+                raise ValueError(
+                    "CUDA graph backend: captured FA2 schedule layout changed"
+                )
             if self._backend == "fa2":
                 # specialized SM90 fp8-KV verify kernel: eligibility, JIT
                 # build and workspace are settled here, outside the hot path
@@ -6195,10 +6213,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 native = get_batch_prefill_module(
                     "fa3", torch.float8_e4m3fn, *get_module_args[1:]
                 )
-                native_args = args[:16]
-                float_bytes, int_bytes = native.workspace_size(
-                    native_args[0], *native_args[3:]
-                )
+                # FA3 has plan(), but need not export workspace_size(). Use
+                # provisioned byte capacities, not the FA2 scheduler's size
+                # estimate. In particular an exact-size FA2 reset may have
+                # made its integer buffer smaller than the stock FA3 reserve.
+                float_bytes = self._workspace_size
+                int_bytes = max(8 * 1024 * 1024, self._int_workspace_buffer.nbytes)
                 prior = getattr(accepted, "_verify_native", None)
                 fbuf = prior[1] if prior is not None else None
                 if fbuf is None or fbuf.numel() < float_bytes:
@@ -6209,7 +6229,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 pin = torch.empty(
                     int_bytes, device="cpu", pin_memory=True, dtype=torch.uint8
                 )
-                info = native.plan(fbuf, ibuf, pin, *native_args[3:])
+                # args[3:16] is the common planner ABI through window_left;
+                # the remaining five arguments belong only to FA2. The native
+                # upload uses a raw pinned host pointer, not a torch copy op.
+                try:
+                    info = native.plan(fbuf, ibuf, pin, *args[3:16])
+                finally:
+                    torch.cuda.current_stream(self.device).synchronize()
+                if getattr(self, "_verify_native_capture", False) and (
+                    prior is None
+                    or prior[0] is not native
+                    or list(prior[3]) != list(info)
+                ):
+                    raise ValueError(
+                        "CUDA graph backend: captured FA3 schedule layout changed"
+                    )
                 if prior is not None and self.is_cuda_graph_enabled:
                     if prior[2].numel() >= int_bytes and prior[1] is fbuf:
                         copies.append((prior[2][:int_bytes], ibuf))
@@ -6794,11 +6828,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             if native_plan is None:
                 q, q_scale = _gqa_dec_fp8q_sm90_dequant_q(self, q, q_scale)
-            with torch.cuda.device(q.device):
-                if torch.cuda.is_current_stream_capturing():
-                    self._verify_stock_capture = True
-                    if native_plan is not None:
-                        self._verify_native_capture = True
         _check_cached_qkv_data_type(
             q,
             k_cache,
@@ -7362,6 +7391,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 native, run_args[0], run_args[1], run_args[2] = native_plan
                 native.paged_run(*run_args)
+            if getattr(self, "_gqa_dec_fp8q_sm90_requested", False):
+                with torch.cuda.device(q.device):
+                    if torch.cuda.is_current_stream_capturing():
+                        self._verify_stock_capture = True
+                        if native_plan is None:
+                            self._verify_fa2_capture = True
+                        else:
+                            self._verify_native_capture = True
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:

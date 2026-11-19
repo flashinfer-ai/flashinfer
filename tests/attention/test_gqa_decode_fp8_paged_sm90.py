@@ -1086,6 +1086,58 @@ def _ref_with_indices(batch, kv_indices, kv_lens):
     return _reference(b)
 
 
+def test_native_positional_graph_survives_failed_then_successful_replan(monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch, wrapper = _graph_batch_and_wrapper(device)
+    qo, ki, ids, last = (
+        batch[n] for n in ("qo_indptr", "kv_indptr", "kv_indices", "last_page_len")
+    )
+    _graph_plan(wrapper, qo, ki, ids, last)
+    native, fbuf, ibuf, _ = wrapper._verify_native
+    assert fbuf.data_ptr() != wrapper._float_workspace_buffer.data_ptr()
+    assert ibuf.data_ptr() != wrapper._int_workspace_buffer.data_ptr()
+    q = batch["q"]
+    kv = batch["k_cache"], batch["v_cache"]
+    sq = torch.arange(1, H_QO + 1, dtype=torch.float32, device=device)
+    sk = torch.ones(H_KV, dtype=torch.float32, device=device)
+    sv = 3 * sk
+    out = wrapper.run(q, kv, sq, sk, sv)
+    before = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, kv, sq, sk, sv, out=out)
+
+    def fail(f, i, pin, *args):
+        assert i.data_ptr() != ibuf.data_ptr()
+        i.zero_()
+        raise ValueError("injected FA3 plan failure")
+
+    changed_ids = ids.flip([0])
+    changed_last = last - 1
+    with monkeypatch.context() as m:
+        m.setattr(native, "plan", fail)
+        with pytest.raises(ValueError, match="injected FA3 plan failure"):
+            _graph_plan(wrapper, qo, ki, changed_ids, changed_last)
+    out.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(out, before)
+    assert torch.equal(wrapper.run(q, kv, sq, sk, sv), before)
+
+    _graph_plan(wrapper, qo, ki, changed_ids, changed_last)
+    stock = _plan_wrapper(
+        dict(batch, kv_indices=changed_ids, last_page_len=changed_last),
+        device,
+        backend="fa3",
+    )
+    expected = stock.run(q, kv, sq, sk, sv)
+    assert not torch.equal(expected, before)
+    assert torch.equal(wrapper.run(q, kv, sq, sk, sv), expected)
+    out.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(out, expected)
+
+
 def test_retained_graph_replay_follows_an_in_contract_replan():
     """A replan the specialized backend serves must refresh the captured
     plan-time metadata in place: the retained graph's replay computes the
