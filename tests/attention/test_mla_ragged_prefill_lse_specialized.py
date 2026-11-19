@@ -233,18 +233,18 @@ def test_dispatch_semantics():
     "TQ,TKV",
     [(128, 12416), (256, 15872), (2101, 66304)],
 )
-@pytest.mark.parametrize("frac", ["half", "17"])
+@pytest.mark.parametrize("frac", ["half", "17", "128"])
 def test_runtime_kv_extent_shorter_than_buffer(TQ, TKV, frac):
     # Capacity-reuse form of an allowlisted class: K/V sized to the class's
     # full capacity while cu_kv/seq_lens describe a shorter active prefix.
     # The specialized route must honor the runtime extent; the inactive tail
     # (poisoned with V=1 here) must not contribute to the output or the LSE.
     dev = torch.device("cuda")
-    active = 17 if frac == "17" else TKV // 2 + 17  # off the BN tile grid
+    active = TKV // 2 + 17 if frac == "half" else int(frac)
     q = torch.zeros((TQ, HQ, D_QK), dtype=torch.float8_e4m3fn, device=dev)
     k = torch.zeros((TKV, HQ, D_QK), dtype=torch.float8_e4m3fn, device=dev)
     v = torch.ones((TKV, HQ, D_V), device=dev).to(torch.float8_e4m3fn)
-    v[:active] = 0.0
+    v[:active] = -0.5
     inp = dict(
         q=q,
         k=k,
@@ -262,12 +262,19 @@ def test_runtime_kv_extent_shorter_than_buffer(TQ, TKV, frac):
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
         spec_mod.LAST_FALLBACK_REASONS
     )
-    # All scores are 0, so attention is uniform over the ACTIVE prefix:
-    # O = mean(V[:active]) = 0 and LSE = log2(active) exactly.  With the full
-    # buffer attended instead, O = (TKV - active) / TKV and LSE = log2(TKV).
-    assert float(o.float().abs().max()) <= 1e-3
+    # Only inactive V changes. With zero logits the exact prefix mean is
+    # -0.5, not an empty-split zero, and base-2 LSE counts active keys.
     gold_lse = torch.log2(torch.tensor(float(active))).item()
-    assert float((l - gold_lse).abs().max()) <= 0.02, float(l.max())
+    torch.testing.assert_close(
+        o.float(), torch.full_like(o.float(), -0.5), atol=0.001, rtol=0
+    )
+    torch.testing.assert_close(l, torch.full_like(l, gold_lse), atol=0.02, rtol=0)
+    v[active:].fill_(float("nan"))
+    o_nan, l_nan = _api(inp)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 2, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    assert torch.equal(o_nan, o) and torch.equal(l_nan, l)
 
 
 @requires_sm103

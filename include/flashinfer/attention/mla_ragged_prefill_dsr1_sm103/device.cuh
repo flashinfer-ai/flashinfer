@@ -590,6 +590,39 @@ DEVFN void tmem_st128(uint32_t taddr, const uint32_t* r) {
         "r"(r[127]));
 }
 
+// Keep the producer's split numbering (the reducer uses the same stride),
+// but intersect its increasing tile sequence with the runtime KV prefix.
+DEVFN int active_tiles(int count, int first, int step, int kv_end) {
+  const int remaining = (kv_end + BN - 1) / BN - first;
+  return remaining <= 0 ? 0 : min(count, 1 + (remaining - 1) / step);
+}
+
+DEVFN void write_empty_split(__nv_bfloat16* out, float* lse, uint16_t* partial, float2* stats,
+                             int row, int stride, int split) {
+  const size_t slot = (size_t)row * stride + split;
+  uint4* dst = stride == 1 ? reinterpret_cast<uint4*>(out + (size_t)row * DV)
+                           : reinterpret_cast<uint4*>(partial + slot * DV);
+  for (int i = 0; i < DV / 8; ++i) dst[i] = make_uint4(0, 0, 0, 0);
+  if (stride == 1)
+    lse[row] = -INFINITY;
+  else
+    stats[slot] = make_float2(-INFINITY, 0.f);
+}
+
+// Called by the PV warp AFTER the TMA wait. Swizzling permutes 16-byte
+// chunks within each V row; clearing whole physical rows needs no unswizzle.
+// Each writer fences its stores before the elected lane publishes/uses V.
+template <int WIDTH, int ROWS>
+DEVFN void mask_v_suffix(uint8_t* stage, int valid, int lane) {
+  if (valid < ROWS) {
+    for (int i = max(valid, 0) * WIDTH + lane * 16; i < ROWS * WIDTH; i += 32 * 16)
+      *reinterpret_cast<uint4*>(stage + i) = make_uint4(0, 0, 0, 0);
+    asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
+                     : "memory");
+    __syncwarp();
+  }
+}
+
 DEVFN void split_range(int nt, int nsplit, int s, int& S_eff, int& tb, int& te) {
   if (nt >= nsplit) {
     S_eff = nsplit;
@@ -731,6 +764,13 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
   if (s >= S_eff) return;
   const int kv_hi = min(t_end * BN, kv_end);
   const int tile_step = INTERLEAVED ? S_eff : 1;
+  if constexpr (EXACT_B1) {
+    ntiles = active_tiles(ntiles, t_begin, tile_step, kv_end);
+    if (ntiles == 0) {
+      if (myrow < rows) write_empty_split(Out, Lse, partial, stats, tok * HQ + h, split_stride, s);
+      return;
+    }
+  }
 
   // ---------------- TMEM + barriers ----------------
   if (warp == 0) tmem_alloc(tslot, 256);
@@ -1079,6 +1119,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
         const int vb1 = h1 - (h1 / VHSTAGES) * VHSTAGES;
         mbar_wait(&tbar_v[vb0], (h0 / VHSTAGES) & 1);
         mbar_wait(&tbar_v[vb1], (h1 / VHSTAGES) & 1);
+        if (kb0 + BN > kvlen) {
+          mask_v_suffix<DV, 64>(sV + vb0 * VHALF, kvlen - kb0, lane);
+          mask_v_suffix<DV, 64>(sV + vb1 * VHALF, kvlen - kb0 - 64, lane);
+        }
         mbar_wait(b_prdy, it & 1);
         if (elect_one()) {
           tc_fence_after();
@@ -1101,6 +1145,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
       } else {
         mbar_wait(b_prdy, it & 1);
         mbar_wait(tbar_v, it & 1);
+        mask_v_suffix<DV, BN>(sV, kvlen - kb0, lane);
         if (elect_one()) {
           tc_fence_after();
 #pragma unroll
@@ -1384,6 +1429,15 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
     }
     ntiles = t_end - t_begin;
   }
+  if constexpr (EXACT || PADDED) {
+    // Pair-uniform decision before collective allocation (not based on rows).
+    ntiles = active_tiles(ntiles, t_begin, tile_step, kv_end);
+    if (ntiles == 0) {
+      if (consumer && myrow < rows)
+        write_empty_split(Out, Lse, partial, stats, tok * HQ + h, split_stride, s);
+      return;
+    }
+  }
   // Per-rank masking limit (the partner may own more keys than we do).
   const int kv_hi = min(t_end * BN, CAUSAL ? min(kvlen, m0 + rows) : kvlen);
 
@@ -1457,7 +1511,7 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
     tma3d(smaddr(sQr), &tm_qr, 128, h, qbase + m0, tbar_q);
 #pragma unroll
     for (int st = 0; st < KS; st++) {
-      if (EXACT || st < ntiles) {
+      if (st < ntiles) {
         int kvi = kbase + (t_begin + st * tile_step) * BN + rank * 64;
         mbar_expect(&tbar_k[st], kbytes);
         tma3d(smaddr(sKn + st * PKN2SZ), &tm_kn, 0, h, kvi, &tbar_k[st]);
@@ -1972,6 +2026,8 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
       // filled VS-1 iterations before it is consumed instead of being awaited
       // in the same iteration it is issued.
       mbar_wait(&tbar_v[vst], (it / VS) & 1);
+      // Each rank owns 64 channels of the SAME BN rows, even for an idle Q partner.
+      mask_v_suffix<64, BN>(sV + vst * PV2SZ, kvlen - (t_begin + it * tile_step) * BN, lane);
       if (lane == 0) mbar_arrive_rank0(&b_vready[vst]);
       if (rank == 0) {
         mbar_wait_cluster(&b_prdy[it & 1], (it >> 1) & 1);
