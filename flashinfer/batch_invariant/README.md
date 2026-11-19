@@ -426,8 +426,8 @@ flashinfer.chunk_gated_delta_rule(
   shortcut `ref + (out - ref).detach()` rounds in bf16 and does not return these bits. What that gradient is, and
   whether it is batch-invariant, is the trainer's.
 
-**Intermediates for a backward pass: `train_states`.** The same call stores every sequence's state at its 64-token
-boundaries in a caller-owned buffer:
+**Intermediates for a backward pass: `train_states`.** The same call stores the state every 64-token chunk of every
+sequence starts from in a caller-owned buffer:
 
 ```python
 from flashinfer.batch_invariant.gdn import training_state_rows, training_state_slots
@@ -437,25 +437,33 @@ flashinfer.chunk_gated_delta_rule(
     q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out, train_states=states,
     use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
 )
-rows = training_state_rows(seq_lens)   # rows[i][j]: the state after the first 64 * (j + 1) tokens of sequence i
+rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequence i starts from (zero for j = 0)
 ```
 
 * A backward over the class's recurrence works from the inputs, the output gradient and, per 64-token chunk, the
   state the chunk starts from. That state is the one term it cannot recompute from the chunk's own inputs; without
-  it a backward re-runs the state scan over the sequence (as FLA's does). The first chunk of a sequence starts from zero; chunk `j + 1` starts from
-  `states[rows[i][j]]`. Every other term of a chunk (the normalized `q` / `k`, the cumulative gates, the triangular
-  solve, the corrected values) is a function of the chunk's own 64 input rows and that state, so a backward evaluates
-  the chunks independently of each other and only the state adjoint runs from chunk to chunk. Those per-chunk terms
-  are internal to the kernel and are not exported; a backward that recomputes them in torch differentiates the
-  real-valued recurrence, not the kernel's rounding.
-* A stored state is `[HV, 128 (value), 128 (key)]`, one per v head (`state @ k` is the predicted value); FLA's `h` is
-  the transpose, `[..., key, value]`, so transpose before handing it to an FLA-style backward.
+  it a backward first re-runs the state scan over the sequence (FLA's backward and cuDNN's default path do). Every
+  other term of a chunk (the normalized `q` / `k`, the cumulative gates, the triangular solve, the corrected values)
+  is a function of the chunk's own 64 input rows and that state, so a backward evaluates the chunks independently of
+  each other and only the state adjoint runs from chunk to chunk. Those per-chunk terms are internal to the kernel
+  and are not exported, and no backward surveyed takes them from a forward.
+* **The layout is the one cuDNN's GDN backward takes** (`cudnn::gated_delta_net_bwd`, argument `state_checkpoints`
+  with `checkpoint_every_n_tokens=64`): `(n - 1) // 64 + 1` rows per sequence of `n` tokens, sequences in call order,
+  a sequence's first row the zero state its first chunk starts from (the call writes the zeros) and row `j` the state
+  after its first `64 * j` tokens; a state is `[HV, 128 (value), 128 (key)]`, one per v head (`state @ k` is the
+  predicted value). The state after a sequence's last token is not stored. With the same `q`, `k`, `v`, `g`, `beta`,
+  `cu_seqlens` and `scale`, `use_qk_l2norm_in_kernel=True` and `gate_domain="log"`, cuDNN frontend 1.32.3 takes the
+  buffer as it is; a frontend that requires the series in the input dtype takes `states.to(torch.bfloat16)`. The
+  gradients it returns from this series agree with the ones from its own recomputed series, and with an fp64 autograd
+  of the token recurrence, to bf16 rounding (`tests/gdn/test_batch_invariant_gdn_stateless.py`, skipped without the
+  frontend). cuDNN's own series is a bf16 rounding of its forward's states and is not these bits; the gradient is
+  the backward's, and this class makes no bitwise statement about it. FLA's `h` is the transpose,
+  `[..., key, value]`.
 * Each stored state is bit for bit the state an inference prefill of the same prefix leaves in its pool, whatever the
   other sequences of the call. The output rows are the rows of the call without `train_states`.
-* One state per boundary inside a sequence, `(n - 1) // 64` for a sequence of `n` tokens: 64 KiB per v head, which
-  approaches 1 KiB per token and v head (48 KiB per token at 48 v heads, four times the output). The state after a
-  sequence's last token is not stored. `training_state_slots` is at least 1; rows the call does not store are left
-  as they are.
+* 64 KiB per v head and chunk, which approaches 1 KiB per token and v head for long sequences (48 KiB per token at
+  48 v heads, four times the output) and is one state per sequence for sequences of at most 64 tokens. Rows past
+  `training_state_slots` are left as they are. The call allocates two small index tensors for the layout.
 * The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
   that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is one of the class's
   state pools, raises the typed error.

@@ -280,16 +280,16 @@ def _with_states(x, lens, extra=0, **kwargs):
 
 
 def test_training_state_layout():
-    assert [training_state_slots([n]) for n in (1, 64, 65, 128, 129)] == [1, 1, 1, 1, 2]
-    assert training_state_slots([64, 65, 200, 1]) == 4
-    assert training_state_rows([64, 65, 200, 1]) == [[], [0], [1, 2, 3], []]
+    assert [training_state_slots([n]) for n in (1, 64, 65, 128, 129)] == [1, 1, 2, 2, 3]
+    assert training_state_slots([64, 65, 200, 1]) == 8
+    assert training_state_rows([64, 65, 200, 1]) == [[0], [1, 2], [3, 4, 5, 6], [7]]
 
 
 @needs_device
 @pytest.mark.parametrize("heads", HEADS)
 @pytest.mark.parametrize("steep", [False, True])
 @pytest.mark.parametrize("lens", [[65], [128], [200], [7, 64, 130, 1, 129, 320]])
-def test_train_states_are_the_pool_states_at_the_boundaries(heads, steep, lens):
+def test_train_states_are_the_pool_states_each_chunk_starts_from(heads, steep, lens):
     HQ, HV = heads
     offs = _offsets(lens)
     x = _inputs(offs[-1], HQ, HV, 21, steep)
@@ -300,9 +300,10 @@ def test_train_states_are_the_pool_states_at_the_boundaries(heads, steep, lens):
     assert bool((states[-1] == 7.0).all())
     for i, seq_rows in enumerate(rows):
         for j, row in enumerate(seq_rows):
-            n = CHUNK * (j + 1)
+            n = CHUNK * j
             pool = torch.zeros(1, HV, D, D, device="cuda")
-            _infer(_cut(x, offs[i], offs[i] + n), [0], [n], pool=pool)
+            if n:
+                _infer(_cut(x, offs[i], offs[i] + n), [0], [n], pool=pool)
             assert torch.equal(states[row], pool[0])
 
 
@@ -321,7 +322,7 @@ def test_train_states_do_not_depend_on_the_batch():
 
 
 @needs_device
-def test_a_chunk_follows_from_its_boundary_state():
+def test_a_chunk_follows_from_its_stored_state():
     lens = [200, 130]
     offs = _offsets(lens)
     x = _inputs(offs[-1], 4, 8, 9)
@@ -335,7 +336,7 @@ def test_a_chunk_follows_from_its_boundary_state():
     for i, seq_rows in enumerate(training_state_rows(lens)):
         for j, row in enumerate(seq_rows):
             S = states[row].double()
-            a = offs[i] + CHUNK * (j + 1)
+            a = offs[i] + CHUNK * j
             for t in range(a, min(a + CHUNK, offs[i + 1])):
                 S = g[t].exp()[:, None, None] * S
                 err = v[t] - (S @ kn[t][:, :, None])[..., 0]
@@ -349,9 +350,9 @@ def test_train_states_single_chunk_and_version():
     x = _inputs(40, 4, 8, 2)
     out, states = _with_states(x, [40])
     assert torch.equal(out, _stateless(x, [40]))
-    assert bool((states == 7.0).all())
+    assert bool((states == 0.0).all())
     x = _inputs(130, 4, 8, 2)
-    states = torch.zeros(2, 8, D, D, device="cuda")
+    states = torch.zeros(3, 8, D, D, device="cuda")
     before = states._version
     _stateless(x, [130], train_states=states)
     assert states._version > before
@@ -359,11 +360,12 @@ def test_train_states_single_chunk_and_version():
 
 @needs_device
 @pytest.mark.parametrize("lens", [[64], [64, 64], [1, 64, 3]])
-def test_sequences_without_an_inner_boundary_store_nothing(lens):
+def test_single_chunk_sequences_store_their_zero_state(lens):
     x = _inputs(sum(lens), 4, 8, 4)
     out, states = _with_states(x, lens, extra=2)
     assert torch.equal(out, _stateless(x, lens))
-    assert bool((states == 7.0).all())
+    assert bool((states[: len(lens)] == 0.0).all())
+    assert bool((states[len(lens) :] == 7.0).all())
 
 
 @needs_device
@@ -383,14 +385,14 @@ def test_train_states_with_host_offsets_and_an_output_buffer():
 @needs_device
 def test_train_states_unsupported_arguments_raise():
     x = _inputs(130, 4, 8, 1)
-    good = torch.zeros(2, 8, D, D, device="cuda")
+    good = torch.zeros(3, 8, D, D, device="cuda")
     for bad in (
-        torch.zeros(1, 8, D, D, device="cuda"),
-        torch.zeros(2, 4, D, D, device="cuda"),
-        torch.zeros(2, 8, D, D, device="cuda", dtype=torch.bfloat16),
-        torch.zeros(2, 8, D, D),
-        torch.zeros(2, 8, D, D, device="cuda", requires_grad=True),
-        torch.zeros(2, 8, D, 2 * D, device="cuda")[..., ::2],
+        torch.zeros(2, 8, D, D, device="cuda"),
+        torch.zeros(3, 4, D, D, device="cuda"),
+        torch.zeros(3, 8, D, D, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(3, 8, D, D),
+        torch.zeros(3, 8, D, D, device="cuda", requires_grad=True),
+        torch.zeros(3, 8, D, 2 * D, device="cuda")[..., ::2],
     ):
         with pytest.raises(BatchInvariantUnsupportedError):
             _stateless(x, [130], train_states=bad)
@@ -409,10 +411,47 @@ def test_train_states_unsupported_arguments_raise():
     with pytest.raises(BatchInvariantUnsupportedError):
         _stateless(x, [130], train_states=[good])
     with torch.inference_mode():
-        made_in_inference_mode = torch.zeros(2, 8, D, D, device="cuda")
+        made_in_inference_mode = torch.zeros(3, 8, D, D, device="cuda")
     with pytest.raises(BatchInvariantUnsupportedError):
         _stateless(x, [130], train_states=made_in_inference_mode)
-    pool = torch.zeros(2, 8, D, D, device="cuda")
+    pool = torch.zeros(3, 8, D, D, device="cuda")
     _infer(x, [0], [130], pool=pool)
     with pytest.raises(BatchInvariantUnsupportedError):
         _stateless(x, [130], train_states=pool)
+
+
+@needs_device
+def test_train_states_are_the_series_the_cudnn_backward_takes():
+    pytest.importorskip("cudnn")
+    gdn = pytest.importorskip("cudnn.linear_attention.ops.gdn")
+    if not hasattr(gdn, "gdn_bwd"):
+        pytest.skip("this cuDNN frontend has no GDN backward")
+    lens = [1, 64, 65, 130, 200]
+    offs = _offsets(lens)
+    x = _inputs(offs[-1], 4, 8, 13)
+    dO = torch.randn(offs[-1], 8, D, device="cuda").to(torch.bfloat16)
+    _, states = _with_states(x, lens)
+    kw = dict(use_qk_l2norm_in_kernel=True, gate_domain="log")
+    _, _, own = torch.ops.cudnn.gated_delta_net_fwd(
+        *x, _i32(offs), SCALE, checkpoint_every_n_tokens=CHUNK, **kw
+    )
+    used = states.shape[0]
+    assert own.shape[0] >= used and tuple(own.shape[1:]) == tuple(states.shape[1:])
+    lead = [rows[0] for rows in training_state_rows(lens)]
+    assert bool((states[lead] == 0).all()) and bool((own[lead] == 0).all())
+    assert (own[:used].float() - states).abs().max() < 2e-2 * states.abs().max()
+
+    def backward(series):
+        return torch.ops.cudnn.gated_delta_net_bwd(
+            dO,
+            *x,
+            _i32(offs),
+            SCALE,
+            state_checkpoints=series,
+            checkpoint_every_n_tokens=CHUNK if series is not None else 0,
+            **kw,
+        )[:5]
+
+    ref = backward(None)
+    for got, want in zip(backward(states.to(x[0].dtype)), ref, strict=True):
+        assert (got.float() - want.float()).norm() <= 2e-2 * want.float().norm()

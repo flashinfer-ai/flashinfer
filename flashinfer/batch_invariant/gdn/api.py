@@ -34,8 +34,8 @@ hold the states at the last chunk boundaries.
 Without ``initial_state`` the call is stateless: every sequence is whole and runs from the zero state in one pinned
 launch, the rows are the ones the pool calls return for it, and no state is read, written, kept or returned (the form a
 trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it. With
-``train_states`` the same launch also stores every sequence's 64-token boundary states in that caller-owned buffer
-(:mod:`.train`), the one term a backward cannot recompute from a chunk's own inputs.
+``train_states`` the same launch also stores the state every 64-token chunk starts from in that caller-owned buffer
+(:mod:`.train`), in the row layout cuDNN's GDN backward takes as ``state_checkpoints``.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -301,7 +301,7 @@ def chunk_gated_delta_rule_batch_invariant(
         raise unsupported(
             CLASS,
             "train_states with initial_state",
-            "the stateless call (no initial_state), whose boundary states it stores, or a pool call",
+            "the stateless call (no initial_state), whose state series it stores, or a pool call",
         )
     _check_pool(initial_state, HV, dev)
     pool = initial_state
