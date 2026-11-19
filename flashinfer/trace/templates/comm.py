@@ -1279,14 +1279,24 @@ all_gather_rmsnorm_fp4_quantize_trace = TraceTemplate(
     description="Gather TP column shards, normalize, and quantize to NVFP4.",
     axes={
         "num_tokens": Var(),
-        "shard_hidden": Const(abbrev="sh"),
+        # shard=None (consumer only): the workspace gives the shard width.
+        "shard_hidden": Const(
+            abbrev="sh",
+            extract=lambda kw: (
+                kw["workspace"].hidden_dim // kw["workspace"].tp_size
+                if kw.get("shard") is None
+                else kw["shard"].shape[1]
+            ),
+        ),
         "hidden": Const(abbrev="h"),
         "packed_hidden": Var(),
         "scale_hidden": Var(),
         "one": Const(value=1),
     },
     inputs={
-        "shard": Tensor(["num_tokens", "shard_hidden"]),
+        "shard": Tensor(
+            ["num_tokens", "shard_hidden"], dtype="bfloat16", optional=True
+        ),
         "weight": Tensor(["hidden"]),
         "global_scale": Tensor(["one"], dtype="float32"),
         "eps": Scalar("float32"),

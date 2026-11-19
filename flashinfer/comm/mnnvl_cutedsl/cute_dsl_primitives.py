@@ -284,11 +284,12 @@ def store_global_u16_bits(
 @dsl_user_op
 def store_lamport_sentinel_u32x4(
     address: Int64,
+    sentinel_pair: int = NEGATIVE_ZERO_BF16_PAIR,
     *,
     loc=None,
     ip=None,
 ) -> None:
-    sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR).ir_value(loc=loc, ip=ip)
+    sentinel = Uint32(sentinel_pair).ir_value(loc=loc, ip=ip)
     llvm.inline_asm(
         None,
         [address.ir_value(loc=loc, ip=ip), sentinel, sentinel, sentinel, sentinel],
@@ -562,6 +563,51 @@ def fragment_has_negative_zero(packed):
     return dirty
 
 
+@cute.jit
+def mark_zero_u32x4(packed, atom_bytes: cutlass.Constexpr[int]):
+    """Make no Lamport atom of ``packed`` equal the zero sentinel.
+
+    ``atom_bytes`` 4: an all-zero 32-bit word is stored as 0x00008000 (its first
+    BF16 as -0). 2: every +0 BF16 is stored as -0.
+    """
+    marked = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+    for index in cutlass.range_constexpr(4):
+        word = packed[index]
+        if cutlass.const_expr(atom_bytes == 4):
+            if word == Uint32(0):
+                word = Uint32(NEGATIVE_ZERO_BF16_BITS)
+        else:
+            if Uint16(word & Uint32(0xFFFF)) == Uint16(0):
+                word = word | Uint32(NEGATIVE_ZERO_BF16_BITS)
+            if Uint16(word >> Uint32(16)) == Uint16(0):
+                word = word | Uint32(NEGATIVE_ZERO_BF16_BITS << 16)
+        marked[index] = word
+    return marked.load()
+
+
+@cute.jit
+def fragment_has_sentinel(
+    packed,
+    sentinel_pair: cutlass.Constexpr[int],
+    atom_bytes: cutlass.Constexpr[int],
+):
+    """Whether any Lamport atom (32-bit word or BF16) of ``packed`` still holds
+    the sentinel; ``sentinel_pair`` is the sentinel as a BF16 pair."""
+    pending = False
+    for index in cutlass.range_constexpr(4):
+        word = packed[index]
+        if cutlass.const_expr(atom_bytes == 4):
+            pending = pending | (word == Uint32(sentinel_pair))
+        else:
+            lane = Uint16(sentinel_pair & 0xFFFF)
+            pending = (
+                pending
+                | (Uint16(word & Uint32(0xFFFF)) == lane)
+                | (Uint16(word >> Uint32(16)) == lane)
+            )
+    return pending
+
+
 @dsl_user_op
 def map_shared_to_peer(
     smem_pointer: cute.Pointer,
@@ -770,6 +816,24 @@ def atomic_add_global_i32(address: Int64, value: Int32, *, loc=None, ip=None) ->
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def red_add_relaxed_gpu_u64(address: Int64, value: Int64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            Int64(address).ir_value(loc=loc, ip=ip),
+            Int64(value).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.u64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 

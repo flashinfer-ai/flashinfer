@@ -20,7 +20,8 @@ blocks in rank order and runs its consumer on the full rows, without
 materializing the gathered ``[M, H]`` tensor: either the residual boundary of
 ``flashinfer.norm.gated_residual_next_rmsnorm`` or an RMSNorm followed by
 NVFP4 quantization. Each is two kernels (LL publish, then gather + consumer)
-over a dedicated LL mailbox.
+over a dedicated LL mailbox; the RMSNorm + NVFP4 op can instead exchange
+through a caller's two-phase :class:`PushPlane`.
 """
 
 from __future__ import annotations
@@ -51,15 +52,18 @@ from .mnnvl_cutedsl.kernel_ll.all_gather_norm_quant import (
     LLAllGatherNormQuant,
     _NormQuantConstants,
 )
+from .mnnvl_cutedsl.kernel_ll.column_gather import PushPlane
 
 __all__ = [
     "LLAllGatherDualNormTuning",
     "MNNVLCuteDSLAllGatherDualNormWorkspace",
     "MNNVLCuteDSLAllGatherNormQuantWorkspace",
+    "PushPlane",
     "all_gather_gated_residual_next_rmsnorm",
     "all_gather_rmsnorm_fp4_quantize",
     "supports_all_gather_gated_residual_next_rmsnorm",
     "supports_all_gather_rmsnorm_fp4_quantize",
+    "supports_push_plane",
 ]
 
 
@@ -295,7 +299,12 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
         *,
         group: ProcessGroup,
         enable_pdl: bool = True,
+        push_plane: PushPlane | None = None,
     ) -> None:
+        if push_plane is not None and not supports_push_plane(
+            push_plane, max_token_num, hidden_dim
+        ):
+            raise ValueError("unsupported push plane")
         super().__init__(
             tp_size,
             max_token_num,
@@ -308,6 +317,7 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
                 capacity_m=max_token_num,
                 group=group,
                 enable_pdl=enable_pdl,
+                push_plane=push_plane,
             ),
         )
 
@@ -316,17 +326,50 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
         self.impl.compiled(_NormQuantConstants(float(eps), float(gain_center)))
 
 
+def supports_push_plane(
+    push_plane: PushPlane, max_token_num: int, hidden_dim: int
+) -> bool:
+    """Whether one phase half holds ``max_token_num`` gathered rows."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    half_bytes = push_plane.half_bytes
+    buffer = push_plane.buffer
+    return (
+        half_bytes > 0
+        and push_plane.atom_bytes in (2, 4)
+        and half_bytes % 16 == 0
+        and max_token_num * hidden_dim * 2 <= half_bytes
+        and is_dense_on(buffer, device, 16)
+        and buffer.numel() * buffer.element_size() >= 2 * half_bytes
+        and push_plane.multicast_address > 0
+        and push_plane.multicast_address % 16 == 0
+        and push_plane.epoch.dtype == torch.int64
+        and push_plane.epoch.numel() == 1
+        and is_dense_on(push_plane.epoch, device, 8)
+    )
+
+
 def supports_all_gather_rmsnorm_fp4_quantize(
     workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
-    shard: torch.Tensor,
+    shard: torch.Tensor | None,
     weight: torch.Tensor,
     global_scale: torch.Tensor,
+    *,
+    num_tokens: int = 0,
 ) -> bool:
-    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks.
+
+    ``shard`` None checks the consumer-only call for ``num_tokens`` rows.
+    """
     hidden = workspace.hidden_dim
     device = workspace.device
-    return (
+    rows_fit = (
         workspace.fits(shard)
+        if shard is not None
+        else workspace.impl.push_plane is not None
+        and 1 <= num_tokens <= workspace.max_token_num
+    )
+    return (
+        rows_fit
         and weight.shape == (hidden,)
         and weight.dtype == torch.bfloat16
         and is_dense_on(weight, device, 16)
@@ -338,13 +381,14 @@ def supports_all_gather_rmsnorm_fp4_quantize(
 
 @flashinfer_api(trace=all_gather_rmsnorm_fp4_quantize_trace)
 def all_gather_rmsnorm_fp4_quantize(
-    shard: torch.Tensor,
+    shard: torch.Tensor | None,
     weight: torch.Tensor,
     global_scale: torch.Tensor,
     workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
     *,
     eps: float,
     gain_center: float = 0.0,
+    num_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather column shards across TP, then RMSNorm and NVFP4-quantize the rows.
 
@@ -356,25 +400,31 @@ def all_gather_rmsnorm_fp4_quantize(
         )
 
     Args:
-        shard: ``[M, H/TP]`` BF16 columns ``[rank*H/TP, (rank+1)*H/TP)``.
+        shard: ``[M, H/TP]`` BF16 columns ``[rank*H/TP, (rank+1)*H/TP)``, or
+            None when another kernel already pushed every rank's shard into the
+            workspace's :class:`PushPlane` (e.g. FlashInfer's peer-store BF16
+            GEMM with ``layout="gather"``, ``slot_bytes = half_bytes / TP``),
+            just before on the same stream and without advancing the epoch.
         weight: ``[H]`` BF16 RMSNorm weight.
         global_scale: ``[1]`` FP32 NVFP4 global scale.
         workspace: Workspace created on every rank of the TP group.
         eps: RMSNorm epsilon.
         gain_center: Constant added to ``weight``.
+        num_tokens: ``M`` when ``shard`` is None.
 
     Returns:
         ``(packed, scales)``: ``[M, H/2]`` uint8 E2M1 pairs and ``[M, H/16]``
         uint8 E4M3 block scales in linear layout.
     """
     if not supports_all_gather_rmsnorm_fp4_quantize(
-        workspace, shard, weight, global_scale
+        workspace, shard, weight, global_scale, num_tokens=num_tokens
     ):
         raise ValueError("unsupported all-gather RMSNorm FP4 quantize arguments")
-    m = shard.shape[0]
+    m = num_tokens if shard is None else shard.shape[0]
     hidden = workspace.hidden_dim
-    packed = torch.empty((m, hidden // 2), dtype=torch.uint8, device=shard.device)
-    scales = torch.empty((m, hidden // 16), dtype=torch.uint8, device=shard.device)
+    device = workspace.device
+    packed = torch.empty((m, hidden // 2), dtype=torch.uint8, device=device)
+    scales = torch.empty((m, hidden // 16), dtype=torch.uint8, device=device)
     workspace.impl(
         shard,
         weight,
