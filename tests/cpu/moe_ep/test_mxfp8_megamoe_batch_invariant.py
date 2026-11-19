@@ -19,7 +19,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant i
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("host_only_cuda")]
 PROVIDERS = ("legacy", "standard", "genphase", "107-standard", "107-genphase")
 KINDS = ("mxfp8_e4m3", "mxfp8_e5m2")
 
