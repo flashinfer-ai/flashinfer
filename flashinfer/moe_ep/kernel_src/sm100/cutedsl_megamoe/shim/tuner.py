@@ -396,8 +396,13 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         knobs.get("accumulator_overlap", False),
         knobs.get("transform_k_tile", 128),
     )
+    stages = knobs.get("num_activation_stages")
     return (
         impl in _BF16_MXFP8_IMPLS
+        and (
+            stages is None
+            or 2 <= stages <= Sm100SwapABMxfp8Bf16Fc12Kernel._MaxBStages[impl[1]]
+        )
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
         and knobs.get("token_back_mode", "epi_warps")
