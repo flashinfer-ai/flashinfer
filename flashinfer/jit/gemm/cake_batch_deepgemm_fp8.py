@@ -9,7 +9,10 @@ symbol and the id of its positional argument plan in ``ARG_PLANS``.  ``MODULES``
 names one JIT module per (program, architecture).  ``SERVING_PROGRAMS`` maps a
 packed-scale serving configuration to its program (a key qualified by an
 architecture, ``"sm_103a:<configuration>"`` or ``"sm_107a:<configuration>"``,
-takes precedence on that architecture).  ``DISPATCH_TABLES`` holds, per
+takes precedence on that architecture).  ``DOMAIN_SERVING_PROGRAMS`` maps an
+sm_107a serving configuration to its locality-domain twin and
+``DOMAIN_SERVING_CELLS`` lists, per SM count, the (die class, expected_m class)
+cells routed to it.  ``DISPATCH_TABLES`` holds, per
 architecture and SM count, the ordered first-match route chain of the Cake
 dispatcher, driven by the route table at the end of this module (``_ROUTES`` read
 by ``select``): every predicate, launch grid, argument binding and workspace shape
@@ -162,9 +165,40 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "plan8": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C_tma"],
+        ["tma_buffer", "SFA_packed"],
+        ["tma_buffer", "SFB_packed"],
+        ["buffer", "masked_m"],
+        ["parameter", "num_groups"],
+        ["parameter", "shape_m"],
+        ["parameter", "N"],
+        ["parameter", "K"],
+        ["parameter", "g_cut"],
+        ["buffer", "counters0"],
+        ["buffer", "counters1"],
+        ["param_array", "sm_table"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 }
 
 PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan8",
+        "arches": ["sm_107a"],
+    },
     "cake_batch_deepgemm_fp8_02cd3d43724acdbda982": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
         "sources": [
@@ -248,6 +282,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan8",
+        "arches": ["sm_107a"],
     },
     "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
@@ -619,6 +665,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_927fea695cd92359d999",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f": {
@@ -1128,6 +1186,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 
 MODULES: dict[str, dict[str, str]] = {
+    "cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f",
+    },
     "cake_batch_deepgemm_fp8_02cd3d43724acdbda982_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
@@ -1171,6 +1233,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15",
+    },
+    "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",
     },
     "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9_sm_100a": {
         "arch": "sm_100a",
@@ -1355,6 +1421,14 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_90284e378e31f0382475_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
     },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_sm_100a": {
         "arch": "sm_100a",
@@ -1626,6 +1700,46 @@ SERVING_PROGRAMS: dict[str, str] = {
     "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_eeb77812570514381d69",
     "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
     "sm_107a:n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_afcc5247e82d569b4b01",
+}
+
+# The locality-domain twins of sm_107a serving programs: one launch over both dies
+# of a dual-die GPU with B homed by groups.  A twin is bitwise equal to the
+# whole-GPU build of the same source for any cut, and equal within the family's
+# tolerance to the whole-GPU program of SERVING_PROGRAMS (an older build).
+DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
+    "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",
+    "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f",
+}
+# The cells routed to a twin: SM count -> (die class, expected_m class) -> the
+# serving keys of DOMAIN_SERVING_PROGRAMS.  Die class: "even" when the two dies'
+# SM counts differ by at most 4, else "uneven"; expected_m class: "em<=1", "em2-7",
+# "em8-15" or "em16+".  Every other call runs the whole program.
+#
+# Only weights homed by localize_weights reach a twin, and it homes one serving
+# shape, n4096_k7168_g64, whose twins cover every expected_m class.  The other
+# three serving shapes have an "em<=1" key without a twin, so localize_weights
+# does not home them and they ship no twin.
+#
+# A cell is listed where the twin on homed weights ran below 0.98 x the fastest
+# whole-GPU build of the same key on ordinary weights, on every timed GPU of the
+# die class, with one exception: the "em16+" cells of
+# n4096_k7168_g64_s5e2_evict_normal_l8.  Homed weights must not fall back to the
+# whole program in any class (the whole program runs slower on homed weights than
+# on ordinary ones).  There the twin is the faster program on homed weights and
+# faster than the shipped whole program on ordinary weights on both die classes,
+# though not by the 0.98 margin over a full-grid whole build, which is not
+# shipped.
+DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
+    212: {
+        ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
+        ("uneven", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
+        ("even", "em2-7"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("uneven", "em2-7"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("even", "em8-15"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("uneven", "em8-15"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("even", "em16+"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+        ("uneven", "em16+"): ("sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",),
+    },
 }
 
 ARCH_NVCC_FLAGS = {
@@ -2255,13 +2369,14 @@ _ROUTES: tuple[_Route, ...] = (
            parent="seed_swap_bm"),
     # The N=512, K=128 geometry, by B, CTA = B * ceil(expected_m / 128) and M. A
     # one-shot n512_k128 grid covers every (group, M tile, N tile) a masked_m <= M
-    # reaches, and M > 1024 takes the persistent masked_bn programs; expected_m only
-    # selects the route.
+    # reaches, and M > 1024 takes the persistent masked_bn programs (with at most
+    # eight CTAs, the masked_m-once form of the BLOCK_N 32 eight-stage build);
+    # expected_m only selects the route.
     _bcta("seed_n512_k128__b1_bn32", (512, 128), (1, 1), (None, 7),
           ("cake_batch_deepgemm_fp8_c580972984193a63c3c2", "n512_k128", 32, "grid_max"),
           m=(None, 1024)),
     _bcta("seed_n512_k128__b1_mbn32", (512, 128), (1, 1), (None, 7),
-          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          ("cake_batch_deepgemm_fp8_927fea695cd92359d999", "masked_bn", 32, 128, "grid_m"),
           m=(1025, None)),
     _bcta("seed_n512_k128__b1_bn192", (512, 128), (1, 1), (8, None),
           ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
@@ -2269,7 +2384,7 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_8d6890e370790c5f11f1", "n512_k128", 32, "grid_max"),
           m=(None, 1024)),
     _bcta("seed_n512_k128__b2_8_mbn32", (512, 128), (2, 8), (None, 8),
-          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          ("cake_batch_deepgemm_fp8_927fea695cd92359d999", "masked_bn", 32, 128, "grid_m"),
           m=(1025, None)),
     _bcta("seed_n512_k128__b2_8_bn128", (512, 128), (2, 8), (9, 32),
           ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128)),

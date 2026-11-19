@@ -14,9 +14,13 @@ from cutlass.cute.typing import AddressSpace
 
 from ..src.api import ImplDesc, ProblemDesc
 from ..src.communication.nvlink_domain.symmetric_buffer import SymmetricBufferHost
+from ..src.helpers import prod_config
 from ..src.helpers.codegen_options import option_scope
 from ..src.helpers.fastquant import _fastquant_launch
 from ..src.helpers.fastquant_mx import _fastquant_mx_launch
+from ..src.kernel_src.blackwell.inference.mega.block_scaled_swap_ab_fc12_epilogue import (
+    SwapABGatedActEpilogue,
+)
 from ..src.kernel_src.blackwell.inference.mega.block_scaled_swap_ab_mega_moe_kernel import (
     BlockScaledSwapAbMegaMoeKernel,
 )
@@ -120,6 +124,14 @@ def _kernel(config, fleet, world):
         )
     )
     kernel = BlockScaledSwapAbMegaMoeKernel(problem, ImplDesc(impl))
+    if prod_config.flag("MEGAMOE_EPI_ASYNC_FLAG", kernel.quant_kind, combine):
+        # Each publisher warp can retain only one pending completion.
+        publishers = SwapABGatedActEpilogue._EpilogueWarpCnt
+        if any(batch > publishers for batch in kernel.epi_flag_batches):
+            raise ValueError(
+                f"Kimi async epilogue flag batches must be at most {publishers}; "
+                f"got {kernel.epi_flag_batches}"
+            )
     kernel._topk_reduce = KimiTopkReducer(
         fleet.token_hidden_size,
         config.top_k,
@@ -350,13 +362,24 @@ class KimiWorkspace:
             raise RuntimeError("Stage Kimi inputs before compute")
         live = self._live
         if output is not None and (
-            not output.is_contiguous()
+            output.ndim != 2
             or output.shape[0] < live
+            or output.shape[1] != self.fleet_params.token_hidden_size
+            or output.dtype != torch.bfloat16
+            or output.device != self.device
+            or not output.is_contiguous()
             or (output.numel() and output.data_ptr() % 16)
         ):
             raise ValueError(
-                "Kimi output must be contiguous, 16-byte aligned, and contain all live rows"
+                "Kimi output must be a contiguous, 16-byte-aligned BF16 tensor "
+                f"on {self.device} with shape [rows >= {live}, "
+                f"{self.fleet_params.token_hidden_size}]"
             )
+        return self._compute(transformed_weights, output=output)
+
+    def _compute(self, transformed_weights, *, output):
+        """Execute with staged inputs and a validated or internally allocated output."""
+        live = self._live
         destination = self.output if output is None or live == 0 else output
         weights = transformed_weights
         stream = torch.cuda.current_stream()

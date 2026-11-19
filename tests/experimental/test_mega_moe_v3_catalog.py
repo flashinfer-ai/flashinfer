@@ -64,13 +64,21 @@ SETMAXNREG = "setmaxnreg."
 SHAPE_BLOCK_M = {(48, 2304, 128): 32, (48, 2304, 512): 32}
 
 
-# The TP/EP route whose sm_103a program runs a persistent grid smaller than
+# The TP/EP routes whose sm_103a programs run a persistent grid smaller than
 # the 152-SM device (route metadata ``num_ctas`` and grid ``[num_ctas, 1, 1]``):
-# the 384-expert shape at one token runs 148 CTAs, the device less its 4
-# combine CTAs, so a stream's next call is admitted while they finish. Every
-# other route runs one CTA per SM.
-PERSISTENT_GRID = {(384, 640, 1): 148}
-E384_T1_PROGRAM = "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a"
+# the 384-expert I640, 96-expert and 48-expert rank shapes at one token run
+# 148 CTAs, the device less their 4 combine CTAs, so a stream's next call is
+# admitted while they finish. Every other route, the 384-expert I384 one-token
+# route included, runs one CTA per SM.
+PERSISTENT_GRID = {
+    (384, 640, 1): 148,
+    (96, 2304, 1): 148,
+    (48, 2304, 1): 148,
+}
+T1_PROGRAMS = {
+    f"deepgemm_mega_moe_v3_pipeline_fp4_e{e}_i{i}_t1_sm103a"
+    for e, i, _ in PERSISTENT_GRID
+}
 
 
 def expected_block_m(num_experts, intermediate, num_tokens):
@@ -439,11 +447,11 @@ def test_load_program_supplies_the_route_sm_count_as_num_ctas():
                     assert flag in flags
 
 
-def test_only_the_e384_t1_rank_route_states_a_persistent_grid():
-    """Exactly one route of the catalog states ``num_ctas``: the sm_103a
-    384-expert one-token rank route, at 148 CTAs with the grid ``[148, 1, 1]``
-    and the 152-SM device it admits. Its program takes ``NUM_CTAS`` from the
-    compile line, so the shipped text runs at the stated count."""
+def test_only_the_one_token_rank_routes_state_a_persistent_grid():
+    """Only sm_103a one-token rank routes state ``num_ctas``: exactly those of
+    ``PERSISTENT_GRID``, each at 148 CTAs with the grid ``[148, 1, 1]`` and the
+    152-SM device it admits. Their programs take ``NUM_CTAS`` from the compile
+    line, so the shipped texts run at the stated count."""
     catalog = _catalog()
     stated = [
         (arch, key)
@@ -451,16 +459,18 @@ def test_only_the_e384_t1_rank_route_states_a_persistent_grid():
         for key, route in catalog.routes(arch).items()
         if "num_ctas" in route["metadata"]
     ]
-    key = tp_ep_route_key(384, 640, 1)
-    assert stated == [("sm_103a", key)]
-    route = catalog.routes("sm_103a")[key]
-    assert route["metadata"]["num_ctas"] == 148
-    assert route["grid"] == {"sm_103a": [148, 1, 1]}
-    assert runtime.route_admitted_num_sms(route, "sm_103a") == (152,)
-    assert runtime.route_num_ctas(route, "sm_103a", 152) == 148
-    (stage,) = route["stages"]
-    assert runtime.stage_program(stage, "sm_103a") == E384_T1_PROGRAM
-    assert catalog.programs("sm_103a")[E384_T1_PROGRAM]["definitions"] == ["NUM_CTAS"]
+    keys = [tp_ep_route_key(*shape) for shape in PERSISTENT_GRID]
+    assert sorted(stated) == sorted(("sm_103a", key) for key in keys)
+    for key in keys:
+        route = catalog.routes("sm_103a")[key]
+        assert route["metadata"]["num_ctas"] == 148, key
+        assert route["grid"] == {"sm_103a": [148, 1, 1]}, key
+        assert runtime.route_admitted_num_sms(route, "sm_103a") == (152,), key
+        assert runtime.route_num_ctas(route, "sm_103a", 152) == 148, key
+        (stage,) = route["stages"]
+        name = runtime.stage_program(stage, "sm_103a")
+        assert name in T1_PROGRAMS, key
+        assert catalog.programs("sm_103a")[name]["definitions"] == ["NUM_CTAS"]
 
 
 def _route(grid=None, num_ctas=None, arch="sm_103a"):
@@ -499,8 +509,9 @@ def test_route_grid_and_num_ctas_with_and_without_a_stated_grid():
 
 def test_load_program_defines_num_ctas_as_the_routes_persistent_grid(monkeypatch):
     """``load_program`` passes the route's persistent grid as ``NUM_CTAS``:
-    148 for the 384-expert one-token rank route, the SM count for every other
-    sm_103a pipeline route; the JIT spec of that program names the count."""
+    148 for the one-token rank routes of ``PERSISTENT_GRID``, the SM count for
+    every other sm_103a pipeline route; the JIT spec of that program names the
+    count."""
     pytest.importorskip("torch")
     catalog = _catalog()
     loaded = []
@@ -520,11 +531,11 @@ def test_load_program_defines_num_ctas_as_the_routes_persistent_grid(monkeypatch
         runtime.load_program("sm_103a", name, num_ctas)
         definitions = catalog.definitions("sm_103a", name, {"NUM_CTAS": num_ctas})
         assert loaded[-1] == ("sm_103a", name, definitions), key
-        expected = 148 if name == E384_T1_PROGRAM else 152
+        expected = 148 if name in T1_PROGRAMS else 152
         assert num_ctas == expected, key
         spec = catalog.jit_spec("sm_103a", name, definitions)
         if catalog.programs("sm_103a")[name].get("definitions"):
             assert f"-DNUM_CTAS={expected}" in spec.extra_cuda_cflags, key
             assert spec.name == f"{jit_spec_name(name, 'sm_103a')}_num_ctas{expected}"
         seen.add(name)
-    assert E384_T1_PROGRAM in seen
+    assert seen >= T1_PROGRAMS

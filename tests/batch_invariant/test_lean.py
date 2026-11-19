@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2`` and ``gemm.mxfp8`` (both instructions'
-classes) (``flashinfer/batch_invariant/lean/``).
+"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2``, ``gemm.e4m3.kblock128`` (the block-scale
+fp8 class) and ``gemm.mxfp8`` (both instructions' classes) (``flashinfer/batch_invariant/lean/``).
 
 Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a
 change to the dataflow, the lowering, a knob constraint or the chunk rule that was not propagated to the Lean cases
@@ -19,6 +19,7 @@ import subprocess
 import pytest
 
 from flashinfer.batch_invariant import lean_cases
+from flashinfer.gemm.batch_invariant.generator import SWAP_K_BLOCK
 from flashinfer.gemm.batch_invariant.spec import MMA_K, MMA_K_OF
 
 LAKE = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
@@ -111,9 +112,12 @@ def test_lean_model_matches_python_engine_and_spec():
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
+    kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
         kinds[F.tag] = "spec"
         kinds[F.tag + "loop"] = "loop"
+        kinds[F.tag + "swaploop"] = "loop"
         kinds[F.tag + "out"] = "out"
         if F.table is not None:
             kinds[F.chunk_tag] = "chunks"
@@ -152,6 +156,12 @@ def test_lean_model_matches_python_engine_and_spec():
         for nblk, sx in lean_cases.loop_cases(in_fmt)[1]:
             assert lean[(F.tag + "loop", nblk)] == sx, (in_fmt, nblk)
             checked += 1
+        if (
+            in_fmt in SWAP_K_BLOCK
+        ):  # the swapped records' k-block: the trace at the class's second radix
+            for nblk, sx in lean_cases.swap_loop_cases(in_fmt)[2]:
+                assert lean[(F.tag + "swaploop", nblk)] == sx, (in_fmt, nblk)
+                checked += 1
         for K, fmt, sx in lean_cases.out_cases(in_fmt):
             assert lean[(F.tag + "out", K // mk, fmt)] == sx, (in_fmt, K, fmt)
             checked += 1
@@ -166,6 +176,15 @@ def test_lean_model_matches_python_engine_and_spec():
     # the biased chain of the bf16 classes
     for K, C, sx in lean_cases.bias_cases():
         assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)
+        checked += 1
+    # the block-scale fp8 class: the spec's output at (0, 0) and at (3, 129) node for node, and the kernel's promotion loop
+    # against the engine's per-block traces folded by the block digit
+    for KB, fmt, sx0, sx1 in lean_cases.fp8bs_cases():
+        assert lean[("gemmfp8bs", KB, fmt)] == sx0, ("e4m3_bs", KB, fmt)
+        assert lean[("gemmfp8bs2", KB, fmt)] == sx1, ("e4m3_bs (3, 129)", KB, fmt)
+        checked += 2
+    for KB, sx in lean_cases.fp8bs_loop_cases():
+        assert lean[("gemmfp8bsloop", KB)] == sx, ("e4m3_bs loop", KB)
         checked += 1
     for name, *_, sx in lean_cases.attn_cases():
         assert lean[("attn", name)] == sx, name

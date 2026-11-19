@@ -30,7 +30,9 @@ from __future__ import annotations
 import ast
 import contextlib
 import importlib
+import importlib.util
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -529,11 +531,20 @@ LEVER_COLUMNS = (256, 3072, 8192, 12288, 16384, 49152)
 LEVER_K_L = (128, 768, 1536, 1664, 2048, 4096, 4224, 8192)
 
 
+def _without_drain(arch, lever):
+    """``lever`` without the drainer lever's suffix (it comes last)."""
+
+    drain = loader.LEVER_DISPATCH[arch].get("DRAIN")
+    if drain and lever.endswith(drain["suffix"]):
+        return lever[: -len(drain["suffix"])]
+    return lever
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ARCHES)
 def test_lever_table_records_each_lever_once(arch):
     table = loader.LEVER_DISPATCH[arch]
-    assert set(table) <= {"REDUCERS", "LOCKSTEP"}
+    assert set(table) <= {"REDUCERS", "LOCKSTEP", "DRAIN"}
     suffixes = loader.lever_suffixes(arch)
     assert suffixes[0] == "" and len(suffixes) == 2 ** len(table)
     assert len(set(suffixes)) == len(suffixes)
@@ -555,6 +566,15 @@ def test_lever_table_records_each_lever_once(arch):
         capacity_suffixes = {row[2] for row in loader.CAPACITY_VARIANTS.get(arch, [])}
         assert lockstep["variants"][0] == ""
         assert set(lockstep["variants"]) <= {"", *capacity_suffixes}
+    if "DRAIN" in table:
+        drain = table["DRAIN"]
+        assert set(drain) == {"suffix", "worlds", "max_m", "variants"}
+        assert drain["suffix"].startswith("_") and drain["max_m"] > 0
+        assert set(drain["worlds"]) <= set(loader.COMM_MODES[arch])
+        assert all(world_size >= 2 for world_size in drain["worlds"])
+        capacity_suffixes = {row[2] for row in loader.CAPACITY_VARIANTS.get(arch, [])}
+        assert drain["variants"][0] == ""
+        assert set(drain["variants"]) <= {"", *capacity_suffixes}
     for world_size in loader.COMM_MODES[arch]:
         for chunks in LEVER_CHUNKS:
             for n in LEVER_COLUMNS:
@@ -647,9 +667,9 @@ def test_lockstep_lever_needs_the_raster_group_the_tiles_and_a_bounded_grid(
     assert loader.raster_group_m(edge, n, k_l, arch) >= lockstep["min_raster_group"]
     assert loader.tiles(edge, n, arch) >= lockstep["min_tiles"]
     assert loader.tiles(edge - 128, n, arch) < lockstep["min_tiles"]
-    assert loader.lever_variant(world_size, edge, n, k_l, arch, sm_count=132).endswith(
-        suffix
-    )
+    # The drainer lever may follow (its suffix comes last).
+    lever = loader.lever_variant(world_size, edge, n, k_l, arch, sm_count=132)
+    assert _without_drain(arch, lever).endswith(suffix)
     assert not loader.lever_variant(
         world_size, edge - 128, n, k_l, arch, sm_count=132
     ).endswith(suffix)
@@ -716,16 +736,25 @@ def _unrouted_key_certificate(arch, world_size, variant, lever):
     ``lever_variant``: the lockstep lever is not offered to this variant; the reducer
     lever has no ``K_l`` bound at this world size; or the reducer bound is below the
     raster threshold that the lockstep lever needs (``raster_group_m`` is 1 for
-    ``K_l < RASTER_MIN_K``)."""
+    ``K_l < RASTER_MIN_K``); or the drainer lever is not offered to this world size or
+    to this variant."""
 
     table = loader.LEVER_DISPATCH[arch]
     reducers, lockstep = table.get("REDUCERS"), table.get("LOCKSTEP")
+    drain = table.get("DRAIN")
     rest = lever
+    with_drain = bool(drain) and rest.endswith(drain["suffix"])
+    if with_drain:
+        rest = rest[: -len(drain["suffix"])]
     with_lockstep = bool(lockstep) and rest.endswith(lockstep["suffix"])
     if with_lockstep:
         rest = rest[: -len(lockstep["suffix"])]
     with_reducers = bool(reducers) and rest == reducers["suffix"]
     assert rest in ("", reducers["suffix"] if reducers else "")
+    if with_drain and world_size not in drain["worlds"]:
+        return "the drainer is not offered to the world size"
+    if with_drain and variant not in drain["variants"]:
+        return "the drainer is not offered to the variant"
     if with_lockstep and variant not in lockstep["variants"]:
         return "lockstep is not offered to the variant"
     bound = reducers["max_k_l"].get(world_size) if reducers else None
@@ -795,6 +824,11 @@ def test_every_reachable_lever_key_is_a_route(arch, world_size):
             chunk_counts = {1, 2, 3, 4, 5, 32, 33, 1024, 8192, 32768}
             raster_chunks = loader.GEOMETRY[arch].get("RASTER_MIN_CHUNKS", 1)
             chunk_counts |= {raster_chunks - 1, raster_chunks, raster_chunks + 1}
+            drain = loader.LEVER_DISPATCH[arch].get("DRAIN")
+            if drain:
+                # the drainer's row bound and its grid of one CTA per peer
+                edge = -(-int(drain["max_m"]) // 128)
+                chunk_counts |= {edge, edge + 1, world_size - 2, world_size - 1}
             for gn in (16, 64):
                 chunk_counts |= {-(-tile_rule // gn) - 1, -(-tile_rule // gn)}
             capacity_rows = None
@@ -851,8 +885,73 @@ def test_capacity_variants_outside_the_lockstep_variants_never_throttle(arch):
             world_size, capacity, n, k_l, arch, sm_count=132, variant=suffix
         )
         # The default variant at the same call takes the throttle, this one not.
-        assert plain.endswith(lockstep["suffix"])
+        assert _without_drain(arch, plain).endswith(lockstep["suffix"])
         assert not lever.endswith(lockstep["suffix"])
+        key = loader.route_key(world_size, arch, capacity) + plain
+        assert key not in loader.ROUTES[arch]
+        main = loader.main_program(world_size, arch, capacity)
+        program = loader.call_program(
+            world_size, arch, capacity, capacity, n, k_l, sm_count=132
+        )
+        programs = loader.dispatch_programs(
+            world_size, arch, capacity, n, k_l, sm_count=132
+        )
+        assert program == main and programs == (main,)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_drain_lever_needs_its_world_size_its_row_bound_and_a_cta_per_peer(
+    arch, world_size
+):
+    drain = loader.LEVER_DISPATCH[arch].get("DRAIN")
+    # N = 3072, K_l = 3072 take neither the reducer nor the lockstep lever.
+    n, k_l = 3072, 3072
+    if drain is None or world_size not in drain["worlds"]:
+        for chunks in LEVER_CHUNKS:
+            lever = loader.lever_variant(
+                world_size, chunks * 128, n, k_l, arch, sm_count=132
+            )
+            assert lever == ""
+        return
+    suffix, max_m = drain["suffix"], int(drain["max_m"])
+    for m in (1, 128, 4096, max_m - 1, max_m):
+        assert loader.lever_variant(world_size, m, n, k_l, arch, sm_count=132) == suffix
+    for m in (max_m + 1, max_m + 128, loader.MAX_ROWS_TIMES_COLS // n):
+        assert loader.lever_variant(world_size, m, n, k_l, arch, sm_count=132) == ""
+    # One CTA per peer: the grid is min(sm_count, tiles).
+    for sm_count in (world_size - 2, world_size - 1, 132):
+        lever = loader.lever_variant(world_size, 4096, n, k_l, arch, sm_count=sm_count)
+        assert lever == (suffix if sm_count >= world_size - 1 else "")
+    narrow = loader.N_MULTIPLE
+    edge = -(-(world_size - 1) // loader.grid_n(narrow, arch)) * 128
+    assert loader.tiles(edge, narrow, arch) >= world_size - 1
+    lever = loader.lever_variant(world_size, edge, narrow, 128, arch, sm_count=132)
+    assert lever == suffix
+    if edge > 128:
+        assert loader.tiles(edge - 128, narrow, arch) < world_size - 1
+        lever = loader.lever_variant(
+            world_size, edge - 128, narrow, 128, arch, sm_count=132
+        )
+        assert lever == ""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_drain_lever_is_only_offered_to_its_program_variants(arch):
+    drain = loader.LEVER_DISPATCH[arch].get("DRAIN")
+    if drain is None:
+        return
+    n, k_l = 3072, 3072
+    for world_size, capacity, suffix in loader.CAPACITY_VARIANTS.get(arch, []):
+        if suffix in drain["variants"] or world_size not in drain["worlds"]:
+            continue
+        # A call of the whole capacity that meets every other drainer condition.
+        plain = loader.lever_variant(world_size, capacity, n, k_l, arch, sm_count=132)
+        lever = loader.lever_variant(
+            world_size, capacity, n, k_l, arch, sm_count=132, variant=suffix
+        )
+        assert plain == drain["suffix"] and lever == ""
         key = loader.route_key(world_size, arch, capacity) + plain
         assert key not in loader.ROUTES[arch]
         main = loader.main_program(world_size, arch, capacity)
@@ -2155,3 +2254,36 @@ def test_cross_stream_join_waits_on_the_previous_tail_and_skips_capture(monkeypa
     assert waited == [other]
     backend._remember_tail(state, 4242, 0)
     assert state.tail_handle == 4242 and state.tail_stream.cuda_stream == 4242
+
+
+def _e2e_test_module():
+    """The multi-GPU e2e test module, loaded from its file (nothing runs)."""
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "comm"
+        / "test_fp8_rowwise_gemm_allreduce_cake_e2e.py"
+    )
+    spec = importlib.util.spec_from_file_location("_cake_fp8_ar_e2e_cases", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_e2e_lever_shapes_select_every_delivered_lever_program(arch, world_size):
+    # The e2e test runs one call per lever program a route delivers, chosen from
+    # its LEVER_SHAPES by the dispatch rule. A new lever, or a new bound of one,
+    # that leaves a delivered program without a call fails here, without a GPU.
+    sm_count = int(loader.GEOMETRY[arch].get("RASTER_SM_COUNT", 148))
+    cases = _e2e_test_module()._lever_cases(world_size, arch, sm_count)
+    for capacity, key, program, shape in cases:
+        assert shape is not None, f"no e2e shape selects {key} on {arch}"
+        m, n, k_l = shape
+        loader.validate_shape(m, n, k_l, arch)
+        rows = capacity or m
+        assert (
+            loader.call_program(world_size, arch, rows, m, n, k_l, sm_count=sm_count)
+            == program
+        )

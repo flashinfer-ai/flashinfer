@@ -58,11 +58,11 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
     resolve_nvfp4_4over6,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_reference
-from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+from tests.moe.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_reference
+from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
     assert_cute_dsl_moe_bits,
 )
-from tests.test_helpers.w4a16_reference import (
+from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     split_w4a16_reference_from_tensors,
 )
@@ -2352,6 +2352,36 @@ class TestCuteDslFusedMoeFunctional:
             num_experts,
             quant_mode,
             use_per_token_activation,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
+        )
+
+    @pytest.mark.parametrize(
+        "quant_mode,intermediate_size",
+        [
+            # intermediate_size % (128 * sf_vec_size) != 0: the act-fusion epilogue's last N
+            # subtile row is partial, so its scale-factor store must stop at the N boundary.
+            # (The mxfp8 scalar-byte path is covered by the mxfp8 cases below at
+            # intermediate_size 128, already short of its 128 * 32 tile.)
+            pytest.param("w4a4", 768, id="w4a4-interm768"),
+            pytest.param("w4a4", 1152, id="w4a4-interm1152"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    def test_numerical_accuracy_ragged_sf_n(
+        self, activation_type: ActivationType, quant_mode: str, intermediate_size: int
+    ):
+        """Accuracy with an intermediate size that is not a multiple of the scale-factor tile."""
+        self._run_numerical_accuracy(
+            activation_type,
+            128,
+            2,
+            256,
+            intermediate_size,
+            256,
+            quant_mode,
+            False,
             use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
         )
 

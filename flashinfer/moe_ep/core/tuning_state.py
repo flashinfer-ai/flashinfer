@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Selection state owned by one MegaMoE workspace."""
+"""Selection state for a prepared collective operation."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -26,3 +26,24 @@ class AutoTuningState:
         self.winner = winner
         self.cache_identity = cache_identity
         self.tuned_identity = tuned_identity
+
+
+def prepared_for_serving(state: AutoTuningState, context) -> bool:
+    # An unrelated thread's tuning context must not trigger collectives here.
+    return (
+        context.scope is None
+        and not context.force_tune
+        and state.serving_generation == context.execution_generation
+    )
+
+
+def record_prepared(state: AutoTuningState, context) -> None:
+    import torch
+
+    state.serving_generation = (
+        context.execution_generation
+        if context.scope is None
+        and not context.force_tune
+        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+        else None
+    )

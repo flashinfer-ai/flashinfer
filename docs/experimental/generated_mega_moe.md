@@ -27,8 +27,8 @@ picks the device's count and refuses any other) and its launch grid, one
 persistent CTA per SM unless its metadata states `num_ctas`: then the
 program runs that many CTAs (the grid and `-DNUM_CTAS`), fewer than the
 device's SMs, so a stream's next call starts on the free SMs while the
-previous call's last CTAs finish (the 384-expert one-token rank route on
-sm_103a runs 148 of 152); a
+previous call's last CTAs finish (the one-token rank routes of the
+384-expert I640, 96-expert and 48-expert shapes on sm_103a run 148 of 152); a
 route's metadata names the program's source-schedule form (`block_m`, the
 source tile height; `readiness`, `"block"` or `"grid"`) and whether its
 program carries the local expert filter (`local_expert_filter`). The

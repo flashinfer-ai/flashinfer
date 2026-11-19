@@ -222,11 +222,11 @@ def test_source_wrap_route_and_grid_placement():
 
     module = _module()
     assert module._WRAP_FROM_VARIANTS == ("", "tail", "ibulk")
-    src = inspect.getsource(module.CakeSSDCombined._materialize_workspace)
+    src = inspect.getsource(module.CakeSSDCombined._program_route)
     i_claim = src.index('program_family, variant = "exactpre", "claim"')
     i_ibulk = src.index("and ibulk_selected(")
     i_wrap = src.index("and wrap_long_selected(")
-    i_one = src.index('if variant == "tail" and tail_one_cta_selected(')
+    i_one = src.index("and tail_one_cta_selected(")
     i_unit = src.index("variant = unit_cluster_variant(")
     assert i_claim < i_ibulk < i_wrap < i_one < i_unit
     assert src.count("wrap_long_selected(") == 1

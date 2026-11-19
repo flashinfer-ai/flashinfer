@@ -24,16 +24,20 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ...batch_invariant import canon
 from .spec import (
     ALPHA_GIVEN,
+    BLOCK_K,
     BLOCK_SCALED,
     ELEM_BITS_OF,
+    FP8_BLOCKSCALE_FMTS,
     MMA_K_OF,
     MMA_OP_OF,
+    MX_MIXED_FMTS,
     SF_FMT,
     SF_VEC,
     EpilogueChain,
@@ -48,11 +52,32 @@ K_TILE_BYTES = (
 )
 
 
-def inner_radix(in_fmt: str = "bf16") -> int:
-    """Instruction K-steps per smem stage: what one 128-byte stage holds at the format's step (4 for the 32-byte steps
-    of both bf16 and fp8). The inner radix of ``MainloopBlock.lowering()``; Lean's ``kblockLoopG_eq_kfoldG`` holds for
-    every value of it."""
-    return K_TILE_BYTES * 8 // (MMA_K_OF[in_fmt] * ELEM_BITS_OF[in_fmt])
+# The k-block (K elements per smem stage) a format admits besides its 128-byte default: the mixed classes stage their 4-bit
+# weight at a 64-byte row under the default, so they also admit the 256-element k-block (a 128-byte weight row;
+# `Knobs.k_block`); the lowering's inner radix follows (`inner_radix`), the fold does not (Lean's `kblockLoopG_eq_kfoldG`
+# holds for every radix).
+K_BLOCK_VALUES = {"mxfp4w8a": (128, 256), "mxfp4w8a_k64": (128, 256)}
+DEFAULT_K_BLOCK: Dict[
+    str, int
+] = {}  # a format's default k-block when it is not the 128-byte rule
+# the k-block of a format's swapped decode records in the enumerated space: the SM107 mixed class streams its e2m1 weight as
+# the instruction's A operand, and the 256-element stage gives that operand a 128-byte TMA row (the dense records keep the
+# 128-byte rule of the e4m3 activation row)
+SWAP_K_BLOCK = {"mxfp4w8a_k64": 256}
+
+
+def default_k_block(in_fmt: str) -> int:
+    """K elements per smem stage under the format's default: 128 bytes of the A operand's row, or the class's declared choice."""
+    return DEFAULT_K_BLOCK.get(in_fmt) or K_TILE_BYTES * 8 // ELEM_BITS_OF[in_fmt]
+
+
+def inner_radix(in_fmt: str = "bf16", k_block: int = 0) -> int:
+    """Instruction K-steps per smem stage: what one stage holds at the format's step (the 128-byte default: 4 for the
+    32-byte steps of both bf16 and fp8), or at an explicit ``k_block`` (`Knobs.k_block`, the formats of ``K_BLOCK_VALUES``).
+    The inner radix of ``MainloopBlock.lowering()``; Lean's ``kblockLoopG_eq_kfoldG`` holds for every value of it."""
+    kb = k_block or default_k_block(in_fmt)
+    assert kb % MMA_K_OF[in_fmt] == 0, (in_fmt, kb)
+    return kb // MMA_K_OF[in_fmt]
 
 
 # ----------------------------------------------------------------------------- knobs
@@ -89,12 +114,21 @@ CTA_CHUNKS_MAX_TN = {
     "nvfp4_k128": 256,
     "mxfp4": 192,
     "mxfp4_k128": 256,
+    "mxfp4w8a": 192,
+    "mxfp4w8a_k64": 256,
+    "e4m3_bs": 128,
 }
 #: The block-scaled instruction fixes MMA M at 128 (1-CTA) / 256 (2-CTA): its scale-factor atom spans 128 rows, so no
 #: 64-row CTA tile exists; tile N below 64 would need sub-tile scale-factor addressing; a scale-factor tile multicasts to
 #: at most 4 CTAs.
 TILES_N_BLOCKSCALED = (64, 128, 192, 256)
 TILES_M_BLOCKSCALED = {False: (128,), True: (256,)}
+#: The block-scale fp8 class (``e4m3_bs``: the dense ``kind::f8f6f4`` body with a per-block promotion by the epilogue warps): the
+#: 128-row CTA tile of the one-row-per-thread promotion (MMA M 128 1-CTA / 256 2-CTA), tile N dividing the 128-column weight
+#: scale block (the register running sum bounds it at 128), the 16-wide tile on the 1-CTA instruction only; no split variant,
+#: no in-CTA fold, no swapped record.
+TILES_N_FP8BS = (16, 32, 64, 128, 256)
+TILES_M_FP8BS = TILES_M_BLOCKSCALED
 MAX_CLUSTER_DIM_BLOCKSCALED = 4
 #: In-cluster split-K (block-scaled body): the ``cluster_k`` CTAs of a (cluster_k, 1, 1) cluster each fold one K chunk and
 #: the partials are folded in chunk order through distributed shared memory in the epilogue; the record computes the class
@@ -110,13 +144,20 @@ TILES_N_NARROW = (8, 16, 32)
 SWAP_WIDE_TILE_N = 64
 #: The 64-wide swapped token tile exists for the UE8M0 classes (their scale-factor atom covers the tile's K extent of one stage);
 #: the NVFP4 classes keep the narrow token tiles only.
-SWAP_WIDE_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4", "mxfp4_k128")
+SWAP_WIDE_FMTS = (
+    "mxfp8",
+    "mxfp8_k64",
+    "mxfp4",
+    "mxfp4_k128",
+    "mxfp4w8a",
+    "mxfp4w8a_k64",
+)
 #: B-reuse (the sm_107 instructions only): a 512-row tiler on the 2-CTA 256-row instruction; each CTA pair issues two
 #: instructions per K step on the two halves of the tile, the B fragment loaded into the collector buffer by the first and
 #: consumed by the second: half the B smem traffic per MMA. One accumulator per half, the same K steps in order from +0:
 #: a placement of the class. Dense records only (no swap, no in-cluster split, no in-CTA chunk fold).
 TILE_M_BREUSE = 512
-BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128")
+BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128", "mxfp4w8a_k64")
 
 
 @dataclass(frozen=True)
@@ -134,6 +175,7 @@ class Knobs:
     cta_chunks: bool = False  # the in-CTA chunk fold (split class): one CTA folds every chunk of its tile
     cluster_k: int = 1  # in-cluster split-K factor (block-scaled body): the record computes the class kchunk[cluster_k]
     swap_ab: bool = False  # the decode specialisation (block-scaled body): operands swapped, one token tile for all tokens
+    k_block: int = 0  # K elements per smem stage: 0 = the format's default, else a value of K_BLOCK_VALUES[in_fmt] (a lowering choice)
 
     # named views
     @property
@@ -186,7 +228,18 @@ class Knobs:
             and self.raster_along in RASTERS
             and self.swizzle_size in SWIZZLES
             and self.use_tma_store
+            and (self.k_block == 0 or self.k_block in K_BLOCK_VALUES.get(in_fmt, ()))
         )
+        if in_fmt in FP8_BLOCKSCALE_FMTS:
+            return (
+                ok
+                and self.tile_m in TILES_M_FP8BS[two]
+                and self.tile_n in TILES_N_FP8BS
+                and (self.tile_n >= 32 or not two)
+                and self.cluster_k == 1
+                and not self.swap_ab
+                and not self.cta_chunks
+            )
         if in_fmt in BLOCK_SCALED:
             tm_ok = self.tile_m in TILES_M_BLOCKSCALED[two] or (
                 self.b_reuse
@@ -254,6 +307,7 @@ class Knobs:
             + (f"_ck{self.cluster_k}" if self.cluster_k > 1 else "")
             + ("_swap" if self.swap_ab else "")
             + ("_cc" if self.cta_chunks else "")
+            + (f"_kb{self.k_block}" if self.k_block else "")
         )
 
     def instruction(self, in_fmt: str = "bf16") -> str:
@@ -266,8 +320,14 @@ class Knobs:
                 "nvfp4_k128": "kind::mxf4nvf4.block_scale",
                 "mxfp4": "kind::mxf4.block_scale",
                 "mxfp4_k128": "kind::mxf4nvf4.block_scale",
+                "mxfp4w8a": "kind::mxf8f6f4.block_scale",
+                "mxfp4w8a_k64": "kind::mxf8f6f4.block_scale",
             }[in_fmt]
             sf = f" sf={SF_FMT[in_fmt]}/{SF_VEC[in_fmt]}"
+            if in_fmt in MX_MIXED_FMTS:
+                # the mixed classes name their operand formats; the swapped decode record exchanges them (the e2m1 weight
+                # as the instruction's A, the e4m3 tokens as its B)
+                sf += " b=e2m1 a=e4m3" if self.swap_ab else " a=e4m3 b=e2m1"
             arch = " (sm_107a)" if in_fmt.endswith(("_k64", "_k128")) else ""
             breuse = (
                 " x2 b-reuse (FILL/LASTUSE)"
@@ -340,6 +400,7 @@ def knob_product(
                                             cc,
                                             ck,
                                             swap,
+                                            SWAP_K_BLOCK.get(in_fmt, 0) if swap else 0,
                                         )
                                         if k.well_formed(in_fmt) and (
                                             bs
@@ -361,14 +422,34 @@ def enumerate_space(
 ) -> List[Knobs]:
     """The configuration space for a shape, layout and class: the knob product the kernel body accepts
     (``can_implement``) for ``chunks`` (the class's chunk count). This is the set R3 is claimed over; the GPU
-    configuration-agreement tests check the dispatcher's candidates and sampled records of it against each other."""
+    configuration-agreement tests check the dispatcher's candidates and sampled records of it against each other.
+    Memoised per argument tuple (the acceptance reads M for the swapped and in-cluster records, so M is part of the
+    key); each call returns its own list."""
+    return list(
+        _enumerate_space_cached(
+            M, N, K, tuple(swizzles), tuple(clusters), chunks, b_major, in_fmt
+        )
+    )
+
+
+@functools.lru_cache(maxsize=512)
+def _enumerate_space_cached(
+    M: int,
+    N: int,
+    K: int,
+    swizzles: tuple,
+    clusters: tuple,
+    chunks: int,
+    b_major: str,
+    in_fmt: str,
+) -> Tuple[Knobs, ...]:
     from .blocks.operands import can_implement
 
-    return [
+    return tuple(
         k
         for k in knob_product(swizzles, clusters, cta_chunks=chunks > 1, in_fmt=in_fmt)
         if can_implement(k, M, N, K, b_major, chunks, in_fmt)
-    ]
+    )
 
 
 REFERENCE_SHAPE = (1000, 4096, 4096)  # the shape whose space is emitted to Lean
@@ -384,6 +465,11 @@ class MainloopBlock:
     fixed by the format; its instruction variant by the knobs."""
 
     in_fmt: str = "bf16"
+    k_block_override: int = (
+        0  # `Knobs.k_block` in K elements: 0 = the format's default stage
+    )
+    #: an override of the K-steps per smem stage (``StaticPlan(k_blocks=)``); None: ``inner_radix`` at the K-block above
+    inner_steps: Optional[int] = None
 
     @property
     def step(self) -> int:
@@ -392,7 +478,7 @@ class MainloopBlock:
     @property
     def inner(self) -> int:
         """Instruction K-steps per smem stage (the lowering's inner radix)."""
-        return inner_radix(self.in_fmt)
+        return self.inner_steps or inner_radix(self.in_fmt, self.k_block_override)
 
     @property
     def k_block(self) -> int:
@@ -434,7 +520,13 @@ class GemmKernelPlan:
 
     @property
     def block(self) -> MainloopBlock:
-        return MainloopBlock(self.in_fmt)
+        return MainloopBlock(self.in_fmt, k_block_override=self.knobs.k_block)
+
+    @property
+    def block_scale(self) -> bool:
+        """The block-scale fp8 class: the K fold per 128-element block, the block fold with the scales
+        (`spec.reduction_blockscale`)."""
+        return self.in_fmt in FP8_BLOCKSCALE_FMTS
 
     @property
     def epilogue(self) -> EpilogueChain:
@@ -447,7 +539,15 @@ class GemmKernelPlan:
 
     def placement(self) -> canon.Placement:
         """Both folds are register-level: the K fold is the accumulator of one output element (TMEM lane); the chunk
-        fold is one fixup thread (or the owning CTA's epilogue) folding the partials in index order."""
+        fold is one fixup thread (or the owning CTA's epilogue) folding the partials in index order; the block-scale
+        class's block fold is one epilogue thread's running sum over the blocks in index order."""
+        if self.block_scale:
+            return canon.Placement.make(
+                {
+                    "kstep": [(BLOCK_K // self.block.step, "reg")],
+                    "block": [(self.K // BLOCK_K, "reg")],
+                }
+            )
         f = {
             "kstep": [
                 (
@@ -463,8 +563,12 @@ class GemmKernelPlan:
         return canon.Placement.make(f)
 
     def plan(self):
-        from .spec import reduction, reduction_chunked
+        from .spec import reduction, reduction_blockscale, reduction_chunked
 
+        if self.block_scale:
+            return canon.plan(
+                reduction_blockscale(self.K, 0, 0, self.in_fmt), self.placement()
+            )
         red = (
             reduction(self.K, 0, 0, self.in_fmt)
             if self.chunks == 1
@@ -485,6 +589,29 @@ class GemmKernelPlan:
         got = canon.verify(p, alg)
         assert got is p.red.canonical(alg), "generated plan is not canonical"
         low = self.block.lowering()
+        if self.block_scale:
+            # every block is one stage of the lowering (one block of `inner` steps from the reset accumulator: the kernel issues
+            # `mma_fold` once per k-tile), and its trace is the block's partial of the spec
+            from .spec import reduction_blockscale
+
+            red = reduction_blockscale(self.K, 0, 0, self.in_fmt)
+            kstep = red.digits[0]
+            assert low.inner == kstep.radix == BLOCK_K // self.block.step, (
+                low.inner,
+                kstep.radix,
+            )
+            for kb in range(self.K // BLOCK_K):
+                partial = kstep.reduce(
+                    alg,
+                    [
+                        red.leaf(alg, {"block": kb, "kstep": t})
+                        for t in range(kstep.radix)
+                    ],
+                )
+                assert low.trace(red, alg, 1, fixed={"block": kb}) is partial, (
+                    f"mainloop lowering differs on block {kb}"
+                )
+            return got
         steps_per_chunk = self.block.steps(self.K // self.chunks)
         nb = low.blocks_for(steps_per_chunk)
         K_pad = nb * low.inner * self.block.step * self.chunks

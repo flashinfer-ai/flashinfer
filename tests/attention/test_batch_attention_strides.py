@@ -12,8 +12,8 @@ import torch
 
 import flashinfer
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
-from tests.test_helpers.paged_kv import make_paged_kv_cache_pair
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.attention.test_helpers.paged_kv import make_paged_kv_cache_pair
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 
 
 def _metadata():

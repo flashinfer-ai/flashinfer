@@ -16,6 +16,8 @@ cutlass / cuda imports lazy, so importing this package stays CPU-safe.
 from .shim import (
     KNOB_KEYS,
     Sm107BlockScaledMoeConfig,
+    Sm107SharedExpertConfig,
+    validate_feature_config,
     Sm107BlockScaledSymmBuffer,
     Sm107QuantKind,
     TransformedBlockScaledWeights,
@@ -79,6 +81,7 @@ __all__ = [
     *_LAZY_HELPERS,
     "KNOB_KEYS",
     "Sm107BlockScaledMoeConfig",
+    "Sm107SharedExpertConfig",
     "Sm107BlockScaledSymmBuffer",
     "Sm107QuantKind",
     "TransformedBlockScaledWeights",

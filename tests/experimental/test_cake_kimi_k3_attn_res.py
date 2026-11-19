@@ -19,7 +19,7 @@ on a supported device, the numerical contract against the independent FP32 refer
 (output within atol 8e-2 / rtol 3e-2, prefix and snapshot bank bit-exact).
 
 This suite exercises the backend package alone: it names the package once, through
-``tests.test_helpers.cake_package``, and imports nothing else from flashinfer, so a
+``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer, so a
 build that vendors the package under another import path runs it unchanged after
 pointing that table entry at its package.  The ``flashinfer.kimi_k3_attn_res`` facade
 is covered by ``test_cake_kimi_k3_attn_res_api.py``.
@@ -33,7 +33,7 @@ import re
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cb = cake_package("cake_kimi_k3_attn_res", "cake_backend")
 cake_build = cake_package("cake_kimi_k3_attn_res", "cake_build")
