@@ -339,8 +339,8 @@ class BlockGemm:
                 tBsB,
                 a_full_mcast_mask,
                 b_full_mcast_mask,
-                chunk_count,
-                cc,
+                chunks=chunk_count,
+                cc=cc,
             )
         if warp_idx == MMA_WARP:
             tmem.wait_for_alloc()
@@ -361,8 +361,8 @@ class BlockGemm:
                 tCrA,
                 tCrB,
                 tCtAcc_base,
-                chunk_count,
-                cc,
+                chunks=chunk_count,
+                cc=cc,
             )
         sC = smem.allocate_tensor(
             element_type=st.c_dtype,
@@ -392,10 +392,10 @@ class BlockGemm:
                 epi_tile,
                 acc_pipeline,
                 alpha,
-                chunk_count,
-                mBias,
-                tCcC,
-                cc,
+                chunks=chunk_count,
+                mBias=mBias,
+                tCcC_base=tCcC,
+                cc=cc,
             )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)

@@ -1682,8 +1682,8 @@ class BlockScaledGemm:
                 a_full_mcast_mask,
                 b_full_mcast_mask,
                 sfb_full_mcast_mask,
-                chunk_count,
-                cc,
+                chunks=chunk_count,
+                cc=cc,
             )
             if cutlass.const_expr(self.enable_pdl):
                 # every load issued: the next grid's prologue may start
@@ -1723,8 +1723,8 @@ class BlockScaledGemm:
                 sSFB,
                 tiled_mma_bkeep,
                 tiled_mma_breuse,
-                chunk_count,
-                cc,
+                chunks=chunk_count,
+                cc=cc,
             )
         sC = smem.allocate_tensor(
             element_type=st.c_dtype,
@@ -1771,7 +1771,7 @@ class BlockScaledGemm:
                     epi_tile,
                     acc_pipeline,
                     alpha,
-                    chunk_count,
+                    chunks=chunk_count,
                     cc=cc,
                 )
             tmem.relinquish_alloc_permit()
