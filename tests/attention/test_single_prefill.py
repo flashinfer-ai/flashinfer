@@ -281,3 +281,19 @@ def test_single_prefill_masked_key_never_dominates(dtype):
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, backend="fa2")
     o_ref, _ = ref_single_prefill(q, k, v, causal=True)
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_sm90_prefill_output_handoff(return_lse):
+    if not flashinfer.utils.is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("requires SM90 FA3")
+
+    q = torch.zeros(2048, 8, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.ones_like(q)
+    v[1::2] = -1
+    # Equal attention scores give exactly zero. Stale shared V rows give +/-1.
+    result = flashinfer.single_prefill_with_kv_cache(
+        q, q, v, causal=False, backend="fa3", return_lse=return_lse
+    )
+    out = result[0] if return_lse else result
+    assert torch.count_nonzero(out).item() == 0
