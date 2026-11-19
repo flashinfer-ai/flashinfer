@@ -47,7 +47,8 @@ def MoEEpLayer(
     callers can drop their reference to reclaim the source copy.
 
     ``nosync`` (optional, SM120 MXFP4): also build the nosync kernel and run every call of at
-    most ``nosync.max_tokens_per_rank`` tokens per rank on it, every other call on the layer
+    most ``nosync.max_tokens_per_rank`` tokens per rank that averages at most
+    ``nosync.max_tokens_per_expert`` tokens per expert on it, every other call on the layer
     ``backend`` configures (:class:`MoEEpNosyncLayer`). ``backend`` is configured as without
     the option.
     """
