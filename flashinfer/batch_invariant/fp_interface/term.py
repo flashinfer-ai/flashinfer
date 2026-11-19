@@ -177,6 +177,8 @@ def sexpr(t: Term) -> str:
             out = f"(cvt {A[1]} {A[0]})"
         elif op == "op:mma_bf16_k16":
             out = f"(mma16 {A[0]} {A[1]})"  # one tcgen05.mma K-step: (accumulator, operand slice)
+        elif op == "op:mma_f16_k16":
+            out = f"(mma16f16 {A[0]} {A[1]})"  # the binary16 variant of the 16-wide K-step (the attention fp16 class)
         elif op == "op:mma_fp8_k32":
             out = f"(mma32 {A[0]} {A[1]})"  # one kind::f8f6f4 K-step of 32 fp8 elements
         elif op == "op:ab_kslice":

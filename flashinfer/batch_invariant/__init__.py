@@ -90,10 +90,31 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
+def _attention_fmt(dtype: Union[torch.dtype, str, None]) -> str:
+    """The attention class of an operand dtype (the one format of q, K, V and the output): bf16 (the default class) or
+    ``torch.float16`` / ``"fp16"`` (the fp16 class)."""
+    names = {
+        None: "bf16",
+        torch.bfloat16: "bf16",
+        "bf16": "bf16",
+        torch.float16: "f16",
+        "f16": "f16",
+        "fp16": "f16",
+    }
+    if dtype not in names:
+        raise ValueError(
+            "fingerprint(<attention wrapper>) takes dtype torch.bfloat16 (the default) or torch.float16 "
+            f"(or 'bf16' / 'fp16'), not {dtype!r}"
+        )
+    return names[dtype]
+
+
+def _attention_fingerprint(
+    head_dim: int, dtype: Union[torch.dtype, str, None] = None
+) -> str:
     from ..attention.batch_invariant.spec import spec_fingerprint
 
-    return spec_fingerprint(head_dim)
+    return spec_fingerprint(head_dim, fmt=_attention_fmt(dtype))
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -610,15 +631,17 @@ CLASSES: Dict[str, ClassInfo] = {
         ("arch",),
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class; the operand dtype (the one format
+    # of q, K, V and the output) is an optional dimension: bf16 (the default) names the class attention.bf16, torch.float16 the
+    # class attention.fp16 (binary16 leaves and MMA steps, the probabilities and the output rounded to binary16)
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("dtype",)
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("dtype",)
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("dtype",)
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -721,7 +744,10 @@ def fingerprint(op: str, **dims) -> str:
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    class's no-window sample row and covers windowed calls too. The optional ``dtype`` names the operand format, the one
+    dtype of q, K, V and the output: ``torch.bfloat16`` (the default) is the bf16 class, ``torch.float16`` the fp16 class
+    (``attn-fp16-d...``: binary16 leaves, the binary16 variant of the 16-wide MMA step, the probabilities of the PV product
+    and the output rounded to binary16 with round-to-nearest-even, an output magnitude of 65520 or more giving ``inf``).
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -729,6 +755,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-bf16-kfold-bias-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=128, dtype=torch.float16)  # doctest: +SKIP
+    'attn-fp16-d128-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kblock128-...'
     >>> fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107")  # doctest: +SKIP
@@ -768,7 +796,7 @@ def class_name(op: str) -> str:
     ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
     ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
     ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``; ``"gemm.mxfp4w8a"`` for the mixed MX classes behind
-    ``mm_mxfp8_mxfp4``)."""
+    ``mm_mxfp8_mxfp4``; ``"attention.bf16"`` for the attention wrappers, whose fp16 plans run ``attention.fp16``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(
