@@ -13,17 +13,14 @@ QSA stage-1 indexer), softmax scale ``256 ** -0.5``.
 
 Launch-state notes (kept out of import time on purpose):
 
-- Triton's launch allocator (used for device-side TMA descriptor scratch) is
-  installed only for the duration of each :func:`run` call and restored
-  afterwards (:func:`_launch_allocator`): the op's private scratch is never
-  left reachable by unrelated Triton kernels launched elsewhere in the
-  process, and importing flashinfer installs nothing.
-- ``_TMA_SCRATCH`` / ``_SCRATCH`` are persistent per-process caches whose
-  sizes are pure functions of the input shape. An eager call therefore
+- QSA does not install a Triton launch allocator. K/V sweeps use host
+  tensor descriptors when available and ordinary pointer loads otherwise;
+  neither path constructs a tensor descriptor on the device.
+- ``_SCRATCH`` holds persistent split-K buffers sized by the input shape. An eager call therefore
   pre-sizes them; CUDA-graph capture requires one same-shape eager warmup
   call first so that no allocation happens during capture (replay then reuses
   stable pointers). Retention is bounded by the largest shape seen
-  (roughly ``4 * T * 6 * 256`` BF16 + ``8 * T * 6`` FP32 elements + 256 KiB),
+  (roughly ``4 * T * 6 * 256`` BF16 + ``8 * T * 6`` FP32 elements),
   plus one pinned copy of each buffer that was live during a CUDA-graph
   capture (``_GRAPH_HELD``): a captured graph bakes in those addresses, so a
   later, larger call may grow the caches but never frees memory an existing
@@ -33,8 +30,6 @@ Launch-state notes (kept out of import time on purpose):
   the public docstring); all calls, captures and replays included, must be
   serialized on one stream at a time.
 """
-
-import contextlib
 
 import torch
 import triton
@@ -54,8 +49,6 @@ except Exception:  # pragma: no cover - very old Triton without the error class
     class _TritonOOR(Exception):  # type: ignore[no-redef]
         pass
 
-_TMA_SCRATCH: dict = {}
-
 # Scratch buffers that were live during a CUDA-graph capture. A captured
 # graph bakes raw device pointers into its launch nodes, and PyTorch requires
 # the allocations behind them to stay reserved for the graph's lifetime; a
@@ -73,68 +66,6 @@ def _hold_for_graph(buf):
     return buf
 
 
-def _tma_alloc(size, alignment, stream):
-    """Reusable device scratch for Triton's device-side TMA descriptors.
-
-    Keyed by the current CUDA device: a cached buffer is reused only on the
-    device that owns it, so a later call on another GPU allocates its own
-    scratch instead of handing the launch a pointer into a peer's memory.
-    """
-    dev = torch.cuda.current_device()
-    buf = _TMA_SCRATCH.get(dev)
-    if buf is None or buf.numel() < size:
-        buf = torch.empty(max(size, 1 << 18), dtype=torch.int8, device=dev)
-        _TMA_SCRATCH[dev] = buf
-    return _hold_for_graph(buf)
-
-
-try:
-    from triton.runtime import _allocation as _triton_allocation
-except Exception:  # pragma: no cover - Triton without the allocation module
-    _triton_allocation = None
-
-_LEGACY_ALLOC_INSTALLED = False
-
-
-@contextlib.contextmanager
-def _launch_allocator():
-    """Install ``_tma_alloc`` around one call's launches, then restore.
-
-    The launch allocator Triton consults for device-side TMA descriptor
-    scratch is process-global state; leaving this op's allocator installed
-    would hand its private scratch to any UNRELATED Triton kernel launched
-    later in the same context (the documented single-stream restriction
-    constrains this op's own calls only, not other libraries' kernels).  The
-    allocator is therefore installed per call and the previous one restored
-    on exit.  Setting it in the calling context on every call also covers
-    threads whose context never saw an install.
-    """
-    holder = getattr(_triton_allocation, "_allocator", None)
-    if holder is not None and hasattr(holder, "set") and hasattr(holder, "reset"):
-        # Newer Triton: the allocator lives in a ContextVar.
-        token = holder.set(_tma_alloc)
-        try:
-            yield
-        finally:
-            holder.reset(token)
-    elif _triton_allocation is not None:
-        # Older Triton: the allocator is a module-global object; save it and
-        # put it back through the public setter.
-        prev = _triton_allocation._allocator
-        triton.set_allocator(_tma_alloc)
-        try:
-            yield
-        finally:
-            triton.set_allocator(prev)
-    else:  # pragma: no cover - very old Triton: no handle on the previous
-        # allocator, so fall back to a one-time process-wide install (the
-        # pre-existing behavior) rather than clobbering a foreign allocator
-        # on every exit.
-        global _LEGACY_ALLOC_INSTALLED
-        if not _LEGACY_ALLOC_INSTALLED:
-            triton.set_allocator(_tma_alloc)
-            _LEGACY_ALLOC_INSTALLED = True
-        yield
 
 NH = 6          # real query heads
 HP = 8          # padded heads (power of two for tl.dot)
@@ -1272,10 +1203,22 @@ def _tpd_step(q8, q8l, KC, VC, base, w0, ii, dd, NSLOT, rcnt, cc, mr,
 
 
 @triton.jit
+def _cache_tile(cache, row, nslot, BN: tl.constexpr, DC: tl.constexpr,
+                HOST_DESC: tl.constexpr):
+    if HOST_DESC:
+        return cache.load([row, 0])
+    else:
+        # Match descriptor zero padding, including a partial final window.
+        slots = row + tl.arange(0, BN)
+        offsets = slots[:, None] * DC + tl.arange(0, DC)[None, :]
+        return tl.load(cache + offsets, mask=slots[:, None] < nslot, other=0.0)
+
+
+@triton.jit
 def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                 BT: tl.constexpr, RW: tl.constexpr, MK: tl.constexpr,
                 BN: tl.constexpr, NHC: tl.constexpr, DC: tl.constexpr,
-                PWC: tl.constexpr, SC: tl.constexpr):
+                PWC: tl.constexpr, SC: tl.constexpr, HOST_DESC: tl.constexpr):
     """Dedicated B=2 long-row kernel: inline dense and sparse TMA paths.
 
     Keeping the cold retry in this entry point is important: Triton's SM107
@@ -1347,10 +1290,10 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
         mr = tl.zeros([RW], tl.float32)
         minc = tl.min(tl.where(rv, rcnt, 0x7FFFFFFF), 0)
         nfull = minc // BN
-        for kw in tl.range(0, nfull, warp_specialize=True):
+        for kw in tl.range(0, nfull, warp_specialize=HOST_DESC):
             w0 = kw * BN
-            kt = tl.trans(KD.load([base + w0, 0]))
-            vt = VD.load([base + w0, 0])
+            kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
+            vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
             s = _qk(qr, qr, kt)
             mx = tl.maximum(mx, tl.max(s, 1))
             pp16 = _ex2h(_mul_rz_h2(s, cc))
@@ -1360,10 +1303,10 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             acc = tl.dot(pl, vt,
                          tl.dot(ph, vt, acc, out_dtype=tl.float32),
                          out_dtype=tl.float32)
-        for kw in tl.range(nfull, nw, warp_specialize=True):
+        for kw in tl.range(nfull, nw, warp_specialize=HOST_DESC):
             w0 = kw * BN
-            kt = tl.trans(KD.load([base + w0, 0]))
-            vt = VD.load([base + w0, 0])
+            kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
+            vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
             qk = _qk(qr, qr, kt)
             s = tl.where(ii[None, :] < (rcnt - w0)[:, None],
                          qk, -3.0e38)
@@ -1382,8 +1325,8 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             li = tl.zeros([RW], tl.float32)
             for kw in range(0, nfull):
                 w0 = kw * BN
-                kt = tl.trans(KD.load([base + w0, 0]))
-                vt = VD.load([base + w0, 0])
+                kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
+                vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
                 s = _qk(qr, qr, kt)
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
                 li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
@@ -1394,8 +1337,8 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                              out_dtype=tl.float32)
             for kw in range(nfull, nw):
                 w0 = kw * BN
-                kt = tl.trans(KD.load([base + w0, 0]))
-                vt = VD.load([base + w0, 0])
+                kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
+                vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
                 qk = _qk(qr, qr, kt)
                 s = tl.where(ii[None, :] < (rcnt - w0)[:, None],
                              qk, -3.0e38)
@@ -1426,7 +1369,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
         acc = tl.zeros([RW, DC], tl.float32)
         li = tl.zeros([RW], tl.float32)
         mx = tl.full([RW], -1.0e30, tl.float32)
-        for kw in tl.range(0, nw, num_stages=1, warp_specialize=True,
+        for kw in tl.range(0, nw, num_stages=1, warp_specialize=HOST_DESC,
                            disable_licm=True,
                            disallow_acc_multi_buffer=True):
             w0 = wlo + kw * BN
@@ -1447,8 +1390,8 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                              mask=si0 < cnt[:, None], other=-1)
                 S1 = tl.load(PK + prow[:, None] + si1,
                              mask=si1 < cnt[:, None], other=-1)
-            kt = tl.trans(KD.load([base + w0, 0]))
-            vt = VD.load([base + w0, 0])
+            kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
+            vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
             qk = _qk(qr, qr, kt)
             if BN == 128:
                 wr0 = tl.gather(bw0, rm, 0)
@@ -1514,8 +1457,8 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                                  mask=si0 < cnt[:, None], other=-1)
                     S1 = tl.load(PK + prow[:, None] + si1,
                                  mask=si1 < cnt[:, None], other=-1)
-                kt = tl.trans(KD.load([base + w0, 0]))
-                vt = VD.load([base + w0, 0])
+                kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
+                vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
                 qk = _qk(qr, qr, kt)
                 if BN == 128:
                     wr0 = tl.gather(bw0, rm, 0)
@@ -1769,12 +1712,9 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
     mi = tl.full([RW], -1.0e30, tl.float32)
     li = tl.zeros([RW], tl.float32)
     ii = tl.arange(0, BN)
-    if TMA == 2:
+    if TMA:
         KD = KDS
         VD = VDS
-    elif TMA == 1:
-        KD = tl.make_tensor_descriptor(KC, [NSLOT, DC], [DC, 1], [BN, DC])
-        VD = tl.make_tensor_descriptor(VC, [NSLOT, DC], [DC, 1], [BN, DC])
     else:
         KD = KC
         VD = VC
@@ -2240,32 +2180,28 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     li = tl.zeros([RW], tl.float32)
     mx = tl.full([RW], -1.0e30, tl.float32)
     mr = tl.zeros([RW], tl.float32)
-    if HTMA:
-        KD = KDS
-        VD = VDS
-    else:
-        KD = tl.make_tensor_descriptor(KC, [NSLOT, DC], [DC, 1], [BN, DC])
-        VD = tl.make_tensor_descriptor(VC, [NSLOT, DC], [DC, 1], [BN, DC])
+    KD = KDS
+    VD = VDS
     if PEEL:
         # The dense proof makes rcnt equal token_position+1 and rm=0 is valid
         # for every hot tile, so the minimum full-window count is scalar.
         nfull = (t0 - s0 + 1) // BN
-        for kw in tl.range(0, nfull, warp_specialize=True):
+        for kw in tl.range(0, nfull, warp_specialize=HTMA):
             acc, mx, li = _tpd_step(
                 q8, q8l, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
                 mr, mx, li, acc, True, DC, 0, FASTEX2, False, True, True,
-                DEN16, True)
-        for kw in tl.range(nfull, nw, warp_specialize=True):
+                DEN16, HTMA)
+        for kw in tl.range(nfull, nw, warp_specialize=HTMA):
             acc, mx, li = _tpd_step(
                 q8, q8l, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
                 mr, mx, li, acc, True, DC, 0, FASTEX2, False, False, True,
-                DEN16, True)
+                DEN16, HTMA)
     else:
-        for kw in tl.range(0, nw, warp_specialize=True):
+        for kw in tl.range(0, nw, warp_specialize=HTMA):
             acc, mx, li = _tpd_step(
                 q8, q8l, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
                 mr, mx, li, acc, True, DC, 0, FASTEX2, False, False, True,
-                DEN16, True)
+                DEN16, HTMA)
     den_ok = (li <= 1.0e30) & ((rcnt <= 0) | (
         li >= rcnt.to(tl.float32) * 3.0e-4))
     # The denominator-range check alone cannot see E4M3 saturation: with the
@@ -2374,15 +2310,6 @@ def _ws(key, nelem, dtype, device):
 
 
 def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
-    # Pre-size the TMA scratch floor eagerly so the allocation never lands
-    # inside a CUDA-graph capture that was warmed up correctly, then scope
-    # the launch allocator to this call's launches only.
-    _tma_alloc(1 << 18, 128, None)
-    with _launch_allocator():
-        _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out)
-
-
-def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
     T = q.shape[0]
     B = page_base.shape[0]
     nslot = k_cache.shape[0] * 64
@@ -2425,7 +2352,7 @@ def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
             _qsa_w7_tma[(w7_nprog,)](
                 q, gate, k_cache, v_cache, kd, vd,
                 packed, cu_seqlens, page_base, out,
-                T, nslot, BT=w7_bt, RW=128, MK=32, BN=128,
+                T, nslot, BT=w7_bt, RW=128, MK=32, BN=128, HOST_DESC=bool(_HTMA),
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
                 num_warps=8, num_stages=2)
             return
@@ -2477,7 +2404,7 @@ def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
                 q, gate, k_cache, v_cache, kd, vd, packed, cu_seqlens,
                 page_base,
                 out, T, nslot, BT=w6_bt, RW=128, MK=32, BN=wbn, NR=B,
-                HTMA=_HTMA,
+                HTMA=bool(_HTMA),
                 CAPQ=False, FASTEX2=(T < 6000), GATEPTX=(T >= 6000),
                 PEEL=(T < 6000), DEN16=(T == 4057),
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
@@ -2524,7 +2451,7 @@ def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
                           PVB=PV_BIG, EX2B=(EX2_BF16 == 1), TP=(DN_TP == 1),
                           NHC=NH, DC=D, PWC=PW, SC=SCL,
                           num_warps=nwarps, num_stages=DN_STAGES)
-    use_tma = USE_TMA == 1 and TMA_TMIN <= T < 12000 and not mid
+    use_tma = bool(_HTMA) and USE_TMA == 1 and TMA_TMIN <= T < 12000 and not mid
     if use_tma:
         kd, vd = _desc(k_cache, v_cache, bn, nslot)
     else:
@@ -2532,8 +2459,7 @@ def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
     wspec_key = ("qsa", bt, rw, mk, bn)
     wspec = (
         USE_WS == 1
-        and TMA_TMIN <= T < 12000
-        and not mid
+        and use_tma
         and wspec_key not in _NO_WSPEC
     )
     # Constexpr-B is a bounded privilege (see B_SPEC_CAP): SINGLE/PAIRREQ
@@ -2566,7 +2492,7 @@ def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         DEN16=(T == 4057),
         CAPQ=False,  # fixed-scale fast path excluded (see _qsa note)
         FAST_CAUSAL=(mid or (not single and 6000 <= T < 12000)),
-        TMA=((2 if _HTMA else 1) if use_tma else 0),
+        TMA=use_tma,
         WSPEC=wspec,
         GATEPTX=(T >= 6000),
         CSPL=mid, VSPL=vsplit,

@@ -528,20 +528,82 @@ def test_negative_gate_keeps_small_sigmoid_accuracy(lengths):
     assert float(err) <= 1e-3, f"negative-gate output off by {float(err)}"
 
 
-def test_allocator_not_left_installed():
-    """The op must not leave its private TMA scratch allocator installed in
-    process-global Triton state: an unrelated Triton kernel launched after a
-    specialized call must not be handed this op's scratch (the documented
-    single-stream restriction constrains QSA calls only, not other
-    libraries' kernels)."""
-    allocation = pytest.importorskip("triton.runtime._allocation")
-    from flashinfer.triton.kernels import qsa_sparse_attention as qsa_mod
+@pytest.mark.parametrize("readable", [False, True])
+def test_foreign_allocator_during_failed_launch(monkeypatch, readable):
+    """Model the process-global setter, including runtimes without a getter.
 
-    inputs = make_inputs((96,), seed=3)
-    run_api(inputs)
-    holder = allocation._allocator
-    current = holder.get() if hasattr(holder, "reset") else holder
-    assert current is not qsa_mod._tma_alloc
+    An unrelated client reads the allocator *inside* the QSA launch, then
+    installs its successor before QSA unwinds. Neither operation takes a QSA
+    lock. Do not mutate the pytest process's real Triton allocator.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from types import SimpleNamespace
+
+    from flashinfer.triton.kernels import qsa_sparse_attention as mod
+
+    first = lambda size, alignment, stream: "foreign scratch"
+    successor = lambda size, alignment, stream: "new scratch"
+    state = SimpleNamespace(_allocator=first)
+    monkeypatch.setattr(
+        mod.triton,
+        "set_allocator",
+        lambda a: setattr(state, "_allocator", a),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod, "_triton_allocation", state if readable else None, raising=False
+    )
+    monkeypatch.setattr(mod, "_LEGACY_ALLOC_INSTALLED", False, raising=False)
+    entered, updated = Event(), Event()
+
+    class FailLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                entered.set()
+                assert updated.wait(10)
+                raise RuntimeError("injected launch failure")
+
+            return launch
+
+    def foreign_client():
+        assert entered.wait(10)
+        try:
+            observed = state._allocator
+            mod.triton.set_allocator(successor)
+            assert observed is first
+            assert observed(128, 128, None) == "foreign scratch"
+        finally:
+            updated.set()
+
+    monkeypatch.setattr(mod, "_qsa_tiny", FailLaunch())
+    x = make_inputs((2,))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(foreign_client)
+        with pytest.raises(RuntimeError, match="injected launch failure"):
+            mod.run(
+                x["q"],
+                x["output_gate"],
+                x["k_cache"],
+                x["v_cache"],
+                x["logical_indices"],
+                x["cu_seqlens"],
+                x["page_base"],
+                torch.empty_like(x["q"]),
+            )
+        other.result()
+    assert state._allocator is successor
+
+
+@pytest.mark.parametrize("route,lengths", [("w6", (2029, 2028)), ("w7", (8191, 8191))])
+def test_pointer_tiles_without_host_descriptors(monkeypatch, route, lengths):
+    from flashinfer.triton.kernels import qsa_sparse_attention as mod
+
+    monkeypatch.setattr(mod, "_HTMA", 0)
+    x = make_uniform_dense_prefix_inputs(lengths)
+    x["q"].zero_()  # exercise the hot sweep, not the large-logit retry
+    out = run_route(x, route, monkeypatch)
+    assert_close_at_gate(out, torch.full_like(out, 0.5))
 
 
 def test_auto_reaches_specialized_by_default(monkeypatch):
@@ -601,13 +663,14 @@ def test_preallocated_out_and_determinism():
     assert torch.equal(run_api(multi), run_api(multi))
 
 
-def test_warmup_then_graph_capture():
+@pytest.mark.parametrize("lengths", [(768,), (2029, 2028)])
+def test_warmup_then_graph_capture(lengths):
     """The documented capture discipline: one same-shape eager warmup call,
     then capture replays bitwise-identically to eager execution."""
     # The docstring must carry the warmup-before-capture claim.
     doc = " ".join((qsa_sparse_paged_attention.__doc__ or "").lower().split())
     assert "before capturing" in doc
-    inputs = make_inputs((768,), seed=5)
+    inputs = make_inputs(lengths, seed=5)
     out = torch.empty_like(inputs["q"])
     eager = run_api(inputs).clone()  # warmup pre-sizes scratch
     g = torch.cuda.CUDAGraph()
