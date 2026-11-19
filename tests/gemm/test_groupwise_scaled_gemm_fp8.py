@@ -174,8 +174,7 @@ def test_fp8_groupwise_gemm(
 
 @pytest.mark.parametrize("n", [192, 200])
 def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
-    # The SM12x kernel rejects n % 128 != 0; the error must reach the caller
-    # instead of returning with `out` unwritten.
+    # The SM12x CUTLASS requirement rejects unaligned N before launch.
     if not torch.cuda.is_available():
         pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
     if not is_sm12x_supported(torch.device("cuda")):
@@ -186,7 +185,7 @@ def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
     a_scale = torch.ones((k // 128, m), device="cuda")
     b_scale = torch.ones((k // 128, math.ceil(n / 128)), device="cuda")
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="sm120"):
+    with pytest.raises(ValueError, match="N must be a multiple of 128"):
         gemm_fp8_nt_groupwise(
             a,
             b,
@@ -200,29 +199,50 @@ def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
         torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("n", [192, 200])
-def test_fp8_groupwise_gemm_sm12x_cutlass_n_alignment_requirement(n):
-    """SM12x cutlass backend requires N alignment based on scale granularity."""
-    from flashinfer.gemm.gemm_base import _cutlass_gemm_fp8_nt_groupwise_requirement
+@pytest.mark.parametrize("m", [32, 160])
+def test_fp8_blockscale_gemm_sm12x_unsupported_m_raises(m):
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_blockscaled requires CUDA")
+    device = torch.device("cuda")
+    if not is_sm12x_supported(device):
+        pytest.skip("SM12x only")
 
-    m, k = 128, 256
-    a = torch.empty((m, k), dtype=torch.float8_e4m3fn)
-    b = torch.empty((n, k), dtype=torch.float8_e4m3fn)
-    a_scale = torch.empty((k // 128, m), dtype=torch.float32)
-    b_scale = torch.empty((k // 128, (n + 127) // 128), dtype=torch.float32)
+    a = torch.empty((m, 256), dtype=torch.float8_e4m3fn, device=device)
+    b = torch.empty((128, 256), dtype=torch.float8_e4m3fn, device=device)
+    a_scale = torch.ones((math.ceil(m / 128), 2), device=device)
+    b_scale = torch.ones((1, 2), device=device)
+    with pytest.raises(ValueError, match="M must be a multiple of 128"):
+        gemm_fp8_nt_blockscaled(a, b, a_scale, b_scale, scale_major_mode="K")
 
-    # On non-SM12x, the check is skipped
-    if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
-        # Should pass on non-SM12x regardless of N alignment
-        assert _cutlass_gemm_fp8_nt_groupwise_requirement(
-            a, b, a_scale, b_scale, "MN", scale_granularity_mnk=(1, 128, 128)
-        )
+
+@pytest.mark.parametrize(
+    "sm12x,m,n,m_granularity,error",
+    [
+        (True, 32, 128, 1, None),
+        (True, 128, 128, 128, None),
+        (True, 32, 128, 128, "M must be a multiple of 128"),
+        (True, 128, 192, 1, "N must be a multiple of 128"),
+        (True, 128, 192, 128, "N must be a multiple of 128"),
+        (False, 32, 192, 128, None),
+    ],
+)
+def test_fp8_sm12x_cutlass_alignment_requirement(
+    monkeypatch, sm12x, m, n, m_granularity, error
+):
+    from flashinfer.gemm import gemm_base
+
+    monkeypatch.setattr(gemm_base, "is_sm12x_supported", lambda device: sm12x)
+    a = torch.empty((m, 256), dtype=torch.float8_e4m3fn)
+    b = torch.empty((n, 256), dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty((math.ceil(m / m_granularity), 2), dtype=torch.float32)
+    b_scale = torch.empty((math.ceil(n / 128), 2), dtype=torch.float32)
+    args = (a, b, a_scale, b_scale, "K")
+    kwargs = {"scale_granularity_mnk": (m_granularity, 128, 128)}
+    if error is None:
+        assert gemm_base._cutlass_gemm_fp8_nt_groupwise_requirement(*args, **kwargs)
     else:
-        # On SM12x, N must be multiple of 128
-        with pytest.raises(ValueError, match=f"N must be a multiple of 128"):
-            _cutlass_gemm_fp8_nt_groupwise_requirement(
-                a, b, a_scale, b_scale, "MN", scale_granularity_mnk=(1, 128, 128)
-            )
+        with pytest.raises(ValueError, match=error):
+            gemm_base._cutlass_gemm_fp8_nt_groupwise_requirement(*args, **kwargs)
 
 
 @pytest.mark.parametrize(
