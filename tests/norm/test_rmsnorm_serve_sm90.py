@@ -86,6 +86,26 @@ def test_unknown_backend_raises():
         flashinfer.norm.rmsnorm(x, w, backend="fa2")
 
 
+def test_sm90_probe_caches_only_indexed_devices(monkeypatch):
+    from flashinfer.norm.kernels import rmsnorm_serve_sm90 as serve
+
+    probes = []
+    caps = iter([(9, 0), (8, 0), (8, 0), (9, 0)])
+
+    def capability(device):
+        probes.append(device.index)
+        return next(caps)
+
+    monkeypatch.setattr(serve, "_SM90_DEVICE_CACHE", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    for _ in range(2):
+        assert serve._is_sm90(torch.device("cuda:1"))
+        assert not serve._is_sm90(torch.device("cuda:0"))
+    assert not serve._is_sm90(torch.device("cuda"))
+    assert serve._is_sm90(torch.device("cuda"))
+    assert probes == [1, 0, None, None]
+
+
 def test_stats_structure():
     stats = _rmsnorm_serve_sm90_stats()
     assert set(stats["backend_dispatches"]) == {"specialized", "cuda", "cutedsl"}
@@ -155,8 +175,9 @@ def test_incompatible_captured_target_declines_only_cute_variant():
 
         torch.cuda.set_device(int(sys.argv[1]))
         assert norm._dsl_captured_arch() == 'sm_100a'
-        x = torch.randn(4, 512, dtype=torch.bfloat16, device='cuda')
-        w = torch.randn(512, dtype=x.dtype, device=x.device)
+        # Use an auto-admitted shape so this exercises the architecture refusal.
+        x = torch.randn(4, 2048, dtype=torch.bfloat16, device='cuda')
+        w = torch.randn(2048, dtype=x.dtype, device=x.device)
         xf = x.double()
         ref = (xf / (xf.square().mean(-1, keepdim=True) + 1e-6).sqrt() * w).to(x.dtype)
         with patch.object(serve, '_COMPILED') as cache:
@@ -228,8 +249,13 @@ def test_auto_routes_on_allowlist_only():
 @pytest.mark.parametrize(
     "tokens,hidden,backend,specialized",
     [
-        (512, 512, "auto", 1),
-        (513, 512, "auto", 0),
+        (1, 512, "auto", 0),
+        (4, 512, "auto", 0),
+        (512, 512, "auto", 0),
+        (64, 6144, "auto", 1),
+        (65, 6144, "auto", 1),
+        (512, 2048, "auto", 1),
+        (513, 2048, "auto", 0),
         (8192, 512, "auto", 0),
         (2048, 4096, "auto", 0),
         (8192, 512, "specialized", 1),

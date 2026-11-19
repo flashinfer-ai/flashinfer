@@ -1321,7 +1321,7 @@ def rmsnorm(
         over the named backends: it routes to ``"specialized"`` only on its
         dispatch allowlist
         (``flashinfer/rmsnorm_serve_sm90_dispatch.json``) and inside the
-        measured-win token region (T <= 512), and otherwise
+        token cap (T <= 512), excluding H=512 where auto keeps the incumbent, and otherwise
         between ``"cuda"`` and ``"cutedsl"`` by device/runtime support — an
         explicitly selected backend is never silently swapped, and unknown
         names raise. A pre-gate with a cached per-device capability check

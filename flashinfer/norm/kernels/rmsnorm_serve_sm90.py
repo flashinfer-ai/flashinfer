@@ -26,7 +26,7 @@ of :func:`flashinfer.norm.rmsnorm` (#5667 pattern):
   only ``"auto"`` routes around a refusal.
 - ``backend="auto"`` (the default) routes to ``"specialized"`` only on the
   dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``) and
-  inside the measured-win token region (T <= 512; see ``_AUTO_MAX_TOKENS``),
+  for T <= 512 and H != 512 (H=512 stays on the incumbent),
   and otherwise among the named incumbents; auto is purely a router and
   carries no behavior of its own.  A cheap cached pre-gate
   (:func:`rmsnorm_serve_auto_eligible`) lets non-SM90 devices and
@@ -78,13 +78,11 @@ _SERVE_H_ALLOWLIST = (512, 2048, 6144)
 _GENERIC_H_MIN = 512
 _GENERIC_H_MAX = 6144
 _MAX_TOKENS = 8192
-# backend="auto" routes to these kernels only inside the measured-win token
-# region: review timing on H200 showed wins at every measured T <= 512 and
-# losses at the large end (H=512 T=8192 0.82x, H=4096 T=2048 0.94x stock), so
-# auto stops at 512.  Explicit backend="specialized" keeps the full
-# correctness-validated envelope (_MAX_TOKENS): an explicit pin is the
-# caller's deliberate choice, and auto is purely a router.
+# Auto stops at T=512. Even within that cap, public warm-call timings
+# favor the incumbent at H=512 (T=1, 4, 512). Neither restriction applies
+# to an explicit specialist pin.
 _AUTO_MAX_TOKENS = 512
+_AUTO_EXCLUDED_H = (512,)
 
 _ENV_VAR = "FLASHINFER_SM90_SERVE_RMSNORM"
 # Kill switch shared by FlashInfer's specialized kernels (read per call).
@@ -465,6 +463,18 @@ def _autotune_active() -> bool:
 _SM90_DEVICE_CACHE: dict = {}
 
 
+def _is_sm90(device: torch.device) -> bool:
+    index = device.index
+    if index is None:
+        # An unindexed CUDA device follows the current device; don't cache it.
+        return torch.cuda.get_device_capability(device) == (9, 0)
+    is_sm90 = _SM90_DEVICE_CACHE.get(index)
+    if is_sm90 is None:
+        is_sm90 = torch.cuda.get_device_capability(device) == (9, 0)
+        _SM90_DEVICE_CACHE[index] = is_sm90
+    return is_sm90
+
+
 def rmsnorm_serve_auto_eligible(input: torch.Tensor) -> bool:
     """O(1) pre-gate for ``backend="auto"``: the cheap dtype/shape/token
     checks plus a per-device cached "SM90 CUDA device" flag (and the CuTe DSL
@@ -477,18 +487,14 @@ def rmsnorm_serve_auto_eligible(input: torch.Tensor) -> bool:
     if input.dtype is not torch.bfloat16:
         return False
     tokens, hidden = input.shape
-    if tokens <= 0 or tokens > _AUTO_MAX_TOKENS:
+    if tokens <= 0 or tokens > _AUTO_MAX_TOKENS or hidden in _AUTO_EXCLUDED_H:
         return False
     if hidden % 8 != 0 or not _GENERIC_H_MIN <= hidden <= _GENERIC_H_MAX:
         return False
     device = input.device
     if device.type != "cuda":
         return False
-    is_sm90 = _SM90_DEVICE_CACHE.get(device.index)
-    if is_sm90 is None:
-        is_sm90 = torch.cuda.get_device_capability(device) == (9, 0)
-        _SM90_DEVICE_CACHE[device.index] = is_sm90
-    if not is_sm90:
+    if not _is_sm90(device):
         return False
     if not _HAS_CUTE_DSL and _variant() != "cuda":
         # No runnable variant: without the DSL runtime only the env-opted
@@ -542,10 +548,10 @@ def try_rmsnorm_serve_sm90(
         _fallback(f"{requested}: tokens {tokens} outside envelope")
         return False
     if requested == "auto" and tokens > _AUTO_MAX_TOKENS:
-        # auto routes to the specialized kernels only where they measured
-        # faster than the incumbents (T <= _AUTO_MAX_TOKENS); explicit
-        # backend="specialized" keeps the full correctness envelope.
         _fallback(f"auto: tokens {tokens} beyond the measured-win cap")
+        return False
+    if requested == "auto" and hidden in _AUTO_EXCLUDED_H:
+        _fallback(f"auto: H {hidden} reserved for incumbent")
         return False
     if not _h_in_envelope(hidden, backend):
         _fallback(f"{requested}: H {hidden} off the allowlist")
@@ -578,7 +584,7 @@ def try_rmsnorm_serve_sm90(
         # be read after an overwrite. Such calls take the incumbent path.
         _fallback(f"{requested}: weight overlaps out")
         return False
-    if torch.cuda.get_device_capability(input.device) != (9, 0):
+    if not _is_sm90(input.device):
         _fallback(f"{requested}: not SM90")
         return False
     if _autotune_active():
