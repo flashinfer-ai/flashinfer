@@ -33,18 +33,30 @@ import torch.nn.functional as F
 
 
 def _is_sm120_exactly():
+    # Check the device the suite actually runs on (the current device, which
+    # every DEVICE="cuda" tensor resolves to), not ordinal 0.
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability(0) == (12, 0)
+    return torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 0)
 
 
 def _has_min_cuda_toolkit():
+    # Require the actual nvcc the JIT build uses: get_cuda_version() falls
+    # back to torch.version.cuda when nvcc is absent, which would enable
+    # these JIT tests on a host that cannot compile the module.
     try:
+        import os
+        import re
+        import subprocess
+
         from packaging.version import Version
 
-        from flashinfer.jit.cpp_ext import get_cuda_version
+        from flashinfer.jit.cpp_ext import get_cuda_path
 
-        return get_cuda_version() >= Version("13.3")
+        nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
+        txt = subprocess.check_output([nvcc, "--version"], text=True)
+        matches = re.findall(r"release (\d+\.\d+),", txt)
+        return bool(matches) and Version(matches[0]) >= Version("13.3")
     except Exception:
         return False
 
