@@ -408,6 +408,7 @@ class _Device:
         monkeypatch.setattr(cake_locality, "tensor_homing", self.tensor_homing)
         monkeypatch.setattr(cake_locality, "launch_counters", self.launch_counters)
         monkeypatch.setattr(gdn_decode, "_cake_gdn_eager_stream", self.eager_stream)
+        monkeypatch.setattr(gdn_decode, "_cake_gdn_launch_arg", lambda tensor: tensor)
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES", {})
@@ -547,6 +548,7 @@ def test_homed_state_launches_the_twin_in_a_listed_cell(
             record,
             whole,
             twin,
+            device.table.entries,
         )
         device.calls.clear()
     assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)]
@@ -656,10 +658,11 @@ def test_twin_load_failure_at_its_launch_runs_whole(monkeypatch) -> None:
     assert launch[0] == key + ((106, 106), 32 * _ROW_BYTES)
     assert launch[1][0] is None and launch[1][1:] == (64 * 32, 32, device.table)
     # The allocation was bound again, to the row's whole-GPU launch.
-    ((record, whole, domain),) = (
+    ((record, whole, domain, table),) = (
         gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.values()
     )
     assert record is device.homings[id(inputs["state"])] and domain is None
+    assert table is None
     assert whole is gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES[key]
 
 
@@ -957,3 +960,58 @@ def test_localize_homes_by_the_byte_cut(monkeypatch, counts) -> None:
 def test_localize_is_exported_next_to_the_state_pool() -> None:
     assert gdn_decode.localize_gdn_decode_state is locality.localize_gdn_decode_state
     assert callable(gdn_decode.ugpu_state_pool)
+
+
+def test_twin_launch_args_share_the_memory_of_their_tensors() -> None:
+    # The SM table and the eager claim counters reach the twin as tvm-ffi tensors made
+    # once; each views the memory of its torch tensor and keeps it alive.
+    entries = torch.arange(cake_locality.SM_TABLE_LENGTH, dtype=torch.int32)
+    converted = gdn_decode._cake_gdn_launch_arg(entries)
+    assert converted is not entries
+    assert torch.equal(torch.from_dlpack(converted), entries)
+    assert torch.from_dlpack(converted).data_ptr() == entries.data_ptr()
+    marker = object()
+    assert gdn_decode._cake_gdn_launch_arg(marker) is marker
+
+
+@pytest.mark.parametrize(
+    ("handle", "capturing", "expected", "tested"),
+    [
+        (0, True, (0, 0), False),
+        (1, True, (0, 1), False),
+        (2, True, None, True),
+        (7, True, None, True),
+        (7, False, (0, 7), True),
+    ],
+)
+def test_eager_stream_tests_capture_off_the_legacy_default_stream(
+    monkeypatch, handle, capturing, expected, tested
+) -> None:
+    # The legacy default stream cannot capture a CUDA graph: its eager twin launches
+    # skip the capture test.  Any other stream is tested (on the current device by
+    # torch's C bindings, on another device by cake_locality._stream_capturing).
+    asked = []
+
+    def is_capturing():
+        asked.append("current")
+        return capturing
+
+    def stream_capturing(_index):
+        asked.append("other")
+        return capturing
+
+    monkeypatch.setattr(
+        torch._C, "_cuda_getCurrentRawStream", lambda _i: handle, raising=False
+    )
+    monkeypatch.setattr(
+        torch._C, "_cuda_isCurrentStreamCapturing", is_capturing, raising=False
+    )
+    monkeypatch.setattr(cake_locality, "_stream_capturing", stream_capturing)
+    monkeypatch.setattr(torch._C, "_cuda_getDevice", lambda: 0, raising=False)
+    assert gdn_decode._cake_gdn_eager_stream(0) == expected
+    assert asked == (["current"] if tested else [])
+    if tested:
+        asked.clear()
+        monkeypatch.setattr(torch._C, "_cuda_getDevice", lambda: 1, raising=False)
+        assert gdn_decode._cake_gdn_eager_stream(0) == expected
+        assert asked == ["other"]
