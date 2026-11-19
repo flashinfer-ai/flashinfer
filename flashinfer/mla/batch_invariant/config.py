@@ -87,15 +87,24 @@ def default_config(
 ) -> SparseMlaConfig:
     """The dispatcher. It may read anything about the call; it only chooses among members of the space.
 
-    One tile per CTA with the fixup fold while the tiles leave SMs idle (a 2,048-key row is then 16 to 17 parallel
-    units); four tiles per CTA once every SM has ``BUSY_UNITS_PER_SM`` tiles queued (a CTA's start and its query
-    rows are then paid once per four tiles); the in-kernel fold, which keeps one partial row per head instead of
-    one per tile, when the partial rows would pass ``FIXUP_WORKSPACE_FLOATS`` (prefill-sized calls)."""
+    Head rows per CTA: the narrowest block whose units all start at once (one unit per SM at most), else the
+    widest the heads need. One tile per CTA with the fixup fold while the tiles leave SMs idle (a 2,048-key row is
+    then 16 to 17 parallel units per head block); four tiles per CTA once every SM has ``BUSY_UNITS_PER_SM`` tiles
+    queued (a CTA's start and its query rows are then paid once per four tiles); the in-kernel fold, which keeps
+    one partial row per head instead of one per tile, when the partial rows would pass ``FIXUP_WORKSPACE_FLOATS``
+    (prefill-sized calls)."""
     head_block = 16 if heads <= 16 else 32 if heads <= 32 else 64
-    split = 4 if head_block == 16 else 1
     tiles = -(-width // 128)
     if rows * heads * tiles * WS_ROW_FLOATS > FIXUP_WORKSPACE_FLOATS:
-        return SparseMlaConfig(head_block, 8, "inkernel", 0, 128, split)
+        return SparseMlaConfig(
+            head_block, 8, "inkernel", 0, 128, 4 if head_block == 16 else 1
+        )
+    for narrow in (16, 32):
+        if narrow < head_block and rows * -(-heads // narrow) * tiles <= sm_count:
+            head_block = narrow
+            break
     units = rows * -(-heads // head_block) * tiles
     per_unit = 4 if units >= BUSY_UNITS_PER_SM * sm_count else 1
-    return SparseMlaConfig(head_block, 8, "fixup", per_unit, 128, split)
+    return SparseMlaConfig(
+        head_block, 8, "fixup", per_unit, 128, 4 if head_block == 16 else 1
+    )

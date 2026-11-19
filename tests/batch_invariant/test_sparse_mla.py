@@ -153,21 +153,28 @@ def test_configuration_space_and_dispatcher():
             for sm in (148, 216):
                 cfg = default_config(rows, heads, 2048, sm)
                 assert cfg in space
-                assert cfg.head_block == (
-                    16 if heads <= 16 else 32 if heads <= 32 else 64
-                )
+                widest = 16 if heads <= 16 else 32 if heads <= 32 else 64
+                assert cfg.head_block <= widest
+                units = rows * -(-heads // cfg.head_block) * 16
+                assert cfg.head_block == widest or units <= sm
                 assert (cfg.mma_split == 4) == (cfg.head_block == 16)
+    # wide heads on idle SMs run as narrower blocks
+    assert default_config(1, 64, 2048, 148).head_block == 16
+    assert default_config(4, 64, 2048, 148).head_block == 32
+    assert default_config(8, 64, 2048, 148).head_block == 64
     assert not SparseMlaConfig(32, 8, "fixup", 1, 128, 4).well_formed()
     assert not SparseMlaConfig(16, 8, "inkernel", 1, 128, 1).well_formed()
     assert not SparseMlaConfig(16, 8, "fixup", 0, 128, 1).well_formed()
 
 
-def test_exact_mma_step():
+def test_mma_step_model():
     one = [1.0] + [0.0] * 15
     assert reference.mma16_exact(0.0, one, one) == 1.0
-    # one rounding of the exact 17-term sum: 2^24 + 1 + 1 rounds to 2^24 + 2, not 2^24
-    a = [1.0, 1.0] + [0.0] * 14
+    # the sum is cut to 24 bits, not rounded: 2^24 + 3 gives 2^24 + 2
+    a = [1.0, 1.0, 1.0] + [0.0] * 13
     assert reference.mma16_exact(float(2**24), a, a) == float(2**24 + 2)
+    # every term is cut 25 bits below the largest exponent before the sum: sixteen products of 0.75 * 2^-25 vanish
+    assert reference.mma16_exact(1.0, [0.75] * 16, [2.0**-25] * 16) == 1.0
     assert reference.mma16_exact(-1.0, one, one) == 0.0
     assert str(reference.mma16_exact(0.0, [-0.0] + [0.0] * 15, one)) == "0.0"
 
@@ -224,6 +231,56 @@ def test_matches_cpu_model(rope, fmt):
     ):
         got = p.run(config=cfg).float().cpu()[:, :, cols]
         assert torch.equal(got.view(torch.int32), want.view(torch.int32)), cfg
+
+
+@needs_device
+@pytest.mark.parametrize("rope,fmt", MEMBERS, ids=MEMBER_IDS)
+@pytest.mark.parametrize("split", [1, 4])
+def test_partial_rows_match_cpu_model(rope, fmt, split):
+    """Float32 level: every tile's maximum, sum and output accumulators, read from the fixup workspace."""
+    lens = [1, 129, 300] if FULL else [129, 300]
+    p = Pool(rope, fmt, 5 if FULL else 2, lens, 300, slots=600, seed=2)
+    cols = [0, 2, 77, 300, 511]
+    tiles = spec.n_tiles(300)
+    ws = torch.zeros(len(lens) * p.H * tiles * 516, dtype=torch.float32, device="cuda")
+    out = torch.empty(len(lens), p.H, 512, dtype=torch.bfloat16, device="cuda")
+    q = p.q.view(torch.uint8) if fmt == "e4m3" else p.q
+    kv = p.kv.view(torch.uint8) if fmt == "e4m3" else p.kv
+    api._module().mla_batch_invariant_sparse(
+        q,
+        kv,
+        p.idx,
+        p.lens_t,
+        ws,
+        out,
+        spec.scale_log2(SCALE),
+        spec.scale_out(1.0),
+        16,
+        8,
+        1,
+        128,
+        split,
+    )
+    got = ws.view(len(lens), p.H, tiles, 516).cpu()
+    q_rows, lists = [], []
+    for r, n in enumerate(lens):
+        for h in range(p.H):
+            q_rows.append(reference.decode_cache_row(p.raw(p.q[r, h]), fmt))
+            lists.append([p.raw(p.kv[j]) for j in p.idx[r, :n].tolist()])
+    ref = reference.reference_rows(
+        q_rows, lists, SCALE, 1.0, fmt, ex2_device=api.ex2_device, cols=cols
+    )
+    for i, res in enumerate(ref):
+        r, h = divmod(i, p.H)
+        assert len(res.tiles) == spec.n_tiles(lens[r])
+        for t, (m, l, o) in enumerate(res.tiles):
+            want = torch.tensor([m, l] + [o[c] for c in cols], dtype=torch.float32)
+            have = got[r, h, t, [512, 513] + cols]
+            assert torch.equal(have.view(torch.int32), want.view(torch.int32)), (
+                r,
+                h,
+                t,
+            )
 
 
 @needs_device
@@ -372,7 +429,7 @@ def test_head_subset_invariance(heads):
 @needs_device
 @pytest.mark.parametrize("rope,heads", [(64, 64), (0, 128), (64, 49)])
 def test_e4m3_with_wide_head_blocks(rope, heads):
-    # 64 heads per CTA: no staging area, the e4m3 rows are converted from direct loads
+    # wide head blocks: the e4m3 rows are expanded in place by 4 and by 8 warps
     lens = [2052, 1, 2049, 127, 0]
     p = Pool(rope, "e4m3", heads, lens, 2052, seed=7)
     ref = p.run(config=SparseMlaConfig(16, 8, "fixup", 1, 128, 4))

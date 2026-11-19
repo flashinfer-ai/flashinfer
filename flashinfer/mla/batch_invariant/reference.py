@@ -3,8 +3,9 @@
 """Exact CPU evaluation of the sparse MLA class.
 
 ``ExactFP`` is the backend the specification's functions are called with: correctly rounded binary32 arithmetic on
-exact rationals (``fp_interface.exact``), the opaque ``MMA16`` step as one exactly summed, once rounded 17-term
-sum (the hypothesis the device tests check against the kernel), and ``EX2`` from a caller-supplied function
+exact rationals (``fp_interface.exact``), the opaque ``MMA16`` step by the rule of :func:`mma16_exact` (terms cut
+toward zero below the largest exponent, the sum cut to 24 bits: a fitted hypothesis the device tests check against
+the kernel's float32 partial rows), and ``EX2`` from a caller-supplied function
 (``ex2.approx.ftz.f32`` evaluated on the device, or :func:`ex2_stand_in` where no device is present).
 
 ``reference_rows`` evaluates rows with the specification's own ``score_term``, ``tile_stats``, ``pv_fold``, ``merge``
@@ -41,30 +42,38 @@ def decode_cache_row(raw: Sequence, fmt: str) -> List[float]:
 
 
 def mma16_exact(acc: float, a: Sequence[float], b: Sequence[float]) -> float:
-    """One ``MMA16`` K-step: ``RN(acc + sum_i a_i * b_i)`` with the sum formed exactly."""
+    """One ``MMA16`` K-step as the tensor core computes it: with ``E`` the largest of the accumulator's exponent and
+    the operand-exponent sums of the non-zero products, the accumulator and every exact product are cut toward zero to
+    a multiple of ``2**(E - 25)``, added exactly, and the sum is cut toward zero to 24 significant bits."""
     vals = [acc, *a, *b]
     if not all(math.isfinite(v) for v in vals):
         out = acc
         for x, y in zip(a, b, strict=True):
             out += x * y
         return exact.to_f32(out) if math.isfinite(out) else out
-    num, sh = 0, 0
-    for x, y in [(acc, 1.0), *zip(a, b, strict=True)]:
-        nx, dx = x.as_integer_ratio()
-        ny, dy = y.as_integer_ratio()
-        n, s = nx * ny, (dx * dy).bit_length() - 1
-        if s > sh:
-            num <<= s - sh
-            sh = s
-        num += n << (sh - s)
-    if num == 0:
-        # an exact zero sum is +0 under round-to-nearest unless every addend is -0
+    pairs = [(x, y) for x, y in zip(a, b, strict=True) if x != 0.0 and y != 0.0]
+    exps = [math.frexp(x)[1] + math.frexp(y)[1] - 2 for x, y in pairs]
+    if acc != 0.0:
+        exps.append(math.frexp(acc)[1] - 1)
+    if not exps:
+        # nothing but zeros: +0 unless every addend is -0
         neg = all(
             math.copysign(1.0, x) < 0
             for x in [acc] + [p * q for p, q in zip(a, b, strict=True)]
         )
         return -0.0 if neg else 0.0
-    return exact.round_to_format(Fraction(num, 1 << sh), exact.F32)
+    shift = 25 - max(exps)
+
+    def cut(v: Fraction) -> int:
+        return int(v * (Fraction(2) ** shift))
+
+    total = cut(Fraction(acc)) + sum(cut(Fraction(x) * Fraction(y)) for x, y in pairs)
+    if total == 0:
+        return 0.0
+    mag = abs(total)
+    drop = max(0, mag.bit_length() - 24)
+    mag = (mag >> drop) << drop
+    return math.ldexp(float(mag), -shift) * (1.0 if total > 0 else -1.0)
 
 
 def ex2_stand_in(x: float) -> float:

@@ -129,21 +129,48 @@ constexpr int SmemRowBytes() {
   return (D + kRowPad) * 2;
 }
 
-// e4m3 rows are copied raw into a staging area half a tile at a time when it fits next to the tile.
-constexpr int kStageKeys = kTile / 2;
-constexpr bool Staged(bool fp8, int head_block) { return fp8 && head_block <= 32; }
-
 template <int D>
-constexpr size_t SmemBytes(int head_block, bool fp8) {
-  return kSmemHead + static_cast<size_t>(kTile + head_block) * SmemRowBytes<D>() +
-         (Staged(fp8, head_block) ? static_cast<size_t>(kStageKeys) * D : 0);
+constexpr size_t SmemBytes(int head_block) {
+  return kSmemHead + static_cast<size_t>(kTile + head_block) * SmemRowBytes<D>();
+}
+
+// A raw e4m3 row is copied into the upper half of its own slot and expanded in place.
+template <int D>
+constexpr int RawOffset() {
+  return SmemRowBytes<D>() - D;
+}
+
+// A warp expands its rows (warp, warp + nwarps, ...) in ascending byte order: a write never reaches raw bytes that
+// a later instruction of the warp still reads.
+template <int D>
+__device__ __forceinline__ void ExpandRows(unsigned char* slots, int nrows, int warp, int nwarps,
+                                           int lane) {
+  constexpr int SK = SmemRowBytes<D>(), U = D / 16;
+  const int units = nrows / nwarps * U;
+  for (int f0 = lane; f0 < units; f0 += 32 * kCvtBatch) {
+    uint4 w[kCvtBatch];
+    for (int k = 0; k < kCvtBatch; ++k) {
+      const int f = f0 + 32 * k;
+      if (f < units)
+        w[k] = *reinterpret_cast<const uint4*>(slots + (warp + f / U * nwarps) * SK + RawOffset<D>() +
+                                               16 * (f % U));
+    }
+    for (int k = 0; k < kCvtBatch; ++k) {
+      const int f = f0 + 32 * k;
+      if (f >= units) continue;
+      unsigned char* dst = slots + (warp + f / U * nwarps) * SK + 32 * (f % U);
+      const uint64_t lo = w[k].x | (static_cast<uint64_t>(w[k].y) << 32);
+      const uint64_t hi = w[k].z | (static_cast<uint64_t>(w[k].w) << 32);
+      *reinterpret_cast<uint4*>(dst) = E4m3x8ToBf16(lo);
+      *reinterpret_cast<uint4*>(dst + 16) = E4m3x8ToBf16(hi);
+    }
+  }
 }
 
 // One CTA: tiles [t0, t1) of one row for one block of heads (tiles_per_unit 0: all, and it folds).
 template <int D, bool FP8, int PVP, int SPLIT>
 __global__ void UnitKernel(const Params p) {
   constexpr int SK = SmemRowBytes<D>();
-  constexpr int PPK = D / 8;
   constexpr int KSTEPS = D / 16;
   constexpr int NB = PVP / 8;
   constexpr int NBK = 16 / SPLIT;
@@ -154,8 +181,6 @@ __global__ void UnitKernel(const Params p) {
   uint32_t* s_p = reinterpret_cast<uint32_t*>(smem + 2048);
   unsigned char* s_keys = smem + kSmemHead;
   unsigned char* s_q = s_keys + kTile * SK;
-  unsigned char* s_stage = s_q + p.head_block * SK;
-  const bool staged = Staged(FP8, p.head_block);
 
   const int tid = threadIdx.x, nthr = blockDim.x, lane = tid & 31, warp = tid >> 5;
   const int HB = p.head_block, H = p.heads;
@@ -180,33 +205,21 @@ __global__ void UnitKernel(const Params p) {
       s_keys + ((lane & 7) + 8 * ((lane >> 3) & 1)) * SK + 16 * (lane >> 4);
 
   // a thread copies one 16-byte column of every ns-th row: no index arithmetic inside the loops
-  const int ns16 = nthr / (D / 16), pc16 = tid % (D / 16);
-  const int ns8 = nthr / PPK, pc8 = tid % PPK;
-  const unsigned char* qsrc = static_cast<const unsigned char*>(p.q) +
-                              (static_cast<size_t>(r) * H + h0) * (FP8 ? D : 2 * D);
-  if (staged) {
-    if (tid < ns16 * (D / 16)) {
-      for (int hh = tid / (D / 16); hh < HB; hh += ns16)
-        if (h0 + hh < H) CpAsync16(s_stage + hh * D + pc16 * 16, qsrc + hh * D + pc16 * 16);
-    }
-    CpAsyncWait();
-    __syncthreads();
-  }
-  if (tid < ns8 * PPK) {
-    for (int hh = tid / PPK; hh < HB; hh += ns8) {
-      void* dst = s_q + hh * SK + pc8 * 16;
-      if (h0 + hh >= H) {
-        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-      } else if (FP8) {
-        const unsigned char* src = staged ? s_stage + hh * D : qsrc + hh * D;
-        *reinterpret_cast<uint4*>(dst) =
-            E4m3x8ToBf16(*reinterpret_cast<const uint64_t*>(src + pc8 * 8));
+  constexpr int CPR = (FP8 ? D : 2 * D) / 16;
+  constexpr int ROFF = FP8 ? RawOffset<D>() : 0;
+  const int ns = nthr / CPR, pc = tid % CPR;
+  const unsigned char* qsrc =
+      static_cast<const unsigned char*>(p.q) + (static_cast<size_t>(r) * H + h0) * (CPR * 16);
+  if (tid < ns * CPR) {
+    for (int hh = tid / CPR; hh < HB; hh += ns) {
+      void* dst = s_q + hh * SK + ROFF + pc * 16;
+      if (h0 + hh < H) {
+        CpAsync16(dst, qsrc + hh * (CPR * 16) + pc * 16);
       } else {
-        CpAsync16(dst, qsrc + hh * (2 * D) + pc8 * 16);
+        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
       }
     }
   }
-  if (staged) __syncthreads();
 
   float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
   bool any = false;
@@ -223,62 +236,24 @@ __global__ void UnitKernel(const Params p) {
     }
     __syncthreads();
     const unsigned char* cache = static_cast<const unsigned char*>(p.cache);
-    for (int half = 0; half < (staged ? kTile / kStageKeys : 0); ++half) {
-      if (tid < ns16 * (D / 16)) {
-        for (int lk = tid / (D / 16); lk < kStageKeys; lk += ns16) {
-          const int j = s_idx[half * kStageKeys + lk];
-          unsigned char* dst = s_stage + lk * D + pc16 * 16;
-          if (j >= 0) {
-            CpAsync16(dst, cache + static_cast<size_t>(j) * D + pc16 * 16);
-          } else {
-            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-          }
+    if (tid < ns * CPR) {
+      for (int key = tid / CPR; key < kTile; key += ns) {
+        const int j = s_idx[key];
+        void* dst = s_keys + key * SK + ROFF + pc * 16;
+        if (j >= 0) {
+          CpAsync16(dst, cache + static_cast<size_t>(j) * (CPR * 16) + pc * 16);
+        } else {
+          *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
         }
-      }
-      CpAsyncWait();
-      __syncthreads();
-      if (tid < ns8 * PPK) {
-        for (int lk = tid / PPK; lk < kStageKeys; lk += ns8 * kCvtBatch) {
-          uint64_t w[kCvtBatch];
-          for (int k = 0; k < kCvtBatch; ++k)
-            if (lk + k * ns8 < kStageKeys)
-              w[k] = *reinterpret_cast<const uint64_t*>(s_stage + (lk + k * ns8) * D + pc8 * 8);
-          for (int k = 0; k < kCvtBatch; ++k)
-            if (lk + k * ns8 < kStageKeys)
-              *reinterpret_cast<uint4*>(s_keys + (half * kStageKeys + lk + k * ns8) * SK +
-                                        pc8 * 16) = E4m3x8ToBf16(w[k]);
-        }
-      }
-      __syncthreads();
-    }
-    for (int i = tid; i < (!staged && !FP8 ? kTile * PPK : 0); i += nthr) {
-      const int key = i / PPK, pc = i % PPK;
-      const int j = s_idx[key];
-      void* dst = s_keys + key * SK + pc * 16;
-      if (j >= 0) {
-        CpAsync16(dst, cache + static_cast<size_t>(j) * (2 * D) + pc * 16);
-      } else {
-        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-      }
-    }
-    if (!staged && FP8 && tid < ns8 * PPK) {
-      for (int key = tid / PPK; key < kTile; key += ns8 * kCvtBatch) {
-        int jj[kCvtBatch];
-        uint64_t w[kCvtBatch];
-        for (int k = 0; k < kCvtBatch; ++k)
-          jj[k] = key + k * ns8 < kTile ? s_idx[key + k * ns8] : -2;
-        for (int k = 0; k < kCvtBatch; ++k)
-          if (jj[k] >= 0)
-            w[k] = *reinterpret_cast<const uint64_t*>(cache + static_cast<size_t>(jj[k]) * D +
-                                                      pc8 * 8);
-        for (int k = 0; k < kCvtBatch; ++k)
-          if (jj[k] != -2)
-            *reinterpret_cast<uint4*>(s_keys + (key + k * ns8) * SK + pc8 * 16) =
-                jj[k] >= 0 ? E4m3x8ToBf16(w[k]) : make_uint4(0, 0, 0, 0);
       }
     }
     CpAsyncWait();
     __syncthreads();
+    if (FP8) {
+      ExpandRows<D>(s_keys, kTile, warp, nthr >> 5, lane);
+      if (t == t0) ExpandRows<D>(s_q, HB, warp, nthr >> 5, lane);
+      __syncthreads();
+    }
 
     uint32_t mask[4];
     int cnt = 0;
@@ -503,7 +478,7 @@ __global__ void Ex2Kernel(const float* x, float* y, int n) {
 template <int D, bool FP8, int PVP, int SPLIT>
 cudaError_t LaunchUnits(const Params& p, int gather_warps, cudaStream_t stream) {
   auto kernel = UnitKernel<D, FP8, PVP, SPLIT>;
-  const size_t smem = SmemBytes<D>(p.head_block, FP8);
+  const size_t smem = SmemBytes<D>(p.head_block);
   cudaError_t st = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(smem));
   if (st != cudaSuccess) return st;
