@@ -57,7 +57,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(64, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_fc64115f77142914c771(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M)
+kernel_cake_warp_decode_fc64115f77142914c771(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M, int* __restrict__ route_experts, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -82,37 +82,41 @@ kernel_cake_warp_decode_fc64115f77142914c771(__nv_bfloat16* __restrict__ route_o
             #pragma unroll 16
             for (int route = 0; route < main_routes; route++) {
                 int route_index = route_base + route;
+                bool ok = (unsigned)route_experts[route_index] < (unsigned)num_experts;
                 int output_row = route_index;
                 __nv_bfloat16 partial = route_outputs[output_row * route_stride + feature];
                 float weight = (float)route_weights[route_index];
                 float _cvt_f32_0 = __bfloat162float(partial);
                 float _fma_0 = __fmaf_rn(_cvt_f32_0, weight, value);
-                value = _fma_0;
+                value = ok ? _fma_0 : value;
             }
             if (remainder >= 2) {
                 int route_index_0 = route_base + main_routes;
+                bool ok_0 = (unsigned)route_experts[route_index_0] < (unsigned)num_experts;
                 int output_row_0 = route_index_0;
                 __nv_bfloat16 partial_0 = route_outputs[output_row_0 * route_stride + feature];
                 float weight_0 = (float)route_weights[route_index_0];
                 float _cvt_f32_1 = __bfloat162float(partial_0);
                 float _fma_1 = __fmaf_rn(_cvt_f32_1, weight_0, value);
-                value = _fma_1;
+                value = ok_0 ? _fma_1 : value;
                 int route_index_1 = route_index_0 + 1;
+                bool ok_1 = (unsigned)route_experts[route_index_1] < (unsigned)num_experts;
                 int output_row_1 = route_index_1;
                 __nv_bfloat16 partial_1 = route_outputs[output_row_1 * route_stride + feature];
                 float weight_1 = (float)route_weights[route_index_1];
                 float _cvt_f32_2 = __bfloat162float(partial_1);
                 float _fma_2 = __fmaf_rn(_cvt_f32_2, weight_1, value);
-                value = _fma_2;
+                value = ok_1 ? _fma_2 : value;
             }
             if ((remainder & 1) != 0) {
                 int route_index_2 = route_base + 16 - 1;
+                bool ok_2 = (unsigned)route_experts[route_index_2] < (unsigned)num_experts;
                 int output_row_2 = route_index_2;
                 __nv_bfloat16 partial_2 = route_outputs[output_row_2 * route_stride + feature];
                 float weight_2 = (float)route_weights[route_index_2];
                 float _cvt_f32_3 = __bfloat162float(partial_2);
                 float _fma_3 = __fmaf_rn(_cvt_f32_3, weight_2, value);
-                value = _fma_3;
+                value = ok_2 ? _fma_3 : value;
             }
         }
         *(reinterpret_cast<__nv_bfloat16*>(output + (token * M + feature)) + (0)) = __float2bfloat16_rn(value);

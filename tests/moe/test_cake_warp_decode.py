@@ -175,7 +175,6 @@ def _runner(
     runner._prepared_workspaces = {}
     runner._workspace_receipt_finalizers = {}
     runner._workspace_stream_claims = {}
-    runner._topk_validation_receipts = OrderedDict()
     return runner, module
 
 
@@ -186,6 +185,7 @@ def _activation_pack(
     mode: RoutingInputMode = RoutingInputMode.UnpackedPrecomputed,
     weights_dtype: torch.dtype = torch.bfloat16,
     topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
     hidden_size: int = 2048,
 ) -> MoEActivationPack:
     return MoEActivationPack(
@@ -194,7 +194,9 @@ def _activation_pack(
         topk_ids
         if topk_ids is not None
         else _TensorSpec((num_tokens, top_k), torch.int32),
-        _TensorSpec((num_tokens, top_k), weights_dtype),
+        topk_weights
+        if topk_weights is not None
+        else _TensorSpec((num_tokens, top_k), weights_dtype),
         routing_input_mode=mode,
     )
 
@@ -241,7 +243,7 @@ def _weight_pack(
     return weights, view
 
 
-def test_config_is_explicit_exact_sm100_sm103_and_not_default():
+def test_config_is_exact_sm100_sm103_and_last_default_entry():
     config = CakeWarpDecodeConfig(backend="cake")
     assert repr(config) == "CakeWarpDecodeConfig(backend='cake')"
     assert config.supported(100)
@@ -249,7 +251,15 @@ def test_config_is_explicit_exact_sm100_sm103_and_not_default():
     assert not config.supported(101)
     assert not config.supported(107)
     assert _BACKEND_RUNNERS[CakeWarpDecodeConfig] is CakeWarpDecodeRunner
-    assert not any(isinstance(item, CakeWarpDecodeConfig) for item in _DEFAULT_BACKEND)
+    # The default list holds only the default-candidate entry, and holds it
+    # last; an explicit config is never part of it.
+    assert [
+        item for item in _DEFAULT_BACKEND if isinstance(item, CakeWarpDecodeConfig)
+    ] == [CakeWarpDecodeConfig(default_candidate=True)]
+    assert _DEFAULT_BACKEND.candidates[-1] == CakeWarpDecodeConfig(
+        default_candidate=True
+    )
+    assert config not in tuple(_DEFAULT_BACKEND)
     with pytest.raises(ValueError, match="must be 'cake'"):
         CakeWarpDecodeConfig(backend="auto")
 
@@ -759,71 +769,67 @@ def test_stream_workspace_cache_fails_closed_at_limit_and_retains_streams():
     assert (65, geometry) not in runner._workspace_cache
 
 
-def test_topk_validation_receipt_reuses_one_tensor_version_during_capture(
-    monkeypatch,
-):
+# Ids outside [0, num_experts) drop their routing slot inside the kernels, so
+# the host path accepts every int32 value and never reads topk_ids.
+_DROPPED_EXPERT_IDS = (-1, 60, 67, 2**31 - 1, -(2**31))
+
+
+def _forbid_host_reads(monkeypatch) -> None:
+    def _host_read(*args, **kwargs):
+        raise AssertionError("Cake warp decode read a tensor on the host")
+
+    for name in ("item", "tolist", "__bool__", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, _host_read)
+
+
+def test_runner_keeps_no_routing_validation_state():
+    runner, _ = _runner()
+    for name in (
+        "_MAX_TOPK_VALIDATION_RECEIPTS",
+        "_topk_validation_receipts",
+        "_validate_expert_id_range",
+        "_topk_version",
+    ):
+        assert not hasattr(runner, name), name
+
+
+@pytest.mark.parametrize("dropped_id", _DROPPED_EXPERT_IDS)
+def test_pack_passes_dropped_expert_ids_without_host_reads(monkeypatch, dropped_id):
     runner, _ = _runner()
     topk_ids = torch.zeros((7, 4), dtype=torch.int32)
-    act = _activation_pack(topk_ids=topk_ids)
+    topk_ids[0, 1] = dropped_id
+    topk_ids[3] = dropped_id  # a token without a valid slot
+    _forbid_host_reads(monkeypatch)
+
+    inputs = runner.pack_inputs(_activation_pack(topk_ids=topk_ids), _weight_pack()[0])
+
+    assert inputs[4] is topk_ids
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_capture_accepts_new_and_mutated_topk_ids(monkeypatch, inference):
+    runner, module = _runner()
     weights, _ = _weight_pack()
-
-    runner.pack_inputs(act, weights)
+    warm = runner.pack_inputs(_activation_pack(), weights)
+    if inference:
+        with torch.inference_mode():
+            topk_ids = torch.full((7, 4), -1, dtype=torch.int32)
+    else:
+        topk_ids = torch.full((7, 4), -1, dtype=torch.int32)
     monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
-    runner.pack_inputs(act, weights)
+    _forbid_host_reads(monkeypatch)
 
-    topk_ids[0, 0] = 1
-    with pytest.raises(RuntimeError, match="exact tensor version"):
-        runner.pack_inputs(act, weights)
+    captured = runner.pack_inputs(_activation_pack(topk_ids=topk_ids), weights)
+    if inference:
+        with torch.inference_mode():
+            topk_ids[0, 0] = 2**31 - 1
+    else:
+        topk_ids[0, 0] = 2**31 - 1
+    replayed = runner.pack_inputs(_activation_pack(topk_ids=topk_ids), weights)
 
-
-def test_capture_rejects_unvalidated_topk_ids(monkeypatch):
-    runner, _ = _runner()
-    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
-
-    with pytest.raises(RuntimeError, match="exact tensor version"):
-        runner.pack_inputs(
-            _activation_pack(topk_ids=torch.zeros((7, 4), dtype=torch.int32)),
-            _weight_pack()[0],
-        )
-
-
-def test_inference_tensor_receipt_is_reusable_during_capture(monkeypatch):
-    runner, _ = _runner()
-    with torch.inference_mode():
-        topk_ids = torch.zeros((7, 4), dtype=torch.int32)
-    act = _activation_pack(topk_ids=topk_ids)
-    weights, _ = _weight_pack()
-
-    runner.pack_inputs(act, weights)
-    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
-    runner.pack_inputs(act, weights)
-
-
-def test_topk_validation_receipt_limit_fails_without_eviction(monkeypatch):
-    runner, _ = _runner()
-    monkeypatch.setattr(runner, "_MAX_TOPK_VALIDATION_RECEIPTS", 2)
-    first = torch.zeros((7, 4), dtype=torch.int32)
-    second = torch.ones((7, 4), dtype=torch.int32)
-    third = torch.full((7, 4), 2, dtype=torch.int32)
-
-    runner._validate_expert_id_range(first, 60)
-    runner._validate_expert_id_range(second, 60)
-    with pytest.raises(RuntimeError, match="at most 64"):
-        runner._validate_expert_id_range(third, 60)
-
-    assert list(runner._topk_validation_receipts) == [id(first), id(second)]
-
-
-@pytest.mark.parametrize("invalid_id", [-1, 60])
-def test_pack_rejects_out_of_range_expert_ids(invalid_id):
-    runner, _ = _runner()
-    topk_ids = torch.zeros((7, 4), dtype=torch.int32)
-    topk_ids[0, 0] = invalid_id
-    with pytest.raises(ValueError, match="0 <= id < 60"):
-        runner.pack_inputs(
-            _activation_pack(topk_ids=topk_ids),
-            _weight_pack()[0],
-        )
+    assert captured[4] is topk_ids and replayed[4] is topk_ids
+    assert captured[1] is warm[1] and replayed[1] is warm[1]
+    assert len(module.prepare_calls) == 1
 
 
 def test_forward_selects_workspace_for_its_current_stream(monkeypatch):
