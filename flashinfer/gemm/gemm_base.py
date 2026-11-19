@@ -25,7 +25,17 @@ import weakref
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Callable, cast, List, Literal, NamedTuple, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    cast,
+    FrozenSet,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 from packaging.version import Version
 import torch
@@ -3541,20 +3551,71 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
-    """Helper function to create cutlass FP4 GEMM module."""
+def _create_cutlass_fp4_gemm_module(
+    module: Any,
+    op_name: str,
+    tuner_name: str,
+    is_stream_k_tactic: Optional[Callable[[int], bool]] = None,
+):
+    """Helper function to create cutlass FP4 GEMM module.
+
+    Args:
+        is_stream_k_tactic: Tells whether a tactic index is a stream-K config. When
+            given, FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 leaves those tactics out
+            of tuning and rejects them when read back from an autotune cache.
+    """
+
+    def _stream_k_disabled() -> bool:
+        # A stream-K tactic sums a tile's K range in more than one CTA, so its result
+        # can differ in the last bits from the data-parallel tactics. When the
+        # autotuner picks by timing, the output then depends on which tactic won;
+        # this option limits the choice to data-parallel tactics.
+        return (
+            is_stream_k_tactic is not None
+            and os.environ.get("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0") == "1"
+        )
 
     def cutlass_fp4_gemm_runner():
         class CutlassFp4GemmRunner(TunableRunner):
             def __init__(self):
                 self._fp4_gemm_runner = module.fp4_gemm
+                # validate_tactic runs on every cache hit; count the configs once.
+                self._tactic_num = module.fp4_gemm_tactic_num()
+                # The name ends in _cache, so TunableRunner.__hash__ skips it. The hash
+                # keys the in-process autotune cache and stays the same when the set
+                # is filled later.
+                self._stream_k_tactics_cache: Optional[FrozenSet[int]] = None
+
+            def _stream_k(self) -> FrozenSet[int]:
+                # Builds the set of stream-K tactics on the first call and caches it.
+                # Without is_stream_k_tactic it returns an empty set and caches nothing.
+                if is_stream_k_tactic is None:
+                    return frozenset()
+                if self._stream_k_tactics_cache is None:
+                    self._stream_k_tactics_cache = frozenset(
+                        t for t in range(self._tactic_num) if is_stream_k_tactic(t)
+                    )
+                return self._stream_k_tactics_cache
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                return list(range(module.fp4_gemm_tactic_num()))
+                tactics = list(range(self._tactic_num))
+                if _stream_k_disabled():
+                    stream_k = self._stream_k()
+                    tactics = [t for t in tactics if t not in stream_k]
+                return tactics
+
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+                # Checks a tactic read back from a saved autotune cache: it must be
+                # one of this module's configs, and not stream-K when that is off.
+                if tactic == -1:
+                    return True
+                if not 0 <= tactic < self._tactic_num:
+                    return False
+                return not (_stream_k_disabled() and tactic in self._stream_k())
 
             def forward(
                 self,
@@ -3615,8 +3676,26 @@ def get_gemm_sm103_module_cutlass_fp4():
 def get_gemm_sm120_module_cutlass_fp4():
     """Get the SM120/121 FP4 GEMM module."""
     module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    is_stream_k_tactic = getattr(module, "fp4_gemm_tactic_is_stream_k", None)
+    if is_stream_k_tactic is None:
+        # A module built by an older FlashInfer lacks fp4_gemm_tactic_is_stream_k but
+        # still runs every tactic. The runner calls _missing_stream_k_export only when
+        # FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1, and that call raises a RuntimeError.
+        def _missing_stream_k_export(tactic: int) -> bool:
+            raise RuntimeError(
+                "FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 needs "
+                "fp4_gemm_tactic_is_stream_k, which this SM120 FP4 GEMM module "
+                "does not export; it was built from an older FlashInfer. Rebuild "
+                "the module or unset the variable."
+            )
+
+        is_stream_k_tactic = _missing_stream_k_export
+
     return _create_cutlass_fp4_gemm_module(
-        module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
+        module,
+        "flashinfer::cutlass_fp4_gemm_sm120",
+        "cutlass_fp4_gemm_sm120",
+        is_stream_k_tactic=is_stream_k_tactic,
     )
 
 
