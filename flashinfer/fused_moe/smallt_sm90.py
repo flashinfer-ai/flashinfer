@@ -54,9 +54,11 @@ kept for one release.
 The dispatch never allocates on the hot path except the output tensor when
 the caller did not pass one: the intermediate workspace is cached per
 (device, stream) at the serving band's capacity. A CUDA-graph capture
-adopts a primed buffer and takes PER-CAPTURE ownership of it (keyed by the
-CUDA capture-sequence id, so two independent graphs never share scratch;
-``FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE=1`` opts back into
+adopts a primed buffer and takes ownership of it per (capture, stream):
+the CUDA capture-sequence id keeps two independent graphs from sharing
+scratch, and the capture-time stream handle keeps fork/join branches
+inside one capture (which replay concurrently) from sharing it
+(``FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE=1`` opts back into
 per-capture-stream sharing for callers that serialize their replays), and
 the JIT build happens at layer init or on the first eligible call outside
 any CUDA-graph capture (a capture without a built module is declined).
@@ -131,20 +133,28 @@ _module_error: Optional[str] = None
 # scratch shared with eager calls could be written by two executions
 # concurrently.
 #
-# _graph_workspaces is keyed by (device index, CUDA capture-sequence id):
-# every independent capture owns its own scratch. The capture stream is NOT
-# an ownership key — torch.cuda.graph reuses one default capture stream for
-# every capture in the process, so two independent graphs (e.g. two
-# MoELayer instances captured back to back) would silently share scratch
-# and corrupt each other when replayed concurrently, even with separate
-# output allocations and no shared graph pool. Launches inside one graph
-# serialize at replay, so reuse within a single capture stays safe (and
-# keeps an N-layer model capture at one buffer). Callers that guarantee
-# their graphs never replay concurrently can opt back into per-capture-
-# stream sharing with _SHARE_GRAPH_WS_ENV=1 to reclaim the per-graph
-# buffers.
+# _graph_workspaces is keyed by (device index, CUDA capture-sequence id,
+# capture-time stream handle): ownership needs BOTH identities.
+#
+# * The capture-sequence id isolates independent graphs: torch.cuda.graph
+#   reuses one default capture stream for every capture in the process, so
+#   a stream-only key would hand two independent graphs (e.g. two MoELayer
+#   instances captured back to back) the same scratch, corrupted under
+#   concurrent replay even with separate output allocations and no shared
+#   graph pool.
+# * The stream handle isolates parallel branches INSIDE one capture: a
+#   CUDA graph may contain fork/join branches (work recorded on different
+#   streams joined into the same capture), and those branches run
+#   concurrently at replay — only work recorded on the SAME stream within
+#   a capture is ordered. Sequential calls on one stream of one capture
+#   therefore share one buffer (an N-layer single-stream model capture
+#   still uses a single buffer), while each forked stream adopts its own.
+#
+# Callers that guarantee their graphs never replay concurrently can opt
+# into per-capture-stream sharing (the pre-fix cross-graph behavior) with
+# _SHARE_GRAPH_WS_ENV=1 to reclaim the per-graph buffers.
 _workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
-_graph_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
+_graph_workspaces: Dict[Tuple[int, ...], torch.Tensor] = {}
 
 
 def _current_capture_id(device: torch.device) -> Optional[int]:
@@ -465,15 +475,16 @@ def _moe_smallt_sm90_dispatch(
     need = int(module.plan_workspace_bytes(band_cap, KTOP, I, H_sz, E_sz))
     ws_key = (dev_index, torch.cuda.current_stream(input.device).cuda_stream)
     if capturing:
-        # Scratch ownership boundary: the CAPTURE, not the capture stream.
-        # torch.cuda.graph reuses one default capture stream, so a stream
-        # key would hand two independent graphs the same scratch — correct
-        # in isolation, corrupted under concurrent replay. The capture-
-        # sequence id is unique per capture; _SHARE_GRAPH_WS_ENV=1 restores
-        # per-capture-stream sharing for callers that explicitly agree to
-        # serialize their replays.
+        # Scratch ownership boundary: (capture, capture-time stream). The
+        # capture-sequence id isolates independent graphs (torch.cuda.graph
+        # reuses one default capture stream, so a stream-only key aliases
+        # them); the stream handle isolates fork/join branches recorded on
+        # different streams INSIDE one capture, which run concurrently at
+        # replay — only same-stream work within a capture is ordered.
+        # _SHARE_GRAPH_WS_ENV=1 restores per-capture-stream sharing for
+        # callers that explicitly agree to serialize their replays.
         if os.environ.get(_SHARE_GRAPH_WS_ENV, "") not in ("", "0"):
-            graph_key = ws_key
+            graph_key: Tuple[int, ...] = ws_key
         else:
             capture_id = _current_capture_id(input.device)
             if capture_id is None:
@@ -481,7 +492,7 @@ def _moe_smallt_sm90_dispatch(
                 _fallback("capture id query failed under capture")
                 _backend_dispatches["declined"] += 1
                 return None
-            graph_key = (dev_index, capture_id)
+            graph_key = (dev_index, capture_id, ws_key[1])
         ws = _graph_workspaces.get(graph_key)
         if ws is not None and (ws.numel() < need or ws.device != input.device):
             ws = None
