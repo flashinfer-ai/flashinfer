@@ -2483,6 +2483,7 @@ _TOP_P_SPECIALIZED_SHAPES = [
     (24, 154880),
     (30, 154880),
     (36, 154880),
+    (54, 154880),
     (4, 248320),
     (7, 248320),
     (12, 248320),
@@ -3236,8 +3237,7 @@ def test_top_p_renorm_probs_specialized_kill_switch_takes_the_stock_path(monkeyp
     )
 
 
-# Unlisted shapes keep the stock path.
-@pytest.mark.parametrize("batch_size,vocab_size", [(8, 248320), (54, 154880)])
+@pytest.mark.parametrize("batch_size,vocab_size", [(8, 248320), (40, 154880)])
 def test_top_p_renorm_probs_specialized_unlisted_shape_takes_the_stock_path(
     batch_size, vocab_size, top_p_specialized_enabled
 ):
