@@ -92,7 +92,7 @@ from .fmha_decode_constants import (
 )
 
 LENGTH_DERIVED_FIELDS = (
-    "max_seq_len_q",
+    "max_seq_len_q",  # will be skipped if fixed_seqlen_q
     "total_kv_tiles",
     "static_seq_len_kv",
     "max_num_pages_per_seq_kv",
@@ -779,6 +779,12 @@ class FmhaDecodeConfig:
     # logical lengths are runtime launch operands and stay out of the compiled
     # program and its cache identity (see ``compile_signature``).
     fixed_seqlen: bool = False
+    # The Q-only half of ``fixed_seqlen``: every request's Q length equals
+    # ``max_seq_len_q`` while K/V lengths stay runtime (one compiled kernel per
+    # query length). The Q geometry then decides at compile time whether Q
+    # tiles are full, so complete grouped tiles drop the per-tile inactive-row
+    # score mask. ``max_seq_len_q`` stays in the compile signature.
+    fixed_seqlen_q: bool = False
     # Whether a grouped sparse route carries a packed-membership table. Runtime Q
     # lengths cannot imply it, and a single-token route keeps the lean layout, so
     # the launch policy records it before the lengths leave the identity.
@@ -794,12 +800,6 @@ class FmhaDecodeConfig:
     use_variable_seqlens_q: bool = False
     # Derived from the affine metadata view; lengths themselves stay runtime.
     uniform_query_offsets: bool = False
-    # The Q-only half of ``fixed_seqlen``: every request's Q length equals
-    # ``max_seq_len_q`` while K/V lengths stay runtime (one compiled kernel per
-    # query length). The Q geometry then decides at compile time whether Q
-    # tiles are full, so complete grouped tiles drop the per-tile inactive-row
-    # score mask. ``max_seq_len_q`` stays in the compile signature.
-    fixed_seqlen_q: bool = False
     # Select the private sparse-block route. This explicit discriminator keeps
     # ordinary storage-subpage callers on the generic paged-KV path. Grouped
     # sparse routes consume query membership from a separate packed-word table;

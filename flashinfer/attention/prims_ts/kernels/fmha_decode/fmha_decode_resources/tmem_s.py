@@ -2118,19 +2118,13 @@ class TmemSResource(DecodeGenResourceBase):
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         local_row_idx = (lane_idx >> Int32(2)) & Int32(0x3)
-        # A dense tile inside every row's visible interval needs no score
-        # mask. It takes a separate copy of the S load only (the inactive-row
-        # mask and lane reduction stay shared below, keeping the loop body
-        # small for the instruction cache): as predicated code, the masks
-        # would issue on every interior tile even when they keep every score.
-        # The copy only pays where the masked path
-        # is expensive (per-row causal or inactive-row masks, or 32-row
-        # tiles); a full one-token Q8/Q16 tile's single tail mask is cheaper
-        # than the extra branch and code, and sliding-window CTAs see mostly
-        # boundary tiles. A persistent 32-row tile that still masks inactive
-        # rows keeps that mask on the copy too, so the copy saves little while
-        # its code spills the persistent kernel's instruction cache.
-        uses_clean_tile_path = (
+        # Skip masking for the tiles inside each row's visible interval when
+        # the masking is expensive: per-row causal or inactive-row masks, or
+        # 32-row tiles.
+        # Persistent 32-row tile is excluded since masking inactive rows keeps that
+        # mask on the copy too, so the copy saves little while its code spills
+        # the persistent kernel's instruction cache.
+        use_kv_unmasked_tile_path = (
             not use_sparse
             and not use_runtime_paged_dense_load
             and not cfg.uses_q_token_kv_block_sparse_page_membership
@@ -2146,10 +2140,10 @@ class TmemSResource(DecodeGenResourceBase):
                 and cfg.q_score_rows_need_mask
             )
         )
-        tile_is_clean = cutlass.Boolean(False)
+        kv_tile_is_unmasked = cutlass.Boolean(False)
         proxy_max_shift = Float32(0.0)
-        if cutlass.const_expr(uses_clean_tile_path):
-            tile_is_clean = _kv_tile_is_fully_unmasked_for_q_group(
+        if cutlass.const_expr(use_kv_unmasked_tile_path):
+            kv_tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
                 cfg,
                 tile_offset_k,
                 seq_len_kv,
@@ -2159,8 +2153,8 @@ class TmemSResource(DecodeGenResourceBase):
                 and (tile_offset_k < seq_len_kv)
                 and not is_masked_final_wave,
             )
-        if tile_is_clean:
-            if cutlass.const_expr(uses_clean_tile_path):
+        if kv_tile_is_unmasked:
+            if cutlass.const_expr(use_kv_unmasked_tile_path):
                 self._load_swaps_scores(stage_info, s_vals, q_repeats)
         else:
             if cutlass.const_expr(not use_runtime_paged_dense_load):
