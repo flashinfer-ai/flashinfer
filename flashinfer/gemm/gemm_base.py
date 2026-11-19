@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from collections import Counter, OrderedDict
+from contextvars import ContextVar
 import logging
 import os
 import struct
@@ -11201,6 +11202,41 @@ def _specialized_gemm_fp8_nt_groupwise_requirement(*args, **kwargs):
     return check_specialized_requirement(*args, **kwargs)
 
 
+# Carry the heuristic's first eligible backend to the body of this auto call.
+# The decorator's suitable_auto_backends attribute is shared across callers.
+_groupwise_auto_choice = ContextVar("_groupwise_auto_choice", default=None)
+
+
+def _select_groupwise_auto_backend(*args, **kwargs):
+    choices = _heuristic_func_gemm_fp8_nt_groupwise(*args, **kwargs)
+    if choices:
+        _groupwise_auto_choice.set(choices[0])
+    return choices
+
+
+def _scope_groupwise_auto_choice(fn):
+    @functools.wraps(fn)
+    def scoped(*args, **kwargs):
+        # backend is the tenth positional parameter; its default is cutlass.
+        backend = args[9] if len(args) > 9 else kwargs.get("backend")
+        if backend != "auto":
+            return fn(*args, **kwargs)
+        token = _groupwise_auto_choice.set(None)
+        try:
+            # Even skip_check needs selection for auto. Use the bound-argument
+            # path so positional auto is selected too, and an empty list raises
+            # the decorator's normal error rather than reusing an old choice.
+            kwargs.pop("skip_check", None)
+            return fn(*args, **kwargs)
+        finally:
+            _groupwise_auto_choice.reset(token)
+
+    # Keep the decorator's live introspection attributes on the public API.
+    scoped.__dict__ = fn.__dict__
+    return scoped
+
+
+@_scope_groupwise_auto_choice
 @backend_requirement(
     {
         "specialized": _specialized_gemm_fp8_nt_groupwise_requirement,
@@ -11210,7 +11246,7 @@ def _specialized_gemm_fp8_nt_groupwise_requirement(*args, **kwargs):
         "cute-dsl": _cute_dsl_gemm_fp8_nt_groupwise_requirement,
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
-    heuristic_func=_heuristic_func_gemm_fp8_nt_groupwise,
+    heuristic_func=_select_groupwise_auto_backend,
 )
 @flashinfer_api(trace=gemm_fp8_nt_groupwise_trace)
 def gemm_fp8_nt_groupwise(
@@ -11349,11 +11385,8 @@ def gemm_fp8_nt_groupwise(
             backend,
         )
 
-    workspace_buffer = _get_stream_cache_buf(
-        "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
-    )
-
-    if out is None:
+    allocating_out = out is None
+    if allocating_out:
         out_dtype = out_dtype or torch.bfloat16
     else:
         out_dtype = out.dtype
@@ -11372,8 +11405,11 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if backend == "auto":
-        backend = gemm_fp8_nt_groupwise.suitable_auto_backends[0]
+    auto_requested = backend == "auto"
+    if auto_requested:
+        backend = _groupwise_auto_choice.get()
+        if backend is None:
+            raise RuntimeError("Missing groupwise auto backend selection")
 
     # "specialized": agent-generated shape-specialized SM120 kernels (see
     # specialized_fp8_blockwise_sm120.py). Reached either explicitly or via
@@ -11388,7 +11424,11 @@ def gemm_fp8_nt_groupwise(
             run_specialized_gemm_fp8_blockwise as _spec_run,
         )
 
-        if _spec_ok(
+        # Auto checked all supplied tensors (and probed module availability).
+        # A fresh contiguous out has the admitted shape, device and dtype and
+        # cannot alias a live input. Its address was not known at admission.
+        admitted = auto_requested and (not allocating_out or out.data_ptr() % 4 == 0)
+        if admitted or _spec_ok(
             a,
             b,
             a_scale,
@@ -11409,6 +11449,11 @@ def gemm_fp8_nt_groupwise(
                 scale_granularity_mnk,
             )
         return out
+
+    if backend in ("cutlass", "trtllm"):
+        workspace_buffer = _get_stream_cache_buf(
+            "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        )
 
     if backend == "cutlass":
         if is_sm12x_supported(a.device):

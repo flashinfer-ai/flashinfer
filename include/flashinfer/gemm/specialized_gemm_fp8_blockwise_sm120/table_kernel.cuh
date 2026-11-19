@@ -179,11 +179,23 @@ __global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
             MMA16832(d, a0, a1, a2, a3, bf[u][i].v[2 * j], bf[u][i].v[2 * j + 1]);
           }
           const int b = (t * NT + i) * ACT;
-          acc[b + 0] += sc[u][t * HH] * d[0];
-          acc[b + 1] += sc[u][t * HH] * d[1];
-          if (HH == 2) {
-            acc[b + 2] += sc[u][t * HH + 1] * d[2];
-            acc[b + 3] += sc[u][t * HH + 1] * d[3];
+#pragma unroll
+          for (int h = 0; h < HH; ++h) {
+            const int q = t * HH + h;
+            const int j = 2 * h;
+            const float s = sc[u][q];
+            if ((__float_as_uint(s) & 0x7fffffffU) == 0x7f800000U) {
+              // A finite scale product can overflow before multiplying a small
+              // (even zero) dot. Both scale pointers are already one step ahead.
+              const int off = u - NW_K * KU;
+              const double wide = static_cast<double>(ld_keepf(asp[q] + off)) *
+                                  static_cast<double>(ld_keepf(bsp + off));
+              acc[b + j] = static_cast<float>(wide * d[j] + acc[b + j]);
+              acc[b + j + 1] = static_cast<float>(wide * d[j + 1] + acc[b + j + 1]);
+            } else {
+              acc[b + j] += s * d[j];
+              acc[b + j + 1] += s * d[j + 1];
+            }
           }
         }
       }

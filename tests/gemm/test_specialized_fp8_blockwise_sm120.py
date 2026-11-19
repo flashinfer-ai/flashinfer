@@ -183,6 +183,63 @@ def test_auto_routes_to_specialized_on_allowlist(stock_sentinel, m, n, k, seed):
     assert _rel(out, ref) < REL_TOL
 
 
+@pytest.mark.parametrize("provide_out", (False, True))
+def test_auto_checks_each_call_once(monkeypatch, stock_sentinel, provide_out):
+    import flashinfer.gemm.gemm_base as gemm_base
+    from flashinfer.gemm import specialized_fp8_blockwise_sm120 as specmod
+
+    calls = 0
+    guard = specmod.is_specialized_supported
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return guard(*args, **kwargs)
+
+    def no_workspace(*args, **kwargs):
+        pytest.fail("specialized dispatch requested a stock workspace")
+
+    monkeypatch.setattr(specmod, "is_specialized_supported", counted)
+    args = _gen_inputs(4, 1024, 2048, seed=51)
+    out = _nan_out(4, 1024) if provide_out else None
+    before = specmod.dispatch_stats["specialized"]
+    with monkeypatch.context() as mp:
+        mp.setattr(gemm_base, "_get_stream_cache_buf", no_workspace)
+        for expected in (1, 2):
+            result = _call(*args, backend="auto", out=out)
+            assert calls == expected
+            assert specmod.dispatch_stats["specialized"] == before + expected
+    assert _rel(result, _reference(*args)) < REL_TOL
+
+    # Same tensors as the successful calls; environmental admission is live.
+    monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
+    with pytest.raises(stock_sentinel):
+        _call(*args, backend="auto", out=out)
+    assert calls == 3
+    assert specmod.dispatch_stats["specialized"] == before + 2
+
+
+@pytest.mark.parametrize("m", (8, 17))
+def test_table_finite_scale_product_overflow(stock_sentinel, m):
+    from flashinfer.gemm import specialized_fp8_blockwise_sm120 as specmod
+
+    n, k = 2048, 512
+    a = torch.zeros(m, k)
+    b = torch.zeros(n, k)
+    a[:, :4] = 2.0**-4
+    b[::2, :4] = -(2.0**-4)
+    a = a.to(device=DEVICE, dtype=torch.float8_e4m3fn)
+    b = b.to(device=DEVICE, dtype=torch.float8_e4m3fn)
+    sa = torch.full((m, k // 128), 2.0**64, dtype=torch.float32, device=DEVICE)
+    sb = torch.full((n // 128, k // 128), 2.0**64, dtype=torch.float32, device=DEVICE)
+    # Even columns: 2^128 * (-4 * 2^-8); odd columns and unused groups: zero.
+    before = specmod.dispatch_stats["specialized"]
+    out = _call(a, b, sa, sb, backend="auto", out=_nan_out(m, n))
+    assert specmod.dispatch_stats["specialized"] == before + 1
+    assert (out[:, ::2] == -(2.0**122)).all()
+    assert (out[:, 1::2] == 0).all()
+
+
 def test_auto_off_allowlist_uses_stock(stock_sentinel):
     """An off-allowlist shape (M above the admitted cap for its (N, K)
     class) keeps the stock path under ``backend="auto"``."""

@@ -277,8 +277,7 @@ def check_specialized_requirement(
     backend="specialized",
     batch_invariant=False,
 ):
-    """``backend_requirement`` checker signature adapter (out may be None
-    at check time; the dispatch body re-validates with the real tensor)."""
+    """Check auto admission; explicit specialized requests are guarded at dispatch."""
     if batch_invariant:
         return False
     if backend == "specialized":
