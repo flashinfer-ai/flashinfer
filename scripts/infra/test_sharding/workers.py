@@ -487,6 +487,12 @@ def _pytest_command(
         f"--flashinfer-result-json={artifacts.temporary_results}",
         f"--flashinfer-telemetry-json={artifacts.temporary_telemetry}",
         f"--junitxml={artifacts.temporary_xml}",
+        # pytest's default capture holds a test's output until the test
+        # reports, so a test that ends the process (a native exit()) loses it.
+        # tee-sys also writes it to the batch log as it is printed, and still
+        # attaches Python output to failure reports. Writes to the file
+        # descriptors, from native code, go straight to the log.
+        "--capture=tee-sys",
         request.batch.source_file,
     ]
 
@@ -508,6 +514,9 @@ def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
         if pythonpath
         else str(request.repo_root)
     )
+    # os._exit() and a native exit() skip flushing Python's stdout buffer, so
+    # without this, output the test printed just before exiting is lost.
+    env.setdefault("PYTHONUNBUFFERED", "1")
     if request.device is not None:
         env["CUDA_VISIBLE_DEVICES"] = request.device
     # Isolate each concurrent worker's rendezvous and sibling TCPStore ports.

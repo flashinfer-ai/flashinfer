@@ -495,3 +495,98 @@ print(
     console = capsys.readouterr().out
     assert "PYTEST LOG TAIL worker=0 batch=batch-1" in console
     assert "visible before the reader failed" in console
+
+
+def _real_pytest_request(tmp_path: Path, source: str) -> BatchExecutionRequest:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "test_sample.py").write_text(source, encoding="utf-8")
+    nodeids = tuple(
+        f"test_sample.py::{line[4:].split('(', 1)[0]}"
+        for line in source.splitlines()
+        if line.startswith("def test_")
+    )
+    batch = Batch(
+        id="batch-1",
+        source_file="test_sample.py",
+        nodeids=nodeids,
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    unit = Unit(
+        id="unit-1",
+        batches=(batch,),
+        estimated_ms=1000,
+        oversized=False,
+        shard_index=0,
+    )
+    return replace(
+        _fake_batch_request(tmp_path),
+        pytest_root=project,
+        unit=unit,
+        batch=batch,
+        timeout_seconds=60,
+    )
+
+
+def test_real_pytest_keeps_output_of_a_test_that_ends_the_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Under pytest's default capture, output of a test that ends the process
+    # (a native library's exit()) is discarded with the unfinished report.
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+    request = _real_pytest_request(
+        tmp_path,
+        """\
+import os
+import sys
+
+
+def test_passes():
+    assert True
+
+
+def test_native_exit():
+    print("STDOUT BEFORE NATIVE EXIT")
+    print("STDERR BEFORE NATIVE EXIT", file=sys.stderr)
+    os.write(2, b"FD WRITE BEFORE NATIVE EXIT\\n")
+    os._exit(1)
+""",
+    )
+
+    result = execute_batch(request)
+
+    assert result.status == "infrastructure"
+    assert "last started node=test_sample.py::test_native_exit)" in result.diagnostic
+    console = capsys.readouterr().out
+    assert "PYTEST LOG TAIL worker=0 batch=batch-1" in console
+    for line in (
+        "STDOUT BEFORE NATIVE EXIT",
+        "STDERR BEFORE NATIVE EXIT",
+        "FD WRITE BEFORE NATIVE EXIT",
+    ):
+        assert line in console
+
+
+def test_real_pytest_failure_report_still_has_captured_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    request = _real_pytest_request(
+        tmp_path,
+        """\
+def test_fails():
+    print("OUTPUT OF A FAILING TEST")
+    assert False
+""",
+    )
+
+    result = execute_batch(request)
+
+    assert result.status != "infrastructure", result.diagnostic
+    log = workers_module._batch_artifacts(request).log.read_text(encoding="utf-8")
+    report = log.split("Captured stdout call", 1)
+    assert len(report) == 2, log
+    assert "OUTPUT OF A FAILING TEST" in report[1]
