@@ -62,13 +62,19 @@ supported arm (y, folded pool rows, k/u/g ring appends); the flush_first
 output is also checked against the random-order output un-permuted.
 ``spd`` = first supported arm's cold median / this arm's cold median.
 
+State-pool arms: ``--state-dtype bf16 fp16`` and ``--sr none philox lcg`` (stochastic
+rounding of the flushed fp16 state, fixed ``rand_seed``; ``--philox-rounds``) multiply
+the backend arms (``umma-fp16``, ``umma-fp16-philox``, ...; HMMA has no fp16 pool and
+reports N/A). The cross-check bounds also cover fp16 vs bf16 pools and SR vs RN.
+
 ``--json PATH`` writes every measured point (and N/A points with
 cold_us = null) plus run metadata (GPU, timing method, iters, git sha).
 
 Run:
   python benchmarks/experimental/bench_kda_ucache_flush.py [--iters 500] [--t 8] \
       [--backend hmma umma] [--w-ring 16] [--batches 8 32 64 128 256] \
-      [--folds 0 6.25 13 25 50] [--order random flush_first] [--json out.json]
+      [--folds 0 6.25 13 25 50] [--order random flush_first] [--json out.json] \
+      [--state-dtype bf16 fp16] [--sr none philox lcg] [--philox-rounds 10]
 """
 
 from __future__ import annotations
@@ -95,12 +101,25 @@ SCALE = 1.0 / math.sqrt(K)
 LOWER_BOUND = -5.0
 
 
-def load(backend="hmma"):
+_SEED = None  # rand_seed of the SR arms (one int64 device tensor, fixed value)
+
+
+def load(backend="hmma", sr="none", philox_rounds=10):
+    """The entry point bound to one arm: backend and, for an fp16 pool, the stochastic
+    rounding mode of the flushed state ("none" = round to nearest)."""
+    global _SEED
     from flashinfer.api_logging import ExperimentalWarning
     from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush
 
     warnings.filterwarnings("ignore", category=ExperimentalWarning)
-    return functools.partial(kda_delta_rule_mtp_ucache_flush, backend=backend)
+    kw = {"backend": backend}
+    if sr != "none":
+        if _SEED is None:
+            _SEED = torch.tensor([0x5EED_1234_ABCD], dtype=torch.int64, device=DEV)
+        kw.update(stochastic_rounding=sr, rand_seed=_SEED)
+        if sr == "philox":
+            kw["philox_rounds"] = philox_rounds
+    return functools.partial(kda_delta_rule_mtp_ucache_flush, **kw)
 
 
 torch.manual_seed(0)
@@ -116,7 +135,7 @@ def graphed(fn):
     return lambda: g.replay()
 
 
-def make_case(B, T, seed, hist):
+def make_case(B, T, seed, hist, state_dtype=torch.bfloat16):
     gen = torch.Generator(device=DEV).manual_seed(seed)
 
     def rn(*s, sc=1.0):
@@ -127,7 +146,7 @@ def make_case(B, T, seed, hist):
     g = rn(B, T, H, K, sc=0.5)  # raw per-channel gate pre-activation
     A_log = (torch.rand(H, generator=gen, device=DEV) * 0.6 - 0.3).float()
     dt_bias = (torch.randn(H * K, generator=gen, device=DEV) * 0.5).float()
-    pool = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).bfloat16()
+    pool = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(state_dtype)
     kh = torch.randn(B, H, RING, K, generator=gen, device=DEV)
     kc = (kh / kh.norm(dim=-1, keepdim=True).clamp_min(1e-6)).bfloat16()
     uc = (torch.randn(B, H, RING, V, generator=gen, device=DEV) * 0.3).bfloat16()
@@ -170,10 +189,10 @@ def order_perm(hist, flush_min, order):
     return torch.argsort((hl < flush_min).to(torch.int32), stable=True)
 
 
-def make_ordered_case(B, T, seed, hist, perm):
+def make_ordered_case(B, T, seed, hist, perm, state_dtype=torch.bfloat16):
     """make_case() in the random layout, then permute the per-row inputs and
     point each row at its request's original pool/ring slot."""
-    case = list(make_case(B, T, seed, hist))
+    case = list(make_case(B, T, seed, hist, state_dtype))
     if torch.equal(perm, torch.arange(B)):
         return tuple(case)
     pd = perm.to(DEV)
@@ -212,10 +231,12 @@ def _call(fn, case, flush_min, w_ring):
 _CHECK_TOL = {"y": 8e-3, "pool": 2e-2, "k": 5e-3, "u": 2e-2, "g": 1e-4}
 
 
-def run_eager(fn, flush_min, B, T, hist, seed, w_ring, perm):
+def run_eager(
+    fn, flush_min, B, T, hist, seed, w_ring, perm, state_dtype=torch.bfloat16
+):
     """One eager call; returns y (in the random/request order) and the
     request-indexed folded pool slots and ring append slots."""
-    case = make_ordered_case(B, T, seed, hist, perm)
+    case = make_ordered_case(B, T, seed, hist, perm, state_dtype)
     y = _call(fn, case, flush_min, w_ring)
     torch.cuda.synchronize()
     y_req = torch.empty_like(y)
@@ -247,11 +268,16 @@ def compare(ref, o, what):
             )
 
 
-def check_arms(fns, names, flush_min, B, T, hist, seed, w_ring, perm, order, base):
+def check_arms(
+    fns, names, flush_min, B, T, hist, seed, w_ring, perm, order, base, dtypes
+):
     """Every arm on identical fresh inputs must match the first arm: output,
     folded pool rows, and the k/u/g ring append slots. ``base`` (the first
     arm's random-order result, or None) also pins flush_first to random."""
-    outs = [run_eager(fn, flush_min, B, T, hist, seed, w_ring, perm) for fn in fns]
+    outs = [
+        run_eager(fn, flush_min, B, T, hist, seed, w_ring, perm, dt)
+        for fn, dt in zip(fns, dtypes, strict=True)
+    ]
     tag = f"B={B} T={T} w_ring={w_ring} order={order}"
     for name, o in zip(names[1:], outs[1:], strict=True):
         compare(outs[0], o, f"backend {name} vs {names[0]} at {tag}")
@@ -289,12 +315,12 @@ def bench_point(fn, flush_min, B, T, case, iters, w_ring=16):
     return {"cold_us": cold_med, "cold_min_us": cold_min, "warm_us": warm}
 
 
-def probe(fn, T, flush_min, w_ring):
+def probe(fn, T, flush_min, w_ring, state_dtype=torch.bfloat16):
     """None if the arm runs this (T, w_ring) config, else the reason."""
     B = 2
     hist = [flush_min, 0]
     try:
-        _call(fn, make_case(B, T, 7, hist), flush_min, w_ring)
+        _call(fn, make_case(B, T, 7, hist, state_dtype), flush_min, w_ring)
         torch.cuda.synchronize()
     except (NotImplementedError, ValueError) as ex:
         return f"{type(ex).__name__}: {ex}"
@@ -353,6 +379,21 @@ def main():
         choices=["hmma", "umma", "auto"],
         help="kernel arms to time; the first supported one is the speed-up reference",
     )
+    ap.add_argument(
+        "--state-dtype",
+        nargs="+",
+        default=["bf16"],
+        choices=["bf16", "fp16"],
+        help="state-pool dtype arms (fp16: UMMA only; HMMA reports N/A)",
+    )
+    ap.add_argument(
+        "--sr",
+        nargs="+",
+        default=["none"],
+        choices=["none", "philox", "lcg"],
+        help="stochastic rounding arms of the flushed fp16 state (fp16 arms only)",
+    )
+    ap.add_argument("--philox-rounds", type=int, default=10)
     ap.add_argument("--w-ring", type=int, default=16, choices=[16, 32])
     ap.add_argument(
         "--check",
@@ -369,8 +410,25 @@ def main():
         ap.error("--batches values must be >= 1")
     orders = list(dict.fromkeys(args.order))
 
-    names = list(args.backend)
-    fns = [load(n) for n in names]
+    # arms: backend x state dtype x SR mode (SR only on fp16 pools); the bf16 / none
+    # arm keeps the bare backend name
+    _DT = {"bf16": torch.bfloat16, "fp16": torch.float16}
+    arms = []
+    for be in args.backend:
+        for sd in dict.fromkeys(args.state_dtype):
+            for sr in dict.fromkeys(args.sr):
+                if sr != "none" and sd != "fp16":
+                    continue
+                name = (
+                    be
+                    if sd == "bf16"
+                    else f"{be}-{sd}" + ("" if sr == "none" else f"-{sr}")
+                )
+                arms.append((name, be, sd, sr))
+    names = [a[0] for a in arms]
+    fns = [load(a[1], a[3], args.philox_rounds) for a in arms]
+    dts = [_DT[a[2]] for a in arms]
+    arm_meta = {a[0]: {"backend": a[1], "state_dtype": a[2], "sr": a[3]} for a in arms}
     T = args.t
     w_ring = args.w_ring
     # lazy flush: min(W - T + 1, RING - 2T + 1); 13/9 at w16, 25/17 at w32
@@ -394,8 +452,8 @@ def main():
     if w_ring == 32 and flush_min <= 16:
         unsupported = {n: f"w_ring=32 needs flush_min > 16 (T={T})" for n in names}
     else:
-        for n, fn in zip(names, fns, strict=True):
-            why = probe(fn, T, flush_min, w_ring)
+        for n, fn, dt in zip(names, fns, dts, strict=True):
+            why = probe(fn, T, flush_min, w_ring, dt)
             if why is not None:
                 unsupported[n] = why
     for n, why in unsupported.items():
@@ -403,6 +461,7 @@ def main():
     live = [i for i, n in enumerate(names) if n not in unsupported]
     live_names = [names[i] for i in live]
     live_fns = [fns[i] for i in live]
+    live_dts = [dts[i] for i in live]
     multi = len(names) > 1
 
     def fold_str(p):
@@ -442,13 +501,14 @@ def main():
                         perm,
                         order,
                         base if order != "random" else None,
+                        live_dts,
                     )
                     if order == "random":
                         base = r
                 eff = 100.0 * nf / B
                 line = f"{B:5d} | {fold_str(p):>6} | {nf:4d} {eff:6.2f} | {order:>11}"
                 cold0 = None
-                for n, fn in zip(names, fns, strict=True):
+                for n, fn, dt in zip(names, fns, dts, strict=True):
                     rec = {
                         "T": T,
                         "w_ring": w_ring,
@@ -461,6 +521,7 @@ def main():
                         "flush_min": flush_min,
                         "order": order,
                         "backend": n,
+                        **{"arm_" + k_: v_ for k_, v_ in arm_meta[n].items()},
                     }
                     if n in unsupported:
                         rec.update(
@@ -475,7 +536,7 @@ def main():
                             line += f" {'':>6}"
                         points.append(rec)
                         continue
-                    case = make_ordered_case(B, T, 1000 + B, hist, perm)
+                    case = make_ordered_case(B, T, 1000 + B, hist, perm, dt)
                     t = bench_point(fn, flush_min, B, T, case, args.iters, w_ring)
                     del case
                     rec.update(supported=True, **t)
@@ -518,6 +579,8 @@ def main():
             "lower_bound": LOWER_BOUND,
             "flush_min": flush_min,
             "backends": names,
+            "arms": arm_meta,
+            "philox_rounds": args.philox_rounds,
             "unsupported": unsupported,
             "orders": orders,
             "check": args.check,

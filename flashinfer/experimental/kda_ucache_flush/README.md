@@ -22,6 +22,14 @@ compiled with `cute.compile` per process (no on-disk cache). Range checks on
 `initial_state_indices`, `hist_len` and `cache_base` cost one host sync per
 eager call and are skipped under CUDA-graph capture.
 
+The SM10x tcgen05 / UMMA backend (`backend="umma"`,
+`kda_replay_mtp_umma.py` and its persistent variant) additionally runs T in
+1..8 and an fp16 state pool (`initial_state_source` fp16; HMMA rejects it),
+with optional stochastic rounding of the flushed fp16 state
+(`stochastic_rounding="philox"` / `"lcg"`, `rand_seed`, `philox_rounds`; the
+GDN UMMA kernel's schemes). Tests: `tests/experimental/test_kda_ucache_flush_umma.py`
+and `tests/experimental/test_kda_ucache_flush_umma_fp16.py`.
+
 Tests: `tests/experimental/test_kda_ucache_flush.py`. Benchmarks:
 `benchmarks/experimental/bench_kda_ucache_flush.py` (fold-rate sweep) and
 `benchmarks/experimental/bench_kda_ucache_vs_recurrent.py` (A/B against the

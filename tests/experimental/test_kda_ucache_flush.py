@@ -96,6 +96,9 @@ def _skip_if_not_sm90_or_later():
 # coverage whatever backend="auto" resolves to. test_kda_ucache_flush_umma.py
 # re-runs this whole file with this dict patched to {"backend": "umma"}.
 _BACKEND_KW: dict = {"backend": "hmma"}
+# State-pool dtype of every case built here; test_kda_ucache_flush_umma_fp16.py re-runs
+# the UMMA suites with it patched to torch.float16.
+_STATE_DTYPE = torch.bfloat16
 
 
 def _load_flush():
@@ -158,7 +161,7 @@ def _make_case(B, hist_lens, seed, bases=None, t=T, strong=False, pool_size=None
     (glog near lower_bound = -5) and ring windows whose cumulative log-decay
     reaches ~-40 per channel at hist 16 — stressing the exp() paths (bdec
     down to e^{-40}, w spanning 17 decades) instead of the mild default."""
-    io, st, rg = torch.bfloat16, torch.bfloat16, torch.bfloat16
+    io, st, rg = torch.bfloat16, _STATE_DTYPE, torch.bfloat16
     gen = torch.Generator(device=DEV).manual_seed(seed)
     pool_size = pool_size or B
 
@@ -458,7 +461,7 @@ def _chained_steps_match_sequential_oracle(t):
     g2 = rn(B, 2 * t, H, K, sc=0.5)
     A_log = (torch.rand(H, generator=gen, device=DEV) * 0.6 - 0.3).float()
     dt_bias = (torch.randn(H * K, generator=gen, device=DEV) * 0.5).float()
-    pool = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(io)
+    pool = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(_STATE_DTYPE)
     pool_before = pool.clone()
     kc = torch.zeros(B, H, RING, K, dtype=io, device=DEV)
     uc = torch.zeros(B, H, RING, V, dtype=io, device=DEV)
@@ -1153,7 +1156,7 @@ def _restart_hist_on_flush_across_steps(graph, w_ring, t):
     va, ba, ga = rn(B, N, H, V, sc=0.5), rn(B, N, H), rn(B, N, H, K, sc=0.5)
     A_log = (torch.rand(H, generator=gen, device=DEV) * 0.6 - 0.3).float()
     dt_bias = (torch.randn(H * K, generator=gen, device=DEV) * 0.5).float()
-    pool0 = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(io)
+    pool0 = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(_STATE_DTYPE)
     bases0 = [0, 7, 29, 31]
 
     def fresh_state():

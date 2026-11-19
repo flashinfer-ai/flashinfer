@@ -2584,6 +2584,8 @@ _BACKENDS = ("auto", "hmma", "umma")
 # Native draft lengths: the HMMA kernel builds T in {4, 8}; the UMMA kernel
 # T = 1..8 (kda_umma_unavailable_reason has the authoritative set).
 _HMMA_T = (4, 8)
+# archs whose ptxas accepts cvt.rs (stochastic rounding), as the GDN UMMA kernel
+_CVT_RS_CC = ((10, 0), (10, 3), (10, 7))
 _UMMA_T_MAX = 8
 
 
@@ -2622,6 +2624,9 @@ def kda_delta_rule_mtp_ucache_flush(
     w_ring: int = W_RING,
     tma_late: Optional[bool] = None,
     backend: str = "auto",
+    stochastic_rounding: Optional[str] = None,
+    rand_seed: Optional[torch.Tensor] = None,
+    philox_rounds: int = 10,
 ) -> torch.Tensor:
     """KDA decode output + u-cache append + PER-REQUEST state flush.
 
@@ -2667,6 +2672,20 @@ def kda_delta_rule_mtp_ucache_flush(
       ``kda_umma_unavailable_reason`` reports a reason; ``"auto"`` uses UMMA
       only when it is available and ``_AUTO_UMMA`` is set, or when T is not
       in {4, 8} (HMMA cannot build it). The UMMA backend ignores ``tma_late``.
+    - ``initial_state_source`` is bf16 (default) or fp16. The fp16 pool is served by
+      the UMMA backend only (``"hmma"`` raises ``ValueError``; ``"auto"`` routes it
+      to UMMA and raises ``ValueError`` when UMMA is unavailable). Rings and
+      outputs stay bf16 (fp32 g ring); only the pool and the readout operand are
+      fp16.
+    - ``stochastic_rounding`` (fp16 pool, UMMA only): ``None`` / ``"none"`` (round
+      to nearest, ``rand_seed`` not read), ``"philox"`` (Philox4x32 with
+      ``philox_rounds`` rounds, key = ``rand_seed``, counter = flat pool offset of
+      the 8-element chunk; needs ``rand_seed``) or ``"lcg"`` (an LCG dither from a
+      hash of the (state row, K half) id and ``rand_seed``, or %clock without one:
+      then not reproducible) -- the GDN UMMA kernel's schemes; outputs, rings and
+      verify rows are unchanged. ``rand_seed`` is a single-element int64 CUDA
+      tensor read on device (a captured graph picks up updates): advance it every
+      step and use a different seed per layer.
 
     Returns ``output`` of shape ``[B, T, H, V]`` bf16.
     """
@@ -2745,10 +2764,39 @@ def kda_delta_rule_mtp_ucache_flush(
         f"b must be [B,T,H]={(B, T_in, HV)}; got {tuple(b.shape)}.",
     )
     _check(
-        initial_state_source.dtype == IO_TORCH,
-        f"initial_state_source must be {IO_TORCH} (pool, H, V, K); got "
-        f"{initial_state_source.dtype}.",
+        initial_state_source.dtype in (IO_TORCH, torch.float16),
+        f"initial_state_source must be {IO_TORCH} or torch.float16 (pool, H, V, K); "
+        f"got {initial_state_source.dtype}.",
     )
+    _state_f16 = initial_state_source.dtype == torch.float16
+    _sr_mode = "none" if stochastic_rounding is None else stochastic_rounding
+    _check(
+        _sr_mode in ("none", "philox", "lcg"),
+        f"stochastic_rounding={stochastic_rounding!r}: use None, 'none', 'philox' or "
+        "'lcg'.",
+    )
+    _check(
+        _sr_mode == "none" or _state_f16,
+        f"stochastic_rounding={_sr_mode!r} rounds the fp16 state pool; "
+        f"initial_state_source is {initial_state_source.dtype}.",
+    )
+    _check(
+        _sr_mode != "philox" or rand_seed is not None,
+        "stochastic_rounding='philox' needs rand_seed.",
+    )
+    _check(
+        _sr_mode != "philox" or int(philox_rounds) > 0,
+        f"philox_rounds must be > 0; got {philox_rounds}.",
+    )
+    if _sr_mode != "none" and rand_seed is not None:
+        _check(
+            isinstance(rand_seed, torch.Tensor)
+            and rand_seed.numel() == 1
+            and rand_seed.dtype == torch.int64
+            and rand_seed.is_cuda
+            and rand_seed.device == q.device,
+            "rand_seed must be a single-element int64 CUDA tensor on the inputs' device.",
+        )
 
     # A_log [H] fp32; dt_bias [H*K] fp32 (accept [H, K] and flatten). Cast
     # the caller's persistent tensor BEFORE reshaping so the cache key is
@@ -2921,6 +2969,26 @@ def kda_delta_rule_mtp_ucache_flush(
             f"'umma'; got {backend!r}."
         )
     _why = kda_umma_unavailable_reason(dev, T_in, w_ring, bool(pdl_trigger))
+    if _sr_mode != "none" and _why is None:
+        if torch.cuda.get_device_capability(dev) not in _CVT_RS_CC:
+            _why = "stochastic rounding needs cvt.rs (sm_100a / sm_103a / sm_107a)"
+    _needs_umma = _state_f16 or _sr_mode != "none"
+    if _needs_umma and backend != "umma":
+        _what = (
+            f"stochastic_rounding={_sr_mode!r}"
+            if _sr_mode != "none"
+            else "an fp16 state pool"
+        )
+        if backend == "hmma":
+            raise ValueError(
+                f"kda_delta_rule_mtp_ucache_flush: {_what} is served by the UMMA backend "
+                "only (SM10x); the HMMA kernel keeps a bf16 pool and rounds to nearest."
+            )
+        if _why is not None:
+            raise ValueError(
+                f"kda_delta_rule_mtp_ucache_flush: {_what} needs the UMMA backend, "
+                f"which is unavailable: {_why}"
+            )
     if backend == "umma" and _why is not None:
         raise ValueError(
             f"kda_delta_rule_mtp_ucache_flush: backend='umma' unavailable: {_why}"
@@ -2935,8 +3003,10 @@ def kda_delta_rule_mtp_ucache_flush(
             )
         _use_umma = True
     else:
-        _use_umma = backend == "umma" or (
-            backend == "auto" and _why is None and _AUTO_UMMA
+        _use_umma = (
+            backend == "umma"
+            or _needs_umma
+            or (backend == "auto" and _why is None and _AUTO_UMMA)
         )
 
     if _use_umma:
@@ -2961,6 +3031,16 @@ def kda_delta_rule_mtp_ucache_flush(
             float(lower_bound),
             int(flush_min),
             int(w_ring),
+            _state_f16,
+            {
+                "none": "",
+                "philox": "philox",
+                "lcg": "lcg" if rand_seed is not None else "lcg_clock",
+            }[_sr_mode],
+            int(philox_rounds) if _sr_mode == "philox" else 0,
+            rand_seed.reshape(1)
+            if (_sr_mode != "none" and rand_seed is not None)
+            else None,
         )
     else:
         _num_sms = torch.cuda.get_device_properties(dev).multi_processor_count

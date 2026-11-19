@@ -1070,6 +1070,9 @@ def kda_delta_rule_mtp_ucache_flush(
     w_ring: int = 16,
     tma_late: Optional[bool] = None,
     backend: str = "auto",
+    stochastic_rounding: Optional[str] = None,
+    rand_seed: Optional[torch.Tensor] = None,
+    philox_rounds: int = 10,
 ) -> torch.Tensor:
     r"""KDA (Kimi K3) speculative-decode verify with a ReplaySSM history ring.
 
@@ -1102,8 +1105,9 @@ def kda_delta_rule_mtp_ucache_flush(
     b : torch.Tensor
         ``[B, T, H]`` bf16 beta logits (sigmoid applied in-kernel).
     initial_state_source : torch.Tensor
-        ``[pool, H, 128, 128]`` bf16 checkpoint state pool (``[.., V, K]``);
-        written in place on a fold.
+        ``[pool, H, 128, 128]`` bf16 or fp16 checkpoint state pool
+        (``[.., V, K]``); written in place on a fold. fp16 needs the UMMA
+        backend (SM10x).
     initial_state_indices : torch.Tensor, optional
         ``[B]`` int32 pool slot per request; ``-1`` marks a padded row whose
         output row is left untouched (pass a preallocated ``output``).
@@ -1144,7 +1148,19 @@ def kda_delta_rule_mtp_ucache_flush(
         ``ValueError`` for configurations it does not support; ``"auto"``
         selects ``"hmma"`` for ``T`` in ``{4, 8}`` and ``"umma"`` for any
         other ``T`` (``NotImplementedError`` when UMMA is unavailable). The
-        UMMA kernel ignores ``tma_late``.
+        UMMA kernel ignores ``tma_late``. An fp16 pool or stochastic
+        rounding routes ``"auto"`` to UMMA.
+    stochastic_rounding : str, optional
+        Rounding of the flushed fp16 state (UMMA only): ``None`` / ``"none"``
+        (round to nearest), ``"philox"`` (Philox4x32, key ``rand_seed``,
+        counter = flat pool offset of the 8-element chunk) or ``"lcg"`` (LCG
+        dither seeded by ``rand_seed``, or by %clock without one). Outputs,
+        rings and verify rows are unaffected.
+    rand_seed : torch.Tensor, optional
+        Single-element int64 CUDA tensor read on device by ``"philox"`` (required)
+        and ``"lcg"``; advance it every step and use a different seed per layer.
+    philox_rounds : int
+        Philox rounds (default 10).
 
     Returns
     -------
@@ -1190,4 +1206,7 @@ def kda_delta_rule_mtp_ucache_flush(
         w_ring=w_ring,
         tma_late=tma_late,
         backend=backend,
+        stochastic_rounding=stochastic_rounding,
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
     )

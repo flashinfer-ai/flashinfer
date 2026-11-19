@@ -90,7 +90,18 @@ at 2T % 8 != 0 the last row-layout pass also covers the dead rows 2T..8 NP - 1
 (clamped in-range loads, zero stores) and the epilogue reads 2^ceil(log2 T) TMEM
 columns per side, as the GDN UMMA kernel. T in {4, 8} builds are unchanged.
 
-Status (stage S3c + T = 1..8): w_ring in {16, 32}, one head per CTA.
+fp16 state pool (``state_f16``; selected by an fp16 ``initial_state_source``): the pool,
+the state SMEM stages and the readout B operand X_r are fp16 (kind::f16 needs one A / B
+type; |X_r| <= 1, magnitudes below 2^-24 flush to zero), so the readout UMMA uses an
+F16 instruction descriptor; the history / fold UMMAs (D, C, K~) stay bf16. Flush rows
+round the folded half to fp16: to nearest, or stochastically (``sr``, cvt.rs.f16x2) with
+the GDN UMMA kernel's schemes -- "philox" (Philox4x32, ``sr_rounds`` rounds, key =
+``rand_seed``, counter = flat [pool, H, V, K] offset of the 8-element chunk, one draw per
+chunk feeding its 4 pairs) or "lcg" / "lcg_clock" (an LCG dither per (state row, K half)
+from a murmur3 hash of its id and the seed / %clock). Outputs and rings are unchanged.
+
+Status (stage S3c + T = 1..8): w_ring in {16, 32}, one head per CTA; bf16 or fp16
+state pool (fp16: round to nearest, "philox" or "lcg").
 """
 
 from __future__ import annotations
@@ -101,7 +112,7 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64
+from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T as _T
@@ -277,6 +288,45 @@ def _fold_fma2_bf16x2(
         " and.b32 _wh, $2, 0xFFFF0000;"
         " mov.b32 _fl, _wl;"
         " mov.b32 _fh, _wh;"
+        " fma.rn.f32 $0, _fl, $3, $5; fma.rn.f32 $1, _fh, $4, $6; }",
+        "=f,=f,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(_T.f32(), r, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(_T.f32(), r, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _fold_fma2_f16x2(
+    w: Uint32,
+    bd_lo: Float32,
+    bd_hi: Float32,
+    f0: Float32,
+    f1: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """_fold_fma2_bf16x2 for a packed fp16 state pair (fp16 state pool): both halves
+    widened exactly (cvt.f32.f16), then one fma.rn each."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal([_T.f32(), _T.f32()]),
+        [
+            Uint32(w).ir_value(loc=loc, ip=ip),
+            Float32(bd_lo).ir_value(loc=loc, ip=ip),
+            Float32(bd_hi).ir_value(loc=loc, ip=ip),
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b16 _hl, _hh; .reg .f32 _fl, _fh;"
+        " mov.b32 {_hl, _hh}, $2;"
+        " cvt.f32.f16 _fl, _hl;"
+        " cvt.f32.f16 _fh, _hh;"
         " fma.rn.f32 $0, _fl, $3, $5; fma.rn.f32 $1, _fh, $4, $6; }",
         "=f,=f,r,f,f,f,f",
         has_side_effects=False,
@@ -555,17 +605,66 @@ def _d_block1(use_smem, u_ptr, base, P, ct, tbase):
     U.tmem_st_u32(ct, tbase + _COL_D + 8, words)
 
 
-def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone):
-    """Flush rows: S_half <- bf16(bdec . S0_half + F) in place on state K half g (TMEM
+def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone, sr=None):
+    """Flush rows: S_half <- round(bdec . S0_half + F) in place on state K half g (TMEM
     F at cols 64..127, this thread's V row = TMEM lane), then publish the half to warp
     0's TMA store (f_gdone). bdec is per channel (s_bdec, a warp-uniform broadcast
     read). Half 0 releases the F columns (f_epi_a) after its last TMEM load so the fold
-    UMMA of half 1 can overwrite them."""
-    ldn = 32  # TMEM columns per load
+    UMMA of half 1 can overwrite them.
+
+    ``sr`` None: bf16 state pool, round to nearest. Otherwise the fp16 state pool, a dict
+    {"mode": "" (RN) | "philox" | "lcg" | "lcg_clock", "rounds": Philox rounds,
+    "seed": the int64 [1] rand_seed tensor, "sid": Int64 state slot * H + head} -- the
+    GDN UMMA kernel's schemes: "philox" = one Philox4x32 draw (key = seed, counter = flat
+    state-pool offset of the 8-element chunk) per chunk, its 4 words feeding the chunk's 4
+    cvt.rs.f16x2 pairs; "lcg" = one LCG step per pair (s ^ (s >> 16)) from a murmur3 hash
+    of the (state row, half) id and the seed (or %clock: "lcg_clock")."""
+    F16 = sr is not None
+    mode = sr["mode"] if F16 else ""
+    rounds = sr["rounds"] if F16 else 0
+    LCG = mode in ("lcg", "lcg_clock")
+    # TMEM columns per load (= 8-element chunks x 8, = Philox streams per call): 32 for RN
+    # and Philox (large batches: 4 streams per call is more ILP for the issue-bound
+    # 10-round loop, T = 4 / 8 at B = 2048 3-6 % faster than 16), 16 for LCG (fewer live
+    # registers). Same bits either way: the counter is per chunk, the LCG chains per pair.
+    ldn = 16 if LCG else 32
     nch = ldn // 8  # 16-B (8-channel) chunks per load
     srow = st_addr + g * 16384 + row * 128
+    if rounds > 0 or mode == "lcg":
+        seed = Int64(sr["seed"][0])
+        seed_lo = Uint32(seed & Int64(0xFFFFFFFF))
+        seed_hi = Uint32(seed >> Int64(32))
+    if mode == "lcg":
+        lcg_k = U.fmix32(seed_lo ^ U.fmix32(seed_hi ^ Uint32(0x9E3779B9)))
+    elif mode == "lcg_clock":
+        lcg_k = U.fmix32(U.clock32())
+    if rounds > 0:
+        # flat element offset of S[slot, head, row, 64 g] in the [pool, H, V, K] pool
+        off_row = (sr["sid"] * Int64(V_DIM) + Int64(row)) * Int64(K_DIM) + Int64(g * 64)
+    if LCG:
+        cid = (sr["sid"] * Int64(V_DIM) + Int64(row)) * Int64(2) + Int64(g)
+        x0 = U.fmix32(
+            Uint32(cid & Int64(0xFFFFFFFF)) * Uint32(0x9E3779B9)
+            + Uint32(cid >> Int64(32)) * Uint32(0x85EBCA6B)
+            + lcg_k
+        )
+        lx = [x0]
+        for _ in range(3):
+            lx.append(lx[-1] * Uint32(U.LCG_A) + Uint32(U.LCG_C))
     for grp in range(64 // ldn):
         fv = U.tmem_ld(ct, tbase + _COL_F + grp * ldn, ldn)
+        if rounds > 0:
+            # one draw per 8-element chunk, the load's chunks in one call (counters
+            # off + 8 s); off_row is a multiple of 64, so no carry into the high word
+            off = off_row + Int64(grp * ldn)
+            rws = U.philox4x32_streams(
+                seed_lo,
+                seed_hi,
+                Uint32(off & Int64(0xFFFFFFFF)),
+                Uint32(off >> Int64(32)),
+                nch,
+                rounds,
+            )
         U.tmem_wait_ld()
         if g == 0 and grp == 64 // ldn - 1:
             U.fence_before_sync()
@@ -576,16 +675,34 @@ def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone):
             bd = _lds_f32x4(ba) + _lds_f32x4(ba + 16)
             sa = srow + ((chunk ^ (row % 8)) * 16)
             ow = U.lds_v4(sa)
+            if LCG:
+                rw = [x ^ (x >> Uint32(16)) for x in lx]  # 16-bit fold
+                lx = [x * Uint32(U.LCG_A4) + Uint32(U.LCG_C4) for x in lx]
             nw = []
             for i in range(4):
-                lo, hi = _fold_fma2_bf16x2(
-                    ow[i],
-                    bd[2 * i],
-                    bd[2 * i + 1],
-                    fv[cc * 8 + 2 * i],
-                    fv[cc * 8 + 2 * i + 1],
-                )
-                nw.append(U.pack_bf16x2(lo, hi))
+                if F16:
+                    lo, hi = _fold_fma2_f16x2(
+                        ow[i],
+                        bd[2 * i],
+                        bd[2 * i + 1],
+                        fv[cc * 8 + 2 * i],
+                        fv[cc * 8 + 2 * i + 1],
+                    )
+                    if rounds > 0:
+                        nw.append(U.pack_f16x2_rs(lo, hi, rws[cc][i]))
+                    elif LCG:
+                        nw.append(U.pack_f16x2_rs(lo, hi, rw[i]))
+                    else:
+                        nw.append(U.pack_f16x2(lo, hi))
+                else:
+                    lo, hi = _fold_fma2_bf16x2(
+                        ow[i],
+                        bd[2 * i],
+                        bd[2 * i + 1],
+                        fv[cc * 8 + 2 * i],
+                        fv[cc * 8 + 2 * i + 1],
+                    )
+                    nw.append(U.pack_bf16x2(lo, hi))
             U.sts_v4(sa, nw[0], nw[1], nw[2], nw[3])
     cute.arch.fence_view_async_shared()  # the TMA store reads the half (async proxy)
     cute.arch.mbarrier_arrive(f_gdone)
@@ -923,6 +1040,9 @@ class KdaReplayMtpUmma:
         u_src: str = "smem",
         persistent: bool = False,
         split: bool = False,
+        state_f16: bool = False,
+        sr: str = "",
+        sr_rounds: int = 0,
     ):
         assert 1 <= T <= 8, T
         assert w_ring in (16, 32), w_ring
@@ -931,6 +1051,14 @@ class KdaReplayMtpUmma:
         self.h = h
         self.w_ring = w_ring
         self.u_src = u_src
+        # fp16 state pool (bf16 default); sr: stochastic rounding of the flushed fp16
+        # state, "" (round to nearest), "philox" (sr_rounds rounds), "lcg" (seeded by
+        # rand_seed) or "lcg_clock" (seeded by %clock)
+        assert sr in ("", "philox", "lcg", "lcg_clock"), sr
+        assert state_f16 or not sr, "stochastic rounding needs the fp16 state"
+        self.state_f16 = state_f16
+        self.sr = sr
+        self.sr_rounds = sr_rounds if sr == "philox" else 0
         # persistent: a fixed grid walks the (request, head) items, overlapping the next
         # item's state load with the current one and prefetching it into L2
         self.persistent = persistent
@@ -939,6 +1067,17 @@ class KdaReplayMtpUmma:
         self.split = split
         self.num_threads = 256 if split else 192
         self.iket = _IKET
+
+    def _sr_cfg(self, rand_seed, sidx, head):
+        """_rmw's ``sr`` argument: None for the bf16 pool, else the fp16 pool's rounding."""
+        if not self.state_f16:
+            return None
+        return {
+            "mode": self.sr,
+            "rounds": self.sr_rounds,
+            "seed": rand_seed,
+            "sid": Int64(sidx) * Int64(self.h) + Int64(head),
+        }
 
     @cute.jit
     def _make_state_tma(self, state: cute.Tensor, op):
@@ -981,6 +1120,7 @@ class KdaReplayMtpUmma:
         flush_min: Int32,
         ncta: Int32,
         ws,
+        rand_seed,
         stream,
     ):
         tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
@@ -1005,6 +1145,7 @@ class KdaReplayMtpUmma:
             lower_bound,
             flush_min,
             ws,
+            rand_seed,
             tma_ld,
             tma_st,
         ).launch(
@@ -1036,6 +1177,7 @@ class KdaReplayMtpUmma:
         lower_bound: Float32,
         flush_min: Int32,
         ws: cute.Tensor,
+        rand_seed: cute.Tensor,
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
@@ -1072,7 +1214,10 @@ class KdaReplayMtpUmma:
             cute.make_layout((V_DIM, (64, 2)), stride=(64, (1, V_DIM * 64))),
         )
         s_state = smem.allocate_tensor(
-            BFloat16, st_layout.outer, byte_alignment=1024, swizzle=st_layout.inner
+            Float16 if self.state_f16 else BFloat16,
+            st_layout.outer,
+            byte_alignment=1024,
+            swizzle=st_layout.inner,
         )
         # X_r: readout B operand, 16 rows x 128 k bf16, K-major SW128 (_x_sw128_off)
         s_x = smem.allocate_tensor(
@@ -1341,6 +1486,9 @@ class KdaReplayMtpUmma:
                 # MN-major SW128 K~: SBO = 1024 B between 8-slot K atoms, N halves 2048 B apart
                 kt_desc = U.sdesc_mn_sw128(2048, 1024) + Uint64(kt_addr >> 4)
                 id_r = _bf16_idesc(128, 16)
+                # readout: A = state, B = X_r, both fp16 with the fp16 pool (kind::f16 needs
+                # one A / B type); history D . C^T stays bf16
+                id_x = U.f16_idesc(128, 16) if self.state_f16 else id_r
                 id_f = _bf16_idesc(128, 64, b_mn_major=True)
                 cute.arch.barrier(barrier_id=3, number_of_threads=64)  # warp 0's inits
                 it = Int32(0)
@@ -1384,7 +1532,7 @@ class KdaReplayMtpUmma:
                                     tbase + _COL_H,
                                     stage_desc[gk] + Uint64((ka * 32) >> 4),
                                     x_desc + Uint64((gk * 2048 + ka * 32) >> 4),
-                                    id_r,
+                                    id_x,
                                     (gk > 0) or (ka > 0),
                                 )
                         U.umma_commit(st_free)  # the next item's state may land
@@ -1670,10 +1818,12 @@ class KdaReplayMtpUmma:
                         )
                         # X_r = X_c . bdec, rounded once from fp32 (readout B operand)
                         U.sts_u16(
-                            x_addr + _x_sw128_off(t, c), U.f32_to_u16(kh * eb, True)
+                            x_addr + _x_sw128_off(t, c),
+                            U.f32_to_u16(kh * eb, not self.state_f16),
                         )
                         U.sts_u16(
-                            x_addr + _x_sw128_off(T + t, c), U.f32_to_u16(qh * eb, True)
+                            x_addr + _x_sw128_off(T + t, c),
+                            U.f32_to_u16(qh * eb, not self.state_f16),
                         )
                     if ct < T:
                         s_coef[_CO_BETA + ct] = Float32(1.0) / (
@@ -1895,7 +2045,15 @@ class KdaReplayMtpUmma:
                         _mbw(f_mma_a, fit & 1, 12, cta, warp, kk)
                         U.fence_after_sync()
                         _rmw(
-                            0, ct, row, tbase, st_addr_c, bdec_addr, f_epi_a, f_gdone[0]
+                            0,
+                            ct,
+                            row,
+                            tbase,
+                            st_addr_c,
+                            bdec_addr,
+                            f_epi_a,
+                            f_gdone[0],
+                            self._sr_cfg(rand_seed, sidx, hh),
                         )
                         _ik_pop(IK)
 
@@ -1938,7 +2096,15 @@ class KdaReplayMtpUmma:
                         _mbw(f_mma_b, fit & 1, 14, cta, warp, kk)
                         U.fence_after_sync()
                         _rmw(
-                            1, ct, row, tbase, st_addr_c, bdec_addr, f_epi_a, f_gdone[1]
+                            1,
+                            ct,
+                            row,
+                            tbase,
+                            st_addr_c,
+                            bdec_addr,
+                            f_epi_a,
+                            f_gdone[1],
+                            self._sr_cfg(rand_seed, sidx, hh),
                         )
                         _ik_pop(IK)
                         U.fence_before_sync()
@@ -1980,6 +2146,9 @@ class KdaReplayMtpUmma:
         u_src: str,
         persistent: bool = False,
         split: bool = False,
+        state_f16: bool = False,
+        sr: str = "",
+        sr_rounds: int = 0,
     ):
         """Compile one specialisation for ``device``'s architecture (callers use
         ``_get_kernel``); batch and pool sizes are dynamic."""
@@ -1994,7 +2163,9 @@ class KdaReplayMtpUmma:
             ft(BFloat16, (batch, T, h), 1),  # b (beta logits)
             ft(Float32, (h,), 1),  # A_log (fp32)
             ft(Float32, (h * K_DIM,), 1),  # dt_bias (fp32, [H * K])
-            ft(BFloat16, (pool, h, V_DIM, K_DIM), 8),  # state pool (bf16)
+            ft(
+                Float16 if state_f16 else BFloat16, (pool, h, V_DIM, K_DIM), 8
+            ),  # state pool
             ft(Int32, (batch,), 1),  # state indices
             ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring
             ft(BFloat16, (pool, h, RING_SLOTS, V_DIM), 8),  # u ring
@@ -2005,13 +2176,16 @@ class KdaReplayMtpUmma:
         ]
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
-            KdaReplayMtpUmma(T, h, w_ring, u_src, persistent, split),
+            KdaReplayMtpUmma(
+                T, h, w_ring, u_src, persistent, split, state_f16, sr, sr_rounds
+            ),
             *args,
             Float32(1.0),
             Float32(-5.0),
             Int32(1),
             Int32(1),
             ft(Int32, (2,), 1),  # claim / done counters
+            ft(Int64, (1,), 1),  # rand_seed (read by "philox" / "lcg")
             stream,
         )
 
@@ -2027,6 +2201,9 @@ def _get_kernel(
     u_src: str,
     persistent: bool = False,
     split: bool = False,
+    state_f16: bool = False,
+    sr: str = "",
+    sr_rounds: int = 0,
 ):
     """The compiled kernel for this specialisation on ``device``'s architecture."""
     key = (
@@ -2042,10 +2219,15 @@ def _get_kernel(
         _HANG_DEBUG_ADDR,
         _PF_WHERE,
         _HANG_PROGRESS_ADDR,
+        state_f16,
+        sr,
+        sr_rounds,
     )
     fn = _KERNELS.get(key)
     if fn is None:
-        fn = KdaReplayMtpUmma.compile(device, T, h, w_ring, u_src, persistent, split)
+        fn = KdaReplayMtpUmma.compile(
+            device, T, h, w_ring, u_src, persistent, split, state_f16, sr, sr_rounds
+        )
         _KERNELS[key] = fn
     return fn
 
@@ -2159,17 +2341,35 @@ def launch_umma_persistent(
     lower_bound: float,
     flush_min: int,
     w_ring: int,
+    state_f16: bool = False,
+    sr: str = "",
+    sr_rounds: int = 0,
+    rand_seed: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch the UMMA kernel on already-validated, contiguous inputs (the dispatcher's
-    contract: bf16 io / state / k and u rings, fp32 g ring, fp32 A_log [H] and dt_bias
-    [H * K], H == HV, K == V == 128)."""
+    contract: bf16 io and k / u rings, bf16 or fp16 (``state_f16``) state pool, fp32 g
+    ring, fp32 A_log [H] and dt_bias [H * K], H == HV, K == V == 128); ``sr`` /
+    ``sr_rounds`` / ``rand_seed`` as ``kda_replay_mtp_umma.launch_umma``."""
+    if rand_seed is None:
+        rand_seed = torch.zeros(1, dtype=torch.int64, device=q.device)
     global _LAUNCHES
     T = q.shape[1]
     H = q.shape[2]
     B = q.shape[0]
     pz, ncta = _grid(B, H, q.device)
     split = _FORCE_SPLIT if _FORCE_SPLIT is not None else pz
-    fn = _get_kernel(q.device, T, H, int(w_ring), _u_src(int(w_ring)), pz, split)
+    fn = _get_kernel(
+        q.device,
+        T,
+        H,
+        int(w_ring),
+        _u_src(int(w_ring)),
+        pz,
+        split,
+        bool(state_f16),
+        sr,
+        int(sr_rounds),
+    )
     fn(
         q,
         k,
@@ -2191,6 +2391,7 @@ def launch_umma_persistent(
         int(flush_min),
         int(ncta),
         _work_counters(q.device),
+        rand_seed,
     )
     _LAUNCHES += 1
 
