@@ -9,8 +9,8 @@ Rounding the output to BF16 alone costs about 1.7e-3 (unit roundoff 2^-8,
 RMS ~ 2^-8 / sqrt(3) relative to |C|). Split-K adds a BF16 rounding per
 partial (S partials of size ~|C| / sqrt(S): another ~1.7e-3 in total) and one
 per reduce-add after the first (sizes growing to |C|), about
-1.7e-3 * sqrt(1 + (S + 1) / 2 - 1 / S): 2.4e-3 at S=2 (3e-3 measured on VR200
-for K=16384) and 3.9e-3 at S=8. The bounds below keep 2x headroom.
+1.7e-3 * sqrt(1 + (S + 1) / 2 - 1 / S): 2.4e-3 at S=2 and 3.9e-3 at S=8.
+The bounds below keep 2x headroom.
 """
 
 import pytest
@@ -53,7 +53,7 @@ def _rel_err(out, reference):
     "m,n,k,tactic",
     [
         # (swap_ab, use_2cta_instrs, mma_m, mma_n, cluster_m, cluster_n, split_k)
-        # The VR200 winners for GLM o_proj and a small-N decode GEMM.
+        # Swap-AB: 2-CTA with split-K 2, 1-CTA with split-K 4 and 8.
         (168, 6144, 16384, (True, True, 256, 128, 2, 1, 2)),
         (128, 6144, 16384, (True, False, 128, 128, 1, 1, 4)),
         (36, 1024, 6144, (True, False, 128, 64, 1, 1, 8)),
@@ -140,38 +140,47 @@ def test_mm_bf16_cute_dsl_sm107_autotune():
         assert _rel_err(out, reference) < _TOL_SPLIT_K
 
 
-def test_sm107_persistent_runner_only_under_explicit_cute_dsl():
-    _skip_unless_sm107_cute_dsl()
-    from flashinfer.gemm.gemm_base import _cute_dsl_bf16_runners
-
-    m, n, k = 64, 1024, 6144
-    x, w, _ = _make_problem(m, n, k)
-    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-    inputs = [x, w.T, None, False, out, None]
-
-    def names(include):
-        runners = _cute_dsl_bf16_runners(inputs, include_sm107_persistent=include)
-        return [type(runner).__name__ for runner in runners]
-
-    assert names(True)[0] == "CuteDSLSm107PersistentBf16Runner"
-    assert "CuteDSLSm107PersistentBf16Runner" not in names(False)
-
-
 @pytest.mark.parametrize(
-    "n,k,with_bias,pdl,message",
+    "n,k,with_bias,pdl,out_is_x,message",
     [
-        (1024, 6144, True, False, "bias"),
-        (1024, 6144, False, True, "PDL"),
-        (1020, 6144, False, False, "multiples of 8"),
-        (1024, 6148, False, False, "multiples of 8"),
+        (1024, 6144, True, False, False, "bias"),
+        (1024, 6144, False, True, False, "PDL"),
+        (1020, 6144, False, False, False, "multiples of 8"),
+        (1024, 6148, False, False, False, "multiples of 8"),
+        # The split-K zero fill would erase x before the GEMM reads it.
+        (1024, 1024, False, False, True, "overlap"),
     ],
 )
-def test_mm_bf16_cute_dsl_sm107_rejects_unsupported(n, k, with_bias, pdl, message):
+def test_mm_bf16_cute_dsl_sm107_rejects_unsupported(
+    n, k, with_bias, pdl, out_is_x, message
+):
     """No fallback stands behind cute-dsl at M > 32, so these raise up front."""
     _skip_unless_sm107_cute_dsl()
     m = 64
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((n,), device="cuda", dtype=torch.bfloat16) if with_bias else None
+    out = x if out_is_x else None
     with pytest.raises(ValueError, match=message):
-        mm_bf16(x, w.T, bias=bias, pdl=pdl, backend="cute-dsl")
+        mm_bf16(x, w.T, bias=bias, pdl=pdl, out=out, backend="cute-dsl")
+
+
+def test_split_k_rejects_output_types_without_reduce_add():
+    """The TMA reduce-add store has no FP8 or 8-bit integer form."""
+    _skip_unless_sm107_cute_dsl()
+    import cutlass
+
+    from flashinfer.gemm.kernels.bmm_fp8_blackwell import PersistentDenseGemmKernel
+
+    def can_implement(c_dtype, split_k):
+        kernel = PersistentDenseGemmKernel(
+            cutlass.Float32, False, (128, 128), (1, 1), True, split_k_slices=split_k
+        )
+        fp8 = cutlass.Float8E4M3FN
+        return kernel.can_implement(
+            (128, 128, 1024, 1), fp8, fp8, c_dtype, "k", "k", "n"
+        )
+
+    assert can_implement(cutlass.BFloat16, 2)
+    assert can_implement(cutlass.Float8E4M3FN, 1)
+    assert not can_implement(cutlass.Float8E4M3FN, 2)

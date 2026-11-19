@@ -4,20 +4,14 @@
 
 Port of TensorRT-LLM's Rubin BF16 GEMM
 (tensorrt_llm/_torch/cute_dsl_kernels/rubin/dense_bf16_gemm_persistent.py and
-the ``_forward_split_k`` path of ``CuteDSLBf16RubinGemmRunner`` in
-tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py, upstream 4e564a0acc).
-Like TensorRT-LLM, it reuses the Blackwell persistent kernel
-(``PersistentDenseGemmKernel``, which carries the split-K port) with the BF16
-tcgen05 MMA unchanged and only retargets it to sm_107, whose 327 KiB of shared
-memory buys deeper A/B pipelines.
-
-It serves ``mm_bf16`` for mid M (decode batches of ~32-300 tokens), where
-cuBLAS streams the weight once per 128 tokens and launches too few CTAs for the
-SMs. Two levers fix that, and the autotuner picks per shape:
+the split-K path of ``CuteDSLBf16RubinGemmRunner``). It reuses the Blackwell
+``PersistentDenseGemmKernel`` and retargets it to sm_107, whose larger shared
+memory allows deeper A/B pipelines. It serves ``mm_bf16`` for M > 32 with two
+options the autotuner picks per shape:
 
 * swap-AB: kernel A is the weight ``W[N, K]`` and kernel B the activations
-  ``X[M, K]``; the kernel writes ``out^T``, an M-major view of ``out``. Up to
-  the MMA tile N (128 or 256 tokens) the weight is streamed once.
+  ``X[M, K]``; the kernel writes ``out^T``, an M-major view of ``out``, and
+  streams the weight once per MMA tile N of tokens.
 * split-K: each output tile is computed by ``split_k`` CTAs over disjoint K
   ranges, and each reduce-adds its BF16 partial into ``out`` with a TMA
   reduction store. ``out`` is zeroed right before the launch on the same
@@ -40,8 +34,7 @@ import torch
 from .bmm_fp8_blackwell import PersistentDenseGemmKernel
 from .bmm_fp8_wrapper import _create_fake_tensors
 
-#: (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn). The configurations
-#: measured with TensorRT-LLM's kernel on VR200 for mid-M decode shapes.
+#: (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) the autotuner sweeps.
 _KERNEL_CONFIGS = (
     (False, (128, 64), (1, 1)),
     (False, (128, 128), (1, 1)),
@@ -254,6 +247,13 @@ def validate_inputs(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None
         raise ValueError(f"K={k} and N={n} must be multiples of 8")
     if any(t.data_ptr() % 16 for t in (a, b, out)):
         raise ValueError("a, b and out must be 16-byte aligned")
+    # All three are dense, so each covers one contiguous byte range.
+    out_begin = out.data_ptr()
+    out_end = out_begin + out.numel() * out.element_size()
+    for t in (a, b):
+        begin = t.data_ptr()
+        if begin < out_end and out_begin < begin + t.numel() * t.element_size():
+            raise ValueError("out must not overlap a or b")
 
 
 @cute.jit

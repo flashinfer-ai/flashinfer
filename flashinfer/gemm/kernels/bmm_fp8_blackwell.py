@@ -136,6 +136,10 @@ def _compute_stages(
     return num_acc_stage, num_ab_stage, num_c_stage
 
 
+def _identity_epilogue(x):
+    return x
+
+
 class PersistentDenseGemmKernel:
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -306,7 +310,7 @@ class PersistentDenseGemmKernel:
         stream: cuda.CUstream,
         a_scale_tensor: Optional[cute.Tensor],
         b_scale_tensor: Optional[cute.Tensor],
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        epilogue_op: cutlass.Constexpr = _identity_epilogue,
     ):
         """Execute the GEMM operation.
 
@@ -314,7 +318,13 @@ class PersistentDenseGemmKernel:
                                b_scale_tensor in the epilogue (no host-side product).
                                Pass None for both scales to skip the multiply (BF16).
         :param b_scale_tensor: 1-element Float32 tensor, see a_scale_tensor.
+        :param epilogue_op: Applied per output element; must be the identity with
+                            split-K, where each K slice's partial is stored.
         """
+        if cutlass.const_expr(
+            self.split_k_slices > 1 and epilogue_op is not _identity_epilogue
+        ):
+            raise ValueError("split-K supports only the identity epilogue_op")
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
@@ -801,10 +811,9 @@ class PersistentDenseGemmKernel:
     def _split_k_range(self, k_tile_cnt, split_idx):
         """Return ``(k_tile_begin, k_tiles_this_split)`` for one K slice.
 
-        Ported from TensorRT-LLM. Balanced partition: split ``s`` covers
+        Balanced partition: split ``s`` covers
         ``[floor(k_tile_cnt * s / S), floor(k_tile_cnt * (s + 1) / S))``, so
-        every split is non-empty when ``k_tile_cnt >= S``. Without split-K the
-        range is the full ``[0, k_tile_cnt)``, as before.
+        every split is non-empty when ``k_tile_cnt >= S``.
         """
         if cutlass.const_expr(self.split_k_slices == 1):
             return 0, k_tile_cnt
@@ -1016,11 +1025,21 @@ class PersistentDenseGemmKernel:
                     f"Problem shape {m}, {n} must be divisible by swizzle size {self.swizzle_size} for non TMA store"
                 )
 
-    def check_split_k(self, k: int, ab_dtype: Type[cutlass.Numeric]):
-        """Check that every K slice gets at least one K tile.
-
-        An empty slice would reduce-add an accumulator it never wrote.
-        """
+    def check_split_k(
+        self,
+        k: int,
+        ab_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
+    ):
+        """Check that the TMA reduce-add store supports C and that every K
+        slice gets at least one K tile (an empty slice would reduce-add an
+        accumulator it never wrote)."""
+        if self.split_k_slices == 1:
+            return
+        if c_dtype not in {cutlass.BFloat16, cutlass.Float16, cutlass.Float32}:
+            raise testing.CantImplementError(
+                f"split-K cannot reduce-add into C of type {c_dtype}"
+            )
         # _setup_attributes uses 4 MMA instructions of 256 bits of K per tile
         k_tile = 4 * 256 // ab_dtype.width
         if (k + k_tile - 1) // k_tile < self.split_k_slices:
@@ -1049,7 +1068,7 @@ class PersistentDenseGemmKernel:
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
             self.check_epilog_store_option(m, n)
-            self.check_split_k(k, a_dtype)
+            self.check_split_k(k, a_dtype, c_dtype)
         except testing.CantImplementError:
             return False
         return True
@@ -1065,7 +1084,7 @@ def bmm(
     stream: cuda.CUstream,
     a_scale_tensor: cute.Tensor,
     b_scale_tensor: cute.Tensor,
-    epilogue_op: cutlass.Constexpr = lambda x: x,
+    epilogue_op: cutlass.Constexpr = _identity_epilogue,
 ):
     """Wrapper API for persistent GEMM kernel to follow the convention of PyTorch's batch matrix-multiply (bmm).
 

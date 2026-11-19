@@ -677,7 +677,7 @@ def _cute_dsl_mm_bf16_requirement(
 
     if a.shape[0] > _CUTE_DSL_BF16_MAX_M:
         if backend == "cute-dsl":
-            _check_cute_dsl_sm107_persistent_bf16(a, b, bias, pdl)
+            _check_cute_dsl_sm107_persistent_bf16(a, b, bias, pdl, out)
         # backend="auto": keep the low-M runners, so that one large-M autotune
         # call still tunes the M <= 32 buckets; they offer no tactics above.
         return True
@@ -695,7 +695,11 @@ def _cute_dsl_mm_bf16_requirement(
 
 
 def _check_cute_dsl_sm107_persistent_bf16(
-    a: torch.Tensor, b: torch.Tensor, bias: Optional[torch.Tensor], pdl: bool
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    pdl: bool,
+    out: Optional[torch.Tensor],
 ) -> None:
     """Reject inputs that explicit ``backend="cute-dsl"`` cannot run at M > 32.
 
@@ -722,8 +726,11 @@ def _check_cute_dsl_sm107_persistent_bf16(
     if k % 8 or n % 8:
         raise ValueError(f"{unsupported} requires N and K to be multiples of 8.")
 
-    from .kernels.dense_bf16_gemm_sm107 import default_tactic
+    from .kernels.dense_bf16_gemm_sm107 import default_tactic, validate_inputs
 
+    if out is not None:
+        validate_inputs(a, b, out)
+    # Raises when no tactic implements the shape.
     default_tactic(m, n, k, a.device)
 
 
@@ -3347,14 +3354,7 @@ def _cute_dsl_sm107_persistent_bf16_gemm_runner(compute_capability: int):
             if tactic == -1:
                 tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1], a.device)
             else:
-                try:
-                    tactic = Sm107Bf16Tactic(*tactic)
-                except TypeError as error:
-                    raise ValueError(
-                        "CuTeDSL SM107 persistent tactics must be (swap_ab, "
-                        "use_2cta_instrs, mma_m, mma_n, cluster_m, cluster_n, "
-                        "split_k)."
-                    ) from error
+                tactic = Sm107Bf16Tactic(*tactic)
             return run_persistent_dense(a, b, out, tactic)
 
     return CuteDSLSm107PersistentBf16Runner(compute_capability)
@@ -3391,7 +3391,6 @@ def _cute_dsl_bf16_runners(
         else None
     )
     cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
-    # The SM107 kernel needs a CuTe DSL with Rubin support.
     sm107_persistent = (
         _cute_dsl_sm107_persistent_bf16_gemm_runner(compute_capability)
         if include_sm107_persistent
