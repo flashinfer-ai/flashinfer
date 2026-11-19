@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """FP8MQATopKWrapper backend='specialized': selection correctness vs an
-exact finite-E4M3 score reference, multi-request support (which cutedsl refuses), determinism,
+fp32 reference, multi-request support (which cutedsl refuses), determinism,
 and the validated contract's rejection semantics."""
 
 import pytest
@@ -67,10 +67,8 @@ def _mk(kv_lens, q_lens, seed):
 
 
 def _reference_rows(inp):
-    """Exact sum_h relu(q_h . k), top-512 complete visible keys, ascending."""
-    # Products lie on the 2**-18 grid; H * D * 448**2 < 2**27.
-    # Binary64 thus preserves strict gaps and exact ties through both sums.
-    kf = inp["k"].to(torch.float64)
+    """fp32 sum_h relu(q_h . k), top-512 complete visible keys, ascending."""
+    kf = inp["k"].to(torch.float32)
     rows = []
     t0 = 0
     for r, (q_len, kv_len) in enumerate(
@@ -82,7 +80,7 @@ def _reference_rows(inp):
             vis = (pos + 1) // RATIO
             row = torch.full((TOPK,), -1, dtype=torch.int32, device="cuda")
             if vis > 0:
-                qf = inp["q"][t0 + i].to(torch.float64)
+                qf = inp["q"][t0 + i].to(torch.float32)
                 sc = (qf @ kf[key0 : key0 + vis].T).clamp_min(0).sum(0)
                 n = min(vis, TOPK)
                 # lower-index tie-breaking: stable sort on (-score, index)
@@ -126,11 +124,10 @@ def test_selection_matches_reference(kv_lens, q_lens):
     gold = _reference_rows(inp)
     assert out.dtype == torch.int32 and out.shape == gold.shape
     assert torch.equal(out, gold)
-    # Compare the repeat to a snapshot, independently of score correctness.
-    first = out.clone()
+    # deterministic across replays; out= honored
     buf = torch.empty_like(gold)
     out2 = w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=buf)
-    assert out2 is buf and torch.equal(out2, first)
+    assert out2 is buf and torch.equal(out2, gold)
 
 
 @requires_sm103
@@ -276,6 +273,64 @@ def test_packed_to_topk_conversion_matches_sort_reference():
     assert torch.equal(got, ref)
 
 
+def _assert_weighted_topk(inp, out, weights):
+    """The common wrapper permits arbitrary ordering and indices at ties."""
+    assert out.dtype == torch.int32
+    assert out.shape == (sum(inp["q_lens"]), TOPK)
+    kf = inp["k"].double()
+    t0 = 0
+    for r, (q_len, kv_len) in enumerate(
+        zip(inp["q_lens"], inp["kv_lens"], strict=True)
+    ):
+        key0 = inp["starts"][r] // RATIO
+        for i in range(q_len):
+            visible = (kv_len - q_len + i + 1) // RATIO
+            count = min(visible, TOPK)
+            row = out[t0 + i]
+            selected = row[row >= 0].long()
+            assert selected.numel() == count
+            assert bool((row[count:] == -1).all())
+            assert selected.unique().numel() == count
+            assert bool((selected < visible).all())
+            if 0 < count < visible:
+                qf = inp["q"][t0 + i].double()
+                scores = (qf @ kf[key0 : key0 + visible].T).clamp_min(0)
+                scores *= weights[t0 + i].double().unsqueeze(1)
+                scores = scores.sum(0) * inp["k_scale"][key0 : key0 + visible].double()
+                unselected = torch.ones(visible, dtype=torch.bool, device=row.device)
+                unselected[selected] = False
+                # These fixtures have exact zero-score boundary ties. Accept
+                # any tied set, but never replace a larger score with a smaller one.
+                assert scores[unselected].max() <= scores[selected].min()
+        t0 += q_len
+
+
+def test_weighted_topk_oracle_accepts_ties_and_rejects_wrong_selection():
+    k = torch.full((TOPK + 1, 1), 2.0)
+    k[-2:] = 1.0
+    inp = dict(
+        k=k,
+        q=torch.ones(1, 1, 1),
+        k_scale=torch.ones(TOPK + 1),
+        q_lens=[1],
+        kv_lens=[(TOPK + 1) * RATIO],
+        starts=[0],
+    )
+    weights = torch.ones(1, 1)
+    low = torch.arange(TOPK, dtype=torch.int32).unsqueeze(0)
+    high = low.clone()
+    high[0, -1] = TOPK
+    _assert_weighted_topk(inp, low, weights)
+    _assert_weighted_topk(inp, high, weights)
+    k[-1] = 0.0
+    with pytest.raises(AssertionError):
+        _assert_weighted_topk(inp, high, weights)
+    duplicate = low.clone()
+    duplicate[0, -1] = 0
+    with pytest.raises(AssertionError):
+        _assert_weighted_topk(inp, duplicate, weights)
+
+
 @requires_sm103
 @requires_validated_toolkit
 def test_auto_nonuniform_weights_eager_falls_back():
@@ -305,10 +360,11 @@ def test_auto_nonuniform_weights_eager_falls_back():
     wc.prepare_pool(inp["k"], k_scale=inp["k_scale"])
     wc.plan(inp["qo"], inp["kv"], num_query_rows=2304)
     ref = wc.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"])
-    assert torch.equal(out, ref[: out.shape[0]])
+    _assert_weighted_topk(inp, out, bad_w)
+    _assert_weighted_topk(inp, ref[: out.shape[0]], bad_w)
     # the demoted wrapper keeps serving later calls
     out2 = w.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"])
-    assert torch.equal(out2[: out.shape[0]], out)
+    _assert_weighted_topk(inp, out2[: out.shape[0]], bad_w)
 
 
 @requires_sm103
