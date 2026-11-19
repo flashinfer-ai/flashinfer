@@ -1,6 +1,7 @@
 # `kda_vibecuda` — Experimental SM100a / SM103a Recurrent KDA Prefill Backend
 
 - **Owner:** `@Edenzzzz`
+- **Tracking issue:** https://github.com/flashinfer-ai/flashinfer/issues/9703
 - **Entry point:** `flashinfer.kda.recurrent_kda(..., backend="vibecuda")`
 - **Targets:** NVIDIA Blackwell SM100a (CC 10.0, B200/GB200) and SM103a (CC 10.3, B300/GB300), JIT-compiled on first use.
 
@@ -13,6 +14,14 @@
 3. **Head-family `fam2` schedule** (`fam2h12`, `fam2h64`, `fam2h96` on SM100a; `fam2h64`, `fam2h96` on SM103a) with compile-time head specialization and direct TMA descriptor reuse.
 4. **Device-planned persistent M128** (`vibecuda_flashkda_bf16_persistent_m128.cu`) for deep packed workloads (`N * H >= 4 * sm_count`).
 5. **Fused-N16 (`bt16`) schedule** for shallow packed `H = 12` (`N <= 5`) and short fixed `H = 12` (`B = 1, T <= 1024` on SM103a).
+
+## Performance Scope (When to Use `backend="vibecuda"`)
+
+- **Where `backend="vibecuda"` wins over `backend="auto"`:**
+  - **Long fixed-layout prefill with low batch × head count (`cu_seqlens=None`, `B * H <= 32`, `T >= 8192`):** The split-sequence affine prefix schedule partitions long sequences across up to 148 SMs and outperforms `backend="auto"` by **1.25x–27.91x** on GB200 (`sm_100a`) and **1.28x–23.18x** on B300 (`sm_103a`).
+  - **Direct comparison against `backend="cake"`:** Across the 18-shape prefill benchmark sweep (both fixed-layout and variable-length packed), `backend="vibecuda"` achieves **1.16x** geomean speedup on GB200 (`1.04x–1.30x`) and **1.14x** geomean speedup on B300 (`1.01x–1.27x`) over explicit `backend="cake"`.
+- **Where `backend="auto"` is faster (`backend="vibecuda"` not recommended):**
+  - **Packed variable-length workloads (`cu_seqlens` provided, `H = 12 / 64 / 96`) and short fixed-layout shapes (`T <= 4096` or `B * H > 32`):** `backend="auto"` routes many of these shapes to `small-bh` / short-prefix schedules, where `backend="vibecuda"` runs at roughly **0.50x–0.95x** of `backend="auto"`'s speed. Use `backend="auto"` (the default) for general serving, and opt into `backend="vibecuda"` specifically for long fixed-layout prefill (`B * H <= 32`, `T >= 8192`) or when benchmarking against the CAKE schedule family.
 
 ## Usage
 

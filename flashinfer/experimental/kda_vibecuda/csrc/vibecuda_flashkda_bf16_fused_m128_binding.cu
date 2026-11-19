@@ -214,11 +214,11 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
                       const void* seq_order_ptr, const void* initial_state_ptr, void* out_ptr,
                       void* final_state_ptr, void* descriptor_storage_ptr, int64_t token_count,
                       int64_t num_seqs, int64_t prepare_descriptors, int64_t num_heads,
-                      int64_t use_initial_state, double scale, double lower_bound,
-                      int64_t beta_tma_rows, int64_t beta_tma_dim1, int64_t num_parts,
-                      void* split_state_ptr, void* map_state_ptr, void* carry_ptr,
-                      void* split_out_ptr, void* lookback_flags_ptr, void* map_state_bf16_ptr,
-                      int64_t ft_slab, int64_t cuda_stream) {
+                      int64_t use_initial_state, int64_t store_final_state, double scale,
+                      double lower_bound, int64_t beta_tma_rows, int64_t beta_tma_dim1,
+                      int64_t num_parts, void* split_state_ptr, void* map_state_ptr,
+                      void* carry_ptr, void* split_out_ptr, void* lookback_flags_ptr,
+                      void* map_state_bf16_ptr, int64_t ft_slab, int64_t cuda_stream) {
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   // Round-120 (shared): exactly-once SMEM-size attribute registration —
   // the split route re-issued SEVEN driver calls per forward; hoist into
@@ -387,8 +387,9 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
         "fused scan flags memset");
     LaunchM128(tma, q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, cu_seqlens_ptr,
                seq_order_ptr, carry_ptr, out_ptr, final_state_ptr, num_seqs, num_heads,
-               /*use_initial_state=*/1, /*store_final_state=*/0, scale, lower_bound, num_parts,
-               split_state_ptr,
+               /*use_initial_state=*/1,
+               /*store_final_state=*/(store_final_state != 0) ? 1 : 0, scale, lower_bound,
+               num_parts, split_state_ptr,
                /*split_gamma_ptr=*/map_state_ptr, /*fixup_mode=*/3,
                /*grid_y=*/32 + num_parts - 1, stream, reinterpret_cast<int*>(lookback_flags_ptr),
                /*map_state_bf16_ptr=*/nullptr, ft_slab,
@@ -485,12 +486,11 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
       // the dead-map channel remains a main/map-pass mechanism only.
       LaunchM128(tma, q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, cu_seqlens_ptr,
                  seq_order_ptr, carry_ptr, out_ptr, final_state_ptr, num_seqs, num_heads,
-                 // Round-79 contract correction: the last correction part emits the
-                 // exact serial final state (M_{P-1} * c_{P-1} + S_{P-1}) in place
-                 // into the caller's initial_state buffer (gated in the kernel;
-                 // only safe when the caller supplied a real initial_state).
+                 // The last correction part emits the exact serial final state
+                 // (M_{P-1} * c_{P-1} + S_{P-1}) into final_state_ptr (which
+                 // aliases initial_state_ptr when initial_state was supplied).
                  /*use_initial_state=*/1,
-                 /*store_final_state=*/(use_initial_state != 0) ? 1 : 0, scale, lower_bound,
+                 /*store_final_state=*/(store_final_state != 0) ? 1 : 0, scale, lower_bound,
                  num_parts, split_state_ptr, /*split_gamma_ptr=*/nullptr, /*fixup_mode=*/1,
                  /*grid_y=*/num_parts - 1, stream,
                  /*progress_flags=*/nullptr,

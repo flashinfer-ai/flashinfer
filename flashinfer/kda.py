@@ -698,7 +698,7 @@ def recurrent_kda(
         # gated_delta_rule_mtp flag): outputs only, no state writes,
         # optional slot-indexed correction/kg caches. Handled ahead of the
         # prefill routing — none of the prefill-only features apply.
-        if backend in ("small-bh", "vibecuda"):
+        if backend == "small-bh" or backend == "vibecuda":
             raise ValueError(
                 f"backend={backend!r} has no frozen-state kernels; "
                 "disable_state_update=True requires the CuTe-DSL backends"
@@ -805,18 +805,10 @@ def recurrent_kda(
             k = k.contiguous()
     if backend == "vibecuda":
         from .api_logging import warn_experimental_backend_once
-        from .experimental.kda_vibecuda import (
-            _run_vibecuda_kda_prefill,
-            _try_run_fast_vibecuda_kda_prefill,
-            _vibecuda_kda_prefill_is_eligible,
-        )
+        from .experimental.kda_vibecuda import run
 
         warn_experimental_backend_once("recurrent_kda", "vibecuda")
-        if checkpoint_state_indices is not None:
-            raise ValueError(
-                "backend='vibecuda' does not support this recurrent_kda prefill contract"
-            )
-        fast_out = _try_run_fast_vibecuda_kda_prefill(
+        return run(
             q=q,
             k=k,
             v=v,
@@ -842,68 +834,8 @@ def recurrent_kda(
             prefill_workspace=prefill_workspace,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        )
-        if fast_out is not None:
-            return fast_out
-        if not is_plain_prefill:
-            raise ValueError(
-                "backend='vibecuda' does not support decode or single-token "
-                "recurrent_kda calls; it covers ordinary multi-token prefill only"
-            )
-        if isinstance(q, torch.Tensor) and q.is_cuda:
-            cc = get_compute_capability(q.device)
-            if cc not in _kda_prefill._FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
-                raise RuntimeError(
-                    "The VibeCUDA recurrent KDA prefill backend supports only "
-                    f"compute capabilities 10.0 and 10.3, got {cc}"
-                )
-        if not _vibecuda_kda_prefill_is_eligible(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            initial_state=initial_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices,
-            num_spec_tokens=num_spec_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            output=output,
-            initial_state_source=initial_state_source,
-            initial_state_indices=initial_state_indices,
-            beta_is_logit=beta_is_logit,
-            state_checkpoints=state_checkpoints,
-            checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        ):
-            raise ValueError(
-                "backend='vibecuda' does not support this recurrent_kda prefill contract"
-            )
-        assert A_log is not None
-        assert dt_bias is not None
-        assert lower_bound is not None
-        return _run_vibecuda_kda_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            output=output,
-            seq_order=seq_order,
-            prefill_workspace=prefill_workspace,
         )
     if backend in ("auto", "small-bh"):
         small_bh_available = (

@@ -108,6 +108,9 @@ def test_public_decode_vibecuda_backend_is_prefill_only():
 def test_vibecuda_prefill_rejects_non_sm100_arch(cuda_device, monkeypatch):
     monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (9, 0))
     monkeypatch.setattr(
+        kda_vibecuda_backend, "get_compute_capability", lambda device: (9, 0)
+    )
+    monkeypatch.setattr(
         kda_vibecuda_backend, "_fast_plan_device_supported", lambda device: False
     )
     inputs = _make_inputs(
@@ -131,6 +134,7 @@ def test_vibecuda_prefill_rejects_non_sm100_arch(cuda_device, monkeypatch):
         ([128] * 8, 96, True, 4208),
         ([4096], 12, False, 4209),
         ([1024] * 4, 12, True, 4210),
+        ([256] * 24, 32, True, 4211),
     ],
 )
 def test_vibecuda_prefill_matches_torch_reference(
@@ -299,32 +303,54 @@ def test_vibecuda_packed_prefill_sorts_sequences_on_device(flash_kda_device):
     )
 
 
-def test_vibecuda_prefill_without_initial_state(flash_kda_device):
+@pytest.mark.parametrize(
+    ("seq_lens", "num_heads", "packed", "seed"),
+    [
+        ([512], 96, False, 4211),
+        ([8192], 4, False, 4215),
+        ([16384], 1, False, 4216),
+        ([256] * 24, 32, True, 4217),
+    ],
+)
+def test_vibecuda_prefill_without_initial_state(
+    flash_kda_device, seq_lens, num_heads, packed, seed
+):
     inputs = _make_inputs(
-        seq_lens=[512], num_heads=96, packed=False, initial_state=False, seed=4211
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=False,
+        seed=seed,
     )
 
     expected = _reference(inputs)
     output = torch.empty_like(inputs["q"])
-    actual = recurrent_kda(
-        **_strict_prefill_kwargs(inputs),
-        output=output,
-        output_final_state=True,
-        backend="vibecuda",
-    )
+    # Run twice so the second invocation exercises the fast-plan hit path with
+    # initial_state=None and output_final_state=True across direct/fam2,
+    # split-sequence, and persistent routes.
+    for _ in range(2):
+        output.fill_(float("nan"))
+        actual = recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=output,
+            output_final_state=True,
+            backend="vibecuda",
+        )
 
-    torch.testing.assert_close(
-        actual[0].float(),
-        expected[0].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        actual[1].float(),
-        expected[1].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+        assert actual[1] is not None
+        assert not torch.isnan(actual[1]).any()
+        torch.testing.assert_close(
+            actual[0].float(),
+            expected[0].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            actual[1].float(),
+            expected[1].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
 
 @pytest.mark.parametrize("packed", [False, True])

@@ -1869,7 +1869,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
             bool _emit_final = (store_final_state != 0);
             const float* _s_add = nullptr;
             if (split_num_parts > 1) {
-                _emit_final = _emit_final && (fixup_mode == 1) &&
+                _emit_final = _emit_final && ((fixup_mode & 1) == 1) &&
                               (split_part == split_num_parts - 1);
                 if (_emit_final && split_state != nullptr) {
                     _s_add = split_state

@@ -43,6 +43,7 @@ from .backend import (
     _vibecuda_split_out_buffer,
     _vibecuda_state,
     _vibecuda_use_transient_pools,
+    run,
 )
 from .jit import (
     VibeCUDAPrefillTarget,
@@ -86,4 +87,5 @@ __all__ = [
     "get_vibecuda_csrc_dir",
     "get_vibecuda_flash_kda_uri",
     "load_vibecuda_flash_kda_module",
+    "run",
 ]

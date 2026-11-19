@@ -85,11 +85,23 @@ from ...kda_prefill import (
     _flash_kda_device_sm_count,
     _fixed_cu_seqlens,
     _identity_seq_order,
-    _stream_cache_key,
     _validate_prefill_seq_order,
     _workspace_buffer,
 )
 from ...utils import get_compute_capability
+
+_raw_stream_ptr = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _stream_cache_key(device: torch.device) -> tuple[int, int]:
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    if _raw_stream_ptr is not None:
+        return device_index, int(_raw_stream_ptr(device_index))
+    stream = torch.cuda.current_stream(device)
+    return device_index, int(stream.cuda_stream)
+
 
 _HEAD_DIM = 128
 _DESCRIPTOR_STORAGE_BYTES = 7 * 128
@@ -299,6 +311,19 @@ def _vibecuda_pool(
 
 class _VibeCUDAStreamWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     """Internal eager-only workspace for one CUDA stream."""
+
+    def __init__(self, device: torch.device | str) -> None:
+        normalized_device = torch.device(device)
+        if normalized_device.type != "cuda":
+            raise ValueError("RecurrentKDAPrefillWorkspace requires a CUDA device")
+        if normalized_device.index is None:
+            normalized_device = torch.device("cuda", torch.cuda.current_device())
+        self.device = normalized_device
+        self._lock = threading.Lock()
+        self._bound_stream_ptr: Optional[int] = None
+        self._captured = False
+        self._vibecuda_state: Optional[object] = None
+        self._vibecuda_state_lock = threading.Lock()
 
 
 _vibecuda_stream_workspaces: dict[tuple[int, int], _VibeCUDAStreamWorkspace] = {}
@@ -1255,6 +1280,7 @@ def _try_run_fast_vibecuda_kda_prefill(
                     prepare_descriptors,
                     num_heads,
                     int(use_initial_state),
+                    int(store_final_state),
                     plan.scale_value,
                     plan.lower_bound_value,
                     plan.sm_count,
@@ -1321,6 +1347,7 @@ def _try_run_fast_vibecuda_kda_prefill(
                     prepare_descriptors,
                     num_heads,
                     int(use_initial_state),
+                    int(store_final_state),
                     plan.scale_value,
                     plan.lower_bound_value,
                     plan.split_parts,
@@ -1796,6 +1823,7 @@ def _run_vibecuda_kda_prefill(
                     prepare_descriptors,
                     num_heads,
                     int(use_initial_state),
+                    int(store_final_state),
                     scale_value,
                     float(lower_bound),
                     sm_count,
@@ -1850,6 +1878,7 @@ def _run_vibecuda_kda_prefill(
                     prepare_descriptors,
                     num_heads,
                     int(use_initial_state),
+                    int(store_final_state),
                     scale_value,
                     float(lower_bound),
                     split_parts,
@@ -1951,3 +1980,135 @@ def _run_vibecuda_kda_prefill(
         if capturing and explicit_workspace:
             workspace._captured = True
     return out_buf, (returned_state if output_final_state else None)
+
+
+def run(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    scale: Optional[float],
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    lower_bound: Optional[float],
+    cu_seqlens: Optional[torch.Tensor],
+    ssm_state_indices: Optional[torch.Tensor],
+    num_spec_tokens: Optional[int],
+    num_accepted_tokens: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    initial_state_source: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
+    beta_is_logit: bool,
+    seq_order: Optional[torch.Tensor],
+    prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_state_indices: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Public hand-off entry point from :func:`flashinfer.kda.recurrent_kda`."""
+    from . import (
+        _run_vibecuda_kda_prefill as _pkg_run_vibecuda,
+        _try_run_fast_vibecuda_kda_prefill as _pkg_try_fast,
+        _vibecuda_kda_prefill_is_eligible as _pkg_is_eligible,
+    )
+
+    if checkpoint_state_indices is not None:
+        raise ValueError(
+            "backend='vibecuda' does not support this recurrent_kda prefill contract"
+        )
+    fast_out = _pkg_try_fast(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_spec_tokens=num_spec_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        output=output,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        beta_is_logit=beta_is_logit,
+        seq_order=seq_order,
+        prefill_workspace=prefill_workspace,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
+    if fast_out is not None:
+        return fast_out
+    if not _kda_prefill._is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
+        raise ValueError(
+            "backend='vibecuda' does not support decode or single-token "
+            "recurrent_kda calls; it covers ordinary multi-token prefill only"
+        )
+    if isinstance(q, torch.Tensor) and q.is_cuda:
+        cc = get_compute_capability(q.device)
+        if cc not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
+            raise RuntimeError(
+                "The VibeCUDA recurrent KDA prefill backend supports only "
+                f"compute capabilities 10.0 and 10.3, got {cc}"
+            )
+    if not _pkg_is_eligible(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_spec_tokens=num_spec_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        output=output,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        beta_is_logit=beta_is_logit,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    ):
+        raise ValueError(
+            "backend='vibecuda' does not support this recurrent_kda prefill contract"
+        )
+    assert A_log is not None
+    assert dt_bias is not None
+    assert lower_bound is not None
+    return _pkg_run_vibecuda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        output=output,
+        seq_order=seq_order,
+        prefill_workspace=prefill_workspace,
+    )

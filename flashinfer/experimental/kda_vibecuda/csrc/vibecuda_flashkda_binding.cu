@@ -48,11 +48,11 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
                       const void* seq_order_ptr, const void* initial_state_ptr, void* out_ptr,
                       void* final_state_ptr, void* descriptor_storage_ptr, int64_t token_count,
                       int64_t num_seqs, int64_t prepare_descriptors, int64_t num_heads,
-                      int64_t use_initial_state, double scale, double lower_bound,
-                      int64_t beta_tma_rows, int64_t beta_tma_dim1, int64_t num_parts,
-                      void* split_state_ptr, void* map_state_ptr, void* carry_ptr,
-                      void* split_out_ptr, void* lookback_flags_ptr, void* map_state_bf16_ptr,
-                      int64_t ft_slab, int64_t cuda_stream);
+                      int64_t use_initial_state, int64_t store_final_state, double scale,
+                      double lower_bound, int64_t beta_tma_rows, int64_t beta_tma_dim1,
+                      int64_t num_parts, void* split_state_ptr, void* map_state_ptr,
+                      void* carry_ptr, void* split_out_ptr, void* lookback_flags_ptr,
+                      void* map_state_bf16_ptr, int64_t ft_slab, int64_t cuda_stream);
 void RunM64(const void* q_ptr, const void* k_ptr, const void* v_ptr, const void* g_ptr,
             const void* beta_ptr, const void* beta_tma_ptr, const void* A_log_ptr,
             const void* dt_bias_ptr, const void* cu_seqlens_ptr, const void* seq_order_ptr,
@@ -88,11 +88,11 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
                       const void* seq_order_ptr, const void* initial_state_ptr, void* out_ptr,
                       void* final_state_ptr, void* descriptor_storage_ptr, int64_t token_count,
                       int64_t num_seqs, int64_t prepare_descriptors, int64_t num_heads,
-                      int64_t use_initial_state, double scale, double lower_bound,
-                      int64_t beta_tma_rows, int64_t beta_tma_dim1, int64_t num_parts,
-                      void* split_state_ptr, void* map_state_ptr, void* carry_ptr,
-                      void* split_out_ptr, void* lookback_flags_ptr, void* map_state_bf16_ptr,
-                      int64_t ft_slab, int64_t cuda_stream);
+                      int64_t use_initial_state, int64_t store_final_state, double scale,
+                      double lower_bound, int64_t beta_tma_rows, int64_t beta_tma_dim1,
+                      int64_t num_parts, void* split_state_ptr, void* map_state_ptr,
+                      void* carry_ptr, void* split_out_ptr, void* lookback_flags_ptr,
+                      void* map_state_bf16_ptr, int64_t ft_slab, int64_t cuda_stream);
 }  // namespace kda_flash_slab
 
 // Head-family launchers: compile-time-H single-kernel per-(sequence, head)
@@ -300,6 +300,11 @@ int64_t CheckVibeCUDAPrefillInputs(
                    num_seqs * num_heads * flash_kda::kHeadDim * flash_kda::kHeadDim)
         << "initial_state must be [N, H, 128, 128]";
   }
+  if (store_final_state != 0) {
+    TVM_FFI_ICHECK(final_state.numel() ==
+                   num_seqs * num_heads * flash_kda::kHeadDim * flash_kda::kHeadDim)
+        << "final_state must be [N, H, 128, 128]";
+  }
 
   CheckNoOverlap(out, "out", q, "q");
   CheckNoOverlap(out, "out", k, "k");
@@ -353,8 +358,8 @@ void SortSeqsInto(TensorView cu_seqlens, TensorView order_out, int64_t cuda_stre
   CheckDtype(order_out, "order_out", dl_int32);
   const int64_t num_seqs = cu_seqlens.numel() - 1;
   TVM_FFI_ICHECK(num_seqs > 0) << "cu_seqlens must describe at least one sequence";
-  TVM_FFI_ICHECK(num_seqs <= 2048) << "sort_seqs_into supports at most 2048 sequences, got "
-                                   << num_seqs;
+  TVM_FFI_ICHECK(num_seqs <= 2048)
+      << "sort_seqs_into supports at most 2048 sequences, got " << num_seqs;
   TVM_FFI_ICHECK(order_out.numel() == num_seqs) << "order_out must have one entry per sequence";
   const int64_t smem = num_seqs * (sizeof(int64_t) + sizeof(int));
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
@@ -437,7 +442,8 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
                        TensorView task_offsets, TensorView choice_scratch, TensorView initial_state,
                        TensorView out, TensorView final_state, TensorView descriptor_storage,
                        int64_t prepare_descriptors, int64_t num_heads, int64_t use_initial_state,
-                       double scale, double lower_bound, int64_t sm_count, int64_t cuda_stream) {
+                       int64_t store_final_state, double scale, double lower_bound,
+                       int64_t sm_count, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
@@ -447,7 +453,7 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
   const int64_t token_count = CheckVibeCUDAPrefillInputs(
       q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order, initial_state, out,
       final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
-      /*store_final_state=*/use_initial_state, scale, lower_bound);
+      store_final_state, scale, lower_bound);
   const int64_t num_seqs = cu_seqlens.numel() - 1;
   CheckCudaTensor(task_ids, "task_ids", device_id);
   CheckCudaTensor(task_offsets, "task_offsets", device_id);
@@ -462,15 +468,14 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
   TVM_FFI_ICHECK(choice_scratch.numel() >= num_seqs * num_heads) << "choice_scratch too small";
   const int64_t beta_tma_dim1 = beta_tma.size(1);
   const int64_t beta_tma_rows = beta_tma.numel() / beta_tma_dim1;
-  kda_flash::RunPersistentM128(q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
-                               beta.data_ptr(), beta_tma.data_ptr(), A_log.data_ptr(),
-                               dt_bias.data_ptr(), cu_seqlens.data_ptr(), seq_order.data_ptr(),
-                               task_ids.data_ptr(), task_offsets.data_ptr(),
-                               choice_scratch.data_ptr(), initial_state.data_ptr(), out.data_ptr(),
-                               final_state.data_ptr(), descriptor_storage.data_ptr(), token_count,
-                               num_seqs, prepare_descriptors, num_heads, use_initial_state,
-                               /*store_final_state=*/use_initial_state, scale, lower_bound,
-                               beta_tma_rows, beta_tma_dim1, sm_count, cuda_stream);
+  kda_flash::RunPersistentM128(
+      q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(), beta_tma.data_ptr(),
+      A_log.data_ptr(), dt_bias.data_ptr(), cu_seqlens.data_ptr(), seq_order.data_ptr(),
+      task_ids.data_ptr(), task_offsets.data_ptr(), choice_scratch.data_ptr(),
+      initial_state.data_ptr(), out.data_ptr(), final_state.data_ptr(),
+      descriptor_storage.data_ptr(), token_count, num_seqs, prepare_descriptors, num_heads,
+      use_initial_state, store_final_state, scale, lower_bound, beta_tma_rows, beta_tma_dim1,
+      sm_count, cuda_stream);
 }
 
 void RunM128Split(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
@@ -479,8 +484,8 @@ void RunM128Split(TensorView q, TensorView k, TensorView v, TensorView g, Tensor
                   TensorView final_state, TensorView descriptor_storage, TensorView split_state,
                   TensorView map_state, TensorView carry, TensorView split_out,
                   TensorView map_state_bf16, TensorView lookback_flags, int64_t prepare_descriptors,
-                  int64_t num_heads, int64_t use_initial_state, double scale, double lower_bound,
-                  int64_t num_parts, int64_t cuda_stream) {
+                  int64_t num_heads, int64_t use_initial_state, int64_t store_final_state,
+                  double scale, double lower_bound, int64_t num_parts, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
@@ -490,7 +495,7 @@ void RunM128Split(TensorView q, TensorView k, TensorView v, TensorView g, Tensor
   const int64_t token_count = CheckVibeCUDAPrefillInputs(
       q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order, initial_state, out,
       final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
-      /*store_final_state=*/0, scale, lower_bound);
+      store_final_state, scale, lower_bound);
   const int64_t num_seqs = cu_seqlens.numel() - 1;
   const int64_t num_tasks = num_seqs * num_heads;
   CheckCudaTensor(split_state, "split_state", device_id);
@@ -543,18 +548,20 @@ void RunM128Split(TensorView q, TensorView k, TensorView v, TensorView g, Tensor
         beta_tma.data_ptr(), A_log.data_ptr(), dt_bias.data_ptr(), cu_seqlens.data_ptr(),
         seq_order.data_ptr(), initial_state.data_ptr(), out.data_ptr(), final_state.data_ptr(),
         descriptor_storage.data_ptr(), token_count, num_seqs, prepare_descriptors, num_heads,
-        use_initial_state, scale, lower_bound, beta_tma_rows, beta_tma_dim1, num_parts,
-        split_state.data_ptr(), map_state.data_ptr(), carry.data_ptr(), split_out.data_ptr(),
-        lookback_flags.data_ptr(), map_state_bf16.data_ptr(), slab, cuda_stream);
+        use_initial_state, store_final_state, scale, lower_bound, beta_tma_rows, beta_tma_dim1,
+        num_parts, split_state.data_ptr(), map_state.data_ptr(), carry.data_ptr(),
+        split_out.data_ptr(), lookback_flags.data_ptr(), map_state_bf16.data_ptr(), slab,
+        cuda_stream);
   } else {
     kda_flash::RunM128SplitFull(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(),
         beta_tma.data_ptr(), A_log.data_ptr(), dt_bias.data_ptr(), cu_seqlens.data_ptr(),
         seq_order.data_ptr(), initial_state.data_ptr(), out.data_ptr(), final_state.data_ptr(),
         descriptor_storage.data_ptr(), token_count, num_seqs, prepare_descriptors, num_heads,
-        use_initial_state, scale, lower_bound, beta_tma_rows, beta_tma_dim1, num_parts,
-        split_state.data_ptr(), map_state.data_ptr(), carry.data_ptr(), split_out.data_ptr(),
-        lookback_flags.data_ptr(), map_state_bf16.data_ptr(), slab, cuda_stream);
+        use_initial_state, store_final_state, scale, lower_bound, beta_tma_rows, beta_tma_dim1,
+        num_parts, split_state.data_ptr(), map_state.data_ptr(), carry.data_ptr(),
+        split_out.data_ptr(), lookback_flags.data_ptr(), map_state_bf16.data_ptr(), slab,
+        cuda_stream);
   }
 }
 
@@ -649,6 +656,11 @@ void RunBt16Fused(TensorView q, TensorView k, TensorView g, TensorView beta, Ten
     TVM_FFI_ICHECK(initial_state.numel() ==
                    num_seqs * num_heads * flash_kda::kHeadDim * flash_kda::kHeadDim)
         << "initial_state must be [N, H, 128, 128]";
+  }
+  if (store_final_state != 0) {
+    TVM_FFI_ICHECK(final_state.numel() ==
+                   num_seqs * num_heads * flash_kda::kHeadDim * flash_kda::kHeadDim)
+        << "final_state must be [N, H, 128, 128]";
   }
   CheckNoOverlap(out, "out", q, "q");
   CheckNoOverlap(out, "out", k, "k");
