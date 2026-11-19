@@ -43,9 +43,8 @@ void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t
 }
 
 int64_t CheckedAdd(int64_t a, int64_t b) {
-  int64_t sum;
-  if (__builtin_add_overflow(a, b, &sum)) NoInt64(a, "+", b);
-  return sum;
+  if (b > 0 ? a > INT64_MAX - b : a < INT64_MIN - b) NoInt64(a, "+", b);
+  return a + b;
 }
 
 void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorView a_q_indptr, TensorView a_page_indices, TensorView a_q_norm_weight, TensorView a_k_norm_weight, TensorView a_k_scale, TensorView a_v_scale, TensorView a_q_scale_inv, TensorView a_out_q, TensorView a_key_cache, TensorView a_value_cache, TensorView a_out_k, TensorView a_out_v, TensorView a_q_scale, TensorView a_split_k_flag, int64_t a_num_rows, int64_t a_num_requests, int64_t a_num_q_heads, int64_t a_num_kv_heads, int64_t a_page_size, int64_t a_max_pages_per_request, int64_t a_max_seqlen, int64_t a_max_seqlen_aligned, int64_t a_quant_policy, int64_t a_norm_policy, bool a_is_prefill, bool a_has_out_kv, double a_upper_max, int64_t grid_x, int64_t grid_y, int64_t grid_z) {

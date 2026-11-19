@@ -43,9 +43,11 @@ void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t
 }
 
 int64_t CheckedMul(int64_t a, int64_t b) {
-  int64_t product;
-  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
-  return product;
+  if (a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a)
+            : (b > 0 ? a < INT64_MIN / b : a != 0 && b < INT64_MAX / a)) {
+    NoInt64(a, "*", b);
+  }
+  return a * b;
 }
 
 void Run(TensorView a_Q, TensorView a_K, TensorView a_V, TensorView a_mean_k, TensorView a_q4, TensorView a_sfq, TensorView a_qm4, TensorView a_sfqm, TensorView a_k4, TensorView a_sfk, TensorView a_vt4, TensorView a_sfv_lo, TensorView a_sfv_hi, int64_t a_seqlen, int64_t a_q_stride, int64_t a_kv_stride, int64_t a_heads, int64_t a_num_q_blocks, int64_t a_total_bh, int64_t a_q_stride_s, int64_t a_q_stride_h, int64_t a_q_stride_b, int64_t a_k_stride_s, int64_t a_k_stride_h, int64_t a_k_stride_b, int64_t a_v_stride_s, int64_t a_v_stride_h, int64_t a_v_stride_b, TensorView a_q4l, TensorView a_sfq_l, TensorView a_k4l, TensorView a_sfk_l, int64_t grid_x, int64_t grid_y, int64_t grid_z) {

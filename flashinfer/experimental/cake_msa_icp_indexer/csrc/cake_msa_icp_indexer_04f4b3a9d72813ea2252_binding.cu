@@ -67,9 +67,8 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
 }
 
 int64_t CheckedAdd(int64_t a, int64_t b) {
-  int64_t sum;
-  if (__builtin_add_overflow(a, b, &sum)) NoInt64(a, "+", b);
-  return sum;
+  if (b > 0 ? a > INT64_MAX - b : a < INT64_MIN - b) NoInt64(a, "+", b);
+  return a + b;
 }
 
 int64_t CMod(int64_t a, int64_t b) {

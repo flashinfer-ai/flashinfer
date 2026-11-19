@@ -68,9 +68,11 @@ void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t
 }
 
 int64_t CheckedMul(int64_t a, int64_t b) {
-  int64_t product;
-  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
-  return product;
+  if (a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a)
+            : (b > 0 ? a < INT64_MIN / b : a != 0 && b < INT64_MAX / a)) {
+    NoInt64(a, "*", b);
+  }
+  return a * b;
 }
 
 void Run(TensorView a_out, TensorView a_prefix, TensorView a_delta, TensorView a_blocks, TensorView a_norm_weight, TensorView a_qk_weight, TensorView a_output_norm_weight, int64_t a_out_stride, int64_t a_prefix_stride, int64_t a_delta_stride, int64_t a_blocks_m_stride, int64_t a_blocks_k_stride, double a_eps, double a_output_norm_eps, int64_t a_block_write_idx, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {

@@ -67,9 +67,8 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
 }
 
 int64_t CheckedSub(int64_t a, int64_t b) {
-  int64_t difference;
-  if (__builtin_sub_overflow(a, b, &difference)) NoInt64(a, "-", b);
-  return difference;
+  if (b < 0 ? a > INT64_MAX + b : a < INT64_MIN + b) NoInt64(a, "-", b);
+  return a - b;
 }
 
 int64_t CMod(int64_t a, int64_t b) {

@@ -73,15 +73,16 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
 }
 
 int64_t CheckedAdd(int64_t a, int64_t b) {
-  int64_t sum;
-  if (__builtin_add_overflow(a, b, &sum)) NoInt64(a, "+", b);
-  return sum;
+  if (b > 0 ? a > INT64_MAX - b : a < INT64_MIN - b) NoInt64(a, "+", b);
+  return a + b;
 }
 
 int64_t CheckedMul(int64_t a, int64_t b) {
-  int64_t product;
-  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
-  return product;
+  if (a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a)
+            : (b > 0 ? a < INT64_MIN / b : a != 0 && b < INT64_MAX / a)) {
+    NoInt64(a, "*", b);
+  }
+  return a * b;
 }
 
 int64_t CDiv(int64_t a, int64_t b) {

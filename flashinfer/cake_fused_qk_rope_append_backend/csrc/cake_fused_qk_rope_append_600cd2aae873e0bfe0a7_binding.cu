@@ -43,9 +43,11 @@ void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t
 }
 
 int64_t CheckedMul(int64_t a, int64_t b) {
-  int64_t product;
-  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
-  return product;
+  if (a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a)
+            : (b > 0 ? a < INT64_MIN / b : a != 0 && b < INT64_MAX / a)) {
+    NoInt64(a, "*", b);
+  }
+  return a * b;
 }
 
 void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_q_indptr, TensorView a_seq_lens, TensorView a_page_table, TensorView a_k_cache, TensorView a_v_cache, TensorView a_out_q, TensorView a_out_k, TensorView a_out_v, TensorView a_q_norm_weight, TensorView a_k_norm_weight, int64_t a_num_rows, int64_t a_num_requests, int64_t a_max_pages, int64_t a_page_size, int64_t a_k_page_stride, int64_t a_v_page_stride, int64_t a_num_row_ctas, int64_t a_clear_units_per_request, int64_t a_qk_norm_policy, double a_eps, int64_t a_use_out_k, int64_t a_use_out_v, int64_t a_clear_last_page, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
