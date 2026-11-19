@@ -229,6 +229,48 @@ def test_dispatch_semantics():
 
 
 @requires_sm103
+@pytest.mark.parametrize(
+    "TQ,TKV",
+    [(128, 12416), (256, 15872), (2101, 66304)],
+)
+@pytest.mark.parametrize("frac", ["half", "17"])
+def test_runtime_kv_extent_shorter_than_buffer(TQ, TKV, frac):
+    # Capacity-reuse form of an allowlisted class: K/V sized to the class's
+    # full capacity while cu_kv/seq_lens describe a shorter active prefix.
+    # The specialized route must honor the runtime extent; the inactive tail
+    # (poisoned with V=1 here) must not contribute to the output or the LSE.
+    dev = torch.device("cuda")
+    active = 17 if frac == "17" else TKV // 2 + 17  # off the BN tile grid
+    q = torch.zeros((TQ, HQ, D_QK), dtype=torch.float8_e4m3fn, device=dev)
+    k = torch.zeros((TKV, HQ, D_QK), dtype=torch.float8_e4m3fn, device=dev)
+    v = torch.ones((TKV, HQ, D_V), device=dev).to(torch.float8_e4m3fn)
+    v[:active] = 0.0
+    inp = dict(
+        q=q,
+        k=k,
+        v=v,
+        kv_lens=torch.tensor([active], dtype=torch.int32, device=dev),
+        cu_q=_cu([TQ], dev),
+        cu_kv=_cu([active], dev),
+        max_q_len=TQ,
+        max_kv_len=TKV,
+        B=1,
+        causal=0,
+    )
+    before = dict(spec_mod.DISPATCH_STATS)
+    o, l = _api(inp)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    # All scores are 0, so attention is uniform over the ACTIVE prefix:
+    # O = mean(V[:active]) = 0 and LSE = log2(active) exactly.  With the full
+    # buffer attended instead, O = (TKV - active) / TKV and LSE = log2(TKV).
+    assert float(o.float().abs().max()) <= 1e-3
+    gold_lse = torch.log2(torch.tensor(float(active))).item()
+    assert float((l - gold_lse).abs().max()) <= 0.02, float(l.max())
+
+
+@requires_sm103
 def test_auto_falls_back_when_module_unavailable():
     # A failed specialized-module build/load (e.g. a cache-only deployment
     # without the compiled artifact) must be a fallback reason under "auto",

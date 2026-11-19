@@ -669,8 +669,14 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
     kbase = qbase;
     kvlen = qlen;
   } else if constexpr (EXACT_B1) {
+    // The exact B=1 routes keep their full-buffer tile geometry (nt stays
+    // TKV/BN, so the compile-time split plans hold), but the ACTIVE key
+    // extent is the runtime length: a capacity-sized K/V buffer whose
+    // cumulative offsets describe a shorter prefix must not attend the
+    // inactive tail.  Keys past kvlen are masked to -inf below, so their
+    // e4m3 weights are exactly zero; at full extent the mask never fires.
     kbase = 0;
-    kvlen = TKV;
+    kvlen = kv_lens[0];
   } else {
     kbase = cu_kv[r];
     kvlen = kv_lens[r];
@@ -713,7 +719,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
     ntiles = t_end - t_begin;
   }
   if (s >= S_eff) return;
-  const int kv_hi = EXACT_B1 ? (t_end * BN) : min(t_end * BN, kv_end);
+  const int kv_hi = min(t_end * BN, kv_end);
   const int tile_step = INTERLEAVED ? S_eff : 1;
 
   // ---------------- TMEM + barriers ----------------
@@ -863,7 +869,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
     }
 
     float rmax = fmaxf(fmaxf(rmx0, rmx1), fmaxf(rmx2, rmx3));
-    if constexpr (!EXACT_B1) {
+    {
+      // Runtime-extent masking on every route (EXACT_B1 included): at full
+      // extent the predicate is false for every tile and this costs one
+      // compare per tile.
       bool masked = (kb0 + BN > kv_hi) || (CAUSAL && (kb0 + BN - 1 > m0 + myrow));
       if (masked) {
         int lim = kv_hi;
@@ -1300,8 +1309,12 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
     kbase = qbase;
     kvlen = qlen;
   } else if constexpr (EXACT || PADDED) {
+    // Full-buffer tile geometry with the runtime ACTIVE key extent (see
+    // mla_kernel): keys past kvlen are masked to -inf, so a capacity-sized
+    // buffer with shorter cumulative offsets stays correct; at full extent
+    // the mask never fires.
     kbase = 0;
-    kvlen = TKV;
+    kvlen = kv_lens[0];
   } else {
     kbase = cu_kv[r];
     kvlen = kv_lens[r];
@@ -1359,7 +1372,7 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
     ntiles = t_end - t_begin;
   }
   // Per-rank masking limit (the partner may own more keys than we do).
-  const int kv_hi = EXACT ? 0 : min(t_end * BN, CAUSAL ? min(kvlen, m0 + rows) : kvlen);
+  const int kv_hi = min(t_end * BN, CAUSAL ? min(kvlen, m0 + rows) : kvlen);
 
   // The collective allocation requires both CTAs to have entered the cluster.
   cluster_sync();
@@ -1583,7 +1596,8 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
         if constexpr (!TS_P)
           if (lane == 0) mbar_arrive_rank0(b_drain);
 
-        if constexpr (!EXACT && !PADDED) {
+        {
+          // Runtime-extent masking on every route (see mla_kernel).
           bool masked = (kb0 + BN > kv_hi) || (CAUSAL && (kb0 + BN - 1 > m0 + myrow));
           if (masked) {
             int lim = kv_hi;
