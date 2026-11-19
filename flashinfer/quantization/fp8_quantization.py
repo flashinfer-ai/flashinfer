@@ -213,7 +213,12 @@ def _ptgq_sm90_device(device_index: int) -> bool:
 def _ptgq_cute_dsl_runtime() -> bool:
     """Cached probe for the optional ``nvidia-cutlass-dsl`` runtime (the
     importability of a package does not change within a process)."""
-    return is_cute_dsl_available()
+    try:
+        return is_cute_dsl_available()
+    except Exception:
+        # A broken optional package must demote auto to the stock route
+        # (reason runtime_unavailable), never escape past the fallback.
+        return False
 
 
 @functools.cache
