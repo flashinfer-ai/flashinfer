@@ -31,7 +31,7 @@ from ...api import (
     RoutingInputMode,
 )
 from ...runners import MoERunner
-from .kernel import SpecializedMoEKernel
+from .kernel import SpecializedMoEKernel, kill_switch_engaged
 from .registry import registered_kernels
 
 
@@ -72,9 +72,19 @@ class SpecializedMoERunner(MoERunner):
     against them like any candidate. Each kernel reads the weight view of the
     backend whose data path it computes, so a default ``MoELayer`` needs no extra
     preparation. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects every call.
+
+    Under CUDA-graph capture a kernel admits only token counts it admitted
+    eagerly, whose winners ``MoELayer`` timed outside capture.
+    ``MoELayer.reset_winner()`` forgets those admissions with the winners
+    (:meth:`forget_selections`), and a winner-cache miss under capture never
+    times this backend (``capture_requires_eager_selection``).
     """
 
     backend_key: ClassVar[str] = "specialized"
+    # MoELayer leaves this backend out of a selection inside a CUDA-graph capture:
+    # the backend serves a captured call only for a winner timed eagerly, so its
+    # admission there without a cached winner never adds a timed candidate.
+    capture_requires_eager_selection: ClassVar[bool] = True
     # The capabilities are the registered kernels', documented per kernel; the
     # generated activation matrix of the design doc leaves this backend out.
     capabilities_from_kernel_registry: ClassVar[bool] = True
@@ -182,13 +192,22 @@ class SpecializedMoERunner(MoERunner):
     def _build(self) -> None:
         """Each kernel is built per device by the first eager call it admits."""
 
-    def refresh(self) -> None:
-        """Forget eagerly admitted token counts (the layer's winners they stand for)."""
+    def forget_selections(self) -> None:
+        """Forget eagerly admitted token counts; ``MoELayer.reset_winner()``
+        calls this when it clears the winners those counts stand for."""
         for kernel in self.kernels:
             kernel.refresh()
         self._admitted_by.clear()
 
+    def refresh(self) -> None:
+        """Forget eagerly admitted token counts (``MoELayer.refresh_backends``)."""
+        self.forget_selections()
+
     def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        # The kill switch rejects every call here, before any kernel is asked;
+        # each kernel also checks it for direct callers.
+        if kill_switch_engaged():
+            return False
         for kernel in self.kernels:
             if act.routing_input_mode not in kernel.routing_modes:
                 continue

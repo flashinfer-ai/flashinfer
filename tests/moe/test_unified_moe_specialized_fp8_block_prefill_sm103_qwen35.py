@@ -10,8 +10,11 @@ every other call on ``trtllm_fp8_block``.
 Regression anchors: the registration and both guards (any host, meta tensors),
 the expert-count permutation (any SM80+ GPU with the CuTe DSL) and on SM103 the
 kernel through ``MoELayer`` against an fp32 reference of the FP8 data path and
-against ``trtllm_fp8_block`` (``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``),
-including the lazy build and CUDA-graph capture and replay.
+against ``trtllm_fp8_block``, the kill switch
+(``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``) through ``MoELayer``, the lazy
+build and CUDA-graph capture and replay. These functional tests pass whichever
+backend the layer's timing selects; the speed comparison is the separate
+``test_performance_layer_selects_specialized``.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import ast
 import json
 import sys
 from importlib import resources
+from statistics import median
 
 import pytest
 import torch
@@ -67,6 +71,10 @@ _BLOCK = fp8_prefill.BLOCK
 _DEEPSEEK = QuantConfig(
     weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
 )
+# Single-candidate lists: a layer with one eligible runner selects it without
+# timing, so a test that needs a given backend never depends on measured speed.
+_SIBLING_ONLY = BackendOptions(candidates=(TrtllmFp8BlockConfig(),))
+_SPECIALIZED_ONLY = BackendOptions(candidates=(SpecializedMoEConfig(),))
 
 
 def _here() -> bool:
@@ -146,6 +154,11 @@ def test_layer_candidates():
     """The default layer of the served configuration builds the specialized
     backend with this kernel only on SM103 with the CuTe DSL; elsewhere it is
     inert."""
+    # Both layers below need trtllm_fp8_block (SM100 / SM103 / SM107); elsewhere,
+    # e.g. on SM90, no configured backend serves this configuration.
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not TrtllmFp8BlockConfig.supported(major * 10 + minor):
+        pytest.skip(f"{_SIBLING} does not run on SM{major}{minor}")
     layer = MoELayer(_config())
     keys = [runner.backend_key for runner in layer.runners]
     if _here():
@@ -154,9 +167,7 @@ def test_layer_candidates():
     else:
         assert keys == [_SIBLING]
     # An explicit trtllm_fp8_block list never includes it.
-    explicit = MoELayer(
-        _config(backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)))
-    )
+    explicit = MoELayer(_config(backend=_SIBLING_ONLY))
     assert [runner.backend_key for runner in explicit.runners] == [_SIBLING]
 
 
@@ -608,7 +619,10 @@ def _runner(layer):
     [(1800, False), (4096, True), (8192, False), (9216, False)],
     ids=["1800", "4096_skew", "8192_compact", "9216_padded"],
 )
-def test_matches_reference(kernel_state, weights, monkeypatch, num_tokens, skew):
+def test_matches_reference(kernel_state, weights, num_tokens, skew):
+    """The kernel, trtllm_fp8_block and the default layer against the fp32
+    reference. The layer's timed selection may pick either backend here; the
+    speed comparison is test_performance_layer_selects_specialized."""
     spec = kernel_state
     tensors, weight_pack = weights
     pack = _pack(*_inputs(num_tokens, skew=skew))
@@ -620,21 +634,16 @@ def test_matches_reference(kernel_state, weights, monkeypatch, num_tokens, skew)
     assert runner.accepts(pack, weight_pack)
     out = runner.forward(runner.pack_inputs(pack, weight_pack)).clone()
     assert spec.stats()["dispatched_num_tokens"] == {num_tokens: 1}
-    # ... and through the layer, which times it against trtllm_fp8_block once.
+    # ... trtllm_fp8_block on its own ...
+    stock = MoELayer(_config(backend=_SIBLING_ONLY))(pack, weight_pack).clone()
+    assert spec.stats()["dispatch_count"] == 1
+    # ... and the default layer, which times both once and runs the faster.
     layered = layer(pack, weight_pack).clone()
-    assert num_tokens in spec.stats()["dispatched_num_tokens"]
-    if num_tokens >= 4096:  # >= 1.4x faster here: the selection is not noise
-        assert layer.winner_backend == _KEY
+    assert spec.stats()["dispatched_num_tokens"][num_tokens] > 1  # timed
+    assert layer.winner_backend in (_KEY, _SIBLING)
     if layer.winner_backend == _KEY:
         # every output row depends only on its own routed rows: bitwise repeatable
         assert torch.equal(layered, out)
-
-    # The kill switch leaves the call to trtllm_fp8_block.
-    monkeypatch.setenv(spec.KILL_SWITCH_ENV, "1")
-    dispatched = spec.stats()["dispatch_count"]
-    stock = layer(pack, weight_pack).clone()
-    assert layer.winner_backend == _SIBLING
-    assert spec.stats()["dispatch_count"] == dispatched
     torch.cuda.synchronize()
 
     ref = _reference(
@@ -642,11 +651,48 @@ def test_matches_reference(kernel_state, weights, monkeypatch, num_tokens, skew)
     )
     # FP8-data-path gate: another accumulation order lands at rel-L2 0.002-0.004
     # here; dropping an FP8 re-quantization or rounding weights to bf16, >= 0.016.
-    for name, o in (("specialized", out), (_SIBLING, stock)):
+    for name, o in (
+        ("specialized", out),
+        (_SIBLING, stock),
+        (f"layer ({layer.winner_backend})", layered),
+    ):
         cos, rel = _cos(ref, o)
         assert cos >= 0.9995 and rel <= 0.012, (name, cos, rel)
     cos, _ = _cos(stock, out)
     assert cos >= 0.999, cos
+
+
+@requires_kernel
+def test_kill_switch_through_layer(kernel_state, weights, monkeypatch):
+    """``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every ``MoELayer`` call
+    off the kernel (no build, no launch), whatever the layer's candidates, and is
+    read per call."""
+    spec = kernel_state
+    _, weight_pack = weights
+    pack = _pack(*_inputs(4096))
+    layer = MoELayer(_config())
+    only = MoELayer(_config(backend=_SPECIALIZED_ONLY))
+    assert [r.backend_key for r in only.runners] == [_KEY]
+
+    monkeypatch.setenv(spec.KILL_SWITCH_ENV, "1")
+    layer(pack, weight_pack)
+    assert layer.winner_backend == _SIBLING
+    # the specialized backend alone has no eligible runner left
+    with pytest.raises(NotImplementedError, match="none of the usable backends"):
+        only(pack, weight_pack)
+    st = spec.stats()
+    assert st["dispatch_count"] == 0 and st["precompiled"] == [], st
+
+    # read at call time: the same layers reach the kernel once it is unset
+    monkeypatch.delenv(spec.KILL_SWITCH_ENV)
+    only(pack, weight_pack)
+    assert only.winner_backend == _KEY
+    st = spec.stats()
+    assert torch.cuda.current_device() in st["precompiled"]
+    dispatched = st["dispatch_count"]
+    assert dispatched >= 1
+    layer(pack, weight_pack)  # a new eligible set: both are timed
+    assert spec.stats()["dispatch_count"] > dispatched
 
 
 @requires_kernel
@@ -684,11 +730,14 @@ def test_cuda_graph(kernel_state, weights, monkeypatch, case):
     num_tokens = 4608
     logits, hs, hs_scale = _inputs(num_tokens, seed=2)
     pack = _pack(logits, hs, hs_scale)
-    layer = MoELayer(_config())
     if case == "selected_eagerly":
+        # The specialized backend alone, so the eager selection is the kernel
+        # whatever the timing (the speed comparison is a separate test).
+        layer = MoELayer(_config(backend=_SPECIALIZED_ONLY))
         layer(pack, weight_pack)
         assert layer.winner_backend == _KEY
     else:
+        layer = MoELayer(_config())
         # warm trtllm_fp8_block for this call eagerly (its first launch must not
         # happen in capture) with the specialized backend switched off
         monkeypatch.setenv(spec.KILL_SWITCH_ENV, "1")
@@ -753,3 +802,40 @@ def test_compact_and_padded_agree(kernel_state, weights, num_tokens):
         outs.append(out)
     torch.cuda.synchronize()
     assert torch.equal(outs[0], outs[1])
+
+
+# ---------------------------------------------------------------------------
+# Performance on SM103 (the functional tests above accept either winner)
+# ---------------------------------------------------------------------------
+
+
+@requires_kernel
+@pytest.mark.parametrize(
+    "num_tokens", [4096, 8192, 9216], ids=["4096", "8192_compact", "9216_padded"]
+)
+def test_performance_layer_selects_specialized(kernel_state, weights, num_tokens):
+    """A performance test, not a functional one: from 4096 tokens the kernel is
+    at least 1.4x faster than trtllm_fp8_block on GB300 (``MoELayer`` with and
+    without the specialized backend, CUPTI), so the default layer's timed
+    selection picks it. A failure here is a speed regression (or a contended
+    GPU), not a numerical one."""
+    from flashinfer.testing import bench_gpu_time
+
+    _, weight_pack = weights
+    pack = _pack(*_inputs(num_tokens))
+    times_ms = {}
+    for key, backend in ((_SIBLING, _SIBLING_ONLY), (_KEY, _SPECIALIZED_ONLY)):
+        single = MoELayer(_config(backend=backend))
+        single(pack, weight_pack)  # build, tune and select outside the timing
+        assert single.winner_backend == key
+        times = bench_gpu_time(
+            lambda single=single: single(pack, weight_pack), enable_cupti=True
+        )
+        times_ms[key] = median(times)
+    speedup = times_ms[_SIBLING] / times_ms[_KEY]
+    # The margin leaves room for timing noise below the measured >= 1.4x.
+    assert speedup >= 1.2, (times_ms, speedup)
+
+    layer = MoELayer(_config())
+    layer(pack, weight_pack)
+    assert layer.winner_backend == _KEY, (times_ms, speedup)

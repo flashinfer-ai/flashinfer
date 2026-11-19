@@ -25,12 +25,15 @@ needs no extra weight preparation for it. The contract, which
   configuration other than the served one is rejected at ``MoELayer``
   construction, so the kernel costs nothing per call elsewhere;
 * :meth:`SpecializedMoEKernel.accepts` is the per-call guard. It never raises,
-  and it rejects every call while ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``.
-  It builds the kernel for the device on the first eager call it admits; under
-  CUDA-graph capture it admits a call only when the kernel is built and the same
-  binding already admitted that token count eagerly (``eager_num_tokens``), that
-  is, when ``MoELayer`` already timed the candidates for that call outside
-  capture. Nothing is built or timed inside a capture;
+  and it rejects every call while ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
+  (the runner also checks the switch before asking any kernel). It builds the
+  kernel for the device on the first eager call it admits; under CUDA-graph
+  capture it admits a call only when the kernel is built and the same binding
+  already admitted that token count eagerly (``eager_num_tokens``), that is,
+  when ``MoELayer`` already timed the candidates for that call outside capture.
+  ``MoELayer.reset_winner()`` clears those records with the winners, and a
+  winner-cache miss under capture leaves this backend out of the selection.
+  Nothing is built or timed inside a capture;
 * :meth:`SpecializedMoEKernel.forward` computes the data path of the backend
   whose weight view it reads (same roundings, fp32 accumulation), and runs that
   backend instead for a call whose launch fails;
@@ -133,8 +136,9 @@ class SpecializedMoEKernel(abc.ABC):
         """Run one packed call and return its output."""
 
     def refresh(self) -> None:
-        """Forget the token counts admitted eagerly (``MoELayer.refresh_backends``
-        clears the layer's winners, which those counts stand for)."""
+        """Forget the token counts admitted eagerly (``MoELayer.reset_winner`` and
+        ``MoELayer.refresh_backends`` clear the layer's winners, which those counts
+        stand for)."""
         self.eager_num_tokens.clear()
 
     @classmethod

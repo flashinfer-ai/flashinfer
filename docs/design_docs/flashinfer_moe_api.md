@@ -1031,9 +1031,12 @@ backend.
   call is admitted only when the kernel is built and the layer already admitted
   that token count eagerly, so its winner was timed outside capture; otherwise,
   including the first call of a token count under capture, the call is captured
-  on another candidate. Nothing is built or timed inside a capture.
+  on another candidate. `MoELayer.reset_winner()` forgets those admissions with
+  the winners, and a winner-cache miss under capture leaves the backend out of
+  the selection. Nothing is built or timed inside a capture.
 - **Kill switch.** `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`, read at call time,
-  keeps every call on the other candidates.
+  keeps every call on the other candidates (the runner rejects the call before
+  asking any kernel).
 
 ### Today's MVP Cut
 

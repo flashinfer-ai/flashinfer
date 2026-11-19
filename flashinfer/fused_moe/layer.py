@@ -235,6 +235,14 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
 }
 
 
+def _stream_capturing() -> bool:
+    """Whether the current CUDA stream is capturing a graph."""
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:  # no CUDA in this build
+        return False
+
+
 class NoEligibleBackend(RuntimeError):
     """No configured backend supports the requested MoE configuration."""
 
@@ -580,6 +588,17 @@ class MoELayer:
         best_tactic: Any = -1
         best_inputs: Optional[List[torch.Tensor]] = None
 
+        if len(runners) > 1 and _stream_capturing():
+            # A winner-cache miss inside a CUDA-graph capture, where timing the
+            # candidates (it synchronizes the device) is not allowed. Runners
+            # that serve captured calls only for winners timed eagerly (the
+            # specialized backend) step aside rather than add a timed candidate.
+            runners = [
+                r
+                for r in runners
+                if not getattr(r, "capture_requires_eager_selection", False)
+            ] or runners
+
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
             launch_kwargs = runner.launch_kwargs_for(inputs)
@@ -642,6 +661,12 @@ class MoELayer:
         """Clear all cached per-bucket winners — next call re-tunes."""
         self._winners.clear()
         self._last_winner_backend = None
+        # Runners that admit captured calls only for winners selected eagerly
+        # (the specialized backend) forget those selections with the winners.
+        for runner in self.runners:
+            forget = getattr(runner, "forget_selections", None)
+            if forget is not None:
+                forget()
 
     def refresh_backends(self) -> None:
         """Refresh backend preparation and clear cached winners.
