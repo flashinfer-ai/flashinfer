@@ -189,7 +189,13 @@ def test_bf16_families(variant, activation):
         pytest.skip("Other GPU architecture")
     tactic = ColonelsTactic(
         variant=variant,
-        block_n=0 if "gmem" in variant else 128 if variant == "bf16_gemv" else 64,
+        block_n=0
+        if "gmem" in variant
+        else 128
+        if variant == "bf16_gemv"
+        else 32
+        if variant in ("bf16", "bf16_persistent") and not activation.is_gated
+        else 64,
         warp_n=8 if arch == 90 and variant != "bf16_gemv" else 4,
         stages=4 if variant == "bf16_gemv" else 1,
     )
