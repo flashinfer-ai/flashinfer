@@ -55,9 +55,12 @@ inline const std::vector<CutlassGemmConfig>& GetMxfp8GemmConfigsSm120() {
 namespace {
 
 // Tactic for untuned calls: the swap-AB 128x32 tile, which puts N on the 128-wide MMA
-// side instead of leaving most of that side empty at decode-sized M. On the shapes
-// benchmarked (RTX PRO 6000) it was 1.5-7.9x faster than the non-swapped 128x32 tile
-// at M <= 24 and within 3.3% of it at M from 256 to 8192.
+// side instead of leaving most of that side empty at decode-sized M. Against the
+// non-swapped 128x32 tile (the previous default) on RTX PRO 6000 at M <= 24, it was
+// 1.0-3.5x faster with weights not resident in L2 and 1.5-7.9x faster with warm L2
+// under CUDA graph replay. With cold L2 it can be up to 1.37x slower on some narrow-N
+// shapes at M from 48 to 256. At M >= 1024 neither 128x32 tile is the fastest;
+// callers that need the best tile there should autotune.
 int64_t defaultMxfp8TacticSm120() {
   static const int64_t kDefault = []() {
     const auto& configs = detail::GetMxfp8GemmConfigsSm120();
