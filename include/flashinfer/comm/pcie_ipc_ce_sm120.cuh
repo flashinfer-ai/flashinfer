@@ -44,6 +44,8 @@ kernel_pcie_ipc_ce_sm120_binary_wait_clear(unsigned int* __restrict__ self_flag)
 #if defined(FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS) && FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS > 0
         // Same bound as SpinGuard in pcie_ipc_all_reduce.cuh: a peer that never
         // publishes its flag traps after the timeout instead of blocking the stream.
+        // globaltimer is never 0, so _spin_start == 0 marks "not started yet" and
+        // a wrapping _spin_iters cannot restart the deadline.
         unsigned int _spin_iters = 0;
         unsigned long long _spin_start = 0;
 #endif
@@ -52,9 +54,9 @@ kernel_pcie_ipc_ce_sm120_binary_wait_clear(unsigned int* __restrict__ self_flag)
             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
             if (_gca_v >= (unsigned int)(1)) break;
 #if defined(FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS) && FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS > 0
-            if (++_spin_iters == 1) {
+            if (_spin_start == 0) {
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_spin_start));
-            } else if ((_spin_iters & 0xFFFu) == 0) {
+            } else if ((++_spin_iters & 0xFFFu) == 0) {
                 unsigned long long _spin_now;
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_spin_now));
                 if (_spin_now - _spin_start > FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS) {
