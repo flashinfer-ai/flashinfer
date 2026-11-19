@@ -843,6 +843,11 @@ def gen_jit_spec(
 
     if is_windows:
         cuda_cflags.append("--disable-warnings")
+        # The generated Cake host bindings use GNU __builtin_*_overflow, which the MSVC host lacks.
+        cuda_cflags += [
+            "-include",
+            str(jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer" / "windows_builtin_compat.h"),
+        ]
 
     if extra_cflags is not None:
         cflags += extra_cflags
