@@ -88,6 +88,13 @@ def _is_sm120_exactly(device: torch.device) -> bool:
     return major == 12 and minor == 0
 
 
+@functools.cache
+def _autotuner_class():
+    from ..autotuner import AutoTuner
+
+    return AutoTuner
+
+
 def is_specialized_supported(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -114,10 +121,13 @@ def is_specialized_supported(
     # The kernel launches on A's device (combo_entry makes it current) and
     # reads every operand through raw pointers: an operand on another device
     # would be an illegal cross-device access, not a torch error.
-    devices = {a.device, b.device, a_scale.device, b_scale.device}
-    if out is not None:
-        devices.add(out.device)
-    if len(devices) != 1:
+    device = a.device
+    if (
+        b.device != device
+        or a_scale.device != device
+        or b_scale.device != device
+        or (out is not None and out.device != device)
+    ):
         return _no("device:operand_mismatch")
     M, K = a.shape
     N = b.shape[0]
@@ -184,19 +194,17 @@ def is_specialized_supported(
     except Exception:  # noqa: BLE001 - no detectable toolkit: cannot JIT
         return _no("toolkit:version_unknown")
     # --- device guards
-    if not _is_sm120_exactly(a.device):  # sm_121 unmeasured -> stock
+    if not _is_sm120_exactly(device):  # sm_121 unmeasured -> stock
         return _no("device:not_sm120")
     try:
-        from ..autotuner import AutoTuner
-
-        if AutoTuner.get().is_tuning_mode:
+        if _autotuner_class().get().is_tuning_mode:
             return _no("autotune_mode")
     except Exception:  # noqa: BLE001 - autotuner surface moved: be safe
         return _no("autotune_probe_failed")
     # A warmed exact shape is admissible on either kind of stream. Only
     # a miss needs the live capture state, queried on the launch device.
-    if (a.device.index, M, N, K) not in _warmed:
-        with torch.cuda.device(a.device):
+    if (device.index, M, N, K) not in _warmed:
+        with torch.cuda.device(device):
             if torch.cuda.is_current_stream_capturing():
                 return _no("capture:unwarmed")
     return True

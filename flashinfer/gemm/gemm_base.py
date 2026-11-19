@@ -11195,11 +11195,16 @@ def _heuristic_func_gemm_fp8_nt_groupwise(
     return heuristic_backends
 
 
+@functools.cache
+def _groupwise_specialized_impl():
+    from . import specialized_fp8_blockwise_sm120
+
+    return specialized_fp8_blockwise_sm120
+
+
 @supported_compute_capability([120])
 def _specialized_gemm_fp8_nt_groupwise_requirement(*args, **kwargs):
-    from .specialized_fp8_blockwise_sm120 import check_specialized_requirement
-
-    return check_specialized_requirement(*args, **kwargs)
+    return _groupwise_specialized_impl().check_specialized_requirement(*args, **kwargs)
 
 
 # Carry the heuristic's first eligible backend to the body of this auto call.
@@ -11418,17 +11423,13 @@ def gemm_fp8_nt_groupwise(
     # explicit "specialized" the kernel cannot serve falls back to the
     # composable torch path, never to another fused backend.
     if backend == "specialized":
-        from .specialized_fp8_blockwise_sm120 import (
-            is_specialized_supported as _spec_ok,
-            run_composable_fallback as _spec_composable,
-            run_specialized_gemm_fp8_blockwise as _spec_run,
-        )
+        spec = _groupwise_specialized_impl()
 
         # Auto checked all supplied tensors (and probed module availability).
         # A fresh contiguous out has the admitted shape, device and dtype and
         # cannot alias a live input. Its address was not known at admission.
         admitted = auto_requested and (not allocating_out or out.data_ptr() % 4 == 0)
-        if admitted or _spec_ok(
+        if admitted or spec.is_specialized_supported(
             a,
             b,
             a_scale,
@@ -11437,9 +11438,9 @@ def gemm_fp8_nt_groupwise(
             scale_granularity_mnk,
             out,
         ):
-            _spec_run(a, b, a_scale, b_scale, out)
+            spec.run_specialized_gemm_fp8_blockwise(a, b, a_scale, b_scale, out)
         else:
-            _spec_composable(
+            spec.run_composable_fallback(
                 a,
                 b,
                 a_scale,
