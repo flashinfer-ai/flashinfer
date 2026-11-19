@@ -19,9 +19,8 @@
  * (small token counts at hidden sizes 512/2048/6144 on H100/H200). Selected
  * only by the dispatch guard in flashinfer/norm/kernels/rmsnorm_serve_sm90.py
  * when FLASHINFER_SM90_SERVE_RMSNORM=cuda; the stock rmsnorm path is
- * unaffected otherwise. The device kernels and the H-dispatch launch
- * heuristic below are kept verbatim from the measured artifact; only the
- * host binding differs (TensorView + current-stream query per call).
+ * unaffected otherwise. The launch heuristic is from the measured artifact;
+ * the epilogue normalizes before weighting to avoid intermediate overflow.
  */
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -105,10 +104,10 @@ __global__ __launch_bounds__(384) void rmsnorm_6144_osplit8(const uint4* __restr
     float2 wa = unpack_bf16x2(wv.x), wb = unpack_bf16x2(wv.y);
     float2 wc = unpack_bf16x2(wv.z), wd = unpack_bf16x2(wv.w);
     uint4 out;
-    out.x = pack_bf16x2(a.x * (wa.x * scale), a.y * (wa.y * scale));
-    out.y = pack_bf16x2(b.x * (wb.x * scale), b.y * (wb.y * scale));
-    out.z = pack_bf16x2(c.x * (wc.x * scale), c.y * (wc.y * scale));
-    out.w = pack_bf16x2(d.x * (wd.x * scale), d.y * (wd.y * scale));
+    out.x = pack_bf16x2((a.x * scale) * wa.x, (a.y * scale) * wa.y);
+    out.y = pack_bf16x2((b.x * scale) * wb.x, (b.y * scale) * wb.y);
+    out.z = pack_bf16x2((c.x * scale) * wc.x, (c.y * scale) * wc.y);
+    out.w = pack_bf16x2((d.x * scale) * wd.x, (d.y * scale) * wd.y);
     output[base + out_idx] = out;
   }
 }
@@ -177,8 +176,8 @@ __global__ __launch_bounds__(THREADS) void rmsnorm_exact(const uint4* __restrict
     for (int pair = 0; pair < 4; ++pair) {
       float2 xv = __bfloat1622float2(x_pairs[pair]);
       const float2 wv = __bfloat1622float2(w_pairs[pair]);
-      xv.x *= inverse_rms * wv.x;
-      xv.y *= inverse_rms * wv.y;
+      xv.x = (xv.x * inverse_rms) * wv.x;
+      xv.y = (xv.y * inverse_rms) * wv.y;
       out_pairs[pair] = __float22bfloat162_rn(xv);
     }
     output[row + column] = result;
@@ -221,10 +220,10 @@ __global__ __launch_bounds__(256) void rmsnorm_2048_osplit2(const uint4* __restr
     const float2 wa = unpack_bf16x2(wv.x), wb = unpack_bf16x2(wv.y);
     const float2 wc = unpack_bf16x2(wv.z), wd = unpack_bf16x2(wv.w);
     uint4 out;
-    out.x = pack_bf16x2(a.x * (wa.x * scale), a.y * (wa.y * scale));
-    out.y = pack_bf16x2(b.x * (wb.x * scale), b.y * (wb.y * scale));
-    out.z = pack_bf16x2(c.x * (wc.x * scale), c.y * (wc.y * scale));
-    out.w = pack_bf16x2(d.x * (wd.x * scale), d.y * (wd.y * scale));
+    out.x = pack_bf16x2((a.x * scale) * wa.x, (a.y * scale) * wa.y);
+    out.y = pack_bf16x2((b.x * scale) * wb.x, (b.y * scale) * wb.y);
+    out.z = pack_bf16x2((c.x * scale) * wc.x, (c.y * scale) * wc.y);
+    out.w = pack_bf16x2((d.x * scale) * wd.x, (d.y * scale) * wd.y);
     output[base + tid] = out;
   }
 }

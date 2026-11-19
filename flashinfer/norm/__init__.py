@@ -294,7 +294,11 @@ def _cutedsl_norm_unavailable(device: torch.device) -> Optional[str]:
             "the CuTe DSL norm kernels are unavailable in this process "
             "(FLASHINFER_USE_CUDA_NORM=1, or nvidia-cutlass-dsl missing/incompatible)"
         )
-    device_cap = torch.cuda.get_device_capability(device)
+    return _cutedsl_norm_arch_unavailable(torch.cuda.get_device_capability(device))
+
+
+def _cutedsl_norm_arch_unavailable(device_cap: tuple[int, int]) -> Optional[str]:
+    """Architecture refusal shared by the incumbent and specialized CuTe kernels."""
     if not _cute_dsl_supports_arch(*device_cap):
         return (
             f"the installed CuTe DSL does not support sm_{device_cap[0]}{device_cap[1]}"
@@ -1320,9 +1324,8 @@ def rmsnorm(
         measured-win token region (T <= 512), and otherwise
         between ``"cuda"`` and ``"cutedsl"`` by device/runtime support — an
         explicitly selected backend is never silently swapped, and unknown
-        names raise. A cached per-device pre-gate keeps the specialized
-        dispatch off the hot path for devices and shapes it can never serve,
-        so those calls cost what they did before this path existed.
+        names raise. A pre-gate with a cached per-device capability check
+        skips the full specialized guard for ineligible devices and shapes.
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) disables
         the specialized kernels (``"auto"`` keeps the incumbent path,
         explicit ``"specialized"`` raises); ``FLASHINFER_SM90_SERVE_RMSNORM=0`` is a
@@ -1388,8 +1391,7 @@ def _rmsnorm_impl(
     if backend == "auto":
         # The cached pre-gate keeps the specialized dispatch off the hot path
         # for calls it can never serve (non-SM90 devices, off-envelope
-        # dtype/shape/token counts): they cost what they did before this
-        # path existed and are not consulted (so not counted) at all.
+        # dtype/shape/token counts): pre-gate misses are not counted.
         if (
             _try_rmsnorm_serve_sm90 is not None
             and input.dim() == 2

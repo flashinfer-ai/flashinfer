@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -134,6 +139,50 @@ def test_specialized_dispatches_and_matches_stock(tokens, hidden):
     assert torch.equal(y_spec, y2)
 
 
+def test_incompatible_captured_target_declines_only_cute_variant():
+    _sm90_or_skip()
+    env = dict(os.environ, CUTE_DSL_ARCH="sm_100a", FLASHINFER_USE_CUDA_NORM="0")
+    script = textwrap.dedent(
+        """\
+        import os
+        import sys
+        from unittest.mock import patch
+
+        import pytest
+        import torch
+        import flashinfer.norm as norm
+        from flashinfer.norm.kernels import rmsnorm_serve_sm90 as serve
+
+        torch.cuda.set_device(int(sys.argv[1]))
+        assert norm._dsl_captured_arch() == 'sm_100a'
+        x = torch.randn(4, 512, dtype=torch.bfloat16, device='cuda')
+        w = torch.randn(512, dtype=x.dtype, device=x.device)
+        xf = x.double()
+        ref = (xf / (xf.square().mean(-1, keepdim=True) + 1e-6).sqrt() * w).to(x.dtype)
+        with patch.object(serve, '_COMPILED') as cache:
+            y = norm.rmsnorm(x, w)
+            torch.testing.assert_close(y, ref, atol=0.01, rtol=0.02)
+            assert serve._rmsnorm_serve_sm90_stats()['backend_dispatches'] == {
+                'specialized': 0, 'cuda': 1, 'cutedsl': 0,
+            }
+            with pytest.raises(NotImplementedError, match='not binary-compatible'):
+                norm.rmsnorm(x, w, backend='specialized')
+            cache.get.assert_not_called()
+        y = norm.rmsnorm(x, w, backend='cuda')
+        torch.testing.assert_close(y, ref, atol=0.01, rtol=0.02)
+        os.environ['FLASHINFER_SM90_SERVE_RMSNORM'] = 'cuda'
+        y = norm.rmsnorm(x, w, backend='specialized')
+        torch.testing.assert_close(y, ref, atol=0.01, rtol=0.02)
+        assert serve._rmsnorm_serve_sm90_stats()['variant_dispatches']['cuda'] == 1
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(torch.cuda.current_device())],
+        env=env,
+        check=True,
+    )
+
+
 def test_explicit_incumbent_backends_are_never_swapped():
     """backend="cuda"/"cutedsl" on an allowlisted shape must never reach the
     specialized kernels, and each pins its own implementation."""
@@ -174,6 +223,26 @@ def test_auto_routes_on_allowlist_only():
     assert stats["calls"] == 0, stats
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert _matched(y3, _ref(x3, w3)) >= 0.999
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden,backend,specialized",
+    [
+        (512, 512, "auto", 1),
+        (513, 512, "auto", 0),
+        (8192, 512, "auto", 0),
+        (2048, 4096, "auto", 0),
+        (8192, 512, "specialized", 1),
+    ],
+)
+def test_token_routing_boundary(tokens, hidden, backend, specialized):
+    _sm90_or_skip()
+    x, w = _case(tokens=tokens, hidden=hidden)
+    y = flashinfer.norm.rmsnorm(x, w, backend=backend)
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == specialized, stats  # auto misses bypass the census
+    assert stats["variant_dispatches"]["cutedsl"] == specialized, stats
+    torch.testing.assert_close(y, _ref(x, w), atol=0.01, rtol=0.02)
 
 
 def test_explicit_specialized_off_envelope_raises():
@@ -220,6 +289,22 @@ def test_cuda_variant_behind_the_one_specialized_backend(tokens, hidden, monkeyp
     assert stats["backend_dispatches"]["specialized"] == 1, stats
     assert stats["variant_dispatches"]["cuda"] == 1, stats
     assert _matched(y, _ref(x, w)) >= 0.999
+
+
+@pytest.mark.parametrize("tokens,hidden", [(4, 512), (2, 2048), (64, 6144)])
+def test_cuda_variant_finite_weighted_result(tokens, hidden, monkeypatch):
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    x = torch.full((tokens, hidden), 2.0**-10, device="cuda", dtype=torch.bfloat16)
+    w = x.new_full((hidden,), 2.0**126)
+    eps = 1e-6
+    # For a constant row the mean square is exactly 2^-20. Evaluate the
+    # closed form in double precision, then round once to the output dtype.
+    expected = torch.full_like(x, 2.0**116 / (2.0**-20 + eps) ** 0.5)
+    y = flashinfer.norm.rmsnorm(x, w, eps=eps, backend="specialized")
+    assert _rmsnorm_serve_sm90_stats()["variant_dispatches"]["cuda"] == 1
+    assert torch.isfinite(y).all()
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
 
 
 def test_cuda_variant_off_exact_list_raises_explicit_serves_auto(monkeypatch):

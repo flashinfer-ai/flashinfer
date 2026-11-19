@@ -29,9 +29,8 @@ of :func:`flashinfer.norm.rmsnorm` (#5667 pattern):
   inside the measured-win token region (T <= 512; see ``_AUTO_MAX_TOKENS``),
   and otherwise among the named incumbents; auto is purely a router and
   carries no behavior of its own.  A cheap cached pre-gate
-  (:func:`rmsnorm_serve_auto_eligible`) runs before the full guard so calls
-  the kernels can never serve (non-SM90 devices, off-envelope shapes) cost
-  what they did before this path existed.
+  (:func:`rmsnorm_serve_auto_eligible`) lets non-SM90 devices and
+  off-envelope shapes bypass the full guard.
 - ``backend="cuda"`` pins the legacy CUDA JIT norm kernel and
   ``backend="cutedsl"`` the CuTe DSL kernels — the incumbent implementations
   by nature-name; an explicitly selected backend is never silently swapped,
@@ -99,12 +98,9 @@ _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 RMSNORM_BACKENDS = ("auto", "specialized", "cuda", "cutedsl")
 _DISPATCH_FILE = "rmsnorm_serve_sm90_dispatch.json"
 
-# Per-backend dispatch census and fallback reasons (#5667-style).  Every
-# call that goes through the backend surface is attributed to exactly one
-# backend ("specialized" when these kernels produced the output; "cuda" or
-# "cutedsl" when the respective incumbent implementation did, recorded by
-# the dispatcher via record_incumbent_dispatch), so
-# ``calls == specialized + cuda + cutedsl`` holds over surface calls.
+# calls counts attributed dispatches plus recorded explicit specialist
+# refusals. A consulted auto decline is attributed to its incumbent, not
+# counted twice. Auto calls that never consult the specialist are excluded.
 _stats: dict = {
     "calls": 0,
     "backend_dispatches": {"specialized": 0, "cuda": 0, "cutedsl": 0},
@@ -474,9 +470,8 @@ def rmsnorm_serve_auto_eligible(input: torch.Tensor) -> bool:
     checks plus a per-device cached "SM90 CUDA device" flag (and the CuTe DSL
     availability constant), evaluated BEFORE :func:`try_rmsnorm_serve_sm90`,
     so a call these kernels can never serve skips the full guard chain — its
-    env reads, stats bookkeeping and capability query — and costs what it did
-    before this path existed (non-SM90 architectures and off-envelope calls
-    in particular).  The full guard stays authoritative: this gate may admit
+    env reads, stats bookkeeping and capability query. The gate itself still
+    runs on the host. The full guard stays authoritative: this gate may admit
     a call the guard then declines, but never excludes one auto would serve.
     """
     if input.dtype is not torch.bfloat16:
@@ -615,6 +610,15 @@ def try_rmsnorm_serve_sm90(
 
     if not _HAS_CUTE_DSL:
         _fallback(f"{requested}: CuTe DSL runtime unavailable")
+        return False
+    # Import here because the parent imports this module during initialization.
+    from .. import _cutedsl_norm_arch_unavailable
+
+    # The device guard above established SM90. Even a cached callable may
+    # target an incompatible architecture captured by the DSL at import.
+    reason = _cutedsl_norm_arch_unavailable((9, 0))
+    if reason is not None:
+        _fallback(f"{requested}: {reason}")
         return False
     key = (hidden, input.dtype)
     fn = _COMPILED.get(key)
