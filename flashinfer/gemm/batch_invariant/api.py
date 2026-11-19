@@ -1,6 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Torch-facing entries of the GEMM classes.
+"""Torch-facing entries of the GEMM classes. This module declares no public API: each entry below is what the FlashInfer
+function it names runs under its ``batch_invariant=True`` keyword, and the consistency classes' fingerprints are published
+by :mod:`flashinfer.batch_invariant`. The remaining module-level names (the launch-handle cache and its clear, the
+occupancy and device registrations) are the entries' own machinery, reached by the tests and by the rankings' clear hook.
 
 ``mm_bf16_batch_invariant`` is what :func:`flashinfer.mm_bf16` runs under ``batch_invariant=True``: C = A @ B (+ bias)
 in bf16 with fp32 accumulation; A is (M, K) row-major, B is (K, N) either row-major or the transpose of a row-major
@@ -45,7 +48,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -480,10 +483,18 @@ def _accepts_mx(config: Knobs, M: int, N: int, K: int, C: int, in_fmt: str) -> b
     ) and _accepts(config, M, N, K, "k", C, in_fmt)
 
 
-# the launch handles by (device index, record, the launch's other compile parameters): the compiled kernel (shared by the
-# records of one tile / cluster bucket: the persistent grid, the raster order and the swizzle size are its trailing
-# arguments, ``blocks/compile.launch_args``) with the record's values of those arguments
-_KERNELS: Dict[tuple, Tuple[Any, tuple]] = {}
+class LaunchHandle(NamedTuple):
+    """What a launch needs besides its tensors: the compiled kernel (shared by the records of one tile / cluster bucket) and
+    the record's placements, the kernel's trailing Int32 arguments (persistent grid in clusters, swizzle size, raster-along-m
+    flag; ``blocks/compile.launch_args``). The kernel takes them after the tensors, so they cannot be bound into it; they are
+    kept next to it instead of being formed on every call."""
+
+    kernel: Any
+    placements: Tuple[int, int, int]
+
+
+# the launch handles by (device index, record, the launch's other compile parameters)
+_KERNELS: Dict[tuple, LaunchHandle] = {}
 
 
 def clear_kernel_cache() -> None:
@@ -497,11 +508,10 @@ on_rank_cache_clear(clear_kernel_cache)
 
 def _handle(
     device: torch.device, config: Knobs, key: tuple, build: Callable[[str], Any]
-) -> Tuple[Any, tuple]:
-    """The compiled kernel of ``config`` on ``device`` for ``key`` (what else selects the compile), from ``build(family)``,
-    with the record's trailing launch arguments (the device's persistent grid in clusters, the swizzle size, the raster
-    flag); kept per (device index, record, key) once the grid is final (a device whose occupancy query is still being
-    retried is asked again on the next call, as `persistent_clusters` does)."""
+) -> LaunchHandle:
+    """The launch handle of ``config`` on ``device`` for ``key`` (what else selects the compile): the kernel from
+    ``build(family)`` with the record's placements; kept per (device index, record, key) once the grid is final (a device
+    whose occupancy query is still being retried is asked again on the next call, as `persistent_clusters` does)."""
     from .blocks.compile import launch_args
 
     index = _device_key(device)
@@ -509,7 +519,9 @@ def _handle(
     handle = _KERNELS.get(k)
     if handle is None:
         _sm, fam = part_of(device)
-        handle = (build(fam), launch_args(config, persistent_clusters(device, config)))
+        handle = LaunchHandle(
+            build(fam), launch_args(config, persistent_clusters(device, config))
+        )
         if (
             config.grid_clusters
             or (index, config.cluster_m * config.cluster_n) in _CO_RESIDENT
@@ -556,7 +568,7 @@ def _run(
     scaled = is_scaled(in_fmt)
     direct = C == 1 or config.cta_chunks
     biased = bias is not None and direct
-    kernel, tail = _handle(
+    h = _handle(
         a.device,
         config,
         ("gemm", b_major, C > 1, in_fmt, out_fmt, False, biased),
@@ -578,7 +590,7 @@ def _run(
         if not out_fresh:
             _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-        kernel(a3, b3, c3, *extra, *tail)  # the chain in the epilogue
+        h.kernel(a3, b3, c3, *extra, *h.placements)  # the chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
     # applied there, once)
@@ -591,7 +603,9 @@ def _run(
         writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
         _require_disjoint(cls, writes, reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
-    kernel(a3, b3, ws, *tail)  # the unscaled, unbiased body: raw fp32 partials
+    h.kernel(
+        a3, b3, ws, *h.placements
+    )  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
     get_fixup(C, out_fmt, scaled, bias is not None)(ws, out, *extra, M, N, rows)
     return out
@@ -1010,7 +1024,7 @@ def _launch_bmm_fp8(
                 [(out, "the output")],
                 [(A, "A"), (B, "B"), (A_scale, "a scale"), (B_scale, "a scale")],
             )
-        kernel, tail = _handle(
+        h = _handle(
             A.device,
             config,
             ("gemm", b_major, False, in_fmt, out_fmt, True, False),
@@ -1019,13 +1033,13 @@ def _launch_bmm_fp8(
             ),
         )
         # (m, k, l) / (n, k, l) / (m, n, l) views with l = the batch element
-        kernel(
+        h.kernel(
             A.permute(1, 2, 0),
             B.permute(2, 1, 0),
             out.permute(1, 2, 0),
             A_scale,
             B_scale,
-            *tail,
+            *h.placements,
         )
         return out
     if workspace is None:
@@ -1291,7 +1305,7 @@ def _run_mx(
         )
     if in_fmt in MX_MIXED_FMTS:
         # the mixed classes' kernels compile as a programmatic dependent launch on request (a placement)
-        kernel, tail = _handle(
+        h = _handle(
             a.device,
             config,
             ("mx_mixed", C > 1, in_fmt, out_fmt, enable_pdl),
@@ -1305,7 +1319,7 @@ def _run_mx(
                 "enable_pdl is wired for the mixed classes only; the mxfp8 and fp4 classes launch without programmatic "
                 "dependent launch"
             )
-        kernel, tail = _handle(
+        h = _handle(
             a.device,
             config,
             ("mx", C > 1, in_fmt, out_fmt),
@@ -1331,14 +1345,14 @@ def _run_mx(
                 [(a, "A"), (b, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
                 + ([(alpha, "alpha")] if alpha is not None else []),
             )
-        kernel(
+        h.kernel(
             b.as_strided((N, Kb_b, 1), (sb_n, 1, Kb_b)),
             a.as_strided((M, Kb_a, 1), (a.stride(0), 1, Kb_a)),
             sfb,
             sfa,
             out.as_strided((N, M, 1), (1, out.stride(0), M * N)),
             *extra,
-            *tail,
+            *h.placements,
         )
         return out
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk of the split views (1 for the unsplit class,
@@ -1355,7 +1369,9 @@ def _run_mx(
         if not out_fresh:
             _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-        kernel(a3, b3, sfa, sfb, c3, *extra, *tail)  # the chain in the epilogue
+        h.kernel(
+            a3, b3, sfa, sfb, c3, *extra, *h.placements
+        )  # the chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
     # applied there, once)
@@ -1370,10 +1386,10 @@ def _run_mx(
     if config.swap_ab:
         # the swapped record of a split class (the mixed classes): the exchanged operands' chunk partials P_c^T into the
         # workspace's (N, M, C) view (the kernel's M contiguous), then the same fixup over the (M, N, C) view
-        kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0), *tail)
+        h.kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0), *h.placements)
     else:
-        kernel(
-            a3, b3, sfa, sfb, ws.permute(1, 2, 0), *tail
+        h.kernel(
+            a3, b3, sfa, sfb, ws.permute(1, 2, 0), *h.placements
         )  # the unscaled body: raw fp32 partials
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     rows = min(M, MAX_GRID_Y)
@@ -1999,7 +2015,7 @@ def _launch_fp8bs(
     c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
     # the compile's architecture query and the launch follow A's device, not the current one
     with torch.cuda.device(a.device):
-        kernel, tail = _handle(
+        h = _handle(
             a.device,
             config,
             ("fp8bs", out_fmt, native_k),
@@ -2007,5 +2023,5 @@ def _launch_fp8bs(
                 config, out_fmt, family=fam, native_k=native_k
             ),
         )
-        kernel(a3, b3, sfa, sfb, c3, *tail)
+        h.kernel(a3, b3, sfa, sfb, c3, *h.placements)
     return out
