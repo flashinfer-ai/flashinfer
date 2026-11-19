@@ -918,7 +918,7 @@ def gen_all_modules(
             jit_specs.append(gen_act_and_mul_module(act_name))
 
     if add_moe:
-        if has_sm90:
+        if has_sm90 and get_cuda_version() >= Version("12.5"):
             jit_specs.extend(gen_colonels_aot_modules(90))
         if has_sm103a_exact:
             jit_specs.extend(gen_colonels_aot_modules(103))
