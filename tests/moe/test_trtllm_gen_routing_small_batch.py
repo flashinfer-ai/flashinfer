@@ -20,9 +20,10 @@ the static-block / dyn-block / split kernels they replace.
 The switch FLASHINFER_ROUTING_SMALL_BATCH_KERNEL=0 restores the previous kernels and is
 read on every routing call, so each case runs both paths in one process:
 - routing: expert ids, BF16 weights, CTA maps, padded size, and the permutation. The layout is
-  compared exactly up to 16 tokens (block kernels, ascending token order inside an expert); from
-  17 tokens the previous path places tokens inside an expert in atomic order, so the permutation
-  is compared as per-expert row sets plus a consistent (token, k) -> row mapping;
+  compared exactly where the previous path runs the block kernels (ascending token order inside an
+  expert): up to 16 tokens from logits, up to 8 for precomputed top-k. Above, the previous path
+  places tokens inside an expert in atomic order, so the permutation is compared as per-expert
+  row sets plus a consistent (token, k) -> row mapping;
 - the NVFP4 MoE output (FromLogits and precomputed top-k, finalized and not), bit for bit,
   including forced tactics of every tile size and CUDA-graph replay.
 """
@@ -57,7 +58,10 @@ SINGLE_CTA_MAX_TOKENS = 18  # SmallBatchKernelSingleCtaMaxNumTokens
 # Token counts of the routing comparisons: the kernel's window plus the counts around it (outside
 # the window both settings run the previous kernels, which the comparison then pins as identical).
 TOKEN_COUNTS = range(1, MAX_TOKENS + 9)
-EXACT_LAYOUT_MAX_TOKENS = 16  # previous path: block kernels up to here, then atomics
+# Previous path: block kernels up to here, then atomics (logits: block-scores + post-TopK;
+# precomputed top-k: the block permutation kernel).
+EXACT_LAYOUT_MAX_TOKENS = 16
+EXACT_LAYOUT_MAX_TOKENS_PRECOMPUTED = 8
 SWITCH = "FLASHINFER_ROUTING_SMALL_BATCH_KERNEL"
 TILES = [8, 16, 32, 64, 128, 192, 256]
 # A GLM-5-class per-rank MoE shape at TP4 (routing: DeepSeek-V3, n_group 1, scale 2.5).
@@ -261,7 +265,16 @@ def run_routing(
 
 
 def assert_same_routing(
-    ref, new, ids, *, num_tokens, tile, local_offset, local_num, tag
+    ref,
+    new,
+    ids,
+    *,
+    num_tokens,
+    tile,
+    local_offset,
+    local_num,
+    tag,
+    exact_max_tokens=EXACT_LAYOUT_MAX_TOKENS,
 ):
     """`ids` [num_tokens, 8]: the expert of every (token, k) pair, -1 when not routed."""
     assert new.num_ctas == ref.num_ctas, f"{tag}: num_non_exiting_ctas"
@@ -290,11 +303,12 @@ def assert_same_routing(
             )
             tok = torch.arange(num_tokens, device="cuda").repeat_interleave(TOP_K)
             assert torch.equal(r.p2t.long()[rows], tok[routed]), f"{tag}: {name} p2t"
-    # Same rows per expert (the previous path's order inside an expert may differ above 16).
+    # Same rows per expert (the previous path's order inside an expert may differ above
+    # exact_max_tokens).
     assert torch.equal(
         torch.sort(new.e2p[routed]).values, torch.sort(ref.e2p[routed]).values
     ), f"{tag}: permuted row sets"
-    if num_tokens <= EXACT_LAYOUT_MAX_TOKENS:
+    if num_tokens <= exact_max_tokens:
         assert torch.equal(new.e2p, ref.e2p), (
             f"{tag}: expanded_idx_to_permuted_idx (exact)"
         )
@@ -413,6 +427,7 @@ def test_routing_precomputed(case, fmt, tile):
             local_offset=0,
             local_num=NUM_EXPERTS,
             tag=tag,
+            exact_max_tokens=EXACT_LAYOUT_MAX_TOKENS_PRECOMPUTED,
         )
 
 
@@ -441,6 +456,7 @@ def test_routing_precomputed_expert_parallel(fmt, window):
             local_offset=local_offset,
             local_num=local_num,
             tag=f"{fmt}/ep{window}/T{T}",
+            exact_max_tokens=EXACT_LAYOUT_MAX_TOKENS_PRECOMPUTED,
         )
 
 
@@ -662,7 +678,8 @@ def _first_config_per_tile(T):
         HIDDEN,
         HIDDEN,
         INTER,
-        NUM_EXPERTS,
+        NUM_EXPERTS,  # num_local_experts
+        NUM_EXPERTS,  # num_experts
         int(ActivationType.Swiglu),
         True,  # use_shuffled_weight
         0,  # weight_layout: MajorK
@@ -729,6 +746,10 @@ def _run_fp4_ffi(kw, logits, bias, tactic):
         None,  # workspace_buffer
         False,  # query_workspace_size
         NVFP4_4OVER6_CODE_FROM_ENV,
+        [],  # localized_weights
+        [],  # localized_streams
+        0,  # localized_sm_count
+        [],  # fc2_input_out
     )
     return [output]
 
