@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from threading import Barrier
@@ -3552,9 +3553,10 @@ def test_top_p_renorm_probs_specialized_vanishing_rows_match_air(
 
 
 def test_top_p_renorm_probs_specialized_exact_mass_contract(top_p_specialized_enabled):
-    # The nucleus target is top_p times the row's EXACT mass (fixed-point sums, independent of any
-    # summation order), so the kept set is the float64 reference's. Float32 [0.5, 0.3, 0.2] sums
-    # to 1 + 2^-26 exactly: at top_p 0.5 the target is just above 0.5, so 0.3 is kept too and the
+    # The nucleus target is top_p times the row's fixed-point mass (exact for these entries,
+    # independent of any summation order), so the kept set is the float64 reference's. Float32
+    # [0.5, 0.3, 0.2] sums to 1 + 2^-26 exactly: at top_p 0.5 the target is just above 0.5, so 0.3
+    # is kept too and the
     # output is [0.625, 0.375]. AIR's float32 row sum rounds to 1.0 here and keeps 0.5 alone; at
     # such ties AIR's float32 result depends on its accumulation order (float atomics across
     # CTAs), so the kernel follows exact arithmetic instead (documented in the kernel header).
@@ -3580,6 +3582,53 @@ def test_top_p_renorm_probs_specialized_exact_mass_contract(top_p_specialized_en
     torch.testing.assert_close(
         out, _top_p_specialized_reference(probs, tp), atol=0.0, rtol=0.0
     )
+
+
+def test_top_p_renorm_probs_specialized_fixed_point_target_and_resolution(
+    top_p_specialized_enabled,
+):
+    # The radix path's masses are whole units of 2^-q of the row's scale (q = 59 for these rows of
+    # mass ~1): an entry of at least 2^-35 of the mass converts exactly, a smaller one rounds to
+    # the nearest unit, and the target top_p * mass is rounded up to a whole unit.
+    _skip_unless_sm103()
+    batch_size, vocab_size = 5, 154880
+    probs = torch.zeros(batch_size, vocab_size, dtype=torch.float64)
+    # row 0: 2^-16, then 131070 x 2^-17 and one 2^-46, at top_p 2^-16. The exact target is
+    # 2^-16 + 2^-62, above the 2^-16 entry alone, so every 2^-17 entry is kept (their mass with
+    # 2^-16 is exactly 1, so the output is the input there). The target rounded to the nearest
+    # unit (2^43 + 1/8 -> 2^43) kept 2^-16 alone; rounded up (2^43 + 1) it does not.
+    probs[0, 0] = 2.0**-16
+    probs[0, 1:131071] = 2.0**-17
+    probs[0, 131071] = 2.0**-46
+    # row 1: [0.5, 0.25, 0.25] plus 131072 x 2^-61 (2^-44 in all) at top_p 0.5. Exact arithmetic
+    # keeps the three entries (target 0.5 + 2^-45), but each 2^-61 entry is a quarter unit and
+    # rounds to 0: the fixed-point target is 0.5, reached by 0.5 alone. The tail mass is within
+    # the documented bound (V/2 units, 2^-41 of the row's mass), so this row is pinned to the
+    # fixed-point result, which is also AIR's float32 result.
+    probs[1, :3] = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    probs[1, 3:131075] = 2.0**-61
+    # row 2: the same row with one 2^-35 entry (2^24 units, converted exactly): target
+    # 0.5 + 2^-36, so the 0.25 ties are kept, as exact arithmetic keeps them (AIR's float32 sum
+    # rounds 1 + 2^-35 to 1 and keeps 0.5 alone).
+    probs[2, :3] = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    probs[2, vocab_size - 1] = 2.0**-35
+    # row 3: an exact tie at the target (0.5 alone reaches 0.5 * 1.0); row 4: all zero
+    probs[3, :3] = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    probs = probs.float()
+    tp = torch.tensor([2.0**-16, 0.5, 0.5, 0.5, 0.5])
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda()).cpu()
+    ref = _top_p_specialized_reference(probs, tp)
+    exact_rows = [0, 2, 3, 4]
+    torch.testing.assert_close(out[exact_rows], ref[exact_rows], atol=0.0, rtol=0.0)
+    assert int((out[0] > 0).sum()) == 131071
+    torch.testing.assert_close(out[0, :131071], probs[0, :131071], atol=0.0, rtol=0.0)
+    assert out[0, 131071].item() == 0.0
+    expected_1 = torch.zeros(vocab_size)
+    expected_1[0] = 1.0
+    torch.testing.assert_close(out[1], expected_1, atol=0.0, rtol=0.0)
+    # exact arithmetic (an exactly rounded sum, which is exact here) puts the target above 0.5
+    assert math.fsum(probs[1].double().tolist()) == 1.0 + 2.0**-44
+    assert out[2, :3].tolist() == [0.5, 0.25, 0.25] and out[3, 0].item() == 1.0
 
 
 def test_top_p_renorm_probs_specialized_launch_plan_matches_the_kernel(

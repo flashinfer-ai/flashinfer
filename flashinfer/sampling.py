@@ -2440,10 +2440,11 @@ def top_p_renorm_probs(
     On compute capability 10.3 (B300 / GB300), float32 ``probs`` with a per-row float32 ``top_p``
     tensor and ``is_deterministic=False`` are served by a single-launch thread-block-cluster
     kernel for the ``(batch_size, vocab_size)`` rows listed in
-    ``top_p_renorm_probs_specialized_workloads.json`` (the same rule, with exact 64-bit
-    fixed-point masses: where a prefix mass lies within float32 rounding of the target, it keeps
-    what exact arithmetic keeps, which AIR's float32 sums may not). Every other call takes the AIR
-    top-p kernels; ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read on every call) forces them.
+    ``top_p_renorm_probs_specialized_workloads.json`` (the same rule, with 64-bit fixed-point
+    masses accurate to ``2**-41`` of the row's mass: where a prefix mass lies within float32
+    rounding of the target, it keeps what exact arithmetic keeps, which AIR's float32 sums may
+    not; a NaN entry is never kept). Every other call takes the AIR top-p kernels;
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read on every call) forces them.
 
     See Also
     --------

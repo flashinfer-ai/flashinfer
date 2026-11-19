@@ -23,16 +23,22 @@
 // descending prefix whose mass reaches top_p * M, M being the row's positive mass; ties at the
 // threshold are kept; the kept entries are divided by their sum (left as they are if it is
 // <= 1e-8), every other entry is 0; a NaN entry has no mass and is never kept (its output is 0).
-// This is the rule of the AIR path of top_p_renorm_probs (its
-// target is blockSum * p, relative to the row's own mass, so a row that does not sum to 1 keeps
-// the same entries), evaluated with exact masses: every sum below is a 64-bit fixed-point sum,
-// exact for the row's entries, so the kept set is what float64 (exact) arithmetic keeps and never
-// depends on a summation order. AIR evaluates the rule with float32 sums whose rounding depends on
-// its reduction order (float atomics across CTAs, so the launch); where a prefix mass lies within
-// that rounding of the target the two can keep different entries. Example: float32 [0.5, 0.3,
-// 0.2] at top_p 0.5 has an exact mass of 1 + 2^-26, so the target is just above 0.5 and this kernel
-// keeps {0.5, 0.3} (output [0.625, 0.375]) like a float64 evaluation; AIR's float32 row sum rounds
-// to 1.0 and keeps 0.5 alone.
+// This is the rule of the AIR path of top_p_renorm_probs (its target is blockSum * p, relative to
+// the row's own mass, so a row that does not sum to 1 keeps the same entries), evaluated with
+// 64-bit fixed-point masses instead of AIR's float32 sums. Each entry is converted to whole units
+// of 2^-q of the row's scale (2^-56 on the head paths, whose entries are all >= 2^-8; on the radix
+// path q follows the row's mass, which is at least 2^58 units), every sum is an exact integer sum,
+// and the target is top_p times the fixed-point mass rounded up to a whole unit. An entry of at
+// least 2^-35 of the row's mass (2^23 units) converts exactly; a smaller one is rounded to the
+// nearest unit, so the fixed-point masses lie within V/2 units of the exact ones: below 2^-41 of
+// the row's mass for V <= 2^18, where float32 rounds at 2^-24. The kept set is therefore what
+// exact arithmetic keeps unless the exact mass of a prefix lies within that bound of the target,
+// and it never depends on a summation order. AIR's float32 sums round in an order that depends
+// on its launch (float atomics across CTAs); where a prefix mass lies within that rounding of the
+// target the two can keep different entries. Example: float32 [0.5, 0.3, 0.2] at top_p 0.5 has an
+// exact mass of 1 + 2^-26, so the target is just above 0.5 and this kernel keeps {0.5, 0.3}
+// (output [0.625, 0.375]) like a float64 evaluation; AIR's float32 row sum rounds to 1.0 and
+// keeps 0.5 alone.
 //
 // Fast path: every CTA streams its slice of the row once, writes zeros to the matching output
 // slice, adds the slice up in float32 and collects the entries >= 2^-8 (at most 256 per row when
@@ -46,19 +52,20 @@
 // (nucleus of 1-2 tokens at top_p 0.95), so this path serves almost every row; up to 32 head
 // entries are resolved by one warp with shuffles, and a single head entry that reaches the target
 // on its own exits right after the gather (its output is exactly 1).
-// Otherwise an exact radix select over the float bits (12/11/9-bit levels, 64-bit fixed-point
-// bin masses) reduced across the cluster through distributed shared memory finds the threshold,
-// and a masked pass rewrites the slice. Its first level also sums the entries below the level's
-// range, which gives the exact fixed-point M, and so the exact target, before any decision.
+// Otherwise a radix select over the float bits (12/11/9-bit levels, 64-bit fixed-point bin masses)
+// reduced across the cluster through distributed shared memory finds the threshold, and a masked
+// pass rewrites the slice. Its first level also sums the entries below the level's range, which
+// gives the row's fixed-point M, and so its target, before any decision.
 //
 // Compared with the AIR radix top-p (air_top_p.cuh: five kernels, one 1024-thread CTA per row in
 // the apply pass), this keeps the whole GPU busy for small batches (16 CTAs per row) and reads
 // the row once on the fast path. Accumulation is 64-bit fixed point: 2^-56 on the head paths
 // (exact for their entries, >= 2^-8), and 2^-q on the radix path, q chosen per row from its
-// float32 mass so that the mass lies in [2^58, 2^61) units: every entry above 2^-61 of the row's
-// mass is resolved, whatever the row's scale, so a vanishing row (entries below 2^-57, down to
-// subnormals) or a heavy one (mass 64 or more; the head paths are off for it) is selected like a
-// probability row. For rows that sum to ~1 this is at least as precise as float64. The one
+// float32 mass so that the mass lies in [2^58, 2^61) units (a row of mass in [8, 64) keeps 2^-56):
+// the resolution follows the row's own mass, whatever its scale, so a vanishing row (entries below
+// 2^-57, down to subnormals) or a heavy one (mass 64 or more; the head paths are off for it) is
+// selected like a probability row. For rows that sum to ~1 this is finer than float64 summation
+// (at most V/2 units of 2^-59 in all, against one float64 rounding per addition). The one
 // discontinuous decision on the mass (a kept mass <= 1e-8 is left unnormalised) is re-checked in
 // float64 near its cutoff. No fast-math is used (the JIT module is built without
 // -use_fast_math, so the renormalising division is the IEEE division).
@@ -94,10 +101,10 @@ __device__ __forceinline__ u64 to_fix(float p, float scale = FIX_SCALE, float sc
 // 2^k as a float, for k in [-126, 127].
 __device__ __forceinline__ float exp2i(int k) { return __int_as_float((k + 127) << 23); }
 
-// max(1, round(top_p * mass)) in exact integer arithmetic: AIR's target blockSum * p for a
-// fixed-point row mass (top_p >= 1 gives the whole mass). The minimum of one unit (top_p <= 0 or
-// NaN, or a product below half a unit) keeps the row maximum, as AIR does: the nucleus always
-// holds at least one entry.
+// max(1, ceil(top_p * mass)) in exact integer arithmetic: AIR's target blockSum * p for a
+// fixed-point row mass (top_p >= 1 gives the whole mass), rounded up, so that a prefix (a whole
+// number of units) reaches it exactly when it reaches top_p * mass. The minimum of one unit (top_p
+// <= 0 or NaN) keeps the row maximum, as AIR does: the nucleus always holds at least one entry.
 __device__ __forceinline__ u64 row_target(float tp, u64 mass) {
   u64 r = 0;
   if (tp >= 1.f) {
@@ -109,11 +116,12 @@ __device__ __forceinline__ u64 row_target(float tp, u64 mass) {
     const u64 m = (b & 0x7FFFFFu) | 0x800000u;
     const u64 lo = mass * m, hi = __umul64hi(mass, m);  // the 88-bit product
     if (e == 0 || sh >= 128) {
-      r = 0;  // below 2^-126 * 2^64 units
+      r = 0;  // below 2^-126 * 2^64 units, so below one unit: the minimum applies
     } else if (sh < 64) {
-      r = ((lo >> sh) | (hi << (64 - sh))) + ((lo >> (sh - 1)) & 1ULL);
+      r = ((lo >> sh) | (hi << (64 - sh))) + ((lo & ((1ULL << sh) - 1)) != 0);
     } else {
-      r = (hi >> (sh - 64)) + ((sh == 64) ? (lo >> 63) : ((hi >> (sh - 65)) & 1ULL));
+      const u64 low_bits = (sh == 64) ? 0ULL : (hi & ((1ULL << (sh - 64)) - 1));
+      r = (hi >> (sh - 64)) + ((lo | low_bits) != 0);
     }
   }
   return r ? r : 1ULL;
@@ -465,13 +473,13 @@ __global__ void __launch_bounds__(NT, MINB)
   const int len4 = len >> 2;
   // The radix path's fixed point is 2^-q per row, q chosen from the row's float32 mass f = 2^e *
   // [1, 2) so that its exact mass lies in [2^58, 2^61) units (below 2^(e+2) allowing for f's
-  // rounding): every entry above 2^-61 of the row's mass is resolved (finer than float64), whatever
-  // the row's scale, so a vanishing row (all entries below 2^-57) is selected like any other
-  // instead of having zero mass. A row the head paths may resolve (mass < 64) keeps q >= 56, their
-  // fixed point, so both paths resolve the same target. An all-zero row (f = 0, ilogbf = INT_MIN)
-  // has no mass at any scale. (A row of mass in [8, 64) keeps 2^-56; computing the scale only in
-  // the branch below keeps ptxas from spilling more in the streaming loop of the 40-register
-  // launch configurations.)
+  // rounding): the resolution follows the row's own mass (an entry of at least 2^-35 of it converts
+  // exactly, a smaller one to the nearest unit), whatever the row's scale, so a vanishing row (all
+  // entries below 2^-57) is selected like any other instead of having zero mass. A row the head
+  // paths may resolve (mass < 64) keeps q >= 56, their fixed point, so both paths resolve the same
+  // target. An all-zero row (f = 0, ilogbf = INT_MIN) has no mass at any scale. (A row of mass in
+  // [8, 64) keeps 2^-56; computing the scale only in the branch below keeps ptxas from spilling
+  // more in the streaming loop of the 40-register launch configurations.)
   int q = 56;
   float scale = FIX_SCALE, scale2 = 1.f;  // 2^q = scale * scale2, each factor a normal float
   if (big || s_fmass < 8.f) {
