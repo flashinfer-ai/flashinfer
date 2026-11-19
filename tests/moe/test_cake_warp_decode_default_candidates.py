@@ -363,6 +363,67 @@ def test_default_entry_leaves_before_stream_workspace_limit(monkeypatch):
     assert len(runner._workspace_cache) == limit
 
 
+def test_default_entry_keeps_streams_with_a_workspace_at_the_limit(monkeypatch):
+    runner = _cpu_default_runner()
+    weights, _ = _cpu_weight_pack()
+    act = _cpu_activation_pack(topk_ids=torch.zeros((7, 4), dtype=torch.int32))
+    limit = runner._MAX_STREAM_WORKSPACES
+    stream = SimpleNamespace(cuda_stream=1)
+    monkeypatch.setattr(runner, "_current_stream", lambda: stream)
+
+    for stream_id in range(1, limit):
+        stream = SimpleNamespace(cuda_stream=stream_id)
+        runner.pack_inputs(act, weights)
+    assert len(runner._workspace_cache) == limit - 1
+    # A new stream would need a new workspace: the entry leaves.
+    stream = SimpleNamespace(cuda_stream=limit)
+    assert not runner.accepts(act, weights)
+    # A stream that already holds this geometry's workspace stays eligible.
+    for stream_id in (1, limit - 1):
+        stream = SimpleNamespace(cuda_stream=stream_id)
+        assert runner.accepts(act, weights)
+        runner.pack_inputs(act, weights)
+    assert len(runner._workspace_cache) == limit - 1
+
+
+def test_default_entry_leaves_after_a_failed_module_load(monkeypatch):
+    runner = _cpu_default_runner()
+    weights, _ = _cpu_weight_pack()
+    act = _cpu_activation_pack(topk_ids=torch.zeros((7, 4), dtype=torch.int32))
+    runner._module = None
+    loads = []
+
+    def failing_load():
+        loads.append(1)
+        raise RuntimeError("no compiler")
+
+    monkeypatch.setattr(runner, "_load_module", failing_load)
+    assert not runner.accepts(act, weights)
+    assert not runner.accepts(act, weights)
+    assert len(loads) == 1, "a failed load is not retried"
+    # An explicit Cake config still loads at build time and reports its errors.
+    explicit, _ = _cpu_runner()
+    assert explicit.accepts(act, weights)
+
+
+def test_default_layer_falls_back_when_the_cake_load_fails(monkeypatch):
+    _require_cake_arch()
+    layer = _layer(_config())
+    cake = layer.runners[-1]
+    assert isinstance(cake, CakeWarpDecodeRunner) and cake._module is None
+
+    def failing_load():
+        raise RuntimeError("no compiler")
+
+    monkeypatch.setattr(cake, "_load_module", failing_load)
+    weights = _weights(_TRTLLM_KEY, "cake")
+    activations = _activations(8)
+    assert len(layer.runners) - 1 not in layer._eligible_runners(activations, weights)
+    output = layer(activations, weights)
+    assert layer.winner_backend == _TRTLLM_KEY
+    assert_close(output, reference(_fixture(), 8))
+
+
 def test_default_layer_builds_cake_runner_last():
     _require_cake_arch()
     layer = _layer(_config())

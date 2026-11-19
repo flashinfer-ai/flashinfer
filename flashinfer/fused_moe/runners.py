@@ -53,6 +53,7 @@ from ..autotuner import (
     TuningConfig,
     cake_group_tuning,
 )
+from ..jit.core import logger
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
     NVFP4_4OVER6_CODE_FROM_ENV,
@@ -990,6 +991,8 @@ class CakeWarpDecodeRunner(MoERunner):
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
         self._module: Any = None
+        # The default entry's first-use load failure; the entry then stays out.
+        self._load_error: Exception | None = None
         self._workspace_cache: OrderedDict[
             tuple[int, tuple[int, int, int, int, int]],
             tuple[Any, torch.Tensor],
@@ -1174,12 +1177,6 @@ class CakeWarpDecodeRunner(MoERunner):
         # entry's eligibility depends on the rank-local token count.
         if cake_group_tuning():
             return False
-        # Stream workspaces are never evicted. Leave the default entry out
-        # before that limit is reached instead of failing the call. One winner
-        # selection can add two stream workspaces: the caller stream and the
-        # timing warmup stream.
-        if len(self._workspace_cache) > self._MAX_STREAM_WORKSPACES - 2:
-            return False
         geometry = (
             num_tokens,
             hidden_size,
@@ -1187,7 +1184,37 @@ class CakeWarpDecodeRunner(MoERunner):
             routing.num_experts,
             routing.top_k,
         )
+        # Stream workspaces are never evicted. Leave the default entry out
+        # before that limit is reached instead of failing the call. One winner
+        # selection can add two stream workspaces: the caller stream and the
+        # timing warmup stream. A stream that already holds a workspace for
+        # this geometry adds none, so it stays eligible.
+        if (
+            len(self._workspace_cache) > self._MAX_STREAM_WORKSPACES - 2
+            and (self._stream_token(self._current_stream()), geometry)
+            not in self._workspace_cache
+        ):
+            return False
         if self._is_current_stream_capturing() and not self._capture_ready(geometry):
+            return False
+        # The default entry loads its module on first use. A failed load leaves
+        # the entry out, so another eligible runner serves the call.
+        return self._module is not None or self._load_default_module()
+
+    def _load_default_module(self) -> bool:
+        """Load the default entry's module once; return whether it is loaded."""
+        if getattr(self, "_load_error", None) is not None:
+            return False
+        try:
+            self._module = self._load_module()
+        except Exception as error:  # noqa: BLE001 - any load failure leaves the entry out
+            self._load_error = error
+            logger.warning(
+                "The default Cake warp-decode MoE entry is left out: its module "
+                "failed to load (%s: %s).",
+                type(error).__name__,
+                error,
+            )
             return False
         return True
 

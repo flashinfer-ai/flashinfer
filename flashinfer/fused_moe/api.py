@@ -708,11 +708,13 @@ class CakeWarpDecodeConfig:
     ``MoELayer`` is built leaves this entry out of that layer (see
     :func:`flashinfer.api_logging.cake_auto_candidates_enabled`). The default
     entry resolves ``ExecutionConfig(enable_pdl=None)`` from the device, still
-    rejects ``enable_pdl=False``, and loads its kernel module on first use.
+    rejects ``enable_pdl=False``, and loads its kernel module on first use; if
+    that load fails, the entry is left out and the other candidates serve the
+    call.
 
     An explicit ``CakeWarpDecodeConfig(backend="cake")`` is not affected by
-    that switch, requires ``ExecutionConfig(enable_pdl=True)``, and raises
-    ``ValueError`` for a ``topk_ids`` value outside ``[0, num_experts)``.
+    that switch, requires ``ExecutionConfig(enable_pdl=True)``, and drops a
+    ``topk_ids`` value outside ``[0, num_experts)`` in the same way.
 
     The physical weight and activation layouts are exactly those produced by
     :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
