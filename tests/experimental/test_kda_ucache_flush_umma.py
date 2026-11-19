@@ -40,8 +40,8 @@ from .test_kda_ucache_flush import _load_flush, _make_case
 
 # Base tests the UMMA backend cannot run yet at the current stage. MUST be
 # empty once the kernel covers T in {4, 8} x w_ring in {16, 32} (stage S3).
-# S3a: verify and flush rows at T=4 / w_ring=16; every w_ring=32 test and every
-# T=8 case is pending.
+# S3b: verify and flush rows at T in {4, 8} / w_ring=16; every w_ring=32 test is
+# pending.
 _PENDING_NAMES: set = {
     "test_w32_output_and_fold_match_fp32_reference",
     "test_w32_tma_late_forced",
@@ -52,8 +52,8 @@ _PENDING_NAMES: set = {
 
 
 def _PENDING_PARAMS(params: dict) -> bool:
-    """Per-parameter pending filter: T=8 and w_ring=32 cases (S3a)."""
-    return params.get("t") == 8 or params.get("w_ring") == 32
+    """Per-parameter pending filter: w_ring=32 cases (S3b)."""
+    return params.get("w_ring") == 32
 
 
 @pytest.fixture(autouse=True)

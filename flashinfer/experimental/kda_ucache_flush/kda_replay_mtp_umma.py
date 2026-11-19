@@ -53,7 +53,7 @@ a time: S_half <- bf16(bdec . S0_half + F) in place in SMEM (per-channel bdec), 
 TMA store of the half back to the pool slot. Consumer order on flush rows: RMW of half
 0 -> epilogue -> RMW of half 1 (the fold UMMA of half 1 hides behind the epilogue).
 
-Status (stage S3a): T = 4, w_ring = 16, one head per CTA.
+Status (stage S3b): T in {4, 8}, w_ring = 16, one head per CTA.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ _FORCE_HPC: Optional[int] = None
 _LAUNCHES = 0
 
 # Stage-supported configurations; widened as the kernel grows.
-_SUPPORTED_T: frozenset = frozenset({4})
+_SUPPORTED_T: frozenset = frozenset({4, 8})
 _SUPPORTED_W_RING: frozenset = frozenset({16})
 _KERNEL_IMPLEMENTED = True
 
