@@ -297,16 +297,20 @@ def preprocess_block_scaled_weights(
     experts, rows, hidden = w13.shape
     if experts <= 0 or hidden <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
-    if rows != (2 if gated else 1) * intermediate_size or w2.shape != (
+    fc1_rows = (2 if gated else 1) * intermediate_size
+    if rows != fc1_rows or w2.shape != (
         experts,
         hidden,
         intermediate_size,
     ):
         raise ValueError(
-            "canonical weight shapes must match FC1 [E, (2 if gated else 1)*I, H] and FC2 [E, H, I]."
+            f"canonical weight shapes must match FC1 {(experts, fc1_rows, hidden)} "
+            f"and FC2 {(experts, hidden, intermediate_size)}."
         )
     intermediate_alignment = (
-        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+        4 * sf_vec
+        if not gated or quant_kind in ("mxfp4", "mxfp4_mxfp8")
+        else 2 * sf_vec
     )
     if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
@@ -398,7 +402,9 @@ def preprocess_prequantized_block_scaled_weights(
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
     intermediate_alignment = (
-        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+        4 * sf_vec
+        if not gated or quant_kind in ("mxfp4", "mxfp4_mxfp8")
+        else 2 * sf_vec
     )
     if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
@@ -560,7 +566,8 @@ def compute_megamoe_reference_sm107_block_scaled(
     before the logical transpose view): ``fc1_weight_k_major
     (E, 2I, hidden[packed])`` with the 16-interleaved gate/up N axis and raw SF
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
-    raw SF ``(E, hidden, I/vec)``.
+    raw SF ``(E, hidden, I/vec)``. Nongated FC1 uses I rather than 2I rows,
+    with no gate/up interleave.
     """
     if activation not in ("swiglu", "clamped_relu2"):
         raise ValueError("reference activation must be swiglu or clamped_relu2")
@@ -596,7 +603,9 @@ def compute_megamoe_reference_sm107_block_scaled(
             sf1 = from_blocked(sf1, fc1_out, hidden // vec)
             sf2 = from_blocked(sf2, hidden, intermediate // vec)
         w1 = _dequant_weight_k_major(quant_kind, fc1_weight_k_major[local_e], sf1)
-        fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
+        fc1 = x[src_t] @ w1.transpose(
+            0, 1
+        )  # (v, I) nongated; otherwise (v, 2I) with gate/up stripes
         if fc1_alpha is not None:
             fc1 = fc1 * fc1_alpha[local_e]
         if nongated:

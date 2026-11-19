@@ -289,7 +289,7 @@ def test_prequantized_ingestion_rejects_invalid_contract(corruption):
 @pytest.mark.parametrize("gated", [False, True])
 def test_clamped_relu2_prequantized_weights_preserve_bytes(gated):
     # Distinct rows catch accidental gate/up interleaving in the nongated path.
-    hidden, intermediate = 384, 192
+    hidden, intermediate = 384, 192 if gated else 256
     gen = torch.Generator().manual_seed(73)
     w1 = torch.randn(2, (2 if gated else 1) * intermediate, hidden, generator=gen)
     w2 = torch.randn(2, hidden, intermediate, generator=gen)

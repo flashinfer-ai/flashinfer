@@ -250,7 +250,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.activation_divisor = 1 if problem_desc.get("gate_activation") == "clamped_relu2" else 2
         if self.activation_divisor == 1 and ((impl_desc.get("die_aware") or "off") != "off" or problem_desc.get("shared_expert", False)):
-            raise ValueError("clamped ReLU2 clamped_relu2 currently requires unlocalized routed experts")
+            raise ValueError("clamped_relu2 requires die_aware='off' and no shared expert")
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.a_dtype = self.quant_kind.weight_dtype

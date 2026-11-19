@@ -150,14 +150,13 @@ These compatibility branches import `flashinfer.moe_ep.batch_invariant`.
 The composed exporter's external-module allowlist includes `flashinfer`;
 those modules stay in FlashInfer and are not copied into `src/`.
 
-
 ## Clamped squared ReLU overlay
 
 `activation="clamped_relu2"` selects `(16*tanh(relu(x)/16))**2` with hardware
 tanh and nongated FC1 weights. It supports MXFP8 E4M3 GenPhase with BF16 combine,
-one epilogue warpgroup, an intermediate width divisible by 128, and unlocalized
-routed experts. Shared experts, dedup,
-and batch invariance are not supported for this activation.
+one epilogue warpgroup, an intermediate width divisible by 128, and
+`die_aware="off"`. Shared experts, dedup, and batch invariance are not supported
+for this activation.
 
 Canonical FC1 weights have shape `[E, I, H]`, without gate/up interleaving;
 FC2 remains `[E, H, I]`. Prequantized weights retain their payload bytes.

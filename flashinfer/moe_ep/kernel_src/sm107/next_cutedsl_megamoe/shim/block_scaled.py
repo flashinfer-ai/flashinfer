@@ -908,8 +908,10 @@ class Sm107BlockScaledSymmBuffer:
                 if activation_variant is not None
                 else cfg.situ_linear_beta,
                 "use_tanh_sigmoid": cfg.use_tanh_sigmoid,
-                "gate_activation": (
-                    "clamped_relu2" if cfg.activation == "clamped_relu2" else "swiglu"
+                **(
+                    {"gate_activation": "clamped_relu2"}
+                    if cfg.activation == "clamped_relu2"
+                    else {}
                 ),
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,

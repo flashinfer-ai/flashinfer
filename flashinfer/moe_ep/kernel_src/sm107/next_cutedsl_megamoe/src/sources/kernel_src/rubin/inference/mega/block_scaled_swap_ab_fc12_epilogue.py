@@ -121,7 +121,11 @@ class QuantImpl:
         elif (
             not isinstance(self.quant_kind, CombineFormat)
             and self.sf_vec_size != 16
-            and not (self.sf_vec_size == 32 and self.sf_vec_direction == "regs_in_thread")
+            and not (
+                self.sf_vec_size == 32
+                and self.sf_vec_direction == "regs_in_thread"
+                and self.quant_kind == QuantKind("mxfp8_e4m3")
+            )
         ):
             # Gated FC1 splits a wider block between paired warps.
             raise ValueError(f"Orthodox sf_vec {self.sf_vec_size} needs the paired direction.")
@@ -1002,11 +1006,11 @@ class SwapABGatedActEpilogue(KernelComponent):
     _EpilogueFc1GateUpInterleave = 16
     _EpilogueTokenTileSize = 64  # Fundamentally the epi_tile_n
     _EpilogueFc1IntermediateGateUpTileSize = 128  # Fundamentally epi_tile_m
-    _EpilogueFc1IntermediateDownTileSize = 64  # Fundamentally epi_tile_m // 2
+    _EpilogueFc1IntermediateDownTileSize = 64  # Default gated width; resolved from activation_divisor in __init__
     _EpilogueFc2HiddenTileSize = 128  # Fundamentally epi_tile_m
     _EpilogueWarpCnt = 4
     # One warp owns this many intermediate_down outputs per token: the TMEM transpose gives each
-    # warp 32 accumulator rows, which the gate/up interleave halves.
+    # warp 32 accumulator rows; gated activations halve this width.
     _EpilogueFc1IntermediateDownPerWarp = 16
     smem_scratch_overlay: ClassVar[str] = "rubin.swap_ab_gated_act_epilogue.scratch"
     fc1_staging_region: ClassVar[str] = "rubin.swap_ab_gated_act_epilogue.fc1_staging"
@@ -1106,8 +1110,10 @@ class SwapABGatedActEpilogue(KernelComponent):
                 or impl_desc.get("epilogue_warpgroups", 1) != 1
             ):
                 raise ValueError("clamped ReLU2 epilogue requires MXFP8 E4M3, one warpgroup, and no BI")
-            self._EpilogueFc1IntermediateDownTileSize = 128
-            self._EpilogueFc1IntermediateDownPerWarp = 32
+        self._EpilogueFc1IntermediateDownTileSize = (
+            self._EpilogueFc1IntermediateGateUpTileSize // self.activation_divisor
+        )
+        self._EpilogueFc1IntermediateDownPerWarp = 32 // self.activation_divisor
         if problem_desc.get("gate_activation") not in (None, "swiglu", "clamped_relu2"):
             raise NotImplementedError(
                 f"Rubin epilogue does not support gate_activation={problem_desc.get('gate_activation')!r} yet."
@@ -2314,7 +2320,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 if cutlass.const_expr(alpha_val is not None):
                     value = value * alpha_val
                 value = cute.arch.fmax(value, cutlass.Float32(0.0))
-                value = limit * cute.math.tanh(value / limit, approx=True)
+                value = limit * cute.math.tanh(value * cutlass.Float32(0.0625), approx=True)
                 out[half * 16 + i] = value * value
         return out
 

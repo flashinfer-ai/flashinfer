@@ -86,7 +86,7 @@ def test_clamped_relu2_layer_ep4():
             graph.replay()
             torch.cuda.synchronize()
             indices, expected = pkg.sampled_reference(
-                layer._workspace, *layer._transformed, capacity, sample_size=8
+                layer._workspace, *layer._transformed, capacity, sample_size=capacity
             )
             error = pkg.output_error(y, indices, expected)
             print(
