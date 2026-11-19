@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """FP8MQATopKWrapper backend='specialized': selection correctness vs an
-fp32 reference, multi-request support (which cutedsl refuses), determinism,
+exact finite-E4M3 score reference, multi-request support (which cutedsl refuses), determinism,
 and the validated contract's rejection semantics."""
 
 import pytest
@@ -67,8 +67,10 @@ def _mk(kv_lens, q_lens, seed):
 
 
 def _reference_rows(inp):
-    """fp32 sum_h relu(q_h . k), top-512 complete visible keys, ascending."""
-    kf = inp["k"].to(torch.float32)
+    """Exact sum_h relu(q_h . k), top-512 complete visible keys, ascending."""
+    # Products lie on the 2**-18 grid; H * D * 448**2 < 2**27.
+    # Binary64 thus preserves strict gaps and exact ties through both sums.
+    kf = inp["k"].to(torch.float64)
     rows = []
     t0 = 0
     for r, (q_len, kv_len) in enumerate(
@@ -80,7 +82,7 @@ def _reference_rows(inp):
             vis = (pos + 1) // RATIO
             row = torch.full((TOPK,), -1, dtype=torch.int32, device="cuda")
             if vis > 0:
-                qf = inp["q"][t0 + i].to(torch.float32)
+                qf = inp["q"][t0 + i].to(torch.float64)
                 sc = (qf @ kf[key0 : key0 + vis].T).clamp_min(0).sum(0)
                 n = min(vis, TOPK)
                 # lower-index tie-breaking: stable sort on (-score, index)
@@ -124,10 +126,11 @@ def test_selection_matches_reference(kv_lens, q_lens):
     gold = _reference_rows(inp)
     assert out.dtype == torch.int32 and out.shape == gold.shape
     assert torch.equal(out, gold)
-    # deterministic across replays; out= honored
+    # Compare the repeat to a snapshot, independently of score correctness.
+    first = out.clone()
     buf = torch.empty_like(gold)
     out2 = w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=buf)
-    assert out2 is buf and torch.equal(out2, gold)
+    assert out2 is buf and torch.equal(out2, first)
 
 
 @requires_sm103

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests for fp8_paged_mqa_topk_indexer (SM103): EXACT integer equality vs an
-fp32 reference (the contract is deterministic, tie-break included), repeat
+mathematical-score reference (lower index wins exact ties), repeat
 determinism, rejection semantics (off-allowlist + kill switch raise), out=
 handling, and CUDA-graph replay == eager.
 """
@@ -80,7 +80,7 @@ def _make_inputs(T, B, seed=0):
 
 
 def _reference(inp):
-    """fp32 indexer reference with the deterministic lower-index tie-break:
+    """Exact finite-E4M3 score reference with the lower-index tie-break:
     score visible blocks with sum_h relu(q_h . k_b), take the top-512 by
     (score, -block) order, expand x4, append the causal tail, emit packed
     ascending int32 rows with the count in the last column."""
@@ -88,7 +88,10 @@ def _reference(inp):
     T = inp["qi"].shape[0]
     B = inp["cpage_table"].shape[0]
     cu = inp["cu_seqlens"].to(torch.int64).tolist()
-    flat_ck = inp["ck_cache"].reshape(-1, ID).to(torch.float32)
+    # E4M3 products are multiples of 2**-18. Even the absolute sum over
+    # 4 * 128 products is < 2**27, so binary64 represents every partial
+    # sum exactly. Neither GEMM nor head reduction order can create a tie.
+    flat_ck = inp["ck_cache"].reshape(-1, ID).to(torch.float64)
     packed = torch.full((T, PW), -1, dtype=torch.int32, device=dev)
     arange_cr = torch.arange(CR, device=dev, dtype=torch.int64)
     for r in range(B):
@@ -108,7 +111,7 @@ def _reference(inp):
             pos_c = inp["pos"][c0:c1].to(torch.int64)
             vis_c = inp["visible"][c0:c1].to(torch.int64)
             if nblk > 0:
-                qf = inp["qi"][c0:c1].to(torch.float32)
+                qf = inp["qi"][c0:c1].to(torch.float64)
                 logits = torch.einsum("thd,bd->thb", qf, ck_r).clamp_min(0).sum(1)
                 blk_idx = torch.arange(nblk, device=dev)
                 vis_mask = blk_idx.view(1, -1) < vis_c.view(-1, 1)
@@ -176,54 +179,31 @@ def test_cuda_130_admitted_with_workaround():
     assert not pi._is_validated_release("13.00")  # exact membership, no prefixes
 
 
-def _row_scores(inp, r, blocks):
-    """fp32 reference scores of the given block indices for request r."""
-    cu = inp["cu_seqlens"].to(torch.int64).tolist()
-    ln = cu[r + 1] - cu[r]
-    nblk = ln // CR
-    n_pages = (nblk + CPAGE - 1) // CPAGE
-    rows = (
-        inp["cpage_table"][r, :n_pages].to(torch.int64).unsqueeze(1) * CPAGE
-        + torch.arange(CPAGE, device=inp["qi"].device).unsqueeze(0)
-    ).reshape(-1)[:nblk]
-    ck_r = inp["ck_cache"].reshape(-1, ID).to(torch.float32)[rows]
-    return ck_r[blocks]
+@requires_sm103
+@requires_validated_toolkit
+def test_selection_boundary_tie_and_small_gap():
+    inp = _make_inputs(2930, 1)
+    t = CR * (BTOPK + 1) - 1  # first row with 513 visible blocks, no tail
+    q = torch.zeros_like(inp["qi"], dtype=torch.float32)
+    q[t : t + 2, 0, 0] = 1
+    q[t + 1, 1, 1] = 2**-6
+    k = torch.zeros_like(inp["ck_cache"], dtype=torch.float32).view(-1, ID)
+    k[: BTOPK - 1, 0] = 64
+    k[BTOPK - 1 : BTOPK + 1, 0] = 32
+    k[BTOPK, 1] = 2**-6
+    inp["qi"] = q.to(inp["qi"].dtype)
+    inp["ck_cache"] = k.view_as(inp["ck_cache"]).to(inp["ck_cache"].dtype)
 
-
-def _assert_selection_invariants(inp, out, gold):
-    """Cross-toolkit contract: per differing row, the selected sets differ
-    by <= 1 block, the swapped blocks are score-tied, and tail/count/order
-    are exact."""
-    if torch.equal(out, gold):
-        return
-    cu = inp["cu_seqlens"].to(torch.int64).tolist()
-    bad = (out != gold).any(dim=1).nonzero().flatten().tolist()
-    for t in bad:
-        got_row, want_row = out[t], gold[t]
-        # count column exact
-        assert int(got_row[PW - 1]) == int(want_row[PW - 1]), t
-        n = int(want_row[PW - 1])
-        got_tok = got_row[:n].tolist()
-        want_tok = want_row[:n].tolist()
-        assert got_tok == sorted(got_tok), t  # ascending order exact
-        # token sets differ only by whole blocks; <= 1 block swapped
-        got_blk = sorted({v // CR for v in got_tok})
-        want_blk = sorted({v // CR for v in want_tok})
-        only_got = sorted(set(got_blk) - set(want_blk))
-        only_want = sorted(set(want_blk) - set(got_blk))
-        assert len(only_got) <= 1 and len(only_want) <= 1, (t, only_got)
-        assert len(only_got) == len(only_want), t
-        if only_got:
-            # the swapped-in and swapped-out blocks must be score-TIED
-            r = next(i for i in range(len(cu) - 1) if cu[i] <= t < cu[i + 1])
-            qf = inp["qi"][t].to(torch.float32)
-            ck = _row_scores(
-                inp, r, torch.tensor([only_got[0], only_want[0]], device=qf.device)
-            )
-            sc = torch.einsum("hd,bd->hb", qf, ck).clamp_min(0).sum(0)
-            s_in, s_out = float(sc[0]), float(sc[1])
-            tie = abs(s_in - s_out) <= 1e-5 * max(abs(s_out), 1.0)
-            assert tie, (t, s_in, s_out)
+    # At t the two candidates score 32; at t+1 the higher index wins
+    # by 2**-12 (< 1e-5 * 32), and token 2052 is the causal tail.
+    expected = torch.full((2, PW), -1, dtype=torch.int32, device=q.device)
+    expected[:, :TOPK] = torch.arange(TOPK, device=q.device)
+    expected[1, TOPK - CR : TOPK] += CR
+    expected[1, TOPK] = t + 1
+    expected[0, -1] = TOPK
+    expected[1, -1] = TOPK + 1
+    for rows in (_reference(inp), _api(inp)):
+        torch.testing.assert_close(rows[t : t + 2], expected, rtol=0, atol=0)
 
 
 @requires_sm103
@@ -241,11 +221,8 @@ def test_selection_contract_and_determinism(T, B):
     inp = _make_inputs(T, B, seed=13)
     gold = _reference(inp)
     out = _api(inp)
-    # selection invariants (set/tie/format checks give a sharper failure
-    # message than raw equality)
-    _assert_selection_invariants(inp, out, gold)
-    # strict reference exactness (this test only runs on validated toolkits)
-    assert torch.equal(out, gold)
+    # Compare every column, including block interiors, tail, padding and count.
+    torch.testing.assert_close(out, gold, rtol=0, atol=0)
     # bitwise determinism per build, always
     for _ in range(3):
         assert torch.equal(_api(inp), out)
