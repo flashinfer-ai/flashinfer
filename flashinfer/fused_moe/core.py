@@ -107,7 +107,7 @@ from .prepare import (
 from .prepare import _TRTLLM_PERMUTE_CACHE, _check_sm80_nvfp4_operands, _trtllm_fc1_rows
 from .prepare import W4A16_SM80_TACTICS, _sm80_records, _w4a16_records_geometry
 from .prepare import cutlass_nvfp4_sm80_weights, trtllm_nvfp4_sm80_weights
-from . import trtllm_gen_routing as tgr
+import flashinfer.fused_moe.trtllm_gen_routing as tgr
 from ..utils import (
     check_shape_dtype_device,
     device_support_pdl,
