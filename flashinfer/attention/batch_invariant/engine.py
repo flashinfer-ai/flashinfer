@@ -11,7 +11,8 @@ one class per head dim, ``spec.HEAD_DIMS``).
 
 Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) or ``(num_pages, Hkv, page, D)``
 (HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16 and, with ``return_lse``, the LSE member
-``(total_q, Hq)`` fp32 (``spec.lse_term``; base 2, or base e with ``lse_base="ln"``). The planner runs on
+``(total_q, Hq)`` fp32 (``spec.lse_term``; base 2, or base e with ``lse_base="ln"``). ``sinks``, an fp32 ``(Hq,)`` tensor of
+per-head sink logits, selects the sink member (``spec.sink_merge``: one more merge per row, after its last chunk). The planner runs on
 host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
 split units, the fixup.
 """
@@ -385,7 +386,7 @@ class _Planned:
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
         self.lse_unused = torch.empty(
             1, dtype=torch.float32, device=desc.device
-        )  # the kernels' LSE operand of a launch without LSE (never written)
+        )  # the kernels' LSE / sink operand of a launch without LSE / sinks (never written, never read)
 
 
 def plan_attention(
@@ -565,6 +566,25 @@ def check_lse_buffer(
     return None
 
 
+def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[str]:
+    """What is wrong with a caller's ``sinks`` (``None`` when the kernels can read it): a contiguous fp32 ``(Hq,)`` tensor
+    on the queries' device, read in place at every launch (so a captured graph replays with the tensor's current values),
+    whose bytes none of the ``written`` tensors (the output, the LSE buffer) share."""
+    if not isinstance(sinks, torch.Tensor):
+        return f"of type {type(sinks).__name__}"
+    if sinks.dtype != torch.float32:
+        return f"of dtype {sinks.dtype}"
+    if tuple(sinks.shape) != (Hq,):
+        return f"of shape {tuple(sinks.shape)}"
+    if sinks.device != device:
+        return f"on {sinks.device}"
+    if not sinks.is_contiguous():
+        return "that is not contiguous"
+    if any(w is not None and _output_overlaps_kv(w, sinks, sinks) for w in written):
+        return "that shares bytes with the output or the LSE buffer"
+    return None
+
+
 def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     """Conservative byte-span overlap for a contiguous output and nonnegative-strided caches.
 
@@ -608,9 +628,11 @@ def run_attention(
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     lse_base: str = "log2",
+    sinks: Optional[torch.Tensor] = None,
 ):
     """``return_lse``: also return the LSE member ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to
-    ``lse`` when given; the output bits are the same with and without it."""
+    ``lse`` when given; the output bits are the same with and without it. ``sinks``: the fp32 ``(Hq,)`` per-head sink logits
+    of the sink member (``None``: the class without sinks)."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -701,6 +723,12 @@ def run_attention(
                 raise ValueError(
                     f"lse must be a contiguous fp32 ({total_q}, {Hq}) tensor on {q.device} that aliases no operand; got one {bad}"
                 )
+    if sinks is not None:
+        bad = check_sinks(sinks, Hq, q.device, (out, lse))
+        if bad is not None:
+            raise ValueError(
+                f"sinks must be a contiguous fp32 ({Hq},) tensor on {q.device} that aliases no output; got one {bad}"
+            )
     _run_attention_validated(
         planned,
         q,
@@ -716,6 +744,7 @@ def run_attention(
         ragged,
         lse=lse if lse_mode else None,
         lse_mode=lse_mode,
+        sinks=sinks,
     )
     return (out, lse) if return_lse else out
 
@@ -736,11 +765,14 @@ def _run_attention_validated(
     enable_pdl: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     lse_mode: int = 0,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale. ``enable_pdl``: launch the
     attention kernel as a programmatic dependent of the preceding kernel (None: the device's default, ``device_support_pdl``).
     ``lse_mode`` 1 / 2 stores the base-2 / base-e LSE member of every row into ``lse`` (contiguous fp32, ``total_q * Hq``
-    elements); every kernel takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0."""
+    elements); every kernel takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0.
+    ``sinks`` (validated fp32 ``(Hq,)``) switches the kernels' run-time ``sink_mode`` on: the row's final fold takes the sink
+    step; without it the launch and every bit are those of the class without sinks."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -764,6 +796,8 @@ def _run_attention_validated(
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     lse_view = lse.view(-1) if lse_mode else planned.lse_unused
+    sink_mode = 0 if sinks is None else 1
+    sink_view = planned.lse_unused if sinks is None else sinks
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
     sm = device_sm_count(q.device)
     grid = (
@@ -794,6 +828,7 @@ def _run_attention_validated(
             kv_v,
             o_view,
             lse_view,
+            sink_view,
             planned.ws,
             planned.groups,
             planned.fold_counters,
@@ -806,6 +841,7 @@ def _run_attention_validated(
             int(plan.num_units),
             int(grid),
             int(lse_mode),
+            int(sink_mode),
         )
     else:
         from .blocks.operands import arch_smem_cap as row_arch_smem_cap
@@ -853,6 +889,7 @@ def _run_attention_validated(
             kv_v,
             o_view,
             lse_view,
+            sink_view,
             planned.ws,
             planned.scratch,
             planned.groups,
@@ -866,6 +903,7 @@ def _run_attention_validated(
             int(n_launch if n_launch is not None else plan.num_units),
             int(grid),
             int(lse_mode),
+            int(sink_mode),
         )
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
@@ -874,6 +912,7 @@ def _run_attention_validated(
             planned.ws,
             o_view,
             lse_view,
+            sink_view,
             planned.fixup_groups,
             float(c),
             float(-c),
@@ -883,6 +922,7 @@ def _run_attention_validated(
             int(min(len(fx), MAX_GRID_Y)),
             int(max_rows),
             int(lse_mode),
+            int(sink_mode),
         )
     return out
 
@@ -904,9 +944,10 @@ def attention_paged(
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     lse_base: str = "log2",
+    sinks: Optional[torch.Tensor] = None,
 ):
     """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned); ``(out, lse)`` with
-    ``return_lse``."""
+    ``return_lse``; ``sinks`` as in ``run_attention``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -939,4 +980,5 @@ def attention_paged(
         lse=lse,
         return_lse=return_lse,
         lse_base=lse_base,
+        sinks=sinks,
     )

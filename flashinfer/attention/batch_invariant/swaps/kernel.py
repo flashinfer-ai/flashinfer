@@ -87,6 +87,7 @@ class SwapsKernel:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLse: cute.Tensor,
+        mSink: cute.Tensor,
         mWs: cute.Tensor,
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
@@ -99,6 +100,7 @@ class SwapsKernel:
         num_units: Int32,
         grid: Int32,
         lse_mode: Int32,
+        sink_mode: Int32,
         stream: cuda.CUstream,
     ):
         st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
@@ -123,6 +125,7 @@ class SwapsKernel:
             tma.tensor_v,
             mO,
             mLse,
+            mSink,
             mWs,
             mGroups,
             mCounters,
@@ -134,6 +137,7 @@ class SwapsKernel:
             window_left,
             num_units,
             lse_mode,
+            sink_mode,
             st.qk_tiled_mma,
             st.pv_tiled_mma,
             st.q_smem_layout,
@@ -162,6 +166,7 @@ class SwapsKernel:
         tV: cute.Tensor,
         mO: cute.Tensor,
         mLse: cute.Tensor,
+        mSink: cute.Tensor,
         mWs: cute.Tensor,
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
@@ -173,6 +178,7 @@ class SwapsKernel:
         window_left: Int32,
         num_units: Int32,
         lse_mode: Int32,
+        sink_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
         q_smem_layout: cute.ComposedLayout,
@@ -471,7 +477,9 @@ class SwapsKernel:
                     mDesc[(u, F_MODE)],
                     mDesc[(u, F_SLOT)],
                     mLse,
+                    mSink,
                     lse_mode,
+                    sink_mode,
                 )
                 fold_group(
                     st,
@@ -486,7 +494,9 @@ class SwapsKernel:
                     window_left,
                     Hq,
                     mLse,
+                    mSink,
                     lse_mode,
+                    sink_mode,
                 )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()
