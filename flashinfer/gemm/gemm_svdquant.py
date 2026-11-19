@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from dataclasses import replace
-from typing import List, Literal, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
 from packaging.version import Version
 import torch
@@ -29,6 +29,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    cake_auto_candidate_open,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -591,6 +592,225 @@ def _nvfp4_svdquant_gemm_runner(enable_pdl: bool):
     return Nvfp4SvdquantGemmRunner()
 
 
+@functools.cache
+def _cake_svdquant_backend():
+    """The ``cake_nvfp4_svdquant_gemm_backend`` package, imported once on first
+    use rather than by a function-level import on every call."""
+    from .. import cake_nvfp4_svdquant_gemm_backend
+
+    return cake_nvfp4_svdquant_gemm_backend
+
+
+def _cake_nvfp4_svdquant_problem(inputs: List[torch.Tensor]) -> Optional[tuple]:
+    """The M-independent Cake route arguments ``(n, k, rank, has_bias, arch,
+    sm_count)`` of ``inputs``, or ``None`` when the device is not a Cake target."""
+    cake_jit = _cake_svdquant_backend().cake_jit
+
+    a, b, _, _, _, d, _, bias = inputs[:8]
+    device = a.device
+    if device.type != "cuda":
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        arch = cake_jit.device_arch(index)
+    except RuntimeError:
+        return None
+    return (
+        int(b.shape[0]),
+        int(a.shape[1]) * 2,
+        int(d.shape[1]),
+        bias is not None,
+        arch,
+        cake_jit.sm_count(index),
+    )
+
+
+def _cake_nvfp4_svdquant_m_pdl(m: int, problem: tuple) -> Optional[bool]:
+    """PDL launch setting of the Cake program routed for ``m`` rows of
+    ``problem``, or ``None`` when the problem has no Cake route."""
+    backend = _cake_svdquant_backend()
+    n, k, rank, has_bias, arch, sm_count = problem
+    try:
+        name = backend.cake_jit.select_record(
+            m=m,
+            n=n,
+            k=k,
+            rank=rank,
+            has_bias=has_bias,
+            arch=arch,
+            sm_count=sm_count,
+        )
+    except (RuntimeError, ValueError):
+        return None
+    return bool(backend.MODULES[name]["launch"]["use_pdl"])
+
+
+def _cake_nvfp4_svdquant_route_pdl(inputs: List[torch.Tensor]) -> Optional[bool]:
+    """PDL launch setting of the Cake program routed for ``inputs``, or ``None``
+    when the device or the problem has no Cake route."""
+    problem = _cake_nvfp4_svdquant_problem(inputs)
+    if problem is None:
+        return None
+    return _cake_nvfp4_svdquant_m_pdl(int(inputs[0].shape[0]), problem)
+
+
+@functools.lru_cache(maxsize=1024)
+def _tuning_bucket_low(mapper: Callable[[int], int], key: int) -> Optional[int]:
+    """The smallest M that ``mapper`` sends to the cache key ``key``, or ``None``
+    when the M sent to ``key`` are not exactly ``[low, key]``.
+
+    ``mapper`` is assumed nondecreasing. It must map ``key`` to itself and
+    ``key + 1`` above it; a mapper that rounds down or clamps a range of M onto
+    ``key`` returns ``None``, so the caller can refuse that key.
+    """
+    if mapper(key) != key or mapper(key + 1) <= key:
+        return None
+    low, high = 1, key
+    while low < high:
+        mid = (low + high) // 2
+        if mapper(mid) < key:
+            low = mid + 1
+        else:
+            high = mid
+    return low
+
+
+@functools.cache
+def _cake_nvfp4_svdquant_route_m_edges() -> Tuple[int, ...]:
+    """The M values at which a row of the Cake route or raster-group table starts
+    or stops admitting M, and the 128-row minimum of every program."""
+    cake_jit = _cake_svdquant_backend().cake_jit
+    edges = {cake_jit.BLOCK_M}
+    for row in cake_jit.ROUTE_TABLE + cake_jit.RASTER_GROUP_TABLE:
+        if row.get("m_min") is not None:
+            edges.add(int(row["m_min"]))
+        if row.get("m_max") is not None:
+            edges.add(int(row["m_max"]) + 1)
+    return tuple(sorted(edges))
+
+
+def _cake_nvfp4_svdquant_route_m_starts(low: int, high: int) -> List[int]:
+    """The first M of each run of ``[low, high]`` on which
+    :func:`cake_jit.select_record` returns one result for any fixed
+    ``(n, k, rank, has_bias, arch, sm_count)``.
+
+    ``select_record`` reads M only through the ``m_min`` / ``m_max`` bounds of
+    the route and raster-group rows, the 128-row minimum, and the token-tile
+    count ``ceil(M / PAIR_M)`` of the wide-tail schedule. Its result can
+    therefore change only at a table edge or at ``j * PAIR_M + 1``.
+    """
+    tile = _cake_svdquant_backend().cake_jit.PAIR_M
+    starts = {low}
+    starts.update(e for e in _cake_nvfp4_svdquant_route_m_edges() if low < e <= high)
+    # ceil(M / tile) grows at j * tile + 1; the first such M above ``low``.
+    starts.update(range(-(-low // tile) * tile + 1, high + 1, tile))
+    return sorted(starts)
+
+
+@functools.lru_cache(maxsize=1024)
+def _cake_nvfp4_svdquant_bucket_admits(
+    key: int, low: int, problem: tuple, enable_pdl: Optional[bool]
+) -> bool:
+    """Whether every M of ``[low, key]`` (all M of the tuning cache key
+    ``key``) has a Cake route whose PDL setting admits ``enable_pdl``.
+
+    ``problem`` holds the device's architecture and SM count, so the verdict is
+    per device type. Only the M where the route can change are checked.
+    """
+    for m in _cake_nvfp4_svdquant_route_m_starts(low, key):
+        route_pdl = _cake_nvfp4_svdquant_m_pdl(m, problem)
+        if route_pdl is None or (
+            enable_pdl is not None and bool(enable_pdl) != route_pdl
+        ):
+            return False
+    return True
+
+
+def _cake_nvfp4_svdquant_offered(
+    m: int, problem: tuple, enable_pdl: Optional[bool]
+) -> bool:
+    """Whether Cake is offered for every M of the tuning cache key of ``m``.
+
+    The tuner caches one winner per key: the effective bucket mapping of
+    ``m``, with any ``autotune(tuning_buckets=..., round_up=...)`` override.
+    Cake is offered for a key only when every M of that key has a Cake route
+    whose PDL setting admits ``enable_pdl``. Then a call lists Cake exactly
+    when its key may hold a Cake winner. A call that does not list Cake still
+    finds that key's tuned CUTLASS tactic.
+    """
+    mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG
+    )
+    key = int(mapper(m))
+    low = _tuning_bucket_low(mapper, key)
+    return low is not None and _cake_nvfp4_svdquant_bucket_admits(
+        key, low, problem, enable_pdl
+    )
+
+
+_CAKE_SVDQUANT_RUNNER = "CakeNvfp4SvdquantGemmRunner"
+
+
+@functools.cache
+def _cake_nvfp4_svdquant_gemm_runner(enable_pdl: Optional[bool]):
+    # ``enable_pdl`` is the caller's value before the device default is applied.
+    # Each Cake program fixes its own PDL launch and rejects a different explicit
+    # value, so ``None`` runs the routed program as built and an explicit value
+    # admits only the programs that match it. The runner holds no per-call
+    # state, so one instance per ``enable_pdl`` serves every call.
+
+    class CakeNvfp4SvdquantGemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (enable_pdl,)
+
+        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+            # The same per-key verdict as get_valid_tactics, so a key's calls
+            # all list Cake or all leave it out.
+            problem = _cake_nvfp4_svdquant_problem(inputs)
+            return problem is not None and _cake_nvfp4_svdquant_offered(
+                int(inputs[0].shape[0]), problem, enable_pdl
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            # The route table picks one program per problem, so there is a single
+            # tactic, offered only where every M of the profiled bucket's cache
+            # key has a matching route.
+            problem = _cake_nvfp4_svdquant_problem(inputs)
+            if problem is None:
+                return []
+            bucket = int(profile.get_opt_shapes()[0][0])
+            admits = _cake_nvfp4_svdquant_offered(bucket, problem, enable_pdl)
+            return [0] if admits else []
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            # The workspace is unused: Cake programs need no scratch buffer.
+            (a, b, a_sf, b_sf, alpha, d, l1, bias, out, _) = inputs
+            return _cake_svdquant_backend().run(
+                a=a,
+                b=b,
+                a_sf=a_sf,
+                b_sf=b_sf,
+                alpha=alpha,
+                d=d,
+                l1=l1,
+                bias=bias,
+                out=out,
+                enable_pdl=enable_pdl,
+            )
+
+    return CakeNvfp4SvdquantGemmRunner()
+
+
 _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
@@ -689,10 +909,24 @@ def _heuristic_func_nvfp4_svdquant(
     # Preserve backend_checks order: on SM120/SM121, cute-dsl precedes
     # cute-dsl-unfused when both are supported, which selects the fused-first
     # implementation tuning configuration.
-    # The generated Cake implementation is explicit-only; preserve the
-    # existing automatic backend selection and autotuning denominator.
     # SM120 CUTLASS joins the measured candidate set; CuTe remains the fallback.
-    return [backend for backend in suitable_backends if backend != "cake"]
+    # Cake is kept only behind another backend: the first entry stays the
+    # untuned default, and Cake joins the measured candidates last.
+    # FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1 removes it.
+    # Outside tuning it is listed only while the tuner holds a Cake entry
+    # (AutoTuner.may_select_runner_class): otherwise no lookup can select it,
+    # and leaving it out keeps the CUTLASS-only call's list and host cost.
+    # Tuning under an autotune process group also leaves it out: Cake is
+    # offered per tuning key of the rank-local M, and every rank of the group
+    # must list the same runners.
+    backends = [backend for backend in suitable_backends if backend != "cake"]
+    if (
+        backends
+        and "cake" in suitable_backends
+        and cake_auto_candidate_open(_CAKE_SVDQUANT_RUNNER)
+    ):
+        backends.append("cake")
+    return backends
 
 
 def _check_mm_nvfp4_svdquant_problem(
@@ -800,7 +1034,7 @@ def mm_nvfp4_svdquant(
 ) -> torch.Tensor:
     r"""SVDQuant NVFP4 GEMM: ``out = alpha * (a @ bᵀ + d @ l1ᵀ) [+ bias]``.
 
-    On SM100/SM103, CUTLASS and the explicit ``"cake"`` backend fuse the block-scaled
+    On SM100/SM103, CUTLASS and the ``"cake"`` backend fuse the block-scaled
     NVFP4 residual GEMM with the rank-r
     BF16 LoRA-up correction and optional bias. On SM120/SM121, ``"cute-dsl"`` fuses the
     correction and bias into the b12x CuTe DSL kernel's FP32 accumulator epilogue, while
@@ -848,13 +1082,27 @@ def mm_nvfp4_svdquant(
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
         ``"cutlass-sm120"`` explicitly selects the SM120 CUTLASS implementation;
-        ``"auto"`` (default) selects by compute capability. On SM120 it tunes
+        ``"auto"`` (default) selects by compute capability. On SM100/SM103 it
+        runs CUTLASS. Under :func:`flashinfer.autotune` it also measures the Cake
+        program as the last candidate when CUDA is 13.0 or later and the problem
+        has a Cake route whose PDL setting matches ``enable_pdl`` (any setting
+        when ``enable_pdl`` is ``None``). Cake is listed and measured for a
+        tuning cache key only when every M that maps to that key has such a
+        route, so ``m <= 128`` never selects it, and it is used only when it
+        measured faster. Untuned calls
+        and cache misses run CUTLASS; outside tuning, Cake is listed only while
+        the autotuner holds a Cake result. Tuning under
+        :func:`flashinfer.autotuner.set_autotune_process_group` does not
+        measure Cake.
+        ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes the Cake
+        candidate. On SM120 it tunes
         across CuTe DSL fused/unfused and CUTLASS implementations; SM121 compares
         the two CuTe DSL implementations. Outside tuning, cached winners are
         reused, with CuTe fused as the default when available.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. For ``"cake"``, ``None``
-        preserves the selected generated route; other backends use the device default.
+        preserves the selected generated route, also when ``"auto"`` selects Cake;
+        other backends use the device default.
 
     Returns
     -------
@@ -883,10 +1131,12 @@ def mm_nvfp4_svdquant(
             enable_pdl=enable_pdl,
         )
 
+    requested_pdl = enable_pdl
     if enable_pdl is None:
         enable_pdl = device_support_pdl(a.device)
 
     tune_sm120_implementations = False
+    offer_cake = False
     if backend == "auto":
         if "cutlass-sm120" in mm_nvfp4_svdquant.suitable_auto_backends:
             from .svdquant_sm120_auto import mm_auto
@@ -898,6 +1148,9 @@ def mm_nvfp4_svdquant(
             )
         backend = mm_nvfp4_svdquant.suitable_auto_backends[0]
         tune_sm120_implementations = backend == "cute-dsl"
+        offer_cake = (
+            backend == "cutlass" and "cake" in mm_nvfp4_svdquant.suitable_auto_backends
+        )
 
     if backend == "cute-dsl":
         inputs = [a, b, a_sf, b_sf, alpha_scalar, d, l1, bias, out]
@@ -948,6 +1201,17 @@ def mm_nvfp4_svdquant(
     tuner = AutoTuner.get()
     runners = [_nvfp4_svdquant_gemm_runner(enable_pdl)]
     inputs = [a, b, a_sf, b_sf, alpha_scalar, d, l1, bias, out, workspace_buffer]
+    if offer_cake:
+        # CUTLASS stays runners[0], the untuned and cache-miss default; Cake is
+        # measured only under autotuning (not under an autotune process group)
+        # and wins only when faster. Cake is
+        # listed only when every M of this call's tuning cache key has a route
+        # with a matching PDL setting, and its tactic is offered under the same
+        # rule. A key that can hold a Cake winner is therefore listed by all
+        # of its calls, and the other keys keep their tuned CUTLASS tactic.
+        cake_runner = _cake_nvfp4_svdquant_gemm_runner(requested_pdl)
+        if cake_runner.supports_inputs(inputs):
+            runners.append(cake_runner)
     runner, tactic = tuner.choose_one(
         "nvfp4_svdquant_gemm",
         runners,

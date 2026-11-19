@@ -24,6 +24,7 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -421,14 +422,34 @@ def enumerate_space(
 ) -> List[Knobs]:
     """The configuration space for a shape, layout and class: the knob product the kernel body accepts
     (``can_implement``) for ``chunks`` (the class's chunk count). This is the set R3 is claimed over; the GPU
-    configuration-agreement tests check the dispatcher's candidates and sampled records of it against each other."""
+    configuration-agreement tests check the dispatcher's candidates and sampled records of it against each other.
+    Memoised per argument tuple (the acceptance reads M for the swapped and in-cluster records, so M is part of the
+    key); each call returns its own list."""
+    return list(
+        _enumerate_space_cached(
+            M, N, K, tuple(swizzles), tuple(clusters), chunks, b_major, in_fmt
+        )
+    )
+
+
+@functools.lru_cache(maxsize=512)
+def _enumerate_space_cached(
+    M: int,
+    N: int,
+    K: int,
+    swizzles: tuple,
+    clusters: tuple,
+    chunks: int,
+    b_major: str,
+    in_fmt: str,
+) -> Tuple[Knobs, ...]:
     from .blocks.operands import can_implement
 
-    return [
+    return tuple(
         k
         for k in knob_product(swizzles, clusters, cta_chunks=chunks > 1, in_fmt=in_fmt)
         if can_implement(k, M, N, K, b_major, chunks, in_fmt)
-    ]
+    )
 
 
 REFERENCE_SHAPE = (1000, 4096, 4096)  # the shape whose space is emitted to Lean
