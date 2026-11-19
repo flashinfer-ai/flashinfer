@@ -617,6 +617,78 @@ def test_routed_attention_builds_write_the_default_bits(sel, wide, monkeypatch):
 
 
 @requires_sm100
+@pytest.mark.parametrize("sel", [9, 11])
+@pytest.mark.parametrize(
+    ("batch", "heads", "kv_heads", "sq"),
+    [
+        (1, 1, 1, 1536),
+        (1, 1, 1, 1472),
+        (1, 1, 1, 4800),
+        (1, 2, 2, 1536),
+        (2, 1, 1, 1500),
+        (1, 2, 1, 2368),
+    ],
+)
+def test_sm103_short_grids_route_one_long_row_to_the_p3_double_s_build(
+    sel, batch, heads, kv_heads, sq, monkeypatch
+):
+    """Below half a wave, SM103 runs the double-S build with the p3 epilogue at 9 and 11
+    blocks a row on a single (batch, head) row of at least 24 query blocks (the
+    optional fields of an ``_SDP3_BANDS`` window) and the default build on a row of 23
+    query blocks or on two rows; both write the default build's bits, with and without
+    PDL.  A combined call after the one-launch quantizer keeps the default build."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+    sms = loader.sm_count(index)
+    q_blocks = _ceil_div(sq, _BLOCK)
+    rows = batch * heads
+    tiles = rows * q_blocks
+    if 2 * tiles >= sms:
+        pytest.skip(f"{sms} SMs leave no case below half a tile per SM")
+    c = _make_case(
+        (
+            f"long_rows_{sel}_{batch}_{heads}_{kv_heads}_{sq}",
+            batch,
+            heads,
+            kv_heads,
+            sq,
+            8192,
+            sel,
+            False,
+            False,
+            3,
+            33,
+            True,
+            1.0,
+        ),
+        device,
+    )
+    sdp3 = q_blocks >= 24 and rows == 1
+    want = {"sm_103a": "attention_sdp3" if sdp3 else "attention"}.get(arch)
+    for pdl in (False, True):
+        record = pkg._route(arch, sel, tiles, index, pdl, q_blocks=q_blocks)[0]
+        if want is not None:
+            assert record == (f"{want}_pdl" if pdl else want), record
+        record = pkg._route(arch, sel, tiles, index, pdl, True, q_blocks)[0]
+        if want is not None:
+            assert record == ("attention_pdl" if pdl else "attention"), record
+    role = pkg._route(arch, sel, tiles, index, False, q_blocks=q_blocks)[0]
+    names = cuda_kernel_names(lambda: _run(c, enable_pdl=False))
+    assert names == [loader.MODULES[role]["kernel_symbol"]], names
+    routed = [_run(c, enable_pdl=pdl) for pdl in (False, True)]
+    with monkeypatch.context() as m:
+        m.setattr(pkg, "_ATTENTION_ROUTES", {})
+        m.setattr(pkg, "_P3_BANDS", {})
+        m.setattr(pkg, "_SDP3_BANDS", {})
+        m.setattr(pkg, "_ROUTES", {})
+        out, lse = _run(c, enable_pdl=False)
+    torch.cuda.synchronize()
+    for o, l in routed:
+        assert torch.equal(o, out) and torch.equal(l, lse)
+
+
+@requires_sm100
 @pytest.mark.parametrize("p3", [True, False])
 def test_tail_split_rows_are_deterministic_and_close_to_the_default_build(
     p3, monkeypatch

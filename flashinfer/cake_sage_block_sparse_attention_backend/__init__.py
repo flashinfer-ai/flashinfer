@@ -299,10 +299,17 @@ _TAIL_SPLIT_P3_SERIAL_BELOW = {"sm_103a": (32, 2, 3)}
 _P3_ROLE = "attention_p3"
 _P3_BANDS = {"sm_100a": (6, 10, 5), "sm_103a": (8, 22, 2)}
 #: The ``s_dbuf`` build with the ``p3`` epilogue warpgroup and, per architecture, the
-#: windows ``(lo, hi, min_waves, max_waves)`` in which it replaces the build of an
-#: unsplit call: ``lo <= block_sparse_num <= hi`` and ``min_waves x SMs <= total_tiles``
-#: (``< max_waves x SMs``; ``None``: no bound); the tiles per SM may be fractional.
-#: The windows come before ``_P3_BANDS``.  It writes the default bits.
+#: windows ``(lo, hi, min_waves, max_waves[, min_q_blocks, max_rows])`` in which it
+#: replaces the build of an unsplit call: ``lo <= block_sparse_num <= hi`` and
+#: ``min_waves x SMs <= total_tiles`` (``< max_waves x SMs``; ``None``: no bound); the
+#: tiles per SM may be fractional.  The two optional fields bound the (batch, head) rows
+#: of the call: each holds at least ``min_q_blocks`` query blocks and there are at most
+#: ``max_rows`` of them.  Below half a wave, SM103 runs this build faster at 9 and 11
+#: blocks a row only on a single row of 24 query blocks or more (shorter rows, or more
+#: rows, lose on long KV).  A combined call after the one-launch quantizer skips the
+#: windows with these fields: an eager PDL launch of this build behind that quantizer
+#: runs slower there.  The windows come before ``_P3_BANDS``.  It writes the default
+#: bits.
 _SDP3_ROLE = "attention_sdp3"
 #: Per architecture, the unsplit ``attention_sdp3`` calls that a combined call gives up
 #: with PDL after the one-launch quantizer: up to ``sel`` selected blocks a row on fewer
@@ -325,6 +332,8 @@ _SDP3_BANDS = {
         (7, 7, 3, 8),
         (6, 22, 1, 2),
         (23, 127, 1, None),
+        (9, 9, 0, 0.5, 24, 1),
+        (11, 11, 0, 0.5, 24, 1),
     ),
 }
 
@@ -350,16 +359,20 @@ def _p3(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
     )
 
 
-def _sdp3(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
-    """Does an unsplit call with ``block_sparse_num`` selected blocks a row and
-    ``tiles`` tiles run the ``attention_sdp3`` build on a device of ``sms`` SMs?"""
+def _sdp3(
+    arch: str, block_sparse_num: int, tiles: int, sms: int, q_blocks: int = 0
+) -> bool:
+    """Does an unsplit call with ``block_sparse_num`` selected blocks a row, ``tiles``
+    tiles and ``q_blocks`` query blocks a (batch, head) row run the ``attention_sdp3``
+    build on a device of ``sms`` SMs?  ``tiles`` is ``q_blocks`` times the rows."""
     if _SDP3_ROLE not in _loader.MODULES:
         return False
     return any(
         lo <= block_sparse_num <= hi
         and tiles >= min_waves * sms
         and (max_waves is None or tiles < max_waves * sms)
-        for lo, hi, min_waves, max_waves in _SDP3_BANDS.get(arch, ())
+        and (not rows or (q_blocks >= rows[0] and tiles <= rows[1] * q_blocks))
+        for lo, hi, min_waves, max_waves, *rows in _SDP3_BANDS.get(arch, ())
     )
 
 
@@ -448,9 +461,9 @@ def _sdp3_gives_way(arch: str, block_sparse_num: int, tiles: int, sms: int) -> b
 
 
 #: The launch route of each call key ``(arch, block_sparse_num, total_tiles, device,
-#: pdl, after_one_launch)``: ``(record, items, split, tail)``, where ``items`` is the
-#: ``total_tiles`` argument, ``split`` the tail-split parameters and ``tail`` the PDL
-#: flag and the grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
+#: pdl, after_one_launch, q_blocks)``: ``(record, items, split, tail)``, where
+#: ``items`` is the ``total_tiles`` argument, ``split`` the tail-split parameters and
+#: ``tail`` the PDL flag and the grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
 #: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES``,
 #: ``_TAIL_SPLIT``, ``_TAIL_SPLIT_P3``, ``_TAIL_SPLIT_P3_SERIAL_BELOW``,
 #: ``_SDP3_GIVE_WAY``, ``_P3_BANDS`` or ``_SDP3_BANDS`` clears it.
@@ -464,8 +477,17 @@ def _route(
     device_index: int,
     pdl: bool,
     after_one_launch: bool = False,
+    q_blocks: int = 0,
 ) -> Tuple[str, int, Tuple[int, ...], Tuple[int, ...]]:
-    key = (arch, block_sparse_num, total_tiles, device_index, pdl, after_one_launch)
+    key = (
+        arch,
+        block_sparse_num,
+        total_tiles,
+        device_index,
+        pdl,
+        after_one_launch,
+        q_blocks,
+    )
     hit = _ROUTES.get(key)
     if hit is not None:
         return hit
@@ -494,7 +516,8 @@ def _route(
             split = (split_from,)
             break
     if not split:
-        if _sdp3(arch, block_sparse_num, total_tiles, sms) and not (
+        rows_q_blocks = 0 if after_one_launch else q_blocks
+        if _sdp3(arch, block_sparse_num, total_tiles, sms, rows_q_blocks) and not (
             pdl
             and after_one_launch
             and _sdp3_gives_way(arch, block_sparse_num, total_tiles, sms)
@@ -667,7 +690,13 @@ def _attention_operands(
     total_tiles = batch * heads * q_blocks
     pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
     record, items, split, tail = _route(
-        arch, int(block_sparse_num), total_tiles, device_index, pdl, after_one_launch
+        arch,
+        int(block_sparse_num),
+        total_tiles,
+        device_index,
+        pdl,
+        after_one_launch,
+        q_blocks,
     )
     # Positional binding in the record's ``arg_plan`` order (buffers, parameters,
     # the PDL launch flag, grid).
