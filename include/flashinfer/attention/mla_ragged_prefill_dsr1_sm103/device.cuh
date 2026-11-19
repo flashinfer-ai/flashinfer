@@ -1132,7 +1132,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
   // lq-normalized partials by the exact per-split sums — exact for uniform
   // rows, second-order otherwise).
   const float nrm = CAUSAL ? lv : lq;
-  float inv = (nrm > 0.0f) ? 1.0f / nrm : 0.0f;
+  // NaN statistics on a nonempty row must poison the output as well as the
+  // LSE (reducer policy); 1/NaN keeps the row NaN.  inv == 0 stays reserved
+  // for the empty-KV row.
+  float inv = (nrm > 0.0f || isnan(nrm)) ? 1.0f / nrm : 0.0f;
   if (split_stride == 1 && (FULL_Q || myrow < rows)) Lse[tok * HQ + h] = lse2(mv, lv);
   uint32_t orr[32];
   if (split_stride == 1) {
@@ -1822,7 +1825,10 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
       // Non-causal normalizes the output by the quantized-weight sum; the
       // LSE and the split stats keep the exact sum (see mla_kernel).
       const float nrm = CAUSAL ? lv : lq;
-      float inv = (nrm > 0.0f) ? 1.0f / nrm : 0.0f;
+      // NaN statistics on a nonempty row must poison the output as well as
+      // the LSE (reducer policy); 1/NaN keeps the row NaN.  inv == 0 stays
+      // reserved for the empty-KV row.
+      float inv = (nrm > 0.0f || isnan(nrm)) ? 1.0f / nrm : 0.0f;
       uint16_t* ep = reinterpret_cast<uint16_t*>(sQn);
       constexpr bool WIDE_DIRECT_EPI =
           !CAUSAL && EXACT && LATE_P_WAIT && !INTERLEAVED2 && FIXED_NS == 0 && !PADDED;
