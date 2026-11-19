@@ -17,6 +17,9 @@ tensor of per-head sink logits, selects the class's sink member (``spec.sink_mer
 of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
 row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
 are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+A run with sinks and a run without are two members with different bits, so ``plan(..., has_sinks=True | False)`` declares
+which one the plan's runs are: a ``run()`` that departs from the declaration raises (``None``, the default, leaves the
+choice to each run). The check is made in Python at ``run()``, so capturing ``run()`` into a CUDA graph is unaffected.
 The values are not checked: a sink whose base-2 value ``mul(sinks[h], LOG2E)`` overflows binary32 (a magnitude above about
 ``2.36e38``) is a sink of that infinity, and a ``+inf`` or NaN sink gives NaN on its head's rows (``spec.sink_merge``).
 
@@ -228,8 +231,11 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        has_sinks: Optional[bool] = None,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``has_sinks`` declares
+        whether every ``run()`` of this plan is given sinks (``True`` / ``False``: a run that departs from it raises);
+        ``None`` leaves the choice to each run."""
         D = int(head_dim_qk)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -464,6 +470,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                has_sinks=has_sinks,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -485,6 +492,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    has_sinks=has_sinks,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -609,6 +617,13 @@ class BatchInvariantAttention:
         per-head sink logits of the sink member."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        mismatch = engine.sinks_declaration_mismatch(self._planned.has_sinks, sinks)
+        if mismatch is not None:
+            raise unsupported(
+                CLASS,
+                mismatch,
+                "the same sinks choice at every run() of the plan (a new plan() changes the declaration)",
+            )
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,

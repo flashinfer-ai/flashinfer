@@ -114,6 +114,7 @@ from .utils import (
     ceil_div,
     check_lse_base,
     check_lse_layout,
+    check_has_sinks_undeclared,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -3905,6 +3906,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -4040,6 +4043,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4102,6 +4115,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -4116,6 +4130,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Reject this during planning so an unsupported request cannot reach the
         # lower-level trtllm-gen launcher if wrapper setup changes later.
@@ -6270,6 +6285,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -6411,6 +6428,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (the ``_sinks`` attribute): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -6498,6 +6525,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -6512,6 +6540,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
             return
+        check_has_sinks_undeclared(has_sinks)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:

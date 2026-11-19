@@ -75,6 +75,7 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
+    check_has_sinks_undeclared,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -2257,6 +2258,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2333,6 +2344,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -2384,6 +2396,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
@@ -2398,6 +2411,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         indptr = indptr.contiguous()

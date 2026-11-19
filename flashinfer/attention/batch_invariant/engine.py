@@ -387,6 +387,8 @@ class _Planned:
         self.lse_unused = torch.empty(
             1, dtype=torch.float32, device=desc.device
         )  # the kernels' LSE / sink operand of a launch without LSE / sinks (never written, never read)
+        # the plan's sinks declaration (set by plan_attention)
+        self.has_sinks: Optional[bool] = None
 
 
 def plan_attention(
@@ -403,10 +405,13 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    has_sinks: Optional[bool] = None,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
-    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
+    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer.
+    ``has_sinks``: declares whether every ``run_attention`` of this plan is given ``sinks`` (``True`` / ``False``: a run that
+    departs from it raises); ``None`` leaves the choice to each run."""
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -495,6 +500,7 @@ def plan_attention(
     planned.window_left = int(window_left)
     planned.config = config
     planned.page = int(page)
+    planned.has_sinks = None if has_sinks is None else bool(has_sinks)
     return planned
 
 
@@ -568,6 +574,15 @@ def check_lse_buffer(
     if q_source is not None and _output_overlaps_kv(lse, q_source, q_source):
         return "that shares bytes with the queries or the output"
     return None
+
+
+def sinks_declaration_mismatch(has_sinks: Optional[bool], sinks) -> Optional[str]:
+    """How a run departs from its plan's ``has_sinks`` declaration (``None``: it does not, or nothing was declared)."""
+    if has_sinks is None or has_sinks == (sinks is not None):
+        return None
+    if has_sinks:
+        return "a run without sinks over a plan declared with has_sinks=True"
+    return "a run with sinks over a plan declared with has_sinks=False"
 
 
 def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[str]:
@@ -651,6 +666,11 @@ def run_attention(
     if planned.window_left is not None and int(window_left) != planned.window_left:
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
+        )
+    mismatch = sinks_declaration_mismatch(planned.has_sinks, sinks)
+    if mismatch is not None:
+        raise ValueError(
+            f"{mismatch}: make the same sinks choice at every run of the plan, or plan again with another has_sinks"
         )
     if ragged:
         # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.

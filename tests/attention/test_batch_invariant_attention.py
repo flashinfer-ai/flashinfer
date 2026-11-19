@@ -2675,6 +2675,142 @@ def test_sinks_refusals(kind):
     assert torch.equal(inside, good)
 
 
+def _run_sinks(kind, w, args, sinks, **kw):
+    """``run()`` with ``sinks`` the way each wrapper takes them (``None``: without)."""
+    if kind == 2:
+        w._sinks = sinks
+        return w.run(*args, **kw)
+    return w.run(*args, **kw) if sinks is None else w.run(*args, sinks=sinks, **kw)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_has_sinks_declaration(kind):
+    """``plan(has_sinks=True | False)`` declares which member every ``run()`` of the plan is: a run that departs from it
+    raises, ``None`` leaves the choice to each run, and a new ``plan()`` replaces the declaration."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=49)
+    good = sink_logits(pr)
+    options = {} if kind == 0 else {"causal": True}
+    w, args, plan_args, kwargs = _wrapper_case(kind, pr)
+    plain = bits(_run_sinks(kind, w, args, None)).clone()
+    sunk = bits(_run_sinks(kind, w, args, good)).clone()
+    assert not torch.equal(plain, sunk)
+
+    # declared with sinks: a wrapper that was never given any (the ragged ``_sinks`` unset) raises on every entry point
+    w, args, plan_args, kwargs = _wrapper_case(kind, pr, has_sinks=True)
+    for call in (w.run, w.run_return_lse):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=True"):
+            call(*args)
+    for call in (w.forward, w.forward_return_lse):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=True"):
+            call(*args, **options)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=True"):
+        _run_sinks(kind, w, args, None)
+    assert torch.equal(bits(_run_sinks(kind, w, args, good)), sunk)
+    if kind == 2:  # the deprecated entry points read the same attribute
+        assert torch.equal(bits(w.forward(*args, **options)), sunk)
+
+    w.plan(*plan_args, **{**kwargs, "has_sinks": False})
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=False"):
+        _run_sinks(kind, w, args, good)
+    if kind == 2:
+        for call in (w.forward, w.forward_return_lse):
+            with pytest.raises(
+                bi.BatchInvariantUnsupportedError, match="has_sinks=False"
+            ):
+                call(*args, **options)
+    assert torch.equal(bits(_run_sinks(kind, w, args, None)), plain)
+    assert torch.equal(bits(w.forward(*args, **options)), plain)
+
+    kwargs.pop("has_sinks")
+    w.plan(*plan_args, **kwargs)
+    assert torch.equal(bits(_run_sinks(kind, w, args, good)), sunk)
+    assert torch.equal(bits(_run_sinks(kind, w, args, None)), plain)
+
+
+@needs_device
+def test_has_sinks_declaration_under_graph_capture():
+    """The declaration is checked in Python at ``run()``: a captured ``run()`` replays as without it."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=50)
+    good = sink_logits(pr)
+    w, args, _, _ = _wrapper_case(1, pr, has_sinks=True)
+    expected = bits(w.run(*args, sinks=good)).clone()
+    out = torch.empty_like(pr.q)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(*args, sinks=good, out=out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+@pytest.mark.parametrize("declared", [True, False])
+def test_has_sinks_is_refused_without_batch_invariant(kind, declared):
+    """The declaration belongs to the batch-invariant plan: the regular wrappers refuse a value instead of ignoring it."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=51)
+    w = getattr(flashinfer, WRAPPERS[kind])(workspace(pr.device, mb=64), "NHD")
+    kwargs = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    paged = (pr.kv_indptr, pr.kv_indices, pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page)
+    if kind == 0:
+        plan_args = paged
+    elif kind == 1:
+        plan_args = (pr.qo_indptr, *paged)
+    else:
+        plan_args = (pr.qo_indptr, pr.kv_indptr_rag, pr.Hq, pr.Hkv, pr.D)
+    if kind:
+        kwargs["causal"] = True
+    with pytest.raises(ValueError, match="has_sinks") as e:
+        w.plan(*plan_args, **kwargs, has_sinks=declared)
+    assert not isinstance(e.value, bi.BatchInvariantUnsupportedError)
+    w.plan(*plan_args, **kwargs, has_sinks=None)
+
+
+def _cpu_plan(engine, device="cpu", **kw):
+    qo = torch.tensor([0, 1, 2], dtype=torch.int32)
+    kv = torch.tensor([0, 2, 5], dtype=torch.int32)
+    last = torch.tensor([3, 16], dtype=torch.int32)
+    planned = engine.plan_attention(
+        qo, kv, last, 8, 2, 128, 16, -1, None, None, torch.device(device), **kw
+    )
+    return planned, kv
+
+
+def test_engine_has_sinks_declaration():
+    """``engine.plan_attention(has_sinks=)`` carries the declaration on the planned record and ``run_attention`` raises
+    ``ValueError`` before any launch (device-free: the check precedes every kernel)."""
+    from flashinfer.attention.batch_invariant import engine
+
+    q = torch.zeros(2, 8, 128, dtype=torch.bfloat16)
+    cache = torch.zeros(5, 16, 2, 128, dtype=torch.bfloat16)
+    indices = torch.arange(5, dtype=torch.int32)
+    sinks = torch.zeros(8)
+    assert _cpu_plan(engine)[0].has_sinks is None
+    for declared, given, text in (
+        (True, None, "has_sinks=True"),
+        (False, sinks, "has_sinks=False"),
+    ):
+        planned, kv = _cpu_plan(engine, has_sinks=declared)
+        assert planned.has_sinks is declared
+        with pytest.raises(ValueError, match=text):
+            engine.run_attention(
+                planned, q, cache, cache, kv, indices, 128**-0.5, sinks=given
+            )
+
+
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_has_sinks_is_a_trailing_keyword_of_plan(op):
+    import inspect
+
+    cls = getattr(flashinfer, op)
+    plan = cls._plan_impl if hasattr(cls, "_plan_impl") else cls.plan
+    last = list(inspect.signature(plan).parameters.values())[-1]
+    assert last.name == "has_sinks" and last.default is None
+    assert last.kind is inspect.Parameter.KEYWORD_ONLY
+
+
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     pr = Problem([64], [700], 32, 8, 128, 16, seed=10)
