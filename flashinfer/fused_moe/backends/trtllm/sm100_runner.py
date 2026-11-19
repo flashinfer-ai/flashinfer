@@ -688,6 +688,10 @@ class MoERunner(TunableRunner):
                 list(kwargs.get("localized_weights") or []),
                 list(kwargs.get("localized_streams") or []),
                 self.localized_sm_count,
+                # Honored by every launch through this runner. Autotuning never
+                # captures because the public op leaves it out of the kwargs it
+                # passes to the tuner.
+                list(kwargs.get("fc2_input_out") or ()),
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

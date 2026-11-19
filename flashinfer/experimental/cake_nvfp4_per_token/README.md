@@ -2,7 +2,9 @@
 
 The backend is experimental and may change without backward compatibility.
 Naming it (`backend="cake"`) is the explicit opt-in and emits FlashInfer's
-experimental backend warning once; `backend="auto"` never selects it.
+experimental backend warning once. With
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`, `backend="auto"` adds the GEMM as the last
+autotuning candidate of the per-token-alpha `mm_fp4` path (used only when it measures fastest).
 
 It serves FlashInfer's per-token NVFP4 quantize + GEMM path on SM100 (B200) and SM103
 (B300 / GB300):
