@@ -2383,6 +2383,18 @@ class MoEStaticKernel:
                                 else k_block_idx + 1
                             )
                             if k_block_idx == num_k_blocks - 1:
+                                if cutlass.const_expr(
+                                    (
+                                        cutlass.CUDA_VERSION.major,
+                                        cutlass.CUDA_VERSION.minor,
+                                    )
+                                    >= (13, 4)
+                                ):
+                                    cute.arch.inline_ptx(
+                                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                    )
+                                else:
+                                    cute.arch.fence_proxy("async.shared", space="cta")
                                 ml_pipeline.consumer_release(cons_state)
                                 cons_state.advance()
                                 peek = ml_pipeline.consumer_try_wait(cons_state)
@@ -2493,6 +2505,15 @@ class MoEStaticKernel:
                             0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
                         )
                         if k_block_idx == num_k_blocks - 1:
+                            if cutlass.const_expr(
+                                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor)
+                                >= (13, 4)
+                            ):
+                                cute.arch.inline_ptx(
+                                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                )
+                            else:
+                                cute.arch.fence_proxy("async.shared", space="cta")
                             ml_pipeline.consumer_release(cons_state)
                             cons_state.advance()
                         if k_next > 0 and fc1_k_tile_cnt > Int32(0):
@@ -2740,6 +2761,18 @@ class MoEStaticKernel:
                                 else k_block_idx + 1
                             )
                             if k_block_idx == num_k_blocks - 1:
+                                if cutlass.const_expr(
+                                    (
+                                        cutlass.CUDA_VERSION.major,
+                                        cutlass.CUDA_VERSION.minor,
+                                    )
+                                    >= (13, 4)
+                                ):
+                                    cute.arch.inline_ptx(
+                                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                    )
+                                else:
+                                    cute.arch.fence_proxy("async.shared", space="cta")
                                 phase2_pipeline.consumer_release(phase2_cons_state)
                                 phase2_cons_state.advance()
                             if k_next > 0:

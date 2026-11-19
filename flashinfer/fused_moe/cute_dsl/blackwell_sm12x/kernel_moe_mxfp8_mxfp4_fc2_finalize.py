@@ -340,6 +340,14 @@ def mma(
                         ],
                         acc,
                     )
+                if cutlass.const_expr(
+                    (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+                ):
+                    cute.arch.inline_ptx(
+                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                    )
+                else:
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(a_empty + s)
                 cute.arch.mbarrier_arrive(b_empty + s)
                 if cutlass.const_expr(s == ab_stages - 1):
