@@ -2065,6 +2065,9 @@ class AutoTuner:
         # Cache-file keys dropped because their tactic is blocklisted, so a
         # lookup for one reports "blocklisted_tactic" rather than "not_found"
         # whichever of the blocklist and the cache file was loaded first.
+        # Kept across autotune(cache=...) entries: save_configs re-reads the
+        # target file and needs these keys to drop a still-blocked on-disk
+        # entry it merges; only clear_cache() resets the set.
         self._blocklisted_file_keys: set[str] = set()
         # Reject legacy entries within one managed/policy identity without
         # deleting the user's global v1 configs. Keep these across v2 reload.

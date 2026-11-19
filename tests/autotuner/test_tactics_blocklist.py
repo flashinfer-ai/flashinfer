@@ -877,6 +877,36 @@ class TestBlocklistCacheFiles:
         assert by_op[f"({self.OP!r}"][:2] == ["StubRunnerA", 2]
         assert by_op[f"({self.OTHER_OP!r}"][:2] == ["StubRunnerA", 1]
 
+    @pytest.mark.parametrize("switch_cache_path", [False, True])
+    def test_save_drops_a_blocklisted_file_entry_after_a_cache_path_switch(
+        self, monkeypatch, tmp_path, switch_cache_path
+    ):
+        """A key rejected at load stays rejected at save, also after the
+        process entered autotune(cache=...) on another path in between."""
+        import torch
+
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = [torch.empty((4, 8), dtype=torch.float32)]
+        cache_path = str(tmp_path / "cache.json")
+        self._write_cache(cache_path, runner, inputs)
+
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+        assert self.tuner.load_configs(cache_path)
+        assert len(self.tuner._file_configs) == 1  # OP's entry was rejected
+
+        if switch_cache_path:
+            with autotune(False, cache=str(tmp_path / "other-cache.json")):
+                pass
+
+        self.tuner.save_configs(cache_path)
+        with open(cache_path) as f:
+            saved = json.load(f)
+        entries = {k: v for k, v in saved.items() if not k.startswith("_")}
+        by_op = {k.split(", ")[0]: v for k, v in entries.items()}
+        assert f"({self.OP!r}" not in by_op
+        assert by_op[f"({self.OTHER_OP!r}"][:2] == ["StubRunnerA", 1]
+
     @pytest.mark.parametrize("blocklist_first", [True, False])
     def test_replay_reports_blocklisted_tactic_in_both_orderings(
         self, monkeypatch, tmp_path, blocklist_first
