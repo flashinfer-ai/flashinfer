@@ -489,10 +489,20 @@ def recurrent_kda(
             Requires ``backend="auto"``, bf16 activations, head dim 128,
             ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
-            ``beta_is_logit``, a finite negative ``lower_bound``; speculative
-            decode, checkpoints, ``initial_state_source``, ``seq_order``,
-            ``prefill_workspace`` and the frozen-verify arguments are not in
-            the class. Unsupported inputs raise
+            ``beta_is_logit``, a finite negative ``lower_bound``; checkpoints,
+            ``initial_state_source``, ``seq_order``, ``prefill_workspace`` and
+            the frozen-verify arguments are not in the class. Speculative
+            decode is: ``num_spec_tokens=S`` with ``1 + S`` tokens per
+            sequence and one slot per sequence (``ssm_state_indices`` ``[N]``;
+            the class keeps the drafts next to the pool, so the ``[N, 1 + S]``
+            checkpoint form is refused) returns the rows ``1 + S`` single
+            decode steps give, in one launch of the step kernel, and
+            ``num_accepted_tokens`` (int32 ``[N]``, the count kept of each
+            slot's previous verify) first takes a slot that kept fewer back
+            to the state that many decode steps leave; see
+            ``recurrent_kda_batch_invariant_verify`` and
+            ``recurrent_kda_batch_invariant_accept`` in
+            ``flashinfer.batch_invariant.kda.api``. Unsupported inputs raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
             instead of falling back. ``fingerprint("recurrent_kda")`` names the
             class; see ``flashinfer/batch_invariant/README.md``.
@@ -544,9 +554,9 @@ def recurrent_kda(
             output=output,
             beta_is_logit=beta_is_logit,
             backend=backend,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
             refused=dict(
-                num_spec_tokens=num_spec_tokens,
-                num_accepted_tokens=num_accepted_tokens,
                 initial_state_source=initial_state_source,
                 initial_state_indices=initial_state_indices,
                 seq_order=seq_order,

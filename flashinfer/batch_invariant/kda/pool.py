@@ -17,6 +17,13 @@ from one the class wrote. Two placements compute the class's term:
 ``api._append`` appends several tokens per sequence with both: the step kernel up to the next boundary, the prefill
 kernel over the whole chunks, the step kernel for the tail. :meth:`ExactPool.span` is the step kernel looping over
 several rows per slot in one launch.
+
+A multi-token verify (:meth:`ExactPool.verify`) is that span behind a snapshot of what it overwrites (the count and the
+decay prefix; the boundary state and the cached rows a completed chunk replaces, only when the span crosses a boundary)
+and a copy of its token rows; :meth:`ExactPool.accept` takes a slot that keeps fewer rows than were run back to the
+snapshot and appends the kept rows again through the same span. The two kernels of
+``include/flashinfer/kda/batch_invariant_verify.cuh`` move bytes and counts only, so every row is still the step
+kernel's and the class's fingerprint sources are untouched.
 """
 
 from __future__ import annotations
@@ -43,6 +50,13 @@ def _module():
     from ...jit.kda_batch_invariant import gen_kda_batch_invariant_module
 
     return gen_kda_batch_invariant_module().build_and_load()
+
+
+@functools.cache
+def _verify_module():
+    from ...jit.kda_batch_invariant_verify import gen_kda_batch_invariant_verify_module
+
+    return gen_kda_batch_invariant_verify_module().build_and_load()
 
 
 def _release(storage: int) -> None:
@@ -97,6 +111,8 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
         ep = ExactPool(pool)
     else:
         ep.cnt.fill_(-1)
+        if ep.record is not None:
+            ep.record.meta.zero_()
     storage = pool.untyped_storage()
     if not any(k[0] == key[0] for k in (*_POOLS, *_RETIRED)):
         weakref.finalize(storage, _release, key[0])
@@ -123,6 +139,9 @@ class ExactPool:
         self.rhs_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.update_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.l_rows = zeros(S, HV, CHUNK, CHUNK)
+        #: The verify record (snapshot and token rows), allocated by the first verify on the pool.
+        self.record: Optional[VerifyRecord] = None
+        self._outgrown: List[VerifyRecord] = []
 
     def mutable(self) -> Tuple[torch.Tensor, ...]:
         """The tensors a step may change besides the pool and the cached rows of the row it writes."""
@@ -177,6 +196,9 @@ class ExactPool:
             _module().kda_batch_invariant_begin(
                 slots, pool, self.state_bf16, self.cnt, self.stamp
             )
+            if self.record is not None:
+                # a slot taken as a boundary has no verify left to settle
+                self.record.meta.index_fill_(0, slots.long(), 0)
 
     def counts(self, pool: torch.Tensor, slot_list: Sequence[int]) -> List[int]:
         """The open rows of each slot (one device read). A slot whose state the caller replaced is begun first, as
@@ -252,3 +274,160 @@ class ExactPool:
             float(scale),
             float(lower_bound) * GATE_LOG2_E * 0.5,
         )
+
+    def _side(self, pool: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        return (
+            pool,
+            self.cnt,
+            self.prefix,
+            self.k_inv_rows,
+            self.k_inv_f32_rows,
+            self.rhs_rows,
+            self.update_rows,
+            self.l_rows,
+            self.stamp,
+        )
+
+    def verify_record(self, tokens: int) -> "VerifyRecord":
+        """The pool's verify record with room for ``tokens`` rows per slot (grown outside a graph capture only)."""
+        rec = self.record
+        if rec is not None and rec.cap >= tokens:
+            return rec
+        if torch.cuda.is_current_stream_capturing():
+            raise unsupported(
+                CLASS,
+                f"a verify of {tokens} tokens first run inside a CUDA graph capture",
+                "one eager verify of at least as many tokens on the pool before the capture",
+            )
+        new = VerifyRecord(self.slots, self.H, tokens, self.device)
+        if rec is not None:
+            # the pending verifies stay settleable; a graph captured on the smaller record may still write it
+            new.adopt(rec)
+            self._outgrown.append(rec)
+        self.record = new
+        return new
+
+    def verify(
+        self,
+        pool: torch.Tensor,
+        slot_ids: torch.Tensor,
+        packed: Tuple[torch.Tensor, ...],
+        out: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        tokens: int,
+    ) -> None:
+        """``tokens`` packed rows per sequence appended to its slot behind a snapshot; their rows go to ``out``. Two
+        launches, nothing read back."""
+        rec = self.verify_record(tokens)
+        _verify_module().kda_batch_invariant_verify_snapshot(
+            *packed, slot_ids, *self._side(pool), *rec.snapshot(), *rec.tokens()
+        )
+        self.span(
+            pool,
+            slot_ids,
+            packed,
+            out,
+            A_log,
+            dt_bias,
+            lower_bound,
+            scale,
+            stride=tokens,
+        )
+
+    def accept(
+        self,
+        pool: torch.Tensor,
+        slot_ids: torch.Tensor,
+        accepted: Optional[torch.Tensor],
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+    ) -> None:
+        """Settle each slot's verify with ``accepted[i]`` of its rows kept (``None``: all of them): a slot that keeps
+        fewer goes back to its snapshot and appends the kept rows again. Two launches, nothing read back; a no-op
+        on a pool that never ran a verify."""
+        rec = self.record
+        if rec is None:
+            return
+        spans = torch.empty(
+            (2, slot_ids.numel()), dtype=torch.int32, device=self.device
+        )
+        _verify_module().kda_batch_invariant_verify_accept(
+            slot_ids,
+            slot_ids if accepted is None else accepted,
+            int(accepted is not None),
+            pool,
+            self.state_bf16,
+            *self._side(pool)[1:],
+            *rec.snapshot(),
+            spans[0],
+            spans[1],
+            rec.cap,
+        )
+        self.span(
+            pool,
+            slot_ids,
+            rec.tokens(),
+            rec.rows,
+            A_log,
+            dt_bias,
+            lower_bound,
+            scale,
+            starts=spans[0],
+            lens=spans[1],
+        )
+
+
+class VerifyRecord:
+    """Per slot: what the last verify's span overwrote and its token rows (``cap`` rows of room)."""
+
+    def __init__(self, S: int, HV: int, cap: int, dev: torch.device) -> None:
+        self.cap = cap
+
+        def zeros(*shape, dtype=_IO):
+            return torch.zeros(shape, dtype=dtype, device=dev)
+
+        # per (slot, head): rows pending, the count after them, the count before them, the cached rows saved
+        self.meta = zeros(S, HV, 4, dtype=torch.int32)
+        self.prefix = zeros(S, HV, HEAD_DIM, dtype=torch.float32)
+        self.state = zeros(S, HV, HEAD_DIM, HEAD_DIM, dtype=torch.float32)
+        self.k_inv_rows = zeros(S, HV, CHUNK, HEAD_DIM)
+        self.k_inv_f32_rows = zeros(S, HV, CHUNK, HEAD_DIM, dtype=torch.float32)
+        self.rhs_rows = zeros(S, HV, CHUNK, HEAD_DIM)
+        self.update_rows = zeros(S, HV, CHUNK, HEAD_DIM)
+        self.l_rows = zeros(S, HV, CHUNK, CHUNK)
+        self.q = zeros(S * cap, HV, HEAD_DIM)
+        self.k = zeros(S * cap, HV, HEAD_DIM)
+        self.v = zeros(S * cap, HV, HEAD_DIM)
+        self.g = zeros(S * cap, HV, HEAD_DIM)
+        self.beta = zeros(S * cap, HV)
+        #: Where the rows of a replay go: they repeat rows the verify already returned.
+        self.rows = zeros(S * cap, HV, HEAD_DIM)
+
+    def snapshot(self) -> Tuple[torch.Tensor, ...]:
+        return (
+            self.meta,
+            self.prefix,
+            self.state,
+            self.k_inv_rows,
+            self.k_inv_f32_rows,
+            self.rhs_rows,
+            self.update_rows,
+            self.l_rows,
+        )
+
+    def tokens(self) -> Tuple[torch.Tensor, ...]:
+        return (self.q, self.k, self.v, self.g, self.beta)
+
+    def adopt(self, old: "VerifyRecord") -> None:
+        for mine, theirs in zip(self.snapshot(), old.snapshot(), strict=True):
+            mine.copy_(theirs)
+        S = self.meta.shape[0]
+        for mine, theirs in zip(self.tokens(), old.tokens(), strict=True):
+            mine.view(S, self.cap, *mine.shape[1:])[:, : old.cap].copy_(
+                theirs.view(S, old.cap, *theirs.shape[1:])
+            )
