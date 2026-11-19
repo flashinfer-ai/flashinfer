@@ -128,7 +128,7 @@ to 128 channels and the FlashInfer adapter explicitly requests its existing
 64-channel contract. Input and weight scale blocks remain 128. The scale choice
 also selects the matching reference and heuristic table.
 
-BF16xMXFP8 (`bangyus/cutedsl_megamoe!91`, 2026-11-09): under
+BF16xMXFP8 (2026-11-09): under
 `pre_unification/moe_mxfp8_bf16_glu/`, `kernel_mxfp8_bf16_glu_fc12.py` raises
 the default `"b"` pipeline depth from 2 to 4 (3 for the N256/`smem`
 implementation, whose 4-stage launch exceeds the SM100 shared-memory limit) and
