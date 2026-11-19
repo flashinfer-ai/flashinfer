@@ -122,9 +122,8 @@ def test_kill_switches_match_stock(monkeypatch, env):
     _skip_unless_stock_cutile_usable()
     torch.manual_seed(7)
     x = torch.empty((64, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-3, 3)
-    # One group with bf16-exact absmax 255: its specialized scale
-    # (reciprocal multiply) differs from the stock IEEE quotient by one ulp,
-    # which the tolerance below covers.
+    # A bf16-exact absmax of 255 distinguishes IEEE division from
+    # reciprocal multiplication. Both routes must produce the exact scale.
     x.view(-1)[0] = 255.0
 
     fast_q, fast_s = per_token_group_quant_8bit(x, 128, backend="specialized")
