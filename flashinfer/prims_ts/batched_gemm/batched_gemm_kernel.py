@@ -1639,6 +1639,7 @@ def _batched_gemm_kernel_bf16_body(
     # mn_limit_tensor: maps token tiles to TRT-LLM Gen absolute end-row limits.
     tile_idx_view = cutlass.make_array_view(tile_idx_tensor)
     mn_limit_view = cutlass.make_array_view(mn_limit_tensor)
+    weight_num_token_tiles_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
     rpe = (
         problem_m // num_experts
         if cutlass.const_expr(cfg.route_act == int(RouteImpl.TMA))
@@ -1669,6 +1670,8 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            weight_tile_idx_view=tile_idx_view,
+            weight_num_token_tiles_view=weight_num_token_tiles_view,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1709,6 +1712,8 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            weight_tile_idx_view=tile_idx_view,
+            weight_num_token_tiles_view=weight_num_token_tiles_view,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1743,6 +1748,8 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            weight_tile_idx_view=tile_idx_view,
+            weight_num_token_tiles_view=weight_num_token_tiles_view,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1771,6 +1778,8 @@ def _batched_gemm_kernel_bf16_body(
         smem_sfa = SmemSfAResource(
             cfg=cfg,
             tma_sfa_desc=tma_sfa_ptr,
+            weight_tile_idx_view=tile_idx_view,
+            weight_num_token_tiles_view=weight_num_token_tiles_view,
             pipeline_config=pcfgs["smem_sfa"],
             name="SmemSfA",
         )
@@ -1813,6 +1822,8 @@ def _batched_gemm_kernel_bf16_body(
                 smem_sfa = SmemSfAResource(
                     cfg=cfg,
                     tma_sfa_desc=tma_sfa_ptr,
+                    weight_tile_idx_view=tile_idx_view,
+                    weight_num_token_tiles_view=weight_num_token_tiles_view,
                     pipeline_config=pcfgs["smem_sfa"],
                     name="SmemSfA",
                 )
@@ -1853,6 +1864,8 @@ def _batched_gemm_kernel_bf16_body(
                 smem_sfa = SmemSfAResource(
                     cfg=cfg,
                     tma_sfa_desc=tma_sfa_ptr,
+                    weight_tile_idx_view=tile_idx_view,
+                    weight_num_token_tiles_view=weight_num_token_tiles_view,
                     pipeline_config=pcfgs["smem_sfa"],
                     name="SmemSfA",
                 )
@@ -1890,6 +1903,8 @@ def _batched_gemm_kernel_bf16_body(
             smem_sfa = SmemSfAResource(
                 cfg=cfg,
                 tma_sfa_desc=tma_sfa_ptr,
+                weight_tile_idx_view=tile_idx_view,
+                weight_num_token_tiles_view=weight_num_token_tiles_view,
                 pipeline_config=pcfgs["smem_sfa"],
                 name="SmemSfA",
             )

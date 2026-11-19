@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <flashinfer/fastdiv.cuh>
 
+#include "../compute/mega.cuh"
+
 using bf16 = __nv_bfloat16;
 
 struct PrefillColdParams {
@@ -28,6 +30,7 @@ struct PrefillColdParams {
   flashinfer::uint_fastdiv main_div;
   flashinfer::uint_fastdiv extra_div;
   float lse_scale = 1.f;
+  SparseMlaMegaParams mega{};
 };
 
 struct Dsv4PageDivisors {
@@ -95,6 +98,7 @@ struct AttentionParams {
   int page_size;
   bool extra_fp4;
   float lse_scale = 1.f;
+  SparseMlaMegaParams mega{};
   size_t row_stride_bytes = 0;        // Inline-scale main row pitch; footer rows are packed.
   size_t extra_row_stride_bytes = 0;  // Inline-scale extra row pitch.
 };

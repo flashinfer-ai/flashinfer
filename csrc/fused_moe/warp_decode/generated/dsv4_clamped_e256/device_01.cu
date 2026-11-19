@@ -450,7 +450,7 @@ __device__ __forceinline__ void tmem_ld_x8_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(352, 3) __cluster_dims__(2,1,1) void
-kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, uint8_t* __restrict__ SFA_raw, uint8_t* __restrict__ C_raw)
+kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, uint8_t* __restrict__ SFA_raw, uint8_t* __restrict__ C_raw, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -634,6 +634,7 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         n_tile = cluster_work / 128 * 4 + cluster_work % 4;
                     }
                     int expert = tile_expert[n_tile];
+                    expert = (unsigned)expert < (unsigned)num_experts ? expert : 0;
                     int valid_rows = (unsigned int)tile_mn_limit[n_tile] - n_tile * (unsigned int)BLOCK_N;
                     float sc = scale_c[expert];
                     float sg = scale_gate[expert];
@@ -1271,6 +1272,7 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         n_tile_2 = cluster_work_5 / 128 * 4 + cluster_work_5 % 4;
                     }
                     int expert_1 = tile_expert[n_tile_2];
+                    expert_1 = (unsigned)expert_1 < (unsigned)num_experts ? expert_1 : 0;
                     #pragma unroll 1
                     for (int iter_k_5 = 0; iter_k_5 < K_tiles; iter_k_5++) {
                         mbarrier_wait(k_done_addr + (stage_4) * 8, _phase_k_done);
@@ -1319,6 +1321,7 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         n_tile_3 = cluster_work_6 / 128 * 4 + cluster_work_6 % 4;
                     }
                     int expert_2 = tile_expert[n_tile_3];
+                    expert_2 = (unsigned)expert_2 < (unsigned)num_experts ? expert_2 : 0;
                     int sf_parent = (unsigned int)(expert_2 * (M_out / 64)) + m_tile_2 / 2;
                     #pragma unroll 1
                     for (int iter_k_6 = 0; iter_k_6 < K_tiles; iter_k_6++) {

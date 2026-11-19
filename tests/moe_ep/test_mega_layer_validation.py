@@ -266,6 +266,7 @@ def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
     layer = _mega_layer()
     with (
         mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}),
+        mock.patch("torch.cuda.current_device", return_value=0),
         pytest.raises(RuntimeError, match="torch.distributed"),
     ):
         layer._ensure_workspace()
@@ -519,6 +520,31 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
 def test_mega_layer_init_accepts_valid_transformed_weights():
     layer = _mega_layer()
     assert layer._transformed is not None
+
+
+def test_mega_layer_transformed_weight_aliases_include_scales():
+    transformed = _fake_deep_gemm_transformed()
+    layer = _mega_layer(transformed_weights=transformed)
+    try:
+        prepared = layer.get_transformed_weights()
+        assert prepared is transformed
+        for stage in prepared:
+            for tensor in stage:
+                tensor.fill_(3)
+        for stage in transformed:
+            for tensor in stage:
+                assert (tensor == 3).all()
+    finally:
+        layer.destroy()
+
+
+def test_mega_layer_transformed_weights_reject_destroyed_layer():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer = _mega_layer()
+    layer.destroy()
+    with pytest.raises(MoEEpConfigError, match="destroyed"):
+        layer.get_transformed_weights()
 
 
 def test_mega_layer_init_rejects_invalid_transformed_weight_dtype():

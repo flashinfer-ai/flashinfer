@@ -31,11 +31,11 @@ from tests.attention.sage_test_utils import (
 _FP8 = torch.float8_e4m3fn
 _INT8 = torch.int8
 _HEAD_DIM = 128
-# The context kernel folds one 128-token K tile per online-softmax step and
-# keeps its exponent anchor while a tile raises the row maximum by at most
-# this many binades (its lazy correction threshold).
+# The context kernel folds one 128-token K tile per online-softmax step. With
+# E4M3 V it takes the exact row max of every tile and scales P by the E4M3
+# maximum before the cast, which keeps probabilities down to 2^-18.
 _KV_TILE = 128
-_ANCHOR_HEADROOM_LOG2 = 8.0
+_P_SCALE = torch.finfo(_FP8).max
 _REQUIRES_CONTEXT_SAGE_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)),
@@ -165,13 +165,12 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, softmax_scale: f
             state = None
             for begin in range(0, seq_len_kv, _KV_TILE):
                 tile = slice(begin, begin + _KV_TILE)
-                # The kernel's P scale is one at this headroom.
                 state = fold(
                     state,
                     logits[..., tile],
                     v[batch_idx, tile, kv_head].float(),
-                    headroom=_ANCHOR_HEADROOM_LOG2,
-                    p_scale=1.0,
+                    headroom=0.0,
+                    p_scale=_P_SCALE,
                 )
             _, total, acc = state
             result = acc / total.unsqueeze(-1) * params.v_scale[batch_idx, kv_head]

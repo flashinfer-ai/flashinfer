@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The Lean coupling of the bf16 MoE classes (``flashinfer/batch_invariant/lean/``: ``MoE.lean`` and the generated
-``MoECases.lean``).
+"""The Lean coupling of the bf16 and the fp8 per-tensor MoE classes (``flashinfer/batch_invariant/lean/``: ``MoE.lean``,
+``MoEFp8.lean`` and the generated ``MoECases.lean``).
 
 Device-free (every CI job): the committed ``MoECases.lean`` is byte for byte what the Python spec emits, so a change to
 a chain (the declared exp / sigmoid / tanh / erf / log, a gated or ungated activation, a parameter set), a routing method
@@ -58,14 +58,38 @@ def test_generated_cases_are_current():
         "act_relu",
         "act_silu",
         "act_gelu",
+        # the fp8 per-tensor classes (`spec_fp8.py` vs `MoEFp8.lean`)
+        "w8a8_gemm1_swiglu",
+        "w8a8_gemm1_glu_gelu_erf",
+        "w8a8_gemm1_glu_swiglu_oai",
+        "w8a8_gemm1_glu_swiglu_step_l7",
+        "w8a8_gemm1_glu_swiglu_step_l3",
+        "w8a8_gemm1_act_relu2",
+        "w8a8_gemm1_act_identity",
+        "w8a8_gemm1_act_relu",
+        "w8a8_gemm1_act_silu",
+        "w8a8_gemm1_act_gelu",
+        "w8a8_gemm2",
+        "x_quant_e4m3",
         "biased_score",
         "group_score",
     }
     for name in theorems:
         assert f"theorem moe_{name} :" in committed
     # the chains too large for a kernel theorem are conformance lines (the executable), never dropped (the log: its
-    # subnormal step repeats the argument through the mantissa and exponent leaves)
-    large = {"log", "glu_situ_default", "glu_powlu_default", "glu_powlu_limit"}
+    # subnormal step repeats the argument through the mantissa and exponent leaves; the fp8 chains carry the alpha
+    # multiply into every use of the accumulators, so the gated GeGLU-tanh and SiTU ones cross the bound too)
+    large = {
+        "log",
+        "glu_situ_default",
+        "glu_powlu_default",
+        "glu_powlu_limit",
+        "w8a8_gemm1_glu_gelu",
+        "w8a8_gemm1_glu_situ_default",
+        "w8a8_gemm1_glu_situ_clamp",
+        "w8a8_gemm1_glu_powlu_default",
+        "w8a8_gemm1_glu_powlu_limit",
+    }
     assert large <= set(names) and not (large & theorems)
     for name, sx, _, as_thm in cases:
         assert as_thm == (len(sx) <= lean_cases.THEOREM_MAX_BYTES) or name.startswith(

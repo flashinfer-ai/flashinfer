@@ -79,8 +79,9 @@ def lse_reference(
     rows: Optional[Sequence[int]] = None,
 ) -> Dict[str, torch.Tensor]:
     """The exact CPU model for ``rows`` of ``x`` (default: all). Returns ``{"m", "s", "lse", "logp"}`` as f32 ``(n,)``
-    tensors (``logp`` NaN where no token id is given or it is out of range), ``"probs"`` ``(n, N)`` in the input dtype
-    and ``"logprobs"`` ``(n, N)`` f32."""
+    tensors (``logp`` NaN where no token id is given or it is out of range), ``"probs"`` ``(n, N)`` in the input dtype,
+    ``"logprobs"`` ``(n, N)`` f32 and ``"logprobs_cvt"`` the same row converted once (RNE) to the input dtype (the 16-bit
+    output member)."""
     x = x.detach().cpu()
     M, N = x.shape
     rows = list(range(M)) if rows is None else list(rows)
@@ -90,7 +91,7 @@ def lse_reference(
         token_ids.detach().cpu().reshape(-1).tolist() if token_ids is not None else None
     )
     out: Dict[str, list] = {
-        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs")
+        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs", "logprobs_cvt")
     }
     for r in rows:
         xr = xf[r]
@@ -121,6 +122,7 @@ def lse_reference(
         out["logp"].append(logp_t)
         out["probs"].append(p)
         out["logprobs"].append(lp)
+        out["logprobs_cvt"].append(lp.to(x.dtype))
     res = {
         k: torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
         for k in ("m", "s", "lse", "logp")
@@ -132,6 +134,11 @@ def lse_reference(
         torch.stack(out["logprobs"])
         if out["logprobs"]
         else torch.empty(0, N, dtype=torch.float32)
+    )
+    res["logprobs_cvt"] = (
+        torch.stack(out["logprobs_cvt"])
+        if out["logprobs_cvt"]
+        else torch.empty(0, N, dtype=x.dtype)
     )
     return res
 
@@ -175,7 +182,7 @@ def exact_rows(
             ts = ts * M
         assert len(ts) == M, (len(ts), M)
     out: Dict[str, list] = {
-        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs")
+        k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs", "logprobs_cvt")
     }
     for r in rows:
         xr = xf[r].tolist()
@@ -231,6 +238,10 @@ def exact_rows(
         out["logprobs"].append(
             torch.tensor(vals[N : 2 * N], dtype=torch.float64).to(torch.float32)
         )
+        # the 16-bit member: the exact fp32 row converted once (RNE) to the input dtype
+        out["logprobs_cvt"].append(
+            torch.tensor(vals[N : 2 * N], dtype=torch.float64).to(x.dtype)
+        )
         out["m"].append(vals[2 * N])
         out["s"].append(vals[2 * N + 1])
         out["lse"].append(vals[2 * N + 2])
@@ -246,5 +257,10 @@ def exact_rows(
         torch.stack(out["logprobs"])
         if out["logprobs"]
         else torch.empty(0, N, dtype=torch.float32)
+    )
+    res["logprobs_cvt"] = (
+        torch.stack(out["logprobs_cvt"])
+        if out["logprobs_cvt"]
+        else torch.empty(0, N, dtype=x.dtype)
     )
     return res
