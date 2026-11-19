@@ -510,6 +510,7 @@ class FixedLaunch:
         ]
         self._staged = [[0, 0, 0], [0, 0, 0]]  # live ints per section of each block
         self._on_device = [0, 0, 0]  # live ints per section of the device tables
+        self.last_plan = None  # the plan in the tables: the next one of the same shape rewrites its KV lengths
         self._copied: List[Optional[torch.cuda.Event]] = [None, None]
         self._turn = 0
 
@@ -537,20 +538,28 @@ class FixedLaunch:
         ), "the plan exceeds the fixed launch's capacity"
         units = plan.desc_array
         walk = self.config.grid or plan.grid or min(plan.num_units, self.sm_count)
-        if self.config.q2:
+        if self.config.q2 and plan.launch_array is None:
             if plan.num_units >= Q2_MIN_UNITS_PER_SM[self.D] * self.sm_count:
-                units = pair_units_array(units, self.sm_count)
-                walk = self.config.grid or min(units.shape[0] // 2, self.sm_count)
+                plan.launch_array = pair_units_array(units, self.sm_count)
+                walk = self.config.grid or min(
+                    plan.launch_array.shape[0] // 2, self.sm_count
+                )
             else:
-                units = lone_units_array(units)
-            plan.num_launch = units.shape[0] // 2
+                plan.launch_array = lone_units_array(units)
+            plan.num_launch, plan.walk = plan.launch_array.shape[0] // 2, walk
+        if self.config.q2:
+            units, walk = plan.launch_array, plan.walk
         i = self._turn
         self._turn = 1 - i
         ev = self._copied[i]
         if ev is not None and not ev.query():
             ev.synchronize()
+        count = plan.num_units if plan.num_launch is None else plan.num_launch
+        walk = max(1, min(walk, self.grid))
+        # the row body walks its units on the whole launch grid: its plans have no grid of their own
+        assert self.n_pad or walk == max(1, min(count, self.grid)), (walk, self.grid)
         counts, *sections = self._stage_views[i]
-        counts[:] = plan_counts(plan, max(1, min(walk, self.grid)))
+        counts[:] = plan_counts(plan, walk)
         extents = []
         for k, (section, rows) in enumerate(
             zip(
@@ -688,7 +697,9 @@ def plan_attention(
             unit_budget=fixed.unit_cap,
             row_budget=fixed.row_budget,
             null_requests=fixed.null_requests,
+            previous=fixed.last_plan,
         )
+        fixed.last_plan = fixed_plan
         fixed.fill(fixed_plan, non_blocking)
         planned = _Planned(
             fixed_plan,

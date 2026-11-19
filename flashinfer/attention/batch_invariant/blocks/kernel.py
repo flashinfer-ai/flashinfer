@@ -39,7 +39,6 @@ from ..plan import (
     F_TILE_HI,
     F_TILE_LO,
     N_UNITS,
-    N_WALK,
 )
 from .correction import correction_loop, correction_loop_q2, fold_group
 from .mma import mma_loop, mma_loop_q2
@@ -151,8 +150,8 @@ class AttentionKernel:
         stream: cuda.CUstream,
     ):
         """``grid`` CTAs walk the ``num_units`` work units persistently (unit ``u`` on CTA ``u % grid``): a launch
-        parameter, never a quantity that reaches the bits (I10). A kernel compiled for a fixed launch takes both counts from
-        ``mCounts`` instead (``plan.COUNT_FIELDS``), so the CTAs that walk may be fewer than the launch grid. ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
+        parameter, never a quantity that reaches the bits (I10). A kernel compiled for a fixed launch takes the unit count from
+        ``mCounts`` instead (``plan.COUNT_FIELDS``), so the CTAs beyond a plan's units idle. ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor."""
         st = StaticPlan(
             self.D,
@@ -260,12 +259,10 @@ class AttentionKernel:
         first = bidx
         walk = grid_size
         if cutlass.const_expr(self.fixed):
-            # a fixed launch: the plan's unit count and the CTAs that walk the units, from its counts table. A CTA beyond
-            # either walks no unit (no TMA load, no global store)
+            # a fixed launch: the plan's unit count, from its counts table. A CTA beyond it walks no unit (no TMA load, no
+            # global store). The walk is the launch grid's (the row body's plans have no grid of their own), so nothing
+            # else stays live through the unit walk
             num_units = mCounts[N_UNITS]
-            walk = mCounts[N_WALK]
-            if bidx >= walk:
-                first = num_units
         if warp_idx == R.load_warp:
             cpasync.prefetch_descriptor(atom_q)
             cpasync.prefetch_descriptor(atom_q_rep)

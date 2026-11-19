@@ -679,6 +679,11 @@ class ArrayPlan:
     num_launch: Optional[int] = (
         None  # the pairs of the paired placement's table, set by the launch that builds it
     )
+    launch_array: Optional[np.ndarray] = None  # that table
+    walk = 0  # ... and the CTAs that walk it
+    shape: Optional[tuple] = (
+        None  # what the tables depend on besides the KV lengths written in them (``build_array_plan``)
+    )
 
     def __init__(
         self,
@@ -700,6 +705,42 @@ class ArrayPlan:
             g,
             row,
         )
+
+    def same_shape(self, shape: tuple) -> bool:
+        """Whether a batch of this ``shape`` (the planner's arguments and every Q tile's tile and chunk range) has this
+        plan's tables up to the KV lengths."""
+        mine = self.shape
+        return (
+            mine is not None
+            and mine[0] == shape[0]
+            and all(
+                a.shape == b.shape and bool((a == b).all())
+                for a, b in zip(mine[1:], shape[1:], strict=True)
+            )
+        )
+
+    def with_kv_lens(self, kv_lens: np.ndarray) -> "ArrayPlan":
+        """This plan for other KV lengths of the same shape: the same units, groups and order, the lengths rewritten."""
+        desc = self.desc_array.copy()
+        desc[:, F_KVLEN] = kv_lens[desc[:, F_REQ]]
+        groups = self.groups_array.copy()
+        groups[:, G_KVLEN] = kv_lens[groups[:, G_REQ]]
+        plan = ArrayPlan(
+            desc,
+            groups,
+            self.inkernel_array,
+            self.ws_rows,
+            self.tokens_per_tile,
+            self.g,
+            self.ws_row,
+            self.grid,
+        )
+        plan.shape = self.shape
+        if self.launch_array is not None:
+            plan.launch_array = self.launch_array.copy()
+            plan.launch_array[:, F_KVLEN] = kv_lens[plan.launch_array[:, F_REQ]]
+            plan.num_launch, plan.walk = self.num_launch, self.walk
+        return plan
 
     @property
     def num_units(self) -> int:
@@ -780,11 +821,15 @@ def build_array_plan(
     unit_budget: int = 0,
     row_budget: int = -1,
     null_requests: bool = False,
+    previous: Optional[ArrayPlan] = None,
 ) -> ArrayPlan:
     """``build_plan`` computed over arrays: request ``b`` has ``q_lens[b]`` query tokens over ``kv_lens[b]`` keys and its packed
     rows start at ``sum(q_lens[:b])``. The tables and the grid are those of ``build_plan`` with the same arguments, entry for
     entry (the planner a replan before every replay of a captured graph runs: its cost must not grow with a Python loop over
-    the units). A request without query tokens gets no unit; under ``null_requests`` neither does one without keys."""
+    the units). A request without query tokens gets no unit; under ``null_requests`` neither does one without keys.
+    ``previous``: the last plan of the caller; when this batch differs from that one in its KV lengths alone, with every
+    Q tile on the same key tiles and chunks -- a decode loop between two tile boundaries --, the tables are that plan's with
+    the lengths rewritten (``ArrayPlan.with_kv_lens``), the same tables as planning afresh."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -815,6 +860,17 @@ def build_array_plan(
         if window_left >= 0
         else np.zeros_like(p_first)
     )
+    shape = (
+        (Hq, Hkv, D, window_left, split_policy, sm_count, q_rows, merge)
+        + (small_swap, swap_max_rows, grid, grid_search, unit_budget, row_budget)
+        + (null_requests,),
+        q_lens,
+        live,
+        lo_min // T,
+        -(-l_max // T),
+    )
+    if previous is not None and previous.same_shape(shape):
+        return previous.with_kv_lens(kv_lens)
     n_tiles = req.size * Hkv
 
     def tiles(a: np.ndarray) -> np.ndarray:
@@ -960,9 +1016,11 @@ def build_array_plan(
         start = pos // waves * waves
         back = start + np.minimum(waves, num_units - start) - 1 - (pos - start)
         desc = desc[order[np.where(pos // waves % 2 == 1, back, pos)]]
-    return ArrayPlan(
+    plan = ArrayPlan(
         desc, groups, inkernel, int(g_size.sum()), tpt, g, ws_row(D), plan_grid
     )
+    plan.shape = shape
+    return plan
 
 
 def _empty_partner(units: np.ndarray) -> np.ndarray:

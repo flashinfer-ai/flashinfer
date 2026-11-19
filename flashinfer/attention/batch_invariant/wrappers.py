@@ -29,6 +29,11 @@ tables and held to their capacity by fusing units, a placement like every other 
 an eager call on the same batch. A request without pages (a padded slot) is a null request there: its output rows are zeros and
 its LSE ``-inf``, with or without sinks.
 
+A plan's table copies are stream-ordered work of the stream ``plan()`` is called on (non-blocking unless ``non_blocking=False``):
+a replay on that stream follows them by itself; a replay on another stream must wait for it (``wait_stream``), and the next
+plan for the replay, as with the other backends' metadata copies. Wrappers may share one float workspace: it holds only the
+split-KV partials of the launch that is running.
+
 The paged prefill wrapper takes ``use_cuda_graph=True`` the same way, with the regular wrapper's contract: the number of request
 slots is fixed and the total query rows stay within a capacity (``max_total_num_rows``, or the first plan's rows); every plan
 may give every slot another query length (zero: a slot without rows, the padding of a captured batch) and another KV length. Its
