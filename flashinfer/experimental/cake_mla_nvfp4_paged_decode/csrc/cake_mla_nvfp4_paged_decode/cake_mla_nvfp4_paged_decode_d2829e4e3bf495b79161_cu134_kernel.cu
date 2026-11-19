@@ -378,8 +378,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k = 0; k < 8; k += 4) {
                         uint32_t _smem_vis_w_reg_0[4];
-                        __int128_t _smem_b128_0;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_0) : "r"(smem_vis_w_addr + (k) * 4));
+                        uint32_t _smem_b128_0[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_0[0]), "=r"(_smem_b128_0[1]), "=r"(_smem_b128_0[2]), "=r"(_smem_b128_0[3]) : "r"(smem_vis_w_addr + (k) * 4));
                         _smem_vis_w_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_0)[0];
                         _smem_vis_w_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_0)[1];
                         _smem_vis_w_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_0)[2];
@@ -396,8 +396,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_1 = 0; k_1 < 8; k_1 += 4) {
                         uint32_t _smem_vis_w_reg_1[4];
-                        __int128_t _smem_b128_1;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_1) : "r"(smem_vis_w_addr + (8 + k_1) * 4));
+                        uint32_t _smem_b128_1[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_1[0]), "=r"(_smem_b128_1[1]), "=r"(_smem_b128_1[2]), "=r"(_smem_b128_1[3]) : "r"(smem_vis_w_addr + (8 + k_1) * 4));
                         _smem_vis_w_reg_1[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_1)[0];
                         _smem_vis_w_reg_1[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_1)[1];
                         _smem_vis_w_reg_1[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_1)[2];
@@ -416,15 +416,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_2 = 0; k_2 < 8; k_2 += 4) {
                     uint32_t _smem_stats_w_reg_0[4];
-                    __int128_t _smem_b128_2;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(smem_stats_w_addr + (96 + k_2) * 4));
+                    uint32_t _smem_b128_2[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_2[0]), "=r"(_smem_b128_2[1]), "=r"(_smem_b128_2[2]), "=r"(_smem_b128_2[3]) : "r"(smem_stats_w_addr + (96 + k_2) * 4));
                     _smem_stats_w_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
                     _smem_stats_w_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
                     _smem_stats_w_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
                     _smem_stats_w_reg_0[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
                     uint32_t _smem_stats_w_reg_1[4];
-                    __int128_t _smem_b128_3;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_3) : "r"(smem_stats_w_addr + (256 + k_2) * 4));
+                    uint32_t _smem_b128_3[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_3[0]), "=r"(_smem_b128_3[1]), "=r"(_smem_b128_3[2]), "=r"(_smem_b128_3[3]) : "r"(smem_stats_w_addr + (256 + k_2) * 4));
                     _smem_stats_w_reg_1[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[0];
                     _smem_stats_w_reg_1[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[1];
                     _smem_stats_w_reg_1[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[2];
@@ -440,15 +440,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_3 = 0; k_3 < 8; k_3 += 4) {
                     uint32_t _smem_stats_w_reg_2[4];
-                    __int128_t _smem_b128_4;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_4) : "r"(smem_stats_w_addr + (104 + k_3) * 4));
+                    uint32_t _smem_b128_4[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_4[0]), "=r"(_smem_b128_4[1]), "=r"(_smem_b128_4[2]), "=r"(_smem_b128_4[3]) : "r"(smem_stats_w_addr + (104 + k_3) * 4));
                     _smem_stats_w_reg_2[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[0];
                     _smem_stats_w_reg_2[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[1];
                     _smem_stats_w_reg_2[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[2];
                     _smem_stats_w_reg_2[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[3];
                     uint32_t _smem_stats_w_reg_3[4];
-                    __int128_t _smem_b128_5;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_5) : "r"(smem_stats_w_addr + (264 + k_3) * 4));
+                    uint32_t _smem_b128_5[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_5[0]), "=r"(_smem_b128_5[1]), "=r"(_smem_b128_5[2]), "=r"(_smem_b128_5[3]) : "r"(smem_stats_w_addr + (264 + k_3) * 4));
                     _smem_stats_w_reg_3[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[0];
                     _smem_stats_w_reg_3[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[1];
                     _smem_stats_w_reg_3[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[2];
@@ -469,8 +469,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 }
                 asm volatile("barrier.sync 8, 128;" ::: "memory");
                 uint32_t _smem_flags_w_reg_0[4];
-                __int128_t _smem_b128_6;
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_6) : "r"(smem_flags_w_addr + (aphase * 8) * 4));
+                uint32_t _smem_b128_6[4];
+                asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_6[0]), "=r"(_smem_b128_6[1]), "=r"(_smem_b128_6[2]), "=r"(_smem_b128_6[3]) : "r"(smem_flags_w_addr + (aphase * 8) * 4));
                 _smem_flags_w_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[0];
                 _smem_flags_w_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[1];
                 _smem_flags_w_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[2];
@@ -595,15 +595,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_4 = 0; k_4 < 8; k_4 += 4) {
                         uint32_t _smem_stats_w_reg_4[4];
-                        __int128_t _smem_b128_7;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_7) : "r"(smem_stats_w_addr + (16 + k_4) * 4));
+                        uint32_t _smem_b128_7[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_7[0]), "=r"(_smem_b128_7[1]), "=r"(_smem_b128_7[2]), "=r"(_smem_b128_7[3]) : "r"(smem_stats_w_addr + (16 + k_4) * 4));
                         _smem_stats_w_reg_4[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[0];
                         _smem_stats_w_reg_4[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[1];
                         _smem_stats_w_reg_4[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[2];
                         _smem_stats_w_reg_4[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[3];
                         uint32_t _smem_stats_w_reg_5[4];
-                        __int128_t _smem_b128_8;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_8) : "r"(smem_stats_w_addr + (k_4) * 4));
+                        uint32_t _smem_b128_8[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_8[0]), "=r"(_smem_b128_8[1]), "=r"(_smem_b128_8[2]), "=r"(_smem_b128_8[3]) : "r"(smem_stats_w_addr + (k_4) * 4));
                         _smem_stats_w_reg_5[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_8)[0];
                         _smem_stats_w_reg_5[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_8)[1];
                         _smem_stats_w_reg_5[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_8)[2];
@@ -617,15 +617,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_5 = 0; k_5 < 8; k_5 += 4) {
                         uint32_t _smem_stats_w_reg_6[4];
-                        __int128_t _smem_b128_9;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_9) : "r"(smem_stats_w_addr + (24 + k_5) * 4));
+                        uint32_t _smem_b128_9[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_9[0]), "=r"(_smem_b128_9[1]), "=r"(_smem_b128_9[2]), "=r"(_smem_b128_9[3]) : "r"(smem_stats_w_addr + (24 + k_5) * 4));
                         _smem_stats_w_reg_6[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[0];
                         _smem_stats_w_reg_6[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[1];
                         _smem_stats_w_reg_6[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[2];
                         _smem_stats_w_reg_6[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[3];
                         uint32_t _smem_stats_w_reg_7[4];
-                        __int128_t _smem_b128_10;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_10) : "r"(smem_stats_w_addr + (8 + k_5) * 4));
+                        uint32_t _smem_b128_10[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_10[0]), "=r"(_smem_b128_10[1]), "=r"(_smem_b128_10[2]), "=r"(_smem_b128_10[3]) : "r"(smem_stats_w_addr + (8 + k_5) * 4));
                         _smem_stats_w_reg_7[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[0];
                         _smem_stats_w_reg_7[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[1];
                         _smem_stats_w_reg_7[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[2];
@@ -737,8 +737,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                             #pragma unroll
                             for (int k_6 = 0; k_6 < 8; k_6 += 4) {
                                 uint32_t _smem_stats_w_reg_8[4];
-                                __int128_t _smem_b128_11;
-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_11) : "r"(smem_stats_w_addr + (k_6) * 4));
+                                uint32_t _smem_b128_11[4];
+                                asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_11[0]), "=r"(_smem_b128_11[1]), "=r"(_smem_b128_11[2]), "=r"(_smem_b128_11[3]) : "r"(smem_stats_w_addr + (k_6) * 4));
                                 _smem_stats_w_reg_8[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[0];
                                 _smem_stats_w_reg_8[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[1];
                                 _smem_stats_w_reg_8[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[2];
@@ -752,8 +752,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                             #pragma unroll
                             for (int k_7 = 0; k_7 < 8; k_7 += 4) {
                                 uint32_t _smem_stats_w_reg_9[4];
-                                __int128_t _smem_b128_12;
-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_12) : "r"(smem_stats_w_addr + (8 + k_7) * 4));
+                                uint32_t _smem_b128_12[4];
+                                asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_12[0]), "=r"(_smem_b128_12[1]), "=r"(_smem_b128_12[2]), "=r"(_smem_b128_12[3]) : "r"(smem_stats_w_addr + (8 + k_7) * 4));
                                 _smem_stats_w_reg_9[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[0];
                                 _smem_stats_w_reg_9[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[1];
                                 _smem_stats_w_reg_9[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[2];
@@ -873,8 +873,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_8 = 0; k_8 < 8; k_8 += 4) {
                     uint32_t _smem_stats_w_reg_10[4];
-                    __int128_t _smem_b128_13;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_13) : "r"(smem_stats_w_addr + (304 + k_8) * 4));
+                    uint32_t _smem_b128_13[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_13[0]), "=r"(_smem_b128_13[1]), "=r"(_smem_b128_13[2]), "=r"(_smem_b128_13[3]) : "r"(smem_stats_w_addr + (304 + k_8) * 4));
                     _smem_stats_w_reg_10[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[0];
                     _smem_stats_w_reg_10[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[1];
                     _smem_stats_w_reg_10[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[2];
@@ -888,8 +888,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_9 = 0; k_9 < 8; k_9 += 4) {
                     uint32_t _smem_stats_w_reg_11[4];
-                    __int128_t _smem_b128_14;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_14) : "r"(smem_stats_w_addr + (320 + k_9) * 4));
+                    uint32_t _smem_b128_14[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_14[0]), "=r"(_smem_b128_14[1]), "=r"(_smem_b128_14[2]), "=r"(_smem_b128_14[3]) : "r"(smem_stats_w_addr + (320 + k_9) * 4));
                     _smem_stats_w_reg_11[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[0];
                     _smem_stats_w_reg_11[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[1];
                     _smem_stats_w_reg_11[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[2];
@@ -919,8 +919,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_10 = 0; k_10 < 8; k_10 += 4) {
                     uint32_t _smem_stats_w_reg_12[4];
-                    __int128_t _smem_b128_15;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_15) : "r"(smem_stats_w_addr + (312 + k_10) * 4));
+                    uint32_t _smem_b128_15[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_15[0]), "=r"(_smem_b128_15[1]), "=r"(_smem_b128_15[2]), "=r"(_smem_b128_15[3]) : "r"(smem_stats_w_addr + (312 + k_10) * 4));
                     _smem_stats_w_reg_12[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[0];
                     _smem_stats_w_reg_12[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[1];
                     _smem_stats_w_reg_12[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[2];
@@ -934,8 +934,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_11 = 0; k_11 < 8; k_11 += 4) {
                     uint32_t _smem_stats_w_reg_13[4];
-                    __int128_t _smem_b128_16;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_16) : "r"(smem_stats_w_addr + (328 + k_11) * 4));
+                    uint32_t _smem_b128_16[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_16[0]), "=r"(_smem_b128_16[1]), "=r"(_smem_b128_16[2]), "=r"(_smem_b128_16[3]) : "r"(smem_stats_w_addr + (328 + k_11) * 4));
                     _smem_stats_w_reg_13[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_16)[0];
                     _smem_stats_w_reg_13[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_16)[1];
                     _smem_stats_w_reg_13[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_16)[2];
@@ -965,8 +965,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_12 = 0; k_12 < 8; k_12 += 4) {
                     uint32_t _smem_stats_w_reg_14[4];
-                    __int128_t _smem_b128_17;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_17) : "r"(smem_stats_w_addr + (304 + k_12) * 4));
+                    uint32_t _smem_b128_17[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_17[0]), "=r"(_smem_b128_17[1]), "=r"(_smem_b128_17[2]), "=r"(_smem_b128_17[3]) : "r"(smem_stats_w_addr + (304 + k_12) * 4));
                     _smem_stats_w_reg_14[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_17)[0];
                     _smem_stats_w_reg_14[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_17)[1];
                     _smem_stats_w_reg_14[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_17)[2];
@@ -980,8 +980,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_13 = 0; k_13 < 8; k_13 += 4) {
                     uint32_t _smem_stats_w_reg_15[4];
-                    __int128_t _smem_b128_18;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_18) : "r"(smem_stats_w_addr + (320 + k_13) * 4));
+                    uint32_t _smem_b128_18[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_18[0]), "=r"(_smem_b128_18[1]), "=r"(_smem_b128_18[2]), "=r"(_smem_b128_18[3]) : "r"(smem_stats_w_addr + (320 + k_13) * 4));
                     _smem_stats_w_reg_15[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_18)[0];
                     _smem_stats_w_reg_15[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_18)[1];
                     _smem_stats_w_reg_15[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_18)[2];
@@ -1011,8 +1011,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_14 = 0; k_14 < 8; k_14 += 4) {
                     uint32_t _smem_stats_w_reg_16[4];
-                    __int128_t _smem_b128_19;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_19) : "r"(smem_stats_w_addr + (312 + k_14) * 4));
+                    uint32_t _smem_b128_19[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_19[0]), "=r"(_smem_b128_19[1]), "=r"(_smem_b128_19[2]), "=r"(_smem_b128_19[3]) : "r"(smem_stats_w_addr + (312 + k_14) * 4));
                     _smem_stats_w_reg_16[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_19)[0];
                     _smem_stats_w_reg_16[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_19)[1];
                     _smem_stats_w_reg_16[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_19)[2];
@@ -1026,8 +1026,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_15 = 0; k_15 < 8; k_15 += 4) {
                     uint32_t _smem_stats_w_reg_17[4];
-                    __int128_t _smem_b128_20;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_20) : "r"(smem_stats_w_addr + (328 + k_15) * 4));
+                    uint32_t _smem_b128_20[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_20[0]), "=r"(_smem_b128_20[1]), "=r"(_smem_b128_20[2]), "=r"(_smem_b128_20[3]) : "r"(smem_stats_w_addr + (328 + k_15) * 4));
                     _smem_stats_w_reg_17[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_20)[0];
                     _smem_stats_w_reg_17[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_20)[1];
                     _smem_stats_w_reg_17[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_20)[2];
@@ -1148,8 +1148,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_16 = 0; k_16 < 8; k_16 += 4) {
                         uint32_t _smem_vis_w_reg_2[4];
-                        __int128_t _smem_b128_0;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_0) : "r"(smem_vis_w_addr + (k_16) * 4));
+                        uint32_t _smem_b128_0[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_0[0]), "=r"(_smem_b128_0[1]), "=r"(_smem_b128_0[2]), "=r"(_smem_b128_0[3]) : "r"(smem_vis_w_addr + (k_16) * 4));
                         _smem_vis_w_reg_2[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_0)[0];
                         _smem_vis_w_reg_2[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_0)[1];
                         _smem_vis_w_reg_2[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_0)[2];
@@ -1166,8 +1166,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_17 = 0; k_17 < 8; k_17 += 4) {
                         uint32_t _smem_vis_w_reg_3[4];
-                        __int128_t _smem_b128_1;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_1) : "r"(smem_vis_w_addr + (8 + k_17) * 4));
+                        uint32_t _smem_b128_1[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_1[0]), "=r"(_smem_b128_1[1]), "=r"(_smem_b128_1[2]), "=r"(_smem_b128_1[3]) : "r"(smem_vis_w_addr + (8 + k_17) * 4));
                         _smem_vis_w_reg_3[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_1)[0];
                         _smem_vis_w_reg_3[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_1)[1];
                         _smem_vis_w_reg_3[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_1)[2];
@@ -1186,15 +1186,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_18 = 0; k_18 < 8; k_18 += 4) {
                     uint32_t _smem_stats_w_reg_18[4];
-                    __int128_t _smem_b128_2;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(smem_stats_w_addr + (224 + k_18) * 4));
+                    uint32_t _smem_b128_2[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_2[0]), "=r"(_smem_b128_2[1]), "=r"(_smem_b128_2[2]), "=r"(_smem_b128_2[3]) : "r"(smem_stats_w_addr + (224 + k_18) * 4));
                     _smem_stats_w_reg_18[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
                     _smem_stats_w_reg_18[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
                     _smem_stats_w_reg_18[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
                     _smem_stats_w_reg_18[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
                     uint32_t _smem_stats_w_reg_19[4];
-                    __int128_t _smem_b128_3;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_3) : "r"(smem_stats_w_addr + (256 + k_18) * 4));
+                    uint32_t _smem_b128_3[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_3[0]), "=r"(_smem_b128_3[1]), "=r"(_smem_b128_3[2]), "=r"(_smem_b128_3[3]) : "r"(smem_stats_w_addr + (256 + k_18) * 4));
                     _smem_stats_w_reg_19[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[0];
                     _smem_stats_w_reg_19[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[1];
                     _smem_stats_w_reg_19[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[2];
@@ -1210,15 +1210,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_19 = 0; k_19 < 8; k_19 += 4) {
                     uint32_t _smem_stats_w_reg_20[4];
-                    __int128_t _smem_b128_4;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_4) : "r"(smem_stats_w_addr + (232 + k_19) * 4));
+                    uint32_t _smem_b128_4[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_4[0]), "=r"(_smem_b128_4[1]), "=r"(_smem_b128_4[2]), "=r"(_smem_b128_4[3]) : "r"(smem_stats_w_addr + (232 + k_19) * 4));
                     _smem_stats_w_reg_20[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[0];
                     _smem_stats_w_reg_20[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[1];
                     _smem_stats_w_reg_20[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[2];
                     _smem_stats_w_reg_20[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[3];
                     uint32_t _smem_stats_w_reg_21[4];
-                    __int128_t _smem_b128_5;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_5) : "r"(smem_stats_w_addr + (264 + k_19) * 4));
+                    uint32_t _smem_b128_5[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_5[0]), "=r"(_smem_b128_5[1]), "=r"(_smem_b128_5[2]), "=r"(_smem_b128_5[3]) : "r"(smem_stats_w_addr + (264 + k_19) * 4));
                     _smem_stats_w_reg_21[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[0];
                     _smem_stats_w_reg_21[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[1];
                     _smem_stats_w_reg_21[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[2];
@@ -1239,8 +1239,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 }
                 asm volatile("barrier.sync 9, 128;" ::: "memory");
                 uint32_t _smem_flags_w_reg_1[4];
-                __int128_t _smem_b128_6;
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_6) : "r"(smem_flags_w_addr + (aphase_1 * 8 + 4) * 4));
+                uint32_t _smem_b128_6[4];
+                asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_6[0]), "=r"(_smem_b128_6[1]), "=r"(_smem_b128_6[2]), "=r"(_smem_b128_6[3]) : "r"(smem_flags_w_addr + (aphase_1 * 8 + 4) * 4));
                 _smem_flags_w_reg_1[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[0];
                 _smem_flags_w_reg_1[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[1];
                 _smem_flags_w_reg_1[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[2];
@@ -1365,15 +1365,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_20 = 0; k_20 < 8; k_20 += 4) {
                         uint32_t _smem_stats_w_reg_22[4];
-                        __int128_t _smem_b128_7;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_7) : "r"(smem_stats_w_addr + (144 + k_20) * 4));
+                        uint32_t _smem_b128_7[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_7[0]), "=r"(_smem_b128_7[1]), "=r"(_smem_b128_7[2]), "=r"(_smem_b128_7[3]) : "r"(smem_stats_w_addr + (144 + k_20) * 4));
                         _smem_stats_w_reg_22[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[0];
                         _smem_stats_w_reg_22[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[1];
                         _smem_stats_w_reg_22[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[2];
                         _smem_stats_w_reg_22[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[3];
                         uint32_t _smem_stats_w_reg_23[4];
-                        __int128_t _smem_b128_8;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_8) : "r"(smem_stats_w_addr + (128 + k_20) * 4));
+                        uint32_t _smem_b128_8[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_8[0]), "=r"(_smem_b128_8[1]), "=r"(_smem_b128_8[2]), "=r"(_smem_b128_8[3]) : "r"(smem_stats_w_addr + (128 + k_20) * 4));
                         _smem_stats_w_reg_23[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_8)[0];
                         _smem_stats_w_reg_23[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_8)[1];
                         _smem_stats_w_reg_23[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_8)[2];
@@ -1387,15 +1387,15 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                     #pragma unroll
                     for (int k_21 = 0; k_21 < 8; k_21 += 4) {
                         uint32_t _smem_stats_w_reg_24[4];
-                        __int128_t _smem_b128_9;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_9) : "r"(smem_stats_w_addr + (152 + k_21) * 4));
+                        uint32_t _smem_b128_9[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_9[0]), "=r"(_smem_b128_9[1]), "=r"(_smem_b128_9[2]), "=r"(_smem_b128_9[3]) : "r"(smem_stats_w_addr + (152 + k_21) * 4));
                         _smem_stats_w_reg_24[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[0];
                         _smem_stats_w_reg_24[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[1];
                         _smem_stats_w_reg_24[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[2];
                         _smem_stats_w_reg_24[3] = reinterpret_cast<const uint32_t*>(&_smem_b128_9)[3];
                         uint32_t _smem_stats_w_reg_25[4];
-                        __int128_t _smem_b128_10;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_10) : "r"(smem_stats_w_addr + (136 + k_21) * 4));
+                        uint32_t _smem_b128_10[4];
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_10[0]), "=r"(_smem_b128_10[1]), "=r"(_smem_b128_10[2]), "=r"(_smem_b128_10[3]) : "r"(smem_stats_w_addr + (136 + k_21) * 4));
                         _smem_stats_w_reg_25[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[0];
                         _smem_stats_w_reg_25[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[1];
                         _smem_stats_w_reg_25[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[2];
@@ -1507,8 +1507,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                             #pragma unroll
                             for (int k_22 = 0; k_22 < 8; k_22 += 4) {
                                 uint32_t _smem_stats_w_reg_26[4];
-                                __int128_t _smem_b128_11;
-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_11) : "r"(smem_stats_w_addr + (128 + k_22) * 4));
+                                uint32_t _smem_b128_11[4];
+                                asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_11[0]), "=r"(_smem_b128_11[1]), "=r"(_smem_b128_11[2]), "=r"(_smem_b128_11[3]) : "r"(smem_stats_w_addr + (128 + k_22) * 4));
                                 _smem_stats_w_reg_26[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[0];
                                 _smem_stats_w_reg_26[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[1];
                                 _smem_stats_w_reg_26[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[2];
@@ -1522,8 +1522,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                             #pragma unroll
                             for (int k_23 = 0; k_23 < 8; k_23 += 4) {
                                 uint32_t _smem_stats_w_reg_27[4];
-                                __int128_t _smem_b128_12;
-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_12) : "r"(smem_stats_w_addr + (136 + k_23) * 4));
+                                uint32_t _smem_b128_12[4];
+                                asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_12[0]), "=r"(_smem_b128_12[1]), "=r"(_smem_b128_12[2]), "=r"(_smem_b128_12[3]) : "r"(smem_stats_w_addr + (136 + k_23) * 4));
                                 _smem_stats_w_reg_27[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[0];
                                 _smem_stats_w_reg_27[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[1];
                                 _smem_stats_w_reg_27[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[2];
@@ -1606,8 +1606,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_24 = 0; k_24 < 8; k_24 += 4) {
                     uint32_t _smem_stats_w_reg_28[4];
-                    __int128_t _smem_b128_13;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_13) : "r"(smem_stats_w_addr + (304 + k_24) * 4));
+                    uint32_t _smem_b128_13[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_13[0]), "=r"(_smem_b128_13[1]), "=r"(_smem_b128_13[2]), "=r"(_smem_b128_13[3]) : "r"(smem_stats_w_addr + (304 + k_24) * 4));
                     _smem_stats_w_reg_28[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[0];
                     _smem_stats_w_reg_28[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[1];
                     _smem_stats_w_reg_28[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[2];
@@ -1621,8 +1621,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_25 = 0; k_25 < 8; k_25 += 4) {
                     uint32_t _smem_stats_w_reg_29[4];
-                    __int128_t _smem_b128_14;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_14) : "r"(smem_stats_w_addr + (320 + k_25) * 4));
+                    uint32_t _smem_b128_14[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_14[0]), "=r"(_smem_b128_14[1]), "=r"(_smem_b128_14[2]), "=r"(_smem_b128_14[3]) : "r"(smem_stats_w_addr + (320 + k_25) * 4));
                     _smem_stats_w_reg_29[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[0];
                     _smem_stats_w_reg_29[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[1];
                     _smem_stats_w_reg_29[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[2];
@@ -1652,8 +1652,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_26 = 0; k_26 < 8; k_26 += 4) {
                     uint32_t _smem_stats_w_reg_30[4];
-                    __int128_t _smem_b128_15;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_15) : "r"(smem_stats_w_addr + (312 + k_26) * 4));
+                    uint32_t _smem_b128_15[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_15[0]), "=r"(_smem_b128_15[1]), "=r"(_smem_b128_15[2]), "=r"(_smem_b128_15[3]) : "r"(smem_stats_w_addr + (312 + k_26) * 4));
                     _smem_stats_w_reg_30[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[0];
                     _smem_stats_w_reg_30[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[1];
                     _smem_stats_w_reg_30[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[2];
@@ -1667,8 +1667,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_27 = 0; k_27 < 8; k_27 += 4) {
                     uint32_t _smem_stats_w_reg_31[4];
-                    __int128_t _smem_b128_16;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_16) : "r"(smem_stats_w_addr + (328 + k_27) * 4));
+                    uint32_t _smem_b128_16[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_16[0]), "=r"(_smem_b128_16[1]), "=r"(_smem_b128_16[2]), "=r"(_smem_b128_16[3]) : "r"(smem_stats_w_addr + (328 + k_27) * 4));
                     _smem_stats_w_reg_31[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_16)[0];
                     _smem_stats_w_reg_31[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_16)[1];
                     _smem_stats_w_reg_31[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_16)[2];
@@ -1698,8 +1698,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_28 = 0; k_28 < 8; k_28 += 4) {
                     uint32_t _smem_stats_w_reg_32[4];
-                    __int128_t _smem_b128_17;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_17) : "r"(smem_stats_w_addr + (304 + k_28) * 4));
+                    uint32_t _smem_b128_17[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_17[0]), "=r"(_smem_b128_17[1]), "=r"(_smem_b128_17[2]), "=r"(_smem_b128_17[3]) : "r"(smem_stats_w_addr + (304 + k_28) * 4));
                     _smem_stats_w_reg_32[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_17)[0];
                     _smem_stats_w_reg_32[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_17)[1];
                     _smem_stats_w_reg_32[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_17)[2];
@@ -1713,8 +1713,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_29 = 0; k_29 < 8; k_29 += 4) {
                     uint32_t _smem_stats_w_reg_33[4];
-                    __int128_t _smem_b128_18;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_18) : "r"(smem_stats_w_addr + (320 + k_29) * 4));
+                    uint32_t _smem_b128_18[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_18[0]), "=r"(_smem_b128_18[1]), "=r"(_smem_b128_18[2]), "=r"(_smem_b128_18[3]) : "r"(smem_stats_w_addr + (320 + k_29) * 4));
                     _smem_stats_w_reg_33[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_18)[0];
                     _smem_stats_w_reg_33[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_18)[1];
                     _smem_stats_w_reg_33[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_18)[2];
@@ -1744,8 +1744,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_30 = 0; k_30 < 8; k_30 += 4) {
                     uint32_t _smem_stats_w_reg_34[4];
-                    __int128_t _smem_b128_19;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_19) : "r"(smem_stats_w_addr + (312 + k_30) * 4));
+                    uint32_t _smem_b128_19[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_19[0]), "=r"(_smem_b128_19[1]), "=r"(_smem_b128_19[2]), "=r"(_smem_b128_19[3]) : "r"(smem_stats_w_addr + (312 + k_30) * 4));
                     _smem_stats_w_reg_34[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_19)[0];
                     _smem_stats_w_reg_34[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_19)[1];
                     _smem_stats_w_reg_34[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_19)[2];
@@ -1759,8 +1759,8 @@ kernel_cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161(const __grid_constant__ 
                 #pragma unroll
                 for (int k_31 = 0; k_31 < 8; k_31 += 4) {
                     uint32_t _smem_stats_w_reg_35[4];
-                    __int128_t _smem_b128_20;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_20) : "r"(smem_stats_w_addr + (328 + k_31) * 4));
+                    uint32_t _smem_b128_20[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_20[0]), "=r"(_smem_b128_20[1]), "=r"(_smem_b128_20[2]), "=r"(_smem_b128_20[3]) : "r"(smem_stats_w_addr + (328 + k_31) * 4));
                     _smem_stats_w_reg_35[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_20)[0];
                     _smem_stats_w_reg_35[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_20)[1];
                     _smem_stats_w_reg_35[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_20)[2];

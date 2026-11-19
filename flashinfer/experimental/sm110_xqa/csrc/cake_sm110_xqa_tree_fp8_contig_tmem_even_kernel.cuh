@@ -1454,8 +1454,8 @@ CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_constant_
                     unsigned int ht = row_begin + r;
                     unsigned int orow = (request_offset + ht / CAKE_HGS) * q_heads + head * CAKE_HGS + ht % CAKE_HGS;
                     uint32_t _sstage_reg_0[4];
-                    __int128_t _smem_raw_77;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_77) : "r"(sstage_addr + (r * 132 + lane * 4) * 4));
+                    uint32_t _smem_raw_77[4];
+                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_77[0]), "=r"(_smem_raw_77[1]), "=r"(_smem_raw_77[2]), "=r"(_smem_raw_77[3]) : "r"(sstage_addr + (r * 132 + lane * 4) * 4));
                     _sstage_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_77)[0];
                     _sstage_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_77)[1];
                     _sstage_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_77)[2];

@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -344,7 +344,7 @@ kernel_cake_kimi_k3_tp12_tail_17117e251598ef1a38ad(__nv_bfloat16* __restrict__ r
         unsigned int boundary = (clear[stage] + 15) / 16;
         for (unsigned int packed = thread; packed < boundary; packed += threads) {
             {
-                auto _gst_12 = reinterpret_cast<unsigned __int128*>(bytes_base + stage_offset) + packed;
+                auto _gst_12 = reinterpret_cast<int4*>(bytes_base + stage_offset) + packed;
                 __builtin_assume(__isGlobal(_gst_12));
                 reinterpret_cast<int4*>(_gst_12)[0] = reinterpret_cast<int4*>(sentinel)[0];
             }
