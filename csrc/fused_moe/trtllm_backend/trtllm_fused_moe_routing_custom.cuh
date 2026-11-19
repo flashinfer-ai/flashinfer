@@ -687,7 +687,7 @@ bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 //
 // 1c. Small-batch kernels — 256 experts / top-8, up to 64 tokens, one launch. Input is logits
 //     with SigmoidBias + ScaledSumNormalize routing (DeepSeek-V3 style, no expert groups) or
-//     precomputed top-k. Outputs match the block and split kernels bit for bit; inside an expert,
+//     precomputed top-k. Outputs match the kernels they replace bit for bit; inside an expert,
 //     tokens are placed in ascending order.
 //
 //     Each expert keeps a bitset of the tokens routed to it:

@@ -15,7 +15,8 @@ limitations under the License.
 
 Bit-identity of routingCustom's small-batch kernels (256 experts, top-8, 1-64 tokens:
 routingIndicesSmallBatchKernel up to 18 tokens, routingIndicesSmallBatchClusterKernel above) with
-the static-block / dyn-block / split kernels they replace.
+the kernels they replace: static-block, dyn-block, and from logits the split path, for precomputed
+top-k the block permutation kernel.
 
 The switch FLASHINFER_ROUTING_SMALL_BATCH_KERNEL=0 restores the previous kernels and is
 read on every routing call, so each case runs both paths in one process:
