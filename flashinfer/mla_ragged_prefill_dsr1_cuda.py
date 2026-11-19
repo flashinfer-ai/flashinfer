@@ -38,6 +38,7 @@ trtllm-gen path of this entry point.
 
 import functools
 import os as _os
+import threading
 
 import torch
 
@@ -82,23 +83,31 @@ def get_mla_ragged_prefill_dsr1_module():
 # A failed module build/load (e.g. a cache-only deployment without the
 # compiled artifact, FLASHINFER_DISABLE_JIT=1) is cached as a fallback
 # reason so "auto" keeps the stock path without retrying the build on
-# every call.  [reason_string, exception] once populated.
-_MODULE_LOAD_FAILURE: list = []
+# every call.  Published atomically as one (reason_string, exception)
+# tuple -- never partially filled -- under _MODULE_LOAD_LOCK, which also
+# serializes the first load so concurrent first calls cannot record a
+# failure while another call's load succeeds.
+_MODULE_LOAD_FAILURE: "tuple | None" = None
+_MODULE_LOAD_LOCK = threading.Lock()
 
 
 def _module_load_reasons():
     """Load (and cache) the specialized module; return [] on success or the
     cached fallback-reason list when the module cannot be built/loaded."""
-    if _MODULE_LOAD_FAILURE:
-        return [_MODULE_LOAD_FAILURE[0]]
-    try:
-        get_mla_ragged_prefill_dsr1_module()
-    except Exception as e:
-        _MODULE_LOAD_FAILURE.append(
-            "specialized_module_unavailable:" + type(e).__name__
-        )
-        _MODULE_LOAD_FAILURE.append(e)
-        return [_MODULE_LOAD_FAILURE[0]]
+    global _MODULE_LOAD_FAILURE
+    failure = _MODULE_LOAD_FAILURE
+    if failure is not None:
+        return [failure[0]]
+    with _MODULE_LOAD_LOCK:
+        failure = _MODULE_LOAD_FAILURE
+        if failure is not None:
+            return [failure[0]]
+        try:
+            get_mla_ragged_prefill_dsr1_module()
+        except Exception as e:
+            failure = ("specialized_module_unavailable:" + type(e).__name__, e)
+            _MODULE_LOAD_FAILURE = failure
+            return [failure[0]]
     return []
 
 

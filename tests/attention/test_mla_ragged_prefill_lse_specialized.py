@@ -284,8 +284,8 @@ def test_auto_falls_back_when_module_unavailable():
         raise RuntimeError("specialized module not in the JIT cache")
 
     before = dict(spec_mod.DISPATCH_STATS)
-    saved_failure = list(spec_mod._MODULE_LOAD_FAILURE)
-    spec_mod._MODULE_LOAD_FAILURE.clear()
+    saved_failure = spec_mod._MODULE_LOAD_FAILURE
+    spec_mod._MODULE_LOAD_FAILURE = None
     try:
         with mock.patch.object(
             spec_mod, "get_mla_ragged_prefill_dsr1_module", side_effect=_boom
@@ -302,8 +302,7 @@ def test_auto_falls_back_when_module_unavailable():
             with pytest.raises(ValueError, match="specialized_module_unavailable"):
                 _api(inp, backend="specialized")
     finally:
-        spec_mod._MODULE_LOAD_FAILURE.clear()
-        spec_mod._MODULE_LOAD_FAILURE.extend(saved_failure)
+        spec_mod._MODULE_LOAD_FAILURE = saved_failure
     # with the real module restored, auto serves specialized again
     before = dict(spec_mod.DISPATCH_STATS)
     _api(inp)

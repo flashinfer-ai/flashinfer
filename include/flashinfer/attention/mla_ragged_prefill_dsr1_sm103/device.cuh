@@ -92,7 +92,12 @@ DEVFN float ex2(float x) {
 // mv is maintained in base-2 score units because QK is multiplied by
 // softmax_scale * log2(e) before exp2.  lv also includes the internal
 // 2^PSHIFT multiplier used to keep E4M3 weights away from underflow.
-DEVFN float lse2(float mv, float lv) { return lv > 0.0f ? mv - PSHIFT + __log2f(lv) : -INFINITY; }
+// NaN statistics (NaN is data: the dtype checks admit non-finite fp8 inputs)
+// must reach the LSE rather than collapse to the empty-row -inf, matching the
+// reducer's poisoning of both outputs; -inf is reserved for lv == 0.
+DEVFN float lse2(float mv, float lv) {
+  return (lv > 0.0f || isnan(lv)) ? mv - PSHIFT + __log2f(lv) : -INFINITY;
+}
 DEVFN void cpasync16(uint32_t dst, const void* src, bool pred) {
   int sz = pred ? 16 : 0;
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(sz));

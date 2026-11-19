@@ -9238,6 +9238,20 @@ _RAGGED_DEEPSEEK_DEFAULTS = dict(
 )
 
 
+@functools.cache
+def _ragged_deepseek_param_info():
+    """Stock-signature metadata for the generic front: (all parameter
+    names, required parameter names, positional index of ``backend``)."""
+    import inspect
+
+    params = inspect.signature(trtllm_ragged_attention_deepseek).parameters
+    names = frozenset(params)
+    required = frozenset(
+        n for n, p in params.items() if p.default is inspect.Parameter.empty
+    )
+    return names, required, list(params).index("backend")
+
+
 def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
     """Generalized ragged (varlen, non-paged) DeepSeek MLA prefill attention.
 
@@ -9262,6 +9276,15 @@ def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
         raise ValueError(
             f"backend must be one of {RAGGED_DEEPSEEK_BACKENDS}, got {backend!r}"
         )
+    param_names, required, backend_pos = _ragged_deepseek_param_info()
+    if len(args) > backend_pos:
+        # The stock signature's positional backend slot would be silently
+        # overridden by this front's own (keyword-only) ``backend`` and then
+        # passed twice on the fallback call.
+        raise TypeError(
+            "ragged_attention_deepseek() takes backend by keyword only; "
+            "do not pass it (or later parameters) positionally"
+        )
     if backend in ("auto", "specialized"):
         from .mla_ragged_prefill_dsr1_cuda import (
             maybe_dispatch_specialized as _mds,
@@ -9278,7 +9301,20 @@ def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
             a = dict(bound.arguments)
         else:
             # keyword usage (the serving call form): defaults + kwargs,
-            # no inspect machinery on the hot path
+            # no inspect machinery on the hot path.  Reject calls the stock
+            # entry would reject, so dispatch never changes error behavior.
+            unknown = kwargs.keys() - param_names
+            if unknown:
+                raise TypeError(
+                    "ragged_attention_deepseek() got unexpected keyword "
+                    f"argument(s): {sorted(unknown)}"
+                )
+            missing = required - kwargs.keys()
+            if missing:
+                raise TypeError(
+                    "ragged_attention_deepseek() missing required "
+                    f"argument(s): {sorted(missing)}"
+                )
             a = dict(_RAGGED_DEEPSEEK_DEFAULTS)
             a.update(kwargs)
         served = _mds(
@@ -9297,7 +9333,7 @@ def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
             extras=dict(
                 is_causal=a["is_causal"],
                 return_lse=a["return_lse"],
-                enable_pdl=a.get("enable_pdl"),
+                enable_pdl=a["enable_pdl"],
                 lse=a["lse"],
                 window_left=a["window_left"],
                 attention_sinks=a["attention_sinks"],
