@@ -1269,9 +1269,10 @@ def _u_src(w_ring: int) -> str:
 
 def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> bool:
     """The persistent kernel where it measured faster (B200, H = 12, w_ring = 16, ncu
-    kernel time vs one item per CTA): T <= 6 once the (request, head) items outnumber
-    the resident CTA slots (4 per SM): T = 4 / 6 +9-20 % at B >= 512; T = 8 only with
-    16+ items per slot (+2-3 % at B >= 1024, -3.5 % at B = 512). w_ring = 32 (u ring
+    kernel time vs one item per CTA): T <= 6 with 4+ (request, head) items per resident
+    CTA slot (4 per SM; at 1.3-2.6 items per slot, B = 64 / 128, it lost 5-16 %):
+    T = 4 / 6 +9-20 % at B >= 512; T = 8 only with 16+ items per slot (+2-3 % at
+    B >= 1024, -3.5 % at B = 512). w_ring = 32 (u ring
     read per row, 32-slot K~) measured 30 % slower: never."""
     if _FORCE_PERSISTENT is not None:
         return bool(_FORCE_PERSISTENT)
@@ -1281,7 +1282,7 @@ def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> b
         _MIN_BLOCKS_PER_SM * torch.cuda.get_device_properties(dev).multi_processor_count
     )
     items = B * H
-    return items > slots if T <= 6 else items >= 16 * slots
+    return items >= (4 if T <= 6 else 16) * slots
 
 
 def launch_umma(
