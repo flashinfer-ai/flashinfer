@@ -1028,7 +1028,7 @@ Rules, in rough order of how easily they are violated:
   to read its CUDA events, which capture forbids. Time `g.replay()` instead
   (`benchmarks/moe_ep/bench_moe_ep_fleet.py --cuda-graph` does exactly this),
   or set `stage_hook` to record external CUDA events around each stage and read
-  them after the replay (`benchmarks/moe_ep/bench_moe_ep.py`).
+  them after the replay (`benchmarks/moe_ep/bench_moe_ep_split_layer.py`).
 - **All EP ranks must run the same sequence of eager calls and replays.**
   Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
   toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every

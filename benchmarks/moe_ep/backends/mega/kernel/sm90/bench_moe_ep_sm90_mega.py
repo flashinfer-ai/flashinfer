@@ -1267,8 +1267,8 @@ def _runtime_tactic(args: argparse.Namespace, workspace) -> dict[str, object]:
 def _time_calls(call, *, warmup: int, iters: int) -> list[float]:
     """Per-rank CUDA-event timings (us) of ``call``, barrier-aligned per iter.
 
-    Mirrors bench_moe_ep's discipline (barrier + sync fencing each sample) so
-    per-rank numbers are comparable with the drop's per-rank profiler means.
+    A barrier and a device sync fence each sample, so per-rank numbers are
+    comparable with the drop's per-rank profiler means.
     """
     import torch
     import torch.distributed as dist
