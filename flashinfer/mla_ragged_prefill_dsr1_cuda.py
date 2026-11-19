@@ -349,6 +349,7 @@ def maybe_dispatch_specialized(
             out,
             extras.get("lse"),
             bool(extras.get("is_causal")),
+            extras.get("enable_pdl"),
         )
     if backend == "specialized":
         err = ValueError(
@@ -376,6 +377,7 @@ def _run_specialized(
     out,
     lse,
     is_causal,
+    enable_pdl=None,
 ):
     if out is None:
         out = torch.empty(
@@ -402,5 +404,8 @@ def _run_specialized(
         workspace_buffer,
         out,
         lse,
+        # The API's enable_pdl is honored on the reducer launches; None
+        # (unspecified) keeps PDL enabled, matching the stock default.
+        int(enable_pdl is not False),
     )
     return out, lse

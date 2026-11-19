@@ -9297,6 +9297,7 @@ def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
             extras=dict(
                 is_causal=a["is_causal"],
                 return_lse=a["return_lse"],
+                enable_pdl=a.get("enable_pdl"),
                 lse=a["lse"],
                 window_left=a["window_left"],
                 attention_sinks=a["attention_sinks"],

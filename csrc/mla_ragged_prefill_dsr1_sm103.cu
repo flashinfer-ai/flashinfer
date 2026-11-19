@@ -2482,7 +2482,12 @@ static double wave_eff2(int n, int t) { return wave_eff(n, t); }
 void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView q_lens,
          ffi::TensorView kv_lens, ffi::TensorView cu_q, ffi::TensorView cu_kv, int64_t max_q_len,
          int64_t max_kv_len, int64_t is_causal, ffi::TensorView workspace_buffer,
-         ffi::TensorView out, ffi::TensorView lse) {
+         ffi::TensorView out, ffi::TensorView lse, int64_t enable_pdl) {
+  // enable_pdl=0 keeps every reducer launch on ordinary stream ordering
+  // (the attribute is simply not granted; the in-kernel dependency wait is
+  // trivially satisfied).  The API's enable_pdl is inherited through the
+  // dispatch adapter, with None treated as enabled.
+  const int pdl_ok = enable_pdl != 0;
   // The stream is re-queried on every call (CUDA-graph requirement: never a
   // cached stream).
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
@@ -2968,7 +2973,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
       dim3 gh((nj + 2 * CMB_WARPS - 1) / (2 * CMB_WARPS));
       cudaLaunchAttribute pdl_attr[1]{};
       pdl_attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      pdl_attr[0].val.programmaticStreamSerializationAllowed = 1;
+      pdl_attr[0].val.programmaticStreamSerializationAllowed = pdl_ok;
       cudaLaunchConfig_t pdl_cfg{};
       pdl_cfg.gridDim = gh;
       pdl_cfg.blockDim = dim3(32 * CMB_WARPS);
@@ -2986,7 +2991,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
       dim3 gh((nj + 2 * CMB_WARPS - 1) / (2 * CMB_WARPS));
       cudaLaunchAttribute pdl_attr[1]{};
       pdl_attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      pdl_attr[0].val.programmaticStreamSerializationAllowed = 1;
+      pdl_attr[0].val.programmaticStreamSerializationAllowed = pdl_ok;
       cudaLaunchConfig_t pdl_cfg{};
       pdl_cfg.gridDim = gh;
       pdl_cfg.blockDim = dim3(32 * CMB_WARPS);
@@ -3000,7 +3005,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
       dim3 gh((nj + 2 * CMB_WARPS - 1) / (2 * CMB_WARPS));
       cudaLaunchAttribute pdl_attr[1]{};
       pdl_attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      pdl_attr[0].val.programmaticStreamSerializationAllowed = 1;
+      pdl_attr[0].val.programmaticStreamSerializationAllowed = pdl_ok;
       cudaLaunchConfig_t pdl_cfg{};
       pdl_cfg.gridDim = gh;
       pdl_cfg.blockDim = dim3(32 * CMB_WARPS);
@@ -3013,7 +3018,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
     } else if (interleaved || fixed_w7_m128 || interleaved2) {
       cudaLaunchAttribute pdl_attr[1]{};
       pdl_attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      pdl_attr[0].val.programmaticStreamSerializationAllowed = 1;
+      pdl_attr[0].val.programmaticStreamSerializationAllowed = pdl_ok;
       cudaLaunchConfig_t pdl_cfg{};
       pdl_cfg.gridDim = g2;
       pdl_cfg.blockDim = dim3(32 * CMB_WARPS);
@@ -3072,7 +3077,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
       dim3 gh((nj + 2 * CMB_WARPS - 1) / (2 * CMB_WARPS));
       cudaLaunchAttribute pdl_attr[1]{};
       pdl_attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      pdl_attr[0].val.programmaticStreamSerializationAllowed = 1;
+      pdl_attr[0].val.programmaticStreamSerializationAllowed = pdl_ok;
       cudaLaunchConfig_t pdl_cfg{};
       pdl_cfg.gridDim = gh;
       pdl_cfg.blockDim = dim3(32 * CMB_WARPS);
