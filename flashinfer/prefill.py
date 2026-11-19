@@ -2793,6 +2793,20 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                             "seq_lens need more KV pages than the "
                             "paged_kv_indptr span provides"
                         )
+                    elif kv_meta[1] is not None:
+                        derived = torch.clamp(spans - 1, min=0) * page_size + kv_meta[
+                            1
+                        ][:batch_size].to(torch.int64)
+                        if bool((kv_lens != derived).any()):
+                            # the specialized kernel honors explicit seq_lens
+                            # while the FA2 fallback positions its causal mask
+                            # from the page metadata (last_page_len); admit
+                            # only plans where both consumers see the same
+                            # KV lengths
+                            reason = (
+                                "explicit seq_lens differ from the "
+                                "page-derived KV lengths"
+                            )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
@@ -2967,6 +2981,8 @@ def _gqa_dec_fp8q_sm90_prepare(
     has_custom_mask: bool,
     prefix_len_ptr: Optional[torch.Tensor],
     token_pos_in_items_len: int,
+    paged_kv_last_page_len_host: Optional[torch.Tensor] = None,
+    non_blocking: bool = True,
 ) -> None:
     """Plan-time half of the dispatch: decide eligibility, JIT-build the
     module (first time in the process), build the dense block table and
@@ -3083,6 +3099,21 @@ def _gqa_dec_fp8q_sm90_prepare(
                 reason = (
                     "seq_lens need more KV pages than the paged_kv_indptr span provides"
                 )
+            elif paged_kv_last_page_len_host is not None:
+                spans = paged_kv_indptr_host[1 : batch_size + 1].to(
+                    torch.int64
+                ) - paged_kv_indptr_host[:batch_size].to(torch.int64)
+                derived = torch.clamp(
+                    spans - 1, min=0
+                ) * _GQA_DEC_FP8Q_SM90_PAGE_SIZE + paged_kv_last_page_len_host[
+                    :batch_size
+                ].to(torch.int64)
+                if bool((kv_lens.to(torch.int64) != derived).any()):
+                    # the specialized kernel honors explicit seq_lens while
+                    # the FA2 fallback positions its causal mask from the
+                    # page metadata (last_page_len); serve mismatched plans
+                    # on one consistent path instead
+                    reason = "explicit seq_lens differ from the page-derived KV lengths"
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
@@ -3181,7 +3212,11 @@ def _gqa_dec_fp8q_sm90_prepare(
 
     seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
     seq_lens_dev = seq_lens_buf[:batch_size]
-    seq_lens_dev.copy_(kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True)
+    # honor the plan's non_blocking option: a caller reusing a pinned host
+    # buffer after a blocking plan() must not race a still-pending copy
+    seq_lens_dev.copy_(
+        kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=non_blocking
+    )
 
     unit_descale = _buf("unit_descale", batch_size, torch.float32)[:batch_size]
     unit_descale.fill_(1.0)
@@ -6086,6 +6121,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         or self._custom_mask_buf is not None,
                         prefix_len_ptr,
                         token_pos_in_items_len,
+                        paged_kv_last_page_len_host=paged_kv_last_page_len_host,
+                        non_blocking=non_blocking,
                     )
         if (
             getattr(self, "_gqa_dec_fp8q_sm90_explicit", False)
