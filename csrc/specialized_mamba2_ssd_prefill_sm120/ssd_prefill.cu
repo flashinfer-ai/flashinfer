@@ -591,7 +591,6 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
           mmaf(ga[0][1], Cfrag[k], ba[2], ba[3]);
           mmaf(ga[1][0], Cfrag[k], bb[0], bb[1]);
           mmaf(ga[1][1], Cfrag[k], bb[2], bb[3]);
-#pragma unroll
           if (k < 7)
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
@@ -611,7 +610,6 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
           if (k < 7) peer_ldm4(bn, bA0 + ((((uint32_t)k + 1) << 5) ^ bPX));
           mmaf(ga[0], Cfrag[k], bb[0], bb[1]);
           mmaf(ga[1], Cfrag[k], bb[2], bb[3]);
-#pragma unroll
           if (k < 7)
 #pragma unroll
             for (int q = 0; q < 4; ++q) bb[q] = bn[q];
