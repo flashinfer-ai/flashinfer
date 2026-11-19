@@ -397,7 +397,7 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         impl in _BF16_MXFP8_IMPLS
         and (
             stages is None
-            or 2 <= stages <= Sm100SwapABMxfp8Bf16Fc12Kernel._MaxBStages[impl[1]]
+            or 2 <= stages <= Sm100SwapABMxfp8Bf16Fc12Kernel.max_b_stages(*impl)
         )
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
