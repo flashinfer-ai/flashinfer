@@ -105,6 +105,9 @@ _CO_A, _CO_BQ, _CO_BETA = 0, 64, 128
 # Test hooks (default None = automatic choice). Not part of the API.
 _FORCE_U_SRC: Optional[str] = None  # "smem" | "ldg"
 _FORCE_HPC: Optional[int] = None
+# None = automatic (T <= 4 and more (request, head) items than 4 CTAs x SMs); True / False
+# force the persistent kernel (kda_replay_mtp_umma_persistent) on / off.
+_FORCE_PERSISTENT: Optional[bool] = None
 # Number of UMMA launches issued (dispatch tests read it).
 _LAUNCHES = 0
 
@@ -1264,6 +1267,17 @@ def _u_src(w_ring: int) -> str:
     return "smem" if w_ring == 16 else "ldg"
 
 
+def _use_persistent(B: int, T: int, H: int, dev: torch.device) -> bool:
+    """The persistent kernel where it measured faster (B200, H = 12): T <= 4 with more
+    (request, head) items than resident CTA slots (4 per SM)."""
+    if _FORCE_PERSISTENT is not None:
+        return bool(_FORCE_PERSISTENT)
+    slots = (
+        _MIN_BLOCKS_PER_SM * torch.cuda.get_device_properties(dev).multi_processor_count
+    )
+    return T <= 4 and B * H > slots
+
+
 def launch_umma(
     q,
     k,
@@ -1291,6 +1305,32 @@ def launch_umma(
     global _LAUNCHES
     T = q.shape[1]
     H = q.shape[2]
+    if _use_persistent(q.shape[0], T, H, q.device):
+        from .kda_replay_mtp_umma_persistent import launch_umma_persistent
+
+        launch_umma_persistent(
+            q,
+            k,
+            v,
+            g,
+            b,
+            A_log,
+            dt_bias,
+            h0,
+            initial_state_indices,
+            k_cache,
+            u_cache,
+            g_cache,
+            hist_len,
+            cache_base,
+            out_t,
+            scale,
+            lower_bound,
+            flush_min,
+            w_ring,
+        )
+        _LAUNCHES += 1
+        return
     fn = _get_kernel(q.device, T, H, int(w_ring), _u_src(int(w_ring)))
     fn(
         q,

@@ -472,3 +472,34 @@ def test_umma_only_t_w32_deep_window_repeat_determinism(t):
 @pytest.mark.parametrize("t", _UMMA_ONLY_T)
 def test_umma_only_t_restart_hist_on_flush_across_steps(t, w_ring, graph):
     _base._restart_hist_on_flush_across_steps(graph, w_ring, t)
+
+
+@pytest.mark.parametrize("t", _ALL_T)
+@pytest.mark.parametrize("w_ring", [16, 32])
+@pytest.mark.parametrize("history", ["verify", "fold"])
+def test_umma_persistent_matches_single_item_bitwise(t, w_ring, history, monkeypatch):
+    """The persistent kernel (kda_replay_mtp_umma_persistent: 4 CTAs / SM walking the
+    (request, head) items) only reschedules work: outputs, rings and pool are bitwise
+    equal to one item per CTA, with padded rows (every 37th) and more items than CTAs."""
+    from flashinfer.experimental.kda_ucache_flush import kda_replay_mtp_umma as um
+
+    B = 700  # 8400 (request, head) items: about 14 per CTA on 148 SMs
+    res = {}
+    for pz in (False, True):
+        monkeypatch.setattr(um, "_FORCE_PERSISTENT", pz)
+        case, _, _ = _random_case(B, t, w_ring, history, seed=4242 + 10 * t + w_ring)
+        case = list(case)
+        idx = case[13].clone()
+        idx[::37] = -1
+        case[13] = idx
+        y = _call(tuple(case), "umma", t=t, w_ring=w_ring)
+        torch.cuda.synchronize()
+        live = idx >= 0
+        res[pz] = [y[live].clone()] + [case[i].clone() for i in (7, 8, 9, 10)]
+    for name, a, b in zip(
+        ("output", "pool", "k_cache", "u_cache", "g_cache"),
+        res[False],
+        res[True],
+        strict=True,
+    ):
+        assert torch.equal(a, b), f"persistent vs single-item differ on {name}"
