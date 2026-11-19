@@ -301,8 +301,11 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
         enable_pdl: bool = True,
         push_plane: PushPlane | None = None,
     ) -> None:
-        if push_plane is not None and not supports_push_plane(
-            push_plane, max_token_num, hidden_dim
+        # Every rank votes, so all ranks reject or construct together.
+        if push_plane is not None and not collective_support(
+            supports_push_plane(push_plane, max_token_num, hidden_dim),
+            group,
+            torch.device("cuda", torch.cuda.current_device()),
         ):
             raise ValueError("unsupported push plane")
         super().__init__(
@@ -343,7 +346,7 @@ def supports_push_plane(
         and push_plane.multicast_address > 0
         and push_plane.multicast_address % 16 == 0
         and push_plane.epoch.dtype == torch.int64
-        and push_plane.epoch.numel() == 1
+        and push_plane.epoch.shape == (1,)
         and is_dense_on(push_plane.epoch, device, 8)
     )
 
@@ -403,7 +406,8 @@ def all_gather_rmsnorm_fp4_quantize(
         shard: ``[M, H/TP]`` BF16 columns ``[rank*H/TP, (rank+1)*H/TP)``, or
             None when another kernel already pushed every rank's shard into the
             workspace's :class:`PushPlane` (e.g. FlashInfer's peer-store BF16
-            GEMM with ``layout="gather"``, ``slot_bytes = half_bytes / TP``),
+            GEMM with ``layout="gather"``, ``slot_bytes = half_bytes / TP``, on
+            a plane with ``atom_bytes=4``),
             just before on the same stream and without advancing the epoch.
         weight: ``[H]`` BF16 RMSNorm weight.
         global_scale: ``[1]`` FP32 NVFP4 global scale.

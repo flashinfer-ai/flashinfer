@@ -942,11 +942,16 @@ def stmc_bf16x8(
     address: Int64,
     values,
     predicate: Int32 | None = None,
+    word_atoms: bool = False,
     *,
     loc=None,
     ip=None,
 ) -> None:
-    """Multicast-store eight BF16s; an omitted predicate stores, false skips."""
+    """Multicast-store eight BF16s; an omitted predicate stores, false skips.
+
+    ``word_atoms`` stores them as four 32-bit words (``.f32``), so a reader
+    never sees half of a word.
+    """
 
     predicate = Int32(1) if predicate is None else Int32(predicate)
     words = [values[index].ir_value(loc=loc, ip=ip) for index in range(4)]
@@ -961,8 +966,9 @@ def stmc_bf16x8(
             "{\n\t"
             ".reg .pred p;\n\t"
             "setp.ne.s32 p, $5, 0;\n\t"
-            "@p multimem.st.relaxed.sys.global.v4.bf16x2 "
-            "[$0], {$1, $2, $3, $4};\n\t"
+            "@p multimem.st.relaxed.sys.global.v4."
+            + ("f32" if word_atoms else "bf16x2")
+            + " [$0], {$1, $2, $3, $4};\n\t"
             "}"
         ),
         "l,r,r,r,r,r",

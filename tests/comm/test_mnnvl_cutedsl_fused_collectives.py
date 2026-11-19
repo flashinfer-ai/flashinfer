@@ -631,7 +631,16 @@ def _gemm_push_worker(
 
         def run_sequence():
             outputs = []
-            for m, x, shard, (_, peer_store, tactic) in cases:
+            for index, (m, x, shard, (_, peer_store, tactic)) in enumerate(cases):
+                if index == 1:
+                    # One more plane call: the later GEMMs push into the other half.
+                    all_gather_rmsnorm_fp4_quantize(
+                        cases[0][2],
+                        norm_weight,
+                        global_scale,
+                        workspace,
+                        eps=NORM_QUANT_EPS,
+                    )
                 peer_store(
                     x,
                     w_slice.T,
@@ -658,7 +667,7 @@ def _gemm_push_worker(
                 outputs.append((pushed, published))
             return outputs
 
-        calls = 2 * len(cases)
+        calls = 2 * len(cases) + (len(cases) > 1)
         if graph:
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())

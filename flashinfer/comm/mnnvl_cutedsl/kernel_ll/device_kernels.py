@@ -810,6 +810,7 @@ class _SharedOnlyPublishDeviceKernel:
                     stmc_bf16x8(
                         contribution_mailbox_multicast_address + mailbox_element * 2,
                         packed_words,
+                        word_atoms=self.lamport_2slot and self.lamport_atom_bytes == 4,
                     )
 
         if cutlass.const_expr(self.bulk_peer_stores):

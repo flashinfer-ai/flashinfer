@@ -73,6 +73,7 @@ class PushPlane:
     ``epoch`` is the rank-local 64-bit phase word: the phase is bit 0 of its
     high half, read after the PDL wait. Each consumer cluster (one per token)
     adds to it once after its re-arms, so the phase flips with the last one.
+    Start it at zero on every rank and never reset it while the plane is in use.
     Every plane user runs on one stream, in the same order on every rank.
     """
 
@@ -253,6 +254,11 @@ class LLColumnGather:
         self.tp_size = tp_size
         self.capacity_m = capacity_m
         self.push_plane = push_plane
+        if push_plane is not None and (
+            dist.get_world_size(group) != tp_size or dist.get_rank(group) != rank
+        ):
+            # create_ll_state checks these in the mailbox mode.
+            raise ValueError("ProcessGroup size or rank does not match tp_size or rank")
         self.state = (
             create_ll_state(group, tp_size, rank, capacity_m, self.hidden_local)
             if push_plane is None
