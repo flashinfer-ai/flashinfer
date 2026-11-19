@@ -5410,10 +5410,11 @@ def test_source_program_table_names_shipped_sources():
     # per ``_SM107_MODULES`` identity (a program without an entry builds its
     # fold source on sm_107a, whose descriptor mask is an ``__CUDA_ARCH__``
     # branch) and the two sm_107a renders of the segment preprocess (with and
-    # without the early dependent-launch trigger); plus the 34 state-slot
+    # without the early dependent-launch trigger); plus the 38 state-slot
     # programs' sources (one sm_100a / sm_103a and one sm_107a source per
-    # ``_SLOT_MODULES`` key, test_cake_ssd_combined_state_slots.py), no other
-    # architecture copies and no orphans.
+    # ``_SLOT_MODULES`` key, and one sm_107a source per claim and wrap twin,
+    # test_cake_ssd_combined_state_slots.py), no other architecture copies
+    # and no orphans.
     rubin_sources = set(module._SM107_MODULES.values()) | {
         module._SM107_SEGMENT_PREPROCESS_MODULE,
         module._SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE,
@@ -5425,7 +5426,7 @@ def test_source_program_table_names_shipped_sources():
     }
     assert all(source.is_file() for source in slot_sources), slot_sources
     device_sources |= slot_sources
-    assert len(device_sources) == 53 + len(rubin_sources) + 34
+    assert len(device_sources) == 53 + len(rubin_sources) + 38
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -10133,7 +10134,7 @@ def test_source_every_selected_program_is_shipped_without_gpu(monkeypatch):
     counts, every call form, every override of the chunk-parallel family --
     resolves a shipped program whose family, state dtype, mode and variant are
     the call's, and the programs so resolved are exactly the table but its
-    sm_107a-only programs: the one selection path (``_materialize_workspace``)
+    sm_107a-only programs: the one selection path (``_program_route``)
     names no missing program and leaves no table entry dead."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
