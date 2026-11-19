@@ -19,7 +19,8 @@ A kernel serves one configuration: a model's expert geometry, routing,
 quantization and token counts on one GPU architecture. It reads the weight view
 another backend already prepares (``weight_view``), so a default ``MoELayer``
 needs no extra weight preparation for it. The contract, which
-:class:`SpecializedMoERunner` relies on and the per-kernel tests check:
+:class:`SpecializedMoERunner` relies on and the backend's tests check for every
+kernel:
 
 * :meth:`SpecializedMoEKernel.config_rejection` is the configuration guard: any
   configuration other than the served one is rejected at ``MoELayer``

@@ -68,8 +68,12 @@ class SpecializedMoERunner(MoERunner):
     architecture); with none, :meth:`check_support` raises, so ``MoELayer`` skips
     the backend for that configuration. Per call, :meth:`accepts` asks the bound
     kernels in name order and the first that admits the call runs it. A rejected
-    call runs on the layer's other candidates, and an admitted one is timed
-    against them like any candidate. Each kernel reads the weight view of the
+    call runs on the layer's other candidates. A kernel admits only the calls
+    where it was measured faster than the other backends, so the backend prefers
+    itself (``prefer_when_accepted``): outside ``flashinfer.autotune(True)``
+    ``MoELayer`` runs an admitted call on it without timing it against the other
+    candidates, and under ``autotune(True)`` times it against them like any
+    candidate. Each kernel reads the weight view of the
     backend whose data path it computes, so a default ``MoELayer`` needs no extra
     preparation. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects every call.
 
@@ -81,6 +85,10 @@ class SpecializedMoERunner(MoERunner):
     """
 
     backend_key: ClassVar[str] = "specialized"
+    # The kernels admit exactly their tested envelope, where each was measured
+    # faster than the other backends: outside autotune, MoELayer takes an
+    # admitted call here without timing the other candidates.
+    prefer_when_accepted: ClassVar[bool] = True
     # MoELayer leaves this backend out of a selection inside a CUDA-graph capture:
     # the backend serves a captured call only for a winner timed eagerly, so its
     # admission there without a cached winner never adds a timed candidate.

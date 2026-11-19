@@ -462,8 +462,27 @@ class MoELayer:
         # and prevent changing weight views or shape eligibility from reusing a winner.
         winner_key = (bucket, mode, eligible)
         winner = self._winners.get(winner_key)
+        pool = eligible
+        if winner is None and len(eligible) > 1 and _stream_capturing():
+            # A miss inside a CUDA-graph capture selects without the runners that
+            # serve captured calls only for winners timed eagerly (see
+            # _select_winner). Key that selection by the pool it chose from, never
+            # the full pool: an eager call of this bucket must still select among
+            # every eligible runner.
+            pool = (
+                tuple(
+                    index
+                    for index in eligible
+                    if not getattr(
+                        self.runners[index], "capture_requires_eager_selection", False
+                    )
+                )
+                or eligible
+            )
+            winner_key = (bucket, mode, pool)
+            winner = self._winners.get(winner_key)
         if winner is None:
-            runners = [self.runners[index] for index in eligible]
+            runners = [self.runners[index] for index in pool]
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
             if len(self._winners) > 128:

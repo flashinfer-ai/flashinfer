@@ -3,9 +3,9 @@
 Kernel-independent: kernel discovery, every registered kernel's declarations, the
 runner's declarations and kernel binding, the backend's registration, the runner's
 kill switch, and how ``MoELayer`` keeps the backend's capture-time admissions tied
-to its cached winners. Each kernel's own guards, numerics, kill switch and
-CUDA-graph behavior are tested in
-``tests/moe/test_unified_moe_specialized_<kernel>.py``.
+to its cached winners. Every kernel's guards, numerics, kill switch, CUDA-graph
+behavior and own checks are tested in ``tests/moe/test_unified_moe_specialized.py``
+from its spec in ``tests/moe/specialized_kernels/``.
 """
 
 from __future__ import annotations
@@ -419,3 +419,71 @@ def test_capture_miss_leaves_the_specialized_backend_out(monkeypatch, others):
     # with one other candidate nothing is timed; with more, only they are
     assert timed == ([] if others == 1 else [p.backend_key for p in plain])
     assert SpecializedMoERunner.capture_requires_eager_selection is True
+
+
+def _layer_runner(name, cost, *, eager_only=False):
+    """A runner that ``MoELayer.__call__`` can select and run: it accepts every
+    call, times as ``cost`` and returns its name."""
+    runner = SimpleNamespace(
+        backend_key=name,
+        cost=cost,
+        supported_routing_modes=(RoutingInputMode.FromLogits,),
+        accepts=lambda act, weights: True,
+        pack_inputs=lambda act, weights: [name],
+        launch_kwargs_for=lambda inputs: {},
+        tuning_config_for=lambda inputs: None,
+        forward=lambda inputs, tactic=-1, **kwargs: name,
+    )
+    if eager_only:
+        runner.capture_requires_eager_selection = True
+    return runner
+
+
+@pytest.mark.cpu_only
+def test_capture_selection_never_takes_the_full_pool_entry(monkeypatch):
+    """A first call of a bucket inside a CUDA-graph capture selects without the
+    specialized backend and caches that under its reduced pool's key, so a later
+    eager call of the same bucket still times every eligible backend and can
+    select the specialized one (which is faster here)."""
+    plain = _layer_runner("plain", cost=2.0)
+    special = _layer_runner("specialized", cost=1.0, eager_only=True)
+    layer = MoELayer.__new__(MoELayer)
+    layer.config = MoEConfig(
+        routing=RoutingConfig(num_experts=24, top_k=3),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+        experts=ExpertConfig(intermediate_size=384),
+    )
+    layer.runners = [plain, special]
+    layer._winners = OrderedDict()
+    layer._last_winner_backend = None
+    layer.tuner = SimpleNamespace(
+        choose_one=lambda custom_op, runners, tuning_config, inputs, **kw: (
+            runners[0],
+            -1,
+        )
+    )
+    timed = []
+
+    def bench(fn, **kwargs):
+        runner = fn.__defaults__[0]
+        timed.append(runner.backend_key)
+        return [runner.cost]
+
+    monkeypatch.setattr("flashinfer.testing.utils.bench_gpu_time", bench)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+    capturing = [True]
+    monkeypatch.setattr(layer_module, "_stream_capturing", lambda: capturing[0])
+
+    assert layer(act, None) == "plain"
+    assert timed == []  # one candidate left in capture: nothing is timed
+    assert [key[2] for key in layer._winners] == [(0,)]
+
+    capturing[0] = False
+    assert layer(act, None) == "specialized"
+    assert timed == ["plain", "specialized"]
+    assert [key[2] for key in layer._winners] == [(0,), (0, 1)]
+
+    # a later capture of the bucket replays the eager selection
+    capturing[0] = True
+    assert layer(act, None) == "specialized"
+    assert layer.winner_backend == "specialized" and len(timed) == 2

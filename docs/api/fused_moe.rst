@@ -235,13 +235,16 @@ Specialized backend
 ``SpecializedMoEConfig`` is the backend of MoE kernels generated for one served
 configuration each: a model's expert geometry, routing, quantization and token
 counts on one GPU architecture. Each kernel registers automatically as a
-subpackage of ``flashinfer/fused_moe/backends/specialized/kernels/`` and reads the
-weight view of the backend whose data path it computes, so the default backend
-list includes it at no preparation cost. ``MoELayer`` binds the kernels that
-serve its configuration, runs every other call on its other candidates, and
-times a call a kernel admits against them like any candidate. A kernel is built
-for a device by the first eager call it admits; the first call of a token count
-under CUDA Graph capture runs on another candidate.
+subpackage of ``flashinfer/fused_moe/backends/specialized/kernels/`` and reads
+the weight view of the backend whose data path it computes, so the default
+backend list includes it, first, at no preparation cost. ``MoELayer`` binds the
+kernels that serve its configuration and runs every other call on its other
+candidates. A kernel admits only the calls where it was measured faster than the
+other backends, so outside :func:`flashinfer.autotune` ``MoELayer`` runs a call
+a kernel admits on it without timing the other candidates; under
+``autotune(True)`` it times the backend against them like any candidate. A
+kernel is built for a device by the first eager call it admits; the first call
+of a token count under CUDA Graph capture runs on another candidate.
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on the other
 candidates. ``flashinfer.fused_moe.backends.specialized.registered_kernels()``
 lists the kernels and ``flashinfer.fused_moe.backends.specialized.stats()``

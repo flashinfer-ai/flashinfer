@@ -1023,9 +1023,12 @@ backend.
   keeps that backend's roundings and fp32 accumulation.
 - **Per call.** `accepts()` asks the bound kernels in name order and the first
   that admits the call runs it. A call no kernel admits (token count outside its
-  allowlist, tensor layout, device) runs on the other candidates; an admitted
-  call is timed against them by `MoELayer` like any candidate, so the backend
-  serves a bucket only where it is faster.
+  allowlist, tensor layout, device) runs on the other candidates. A kernel's
+  allowlist holds only the calls where it was measured faster than the other
+  backends, so the backend is first in the default list and prefers itself
+  (`prefer_when_accepted`): outside `flashinfer.autotune(True)`, `MoELayer`
+  runs an admitted call on it without timing the other candidates; under
+  `autotune(True)` it is timed against them like any candidate.
 - **Build and CUDA graphs.** A kernel is built for a device by the first eager
   call it admits, never at import or construction. Under CUDA-graph capture a
   call is admitted only when the kernel is built and the layer already admitted
@@ -1033,7 +1036,9 @@ backend.
   including the first call of a token count under capture, the call is captured
   on another candidate. `MoELayer.reset_winner()` forgets those admissions with
   the winners, and a winner-cache miss under capture leaves the backend out of
-  the selection. Nothing is built or timed inside a capture.
+  the selection and caches it for the remaining candidates only, so a later eager
+  call of that bucket still selects among all of them. Nothing is built or timed
+  inside a capture.
 - **Kill switch.** `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`, read at call time,
   keeps every call on the other candidates (the runner rejects the call before
   asking any kernel).
