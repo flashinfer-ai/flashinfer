@@ -974,7 +974,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   static_assert(TopK <= WarpSize && NumExperts <= SmallBatchKernelMaxThreads);
   static_assert(ExpertsPerLane == 8, "the per-lane sort network is written for 8 candidates");
 
-  // Selection bias, staged before the PDL wait.
+  // Selection bias, staged after the PDL wait.
   __shared__ __align__(16) float smemBias[Input == SmallBatchInput::Scores ? NumExperts : 1];
   // This CTA's tokens that selected each expert: bit j = the CTA's j-th token.
   __shared__ uint32_t smemTokenSet[NumExperts];
@@ -1002,19 +1002,31 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
            (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
   };
 
-  // Before the PDL wait: clear the token sets and stage the bias (a weight, not written by the
-  // preceding kernels).
+  // Before the PDL wait: shared memory only.
   if (threadIdxX < NumExperts) {
-    if constexpr (Input == SmallBatchInput::Scores) {
-      auto const& pre = params.mExpertSelectParams.mPreprocessParams;
-      smemBias[threadIdxX] = loadScalar(pre.ptrRoutingBias, threadIdxX, pre.dtypeBias);
-    }
     smemTokenSet[threadIdxX] = 0u;
   }
   __syncthreads();
 
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+  }
+
+  // Every input is read after the wait, the bias too: the preceding kernel may write it. The bias
+  // is staged in shared memory once per CTA after each warp has issued its logits loads, so the two
+  // loads overlap.
+  [[maybe_unused]] float logit[ExpertsPerLane];
+  if constexpr (Input == SmallBatchInput::Scores) {
+    if (warpIdx < ctaTokens) {
+      smallBatchLoadLogits<InputT, VecLoad>(
+          params.mPtrScores + (firstToken + warpIdx) * NumExperts + laneIdx * ExpertsPerLane,
+          logit);
+    }
+    if (threadIdxX < NumExperts) {
+      auto const& pre = params.mExpertSelectParams.mPreprocessParams;
+      smemBias[threadIdxX] = loadScalar(pre.ptrRoutingBias, threadIdxX, pre.dtypeBias);
+    }
+    __syncthreads();
   }
 
   // A. One warp per token of this CTA.
@@ -1030,8 +1042,6 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
       using PostProc = typename ExpertSelect::PostprocessPolicy;
       InputT const* row = params.mPtrScores + tokenIdx * NumExperts;
       int32_t const firstExpert = laneIdx * ExpertsPerLane;
-      float logit[ExpertsPerLane];
-      smallBatchLoadLogits<InputT, VecLoad>(row + firstExpert, logit);
       float4 const bias0 = reinterpret_cast<float4 const*>(smemBias + firstExpert)[0];
       float4 const bias1 = reinterpret_cast<float4 const*>(smemBias + firstExpert)[1];
       float const bias[ExpertsPerLane] = {bias0.x, bias0.y, bias0.z, bias0.w,
