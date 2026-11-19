@@ -889,12 +889,11 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger after the last global store, so the next GEMM does not take SMs while routing runs.
+  // Trigger after the last global store of every thread, so the next GEMM does not take SMs
+  // while routing runs and reads complete routing outputs (see triggerDependentLaunchAfterWrites).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif
 }
 
 template <typename T>
@@ -1207,9 +1206,10 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
     }
   }
 
-  // After the last global store (see routingIndicesSmallBatchKernel).
+  // After the last global store of every thread of this CTA (see routingIndicesSmallBatchKernel).
+  // Every thread reaches this point, so the CTA barrier inside the trigger is safe.
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
   // Do not exit while the other CTA may still read this CTA's token sets.
   __cluster_barrier_wait();
