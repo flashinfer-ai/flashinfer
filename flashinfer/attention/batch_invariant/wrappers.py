@@ -27,7 +27,18 @@ lengths and the page table, which a captured ``run()`` then follows. The launch 
 (``engine.FixedLaunch``: the kernel, the grid, the tables' addresses and capacities); every plan is written into the same
 tables and held to their capacity by fusing units, a placement like every other planner choice, so a replay's bits are those of
 an eager call on the same batch. A request without pages (a padded slot) is a null request there: its output rows are zeros and
-its LSE ``-inf``, with or without sinks. The prefill wrappers refuse ``use_cuda_graph=True``.
+its LSE ``-inf``, with or without sinks.
+
+The paged prefill wrapper takes ``use_cuda_graph=True`` the same way, with the regular wrapper's contract: the number of request
+slots is fixed and the total query rows stay within a capacity (``max_total_num_rows``, or the first plan's rows); every plan
+may give every slot another query length (zero: a slot without rows, the padding of a captured batch) and another KV length. Its
+fixed launch is sized for any split of the row capacity over the slots; its kernel is the row body for every plan -- with the
+paired placement's kernel where that is the wrapper's default, a batch too small to pair running every unit alone in its pair
+-- since the batch can no longer choose the body. ``run()`` is captured on the caller's ``q`` / ``out`` (/ ``lse``) of the
+capture, which are the tensors of every replay: a plan's rows are their first ``qo_indptr[-1]`` rows, and no row beyond is
+written (with ``lse_layout="HN"`` the transposed copy covers the whole buffer). A request with fewer keys than query tokens is
+refused as in eager mode, with no key at all too. The page indices are range-checked at the first plan only (a check is a
+device readback, and later plans run before every replay). The ragged prefill wrapper refuses ``use_cuda_graph=True``.
 
 A plan's execution state (the split-KV partials in the workspace, the arrival counters) is single-use per launch: two ``run()``
 calls of one plan must be stream-ordered, as with every FlashInfer wrapper's workspace; the counters reset themselves at every
@@ -73,12 +84,12 @@ class BatchInvariantAttention:
         use_cuda_graph: bool = False,
     ) -> None:
         assert kind in ("decode", "prefill", "ragged"), kind
-        if use_cuda_graph and kind != "decode":
+        if use_cuda_graph and kind == "ragged":
             raise unsupported(
                 CLASS,
-                "use_cuda_graph=True with batch_invariant=True on a prefill wrapper",
+                "use_cuda_graph=True with batch_invariant=True on the ragged prefill wrapper",
                 "capturing run() after plan(): a replay reproduces the planned batch, a new plan() needs a new capture "
-                "(the decode wrapper takes use_cuda_graph=True)",
+                "(the paged decode and prefill wrappers take use_cuda_graph=True)",
             )
         if backend != "auto":
             raise unsupported(
@@ -121,21 +132,34 @@ class BatchInvariantAttention:
         self._fixed: Optional[engine.FixedLaunch] = None
         self._frozen_plan: Optional[tuple] = None
         self._frozen_run: Optional[tuple] = None
+        self._qo_buffer: Optional[torch.Tensor] = None
+        self._max_rows: Optional[int] = (
+            None  # the packed query rows a plan may hold (prefill)
+        )
 
     def bind_graph_buffers(
         self,
         paged_kv_indptr_buffer: torch.Tensor,
         paged_kv_indices_buffer: torch.Tensor,
         paged_kv_last_page_len_buffer: torch.Tensor,
+        qo_indptr_buffer: Optional[torch.Tensor] = None,
+        max_total_num_rows: Optional[int] = None,
     ) -> None:
-        """The decode wrapper's ``paged_kv_*_buffer`` arguments under ``use_cuda_graph=True``: ``plan()`` refreshes them and the
-        captured kernels read the first two in place, so they are int32 tensors on the wrapper's device."""
+        """The wrappers' page-table buffers under ``use_cuda_graph=True`` (``paged_kv_*_buffer`` on the decode wrapper,
+        ``*_buf`` on the prefill wrapper, with its ``qo_indptr_buf`` and ``max_total_num_rows``): ``plan()`` refreshes them
+        and the captured kernels read the KV offsets and page indices in place, so they are int32 tensors on the wrapper's
+        device."""
         assert self.graph
+        self._qo_buffer = qo_indptr_buffer
+        self._max_rows = max_total_num_rows
         for name, t in (
-            ("paged_kv_indptr_buffer", paged_kv_indptr_buffer),
-            ("paged_kv_indices_buffer", paged_kv_indices_buffer),
-            ("paged_kv_last_page_len_buffer", paged_kv_last_page_len_buffer),
+            ("the KV indptr buffer", paged_kv_indptr_buffer),
+            ("the KV page-index buffer", paged_kv_indices_buffer),
+            ("the KV last-page-length buffer", paged_kv_last_page_len_buffer),
+            ("the query indptr buffer", qo_indptr_buffer),
         ):
+            if t is None:
+                continue
             if (
                 t.dtype != torch.int32
                 or t.device != self.device
@@ -437,6 +461,26 @@ class BatchInvariantAttention:
                 raise unsupported(
                     CLASS, "a plan without qo_indptr", "the packed query offsets"
                 )
+            if self.graph:
+                # the regular wrapper's frozen shape, with its errors
+                if self._kv_buffers is None:
+                    raise RuntimeError(
+                        "use_cuda_graph=True needs the wrapper's page-table buffers"
+                    )
+                batch = int(qo_indptr.numel()) - 1
+                fixed_batch = self._kv_buffers[2].numel()
+                if batch != fixed_batch:
+                    raise ValueError(
+                        "The batch size should be fixed during the lifecycle of the wrapper in "
+                        "cuda graph mode, the runtime batch size {} mismatches the batch size {} "
+                        " set during initialization.".format(batch, fixed_batch)
+                    )
+                if kv_indices is not None and kv_indices.numel() > (
+                    self._kv_buffers[1].numel()
+                ):
+                    raise ValueError(
+                        "The length of paged_kv_indices exceeds the allocated buffer size."
+                    )
         kv_indptr_host = (
             (kv_indptr if kv_indptr_host is None else kv_indptr_host)
             .to("cpu", non_blocking=False)
@@ -456,6 +500,19 @@ class BatchInvariantAttention:
                 "one KV range per request",
             )
         kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
+        if (
+            self.graph
+            and self.kind == "prefill"
+            and self._max_rows is not None
+            and qo_host.numel()
+            and int(qo_host[-1]) > self._max_rows
+        ):
+            raise ValueError(
+                "The total number of rows in qo_indptr {} in cuda graph mode cannot "
+                "exceed the number of rows set during initialization {}.".format(
+                    int(qo_host[-1]), self._max_rows
+                )
+            )
         if qo_host.numel() and int(qo_host[0]) != 0:
             raise unsupported(
                 CLASS,
@@ -504,7 +561,12 @@ class BatchInvariantAttention:
                     f"kv_indices of {kv_indices.numel()} entries for kv_indptr[-1] = {n_pages}",
                     "one page index per referenced page",
                 )
-            if n_pages and not fast:
+            # a prefill wrapper under use_cuda_graph checks the page indices at its first plan only: later plans run before
+            # every replay and a range check is a device readback
+            unchecked = fast or (
+                self.graph and self.kind == "prefill" and self._fixed is not None
+            )
+            if n_pages and not unchecked:
                 used = kv_indices[:n_pages]
                 bounds = torch.aminmax(used)
                 # Only two scalars cross from CUDA; one readback waits for both bounds.
@@ -529,7 +591,7 @@ class BatchInvariantAttention:
                     f"request {i} with a decreasing qo_indptr / kv_indptr",
                     "non-decreasing offsets",
                 )
-            if ql > kl and not (self.graph and kl == 0):
+            if ql > kl and not (self.graph and self.kind == "decode" and kl == 0):
                 raise unsupported(
                     CLASS,
                     f"request {i} with {ql} query tokens over {kl} keys",
@@ -549,6 +611,22 @@ class BatchInvariantAttention:
             from dataclasses import replace
 
             config = replace(config, split_policy="fused")
+        if (
+            D in engine.Q2_DEFAULT_DIMS
+            and self.kind != "decode"
+            and g >= engine.Q2_DEFAULT_MIN_GROUP[D]
+        ):
+            from dataclasses import replace
+
+            from .swaps.operands import arch_smem_cap
+
+            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill (paged and ragged) from GQA
+            # group engine.Q2_DEFAULT_MIN_GROUP up (smaller groups keep the one-warpgroup body). Its two Q tiles and the
+            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103) at
+            # D = 64; at D = 128 the placement fits the 328 KB parts only (engine.Q2_RING)
+            slots = engine.Q2_RING[D][arch_smem_cap(self.device) >= (300 << 10)]
+            if slots:
+                config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         if self.graph:
             self._plan_fixed(
                 config,
@@ -568,24 +646,9 @@ class BatchInvariantAttention:
                 non_blocking,
                 max_page,
                 fast,
+                qo_indptr,
             )
             return
-        if (
-            D in engine.Q2_DEFAULT_DIMS
-            and self.kind != "decode"
-            and g >= engine.Q2_DEFAULT_MIN_GROUP[D]
-        ):
-            from dataclasses import replace
-
-            from .swaps.operands import arch_smem_cap
-
-            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill (paged and ragged) from GQA
-            # group engine.Q2_DEFAULT_MIN_GROUP up (smaller groups keep the one-warpgroup body). Its two Q tiles and the
-            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103) at
-            # D = 64; at D = 128 the placement fits the 328 KB parts only (engine.Q2_RING)
-            slots = engine.Q2_RING[D][arch_smem_cap(self.device) >= (300 << 10)]
-            if slots:
-                config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         try:
             planned = engine.plan_attention(
                 qo_host,
@@ -676,9 +739,12 @@ class BatchInvariantAttention:
         non_blocking: bool,
         max_page: int,
         fast: bool,
+        qo_indptr: Optional[torch.Tensor] = None,
     ) -> None:
-        """The plan of a ``use_cuda_graph=True`` decode wrapper: the first builds the fixed launch, every one is written into its
-        tables and the wrapper's page-table buffers (``engine.FixedLaunch``), after the frozen options are checked."""
+        """The plan of a ``use_cuda_graph=True`` wrapper: the first builds the fixed launch, every one is written into its
+        tables and the wrapper's page-table buffers (``engine.FixedLaunch``), after the frozen options are checked. A prefill
+        wrapper's kernel knobs (the paired placement, the ring) are those of the first plan; its row capacity is
+        ``max_total_num_rows`` or, without it, the first plan's row count."""
         assert self._kv_buffers is not None
         indptr_buf, indices_buf, last_buf = self._kv_buffers
         c = scale_log2(sm_scale)
@@ -703,10 +769,14 @@ class BatchInvariantAttention:
                 "the options of the wrapper's first plan (a captured graph holds them); only the KV lengths and the page "
                 "table may change",
             )
+        total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         if self._fixed is None:
+            decode = self.kind == "decode"
+            if not decode and self._max_rows is None:
+                self._max_rows = total_q
             self._fixed = engine.FixedLaunch(
                 qo_host.numel() - 1,
-                q_len_per_req,
+                q_len_per_req if decode else None,
                 Hq,
                 Hkv,
                 D,
@@ -714,7 +784,13 @@ class BatchInvariantAttention:
                 config,
                 self.workspace,
                 self.device,
+                max_rows=None if decode else self._max_rows,
             )
+        else:
+            from dataclasses import replace
+
+            # the kernel is the first plan's; the unit kind is this plan's
+            config = replace(self._fixed.config, split_policy=config.split_policy)
         planned = engine.plan_attention(
             qo_host,
             kv_indptr_host,
@@ -734,7 +810,10 @@ class BatchInvariantAttention:
             (indptr_buf, kv_indptr),
             (indices_buf, kv_indices),
             (last_buf, None if fast else kv_last_page_len),
+            (self._qo_buffer, qo_indptr),
         ):
+            if buf is None:
+                continue
             if src is None or (
                 src.device == buf.device and src.data_ptr() == buf.data_ptr()
             ):
@@ -749,7 +828,7 @@ class BatchInvariantAttention:
         self._sm_scale = sm_scale
         self._scale_log2 = c
         self._window_left = window_left
-        self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
+        self._total_q = total_q
         self._heads = (Hq, Hkv, D)
         self._page = page
         self._frozen_plan = frozen
@@ -880,7 +959,15 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"q of shape {tuple(q.shape)}", f"(total_q, {Hq}, {D})"
             )
-        if q.shape[0] != self._total_q:
+        if self.graph and self.kind == "prefill":
+            # the captured launch is built over the caller's q / out of the capture: the plan's rows are its first rows
+            if q.shape[0] < self._total_q:
+                raise unsupported(
+                    CLASS,
+                    f"{q.shape[0]} query rows",
+                    f"at least the planned {self._total_q}",
+                )
+        elif q.shape[0] != self._total_q:
             raise unsupported(
                 CLASS, f"{q.shape[0]} query rows", f"the planned {self._total_q}"
             )
@@ -984,7 +1071,7 @@ class BatchInvariantAttention:
         if self.graph:
             asked = (
                 bool(return_lse),
-                lse_base if return_lse else None,
+                (lse_base, lse_layout) if return_lse else None,
                 sinks is not None,
             )
             if self._frozen_run is None:
@@ -992,7 +1079,7 @@ class BatchInvariantAttention:
             elif asked != self._frozen_run:
                 raise unsupported(
                     CLASS,
-                    f"run() of a use_cuda_graph=True wrapper with (return_lse, lse_base, sinks given) = {asked} after "
+                    f"run() of a use_cuda_graph=True wrapper with (return_lse, LSE base and layout, sinks given) = {asked} after "
                     f"{self._frozen_run}",
                     "the LSE mode and the presence of sinks of the wrapper's first run() (they select the captured kernels)",
                 )

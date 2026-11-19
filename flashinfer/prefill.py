@@ -3253,9 +3253,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
             the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
             fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
             denominator, merged once after the row's last chunk; the LSE includes it). CUDA graphs: capture
-            ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
-            (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
-            (of the order of 10 us per request).
+            ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture --
+            unless the wrapper is built with ``use_cuda_graph=True``, which has the contract of the other backends: the
+            ``qo_indptr_buf`` and ``paged_kv_*_buf`` tensors are given (int32, on the device), the number of requests is
+            fixed for the wrapper's lifetime and the total query rows stay within ``max_total_num_rows`` (the first
+            plan's rows when omitted; a violation raises ``ValueError``), the head counts, head dim, page size, window,
+            ``sm_scale`` and -- from the first ``run()`` -- the LSE mode and the presence of sinks are frozen (a change
+            raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`), and ``plan()`` before every
+            replay may change every request's query length (zero included: a slot without rows) and KV length. The
+            captured ``run()`` then computes the planned rows -- the first ``qo_indptr[-1]`` rows of the ``q`` / ``out``
+            / ``lse`` tensors of the capture, which stay the tensors of every replay; rows beyond are not written --
+            with the bits of an eager call on the same batch. The page indices are range-checked at the first plan
+            only. ``plan()`` runs a host-side planner whose cost grows with the number of requests (of the order of
+            10 us per request; an array planner under ``use_cuda_graph=True``).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -3413,6 +3423,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = max_total_num_rows
+        if self._batch_invariant is not None and use_cuda_graph:
+            self._batch_invariant.bind_graph_buffers(
+                paged_kv_indptr_buf,
+                paged_kv_indices_buf,
+                paged_kv_last_page_len_buf,
+                qo_indptr_buf,
+                max_total_num_rows,
+            )
         # `auto` is re-resolved on every plan() (its answer depends on plan
         # arguments such as window_left); _backend holds the resolved value.
         self._requested_backend = backend
