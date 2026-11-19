@@ -19,7 +19,7 @@
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤4 tokens)
 //   1c. routingIndicesSmallBatchKernel / routingIndicesSmallBatchClusterKernel — single-launch
-//       kernels for 256 experts / top-8, ≤64 tokens (SM10x only)
+//       kernels for 256 experts / top-8, ≤48 tokens (SM10x only)
 //   2. routingIndicesClusterKernel    — single-cluster fused kernel (≤256 tokens, SM90+)
 //   3. routingIndicesHistogramScoresKernel — TopK + histogram from raw scores
 //   4. routingIndicesCoopKernel       — cooperative histogram + offsets (defined in
@@ -66,10 +66,11 @@ void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t nu
 void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThreadsHist,
                          void* stream);
 
-// Small-batch kernels (section 1c): 256 experts, top-8, up to 64 tokens.
+// Small-batch kernels (section 1c): 256 experts, top-8, up to 48 tokens. Above, the kernels used
+// otherwise are as fast in the MoE call.
 static constexpr int SmallBatchKernelNumExperts = NumExperts256Experts;
 static constexpr int SmallBatchKernelTopK = NumTop8Experts;
-static constexpr int SmallBatchKernelMaxNumTokens = 64;
+static constexpr int SmallBatchKernelMaxNumTokens = 48;
 static constexpr int SmallBatchKernelMaxThreads = 1024;
 // Largest batch for the single-CTA kernel; larger batches use the 2-CTA cluster kernel. Small
 // batches keep the policy's own top-k: a faster one lets the routed FC1 GEMM take the SMs ahead
@@ -685,7 +686,7 @@ bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// 1c. Small-batch kernels — 256 experts / top-8, up to 64 tokens, one launch. Input is logits
+// 1c. Small-batch kernels — 256 experts / top-8, up to 48 tokens, one launch. Input is logits
 //     with SigmoidBias + ScaledSumNormalize routing (DeepSeek-V3 style, no expert groups) or
 //     precomputed top-k. Outputs match the kernels they replace bit for bit; inside an expert,
 //     tokens are placed in ascending order.
@@ -2258,7 +2259,7 @@ inline bool smallBatchKernelEnabled() {
 }
 
 // Whether the small-batch kernels (section 1c) serve this call: SM10x only (other architectures
-// keep the existing kernels), 256 experts, top-8, 1-64 tokens, BF16 weights, and either
+// keep the existing kernels), 256 experts, top-8, 1-48 tokens, BF16 weights, and either
 // precomputed top-k or logits with DeepSeek-V3-style SigmoidBias + ScaledSumNormalize routing.
 inline bool canUseSmallBatchKernel(Data const& data) {
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;

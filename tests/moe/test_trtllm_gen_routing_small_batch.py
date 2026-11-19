@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Bit-identity of routingCustom's small-batch kernels (256 experts, top-8, 1-64 tokens:
+Bit-identity of routingCustom's small-batch kernels (256 experts, top-8, 1-48 tokens:
 routingIndicesSmallBatchKernel up to 18 tokens, routingIndicesSmallBatchClusterKernel above) with
 the kernels they replace: static-block, dyn-block, and from logits the split path, for precomputed
 top-k the block permutation kernel.
@@ -54,7 +54,7 @@ from flashinfer.utils import get_compute_capability
 
 NUM_EXPERTS = 256
 TOP_K = 8
-MAX_TOKENS = 64  # SmallBatchKernelMaxNumTokens
+MAX_TOKENS = 48  # SmallBatchKernelMaxNumTokens
 SINGLE_CTA_MAX_TOKENS = 18  # SmallBatchKernelSingleCtaMaxNumTokens
 # Token counts of the routing comparisons: the kernel's window plus the counts around it (outside
 # the window both settings run the previous kernels, which the comparison then pins as identical).
@@ -465,10 +465,10 @@ def test_routing_precomputed_expert_parallel(fmt, window):
 def test_routing_precomputed_invalid_and_duplicate_ids(fmt):
     """Out-of-range ids are not routed; an expert listed twice for a token is routed once,
     from its lowest k. (The previous kernels disagree on duplicates: the block kernels keep one
-    pair, chosen by a race; the cluster kernel routes every copy.)"""
+    pair, chosen by a race; the block permutation kernel routes every copy.)"""
     if not small_batch_kernels_dispatched():
         pytest.skip("the small-batch routing kernels run on SM10x only")
-    for T in [1, 6, 16, 18, 19, 24, 32, 33, 48, 64]:
+    for T in [1, 6, 16, 18, 19, 24, 32, 33, 47, 48]:
         ids, weights = make_topk(T, stable_seed("bad", fmt, T))
         ids[0, 1] = -1
         ids[-1, 7] = NUM_EXPERTS + 3 if fmt == "ids" else -5
@@ -514,7 +514,7 @@ def _routing_kernels(fn):
     )
 
 
-@pytest.mark.parametrize("T", [1, 6, 16, 18, 19, 32, 64, 65])
+@pytest.mark.parametrize("T", [1, 6, 16, 18, 19, 32, 48, 49])
 def test_switch_selects_kernels(T):
     """Guards the premise of the comparisons: the switch really changes the kernels, and the
     small-batch kernels serve exactly the calls in their token windows, in a single launch
@@ -772,7 +772,7 @@ def test_fp4_moe_every_tile(fp4_weights):
     assert {8, 16}.issubset(seen_tiles), f"tiles covered: {sorted(seen_tiles)}"
 
 
-@pytest.mark.parametrize("T", [1, 6, 12, 18, 19, 33, 64])
+@pytest.mark.parametrize("T", [1, 6, 12, 18, 19, 33, 48])
 def test_fp4_moe_cuda_graph(fp4_weights, T):
     """Capture the small-batch path, replay on fresh inputs, compare with the previous path
     run eagerly on the same inputs."""

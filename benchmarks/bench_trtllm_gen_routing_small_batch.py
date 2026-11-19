@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Small-batch DeepSeek-V3-style routing (256 experts, top-8, SigmoidBias + ScaledSumNormalize):
-routingCustom's single-launch small-batch kernels (1-64 tokens) vs the kernels they replace,
+routingCustom's single-launch small-batch kernels (1-48 tokens) vs the kernels they replace,
 selected with FLASHINFER_ROUTING_SMALL_BATCH_KERNEL (read per call). From logits: static block
 <= 4 tokens, dyn-block 5-16, block-scores + post-TopK from 17. Precomputed top-k: static block
 <= 4 tokens, dyn-block 5-8, block permutation from 9.
