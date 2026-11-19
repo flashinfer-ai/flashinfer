@@ -2096,9 +2096,11 @@ __global__ __launch_bounds__(32 * CMB_WARPS, 1) void combine_kernel(
     const float2* st = stats + (size_t)j * split_stride;
     float m0v = -INFINITY, l0v = 0.f, m1v = -INFINITY, l1v = 0.f;
     float g0 = 1.f, g1 = 1.f;
+    bool bad = false;
     if (lane < S) {
       float2 ml = st[lane];
       float lq = ml.y;
+      bad = (lq != lq) || (ml.x != ml.x);
       if (lq > 0.f) {
         m0v = ml.x;
         l0v = lq;
@@ -2107,15 +2109,25 @@ __global__ __launch_bounds__(32 * CMB_WARPS, 1) void combine_kernel(
     if (lane + 32 < S) {
       float2 ml = st[lane + 32];
       float lq = ml.y;
+      bad = bad || (lq != lq) || (ml.x != ml.x);
       if (lq > 0.f) {
         m1v = ml.x;
         l1v = lq;
       }
     }
+    bad = __any_sync(0xffffffffu, bad);
     M = fmaxf(m0v, m1v);
 #pragma unroll
     for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
-    if (M > -INFINITY) {
+    if (bad) {
+      // NaN statistics in any split of this row: NaN is data (the public
+      // dtype checks admit non-finite fp8 inputs), so poison BOTH outputs
+      // -- the fmaxf-based reductions would otherwise drop the NaN split
+      // and produce a finite wrong result (or a -inf LSE).
+      a0 = a1 = a2 = a3 = __int_as_float(0x7fc00000);
+      M = __int_as_float(0x7fc00000);
+      L = 1.0f;  // lse2(NaN, 1) propagates NaN to the LSE
+    } else if (M > -INFINITY) {
       float w0 = (l0v > 0.f) ? ex2(m0v - M) * l0v : 0.f;
       float w1 = (l1v > 0.f) ? ex2(m1v - M) * l1v : 0.f;
       sw[warp][lane] = w0 * g0;
@@ -2155,11 +2167,10 @@ __global__ __launch_bounds__(32 * CMB_WARPS, 1) void combine_kernel(
           }
         }
       }
-    } else {
-      // A nonempty row whose statistics are all invalid must propagate NaN.
-      // True empty-KV rows have S == 0 and retain their zero result.
-      a0 = a1 = a2 = a3 = __int_as_float(0x7fc00000);
     }
+    // else: every split published l == 0 (an empty runtime extent).  Keep
+    // the empty-KV form -- zero output and lse2(-inf, 0) == -inf -- the
+    // NaN case is handled above, from the statistics themselves.
   }
   float iv = (L > 0.0f) ? 1.0f / L : 0.0f;
   if (lane == 0) Lse[j] = lse2(M, L);
@@ -2198,20 +2209,27 @@ __global__ __launch_bounds__(32 * CMB_WARPS,
   }
 
   float m = -INFINITY, l = 0.0f, g = 1.0f;
+  int bad = 0;
   if (valid && hlane < S) {
     if constexpr (PACKED_STATS) {
       uint32_t ml = reinterpret_cast<const uint32_t*>(stats)[(size_t)j * S + hlane];
       l = unpack_bf((uint16_t)(ml >> 16));
-      if (l > 0.0f) m = unpack_bf((uint16_t)ml);
+      float mraw = unpack_bf((uint16_t)ml);
+      bad = (l != l) || (mraw != mraw);
+      if (l > 0.0f) m = mraw;
     } else {
       float2 ml = stats[(size_t)j * S + hlane];
       l = ml.y;
+      bad = (l != l) || (ml.x != ml.x);
       if (l > 0.0f) m = ml.x;
     }
   }
   float M = m;
 #pragma unroll
-  for (int o = 8; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o, 16));
+  for (int o = 8; o; o >>= 1) {
+    M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o, 16));
+    bad |= __shfl_xor_sync(0xffffffffu, bad, o, 16);
+  }
 
   float w = (M > -INFINITY && l > 0.0f) ? ex2(m - M) * l : 0.0f;
   sw[local][hlane] = w * g;
@@ -2220,7 +2238,14 @@ __global__ __launch_bounds__(32 * CMB_WARPS,
   for (int o = 8; o; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o, 16);
   __syncwarp();
 
-  if (valid && M > -INFINITY) {
+  if (valid && bad) {
+    // NaN statistics in any split of this row: poison BOTH outputs (see
+    // combine_kernel) -- the max/sum reductions would otherwise drop the
+    // NaN split and produce a finite wrong result.
+    if (hlane == 0) Lse[j] = __int_as_float(0x7fc00000);
+    const uint32_t nan2 = 0x7fc07fc0u;
+    *(uint4*)(Out + (size_t)j * DV + hlane * 8) = make_uint4(nan2, nan2, nan2, nan2);
+  } else if (valid && M > -INFINITY) {
     if (hlane == 0) Lse[j] = lse2(M, L);
     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
     float a4 = 0.f, a5 = 0.f, a6 = 0.f, a7 = 0.f;
@@ -2245,9 +2270,11 @@ __global__ __launch_bounds__(32 * CMB_WARPS,
                           pack_bf2(a4 * iv, a5 * iv), pack_bf2(a6 * iv, a7 * iv));
     *(uint4*)(Out + (size_t)j * DV + hlane * 8) = ov;
   } else if (valid) {
+    // Every split published l == 0 (an empty runtime extent): keep the
+    // empty-KV form, zero output and -inf LSE.  The NaN case is handled
+    // above, from the statistics themselves.
     if (hlane == 0) Lse[j] = -INFINITY;
-    const uint32_t nan2 = 0x7fc07fc0u;
-    *(uint4*)(Out + (size_t)j * DV + hlane * 8) = make_uint4(nan2, nan2, nan2, nan2);
+    *(uint4*)(Out + (size_t)j * DV + hlane * 8) = make_uint4(0u, 0u, 0u, 0u);
   }
 }
 
