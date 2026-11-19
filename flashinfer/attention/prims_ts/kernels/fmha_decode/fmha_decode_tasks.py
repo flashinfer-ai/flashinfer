@@ -831,6 +831,7 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
+        queue_work_tile = work_tile
         if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
             work_tile = WorkTileInfo(
                 split_kv_grid_coord(self.cfg, work_tile.tile_idx),
@@ -851,20 +852,10 @@ class DecodeGenTask(Task):
             # task graph.  Keep all persistent tasks on the same logical tile
             # until that tail has drained.  KV256's shared-KV alias instead
             # uses a narrow Load/Correction credit in the captured schedule.
-            if cutlass.const_expr(
-                self.cfg.use_variable_seqlens_q and self.cfg.use_persistent_scheduler
-            ):
-                assert isinstance(self.work_queue, PackedDecodeWorkQueue)
-                q_group_cta_idx, _, b_idx = work_tile.tile_idx
-                _, seq_len_q = _q_seq_bounds(
-                    self.cfg,
-                    self.work_queue.cu_seqlens_q,
-                    cutlass.Int32(b_idx),
-                )
-                q_group_idx = cutlass.Int32(q_group_cta_idx)
-                if _q_group_token_base(self.cfg, q_group_idx) < seq_len_q:
-                    prims.barrier_cta_sync(12, thread_count=16 * 32)
-            else:
+            # Tasks with ``skip_if`` reach this barrier only on tiles the work
+            # queue keeps, so tasks without it test the same predicate.
+            assert isinstance(self.work_queue, PackedDecodeWorkQueue)
+            if not self.work_queue.skip_work_tile_if(queue_work_tile):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
 
     @cute.jit
