@@ -50,7 +50,9 @@ def _clean(monkeypatch):
 def _sm90_or_skip():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if torch.cuda.get_device_capability() != (9, 0):
+    # the GPU tests allocate and capture on cuda:0, so gate on THAT device's
+    # capability, not on torch.cuda.current_device()
+    if torch.cuda.get_device_capability(0) != (9, 0):
         pytest.skip("SM90 required")
 
 
