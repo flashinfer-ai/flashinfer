@@ -67,12 +67,13 @@ from .support_kernel import (
     _compact_sweep,
     _list_filter,
     _cvt_rzi_s64_f32,
+    _bitcast_i32_to_f32,
     _f32_bits,
+    _neg_or_nan,
     _IntReducer,
     _kept_shortcut,
     _kind,
     _masked_sum,
-    _neg_sweep,
     _Radix,
     _list_totals,
     _radix_select,
@@ -462,25 +463,6 @@ class DrawSupportKernel:
             cbox,
             lpos,
         )
-        # ===== the input domain: a probability row with a negative weight is invalid on every path (support_kernel._neg_sweep) ====
-        no_neg = Boolean(True)
-        if cutlass.const_expr(not self.from_logits):
-            n_iters_w = -(
-                -(self.cfg.blocks_per_cta(self.N) * BLOCK * self.elem_bytes // 4)
-                // (self.num_threads * WPT)
-            )
-            neg_cnt = _neg_sweep(
-                words,
-                rx.n_words,
-                rx.col0,
-                N,
-                tid,
-                self.kind,
-                self.num_threads,
-                n_iters_w,
-                1 if self.kind == 0 else 2,
-            )
-            no_neg = red.reduce(neg_cnt, "add", peers) == Int32(0)
         # the row sum is read by a top-p selection over the whole row (the joint order, or no top-k) -- with the top_k_first
         # shortcut the top-p base is the top-k kept mass (the masked tree below) -- and by the drawn token's
         # full-distribution log-probability
@@ -510,14 +492,21 @@ class DrawSupportKernel:
         n_all = Int32(
             CAP + 1
         )  # the tail's list count: the top-k kept set (filtered from the count tail's list)
+        neg_k = Boolean(
+            False
+        )  # the top-k pass admits no negative weight / NaN: its candidate count then falls short of N
         if cutlass.const_expr(self.use_k):
             kk = mK[row_c]
-            # k <= 0: nothing kept (INF_BITS, an empty list); k >= N: everything kept (threshold 0, the list beyond its
-            # capacity -- the dense path); otherwise the selection
+            # k <= 0: nothing kept (INF_BITS; the dense tail over an all-masked row, whose flagged leaves still report a
+            # negative weight or a NaN as the contract's NaN mass -- the count pass that flags the list paths is skipped
+            # here); k >= N: everything kept (threshold 0, the list beyond its capacity -- the dense path); otherwise the
+            # selection
             thr_bits = _select(kk <= Int32(0), Int32(INF_BITS), Int32(0))
-            n_all = _select(kk <= Int32(0), Int32(0), Int32(CAP + 1))
             if (kk > Int32(0)) & (kk < N):
-                thr_bits, n_list = _topk_threshold(self, rx, tid, t, kk, peers, red)
+                thr_bits, n_list, tot_c0 = _topk_threshold(
+                    self, rx, tid, t, kk, peers, red
+                )
+                neg_k = tot_c0 != N
                 # the kept set leaves the count tail's list NOW: the list aliases the mass slots that a top-p selection
                 # over the row clears (the joint order; a shortcut whose kept set exceeds the list) -- the tail's floor
                 # applies any later threshold (the final kept set is a subset of this one)
@@ -650,9 +639,9 @@ class DrawSupportKernel:
                 self, loader, leaf, peers, thr_bits, u, t, w, c_rank
             )
         loader.frags.clear()
-        mass = _select(
-            no_neg, mass, Float32(NAN)
-        )  # a negative weight in the row: invalid (NaN mass fails every validity test below)
+        # the input domain (a negative weight or a NaN in the row): NaN mass, which fails every validity test below -- the
+        # list tail's rows know it from the top-k pass (its candidate count), the dense tail's from its own masked tree
+        mass = _select(neg_k, Float32(NAN), mass)
         if cutlass.const_expr(self.score):
             token, valid, mass, lp, lpk = _score_token(
                 self, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp
@@ -696,12 +685,14 @@ class DrawSupportKernel:
 
 
 def _topk_threshold(k, rx, tid, lane, kk, peers, red):
-    """The top-k threshold pattern of a row with ``0 < k < N`` and the count tail's list count (-1 when the kept set is not on
-    its list) -- two scalars, so the kernel's row-uniform branch around the selection carries no tuple."""
+    """The top-k threshold pattern of a row with ``0 < k < N``, the count tail's list count (-1 when the kept set is not on
+    its list) and pass 0's cluster-wide candidate count -- ``N`` unless the row holds a negative weight or a NaN
+    (``_radix_sweep``'s value test admits neither): three scalars, so the kernel's row-uniform branch around the selection
+    carries no tuple."""
     r = _radix_select(
         k, rx, tid, lane, False, kk, Int64(0), Float32(0.0), Int32(0), peers, red
     )
-    return r[0], r[4]
+    return r[0], r[4], r[1]
 
 
 def _kept_compact(k, rx, tid, lane, warp, c_rank, base_bits, peers, cpos):
@@ -752,26 +743,74 @@ def _addr_token(k, a, ok):
     return _select(ok, ((block_a << 5) + lane_a) * 8 + (a & 7), Int32(-1))
 
 
+def _flagged(leaf):
+    """``leaf`` with a side effect: ``flags`` collects ``_neg_or_nan(we)`` for every value it returns -- one predicate compare
+    per element, no register, no extra pass: the input-domain test of a probability row (a negative weight) and of any row (a
+    NaN) inside a tree the kernel runs anyway. Returns ``(the wrapped leaf, flags)``; ``_poison`` combines them."""
+    flags = []
+
+    def f(key):
+        we = leaf(key)
+        flags.append(_neg_or_nan(we))
+        return we
+
+    return f, flags
+
+
+def _any(flags):
+    """The OR of the flags as a PAIRWISE tree. A chain (``neg = neg | flag`` leaf after leaf) is a serial critical path of
+    70-odd dependent predicate ops that the scheduler covers by hoisting the leaves' loads and conversions ahead of it: the
+    top-k kernel at bf16 152064 went from 64 to 117 registers on that form alone (2026-11-18, attributed by ablation), and the
+    Int32 chain before it spilled the T512 kernels. The tree is seven deep and ptxas still fuses each first-level OR into its
+    compare (``FSETP.LTU.OR``)."""
+    while len(flags) > 1:
+        nxt = [flags[i] | flags[i + 1] for i in range(0, len(flags) - 1, 2)]
+        if len(flags) % 2:
+            nxt.append(flags[-1])
+        flags = nxt
+    return flags[0]
+
+
+def _poison(state, flags):
+    """One partial of a tree's per-thread state (what ``canon.init_state`` returns) becomes NaN where any of the thread's flags
+    is set, so the tree's result is NaN on every thread of the row: the row-wide test rides the tree's own exchanges, no extra
+    reduction; clear flags leave the partial, and every bit of the tree, untouched."""
+    if flags:
+        k0 = next(iter(state))
+        state[k0] = _select(_any(flags), Float32(NAN), state[k0])
+
+
 def _dense_tail(k, loader, leaf, peers, thr_bits, u, t, w, c_rank):
     """The list tail's fallback over the row: the kept mass as the masked tree with the peers recording, and (the draw forms)
-    the crossing over the masked leaf -- returns ``(mass, first token, last token)`` with ``-1`` tokens where none."""
+    the crossing over the masked leaf -- returns ``(mass, first token, last token)`` with ``-1`` tokens where none. The kept
+    test is one compare on the value (``we >= thr``: the pattern test's set for the class's non-negative weights, no magnitude
+    mask), and the input-domain test rides the tree: its leaves flag a negative weight or a NaN (``_flagged``) and the flag
+    poisons one partial (``_poison``), so such a row's mass is NaN on every thread -- no token, no validity; no extra pass or
+    exchange (2026-11-18, the review's second round; docs 21.9)."""
     fp = CuteF32
+    thr = _bitcast_i32_to_f32(thr_bits)
+    flagged, neg = _flagged(leaf)
 
-    def masked_leaf(key):
+    def masked_leaf(key):  # the crossing's leaf: the kept value, no side effect
         we = leaf(key)
-        return _select(_weight_bits(we) >= thr_bits, we, Float32(0.0))
+        return _select(we >= thr, we, Float32(0.0))
+
+    def tree_leaf(key):  # the tree's leaf: the same value, the flag on the way
+        we = flagged(key)
+        return _select(we >= thr, we, Float32(0.0))
 
     peers.recording = True
-    state, start = canon.init_state(k.plan_sum, fp, masked_leaf)
+    state, start = canon.init_state(k.plan_sum, fp, tree_leaf)
+    _poison(state, neg)
     totals = _block_totals(k.plan_sum, state, k.kpw)
     mass = canon.run(k.plan_sum, state, start, peers, fp)
     peers.recording = False
     first = Int32(INT_MAX)
     last = Int32(-1)
     if not k.score:
-        thr = fp.mul(u, mass)
+        thr_u = fp.mul(u, mass)
         first, last = _crossing_pass(
-            k, loader, masked_leaf, peers, totals, thr, t, w, c_rank
+            k, loader, masked_leaf, peers, totals, thr_u, t, w, c_rank
         )
         first, last = peers.int_reduce(first, last)
     return (

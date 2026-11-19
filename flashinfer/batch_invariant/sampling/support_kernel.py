@@ -47,7 +47,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int32, Int64
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import arith, llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import canon
@@ -102,6 +102,17 @@ def _f32_bits(a: Float32, *, loc=None, ip=None) -> Int32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _neg_or_nan(we) -> Boolean:
+    """``we < 0`` or NaN in ONE compare (``setp.ltu.f32``, the unordered less-than): a weight outside the class -- the sign bit
+    with a non-zero magnitude (``-0.0`` is a zero: ``-0.0 < 0`` is false), or a NaN of either sign (a logits input's ``ex2`` is
+    never negative, so there it is the NaN test); ``+inf`` is not flagged (its row sum is, as before)."""
+    return Boolean(
+        arith.cmpf(
+            arith.CmpFPredicate.ULT, Float32(we).ir_value(), Float32(0.0).ir_value()
         )
     )
 
@@ -548,45 +559,6 @@ def _staged_weight(wv, h: int, kind: int, from_logits: bool, nm, c):
 
 
 @cute.jit
-def _neg_sweep(
-    words: cute.Tensor,
-    n_words: Int32,
-    col0: Int32,
-    N: Int32,
-    tid: Int32,
-    kind: cutlass.Constexpr[int],
-    nthreads: cutlass.Constexpr[int],
-    n_iters: cutlass.Constexpr[int],
-    epw: cutlass.Constexpr[int],
-) -> Int32:
-    """This thread's count of NEGATIVE weights among the staged words of a probability input: the sign bit set with a non-zero
-    magnitude (``-0.0`` is a zero; a negative NaN counts). The class's weights are non-negative (``support_spec.pattern``), so a
-    row with a negative value is outside the contract and the kernels make it invalid on every path and placement -- the
-    selections work on 31-bit patterns, so the list path would otherwise sum such a weight as its magnitude and draw it where
-    the dense sweeps flagged the row invalid, the same row valid or invalid depending on k (the review of #9619, 2026-11-18)."""
-    cnt = Int32(0)
-    for it in cutlass.range_constexpr(n_iters):
-        for m in cutlass.range_constexpr(WPT):
-            idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
-            valid = idx < n_words
-            idxc = _select(valid, idx, n_words - 1)
-            wv = words[idxc]
-            for h in cutlass.range_constexpr(epw):
-                raw = _f32_bits(
-                    _staged_weight(wv, h, kind, False, Float32(0.0), Float32(0.0))
-                )
-                g = col0 + idxc * epw + h
-                neg = (
-                    valid
-                    & (g < N)
-                    & (raw < Int32(0))
-                    & ((raw & Int32(0x7FFFFFFF)) != Int32(0))
-                )
-                cnt = cnt + _select(neg, Int32(1), Int32(0))
-    return cnt
-
-
-@cute.jit
 def _radix_sweep(
     words: cute.Tensor,
     n_words: Int32,
@@ -621,6 +593,14 @@ def _radix_sweep(
     rep = lane & Int32(RM - 1)
     dummy_c = cnt_base + Int32(BINS * 4)
     dummy_m = m_base + (Int32(BINS * RM * n_chunks) + lane * n_chunks) * 4
+    # the candidate test is on the VALUE: ``we >= base`` (a mass selection: ``>=`` the smallest positive pattern, so zeros are
+    # out) -- for the class's non-negative weights exactly the pattern test ``bits >= base_bits`` (one compare, as before, and no
+    # magnitude mask), and a NEGATIVE weight or a NaN is no candidate at all, so pass 0's cluster-wide count falls short of N
+    # exactly when the row holds one: the kernel's input-domain test on the list paths, at no cost (2026-11-18, docs 21.9)
+    if cutlass.const_expr(by_mass):
+        base_f = _bitcast_i32_to_f32(_imax(base_bits, Int32(1)))
+    else:
+        base_f = _bitcast_i32_to_f32(base_bits)
     for it in range(n_iters):
         for m in cutlass.range_constexpr(WPT):
             idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
@@ -629,11 +609,11 @@ def _radix_sweep(
             wv = words[idxc]
             for h in cutlass.range_constexpr(epw):
                 we = _staged_weight(wv, h, kind, from_logits, nm, c)
-                bits = _weight_bits(we)
+                bits = _f32_bits(
+                    we
+                )  # a candidate's pattern (non-negative: the value test admits no other)
                 g = col0 + idxc * epw + h
-                ok = valid & (g < N) & (bits >= base_bits)
-                if cutlass.const_expr(by_mass):
-                    ok = ok & (bits > Int32(0))
+                ok = valid & (g < N) & (we >= base_f)
                 if cutlass.const_expr(p > 0):
                     ok = ok & ((bits >> (shift + width)) == prefix)
                 digit = (bits >> shift) & dmask
@@ -907,6 +887,12 @@ def _compact_sweep(
     lane_lt = (Int32(1) << lane) - Int32(1)
     lead = lane == Int32(0)
     dummy = cnt_addr + Int32(4)
+    if cutlass.const_expr(
+        by_mass
+    ):  # the value test (_radix_sweep's note): negatives and NaN out; a mass selection: zeros out
+        base_f = _bitcast_i32_to_f32(_imax(base_bits, Int32(1)))
+    else:
+        base_f = _bitcast_i32_to_f32(base_bits)
     for it in cutlass.range_constexpr(n_iters):
         bl = []
         gl = []
@@ -919,17 +905,15 @@ def _compact_sweep(
             wv = words[idxc]
             for h in cutlass.range_constexpr(epw):
                 we = _staged_weight(wv, h, kind, from_logits, nm, c)
-                bits = _weight_bits(we)
+                bits = _f32_bits(we)
                 g = col0 + idxc * epw + h
                 ok = (
                     valid
                     & (g < N)
-                    & (bits >= base_bits)
+                    & (we >= base_f)
                     & (bits < hi_bits)
                     & ((bits >> shift) == prefix)
                 )
-                if cutlass.const_expr(by_mass):
-                    ok = ok & (bits > Int32(0))
                 bl.append(bits)
                 gl.append(g)
                 okl.append(ok)
@@ -985,6 +969,10 @@ def _compact_sweep_eager(
     one ``atom.shared.add`` by lane 0, the lanes' ranks within the ballot place them; a candidate past the list's capacity
     goes to the dummy slot ``CAP`` (the caller takes this path only when the count fits)."""
     lane_lt = (Int32(1) << lane) - Int32(1)
+    if cutlass.const_expr(by_mass):  # the value test (_radix_sweep's note)
+        base_f = _bitcast_i32_to_f32(_imax(base_bits, Int32(1)))
+    else:
+        base_f = _bitcast_i32_to_f32(base_bits)
     for it in range(n_iters):
         for m in cutlass.range_constexpr(WPT):
             idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
@@ -993,11 +981,9 @@ def _compact_sweep_eager(
             wv = words[idxc]
             for h in cutlass.range_constexpr(epw):
                 we = _staged_weight(wv, h, kind, from_logits, nm, c)
-                bits = _weight_bits(we)
+                bits = _f32_bits(we)
                 g = col0 + idxc * epw + h
-                ok = valid & (g < N) & (bits >= base_bits) & ((bits >> shift) == prefix)
-                if cutlass.const_expr(by_mass):
-                    ok = ok & (bits > Int32(0))
+                ok = valid & (g < N) & (we >= base_f) & ((bits >> shift) == prefix)
                 ballot = cute.arch.vote_ballot_sync(ok)
                 n_w = _popc(ballot)
                 if n_w > Int32(0):
@@ -1831,12 +1817,14 @@ def _radix_select(
 
 
 def _masked_sum(k, leaf, peers, thr_bits):
-    """The canonical sum tree over the weights with pattern ``>= thr_bits`` (the others ``+0``)."""
+    """The canonical sum tree over the weights with pattern ``>= thr_bits`` (the others ``+0``): the kept test on the value
+    (the same set for the class's non-negative weights; a negative weight or a NaN is ``+0`` here and flagged elsewhere)."""
     fp = CuteF32
+    thr = _bitcast_i32_to_f32(thr_bits)
 
     def masked_leaf(key):
         we = leaf(key)
-        return _select(_weight_bits(we) >= thr_bits, we, Float32(0.0))
+        return _select(we >= thr, we, Float32(0.0))
 
     state, start = canon.init_state(k.plan_sum, fp, masked_leaf)
     return canon.run(k.plan_sum, state, start, peers, fp)

@@ -2167,7 +2167,9 @@ def test_negative_weights_make_the_row_invalid_on_every_placement():
     invalid -- token -1, no validity, NaN mass -- on every path and placement: the kept-set list (k <= 64), the dense sweeps
     (k above the list, top-p alone, min-p alone), the joint order, the re-read, cluster and staged members; ``-0.0`` is a zero
     and the other rows are untouched, as the exact model declares. The review of #9619 (2026-11-18) found the list path summing
-    such a weight as its magnitude and drawing it where the dense sweeps flagged the row invalid."""
+    such a weight as its magnitude and drawing it where the dense sweeps flagged the row invalid; the second round found the first fix's sweep
+    costing up to half the FlashInfer build's time, so the rule now rides the kernels' own passes (a NaN weight of
+    either sign invalidates the row as before) -- this test is its contract."""
     M = 8
     for N, dtype in ((1000, torch.float32), (4097, torch.bfloat16)):
         w = weights(M, N, dtype, seed=9)
@@ -2181,6 +2183,9 @@ def test_negative_weights_make_the_row_invalid_on_every_placement():
             ] = -4194304  # 0xFFC00000: a NaN with the sign bit set
         else:
             w.view(torch.int16)[6, 3] = -64  # bf16 0xFFC0: a NaN with the sign bit set
+        w[7, 9] = float(
+            "nan"
+        )  # a NaN with the sign bit clear: NaN mass, invalid as before
         s, o = keys(M, 7)
 
         def full(v, dt=torch.float32):
@@ -2210,7 +2215,7 @@ def test_negative_weights_make_the_row_invalid_on_every_placement():
         for kw, f in cases:
             ref = DR.draw_support_reference(w, s.tolist(), o.tolist(), [f] * M)
             assert (
-                not ref["valid"][[1, 2, 4, 6]].any()
+                not ref["valid"][[1, 2, 4, 6, 7]].any()
                 and bool(ref["valid"][0])
                 and bool(ref["valid"][3])
             ), f
@@ -2218,10 +2223,24 @@ def test_negative_weights_make_the_row_invalid_on_every_placement():
                 r = probs_draw(w, s, o, config=cfg, **kw)
                 _same(r, ref, label=f"{f} {cfg.describe() if cfg else 'default'}")
                 assert torch.equal(
-                    r["samples"][[1, 2, 4, 6]].cpu().long(),
-                    torch.full((4,), -1, dtype=torch.int64),
+                    r["samples"][[1, 2, 4, 6, 7]].cpu().long(),
+                    torch.full((5,), -1, dtype=torch.int64),
                 )
-                assert bool(torch.isnan(r["mass"][[1, 2, 4, 6]]).all())
+                assert bool(torch.isnan(r["mass"][[1, 2, 4, 6, 7]]).all())
+        # k <= 0 keeps nothing: every row invalid, the negative rows with the contract's NaN mass (no count pass runs for
+        # them: the dense tail's flagged leaves report it), the others with the empty kept set's +0
+        kw0 = {"top_k": full(0, torch.int32)}
+        ref0 = DR.draw_support_reference(
+            w, s.tolist(), o.tolist(), [Filters(top_k=0)] * M
+        )
+        assert (
+            not ref0["valid"].any()
+            and bool(torch.isnan(ref0["mass"][[1, 2, 4, 6, 7]]).all())
+            and float(ref0["mass"][0]) == 0.0
+        )
+        for cfg in _configs(N, dtype.itemsize, k=5) + [None]:
+            r = probs_draw(w, s, o, config=cfg, **kw0)
+            _same(r, ref0, label=f"top_k=0 {cfg.describe() if cfg else 'default'}")
 
 
 @needs_device
