@@ -2376,9 +2376,8 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
   // uniform2 must be here: its kernels verify the uniform speculation against
   // cu_q's ABSOLUTE packed offsets, which a chunk-local request index and a
   // rebased q/out pointer would both break on every chunk after the first.
-  const bool batch_on_x =
-      uniform128 || uniform2 ||
-      (max_kv_len <= 8 && max_q == max_kv_len && (max_q == 6 || max_q == 8));
+  const bool batch_on_x = uniform128 || uniform2 ||
+                          (max_kv_len <= 8 && max_q == max_kv_len && (max_q == 6 || max_q == 8));
   const int batch_step = batch_on_x || total_B <= 65535 ? total_B : 65535;
   int rbase = 0;
   do {
