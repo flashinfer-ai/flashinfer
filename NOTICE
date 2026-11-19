@@ -46,3 +46,14 @@ and FlashInfer PR #4266 provenance. The fixed-order batched GEMM retains
 code derived from batch_invariant_ops, Copyright 2025 Thinking Machines Lab,
 under the MIT License (licenses/LICENSE.batch-invariant-ops.txt).
 Pinned sources and modifications: flashinfer/experimental/hc_sum_sm100/SOURCES.md.
+
+The SM90 NVFP4-weight x BF16-activation fused MoE kernels
+(include/flashinfer/fused_moe/sm90_nvfp4_w4a16/, csrc/sm90_nvfp4_w4a16_moe_*.cu,
+flashinfer/fused_moe/sm90_nvfp4_w4a16.py) are adapted from
+gauravjain14/muse-okc-submissions (muse_moe_w4a16), Copyright gauravjain14,
+under Apache-2.0. That work builds on vjeux/okc-2026, Copyright vjeux, and
+alygg77/okc-muse-spark-kernels, Copyright 2026 alygg77, both under Apache-2.0.
+Changes: hidden / intermediate sizes, expert count and post-norm became
+parameters, gate and up take separate global scales, a large-batch persistent
+kernel and finalize kernel were added, and multi-GPU paths were removed.
+Source: https://github.com/gauravjain14/muse-okc-submissions

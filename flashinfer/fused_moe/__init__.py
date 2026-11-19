@@ -276,6 +276,14 @@ from .moe_lora_delta import (  # noqa: F401
     bgmv_moe_gemm1_lora_delta as bgmv_moe_gemm1_lora_delta,
     bgmv_moe_gemm2_lora_delta as bgmv_moe_gemm2_lora_delta,
 )
+from .sm90_nvfp4_w4a16 import (  # noqa: F401
+    Sm90Nvfp4W4A16MoEWorkspace as Sm90Nvfp4W4A16MoEWorkspace,
+    Sm90Nvfp4W4A16Weights as Sm90Nvfp4W4A16Weights,
+    dequantize_sm90_nvfp4_w4a16_weights as dequantize_sm90_nvfp4_w4a16_weights,
+    get_sm90_nvfp4_w4a16_moe_workspace as get_sm90_nvfp4_w4a16_moe_workspace,
+    prepare_sm90_nvfp4_w4a16_weights as prepare_sm90_nvfp4_w4a16_weights,
+    sm90_nvfp4_w4a16_moe as sm90_nvfp4_w4a16_moe,
+)
 from .monomoe import (  # noqa: F401
     mono_moe as mono_moe,
     has_monomoe as has_monomoe,
@@ -545,6 +553,12 @@ __all__ = [
     "alloc_scratchpad",
     "get_scratchpad_size_bytes",
     "interleave_for_tma_wgmma_up",
+    "Sm90Nvfp4W4A16MoEWorkspace",
+    "Sm90Nvfp4W4A16Weights",
+    "dequantize_sm90_nvfp4_w4a16_weights",
+    "get_sm90_nvfp4_w4a16_moe_workspace",
+    "prepare_sm90_nvfp4_w4a16_weights",
+    "sm90_nvfp4_w4a16_moe",
 ]
 
 # Add CuteDSL exports if available

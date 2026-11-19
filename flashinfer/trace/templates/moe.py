@@ -6420,3 +6420,65 @@ alphamoe_fused_router_trace = TraceTemplate(
     tags=["status:experimental", "moe", "sm100", "sm103"],
     init=_alphamoe_fused_router_init,
 )
+
+
+# ---------------------------------------------------------------------------
+# sm90_nvfp4_w4a16_moe — SM90 NVFP4-weight x BF16-activation fused MoE
+# ---------------------------------------------------------------------------
+# Packed weights (flashinfer.fused_moe.prepare_sm90_nvfp4_w4a16_weights):
+#   w13 : [num_local_experts, hidden_size / 256, 2 * intermediate_size / 256, 35840] uint8
+#   w2  : [num_local_experts, intermediate_size / 256, hidden_size / 256, 35840] uint8
+sm90_nvfp4_w4a16_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="sm90_nvfp4_w4a16_moe",
+    description=(
+        "SM90 fused MoE with NVFP4 expert weights (packed for the in-register decoder) "
+        "and BF16 activations: SwiGLU experts, optional per-route RMSNorm, top-k sum. "
+        "Precomputed routing with local expert ids."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of input tokens."),
+        "hidden_size": Const(abbrev="h"),
+        "num_local_experts": Const(abbrev="e"),
+        "top_k": Const(abbrev="topk"),
+        "gate_up_k_chunks": Const(abbrev="", description="hidden_size / 256."),
+        "gate_up_row_blocks": Const(
+            abbrev="", description="2 * intermediate_size / 256."
+        ),
+        "down_k_chunks": Const(abbrev="ic", description="intermediate_size / 256."),
+        "down_row_blocks": Const(abbrev="", description="hidden_size / 256."),
+        "weight_block_bytes": Const(abbrev="", description="35840."),
+        "two": Const(abbrev="", description="2 (gate, up)."),
+    },
+    inputs={
+        "hidden_states": Tensor(["num_tokens", "hidden_size"]),
+        "topk_ids": Tensor(
+            ["num_tokens", "top_k"],
+            description="Local expert ids; ids outside [0, num_local_experts) are skipped.",
+        ),
+        "topk_weights": Tensor(["num_tokens", "top_k"]),
+        "w13": Tensor(
+            [
+                "num_local_experts",
+                "gate_up_k_chunks",
+                "gate_up_row_blocks",
+                "weight_block_bytes",
+            ]
+        ),
+        "w13_global_scale": Tensor(["two", "num_local_experts"]),
+        "w2": Tensor(
+            [
+                "num_local_experts",
+                "down_k_chunks",
+                "down_row_blocks",
+                "weight_block_bytes",
+            ]
+        ),
+        "w2_global_scale": Tensor(["num_local_experts"]),
+        "post_norm_weight": Tensor(["hidden_size"], optional=True),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "hidden_size"], dtype="bfloat16"),
+    },
+    tags=["moe", "sm90", "quantization:fp4"],
+)
