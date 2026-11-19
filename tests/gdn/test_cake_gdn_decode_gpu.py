@@ -1172,10 +1172,10 @@ def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma
     # No sm_107a record from 10 rows on runs a state whose base is not 16-byte aligned: the
     # pointer twins it replaces move the state with 16-byte vector loads and stores (a
     # misaligned-address fault), and the TMA-state record needs an aligned tensor-map
-    # base.  Through the public API the misaligned call is refused before launch with
-    # the state untouched; the same call on an aligned state runs the TMA-state record
-    # and matches a direct launch of that record bit for bit.  The row resolves its
-    # launch once (an empty launch table here) and every later call reuses it.
+    # base.  Through the public API the misaligned call is refused before the row
+    # resolves its launch, with the state untouched; the same call on an aligned state
+    # runs the TMA-state record and matches a direct launch of that record bit for bit.
+    # The aligned call resolves the row's launch once (an empty launch table here).
     route, entry = _require_tma_state_route(batch_size)
     tensors = _make_inputs(batch_size)
     initial = tensors["state"].clone()
@@ -1216,7 +1216,8 @@ def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma
             call(misaligned)
         torch.cuda.synchronize()
         assert torch.equal(misaligned, initial)
-    assert selected == [route.variant_name]
+    assert selected == []
+    assert gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES == {}
 
     tensors["out"].zero_()
     call(tensors["state"])

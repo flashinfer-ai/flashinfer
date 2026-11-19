@@ -573,10 +573,17 @@ _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES: dict[int, tuple] = {}
 # The twin's claim counter pairs of this thread's eager launches, by (device index, raw
 # stream handle): the pair ``cake_locality.launch_counters`` returned for that stream,
 # as tvm-ffi tensors (``_cake_gdn_launch_arg``), reused by later eager launches on it
-# without that call.  That is the reuse ``launch_counters`` makes itself: launches on
-# one stream are ordered, and each launch leaves its pair zero.  Never used under CUDA
-# graph capture.  At most ``cake_locality.STREAM_PAIR_LIMIT`` pairs per thread; past it
-# they are dropped.
+# without that call.  Never used under CUDA graph capture.  At most
+# ``cake_locality.STREAM_PAIR_LIMIT`` pairs per thread; past it they are dropped.
+#
+# The reuse is the one ``launch_counters`` makes itself: launches on one stream are
+# ordered, and each launch leaves its pair zero.  Per thread because the handles 0, 1
+# and 2 can name another stream in each thread (``launch_counters`` keys those per
+# thread too); for any other handle every thread memoizes the one pair
+# ``launch_counters`` keeps for that stream (or one it has since dropped, still used on
+# that stream only).  As for ``launch_counters``, a stream wrapped by
+# ``torch.cuda.ExternalStream`` must not be destroyed while launches on it are in
+# flight.
 _CAKE_GDN_DOMAIN_PAIRS = threading.local()
 # Devices on which a captured twin launch took a pair of the capture reserve since the
 # last eager twin launch through ``cake_locality.launch_counters``: the next eager twin
@@ -789,7 +796,8 @@ def _run_cake_gdn_decode_nontranspose(
     Runs on every eager decode call, so the checks compare the device index, dtype
     identity and shapes directly (no ``torch.device`` built per tensor) and the launch
     comes from ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES``; the checks, their order, the error
-    types and the messages are those of the resolver path.
+    types and the messages are those of the resolver path, followed by one check that
+    path did not have: the row-independent alignment check (``ValueError``).
     """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
@@ -863,6 +871,19 @@ def _run_cake_gdn_decode_nontranspose(
     ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
+        )
+    # Contiguous views may still start at an unaligned storage offset. Every kernel this
+    # path launches (each row and architecture, and the twin) reads q and k in 8-byte
+    # vectors and the state in 16-byte copies (cp.async, float4 or TMA), so such a view
+    # would fault asynchronously; it reads and writes v, a, b, A_log, dt_bias and the
+    # output one element at a time, so their element alignment is enough.
+    # The check is deliberately row-independent: it runs before the row resolves.
+    # ValueError, not CakeGDNUnsupportedError: the FlashInfer kernel that
+    # backend="auto" falls back to assumes 16-byte aligned q, k, v, output and state.
+    if (q.data_ptr() | k.data_ptr()) % 8 or state.data_ptr() % 16:
+        raise ValueError(
+            "GDN non-CP nontranspose decode requires 8-byte aligned q and k and a "
+            "16-byte aligned state"
         )
     num_k_heads = k.shape[2]
     key = (
