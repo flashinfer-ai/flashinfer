@@ -318,6 +318,7 @@ def suggest_sparse_group(
     union_exponent: float = DEFAULT_UNION_EXPONENT,
     nvfp4_kv: bool = False,
     kv_tokens: int = 0,
+    packed_query: bool = False,
 ) -> int:
     """Choose G by an estimated-latency model of the whole sparse call.
 
@@ -329,7 +330,9 @@ def suggest_sparse_group(
     ``waves * (tiles_per_item * tile_cost[TileQ] + item_cost)`` plus the
     grouped metadata launch and the split reduction (active splits > 1).
     ``nvfp4_kv`` plans the NVFP4 transform recipes as the resolver does
-    (``prefers_nvfp4_keeps``, else one-instance Swaps).
+    (``prefers_nvfp4_keeps``, else one-instance Swaps). G16/G32 are
+    candidates only for ``packed_query`` launches with blocks of at most
+    ``MAX_WIDE_GROUP_BLOCK_SIZE`` tokens, the routes ``plan`` accepts for them.
     Bounds and dtype validation belong to the public caller. No SQ % G
     divisibility is required. Ties prefer the smaller G.
     """
@@ -344,7 +347,9 @@ def suggest_sparse_group(
     candidates = sorted({g for g in _CANDIDATE_GROUPS if g <= largest} | {largest})
     for group in candidates:
         if group > 8 and (
-            group not in SUPPORTED_GROUP_SIZES or block_size > MAX_WIDE_GROUP_BLOCK_SIZE
+            not packed_query
+            or group not in SUPPORTED_GROUP_SIZES
+            or block_size > MAX_WIDE_GROUP_BLOCK_SIZE
         ):
             continue
         full_groups, tail = divmod(seq_len_q, group)

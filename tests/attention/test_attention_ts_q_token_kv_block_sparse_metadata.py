@@ -28,6 +28,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
     _get_prims_ts_q_token_kv_block_sparse_workspace_layout,
     _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
+    _validate_wide_metadata_fits,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
@@ -1347,6 +1348,12 @@ def test_wide_group_sort_union_long_context_matches_reference(
 ) -> None:
     """G16/G32 bit-map unions over long prefixes match a host reference, plane by plane."""
 
+    try:
+        _validate_wide_metadata_fits(
+            group_size, max_seq_len_kv, 4, torch.cuda.current_device()
+        )
+    except ValueError as error:
+        pytest.skip(str(error))
     (
         blocks,
         table,
@@ -2169,6 +2176,9 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
         False,
     )
     assert spec.config.use_keeps_mma_ab is expected_keeps
+    # D256 takes SwapsMmaAb only up to 16 rows (Q8/Q16 tiles): on GB300 a Swaps
+    # Q32 tile measured 10-110% slower than the Keeps Q64 tile at every dtype
+    # (``SWAPS_MAX_ROWS_D256``), so 24 and 48 rows take Keeps Q64.
     assert spec.config.tile_size_q == (64 if expected_keeps else 16)
     # The exact first-wave fanout is device-capacity dependent; this test only
     # requires a real multi-split launch to exercise split-local addressing.
@@ -4178,6 +4188,19 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     )
 
 
+def _interleave_v_scale_factors(scales: torch.Tensor) -> torch.Tensor:
+    """Reorder ``[pages, Hkv, page_size, D/16]`` V scales into TRT-LLM's
+    four-token interleaved order."""
+
+    pages, heads, page_size, groups = scales.shape
+    return (
+        scales.reshape(pages, heads, page_size // 4, 4, 4, groups // 4)
+        .permute(0, 1, 2, 4, 5, 3)
+        .reshape(scales.shape)
+        .contiguous()
+    )
+
+
 def dequantize_nvfp4_reference(
     payload: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
@@ -4364,15 +4387,7 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
         kv_scale_factors = None
     else:
         caches = tuple(payload)
-        # V scales use TRT-LLM's four-token interleaved order.
-        v_scale = (
-            scales[1]
-            .reshape(num_pages, num_kv_heads, page_size // 4, 4, 4, head_dim // 64)
-            .permute(0, 1, 2, 4, 5, 3)
-            .reshape(scales[1].shape)
-            .contiguous()
-        )
-        kv_scale_factors = (scales[0], v_scale)
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
         if cache_layout == "nhd-view":
             caches, kv_scale_factors = (
                 tuple(
@@ -4470,6 +4485,255 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
                     rtol=tolerance,
                     atol=tolerance,
                 )
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("split_kv", (True, False))
+@pytest.mark.parametrize(
+    ("kv_dtype", "head_dim"),
+    ((torch.bfloat16, 128), (torch.bfloat16, 256), (torch.uint8, 256)),
+    ids=("bf16-d128", "bf16-d256", "nvfp4-d256"),
+)
+@pytest.mark.parametrize(
+    ("num_qo_heads", "num_kv_heads", "group_size", "block_size", "page_size"),
+    (
+        (4, 1, 16, 4, 64),
+        (4, 1, 32, 4, 64),
+        (16, 2, 16, 4, 64),
+        (2, 1, 32, 4, 64),
+        # One Q head per KV head: rows 16-63 of the Keeps Q64 tile are padding,
+        # read through the preloaded (4-token) and on-demand (8-token) paths.
+        (1, 1, 16, 4, 64),
+        (1, 1, 16, 8, 8),
+        # 32-token blocks on 4-token pages: 4-token fragments, one membership
+        # byte each, which G16/G32 support.
+        (4, 1, 16, 32, 4),
+    ),
+)
+def test_wide_group_packed_attention_matches_reference(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    group_size: int,
+    block_size: int,
+    page_size: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    split_kv: bool,
+) -> None:
+    """G16/G32 routes (two/four page-major membership planes) match FP32.
+
+    Every query of each route, including a short tail route, is compared.
+    Each query takes half of its blocks from a pool shared by the route and
+    half privately, so the memberships differ per query and per plane.
+    """
+
+    block_topk = 64 if block_size == 4 else 16
+    generator = torch.Generator(device="cuda").manual_seed(
+        group_size * 131 + num_qo_heads
+    )
+    prefix, num_queries = 1100, 3 * group_size + 5
+    seq_len = prefix + num_queries
+    num_pages = (seq_len + page_size - 1) // page_size
+    table = (
+        torch.randperm(num_pages, generator=generator, device="cuda")
+        .to(torch.int32)
+        .view(1, num_pages)
+    )
+    shape = (num_pages, num_kv_heads, page_size)
+    if kv_dtype == torch.bfloat16:
+        caches = tuple(
+            torch.randn((*shape, head_dim), generator=generator, device="cuda").to(
+                torch.bfloat16
+            )
+            for _ in range(2)
+        )
+        kv_scale_factors = None
+        keys, values = (cache.float() for cache in caches)
+    else:
+        caches = tuple(
+            torch.randint(
+                0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+            ).to(torch.uint8)
+            for _ in range(2)
+        )
+        scales = [
+            (
+                torch.rand((*shape, head_dim // 16), generator=generator, device="cuda")
+                / 2
+            )
+            .add(0.05)
+            .to(torch.float8_e4m3fn)
+            for _ in range(2)
+        ]
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
+        keys, values = (
+            dequantize_nvfp4_reference(data, scale)
+            for data, scale in zip(caches, scales, strict=True)
+        )
+    positions = torch.arange(prefix, seq_len, dtype=torch.int32, device="cuda")
+    blocks = torch.full((num_queries, block_topk), -1, dtype=torch.int32, device="cuda")
+    pool = torch.randperm(prefix // block_size, generator=generator, device="cuda")[
+        : 2 * block_topk
+    ]
+    for token in range(num_queries):
+        bound = (int(positions[token]) + 1) // block_size
+        shared = pool[
+            torch.randperm(pool.numel(), generator=generator, device="cuda")[
+                : block_topk // 2
+            ]
+        ]
+        private = torch.randperm(bound, generator=generator, device="cuda")
+        private = private[~torch.isin(private, shared)][: block_topk - shared.numel()]
+        selected = torch.cat((shared, private))
+        blocks[token, : selected.numel()] = selected.to(torch.int32)
+    query = torch.randn(
+        (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    requests = torch.zeros(num_queries, dtype=torch.int32, device="cuda")
+    qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor([0, num_queries], dtype=torch.int32),
+        num_queries,
+        group_size=group_size,
+        device="cuda",
+    )
+    workspace = torch.zeros(
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            caches[0],
+            table,
+            block_topk=block_topk,
+            max_seq_len_kv=seq_len,
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=group_size,
+            kv_block_size=block_size,
+            split_kv=split_kv,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        qo_indptr.numel() - 1,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        page_size,
+        block_topk,
+        seq_len,
+        device="cuda",
+        workspace_buffer=workspace,
+        group_size=group_size,
+        packed_query=True,
+        split_kv=split_kv,
+        q_dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+    )
+    output = torch.empty_like(query)
+    wrapper.run(
+        query,
+        caches,
+        table,
+        blocks,
+        requests,
+        positions,
+        qo_indptr=qo_indptr,
+        out=output,
+        kv_scale_factors=kv_scale_factors,
+    )
+
+    keys, values = (
+        tensor[table[0].long()]
+        .permute(0, 2, 1, 3)
+        .reshape(num_pages * page_size, num_kv_heads, head_dim)
+        for tensor in (keys, values)
+    )
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+    for token in range(num_queries):
+        visible = int(positions[token]) + 1
+        live = blocks[token][blocks[token] >= 0].long()
+        token_ids = (
+            live[:, None] * block_size + torch.arange(block_size, device="cuda")
+        ).flatten()
+        if visible % block_size:
+            token_ids = torch.cat(
+                (
+                    token_ids,
+                    torch.arange(
+                        visible - visible % block_size, visible, device="cuda"
+                    ),
+                )
+            )
+        grouped_query = query[token].float().view(num_kv_heads, heads_q_per_kv, -1)
+        scores = torch.einsum("hgd,nhd->hgn", grouped_query, keys[token_ids])
+        reference = torch.einsum(
+            "hgn,nhd->hgd", (scores / head_dim**0.5).softmax(-1), values[token_ids]
+        ).reshape(num_qo_heads, head_dim)
+        error = (output[token].float() - reference).norm() / reference.norm()
+        assert error < 0.01, (token, token % group_size, float(error))
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_wide_group_rejects_metadata_map_beyond_shared_memory() -> None:
+    """G32 over a 64M-token model prefix has no metadata map that fits SMEM;
+    workspace sizing (and plan) rejects it instead of failing at run."""
+
+    page_size, max_seq_len_kv = 4096, 64 * 1024 * 1024
+    query = torch.empty((32, 4, 256), dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty((1, 1, page_size, 256), dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(
+        (1, max_seq_len_kv // page_size), dtype=torch.int32, device="cuda"
+    )
+    qo_indptr = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="shared memory"):
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            cache,
+            table,
+            block_topk=64,
+            max_seq_len_kv=max_seq_len_kv,
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=32,
+            kv_block_size=4,
+        )
+
+
+def test_wide_group_suggestion_for_long_nvfp4_prefill() -> None:
+    """Long packed NVFP4 prefill takes a two/four-plane group where it pays:
+    4/1 heads over a 64K context (G16) or from an empty prefix (G32); 16/2
+    heads over 64K keep G8. Fixed-shape queries never get G16/G32, which
+    ``plan`` rejects for them."""
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    long_4_1 = suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=65536 + 4096, **packed)
+    fresh_4_1 = suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, **packed)
+    long_16_2 = suggest(1, 2048, 2051, 16, 2, 148, seq_len_kv=65536 + 2048, **packed)
+    short = suggest(1, 4, 2051, 16, 2, 148, seq_len_kv=65536 + 4, **packed)
+    assert (long_4_1, fresh_4_1, long_16_2) == (16, 32, 8) and short <= 4
+    assert suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, nvfp4_kv=True) <= 8
+
+
+def test_wide_group_suggestion_needs_small_blocks() -> None:
+    """Keeps lanes read four blocks per G16/G32 membership word, so blocks
+    wider than 16 tokens keep the suggestion at G8 or below."""
+
+    for block_size in (32, 64):
+        group_size = suggest_prims_ts_q_token_kv_block_sparse_group_size(
+            1,
+            4096,
+            2048 + block_size - 1,
+            4,
+            1,
+            148,
+            kv_block_size=block_size,
+            nvfp4_kv=True,
+            packed_query=True,
+        )
+        assert group_size <= 8
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION

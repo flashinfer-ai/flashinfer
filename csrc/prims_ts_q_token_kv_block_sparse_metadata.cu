@@ -380,6 +380,23 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
             locator_head_multiplier, count_current_block_in_topk, fixed_query_len);
 }
 
+// Dynamic SMEM the G16/G32 metadata launch needs for a model prefix, or -1
+// when no G9-G32 map supports it; plan() compares it with the device limit.
+int64_t PrimsTSQTokenKvBlockSparseWideMetadataSmemBytes(int64_t group_size, int64_t max_seq_len_kv,
+                                                        int64_t sparse_block_size) {
+  TVM_FFI_ICHECK(group_size == 16 || group_size == 32) << "group_size must be 16 or 32";
+  TVM_FFI_ICHECK(max_seq_len_kv > 0 && max_seq_len_kv <= std::numeric_limits<int32_t>::max())
+      << "max_seq_len_kv must fit positive int32";
+  TVM_FFI_ICHECK(sparse_block_size >= 4 && sparse_block_size <= 128 &&
+                 (sparse_block_size & (sparse_block_size - 1)) == 0)
+      << "sparse_block_size must be 4, 8, 16, 32, 64, or 128";
+  const auto bound =
+      static_cast<int32_t>((max_seq_len_kv + sparse_block_size - 1) / sparse_block_size);
+  using flashinfer::attention::prims_ts::detail::QTokenKvBlockSparseWideMetadataMinSmemBytes;
+  return group_size == 16 ? QTokenKvBlockSparseWideMetadataMinSmemBytes<16>(bound)
+                          : QTokenKvBlockSparseWideMetadataMinSmemBytes<32>(bound);
+}
+
 // Prepared-plan entries; standalone metadata APIs retain byte membership.
 void PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor(
     TensorView block_indices, TensorView block_table, Optional<TensorView> token_to_request,

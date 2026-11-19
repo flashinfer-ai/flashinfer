@@ -236,6 +236,7 @@ def test_suggest_prims_ts_q_token_kv_block_sparse_group_size_rejects_invalid_ext
         {"q_dtype": torch.float32},
         {"q_dtype": "bfloat16"},
         {"split_kv": 1},
+        {"packed_query": 1},
     ),
 )
 def test_q_token_kv_block_sparse_recommendation_rejects_invalid_recipe(kwargs):

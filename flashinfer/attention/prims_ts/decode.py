@@ -3292,12 +3292,15 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         packed_query and page_size <= _sparse_policy.MAX_WIDE_GROUP_BLOCK_SIZE
     ):
         # G16/G32 memberships are read from page-major GMEM planes only (the
-        # fixed-Q layout caches one plane in SMEM), four blocks per word.
+        # fixed-Q layout caches one plane in SMEM), four kernel pages per word.
+        # ``page_size`` here is the kernel page: the K/V fragment
+        # gcd(kv_block_size, storage page size) that holds one membership byte.
         raise ValueError(
             f"QToken-KvBlock-Sparse-Attention group_size={group_size} needs packed "
-            "queries (qo_indptr) and a sparse block size of at most "
-            f"{_sparse_policy.MAX_WIDE_GROUP_BLOCK_SIZE}; got "
-            f"{'packed' if packed_query else 'fixed'} queries and block size {page_size}"
+            "queries (qo_indptr) and K/V fragments, gcd(kv_block_size, page_size), "
+            f"of at most {_sparse_policy.MAX_WIDE_GROUP_BLOCK_SIZE} tokens; got "
+            f"{'packed' if packed_query else 'fixed'} queries and {page_size}-token "
+            "fragments"
         )
     # This route has no QK-BF16/PV-FP8 kernel, so Q, K, and V must match,
     # except NVFP4 K/V, which is transformed exactly to BF16 for BF16 Q.
@@ -3525,6 +3528,7 @@ def suggest_q_token_kv_block_sparse_group_size(
     union_exponent: float = _sparse_policy.DEFAULT_UNION_EXPONENT,
     nvfp4_kv: bool = False,
     seq_len_kv: Optional[int] = None,
+    packed_query: bool = False,
 ) -> int:
     """Suggest a QToken-KvBlock-Sparse-Attention group (G1-G8, G16 or G32).
 
@@ -3593,12 +3597,16 @@ def suggest_q_token_kv_block_sparse_group_size(
         queries). A group's union cannot exceed it, so short contexts (e.g. a
         prefill from an empty prefix) favor larger groups; pass it whenever it
         is known. ``None`` keeps the uncapped union estimate.
+    packed_query : bool
+        Whether the launch passes packed queries (``qo_indptr``). G16 and G32
+        are suggested only when True and ``kv_block_size`` is at most 16;
+        ``plan`` rejects them for fixed-shape queries. Default False (G1-G8).
 
     Returns
     -------
     int
-        One of G1--G8, G16 or G32, subject to the TileQ128 head-capacity
-        bound.
+        One of G1--G8, or G16/G32 for packed queries, subject to the TileQ128
+        head-capacity bound.
     """
 
     from .q_token_kv_block_sparse_metadata import _validate_sparse_block_size
@@ -3620,6 +3628,8 @@ def suggest_q_token_kv_block_sparse_group_size(
         raise ValueError("q_dtype must be float16, bfloat16, or float8_e4m3fn")
     if not isinstance(split_kv, bool):
         raise TypeError("split_kv must be a bool")
+    if not isinstance(packed_query, bool):
+        raise TypeError("packed_query must be a bool")
     kv_tokens = (
         0 if seq_len_kv is None else _validate_positive_int(seq_len_kv, "seq_len_kv")
     )
@@ -3637,6 +3647,7 @@ def suggest_q_token_kv_block_sparse_group_size(
         union_exponent=float(union_exponent),
         nvfp4_kv=bool(nvfp4_kv),
         kv_tokens=kv_tokens,
+        packed_query=packed_query,
     )
 
 

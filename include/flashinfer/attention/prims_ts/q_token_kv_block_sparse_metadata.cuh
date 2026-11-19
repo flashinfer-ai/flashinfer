@@ -19,6 +19,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
@@ -1503,6 +1504,25 @@ struct QTokenKvBlockSparseUnionLaunchState {
   // Per model block bound: map-kernel footprint and rank mode.
   std::unordered_map<int32_t, QTokenKvBlockSparseBitmapFootprint> map_footprints;
 };
+
+// Smallest dynamic SMEM a G9-G32 metadata launch can use for a model block
+// bound: the entry map when the prefix allows it, or the bit map without the
+// word-rank array. -1 when the bit map exceeds the per-thread word limit.
+template <int GroupSize>
+int64_t QTokenKvBlockSparseWideMetadataMinSmemBytes(int32_t model_block_bound) {
+  static_assert(GroupSize > 8 && GroupSize <= 32);
+  constexpr int kThreads = QTokenKvBlockSparseBitmapThreads<GroupSize>();
+  if (QTokenKvBlockSparseWordsPerThread(QTokenKvBlockSparseMapWords(model_block_bound, true),
+                                        kThreads) > kQTokenKvBlockSparseBitmapMaxWordsPerThread) {
+    return -1;
+  }
+  size_t bytes = QTokenKvBlockSparseBitmapSmemBytes<GroupSize>(model_block_bound, false, 0);
+  if (model_block_bound <= kQTokenKvBlockSparseWideEntryMapMaxBlocks) {
+    bytes = std::min(bytes, QTokenKvBlockSparseBitmapSmemBytes<GroupSize>(model_block_bound, false,
+                                                                          model_block_bound));
+  }
+  return static_cast<int64_t>(bytes);
+}
 
 // G9-G32 (two to four membership planes) only has the bit-map kernel.
 template <typename PositionType, int GroupSize, bool PackedQuery>

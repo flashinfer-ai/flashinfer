@@ -1147,6 +1147,18 @@ class FmhaDecodeConfig:
         return self.use_fp8_qk
 
     @property
+    def preloaded_page_membership_words(self) -> int:
+        """Raw GMEM membership words a Softmax lane preloads per S tile.
+
+        Keeps lanes own a contiguous half (Q64, sixteen pages) or all (Q128,
+        32 pages) of a 128-token row, four pages per word; Swaps lanes load
+        one word per token group.
+        """
+        if self.use_keeps_mma_ab and self.tile_size_q == 128:
+            return 8
+        return 4
+
+    @property
     def uses_held_encoded_locator_window(self) -> bool:
         """Whether encoded paging keeps the complete CTA route in SMEM."""
 

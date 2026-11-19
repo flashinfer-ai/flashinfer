@@ -2051,6 +2051,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             plane_offset = cutlass.Int64(0)
             if cutlass.const_expr(cfg.page_membership_planes > 1):
                 # Queries 8p..8p+7 read byte plane p, p / planes of a row later.
+                # Callers pass ``wrap_membership_plane_query`` indices.
                 assert query_idx is not None
                 plane_shift = {2: 1, 4: 2}[cfg.page_membership_planes]
                 plane_offset = cutlass.Int64(query_idx >> Int32(3)) * (
@@ -2085,6 +2086,25 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 << (live_bytes * Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS))
             ) - Uint32(1)
         return word
+
+    @cute.jit
+    def wrap_membership_plane_query(self, query_idx: Int32) -> Int32:
+        """Map a row's query index into ``[0, 8 * planes)`` for plane selection.
+
+        Padded Keeps rows can carry query indices past the last plane. Wrapping
+        keeps their GMEM read inside the route row; the keep-word extraction
+        still zeroes those queries from the unwrapped index. Valid queries are
+        unchanged. Apply once per row, not per membership word. Grouped tiles
+        whose rows hold at most ``8 * planes`` queries have no such rows, so
+        their index passes through unchanged.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(
+            cfg.uses_nontrivial_grouped_q_layout
+            and cfg.q_tokens_per_cta <= 8 * cfg.page_membership_planes
+        ):
+            return query_idx
+        return query_idx & Int32(8 * cfg.page_membership_planes - 1)
 
     @cute.jit
     def load_q_token_kv_block_sparse_page_membership_raw(
@@ -2233,6 +2253,9 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         assert self.cfg.uses_q_token_kv_block_sparse_page_membership
         assert not self.cfg.query_major_memberships
         if cutlass.const_expr(self.cache_memberships_in_smem):
+            # The SMEM cache holds one plane; plan() rejects G9-G32 on the
+            # fixed-Q routes that cache memberships in SMEM.
+            assert self.cfg.page_membership_planes == 1
             self._create_initial_task_locals(stage_info.context)
             pages_per_tile = Int32(
                 self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
@@ -2249,17 +2272,20 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         else:
             # Public GMEM rows need not have sixteen readable tail bytes.
             # Preserve the existing live-prefix checks for each packed word.
+            plane_query = query_idx
+            if cutlass.const_expr(self.cfg.page_membership_planes > 1):
+                plane_query = self.wrap_membership_plane_query(query_idx)
             word0 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag, query_idx
+                stage_info, local_tile_idx, page_frag, plane_query
             )
             word1 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag + Int32(4), query_idx
+                stage_info, local_tile_idx, page_frag + Int32(4), plane_query
             )
             word2 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag + Int32(8), query_idx
+                stage_info, local_tile_idx, page_frag + Int32(8), plane_query
             )
             word3 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag + Int32(12), query_idx
+                stage_info, local_tile_idx, page_frag + Int32(12), plane_query
             )
         return _q_token_membership_keep_word16(
             word0, word1, word2, word3, query_idx, 8 * self.cfg.page_membership_planes
