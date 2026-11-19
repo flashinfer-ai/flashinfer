@@ -836,6 +836,15 @@ struct CollectiveMainloopFwd {
         add_delta_s_slot(tSrS, score_slot);
         refill_score_slot(score_slot);
         if constexpr (ScoreSlot == 1) {
+          asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+              "fence.proxy.async.shared::cta;"
+#endif
+              ::
+                  : "memory");
           pipeline_k.consumer_release(smem_pipe_read_k);
           ++smem_pipe_read_k;
         }
@@ -852,6 +861,15 @@ struct CollectiveMainloopFwd {
     consumer_wait(pipeline_q, smem_pipe_read_q);
     copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
+    asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+        "fence.proxy.async.shared::cta;"
+#endif
+        ::
+            : "memory");
     pipeline_q.consumer_release(smem_pipe_read_q);
     ++smem_pipe_read_q;
     clear(tOrO_store);
@@ -869,6 +887,15 @@ struct CollectiveMainloopFwd {
       cute::gemm(tiled_mma_qk, make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block)),
                  make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block)), tSrS);
     }
+    asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+        "fence.proxy.async.shared::cta;"
+#endif
+        ::
+            : "memory");
     pipeline_k.consumer_release(smem_pipe_read_k);
     ++smem_pipe_read_k;
 
@@ -891,6 +918,15 @@ struct CollectiveMainloopFwd {
       process_score_slot(_0{}, cute::true_type{});
       process_score_slot(_1{}, cute::true_type{});
 
+      asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+          "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+          "fence.proxy.async.shared::cta;"
+#endif
+          ::
+              : "memory");
       pipeline_v.consumer_release(smem_pipe_read_v);
       ++smem_pipe_read_v;
       tma_refill.refill_v(tile_idx);
@@ -908,6 +944,15 @@ struct CollectiveMainloopFwd {
     process_score_slot(_0{}, cute::false_type{});
     process_score_slot(_1{}, cute::false_type{});
 
+    asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+        "fence.proxy.async.shared::cta;"
+#endif
+        ::
+            : "memory");
     pipeline_v.consumer_release(smem_pipe_read_v);
     ++smem_pipe_read_v;
     tma_refill.refill_v(n_block_count - 1);

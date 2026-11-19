@@ -919,6 +919,14 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         )
         tXrX.fill(self.acc_dtype(0.0))
         cute.gemm(x_tiled_mma, tXrX, tXrK, tXrT, tXrX)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         t_pipeline.consumer_release(t_consumer_state)
         t_consumer_state.advance()
         self.store_acc_to_smem(tXrX, sX_DS, x_tiled_mma, thread_idx, False)
@@ -1001,6 +1009,14 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         self._math_order_notify(wg_idx)
 
         cute.arch.barrier(barrier_id=NamedBarrier.MATH_SYNC, number_of_threads=256)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         v_pipeline.consumer_release(v_consumer_state)
@@ -3740,6 +3756,14 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         )
         tQKrQK.fill(self.acc_dtype(0.0))
         cute.gemm(qk_tiled_mma, tQKrQK, tQKrQ, tQKrK, tQKrQK)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         q_pipeline.consumer_release(q_consumer_state)
@@ -3766,6 +3790,14 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             kk_tiled_mma,
             aux_tidx,
         )
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         t_pipeline.consumer_release(t_consumer_state)
         t_consumer_state.advance()
         cute.arch.fence_view_async_shared()
@@ -3893,6 +3925,14 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             cO = cute.make_identity_tensor((d, blk_q))
             tOcO = o1_thr_mma.partition_C(cO)
             self.o1_epi(tOrO, tOcO, sAlpha, alpha_stage, scale)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         q_pipeline.consumer_release(q_consumer_state)
         q_consumer_state.advance()
 
@@ -3953,6 +3993,14 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         tNewVrC.fill(self.acc_dtype(0.0))
         cute.gemm(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, tNewVrC)
         self._math_order_notify(wg_idx)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
         kk_pipeline.consumer_release(kk_consumer_state)
@@ -4010,6 +4058,14 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             alpha_consumer_state.advance()
         cute.copy(kv_tiled_copy_B, tKVsK[None, None, None, k_stage], tKVrK_cv)
         cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         return (
