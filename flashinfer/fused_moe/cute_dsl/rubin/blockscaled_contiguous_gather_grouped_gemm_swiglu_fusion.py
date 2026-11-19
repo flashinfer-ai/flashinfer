@@ -257,6 +257,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         swiglu_limit: float = float("inf"),
+        swiglu_alpha: float = 1.0,
+        swiglu_beta: float = 0.0,
         enable_pdl: Optional[bool] = None,
         ugpu_half_gemm: Optional[bool] = None,
     ):
@@ -311,6 +313,21 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
             raise ValueError(
                 "swiglu_limit applies to ActivationType.Swiglu only; "
                 f"got {self.activation_type.name} with swiglu_limit={self.swiglu_limit}."
+            )
+        # flashinfer: GPT-OSS style parameterized SwiGLU, matching the Blackwell
+        # kernel: ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)``.
+        # The defaults (1.0, 0.0) are plain SwiGLU and generate no extra code.
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.has_swiglu_alpha = self.swiglu_alpha != 1.0
+        self.has_swiglu_beta = self.swiglu_beta != 0.0
+        if (
+            self.has_swiglu_alpha or self.has_swiglu_beta
+        ) and self.activation_type != ActivationType.Swiglu:
+            raise ValueError(
+                "swiglu_alpha / swiglu_beta apply to ActivationType.Swiglu only; "
+                f"got {self.activation_type.name} with swiglu_alpha={self.swiglu_alpha} "
+                f"and swiglu_beta={self.swiglu_beta}."
             )
         self.is_gated = is_gated_activation(self.activation_type)
         if locality_domain_half_gemm and not self.is_gated:
@@ -3349,9 +3366,18 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
 
         With ``has_swiglu_limit`` the scaled gate is capped at ``+swiglu_limit`` and
         the scaled up is clipped to ``[-swiglu_limit, swiglu_limit]`` first.
+
+        flashinfer: non-default ``swiglu_alpha`` / ``swiglu_beta`` then turn the
+        activation into ``g * sigmoid(swiglu_alpha * g) * (u + swiglu_beta)``,
+        with ``g`` / ``u`` the scaled (and clamped) gate / up.
         """
         if cutlass.const_expr(self.vectorized_f32):
             LOG2_E = cutlass.Float32(1.4426950408889634)
+            # exp2(-(swiglu_alpha * log2(e)) * g) == exp(-swiglu_alpha * g)
+            if cutlass.const_expr(self.has_swiglu_alpha):
+                neg_sigmoid_scale = -(cutlass.Float32(self.swiglu_alpha) * LOG2_E)
+            else:
+                neg_sigmoid_scale = -LOG2_E
             for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
                 acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
                     (acc_vec_up[i], acc_vec_up[i + 1]),
@@ -3372,7 +3398,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                     )
                 tCompute_log2e = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                    (-LOG2_E, -LOG2_E),
+                    (neg_sigmoid_scale, neg_sigmoid_scale),
                 )
                 (
                     tCompute[i],
@@ -3393,6 +3419,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                     (tCompute[i], tCompute[i + 1]),
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
                 )
+                if cutlass.const_expr(self.has_swiglu_beta):
+                    acc_vec_up_alpha = cute.arch.add_packed_f32x2(
+                        (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                        (
+                            cutlass.Float32(self.swiglu_beta),
+                            cutlass.Float32(self.swiglu_beta),
+                        ),
+                    )
                 (
                     tCompute[i],
                     tCompute[i + 1],
@@ -3407,7 +3441,19 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                 if cutlass.const_expr(self.has_swiglu_limit):
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit, nan=True)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
-                tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+                if cutlass.const_expr(self.has_swiglu_beta):
+                    acc_vec_up_alpha = acc_vec_up_alpha + cutlass.Float32(self.swiglu_beta)
+                if cutlass.const_expr(self.has_swiglu_alpha):
+                    tCompute[i] = (
+                        acc_vec_up_alpha
+                        * acc_vec_gate_alpha
+                        * sigmoid_f32(
+                            acc_vec_gate_alpha * cutlass.Float32(self.swiglu_alpha),
+                            fastmath=True,
+                        )
+                    )
+                else:
+                    tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit
     def _apply_situ_epilogue(
