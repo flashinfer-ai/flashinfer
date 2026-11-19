@@ -326,9 +326,12 @@ class MaskedScheduler:
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
         is_swap_ab = self.params.is_swap_ab
-        num_tiles_n = self.params.problem_shape_ntile_mnl[
-            0 if cutlass.const_expr(is_swap_ab) else 1
-        ]
+        m_mode = 1 if cutlass.const_expr(is_swap_ab) else 0
+        n_mode = 0 if cutlass.const_expr(is_swap_ab) else 1
+        cluster_tile_m = (
+            self.params.c_tiler[m_mode] * self.params.cluster_shape_mn[m_mode]
+        )
+        num_clusters_n = self.params.problem_layout_ncluster_mnl.shape[n_mode]
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
         num_batches = self.params.masked_m.shape[0]
@@ -342,11 +345,11 @@ class MaskedScheduler:
         # memory access (CUDA error 700).
         keep_running = batch_idx < num_batches
         while keep_running:
-            num_tiles_m_cur = cute.ceil_div(
+            num_clusters_m_cur = cute.ceil_div(
                 self.params.masked_m[batch_idx],
-                self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                cluster_tile_m,
             )
-            if (accum_tile_m + num_tiles_m_cur) * num_tiles_n <= (
+            if (accum_tile_m + num_clusters_m_cur) * num_clusters_n <= (
                 current_work_linear_idx
             ):
                 if cutlass.const_expr(
@@ -359,7 +362,7 @@ class MaskedScheduler:
                         value=dsm_counter + (num_c_stage - 1),
                     )
 
-                accum_tile_m += num_tiles_m_cur
+                accum_tile_m += num_clusters_m_cur
                 batch_idx += Int32(1)
                 keep_running = batch_idx < num_batches
             else:
@@ -374,23 +377,23 @@ class MaskedScheduler:
                 accum_tile_m
                 + cute.ceil_div(
                     self.params.masked_m[batch_idx],
-                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                    cluster_tile_m,
                 )
-            ) * num_tiles_n > current_work_linear_idx
+            ) * num_clusters_n > current_work_linear_idx
 
         # cur_cluster_coord = self.params.problem_layout_ncluster_mnl.get_hier_coord(
         #     current_work_linear_idx, loc=loc, ip=ip
         # )
         if cutlass.const_expr(is_swap_ab):
             cur_cluster_coord = (
-                current_work_linear_idx % num_tiles_n,
-                current_work_linear_idx // num_tiles_n - accum_tile_m,
+                current_work_linear_idx % num_clusters_n,
+                current_work_linear_idx // num_clusters_n - accum_tile_m,
                 batch_idx,
             )
         else:
             cur_cluster_coord = (
-                current_work_linear_idx // num_tiles_n - accum_tile_m,
-                current_work_linear_idx % num_tiles_n,
+                current_work_linear_idx // num_clusters_n - accum_tile_m,
+                current_work_linear_idx % num_clusters_n,
                 batch_idx,
             )
 
