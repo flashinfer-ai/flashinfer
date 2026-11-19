@@ -12,7 +12,8 @@ bmm2_scale, q_len > 1) on live rows while padded rows output exact zeros, that i
 reads no host state and launches only the kernels of explicit ``backend="cake"``,
 that it stays correct after input updates that bypass torch's version counter and
 under CUDA-graph replay with updated inputs (also two graphs replayed on two
-streams at once), that a Cake build failure drops Cake from tuning, and that a
+streams at once), that a Cake build failure drops Cake from tuning, that SM100a
+leaves Cake out where it does not beat the other candidates, and that a
 Cake choice the actual batch cannot launch, whose family is unavailable, or whose
 program is not loaded during stream capture falls back to the first candidate.
 """
@@ -504,17 +505,21 @@ def test_cake_bucket_rule_covers_every_batch_of_the_bucket(cake_families):
     page64 = _cpu_runner(bf16, 64)
     # 148 SMs (74 resident clusters): aligned BF16 takes VQUARTER while
     # 4 * rows <= 74 and VHALF while 2 * rows <= 74; page 64 has nothing above.
-    assert page64.get_valid_tactics(_cpu_inputs(bf16, 8), _bucket(8, 16)) == [-1]
+    # SM100a leaves single-token VQUARTER rows without sinks out (see
+    # test_cake_auto_excluded_where_it_does_not_win), so two-token rows show the
+    # VQUARTER buckets: bucket 4 serves 8-14 rows.
+    assert page64.get_valid_tactics(_cpu_inputs(bf16, 4, 2), _bucket(4, 8)) == [-1]
     assert _family(cake_module.DOMAIN_BF16_VQUARTER) in built
-    # Bucket 16 spans VQUARTER (16-18 rows) and VHALF (19-31 rows): the profile
+    # Bucket 8 spans VQUARTER (16-18 rows) and VHALF (20-30 rows): the profile
     # measures one of them only.
-    assert page64.get_valid_tactics(_cpu_inputs(bf16, 16), _bucket(16, 32)) == []
+    assert page64.get_valid_tactics(_cpu_inputs(bf16, 8, 2), _bucket(8, 16)) == []
     # Batches 38-63 of bucket 32 leave its domains.
     assert page64.get_valid_tactics(_cpu_inputs(bf16, 32), _bucket(32, 64)) == []
     # The largest bucket also serves every larger batch.
-    assert page64.get_valid_tactics(_cpu_inputs(bf16, 4), _bucket(4)) == []
-    assert page64.get_valid_tactics(_cpu_inputs(bf16, 4), None) == [-1]
-    # Sinks keep every BF16 row on VQUARTER: bucket 16 is uniform then.
+    assert page64.get_valid_tactics(_cpu_inputs(bf16, 4, 2), _bucket(4)) == []
+    assert page64.get_valid_tactics(_cpu_inputs(bf16, 4, 2), None) == [-1]
+    # Sinks keep every BF16 row on VQUARTER: bucket 16 (16-31 rows) is uniform
+    # then.
     sink = [torch.zeros(NUM_HEADS, dtype=torch.float32)]
     page64_sink = _cpu_runner(bf16, 64, sinks=sink)
     assert page64_sink.get_valid_tactics(_cpu_inputs(bf16, 16), _bucket(16, 32)) == [-1]
@@ -581,21 +586,24 @@ def test_cake_bucket_rule_covers_every_batch_of_the_bucket(cake_families):
 
     # Revalidating a reused bucket during tuning checks the bucket's batches,
     # not the caller's.
-    caller = _cpu_inputs(bf16, 600)
-    assert page64.validate_tactic_for_profile(caller, -1, _bucket(8, 16))
-    assert not page64.validate_tactic_for_profile(caller, -1, _bucket(16, 32))
+    caller = _cpu_inputs(bf16, 300, 2)
+    assert page64.validate_tactic_for_profile(caller, -1, _bucket(4, 8))
+    assert not page64.validate_tactic_for_profile(caller, -1, _bucket(8, 16))
     assert not page64.validate_tactic(caller, -1)
 
 
 def test_cake_bucket_rule_on_generated_profiles(cake_families):
     """The bucket rule holds on the profiles the tuner generates from the MLA
     tuning config: their batch dimension is a DynamicDim whose max is the next
-    bucket. No GPU needed."""
+    bucket. Two-token rows, as SM100a leaves single-token VQUARTER rows without
+    sinks out. No GPU needed."""
     bf16 = torch.bfloat16
     config = core._mla_decode_tuning_config(
         buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256), num_pages=64, profile_seq_len=1024
     )
-    profiles = AutoTuner()._generate_optimization_profiles(config, _cpu_inputs(bf16, 4))
+    profiles = AutoTuner()._generate_optimization_profiles(
+        config, _cpu_inputs(bf16, 4, 2)
+    )
     page64 = _cpu_runner(bf16, 64)
     page32 = _cpu_runner(bf16, 32)
     tactics = {}
@@ -603,19 +611,20 @@ def test_cake_bucket_rule_on_generated_profiles(cake_families):
         dim = profile.shapes[0][0]
         assert isinstance(dim, DynamicDim)
         tactics[dim.opt] = (
-            page64.get_valid_tactics(_cpu_inputs(bf16, dim.opt), profile),
-            page32.get_valid_tactics(_cpu_inputs(bf16, dim.opt), profile),
+            page64.get_valid_tactics(_cpu_inputs(bf16, dim.opt, 2), profile),
+            page32.get_valid_tactics(_cpu_inputs(bf16, dim.opt, 2), profile),
         )
-    # 148 SMs: VQUARTER up to 18 rows, VHALF up to 37, then (page 32 only) the
-    # one-wave CLC program up to 74 and the ordered CLC program above.
+    # 148 SMs: VQUARTER up to 18 rows (batch 9), VHALF up to 37 (batch 18), then
+    # (page 32 only) the one-wave CLC program up to 74 rows (batch 37) and the
+    # ordered CLC program above.
     assert tactics == {
         1: ([-1], [-1]),
         2: ([-1], [-1]),
         4: ([-1], [-1]),
-        8: ([-1], [-1]),
+        8: ([], []),
         16: ([], []),
         32: ([], []),
-        64: ([], []),
+        64: ([], [-1]),
         128: ([], [-1]),
         256: ([], []),
     }
@@ -628,7 +637,7 @@ def test_cake_validate_tactic_contains_builds_and_capture(cake_families):
     built, state = cake_families
     bf16 = torch.bfloat16
     runner = _cpu_runner(bf16, 64)
-    inputs = _cpu_inputs(bf16, 4)
+    inputs = _cpu_inputs(bf16, 4, 2)
     device = inputs[0].device
 
     assert not runner.validate_tactic(inputs, 0)
@@ -679,11 +688,59 @@ def test_cake_build_failure_is_recorded_once(monkeypatch, cake_families):
         cake_module, "get_cake_trtllm_mla_blackwell_family", unavailable
     )
     runner = _cpu_runner(torch.bfloat16, 64)
-    inputs = _cpu_inputs(torch.bfloat16, 4)
+    inputs = _cpu_inputs(torch.bfloat16, 4, 2)
     assert not runner.validate_tactic(inputs, -1)
     assert not runner.validate_tactic(inputs, -1)
     assert runner.get_valid_tactics(inputs, _bucket(4, 8)) == []
     assert len(attempts) == 1 and set(attempts) == core._CAKE_MLA_UNAVAILABLE_FAMILIES
+
+
+@pytest.mark.parametrize("arch,num_sms", [("sm_100a", 148), ("sm_103a", 152)])
+def test_cake_auto_excluded_where_it_does_not_win(
+    monkeypatch, cake_families, arch, num_sms
+):
+    """SM100a (B200) leaves Cake out of backend="auto" for single-token BF16
+    VQUARTER rows without sinks, where it does not beat the other candidates,
+    without building its program; sinks, two-token rows, VHALF rows and SM103a
+    (GB300) keep it. No GPU needed."""
+    built, _ = cake_families
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: (arch, num_sms))
+    bf16 = torch.bfloat16
+    sink = [torch.zeros(NUM_HEADS, dtype=torch.float32)]
+    excluded = arch == "sm_100a"
+    vquarter = cake_module.DOMAIN_BF16_VQUARTER
+    for page_size in (64, 32):
+        plain = _cpu_runner(bf16, page_size)
+        inputs = _cpu_inputs(bf16, 8)
+        assert plain._domain(inputs, num_sms) == vquarter
+        assert core._cake_mla_auto_excluded(arch, bf16, vquarter, 1, False) == excluded
+        before = list(built)
+        # Bucket 8 serves 8-15 rows, all VQUARTER on 148 and 152 SMs.
+        assert plain.get_valid_tactics(inputs, _bucket(8, 16)) == (
+            [] if excluded else [-1]
+        )
+        assert plain.supports(inputs) == (not excluded)
+        assert plain.validate_tactic(inputs, -1) == (not excluded)
+        assert plain.validate_tactic_for_profile(inputs, -1, _bucket(8, 16)) == (
+            not excluded
+        )
+        if excluded:
+            assert built == before, "an excluded bucket built a Cake program"
+
+        with_sinks = _cpu_runner(bf16, page_size, sinks=sink)
+        assert with_sinks._domain(inputs, num_sms) == vquarter
+        assert with_sinks.get_valid_tactics(inputs, _bucket(8, 16)) == [-1]
+        assert with_sinks.supports(inputs) and with_sinks.validate_tactic(inputs, -1)
+        # Two-token rows: bucket 4 serves 8-14 VQUARTER rows.
+        two_token = _cpu_inputs(bf16, 4, 2)
+        assert plain._domain(two_token, num_sms) == vquarter
+        assert plain.get_valid_tactics(two_token, _bucket(4, 8)) == [-1]
+        assert plain.validate_tactic(two_token, -1)
+        # Single-token VHALF rows (20 rows, beyond VQUARTER on 148 and 152 SMs).
+        vhalf = _cpu_inputs(bf16, 20)
+        assert plain._domain(vhalf, num_sms) == cake_module.DOMAIN_BF16_VHALF
+        assert plain.get_valid_tactics(vhalf, None) == [-1]
+    assert cake_module.family_for(vquarter, arch, num_sms) in built
 
 
 def test_untuned_auto_keeps_first_candidate(monkeypatch, clean_tuner):
@@ -730,6 +787,9 @@ def test_autotuned_auto_matches_reference(
     case = _make_case(
         dtype=dtype, batch_size=batch_size, q_len=q_len, page_size=page_size
     )
+    # The tuner can profile Cake for this cell only in the buckets of its own
+    # domain (bucket 8 crosses domains, the largest bucket is never offered).
+    _skip_auto_excluded(case)
 
     with autotune(True, tuning_buckets=TUNING_BUCKETS):
         tuned = _decode(case)
@@ -807,7 +867,9 @@ def test_unavailable_cake_family_falls_back(monkeypatch, clean_tuner):
     """A Cake choice whose family this process recorded as unavailable is not
     launched although the batch is in its domains (supports() holds)."""
     _require_cake_arch()
-    case = _make_case(batch_size=4, page_size=32)
+    # Two-token rows: SM100a leaves single-token VQUARTER rows without sinks out
+    # of backend="auto" (``_cake_mla_auto_excluded``).
+    case = _make_case(batch_size=2, q_len=2, page_size=32)
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     family = cake_module.launch_family(
         cake_module.DOMAIN_BF16_VQUARTER, arch, num_sms, 4
@@ -830,7 +892,9 @@ def test_cake_choice_not_built_during_capture(monkeypatch, clean_tuner):
     """A Cake choice whose program is not loaded when a CUDA graph is captured
     runs the first candidate in the graph: no build, no Cake launch."""
     _require_cake_arch()
-    case = _make_case(batch_size=4, page_size=32)
+    # Two-token rows: SM100a leaves single-token VQUARTER rows without sinks out
+    # of backend="auto" (``_cake_mla_auto_excluded``).
+    case = _make_case(batch_size=2, q_len=2, page_size=32)
     batch_size, q_len = case["query"].shape[:2]
     case["out"] = torch.zeros(
         batch_size, q_len, NUM_HEADS, LATENT, dtype=torch.bfloat16, device="cuda"
@@ -940,6 +1004,30 @@ def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
         pytest.skip(f"no one-wave CLC program for {arch} with {num_sms} SMs")
 
 
+def _skip_auto_excluded(case) -> None:
+    """Skip a cell whose Cake domain backend="auto" leaves out on this device
+    (``_cake_mla_auto_excluded``): the dispatcher runs the first candidate
+    there, so the cell would check no Cake launch."""
+    arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
+    query, sinks = case["query"], case.get("sinks")
+    runner = _cpu_runner(
+        query.dtype,
+        case["kv_cache"].shape[-2],
+        case["max_seq_len"],
+        bmm2_scale=case["bmm2_scale"],
+        sinks=sinks,
+    )
+    inputs = [query, case["block_tables"], case["seq_lens"], _nan_out(case)]
+    domain = runner._domain(inputs, num_sms)
+    if domain is not None and core._cake_mla_auto_excluded(
+        arch, query.dtype, domain, query.shape[1], sinks is not None
+    ):
+        pytest.skip(
+            f"backend='auto' does not offer Cake for {domain} with q_len "
+            f"{query.shape[1]} and sinks={sinks is not None} on {arch}"
+        )
+
+
 def _parity_case(geometry, q_len=1, seed=0):
     dtype, page_size, rows = _PARITY_GEOMETRIES[geometry]
     return _make_case(
@@ -1009,6 +1097,7 @@ def test_forced_cake_matches_trtllm_gen(monkeypatch, clean_tuner, geometry, vari
         case["sinks"] = [sink.to("cuda")]
     elif variant == "bmm2_scale":
         case["bmm2_scale"] = 0.5
+    _skip_auto_excluded(case)
     if variant == "all_padded":
         case["seq_lens"].zero_()
     elif "padded" in variant:
@@ -1080,9 +1169,10 @@ def test_forced_cake_reads_updated_inputs(monkeypatch, clean_tuner, geometry, q_
     _require_cake_arch()
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     _skip_unserved_geometry(geometry, "plain", arch, num_sms)
+    case = _parity_case(geometry, q_len)
+    _skip_auto_excluded(case)
     selected = _force_cake(monkeypatch)
     launches = _spy_cake_forward(monkeypatch)
-    case = _parity_case(geometry, q_len)
     _assert_live_and_padded(_decode(dict(case, out=_nan_out(case))), case, "first call")
     _assert_cake_launched(selected, launches)
 
@@ -1121,8 +1211,9 @@ def test_forced_cake_cuda_graph_replay_with_updated_inputs(
     _require_cake_arch()
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     _skip_unserved_geometry(geometry, "plain", arch, num_sms)
-    selected = _force_cake(monkeypatch)
     case = _parity_case(geometry, q_len)
+    _skip_auto_excluded(case)
+    selected = _force_cake(monkeypatch)
     batch_size, max_len = case["query"].shape[0], case["max_seq_len"]
     case["out"] = _nan_out(case)
 
@@ -1369,7 +1460,9 @@ def test_cake_build_failure_drops_cake_from_tuning(monkeypatch, clean_tuner):
         core._CakeTrtllmMlaBlackwellRunner, "get_valid_tactics", get_valid_tactics
     )
     calls = _spy_choose_one(monkeypatch)
-    case = _make_case()
+    # Two-token rows, which Cake serves on every device: its VQUARTER buckets
+    # try the build.
+    case = _make_case(batch_size=2, q_len=2)
 
     with autotune(True, tuning_buckets=TUNING_BUCKETS):
         output = _decode(case)

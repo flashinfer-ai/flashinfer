@@ -2841,6 +2841,26 @@ _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 _CAKE_MLA_MAX_ROWS = 512
 _CAKE_MLA_FP8_MAX_ROWS = 128
 
+
+def _cake_mla_auto_excluded(
+    arch: str, dtype: torch.dtype, domain: str, q_len: int, has_sinks: bool
+) -> bool:
+    """Whether ``backend="auto"`` leaves out the Cake candidate for a domain the
+    route serves, because it measured at parity with or slower than the best
+    other candidate there.
+
+    B200 (sm_100a, 148 SMs), BF16 single-token decode without sinks on the
+    quarter-value split program: Cake ties or trails CuTe DSL (e.g. batch 8,
+    page 64, KV 1024: 14.11 us vs 13.76 us). GB300 (sm_103a) keeps it, where the
+    same program is about 10% faster. Explicit ``backend="cake"`` is unaffected.
+    """
+    from .cake_trtllm_mla_blackwell import DOMAIN_BF16_VQUARTER
+
+    return (arch, dtype, domain, q_len, has_sinks) in {
+        ("sm_100a", torch.bfloat16, DOMAIN_BF16_VQUARTER, 1, False),
+    }
+
+
 # Cake MLA families the candidate loaded (it never builds one during stream
 # capture), and those whose JIT build or load failed in this process: the
 # candidate does not retry them.
@@ -3127,10 +3147,12 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
     A tuning bucket offers it only when every batch the bucket serves launches
     the same programs as the profiled batch, so a measured win holds for the
     whole bucket; never the largest bucket, which also serves every larger
-    batch. ``validate_tactic`` turns a cached Cake choice into a
-    cache miss (the first candidate's default tactic) when the actual batch
-    leaves its domains or row cap, or when a stream capture would have to build
-    its program or allocate its FP8 decode table.
+    batch; and never for a domain ``_cake_mla_auto_excluded`` leaves out on the
+    device, where Cake does not beat the other candidates.
+    ``validate_tactic`` turns a cached Cake choice into a cache miss (the first
+    candidate's default tactic) when the actual batch leaves its domains or row
+    cap, or when a stream capture would have to build its program or allocate
+    its FP8 decode table.
     ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes the candidate, so a
     cached bucket whose winner was Cake then misses as well, also running the
     first candidate's default tactic rather than the bucket's runner-up.
@@ -3215,8 +3237,9 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
 
     def _families(self, inputs, batch_sizes) -> Optional[frozenset]:
         """The families the route launches for each of these batch sizes, or
-        ``None`` when one of them does not launch or launches other families
-        than the first."""
+        ``None`` when one of them does not launch, falls in a domain
+        ``_cake_mla_auto_excluded`` leaves out, or launches other families than
+        the first."""
         from .cake_trtllm_mla_blackwell import _device_facts, launch_families
 
         query = inputs[0]
@@ -3225,7 +3248,9 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             arch, num_sms = _device_facts(query.device.index)
             for batch_size in batch_sizes:
                 domain = self._domain(inputs, num_sms, batch_size)
-                if domain is None:
+                if domain is None or _cake_mla_auto_excluded(
+                    arch, query.dtype, domain, query.size(1), self.sinks is not None
+                ):
                     return None
                 launched = frozenset(
                     launch_families(domain, arch, num_sms, batch_size * query.size(1))
