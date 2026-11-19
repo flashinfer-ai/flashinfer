@@ -1106,7 +1106,8 @@ def kda_delta_rule_mtp_ucache_flush(
         ``[B, T, H]`` bf16 beta logits (sigmoid applied in-kernel).
     initial_state_source : torch.Tensor
         ``[pool, H, 128, 128]`` bf16 or fp16 checkpoint state pool
-        (``[.., V, K]``); written in place on a fold. fp16 needs the UMMA
+        (``[.., V, K]``); written in place on a fold (an fp16 pool saturates to
+        +-Inf above 65504, with or without stochastic rounding). fp16 needs the UMMA
         backend (SM10x).
     initial_state_indices : torch.Tensor, optional
         ``[B]`` int32 pool slot per request; ``-1`` marks a padded row whose
@@ -1160,7 +1161,8 @@ def kda_delta_rule_mtp_ucache_flush(
         Single-element int64 CUDA tensor read on device by ``"philox"`` (required)
         and ``"lcg"``; advance it every step and use a different seed per layer.
     philox_rounds : int
-        Philox rounds (default 10).
+        Philox rounds (default 10, at least 2). Each distinct value compiles a
+        separate kernel.
 
     Returns
     -------

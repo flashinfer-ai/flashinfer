@@ -2676,11 +2676,17 @@ def kda_delta_rule_mtp_ucache_flush(
       the UMMA backend only (``"hmma"`` raises ``ValueError``; ``"auto"`` routes it
       to UMMA and raises ``ValueError`` when UMMA is unavailable). Rings and
       outputs stay bf16 (fp32 g ring); only the pool and the readout operand are
-      fp16.
+      fp16. The pool saturates to +-Inf where a folded value exceeds 65504 (round to
+      nearest and stochastic rounding alike; no satfinite), so keep |S| well below it.
+      The fp16 readout operand [k; q] e^{G_P} goes subnormal once every channel has
+      decayed (max_c G_P[c] < ~-10); with a large state that adds up to
+      ~3.4e-7 max|S| absolute error to the verify outputs (negligible for |S| <= ~100,
+      6e-4 at |S| ~ 3000).
     - ``stochastic_rounding`` (fp16 pool, UMMA only): ``None`` / ``"none"`` (round
       to nearest, ``rand_seed`` not read), ``"philox"`` (Philox4x32 with
       ``philox_rounds`` rounds, key = ``rand_seed``, counter = flat pool offset of
-      the 8-element chunk; needs ``rand_seed``) or ``"lcg"`` (an LCG dither from a
+      the 8-element chunk; needs ``rand_seed``; ``philox_rounds`` >= 2, and each
+      distinct value is a separate kernel build) or ``"lcg"`` (an LCG dither from a
       hash of the (state row, K half) id and ``rand_seed``, or %clock without one:
       then not reproducible) -- the GDN UMMA kernel's schemes; outputs, rings and
       verify rows are unchanged. ``rand_seed`` is a single-element int64 CUDA
@@ -2785,8 +2791,9 @@ def kda_delta_rule_mtp_ucache_flush(
         "stochastic_rounding='philox' needs rand_seed.",
     )
     _check(
-        _sr_mode != "philox" or int(philox_rounds) > 0,
-        f"philox_rounds must be > 0; got {philox_rounds}.",
+        _sr_mode != "philox" or int(philox_rounds) >= 2,
+        f"philox_rounds must be >= 2 (the Philox helper always runs the first two "
+        f"rounds); got {philox_rounds}.",
     )
     if _sr_mode != "none" and rand_seed is not None:
         _check(

@@ -65,8 +65,14 @@ columns per side, as the GDN UMMA kernel. T in {4, 8} builds are unchanged.
 
 fp16 state pool (``state_f16``; selected by an fp16 ``initial_state_source``): the pool,
 the state SMEM stages and the readout B operand X_r are fp16 (kind::f16 needs one A / B
-type; |X_r| <= 1, magnitudes below 2^-24 flush to zero), so the readout UMMA uses an
-F16 instruction descriptor; the history / fold UMMAs (D, C, K~) stay bf16. Flush rows
+type), so the readout UMMA uses an F16 instruction descriptor. X_r = [khat; qhat] e^{G_P}
+(|x| <= 1) is NOT rescaled: entries below 2^-14 are fp16 subnormals and below 2^-24 flush
+to zero, which only matters once every channel has decayed (max_c G_P[c] < ~-10) AND the
+state is large -- the readout's S0 term then gains up to ~2^-25 sqrt(K) max|S0| ~ 3.4e-7
+max|S0| absolute error per output (|S0| ~ 3000 at G_P ~ -11: y error 6e-4 vs 1e-4 with
+a bf16 pool; negligible for |S0| <= ~100). A per-CTA power-of-two X_r scale fixes it
+exactly but cost 7-12 % (fp16 RN) / 10-21 % (Philox) at T = 8 B >= 1024 through extra
+spills in the persistent kernel, so it is not applied; the history / fold UMMAs (D, C, K~) stay bf16. Flush rows
 round the folded half to fp16: to nearest, or stochastically (``sr``, cvt.rs.f16x2) with
 the GDN UMMA kernel's schemes -- "philox" (Philox4x32, ``sr_rounds`` rounds, key =
 ``rand_seed``, counter = flat [pool, H, V, K] offset of the 8-element chunk, one draw per

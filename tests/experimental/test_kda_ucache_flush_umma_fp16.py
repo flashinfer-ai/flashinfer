@@ -25,8 +25,9 @@ itself re-collects test_kda_ucache_flush.py). The autouse fixture pins
 build their own pools) creates carries an fp16 pool. The oracle reads the pool as fp32,
 so the same fp32 reference and the same tolerances apply: fp16 holds the pool values
 (|S| < 2^15, here O(1)) with 3 more mantissa bits than bf16, and the readout operand
-X_r = [khat; qhat] . e^{G_P} (|x| <= 1) only loses magnitudes below fp16's subnormal
-range (2^-24), whose contribution to y is far below Y_TOL.
+X_r = [khat; qhat] . e^{G_P} (|x| <= 1) goes subnormal (and below 2^-24 to
+zero) only when every channel has decayed; with O(1) states that is far below Y_TOL, and
+``test_fp16_large_state_strong_decay`` bounds the large-|S| case (|S| ~ 3000, G_P ~ -11).
 
 Tests that need the HMMA backend on the same case (it keeps a bf16 pool) are skipped
 here; ``test_fp16_hmma_rejects`` checks that HMMA refuses an fp16 pool instead.
@@ -516,3 +517,64 @@ def test_fp16_pool_through_auto_dispatch_at_hmma_t():
     n0 = um._LAUNCHES
     _sr_call(case, fm, 8, backend="auto")
     assert n0 + 1 == um._LAUNCHES
+
+
+@pytest.mark.parametrize("t", [1, 4, 8])
+@pytest.mark.parametrize("w_ring", [16, 32])
+def test_fp16_large_state_strong_decay(t, w_ring):
+    """Large state (|S| ~ 3000) under strong decay (every channel's G_P ~ -11): the
+    readout's S0 term rides on X_r = [khat; qhat] e^{G_P} ~ 2^-16, which fp16 stores as
+    a subnormal (the documented limit of the fp16 pool: the operand is not rescaled).
+    Bound: the fp16 pool's output error exceeds the bf16 pool's (same values) by at most
+    2^-25 sqrt(K) max|S0| (half an ulp of the smallest fp16 subnormal per X_r entry,
+    summed over K channels as a random walk). Measured: 6e-4 vs 1e-4, bound 2.5e-3."""
+    fm = _fm(t, w_ring)
+    hist = [fm - 1, fm - 2, 3, 1, fm - 1, 2]  # verify rows (the readout path)
+    bases = [28, 5, 30, 9, 0, 17]
+    _base._STATE_DTYPE = torch.bfloat16
+    c_bf = list(_make_case(len(hist), hist, seed=91 + t, bases=bases, t=t))
+    _base._STATE_DTYPE = torch.float16
+    c_bf[7] = (c_bf[7].float() * 3000.0).to(torch.bfloat16)  # exact in fp16 too
+    c_bf[10] = c_bf[10] - 11.0  # shift every G: same w_j, e^{G_P} ~ 1.7e-5
+    c_h = list(c_bf)
+    c_h[7] = c_bf[7].to(torch.float16)
+    assert torch.equal(c_h[7].float(), c_bf[7].float())
+    y_bf, _, _ = _sr_call(c_bf, fm, t, w_ring)
+    y_h, _, _ = _sr_call(c_h, fm, t, w_ring)
+    err_bf = err_h = 0.0
+    for r, p in enumerate(hist):
+        kc_l, uc_l, gc_l = _base._logical_rings(
+            c_bf[8][r], c_bf[9][r], c_bf[10][r], bases[r], w=w_ring
+        )
+        y_ref, _ = _base._ref_fp32(
+            *(c_bf[i][r] for i in range(5)),
+            c_bf[5],
+            c_bf[6],
+            c_bf[7][r],
+            kc_l,
+            uc_l,
+            gc_l,
+            p,
+            t_len=t,
+        )
+        err_bf = max(err_bf, (y_bf[r].float() - y_ref).abs().max().item())
+        err_h = max(err_h, (y_h[r].float() - y_ref).abs().max().item())
+    bound = 2.0**-25 * K**0.5 * c_bf[7].float().abs().max().item()
+    assert err_h <= err_bf + bound, (err_h, err_bf, bound)
+
+
+def test_philox_rounds_below_two_rejected():
+    """The shared Philox helper always runs its first two rounds, so philox_rounds = 1
+    would silently run 2: the dispatcher rejects it."""
+    _skip_if_no_cvt_rs()
+    case, _, fm = _sr_case(4, seed=5)
+    for bad in (1, 0, -3):
+        with pytest.raises(ValueError, match="philox_rounds must be >= 2"):
+            _sr_call(
+                case,
+                fm,
+                4,
+                stochastic_rounding="philox",
+                rand_seed=_seed(1),
+                philox_rounds=bad,
+            )
