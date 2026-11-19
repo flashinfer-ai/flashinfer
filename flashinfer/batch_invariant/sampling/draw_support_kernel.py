@@ -900,9 +900,10 @@ def get_compiled_kernel(
     score: bool = False,
     count_list: Optional[bool] = None,
 ):
-    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set, the full
-    log-probability output, the placements, the score form); ``N``, ``M``, the row strides, the temperature form, the gather,
-    the kept log-probability output and PDL are runtime arguments (those four are accepted and ignored here)."""
+    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set, temperature
+    form, the index gather, the two log-probability outputs, the placements, the score form; the probability kernels have
+    neither the temperature nor the kept chain and key both False); ``N``, ``M``, the row strides and PDL are runtime
+    arguments (``enable_pdl`` is accepted and ignored here)."""
     return _compile_bucket(
         *_key(
             dtype_str,
