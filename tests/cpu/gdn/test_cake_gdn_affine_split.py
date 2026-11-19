@@ -135,14 +135,15 @@ def test_unsupported_features_are_named_in_order():
 @pytest.mark.parametrize(
     "capability,message",
     [
-        ((10, 0), "use_affine_split=True: sm_100a is not yet supported"),
-        ((10, 7), "use_affine_split=True: sm_107a is not supported (sm_103a only)"),
-        ((9, 0), "use_affine_split=True: sm_90a is not supported (sm_103a only)"),
-        ((12, 0), "use_affine_split=True: sm_120a is not supported (sm_103a only)"),
-        ((8, 0), "use_affine_split=True: sm_80 is not supported (sm_103a only)"),
+        ((9, 0), "sm_90a is not supported"),
+        ((11, 0), "sm_110a is not supported"),
+        ((12, 0), "sm_120a is not supported"),
+        ((12, 1), "sm_121a is not supported"),
+        ((8, 0), "sm_80 is not supported"),
     ],
 )
 def test_other_architectures_are_rejected(monkeypatch, capability, message):
+    message = f"use_affine_split=True: {message} (sm_100a, sm_103a and sm_107a only)"
     _device(monkeypatch, capability)
     q, k, v, cu = _inputs()
     with pytest.raises(ValueError, match=re.escape(message)):
@@ -227,17 +228,40 @@ def test_split_route_receives_the_resolved_arguments(monkeypatch):
 # --- planner -------------------------------------------------------------------
 
 
-def test_plan_constants_on_152_sms():
-    assert [split.tile_cap(h, 152) for h in (4, 8, 16, 32)] == [10, 5, 2, 1]
-    assert [split.plan_constants(h, 152) for h in (4, 8, 16, 32)] == [
-        (8, 8),
-        (5, 8),
-        (2, 16),
-        (1, 16),
+@pytest.mark.parametrize(
+    "target,sm_count,tile_caps,constants",
+    [
+        ("sm_100a", 148, [9, 5, 2, 1], [(8, 8), (5, 8), (2, 16), (1, 16)]),
+        ("sm_103a", 152, [10, 5, 2, 1], [(8, 8), (5, 8), (2, 16), (1, 16)]),
+        ("sm_107a", 212, [13, 7, 3, 2], [(8, 8), (6, 8), (3, 12), (2, 32)]),
+    ],
+)
+def test_plan_constants_per_target(target, sm_count, tile_caps, constants):
+    heads = (4, 8, 16, 32)
+    assert [split.tile_cap(h, sm_count) for h in heads] == tile_caps
+    assert [
+        split.plan_constants(h, sm_count, target=target) for h in heads
+    ] == constants
+    assert split.plan_constants(4, sm_count, 3, target=target) == (3, 1)
+    assert split.plan_constants(8, sm_count, 8, target=target) == (
+        tile_caps[1],
+        1,
+    )
+    assert split.plan_constants(32, sm_count, 4, target=target) == (
+        tile_caps[3],
+        1,
+    )
+
+
+def test_plan_tables_cover_every_target_and_head_count():
+    assert set(split.P_MAX) == set(split.C_MIN) == set(split.TARGETS)
+    assert programs.PASS1.targets == split.TARGETS
+    for target in split.TARGETS:
+        assert set(split.P_MAX[target]) == set(split.C_MIN[target]) == {4, 8, 16, 32}
+    # A 216-SM sm_107a board keeps the 212-SM constants.
+    assert [split.plan_constants(h, 216, target="sm_107a") for h in (4, 8, 16, 32)] == [
+        split.plan_constants(h, 212, target="sm_107a") for h in (4, 8, 16, 32)
     ]
-    assert split.plan_constants(4, 152, split_count=3) == (3, 1)
-    assert split.plan_constants(8, 152, split_count=8) == (5, 1)
-    assert split.plan_constants(32, 152, split_count=4) == (1, 1)
 
 
 @pytest.mark.parametrize(
@@ -266,7 +290,40 @@ def test_plan_constants_on_152_sms():
     ],
 )
 def test_segment_count_of_the_planner(heads, tokens, expected):
-    plan = split.plan_split(num_heads=heads, max_seqlen=tokens, sm_count=152)
+    plan = split.plan_split(
+        num_heads=heads, max_seqlen=tokens, sm_count=152, target="sm_103a"
+    )
+    assert plan.p_bound == expected
+    plan = split.plan_split(
+        num_heads=heads, max_seqlen=tokens, sm_count=148, target="sm_100a"
+    )
+    assert plan.p_bound == expected
+
+
+@pytest.mark.parametrize(
+    "heads,tokens,expected",
+    [
+        (4, 960, 1),
+        (4, 4096, 8),
+        (4, 8192, 8),
+        (8, 2048, 4),
+        (8, 4096, 6),
+        (16, 960, 1),
+        (16, 1024, 1),
+        (16, 1535, 2),
+        (16, 2304, 3),
+        (16, 8192, 3),
+        (32, 2047, 1),
+        (32, 2048, 1),
+        (32, 4032, 1),
+        (32, 4096, 2),
+        (32, 8192, 2),
+    ],
+)
+def test_segment_count_of_the_planner_on_212_sms(heads, tokens, expected):
+    plan = split.plan_split(
+        num_heads=heads, max_seqlen=tokens, sm_count=212, target="sm_107a"
+    )
     assert plan.p_bound == expected
 
 
@@ -275,18 +332,19 @@ def test_no_sequence_of_the_minimum_length_is_split():
     ``SPLIT_MIN_TOKENS`` tokens gets two segments, whatever the batch."""
 
     assert split.SPLIT_MIN_TOKENS == 960
-    for heads in (4, 8, 16, 32):
-        p_cap, c_min = split.plan_constants(heads, 152)
-        assert all(
-            split.segment_count(n, p_cap, c_min) == 1
-            for n in range(split.SPLIT_MIN_TOKENS + 1)
-        )
-    assert split.segment_count(961, 8, split.C_MIN[4]) == 2
+    for target, sm_count in (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)):
+        for heads in (4, 8, 16, 32):
+            p_cap, c_min = split.plan_constants(heads, sm_count, target=target)
+            assert all(
+                split.segment_count(n, p_cap, c_min) == 1
+                for n in range(split.SPLIT_MIN_TOKENS + 1)
+            )
+        assert split.segment_count(961, 8, split.C_MIN[target][4]) == 2
 
 
 def test_forced_split_count_ignores_the_minimum_length():
     assert split.plan_split(
-        num_heads=4, max_seqlen=900, sm_count=152, split_count=3
+        num_heads=4, max_seqlen=900, sm_count=152, target="sm_103a", split_count=3
     ) == (3, 1, 3)
 
 
@@ -325,11 +383,14 @@ def test_grids():
 # --- the generated program table -------------------------------------------------
 
 
-def test_program_table_matches_the_sources_and_the_host(monkeypatch):
+@pytest.mark.parametrize("target", ["sm_100a", "sm_103a", "sm_107a"])
+def test_program_table_matches_the_sources_and_the_host(monkeypatch, target):
     # The spec checks the build's target architectures; a CPU runner detects
-    # none, so pin the one these programs ship for.
+    # none, so pin the one under test.
     monkeypatch.setattr(
-        jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "3a")}
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(10, target[4:])},
     )
     assert programs.PROGRAMS == (
         programs.PASS1,
@@ -347,7 +408,7 @@ def test_program_table_matches_the_sources_and_the_host(monkeypatch):
     )
     for program in programs.PROGRAMS:
         assert isinstance(program, CakeProgram)
-        assert program.targets == ("sm_103a",)
+        assert program.targets == ("sm_100a", "sm_103a", "sm_107a")
         assert program.kernel == "kernel_" + program.name
         # Pass 2 runs in stream order after pass 1: no launch is a dependent launch.
         assert program.use_pdl is False and program.cooperative is False
@@ -360,24 +421,33 @@ def test_program_table_matches_the_sources_and_the_host(monkeypatch):
         assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run," in binding
         assert '#include "cake_ffi_checks.h"' in binding
         assert "CAKE_KERNEL_SYMBOL" not in kernel + binding
-        spec = program.spec("sm_103a")
-        options = program.options_for("sm_103a")
+        spec = program.spec(target)
+        options = program.options_for(target)
         flags = [str(flag) for flag in spec.extra_cuda_cflags]
-        tail = [*TARGET_FLAGS["sm_103a"], "--fmad=false", *options]
+        tail = [*TARGET_FLAGS[target], "--fmad=false", *options]
         assert flags[-len(tail) :] == tail
-        assert program.module_name("sm_103a").startswith(f"{program.name}_sm_103a_")
+        assert program.module_name(target).startswith(f"{program.name}_{target}_")
 
 
 # --- the bound a call launches with ----------------------------------------------
 
 
-def _route(monkeypatch, *, lens, heads=8, max_seqlen=None, cu_cpu=None):
+def _route(
+    monkeypatch,
+    *,
+    lens,
+    heads=8,
+    max_seqlen=None,
+    cu_cpu=None,
+    capability=(10, 3),
+    sm_count=152,
+):
     """``_run_cake_gdn_affine_split`` on host tensors with the launch
     recorded: returns the plan it launched with."""
 
     seen = {}
     monkeypatch.setattr(gdn_prefill, "_cake_gdn_affine_split_scope", lambda **_k: None)
-    monkeypatch.setattr(gdn_prefill, "_cake_gdn_sm_count", lambda _i: 152)
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_sm_count", lambda _i: sm_count)
     monkeypatch.setattr(gdn_prefill.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         gdn_prefill,
@@ -405,7 +475,7 @@ def _route(monkeypatch, *, lens, heads=8, max_seqlen=None, cu_cpu=None):
         use_qk_l2norm_in_kernel=False,
         output=torch.zeros_like(v),
         output_state=None,
-        device_capability=(10, 3),
+        device_capability=capability,
         cuda_major=13,
         split_count=None,
     )
@@ -423,6 +493,34 @@ def test_launch_cap_is_the_longest_sequence_of_the_host_offsets(monkeypatch):
     assert _route(monkeypatch, lens=[900, 960, 64], max_seqlen=960) == (5, 8, 1)
     with pytest.raises(ValueError, match="max_seqlen is smaller than the longest"):
         _route(monkeypatch, lens=lens, max_seqlen=1500, cu_cpu=True)
+
+
+@pytest.mark.parametrize(
+    "capability,sm_count,heads,plan",
+    [
+        ((10, 0), 148, 8, (5, 8, 5)),
+        ((10, 3), 152, 8, (5, 8, 5)),
+        ((10, 7), 212, 8, (6, 8, 6)),
+        ((10, 0), 148, 32, (1, 16, 1)),
+        ((10, 7), 212, 32, (2, 32, 2)),
+        ((10, 7), 212, 16, (3, 12, 3)),
+    ],
+)
+def test_route_plans_with_the_tables_of_the_device(
+    monkeypatch, capability, sm_count, heads, plan
+):
+    lens = [4096, 1000]
+    assert (
+        _route(
+            monkeypatch,
+            lens=lens,
+            heads=heads,
+            cu_cpu=True,
+            capability=capability,
+            sm_count=sm_count,
+        )
+        == plan
+    )
 
 
 def test_tile_limit_is_rejected_on_the_host(monkeypatch):

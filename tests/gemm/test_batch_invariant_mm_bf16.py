@@ -257,6 +257,93 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in space, cfg.describe()
 
 
+@pytest.mark.parametrize("family,sm_count", PARTS)
+def test_memoised_dispatcher_pick_equals_a_fresh_ranking(family, sm_count):
+    """The dispatcher's pick, its candidate list and the enumerated space are memoised per argument tuple: a memoised
+    answer is the fresh computation's, element for element, over a grid of shapes of every format; the memos are
+    cleared with the rankings (a device's registered numbers, ``rank.cache_clear()``), and a memoised list is never the
+    caller's to mutate into the memo."""
+    from flashinfer.gemm.batch_invariant import heuristic as H
+    from flashinfer.gemm.batch_invariant import schedule as S
+    from flashinfer.gemm.batch_invariant.generator import _enumerate_space_cached
+
+    cases = []
+    for in_fmt, layouts in [
+        ("bf16", ("n", "k")),
+        ("e4m3", ("n", "k")),
+        ("mxfp8", ("k",)),
+        ("nvfp4", ("k",)),
+        ("mxfp4w8a", ("k",)),
+        ("e4m3_bs", ("k",)),
+    ]:
+        for N, K in [(4096, 4096), (128, 8192), (2048, 16384)]:
+            C = chunks_for(N, K, in_fmt)
+            for M in (1, 16, 300, 4096):
+                for b_major in layouts:
+                    cases.append((M, N, K, C, b_major, sm_count, family, in_fmt))
+    for args in cases:
+        memo = default_config(*args)
+        assert memo == default_config.__wrapped__(*args), args
+        assert memo == default_config(*args)  # the hit
+        top = rank_topk(*args[:6], 10, *args[6:])
+        fresh = S._rank_topk_cached.__wrapped__(*args[:6], 10, *args[6:], False)
+        assert tuple(top) == fresh and top[0] == memo, args
+        top.append(memo)  # the caller's list, not the memo
+        assert len(rank_topk(*args[:6], 10, *args[6:])) == len(fresh)
+    M, N, K, C, b_major, _, _, in_fmt = cases[0]
+    space = enumerate_space(M, N, K, chunks=C, b_major=b_major, in_fmt=in_fmt)
+    assert tuple(space) == _enumerate_space_cached.__wrapped__(
+        M, N, K, S.SWIZZLES, S.CLUSTERS, C, b_major, in_fmt
+    )
+    space.clear()
+    assert enumerate_space(M, N, K, chunks=C, b_major=b_major, in_fmt=in_fmt)
+    assert default_config.cache_info().currsize >= len(cases) // 2
+    H.rank.cache_clear()  # the rankings' clear takes the memos with it
+    assert default_config.cache_info().currsize == 0
+    assert S._rank_topk_cached.cache_info().currsize == 0
+    default_config(*cases[0])
+    saved = {k: dict(v) for k, v in H._QUERIED_CAPACITY.items()}
+    try:
+        cap = H.capacity_for(family, sm_count)
+        H.register_capacity(family, sm_count, 2, cap[2] + 1)  # a changed device number
+        assert default_config.cache_info().currsize == 0
+    finally:
+        H._QUERIED_CAPACITY.clear()
+        H._QUERIED_CAPACITY.update(saved)
+        H.rank.cache_clear()
+
+
+def test_autotuner_lookup_is_skipped_exactly_when_it_cannot_hit(monkeypatch):
+    """``AutoTuner._has_tune_data(op)`` is the public path's precondition for the autotuner's lookup: False only when every
+    source the lookup consults is empty for the op (no tuning mode, no replay diagnostics, no managed store, no loaded or
+    bundled configs, no in-memory winner of the op); it follows every publication and ``clear_cache``."""
+    from flashinfer.autotuner.autotuner import ProfilingCacheKey
+
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", raising=False)
+    tuner = AutoTuner()  # a fresh instance: not the process singleton
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP)
+    tuner.is_tuning_mode = True
+    assert tuner._has_tune_data(tuning.CUSTOM_OP)
+    tuner.is_tuning_mode = False
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP)  # the memoised negative
+    key = ProfilingCacheKey(tuning.CUSTOM_OP_MM_FP4, "R", 1, ((1, 2),), ())
+    tuner._cache_profile_result(key, None, TUNING_CONFIG_OF_TEST, (1, 2), {})
+    assert tuner._has_tune_data(tuning.CUSTOM_OP_MM_FP4)
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP)  # another op's winner is not ours
+    tuner._file_configs["x"] = (
+        "R",
+        -1,
+    )  # a loaded cache: any op may hit (the file may name it)
+    assert tuner._has_tune_data(tuning.CUSTOM_OP)
+    tuner.clear_cache()
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP_MM_FP4)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+    assert tuner._has_tune_data(tuning.CUSTOM_OP)
+
+
+TUNING_CONFIG_OF_TEST = tuning.TUNING_CONFIG
+
+
 def test_hbm_traffic_follows_the_tile_order():
     """The traffic model: the operands' own bytes when every band's panels stay resident in the L2, refetches per band
     or per wave when they do not, fewer of them with a wider swizzle band, and never below the operands' own bytes."""
@@ -607,6 +694,35 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, layout, bi
 
 
 @needs_device
+def test_public_api_takes_the_autotuner_lookup_only_where_it_may_hit(monkeypatch):
+    """The public path asks the autotuner only where ``_has_tune_data`` says it may hold something; otherwise it runs the
+    dispatcher's pick directly, the same configuration the lookup would have fallen back to (the same bits as the class
+    entry). A process that tuned the op keeps the lookup."""
+    a, b = adv_bf16(16, 4096, 171), adv_bf16(4096, 4096, 172)
+    ref = bits(mm_bf16_batch_invariant(a, b))
+    calls = []
+    real = AutoTuner.choose_one
+
+    def counting(self, custom_op, *args, **kw):
+        calls.append(custom_op)
+        return real(self, custom_op, *args, **kw)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", counting)
+    monkeypatch.setattr(AutoTuner, "_has_tune_data", lambda self, op: False)
+    assert torch.equal(bits(bi_mm(a, b)), ref) and calls == []
+    monkeypatch.setattr(AutoTuner, "_has_tune_data", lambda self, op: True)
+    assert torch.equal(bits(bi_mm(a, b)), ref) and calls == [tuning.CUSTOM_OP]
+    monkeypatch.undo()
+    monkeypatch.setattr(AutoTuner, "choose_one", counting)
+    calls.clear()
+    with autotune(True):
+        assert torch.equal(bits(bi_mm(a, b)), ref)
+    assert AutoTuner.get()._has_tune_data(tuning.CUSTOM_OP)  # tuned in this process
+    n = len(calls)
+    assert torch.equal(bits(bi_mm(a, b)), ref) and len(calls) == n + 1
+
+
+@needs_device
 def test_public_api_skips_backend_selection(monkeypatch):
     """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
     for it (host cost only): a selecting call rewrites `mm_bf16.suitable_auto_backends`, a bypassed one leaves it."""
@@ -778,6 +894,47 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
             "torch.profiler records no CUDA kernel on this device with the installed toolkit (CUPTI unavailable): the "
             "launched grid was not read back; the occupancy query, the cache key and the bits were checked"
         )
+
+
+@needs_device
+@pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    a, b = adv_bf16(M, K, 181), adv_bf16(K, N, 182)
+    bias = adv_bf16(1, N, 183)[0]
+    for kw in ({}, {"bias": bias}):
+        ref = bits(mm_bf16_batch_invariant(a, b, **kw))
+        assert torch.equal(bits(bi_mm(a, b, **kw)), ref)
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        assert bi_mm(a, b, out=out, **kw) is out and torch.equal(bits(out), ref)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            bi_mm(a, b, out=out, **kw)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                bi_mm(a, b, out=out, **kw)
+        torch.cuda.current_stream().wait_stream(s)
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    buf = torch.empty(M, K, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_mm(buf, b, out=buf.view(-1)[: M * N].view(M, N))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
+    ):
+        bi_mm(a, b, out=b[:M])
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="bias overlapping the output"
+    ):
+        bi_mm(a, b, bias=out[0], out=out)
 
 
 @needs_device

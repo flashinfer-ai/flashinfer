@@ -11,7 +11,7 @@ by at most 10 % on realistic gates and 20 % on near-unit gates, per sequence
 of a batch.  A call whose longest sequence gets one segment is bitwise equal
 to the unsplit kernel.  A sequence's bits do not depend on the batch around
 it.  Graph capture, replay with changed lengths, plan reuse and streams are
-checked against eager calls.  SM103 only.
+checked against eager calls.  SM100, SM103 and SM107.
 """
 
 from __future__ import annotations
@@ -31,12 +31,15 @@ HEADS = [(2, 4), (4, 8), (8, 16), (16, 32)]
 GATE = {"real": 1.10, "stress": 1.20}
 
 
+_TARGETS = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
+
+
 @pytest.fixture(autouse=True)
-def _require_sm103():
+def _require_target():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("the Cake GDN affine-split route ships for SM103 only")
+    if torch.cuda.get_device_capability() not in _TARGETS:
+        pytest.skip("the Cake GDN affine-split route ships for SM100/SM103/SM107")
     if prefill_mod._chunk_gated_delta_rule_gdn_affine_split_sm100 is None:
         pytest.skip("the Cake GDN affine-split backend is not installed")
 
@@ -48,7 +51,34 @@ def _split_module():
 
 
 def _sm_count() -> int:
-    return torch.cuda.get_device_properties(0).multi_processor_count
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+def _require_qk_norm():
+    """``use_qk_l2norm_in_kernel=True`` needs the Q/K normalization kernel
+    (CUDA 13 and a CuTe DSL architecture)."""
+
+    from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
+
+    cuda_major = int((torch.version.cuda or "0").split(".")[0])
+    if not (
+        cuda_major >= 13
+        and is_cute_dsl_arch_supported(*torch.cuda.get_device_capability())
+    ):
+        pytest.skip("use_qk_l2norm_in_kernel needs the Q/K normalization kernel")
+
+
+def _target() -> str:
+    return _TARGETS[torch.cuda.get_device_capability()]
+
+
+def _active_clusters() -> int:
+    """The CTA count up to which the unsplit kernel resolves its DV-split
+    variant on this device (``2 * num_seqs * num_v_heads`` at most this)."""
+
+    return prefill_mod._cake_gdn._ARCH_ACTIVE_CLUSTERS[_target()]
 
 
 def _problem(hq, hv, t, kind="real", seed=0):
@@ -156,7 +186,11 @@ def _p_bound(hv, t, split_count=None):
     return (
         _split_module()
         .plan_split(
-            num_heads=hv, max_seqlen=t, sm_count=_sm_count(), split_count=split_count
+            num_heads=hv,
+            max_seqlen=t,
+            sm_count=_sm_count(),
+            target=_target(),
+            split_count=split_count,
         )
         .p_bound
     )
@@ -242,10 +276,13 @@ def test_split_is_run_to_run_deterministic():
         (16, 32, 8192, None),
         (4, 8, 4096, 1),
         (2, 4, 2048, 1),
+        (8, 16, 1984, 1),
+        (16, 32, 8192, 1),
     ],
 )
 def test_one_segment_is_bitwise_the_unsplit_kernel(hq, hv, t, split_count, with_h0):
-    assert _p_bound(hv, t, split_count) == 1
+    if _p_bound(hv, t, split_count) != 1:
+        pytest.skip(f"{hv} heads at {t} tokens take several segments on this device")
     pr = _problem(hq, hv, t, "real")
     h0 = pr["h0"] if with_h0 else None
     o_split, s_split = _call(
@@ -256,8 +293,8 @@ def test_one_segment_is_bitwise_the_unsplit_kernel(hq, hv, t, split_count, with_
         o_base, s_base = _call(pr, initial_state=h0, use_cp=False)
     except CakeGDNUnsupportedError:
         # The unsplit route has no kernel without an initial state for these
-        # heads on SM103; the split route serves the call as from zeros.
-        assert not with_h0 and hv in (8, 16)
+        # heads on this device; the split route serves the call as from zeros.
+        assert not with_h0
         o_base, s_base = _call(
             pr, initial_state=torch.zeros_like(pr["h0"]), use_cp=False
         )
@@ -299,20 +336,23 @@ def test_one_sequence_of_one_segment_runs_the_unsplit_kernel():
     assert len(names) == 1 and "cake_gdn_affine_split" in names[0], names
 
 
-@pytest.mark.parametrize("hq,hv,n", [(8, 16, 5), (8, 16, 6), (16, 32, 2), (16, 32, 3)])
+@pytest.mark.parametrize(
+    "hq,hv,n",
+    [(8, 16, 5), (8, 16, 6), (8, 16, 7), (16, 32, 2), (16, 32, 3), (16, 32, 4)],
+)
 def test_batch_of_one_segment_uses_the_unsplit_kernel_only_where_bitwise(hq, hv, n):
     """A batch of one-segment sequences from initial states runs the unsplit
-    kernel while it resolves the DV-split variant (2 N Hv <= 160 on SM103),
-    else the first kernel alone; either way each sequence holds the bits it
-    has alone."""
+    kernel while it resolves the DV-split variant (2 N Hv at most 148 on SM100,
+    160 on SM103 and 212 on SM107), else the first kernel alone; either way
+    each sequence holds the bits it has alone."""
 
-    lens = [1000] * n
+    lens = [960] * n  # one segment on every target
     pr = _batch(hq, hv, lens)
     _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
     names = _kernel_names(
         lambda: _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
     )
-    unsplit = 2 * n * hv <= 160
+    unsplit = 2 * n * hv <= _active_clusters()
     assert any("affine_split" in name for name in names) != unsplit, names
     o, s = _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
     o, s = o.clone(), s.clone()
@@ -322,12 +362,42 @@ def test_batch_of_one_segment_uses_the_unsplit_kernel_only_where_bitwise(hq, hv,
         assert torch.equal(o_alone, o[a:b]) and torch.equal(s_alone[0], s[i]), i
 
 
+@pytest.mark.parametrize("hq,hv", [(1, 4), (1, 32), (2, 32)])
+def test_one_segment_batch_of_any_head_group(hq, hv):
+    """A one-segment batch from initial states runs for every admitted head
+    group: through the unsplit kernel where it ships the record, else
+    through the first kernel alone. Each sequence holds the bits it has
+    alone, and the unsplit kernel's accuracy where it runs."""
+
+    pr = _batch(hq, hv, [512, 512])
+    o, s = (
+        x.clone()
+        for x in _call_batch(pr, use_affine_split=True, cu_seqlens_cpu=pr["cu"])
+    )
+    for i in range(2):
+        seq = _sequence(pr, i)
+        o_alone, s_alone = _call(seq, use_affine_split=True)
+        a, b = pr["cu"][i], pr["cu"][i + 1]
+        assert torch.equal(o_alone, o[a:b]) and torch.equal(s_alone[0], s[i]), i
+        ref_o, ref_s = _fp64_reference(seq, 0, seq["t"])
+        try:
+            o_base, s_base = _call(seq, use_cp=False)
+        except CakeGDNUnsupportedError:
+            # No unsplit record for this head group. Observed on B200, GB300
+            # and VR200: at most 0.0039 (output) and 0.0032 (state), as for
+            # the head groups the unsplit kernel serves.
+            assert _rel_rms(o[a:b], ref_o) <= 1e-2 and _rel_rms(s[i], ref_s) <= 1e-2
+            continue
+        assert _rel_rms(o[a:b], ref_o) <= GATE["real"] * _rel_rms(o_base, ref_o)
+        assert _rel_rms(s[i], ref_s) <= GATE["real"] * _rel_rms(s_base, ref_s)
+
+
 def test_one_segment_from_initial_states_without_final_states():
     """From initial states and without final states, a batch of one-segment
     sequences runs the first kernel alone, as the unsplit kernel ships no
     such variant, with the output of the call that keeps the states."""
 
-    pr = _batch(8, 16, [512, 512])
+    pr = _batch(8, 16, [480, 480])  # one segment on every target, unhinted
     cu = torch.tensor(pr["cu"], dtype=torch.int32, device="cuda")
 
     def only():
@@ -458,7 +528,7 @@ def test_no_initial_state_unit_gates_and_no_final_state():
         assert torch.equal(only, o)
 
 
-def test_in_place_state_and_qk_l2norm():
+def test_in_place_state():
     pr = _problem(4, 8, 2048, "real")
     state = pr["h0"].clone()
     o_inplace, s_inplace = _call(
@@ -467,6 +537,11 @@ def test_in_place_state_and_qk_l2norm():
     o_ref, s_ref = _call(pr, use_affine_split=True)
     assert s_inplace.data_ptr() == state.data_ptr()
     assert torch.equal(o_inplace, o_ref) and torch.equal(s_inplace, s_ref)
+
+
+def test_qk_l2norm():
+    _require_qk_norm()
+    pr = _problem(4, 8, 2048, "real")
     raw = dict(
         pr,
         q=(pr["q"].float() * 3).to(torch.bfloat16),
@@ -967,7 +1042,7 @@ def test_batch_launch_cap_follows_the_bound():
         (dict(cu_seqlens_cpu=pr["cu"]), 4),
         (dict(max_seqlen=2048), 4),
         (dict(max_seqlen=1200), None),
-        ({}, 5),
+        ({}, _p_bound(8, 3500)),
     ):
         split.clear_affine_split_plans()
         if cap is None:
@@ -988,8 +1063,8 @@ def test_batch_launch_cap_follows_the_bound():
 def test_batch_call_forms_keep_the_bits():
     """int64 ``cu_seqlens``, ``cu_seqlens_cpu`` as a tensor, an in-place
     state, ``initial_state=None`` (against explicit zeros), unit gates
-    (against ones), ``output_final_state=False`` and the Q/K L2 norm (against
-    normalized inputs) hold the bits of the plain call over a batch."""
+    (against ones) and ``output_final_state=False`` hold the bits of the
+    plain call over a batch."""
 
     pr = _batch(4, 8, [4096, 1000, 0, 2500])
     n = 4
@@ -1045,6 +1120,13 @@ def test_batch_call_forms_keep_the_bits():
         use_affine_split=True,
     )
     assert torch.equal(only, o_ref)
+
+
+def test_batch_qk_l2norm_keeps_the_bits():
+    """The Q/K L2 norm holds the bits of normalized inputs over a batch."""
+
+    _require_qk_norm()
+    pr = _batch(4, 8, [4096, 1000, 0, 2500])
     raw = dict(
         pr,
         q=(pr["q"].float() * 3).to(torch.bfloat16),

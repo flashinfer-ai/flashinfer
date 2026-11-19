@@ -30,10 +30,17 @@ APIs:
 
 import functools
 import os
+import threading
 from typing import Literal, Optional, Tuple
 
 import torch
 
+from . import cake_locality as _cake_locality
+from .cake_gdn_decode_locality import (
+    DOMAIN_COUNTER_WORDS as _CAKE_GDN_DOMAIN_COUNTER_WORDS,
+    localize_gdn_decode_state as localize_gdn_decode_state,
+    nontranspose_domain_variant as _cake_gdn_nontranspose_domain_variant,
+)
 from .jit.core import logger
 from .utils import get_compute_capability
 
@@ -535,6 +542,232 @@ def _run_cake_gdn_decode_pretranspose(
 # reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
 _CAKE_GDN_NONTRANSPOSE_LAUNCHES: dict[tuple, tuple] = {}
 _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT = 1024
+# Launch of the locality-domain twin of a row (``localize_gdn_decode_state``) per the row's
+# ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` key, the dies' SM counts and the die cut of the homed
+# state: ``(entry, grid_x, rows0, table)``, where ``entry`` is the twin's kernel entry or
+# ``None`` when the row runs its whole-GPU launch on that state (no twin listed for the cell
+# or shipped for the row, or a twin that failed to build, load or launch), ``grid_x``
+# the requested grid (B * HV; the host shim launches at most the resident CTAs),
+# ``rows0`` the batch row nearest the die cut and ``table`` the SM table the launch was
+# resolved with (a hit is reused only for the same table object).  Cleared when it
+# reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
+_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES: dict[tuple, tuple] = {}
+# Bytes of one [K=128, V=128] FP32 state head.
+_CAKE_GDN_HEAD_BYTES = 128 * 128 * 4
+# The launch a homed state allocation is bound to, by ``id`` of the allocation's homing
+# record (``cake_locality.tensor_homing`` gives one record object per allocation for its
+# whole life): ``(record, whole, domain, table)``, where ``whole`` is the row's
+# ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` value the binding was made for and ``domain`` the
+# ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`` value the call runs, or ``None`` for the
+# row's whole-GPU launch, and ``table`` the SM table entries of that twin launch as a
+# tvm-ffi tensor (``_cake_gdn_launch_arg``), or ``None``.  A call reuses a binding only
+# for the same record object (held here, so its id is not reused while the entry
+# lives) and the same ``whole`` object (so the same row), and then skips the SM table
+# query, the twin launch lookup and the conversion of the table.  A binding keeps the
+# SM table it was resolved with: a device's table does not change once probed, and the
+# twin's bits do not depend on the table or the cut (they only order its claims).  A
+# call that finds no SM table is not bound (a later probe may find one).  Cleared when
+# it reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` entries and when a twin is dropped
+# (``_drop_cake_gdn_nontranspose_domain_twin``).
+_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES: dict[int, tuple] = {}
+# The twin's claim counter pairs of this thread's eager launches, by (device index, raw
+# stream handle): the pair ``cake_locality.launch_counters`` returned for that stream,
+# as tvm-ffi tensors (``_cake_gdn_launch_arg``), reused by later eager launches on it
+# without that call.  That is the reuse ``launch_counters`` makes itself: launches on
+# one stream are ordered, and each launch leaves its pair zero.  Never used under CUDA
+# graph capture.  At most ``cake_locality.STREAM_PAIR_LIMIT`` pairs per thread; past it
+# they are dropped.
+_CAKE_GDN_DOMAIN_PAIRS = threading.local()
+# Devices on which a captured twin launch took a pair of the capture reserve since the
+# last eager twin launch through ``cake_locality.launch_counters``: the next eager twin
+# launch on the device goes through it again, which tops the reserve up.
+_CAKE_GDN_DOMAIN_CAPTURED: set[int] = set()
+# Raw stream handles on which CUDA graph capture cannot begin: the legacy default
+# stream, as torch's default stream (0) and as ``cudaStreamLegacy`` (1).
+_CAKE_GDN_UNCAPTURABLE_STREAMS = frozenset({0, 1})
+
+
+def _cake_gdn_nontranspose_domain_launch(
+    key: tuple, state: torch.Tensor, homed
+) -> Optional[tuple]:
+    """``(entry, grid_x, rows0, table)`` of the locality-domain twin for the row ``key`` of
+    ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` on ``state``, whose homing record is ``homed``, or
+    ``None`` when the call runs the row's whole-GPU launch: ``state`` is not the whole
+    allocation of its homing record on the call's device, the device has no SM table, or
+    the row has no twin there (see ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES``)."""
+    device_index = key[0]
+    if (
+        homed.device_index != device_index
+        or state.numel() * state.element_size() != homed.nbytes
+    ):
+        return None
+    table = _cake_locality.sm_table(device_index)
+    if table is None:
+        return None
+    domain_key = key + (table.counts, homed.cut)
+    launch = _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.get(domain_key)
+    if launch is None or launch[3] is not table:
+        launch = _resolve_cake_gdn_nontranspose_domain_launch(key, table, homed.cut)
+        if (
+            len(_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES)
+            >= _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT
+        ):
+            _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.clear()
+        _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES[domain_key] = launch
+    return None if launch[0] is None else launch
+
+
+def _resolve_cake_gdn_nontranspose_domain_launch(key: tuple, table, cut: int) -> tuple:
+    """The ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`` value of the row ``key`` on a state
+    homed with die cut ``cut`` (bytes) on a device with SM table ``table``."""
+    (
+        device_index,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        scale,
+        use_qk_l2norm,
+    ) = key
+    properties = torch.cuda.get_device_properties(device_index)
+    arch = _cake_gdn.arch_for_compute_capability(properties.major, properties.minor)
+    name = _cake_gdn_nontranspose_domain_variant(
+        arch=arch,
+        sm_count=int(properties.multi_processor_count),
+        die_class=_cake_locality.die_class(table.counts),
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    entry = None
+    if name is not None:
+        try:
+            entry = _cake_gdn.load_cake_gdn_kernel(name, arch)
+        except Exception as error:  # noqa: BLE001 - the row keeps its whole-GPU launch
+            logger.warning(
+                "Cake GDN locality-domain decode %s failed to build or load (%s); "
+                "the row runs its whole-GPU kernel",
+                name,
+                error,
+            )
+    row_bytes = num_v_heads * _CAKE_GDN_HEAD_BYTES
+    rows0 = min(batch_size, max(0, (2 * cut + row_bytes) // (2 * row_bytes)))
+    return (entry, batch_size * num_v_heads, rows0, table)
+
+
+def _drop_cake_gdn_nontranspose_domain_twin(
+    key: tuple, homed, launch: tuple, error: Exception
+) -> None:
+    """Record that the twin of ``launch`` (the ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES``
+    value of the row ``key`` on a state whose homing record is ``homed``) failed at its
+    launch where the row's whole-GPU launch runs: the row runs its whole-GPU launch on
+    such states from now on."""
+    _, grid_x, rows0, table = launch
+    logger.warning(
+        "Cake GDN locality-domain decode of row %s failed to load or launch (%s); "
+        "the row runs its whole-GPU kernel",
+        key,
+        error,
+    )
+    _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES[key + (table.counts, homed.cut)] = (
+        None,
+        grid_x,
+        rows0,
+        table,
+    )
+    # Every allocation bound to that twin binds again, to the entry above.
+    _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.clear()
+
+
+def _bind_cake_gdn_nontranspose_domain_launch(
+    key: tuple, whole: tuple, state: torch.Tensor, homed
+) -> tuple:
+    """Bind the homed allocation of ``state`` (homing record ``homed``) to the row
+    ``key`` (``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` value ``whole``): the
+    ``_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES`` value, stored unless the device has no
+    SM table."""
+    domain = None
+    lasting = True
+    if (
+        homed.device_index == key[0]
+        and state.numel() * state.element_size() == homed.nbytes
+    ):
+        if _cake_locality.sm_table(key[0]) is None:
+            lasting = False  # a later probe may find a table
+        else:
+            domain = _cake_gdn_nontranspose_domain_launch(key, state, homed)
+    bound = (
+        homed,
+        whole,
+        domain,
+        None if domain is None else _cake_gdn_launch_arg(domain[3].entries),
+    )
+    if lasting:
+        if (
+            len(_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES)
+            >= _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT
+        ):
+            _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.clear()
+        _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES[id(homed)] = bound
+    return bound
+
+
+def _cake_gdn_launch_arg(tensor):
+    """``tensor`` as a tvm-ffi tensor over the same memory, which keeps ``tensor``
+    alive: an argument the twin's entry then takes without converting it from torch
+    on every call.  Anything else is returned as is."""
+    if isinstance(tensor, torch.Tensor):
+        import tvm_ffi
+
+        return tvm_ffi.from_dlpack(tensor)
+    return tensor
+
+
+def _cake_gdn_eager_stream(device_index: int) -> Optional[tuple[int, int]]:
+    """``(device_index, raw handle of the current stream of device device_index)``,
+    or ``None`` when that stream is capturing a CUDA graph (the capture test of
+    ``cake_locality.launch_counters``).  The legacy default stream (handle 0, or 1
+    for ``cudaStreamLegacy``) cannot capture, so it needs no test.  Otherwise, when
+    ``device_index`` is the current device, the test asks torch's C bindings
+    directly, the call ``torch.cuda.is_current_stream_capturing`` makes; on another
+    device it is ``cake_locality._stream_capturing``."""
+    handle = torch._C._cuda_getCurrentRawStream(device_index)
+    if handle not in _CAKE_GDN_UNCAPTURABLE_STREAMS:
+        if torch._C._cuda_getDevice() == device_index:
+            if torch._C._cuda_isCurrentStreamCapturing():
+                return None
+        elif _cake_locality._stream_capturing(device_index):
+            return None
+    return (device_index, handle)
+
+
+def _cake_gdn_domain_counters(device_index: int) -> tuple:
+    """The claim counter pair of one twin launch enqueued now on the current stream of
+    device ``device_index`` (``cake_locality.launch_counters``)."""
+    stream = _cake_gdn_eager_stream(device_index)
+    if stream is None:
+        # A pre-zeroed pair of this capture's own.
+        _CAKE_GDN_DOMAIN_CAPTURED.add(device_index)
+        return _cake_locality.launch_counters(
+            _CAKE_GDN_DOMAIN_COUNTER_WORDS, device_index
+        )
+    pairs = getattr(_CAKE_GDN_DOMAIN_PAIRS, "pairs", None)
+    if pairs is None:
+        pairs = _CAKE_GDN_DOMAIN_PAIRS.pairs = {}
+    pair = pairs.get(stream)
+    if pair is None or device_index in _CAKE_GDN_DOMAIN_CAPTURED:
+        _CAKE_GDN_DOMAIN_CAPTURED.discard(device_index)
+        counters0, counters1 = _cake_locality.launch_counters(
+            _CAKE_GDN_DOMAIN_COUNTER_WORDS, device_index
+        )
+        pair = (_cake_gdn_launch_arg(counters0), _cake_gdn_launch_arg(counters1))
+        if len(pairs) >= _cake_locality.STREAM_PAIR_LIMIT:
+            pairs.clear()
+        pairs[stream] = pair
+    return pair
 
 
 def _run_cake_gdn_decode_nontranspose(
@@ -668,6 +901,49 @@ def _run_cake_gdn_decode_nontranspose(
             _CAKE_GDN_NONTRANSPOSE_LAUNCHES.clear()
         _CAKE_GDN_NONTRANSPOSE_LAUNCHES[key] = launch
     entry, grid_x = launch
+    # A state that ``localize_gdn_decode_state`` homed may run the row's locality-domain
+    # twin; ``tensor_homing`` returns at once in a process that never homed a tensor.
+    homed = _cake_locality.tensor_homing(state)
+    if homed is not None:
+        bound = _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.get(id(homed))
+        if bound is None or bound[0] is not homed or bound[1] is not launch:
+            bound = _bind_cake_gdn_nontranspose_domain_launch(key, launch, state, homed)
+        domain = bound[2]
+        if domain is not None:
+            twin, twin_grid_x, rows0, _ = domain
+            counters0, counters1 = _cake_gdn_domain_counters(device_index)
+            try:
+                twin(
+                    q,
+                    k,
+                    v,
+                    state,
+                    A_log,
+                    a,
+                    dt_bias,
+                    b,
+                    output,
+                    rows0,
+                    counters0,
+                    counters1,
+                    bound[3],
+                    twin_grid_x,
+                    1,
+                    1,
+                )
+            except RuntimeError as error:
+                # The twin loads its kernel and opts in to its shared memory on a
+                # device at its first launch there, before the launch itself.  A
+                # failure leaves the state, the output and the counters untouched,
+                # and the call runs the row's whole-GPU launch.  If that raises too,
+                # the error is the call's, not the twin's (for example a launch on
+                # the legacy default stream while another thread captures on a
+                # blocking stream): it propagates as from the whole launch alone, and
+                # the twin is kept.  Otherwise the twin cannot run here, and the row
+                # runs its whole-GPU launch on such states from now on.
+                entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
+                _drop_cake_gdn_nontranspose_domain_twin(key, homed, domain, error)
+            return output
     entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
     return output
 
@@ -1228,7 +1504,9 @@ def gated_delta_rule_decode(
         Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
     state : torch.Tensor
         Current state of shape ``[B, HV, K, V]`` (k-major layout).  Must be
-        float32.  Updated in-place.
+        float32.  Updated in-place.  On a dual-die SM107a GPU, a state from
+        :func:`localize_gdn_decode_state` runs the Cake locality-domain twin
+        where it is listed (bitwise equal to the whole-GPU kernel).
     A_log : torch.Tensor
         Log decay parameter of shape ``[HV]``.  Must be float32.
     a : torch.Tensor
