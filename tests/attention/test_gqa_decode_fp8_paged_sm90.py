@@ -23,6 +23,7 @@ import torch
 import flashinfer
 from flashinfer.prefill import (
     GQA_DEC_FP8Q_SM90_BACKENDS,
+    _gqa_dec_fp8q_sm90_auto_admits,
     _gqa_dec_fp8q_sm90_auto_routes,
     _gqa_dec_fp8q_sm90_backend_order,
     _gqa_dec_fp8q_sm90_plan_eligibility,
@@ -388,12 +389,20 @@ def test_non_uniform_q_len_takes_the_stock_path():
         _plan_wrapper(batch, device)
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 0 and stats["plans_ineligible"] == 1, stats
-    # auto keeps the stock resolution and serves the call by the dequant path
+    # auto never arms off the q_len domain: the stock auto resolution serves
+    # the plan untouched (never the slower composable bf16-dequant fa2 pin)
     wrapper = _plan_wrapper(batch, device, backend="auto")
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+    assert not getattr(wrapper, "_gqa_dec_fp8q_sm90_requested", False)
+    assert wrapper._cached_q_data_type == torch.float8_e4m3fn  # dtype not flipped
+    assert any(
+        r.startswith("auto:") and "q_len" in r for r in stats["fallback_reasons"]
+    ), stats
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0
-    assert stats["runs_dequant_fallback"] == 1
+    assert stats["runs_dequant_fallback"] == 0  # stock-served, not composable
     assert out.shape == batch["q"].shape
 
 
@@ -747,3 +756,430 @@ def test_auto_replan_never_arms_over_a_retained_fa3_graph(monkeypatch):
     assert any("retained CUDA-graph backend" in r for r in stats["fallback_reasons"]), (
         stats
     )
+
+
+# --------------------------------------------------------------------------
+# Codex review regressions: complete auto admission, fp16 P-staging range,
+# retained-graph replan contract
+# --------------------------------------------------------------------------
+
+
+def _admit_kwargs(batch_size, qo_indptr, kv_lens, **overrides):
+    kwargs = dict(
+        num_qo_heads=H_QO,
+        num_kv_heads=H_KV,
+        head_dim_qk=HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        page_size=PAGE,
+        kv_layout="NHD",
+        causal=True,
+        has_custom_mask=False,
+        pos_encoding_mode="NONE",
+        use_fp16_qk_reduction=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        sm_scale=None,
+        batch_size=batch_size,
+        qo_indptr_host=torch.tensor(qo_indptr, dtype=torch.int32),
+        prefix_len_ptr=None,
+        token_pos_in_items_len=0,
+        has_jit_module=False,
+        kv_meta_fn=lambda: (
+            (
+                None,
+                None,
+                torch.tensor(kv_lens, dtype=torch.int32),
+            )
+            if kv_lens is not None
+            else None
+        ),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_auto_admission_resolves_the_full_domain_gpu_free():
+    """backend='auto' admission must check the whole measured domain (q_len,
+    batch, kv envelope, plan options) from host metadata, not just geometry."""
+    ok, reason, kv_meta = _gqa_dec_fp8q_sm90_auto_admits(
+        **_admit_kwargs(2, [0, 6, 12], [64, 64])
+    )
+    assert ok and reason is None and kv_meta is not None
+    declined = [
+        _admit_kwargs(2, [0, 4, 12], [64, 64]),  # non-uniform q_len
+        _admit_kwargs(1, [0, 128], [1024]),  # ordinary prefill q_len
+        _admit_kwargs(1, [0, 1], [64]),  # single-token decode
+        _admit_kwargs(129, [i * QL for i in range(130)], [64] * 129),  # batch
+        _admit_kwargs(1, [0, 6], [262145]),  # kv above measured envelope
+        _admit_kwargs(1, [0, 6], [4]),  # kv_len < q_len
+        _admit_kwargs(1, [0, 6], None),  # kv lengths unavailable
+        _admit_kwargs(1, [0, 6], [64], window_left=1024),
+        _admit_kwargs(1, [0, 6], [64], logits_soft_cap=30.0),
+        _admit_kwargs(1, [0, 6], [64], sm_scale=1.0),
+        _admit_kwargs(1, [0, 6], [64], has_custom_mask=True),
+        _admit_kwargs(1, [0, 6], [64], has_jit_module=True),
+    ]
+    for kwargs in declined:
+        ok, reason, _ = _gqa_dec_fp8q_sm90_auto_admits(**kwargs)
+        assert not ok and reason, kwargs
+
+
+def test_auto_keeps_stock_resolution_for_ordinary_prefill():
+    """An fp8-Q prefill outside the six-token verify domain must keep the
+    stock auto resolution: no bf16 dtype flip, no fa2 pin, no composable
+    dequant fallback (the measured 2.6x ordinary-prefill regression)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    for q_len, kv_len in [(128, 1024), (1, 64)]:
+        _reset_gqa_dec_fp8q_sm90_stats()
+        g = torch.Generator(device=device)
+        g.manual_seed(3)
+        npages = (kv_len + PAGE - 1) // PAGE
+
+        def rnd(shape):
+            x = torch.randn(shape, generator=g, device=device, dtype=torch.float32)
+            return (x * 0.5).to(torch.float8_e4m3fn)
+
+        batch = dict(
+            q=rnd((q_len, H_QO, HEAD_DIM)),
+            k_cache=rnd((npages, PAGE, H_KV, HEAD_DIM)),
+            v_cache=rnd((npages, PAGE, H_KV, HEAD_DIM)),
+            qo_indptr=torch.tensor([0, q_len], dtype=torch.int32, device=device),
+            kv_indptr=torch.tensor([0, npages], dtype=torch.int32, device=device),
+            kv_indices=torch.arange(npages, dtype=torch.int32, device=device),
+            last_page_len=torch.tensor(
+                [(kv_len - 1) % PAGE + 1], dtype=torch.int32, device=device
+            ),
+            seq_lens=torch.tensor([kv_len], dtype=torch.int32, device=device),
+            block_table=torch.arange(npages, dtype=torch.int32, device=device).view(
+                1, npages
+            ),
+        )
+        wrapper = _plan_wrapper(batch, device, backend="auto")
+        stats = _gqa_dec_fp8q_sm90_stats()
+        assert stats["plans_prepared"] == 0, (q_len, stats)
+        assert not getattr(wrapper, "_gqa_dec_fp8q_sm90_requested", False)
+        assert wrapper._cached_q_data_type == torch.float8_e4m3fn
+        assert wrapper._backend != "fa2" or q_len == 1  # never the dequant pin
+        out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+        stats = _gqa_dec_fp8q_sm90_stats()
+        assert stats["runs_dequant_fallback"] == 0, (q_len, stats)
+        assert stats["runs_dispatched"] == 0
+        assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_workspace_size_off_domain_auto_sizes_the_stock_plan(monkeypatch):
+    """workspace_size must apply the same complete auto admission as plan():
+    an off-domain fp8-Q plan is sized for the stock resolution, not for the
+    composable fa2/bf16 pin."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([584, 727, 75], device)
+    # off-domain: non-uniform q_len
+    qo = torch.tensor([0, 5, 12, 18], dtype=torch.int32, device=device)
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    ws_args = (
+        qo,
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+    )
+    kwargs = dict(
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+
+    def size_with(auto_routes):
+        import flashinfer.prefill as fp
+
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, kv_layout="NHD", backend="auto"
+        )
+        if auto_routes is not None:
+            monkeypatch.setattr(fp, "_gqa_dec_fp8q_sm90_auto_routes", auto_routes)
+        try:
+            return w.workspace_size(*ws_args, **kwargs)
+        except Exception as exc:  # stock behavior may be an exception too
+            return (type(exc), str(exc))
+        finally:
+            monkeypatch.undo()
+
+    # the stock resolution's behavior for this plan (value, or its exception)
+    # must be exactly what the off-domain auto wrapper reports
+    sized = size_with(None)
+    stock = size_with(lambda *a, **k: (False, "bypassed"))
+    assert sized == stock
+    assert not (isinstance(sized, tuple) and sized and sized[0] is ValueError), sized
+    # in-domain sizing still matches the composable fa2/bf16 plan
+    in_domain = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="auto"
+    ).workspace_size(
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        **kwargs,
+    )
+    fa2_bf16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="fa2"
+    ).workspace_size(
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    assert in_domain == fa2_bf16
+
+
+@pytest.mark.parametrize("gap", [17, 18, 22])
+def test_small_probabilities_survive_fp16_p_staging(gap):
+    """Softmax weights far below the maximum must contribute to P.V when V
+    and its descale are large: the fp16 P staging carries a 2^PSHIFT power
+    shift so they survive the conversion (an unshifted staging flushed them
+    to zero and auto returned silently incorrect finite outputs)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    kv_len = 48
+    npages = (kv_len + PAGE - 1) // PAGE
+    q = torch.zeros((QL, H_QO, HEAD_DIM), dtype=torch.float32, device=device)
+    q[:, :, 0] = 4.0
+    k = torch.zeros((npages, PAGE, H_KV, HEAD_DIM), dtype=torch.float32, device=device)
+    k[0, 0, 0, 0] = 64.0
+    v = torch.full(
+        (npages, PAGE, H_KV, HEAD_DIM), 448.0, dtype=torch.float32, device=device
+    )
+    v[0, 0, 0, :] = 0.0
+    batch = dict(
+        q=q.to(torch.float8_e4m3fn),
+        k_cache=k.to(torch.float8_e4m3fn),
+        v_cache=v.to(torch.float8_e4m3fn),
+        qo_indptr=torch.tensor([0, QL], dtype=torch.int32, device=device),
+        kv_indptr=torch.tensor([0, npages], dtype=torch.int32, device=device),
+        kv_indices=torch.arange(npages, dtype=torch.int32, device=device),
+        last_page_len=torch.tensor(
+            [(kv_len - 1) % PAGE + 1], dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.tensor([kv_len], dtype=torch.int32, device=device),
+        block_table=torch.arange(npages, dtype=torch.int32, device=device).view(
+            1, npages
+        ),
+    )
+    # key 0 scores `gap` nats; every other key's softmax weight is exp(-gap)
+    qd = torch.tensor(
+        [gap * math.sqrt(HEAD_DIM) / 256.0], dtype=torch.float32, device=device
+    )
+    vd = torch.tensor([256.0], dtype=torch.float32, device=device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
+    out = wrapper.run(
+        batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=qd, v_scale=vd
+    )
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 1, stats
+    ref = _reference(batch, q_descale=qd, v_descale=vd)
+    assert not bool((out.float() == 0).all())
+    assert _matched_ratio(out, ref) >= MATCHED
+    # the recovered contributions are small; hold them to a tight absolute bound
+    assert float((out.float() - ref.float()).abs().max()) <= 2e-3
+
+
+def _graph_batch_and_wrapper(device, kv_lens=(64, 64)):
+    batch = _make_batch(list(kv_lens), device)
+    ws = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws,
+        kv_layout="NHD",
+        backend="auto",
+        use_cuda_graph=True,
+        qo_indptr_buf=batch["qo_indptr"].clone(),
+        paged_kv_indptr_buf=batch["kv_indptr"].clone(),
+        paged_kv_indices_buf=batch["kv_indices"].clone(),
+        paged_kv_last_page_len_buf=batch["last_page_len"].clone(),
+    )
+    return batch, wrapper
+
+
+def _graph_plan(wrapper, qo_indptr, kv_indptr, kv_indices, last_page_len):
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+
+
+def _capture(wrapper, q, kv, out):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        wrapper.run(q, kv, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, kv, out=out)
+    return graph
+
+
+def _ref_with_indices(batch, kv_indices, kv_lens):
+    b = dict(batch)
+    device = batch["q"].device
+    b["kv_indices"] = kv_indices
+    b["seq_lens"] = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    # rebuild the per-request block table the reference walks
+    pprs = [(k + PAGE - 1) // PAGE for k in kv_lens]
+    nb = max(pprs)
+    bt = torch.zeros((len(kv_lens), nb), dtype=torch.int32, device=device)
+    s = 0
+    for i, ppr in enumerate(pprs):
+        bt[i, :ppr] = kv_indices[s : s + ppr]
+        s += ppr
+    b["block_table"] = bt
+    return _reference(b)
+
+
+def test_retained_graph_replay_follows_an_in_contract_replan():
+    """A replan the specialized backend serves must refresh the captured
+    plan-time metadata in place: the retained graph's replay computes the
+    NEW plan (reviewer probe: real replay, not pointer checks)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch, wrapper = _graph_batch_and_wrapper(device)
+    _graph_plan(
+        wrapper,
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+    )
+    kv = (batch["k_cache"], batch["v_cache"])
+    out = torch.empty(batch["q"].shape, dtype=torch.bfloat16, device=device)
+    graph = _capture(wrapper, batch["q"], kv, out)
+    assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == 1
+    # in-contract replan: same geometry, permuted page ids and a shorter kv
+    # (request 1 drops to 3 pages / 48 keys)
+    new_indices = torch.tensor([7, 6, 5, 4, 3, 2, 1], dtype=torch.int32, device=device)
+    new_lens = [64, 48]
+    _graph_plan(
+        wrapper,
+        batch["qo_indptr"],
+        torch.tensor([0, 4, 7], dtype=torch.int32, device=device),
+        new_indices,
+        torch.tensor(
+            [(k - 1) % PAGE + 1 for k in new_lens], dtype=torch.int32, device=device
+        ),
+    )
+    eager = wrapper.run(batch["q"], kv)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+    assert _matched_ratio(out, _ref_with_indices(batch, new_indices, new_lens)) >= (
+        MATCHED
+    )
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["replans_invalidating_capture"] == 0, stats
+
+
+def test_fallback_replan_invalidates_capture_and_never_mixes(monkeypatch):
+    """A successful replan the specialized backend does NOT serve leaves the
+    captured metadata untouched (documented as invalidating the capture, with
+    a warning): the replay keeps computing the PREVIOUS plan bitwise — never
+    a mix of old kernels with new pages/lengths."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch, wrapper = _graph_batch_and_wrapper(device)
+    _graph_plan(
+        wrapper,
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+    )
+    kv = (batch["k_cache"], batch["v_cache"])
+    out = torch.empty(batch["q"].shape, dtype=torch.bfloat16, device=device)
+    graph = _capture(wrapper, batch["q"], kv, out)
+    pre_eager = wrapper.run(batch["q"], kv).clone()
+    # the kill switch forces the replan onto the composable path; the page
+    # permutation makes stale metadata observable (the reviewer's probe)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    new_indices = torch.tensor(
+        [7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.int32, device=device
+    )
+    _graph_plan(
+        wrapper,
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        new_indices,
+        batch["last_page_len"],
+    )
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["replans_invalidating_capture"] == 1, stats
+    eager = wrapper.run(batch["q"], kv)  # the new plan, served composably
+    assert _matched_ratio(eager, _ref_with_indices(batch, new_indices, [64, 64])) >= (
+        MATCHED
+    )
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    # never a mix: the invalidated capture still computes the previous plan
+    assert torch.equal(out, pre_eager)
+
+
+def test_graph_q_partition_replan_is_rejected_before_state_changes():
+    """A replan with a non-verify Q partition on a wrapper whose retained
+    fa2 capture cannot serve an fp8 query must be rejected by the stock
+    resolver before any accepted state changes (the capture stays valid)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch, wrapper = _graph_batch_and_wrapper(device)
+    _graph_plan(
+        wrapper,
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+    )
+    kv = (batch["k_cache"], batch["v_cache"])
+    out = torch.empty(batch["q"].shape, dtype=torch.bfloat16, device=device)
+    graph = _capture(wrapper, batch["q"], kv, out)
+    eager = wrapper.run(batch["q"], kv).clone()
+    qo2 = torch.tensor([0, 4, 12], dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="CUDA graph backend"):
+        _graph_plan(
+            wrapper,
+            qo2,
+            batch["kv_indptr"],
+            batch["kv_indices"],
+            batch["last_page_len"],
+        )
+    # the rejected replan changed nothing: the capture still replays the
+    # accepted plan bitwise
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)

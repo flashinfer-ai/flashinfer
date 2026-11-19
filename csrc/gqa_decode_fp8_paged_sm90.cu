@@ -28,9 +28,17 @@
 // reducer); QK^T runs as fp8 mma (m16n8k32 e4m3, fp32 accumulate) on
 // cp.async-staged K pages; softmax statistics are fp32 online-softmax; the
 // P.V product accumulates in fp16 (m16n8k16 on power-of-two prescaled
-// values, exact for every finite e4m3 input, bounded by the 48-key x
-// 24-tile x 448 range cap); per-split partial outputs (fp16) and LSEs
-// (fp32) land in a caller-owned workspace and a second kernel (`reduce_u4`)
+// values, exact for every finite e4m3 input). P is staged as
+// exp2(s - m + PSHIFT) so probabilities down to ~2^-(24+PSHIFT) of the row
+// maximum survive the fp16 conversion (an unshifted staging flushed
+// meaningful weights below 2^-24 to zero before P.V, erasing their
+// contribution when V and its descale are large); V is prescaled by
+// 2^-(4+PSHIFT), keeping the worst-case fp16 accumulation bounded by the
+// same 48-key x 24-tile x 448/16 = 32256 cap as the unshifted form (the
+// shift cancels between the row sums and the partial outputs at the
+// normalization). Per-split partial outputs (fp16) and LSEs (fp32, carrying
+// the same +PSHIFT bias, which cancels in the shift-invariant split merge)
+// land in a caller-owned workspace and a second kernel (`reduce_u4`)
 // merges the splits and applies the V descale, writing bf16. Both launches
 // use programmatic stream serialization (PDL); the whole sequence is two
 // kernels, no host round trips.
@@ -71,6 +79,15 @@
 #define TMAX 512
 #define GMB 660
 #define SMAX 660
+// P is staged into fp16 as exp2(s - m + PSHIFT): probabilities down to
+// ~2^-(24+PSHIFT) of the running maximum survive the conversion instead of
+// flushing at fp16's 2^-24 subnormal floor. V carries a matching extra
+// 2^-PSHIFT prescale (total 2^-(4+PSHIFT)) so the fp16 P.V accumulator
+// keeps the original 48 * 24 * 448/16 = 32256 worst-case bound, and the
+// combined 2^(4+PSHIFT) factor is undone in one place (vsc) at the
+// normalization. PSHIFT is bounded by the e4m3->fp16 exactness of the V
+// prescale (4 + PSHIFT <= 15, so the smallest e4m3 subnormal stays exact).
+#define PSHIFT 11
 
 __device__ __forceinline__ int sw8(int row, int byte) {
   int c = byte >> 4, o = byte & 15;
@@ -84,9 +101,12 @@ __device__ __forceinline__ int sw16(int row, int h) {
 __device__ __forceinline__ uint32_t cvt8x2(uint32_t x) {
   uint32_t r;
   asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)(x & 0xffffu)));
-  // A power-of-two transform is exact for every finite e4m3 value.
-  // 48 keys * 24 tiles * 448 / 16 stays below the FP16 accumulator range.
-  __half2 h = __hmul2(*reinterpret_cast<__half2*>(&r), __float2half2_rn(0.0625f));
+  // A power-of-two transform is exact for every finite e4m3 value down to
+  // the smallest subnormal (2^-9 * 2^-(4+PSHIFT) >= fp16's 2^-24).  With the
+  // 2^PSHIFT-staged P, 48 keys * 24 tiles * 2^PSHIFT * 448 * 2^-(4+PSHIFT)
+  // = 32256 stays below the FP16 accumulator range.
+  __half2 h =
+      __hmul2(*reinterpret_cast<__half2*>(&r), __float2half2_rn(1.0f / (float)(1 << (4 + PSHIFT))));
   return *reinterpret_cast<uint32_t*>(&h);
 }
 __device__ __forceinline__ uint32_t smaddr(const void* p) {
@@ -542,7 +562,11 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
       m_a = mna;
       m_b = mnb;
       float sa = 0.f, sb = 0.f;
-      const float nega = -mna, negb = -mnb;
+      // Stage P as exp2(s - m + PSHIFT): the shift rides the fp16 P operands,
+      // the O accumulators and the row sums alike and cancels at the vsc/l
+      // normalization, while probabilities down to ~2^-(24+PSHIFT) of the
+      // maximum survive the __floats2half2_rn conversion below.
+      const float nega = (float)PSHIFT - mna, negb = (float)PSHIFT - mnb;
 #pragma unroll
       for (int j = 0; j < 6; ++j) {
         sm[j][0] = exp2f(fmaf(sm[j][0], scale2, nega));
@@ -591,11 +615,12 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
   }
   asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 
-  // Undo only the exact power-of-two PV prescale here. The per-sequence V
+  // Undo only the exact power-of-two PV prescale (the 2^-(4+PSHIFT) V
+  // prescale and the 2^PSHIFT P shift riding l) here. The per-sequence V
   // descale is applied by the reducer in FP32: folding it into this FP16
   // normalization would overflow the stored partials for a large descale
   // (448 * 256 > 65504) and underflow them for a small one.
-  const float vsc = 16.f;
+  const float vsc = (float)(1 << (4 + PSHIFT));
   float la = l_a, lb = l_b, inva = 0.f, invb = 0.f;
   if (w < 3) {
     la += __shfl_xor_sync(0xffffffffu, la, 1);
@@ -664,7 +689,11 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
   }
   if (w < 3 && (lane & 3) == 0) {
     // LSE row-major over splits: the merge streams a contiguous run of S
-    // floats instead of touching one 32 B sector per split.
+    // floats instead of touching one 32 B sector per split.  l carries the
+    // 2^PSHIFT P staging, so these internal LSEs are biased by +PSHIFT;
+    // every split carries the same bias and it cancels in the reducer's
+    // shift-invariant exp2(lse - max) merge (the LSE never leaves the
+    // workspace: the dispatcher declines return_lse).
     plse[(size_t)ra * GSTRIDE + bid] = (la > 0.f) ? (m_a + log2f(la)) : -3e30f;
     plse[(size_t)rb * GSTRIDE + bid] = (lb > 0.f) ? (m_b + log2f(lb)) : -3e30f;
   }

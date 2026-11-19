@@ -2580,6 +2580,8 @@ _gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
     "runs_autotune_bail": 0,  # autotuner measurement window: stock path
     "runs_capture_unready": 0,  # capturing without a loaded module: fallback
     "runs_dequant_fallback": 0,  # fp8-Q call served by dequant + stock fa2
+    # a successful re-plan left a live specialized capture's metadata stale
+    "replans_invalidating_capture": 0,
 }
 # Per-backend dispatch census and fallback reasons (#5667-style introspection):
 # "specialized" = the fused kernel; "composable" = exact dequant + stock fa2.
@@ -2681,6 +2683,118 @@ def _gqa_dec_fp8q_sm90_auto_routes(
     if not routed:
         return False, "plan geometry off the auto-routing allowlist"
     return True, None
+
+
+def _gqa_dec_fp8q_sm90_auto_admits(
+    *,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    kv_layout: str,
+    causal: bool,
+    has_custom_mask: bool,
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    window_left: int,
+    logits_soft_cap: Optional[float],
+    sm_scale: Optional[float],
+    batch_size: int,
+    qo_indptr_host: torch.Tensor,
+    prefix_len_ptr: Optional[torch.Tensor],
+    token_pos_in_items_len: int,
+    has_jit_module: bool,
+    kv_meta_fn: Any,
+) -> Tuple[bool, Optional[str], Optional[tuple]]:
+    """Complete plan-time auto-admission for ``backend="auto"``: route to
+    "specialized" only when the WHOLE plan — geometry allowlist, plan options,
+    the uniform q_len==6 verify width and the measured batch/kv envelope — is
+    inside the kernel's serve domain, resolved from the host metadata the
+    plan already needs. An off-domain plan keeps FlashInfer's stock auto
+    resolution untouched (it is never pinned to the composable bf16-dequant
+    fa2 route); the composable fallback is reserved for run-time refusals of
+    a genuinely admitted plan. ``kv_meta_fn`` lazily supplies
+    ``(paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host)``
+    or ``None`` when kv lengths are not available on the host at plan time.
+    Returns ``(admitted, reason-if-not, kv_meta-for-reuse)``."""
+    routed, reason = _gqa_dec_fp8q_sm90_auto_routes(
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        page_size,
+        kv_layout,
+        causal,
+    )
+    if not routed:
+        return False, reason, None
+    kv_meta: Optional[tuple] = None
+    try:
+        total_q = int(qo_indptr_host[-1])
+        reason = _gqa_dec_fp8q_sm90_plan_eligibility(
+            kv_layout,
+            causal,
+            has_custom_mask,
+            pos_encoding_mode,
+            use_fp16_qk_reduction,
+            window_left,
+            logits_soft_cap,
+            sm_scale,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo,
+            page_size,
+            batch_size,
+            total_q,
+        )
+        if reason is None:
+            if prefix_len_ptr is not None:
+                reason = "prefix_len_ptr"
+            elif token_pos_in_items_len:
+                reason = f"token_pos_in_items_len={token_pos_in_items_len}"
+            elif has_jit_module:
+                reason = "jit_module"
+        if reason is None:
+            q_lens = qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
+            if bool((q_lens != _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
+                reason = "non-uniform q_len (kernel verify width is 6)"
+        if reason is None:
+            kv_meta = kv_meta_fn()
+            if kv_meta is None:
+                reason = "kv lengths unavailable on the host at plan time"
+            else:
+                kv_lens = kv_meta[2][:batch_size].to(torch.int64)
+                if bool((kv_lens < _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
+                    reason = "kv_len < q_len (not a verify-decode batch)"
+                elif int(kv_lens.max()) > _GQA_DEC_FP8Q_SM90_MAX_KV_LEN:
+                    reason = f"kv_len={int(kv_lens.max())} above measured envelope"
+    except Exception as exc:  # a guard failure must never break the stock path
+        reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
+    if reason is not None:
+        return False, reason, None
+    return True, None, kv_meta
+
+
+def _gqa_dec_fp8q_sm90_warn_stale_capture(wrapper: Any, reason: str) -> None:
+    """A wrapper holding a live CUDA-graph capture of the specialized kernels
+    completed a re-plan that does not refresh the captured plan-time metadata
+    (the wrapper-owned block table / kv lengths). Contract (documented at the
+    dispatcher): such a re-plan INVALIDATES prior captures — the owned
+    buffers are left untouched, so a replay keeps computing the PREVIOUS
+    plan's attention intact (never a mix of plans) — and the wrapper must be
+    re-captured before replaying."""
+    _gqa_dec_fp8q_sm90_counters["replans_invalidating_capture"] += 1
+    logger.warning(
+        "gqa_decode_fp8_paged_sm90: this re-plan is not served by the "
+        "specialized backend (%s), but an earlier CUDA graph captured the "
+        "specialized kernels on this wrapper. The capture's plan-time "
+        "metadata is NOT refreshed and the capture is invalidated: replays "
+        "keep computing the previous plan's attention (the owned buffers "
+        "are left untouched — never a mix); re-capture before replaying.",
+        reason,
+    )
 
 
 def _gqa_dec_fp8q_sm90_backend_order(
@@ -3265,6 +3379,11 @@ def _gqa_dec_fp8q_sm90_dispatch(
     _gqa_dec_fp8q_sm90_backend_dispatches["specialized"] += 1
     if capturing:
         counters["runs_dispatched_capturing"] += 1
+        # A CUDA graph now holds the specialized kernels with this plan's
+        # owned block-table/kv-length buffers baked in: later re-plans the
+        # specialized backend does not serve must warn that they invalidate
+        # the capture (see _gqa_dec_fp8q_sm90_warn_stale_capture).
+        wrapper._gqa_dec_fp8q_sm90_capture_live = True
     if not _gqa_dec_fp8q_sm90_announced:
         # one line per process so a measurement can name the kernel behind
         # its numbers (normal operation, hence INFO)
@@ -4550,14 +4669,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             block_tables,
             max_item_len_ptr,
             max_token_per_sequence,
-            prefix_len_ptr,
             rope_scale,
             rope_theta,
             seq_lens_q,
-            sm_scale,
-            token_pos_in_items_len,
             token_pos_in_items_ptr,
         )
+        # sm_scale, prefix_len_ptr and token_pos_in_items_len are kept: the
+        # specialized SM90 fp8-Q auto-admission below must size the same
+        # backend plan() would select for them.
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -4603,19 +4722,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             q_data_type = torch.bfloat16
             _gqa_fp8q_backend_override = "fa2"
-        elif self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
-            _auto_routed, _ = _gqa_dec_fp8q_sm90_auto_routes(
-                num_qo_heads,
-                num_kv_heads,
-                head_dim_qk,
-                head_dim_vo,
-                page_size,
-                self._kv_layout,
-                causal,
-            )
-            if _auto_routed and self._cuda_graph_backend in (None, "fa2"):
-                q_data_type = torch.bfloat16
-                _gqa_fp8q_backend_override = "fa2"
+        # (the backend="auto" admission runs below, once the host metadata it
+        # needs — q lengths and kv lengths — has been staged like plan()'s)
 
         # Normalized like plan(): the native size query reads raw pointers (#5260).
         qo_indptr = qo_indptr.contiguous()
@@ -4636,6 +4744,41 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
         else:
             kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
+
+        if self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
+            # Same complete auto-admission as plan(): size the composable
+            # fa2/bf16 plan only for plans auto would actually arm; an
+            # off-domain fp8-Q plan is sized for the stock auto resolution.
+            _auto_routed, _, _ = _gqa_dec_fp8q_sm90_auto_admits(
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page_size,
+                kv_layout=self._kv_layout,
+                causal=causal,
+                has_custom_mask=(
+                    custom_mask is not None or packed_custom_mask is not None
+                ),
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                sm_scale=sm_scale,
+                batch_size=batch_size,
+                qo_indptr_host=qo_indptr_host,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                has_jit_module=self._jit_module is not None,
+                kv_meta_fn=lambda: (
+                    paged_kv_indptr_host,
+                    paged_kv_last_page_len_host,
+                    kv_lens_arr_host,
+                ),
+            )
+            if _auto_routed and self._cuda_graph_backend in (None, "fa2"):
+                q_data_type = torch.bfloat16
+                _gqa_fp8q_backend_override = "fa2"
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -4974,6 +5117,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # arming decision is tracked in a local and only committed to the
         # wrapper after validation (or immediately on the armed SM90 fp8-Q
         # path, which the validated contract below explicitly requested).
+        #
+        # CUDA-graph contract: a capture that recorded the specialized
+        # kernels stays valid across re-plans the specialized backend serves
+        # (same wrapper geometry — the owned block-table/kv-length buffers
+        # are refreshed in place). A successful re-plan the specialized
+        # backend does NOT serve (off the auto domain, kill switch, run-time
+        # contract change) leaves those owned buffers untouched and
+        # INVALIDATES prior captures: replays keep computing the previous
+        # plan's attention intact (never a mix); a warning is logged and
+        # counted (replans_invalidating_capture) — re-capture after such a
+        # re-plan. An incompatible re-plan of the underlying stock route
+        # (e.g. a non-verify fp8-Q partition on a retained fa2 capture) is
+        # rejected by the stock resolver before any accepted state changes.
+        qo_indptr = qo_indptr.contiguous()
+        qo_indptr_host = qo_indptr.to("cpu")
+        _gqa_fp8q_kv_meta: Optional[tuple] = None
         _gqa_dec_fp8q_sm90_armed = False
         _gqa_fp8q_contract_ok = (
             q_data_type == torch.float8_e4m3fn
@@ -5005,14 +5164,48 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # the underlying plan is made on the stock fa2 route
             self._backend = "fa2"
         elif self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
-            _auto_routed, _auto_reason = _gqa_dec_fp8q_sm90_auto_routes(
-                num_qo_heads,
-                num_kv_heads,
-                head_dim_qk,
-                head_dim_vo if head_dim_vo is not None else head_dim_qk,
-                page_size,
-                self._kv_layout,
-                causal,
+            # Resolve the COMPLETE auto eligibility (geometry, plan options,
+            # uniform q_len == 6 and the measured batch/kv envelope) from the
+            # host metadata the plan needs anyway, BEFORE changing the query
+            # dtype or pinning the fa2 route: an ordinary fp8-Q prefill
+            # outside the kernel's verify domain keeps the stock auto
+            # resolution (e.g. native fa3) instead of the slower composable
+            # bf16-dequant fa2 form.
+            def _gqa_fp8q_kv_meta_fn() -> Optional[tuple]:
+                if max_sequence_kv is not None:
+                    return None
+                return _paged_kv_host_metadata(
+                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+                )
+
+            _auto_routed, _auto_reason, _gqa_fp8q_kv_meta = (
+                _gqa_dec_fp8q_sm90_auto_admits(
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=(
+                        head_dim_vo if head_dim_vo is not None else head_dim_qk
+                    ),
+                    page_size=page_size,
+                    kv_layout=self._kv_layout,
+                    causal=causal,
+                    has_custom_mask=(
+                        custom_mask is not None
+                        or packed_custom_mask is not None
+                        or self._custom_mask_buf is not None
+                    ),
+                    pos_encoding_mode=pos_encoding_mode,
+                    use_fp16_qk_reduction=use_fp16_qk_reduction,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    sm_scale=sm_scale,
+                    batch_size=len(qo_indptr) - 1,
+                    qo_indptr_host=qo_indptr_host,
+                    prefix_len_ptr=prefix_len_ptr,
+                    token_pos_in_items_len=token_pos_in_items_len,
+                    has_jit_module=self._jit_module is not None,
+                    kv_meta_fn=_gqa_fp8q_kv_meta_fn,
+                )
             )
             if _auto_routed and self._cuda_graph_backend not in (None, "fa2"):
                 # A retained capture holds pointers into the integer
@@ -5105,9 +5298,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
-        # Reject incompatible graph replans before changing any accepted plan state.
-        qo_indptr = qo_indptr.contiguous()
-        qo_indptr_host = qo_indptr.to("cpu")
+        # Reject incompatible graph replans before changing any accepted plan
+        # state (qo_indptr was staged to the host above, before the
+        # specialized fp8-Q admission).
         auto_backend = None
         # an armed specialized fp8-Q plan already fixed the stock fa2 route
         # for its composable fallback; auto resolution must not override it
@@ -5143,11 +5336,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         kv_lens_arr_host = None
         if max_sequence_kv is None:
-            paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
-                _paged_kv_host_metadata(
-                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+            if _gqa_fp8q_kv_meta is not None:
+                # reuse the host staging the specialized auto-admission did
+                paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                    _gqa_fp8q_kv_meta
                 )
-            )
+            else:
+                paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                    _paged_kv_host_metadata(
+                        paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+                    )
+                )
             max_kv_len = kv_lens_arr_host.max().item()
         else:
             max_kv_len = max_sequence_kv
@@ -5755,6 +5954,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"({_gqa_dec_fp8q_sm90_last_fallback or 'plan not prepared'}); "
                 "an explicitly selected backend never falls back — use "
                 "backend='auto' for guarded routing"
+            )
+        if (
+            getattr(self, "_gqa_dec_fp8q_sm90_capture_live", False)
+            and getattr(self, "_gqa_dec_fp8q_sm90_state", None) is None
+        ):
+            # This successful re-plan did not refresh the specialized
+            # kernels' plan-time metadata, but a live CUDA graph on this
+            # wrapper captured them: the capture is invalidated (replays
+            # keep computing the previous plan — never a mix).
+            _gqa_dec_fp8q_sm90_warn_stale_capture(
+                self, _gqa_dec_fp8q_sm90_last_fallback or "plan not prepared"
             )
 
         self._causal = causal
