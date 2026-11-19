@@ -103,7 +103,10 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
              ffi::TensorView topk_weights, ffi::TensorView out, void* workspace,
              size_t workspace_bytes) {
-  const int tokens = static_cast<int>(hidden_states.size(0));
+  const int64_t T = hidden_states.size(0);
+  TVM_FFI_ICHECK(T == 256 || T == 1024 || T == 4096)
+      << "RunOurs requires T=256, 1024 or 4096, got " << T;
+  const int tokens = static_cast<int>(T);
   const int routes = tokens * TOPK;
   const int dev = hidden_states.device().device_id;
   TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
@@ -119,33 +122,11 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
 
   const size_t xq_bytes = static_cast<size_t>(tokens) * H;
   const size_t xs_bytes = static_cast<size_t>(tokens) * 16 * sizeof(float);
-  const size_t zq_bytes = static_cast<size_t>(routes) * I;
-  const size_t zs_bytes = static_cast<size_t>(routes) * 4 * sizeof(float);
   const size_t zbf_bytes = static_cast<size_t>(routes) * I * sizeof(__nv_bfloat16);
 
   TVM_FFI_ICHECK(workspace != nullptr && workspace_bytes >= PrefillWorkspaceBytes(tokens))
       << "prefill workspace too small: " << workspace_bytes << " < "
       << PrefillWorkspaceBytes(tokens);
-  if (tokens <= 64) {
-    const size_t zf_bytes = static_cast<size_t>(routes) * I * sizeof(float);
-    uint8_t* scratch = static_cast<uint8_t*>(workspace) + kWorkspaceDataOffset;
-    uint8_t* xq = scratch;
-    float* xs = reinterpret_cast<float*>(xq + xq_bytes);
-    float* zfloat = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xs) + xs_bytes);
-    uint8_t* zq = reinterpret_cast<uint8_t*>(zfloat) + zf_bytes;
-    float* zs = reinterpret_cast<float*>(zq + zq_bytes);
-    int* barriers = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(zs) + zs_bytes);
-    const int blocks = tokens == 1 ? 175 : (tokens <= 4 ? 128 : (tokens <= 16 ? 160 : 175));
-    const int threads = 256;
-    int token_arg = tokens;
-    void* args[] = {&xp, &w13p, &w13sp,  &w2p, &w2sp, &idp,      &rwp,      &outp,
-                    &xq, &xs,   &zfloat, &zq,  &zs,   &barriers, &token_arg};
-    const cudaError_t st = cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(fused_decode_kernel), dim3(blocks), dim3(threads), args, 0, stream);
-    TVM_FFI_ICHECK(st == cudaSuccess)
-        << "fused decode cooperative launch failed: " << cudaGetErrorString(st);
-    return;
-  }
 
   const CUtensorMap w13_map = make_u8_map(w13p, H, 256ull * (2 * I));
   const CUtensorMap w2_map = make_u8_map64x256(w2p, I, 256ull * H, tokens >= 4096);

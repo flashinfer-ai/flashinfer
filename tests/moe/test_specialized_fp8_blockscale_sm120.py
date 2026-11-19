@@ -648,3 +648,23 @@ def test_persistent_decode_residency_fails_closed(analytic_weights):
     probe = torch.ones(1, device=dev).add_(1)
     torch.cuda.synchronize(dev)
     assert probe.item() == 2
+
+
+def test_native_rejects_off_allowlist_before_workspace_or_launch():
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+        gen_specialized_fused_moe_fp8_blockscale_sm120_module,
+    )
+
+    mod = gen_specialized_fused_moe_fp8_blockscale_sm120_module().build_and_load()
+    for t in (-1, 0, 2, 17, 128, 8192, 16385, (1 << 32) + 1):
+        with pytest.raises(
+            RuntimeError, match=f"unsupported SM120 MoE token count: {t}"
+        ):
+            mod.plan_workspace_bytes(t)
+    dummy = torch.empty(0, device="cuda", dtype=torch.uint8)
+    for t in (2, 17, 128, 8192, (1 << 32) + 1):
+        x = torch.empty((t, 0), device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(
+            RuntimeError, match=f"unsupported SM120 MoE token count: {t}"
+        ):
+            mod.run(x, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy)

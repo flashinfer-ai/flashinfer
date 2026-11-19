@@ -84,7 +84,9 @@ void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
              ffi::TensorView topk_weights, ffi::TensorView out, void* workspace,
              size_t workspace_bytes) {
-  const int tokens = static_cast<int>(hidden_states.size(0));
+  const int64_t T = hidden_states.size(0);
+  TVM_FFI_ICHECK(T == 16384) << "RunOursFlat requires T=16384, got " << T;
+  const int tokens = static_cast<int>(T);
   const int routes = tokens * TOPK;
   const int dev = hidden_states.device().device_id;
   TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;

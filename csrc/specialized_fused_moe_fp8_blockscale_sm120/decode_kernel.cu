@@ -47,11 +47,20 @@ static struct DecodeCacheInit {
   }
 } g_decode_cache_init;
 
+// Check the original extent, not an int that may already have wrapped.
+static int CheckedTokenCount(int64_t T) {
+  TVM_FFI_ICHECK(T == 1 || T == 4 || T == 16 || T == 64 || T == 256 || T == 1024 || T == 4096 ||
+                 T == 16384)
+      << "unsupported SM120 MoE token count: " << T;
+  return static_cast<int>(T);
+}
+
 // Workspace bytes the dispatch for T tokens requires. The Python layer sizes
 // the per-(device, stream) / per-capture workspace it passes to Run with
 // this; keep the two dispatch trees in exact agreement.
-int64_t PlanWorkspaceBytes(int64_t T) {
-  if (T == 1) return (int64_t)GemvWorkspaceBytes((int)T);
+int64_t PlanWorkspaceBytes(int64_t tokens) {
+  const int T = CheckedTokenCount(tokens);
+  if (T == 1) return (int64_t)GemvWorkspaceBytes(T);
   if (T <= 16) return (int64_t)kPersistentDecodeWsBytes;
   if (T < 128) return (int64_t)GemvWorkspaceBytes((int)T);
   if (T < 16384) return (int64_t)PrefillWorkspaceBytes((int)T);
@@ -61,10 +70,10 @@ int64_t PlanWorkspaceBytes(int64_t T) {
 void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
          ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
          ffi::TensorView topk_weights, ffi::TensorView out, ffi::TensorView workspace) {
+  const int T = CheckedTokenCount(hidden_states.size(0));
   const int dev = hidden_states.device().device_id;
   TVM_FFI_ICHECK(dev >= 0 && dev < kMaxDevices) << "device index out of range: " << dev;
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, dev));
-  const int T = (int)hidden_states.shape()[0];
   TVM_FFI_ICHECK(workspace.ndim() == 1) << "workspace must be a 1-D byte tensor";
   TVM_FFI_ICHECK(workspace.device().device_id == dev)
       << "workspace must live on the input's device";

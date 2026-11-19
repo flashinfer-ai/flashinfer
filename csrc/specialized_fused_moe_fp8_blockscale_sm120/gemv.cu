@@ -70,7 +70,9 @@ void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView
              ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
              ffi::TensorView topk_weights, ffi::TensorView out, cudaStream_t stream,
              void* workspace, size_t workspace_bytes) {
-  const int T = static_cast<int>(hidden_states.shape()[0]);
+  const int64_t tokens = hidden_states.size(0);
+  TVM_FFI_ICHECK(tokens == 1 || tokens == 64) << "RunGemv requires T=1 or 64, got " << tokens;
+  const int T = static_cast<int>(tokens);
   const int P = T * TOPK;
 
   const int MT = (T == 1) ? 1 : ((T <= 8) ? 2 : ((T >= 1024) ? 128 : 4));
