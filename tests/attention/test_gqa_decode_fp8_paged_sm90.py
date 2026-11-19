@@ -604,17 +604,22 @@ def test_kill_switch_still_serves_per_sequence_q_scale(monkeypatch):
     assert _matched_ratio(out, _reference(batch, q_descale=qd)) >= MATCHED
 
 
-def test_positional_scale_args_are_rejected_on_the_fallback():
-    """Positional fp8 scale *args would be silently dropped by the bf16
-    dequant fallback; they must be rejected loudly instead (on an auto-armed
-    plan — the explicit form raises on the decline itself)."""
+def test_positional_scales_on_default_auto_match_native_per_head_abi():
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([584, 75], device)
     wrapper = _plan_wrapper(batch, device, backend="auto")
     s = torch.ones(1, dtype=torch.float32, device=device)
-    with pytest.raises(NotImplementedError, match="positional"):
-        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), s, s, s)
+    sq = torch.arange(1, H_QO + 1, dtype=torch.float32, device=device)
+    kv = batch["k_cache"], batch["v_cache"]
+    assert _matched_ratio(wrapper.run(batch["q"], kv), _reference(batch)) >= MATCHED
+    assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    stock = _plan_wrapper(batch, device, backend="fa3")
+    expected = stock.run(batch["q"], kv, sq, 2 * s, 3 * s)
+    assert torch.equal(wrapper.run(batch["q"], kv, sq, 2 * s, 3 * s), expected)
+    assert not torch.equal(
+        expected, stock.run(batch["q"], kv, sq.flip([0]), 2 * s, 3 * s)
+    )
     wrapper_exp = _plan_wrapper(batch, device)
     with pytest.raises(NotImplementedError, match="never falls back"):
         wrapper_exp.run(batch["q"], (batch["k_cache"], batch["v_cache"]), s, s, s)
@@ -1120,15 +1125,14 @@ def test_retained_graph_replay_follows_an_in_contract_replan():
     assert _matched_ratio(out, _ref_with_indices(batch, new_indices, new_lens)) >= (
         MATCHED
     )
-    stats = _gqa_dec_fp8q_sm90_stats()
-    assert stats["replans_invalidating_capture"] == 0, stats
 
 
-def test_fallback_replan_invalidates_capture_and_never_mixes(monkeypatch):
-    """A successful replan the specialized backend does NOT serve leaves the
-    captured metadata untouched (documented as invalidating the capture, with
-    a warning): the replay keeps computing the PREVIOUS plan bitwise — never
-    a mix of old kernels with new pages/lengths."""
+@pytest.mark.parametrize(
+    "change", ["disabled", "dtype", "mask", "prepare", "query_lengths"]
+)
+def test_refused_replan_preserves_graph_and_eager(monkeypatch, change):
+    import flashinfer.prefill as fp
+
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch, wrapper = _graph_batch_and_wrapper(device)
@@ -1143,30 +1147,103 @@ def test_fallback_replan_invalidates_capture_and_never_mixes(monkeypatch):
     out = torch.empty(batch["q"].shape, dtype=torch.bfloat16, device=device)
     graph = _capture(wrapper, batch["q"], kv, out)
     pre_eager = wrapper.run(batch["q"], kv).clone()
-    # the kill switch forces the replan onto the composable path; the page
-    # permutation makes stale metadata observable (the reviewer's probe)
-    monkeypatch.setenv(DISABLE_ENV, "1")
-    new_indices = torch.tensor(
-        [7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.int32, device=device
+    assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == 1
+    opts = dict(
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
     )
-    _graph_plan(
-        wrapper,
-        batch["qo_indptr"],
-        batch["kv_indptr"],
-        new_indices,
-        batch["last_page_len"],
-    )
-    stats = _gqa_dec_fp8q_sm90_stats()
-    assert stats["replans_invalidating_capture"] == 1, stats
-    eager = wrapper.run(batch["q"], kv)  # the new plan, served composably
-    assert _matched_ratio(eager, _ref_with_indices(batch, new_indices, [64, 64])) >= (
-        MATCHED
-    )
+    with monkeypatch.context() as m:
+        if change == "disabled":
+            m.setenv(DISABLE_ENV, "1")
+        elif change == "dtype":
+            opts["q_data_type"] = torch.bfloat16
+        elif change == "mask":
+            opts["custom_mask"] = torch.ones(
+                2 * QL * 64, device=device, dtype=torch.bool
+            )
+        elif change == "query_lengths":
+            opts["seq_lens_q"] = torch.tensor([5, 7])
+        else:
+
+            def fail(*args, **kwargs):
+                raise ValueError("injected block table failure")
+
+            m.setattr(fp, "_build_block_tables_from_paged_kv_indices", fail)
+        with pytest.raises(ValueError):
+            wrapper.plan(
+                batch["qo_indptr"],
+                batch["kv_indptr"],
+                batch["kv_indices"].flip([0]),
+                batch["last_page_len"],
+                H_QO,
+                H_KV,
+                HEAD_DIM,
+                PAGE,
+                **opts,
+            )
+    assert torch.equal(wrapper._paged_kv_indices_buf, batch["kv_indices"])
+    assert torch.equal(wrapper.run(batch["q"], kv), pre_eager)
+    assert _matched_ratio(pre_eager, _reference(batch)) >= MATCHED
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
     # never a mix: the invalidated capture still computes the previous plan
     assert torch.equal(out, pre_eager)
+
+
+def test_masked_eager_to_unmasked_verify_and_graph_retained_mask_size():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([80], device)
+    ws = torch.empty(8 << 20, dtype=torch.uint8, device=device)
+    eager = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws)
+    args = (
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+    )
+    eager.plan(
+        *args,
+        custom_mask=torch.ones(QL * 80, dtype=torch.bool, device=device),
+        q_data_type=torch.bfloat16,
+    )
+    _graph_plan(eager, *args[:4])
+    assert eager._gqa_dec_fp8q_sm90_state is not None
+    assert (
+        _matched_ratio(
+            eager.run(batch["q"], (batch["k_cache"], batch["v_cache"])),
+            _reference(batch),
+        )
+        >= MATCHED
+    )
+
+    qo = batch["qo_indptr"].new_tensor([0, 65])
+    graph_args = (qo, *args[1:])
+    graph = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws,
+        "NHD",
+        True,
+        qo.clone(),
+        args[1].clone(),
+        args[2].clone(),
+        args[3].clone(),
+        torch.full((650,), 255, dtype=torch.uint8, device=device),
+        qo.new_tensor([0, 650]),
+    )
+    sizes = graph.workspace_size(*graph_args, q_data_type=torch.bfloat16)
+    graph.reset_workspace_buffer(
+        *(torch.empty(n, dtype=torch.uint8, device=device) for n in sizes)
+    )
+    graph.plan(*graph_args, q_data_type=torch.bfloat16)
+    assert graph._backend == "fa2"
+    assert graph._workspace_size == sizes[0]
 
 
 def test_graph_q_partition_replan_is_rejected_before_state_changes():

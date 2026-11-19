@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import copy
 import functools
 import json
 import logging
@@ -2580,8 +2581,6 @@ _gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
     "runs_autotune_bail": 0,  # autotuner measurement window: stock path
     "runs_capture_unready": 0,  # capturing without a loaded module: fallback
     "runs_dequant_fallback": 0,  # fp8-Q call served by dequant + stock fa2
-    # a successful re-plan left a live specialized capture's metadata stale
-    "replans_invalidating_capture": 0,
 }
 # Per-backend dispatch census and fallback reasons (#5667-style introspection):
 # "specialized" = the fused kernel; "composable" = exact dequant + stock fa2.
@@ -2814,24 +2813,67 @@ def _gqa_dec_fp8q_sm90_auto_admits(
     return True, None, kv_meta
 
 
-def _gqa_dec_fp8q_sm90_warn_stale_capture(wrapper: Any, reason: str) -> None:
-    """A wrapper holding a live CUDA-graph capture of the specialized kernels
-    completed a re-plan that does not refresh the captured plan-time metadata
-    (the wrapper-owned block table / kv lengths). Contract (documented at the
-    dispatcher): such a re-plan INVALIDATES prior captures — the owned
-    buffers are left untouched, so a replay keeps computing the PREVIOUS
-    plan's attention intact (never a mix of plans) — and the wrapper must be
-    re-captured before replaying."""
-    _gqa_dec_fp8q_sm90_counters["replans_invalidating_capture"] += 1
-    logger.warning(
-        "gqa_decode_fp8_paged_sm90: this re-plan is not served by the "
-        "specialized backend (%s), but an earlier CUDA graph captured the "
-        "specialized kernels on this wrapper. The capture's plan-time "
-        "metadata is NOT refreshed and the capture is invalidated: replays "
-        "keep computing the previous plan's attention (the owned buffers "
-        "are left untouched — never a mix); re-capture before replaying.",
-        reason,
+def _paged_plan_has_mask(wrapper, custom_mask, packed_custom_mask):
+    return (
+        custom_mask is not None
+        or packed_custom_mask is not None
+        or (wrapper.is_cuda_graph_enabled and wrapper._custom_mask_buf is not None)
     )
+
+
+def _stage_verify_plan(wrapper):
+    """Isolate writes by the FA planner and by prepare() from the accepted plan.
+
+    The float workspace and the specialized split workspace are run scratch;
+    planning computes offsets in them but does not populate them. The integer
+    workspace, in contrast, contains the actual schedule.
+    """
+    staged = copy.copy(wrapper)
+    staged._int_workspace_buffer = torch.empty_like(wrapper._int_workspace_buffer)
+    staged._pin_memory_int_workspace_buffer = torch.empty_like(
+        wrapper._pin_memory_int_workspace_buffer, pin_memory=True
+    )
+    staged._kv_lens_buffer = torch.empty_like(wrapper._kv_lens_buffer)
+    staged._gqa_dec_fp8q_sm90_row_seq_buf = None
+    previous = getattr(wrapper, "_gqa_dec_fp8q_sm90_bufs", {})
+    staged._gqa_dec_fp8q_sm90_bufs = (
+        {"workspace": previous["workspace"]} if "workspace" in previous else {}
+    )
+    return staged
+
+
+def _commit_verify_plan(wrapper, staged, copies):
+    # All builders, allocations and capacity checks have finished. Destinations
+    # are same-device tensors; sources are independent of every destination.
+    copies.append((wrapper._int_workspace_buffer, staged._int_workspace_buffer))
+    staged._int_workspace_buffer = wrapper._int_workspace_buffer
+    old = wrapper._gqa_dec_fp8q_sm90_state
+    new = staged._gqa_dec_fp8q_sm90_state
+    if getattr(wrapper, "_verify_stock_capture", False):
+        old_map = wrapper._gqa_dec_fp8q_sm90_row_seq
+        new_map = staged._gqa_dec_fp8q_sm90_row_seq
+        if not wrapper.is_cuda_graph_enabled or old_map.shape != new_map.shape:
+            raise ValueError("CUDA graph backend: incompatible captured query map")
+        copies.append((old_map, new_map))
+        staged._gqa_dec_fp8q_sm90_row_seq = old_map
+        staged._gqa_dec_fp8q_sm90_row_seq_buf = wrapper._gqa_dec_fp8q_sm90_row_seq_buf
+    if wrapper.is_cuda_graph_enabled and old is not None and new is not None:
+        if (
+            old.block_table.shape != new.block_table.shape
+            or old.seq_lens.shape != new.seq_lens.shape
+            or old.workspace is not new.workspace
+        ):
+            raise ValueError(
+                "CUDA graph backend: incompatible specialized launch geometry"
+            )
+        copies.extend(
+            ((old.block_table, new.block_table), (old.seq_lens, new.seq_lens))
+        )
+        staged._gqa_dec_fp8q_sm90_state = old
+        staged._gqa_dec_fp8q_sm90_bufs = wrapper._gqa_dec_fp8q_sm90_bufs
+    for dst, src in copies:
+        dst.copy_(src, non_blocking=True)
+    wrapper.__dict__.update(staged.__dict__)
 
 
 def _gqa_dec_fp8q_sm90_backend_order(
@@ -3030,8 +3072,9 @@ def _gqa_dec_fp8q_sm90_prepare(
             buf[:n].copy_(row_map, non_blocking=True)
             wrapper._gqa_dec_fp8q_sm90_row_seq = buf[:n]
             wrapper._gqa_dec_fp8q_sm90_row_seq_batch = batch_size
-        except Exception:  # best-effort map; never break the stock plan
-            wrapper._gqa_dec_fp8q_sm90_row_seq = None
+        except Exception:
+            # Without the map the accepted fallback could not serve q_scale.
+            raise
     if _gqa_dec_fp8q_sm90_disabled():
         counters["plans_disabled"] += 1
         wrapper._gqa_dec_fp8q_sm90_plan_refusal = "plan: kill switch"
@@ -3453,10 +3496,8 @@ def _gqa_dec_fp8q_sm90_dispatch(
         )
         return None, f"run: {reason}"
     module = _gqa_dec_fp8q_sm90_module
-    capturing = bool(
-        hasattr(torch.cuda, "is_current_stream_capturing")
-        and torch.cuda.is_current_stream_capturing()
-    )
+    with torch.cuda.device(q.device):
+        capturing = torch.cuda.is_current_stream_capturing()
     if module is None:
         # prepare() loads the module before it sets the state; this only
         # happens if the module was dropped behind our back
@@ -3483,9 +3524,8 @@ def _gqa_dec_fp8q_sm90_dispatch(
     if capturing:
         counters["runs_dispatched_capturing"] += 1
         # A CUDA graph now holds the specialized kernels with this plan's
-        # owned block-table/kv-length buffers baked in: later re-plans the
-        # specialized backend does not serve must warn that they invalidate
-        # the capture (see _gqa_dec_fp8q_sm90_warn_stale_capture).
+        # owned block-table/kv-length buffers baked in. Refuse a plan that
+        # cannot refresh these addresses.
         wrapper._gqa_dec_fp8q_sm90_capture_live = True
     if not _gqa_dec_fp8q_sm90_announced:
         # one line per process so a measurement can name the kernel behind
@@ -4490,6 +4530,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._gqa_dec_fp8q_sm90_requested = False
         self._gqa_dec_fp8q_sm90_explicit = False
         self._gqa_dec_fp8q_sm90_state = None
+        self._gqa_dec_fp8q_sm90_plan_refusal: Optional[str] = None
+        self._verify_native: Any = None
         self._gqa_dec_fp8q_sm90_row_seq = None
         self._eagle_verify_fp8kv_sm90_workspace = None
         self._cudnn_block_tables: Optional[torch.Tensor] = None
@@ -4538,6 +4580,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
+        if getattr(self, "_verify_stock_capture", False):
+            raise ValueError(
+                "a captured stock launch retains the workspaces; use a new wrapper"
+            )
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         if self._batch_invariant is not None:
             self._batch_invariant.reset_workspace(float_workspace_buffer)
         self._float_workspace_buffer = float_workspace_buffer
@@ -4790,7 +4839,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             max_token_per_sequence,
             rope_scale,
             rope_theta,
-            seq_lens_q,
             token_pos_in_items_ptr,
         )
         # sm_scale, prefix_len_ptr and token_pos_in_items_len are kept: the
@@ -4902,10 +4950,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 kv_layout=self._kv_layout,
                 causal=causal,
-                has_custom_mask=(
-                    custom_mask is not None
-                    or packed_custom_mask is not None
-                    or self._custom_mask_buf is not None
+                has_custom_mask=_paged_plan_has_mask(
+                    self, custom_mask, packed_custom_mask
                 ),
                 pos_encoding_mode=pos_encoding_mode,
                 use_fp16_qk_reduction=use_fp16_qk_reduction,
@@ -4949,7 +4995,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     )
                 )
 
-        use_custom_mask = custom_mask is not None or packed_custom_mask is not None
+        use_custom_mask = _paged_plan_has_mask(self, custom_mask, packed_custom_mask)
         backend = _gqa_fp8q_backend_override or self._requested_backend
         if self._jit_module is not None:
             module = self._jit_module
@@ -4985,6 +5031,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,
                 use_fp16_qk_reduction,
             )
+        _validate_paged_query_lengths(backend, seq_lens_q, qo_indptr_host)
         if module.workspace_size is None:
             raise NotImplementedError(
                 f"workspace_size is not available for prefill backend {backend!r}"
@@ -5166,14 +5213,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             such a plan or call raises with the refusal reason (an explicitly
             selected backend never falls back), and a caller who names a
             stock backend (``fa2``, ``fa3``, ...) is never served by the
-            specialized kernel. The composable fallback takes keyword
-            ``q_scale``/``k_scale``/``v_scale`` only: positional ``*args``
-            scale tensors are rejected rather than silently dropped, and
-            per-sequence ``k_scale``/``v_scale`` tensors are served only by
-            the specialized kernel itself — callers who need the stock
-            positional-scale fp8 route should name a stock backend (e.g.
-            ``backend="fa3"``), which is never served by the specialized
-            kernel.
+            specialized kernel. As an exception to the composable fallback,
+            positional FP8 scales on ``auto`` retain their native per-head
+            semantics and use a separately prepared FA3 schedule.
             ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at plan and run
             time) disables the kernel (auto: composable path; explicit:
             raise);
@@ -5276,24 +5318,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # exactly) on the stock fa2 route — the composable path run() falls
         # back to.
         #
-        # The dormant path must not write any wrapper state before
-        # _validate_paged_query_lengths rejects an incompatible plan, so the
-        # arming decision is tracked in a local and only committed to the
-        # wrapper after validation (or immediately on the armed SM90 fp8-Q
-        # path, which the validated contract below explicitly requested).
-        #
-        # CUDA-graph contract: a capture that recorded the specialized
-        # kernels stays valid across re-plans the specialized backend serves
-        # (same wrapper geometry — the owned block-table/kv-length buffers
-        # are refreshed in place). A successful re-plan the specialized
-        # backend does NOT serve (off the auto domain, kill switch, run-time
-        # contract change) leaves those owned buffers untouched and
-        # INVALIDATES prior captures: replays keep computing the previous
-        # plan's attention intact (never a mix); a warning is logged and
-        # counted (replans_invalidating_capture) — re-capture after such a
-        # re-plan. An incompatible re-plan of the underlying stock route
-        # (e.g. a non-verify fp8-Q partition on a retained fa2 capture) is
-        # rejected by the stock resolver before any accepted state changes.
+        # Resolve the external contract before substituting the internal Q dtype.
+        explicit_verify = self._requested_backend == "specialized"
+        live_verify = getattr(self, "_gqa_dec_fp8q_sm90_capture_live", False)
         qo_indptr = qo_indptr.contiguous()
         qo_indptr_host = qo_indptr.to("cpu")
         _gqa_fp8q_kv_meta: Optional[tuple] = None
@@ -5335,12 +5362,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "Drop the option or use backend='auto' / a stock backend."
                 )
             _gqa_dec_fp8q_sm90_armed = True
-            self._gqa_dec_fp8q_sm90_requested = True
-            self._gqa_dec_fp8q_sm90_explicit = True
-            self._gqa_dec_fp8q_sm90_plan_refusal = None
             q_data_type = torch.bfloat16
-            # the underlying plan is made on the stock fa2 route
-            self._backend = "fa2"
         elif self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
             # Resolve the COMPLETE auto eligibility (geometry, plan options,
             # uniform q_len == 6 and the measured batch/kv envelope) from the
@@ -5367,10 +5389,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     page_size=page_size,
                     kv_layout=self._kv_layout,
                     causal=causal,
-                    has_custom_mask=(
-                        custom_mask is not None
-                        or packed_custom_mask is not None
-                        or self._custom_mask_buf is not None
+                    has_custom_mask=_paged_plan_has_mask(
+                        self, custom_mask, packed_custom_mask
                     ),
                     pos_encoding_mode=pos_encoding_mode,
                     use_fp16_qk_reduction=use_fp16_qk_reduction,
@@ -5399,11 +5419,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             if _auto_routed:
                 _gqa_dec_fp8q_sm90_armed = True
-                self._gqa_dec_fp8q_sm90_requested = True
-                self._gqa_dec_fp8q_sm90_explicit = False
-                self._gqa_dec_fp8q_sm90_plan_refusal = None
                 q_data_type = torch.bfloat16
-                self._backend = "fa2"
             else:
                 _gqa_dec_fp8q_sm90_fallback(f"auto: {_auto_reason}")
                 logger.info_once(
@@ -5532,7 +5548,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             max_kv_len = max_sequence_kv
 
-        planned_backend = "fa2" if use_token_head_sf else self._backend
+        planned_backend = (
+            "fa2" if use_token_head_sf or _gqa_dec_fp8q_sm90_armed else self._backend
+        )
         # Per-token/head scales pin FA2; resolve auto without modifying plan state.
         if auto_backend is not None:
             planned_backend = auto_backend
@@ -5590,10 +5608,29 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
 
-        # Reset the specialized kernels only after checking backend compatibility.
-        if not _gqa_dec_fp8q_sm90_armed:
-            self._gqa_dec_fp8q_sm90_requested = False
-            self._gqa_dec_fp8q_sm90_explicit = False
+        if live_verify and (
+            not _gqa_dec_fp8q_sm90_armed or not self.is_cuda_graph_enabled
+        ):
+            raise ValueError(
+                "CUDA graph backend: cannot refresh the captured specialized launch"
+            )
+        if (
+            getattr(self, "_verify_stock_capture", False)
+            and not _gqa_dec_fp8q_sm90_armed
+        ):
+            raise ValueError(
+                "CUDA graph backend: captured fp8 dequantization requires a verify plan"
+            )
+
+        accepted = None
+        copies = []
+        if _gqa_dec_fp8q_sm90_armed or getattr(
+            self, "_gqa_dec_fp8q_sm90_requested", False
+        ):
+            accepted = self
+            self = _stage_verify_plan(accepted)
+        self._gqa_dec_fp8q_sm90_requested = _gqa_dec_fp8q_sm90_armed
+        self._gqa_dec_fp8q_sm90_explicit = explicit_verify
         self._eagle_verify_fp8kv_sm90_state = None
         self._gqa_dec_fp8q_sm90_state = None
         self._gqa_dec_fp8q_sm90_row_seq = None
@@ -5728,6 +5765,57 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
             )
+        if _gqa_dec_fp8q_sm90_armed:
+            if (
+                len(kv_lens_arr_host) != batch_size
+                or len(paged_kv_indptr_host) != batch_size + 1
+                or len(paged_kv_last_page_len_host) != batch_size
+            ):
+                raise ValueError("verify metadata length does not match batch size")
+            if (
+                int(paged_kv_indptr_host[0]) != 0
+                or int(paged_kv_indptr_host[-1]) > paged_kv_indices.numel()
+                or bool((paged_kv_indptr_host.diff() < 0).any())
+            ):
+                raise ValueError("invalid verify page offsets")
+            with torch.cuda.device(self.device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError("plan outside CUDA graph capture")
+                _gqa_dec_fp8q_sm90_prepare(
+                    self,
+                    causal,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim_qk,
+                    head_dim_vo,
+                    page_size,
+                    pos_encoding_mode,
+                    use_fp16_qk_reduction,
+                    window_left,
+                    logits_soft_cap,
+                    sm_scale,
+                    batch_size,
+                    total_num_rows,
+                    qo_indptr_host,
+                    kv_lens_arr_host,
+                    paged_kv_indptr_host,
+                    paged_kv_indices,
+                    _paged_plan_has_mask(self, custom_mask, packed_custom_mask),
+                    prefix_len_ptr,
+                    token_pos_in_items_len,
+                    paged_kv_last_page_len_host,
+                    non_blocking,
+                )
+            if self._gqa_dec_fp8q_sm90_state is None:
+                reason = self._gqa_dec_fp8q_sm90_plan_refusal
+                if explicit_verify:
+                    raise NotImplementedError(
+                        f"backend='specialized': {reason}; never falls back"
+                    )
+                if live_verify:
+                    raise ValueError(
+                        f"CUDA graph backend: cannot refresh specialized plan ({reason})"
+                    )
         if kv_lens_arr_host is not None:
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
@@ -5762,14 +5850,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "The length of paged_kv_indices exceeds the allocated buffer size."
                 )
 
-            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
-            self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
-            self._paged_kv_last_page_len_buf.copy_(
-                paged_kv_last_page_len, non_blocking=non_blocking
+            def stage_copy(dst, src, asynchronous):
+                if accepted is None:
+                    dst.copy_(src, non_blocking=asynchronous)
+                else:
+                    if dst.shape != src.shape:
+                        raise ValueError("CUDA graph metadata shape mismatch")
+                    copies.append(
+                        (dst, src.to(dst, copy=True, non_blocking=asynchronous))
+                    )
+
+            stage_copy(self._qo_indptr_buf, qo_indptr, non_blocking)
+            stage_copy(self._paged_kv_indptr_buf, paged_kv_indptr, non_blocking)
+            stage_copy(
+                self._paged_kv_last_page_len_buf, paged_kv_last_page_len, non_blocking
             )
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+            stage_copy(
+                self._paged_kv_indices_buf[: len(paged_kv_indices)],
                 paged_kv_indices,
-                non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
+                paged_kv_indices.device == self.device and non_blocking,
             )
 
             if packed_custom_mask is not None:
@@ -5781,13 +5880,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     raise ValueError(
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
-                self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+                stage_copy(
+                    self._custom_mask_buf[: len(packed_custom_mask)],
                     packed_custom_mask,
-                    non_blocking=(packed_custom_mask.device == self.device)
-                    and non_blocking,
+                    packed_custom_mask.device == self.device and non_blocking,
                 )
-                # NOTE(Zihao): mask_indptr has the same length as qo_indptr
-                self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
+                stage_copy(self._mask_indptr_buf, mask_indptr, non_blocking)
         else:
             if self._backend == "cudnn" and qo_indptr.device.type == "cpu":
                 # Own CPU-origin prefixes so a same-batch plan can retain its
@@ -6090,67 +6188,39 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         else 0
                     ),
                 )
-                # specialized SM90 fp8-Q verify-decode kernel: eligibility,
-                # JIT build, block table and workspace are settled here,
-                # outside the hot path (and outside any CUDA-graph capture)
-                if (
-                    getattr(self, "_gqa_dec_fp8q_sm90_requested", False)
-                    and kv_lens_arr_host is not None
-                ):
-                    _gqa_dec_fp8q_sm90_prepare(
-                        self,
-                        causal,
-                        num_qo_heads,
-                        num_kv_heads,
-                        head_dim_qk,
-                        head_dim_vo,
-                        page_size,
-                        pos_encoding_mode,
-                        use_fp16_qk_reduction,
-                        window_left,
-                        logits_soft_cap,
-                        sm_scale,
-                        batch_size,
-                        total_num_rows,
-                        qo_indptr_host,
-                        kv_lens_arr_host,
-                        paged_kv_indptr_host,
-                        paged_kv_indices,
-                        custom_mask is not None
-                        or packed_custom_mask is not None
-                        or self._custom_mask_buf is not None,
-                        prefix_len_ptr,
-                        token_pos_in_items_len,
-                        paged_kv_last_page_len_host=paged_kv_last_page_len_host,
-                        non_blocking=non_blocking,
+            if _gqa_dec_fp8q_sm90_armed and not explicit_verify:
+                # Positional scales use the native FP8 per-head ABI, not the
+                # per-sequence specialized ABI. Prepare its schedule separately:
+                # FA2 and FA3 must never plan into the same integer workspace.
+                native = get_batch_prefill_module(
+                    "fa3", torch.float8_e4m3fn, *get_module_args[1:]
+                )
+                native_args = args[:16]
+                float_bytes, int_bytes = native.workspace_size(
+                    native_args[0], *native_args[3:]
+                )
+                prior = getattr(accepted, "_verify_native", None)
+                fbuf = prior[1] if prior is not None else None
+                if fbuf is None or fbuf.numel() < float_bytes:
+                    fbuf = torch.empty(
+                        float_bytes, device=self.device, dtype=torch.uint8
                     )
-        if (
-            getattr(self, "_gqa_dec_fp8q_sm90_explicit", False)
-            and getattr(self, "_gqa_dec_fp8q_sm90_state", None) is None
-        ):
-            # An explicitly selected backend never falls back: a
-            # backend="specialized" plan the kernel cannot serve raises with
-            # the refusal reason instead of arming the composable route.
-            raise NotImplementedError(
-                "backend='specialized' (SM90 fp8-Q paged verify-decode "
-                "kernel) cannot serve this plan "
-                f"({getattr(self, '_gqa_dec_fp8q_sm90_plan_refusal', None) or 'plan not prepared'}); "
-                "an explicitly selected backend never falls back — use "
-                "backend='auto' for guarded routing"
-            )
-        if (
-            getattr(self, "_gqa_dec_fp8q_sm90_capture_live", False)
-            and getattr(self, "_gqa_dec_fp8q_sm90_state", None) is None
-        ):
-            # This successful re-plan did not refresh the specialized
-            # kernels' plan-time metadata, but a live CUDA graph on this
-            # wrapper captured them: the capture is invalidated (replays
-            # keep computing the previous plan — never a mix).
-            _gqa_dec_fp8q_sm90_warn_stale_capture(
-                self,
-                getattr(self, "_gqa_dec_fp8q_sm90_plan_refusal", None)
-                or "plan not prepared",
-            )
+                ibuf = torch.empty(int_bytes, device=self.device, dtype=torch.uint8)
+                pin = torch.empty(
+                    int_bytes, device="cpu", pin_memory=True, dtype=torch.uint8
+                )
+                info = native.plan(fbuf, ibuf, pin, *native_args[3:])
+                if prior is not None and self.is_cuda_graph_enabled:
+                    if prior[2].numel() >= int_bytes and prior[1] is fbuf:
+                        copies.append((prior[2][:int_bytes], ibuf))
+                        ibuf = prior[2]
+                    elif getattr(self, "_verify_native_capture", False):
+                        raise ValueError(
+                            "CUDA graph backend: captured native workspace cannot grow"
+                        )
+                self._verify_native = native, fbuf, ibuf, info
+            else:
+                self._verify_native = None
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -6331,6 +6401,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ):
             # A failed plan must not establish the backend for future captures.
             self._cuda_graph_backend = self._backend
+        if accepted is not None:
+            _commit_verify_plan(accepted, self, copies)
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -6640,6 +6712,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"{q.dtype}. An explicitly selected backend never falls back "
                 "— pass an fp8 query or re-plan with backend='auto'"
             )
+        native_plan = None
         if getattr(self, "_gqa_dec_fp8q_sm90_requested", False) and is_float8(q):
             # fp8 Q on the SM90 paged route, armed by backend="specialized"
             # or an allowlisted backend="auto" plan: the specialized
@@ -6702,19 +6775,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "backend='auto' for guarded routing"
                 )
             if args:
-                # the stock fp8 route reads positional scale tensors out of
-                # *args, but the composable fallback below dequantises q to
-                # bf16, after which those positional scales would be silently
-                # dropped. Reject them instead of mis-scaling the output.
-                raise NotImplementedError(
-                    "positional fp8 scale arguments (*args) are not served by "
-                    "the composable fallback of the specialized SM90 fp8-Q "
-                    "verify-decode route; pass q_scale/k_scale/v_scale "
-                    "keywords instead, or keep the stock positional-scale "
-                    "route by planning with a stock backend (e.g. "
-                    "backend='fa3')"
-                )
-            if isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
+                native_plan = self._verify_native
+            elif isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
                 # the stock fa2 path folds scalar k_scale into sm_scale and
                 # applies scalar v_scale to the output; it has no
                 # per-sequence KV-descale ABI, so a tensor here cannot be
@@ -6730,9 +6792,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "Pass scalars (unit descales may simply be omitted) or "
                     "re-enable the specialized kernel."
                 )
-            q, q_scale = _gqa_dec_fp8q_sm90_dequant_q(self, q, q_scale)
+            if native_plan is None:
+                q, q_scale = _gqa_dec_fp8q_sm90_dequant_q(self, q, q_scale)
+            with torch.cuda.device(q.device):
+                if torch.cuda.is_current_stream_capturing():
+                    self._verify_stock_capture = True
+                    if native_plan is not None:
+                        self._verify_native_capture = True
         _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+            q,
+            k_cache,
+            torch.float8_e4m3fn if native_plan else self._cached_q_data_type,
+            self._cached_kv_data_type,
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
@@ -7286,7 +7357,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "trtllm-gen":
                 assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
             assert self._cached_module is not None, "cached module is not initialized"
-            self._cached_module.paged_run(*run_args)
+            if native_plan is None:
+                self._cached_module.paged_run(*run_args)
+            else:
+                native, run_args[0], run_args[1], run_args[2] = native_plan
+                native.paged_run(*run_args)
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:
