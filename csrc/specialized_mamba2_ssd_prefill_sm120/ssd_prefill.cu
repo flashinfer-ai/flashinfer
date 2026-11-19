@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
@@ -873,6 +874,15 @@ DI void ldm2t(uint32_t (&d)[2], uint32_t a) {
                : "=r"(d[0]), "=r"(d[1])
                : "r"(a));
 }
+// Maximum magnitude of eight packed bf16 operands. Map NaNs to infinity so
+// a nonfinite fast-path result requests replay rather than certifying itself.
+DI float peak8(int4 v) {
+  uint32_t m = __vmaxu2((uint32_t)v.x & 0x7fff7fffu, (uint32_t)v.y & 0x7fff7fffu);
+  uint32_t n = __vmaxu2((uint32_t)v.z & 0x7fff7fffu, (uint32_t)v.w & 0x7fff7fffu);
+  m = __vmaxu2(m, n);
+  return __uint_as_float(min(max(m >> 16, m & 0xffffu), 0x7f80u) << 16);
+}
+
 DI uint32_t pack2f(float a, float b) { return punned<uint32_t>(__floats2bfloat162_rn(a, b)); }
 DI void mma_f32(float* d, const uint32_t* a, const uint32_t* b) {
   asm volatile(
@@ -1278,7 +1288,8 @@ __device__ __forceinline__ void gram_producer(const CUtensorMap* tmaB, const CUt
       __nv_bfloat162 w1 = __floats2bfloat162_rn(accS[0][2], accS[0][3]);
       __nv_bfloat162 w2 = __floats2bfloat162_rn(accS[1][0], accS[1][1]);
       __nv_bfloat162 w3 = __floats2bfloat162_rn(accS[1][2], accS[1][3]);
-      uint4 v = {*(uint32_t*)&w0, *(uint32_t*)&w1, *(uint32_t*)&w2, *(uint32_t*)&w3};
+      uint4 v = {punned<uint32_t>(w0), punned<uint32_t>(w1), punned<uint32_t>(w2),
+                 punned<uint32_t>(w3)};
       __nv_bfloat16* gout =
           g_gram +
           ((((size_t)g * GTILES + (size_t)tw) * GWIN + (size_t)(c & (GWIN - 1))) * GTILE_BF);
@@ -1327,21 +1338,6 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
                                           const __nv_bfloat16* C, const __nv_bfloat16* D,
                                           const __nv_bfloat16* bias, __nv_bfloat16* y, int T,
                                           int NH, int h, int p0, int pcnt, char* scratch) {
-  // Retain the incumbent path for overlapping input/output views.  A
-  // post-pass cannot reread input bytes that the original pass overwrote.
-  const uint64_t dst = (uint64_t)y;
-  const size_t ybytes = (size_t)T * NH * 64 * sizeof(__nv_bfloat16);
-  auto overlaps = [&](const void* ptr, size_t bytes) {
-    uint64_t src = (uint64_t)ptr;
-    return src <= dst ? dst - src < bytes : src - dst < ybytes;
-  };
-  if (overlaps(x, ybytes) || overlaps(dt, (size_t)T * NH * sizeof(__nv_bfloat16)) ||
-      overlaps(A, (size_t)NH * sizeof(float)) ||
-      overlaps(B, (size_t)T * 8 * 128 * sizeof(__nv_bfloat16)) ||
-      overlaps(C, (size_t)T * 8 * 128 * sizeof(__nv_bfloat16)) ||
-      overlaps(D, (size_t)NH * sizeof(__nv_bfloat16)) ||
-      overlaps(bias, (size_t)NH * sizeof(__nv_bfloat16)))
-    return;
   // At pcnt=64: 99,328 bytes, within the PT=64 consumer's existing
   // 99,352-byte allocation.  At the NH64 kernels' pcnt=32: 82,944 bytes,
   // within their 101,376-byte allocation.
@@ -1702,6 +1698,7 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
     // (group,tile) stream contiguous lets the consumer advance one pointer and
     // gives L2 a sequential 512-byte window-to-window access pattern.
     bool precise_output = false;
+    float peak_x = 0.f, peak_y = 0.f, peak_row_sum = 0.f;
     const __nv_bfloat16* gpWalk = nullptr;
     const __nv_bfloat16* gpWalk1 = nullptr;
     if constexpr (!TRACK_PROGRESS && FULL_T) {
@@ -1765,6 +1762,7 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
       // any residual TMA latency; the score-publication barrier below still
       // makes sX visible before y_diag/state consumers.
       STORE_X()
+      if constexpr (PT == 64) peak_x = fmaxf(peak_x, peak8(rX));
       // Pick up this chunk's raw score tile as early as possible: the producer
       // is several chunks ahead, so the spin is normally skipped outright and
       // the L2 hit hides behind the C.state phase below.
@@ -2197,6 +2195,19 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
         if (stateFirst) update_state_tile<NSN, LDX>(accSt[0], sX, bCur, sWt, sEcum, pm, nn, lane);
       }
 
+      // Bound errors in the intra-window score operands *before* cancellation
+      // by measuring their absolute row sums. Only read live causal entries.
+      if constexpr (PT == 64) {
+        const int rows = min(QT, T - c * QT);
+        for (int i = warp; i < rows; i += NW) {
+          float s = 0.f;
+          for (int j = lane; j <= i; j += 32) s += fabsf(__bfloat162float(sSc[i * LDS + j]));
+#pragma unroll
+          for (int d = 16; d; d >>= 1) s += __shfl_down_sync(0xffffffffu, s, d);
+          if (lane == 0) peak_row_sum = fmaxf(peak_row_sum, isfinite(s) ? s : CUDART_INF_F);
+        }
+      }
+
       // ---------------- y_diag = scores . x -----------------------------
       if constexpr (SPEC) {
         if (yrole) {
@@ -2275,14 +2286,14 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
               int pc = 8 * (NPY * ng + pt) + 2 * (lane & 3);
               uint32_t xr0 = *(const uint32_t*)(sX + i0 * LDX + pc);
               uint32_t xr1 = *(const uint32_t*)(sX + (i0 + 8) * LDX + pc);
-              float2 xa = __bfloat1622float2(*(__nv_bfloat162*)&xr0);
-              float2 xb = __bfloat1622float2(*(__nv_bfloat162*)&xr1);
+              float2 xa = __bfloat1622float2(punned<__nv_bfloat162>(xr0));
+              float2 xb = __bfloat1622float2(punned<__nv_bfloat162>(xr1));
               __nv_bfloat162 y0 =
                   __floats2bfloat162_rn(accY[rb][pt][0] + Dh * xa.x, accY[rb][pt][1] + Dh * xa.y);
               __nv_bfloat162 y1 =
                   __floats2bfloat162_rn(accY[rb][pt][2] + Dh * xb.x, accY[rb][pt][3] + Dh * xb.y);
-              yFrag[2 * pt] = *(uint32_t*)&y0;
-              yFrag[2 * pt + 1] = *(uint32_t*)&y1;
+              yFrag[2 * pt] = punned<uint32_t>(y0);
+              yFrag[2 * pt + 1] = punned<uint32_t>(y1);
             }
             uint32_t dst =
                 sptr(sY + (16 * (myi + rb) + (lane & 15)) * LDX + 8 * (NPY * ng + (lane >> 4)));
@@ -2301,14 +2312,14 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
           int pc = 8 * (NPY * ng + pt) + 2 * (lane & 3);
           uint32_t xr0 = *(const uint32_t*)(sX + ia0 * LDX + pc);
           uint32_t xr1 = *(const uint32_t*)(sX + (ia0 + 8) * LDX + pc);
-          float2 xa = __bfloat1622float2(*(__nv_bfloat162*)&xr0);
-          float2 xb = __bfloat1622float2(*(__nv_bfloat162*)&xr1);
+          float2 xa = __bfloat1622float2(punned<__nv_bfloat162>(xr0));
+          float2 xb = __bfloat1622float2(punned<__nv_bfloat162>(xr1));
           __nv_bfloat162 y0 =
               __floats2bfloat162_rn(accY[0][pt][0] + Dh * xa.x, accY[0][pt][1] + Dh * xa.y);
           __nv_bfloat162 y1 =
               __floats2bfloat162_rn(accY[0][pt][2] + Dh * xb.x, accY[0][pt][3] + Dh * xb.y);
-          yFrag[2 * pt] = *(uint32_t*)&y0;
-          yFrag[2 * pt + 1] = *(uint32_t*)&y1;
+          yFrag[2 * pt] = punned<uint32_t>(y0);
+          yFrag[2 * pt + 1] = punned<uint32_t>(y1);
         }
         uint32_t dst = sptr(sY + (16 * mi + (lane & 15)) * LDX + 8 * (NPY * ng + (lane >> 4)));
         asm volatile(
@@ -2321,8 +2332,8 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
           int pc = 8 * (NPY * ng + pt) + 2 * (lane & 3);
           uint32_t xr0 = *(const uint32_t*)(sX + ia0 * LDX + pc);
           uint32_t xr1 = *(const uint32_t*)(sX + (ia0 + 8) * LDX + pc);
-          float2 xa = __bfloat1622float2(*(__nv_bfloat162*)&xr0);
-          float2 xb = __bfloat1622float2(*(__nv_bfloat162*)&xr1);
+          float2 xa = __bfloat1622float2(punned<__nv_bfloat162>(xr0));
+          float2 xb = __bfloat1622float2(punned<__nv_bfloat162>(xr1));
           *(__nv_bfloat162*)(sY + ia0 * LDX + pc) =
               __floats2bfloat162_rn(accY[0][pt][0] + Dh * xa.x, accY[0][pt][1] + Dh * xa.y);
           *(__nv_bfloat162*)(sY + (ia0 + 8) * LDX + pc) =
@@ -2354,12 +2365,15 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
           asm volatile(
               "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
               "[%0], {%1,%2,%3,%4};\n" ::"r"(dst),
-              "r"(*(uint32_t*)&w00), "r"(*(uint32_t*)&w01), "r"(*(uint32_t*)&w10),
-              "r"(*(uint32_t*)&w11));
+              "r"(punned<uint32_t>(w00)), "r"(punned<uint32_t>(w01)), "r"(punned<uint32_t>(w10)),
+              "r"(punned<uint32_t>(w11)));
         }
       }
 
       __syncthreads();  // epilogue + next scan ready; sX/sXw readers finished
+      if constexpr (PT == 64) {
+        if (c * QT + xr_ < T) peak_y = fmaxf(peak_y, peak8(*(const int4*)(sY + xso_)));
+      }
       if constexpr (SPEC) {
         if constexpr (FULL_T) {
           if (hasNext && tid == TMA_LEADER_TID)
@@ -2380,8 +2394,8 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
               asm volatile(
                   "stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
                   "[%0], {%1,%2,%3,%4};\n" ::"r"(dst),
-                  "r"(*(uint32_t*)&w00), "r"(*(uint32_t*)&w01), "r"(*(uint32_t*)&w10),
-                  "r"(*(uint32_t*)&w11));
+                  "r"(punned<uint32_t>(w00)), "r"(punned<uint32_t>(w01)),
+                  "r"(punned<uint32_t>(w10)), "r"(punned<uint32_t>(w11)));
             }
         }
       }
@@ -2407,8 +2421,43 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
     // magnitude path, finish draining y before reusing the existing shared
     // allocation for the fp32 128-token SSD calculation.
     if constexpr (PT == 64) {
-      if (precise_output) {
-        __syncthreads();
+      // Reuse the retired tile storage; all ring traffic and y drains finish
+      // before any thread enters precise_head. Reduce once per head, not per
+      // token, and make the replay decision uniform across the CTA.
+      __syncthreads();
+      float* peaks = reinterpret_cast<float*>(smem_raw);
+#pragma unroll
+      for (int d = 16; d; d >>= 1) {
+        peak_x = fmaxf(peak_x, __shfl_down_sync(0xffffffffu, peak_x, d));
+        peak_y = fmaxf(peak_y, __shfl_down_sync(0xffffffffu, peak_y, d));
+      }
+      if (lane == 0) {
+        peaks[warp] = peak_x;
+        peaks[NW + warp] = peak_y;
+        peaks[2 * NW + warp] = peak_row_sum;
+      }
+      __syncthreads();
+      if (warp == 0) {
+        peak_x = lane < NW ? peaks[lane] : 0.f;
+        peak_y = lane < NW ? peaks[NW + lane] : 0.f;
+        peak_row_sum = lane < NW ? peaks[2 * NW + lane] : 0.f;
+#pragma unroll
+        for (int d = NW / 2; d; d >>= 1) {
+          peak_x = fmaxf(peak_x, __shfl_down_sync(0xffffffffu, peak_x, d));
+          peak_y = fmaxf(peak_y, __shfl_down_sync(0xffffffffu, peak_y, d));
+          peak_row_sum = fmaxf(peak_row_sum, __shfl_down_sync(0xffffffffu, peak_row_sum, d));
+        }
+        if (lane == 0) {
+          // Raw Gram and then weighted score each round once. Relative to
+          // the staged score their combined coefficient is < .008. Allow
+          // an absolute floor for flushed tiny operands (decay <= 1 and
+          // step <= 4096 on the non-escalated path). Use double only here.
+          double err = (0.008 * peak_row_sum + QT * 4098.0 * 0x1p-126) * peak_x;
+          precise_output |=
+              Ah > 0.f || !isfinite(err) || !isfinite(peak_y) || err > 0.015 * (peak_y + 1.e-9);
+        }
+      }
+      if (__syncthreads_or(precise_output)) {
         precise_head(gx, gdt, gA, gB, gC, gD, gdtb, gy, T, NH, h, 0, 64, smem_raw);
       }
     }
@@ -2442,14 +2491,15 @@ static CooperativeLaunchState g_coop32_noprog;
 static CooperativeLaunchState g_coop32_full;
 static CooperativeLaunchState g_coop32_full_noprog;
 
-static inline void make_bc_tma(CUtensorMap* map, const __nv_bfloat16* ptr, int T) {
+static inline CUresult make_bc_tma(CUtensorMap* map, const __nv_bfloat16* ptr, int T) {
   const uint64_t dims[2] = {(uint64_t)(NGR * DSN), (uint64_t)T};
   const uint64_t strides[1] = {(uint64_t)(NGR * DSN * sizeof(__nv_bfloat16))};
   const uint32_t box[2] = {(uint32_t)LDN, (uint32_t)QT};
   const uint32_t elem_strides[2] = {1, 1};
-  cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr, dims, strides, box,
-                         elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-                         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr, dims, strides,
+                                box, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorView Bm,
          ffi::TensorView Cm, ffi::TensorView D, ffi::TensorView dtb, ffi::TensorView y) {
@@ -2470,8 +2520,8 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
   __nv_bfloat16* py = (__nv_bfloat16*)y.data_ptr();
 
   alignas(64) CUtensorMap tmaB{}, tmaC{};
-  make_bc_tma(&tmaB, pB, T);
-  make_bc_tma(&tmaC, pC, T);
+  TVM_FFI_ICHECK_EQ(make_bc_tma(&tmaB, pB, T), CUDA_SUCCESS) << "failed to encode B tensor map";
+  TVM_FFI_ICHECK_EQ(make_bc_tma(&tmaC, pC, T), CUDA_SUCCESS) << "failed to encode C tensor map";
 
   const int smem64 = (int)((3 * QT * LDN + 64 * LDN + 2 * QT * (64 + 8) + QT * LDS) * 2 +
                            8 * QT * (int)sizeof(float) + 2 * sizeof(uint64_t) + 2 * sizeof(float));
@@ -2485,6 +2535,15 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
   auto launch_cooperative = [&](const void* kernel, int grid, int smem,
                                 CooperativeLaunchState& state, int threads) {
     const int device = x.device().device_id;
+    auto submit = [&] {
+      void* args[] = {&px, &pdt, &pA, &pB, &pC, &pD, &pdb, &py, &T, &NH, &nchunks, &tmaB, &tmaC};
+      const cudaError_t launch_status =
+          cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(threads), args, smem, stream);
+      const cudaError_t last_status = cudaGetLastError();
+      TVM_FFI_CHECK_CUDA_ERROR(launch_status);
+      TVM_FFI_CHECK_CUDA_ERROR(last_status);
+    };
+    bool submitted = false;
     std::call_once(state.initialize, [&] {
       TVM_FFI_CHECK_CUDA_ERROR(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
@@ -2506,9 +2565,12 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
           << "SSD cooperative grid exceeds whole-grid residency capacity";
       TVM_FFI_ICHECK_GT(2 * grid, capacity)
           << "SSD ring is unsafe when two cooperative grids can co-reside";
+      submit();  // A submission error must leave the once-flag retriable too.
+      submitted = true;
       state.device = device;
       state.resident_capacity = capacity;
     });
+    if (submitted) return;
     TVM_FFI_ICHECK_EQ(state.device, device)
         << "SSD cooperative launch state was initialized on another device";
     TVM_FFI_ICHECK_LE(grid, state.resident_capacity)
@@ -2516,9 +2578,7 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
     TVM_FFI_ICHECK_GT(2 * grid, state.resident_capacity)
         << "SSD ring is unsafe when two cooperative grids can co-reside";
 
-    void* args[] = {&px, &pdt, &pA, &pB, &pC, &pD, &pdb, &py, &T, &NH, &nchunks, &tmaB, &tmaC};
-    TVM_FFI_CHECK_CUDA_ERROR(
-        cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(threads), args, smem, stream));
+    submit();
   };
 
   // Eight group-Gram producers ride on the SMs left idle by the 128 consumer
@@ -2577,6 +2637,25 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
   same_device(D, "D");
   same_device(dt_bias, "dt_bias");
   same_device(y, "y");
+  auto address = [](const ffi::TensorView& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()); };
+  TVM_FFI_ICHECK(((address(x) | address(Bmat) | address(Cmat) | address(y)) & 15) == 0)
+      << "x, B, C and y must be 16-byte aligned";
+  const size_t tokens = x.shape()[0], heads = x.shape()[1];
+  const size_t dt_bytes = tokens * heads * sizeof(bf16);
+  const size_t y_bytes = dt_bytes * 64, bc_bytes = tokens * 8 * 128 * sizeof(bf16);
+  const uintptr_t dst = address(y);
+  auto disjoint = [&](const ffi::TensorView& input, size_t bytes, const char* name) {
+    const uintptr_t src = address(input);
+    TVM_FFI_ICHECK(!bytes || !y_bytes || (src <= dst ? dst - src >= bytes : src - dst >= y_bytes))
+        << "y must not overlap " << name;
+  };
+  disjoint(x, y_bytes, "x");
+  disjoint(dt, dt_bytes, "dt");
+  disjoint(A, heads * sizeof(float), "A");
+  disjoint(Bmat, bc_bytes, "B");
+  disjoint(Cmat, bc_bytes, "C");
+  disjoint(D, heads * sizeof(bf16), "D");
+  disjoint(dt_bias, heads * sizeof(bf16), "dt_bias");
   // The module binds its per-kernel launch state (shared-memory opt-in,
   // cooperative residency capacity) to the first CUDA device that runs it.
   // Enforce that binding here so a direct native caller on another device

@@ -45,23 +45,30 @@ def _has_min_cuda_toolkit():
     # back to torch.version.cuda when nvcc is absent, which would enable
     # these JIT tests on a host that cannot compile the module.  The Ninja
     # build honors FLASHINFER_NVCC, so probe the same compiler it selects.
-    try:
-        import os
-        import re
-        import subprocess
+    import os
+    import re
+    import subprocess
 
-        from packaging.version import Version
+    from packaging.version import Version
 
+    nvcc = os.environ.get("FLASHINFER_NVCC")
+    if nvcc is None:
         from flashinfer.jit.cpp_ext import get_cuda_path
 
-        nvcc = os.environ.get(
-            "FLASHINFER_NVCC", os.path.join(get_cuda_path(), "bin", "nvcc")
-        )
+        try:
+            nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
+        except (FileNotFoundError, RuntimeError):
+            return False
+    try:
         txt = subprocess.check_output([nvcc, "--version"], text=True)
-        matches = re.findall(r"release (\d+\.\d+),", txt)
-        return bool(matches) and Version(matches[0]) >= Version("13.3")
-    except Exception:
+    except FileNotFoundError:
+        if "FLASHINFER_NVCC" in os.environ:
+            raise
         return False
+    match = re.search(r"release (\d+\.\d+),", txt)
+    if match is None:
+        raise ValueError(f"Unrecognized {nvcc} --version output: {txt}")
+    return Version(match[1]) >= Version("13.3")
 
 
 pytestmark = [
@@ -176,7 +183,7 @@ def _rel_max(out, ref):
 
 
 @requires_toolkit
-@pytest.mark.parametrize("t,nheads", [(120, 64), (500, 128)])
+@pytest.mark.parametrize("t,nheads", [(120, 64), (128, 128), (500, 128)])
 def test_auto_constructs_specialized_and_matches_reference(t, nheads):
     from flashinfer.mamba import specialized_ssd_prefill_stats
 
@@ -219,6 +226,50 @@ def test_large_step_decay_protection(nheads, t, step_pos):
     out = _run(ssd, p, t, nheads)
     rel = _rel_max(out.float(), _reference(p, t, nheads))
     assert rel <= REL_TOL, f"rel {rel} at T={t} nheads={nheads} step at {step_pos}"
+
+
+def test_nvcc_override_without_default_toolkit(monkeypatch):
+    import subprocess
+
+    from flashinfer.jit import cpp_ext
+
+    compiler = "/override/bin/nvcc"
+    monkeypatch.setenv("FLASHINFER_NVCC", compiler)
+    monkeypatch.setattr(
+        cpp_ext, "get_cuda_path", lambda: pytest.fail("unexpected lookup")
+    )
+
+    def version(argv, *, text):
+        assert argv == [compiler, "--version"] and text
+        return "Cuda compilation tools, release 13.3, V13.3.0"
+
+    monkeypatch.setattr(subprocess, "check_output", version)
+    assert _has_min_cuda_toolkit()
+
+
+@requires_toolkit
+def test_nh128_score_cancellation(record_property):
+    nheads, t = 128, 2
+    _skip_unless_resident(nheads)
+    p = _make_inputs(t, nheads, seed=0)
+    for v in p.values():
+        v.zero_()
+    p["A"].fill_(-(2.0**-30))
+    p["x"][0].fill_(1)
+    p["x"][1].fill_(-1)
+    # Row 0 emits nothing. Row 1 subtracts dots 1+2^-9 and 1,
+    # which are distinct in the recurrence but equal if staged in bf16.
+    p["B"][:, :, 0] = 1
+    p["B"][0, :, 1] = 2.0**-9
+    p["C"][1, :, :2] = 1
+    ref = _reference(p, t, nheads)
+    out = _run(_make_ssd(nheads), p, t, nheads)
+    rel = _rel_max(out, ref)
+    actual, expected = out[1, 0, 0].item(), ref[1, 0, 0].item()
+    record_property("row1_actual", actual)
+    record_property("row1_fp64", expected)
+    record_property("rel_max", rel)
+    assert rel <= REL_TOL, (actual, expected, rel)
 
 
 def test_backends_declared_and_bogus_backend_raises():
@@ -265,6 +316,107 @@ def test_unservable_call_form_raises():
         )
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["out_form", "device_mismatch", "alignment", "out_overlap", "capture_unwarmed"],
+)
+def test_refusal_before_kernel_entry(monkeypatch, reason):
+    from flashinfer.mamba.specialized import ssd_prefill_sm120 as backend
+
+    monkeypatch.setattr(backend, "_kernel_entry", lambda: pytest.fail("entered JIT"))
+    t, nh = 256, 64
+    p = _make_inputs(t, nh, seed=1)
+    ssd = _make_ssd(nh, backend="specialized")
+    out = None
+    if reason == "out_form":
+        out = torch.empty_like(p["x"])
+    elif reason == "device_mismatch":
+        p["D"] = p["D"].cpu()
+    elif reason == "alignment":
+        b = p["B"]
+        p["B"] = b.new_empty(b.numel() + 1)[1:].view_as(b)
+    elif reason == "out_overlap":
+        x = p["x"]
+        backing = x.new_empty(x.numel() + 8)
+        p["x"] = backing[:-8].view_as(x)
+        out = backing[8:].view(1, t, nh, HD)
+    else:
+        monkeypatch.setattr(backend, "_warmed", set())
+        monkeypatch.setattr(backend, "_native_device", None)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    before = backend.specialized_ssd_prefill_stats()["fallback_reasons"].get(reason, 0)
+    with pytest.raises(NotImplementedError, match=rf"reason: {reason}\)"):
+        _run(ssd, p, t, nh, out=out)
+    assert (
+        backend.specialized_ssd_prefill_stats()["fallback_reasons"][reason]
+        == before + 1
+    )
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nh", [64, 128])
+def test_native_operand_checks(nh):
+    from flashinfer.mamba.specialized import ssd_prefill_sm120 as backend
+
+    _skip_unless_resident(nh)
+    t = 256
+    p = _make_inputs(t, nh, seed=1)
+    run = backend._kernel_entry()
+    y = torch.empty_like(p["x"])
+    keys = ("x", "dt", "A", "B", "C", "D", "dt_bias")
+
+    def call(inputs, dst):
+        run(*(inputs[k] for k in keys), dst)
+
+    # Count executed SSD kernels independently of the Python dispatch stats;
+    # the valid control also checks that device events are actually visible.
+    def profile():
+        return torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        )
+
+    def launches(trace):
+        return sum(
+            e.device_type == torch.autograd.DeviceType.CUDA and "ssd_kernel" in e.name
+            for e in trace.events()
+        )
+
+    with profile() as control:
+        call(p, y)
+        torch.cuda.synchronize()
+    assert launches(control) == 1
+    assert _rel_max(y, _reference(p, t, nh)) <= REL_TOL
+    saved_y = y.clone()
+    with profile() as refused:
+        for key in ("x", "B", "C", "y"):
+            value = y if key == "y" else p[key]
+            backing = value.new_full((value.numel() + 1,), 3)
+            view = backing[1:].view_as(value)
+            assert view.data_ptr() % 16 == 2
+            bad = dict(p, **{key: view})
+            with pytest.raises(RuntimeError, match="16-byte aligned"):
+                call(bad, view if key == "y" else y)
+            assert (backing == 3).all() and torch.equal(y, saved_y)
+        for key in keys:
+            # Distinct, aligned starts; exactly 16 bytes in common. Use a
+            # byte view so A's fp32 footprint is tested as bytes, not bf16s.
+            value = p[key]
+            n = value.numel() * value.element_size()
+            backing = torch.full(
+                (n + y.numel() * 2 - 16,), 7, device=DEVICE, dtype=torch.uint8
+            )
+            src = backing[:n].view(value.dtype).view_as(value)
+            dst = backing[n - 16 :].view(y.dtype).view_as(y)
+            with pytest.raises(RuntimeError, match=f"y must not overlap {key}"):
+                call(dict(p, **{key: src}), dst)
+            assert (backing == 7).all()
+        torch.cuda.synchronize()
+    assert launches(refused) == 0
+
+
 def test_kill_switch(monkeypatch):
     # Set at construction time: auto resolves to today's refusal.
     monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
@@ -279,20 +431,40 @@ def test_kill_switch(monkeypatch):
         _run(ssd, p, 128, 64)
 
 
-@requires_toolkit
-def test_cuda_graph_replay_matches_eager():
+def _graph_worker(device, nh, t):
     from flashinfer.mamba import specialized_ssd_prefill_warmup
 
-    specialized_ssd_prefill_warmup(64, device=DEVICE)
-    ssd = _make_ssd(64)
-    t = 256
-    p = _make_inputs(t, 64, seed=3)
-    eager = _run(ssd, p, t, 64).clone()
-    out = torch.empty(1, t, 64, HD, dtype=torch.bfloat16, device=DEVICE)
+    torch.cuda.set_device(device)
+    specialized_ssd_prefill_warmup(nh, device=device)  # T=128 only
+    ssd = _make_ssd(nh)
+    p = _make_inputs(t, nh, seed=3)
+    out = torch.empty(1, t, nh, HD, dtype=torch.bfloat16, device=DEVICE)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _run(ssd, p, t, 64, out=out)
-    out.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out.view(t, 64, HD), eager)
+        _run(ssd, p, t, nh, out=out)
+    for sign in (1, -1):
+        p["x"].mul_(sign)
+        out.fill_(float("nan"))
+        graph.replay()
+        eager = _run(ssd, p, t, nh)
+        assert eager.count_nonzero() > 0
+        assert torch.equal(out.view_as(eager), eager)
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nh,t", [(64, 256), (128, 129), (128, 256 * 64 + 1)])
+def test_cuda_graph_replay_matches_eager(nh, t):
+    import multiprocessing
+
+    _skip_unless_resident(nh)
+    child = multiprocessing.get_context("spawn").Process(
+        target=_graph_worker, args=(torch.cuda.current_device(), nh, t)
+    )
+    child.start()
+    try:
+        child.join(timeout=600)
+        assert child.exitcode == 0, f"graph worker exit code: {child.exitcode}"
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
