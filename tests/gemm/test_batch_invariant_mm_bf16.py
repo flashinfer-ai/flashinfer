@@ -257,6 +257,19 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in space, cfg.describe()
 
 
+def test_kernel_handle_cache_clears_with_the_rankings():
+    """The launch-handle cache has one supported clear, and forgetting the rankings (a device's registered numbers) forgets
+    the handles too: a handle is sized with the grid the rankings were computed for."""
+    from flashinfer.gemm.batch_invariant import api as bi_api, heuristic
+
+    bi_api._KERNELS[("probe",)] = object()
+    bi_api.clear_kernel_cache()
+    assert ("probe",) not in bi_api._KERNELS
+    bi_api._KERNELS[("probe",)] = object()
+    heuristic.rank.cache_clear()
+    assert ("probe",) not in bi_api._KERNELS
+
+
 @pytest.mark.parametrize("family,sm_count", PARTS)
 def test_memoised_dispatcher_pick_equals_a_fresh_ranking(family, sm_count):
     """The dispatcher's pick, its candidate list and the enumerated space are memoised per argument tuple: a memoised

@@ -51,6 +51,7 @@ import torch
 
 from ...batch_invariant.support import check_device, register_self_served, unsupported
 from .generator import Knobs
+from .heuristic import on_rank_cache_clear
 from .schedule import chunks_for, default_config, fp4_class_for, mx_class_for
 from .spec import (
     A_ELEM_BITS_OF,
@@ -482,6 +483,15 @@ def _accepts_mx(config: Knobs, M: int, N: int, K: int, C: int, in_fmt: str) -> b
 # the compiled kernels by (device index, record, the launch's other compile parameters): the persistent grid is the
 # device's co-resident cluster count for the record, so once that count is final the handle is a function of the key
 _KERNELS: Dict[tuple, Any] = {}
+
+
+def clear_kernel_cache() -> None:
+    """Forget every cached launch handle: the one supported way to drop them (tests; a device re-registration, which also
+    forgets the rankings the grids were sized with)."""
+    _KERNELS.clear()
+
+
+on_rank_cache_clear(clear_kernel_cache)
 
 
 def _kernel(
