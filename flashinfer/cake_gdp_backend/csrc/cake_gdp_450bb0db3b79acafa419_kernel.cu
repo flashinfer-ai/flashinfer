@@ -1106,8 +1106,8 @@ kernel_cake_gdp_450bb0db3b79acafa419(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         S2[15] = make_float2(S[30], S[31]);
 #endif
         if (use_ssm_state_indices != 0) {
-            #pragma unroll 1
 #if __CUDA_ARCH__ == 900
+            #pragma unroll 2
             for (int t = 0; t < 16; t++) {
                 float alpha = sAlpha[t];
                 S[0] = mul_f32_rn_ftz(S[0], alpha);
@@ -1144,6 +1144,7 @@ kernel_cake_gdp_450bb0db3b79acafa419(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                 S[31] = mul_f32_rn_ftz(S[31], alpha);
                 int m_0 = t * 3;
 #else
+            #pragma unroll 1
             for (int t_1 = 0; t_1 < 16; t_1++) {
                 float alpha_2 = sAlpha[t_1];
                 float2 alpha2 = make_float2(alpha_2, alpha_2);
@@ -2382,8 +2383,8 @@ kernel_cake_gdp_450bb0db3b79acafa419(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             }
         }
         if (use_ssm_state_indices == 0) {
-            #pragma unroll 1
 #if __CUDA_ARCH__ == 900
+            #pragma unroll 2
             for (int t_1 = 0; t_1 < 16; t_1++) {
                 float alpha_1 = sAlpha[t_1];
                 S[0] = mul_f32_rn_ftz(S[0], alpha_1);
@@ -2420,6 +2421,7 @@ kernel_cake_gdp_450bb0db3b79acafa419(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                 S[31] = mul_f32_rn_ftz(S[31], alpha_1);
                 int m_3 = t_1 * 3;
 #else
+            #pragma unroll 1
             for (int t_2 = 0; t_2 < 16; t_2++) {
                 float alpha_3 = sAlpha[t_2];
                 float2 alpha2_1 = make_float2(alpha_3, alpha_3);

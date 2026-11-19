@@ -190,15 +190,27 @@ def unit_loop(
     # full (128, T) tile composed down to the slice's columns, as the correction block does for its pieces)
     cS = cute.make_identity_tensor((Q_ROWS, T))
     tScS = qk_thr_mma.partition_C(cS)
-    ld_full = cute.make_copy_atom(
-        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
-    )
+    HWM = st.hw_rowmax
+    if cutlass.const_expr(HWM):
+        # the load returns each 32-column piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
+        # is the max.f32 join of the pieces -- the same exact maximum as the register tree
+        ld_full = cute.make_copy_atom(
+            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+        )
+    else:
+        ld_full = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+        )
     tiled_full = tcgen05.make_tmem_copy(ld_full, tStS)
     thr_full = tiled_full.get_slice(thread_idx)
     tFtS = thr_full.partition_S(tStS)
     tFcS = thr_full.partition_D(tScS)
     rF = cute.make_rmem_tensor(tFcS.shape, ACC_DTYPE)
     assert cute.size(rF) == T
+    rRed = None
+    if cutlass.const_expr(HWM):
+        rRed = cute.make_rmem_tensor(((1, 1), *tFcS.shape[1:]), ACC_DTYPE)
+        assert cute.size(rRed) == T // 32, cute.size(rRed)
     one_slice = kpt == T  # one warpgroup: the slice is the row, loaded once
     # two warpgroups on whole rows: each loads ONLY its key slice, forms the slice's maximum and exchanges it with the other
     # warpgroup through shared memory (fmax is exact and order-free, so the maximum of the two partials is the row maximum: a
@@ -288,9 +300,18 @@ def unit_loop(
             s_cons.advance(1)  # the other warpgroup's stage
         s_off = sh.index * st.tmem_s_stride  # this tile's S stage (0 with one stage)
         if cutlass.const_expr(not exchange):
-            cute.copy(
-                tiled_full, cute.make_tensor(tFtS.iterator + s_off, tFtS.layout), rF
-            )
+            if cutlass.const_expr(HWM):
+                cute.copy(
+                    tiled_full,
+                    cute.make_tensor(tFtS.iterator + s_off, tFtS.layout),
+                    (rF, rRed),
+                )
+            else:
+                cute.copy(
+                    tiled_full,
+                    cute.make_tensor(tFtS.iterator + s_off, tFtS.layout),
+                    rF,
+                )
         if cutlass.const_expr(not one_slice):
             cute.copy(
                 tiled_slice,
@@ -338,9 +359,19 @@ def unit_loop(
             sf = []
             for i in cutlass.range_constexpr(T):
                 sf.append(rF[i])
-            m_t = max3_tree(
-                sf
-            )  # the same value as the rowmax plan (max is exact and order-free)
+            if cutlass.const_expr(HWM):
+                sr = []
+                for i in cutlass.range_constexpr(T // 32):
+                    sr.append(rRed[i])
+                m_t = max3_tree(
+                    sr
+                )  # the pieces' hardware maxima joined (an unmasked tile)
+                if need_mask:  # the maximum of the masked values: the register tree
+                    m_t = max3_tree(sf)
+            else:
+                m_t = max3_tree(
+                    sf
+                )  # the same value as the rowmax plan (max is exact and order-free)
         if chunk_first:
             m = neg_inf
         null = m_t == neg_inf  # no visible key for this row: a null step

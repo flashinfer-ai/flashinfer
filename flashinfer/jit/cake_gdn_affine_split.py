@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generated programs of the opt-in exact sequence split of the Cake GDN prefill on sm_103a
-(BF16 Q/K/V/output, FP32 state, head size 128): pass 1 walks every chunk-aligned segment
-of a sequence in one wave (the first from the initial state into the output, every other
-one from zeros and from the identity, into the local output, its BF16 transfer and its
-two segment states), pass 2 composes the carried states and corrects the outputs of
-every later segment, one program per compose slice width (4, 8 and 16 value columns).
-The host module ``flashinfer.gdn_kernels.blackwell.cake_gdn_affine_split`` picks the
-segment cap, owns the workspaces, computes the grids and launches the two programs of a
-call.
+"""Generated programs of the opt-in exact sequence split of the Cake GDN prefill on
+sm_100a, sm_103a and sm_107a (BF16 Q/K/V/output, FP32 state, head size 128): pass 1
+walks every chunk-aligned segment of a sequence in one wave (the first from the initial
+state into the output, every other one from zeros and from the identity, into the local
+output, its BF16 transfer and its two segment states), pass 2 composes the carried
+states and corrects the outputs of every later segment, one program per compose slice
+width (4, 8 and 16 value columns). The host module
+``flashinfer.gdn_kernels.blackwell.cake_gdn_affine_split`` picks the segment cap, owns
+the workspaces, computes the grids and launches the two programs of a call.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -38,8 +38,12 @@ PASS1 = cake_program.CakeProgram(
         "cake_gdn_affine_split_03829716e38373da30f9_kernel.cu",
         "cake_gdn_affine_split_03829716e38373da30f9_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math",)),
+    ),
     args=(
         "Q",
         "K",
@@ -106,8 +110,12 @@ PASS2_W4 = cake_program.CakeProgram(
         "cake_gdn_affine_split_dc6b2bd2dc435072698e_kernel.cu",
         "cake_gdn_affine_split_dc6b2bd2dc435072698e_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--fmad=true",)),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--fmad=true",)),
+        ("sm_103a", ("--fmad=true",)),
+        ("sm_107a", ("--fmad=true",)),
+    ),
     args=(
         "o_loc",
         "c_rows",
@@ -159,8 +167,12 @@ PASS2_W8 = cake_program.CakeProgram(
         "cake_gdn_affine_split_4cd76cf613d87c68257c_kernel.cu",
         "cake_gdn_affine_split_4cd76cf613d87c68257c_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--fmad=true",)),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--fmad=true",)),
+        ("sm_103a", ("--fmad=true",)),
+        ("sm_107a", ("--fmad=true",)),
+    ),
     args=(
         "o_loc",
         "c_rows",
@@ -212,8 +224,12 @@ PASS2_W16 = cake_program.CakeProgram(
         "cake_gdn_affine_split_4bb897eeba49c85dd937_kernel.cu",
         "cake_gdn_affine_split_4bb897eeba49c85dd937_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--fmad=true",)),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--fmad=true",)),
+        ("sm_103a", ("--fmad=true",)),
+        ("sm_107a", ("--fmad=true",)),
+    ),
     args=(
         "o_loc",
         "c_rows",

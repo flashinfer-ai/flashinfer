@@ -357,7 +357,8 @@ def load_loop_q2(
 ):
     """The paired placement's load warp: Q tiles A and B of the unit into tiles ``2 s``, ``2 s + 1`` of one Q stage (one barrier, armed
     with the bytes of the tiles present; B is absent when its tile range is empty), then K and V of the union of the two tile ranges in
-    the MMA warp's order ``K_lo``, then per tile ``t``: ``K_{t+1}``, ``V_t`` (each K / V tile is consumed by both Q tiles' MMAs)."""
+    the MMA warp's order (``mma.mma_loop_q2``): ``K_lo``, then per tile ``t`` either ``K_{t+1}``, ``V_t`` (P in its own TMEM columns) or
+    ``V_t``, ``K_{t+1}`` (P over its own S stage, ``st.p_over_s``); each K / V tile is consumed by both Q tiles' MMAs."""
     kv_ptr0 = mKvIndptr[req]
     n_pages = mKvIndptr[req + 1] - kv_ptr0
     has_b = hi_b > lo_b
@@ -416,19 +417,20 @@ def load_loop_q2(
             st, lo, kv_prod, atom_k, tKgK, tKsK, mKvIndices, kv_ptr0, n_pages, kv_head
         )
         for t in range(lo, hi):
-            if t + 1 < hi:
-                kv_prod = issue_tile(
-                    st,
-                    t + 1,
-                    kv_prod,
-                    atom_k,
-                    tKgK,
-                    tKsK,
-                    mKvIndices,
-                    kv_ptr0,
-                    n_pages,
-                    kv_head,
-                )
+            if cutlass.const_expr(not st.p_over_s):
+                if t + 1 < hi:
+                    kv_prod = issue_tile(
+                        st,
+                        t + 1,
+                        kv_prod,
+                        atom_k,
+                        tKgK,
+                        tKsK,
+                        mKvIndices,
+                        kv_ptr0,
+                        n_pages,
+                        kv_head,
+                    )
             kv_prod = issue_tile(
                 st,
                 t,
@@ -441,4 +443,18 @@ def load_loop_q2(
                 n_pages,
                 kv_head,
             )
+            if cutlass.const_expr(st.p_over_s):
+                if t + 1 < hi:
+                    kv_prod = issue_tile(
+                        st,
+                        t + 1,
+                        kv_prod,
+                        atom_k,
+                        tKgK,
+                        tKsK,
+                        mKvIndices,
+                        kv_ptr0,
+                        n_pages,
+                        kv_head,
+                    )
     return q_prod, kv_prod
