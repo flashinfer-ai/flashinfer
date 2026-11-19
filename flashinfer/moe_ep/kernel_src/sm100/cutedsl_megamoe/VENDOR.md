@@ -102,12 +102,13 @@ replace its own device snapshot.
 
 - **BF16xMXFP8 B-stage count (`bangyus/cutedsl_megamoe!91`, 2026-11-09):**
   `src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py` raises the default
-  `"b"` pipeline depth from 2 to 4 and adds an optional
-  `num_activation_stages` constructor argument (must be at least 2) that
-  overrides it. `src/moe_mxfp8_bf16_glu/megamoe_kernel_mxfp8_bf16.py` also
+  `"b"` pipeline depth from 2 to 4 (3 for the N256/`smem` implementation, whose
+  4-stage launch exceeds the SM100 shared-memory limit) and adds an optional
+  `num_activation_stages` constructor argument (2 up to that per-implementation
+  maximum) that overrides it. `src/moe_mxfp8_bf16_glu/megamoe_kernel_mxfp8_bf16.py` also
   forwards the argument (not in the MR) so `MegaMoEBf16Mxfp8Config` can expose
-  it as `num_activation_stages` (default 4). Drop once the MR merges and the
-  tree re-syncs past it.
+  it as `num_activation_stages` (default `None`: per-implementation depth).
+  Drop once the MR merges and the tree re-syncs past it.
 
 - **Sparse decode (FlashInfer PR #6447 / #6565, 2026-10-14):** re-ported onto
   this drop in four device files. `src/src/token_comm.py` gives CTA0 ownership
