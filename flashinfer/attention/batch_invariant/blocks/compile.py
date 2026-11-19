@@ -4,7 +4,8 @@
 kv_slots, n_wg, q2, ragged, kv_fmt)`` with dynamic shapes, strides, page table, work units and scales; cache module
 ``batch_invariant_attention``. ``kv_fmt`` ``"bf16"`` is the bf16 class's kernel; ``"e4m3"`` / ``"e5m2"`` the fp8-KV kernels, whose
 K / V operands are the fp8 caches viewed as bytes (``(D, page, Hkv, num_pages)`` uint8, 16-byte-aligned strides) and which take
-the value scale ``vs``.
+the value scale ``vs``; ``"e4m3th"`` / ``"e5m2th"`` the token-head-scale kernels, which take the same byte caches and two
+binary32 scale tensors ``(page, Hkv, num_pages)`` of any strides.
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
@@ -22,6 +23,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..plan import GROUP_FIELDS
+from ..spec import TH_KV_FMTS
 from .kernel import AttentionKernel
 
 MODULE = "batch_invariant_attention"
@@ -62,6 +64,7 @@ def get_compiled_attention(
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
         lowbit = kv_fmt != "bf16"
         fp4 = kv_fmt == "nvfp4"
+        th = kv_fmt in TH_KV_FMTS
         kv_dtype = cutlass.Uint8 if lowbit else bf16
         kv_div = (
             16 if lowbit else 8
@@ -118,6 +121,21 @@ def get_compiled_attention(
                 (D // 16, kv_tok, s_hkv, s_npages),
                 (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
                 assumed_align=1,
+            )
+        elif th:
+            # the per-(token, head) scales: one binary32 per key and KV head in the cache's geometry minus the head dim, with
+            # the scale tensor's own strides (a view into a wider slot tensor is addressed as it is)
+            ksf_fake = cute.runtime.make_fake_tensor(
+                f32,
+                (kv_tok, s_hkv, s_npages),
+                (cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=4,
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                f32,
+                (kv_tok, s_hkv, s_npages),
+                (cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=4,
             )
         else:
             ksf_fake = cute.runtime.make_fake_tensor(

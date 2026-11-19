@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, ws_row
-from .spec import FLT_MAX, HEAD_DIMS, KV_FMTS, scale_log2
+from .spec import FLT_MAX, HEAD_DIMS, KV_FMTS, TH_KV_FMTS, scale_log2
 from ...batch_invariant.fp_interface.term import to_f32
 
 #: The KV cache dtypes of the attention classes: bf16 (the bf16 class) and the two fp8 formats (the fp8-KV classes).
@@ -53,14 +53,56 @@ def cache_width(D: int, kv_fmt: str) -> int:
     return D // 2 if kv_fmt == "nvfp4" else D
 
 
-def kv_format(dtype: torch.dtype) -> str:
-    """The class's KV format of a cache dtype; ``ValueError`` for any other dtype."""
+def kv_format(dtype: torch.dtype, token_head_sf: bool = False) -> str:
+    """The class's KV format of a cache dtype (``token_head_sf``: the token-head-scale class of an fp8 dtype); ``ValueError``
+    for any other dtype."""
     fmt = KV_FORMAT_OF_DTYPE.get(dtype)
     if fmt is None:
         raise ValueError(
             f"a KV cache of dtype {dtype}: the classes take bf16, float8_e4m3fn, float8_e5m2 or uint8 (NVFP4) caches"
         )
+    if token_head_sf:
+        if fmt + "th" not in TH_KV_FMTS:
+            raise ValueError(
+                f"per-(token, head) scales with a KV cache of dtype {dtype}: the token-head-scale classes take float8_e4m3fn "
+                "or float8_e5m2 caches"
+            )
+        fmt += "th"
     return fmt
+
+
+def check_token_head_scales(
+    k_sf, v_sf, k_cache: torch.Tensor, v_cache: torch.Tensor, out: torch.Tensor
+) -> None:
+    """The token-head-scale classes' scale tensors: binary32, on the cache's device, of the cache's shape minus the head dim
+    (any strides: a view into a wider slot tensor is read as it is), 4-byte aligned, and disjoint from the output's bytes;
+    ``ValueError`` otherwise. The values are inputs of the class and are not inspected."""
+    for name, sf, cache in (("k_sf", k_sf, k_cache), ("v_sf", v_sf, v_cache)):
+        if not isinstance(sf, torch.Tensor):
+            raise ValueError(
+                f"{name} of type {type(sf).__name__}: the per-(token, head) scales are float32 tensors"
+            )
+        if sf.dtype != torch.float32:
+            raise ValueError(
+                f"{name} of dtype {sf.dtype}: the per-(token, head) scales are float32"
+            )
+        if sf.device != cache.device:
+            raise ValueError(
+                f"{name} on {sf.device}: the scales live on the cache's device {cache.device}"
+            )
+        if tuple(sf.shape) != tuple(cache.shape[:-1]):
+            raise ValueError(
+                f"{name} of shape {tuple(sf.shape)} for a cache of shape {tuple(cache.shape)}: one scale per (token, KV head), "
+                f"the cache's shape minus the head dim {tuple(cache.shape[:-1])}"
+            )
+        if sf.data_ptr() % 4:
+            raise ValueError(
+                f"{name} must be 4-byte aligned (the kernels load binary32 scales)"
+            )
+    if _output_overlaps_kv(out, k_sf, v_sf):
+        raise ValueError(
+            "out must not alias the per-(token, head) scales: CTAs store output rows while others still read scales"
+        )
 
 
 PAGE_SIZES = (
@@ -279,8 +321,8 @@ DEFAULT_RING = {
 
 def default_config(D: int = 128, kv_fmt: str = "bf16"):
     """The default placement of the class at head dim ``D``: the ring depth of ``DEFAULT_RING`` (4 / 4 / 2 at D = 64 / 128 / 256), one
-    softmax warpgroup, the planner's unit kind and fold placement (``plan.build_plan``: per head dim). The fp8-KV classes
-    (``kv_fmt`` ``"e4m3"`` / ``"e5m2"``) take the row body for small units too (``small="rep"``: the Swaps-AB body has no
+    softmax warpgroup, the planner's unit kind and fold placement (``plan.build_plan``: per head dim). The low-bit-KV classes
+    (every ``kv_fmt`` but ``"bf16"``) take the row body for small units too (``small="rep"``: the Swaps-AB body has no
     conversion stage)."""
     assert kv_fmt in KV_FMTS, kv_fmt
     return AttnConfig(
@@ -295,6 +337,14 @@ def _kv_view(
     if kv_layout == "NHD":
         return cache.permute(3, 1, 2, 0)
     return cache.permute(3, 2, 1, 0)
+
+
+def _sf_view(sf: torch.Tensor, kv_layout: str, ragged: bool) -> torch.Tensor:
+    """The per-(token, head) scales -- the cache's shape minus the head dim -- as the kernel's ``(page, Hkv, num_pages)``
+    tensor (the ragged pool: ``(total_kv, Hkv, 1)``), with the scale tensor's own strides (no copy)."""
+    if ragged:
+        return (sf if kv_layout == "NHD" else sf.transpose(0, 1)).unsqueeze(-1)
+    return sf.permute(1, 2, 0) if kv_layout == "NHD" else sf.permute(2, 1, 0)
 
 
 def _kv_view_ragged(kv: torch.Tensor, kv_layout: str, Hkv: int, D: int) -> torch.Tensor:
@@ -560,12 +610,32 @@ def run_attention(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """``k_scale`` / ``v_scale``: the low-bit-KV classes' per-tensor scales (Python floats; 1.0 when None), refused for a bf16 cache
-    (the bf16 class has no scale in its chain). ``kv_cache_sf``: the NVFP4-KV class's ``(k_sf, v_sf)`` block scales (e4m3 or
-    uint8 bytes of the cache's geometry with ``D / 16`` per row), required by it and refused by the others."""
+    (the bf16 class has no scale in its chain) and for the token-head-scale classes (their scales are per key).
+    ``kv_cache_sf``: the NVFP4-KV class's ``(k_sf, v_sf)`` block scales (e4m3 or uint8 bytes of the cache's geometry with
+    ``D / 16`` per row), or the token-head-scale classes' ``(k_sf, v_sf)`` float32 scales (the cache's shape minus the head dim,
+    any strides) when the plan was built for them (``plan_attention(kv_fmt="e4m3th" | "e5m2th")``); required by those classes and
+    refused by the others."""
     total_q, Hq, D = q.shape
-    kv_fmt = kv_format(k_cache.dtype)
+    th = planned.kv_fmt in TH_KV_FMTS
+    kv_fmt = kv_format(k_cache.dtype, th)
     fp4 = kv_fmt == "nvfp4"
-    if fp4:
+    if th:
+        if (
+            not isinstance(kv_cache_sf, (tuple, list))
+            or len(kv_cache_sf) != 2
+            or v_cache.dtype != k_cache.dtype
+        ):
+            raise ValueError(
+                "the token-head-scale classes need kv_cache_sf=(k_sf, v_sf): float32 scales of the cache's shape minus the "
+                "head dim, over K and V caches of one fp8 dtype"
+            )
+        if k_scale is not None or v_scale is not None:
+            raise ValueError(
+                "k_scale / v_scale with per-(token, head) scales: the token-head-scale classes have no per-tensor scale in "
+                "their chain"
+            )
+        k_sf, v_sf = kv_cache_sf
+    elif fp4:
         if kv_cache_sf is None or len(kv_cache_sf) != 2:
             raise ValueError(
                 "an NVFP4 KV cache needs kv_cache_sf=(k_sf, v_sf): the e4m3 block scales, one per 16 elements of the head dim"
@@ -585,7 +655,8 @@ def run_attention(
                 )
     elif kv_cache_sf is not None:
         raise ValueError(
-            "kv_cache_sf with a bf16 or fp8 KV cache: only the NVFP4-KV class takes block scales"
+            "kv_cache_sf with a bf16 or fp8 KV cache: the NVFP4-KV class takes block scales, the token-head-scale classes "
+            'per-(token, head) scales (plan with kv_fmt="e4m3th" / "e5m2th")'
         )
     else:
         k_sf = v_sf = None
@@ -675,6 +746,8 @@ def run_attention(
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
+    if th:
+        check_token_head_scales(k_sf, v_sf, k_cache, v_cache, out)
     c = check_sm_scale(sm_scale, 1.0 if k_scale is None else k_scale)
     vs = check_v_scale(1.0 if v_scale is None else v_scale)
     return _run_attention_validated(
@@ -716,9 +789,11 @@ def _run_attention_validated(
     v_sf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale (the key scale inside it for
-    the low-bit-KV classes), ``vs`` the binary32 value scale (1.0 for the bf16 class, whose kernels ignore it), ``kv_fmt`` the cache
-    format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the cache's geometry, the NVFP4 caches as their
-    packed bytes with the block scales ``k_sf`` / ``v_sf`` (bytes, ``D / 16`` per row)."""
+    the per-tensor-scale classes), ``vs`` the binary32 value scale (1.0 for the bf16 and the token-head-scale classes, whose
+    kernels ignore it), ``kv_fmt`` the cache format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the
+    cache's geometry, the NVFP4 caches as their packed bytes with the block scales ``k_sf`` / ``v_sf`` (bytes, ``D / 16`` per
+    row), the token-head-scale classes' fp8 caches with their float32 scales ``k_sf`` / ``v_sf`` (the cache's shape minus the
+    head dim), which the softmax applies per key."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -726,6 +801,7 @@ def _run_attention_validated(
     total_q, Hq, D = q.shape
     lowbit = kv_fmt != "bf16"
     fp4 = kv_fmt == "nvfp4"
+    th = kv_fmt in TH_KV_FMTS
     if lowbit:
         k_cache = k_cache.view(torch.uint8)
         v_cache = v_cache.view(torch.uint8)
@@ -733,6 +809,10 @@ def _run_attention_validated(
     if fp4:
         assert k_sf is not None and v_sf is not None
         k_sf, v_sf = k_sf.view(torch.uint8), v_sf.view(torch.uint8)
+    elif th:
+        assert k_sf is not None and v_sf is not None
+        k_sf = _sf_view(k_sf, kv_layout, ragged)
+        v_sf = _sf_view(v_sf, kv_layout, ragged)
     else:
         k_sf = v_sf = _dummy(q.device)
     if ragged:
@@ -850,7 +930,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g, lowbit)(
+        get_fixup(D, g, lowbit and not th)(
             planned.ws,
             o_view,
             planned.fixup_groups,
@@ -883,9 +963,11 @@ def attention_paged(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    use_token_head_sf: bool = False,
 ) -> torch.Tensor:
     """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned); an fp8 cache runs the fp8-KV class
-    of its dtype with the per-tensor ``k_scale`` / ``v_scale``, a uint8 (NVFP4) cache the NVFP4-KV class with its ``kv_cache_sf``."""
+    of its dtype with the per-tensor ``k_scale`` / ``v_scale``, or with ``use_token_head_sf`` the token-head-scale class with the
+    float32 ``kv_cache_sf=(k_sf, v_sf)``; a uint8 (NVFP4) cache the NVFP4-KV class with its ``kv_cache_sf``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -902,7 +984,7 @@ def attention_paged(
         config,
         workspace,
         q.device,
-        kv_fmt=kv_format(k_cache.dtype),
+        kv_fmt=kv_format(k_cache.dtype, use_token_head_sf),
     )
     return run_attention(
         planned,

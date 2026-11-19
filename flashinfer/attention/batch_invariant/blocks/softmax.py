@@ -30,6 +30,14 @@ warps 1..3 from overwriting the exchange buffer with the next tile's slices) bef
 the correction reads rows 0..31. Padding rows compute values that are never stored (no predicated regions).
 With the two-stage S / P plan (``operands.tmem_plan_for``) tile ``n`` reads ``S`` from and writes ``P`` into stage
 ``n % 2`` (a dynamic TMEM column offset; ``P`` over the first ``T/2`` columns of its own ``S`` stage).
+
+The token-head-scale kernels (``st.th``) apply the per-(token, head) scales here, once per key (``spec.scaled_score`` /
+``spec.scaled_prob``): every score copied out of TMEM is multiplied by its key's scale (``mul.rn``) BEFORE the mask and the
+maximum, so the step below runs on the scaled scores unchanged; every probability is multiplied by its key's value scale
+(``mul.rn``) right before the bf16 conversion that forms the P operand, while the row sum adds the unscaled probabilities.
+A masked key's operand is then set to ``+0`` by a select, never by the multiply: whatever bytes its scales hold (a NaN, an
+infinity), they reach no stored value. The scales of the tile's keys come from the smem side ring the conversion stage
+fills with the tile's K slot (``convert.fetch_tile_scales``), entry ``seq % sf_stages`` for the CTA's ``seq``-th tile.
 """
 
 from __future__ import annotations
@@ -133,11 +141,15 @@ def unit_loop(
     q_len: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    seq0: Int32,
 ):
     """One unit for softmax warpgroup ``k``, in the full-row placement (its slice = keys ``[k kpt, (k+1) kpt)``) or the
     replicated-row placement (warp ``wq`` of the warpgroup takes slice ``4k + wq`` of ``4 n_wg``; the warpgroup's four
     slices are gathered in its warp 0 through smem before the P store). ``k`` is dynamic: the warpgroups run one copy
-    of this code (the slice index only moves TMEM column offsets and smem indices)."""
+    of this code (the slice index only moves TMEM column offsets and smem indices). ``s_ks`` / ``s_vs`` / ``seq0``: the
+    token-head-scale kernels' scale side ring and the CTA's tile count at the unit's first tile."""
     T, g, TPC = st.T, st.g, st.tpc
     tidx, _, _ = cute.arch.thread_idx()
     thread_idx = tidx % 128  # thread within the warpgroup (= TMEM lane)
@@ -268,6 +280,30 @@ def unit_loop(
                 barrier_id=BAR_SOFTMAX_ALL, number_of_threads=st.softmax_threads
             )
         k0 = t * T
+        if cutlass.const_expr(st.th):
+            # s'_k = mul(s_k, ks_k) for every key of the row (and of the slice), before the mask and the maximum
+            sfe = (seq0 + n) % st.sf_stages
+            for i in cutlass.range_constexpr(0, T, 2):
+                x0, x1 = CuteF32.mul2(
+                    (rF[i], rF[i + 1]),
+                    (
+                        s_ks[(int(cols_f[i]), sfe)],
+                        s_ks[(int(cols_f[i + 1]), sfe)],
+                    ),
+                )
+                rF[i] = x0
+                rF[i + 1] = x1
+            if cutlass.const_expr(not one_slice):
+                for i in cutlass.range_constexpr(0, kpt, 2):
+                    x0, x1 = CuteF32.mul2(
+                        (rS[i], rS[i + 1]),
+                        (
+                            s_ks[(col_base + int(cols_s[i]), sfe)],
+                            s_ks[(col_base + int(cols_s[i + 1]), sfe)],
+                        ),
+                    )
+                    rS[i] = x0
+                    rS[i + 1] = x1
         # mask only the tiles that need it: a boundary of a live row's visible range inside the tile. Interior tiles
         # are fully visible and padding rows (row >= rows_valid) are never masked: their values are never stored (a
         # warp-uniform decision, no arithmetic involved)
@@ -330,6 +366,18 @@ def unit_loop(
         sth.commit()
         if cutlass.const_expr(OWN2):
             stats_prod.advance(2)  # the other warpgroup's two entries of the next tile
+        if cutlass.const_expr(st.th):
+            # P'_k = mul(p_k, vs_k): the operand the conversion below rounds once to bf16 (the row sum above took p_k)
+            for i in cutlass.range_constexpr(0, kpt, 2):
+                y0, y1 = CuteF32.mul2(
+                    (ps[i], ps[i + 1]),
+                    (
+                        s_vs[(col_base + int(cols_s[i]), sfe)],
+                        s_vs[(col_base + int(cols_s[i + 1]), sfe)],
+                    ),
+                )
+                ps[i] = y0
+                ps[i + 1] = y1
         # ---- P to TMEM (bf16, cvt.rn per element), the warpgroup's columns in key order
         ph = p_prod.acquire_and_advance()
         if cutlass.const_expr(OWN2):
@@ -345,6 +393,12 @@ def unit_loop(
             )
             for i in cutlass.range_constexpr(kpt):
                 rPq_e[i] = ps[i].to(IN_DTYPE)
+            if cutlass.const_expr(st.th):
+                if need_mask:
+                    for i in cutlass.range_constexpr(kpt):
+                        key = k0 + col_base + cols_s[i]
+                        if (key < lo_row) | (key >= L_row):
+                            rPq_e[i] = Float32(0.0).to(IN_DTYPE)
             if wq > 0:
                 for i in cutlass.range_constexpr(kpt // 2):
                     s_p[(k, wq - 1, lane, i)] = rPq[i]
@@ -367,6 +421,12 @@ def unit_loop(
         else:
             for i in cutlass.range_constexpr(kpt):
                 rP_e[i] = ps[i].to(IN_DTYPE)
+            if cutlass.const_expr(st.th):
+                if need_mask:
+                    for i in cutlass.range_constexpr(kpt):
+                        key = k0 + col_base + cols_s[i]
+                        if (key < lo_row) | (key >= L_row):
+                            rP_e[i] = Float32(0.0).to(IN_DTYPE)
             cute.copy(tiled_st, rP, tPtS_k)
             cute.arch.fence_view_async_tmem_store()
         ph.commit()
@@ -395,6 +455,9 @@ def softmax_loop(
     q_len: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    seq0: Int32,
 ):
     """One unit for softmax warpgroup ``k``: the replicated-row placement when the unit has at most ``rep_rows = (32 // g) g``
     live rows (``g <= 32``), the full-row placement otherwise. Returns the advanced pipelines."""
@@ -422,6 +485,9 @@ def softmax_loop(
                 q_len,
                 tile_lo,
                 tile_hi,
+                s_ks,
+                s_vs,
+                seq0,
             )
         else:
             s_cons, p_prod, stats_prod = unit_loop(
@@ -446,6 +512,9 @@ def softmax_loop(
                 q_len,
                 tile_lo,
                 tile_hi,
+                s_ks,
+                s_vs,
+                seq0,
             )
     else:
         s_cons, p_prod, stats_prod = unit_loop(
@@ -470,5 +539,8 @@ def softmax_loop(
             q_len,
             tile_lo,
             tile_hi,
+            s_ks,
+            s_vs,
+            seq0,
         )
     return s_cons, p_prod, stats_prod

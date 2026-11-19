@@ -33,7 +33,7 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
 from ..plan import om_in_tmem as _om_in_tmem
 from ..plan import ws_row
-from ..spec import KV_FMTS, MMA_K, TILE_KEYS, tiles_per_chunk
+from ..spec import KV_FMTS, MMA_K, TH_KV_FMTS, TILE_KEYS, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
 IN_DTYPE = cutlass.BFloat16
@@ -165,11 +165,24 @@ class StaticPlan:
         # holding those values -- the MMAs, the softmax and the correction are the bf16 body's, untouched. One softmax warpgroup, no
         # pairing (the conversion stage takes the second warpgroup's register budget).
         # "nvfp4": the cache is packed e2m1 nibbles ((D / 2, page, Hkv, num_pages) bytes) with one e4m3 block scale per 16 elements
-        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16
+        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16.
+        # "e4m3th" / "e5m2th": an fp8 cache converted exactly as "e4m3" / "e5m2", with one binary32 key scale and one value scale
+        # per (token, KV head) ((page, Hkv, num_pages) fp32 of any strides) that the softmax applies per key: the conversion stage
+        # fetches a tile's scales into a smem side ring of sf_stages entries (convert.py), the softmax multiplies the scores and
+        # the probabilities by them (softmax.py), and the epilogue is the bf16 class's
         assert kv_fmt in KV_FMTS, kv_fmt
         self.kv_fmt = kv_fmt
         self.lowbit = kv_fmt != "bf16"
         self.fp4 = kv_fmt == "nvfp4"
+        self.th = kv_fmt in TH_KV_FMTS
+        self.fp8_fmt = TH_KV_FMTS.get(kv_fmt, kv_fmt)  # the cache's element format
+        self.scaled_out = (
+            self.lowbit and not self.th
+        )  # the epilogue's one mul by the per-tensor value scale
+        # entries of the scale side ring: the conversion stage holds a K slot at most kv_slots tiles ahead of the tile whose P
+        # the softmax is forming (the V tiles in between stay in the ring until that P is stored), so kv_slots + 1 entries are
+        # never overwritten while read; one spare
+        self.sf_stages = kv_slots + 2 if self.th else 1
         assert not self.lowbit or (n_wg == 1 and not q2), (kv_fmt, n_wg, q2)
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
@@ -442,9 +455,9 @@ class StaticPlan:
 
         assert (
             self.q_tiles + kv_slots + (4 * self.n_q if q2 else 0) // 2
-        ) * slot_bytes(D) + ((40 if q2 else 24) << 10) <= max(
-            SMEM_CAP, arch_smem_cap() - (8 << 10)
-        ), (D, kv_slots)
+        ) * slot_bytes(D) + ((40 if q2 else 24) << 10) + (
+            2 * self.sf_stages * TILE_KEYS * 4 if self.th else 0
+        ) <= max(SMEM_CAP, arch_smem_cap() - (8 << 10)), (D, kv_slots)
         assert (
             cute.cosize(cute.select(self.q_smem_layout, mode=[0, 1, 2]))
             == self.q_tile_elems

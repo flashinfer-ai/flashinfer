@@ -14,7 +14,9 @@ trees come from ``canon`` plans; the arithmetic functions are ``spec.py``'s.
 The low-bit-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"`` / ``"nvfp4"``) differ in one role: the load warp and the two empty
 warps form the conversion stage (``convert.py``) that fills the bf16 ring from the fp8 or NVFP4 cache instead of the TMA, through
 a thread-to-UMMA ring pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the bf16
-kernel's code.
+kernel's code. The token-head-scale kernels (``"e4m3th"`` / ``"e5m2th"``) run the fp8-KV kernels' exact conversion stage,
+which also fetches every tile's per-(key, KV head) binary32 scales (``mKsf`` / ``mVsf``) into a smem side ring; the softmax
+multiplies each key's score and each key's probability by them (``softmax.py``); the epilogue is the bf16 kernel's.
 """
 
 from __future__ import annotations
@@ -151,7 +153,8 @@ class AttentionKernel:
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor. ``vs`` is the fp8-KV classes' value scale
         (the epilogue's one ``mul.rn``; unused by the bf16 kernel, which passes 1.0). ``mK`` / ``mV`` are the bf16 caches, or the
         fp8 caches viewed as bytes for the fp8-KV kernels, or the packed NVFP4 caches with their block scales ``mKsf`` / ``mVsf``
-        (``(D / 16, page, Hkv, num_pages)`` bytes; any one-element tensor for the other kernels)."""
+        (``(D / 16, page, Hkv, num_pages)`` bytes; any one-element tensor for the other kernels), or the fp8 caches with their
+        per-(token, head) binary32 scales (``(page, Hkv, num_pages)``, any strides) for the token-head-scale kernels."""
         st = StaticPlan(
             self.D,
             self.g,
@@ -184,6 +187,8 @@ class AttentionKernel:
             s_p: cute.struct.Align[
                 cute.struct.MemRange[Float32, self.n_wg * 3 * 32 * 16], 16
             ]
+            s_ks: cute.struct.MemRange[Float32, st.sf_stages * st.T if st.th else 4]
+            s_vs: cute.struct.MemRange[Float32, st.sf_stages * st.T if st.th else 4]
             sOm: cute.struct.Align[
                 cute.struct.MemRange[
                     Float32, st.n_q * Q_ROWS * st.D if st.om_smem else 4
@@ -409,6 +414,10 @@ class AttentionKernel:
         s_p_all = storage.s_p.get_tensor(
             cute.make_layout((st.n_wg, 3, 32, 16))
         )  # per warpgroup: the P slices of its warps 1..3
+        # the token-head-scale kernels' side ring: entry e holds the T key scales / value scales of one tile (convert.py)
+        sf_layout = cute.make_layout((st.T, st.sf_stages) if st.th else (4, 1))
+        s_ks = storage.s_ks.get_tensor(sf_layout)
+        s_vs = storage.s_vs.get_tensor(sf_layout)
         qk_thr_mma = qk_tiled_mma.get_slice(0)
         qks_thr_mma = qks_tiled_mma.get_slice(0)
         pv_thr_mma = pv_tiled_mma.get_slice(0)
@@ -433,6 +442,7 @@ class AttentionKernel:
                 cute.arch.setmaxregister_decrease(R.regs_other)
                 tidx, _, _ = cute.arch.thread_idx()
                 ctid = tidx - 32 * R.load_warp
+                seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
                     q_prod = load_q_unit(
                         st,
@@ -462,12 +472,17 @@ class AttentionKernel:
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
                         ctid,
+                        s_ks,
+                        s_vs,
+                        seq,
                     )
+                    seq = seq + mDesc[(u, F_TILE_HI)] - mDesc[(u, F_TILE_LO)]
                 cute.arch.griddepcontrol_launch_dependents()
             if warp_idx >= R.empty_warps[0]:
                 cute.arch.setmaxregister_decrease(R.regs_other)
                 tidx, _, _ = cute.arch.thread_idx()
                 ctid = tidx - 32 * R.load_warp
+                seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
                     kv_prod = convert_unit(
                         st,
@@ -484,7 +499,11 @@ class AttentionKernel:
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
                         ctid,
+                        s_ks,
+                        s_vs,
+                        seq,
                     )
+                    seq = seq + mDesc[(u, F_TILE_HI)] - mDesc[(u, F_TILE_LO)]
                 cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not st.lowbit):
             if warp_idx == R.load_warp:
@@ -692,8 +711,12 @@ class AttentionKernel:
                         mDesc[(uk, F_QLEN)],
                         mDesc[(uk, F_TILE_LO)],
                         mDesc[(uk, F_TILE_HI)],
+                        s_ks,
+                        s_vs,
+                        Int32(0),
                     )
             if cutlass.const_expr(not st.q2):
+                seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
@@ -716,7 +739,11 @@ class AttentionKernel:
                         mDesc[(u, F_QLEN)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        s_ks,
+                        s_vs,
+                        seq,
                     )
+                    seq = seq + mDesc[(u, F_TILE_HI)] - mDesc[(u, F_TILE_LO)]
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx >= R.correction_warps[0] and warp_idx < R.mma_warp:
             if cutlass.const_expr(R.regs_correction > R.regs_launch):

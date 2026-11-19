@@ -671,7 +671,7 @@ def correction_loop(
         om_tmem,
         WS,
         vs,
-        st.lowbit,
+        st.scaled_out,
     )
     return o_cons, stats_cons
 
@@ -750,7 +750,7 @@ def fold_group(
                         8 if st.n_wg == 1 else 4,
                         st.ws_row,
                         vs,
-                        st.lowbit,
+                        st.scaled_out,
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(
@@ -1084,7 +1084,7 @@ def correction_loop_q2(
             st.om_tmem,
             WS,
             vs,
-            st.lowbit,
+            st.scaled_out,
         )
     if has_b:
         inv_b = CuteF32.div(Float32(1.0), lr_b)
@@ -1120,6 +1120,6 @@ def correction_loop_q2(
             st.om_tmem,
             WS,
             vs,
-            st.lowbit,
+            st.scaled_out,
         )
     return o_cons_a, o_cons_b, stats_cons_a, stats_cons_b
