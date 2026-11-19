@@ -36,8 +36,10 @@ Persistent layout (study log: /home/scratch.ameyn_gpu_3/kda_umma_dram_log.md):
     item's row inputs one item ahead.
   * it removes the per-CTA launch gap (~1 us with TMEM alloc / dealloc) and the cursor round
     trip of every item; selection in ``kda_replay_mtp_umma._use_persistent``.
-  * concurrency: the counters are per (device, stream); concurrent launches on one stream
-    cannot overlap. Do not launch it concurrently from two streams sharing a stream handle.
+  * concurrency: eager launches use one counter per (device, stream); every launch captured
+    into a CUDA graph gets a counter slot of its own (``_work_counters``), so graphs replayed
+    concurrently on different streams never share one. ``persistent_counter_reset`` re-zeroes
+    them after an aborted launch.
 
 The original single-item description follows.
 
@@ -2061,17 +2063,52 @@ def _grid(B: int, H: int, dev: torch.device):
     return bool(pz), (min(n, slots) if pz else n)
 
 
-_COUNTERS: dict = {}
+# Claim counters (int32[2] = [claim, done]; zero between launches: each launch's last CTA
+# re-zeroes its own). Eager launches: one per (device, stream), so launches on two streams never
+# share one. Launches captured into CUDA graphs: a slot of their own from an eagerly zeroed arena,
+# never reused (graphs captured on one capture stream -- torch.cuda.graph's default -- may be
+# replayed concurrently on different streams). Same scheme as the GDN Rubin persistent kernel.
+_ARENA_SLOTS = 4096
+_ARENA: dict = {}  # device index -> {"chunks": [int32[slots, 2], ...], "next": free slot}
+_COUNTERS: dict = {}  # (device index, raw stream) -> int32[2]
+
+
+def persistent_counter_reset() -> None:
+    """Zero every cached claim counter, the captured launches' ones included (recovery hook:
+    a launch that did not run to completion leaves its counter non-zero)."""
+    for c in _COUNTERS.values():
+        c.zero_()
+    for a in _ARENA.values():
+        for c in a["chunks"]:
+            c.zero_()
+
+
+def _arena_topup(dev: torch.device) -> None:
+    """Eager only: keep free zeroed slots in the arena for later captures."""
+    a = _ARENA.get(dev.index)
+    if a is None or a["chunks"][-1].shape[0] - a["next"] < _ARENA_SLOTS // 4:
+        chunk = torch.zeros(_ARENA_SLOTS, 2, dtype=torch.int32, device=dev)
+        if a is None:
+            _ARENA[dev.index] = {"chunks": [chunk], "next": 0}
+        else:
+            a["chunks"].append(chunk)
+            a["next"] = 0
 
 
 def _work_counters(dev: torch.device) -> torch.Tensor:
-    """The dynamic-claim counters [claim, done] of this device and stream (zeroed once;
-    the last CTA of every launch resets them). Launches on one stream are ordered, so
-    they never share the counters concurrently."""
-    key = (
-        dev.index if dev.index is not None else torch.cuda.current_device(),
-        torch.cuda.current_stream(dev).cuda_stream,
-    )
+    """The launch's claim counter (see above). Under capture with an exhausted (or never
+    topped-up) arena: a fresh zeroed tensor allocated in the capture's private pool."""
+    if dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.is_current_stream_capturing():
+        a = _ARENA.get(dev.index)
+        if a is not None and a["next"] < a["chunks"][-1].shape[0]:
+            c = a["chunks"][-1][a["next"]]
+            a["next"] += 1
+            return c
+        return torch.zeros(2, dtype=torch.int32, device=dev)
+    _arena_topup(dev)
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
     t = _COUNTERS.get(key)
     if t is None:
         t = torch.zeros(2, dtype=torch.int32, device=dev)
@@ -2135,4 +2172,4 @@ def launch_umma_persistent(
     _LAUNCHES += 1
 
 
-__all__ = ["launch_umma_persistent"]
+__all__ = ["launch_umma_persistent", "persistent_counter_reset"]

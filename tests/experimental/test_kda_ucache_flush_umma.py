@@ -503,3 +503,79 @@ def test_umma_persistent_matches_single_item_bitwise(t, w_ring, history, monkeyp
         strict=True,
     ):
         assert torch.equal(a, b), f"persistent vs single-item differ on {name}"
+
+
+def _pz_cases(n, t, seed):
+    """n independent persistent-sized cases (B=600: about 12 items per CTA slot)."""
+    return [list(_random_case(600, t, 16, "fold", seed=seed + i)[0]) for i in range(n)]
+
+
+def _pz_snapshot(case, y):
+    return [y.clone()] + [case[i].clone() for i in (7, 8, 9, 10)]
+
+
+@pytest.mark.parametrize("mode", ["streams", "graphs"])
+def test_umma_persistent_concurrent_launches(mode, monkeypatch):
+    """Persistent launches on two streams claim from separate work counters. "graphs": two
+    CUDA graphs captured with torch.cuda.graph's defaults (one capture stream) and replayed
+    concurrently on two streams -- with one shared counter this corrupts the results. "streams":
+    eager calls on two streams (the eager range check syncs, so these only exercise the
+    per-stream counters and their reset). Results are bitwise equal to running the cases one
+    after another, and every counter ends at zero."""
+    from flashinfer.experimental.kda_ucache_flush import kda_replay_mtp_umma as um
+    from flashinfer.experimental.kda_ucache_flush import (
+        kda_replay_mtp_umma_persistent as pzm,
+    )
+
+    monkeypatch.setattr(um, "_FORCE_PERSISTENT", True)
+    t = 4
+    # serial reference (fresh copies of the same cases)
+    ref = []
+    for c in _pz_cases(2, t, 9100):
+        y = _call(tuple(c), "umma", t=t)
+        torch.cuda.synchronize()
+        ref.append(_pz_snapshot(c, y))
+    cases = _pz_cases(2, t, 9100)
+    s0, s1 = torch.cuda.Stream(), torch.cuda.Stream()
+    outs = [None, None]
+    if mode == "streams":
+        torch.cuda.synchronize()
+        for _ in range(4):  # several rounds: the counters must reset between launches
+            cases = _pz_cases(2, t, 9100)
+            torch.cuda.synchronize()
+            for i, s in enumerate((s0, s1)):
+                with torch.cuda.stream(s):
+                    torch.cuda._sleep(200_000)
+                    outs[i] = _call(tuple(cases[i]), "umma", t=t)
+            torch.cuda.synchronize()
+            for i in range(2):
+                for a, b in zip(ref[i], _pz_snapshot(cases[i], outs[i]), strict=True):
+                    assert torch.equal(a, b)
+    else:
+        _call(tuple(_pz_cases(1, t, 1)[0]), "umma", t=t)  # eager call: arena topped up
+        torch.cuda.synchronize()
+        graphs = []
+        for i in range(2):
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                outs[i] = _call(tuple(cases[i]), "umma", t=t)
+            graphs.append(gr)
+        snap = [[cases[i][j].clone() for j in (7, 8, 9, 10)] for i in range(2)]
+        for _ in range(3):
+            for i in range(2):  # restore the inputs the kernel updates in place
+                for j, v in zip((7, 8, 9, 10), snap[i], strict=True):
+                    cases[i][j].copy_(v)
+            torch.cuda.synchronize()
+            for i, s in enumerate((s0, s1)):
+                with torch.cuda.stream(s):
+                    torch.cuda._sleep(200_000)
+                    graphs[i].replay()
+            torch.cuda.synchronize()
+            for i in range(2):
+                for a, b in zip(ref[i], _pz_snapshot(cases[i], outs[i]), strict=True):
+                    assert torch.equal(a, b)
+    for c in pzm._COUNTERS.values():
+        assert int(c.abs().sum()) == 0
+    for a in pzm._ARENA.values():
+        for c in a["chunks"]:
+            assert int(c.abs().sum()) == 0
