@@ -22,7 +22,8 @@
 // Semantics: keep {p >= threshold}, where threshold is the smallest value of the shortest
 // descending prefix whose mass reaches top_p * M, M being the row's positive mass; ties at the
 // threshold are kept; the kept entries are divided by their sum (left as they are if it is
-// <= 1e-8), every other entry is 0. This is the rule of the AIR path of top_p_renorm_probs (its
+// <= 1e-8), every other entry is 0; a NaN entry has no mass and is never kept (its output is 0).
+// This is the rule of the AIR path of top_p_renorm_probs (its
 // target is blockSum * p, relative to the row's own mass, so a row that does not sum to 1 keeps
 // the same entries), evaluated with exact masses: every sum below is a 64-bit fixed-point sum,
 // exact for the row's entries, so the kept set is what float64 (exact) arithmetic keeps and never
@@ -156,6 +157,15 @@ __device__ __forceinline__ void hist_add(float x, int mode, int prefix, float sc
     atomicAdd(&lmass[key], to_fix(x, scale, scale2));
     atomicAdd(&lcnt[key], 1u);
   }
+}
+
+// The radix path's rewrite predicate: x is at or above the threshold's bit prefix and is not a NaN.
+// A NaN has no mass anywhere in this kernel (to_fix and the float32 slice sums count it as 0) and
+// is never kept, as on the head paths (x >= thr is false for it); its bit pattern sorts above every
+// finite value, so the prefix test alone would keep it.
+__device__ __forceinline__ bool radix_keep(float x, int kshift, int kprefix) {
+  const int bits = __float_as_int(x);
+  return bits <= 0x7f800000 && (bits >> kshift) >= kprefix;
 }
 
 // A finite positive entry kept by the rewrite predicate, as float64 (0 otherwise).
@@ -665,16 +675,16 @@ __global__ void __launch_bounds__(NT, MINB)
     float4* o4 = reinterpret_cast<float4*>(odst);
     for (int i = t; i < len4; i += NT) {
       float4 x = sd4[i], o = make_float4(0.f, 0.f, 0.f, 0.f);
-      if ((__float_as_int(x.x) >> kshift) >= kprefix) o.x = x.x / sumf;
-      if ((__float_as_int(x.y) >> kshift) >= kprefix) o.y = x.y / sumf;
-      if ((__float_as_int(x.z) >> kshift) >= kprefix) o.z = x.z / sumf;
-      if ((__float_as_int(x.w) >> kshift) >= kprefix) o.w = x.w / sumf;
+      if (radix_keep(x.x, kshift, kprefix)) o.x = x.x / sumf;
+      if (radix_keep(x.y, kshift, kprefix)) o.y = x.y / sumf;
+      if (radix_keep(x.z, kshift, kprefix)) o.z = x.z / sumf;
+      if (radix_keep(x.w, kshift, kprefix)) o.w = x.w / sumf;
       o4[i] = o;
     }
   } else {
     for (int i = t; i < len; i += NT) {
       float x = psrc[i];
-      odst[i] = ((__float_as_int(x) >> kshift) >= kprefix) ? x / sumf : 0.f;
+      odst[i] = radix_keep(x, kshift, kprefix) ? x / sumf : 0.f;
     }
   }
   cl_wait();  // keep this CTA's shared memory alive until the cluster is done with it

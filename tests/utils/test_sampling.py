@@ -3336,6 +3336,41 @@ def test_top_p_renorm_probs_specialized_zero_mass_rows(
     assert int((out[2] > 0).sum()) == (1 if top_p_value <= 0.5 else 2)
 
 
+def test_top_p_renorm_probs_specialized_nan_entries_are_never_kept(
+    top_p_specialized_enabled, monkeypatch
+):
+    # A NaN entry has no mass and is never kept, on the radix path (whose bit-prefix test alone
+    # would keep it: +NaN's bits sort above every finite value) as on the head paths: the output
+    # is the float64 reference of the row with its NaNs set to 0. The AIR path writes no NaN
+    # either, but its float32 sums become NaN, so it keeps every finite positive entry of such a
+    # row (top_p is lost); only the absence of NaN is compared with it.
+    _skip_unless_sm103()
+    vocab_size = 154880  # 6 rows: an allowlisted shape
+    g = torch.Generator().manual_seed(31)
+    # radix, radix (keep all at top_p 1), radix, and the head paths: warp-level (a +NaN is a
+    # head candidate: its bits are >= those of 2^-8) and block-wide
+    kinds = [2, 2, 3, 1, 4]
+    rows = [_top_p_specialized_row(kind, vocab_size, g) for kind in kinds]
+    rows.append(torch.zeros(vocab_size, dtype=torch.float64))
+    probs = torch.stack(rows).float()
+    assert probs.shape == (6, vocab_size)
+    nan_at = torch.arange(5) * (vocab_size // 5) + 3  # one NaN in several CTAs' slices
+    probs[:5, nan_at] = float("nan")
+    probs[5] = float("nan")  # all NaN: no mass, stays all zero
+    clean = torch.nan_to_num(probs, nan=0.0)
+    tp = torch.tensor([0.9, 1.0, 0.95, 0.95, 0.9, 0.5])
+    tp = _top_p_specialized_robust_top_p(clean, tp)
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda())
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    assert not torch.isnan(out).any()
+    assert (out[:5, nan_at] == 0).all() and not out[5].any()
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(clean, tp))
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda())
+    assert not torch.isnan(stock).any()
+
+
 def test_top_p_renorm_probs_specialized_unnormalised_cutoff_is_exact(
     top_p_specialized_enabled, monkeypatch
 ):
