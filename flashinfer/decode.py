@@ -1536,8 +1536,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
             key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
             (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
-            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). Inputs
-            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, ``q_scale``, head dims other than
+            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). An fp8
+            cache planned with ``use_token_head_sf=True`` runs the classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``:
+            ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per (token, KV head) (the cache's shape minus the
+            head dim; any strides); the fp8 values are widened exactly and each scale enters once per key: key ``j``'s score is
+            multiplied by ``k_sf_j`` before the softmax and its softmax weight by ``v_sf_j`` before the bf16 rounding that
+            forms the P operand of the PV product (the normaliser sums the unscaled weights); ``k_scale`` / ``v_scale``
+            are not taken with it. Inputs outside the classes (q / o dtypes other than bf16, ``q_scale``, head dims other than
             64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture

@@ -13,8 +13,16 @@ host: a synchronisation) in the chain the specification states (``spec.py``): ``
 ``mul.rn`` by ``v_scale`` before the output rounding. The NVFP4-KV class ``attention.nvfp4kv`` takes ``plan(kv_data_type=torch.uint8)``
 (FlashInfer's packed NVFP4 cache, ``head_dim // 2`` bytes per row) and at ``run()`` the ``kv_cache_sf`` block scales in the wrappers'
 forms (a ``(k_sf, v_sf)`` tuple, or the single 5-D tensor of the paged wrappers; e4m3 bytes, ``head_dim // 16`` per row, the linear
-layout the NVFP4 append kernel writes) with the same two per-tensor scales. Per-(token, head) fp8 scales (``use_token_head_sf``),
-``q_scale`` and ``o_scale`` are not classes of the mode and raise the typed error.
+layout the NVFP4 append kernel writes) with the same two per-tensor scales. The token-head-scale classes
+``attention.e4m3kv_th`` / ``attention.e5m2kv_th`` take ``plan(kv_data_type=<fp8>, use_token_head_sf=True)`` and at ``run()``
+``kv_cache_sf=(k_sf, v_sf)``: float32 tensors of the cache's shape minus the head dim, one scale per (token, KV head), with any
+strides (e.g. views into an inline slot tensor). K and V stay the exactly widened fp8 values and each scale enters once per
+key (``spec.py``): the score of key ``j`` is ``mul.rn(S_j, k_sf_j)`` before the softmax step, and the PV operand of key ``j`` is
+``cvt.rn.bf16(mul.rn(p_j, v_sf_j))`` while the normaliser adds the unscaled ``p_j``; no scale enters ``c`` or the epilogue.
+The scale values are inputs and are not inspected: zero, negative, tiny and huge scales follow the two multiplies; the classes
+are stated for finite scales on visible keys (a non-finite one gives what the arithmetic gives, as a non-finite K / V does),
+and the scales of masked keys -- past a request's length, outside the window, junk pages -- reach no output. The per-tensor
+``k_scale`` / ``v_scale`` are not part of these classes and raise with them, as do ``q_scale`` and ``o_scale`` everywhere.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -34,7 +42,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, TH_KV_FMTS, scale_log2
 from .spec import class_name as _class_name
 
 CLASS = "attention.bf16"
@@ -325,11 +333,14 @@ class BatchInvariantAttention:
                 "the class's own split rule (a function of the SM count only)",
             )
         if use_token_head_sf:
-            raise unsupported(
-                cls,
-                "use_token_head_sf (per-(token, head) fp8 KV scales)",
-                "a bf16 KV cache, an fp8 KV cache with the per-tensor k_scale / v_scale, or an NVFP4 cache with its block scales",
-            )
+            if kv_fmt + "th" not in TH_KV_FMTS:
+                raise unsupported(
+                    cls,
+                    f"use_token_head_sf with kv_data_type {kv_dtype}",
+                    "per-(token, head) scales over a float8_e4m3fn or float8_e5m2 KV cache",
+                )
+            kv_fmt += "th"
+            cls = _class_name(kv_fmt)
         if window_left is None:
             window_left = -1
         if window_left < -1:
@@ -639,6 +650,7 @@ class BatchInvariantAttention:
             )
         cls = self.CLASS
         lowbit = self._kv_fmt != "bf16"
+        th = self._kv_fmt in TH_KV_FMTS
         q_scale = scales[0] if len(scales) > 0 else None
         k_scale = scales[1] if len(scales) > 1 else None
         v_scale = scales[2] if len(scales) > 2 else None
@@ -652,16 +664,29 @@ class BatchInvariantAttention:
                 "k_scale / v_scale with a bf16 KV cache",
                 "unscaled bf16 K / V (the fp8-KV classes take the per-tensor scales)",
             )
+        if th and (k_scale is not None or v_scale is not None):
+            raise unsupported(
+                cls,
+                "k_scale / v_scale with per-(token, head) scales",
+                "the kv_cache_sf scales alone (fold a per-tensor scale into them)",
+            )
         k_scale = self._scalar(k_scale, "k_scale", cls)
         v_scale = self._scalar(v_scale, "v_scale", cls)
         if sinks is not None:
             raise unsupported(cls, "attention sinks", "plain softmax")
         fp4 = self._kv_fmt == "nvfp4"
-        if kv_cache_sf is not None and not fp4:
+        if kv_cache_sf is not None and not (fp4 or th):
             raise unsupported(
                 cls,
-                "kv_cache_sf (per-(token, head) fp8 scales or NVFP4 block scales)",
-                "a bf16 KV cache, an fp8 KV cache with the per-tensor k_scale / v_scale, or an NVFP4 cache (kv_data_type uint8)",
+                "kv_cache_sf on a plan without scale tensors",
+                "a bf16 KV cache, an fp8 KV cache with the per-tensor k_scale / v_scale, an fp8 KV cache planned with "
+                "use_token_head_sf=True, or an NVFP4 cache (kv_data_type uint8)",
+            )
+        if th and (not isinstance(kv_cache_sf, (tuple, list)) or len(kv_cache_sf) != 2):
+            raise unsupported(
+                cls,
+                "a use_token_head_sf plan without kv_cache_sf=(k_sf, v_sf)",
+                "the (k_sf, v_sf) tuple of float32 per-(token, head) scales with the cache",
             )
         if fp4 and kv_cache_sf is None:
             raise unsupported(
@@ -783,8 +808,19 @@ class BatchInvariantAttention:
         k_sf = v_sf = None
         if fp4:
             k_sf, v_sf = self._block_scales(kv_cache_sf, k, v, D, cls)
+        if th:
+            k_sf, v_sf = kv_cache_sf
+            try:
+                engine.check_token_head_scales(k_sf, v_sf, k, v, out)
+            except ValueError as e:
+                raise unsupported(
+                    cls,
+                    f"kv_cache_sf of this form ({e})",
+                    "float32 (k_sf, v_sf) on the wrapper's device, each of its cache's shape minus the head dim, disjoint "
+                    "from out",
+                ) from None
         c, vs = self._scale_log2, 1.0
-        if lowbit:
+        if lowbit and not th:
             # the fp8-KV chain: the key scale inside the one log2 constant (formed in double, rounded once), the value scale as the
             # epilogue's binary32 multiplier
             try:
