@@ -615,6 +615,10 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
       uint32_t a1 = *reinterpret_cast<uint32_t*>(&t1);
       uint32_t a2 = *reinterpret_cast<uint32_t*>(&t2);
       uint32_t a3 = *reinterpret_cast<uint32_t*>(&t3);
+      // Required between writing the A-fragment registers and the
+      // wgmma.mma_async that reads them; the pre-loop fence only covers
+      // the accumulator.
+      asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
       uint64_t b0 = wgmma_desc((char*)kv[stage][0] + kstep * (16 * 128));
       uint64_t b1 = wgmma_desc((char*)kv[stage][1] + kstep * (16 * 128));
       WGMMA_PV_N64(oa, 0, a0, a1, a2, a3, b0);
