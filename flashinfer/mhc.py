@@ -177,12 +177,17 @@ def _check_mhc_pre_common_inputs(
     return total_tokens, hidden_size, outer_shape
 
 
-def _aligned_contiguous_residual(residual_flat: torch.Tensor) -> torch.Tensor:
+def _align_residual_16b(residual_flat: torch.Tensor) -> torch.Tensor:
     """The big-fuse kernels use 16-byte vector loads on the residual;
     contiguity alone does not establish base alignment (e.g. a
     ``backing[1:].view(...)`` is contiguous with a misaligned base). Copy
-    only when the contiguous tensor's address is still misaligned."""
-    residual_flat = residual_flat.contiguous()
+    only when the contiguous tensor's address is still misaligned.
+
+    Called INSIDE the registered custom ops, never in the traced wrapper:
+    ``Tensor.data_ptr()`` graph-breaks Dynamo (an error under
+    ``torch.compile(fullgraph=True)``), while custom-op bodies are opaque
+    to the tracer. The wrappers keep only ``.contiguous()`` on the traced
+    path."""
     if residual_flat.data_ptr() % 16:
         residual_flat = residual_flat.clone(memory_format=torch.contiguous_format)
     return residual_flat
@@ -314,9 +319,7 @@ def mhc_pre_big_fuse(
         dot_mix_flat = dot_mix.reshape(num_splits, total_tokens, _MHC_MIX).contiguous()
         sqrsum_flat = sqrsum.reshape(num_splits, total_tokens).contiguous()
 
-    residual_flat = _aligned_contiguous_residual(
-        residual.reshape(total_tokens, _MHC_HC, hidden_size)
-    )
+    residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
     mhc_scale = mhc_scale.contiguous()
     mhc_base = mhc_base.contiguous()
     post_mix = torch.empty(
@@ -610,9 +613,7 @@ def mhc_pre_big_fuse_with_prenorm(
             f"got {dot_mix_shape}"
         )
 
-    residual_flat = _aligned_contiguous_residual(
-        residual.reshape(total_tokens, _MHC_HC, hidden_size)
-    )
+    residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
     mhc_scale = mhc_scale.contiguous()
     mhc_base = mhc_base.contiguous()
     post_mix = torch.empty(
@@ -670,6 +671,7 @@ def _mhc_pre_big_fuse_impl(
     num_splits: int,
     block_size: int,
 ) -> None:
+    residual = _align_residual_16b(residual)
     get_mhc_module().mhc_pre_big_fuse(
         post_mix,
         comb_mix,
@@ -731,6 +733,7 @@ def _mhc_pre_big_fuse_with_prenorm_impl(
     sinkhorn_repeat: int,
     block_size: int,
 ) -> None:
+    residual = _align_residual_16b(residual)
     get_mhc_module().mhc_pre_big_fuse_with_prenorm(
         post_mix,
         comb_mix,
