@@ -243,7 +243,12 @@ class MlaConfig(Nvfp4KVConfig):
     # whose loaders bind sparse sources without reading them waits after its
     # prologue (TMA descriptor prefetch, shared-memory carve-out and barrier
     # initialization, TMEM allocation) instead of at entry, so that prologue
-    # overlaps the preceding grid. Other grids keep the entry wait.
+    # overlaps the preceding grid. Other grids keep the entry wait
+    # (ThroughputLatencyMlaDecodeTs.waits_after_prologue). Like use_pdl, it is
+    # set on the kernel object by callers that launch it directly with PDL,
+    # such as TensorRT-LLM's DeepSeek-V4.1 CSA2 decode. No FlashInfer entry
+    # point enables it: the sparse MLA wrapper launches without PDL, and the
+    # DeepSeek-V4.1 backend binds a KV producer, which keeps the entry wait.
     pdl_wait_after_prologue: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
