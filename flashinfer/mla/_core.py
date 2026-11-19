@@ -3874,8 +3874,10 @@ def _mla_with_kv_cache_impl(
         shape, which is kept until
         ``flashinfer.batch_invariant.mla.clear_plans()``. Set
         ``FLASHINFER_VALIDATE_INPUTS=1`` to check the list contract on the
-        host (synchronizes). Callers that plan once can use
-        ``flashinfer.batch_invariant.mla.plan`` directly.
+        host (synchronizes; a ``-1`` tail passes, a live entry after a
+        ``-1`` is refused). Callers that plan once can use
+        ``flashinfer.batch_invariant.mla.plan`` directly. A flagged call is
+        not traced by ``fi_trace``.
 
     Note
     ----
@@ -3922,7 +3924,7 @@ def _mla_with_kv_cache_impl(
     the production page-sharing pattern of your workload (e.g., heavily shared
     prefix → smaller pool; independent contexts → larger pool).
     """
-    if batch_invariant:
+    if batch_invariant is not False:
         return _mla_batch_invariant(
             query,
             kv_cache,

@@ -152,8 +152,8 @@ def _dsl_version() -> str:
 
 @functools.lru_cache(maxsize=None)
 def spec_fingerprint(dtype, head_dim: int) -> str:
-    """Identifier of one class: its constants, the pinned schedule, the digest of the class's own kernel sources
-    (hand-written, so their source is the dataflow and an edit renames the class) and the installed
+    """Identifier of one class: its constants, the pinned schedule, the digest of the classes' own kernel sources
+    (a frozen copy, so their source is the dataflow and an edit renames the class) and the installed
     ``nvidia-cutlass-dsl`` version that compiles them. The identifier therefore differs between environments with
     different DSL builds, and does not move when ``flashinfer.attention.prims_ts`` changes."""
     name = class_name(dtype, head_dim)

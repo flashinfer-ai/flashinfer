@@ -1,8 +1,9 @@
 """The batch-invariant sparse MLA classes ``mla.sparse.<dtype>.d<576|512>`` (SM100 / SM103 / SM107).
 
-Bitwise only. The quick tier runs by default; ``FLASHINFER_MLA_BI_NIGHTLY=1`` adds the larger batches, the
-prefill-sized calls, more head counts and the remaining dtype / layout pairs. The device-free tests (registry,
-fingerprint, list arithmetic, Lean cases) run everywhere.
+Bitwise only. The default tier covers every guarantee on the GLM-5.3 and GLM-5.3-Flash shapes;
+``FLASHINFER_MLA_BI_NIGHTLY=1`` (set by hand, no CI lane sets it) repeats it at batches of 256 and 512, a 2,304-row
+prefill, more head counts and the remaining dtype / layout pairs. The device-free tests (registry, fingerprint, list
+arithmetic, Lean cases) run everywhere.
 """
 
 import hashlib
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import warnings
 
+import numpy
 import pytest
 import torch
 
@@ -322,7 +324,16 @@ def test_case_inputs_are_exact_and_reproducible():
     picked = cases.selection(7, 6000, 2048)
     assert len(picked) == 2048 and picked == sorted(set(picked)) and picked[-1] < 6000
     assert cases.selection(7, 5, 2048) == [0, 1, 2, 3, 4]
-    assert len(cases.DIGESTS) == len(cases.DIGEST_CASES) * len(cases.DIGEST_ROWS)
+    assert len(cases.DIGESTS) == len(cases.DIGEST_CASES) * (
+        len(cases.DIGEST_ROWS) + len(cases.DENSE_ROWS)
+    )
+    for bits, dtype in ((4, torch.float8_e4m3fn), (8, torch.bfloat16)):
+        d = cases.dense_values(4096, 5, bits=bits)
+        assert torch.equal(d, cases.dense_values(4096, 5, bits=bits))
+        assert torch.equal(d.to(dtype).float(), d)
+        assert float(d.abs().min()) == 2.0**-6 and float(d.abs().max()) < 16.0
+        exact = (d[:576].double() * d[576:1152].double()).sum()
+        assert float(exact.float()) != float(exact), "the score must not fit fp32"
 
 
 def test_generated_lean_cases_are_current():
@@ -524,38 +535,13 @@ def test_default_schedule_is_not_batch_invariant():
 
     alone = [default(full.take([i])) for i in range(2)]
     batch = join(full, mates(cfg, pool, 62, "long"))
-    if same_bits(default(batch)[:2], torch.cat(alone)):
-        pytest.skip("the default prims_ts schedule gave batch-independent bits here")
+    assert not same_bits(default(batch)[:2], torch.cat(alone)), (
+        "the default prims_ts schedule gave batch-independent bits: the control needs another shape"
+    )
     flagged = run_batch(batch)[0][:2]
     assert same_bits(
         flagged, torch.cat([run_batch(full.take([i]))[0] for i in range(2)])
     )
-
-
-@needs_device
-def test_buffers_do_not_grow_with_the_number_of_row_counts():
-    """Every row count of a prefill reuses a few kept buffers; ``clear_plans`` drops plans and buffers."""
-    from flashinfer.batch_invariant import mla
-    from flashinfer.batch_invariant.mla import engine
-
-    cfg = CONFIGS[2]
-    pool, targets, (ref_out, _) = shared(cfg)
-    one = targets.take([3])
-    stable(one)
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
-    for n in range(1, 61):
-        rows = targets.take([3] * n)
-        out = stable(rows)
-        assert same_bits(out.view(n, cfg[2], 512)[-1:], ref_out[3:4])
-        del out, rows
-    torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() - before < 64 * 1024
-    plan = make_wrapper(cfg).plan
-    assert len(plan._rows.backing) == 1 and plan._rows.capacity == 64
-    mla.clear_plans()
-    assert not engine._plans and not engine._full and not engine._full_views
-    assert same_bits(stable(one).view(1, cfg[2], 512), ref_out[3:4])
 
 
 @needs_device
@@ -655,7 +641,55 @@ def test_recorded_digests():
     """One table for SM100, SM103 and SM107: the bits do not depend on the architecture."""
     got = _digest_cases()
     wrong = sorted(k for k in cases.DIGESTS if got.get(k) != cases.DIGESTS[k])
-    assert not wrong and set(got) == set(cases.DIGESTS), wrong
+    assert not wrong and set(got) == set(cases.DIGESTS), (
+        f"{wrong}: the table was recorded with {cases.RECORDED_WITH}; this run has nvidia-cutlass-dsl "
+        f"{spec._dsl_version()} on CUDA {torch.version.cuda}. The approximate exp2 / log2 / reciprocal and two "
+        "fused multiply-adds are the compiler's choice, so a new toolchain can move the bits."
+    )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "case", cases.DIGEST_CASES, ids=[c[0] for c in cases.DIGEST_CASES]
+)
+def test_full_significand_rows_do_not_depend_on_the_batch(case):
+    """Inputs whose Q.K fold rounds in fp32: a row alone, in a batch and at another position gives the same bits."""
+    from flashinfer.batch_invariant import mla
+
+    _, dtype, head_dim, heads = case
+    pool = cases.Pool([cases.DIGEST_REQUEST], head_dim, dtype, "cuda", dense=True)
+    plan = mla.plan(
+        "cuda",
+        heads,
+        q_dtype=pool.dtype,
+        qk_rope_head_dim=head_dim - 512,
+        softmax_scale=SCALE,
+    )
+    visibles = [1, 127, 129, 300, 2048, 4096, 3000]
+    built = [pool.row(0, v, 2048, 2052) for v in visibles]
+    indices = torch.stack([r for r, _ in built]).cuda()
+    lengths = torch.tensor([n for _, n in built], dtype=torch.int32, device="cuda")
+    query = torch.stack([pool.query(0, v - 1, heads) for v in visibles])
+    kv = pool.kv.view(-1, head_dim)
+    out, lse = plan.run(query, kv, indices, lengths, return_lse=True)
+    order = [6, 2, 5, 0, 4, 1, 3]
+    out2, lse2 = plan.run(
+        query[order].contiguous(),
+        kv,
+        indices[order].contiguous(),
+        lengths[order].contiguous(),
+        return_lse=True,
+    )
+    assert same_bits(out2, out[order]) and same_bits(lse2, lse[order])
+    for i in range(len(visibles)):
+        one, one_lse = plan.run(
+            query[i : i + 1].contiguous(),
+            kv,
+            indices[i : i + 1, :2048].contiguous(),
+            lengths[i : i + 1].contiguous(),
+            return_lse=True,
+        )
+        assert same_bits(one, out[i : i + 1]) and same_bits(one_lse, lse[i : i + 1])
 
 
 @needs_device
@@ -1019,6 +1053,16 @@ def test_stable_function_runs_the_class(cfg):
         )
     scale = torch.tensor([SCALE], dtype=torch.float32, device="cuda")
     assert same_bits(stable(targets, bmm1_scale=scale).view(n, heads, 512), ref_out)
+    host = numpy.float32(SCALE)
+    assert same_bits(stable(targets, bmm1_scale=host).view(n, heads, 512), ref_out)
+    odd = torch.empty(n * heads + 1, dtype=torch.float32, device="cuda")[1:]
+    stable(
+        targets,
+        sparse_mla_top_k_lens=targets.lengths,
+        lse=odd.view(n, heads),
+        return_lse_base="basee",
+    )
+    assert odd.data_ptr() % 16 and same_bits(odd.view(n, heads), ref_lse)
     mtp = targets.take(range(8))
     out = stable(
         mtp,
@@ -1077,13 +1121,16 @@ def test_stable_function_refuses_inputs_outside_the_class(monkeypatch):
     for kw, fragment in refused:
         with pytest.raises(bi.BatchInvariantUnsupportedError, match=fragment):
             stable(rows, **kw)
-    with pytest.raises(TypeError):
-        stable(rows, batch_invariant=1)
+    for not_bool in (1, 0, None, "yes"):
+        with pytest.raises(TypeError):
+            stable(rows, batch_invariant=not_bool)
 
     holes = targets.take([5, 6])
     holes.indices[1, 7] = -1
     assert stable(holes, sparse_mla_top_k_lens=holes.lengths).shape[0] == 2
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    tail = targets.take([5, 6])
+    assert same_bits(stable(tail), stable(tail, sparse_mla_top_k_lens=tail.lengths))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="hole"):
         stable(holes, sparse_mla_top_k_lens=holes.lengths)
     far = targets.take([5, 6])
@@ -1251,7 +1298,6 @@ def test_plan_refuses_inputs_outside_the_class():
 
 
 @needs_device
-@pytest.mark.skipif(not NIGHTLY, reason="nightly tier")
 @config
 def test_scales_are_row_inputs(cfg):
     """Other softmax / output scales, host and tensor: still one result per row."""
@@ -1272,6 +1318,34 @@ def test_scales_are_row_inputs(cfg):
         )
         out2, _ = run_batch(batch, make_wrapper(cfg, **tensors))
         assert same_bits(out2, out)
+
+
+@needs_device
+def test_buffers_do_not_grow_with_the_number_of_row_counts():
+    """Every row count of a prefill reuses a few kept buffers; ``clear_plans`` drops plans and buffers. Kept last:
+    it empties the plan cache."""
+    from flashinfer.batch_invariant import mla
+    from flashinfer.batch_invariant.mla import engine
+
+    cfg = CONFIGS[2]
+    pool, targets, (ref_out, _) = shared(cfg)
+    one = targets.take([3])
+    mla.clear_plans()
+    stable(one)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    for n in range(1, 61):
+        rows = targets.take([3] * n)
+        out = stable(rows)
+        assert same_bits(out.view(n, cfg[2], 512)[-1:], ref_out[3:4])
+        del out, rows
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() - before < 64 * 1024
+    plan = make_wrapper(cfg).plan
+    assert len(plan._rows.backing) == 1 and plan._rows.capacity == 64
+    mla.clear_plans()
+    assert not engine._plans and not engine._full and not engine._full_views
+    assert same_bits(stable(one).view(1, cfg[2], 512), ref_out[3:4])
 
 
 if __name__ == "__main__" and "--digest" in sys.argv:

@@ -9,12 +9,14 @@ every ``top_k``. Nothing here reads ``flashinfer.attention.prims_ts``."""
 from __future__ import annotations
 
 import hashlib
+import numbers
 import os
 import threading
 from typing import Dict, Optional, Union
 
 import torch
 
+from ...api_logging import flashinfer_api
 from ..support import check_device, unsupported
 from . import spec
 
@@ -30,6 +32,7 @@ _plans: Dict[tuple, "SparseMLAPlan"] = {}
 _full: Dict[tuple, tuple] = {}
 _full_views: Dict[tuple, torch.Tensor] = {}
 _lock = threading.Lock()
+_build_locks: Dict[tuple, threading.Lock] = {}
 
 
 def clear_plans() -> None:
@@ -423,12 +426,12 @@ class SparseMLAPlan:
             or lse.dtype != torch.float32
             or lse.device != dev
             or not lse.is_contiguous()
-            or lse.data_ptr() % 16
+            or lse.data_ptr() % 4
         ):
             raise unsupported(
                 name,
                 f"lse of shape {tuple(lse.shape)}, dtype {lse.dtype}",
-                f"a contiguous 16-byte-aligned fp32 [{rows}, {heads}] on {dev}",
+                f"a contiguous fp32 [{rows}, {heads}] on {dev}",
             )
         if contents and rows:
             width = indices.shape[1]
@@ -438,7 +441,8 @@ class SparseMLAPlan:
             storage_rows = kv_cache.numel() // dim
             if (live & ((indices < -1) | (indices >= storage_rows))).any().item():
                 raise ValueError(f"{name}: a live index is outside the cache")
-            if (live & (indices < 0)).any().item():
+            empty = live & (indices < 0)
+            if (empty.cummax(dim=1).values & live & ~empty).any().item():
                 raise unsupported(
                     name,
                     "a -1 hole inside the live part of the list",
@@ -511,6 +515,7 @@ class SparseMLAPlan:
             None,
         )
 
+    @flashinfer_api
     def run(
         self,
         query: torch.Tensor,
@@ -526,7 +531,7 @@ class SparseMLAPlan:
         validate: bool = True,
     ):
         """Checked launch; returns ``out`` ``[rows, heads, 512]``, or ``(out, lse)`` with ``return_lse``.
-        ``validate=True`` also reads the list on the host (bounds, no ``-1`` inside the live part), which
+        ``validate=True`` also reads the list on the host (bounds, no live entry after a ``-1``), which
         synchronizes; serving passes ``validate=False`` and keeps the layout checks, or calls :meth:`launch`."""
         rows = lengths.shape[0] if lengths.ndim == 1 else 0
         if out is None:
@@ -587,11 +592,11 @@ def check_scale(
                 f"a contiguous fp32 tensor of one element on {device}",
             )
         return value.view(1) if value.ndim == 0 else value
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise unsupported(class_name, f"{name}={value!r}", "a positive scale")
     try:
         value = float(value)
-    except OverflowError:
+    except (OverflowError, TypeError, ValueError):
         value = float("inf")
     if not _MIN_SCALE <= value <= _MAX_SCALE:
         raise unsupported(
@@ -600,6 +605,7 @@ def check_scale(
     return value
 
 
+@flashinfer_api
 def plan(
     device,
     num_qo_heads: int,
@@ -666,6 +672,8 @@ def plan(
 
         require_cute_dsl_arch(device.index)
     with _lock:
+        building = _build_locks.setdefault(key, threading.Lock())
+    with building:
         made = _plans.get(key)
         if made is None:
             made = SparseMLAPlan(
@@ -676,7 +684,8 @@ def plan(
                 softmax_scale,
                 output_scale,
             )
-            _plans[key] = made
+            with _lock:
+                _plans[key] = made
     return made
 
 

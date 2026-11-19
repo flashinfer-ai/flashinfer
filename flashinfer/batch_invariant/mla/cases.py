@@ -4,8 +4,10 @@
 
 Every value is a multiple of 1/8 in [-2, 2] computed from 64-bit integer arithmetic, so it is exact in bf16 and e4m3
 and identical on every host and device. A request's cache rows and query rows are functions of its seed and the token
-position alone, whatever pool or batch they sit in. ``DIGESTS`` holds sha256 of the output and LSE bits of
-:func:`run_digest_cases`; SM100, SM103 and SM107 give the same bits, so one table serves the three architectures.
+position alone, whatever pool or batch they sit in. Dot products of such values are exact in fp32 in any order, so
+the ``dense`` cases use :func:`dense_values` (full significands over ten binades), whose score fold rounds.
+``DIGESTS`` holds sha256 of the output and LSE bits of :func:`run_digest_cases`; SM100, SM103 and SM107 give the same
+bits, so one table serves the three architectures.
 
     python -m flashinfer.batch_invariant.mla.cases     # print the digests of the current device
 """
@@ -37,20 +39,41 @@ def values(count: int, seed: int, start: int = 0) -> torch.Tensor:
     return ((_mix(idx, seed) % 33).to(torch.float32) - 16.0) / 8.0
 
 
+def dense_values(count: int, seed: int, start: int = 0, bits: int = 4) -> torch.Tensor:
+    """``count`` fp32 values ``+-m * 2**(3 - e)`` with a full ``bits``-bit significand ``m`` in [1, 2), ``e`` in 0..9."""
+    idx = torch.arange(start, start + count, dtype=torch.int64)
+    h = _mix(idx, seed)
+    top = 1 << (bits - 1)
+    signed = ((h & (top - 1)) + top) * (1 - 2 * ((h >> 16) & 1))
+    return torch.ldexp(
+        signed.to(torch.float32), (4 - bits - (h >> 8) % 10).to(torch.int32)
+    )
+
+
+def significand_bits(dtype) -> int:
+    return 4 if spec.dtype_name(dtype) == "e4m3" else 8
+
+
 def torch_dtype(dtype) -> torch.dtype:
     return torch.float8_e4m3fn if spec.dtype_name(dtype) == "e4m3" else torch.bfloat16
 
 
-def request_keys(seed: int, start: int, count: int, head_dim: int) -> torch.Tensor:
+def request_keys(
+    seed: int, start: int, count: int, head_dim: int, dense_bits: int = 0
+) -> torch.Tensor:
     """Cache rows ``[count, head_dim]`` of tokens ``start .. start + count`` of request ``seed`` (fp32)."""
-    return values(count * head_dim, seed, start * head_dim).view(count, head_dim)
+    n, at = count * head_dim, start * head_dim
+    flat = dense_values(n, seed, at, dense_bits) if dense_bits else values(n, seed, at)
+    return flat.view(count, head_dim)
 
 
-def request_query(seed: int, position: int, heads: int, head_dim: int) -> torch.Tensor:
+def request_query(
+    seed: int, position: int, heads: int, head_dim: int, dense_bits: int = 0
+) -> torch.Tensor:
     """Query rows ``[heads, head_dim]`` of the token at ``position`` of request ``seed`` (fp32)."""
-    return values(heads * head_dim, seed * 31 + 17, position * 7919).view(
-        heads, head_dim
-    )
+    n, seed, at = heads * head_dim, seed * 31 + 17, position * 7919
+    flat = dense_values(n, seed, at, dense_bits) if dense_bits else values(n, seed, at)
+    return flat.view(heads, head_dim)
 
 
 def selection(seed: int, visible: int, topk: int) -> List[int]:
@@ -78,8 +101,10 @@ class Pool:
         dtype,
         device,
         scramble: int = 7,
+        dense: bool = False,
     ):
         self.requests = list(requests)
+        self.dense_bits = significand_bits(dtype) if dense else 0
         self.head_dim = head_dim
         self.dtype = torch_dtype(dtype)
         self.device = torch.device(device)
@@ -95,7 +120,7 @@ class Pool:
             page_ids = order[offset : offset + n]
             offset += n
             rows = torch.zeros(n * PAGE_SIZE, head_dim)
-            rows[:length] = request_keys(seed, 0, length, head_dim)
+            rows[:length] = request_keys(seed, 0, length, head_dim, self.dense_bits)
             kv[page_ids] = rows.view(n, PAGE_SIZE, head_dim)
             pos = torch.arange(length)
             self.slots.append(
@@ -120,7 +145,7 @@ class Pool:
     def query(self, request: int, position: int, heads: int) -> torch.Tensor:
         seed = self.requests[request][0]
         return (
-            request_query(seed, position, heads, self.head_dim)
+            request_query(seed, position, heads, self.head_dim, self.dense_bits)
             .to(self.device)
             .to(self.dtype)
         )
@@ -151,7 +176,11 @@ DIGEST_ROWS = (
     (2051, 2052),
     (4096, 2051),
 )
+#: Rows also recorded on :func:`dense_values` inputs (``<case>.dense.v<visible>.w<width>``).
+DENSE_ROWS = ((129, 2048), (2048, 2048), (4096, 2051))
 DIGEST_REQUEST = (4242, 4096)
+#: Toolchains the table was recorded and reproduced with.
+RECORDED_WITH = "nvidia-cutlass-dsl 4.8.0 on CUDA 13.0 and CUDA 13.4"
 
 
 def digest(out: torch.Tensor, lse: torch.Tensor) -> str:
@@ -168,15 +197,22 @@ def run_digest_cases(device="cuda") -> Dict[str, str]:
     device = torch.device(device)
     result = {}
     for name, dtype, head_dim, heads in DIGEST_CASES:
-        pool = Pool([DIGEST_REQUEST], head_dim, dtype, device)
+        pools: Dict[bool, Pool] = {}
         plan = engine.plan(
             device,
             heads,
-            q_dtype=pool.dtype,
+            q_dtype=torch_dtype(dtype),
             qk_rope_head_dim=head_dim - spec.LATENT_DIM,
             softmax_scale=SOFTMAX_SCALE,
         )
-        for visible, width in DIGEST_ROWS:
+        for tag, dense, visible, width in [("", False, *row) for row in DIGEST_ROWS] + [
+            (".dense", True, *row) for row in DENSE_ROWS
+        ]:
+            pool = pools.get(dense)
+            if pool is None:
+                pool = pools[dense] = Pool(
+                    [DIGEST_REQUEST], head_dim, dtype, device, dense=dense
+                )
             topk = min(width, 2051) if width > 2048 else 2048
             index_row, live = pool.row(0, visible, topk, width)
             out, lse = plan.run(
@@ -186,7 +222,7 @@ def run_digest_cases(device="cuda") -> Dict[str, str]:
                 torch.tensor([live], dtype=torch.int32, device=device),
                 return_lse=True,
             )
-            result[f"{name}.v{visible}.w{width}"] = digest(
+            result[f"{name}{tag}.v{visible}.w{width}"] = digest(
                 out.view(1, 1, heads, spec.LATENT_DIM), lse.view(1, 1, heads)
             )
     return result
@@ -194,6 +230,9 @@ def run_digest_cases(device="cuda") -> Dict[str, str]:
 
 #: One table for SM100, SM103 and SM107 (``tests/batch_invariant/test_mla_sparse.py``).
 DIGESTS: Dict[str, str] = {
+    "bf16.d512.h16.dense.v129.w2048": "eec24efc23222d261d2cd0ba3c2f55ea",
+    "bf16.d512.h16.dense.v2048.w2048": "27625e2d19200a60532ed3814850fa57",
+    "bf16.d512.h16.dense.v4096.w2051": "ebfdfb0ae92ca4360f05d71a040c333b",
     "bf16.d512.h16.v1.w2048": "f7353a6c554581e4059ee9ff97ed6115",
     "bf16.d512.h16.v127.w2048": "a60ce86eb91d30bc5fd137a4206cb621",
     "bf16.d512.h16.v128.w2048": "05772489ebd42d0e53ce65086db33d7a",
@@ -204,6 +243,9 @@ DIGESTS: Dict[str, str] = {
     "bf16.d512.h16.v4096.w2048": "ce9234f425ad5444e4576a1868a5f97f",
     "bf16.d512.h16.v4096.w2051": "b737f11d485dccbfce79100a4c45420c",
     "bf16.d512.h16.v5.w2048": "aba0c7f9b0daa157117927f1775c1581",
+    "bf16.d576.h64.dense.v129.w2048": "fda4d25162b30f597761743a34a32985",
+    "bf16.d576.h64.dense.v2048.w2048": "3e85cd3b9738cf0bd8005c5827800143",
+    "bf16.d576.h64.dense.v4096.w2051": "fcff2eb3feffb35054463b08ab46e988",
     "bf16.d576.h64.v1.w2048": "8728d7a0880ffb03e90cc20575b18504",
     "bf16.d576.h64.v127.w2048": "b2998953cb067b2eab072429773c5d12",
     "bf16.d576.h64.v128.w2048": "9bc9c524e3731189530466dcb1a4c321",
@@ -214,6 +256,9 @@ DIGESTS: Dict[str, str] = {
     "bf16.d576.h64.v4096.w2048": "78f27afb9d7e36c91c9ece56b8f3355c",
     "bf16.d576.h64.v4096.w2051": "63dd83c123fb0497a051a7a5c65ee4e7",
     "bf16.d576.h64.v5.w2048": "0f1ff4f04901551d1970aad72eda07f6",
+    "bf16.d576.h8.dense.v129.w2048": "8b01d01a452617910a0c9a168399f895",
+    "bf16.d576.h8.dense.v2048.w2048": "6d08d9f3a53a4fcb429871e9fbe71952",
+    "bf16.d576.h8.dense.v4096.w2051": "de0b1fffef151d60514f17adf85e4f3e",
     "bf16.d576.h8.v1.w2048": "11e6251301386b8cba83b844578839a6",
     "bf16.d576.h8.v127.w2048": "82483cbf1e07eeb9f391a4ba699dca06",
     "bf16.d576.h8.v128.w2048": "982e8e6a739bcaf5c02c4caa247ce2aa",
@@ -224,6 +269,9 @@ DIGESTS: Dict[str, str] = {
     "bf16.d576.h8.v4096.w2048": "ae0a1427915de3d590bc228af4eb142e",
     "bf16.d576.h8.v4096.w2051": "02a134e153b149985d7e1486ab66e779",
     "bf16.d576.h8.v5.w2048": "4056fe16a3095997064578f8211d6225",
+    "e4m3.d512.h16.dense.v129.w2048": "0aecc845ddad763cdff2da0dba4e1899",
+    "e4m3.d512.h16.dense.v2048.w2048": "022769eea1e07a6219bb03f65944af11",
+    "e4m3.d512.h16.dense.v4096.w2051": "3f6dcf5630cae925062f1e2f3bcdc9ba",
     "e4m3.d512.h16.v1.w2048": "b0ca2ddcca410f513ebacc0218b12c5f",
     "e4m3.d512.h16.v127.w2048": "6f462fee06128ddbabeba3981e77289c",
     "e4m3.d512.h16.v128.w2048": "3a8fe168ad4b848fa54c3a30e2254c66",
@@ -234,6 +282,9 @@ DIGESTS: Dict[str, str] = {
     "e4m3.d512.h16.v4096.w2048": "0334c04aea316aa56d17e892bba2265e",
     "e4m3.d512.h16.v4096.w2051": "dd343a2d60355556f0094e37b5d96a7d",
     "e4m3.d512.h16.v5.w2048": "b1dd74c51d7839d02be8c8a4690c7eec",
+    "e4m3.d576.h64.dense.v129.w2048": "81fdd1aac384d50fcc63640a523336a0",
+    "e4m3.d576.h64.dense.v2048.w2048": "38c12cc0f5960a90a6b7d544011c0edd",
+    "e4m3.d576.h64.dense.v4096.w2051": "e56fdcd088aede173dc64b0313839bb7",
     "e4m3.d576.h64.v1.w2048": "f038bbd8e669da502098fd1fcf69ff68",
     "e4m3.d576.h64.v127.w2048": "2518e28fccbb83ab853314a9f5ef0174",
     "e4m3.d576.h64.v128.w2048": "5a07e3409ad26a4ac93968f47155e677",
@@ -244,6 +295,9 @@ DIGESTS: Dict[str, str] = {
     "e4m3.d576.h64.v4096.w2048": "b33e7c3570eb43366d42d4ec08dc465e",
     "e4m3.d576.h64.v4096.w2051": "45c3b1debe955f17269e8b969156391e",
     "e4m3.d576.h64.v5.w2048": "a3a350c241a637e5bedbb507bb03ac6c",
+    "e4m3.d576.h8.dense.v129.w2048": "19c61a6716f8509768c0ce94efe38f6d",
+    "e4m3.d576.h8.dense.v2048.w2048": "800758178daa1997e34508e09a19c322",
+    "e4m3.d576.h8.dense.v4096.w2051": "a389520be20005e502254fd7ed3a68ea",
     "e4m3.d576.h8.v1.w2048": "61a037d17b236bbbcd708e667c027d91",
     "e4m3.d576.h8.v127.w2048": "1b90359abc53b8f7673ab75ccd2e033d",
     "e4m3.d576.h8.v128.w2048": "f1dbebac25e609ae7f258fb941c0bf4b",
