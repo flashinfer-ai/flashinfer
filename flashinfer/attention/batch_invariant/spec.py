@@ -20,7 +20,17 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
 * the epilogue is ``cvt_bf16(add(mul(O, div(1, l)), +0))``;
 * the LSE member (``lse_term``), a second output of the same row state: ``lse2 = add(mul(m, c), LG2(l))`` in base 2 and
   ``mul(lse2, LN2)`` in base e, with ``LG2 = lg2.approx.ftz.f32`` (opaque, like ``EX2``). It reads the ``(m, l)`` that
-  normalise the output and has its own fingerprints (``lse_fingerprint``); the output terms do not contain it.
+  normalise the output and has its own fingerprints (``lse_fingerprint``); the output terms do not contain it;
+* attention sinks (``sink_merge``), the member of a call that passes ``sinks``: one more merge after the last chunk merge
+  and before the epilogue, of the row state with a virtual key of head ``h`` whose logit is ``sinks[h]`` (natural-log units
+  of the scaled score; ``sm_scale`` is not applied to it) and whose value is zero. In base-2 units, with ``LOG2E = fp32(log2 e)``:
+  ``ms = mul(m, c)``, ``s2 = mul(sink, LOG2E)``, ``m' = fmax(ms, s2)``, ``nm = mul(m', -1)`` (exact),
+  ``a = EX2(add(ms, nm))``, ``b = EX2(add(s2, nm))``, ``l' = fma(l, a, b)``; the epilogue is
+  ``cvt_bf16(add(mul(O, mul(a, div(1, l'))), +0))`` and the LSE member ``add(m', LG2(l'))`` (``m'`` is already scaled).
+  The step is taken once per row whatever the tiling, the unit kind and the kernel body; a row without sinks does not
+  take it (the terms above, unchanged), so the sink member has its own fingerprints (``sink_fingerprint``).
+  ``sink = -inf`` gives ``b = +0``, ``a = 1`` and the bits of the row without sinks; a sink so large that ``a``
+  underflows gives ``+0`` outputs; a ``+inf`` or NaN sink gives NaN, like any non-finite operand.
 
 Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
@@ -54,6 +64,9 @@ HEAD_DIMS = (
 )  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
 NEG_INF = float("-inf")
 LN2 = to_f32(math.log(2.0))  # fp32(ln 2): the constant of the base-e LSE member
+LOG2E = to_f32(
+    1.0 / math.log(2.0)
+)  # fp32(log2 e): a sink logit in the fold's base-2 units
 LSE_BASES = ("log2", "ln")
 
 
@@ -298,6 +311,40 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
     return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
 
 
+@dataclass(frozen=True)
+class SinkState:
+    """A row's statistics after the sink merge: the maximum ``m`` over the keys and the sink in scaled base-2 units, the
+    sum ``l`` relative to it, and ``a``, the rescale of the keys' accumulator to it."""
+
+    m: Any
+    l: Any
+    a: Any
+
+
+def sink_merge(fp, st: State, sink, c) -> SinkState:
+    """The sink step on the row's final ``(m, l)``: the merge with a virtual key of logit ``sink`` (natural-log units,
+    never divided by the scale) and zero value. ``m' = fmax(mul(m, c), mul(sink, LOG2E))``; the two exponentials are of the
+    exact differences to ``m'`` (one of them ``EX2(+0) = 1``); ``l' = fma(l, a, b)``."""
+    ms = fp.mul(st.m, c)
+    s2 = fp.mul(sink, fp.const(LOG2E))
+    m = fp.fmaxc(ms, s2)
+    nm = fp.mul(m, fp.const(-1.0))
+    a = fp.ex2(fp.add(ms, nm))
+    b = fp.ex2(fp.add(s2, nm))
+    return SinkState(m, fp.fma(st.l, a, b), a)
+
+
+def sink_normaliser(fp, sk: SinkState):
+    """``mul(a, div(1, l'))``: the row's normaliser under sinks, in the place of the epilogue's ``div(1, l)``."""
+    return fp.mul(sk.a, fp.div(fp.const(1.0), sk.l))
+
+
+def output_elem_sink(fp, st: State, sink, c, out_fmt: str = "bf16"):
+    """The epilogue of a row with sinks: ``cvt(add(mul(O, mul(a, div(1, l'))), +0))``."""
+    inv = sink_normaliser(fp, sink_merge(fp, st, sink, c))
+    return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
+
+
 def lg2(fp, x):
     """``LG2(x) = lg2.approx.ftz.f32``: ``fp.lg2`` on the backends that name it, the opaque ``op`` on the term algebra
     (printed ``(op:lg2 x)``)."""
@@ -312,6 +359,14 @@ def lse_term(fp, st: State, c, base: str = "log2"):
     ``(-inf, +0)`` both are ``-inf`` (``mul(-inf, c) = -inf`` for the class's ``c > 0``, ``LG2(+0) = -inf``)."""
     assert base in LSE_BASES, base
     lse2 = fp.add(fp.mul(st.m, c), lg2(fp, st.l))
+    return lse2 if base == "log2" else fp.mul(lse2, fp.const(LN2))
+
+
+def lse_term_sink(fp, sk: SinkState, base: str = "log2"):
+    """The LSE member of a row with sinks, the sink included: ``lse2 = add(m', LG2(l'))`` on the merged statistics (``m'``
+    is in scaled base-2 units already), ``mul(lse2, LN2)`` for ``base="ln"``."""
+    assert base in LSE_BASES, base
+    lse2 = fp.add(sk.m, lg2(fp, sk.l))
     return lse2 if base == "log2" else fp.mul(lse2, fp.const(LN2))
 
 
@@ -375,7 +430,8 @@ def verify_plan(red: Reduction, fp) -> Any:
 
 
 class AttentionSpec:
-    """Symbolic view: ``output(row, d)`` is the term of one output element, ``lse(row, base)`` the LSE member."""
+    """Symbolic view: ``output(row, d)`` is the term of one output element, ``lse(row, base)`` the LSE member;
+    ``sinks=True`` gives the terms of a call with attention sinks (the row's sink is the leaf ``sink``)."""
 
     def __init__(
         self,
@@ -389,6 +445,7 @@ class AttentionSpec:
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
         self.c, self.nc = self.alg.sym("c"), self.alg.sym("nc")
+        self.sink = self.alg.sym("sink")
 
     def reduction(self, row: RowSpec, d: int) -> Reduction:
         return attention_reduction(row, self.D, d, self.c, self.nc, self.T, self.C)
@@ -396,11 +453,19 @@ class AttentionSpec:
     def state(self, row: RowSpec, d: int) -> State:
         return self.reduction(row, d).canonical(self.alg)
 
-    def output(self, row: RowSpec, d: int) -> Term:
-        return output_elem(self.alg, self.state(row, d), self.out_fmt)
+    def output(self, row: RowSpec, d: int, sinks: bool = False) -> Term:
+        st = self.state(row, d)
+        if sinks:
+            return output_elem_sink(self.alg, st, self.sink, self.c, self.out_fmt)
+        return output_elem(self.alg, st, self.out_fmt)
 
-    def lse(self, row: RowSpec, base: str = "log2") -> Term:
-        return lse_term(self.alg, self.state(row, 0), self.c, base)
+    def lse(self, row: RowSpec, base: str = "log2", sinks: bool = False) -> Term:
+        st = self.state(row, 0)
+        if sinks:
+            return lse_term_sink(
+                self.alg, sink_merge(self.alg, st, self.sink, self.c), base
+            )
+        return lse_term(self.alg, st, self.c, base)
 
 
 _FINGERPRINTS: Dict[tuple, str] = {}
@@ -453,13 +518,30 @@ LSE_FINGERPRINTS = {
 }
 
 
-def lse_fingerprint(D: int = 128, base: str = "log2") -> str:
+# the recorded fingerprints of the sink member (a call with ``sinks``): its output per head dim, its LSE per (head dim, base)
+SINK_FINGERPRINTS = {
+    64: "attn-bf16-d64-sink-a239bf124352c39c",
+    128: "attn-bf16-d128-sink-08ebe33f73cbe897",
+    256: "attn-bf16-d256-sink-97a726a039ac102d",
+}
+SINK_LSE_FINGERPRINTS = {
+    (64, "log2"): "attn-bf16-d64-sink-lse-log2-ce5540cea8c9060a",
+    (64, "ln"): "attn-bf16-d64-sink-lse-ln-411e595f84dacdf6",
+    (128, "log2"): "attn-bf16-d128-sink-lse-log2-d06a4faff7897362",
+    (128, "ln"): "attn-bf16-d128-sink-lse-ln-911ada9a2df50aef",
+    (256, "log2"): "attn-bf16-d256-sink-lse-log2-fcdaa847d25ab16a",
+    (256, "ln"): "attn-bf16-d256-sink-lse-ln-8bd8ede7bafb8ca0",
+}
+
+
+def lse_fingerprint(D: int = 128, base: str = "log2", sinks: bool = False) -> str:
     """Identifier of the LSE member of the class at head dim ``D`` in ``base`` (``"log2"`` | ``"ln"``): hashes the LSE term of
     ``spec_fingerprint``'s sample row together with ``D``, ``T``, ``C`` and the base. A receipt of its own: the class
-    fingerprints (``spec_fingerprint``) hash the output terms alone and do not move with it."""
+    fingerprints (``spec_fingerprint``) hash the output terms alone and do not move with it. ``sinks``: the LSE of the sink
+    member (the sink included), ``attn-bf16-d<D>-sink-lse-<base>-...``."""
     if base not in LSE_BASES:
         raise ValueError(f"lse_base must be one of {LSE_BASES}, got {base!r}")
-    key = (D, base)
+    key = (D, base, bool(sinks))
     if key not in _LSE_FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
@@ -470,10 +552,37 @@ def lse_fingerprint(D: int = 128, base: str = "log2") -> str:
             f"T={spec.T}",
             f"C={spec.C}",
             f"base={base}",
-            fingerprint(spec.lse(row, base)),
+            fingerprint(spec.lse(row, base, sinks=bool(sinks))),
         ]
+        if sinks:
+            parts.insert(3, "sinks")
         _LSE_FINGERPRINTS[key] = (
-            f"attn-bf16-d{D}-lse-{base}-"
+            f"attn-bf16-d{D}-{'sink-' if sinks else ''}lse-{base}-"
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _LSE_FINGERPRINTS[key]
+
+
+def sink_fingerprint(D: int = 128) -> str:
+    """Identifier of the sink member of the class at head dim ``D`` (a call with ``sinks``): hashes the output terms of
+    ``spec_fingerprint``'s sample row with the sink step, together with ``D``, ``T``, ``C``. The sink values are per-call inputs,
+    like the scale; the fingerprints of the class without sinks do not move with it."""
+    key = (D, "sink")
+    if key not in _FINGERPRINTS:
+        from ...batch_invariant.fp_interface.term import fingerprint
+
+        spec = AttentionSpec(D)
+        row = RowSpec(p=spec.C + spec.T // 2)
+        parts = [
+            f"D={D}",
+            f"T={spec.T}",
+            f"C={spec.C}",
+            "sinks",
+            fingerprint(spec.output(row, 0, sinks=True)),
+            fingerprint(spec.output(row, 1, sinks=True)),
+        ]
+        _FINGERPRINTS[key] = (
+            f"attn-bf16-d{D}-sink-"
+            + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        )
+    return _FINGERPRINTS[key]
