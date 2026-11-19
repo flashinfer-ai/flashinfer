@@ -92,10 +92,13 @@ DRAW_SUPPORT_MODULE = "batch_invariant_sampling_draw_support"
 
 # The per-call switches of the K5 kernels (a flag word, runtime; never a kernel variant): each one select or one predicated
 # store per ROW, the bits of every row those of the specialised kernels they replace (2026-11-18). `return_logprob` is NOT a
-# flag: the full distribution's log-probability needs the row-sum pass, which the top-k forms do not otherwise run.
+# flag: the full distribution's log-probability needs the row-sum pass, which the top-k forms do not otherwise run. The INDEX
+# GATHER is a compile-time variant (16 -> 2 kernels, not 16 -> 1): as a runtime flag, the row base built from a loaded index
+# instead of the blockIdx-derived row cost 50-90 registers on the 256-thread cluster picks (one CTA per SM fewer: 0.59-0.92x at
+# bf16 top-k 128256 / 152064 x 16 and top-p 128256 x 48-128 in #9695's review) and the per-thread values carried across the
+# passes a spill elsewhere; re-deriving them at the end cured only the non-cluster pick (2026-11-19).
 FLAG_TEMP_ROWS = 1  # the temperature per row (mTemp) instead of the constant c_const
-FLAG_INDICES = 2  # the index gather: row r reads source row mIdx[r]
-FLAG_KEPT_LOGPROB = 4  # the drawn token's log-probability over the kept set is written (logits kernels; the score form always)
+FLAG_KEPT_LOGPROB = 2  # the drawn token's log-probability over the kept set is written (logits kernels; the score form always)
 
 
 class DrawSupportKernel:
@@ -126,11 +129,13 @@ class DrawSupportKernel:
         assert early_finish in ("", "mass", "all")
         # the score form (``log_probs`` under the sampler's filters): the exact form's selection and kept mass, then the
         # given token's log-probabilities instead of a draw -- logits only, the kept-set value always, no stream, no gather
-        assert not score or from_logits, (
-            "the score form takes logits (the kept-set log-probability is its output)"
+        assert not score or (from_logits and not has_indices), (
+            "the score form takes logits (the kept-set log-probability is its output) and gathers no source rows"
         )
-        # temp_rows / has_indices / return_kept_logprob are runtime flags of the kernel (FLAG_*): accepted here and ignored
+        # temp_rows / return_kept_logprob are runtime flags of the kernel (FLAG_*): accepted here and ignored; the index gather
+        # is a compile-time variant (the module header)
         self.score = score
+        self.has_indices = has_indices
         self.early_finish, self.study = early_finish, ""
         self.dtype, self.N, self.Kp, self.cfg = dtype, N, Kp, cfg
         self.from_logits, self.filters, self.return_logprob = (
@@ -318,7 +323,6 @@ class DrawSupportKernel:
         bidx, _, _ = cute.arch.block_idx()
         cute.arch.griddepcontrol_wait()  # no effect unless the launch carried the PDL attribute (a runtime launch argument)
         flag_temp = (flags & Int32(FLAG_TEMP_ROWS)) != Int32(0)
-        flag_idx = (flags & Int32(FLAG_INDICES)) != Int32(0)
         flag_lpk = (flags & Int32(FLAG_KEPT_LOGPROB)) != Int32(0)
         W, C = self.W, self.C
         warp_idx = cute.arch.warp_idx()
@@ -336,10 +340,16 @@ class DrawSupportKernel:
         row = rg.to(Int64)
         row_ok = row < M
         row_c = _select(row_ok, row, M - 1)
-        # the source row: an index gather reads row indices[row] (the flag's dummy index tensor is read at 0 when the flag is off)
-        src = _select(flag_idx, mIdx[_select(flag_idx, row_c, Int64(0))], row_c)
-        src_ok = _select(flag_idx, (src >= 0) & (src < Msrc), row_ok)
-        src_c = _select(src_ok, src, Int64(0))
+        # the source row (an index gather reads row indices[row]): a COMPILE-TIME variant -- see the module header
+        src_ok = row_ok  # the gather branch overrides it; a value before the staged regions below (the DSL needs one)
+        if cutlass.const_expr(self.has_indices):
+            src = mIdx[row_c]
+            src_ok = (src >= 0) & (src < Msrc)
+            src_c = _select(src_ok, src, Int64(0))
+            tile_row = src_c.to(Int32)
+        else:
+            src_c = row_c
+            tile_row = rg
 
         # ---- shared memory: the staged share, the exchange buffers, the histograms ------------------------------
         smem = cutlass.utils.SmemAllocator()
@@ -406,27 +416,14 @@ class DrawSupportKernel:
         )
         pad = NEG_INF if self.from_logits else 0.0
         cta_base = c_rank * self.cfg.blocks_per_cta(self.N)
-        # the source row applied ONCE to the pointer (its element offset through the layout's row stride; the API aligns
-        # every row base and row stride to the vector, so the shifted base keeps the copy atoms' alignment) and the loader's
-        # tiles at row 0: a gathered tile row entering the loader as a loaded value cost 60-90 registers at 256 threads and
-        # spills at the 128-register cap of 512 threads (2026-11-18); with the shifted base every kernel is at its pre-fold count
-        mXr = cute.make_tensor(
-            cute.make_ptr(
-                mX.element_type,
-                (mX.iterator + cute.crd2idx((src_c, 0), mX.layout)).toint(),
-                cute.AddressSpace.gmem,
-                assumed_align=in_bits // 8,
-            ),
-            mX.layout,
-        )
         loader = _DrawLoader(
             self,
             self.plan_sum,
             coords,
-            mXr,
+            mX,
             idX,
             tiler_mn,
-            Int32(0),
+            tile_row,
             Msrc,
             N,
             thr_x,
@@ -882,13 +879,12 @@ def kernel_name(
     score: bool = False,
     count_list: Optional[bool] = None,
 ) -> str:
-    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, gather,
-    the two log-probabilities, pdl, the selection's placements, the score form)."""
-    # the temperature form, the index gather, the kept log-probability output and PDL are runtime arguments (FLAG_*,
-    # enable_pdl): not in the name
+    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, with / without the index gather,
+    the full-distribution log-probability, the selection's placements, the score form)."""
+    # the temperature form, the kept log-probability output and PDL are runtime arguments (FLAG_*, enable_pdl): not in the name
     return jit.sanitize_symbol_name(
         f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}"
-        f"{'_lp' if return_logprob else ''}"
+        f"{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
         f"{f'_ef{early_finish}' if early_finish else ''}"
         f"{'' if count_list is None else ('_cl1' if count_list else '_cl0')}"
     )
@@ -946,8 +942,8 @@ def _key(
     score=False,
     count_list=None,
 ):
-    """The compile key of the kernel serving ``N``; temp_rows / has_indices / enable_pdl / return_kept_logprob are runtime
-    arguments and leave it."""
+    """The compile key of the kernel serving ``N``; temp_rows / enable_pdl / return_kept_logprob are runtime arguments and
+    leave it, the index gather is a compile dimension."""
     from .schedule import padded_blocks
 
     return (
@@ -957,7 +953,7 @@ def _key(
         from_logits,
         filters,
         False,
-        False,
+        bool(has_indices),
         return_logprob,
         False,
         early_finish,

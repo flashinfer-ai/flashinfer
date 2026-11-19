@@ -699,10 +699,9 @@ def _spec(
 ):
     del (
         trow,
-        idx,
         pdl,
         lpk,
-    )  # runtime arguments of one kernel (FLAG_*, enable_pdl): not a compile dimension
+    )  # runtime arguments of one kernel (FLAG_*, enable_pdl): not a compile dimension; the gather is one
     return (
         ds,
         N,
@@ -710,7 +709,7 @@ def _spec(
         from_logits,
         _fset(SETS[fset]),
         False,
-        False,
+        idx,
         lp,
         False,
         ef,

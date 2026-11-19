@@ -228,7 +228,6 @@ def draw_support(
     other by the suite. ``out`` (int32), ``logprob_out`` and ``kept_logprob_out`` (fp32; each
     implies its ``return_*``) are caller-owned buffers of the output shape, written in place and returned as given."""
     from .draw_support_kernel import (
-        FLAG_INDICES,
         FLAG_KEPT_LOGPROB,
         FLAG_TEMP_ROWS,
         get_compiled_kernel,
@@ -390,7 +389,6 @@ def draw_support(
             Msrc,
             N,
             (FLAG_TEMP_ROWS if temp_t is not None else 0)
-            | (FLAG_INDICES if indices is not None else 0)
             | (FLAG_KEPT_LOGPROB if return_kept_logprob else 0),
             int(bool(enable_pdl)),
         )
