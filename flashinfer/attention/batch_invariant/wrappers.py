@@ -53,10 +53,26 @@ ATTENTION_ARCHS = ((10, 0), (10, 3), (10, 7))
 _MAX_PAGE = 128
 
 
-def _dtype(x) -> torch.dtype:
+#: The name of the family in a typed error raised before the KV cache format (hence the class) of a plan is known.
+FAMILY = "attention"
+
+
+def _dtype(x, name: str, cls: str) -> torch.dtype:
+    """A ``plan()`` dtype argument (a ``torch.dtype``, a torch dtype name, or None for bf16); anything that does not name a torch
+    dtype raises the typed error of ``cls``."""
     from ...utils import canonicalize_torch_dtype
 
-    return canonicalize_torch_dtype(x) if x is not None else torch.bfloat16
+    if x is None:
+        return torch.bfloat16
+    try:
+        dt = canonicalize_torch_dtype(x)
+    except (AttributeError, TypeError):
+        dt = None
+    if not isinstance(dt, torch.dtype):
+        raise unsupported(
+            cls, f"{name} {x!r}", "a torch.dtype or the name of one (e.g. torch.uint8)"
+        )
+    return dt
 
 
 class BatchInvariantAttention:
@@ -162,6 +178,12 @@ class BatchInvariantAttention:
                 self._PLAN_ARGS_OUTSIDE_THE_CLASS.get(name, "the class's own inputs"),
             )
 
+    def check_dtype_args(self, **dtypes) -> None:
+        """The wrappers call this with their ``plan()`` dtype arguments (``name=value``) before they canonicalize them: a value that
+        names no torch dtype (a string such as ``"nvfp4"``) raises the typed error instead of the lookup's ``AttributeError``."""
+        for name, value in dtypes.items():
+            _dtype(value, name, FAMILY)
+
     def workspace_bytes(
         self,
         qo_indptr: Optional[torch.Tensor],
@@ -263,20 +285,11 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"a GQA group of {g}", "at most 128 query heads per KV head"
             )
-        for name, dt in (
-            ("q_data_type", q_data_type),
-            ("o_data_type", o_data_type),
-        ):
-            if _dtype(dt) != torch.bfloat16:
-                raise unsupported(
-                    CLASS,
-                    f"{name} {_dtype(dt)}",
-                    "bf16 queries and output (the KV cache may be bf16, float8_e4m3fn or float8_e5m2)",
-                )
-        kv_dtype = _dtype(kv_data_type)
+        # the KV cache format selects the class; until it is known the typed errors name the family
+        kv_dtype = _dtype(kv_data_type, "kv_data_type", FAMILY)
         if kv_dtype not in KV_DTYPES:
             raise unsupported(
-                CLASS,
+                FAMILY,
                 f"kv_data_type {kv_dtype}",
                 "a bf16, float8_e4m3fn, float8_e5m2 or uint8 (packed NVFP4) KV cache",
             )
@@ -284,6 +297,16 @@ class BatchInvariantAttention:
         if kv_fmt == "nvfp4":
             kv_dtype = torch.uint8  # the packed cache's storage dtype (a float4_e2m1fn_x2 cache is viewed as its bytes)
         cls = _class_name(kv_fmt)
+        for name, dt in (
+            ("q_data_type", q_data_type),
+            ("o_data_type", o_data_type),
+        ):
+            if _dtype(dt, name, cls) != torch.bfloat16:
+                raise unsupported(
+                    cls,
+                    f"{name} {_dtype(dt, name, cls)}",
+                    "bf16 queries and output (the KV cache may be bf16, float8_e4m3fn, float8_e5m2 or packed NVFP4)",
+                )
         if self.kind == "ragged":
             page_size = 1
         if page_size < 1 or page_size > _MAX_PAGE or page_size & (page_size - 1):

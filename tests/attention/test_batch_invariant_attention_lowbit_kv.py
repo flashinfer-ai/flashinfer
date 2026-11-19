@@ -1363,3 +1363,56 @@ def test_scale_constants_outside_binary32_are_refused():
             engine.check_v_scale(v)
     assert engine.check_v_scale(-1.5) == -1.5  # a signed scale is an input of the chain
     assert engine.check_v_scale(0.1) == spec.to_f32(0.1)
+
+
+# ------------------------------------------------------------------------------------------------------ plan dtype arguments
+@needs_device
+def test_dtype_arguments_raise_the_typed_error_and_name_the_planned_class():
+    """A ``kv_data_type`` that names no torch dtype (``"nvfp4"``) raises the typed error, not the lookup's ``AttributeError``; the
+    refusal of a query dtype names the class the KV dtype plans, and the family while the KV dtype itself is not one of them."""
+    lp = problem([64], [700], 32, 8, 128, 16, 10, E4)
+    pr = lp.pr
+    ws = workspace(pr.device)
+    paged = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+
+    def plans():
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        yield lambda **kw: w.plan(*paged, causal=True, **kw)
+        d = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        yield lambda **kw: d.plan(*paged[1:], **kw)
+        r = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        yield lambda **kw: r.plan(
+            pr.qo_indptr, pr.kv_indptr_rag, 32, 8, 128, causal=True, **kw
+        )
+
+    for plan in plans():
+        for bad in ("nvfp4", "fp8", "nn"):
+            with pytest.raises(bi.BatchInvariantUnsupportedError, match="kv_data_type"):
+                plan(q_data_type=torch.bfloat16, kv_data_type=bad)
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="q_data_type"):
+            plan(q_data_type="bf16", kv_data_type=E4)
+        for kv, cls in (
+            (E4, "attention.e4m3kv"),
+            (E5, "attention.e5m2kv"),
+            (torch.uint8, "attention.nvfp4kv"),
+            (torch.bfloat16, "attention.bf16"),
+        ):
+            with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+                plan(q_data_type=E4, kv_data_type=kv)
+            assert f"`{cls}`" in str(e.value) and "q_data_type" in str(e.value)
+        with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+            plan(q_data_type=torch.bfloat16, kv_data_type=torch.float16)
+        assert "`attention`" in str(e.value) and "attention.bf16" not in str(e.value)
+    # dtype names are still dtypes
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
+    w.plan(*paged, causal=True, q_data_type="bfloat16", kv_data_type="float8_e4m3fn")
+    assert torch.equal(
+        bits(w.run(pr.q, lp.cache("NHD"), k_scale=lp.k_scale, v_scale=lp.v_scale)),
+        bits(run_paged_prefill(lp)),
+    )
