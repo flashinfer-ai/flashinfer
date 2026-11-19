@@ -383,6 +383,55 @@ def red_add_release_sys_s32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -
 
 
 @dsl_user_op
+def multimem_red_add_release_sys_s32_raw(
+    mc_addr: Int64, val: Int32, *, loc=None, ip=None
+) -> None:
+    """``multimem.red.release.sys.global.add.s32 [mc], val`` (NVSwitch / NVLS).
+
+    One in-network reduction fanned by the NVSwitch to EVERY rank's copy bound
+    to the multicast address ``mc`` -- the single-instruction replacement for the
+    ``lane < world_size`` loop of unicast ``red.release.sys.global.add.s32`` in
+    ``nvlink_barrier``. Requires a multicast (NVLS) mapping of the signal region
+    and an NVSwitch domain (Blackwell NVL). Signed add so the sense-reversing
+    ``signal_delta`` (+1 up to world_size, -1 back to 0) carries unchanged.
+    """
+    llvm.inline_asm(
+        None,
+        [mc_addr.ir_value(), val.ir_value()],
+        "multimem.red.release.sys.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def fence_proxy_alias(*, loc=None, ip=None) -> None:
+    """``fence.proxy.alias;`` -- order a multimem write before a unicast read of
+    the same (aliased) location.
+
+    ``multimem.red`` reaches a copy of the signal through the multicast proxy,
+    while the acquire-poll in ``nvlink_barrier`` reads that same copy through the
+    generic (unicast) proxy. PTX treats the two proxies as distinct, so release
+    ordering and ``bar``/``sync_warp`` do NOT make the multicast update visible
+    to the unicast load. ``fence.proxy.alias`` is the documented fence for this
+    multicast-store / unicast-load alias (CUDA C Programming Guide, multimem).
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.alias;",
+        "",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_f32(address, value: Float32, *, loc=None, ip=None) -> None:
     """System-scope relaxed reduction add for a remote float32 destination."""
     llvm.inline_asm(
