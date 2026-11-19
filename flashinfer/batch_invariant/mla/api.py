@@ -6,16 +6,13 @@ the classes do not take."""
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
 from ..support import unsupported
 from . import engine, spec
-from .engine import clear_plans  # noqa: F401
-
-#: Full-width list lengths per (device, rows, top_k). Never evicted: a captured CUDA graph reads them.
-_full: Dict[tuple, torch.Tensor] = {}
+from .engine import _plans, clear_plans  # noqa: F401
 
 
 _STABLE_API = "trtllm_batch_decode_with_kv_cache_mla"
@@ -29,8 +26,7 @@ def _family_name(q_dtype, qk_rope_head_dim) -> str:
 
 
 _BEFORE_CAPTURE = f"{_STABLE_API}(batch_invariant=True): run one call of this shape before CUDA graph capture"
-#: Arguments of the stable function the classes do not take, in the order its ``refused`` tuple carries their values,
-#: and the values that mean "not used".
+#: Stable-function arguments the classes refuse, in ``refused`` tuple order; ``_NOT_REFUSED`` holds their unused values.
 REFUSED = (
     "sinks",
     "skip_softmax_threshold_scale_factor",
@@ -45,7 +41,6 @@ REFUSED = (
     "kv_scale_format",
 )
 _NOT_REFUSED = (None, None, False, 1, 0, None, None, None, True, "auto", "auto")
-_DEFAULT_LIMIT = "the class's own inputs"
 _LIMITS = {
     "sinks": "no attention sinks",
     "skip_softmax_threshold_scale_factor": "standard attention",
@@ -86,18 +81,25 @@ def sparse_mla_batch_invariant(
     ``block_tables`` holds each token's selected storage rows (``page * page_size + offset``), live entries first and
     ``-1`` after them; ``sparse_mla_top_k_lens`` gives the live counts and defaults to the full width (a ``-1`` tail is
     masked and gives the same bits as the shorter live count). ``bmm1_scale`` and ``bmm2_scale`` are the softmax and
-    output scales. ``seq_lens`` and ``max_seq_len`` are not read: a row sees its list and nothing else. ``refused``
-    holds the values of the arguments named in :data:`REFUSED`."""
+    output scales. ``seq_lens``, ``max_seq_len``, ``workspace_buffer``, ``qk_nope_head_dim``, ``is_var_seq``,
+    ``enable_pdl`` and ``max_q_len`` are not read: a row sees its list and nothing else, and ``cum_seq_lens_q`` only
+    marks a ``[total_q, heads, head_dim]`` query. ``refused`` holds the values of the arguments named in
+    :data:`REFUSED`."""
 
-    if (
-        backend != "auto"
-        or type(sparse_mla_top_k) is not int
-        or sparse_mla_top_k <= 0
-        or kv_lora_rank != spec.LATENT_DIM
-        or refused != _NOT_REFUSED
-        or bmm1_scale is None
-        or bmm2_scale is None
-    ):
+    try:
+        plain = (
+            backend == "auto"
+            and type(sparse_mla_top_k) is int
+            and sparse_mla_top_k > 0
+            and kv_lora_rank == spec.LATENT_DIM
+            and refused == _NOT_REFUSED
+            and bmm1_scale is not None
+            and bmm2_scale is not None
+            and (return_lse_base is None or return_lse_base == "basee")
+        )
+    except RuntimeError:  # a tensor in a slot that takes none
+        plain = False
+    if not plain:
         error = _refusal(
             _family_name(query.dtype, qk_rope_head_dim),
             backend,
@@ -106,6 +108,7 @@ def sparse_mla_batch_invariant(
             refused,
             bmm1_scale,
             bmm2_scale,
+            return_lse_base,
         )
         if error is not None:
             raise error
@@ -130,13 +133,15 @@ def sparse_mla_batch_invariant(
         )
     heads = shape[-2]
     device = query.device
-    plan = engine.planned(
-        device,
-        heads,
-        query.dtype,
-        qk_rope_head_dim,
-        isinstance(bmm1_scale, torch.Tensor),
-        isinstance(bmm2_scale, torch.Tensor),
+    plan = _plans.get(
+        (
+            device,
+            heads,
+            query.dtype,
+            qk_rope_head_dim,
+            isinstance(bmm1_scale, torch.Tensor),
+            isinstance(bmm2_scale, torch.Tensor),
+        )
     )
     if plan is None:
         if torch.cuda.is_current_stream_capturing():
@@ -170,14 +175,7 @@ def sparse_mla_batch_invariant(
             plan.class_name, "a KV cache with several KV heads", "one KV head"
         )
     if sparse_mla_top_k_lens is None:
-        lengths = _full.get((device, rows, sparse_mla_top_k))
-        if lengths is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(_BEFORE_CAPTURE)
-            lengths = torch.full(
-                (rows,), sparse_mla_top_k, dtype=torch.int32, device=device
-            )
-            _full[(device, rows, sparse_mla_top_k)] = lengths
+        lengths = engine.full_lengths(device, rows, sparse_mla_top_k)
     elif sparse_mla_top_k_lens.ndim == 1:
         lengths = sparse_mla_top_k_lens
     else:
@@ -191,12 +189,6 @@ def sparse_mla_batch_invariant(
     if out is None:
         out = torch.empty(
             (*shape[:-1], spec.LATENT_DIM), dtype=torch.bfloat16, device=device
-        )
-    elif out.shape[:-1] != shape[:-1]:
-        raise unsupported(
-            plan.class_name,
-            f"out of shape {tuple(out.shape)}",
-            f"bf16 {(*shape[:-1], spec.LATENT_DIM)}",
         )
     if want_lse and lse is None:
         lse = torch.empty((rows, heads), dtype=torch.float32, device=device)
@@ -214,7 +206,9 @@ def sparse_mla_batch_invariant(
     return (out, lse) if return_lse else out
 
 
-def _refusal(name, backend, top_k, kv_lora_rank, refused, bmm1_scale, bmm2_scale):
+def _refusal(
+    name, backend, top_k, kv_lora_rank, refused, bmm1_scale, bmm2_scale, lse_base
+):
     if backend != "auto":
         return unsupported(
             name,
@@ -235,13 +229,15 @@ def _refusal(name, backend, top_k, kv_lora_rank, refused, bmm1_scale, bmm2_scale
         else:
             used = value != default
         if used:
-            return unsupported(
-                name, f"{arg}={value!r}", _LIMITS.get(arg, _DEFAULT_LIMIT)
-            )
+            return unsupported(name, f"{arg}={value!r}", _LIMITS[arg])
     if bmm1_scale is None or bmm2_scale is None:
         return unsupported(
             name,
             f"bmm1_scale={bmm1_scale!r}, bmm2_scale={bmm2_scale!r}",
             "explicit softmax and output scales",
+        )
+    if lse_base not in (None, "basee", "base2"):
+        return unsupported(
+            name, f"return_lse_base={lse_base!r}", '"basee" (natural-log LSE)'
         )
     return None

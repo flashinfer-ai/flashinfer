@@ -15,8 +15,9 @@
 """Kernel sources of the batch-invariant sparse MLA classes ``mla.sparse.<dtype>.d<576|512>``.
 
 A frozen copy of the part of ``flashinfer/attention/prims_ts/kernels`` (commit ``25bc267eb84dd1b28997f62aa4c282a09184c952``) that the classes' pinned
-schedule reaches: the two-CTA sparse MLA decode kernel and the helpers it names. Functions, classes and constants
-were kept whole or left out; no function body was edited. The classes own these files: a change to the ``prims_ts``
-kernels or to their schedule policy does not reach them, and an edit here changes the class fingerprint
-(``flashinfer.batch_invariant.mla.spec``) and must reproduce the recorded digests (``cases.py``).
+build runs: the two-CTA sparse MLA decode kernel and what its executed functions name. A function, class or constant
+was kept whole or left out, and no function body was edited, so branches the classes never take remain as source.
+The classes own these files: a change to the ``prims_ts`` kernels or to their schedule policy does not reach them,
+and an edit here changes the class fingerprint (``flashinfer.batch_invariant.mla.spec``) and must reproduce the
+recorded digests (``cases.py``).
 """

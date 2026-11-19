@@ -20,8 +20,6 @@ import flashinfer.batch_invariant as bi
 from flashinfer.batch_invariant.mla import cases, lean_cases, spec
 from flashinfer.batch_invariant.mla.classes import OPERATORS
 
-warnings.filterwarnings("ignore", message=".*experimental.*")
-
 NIGHTLY = os.environ.get("FLASHINFER_MLA_BI_NIGHTLY", "0") == "1"
 needs_device = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -35,8 +33,7 @@ needs_lake = pytest.mark.skipif(
 
 SCALE = cases.SOFTMAX_SCALE
 TOPK = 2048
-#: (dtype, head_dim, heads): GLM-5.3 (576 RoPE rows, 64 heads and the 8-head TP 8 rank) and GLM-5.3-Flash (512 NoPE
-#: rows, 16 heads per TP 4 rank).
+#: (dtype, head_dim, heads): GLM-5.3 RoPE rows at 64 and 8 heads, GLM-5.3-Flash NoPE rows at 16 heads.
 CONFIGS = [
     ("e4m3", 576, 64),
     ("e4m3", 576, 8),
@@ -57,11 +54,9 @@ if NIGHTLY:
 config = pytest.mark.parametrize(
     "cfg", CONFIGS, ids=lambda c: f"{c[0]}-d{c[1]}-h{c[2]}"
 )
-#: The requests of the shared pool: (seed, tokens). Request 0 is long, 1 is shorter than one tile, 2 ends inside the
-#: selected width, 3 holds exactly top-k tokens plus the Flash tail.
+#: Requests of the shared pool, (seed, tokens): long, under one tile, inside the width, top-k plus the Flash tail.
 REQUESTS = [(11, 6000), (12, 150), (13, 1500), (14, 2051), (15, 3000), (16, 40)]
-#: Target rows: (request, visible tokens). Lists of 1, 2, 127, 128, 129 and 300 keys, full lists, and a row deep in
-#: the prompt.
+#: Target rows, (request, visible tokens): lists of 1 to 300 keys around the tile edge, full lists, a deep row.
 TARGETS = [
     (1, 1),
     (1, 2),
@@ -122,7 +117,7 @@ class Planned:
         return got[0].view(*prefix, heads, 512), got[1].view(*prefix, heads)
 
 
-def make_wrapper(cfg, rows=None, width=TOPK, **plan):
+def make_wrapper(cfg, **plan):
     return Planned(cfg, **plan)
 
 
@@ -131,17 +126,19 @@ def default_wrapper(cfg, rows, width=TOPK):
     from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
 
     dtype, head_dim, heads = cfg
-    wrapper = BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(
-        torch.device("cuda"),
-        rows,
-        heads,
-        max_topk=width,
-        q_dtype=cases.torch_dtype(dtype),
-        qk_rope_head_dim=head_dim - 512,
-        softmax_scale=SCALE,
-        return_lse=True,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wrapper = BatchSparseMLADecodePagedTSWrapper()
+        wrapper.plan(
+            torch.device("cuda"),
+            rows,
+            heads,
+            max_topk=width,
+            q_dtype=cases.torch_dtype(dtype),
+            qk_rope_head_dim=head_dim - 512,
+            softmax_scale=SCALE,
+            return_lse=True,
+        )
     return wrapper
 
 
@@ -508,8 +505,9 @@ def test_one_plan_serves_every_row_count_and_width():
 
 @needs_device
 def test_default_schedule_is_not_batch_invariant():
-    """Negative control: on the default ``prims_ts`` schedule the same comparison fails, so the invariance tests can
-    fail."""
+    """Negative control: on today's default ``prims_ts`` schedule the same comparison fails, so the invariance tests
+    can fail. The classes do not depend on that schedule: if it stops differing, this control has nothing to show."""
+    pytest.importorskip("flashinfer.attention.prims_ts")
     cfg = ("e4m3", 576, 64)
     _, head_dim, heads = cfg
     pool, targets, _ = shared(cfg)
@@ -517,14 +515,85 @@ def test_default_schedule_is_not_batch_invariant():
 
     def default(rows):
         n = len(rows)
-        out, _ = default_wrapper(cfg, n).run(
-            rows.q.view(n, 1, heads, head_dim), pool.kv, rows.indices, rows.lengths
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out, _ = default_wrapper(cfg, n).run(
+                rows.q.view(n, 1, heads, head_dim), pool.kv, rows.indices, rows.lengths
+            )
         return out.view(n, heads, 512)
 
     alone = [default(full.take([i])) for i in range(2)]
     batch = join(full, mates(cfg, pool, 62, "long"))
-    assert not same_bits(default(batch)[:2], torch.cat(alone))
+    if same_bits(default(batch)[:2], torch.cat(alone)):
+        pytest.skip("the default prims_ts schedule gave batch-independent bits here")
+    flagged = run_batch(batch)[0][:2]
+    assert same_bits(
+        flagged, torch.cat([run_batch(full.take([i]))[0] for i in range(2)])
+    )
+
+
+@needs_device
+def test_buffers_do_not_grow_with_the_number_of_row_counts():
+    """Every row count of a prefill reuses a few kept buffers; ``clear_plans`` drops plans and buffers."""
+    from flashinfer.batch_invariant import mla
+    from flashinfer.batch_invariant.mla import engine
+
+    cfg = CONFIGS[2]
+    pool, targets, (ref_out, _) = shared(cfg)
+    one = targets.take([3])
+    stable(one)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    for n in range(1, 61):
+        rows = targets.take([3] * n)
+        out = stable(rows)
+        assert same_bits(out.view(n, cfg[2], 512)[-1:], ref_out[3:4])
+        del out, rows
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() - before < 64 * 1024
+    plan = make_wrapper(cfg).plan
+    assert len(plan._rows.backing) == 1 and plan._rows.capacity == 64
+    mla.clear_plans()
+    assert not engine._plans and not engine._full and not engine._full_views
+    assert same_bits(stable(one).view(1, cfg[2], 512), ref_out[3:4])
+
+
+@needs_device
+def test_inputs_at_storage_offsets_and_strided_lists():
+    cfg = CONFIGS[1]
+    _, head_dim, heads = cfg
+    pool, targets, (ref_out, ref_lse) = shared(cfg)
+    rows = targets.take(range(4))
+    plan = make_wrapper(cfg).plan
+    flat = pool.kv.view(-1, head_dim)
+    q = torch.zeros(6, heads, head_dim, dtype=rows.q.dtype, device="cuda")
+    q[2:] = rows.q
+    wide = torch.full((4, TOPK + 8), -1, dtype=torch.int32, device="cuda")
+    wide[:, 4 : 4 + TOPK] = rows.indices
+    out = torch.zeros(7, heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros(4 + 4, heads, dtype=torch.float32, device="cuda")
+    shift = 16 // heads if heads <= 16 else 1
+    got = plan.run(
+        q[2:],
+        flat,
+        wide[:, 4 : 4 + TOPK],
+        rows.lengths,
+        out=out[3:],
+        lse=lse[4:] if (4 * heads * 4) % 16 == 0 else lse[:4],
+        return_lse=True,
+    )
+    assert (
+        shift >= 1 and same_bits(got[0], ref_out[:4]) and same_bits(got[1], ref_lse[:4])
+    )
+    assert not out[:3].float().any()
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="lse"):
+        plan.run(
+            rows.q,
+            flat,
+            rows.indices,
+            rows.lengths,
+            lse=torch.zeros(heads, 4, dtype=torch.float32, device="cuda"),
+        )
 
 
 @needs_device
@@ -562,7 +631,16 @@ def test_reruns_and_replans_repeat(cfg):
     for _ in range(3):
         again = run_batch(batch, wrapper)
         assert same_bits(again[0], first[0]) and same_bits(again[1], first[1])
-    replanned = run_batch(batch)
+    from flashinfer.batch_invariant.mla import engine
+
+    dtype, head_dim, _ = cfg
+    old = wrapper.plan
+    rebuilt = engine.SparseMLAPlan(
+        old.device, old.num_qo_heads, old.q_dtype, head_dim - 512, SCALE, 1.0
+    )
+    assert rebuilt._compiled is not old._compiled
+    wrapper.plan = rebuilt
+    replanned = run_batch(batch, wrapper)
     assert same_bits(replanned[0], first[0]) and same_bits(replanned[1], first[1])
     assert same_bits(first[0][: len(targets)], ref_out)
     assert same_bits(first[1][: len(targets)], ref_lse)
@@ -988,6 +1066,13 @@ def test_stable_function_refuses_inputs_outside_the_class(monkeypatch):
             "out of shape",
         ),
         (dict(block_tables=rows.indices.view(2, 1, TOPK)[:, :, :1024]), "block_tables"),
+        (dict(return_lse_base="bogus"), "return_lse_base"),
+        (dict(cp_world=torch.tensor([1, 2], device="cuda")), "cp_world"),
+        (dict(bmm1_scale=10**400), "bmm1_scale"),
+        (
+            dict(lse=torch.zeros(cfg[2], 2, device="cuda"), return_lse_base="basee"),
+            "lse",
+        ),
     ]
     for kw, fragment in refused:
         with pytest.raises(bi.BatchInvariantUnsupportedError, match=fragment):
@@ -1001,6 +1086,10 @@ def test_stable_function_refuses_inputs_outside_the_class(monkeypatch):
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="hole"):
         stable(holes, sparse_mla_top_k_lens=holes.lengths)
+    far = targets.take([5, 6])
+    far.indices[0, 3] = rows.pool.kv.shape[0] * rows.pool.kv.shape[1]
+    with pytest.raises(ValueError, match="outside the cache"):
+        stable(far, sparse_mla_top_k_lens=far.lengths)
     monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS")
 
     _, head_dim, heads = cfg

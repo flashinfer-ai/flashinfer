@@ -35,10 +35,8 @@ QUERY_TILE = 128
 #: CTAs that serve one query row (one cluster).
 CTAS_PER_ROW = 2
 SPLIT_KV = 1
-HEAD_DIM_CTAS = 1
 
-#: Loader settings per Q / KV dtype (issue warps of the list gather, KV pipeline depth; 0 keeps the kernel's own
-#: depth). They move no arithmetic. The schedule itself is fixed in :func:`.engine.build_kernel`.
+#: Loader settings per Q / KV dtype (list-gather issue warps, KV pipeline depth); they move no arithmetic.
 PROFILES: Dict[str, Dict[str, int]] = {
     "e4m3": dict(gather_issue_warps=1),
     "bf16": dict(gather_issue_warps=8, kv_pipeline_stages=7),
@@ -59,12 +57,18 @@ KERNEL_STATE: Dict[str, object] = dict(
     output_quant=None,
     kv_cache_format="native",
     extra_kv_cache_format="native",
+    lse_base_on_e=False,
+    use_kv_bounds=False,
+    zero_empty_rows=False,
+    sparse_uniform_pages=False,
+    sparse_balanced_registers=False,
+    direct_sparse_capacities=(1, 0),
 )
 
 #: The ``prims_ts`` commit the kernel copy was taken from.
 KERNEL_BASE = "25bc267eb84dd1b28997f62aa4c282a09184c952"
 #: sha256 over the kernel copy (:func:`source_digest`); a device-free test pins it, so an edit is a decision.
-KERNEL_DIGEST = "6fea009cc0482fd3ab05e816f5440c2db61ef9095a11d611ad29141583ee36ff"
+KERNEL_DIGEST = "52ed2727e4dedf29e7843620fc827e0d4385ad4e035f952ee670ff5da0906932"
 
 
 def dtype_name(dtype) -> str:

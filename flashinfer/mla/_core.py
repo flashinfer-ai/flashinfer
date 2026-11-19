@@ -908,6 +908,54 @@ def _normalize_dsv4_topk_lens(
 _sparse_mla_batch_invariant = None
 
 
+def _mla_batch_invariant(
+    query,
+    kv_cache,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    block_tables,
+    sparse_mla_top_k,
+    out,
+    bmm1_scale,
+    bmm2_scale,
+    backend,
+    lse,
+    return_lse,
+    return_lse_base,
+    cum_seq_lens_q,
+    sparse_mla_top_k_lens,
+    batch_invariant,
+    refused,
+):
+    """``batch_invariant=True`` on the MLA functions: the sparse MLA classes of ``flashinfer.batch_invariant.mla``."""
+    if batch_invariant is not True:
+        raise TypeError("batch_invariant must be bool")
+    global _sparse_mla_batch_invariant
+    if _sparse_mla_batch_invariant is None:
+        from ..batch_invariant.mla.api import sparse_mla_batch_invariant
+
+        _sparse_mla_batch_invariant = sparse_mla_batch_invariant
+    return _sparse_mla_batch_invariant(
+        query,
+        kv_cache,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        sparse_mla_top_k,
+        out,
+        bmm1_scale,
+        bmm2_scale,
+        backend,
+        lse,
+        return_lse,
+        return_lse_base,
+        cum_seq_lens_q,
+        sparse_mla_top_k_lens,
+        _validate_dsv4_sync_checks(query.device),
+        refused,
+    )
+
+
 def _validate_dsv4_sync_checks(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
         return False
@@ -3811,7 +3859,10 @@ def _mla_with_kv_cache_impl(
         (``page * page_size + offset``) of each query token in list order,
         live entries before any ``-1``; ``sparse_mla_top_k_lens`` is accepted
         for both layouts and defaults to the full width; ``seq_lens``,
-        ``max_seq_len`` and ``workspace_buffer`` are not read. Contiguous
+        ``max_seq_len``, ``workspace_buffer``, ``qk_nope_head_dim``,
+        ``is_var_seq``, ``enable_pdl`` and ``max_q_len`` are not read, and
+        ``cum_seq_lens_q`` only marks a ``[total_q, heads, head_dim]`` query
+        (every query token is its own row). Contiguous
         16-byte-aligned BF16 or E4M3 query and KV cache of width 576 or 512,
         any list width, 1 to 128 heads. LSE output is natural-log and needs
         ``return_lse_base="basee"``. Any other backend, architecture or input
@@ -3825,29 +3876,54 @@ def _mla_with_kv_cache_impl(
         ``FLASHINFER_VALIDATE_INPUTS=1`` to check the list contract on the
         host (synchronizes). Callers that plan once can use
         ``flashinfer.batch_invariant.mla.plan`` directly.
+
+    Note
+    ----
+    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
+    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
+    bmm2_scale = v_scale * o_scale
+    or,
+    bmm1_scale = torch.Tensor([q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5))
+    bmm2_scale = torch.Tensor([v_scale * o_scale])
+
+    The two scale factors should be static constant for cuda graph capture.
+    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
+
+    For static constant scale factors, the scale factors should be provided as float.
+        - (bmm1_scale, bmm2_scale)
+    For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
+        - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
+        - Currently, only fp8 tensor core operation supports this mode.
+    When both are provided, the dynamic scale factor tensors will be used.
+
+    Autotune
+    --------
+    On SM100/SM103/SM107 dense MLA, calling under ``flashinfer.autotune(True)`` with
+    ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` when DCP
+    is disabled. DCP profiles only its required monolithic CuTeDSL runner.
+    Both modes use a bucketed batch sweep up to each runner's kernel/workspace
+    cap and cache the winning tactic per shape signature. Subsequent calls under
+    ``autotune(False)`` use the cached choice; any batch outside the tuned range
+    falls back to the runner's default tactic with a one-time warning.
+    Uniform explicit CuTeDSL requests use the same tuner with one candidate.
+    Explicit TRTLLM-GEN requests enter the tuner only during tuning; inference
+    directly executes its sole tactic. Compact variable-Q requests select an eligible backend directly
+    and do not enter the autotuner. The internal ``autotune`` execution route
+    does not introduce a public functional ``backend="autotune"`` option.
+
+    The autotune bucket range and cache key do **not** depend on
+    ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
+    pool between tuning and inference does not invalidate cached choices. However,
+    the **page-aliasing ratio** during profiling does depend on the pool size:
+    synthetic ``block_tables`` are filled by uniform random sampling into
+    ``[0, kv_cache.shape[0])``, so a small pool produces high aliasing
+    (L2-resident reads) and a large pool produces low aliasing (HBM-bound reads).
+    For best profile fidelity, autotune with a ``kv_cache`` whose size reflects
+    the production page-sharing pattern of your workload (e.g., heavily shared
+    prefix → smaller pool; independent contexts → larger pool).
     """
     if batch_invariant:
-        if batch_invariant is not True:
-            raise TypeError("batch_invariant must be bool")
-        global _sparse_mla_batch_invariant
-        if _sparse_mla_batch_invariant is None:
-            from ..batch_invariant.mla.api import sparse_mla_batch_invariant
-
-            _sparse_mla_batch_invariant = sparse_mla_batch_invariant
-        refused = (
-            sinks,
-            skip_softmax_threshold_scale_factor,
-            enable_dcp,
-            cp_world,
-            cp_rank,
-            causal_seqlens_kv_global,
-            use_fp16_softmax,
-            multi_ctas_kv_counter_buffer,
-            uses_shared_paged_kv_idx,
-            cute_dsl_impl,
-            kv_scale_format,
-        )
-        return _sparse_mla_batch_invariant(
+        return _mla_batch_invariant(
             query,
             kv_cache,
             kv_lora_rank,
@@ -3863,8 +3939,20 @@ def _mla_with_kv_cache_impl(
             return_lse_base,
             cum_seq_lens_q,
             sparse_mla_top_k_lens,
-            _validate_dsv4_sync_checks(query.device),
-            refused,
+            batch_invariant,
+            (
+                sinks,
+                skip_softmax_threshold_scale_factor,
+                enable_dcp,
+                cp_world,
+                cp_rank,
+                causal_seqlens_kv_global,
+                use_fp16_softmax,
+                multi_ctas_kv_counter_buffer,
+                uses_shared_paged_kv_idx,
+                cute_dsl_impl,
+                kv_scale_format,
+            ),
         )
     # Shared argument validation. Packed sparse inputs keep their own contract.
     if return_lse_base is not None and (

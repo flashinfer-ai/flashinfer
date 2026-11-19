@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from typing import Dict, Optional, Union
 
 import torch
@@ -26,11 +27,87 @@ _MIN_SCALE, _MAX_SCALE = 1e-45, 3.4028234663852886e38
 
 #: Plans per compiled shape. Never evicted: a captured CUDA graph reads its plan's buffers.
 _plans: Dict[tuple, "SparseMLAPlan"] = {}
+#: Full-width list lengths: backing tensors per (device, top_k) and their views per row count.
+_full: Dict[tuple, tuple] = {}
+_full_views: Dict[tuple, torch.Tensor] = {}
+_lock = threading.Lock()
 
 
 def clear_plans() -> None:
-    """Drop every cached plan. CUDA graphs captured through one must not be replayed afterwards."""
-    _plans.clear()
+    """Drop every cached plan and buffer. CUDA graphs captured through one must not be replayed afterwards."""
+    with _lock:
+        _plans.clear()
+        _full.clear()
+        _full_views.clear()
+
+
+def _capacity(rows: int) -> int:
+    return max(64, 1 << (rows - 1).bit_length())
+
+
+def _not_capturing(what: str) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{what}: run one call of this shape before CUDA graph capture"
+        )
+
+
+def full_lengths(device, rows: int, top_k: int) -> torch.Tensor:
+    """``[rows]`` int32 lengths equal to ``top_k``: a view of a kept buffer, so no row count allocates twice."""
+    view = _full_views.get((device, rows, top_k))
+    if view is None:
+        _not_capturing(spec.FAMILY)
+        with _lock:
+            capacity, backing = _full.get((device, top_k), (0, None))
+            if rows > capacity:
+                capacity = _capacity(rows)
+                backing = torch.full(
+                    (capacity,), top_k, dtype=torch.int32, device=device
+                )
+                # Earlier backings stay alive through the views that captured graphs hold.
+                _full[(device, top_k)] = (capacity, backing)
+            view = _full_views.setdefault((device, rows, top_k), backing[:rows])
+    return view
+
+
+class _RowBuffers:
+    """Per row count: the unused second list, its zero lengths and the LSE scratch, as views of kept buffers."""
+
+    def __init__(self, device, heads: int, name: str):
+        self.device, self.heads, self.name = device, heads, name
+        self.views: Dict[int, tuple] = {}
+        self.capacity = 0
+        self.backing: list = []
+
+    def get(self, rows: int) -> tuple:
+        found = self.views.get(rows)
+        if found is None:
+            _not_capturing(self.name)
+            with _lock:
+                if rows > self.capacity:
+                    capacity, dev = _capacity(rows), self.device
+                    self.backing.append(
+                        (
+                            torch.zeros((capacity, 1), device=dev, dtype=torch.int32),
+                            torch.zeros((capacity,), device=dev, dtype=torch.int32),
+                            torch.empty(
+                                (capacity, 1, self.heads),
+                                device=dev,
+                                dtype=torch.float32,
+                            ),
+                        )
+                    )
+                    self.capacity = capacity
+                no_list, no_lengths, scratch = self.backing[-1]
+                found = self.views.setdefault(
+                    rows,
+                    (
+                        _ffi(no_list[:rows]),
+                        _ffi(no_lengths[:rows]),
+                        _ffi(scratch[:rows].permute(2, 1, 0)),
+                    ),
+                )
+        return found
 
 
 def _stable(value) -> object:
@@ -229,7 +306,8 @@ def _compile(kernel, device, num_qo_heads, q_dtype, rope_dim, scale_is_tensor):
             _JIT_MODULE,
             f"sm{major}{minor}_{key}",
             compile_kernel,
-            extra_key_files=[os.path.join(root, f) for f in spec.term_source_files()],
+            extra_key_files=[os.path.join(root, f) for f in spec.term_source_files()]
+            + [os.path.abspath(__file__), os.path.abspath(spec.__file__)],
         )
 
 
@@ -262,28 +340,7 @@ class SparseMLAPlan:
             (1, 1, self.query_dim), device=device, dtype=q_dtype
         ).permute(1, 2, 0)
         self._sinks, self._extra = _ffi(sinks), _ffi(extra)
-        #: Per row count: the unused second list, its zero lengths and the LSE scratch. Never freed (CUDA graphs).
-        self._rows: Dict[int, tuple] = {}
-
-    def _row_buffers(self, rows: int) -> tuple:
-        buffers = self._rows.get(rows)
-        if buffers is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"{self.class_name}: run one call of {rows} rows before CUDA graph capture"
-                )
-            dev = self.device
-            buffers = (
-                _ffi(torch.zeros((rows, 1), device=dev, dtype=torch.int32)),
-                _ffi(torch.zeros((rows,), device=dev, dtype=torch.int32)),
-                _ffi(
-                    torch.empty(
-                        (rows, 1, self.num_qo_heads), device=dev, dtype=torch.float32
-                    ).permute(2, 1, 0)
-                ),
-            )
-            self._rows[rows] = buffers
-        return buffers
+        self._rows = _RowBuffers(device, num_qo_heads, self.class_name)
 
     def check(self, query, kv_cache, indices, lengths, out, lse, contents: bool):
         """Layout checks of one launch (element counts, trailing dimensions, dtype, device, contiguity, alignment);
@@ -302,10 +359,11 @@ class SparseMLAPlan:
                 f"contiguous int32 [rows] on {dev}",
             )
         rows = lengths.shape[0]
+        shape = query.shape
         if (
-            query.ndim < 2
-            or query.shape[-1] != dim
-            or query.shape[-2] != heads
+            len(shape) < 2
+            or shape[-1] != dim
+            or shape[-2] != heads
             or query.numel() != rows * heads * dim
             or query.dtype != self.q_dtype
             or query.device != dev
@@ -314,7 +372,7 @@ class SparseMLAPlan:
         ):
             raise unsupported(
                 name,
-                f"a query of shape {tuple(query.shape)}, dtype {query.dtype}",
+                f"a query of shape {tuple(shape)}, dtype {query.dtype}",
                 f"a contiguous 16-byte-aligned {self.q_dtype} [{rows}, {heads}, {dim}] on {dev}",
             )
         if (
@@ -331,17 +389,18 @@ class SparseMLAPlan:
                 f"a KV cache of shape {tuple(kv_cache.shape)}, dtype {kv_cache.dtype}",
                 f"contiguous 16-byte-aligned {self.q_dtype} rows [storage_rows, {dim}] on {dev}",
             )
+        shape = indices.shape
         if (
-            indices.ndim != 2
-            or indices.shape[0] != rows
-            or indices.shape[1] <= 0
+            len(shape) != 2
+            or shape[0] != rows
+            or shape[1] <= 0
             or indices.dtype != torch.int32
             or indices.device != dev
             or indices.stride(1) != 1
         ):
             raise unsupported(
                 name,
-                f"indices of shape {tuple(indices.shape)}, dtype {indices.dtype}",
+                f"indices of shape {tuple(shape)}, dtype {indices.dtype}",
                 f"int32 [{rows}, top_k] on {dev} with a contiguous last dimension",
             )
         if (
@@ -359,7 +418,9 @@ class SparseMLAPlan:
                 f"a contiguous 16-byte-aligned bf16 [{rows}, {heads}, {spec.LATENT_DIM}] on {dev}",
             )
         if lse is not None and (
-            lse.numel() != rows * heads
+            lse.ndim < 1
+            or lse.shape[-1] != heads
+            or lse.numel() != rows * heads
             or lse.dtype != torch.float32
             or lse.device != dev
             or not lse.is_contiguous()
@@ -408,7 +469,9 @@ class SparseMLAPlan:
         latent = spec.LATENT_DIM
         heads = self.num_qo_heads
         dim = self.query_dim
-        no_list, no_lengths, scratch = self._rows.get(rows) or self._row_buffers(rows)
+        no_list, no_lengths, scratch = self._rows.views.get(rows) or self._rows.get(
+            rows
+        )
         row = heads * dim
         start = query.storage_offset()
         q_latent = query.as_strided((heads, latent, 1, rows), (dim, 1, row, row), start)
@@ -491,7 +554,9 @@ class SparseMLAPlan:
         if value is None:
             return None
         planned = self.output_scale if which else self.softmax_scale
-        if value is planned or (type(value) is float and value == planned):
+        if value is planned or (
+            type(value) is float and type(planned) is float and value == planned
+        ):
             return None
         return check_scale(
             value, name, self.device, self.class_name, self.scale_is_tensor[which]
@@ -525,7 +590,10 @@ def check_scale(
         return value.view(1) if value.ndim == 0 else value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise unsupported(class_name, f"{name}={value!r}", "a positive scale")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        value = float("inf")
     if not _MIN_SCALE <= value <= _MAX_SCALE:
         raise unsupported(
             class_name, f"{name}={value!r}", "a positive finite fp32 scale"
@@ -552,7 +620,7 @@ def plan(
         name = spec.class_name(q_dtype, spec.LATENT_DIM + qk_rope_head_dim)
     except (ValueError, TypeError):
         name = spec.FAMILY
-    check_device(device, name, spec.MLA_ARCHS)
+    cc = check_device(device, name, spec.MLA_ARCHS)
     if q_dtype not in _DTYPE_KEYS:
         raise unsupported(name, f"q_dtype {q_dtype}", "bf16 or e4m3 Q / KV")
     if isinstance(qk_rope_head_dim, bool) or qk_rope_head_dim not in (0, spec.ROPE_DIM):
@@ -570,7 +638,7 @@ def plan(
     if softmax_scale is None:
         raise unsupported(
             name,
-            "the default softmax_scale ((512 + qk_rope_head_dim) ** -0.5)",
+            "softmax_scale=None",
             "an explicit softmax_scale (the scale is an input of the row term)",
         )
     softmax_scale = check_scale(softmax_scale, "softmax_scale", device, name)
@@ -593,25 +661,25 @@ def plan(
         twin.__dict__.update(found.__dict__)
         twin.softmax_scale, twin.output_scale = softmax_scale, output_scale
         return twin
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(f"{name}: make the plan before CUDA graph capture")
-    if check_device(device, name, spec.MLA_ARCHS) == (10, 7):
+    _not_capturing(name)
+    if cc == (10, 7):
         from ...cute_dsl.utils import require_cute_dsl_arch
 
         require_cute_dsl_arch(device.index)
-    made = SparseMLAPlan(
-        device, num_qo_heads, q_dtype, qk_rope_head_dim, softmax_scale, output_scale
-    )
-    _plans[key] = made
+    with _lock:
+        made = _plans.get(key)
+        if made is None:
+            made = SparseMLAPlan(
+                device,
+                num_qo_heads,
+                q_dtype,
+                qk_rope_head_dim,
+                softmax_scale,
+                output_scale,
+            )
+            _plans[key] = made
     return made
 
 
 def _same_scale(a, b) -> bool:
     return a is b or (not isinstance(a, torch.Tensor) and a == b)
-
-
-def planned(device, num_qo_heads, q_dtype, qk_rope_head_dim, soft_tensor, out_tensor):
-    """The cached plan of a compiled shape, or ``None``."""
-    return _plans.get(
-        (device, num_qo_heads, q_dtype, qk_rope_head_dim, soft_tensor, out_tensor)
-    )

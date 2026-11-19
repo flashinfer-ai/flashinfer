@@ -5,7 +5,7 @@
 Every value is a multiple of 1/8 in [-2, 2] computed from 64-bit integer arithmetic, so it is exact in bf16 and e4m3
 and identical on every host and device. A request's cache rows and query rows are functions of its seed and the token
 position alone, whatever pool or batch they sit in. ``DIGESTS`` holds sha256 of the output and LSE bits of
-:func:`digest_cases`; SM100, SM103 and SM107 give the same bits, so one table serves the three architectures.
+:func:`run_digest_cases`; SM100, SM103 and SM107 give the same bits, so one table serves the three architectures.
 
     python -m flashinfer.batch_invariant.mla.cases     # print the digests of the current device
 """
