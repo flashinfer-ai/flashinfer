@@ -12,7 +12,8 @@ either
     and RESTARTS the ring.
 
 Target: SM90+ (H200 / B200). Fixed K == V == 128, H == HV (KDA has no GQA).
-Native draft length T in {4, 8}.
+Native draft length T in {4, 8} (this HMMA kernel; the UMMA backend in
+kda_replay_mtp_umma runs T = 1..8 on SM10x).
 
 KDA vs GDN — the one structural difference
 ------------------------------------------
@@ -2469,7 +2470,8 @@ class KdaDecodeUCacheFlushKernel:
 # ============================================================================
 # Public entry point — kda_delta_rule_mtp_ucache_flush: the draft-token
 # decode output PLUS the (k_cache, u_cache, g_cache, hist_len) history-ring
-# append AND per-request state flush. Native T in {4, 8} only. bf16 only.
+# append AND per-request state flush. Native T in {4, 8} (HMMA) or 1..8
+# (UMMA, SM10x). bf16 only.
 # Requires SM90+ (TMA + mbarrier); K == V == 128; H == HV.
 # ============================================================================
 
@@ -2579,6 +2581,10 @@ except (ImportError, RuntimeError) as _e:  # pragma: no cover - no tcgen05 DSL
 # supported). Off until the UMMA kernel is complete and measured.
 _AUTO_UMMA = False
 _BACKENDS = ("auto", "hmma", "umma")
+# Native draft lengths: the HMMA kernel builds T in {4, 8}; the UMMA kernel
+# T = 1..8 (kda_umma_unavailable_reason has the authoritative set).
+_HMMA_T = (4, 8)
+_UMMA_T_MAX = 8
 
 
 def kda_umma_unavailable_reason(
@@ -2638,7 +2644,10 @@ def kda_delta_rule_mtp_ucache_flush(
     Contract (every violation raises ``ValueError``):
 
     - ``q``, ``k``: [B, T, H, 128] bf16; ``v``: [B, T, H, 128] bf16;
-      ``g``: [B, T, H, 128] bf16; ``b``: [B, T, H] bf16; T in {4, 8}.
+      ``g``: [B, T, H, 128] bf16; ``b``: [B, T, H] bf16. T in {4, 8} on
+      ``backend="hmma"``; T in 1..8 on ``backend="umma"`` (SM10x). ``"auto"``
+      routes T outside {4, 8} to UMMA and raises ``NotImplementedError`` when
+      UMMA is unavailable.
     - ``initial_state_indices``: [B] int32, each -1 (padded row: the CTA
       retires, its output row is left untouched) or a slot in [0, pool);
       non-negative slots must be unique.
@@ -2656,8 +2665,8 @@ def kda_delta_rule_mtp_ucache_flush(
       this file) or ``"umma"`` (tcgen05 / TMEM, SM10x,
       ``kda_replay_mtp_umma``). ``"umma"`` raises ``ValueError`` when
       ``kda_umma_unavailable_reason`` reports a reason; ``"auto"`` uses UMMA
-      only when it is available and ``_AUTO_UMMA`` is set. The UMMA backend
-      ignores ``tma_late``.
+      only when it is available and ``_AUTO_UMMA`` is set, or when T is not
+      in {4, 8} (HMMA cannot build it). The UMMA backend ignores ``tma_late``.
 
     Returns ``output`` of shape ``[B, T, H, V]`` bf16.
     """
@@ -2674,11 +2683,20 @@ def kda_delta_rule_mtp_ucache_flush(
     _check(q.dim() == 4, f"q must be [B, T, H, K]; got {tuple(q.shape)}.")
     B, T_in, H, K_dim = q.shape
     _check(K_dim == K_DIM, f"this kernel requires K == {K_DIM}; got K={K_dim}.")
-    if T_in not in (4, 8):
-        raise NotImplementedError(
-            f"kda_delta_rule_mtp_ucache_flush: T={T_in} unsupported — native T in "
-            "{4, 8} only."
-        )
+    if T_in not in _HMMA_T:
+        # HMMA: T in {4, 8} only. "umma" / "auto" may still run T in 1..8 on the
+        # UMMA kernel (SM10x); availability is decided after validation.
+        if backend == "hmma":
+            raise NotImplementedError(
+                f"kda_delta_rule_mtp_ucache_flush: T={T_in} unsupported — native T in "
+                "{4, 8} only."
+            )
+        if not 1 <= T_in <= _UMMA_T_MAX:
+            raise NotImplementedError(
+                f"kda_delta_rule_mtp_ucache_flush: T={T_in} unsupported — native T "
+                f"in {{4, 8}} (backend='hmma') or 1..{_UMMA_T_MAX} (backend='umma', "
+                "SM10x)."
+            )
     _check(
         tuple(k.shape) == tuple(q.shape),
         f"k must match q's shape {tuple(q.shape)}; got {tuple(k.shape)}.",
@@ -2900,7 +2918,19 @@ def kda_delta_rule_mtp_ucache_flush(
         raise ValueError(
             f"kda_delta_rule_mtp_ucache_flush: backend='umma' unavailable: {_why}"
         )
-    _use_umma = backend == "umma" or (backend == "auto" and _why is None and _AUTO_UMMA)
+    if backend == "auto" and T_in not in _HMMA_T:
+        # T the HMMA kernel cannot build: UMMA is the only candidate.
+        if _why is not None:
+            raise NotImplementedError(
+                f"kda_delta_rule_mtp_ucache_flush: T={T_in} needs the UMMA backend "
+                f"(the HMMA kernel supports T in {{4, 8}} only), which is "
+                f"unavailable: {_why}"
+            )
+        _use_umma = True
+    else:
+        _use_umma = backend == "umma" or (
+            backend == "auto" and _why is None and _AUTO_UMMA
+        )
 
     if _use_umma:
         # tma_late only selects the HMMA load schedule; UMMA ignores it.

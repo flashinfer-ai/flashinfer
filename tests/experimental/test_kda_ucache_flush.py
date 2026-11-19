@@ -374,12 +374,19 @@ def test_flush_never_overwrites_live_window():
     """THE ring property: a flush must not modify any physical ring row
     inside the live window [base, base+P) — sibling CTAs read those rows as
     their fold source. Appends must land at (base+P+s) & RING_MASK only."""
+    _flush_never_overwrites_live_window(T)
+
+
+def _flush_never_overwrites_live_window(t):
+    """Body of test_flush_never_overwrites_live_window at draft length t
+    (the UMMA file re-runs it at the T only that backend supports)."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush()
     B = 4
+    fm = W - t + 1
     bases = [28, 0, 30, 12]  # rows 0/2 wrap through the ring end
-    hist = [13, 13, 14, 16]  # ALL rows flush (P >= 13)
-    case = _make_case(B, hist, seed=4242, bases=bases)
+    hist = [fm, fm, min(fm + 1, W), W]  # ALL rows flush (P >= fm)
+    case = _make_case(B, hist, seed=4242, bases=bases, t=t)
     q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     kc_in, uc_in, gc_in = kc.clone(), uc.clone(), gc.clone()
 
@@ -399,12 +406,12 @@ def test_flush_never_overwrites_live_window():
         cb.clone(),
         idx,
     )
-    _run(mod, run_case)
+    _run(mod, run_case, flush_min=fm)
 
     for r in range(B):
         P = hist[r]
         window = [(bases[r] + j) % RING for j in range(P)]
-        appends = [(bases[r] + P + s) % RING for s in range(T)]
+        appends = [(bases[r] + P + s) % RING for s in range(t)]
         for rows, name, before, after in (
             (window, "k", kc_in, kc),
             (window, "u", uc_in, uc),
@@ -430,6 +437,11 @@ def test_chained_steps_match_sequential_oracle():
 
     This closes a hole in the GDN W16 suite, which never numerically checks
     appended values (only that they landed / didn't clobber the window)."""
+    _chained_steps_match_sequential_oracle(T)
+
+
+def _chained_steps_match_sequential_oracle(t):
+    """Body of test_chained_steps_match_sequential_oracle at draft length t."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush()
     B = 4
@@ -441,9 +453,9 @@ def test_chained_steps_match_sequential_oracle():
         return (torch.randn(*s, generator=gen, device=DEV) * sc).to(io)
 
     # 2T tokens of fresh input; step 1 sees [:T], step 2 sees [T:]
-    q2, k2 = rn(B, 2 * T, H, K), rn(B, 2 * T, H, K)
-    v2, b2 = rn(B, 2 * T, H, V, sc=0.5), rn(B, 2 * T, H)
-    g2 = rn(B, 2 * T, H, K, sc=0.5)
+    q2, k2 = rn(B, 2 * t, H, K), rn(B, 2 * t, H, K)
+    v2, b2 = rn(B, 2 * t, H, V, sc=0.5), rn(B, 2 * t, H)
+    g2 = rn(B, 2 * t, H, K, sc=0.5)
     A_log = (torch.rand(H, generator=gen, device=DEV) * 0.6 - 0.3).float()
     dt_bias = (torch.randn(H * K, generator=gen, device=DEV) * 0.5).float()
     pool = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(io)
@@ -455,8 +467,8 @@ def test_chained_steps_match_sequential_oracle():
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
 
     for step in range(2):
-        sl = slice(step * T, (step + 1) * T)
-        hl = torch.full((B,), step * T, dtype=torch.int32, device=DEV)
+        sl = slice(step * t, (step + 1) * t)
+        hl = torch.full((B,), step * t, dtype=torch.int32, device=DEV)
         y = mod.kda_delta_rule_mtp_ucache_flush(
             A_log,
             g2[:, sl].contiguous(),
@@ -474,7 +486,7 @@ def test_chained_steps_match_sequential_oracle():
             hist_len=hl,
             cache_base=cb.clone(),
             scale=SCALE,
-            flush_min=FLUSH_MIN,
+            flush_min=W - t + 1,
             restart_hist_on_flush=False,  # caller-owned commit (serving mode)
         )
 
@@ -484,19 +496,19 @@ def test_chained_steps_match_sequential_oracle():
         S = pool_before[r].to(f).clone()
         khat = F.normalize(k2[r].to(f), dim=-1)
         qhat = F.normalize(q2[r].to(f), dim=-1) * SCALE
-        for t in range(2 * T):
-            glog = _gate_log(g2[r, t], A_log, dt_bias)
-            beta = torch.sigmoid(b2[r, t].to(f))
+        for n in range(2 * t):
+            glog = _gate_log(g2[r, n], A_log, dt_bias)
+            beta = torch.sigmoid(b2[r, n].to(f))
             S = S * torch.exp(glog)[:, None, :]
-            pred = torch.einsum("hvk,hk->hv", S, khat[t])
-            u_t = (v2[r, t].to(f) - pred) * beta[:, None]
-            S = S + u_t[:, :, None] * khat[t][:, None, :]
-            if t >= T:
-                y_ref = torch.einsum("hvk,hk->hv", S, qhat[t])
-                err = (y[r, t - T].float() - y_ref).abs().max().item()
+            pred = torch.einsum("hvk,hk->hv", S, khat[n])
+            u_t = (v2[r, n].to(f) - pred) * beta[:, None]
+            S = S + u_t[:, :, None] * khat[n][:, None, :]
+            if n >= t:
+                y_ref = torch.einsum("hvk,hk->hv", S, qhat[n])
+                err = (y[r, n - t].float() - y_ref).abs().max().item()
                 # step 2 consumes bf16 ring rows -> a bit looser than Y_TOL
                 assert err < 2e-2, (
-                    f"row {r} token {t}: chained |y - fp32 ref| = {err:.2e}"
+                    f"row {r} token {n}: chained |y - fp32 ref| = {err:.2e}"
                 )
 
 
@@ -627,12 +639,18 @@ def test_padded_rows_and_permuted_pool():
     while real rows address a LARGER pool through permuted slots and stay
     oracle-exact. This pins the slot-indexed addressing (cache_idx * pool
     strides) that the arange-idx tests never exercise."""
+    _padded_rows_and_permuted_pool(T)
+
+
+def _padded_rows_and_permuted_pool(t):
+    """Body of test_padded_rows_and_permuted_pool at draft length t."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush()
     B, POOL = 4, 8
-    hist = [13, 5, 13, 9]
+    fm = W - t + 1
+    hist = [fm, 5, fm, 9]
     bases = [28, 0, 30, 12]
-    case = _make_case(B, hist, seed=555, bases=bases, pool_size=POOL)
+    case = _make_case(B, hist, seed=555, bases=bases, t=t, pool_size=POOL)
     q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     # rows 1 and 3 are padding; rows 0 and 2 use permuted slots 5 and 2.
     idx = torch.tensor([5, -1, 2, -1], dtype=torch.int32, device=DEV)
@@ -644,7 +662,7 @@ def test_padded_rows_and_permuted_pool():
                 ring[r].zero_()
     pool_before = pool.clone()
     kc_in, uc_in, gc_in = kc.clone(), uc.clone(), gc.clone()
-    out = torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=DEV)
+    out = torch.zeros(B, t, H, V, dtype=torch.bfloat16, device=DEV)
 
     mod.kda_delta_rule_mtp_ucache_flush(
         A_log,
@@ -663,7 +681,7 @@ def test_padded_rows_and_permuted_pool():
         hist_len=hl,
         cache_base=cb,
         scale=SCALE,
-        flush_min=FLUSH_MIN,
+        flush_min=fm,
         restart_hist_on_flush=False,
         output=out,
     )
@@ -686,9 +704,10 @@ def test_padded_rows_and_permuted_pool():
             uc_l,
             gc_l,
             hist[r],
+            t_len=t,
         )
         assert (out[r].float() - y_ref).abs().max().item() < Y_TOL
-        if hist[r] >= FLUSH_MIN:
+        if hist[r] >= fm:
             assert (pool[slot].float() - S_ref).abs().max().item() < STATE_TOL
     # padded rows: zero output, and NOTHING else in the pool/rings moved —
     # every slot not owned by a real row is bit-identical.
@@ -708,15 +727,21 @@ def test_cuda_graph_replay_matches_eager():
     static tensors, restore the pre-run ring/pool bytes, replay, and demand
     BITWISE equality with an eager run on identical inputs (the kernel is
     deterministic: fixed MMA order, no atomics)."""
+    _cuda_graph_replay_matches_eager(T)
+
+
+def _cuda_graph_replay_matches_eager(t):
+    """Body of test_cuda_graph_replay_matches_eager at draft length t."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush()
     B = 4
-    hist = [13, 0, 12, 16]
+    fm = W - t + 1
+    hist = [fm, 0, fm - 1, W]
     bases = [30, 0, 5, 28]
-    case = _make_case(B, hist, seed=808, bases=bases)
+    case = _make_case(B, hist, seed=808, bases=bases, t=t)
     q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
-    snap = [t.clone() for t in (pool, kc, uc, gc)]
-    out = torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=DEV)
+    snap = [x.clone() for x in (pool, kc, uc, gc)]
+    out = torch.zeros(B, t, H, V, dtype=torch.bfloat16, device=DEV)
 
     def call():
         mod.kda_delta_rule_mtp_ucache_flush(
@@ -736,7 +761,7 @@ def test_cuda_graph_replay_matches_eager():
             hist_len=hl,
             cache_base=cb,
             scale=SCALE,
-            flush_min=FLUSH_MIN,
+            flush_min=fm,
             restart_hist_on_flush=False,
             output=out,
         )
@@ -861,7 +886,7 @@ def test_w32_output_and_fold_match_fp32_reference(t, basecase):
     fm = _w32_fm(t)
     cap = RING - t  # 28 @T=4, 24 @T=8
     bases = BASES[basecase]
-    for hist in ([0, 7, 16, 20], [fm - 1, fm, fm + 1, cap]):
+    for hist in ([0, 7, 16, 20], [fm - 1, fm, min(fm + 1, cap), cap]):
         case = _make_case(4, hist, seed=2468 + t, bases=bases, t=t)
         _check_case(mod, case, bases, t, flush_min=fm, w_ring=32)
 
@@ -1107,9 +1132,14 @@ def test_restart_hist_on_flush_across_steps(graph, w_ring):
     all tokens. The graph variant captures (launch + commit + accept) once
     and replays it per step with fresh inputs copied into static buffers;
     its outputs, pool and rings must equal the eager run's bitwise."""
+    _restart_hist_on_flush_across_steps(graph, w_ring, T)
+
+
+def _restart_hist_on_flush_across_steps(graph, w_ring, t):
+    """Body of test_restart_hist_on_flush_across_steps at draft length t."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush()
-    B, t = 4, T
+    B = 4
     fm = W - t + 1 if w_ring == 16 else _w32_fm(t)
     steps = fm // t + 3  # every row folds at least once
     gen = torch.Generator(device=DEV).manual_seed(4864 + w_ring)

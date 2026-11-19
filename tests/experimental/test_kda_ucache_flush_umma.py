@@ -25,6 +25,10 @@ module's globals, and every one of them reaches the kernel through
 fixture patches that dict to ``{"backend": "umma"}`` for every test collected
 here, so the base file's oracle, cases and tolerances apply unchanged.
 
+The base tests cover T in {4, 8} (all the HMMA kernel builds). The UMMA kernel
+also runs T = 1 (STP) and T = 2, 3, 5, 6, 7: the ``test_umma_only_t_*`` tests
+below re-run the base test bodies at those T (same oracle, cases, tolerances).
+
 Run:
   pytest tests/experimental/test_kda_ucache_flush_umma.py -v
 """
@@ -36,7 +40,11 @@ import torch
 
 from . import test_kda_ucache_flush as _base
 from .test_kda_ucache_flush import *  # noqa: F401,F403  re-collects all base cases
-from .test_kda_ucache_flush import _load_flush, _make_case
+from .test_kda_ucache_flush import BASES, _load_flush, _make_case
+
+# Draft lengths only the UMMA backend builds (the HMMA kernel: T in {4, 8}).
+_UMMA_ONLY_T = [1, 2, 3, 5, 6, 7]
+_ALL_T = list(range(1, 9))
 
 # Base tests the UMMA backend cannot run yet at the current stage. Empty since
 # stage S3c: the kernel covers T in {4, 8} x w_ring in {16, 32}.
@@ -244,7 +252,7 @@ def _poison_outside_window(case, hist, bases):
             ring[s_, :, dead] = float("nan")
 
 
-@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("t", _ALL_T)
 @pytest.mark.parametrize("w_ring", [16, 32])
 @pytest.mark.parametrize("history", ["verify", "fold"])
 @pytest.mark.parametrize("strong", [False, True], ids=["mild", "strong"])
@@ -264,7 +272,7 @@ def test_umma_nan_poisoned_rings(t, w_ring, history, strong):
     assert torch.isfinite(pool.float()).all()
 
 
-@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("t", _ALL_T)
 def test_umma_repeat_determinism_w16(t):
     """B=1024 random rows, 50 launches on restored rings / pool: every launch
     bitwise equal to the first (TMEM / mbarrier race tripwire)."""
@@ -291,7 +299,7 @@ def test_umma_repeat_determinism_w16(t):
     assert bad == 0, f"{bad}/{REPEATS} identical UMMA launches differ"
 
 
-@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("t", _ALL_T)
 def test_umma_u_src_smem_vs_ldg_bitwise(t, monkeypatch):
     """The u window from the SMEM bulk copy and from direct loads gives the same
     D tile: outputs, rings and pool bitwise equal."""
@@ -313,7 +321,7 @@ def test_umma_u_src_smem_vs_ldg_bitwise(t, monkeypatch):
         assert torch.equal(a, b), f"u_src smem vs ldg differ on {name}"
 
 
-@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("t", _ALL_T)
 @pytest.mark.parametrize("w_ring", [16, 32])
 def test_umma_history_dominated_matches_fp32_reference(t, w_ring):
     """History-dominated case: every live window key is (a normalized copy
@@ -336,3 +344,131 @@ def test_umma_history_dominated_matches_fp32_reference(t, w_ring):
         kr = torch.nn.functional.normalize(k[r, 0].float(), dim=-1)  # [H, K]
         kc[r, :, rows] = kr[:, None, :].expand(-1, P, -1).to(kc.dtype)
     _base._check_case(_load_flush(), tuple(case), bases, t, flush_min=fm, w_ring=w_ring)
+
+
+# ---------------------------------------------------------------------------
+# T = 1 (STP) and T = 2, 3, 5, 6, 7: UMMA-only draft lengths
+# ---------------------------------------------------------------------------
+def test_umma_only_t_dispatch(monkeypatch):
+    """T outside {4, 8}: 'hmma' keeps its NotImplementedError, 'umma' and
+    'auto' launch the UMMA kernel (bitwise the same result), T = 9 is rejected
+    by every backend, and 'auto' raises clearly when UMMA is unavailable
+    (T in {4, 8} then stays on HMMA)."""
+    from flashinfer.experimental.kda_ucache_flush import (
+        kda_decode_bf16_wy_ucache_flush as disp,
+    )
+    from flashinfer.experimental.kda_ucache_flush import kda_replay_mtp_umma as um
+
+    def launches() -> int:
+        return um._LAUNCHES
+
+    dev = torch.device("cuda")
+    for t in _UMMA_ONLY_T:
+        fm = _fm(t, 16)
+        hist = [0, fm - 1, fm, 1]
+        assert disp.kda_umma_unavailable_reason(dev, t, 16, False) is None
+        with pytest.raises(NotImplementedError, match=r"native T in \{4, 8\} only"):
+            _call(_make_case(4, hist, seed=13, t=t), "hmma", t=t)
+        outs = {}
+        for backend in ("umma", "auto"):
+            n0 = launches()
+            case = _make_case(4, hist, seed=13, t=t)
+            y = _call(case, backend, t=t)
+            assert launches() == n0 + 1, backend
+            outs[backend] = [y.clone()] + [case[i].clone() for i in (7, 8, 9, 10)]
+        for a, b in zip(outs["umma"], outs["auto"], strict=True):
+            assert torch.equal(a, b)
+
+    for backend in ("hmma", "umma", "auto"):
+        with pytest.raises(NotImplementedError, match="T=9 unsupported"):
+            _call(_make_case(4, [0, 0, 0, 0], seed=13, t=9), backend, t=8)
+
+    monkeypatch.setattr(
+        disp, "kda_umma_unavailable_reason", lambda *a, **kw: "forced off"
+    )
+    with pytest.raises(NotImplementedError, match="needs the UMMA backend.*forced off"):
+        _call(_make_case(4, [0, 15, 16, 1], seed=13, t=1), "auto", t=1)
+    with pytest.raises(ValueError, match="backend='umma' unavailable: forced off"):
+        _call(_make_case(4, [0, 15, 16, 1], seed=13, t=1), "umma", t=1)
+    n0 = launches()
+    _call(_make_case(4, [0, 12, 13, 1], seed=13, t=4), "auto", t=4)
+    assert launches() == n0
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+@pytest.mark.parametrize("history", ["empty_P0", "replay_max", "fold_mixed"])
+@pytest.mark.parametrize("basecase", list(BASES))
+def test_umma_only_t_output_matches_fp32_reference(t, history, basecase):
+    _base.test_output_matches_fp32_reference(t, history, basecase)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+@pytest.mark.parametrize("basecase", list(BASES))
+def test_umma_only_t_folded_state_matches_fp32_reference(t, basecase):
+    _base.test_folded_state_matches_fp32_reference(t, basecase)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_strong_decay_matches_fp32_reference(t):
+    _base.test_strong_decay_matches_fp32_reference(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_ring_append_values_match_reference(t):
+    _base.test_ring_append_values_match_reference(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_flush_never_overwrites_live_window(t):
+    _base._flush_never_overwrites_live_window(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_chained_steps_match_sequential_oracle(t):
+    _base._chained_steps_match_sequential_oracle(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_padded_rows_and_permuted_pool(t):
+    _base._padded_rows_and_permuted_pool(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_cuda_graph_replay_matches_eager(t):
+    _base._cuda_graph_replay_matches_eager(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_large_batch_randomized_oracle_and_determinism(t):
+    _base.test_large_batch_randomized_oracle_and_determinism(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_lower_bound_range(t):
+    """lower_bound in [-80 / T, 0): at T = 1 the boundary is -80 (one
+    saturated token spans the whole e^{80} exp(-cum) budget)."""
+    _base.test_lower_bound_range(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+@pytest.mark.parametrize("basecase", list(BASES))
+def test_umma_only_t_w32_output_and_fold_match_fp32_reference(t, basecase):
+    _base.test_w32_output_and_fold_match_fp32_reference(t, basecase)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_w32_strong_decay_deep_window(t):
+    _base.test_w32_strong_decay_deep_window(t)
+
+
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_w32_deep_window_repeat_determinism(t):
+    # tma_late only selects the HMMA load schedule; UMMA ignores it
+    _base.test_w32_deep_window_repeat_determinism(t, False)
+
+
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "cuda_graph"])
+@pytest.mark.parametrize("w_ring", [16, 32])
+@pytest.mark.parametrize("t", _UMMA_ONLY_T)
+def test_umma_only_t_restart_hist_on_flush_across_steps(t, w_ring, graph):
+    _base._restart_hist_on_flush_across_steps(graph, w_ring, t)

@@ -1082,7 +1082,8 @@ def kda_delta_rule_mtp_ucache_flush(
 
     Experimental: SM90+ only, bf16 only (fp32 ``g_cache``, ``A_log`` and
     ``dt_bias``), ``K == V == 128``, ``H == HV``, draft length ``T`` in
-    ``{4, 8}``, contiguous pools. The kernel is JIT-compiled with
+    ``{4, 8}`` (``T`` in ``1..8`` with the SM10x UMMA backend), contiguous
+    pools. The kernel is JIT-compiled with
     ``cute.compile`` on first use per configuration (no on-disk cache).
 
     Parameters
@@ -1141,8 +1142,9 @@ def kda_delta_rule_mtp_ucache_flush(
         ``"auto"`` (default), ``"hmma"`` (mma.sync kernel, SM90+) or
         ``"umma"`` (tcgen05 / TMEM kernel, SM10x only). ``"umma"`` raises
         ``ValueError`` for configurations it does not support; ``"auto"``
-        currently always selects ``"hmma"``. The UMMA kernel ignores
-        ``tma_late``.
+        selects ``"hmma"`` for ``T`` in ``{4, 8}`` and ``"umma"`` for any
+        other ``T`` (``NotImplementedError`` when UMMA is unavailable). The
+        UMMA kernel ignores ``tma_late``.
 
     Returns
     -------
@@ -1156,7 +1158,8 @@ def kda_delta_rule_mtp_ucache_flush(
         checks (slot range and uniqueness, ``hist_len``, ``cache_base``) need
         one host synchronization and are skipped during CUDA-graph capture.
     NotImplementedError
-        For ``T`` outside ``{4, 8}`` or block-strided pools.
+        For ``T`` outside ``{4, 8}`` on ``"hmma"`` (outside ``1..8``, or
+        with UMMA unavailable, on ``"auto"``) or block-strided pools.
     """
     from .experimental.kda_ucache_flush import (
         kda_delta_rule_mtp_ucache_flush as _run,

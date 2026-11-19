@@ -58,7 +58,12 @@ D cols 40..47) built and multiplied only when P > 16 (CTA-uniform), so shallow
 windows issue exactly the w_ring = 16 work; u is read from the ring per row (ldg)
 by default instead of the SMEM window copy.
 
-Status (stage S3c): T in {4, 8}, w_ring in {16, 32}, one head per CTA.
+T = 1..8 natively (STP T = 1 included). X rows 2T..15 of the operand tiles are zero;
+at 2T % 8 != 0 the last row-layout pass also covers the dead rows 2T..8 NP - 1
+(clamped in-range loads, zero stores) and the epilogue reads 2^ceil(log2 T) TMEM
+columns per side, as the GDN UMMA kernel. T in {4, 8} builds are unchanged.
+
+Status (stage S3c + T = 1..8): w_ring in {16, 32}, one head per CTA.
 """
 
 from __future__ import annotations
@@ -104,7 +109,7 @@ _FORCE_HPC: Optional[int] = None
 _LAUNCHES = 0
 
 # Stage-supported configurations; widened as the kernel grows.
-_SUPPORTED_T: frozenset = frozenset({4, 8})
+_SUPPORTED_T: frozenset = frozenset(range(1, 9))
 _SUPPORTED_W_RING: frozenset = frozenset({16, 32})
 _KERNEL_IMPLEMENTED = True
 
@@ -515,7 +520,7 @@ def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone):
 # ----------------------------------------------------------------------------- kernel
 class KdaReplayMtpUmma:
     def __init__(self, T: int, h: int, w_ring: int = 16, u_src: str = "smem"):
-        assert T in (4, 8), T
+        assert 1 <= T <= 8, T
         assert w_ring in (16, 32), w_ring
         assert u_src in ("smem", "ldg"), u_src
         self.T = T
@@ -620,6 +625,8 @@ class KdaReplayMtpUmma:
         T = self.T
         T2 = 2 * T
         NP = (T2 + 7) // 8  # row-layout passes (8 X rows per pass)
+        # T not in {4, 8}: the last pass also holds dead rows 2T..8 NP - 1 (zeroed)
+        PARTIAL = T2 % 8 != 0
         WR = self.w_ring
         USE_SMEM_U = self.u_src == "smem"
         NJB = WR // 16  # 16-slot window j-blocks (2 at w_ring = 32)
@@ -729,6 +736,9 @@ class KdaReplayMtpUmma:
             is_q = xr >= T
             t_k = _sel(is_q, 0, xr, Int32)
             t_q = _sel(is_q, xr - T, 0, Int32)
+            if cutlass.const_expr(PARTIAL and p == NP - 1):
+                # dead rows xr >= 2T: an in-range dummy load (q token 0), zeroed in P1
+                t_q = _sel(xr >= T2, 0, t_q, Int32)
             ak = k.iterator.toint() + Int64(
                 cute.crd2idx((brow, t_k, h, l16 * 8), k.layout)
             ) * Int64(2)
@@ -929,7 +939,25 @@ class KdaReplayMtpUmma:
                             U.bf16x2_hi_f32(xw[p][i]) * inv,
                         )
                     )
-                U.sts_v4(xc_addr + xr * XC_PITCH + l16 * 16, nw[0], nw[1], nw[2], nw[3])
+                xcw = nw
+                if cutlass.const_expr(PARTIAL and p == NP - 1):
+                    # dead rows xr >= 2T: zero X_c here and X_r (P2 writes rows < 2T)
+                    xcw = [_sel(xr < T2, w_, Uint32(0), Uint32) for w_ in nw]
+                    if xr >= T2:
+                        zd = Uint32(0)
+                        U.sts_v4(
+                            x_addr
+                            + (l16 // 8) * 2048
+                            + xr * 128
+                            + (((l16 % 8) ^ (xr % 8)) * 16),
+                            zd,
+                            zd,
+                            zd,
+                            zd,
+                        )
+                U.sts_v4(
+                    xc_addr + xr * XC_PITCH + l16 * 16, xcw[0], xcw[1], xcw[2], xcw[3]
+                )
                 if xr < T:
                     # ring append: the L2-normed, UNDECAYED k̂ (the ring contract)
                     kdst = kc_row + Int64(
@@ -938,9 +966,9 @@ class KdaReplayMtpUmma:
                     U.stg_v4(kdst, nw[0], nw[1], nw[2], nw[3])
             z = Uint32(0)
             for p in cutlass.range_constexpr(NP, 2):
-                # X_c rows 2T..15 (T = 4: rows 8..15) are zero
+                # X_c rows 8 NP..15 are zero (rows 2T..8 NP - 1: in P1 above)
                 U.sts_v4(xc_addr + (r8 + 8 * p) * XC_PITCH + l16 * 16, z, z, z, z)
-            # X_r rows 2T..15 and Ktil rows T..7 are zero
+            # X_r rows 8 NP..15 and Ktil rows T..7 are zero
             for p in cutlass.range_constexpr(NP, 2):
                 zr = r8 + 8 * p
                 U.sts_v4(
@@ -1133,8 +1161,9 @@ class KdaReplayMtpUmma:
             # -------- epilogue: per V row forward substitution
             cute.arch.mbarrier_wait(mma_done, 0)
             U.fence_after_sync()
-            hk = U.tmem_ld(ct, tbase + _COL_H, T)
-            hq = U.tmem_ld(ct, tbase + _COL_H + T, T)
+            nld = 1 << (T - 1).bit_length()  # tcgen05.ld widths are powers of two
+            hk = U.tmem_ld(ct, tbase + _COL_H, nld)
+            hq = U.tmem_ld(ct, tbase + _COL_H + T, nld)
             U.tmem_wait_ld()
             U.fence_before_sync()
             if not is_flush:
