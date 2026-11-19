@@ -1784,6 +1784,9 @@ _E2E_SKIP = {
     "ulysses_scatter_heads",
     "ulysses_gather_heads",
     "ulysses_exchange_chunks",
+    # Packed NVFP4 weights come from prepare_sm90_nvfp4_w4a16_weights (fixed block
+    # size, row blocks derived from the model shape); not sampled generically.
+    "sm90_nvfp4_w4a16_moe",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
