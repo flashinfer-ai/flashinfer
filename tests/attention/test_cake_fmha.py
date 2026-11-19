@@ -60,7 +60,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_decode_quant_nvfp4_uri,
     get_cake_fmha_manifest,
 )
-from tests.test_helpers.cake_fmha_capability import (
+from tests.attention.test_helpers.cake_fmha_capability import (
     PINNED_FLASHINFER_REVISION,
     replay_selectors,
     select_case,

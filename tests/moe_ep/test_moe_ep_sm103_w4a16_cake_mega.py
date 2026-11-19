@@ -22,7 +22,7 @@ Launch on 8 Blackwell GPUs of one host (EP world 8) or as plain pytest on one GP
     python -m pytest tests/moe_ep/test_moe_ep_sm103_w4a16_cake_mega.py -m arch_blackwell -v
 
 The expert weights are random packed E2M1 codes with E4M3 block scales
-(``tests.test_helpers.w4a16_reference.make_w4a16_weights``), the activations
+(``tests.moe_ep.test_helpers.w4a16_reference.make_w4a16_weights``), the activations
 Gaussian BF16. Every output is compared against the independent BF16 / FP32
 route of ``w4a16_reference`` on the band ``|y - ref| <= 2e-3 max|ref| + 0.05 |ref|``, and
 against an optional second oracle named by ``CAKE_W4A16_ORACLE_MODULE``
@@ -177,7 +177,7 @@ def make_problem(
 
 
 def reference(problem: Problem, weights) -> torch.Tensor:
-    from tests.test_helpers.w4a16_reference import w4a16_reference
+    from tests.moe_ep.test_helpers.w4a16_reference import w4a16_reference
 
     return w4a16_reference(problem.reference_problem(), weights)
 
@@ -259,7 +259,7 @@ def ep_layer(request, tmp_path_factory):
 
     import torch.distributed as dist
 
-    from tests.test_helpers.w4a16_reference import make_w4a16_weights
+    from tests.moe_ep.test_helpers.w4a16_reference import make_w4a16_weights
 
     hidden = request.param
     rank, world_size = init_distributed(tmp_path_factory)

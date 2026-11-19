@@ -858,12 +858,12 @@ def nvfp4_dequant(x: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
 
 
 class Fp4Problem:
-    """``Problem``'s geometry with random NVFP4 pools (``tests.test_helpers.utils_fp4.create_nvfp4_kv``: packed nibbles and e4m3
+    """``Problem``'s geometry with random NVFP4 pools (``tests.quantization.test_helpers.utils_fp4.create_nvfp4_kv``: packed nibbles and e4m3
     block scales of the cache's geometry, as FlashInfer's NVFP4 append kernel lays them out) and per-tensor scales; the ragged
     copies are gathered through the page table (the same bytes)."""
 
     def __init__(self, pr: Problem, k_scale=0.75, v_scale=1.5, seed=0):
-        from tests.test_helpers.utils_fp4 import create_nvfp4_kv
+        from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv
 
         self.pr, self.k_scale, self.v_scale = pr, k_scale, v_scale
         torch.manual_seed(seed)

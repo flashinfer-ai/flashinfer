@@ -2,6 +2,7 @@
 #include "config.cuh"
 #include "primitives.cuh"
 // Shared executable code; structural branches preserve lexical scope.
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/barrier.h>

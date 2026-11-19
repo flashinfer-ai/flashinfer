@@ -78,6 +78,8 @@ class AttentionPlanObj : public ffi::ModuleObj {
     if (name == "inspect")
       return ffi::Function::FromTyped([this]() {
         const char* numeric[] = {"fp8", "hybrid", "bf16", "nvfp4"};
+        // These names identify execution::Implementation kernel families; mega
+        // fusion is selected separately and does not introduce another family.
         const char* implementation[] = {"ordinary",
                                         "mixed",
                                         "full_bf16",
@@ -87,7 +89,9 @@ class AttentionPlanObj : public ffi::ModuleObj {
                                         "mg",
                                         "fulltile",
                                         "swapab",
-                                        "dsv4_nvfp4_prefill"};
+                                        "dsv4_nvfp4_prefill",
+                                        "dsv4_fp8_splitkv_decode",
+                                        "dsv4_fp8_decode"};
         const char* merge[] = {"direct", "merge2", "general", "stage1"};
         return ffi::Map<ffi::String, ffi::Any>{
             {"numeric_route", ffi::String(numeric[int(plan.numeric)])},

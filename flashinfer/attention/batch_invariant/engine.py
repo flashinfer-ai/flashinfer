@@ -17,13 +17,21 @@ split units, the fixup.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, ws_row
+from .plan import (
+    DESC_FIELDS,
+    GRID_SEARCH_ARCHES,
+    GROUP_FIELDS,
+    build_plan,
+    snake_order,
+    ws_row,
+)
 from .spec import FLT_MAX, HEAD_DIMS, KV_FMTS, TH_KV_FMTS, scale_log2
 from ...batch_invariant.fp_interface.term import to_f32
 
@@ -175,6 +183,69 @@ def valid_kv_slots(D: int = 128) -> tuple:
     return tuple(range(2, max_kv_slots(D) + 1))
 
 
+HW_ROW_MAX_MAX_D = 128  # the hardware row maximum serves the one-stage TMEM plan (D <= 128); the two-stage plan at D = 256 streams
+# its exponentials off the slice copies and gains nothing from it
+
+
+def _resolve_device(device: torch.device) -> torch.device:
+    """Resolve the current CUDA device before it becomes a cache key."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def device_sm_count(device: torch.device) -> int:
+    """The device's SM count (a launch parameter: it steers the unit kinds and the grid, never the bits); cached per device."""
+    return _device_sm_count(_resolve_device(device))
+
+
+@functools.cache
+def _device_sm_count(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def planner_grid_search(device: torch.device) -> bool:
+    """Whether the planner may shrink a fused walk's launch grid on ``device``: only on the parts the launch-grid model was fitted on
+    (``plan.GRID_SEARCH_ARCHES``); elsewhere the fused walk keeps the full grid and the model decides only fuse-or-split."""
+    return _planner_grid_search(_resolve_device(device))
+
+
+@functools.cache
+def _planner_grid_search(device: torch.device) -> bool:
+    from ...utils import get_compute_capability
+
+    if device.type != "cuda":
+        return False
+    major, minor = get_compute_capability(device)
+    return (int(major), int(minor)) in GRID_SEARCH_ARCHES
+
+
+def hw_row_max_enabled(device=None, D: int = 128) -> bool:
+    """Whether the row body on ``device`` at head dim ``D`` takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``:
+    each 32-column piece's maximum in an extra register, the pieces joined by ``max.f32``) instead of the register tree: the parts
+    that have the instruction (sm_103 / sm_107) at ``D <= HW_ROW_MAX_MAX_D``. Either way the same value -- the maximum is exact and
+    order-free -- so the choice is a placement; the kernel's identity carries it (tests select the tree kernel by patching this
+    function)."""
+    if D > HW_ROW_MAX_MAX_D:
+        return False
+    if device is None:
+        if not torch.cuda.is_available():
+            return False
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _part_has_hw_row_max(_resolve_device(device))
+
+
+@functools.cache
+def _part_has_hw_row_max(device: torch.device) -> bool:
+    from ...utils import get_compute_capability
+
+    if device.type != "cuda":
+        return False
+    major, minor = get_compute_capability(device)
+    return int(major) == 10 and int(minor) >= 3
+
+
 @dataclass(frozen=True)
 class AttnConfig:
     """A configuration of the kernel: every member of the space computes the class (R3)."""
@@ -193,7 +264,8 @@ class AttnConfig:
     # replicated-row placement;
     # mixed batches take the row body either way (same bits)
     q2: bool = False  # with softmax_wgs = 2: the paired placement -- two Q tiles per unit, warpgroup k owns Q tile k (whole rows), one
-    # K / V stream for both; D = 64 (blocks/operands.py: S_A | S_B | O_c,A | O_m,A | O_c,B | O_m,B in TMEM)
+    # K / V stream for both; D = 64 and D = 128 (blocks/operands.py: both tiles' S and O_c in TMEM, O_m in smem; at D = 128 P over S,
+    # which fits 328 KB parts only)
 
     def describe(self) -> str:
         return (
@@ -216,7 +288,7 @@ class AttnConfig:
             and self.grid >= 0
             and self.merge in ("auto", "fixup", "inkernel")
             and self.small in ("rep", "swap")
-            and (not self.q2 or (self.softmax_wgs == 2 and D == 64))
+            and (not self.q2 or (self.softmax_wgs == 2 and D in (64, 128)))
         )
         if lowbit:
             ok = ok and self.softmax_wgs == 1 and not self.q2 and self.small == "rep"
@@ -252,14 +324,33 @@ SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB ker
 SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
 
 
-Q2_MIN_UNITS_PER_SM = 4  # the paired placement halves the unit count: below this many units per SM the lost parallelism
-# outweighs the overlap of the two softmax warpgroups, so smaller batches take the one-warpgroup body (a placement rule: same bits)
+Q2_MIN_UNITS_PER_SM = {
+    64: 4,
+    128: 4,
+}  # the paired placement halves the unit count: below this many units per SM the lost parallelism outweighs the overlap of the two
+# softmax warpgroups, so smaller batches take the one-warpgroup body with the default ring (a placement rule: same bits); per head dim
+Q2_DEFAULT_DIMS = (
+    64,
+)  # head dims whose prefill / ragged default is the paired placement (from Q2_DEFAULT_MIN_GROUP); at D = 128 the placement is implemented (328 KB parts) but measured
+# slower than the one-warpgroup body on SM107, so it stays an explicit configuration (AttnConfig(q2=True))
+Q2_DEFAULT_MIN_GROUP = {
+    64: 4,
+}  # the wrappers take the paired placement for prefill and ragged batches whose GQA group reaches this (per head dim); smaller groups take
+# the one-warpgroup body, measured as fast or faster there (single-group units pair rarely); an explicit AttnConfig(q2=True) runs the
+# placement anywhere it is implemented (same bits)
+Q2_RING = {
+    64: {True: 4, False: 3},
+    128: {True: 3, False: 0},
+}  # the paired placement's ring depth per head dim, keyed by "a 328 KB part" (SM107) vs a 228 KB part (SM100 / SM103): the two Q
+# tiles and the smem O_m leave room for 4 / 3 slots at D = 64; at D = 128 (two 32 KB Q tiles, a 128 KB O_m, the replicated
+# placement's payload dropped) 3 slots on the larger part, which alone fits the placement (0: not available)
 
 
-def pair_units(desc: list) -> list:
+def pair_units(desc: list, grid: int = 0) -> list:
     """The paired placement's unit table: rows ``2 u`` (Q tile A) and ``2 u + 1`` (Q tile B) of pair ``u``. Two units pair when they share the
     request, the KV head, the chunk range and the kind (``F_MODE``): consecutive Q tiles of one (request, head, chunk range) in token order; an
-    odd one out pairs with an empty B (no rows, empty tile range, no group). Pairs are ordered longest first (LPT, as ``build_plan``). A
+    odd one out pairs with an empty B (no rows, empty tile range, no group). Pairs are ordered longest first, in waves of ``grid`` pairs
+    of alternating direction (``plan.snake_order``, as ``build_plan`` orders its units; ``grid`` 0 keeps the descending order). A
     placement: every unit's descriptor is unchanged, only its CTA and warpgroup move."""
     from .plan import (
         F_CHUNK_HI,
@@ -299,6 +390,7 @@ def pair_units(desc: list) -> list:
             )
         )
     )
+    pairs = snake_order(pairs, min(len(pairs), grid))
     return [row for ab in pairs for row in ab]
 
 
@@ -432,15 +524,11 @@ def plan_attention(
     assert kv_fmt in KV_FMTS, kv_fmt
     config = config or default_config(D=D, kv_fmt=kv_fmt)
     assert config.well_formed(D, lowbit=kv_fmt != "bf16"), (config, D, kv_fmt)
-    device = device or qo_indptr.device
+    device = torch.device(device or qo_indptr.device)
     sm = (
         sm_count
         if sm_count is not None
-        else (
-            torch.cuda.get_device_properties(device).multi_processor_count
-            if torch.device(device).type == "cuda"
-            else 204
-        )
+        else (device_sm_count(device) if device.type == "cuda" else 204)
     )
     plan = build_plan(
         qo_indptr.cpu().tolist(),
@@ -456,6 +544,8 @@ def plan_attention(
         merge=config.merge,
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
+        grid=config.grid,
+        grid_search=planner_grid_search(device),
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -465,10 +555,10 @@ def plan_attention(
     )
     if (
         config.q2
-        and len(plan.desc) >= Q2_MIN_UNITS_PER_SM * sm
+        and len(plan.desc) >= Q2_MIN_UNITS_PER_SM[D] * sm
         and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))
     ):
-        paired = pair_units(plan.desc)
+        paired = pair_units(plan.desc, sm)
         plan.num_launch = len(paired) // 2
         desc = torch.tensor(paired, dtype=torch.int32, device=device)
     groups = torch.tensor(
@@ -541,12 +631,8 @@ def workspace_bytes(
     assert kv_last_page_len is not None
     check_supported(D, Hq, Hkv, page)
     config = config or default_config(D=D)
-    device = device or qo_indptr.device
-    sm = (
-        torch.cuda.get_device_properties(device).multi_processor_count
-        if torch.device(device).type == "cuda"
-        else 204
-    )
+    device = torch.device(device or qo_indptr.device)
+    sm = device_sm_count(device) if device.type == "cuda" else 204
     plan = build_plan(
         qo_indptr.cpu().tolist(),
         kv_indptr.cpu().tolist(),
@@ -561,6 +647,7 @@ def workspace_bytes(
         merge=config.merge,
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
+        grid_search=planner_grid_search(device),
     )
     return plan.ws_rows * ws_row(D) * 4
 
@@ -787,13 +874,15 @@ def _run_attention_validated(
     vs: float = 1.0,
     k_sf: Optional[torch.Tensor] = None,
     v_sf: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale (the key scale inside it for
     the per-tensor-scale classes), ``vs`` the binary32 value scale (1.0 for the bf16 and the token-head-scale classes, whose
     kernels ignore it), ``kv_fmt`` the cache format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the
     cache's geometry, the NVFP4 caches as their packed bytes with the block scales ``k_sf`` / ``v_sf`` (bytes, ``D / 16`` per
     row), the token-head-scale classes' fp8 caches with their float32 scales ``k_sf`` / ``v_sf`` (the cache's shape minus the
-    head dim), which the softmax applies per key."""
+    head dim), which the softmax applies per key. ``enable_pdl``: launch the attention kernel as a programmatic dependent of
+    the preceding kernel (None: the device's default, ``device_support_pdl``)."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -839,8 +928,12 @@ def _run_attention_validated(
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
-    sm = torch.cuda.get_device_properties(q.device).multi_processor_count
-    grid = config.grid if config.grid else min(plan.num_units, sm)
+    sm = device_sm_count(q.device)
+    grid = (
+        config.grid
+        if config.grid
+        else (getattr(plan, "grid", 0) or min(plan.num_units, sm))
+    )  # the planner's grid (Swaps batches: plan.swaps_unit_kinds) unless the configuration fixes one
     grid = max(1, min(grid, plan.num_units))
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
@@ -855,8 +948,13 @@ def _run_attention_validated(
 
         from .swaps.operands import arch_smem_cap
 
+        from ...utils import device_support_pdl
+
+        pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
-        kernel = get_compiled_swaps(D, g, page, n_pad, ragged, arch_smem_cap(q.device))
+        kernel = get_compiled_swaps(
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+        )
         kernel(
             q_view,
             kv_k,
@@ -875,12 +973,19 @@ def _run_attention_validated(
             int(grid),
         )
     else:
+        from .blocks.operands import arch_smem_cap as row_arch_smem_cap
+
+        # the smem plan is sized for the execution device's shared memory: part of the kernel's identity, in-process and on disk
+        cap = row_arch_smem_cap(q.device)
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
+        # the row maximum's placement: part of the kernel's identity. The token-head-scale classes take the maximum of the SCALED
+        # scores, which the softmax forms in registers: the TMEM load's own maximum is not theirs
+        hwm = hw_row_max_enabled(q.device, D) and not th
         if (
             config.q2 and n_launch is None
-        ):  # too few units to pair: the one-warpgroup body (same bits)
+        ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, 1, False, ragged, kv_fmt
+                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, kv_fmt
             )
         else:
             kernel = get_compiled_attention(
@@ -891,6 +996,8 @@ def _run_attention_validated(
                 config.softmax_wgs,
                 config.q2,
                 ragged,
+                hwm,
+                cap,
                 kv_fmt,
             )
         if n_launch is not None:  # the paired placement walks pairs of units

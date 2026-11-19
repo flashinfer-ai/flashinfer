@@ -68,7 +68,7 @@ def assert_accuracy(actual, args):
         )
 
 
-@pytest.mark.parametrize("tactic", range(6))
+@pytest.mark.parametrize("tactic", range(7))
 @pytest.mark.parametrize("sq", [1, 4])
 @pytest.mark.parametrize("offset", [0, 1, 31, 63])
 def test_correctness(tactic, sq, offset):
@@ -77,7 +77,17 @@ def test_correctness(tactic, sq, offset):
     assert_accuracy(args[-1], args)
 
 
-@pytest.mark.parametrize("tactic", range(6))
+@pytest.mark.parametrize("tactic", [0, 1, 2, 6])
+@pytest.mark.parametrize("b", [1, 16])
+def test_global_fp32_fused_and_separate_combine(tactic, b):
+    # B=1 permits cooperative fusion on H100; B=16 exceeds the row guard
+    # and must retain the separate FP32 combine. Both use the same API.
+    args = inputs(b=b, sq=1, context=1025)
+    _runner(0.0625, 512)(args, tactic=tactic)
+    assert_accuracy(args[-1], args)
+
+
+@pytest.mark.parametrize("tactic", range(7))
 @pytest.mark.parametrize("sq", [1, 4])
 @pytest.mark.parametrize("context", [63, 65, 191, 255, 511, 1024, 1025, 1055, 1087])
 def test_nonfinite_masked_cache_slots(tactic, sq, context):
@@ -154,7 +164,7 @@ def test_bad_workspace_and_alias():
         run(*args[:-1], window_left=512, sm_scale=0.0625, out=alias)
 
 
-@pytest.mark.parametrize("tactic", range(6))
+@pytest.mark.parametrize("tactic", range(7))
 def test_short_and_empty(tactic):
     args = inputs(b=2, sq=4, context=63)
     args[4][-1] = 0
@@ -162,7 +172,7 @@ def test_short_and_empty(tactic):
     assert_accuracy(args[-1], args)
 
 
-@pytest.mark.parametrize("tactic", range(6))
+@pytest.mark.parametrize("tactic", range(7))
 def test_large_scores(tactic):
     args = inputs(b=2, sq=4, context=1055)
     args[0].mul_(3)

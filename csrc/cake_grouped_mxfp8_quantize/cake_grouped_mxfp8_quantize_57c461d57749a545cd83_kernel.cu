@@ -61,10 +61,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float max_noftz(float a, float b) {
@@ -412,7 +408,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                     magnitudes[29] = fabsf(magnitudes[29]);
                     magnitudes[30] = fabsf(magnitudes[30]);
                     magnitudes[31] = fabsf(magnitudes[31]);
-                    float2 _reg_reduce_max2_1 = {-CAKE_INF, -CAKE_INF};
+                    float2 _reg_reduce_max2_1 = {-CUDART_INF_F, -CUDART_INF_F};
                     _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[0], magnitudes[1]));
                     _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[2], magnitudes[3]));
                     _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[4], magnitudes[5]));
@@ -438,9 +434,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                     unsigned int normal = ((exponent != 0) ? 1 : 0);
                     unsigned int large_subnormal = ((mantissa > 4194304) ? 1 : 0);
                     unsigned int scale_byte = ((exponent + (has_mantissa & (normal | large_subnormal))) < (254) ? (exponent + (has_mantissa & (normal | large_subnormal))) : (254));
-                    unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
-                    unsigned int zero_bits = 0;
-                    unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
+                    unsigned int inverse_bits = 254 - scale_byte << 23;
                     float inverse = 0.0f;
                     inverse = reinterpret_cast<float*>(&inverse_bits)[0];
                     const float2 _scale2_2 = {inverse, inverse};
@@ -448,7 +442,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                     for (int _ls = 0; _ls < 16; _ls++)
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_2);
                     unsigned long long task = global_row * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) + (unsigned long long)_fast_div_r_0;
-                    unsigned long long q_offset = task * 32;
+                    unsigned long long q_offset = task * 32ull;
                     unsigned int _packed_0[8];
                     {
                         uint32_t _packed;
@@ -565,7 +559,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                     unsigned int k_tile = _fast_div_r_0 / 4;
                     unsigned int scale_col = _fast_div_r_0 - k_tile * 4;
                     unsigned long long tile_linear = ((unsigned long long)group * (unsigned long long)PM_TILES + (unsigned long long)m_tile) * (unsigned long long)PK_TILES + (unsigned long long)k_tile;
-                    unsigned long long scale_offset = tile_linear * 512 + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4 + (unsigned long long)scale_col;
+                    unsigned long long scale_offset = tile_linear * 512ull + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull + (unsigned long long)scale_col;
                     *(reinterpret_cast<unsigned char*>(scales + scale_offset) + (0)) = (unsigned char)(scale_byte);
                 }
                 row = row + SUBROWS;

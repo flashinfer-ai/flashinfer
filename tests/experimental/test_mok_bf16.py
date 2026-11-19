@@ -9,7 +9,7 @@ context-free forward, every exported scheduler layout and the epilogues, plus th
 communication-split tables, resolvers and configuration switches.
 
 Backend suite: the package is imported only through
-:func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+:func:`tests.cake.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
 wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from tests.experimental._mok_reference import require_gpu, single_rank_schedule
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kernels = cake_package("cake_mok_bf16", "_kernels")
 api = cake_package("cake_mok_bf16", "api")
@@ -262,11 +262,8 @@ def _check_fused_training(
 
 
 @pytest.fixture(autouse=True)
-def _exact_matmul(monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    monkeypatch.setattr(
-        torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False
-    )
+def _exact_matmul(cuda_matmul_flags):
+    cuda_matmul_flags(allow_tf32=False, allow_bf16_reduced_precision_reduction=False)
 
 
 def test_fused_training():

@@ -42,7 +42,7 @@ program.  ``test_cake_gdp_prefill_route.py`` covers the route arithmetic and
 the registry without a GPU.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path runs
 it unchanged after pointing that table entry at its package.  The
 ``flashinfer.gdp_prefill.chunk_gated_delta_product(backend="cake")`` route is
@@ -60,7 +60,7 @@ from typing import Optional
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_gdp")
 cake_build = cake_package("cake_gdp", "cake_build")
