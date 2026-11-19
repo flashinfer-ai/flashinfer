@@ -42,6 +42,7 @@ from ...jit.cake_gdn_cp_backend import (
     load_gdn_cp_kernel,
     program_for,
 )
+from ...jit.cpp_ext import is_cuda_version_at_least
 
 _BLOCK = 64
 _HEAD_DIM = 128
@@ -671,9 +672,15 @@ def _build_plan(
         t_kernel = f"{t_kernel}_cu32"
     # Without reading prefix-sum payloads, the full-block path is provably safe
     # only when the host bound and total force every sequence to have the same
-    # aligned length. All other batches use the tail-safe generic kernel.
+    # aligned length and every CP chunk is whole 128-token block pairs (the
+    # full-block kernel reads the gates of whole pairs, past the end of a chunk
+    # that ends inside one). All other batches use the tail-safe generic kernel.
     all_sequences_equal = total_tokens == num_seqs * max_seqlen
-    generic_tail = not (all_sequences_equal and max_seqlen % (2 * _BLOCK) == 0)
+    generic_tail = not (
+        all_sequences_equal
+        and max_seqlen % (2 * _BLOCK) == 0
+        and cp_chunk_len % (2 * _BLOCK) == 0
+    )
     if q.dtype == torch.float16 and not generic_tail and hq == hk == hv:
         prefill_kernel = (
             "cp_prefill_equal_head_h32"
@@ -1810,19 +1817,21 @@ def _assert_paged_slots(
         ((crossed == 0) | ((starts >= 0) & (starts + crossed <= num_entries))).all(),
         "GDN paged prefill checkpoint_cu_starts must address page_indices",
     )
-    # The checkpoint entries some sequence writes: +1 at each range start,
+    # How many sequences write each checkpoint entry: +1 at each range start,
     # -1 past its end, then a running sum.
     edges = torch.zeros(num_entries + 1, dtype=torch.int64, device=starts.device)
     live = (crossed > 0).long()
     edges.index_add_(0, starts.clamp(0, num_entries), live)
     edges.index_add_(0, (starts + crossed).clamp(0, num_entries), -live)
-    written = edges.cumsum(0)[:-1] > 0
+    coverage = edges.cumsum(0)[:-1]
     rows = torch.cat(
         (
-            torch.where(written, checkpoint_state_indices.long(), -1),
+            torch.where(coverage > 0, checkpoint_state_indices.long(), -1),
             output_state_indices.long(),
         )
     )
+    # An entry in the ranges of two sequences counts its row twice.
+    writes = torch.cat((coverage, torch.ones_like(output_state_indices.long())))
     for name, tensor in (
         ("state_indices", state_indices.long()),
         ("written rows", rows),
@@ -1832,7 +1841,7 @@ def _assert_paged_slots(
             f"GDN paged prefill {name} must contain -1 or slots in [0, {pool_size})",
         )
     counts = torch.zeros(pool_size + 1, dtype=torch.int64, device=rows.device)
-    counts.index_add_(0, rows.clamp(-1, pool_size - 1) + 1, torch.ones_like(rows))
+    counts.index_add_(0, rows.clamp(-1, pool_size - 1) + 1, writes)
     torch._assert_async(
         (counts[1:] <= 1).all(),
         "GDN paged prefill must not write a state row twice",
@@ -1868,6 +1877,31 @@ def _paged_plan(
     )
 
 
+# Stage 4 places CTA ``i``'s tensor maps at byte ``i * 640 + 128 * map`` of the
+# tensor-map workspace, computed in 32-bit integers.
+_MAX_TENSOR_MAP_OFFSET = 2**31 - 1
+# T, MN and stage 4 launch one grid row per sequence.
+_MAX_GRID_Y = 65535
+
+
+def _paged_grid_rejection_reason(plan: GDNCPPrefillPlan) -> str | None:
+    """Why the T, MN and stage-4 grids of a paged plan cannot launch, or
+    ``None``.  Without new tokens only the one-dimensional fixup grid runs."""
+
+    if not plan.total_tokens:
+        return None
+    if plan.num_seqs > _MAX_GRID_Y:
+        return f"supports at most {_MAX_GRID_Y} sequences, got {plan.num_seqs}"
+    # The byte offset of the last map of the last CTA.
+    last_map = (math.prod(plan.cp_grid) * _PREFILL_TENSOR_MAPS - 1) * _TENSOR_MAP_BYTES
+    if last_map > _MAX_TENSOR_MAP_OFFSET:
+        return (
+            f"supports at most {_MAX_TENSOR_MAP_OFFSET} bytes of stage-4 tensor-map "
+            f"offsets, got {last_map} for the grid {plan.cp_grid}"
+        )
+    return None
+
+
 def gdn_cp_paged_rejection_reason(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1878,7 +1912,8 @@ def gdn_cp_paged_rejection_reason(
 ) -> str | None:
     """Why the paged CP route cannot serve this call, or ``None``.
 
-    Reads only shapes, dtypes, strides and the device: no host synchronization.
+    Reads only shapes, dtypes, strides, addresses and the device: no host
+    synchronization.
     """
 
     if not q.is_cuda:
@@ -1894,6 +1929,9 @@ def gdn_cp_paged_rejection_reason(
     )
     if cuda_version < (12, 8):
         return "requires CUDA 12.8 or newer"
+    # The sm_107a programs need CUDA 13.4, as tinygemm2_sm100 does on SM107.
+    if arch == "sm_107a" and not is_cuda_version_at_least("13.4"):
+        return "requires CUDA 13.4 or newer on sm_107a"
     if q.dtype not in (torch.float16, torch.bfloat16):
         return "requires float16 or bfloat16 q/k/v"
     if (
@@ -1912,6 +1950,8 @@ def gdn_cp_paged_rejection_reason(
         return "requires head size 128 and an equal-head, GQA or GVA mapping"
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
         return "requires contiguous q/k/v"
+    if any(tensor.data_ptr() % 16 for tensor in (q, k, v)):
+        return "requires 16-byte aligned q/k/v"
     num_sab_heads = max(hq, hv)
     if state_pool.dtype != torch.float32:
         return "requires a float32 state pool"
@@ -1926,9 +1966,10 @@ def gdn_cp_paged_rejection_reason(
     )
     if inner:
         return "requires dense [H, 128, 128] state pool rows"
+    # Stage 4 takes the row stride in 16-byte groups even for a one-row pool.
     stride0 = int(state_pool.stride(0))
-    if state_pool.shape[0] > 1 and (
-        stride0 < num_sab_heads * _HEAD_DIM * _HEAD_DIM or stride0 % 4
+    if stride0 % 4 or (
+        state_pool.shape[0] > 1 and stride0 < num_sab_heads * _HEAD_DIM * _HEAD_DIM
     ):
         return "requires a state pool row stride of whole 16-byte groups"
     if state_pool.data_ptr() % 16:
@@ -2008,6 +2049,13 @@ def chunk_gated_delta_rule_gdn_cp_paged_sm100(
         dtype=q.dtype,
         device=device,
     )
+    # Rejected before any launch: stage 4 checks the output alignment only after
+    # the fixup has written the pool, and does not check its tensor-map offsets.
+    if output.data_ptr() % 16:
+        raise ValueError("output must be 16-byte aligned")
+    reason = _paged_grid_rejection_reason(plan)
+    if reason is not None:
+        raise ValueError(f"GDN CP paged prefill {reason}")
 
     def as_i32(tensor: torch.Tensor) -> torch.Tensor:
         return tensor if tensor.dtype == torch.int32 else tensor.to(torch.int32)

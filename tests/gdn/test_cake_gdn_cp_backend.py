@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,7 +151,12 @@ def test_long_row_dispatch_is_exact(
         ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
         ("sm_107a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
-        ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
+        ("sm_100a", (1024,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
+        # Equal 128-aligned lengths whose CP chunk is 64 (bf16, source chunk
+        # 128) or 192 tokens: the last chunk ends inside a 128-token pair.
+        ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_generic_bf16"),
+        ("sm_100a", (256, 256), torch.bfloat16, (2, 2, 4), "cp_prefill_generic_bf16"),
+        ("sm_100a", (384,), torch.float16, (1, 1, 1), "cp_prefill_generic"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
         ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
     ],
@@ -189,6 +195,55 @@ def test_generic_plan_selects_head_dtype_and_tail_routes(
     assert plan.mn_kernel == f"mn_precompute{suffix}"
     assert plan.prefill_kernel == expected_prefill
     assert plan.num_sab_heads == max(hq, hv)
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "num_sab_heads", "max_cp_chunks", "total_tokens", "rejected"),
+    [
+        (65535, 1, 1, 65535, None),
+        (65536, 1, 1, 65536, "at most 65535 sequences"),
+        # Only the one-dimensional fixup grid runs without new tokens.
+        (65536, 1, 1, 0, None),
+        # The last map of 3355443 CTAs starts at byte 2**31 - 256; one more
+        # CTA puts it at 2**31 + 384.
+        (1, 1, 3355443, 1, None),
+        (1, 1, 3355444, 1, "tensor-map offsets"),
+        (2048, 64, 25, 1, None),
+        (2048, 64, 26, 1, "tensor-map offsets"),
+    ],
+)
+def test_paged_grid_rejection_reason_bounds_grid_y_and_tensor_map_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+    num_seqs: int,
+    num_sab_heads: int,
+    max_cp_chunks: int,
+    total_tokens: int,
+    rejected: str | None,
+) -> None:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_103a")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=148),
+    )
+    q = SimpleNamespace(
+        shape=(128, 1, 128), device=SimpleNamespace(), dtype=torch.bfloat16
+    )
+    k = SimpleNamespace(shape=(128, 1, 128))
+    plan = dataclasses.replace(
+        gdn_cp._build_plan(q, k, k, num_seqs=1, max_seqlen=128),
+        num_seqs=num_seqs,
+        num_sab_heads=num_sab_heads,
+        max_cp_chunks_per_seq=max_cp_chunks,
+        total_tokens=total_tokens,
+    )
+
+    reason = gdn_cp._paged_grid_rejection_reason(plan)
+
+    if rejected is None:
+        assert reason is None
+    else:
+        assert reason is not None and rejected in reason, reason
 
 
 @pytest.mark.parametrize("cu_dtype", [torch.int32, torch.int64])

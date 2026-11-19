@@ -414,7 +414,11 @@ def chunk_gated_delta_rule_paged(
         with NaN instead of a state; the other sequences are unaffected. Its
         results are not bitwise those of
         ``"flashinfer"`` (about 4e-3 relative on the states), and its
-        checkpoint bits depend on the batch shape.
+        checkpoint bits depend on the batch shape. It helps when few states
+        run in parallel: on GB300 it is up to 4.3x faster than
+        ``"flashinfer"`` at small ``num_seqs * num_sab_heads`` with long
+        sequences, about even at 32 with 2048 new tokens per sequence, and
+        slower (0.4-0.8x) at 64 or more.
     max_seqlen : int, optional
         With ``backend="cake_gdn"``, an upper bound of the new tokens of any
         sequence; it sizes the split. Without it the bound is the total.

@@ -875,6 +875,38 @@ def test_paged_prefill_cake_cp_equal_lengths_full_block(
 
 
 @pytest.mark.parametrize(
+    "dtype, new_lens, cp_chunk_len",
+    [
+        (torch.bfloat16, [128], 64),
+        (torch.bfloat16, [256, 256], 64),
+        (torch.float16, [384], 192),
+    ],
+    ids=["bf16_128", "bf16_2x256", "fp16_384"],
+)
+def test_paged_prefill_cake_cp_equal_lengths_partial_pair_chunks(
+    monkeypatch, dtype, new_lens, cp_chunk_len
+):
+    """Equal 128-aligned spans whose CP chunk is not whole 128-token pairs run
+    the generic stage-4 program: the full-block one reads the gates of whole
+    pairs, past the end of a chunk that ends inside one."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    plans = _record_cake_cp_plans(monkeypatch)
+    _run_cake_cp_against_flashinfer(
+        [0, 128][: len(new_lens)],
+        new_lens,
+        128,
+        (2, 2, 4),
+        dtype,
+        max_seqlen=max(new_lens),
+    )
+    suffix = "_bf16" if dtype == torch.bfloat16 else ""
+    assert [(plan.cp_chunk_len, plan.prefill_kernel) for plan in plans] == [
+        (cp_chunk_len, f"cp_prefill_generic{suffix}_paged")
+    ]
+
+
+@pytest.mark.parametrize(
     "heads, prefix_lens, new_lens, page_size, fixup, cp_chunk_len",
     [
         ((4, 4, 16), [64], [8128], 1024, "state_fixup_utcmma64_paged", None),
@@ -1087,35 +1119,153 @@ def test_cake_cp_paged_rejection_reason(case, match):
     assert reason is not None and match in reason, reason
 
 
+@pytest.mark.parametrize(
+    "arch, nvcc_134, rejected",
+    [("sm_107a", False, True), ("sm_107a", True, False), ("sm_103a", False, False)],
+)
+def test_cake_cp_paged_rejection_reason_needs_cuda_13_4_on_sm107(
+    monkeypatch, arch, nvcc_134, rejected
+):
+    """The sm_107a programs need a CUDA 13.4 nvcc; the other architectures keep
+    the CUDA 12.8 floor."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    gdn_cp = _cake_cp_backend()
+
+    def at_least(version):
+        assert version == "13.4"
+        return nvcc_134
+
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: arch)
+    monkeypatch.setattr(gdn_cp, "is_cuda_version_at_least", at_least)
+    q = torch.zeros(128, 2, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    pool = torch.zeros(4, 2, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    reason = gdn_cp.gdn_cp_paged_rejection_reason(q, q, q, pool, page_size=64)
+    assert reason == ("requires CUDA 13.4 or newer on sm_107a" if rejected else None)
+
+
+def _misaligned(shape, dtype):
+    """A contiguous tensor 2 bytes past a 16-byte boundary."""
+    flat = torch.zeros(math.prod(shape) + 1, dtype=dtype, device="cuda")
+    return flat[1:].view(shape)
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("q", "16-byte aligned q/k/v"),
+        ("k", "16-byte aligned q/k/v"),
+        ("v", "16-byte aligned q/k/v"),
+        ("output", "output must be 16-byte aligned"),
+        ("one_row_pool", "row stride of whole 16-byte groups"),
+        ("grid_y", "at most 1 sequences"),
+        ("tensor_map_offset", "tensor-map offsets"),
+    ],
+)
+def test_paged_prefill_cake_cp_rejects_before_any_launch(monkeypatch, case, match):
+    """What stage 4 would reject only after the fixup has written the pool
+    (misaligned q/k/v or output, a one-row pool whose row stride is not whole
+    16-byte groups), and grids past the launch or 32-bit tensor-map offset
+    limits, raise before any launch: the pool is unchanged."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    gdn_cp = _cake_cp_backend()
+    torch.manual_seed(3)
+    heads = 2
+    new_lens = [128] if case == "one_row_pool" else [128, 128]
+    num_seqs = len(new_lens)
+    shape = (sum(new_lens), heads, HEAD_SIZE)
+    qkv = {
+        name: torch.randn(shape, device="cuda").to(torch.bfloat16)
+        for name in ("q", "k", "v")
+    }
+    output = None
+    if case in qkv:
+        qkv[case] = _misaligned(shape, torch.bfloat16).copy_(qkv[case])
+    elif case == "output":
+        output = _misaligned(shape, torch.bfloat16)
+    elif case == "grid_y":
+        monkeypatch.setattr(gdn_cp, "_MAX_GRID_Y", 1)
+    elif case == "tensor_map_offset":
+        monkeypatch.setattr(gdn_cp, "_MAX_TENSOR_MAP_OFFSET", 0)
+    row = heads * HEAD_SIZE * HEAD_SIZE
+    pool = torch.empty_strided(
+        (num_seqs, heads, HEAD_SIZE, HEAD_SIZE),
+        (row + (case == "one_row_pool"), HEAD_SIZE * HEAD_SIZE, HEAD_SIZE, 1),
+        device="cuda",
+    )
+    pool.copy_(torch.randn(pool.shape, device="cuda"))
+    before = pool.clone()
+    with pytest.raises(ValueError, match=match):
+        chunk_gated_delta_rule_paged(
+            qkv["q"],
+            qkv["k"],
+            qkv["v"],
+            cu_seqlens=_cu(new_lens, "cuda"),
+            state_pool=pool,
+            page_indices=torch.arange(num_seqs, dtype=torch.int32, device="cuda"),
+            page_indptr=torch.arange(num_seqs + 1, dtype=torch.int32, device="cuda"),
+            page_size=128,
+            last_page_len=torch.full(
+                (num_seqs,), 128, dtype=torch.int32, device="cuda"
+            ),
+            output=output,
+            backend="cake_gdn",
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(pool, before)
+
+
 _INVALID_ROW_CHILD = """
 import sys
 import torch
-from flashinfer.gdn_paged import chunk_gated_delta_rule_paged
+from flashinfer.gdn_paged import chunk_gated_delta_rule_paged, gdn_paged_prefill_slots
 
+case = sys.argv[1]
 pool = torch.zeros(4, 4, 128, 128, device="cuda")
 q = torch.zeros(128, 4, 128, dtype=torch.bfloat16, device="cuda")
-pages = {"valid": [0, 1], "duplicate": [0, 0], "out_of_pool": [0, 4]}[sys.argv[1]]
+pages = {
+    "valid": [0, 1],
+    "duplicate": [0, 0],
+    "out_of_pool": [0, 4],
+    "overlapping_starts": [0, 1],
+}[case]
+cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
+page_indices = torch.tensor(pages, dtype=torch.int32, device="cuda")
+page_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+last_page_len = torch.tensor([64, 64], dtype=torch.int32, device="cuda")
+slots = gdn_paged_prefill_slots(
+    cu_seqlens, page_indices, page_indptr, 64, last_page_len
+)
+if case == "overlapping_starts":
+    # Both sequences write their page-end checkpoint to entry 0 (row 0).
+    starts = torch.zeros_like(slots.checkpoint_cu_starts)
+    slots = slots._replace(checkpoint_cu_starts=starts)
 chunk_gated_delta_rule_paged(
     q,
     q,
     q,
-    cu_seqlens=torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda"),
+    cu_seqlens=cu_seqlens,
     state_pool=pool,
-    page_indices=torch.tensor(pages, dtype=torch.int32, device="cuda"),
-    page_indptr=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+    page_indices=page_indices,
+    page_indptr=page_indptr,
     page_size=64,
-    last_page_len=torch.tensor([64, 64], dtype=torch.int32, device="cuda"),
+    last_page_len=last_page_len,
+    slots=slots,
     backend="cake_gdn",
 )
 torch.cuda.synchronize()
 """
 
 
-@pytest.mark.parametrize("case", ["valid", "duplicate", "out_of_pool"])
+@pytest.mark.parametrize(
+    "case", ["valid", "duplicate", "out_of_pool", "overlapping_starts"]
+)
 def test_paged_prefill_cake_cp_invalid_rows_fail_in_isolated_process(case):
     """With FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1 a row written by two sequences
-    or past the pool fails a device assert (in a child: it poisons CUDA), and
-    distinct rows pass."""
+    (through duplicate page ids or overlapping checkpoint ranges) or past the
+    pool fails a device assert (in a child: it poisons CUDA), and distinct rows
+    pass."""
     _skip_if_unsupported()
     _skip_unless_cake_cp()
     repo_root = Path(__file__).resolve().parents[2]
@@ -2207,7 +2357,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
         ([6, 9, 2, 11, 15], [2, 2], [42 if backend == "flashinfer" else 70, 2]),
     ]
 
-    def call(state_pool):
+    def call(state_pool, output):
         return chunk_gated_delta_rule_paged(
             q,
             k,
@@ -2221,7 +2371,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
             page_indptr=indptr,
             page_size=L,
             last_page_len=last,
-            output=out,
+            output=output,
             backend=backend,
         )
 
@@ -2232,16 +2382,21 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
         last.copy_(torch.tensor(last_lens, dtype=torch.int32))
 
     set_tables(steps[0])
-    graph = _capture(lambda warmup: call(scratch if warmup else pool))
+    graph = _capture(lambda warmup: call(scratch if warmup else pool, out))
+    expected_out = torch.empty_like(out)
     for i, step in enumerate(steps):
         set_tables(step)
         expected_pool = pool.clone()
-        expected_out = call(expected_pool).clone()
+        call(expected_pool, expected_out)
+        # A row the replay does not store stays NaN and fails the comparison.
+        out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         _assert_output_guard(guard)
         # A stale page table reads another page's (unrelated) state.
-        torch.testing.assert_close(out, expected_out, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            out, expected_out, atol=1e-3, rtol=1e-3, msg=f"step {i}: output"
+        )
         torch.testing.assert_close(
             pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"step {i}: pool"
         )
