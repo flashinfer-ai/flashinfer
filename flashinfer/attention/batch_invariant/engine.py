@@ -580,6 +580,7 @@ def plan_kv_indptr(planned: _Planned, kv_indptr: torch.Tensor) -> torch.Tensor:
         and kv_indptr.dtype == snap.dtype
         and kv_indptr.data_ptr() == snap.data_ptr()
         and kv_indptr.numel() == snap.numel()
+        and kv_indptr.is_contiguous()
     ):
         return snap
     if kv_indptr.numel() != snap.numel():
