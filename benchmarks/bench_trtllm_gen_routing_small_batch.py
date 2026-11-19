@@ -14,15 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Small-batch DeepSeek-V3-style routing (256 experts, top-8, SigmoidBias + ScaledSumNormalize):
-routingCustom's single-launch small-batch kernels (1-64 tokens) vs the kernels they replace
-(static block <= 4 tokens, dyn-block 5-16, block-scores + post-TopK from 17), selected with
-FLASHINFER_ROUTING_SMALL_BATCH_KERNEL (read per call).
+routingCustom's single-launch small-batch kernels (1-64 tokens) vs the kernels they replace,
+selected with FLASHINFER_ROUTING_SMALL_BATCH_KERNEL (read per call). From logits: static block
+<= 4 tokens, dyn-block 5-16, block-scores + post-TopK from 17. Precomputed top-k: static block
+<= 4 tokens, dyn-block 5-8, block permutation from 9.
 
-Timing: CUDA-graph replay (20 calls per graph, median over replays), alternating the two paths
-over several rounds; CUPTI is not required. Ops:
+Timing: CUDA-graph replay (20 calls per graph, median over replays), over several rounds with
+the order of the two paths alternating between rounds; CUPTI is not required. Ops:
   routing      the routing kernel(s) alone (trtllm_gen_routing module, preallocated outputs)
   moe          trtllm_fp4_block_scale_moe (NVFP4, FromLogits, deferred finalize)
-  moe+side     the same with a BF16 shared-expert MLP on a forked stream, as SGLang's
+  moe-topk     trtllm_fp4_block_scale_routed_moe (the same MoE with packed precomputed top-k)
+  moe+side     the FromLogits MoE with a BF16 shared-expert MLP on a forked stream, as SGLang's
                dual-stream DeepSeek MoE runs it (contention for SMs)
 
 Example:
@@ -36,7 +38,10 @@ import statistics
 
 import torch
 
-from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+from flashinfer.fused_moe import (
+    trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
+)
 from flashinfer.fused_moe.trtllm_gen_routing import (
     _max_num_ctas_in_batch_dim,
     get_trtllm_gen_routing_module,
@@ -172,8 +177,7 @@ class Fp4Moe:
             output2_scale_scalar=torch.full((NUM_EXPERTS,), 1e-2, device="cuda"),
         )
 
-    def op(self, T):
-        logits, bias = glm_inputs(T, T)
+    def kwargs(self, T):
         gen = torch.Generator(device="cuda").manual_seed(T + 1)
         hs = torch.randint(
             0, 256, (T, HIDDEN // 2), generator=gen, device="cuda", dtype=torch.uint8
@@ -181,33 +185,55 @@ class Fp4Moe:
         hs_scale = (0.5 + torch.rand(T, HIDDEN // 16, generator=gen, device="cuda")).to(
             torch.float8_e4m3fn
         )
+        return dict(
+            hidden_states=hs,
+            hidden_states_scale=hs_scale,
+            hidden_states_scale_layout=SfLayout.layout_linear,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_bias=None,
+            num_experts=NUM_EXPERTS,
+            top_k=TOP_K,
+            n_group=1,
+            topk_group=1,
+            intermediate_size=self.inter,
+            local_expert_offset=0,
+            local_num_experts=NUM_EXPERTS,
+            routed_scaling_factor=2.5,
+            routing_method_type=int(RoutingMethodType.DeepSeekV3),
+            do_finalize=False,
+            enable_pdl=True,
+            activation_type=int(ActivationType.Swiglu),
+            **self.weights,
+        )
+
+    def op(self, T):
+        logits, bias = glm_inputs(T, T)
+        kw = self.kwargs(T)
 
         def run():
-            trtllm_fp4_block_scale_moe(
-                logits,
-                bias,
-                hs,
-                hs_scale,
-                hidden_states_scale_layout=SfLayout.layout_linear,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_bias=None,
-                num_experts=NUM_EXPERTS,
-                top_k=TOP_K,
-                n_group=1,
-                topk_group=1,
-                intermediate_size=self.inter,
-                local_expert_offset=0,
-                local_num_experts=NUM_EXPERTS,
-                routed_scaling_factor=2.5,
-                routing_method_type=int(RoutingMethodType.DeepSeekV3),
-                do_finalize=False,
-                enable_pdl=True,
-                activation_type=int(ActivationType.Swiglu),
-                **self.weights,
-            )
+            trtllm_fp4_block_scale_moe(logits, bias, **kw)
+
+        return run
+
+    def op_topk(self, T):
+        """The same call with the top-k of glm_inputs precomputed: packed (expert << 16) | bf16
+        weight bits."""
+        logits, bias = glm_inputs(T, T)
+        scores = torch.sigmoid(logits)
+        ids = (scores + bias).topk(TOP_K, dim=1).indices
+        weights = scores.gather(1, ids)
+        weights = (2.5 * weights / weights.sum(dim=1, keepdim=True)).to(torch.bfloat16)
+        packed = (
+            (ids.to(torch.int32) << 16)
+            | (weights.view(torch.int16).to(torch.int32) & 0xFFFF)
+        ).contiguous()
+        kw = self.kwargs(T)
+
+        def run():
+            trtllm_fp4_block_scale_routed_moe(packed, None, **kw)
 
         return run
 
@@ -234,11 +260,18 @@ class Fp4Moe:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("Example")[0])
-    p.add_argument("--ops", nargs="+", default=["routing", "moe", "moe+side"])
+    p.add_argument(
+        "--ops", nargs="+", default=["routing", "moe", "moe-topk", "moe+side"]
+    )
     p.add_argument("--tokens", type=int, nargs="+", default=None)
     p.add_argument("--tile", type=int, default=8, help="routing op tile size")
     p.add_argument("--inter", type=int, default=512, help="per-rank intermediate size")
     p.add_argument("--rounds", type=int, default=3)
+    p.add_argument(
+        "--raw",
+        action="store_true",
+        help="also print every round's timings with the order the paths ran in",
+    )
     args = p.parse_args()
 
     print(
@@ -257,13 +290,27 @@ def main():
             else [1, 3, 6, 8, 12, 16, 18, 19, 24, 32, 40, 48, 56, 64]
         )
         for T in tokens:
-            fn = routing_op(T, args.tile) if op == "routing" else moe.op(T)
+            if op == "routing":
+                fn = routing_op(T, args.tile)
+            elif op == "moe-topk":
+                fn = moe.op_topk(T)
+            else:
+                fn = moe.op(T)
             side = moe.shared_expert(T) if op == "moe+side" else None
             samples = {False: [], True: []}
-            for _ in range(args.rounds):
-                for enabled in (False, True):
+            for r in range(args.rounds):
+                # Alternate which path runs first, so drift within a round does not favor one.
+                order = (False, True) if r % 2 == 0 else (True, False)
+                for enabled in order:
                     with small_batch_kernel(enabled):
                         samples[enabled].append(graph_time_us(fn, side))
+                if args.raw:
+                    first = "new" if order[0] else "old"
+                    print(
+                        f"raw,{op},{T},{r},{first}-first,"
+                        f"{samples[False][-1]:.2f},{samples[True][-1]:.2f}",
+                        flush=True,
+                    )
             old = statistics.median(samples[False])
             new = statistics.median(samples[True])
             spread = {k: max(v) - min(v) for k, v in samples.items()}
