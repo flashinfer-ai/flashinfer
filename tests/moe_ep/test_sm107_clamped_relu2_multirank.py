@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-pytestmark = [pytest.mark.gpu_2, pytest.mark.arch_rubin]
+pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_rubin]
 
 
 def test_clamped_relu2_layer_ep4():
