@@ -5502,7 +5502,7 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(module.subprocess, "run", run)
-    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    monkeypatch.setattr(module, "load_inline_with_cubin", load_inline)
     module._load_generated_program.cache_clear()
 
     actual = module._load_generated_program("exact_bf16_varlen", "sm_103a")
@@ -6389,7 +6389,7 @@ def test_source_sm107_program_builds_its_table_module(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(module.subprocess, "run", run)
-    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    monkeypatch.setattr(module, "load_inline_with_cubin", load_inline)
 
     module._load_generated_program(name, "sm_107a")
     module._load_generated_program.cache_clear()
@@ -6555,7 +6555,7 @@ def test_source_chunk_parallel_program_builds_from_its_own_template(
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(module.subprocess, "run", run)
-    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    monkeypatch.setattr(module, "load_inline_with_cubin", load_inline)
     module._load_generated_program.cache_clear()
 
     module._load_generated_program(name, "sm_100a")

@@ -29,9 +29,9 @@ from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
 from filelock import FileLock
-from tvm_ffi import cpp
 
 from ..jit import env as jit_env
+from ..jit.inline_cubin import load_inline_with_cubin
 
 _CHUNK_SIZE = 128
 _HEADDIM = 64
@@ -3407,7 +3407,7 @@ def _load_generated_program(name: str, arch: str):
                 os.replace(temporary_cubin, cubin_path)
             cubins[kernel.module] = cubin_path.read_bytes()
 
-        return cpp.load_inline(
+        return load_inline_with_cubin(
             module_name,
             cpp_sources=host_source,
             embed_cubin=cubins,
