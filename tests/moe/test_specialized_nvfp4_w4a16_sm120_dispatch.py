@@ -61,13 +61,13 @@ def sm120_env(monkeypatch, record):
     never-swap) stays real; only what needs silicon or the CuTe-DSL stack is
     replaced.
     """
-    # --- SM120 device + CUDA >= 13.1 toolkit probes
+    # --- SM120 device + CUDA >= 13.2 toolkit probes
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: (12, 0)
     )
     monkeypatch.setattr(
         "flashinfer.jit.cpp_ext.get_cuda_version",
-        lambda: SimpleNamespace(major=13, minor=1),
+        lambda: SimpleNamespace(major=13, minor=2),
     )
     # Unified-runner environment probes (resolved at call time).
     monkeypatch.setattr(
@@ -111,8 +111,8 @@ def sm120_env(monkeypatch, record):
         return kwargs["scatter_output"]
 
     stub._normalize_quant_mode = _normalize_quant_mode
-    stub._activation_precision_from_quant_mode = (
-        lambda quant_mode: "bf16" if quant_mode == "w4a16" else "fp4"
+    stub._activation_precision_from_quant_mode = lambda quant_mode: (
+        "bf16" if quant_mode == "w4a16" else "fp4"
     )
     stub._validate_w4a4_dimensions = lambda *args, **kwargs: None
     stub.launch_sm120_moe = launch_sm120_moe
@@ -181,6 +181,18 @@ class TestGuard:
     def test_on_allowlist_supported(self, sm120_env, weights):
         ok, reasons = self._reasons(16, weights)
         assert ok and not reasons
+
+    @pytest.mark.parametrize("minor", [0, 1])
+    def test_unsupported_toolkit_declines_before_build(
+        self, sm120_env, weights, monkeypatch, minor
+    ):
+        monkeypatch.setattr(
+            "flashinfer.jit.cpp_ext.get_cuda_version",
+            lambda: SimpleNamespace(major=13, minor=minor),
+        )
+        ok, reasons = self._reasons(16, weights)
+        assert not ok and f"cuda_version:13.{minor}" in reasons
+        assert sm120_env["spec_calls"] == 0
 
     def test_off_allowlist_token_count(self, sm120_env, weights):
         ok, reasons = self._reasons(8, weights)
@@ -313,7 +325,13 @@ def _make_layer_and_packs(weights, t, backends=None, winner_key=None):
         layer._select_winner = lambda *_, **__: (winner, -1)
 
     weight_pack = MoEWeightPack()
+    # The two views carry DIFFERENT layouts (stock: swizzled 128-row-padded
+    # scales; specialized: row-major unpadded) and neither aliases the
+    # other, so each candidate gets its own registration. The mocked
+    # contract-shaped tensors satisfy the specialized runner's metadata
+    # check, which is all these CPU tests consume.
     weight_pack.prepare_for("b12x_w4a16", weights)
+    weight_pack.prepare_for("specialized_w4a16", weights)
     x, ids, tw = _activations(t)
     act_pack = MoEActivationPack(
         hidden_states_q=x,
@@ -356,9 +374,27 @@ class TestUnifiedSurface:
             "specialized_w4a16",
         ]
 
+    @pytest.mark.parametrize("minor", [0, 1])
+    def test_unsupported_toolkit_keeps_stock_candidate(
+        self, sm120_env, weights, monkeypatch, minor
+    ):
+        monkeypatch.setattr(
+            "flashinfer.jit.cpp_ext.get_cuda_version",
+            lambda: SimpleNamespace(major=13, minor=minor),
+        )
+        B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 16, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+        )
+        assert [r.backend_key for r in layer.runners] == ["b12x_w4a16"]
+        layer(act_pack, weight_pack)
+        assert sm120_env["spec_calls"] == 0
+        assert sm120_env["stock_calls"] == 1
+
     def test_specialized_runner_dispatches_its_own_module(self, sm120_env, weights):
-        """The runner calls the kernels' own module directly; the
-        layout-identical b12x_w4a16 weight view serves it as an alias."""
+        """The runner calls the kernels' own module directly, served by its
+        own ``specialized_w4a16`` weight view (the stock swizzled view is a
+        different layout and is not an alias)."""
         B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
         layer, act_pack, weight_pack = _make_layer_and_packs(
             weights,
@@ -469,3 +505,42 @@ class TestUnifiedSurface:
                 _moe_config(16, (SpecializedW4A16Config(),), top_k=4),
                 device=torch.device("cpu"),
             )
+
+
+class TestWeightViewEligibility:
+    """The specialized candidate is eligible only with a registered,
+    layout-compatible ``specialized_w4a16`` view (row-major unpadded
+    group-16 scales): an absent view or the stock swizzled storage leaves
+    it out of the shootout instead of raising while profiling."""
+
+    def test_b12x_only_pack_leaves_specialized_ineligible(self, sm120_env, weights):
+        B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 16, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+        )
+        del weight_pack.native_views["specialized_w4a16"]
+        eligible = layer._eligible_runners(act_pack, weight_pack)
+        assert [layer.runners[i].backend_key for i in eligible] == ["b12x_w4a16"]
+
+    def test_swizzled_scale_view_leaves_specialized_ineligible(
+        self, sm120_env, weights
+    ):
+        B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 16, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+        )
+        swizzled = dict(weights)
+        swizzled["w1_weight_sf"] = torch.empty(
+            E, 1920, 168, dtype=torch.float8_e4m3fn
+        )  # 128-row-padded stock storage
+        weight_pack.native_views["specialized_w4a16"] = swizzled
+        eligible = layer._eligible_runners(act_pack, weight_pack)
+        assert [layer.runners[i].backend_key for i in eligible] == ["b12x_w4a16"]
+
+    def test_prepare_weights_no_longer_delegates_to_stock(self):
+        from flashinfer.fused_moe import B12xW4A16Config, SpecializedW4A16Config
+
+        assert (
+            SpecializedW4A16Config.prepare_weights
+            is not B12xW4A16Config.prepare_weights
+        )

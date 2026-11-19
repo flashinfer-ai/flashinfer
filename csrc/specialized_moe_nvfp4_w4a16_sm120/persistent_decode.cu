@@ -48,8 +48,6 @@ struct Workspace {
   std::mutex mutex;
 };
 
-Workspace g_workspace;
-
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 // Persistent-grid sizes depend on the launch device's SM count and occupancy;
@@ -58,31 +56,43 @@ inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1)
 // blocks waiting at the grid barrier).
 constexpr int kMaxCachedDevices = 64;
 
-// Buffers retired by workspace growth or a device change stay alive for the
-// process lifetime: a CUDA graph captured earlier may still replay kernels
-// holding the old address. Growth is monotone along the warmup ladder, so
-// the retained total stays bounded (under 2x the final capacity per device).
+// Buffers retired by workspace growth stay alive for the process lifetime:
+// a CUDA graph captured earlier may still replay kernels holding the old
+// address. One workspace slot per device (a device switch retires nothing),
+// and growth at least doubles a slot's capacity, so every retired buffer is
+// at most half its replacement and the retained total stays below the live
+// per-device capacity across arbitrary admitted token-count sequences.
 std::vector<void*> g_retired_workspaces;
+Workspace g_workspaces_by_device[kMaxCachedDevices];
 
 void* ensure_workspace(size_t bytes, int device) {
-  if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
-    g_retired_workspaces.push_back(g_workspace.ptr);
-    g_workspace.ptr = nullptr;
-    g_workspace.bytes = 0;
+  // Devices beyond the per-device table share one slot with the old
+  // retire-on-switch policy (bounded by how rarely such devices occur).
+  static Workspace overflow;
+  Workspace& ws =
+      (device >= 0 && device < kMaxCachedDevices) ? g_workspaces_by_device[device] : overflow;
+  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
+    // Geometric growth: never grow a slot by less than 2x, so each retired
+    // buffer is at most half its replacement and the retained total is
+    // bounded by the live capacity.
+    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
+    g_retired_workspaces.push_back(ws.ptr);
+    ws.ptr = nullptr;
+    ws.bytes = 0;
   }
-  if (g_workspace.ptr == nullptr) {
+  if (ws.ptr == nullptr) {
     cudaSetDevice(device);
-    cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
+    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
-    cudaError_t zerr = cudaMemset(g_workspace.ptr, 0, bytes);
+    cudaError_t zerr = cudaMemset(ws.ptr, 0, bytes);
     TVM_FFI_ICHECK(zerr == cudaSuccess) << "specialized MoE workspace cudaMemset(" << bytes
                                         << ") failed: " << cudaGetErrorString(zerr);
-    g_workspace.bytes = bytes;
-    g_workspace.device = device;
+    ws.bytes = bytes;
+    ws.device = device;
   }
-  return g_workspace.ptr;
+  return ws.ptr;
 }
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {
@@ -1061,6 +1071,17 @@ __device__ __forceinline__ float sum_bf16x2(uint32_t v) {
   return __uint_as_float(v << 16) + __uint_as_float(v & 0xffff0000u);
 }
 
+// FP32 dot-product step over one packed bf16x2 pair: each bf16 x bf16
+// product is exact in FP32 and the running sum never rounds to BF16, so a
+// small contribution is not absorbed between large cancelling partials the
+// way a chained fma.rn.bf16x2 accumulator absorbs it.
+__device__ __forceinline__ float ffma_bf16x2(uint32_t a, uint32_t b, float acc) {
+  acc = fmaf(__uint_as_float(a << 16), __uint_as_float(b << 16), acc);
+  return fmaf(__uint_as_float(a & 0xffff0000u), __uint_as_float(b & 0xffff0000u), acc);
+}
+
+__device__ __forceinline__ float bf16x2_low(uint32_t v) { return __uint_as_float(v << 16); }
+
 // Grouped BF16 mma.sync GEMM with on-the-fly NVFP4 dequant.  The group scale is
 // folded into the B fragment (exact: 2-bit e2m1 x 4-bit e4m3 fits bf16's mantissa),
 // so one accumulator chain spans the whole K loop and MM rows share each B tile.
@@ -1417,9 +1438,9 @@ __device__ __forceinline__ void dec_tile_direct_bf16(const __nv_bfloat16* __rest
     scb[it] = scpack;
   }
 
-  uint32_t acc[RPW];
+  float acc[RPW];
 #pragma unroll
-  for (int r = 0; r < RPW; ++r) acc[r] = 0u;
+  for (int r = 0; r < RPW; ++r) acc[r] = 0.0f;
 
 #pragma unroll
   for (int it = 0; it < NIT; ++it) {
@@ -1437,22 +1458,22 @@ __device__ __forceinline__ void dec_tile_direct_bf16(const __nv_bfloat16* __rest
     }
 #pragma unroll
     for (int r = 0; r < RPW; ++r) {
-      const uint32_t sf = e4m3_bcast_bf16x2(scb[it] >> (8 * r));
+      const float sf = bf16x2_low(e4m3_bcast_bf16x2(scb[it] >> (8 * r)));
       uint32_t wv[4];
-      uint32_t sacc = 0u;
+      float sacc = 0.0f;
       e2m1x8_to_bf16x2x4(qb[it][r].x, wv);
 #pragma unroll
-      for (int p = 0; p < 4; ++p) sacc = fma_bf16x2(wv[p], xv[p], sacc);
+      for (int p = 0; p < 4; ++p) sacc = ffma_bf16x2(wv[p], xv[p], sacc);
       e2m1x8_to_bf16x2x4(qb[it][r].y, wv);
 #pragma unroll
-      for (int p = 0; p < 4; ++p) sacc = fma_bf16x2(wv[p], xv[p + 4], sacc);
-      acc[r] = fma_bf16x2(sacc, sf, acc[r]);
+      for (int p = 0; p < 4; ++p) sacc = ffma_bf16x2(wv[p], xv[p + 4], sacc);
+      acc[r] = fmaf(sacc, sf, acc[r]);
     }
   }
 
   float red[RPW];
 #pragma unroll
-  for (int r = 0; r < RPW; ++r) red[r] = warp_sum(sum_bf16x2(acc[r])) * alph;
+  for (int r = 0; r < RPW; ++r) red[r] = warp_sum(acc[r]) * alph;
   if (lane == 0) {
     if (FIRST) {
 #pragma unroll

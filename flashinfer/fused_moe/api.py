@@ -2909,13 +2909,32 @@ class SpecializedW4A16Config:
     — not a b12x kernel, and not reachable through ``b12x_fused_moe`` or
     ``B12xMoEWrapper``).
 
-    Uses the same checkpoint weight view as :class:`B12xW4A16Config` (its
-    runner also accepts the ``"b12x_w4a16"`` view as an alias, so one
-    prepared pack serves both candidates with no second weight copy).
+    Weights: its own ``specialized_w4a16`` view only, in the kernels'
+    documented ROW-MAJOR group-16 scale layout at the exact unpadded
+    geometry (``[E, I, H/16]`` / ``[E, H, I/16]``). This is NOT the stock
+    b12x view, whose scales are stored 128-row-padded and swizzled
+    (``[E, 1920, 168]`` for w1 at this geometry): the two views are not
+    interchangeable, neither runner aliases the other's, and a pack that
+    carries only the b12x view leaves this candidate ineligible instead of
+    raising mid-shootout.
+
+    CUDA graphs: the kernels bake process-global workspace addresses into a
+    capture, so captured graphs replay under a SINGLE-FLIGHT contract —
+    two captured graphs must never replay concurrently, and the workspace
+    must not grow while a captured graph may still replay. Callers that
+    capture multiple graphs over layers using this backend must serialize
+    their replays (see ``specialized_moe_nvfp4_w4a16_sm120.warmup``);
+    consumers that cannot guarantee that should not configure this
+    candidate for captured serving.
+
+    Determinism: expert partials combine with BF16 atomics, so repeated
+    identical calls can differ by a few BF16 ulp in accumulation order.
+    Consumers that require bitwise reproducibility should route to a
+    deterministic backend (e.g. the stock :class:`B12xW4A16Config`).
 
     A DEFAULT backend candidate: ``supported()`` gates the arch (SM120) and
     the runner gates the kernels' fixed contract (E=128, top_k=6,
-    hidden=2688, intermediate=1856, ReLU^2, CUDA >= 13.1 toolkit) and
+    hidden=2688, intermediate=1856, ReLU^2, CUDA >= 13.2 toolkit) and
     per-call token-count allowlist, so under ``backend=auto`` the
     ``MoELayer`` per-token-bucket shootout times the specialized kernels
     directly on matching layers — including under autotune tuning mode —
@@ -2942,20 +2961,26 @@ class SpecializedW4A16Config:
         activation: Optional[ActivationConfig] = None,
         source_format: str = "modelopt",
     ):
-        """Build the ``specialized_w4a16`` weight view (identical layout to
-        ``b12x_w4a16``; a pack prepared for either key serves both runners).
+        """Build the ``specialized_w4a16`` weight view from row-major
+        group-16 checkpoint tensors (the kernels' documented layout; NOT
+        the stock b12x swizzled storage — the two views carry different
+        memory layouts and are not interchangeable).
 
         Register the result with
         ``MoEWeightPack.prepare_for("specialized_w4a16", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_specialized_w4a16_weights`.
         """
-        return B12xW4A16Config.prepare_weights(
+        from .prepare import prepare_specialized_w4a16_weights
+        from .utils import resolve_b12x_activation_name
+
+        return prepare_specialized_w4a16_weights(
             w1_fp4,
             w1_blockscale,
             w1_global_scale,
             w2_fp4,
             w2_blockscale,
             w2_global_scale,
-            activation=activation,
+            activation=resolve_b12x_activation_name(activation),
             source_format=source_format,
         )
 

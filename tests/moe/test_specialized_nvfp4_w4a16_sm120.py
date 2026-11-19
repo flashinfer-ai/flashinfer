@@ -39,12 +39,12 @@ def _is_sm120_exactly():
     return torch.cuda.get_device_capability(0) == (12, 0)
 
 
-def _has_cuda_13_1_toolkit():
+def _has_cuda_13_2_toolkit():
     try:
         from flashinfer.jit.cpp_ext import get_cuda_version
 
         v = get_cuda_version()
-        return (v.major, v.minor) >= (13, 1)
+        return (v.major, v.minor) >= (13, 2)
     except Exception:
         return False
 
@@ -55,9 +55,9 @@ pytestmark = [
         reason="the specialized NVFP4-W4A16 MoE backend is SM120-only",
     ),
     pytest.mark.skipif(
-        not _has_cuda_13_1_toolkit(),
+        not _has_cuda_13_2_toolkit(),
         reason="the specialized backend JIT-builds an sm_120a module whose "
-        "cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.1-line ptxas",
+        "cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.2-line ptxas",
     ),
     pytest.mark.skipif(
         not is_cute_dsl_available(),
@@ -223,12 +223,35 @@ def test_kill_switch_rejects_candidate(weights, monkeypatch):
         )
 
 
-def _unified_layer_and_weight_pack(weights, t, backends=None):
-    """MoELayer over the b12x/specialized W4A16 backend candidates."""
+def _stock_swizzled_scales(sf):
+    """Row-major group-16 scales [E, rows, cols/16] -> the stock b12x
+    checkpoint storage: 128-row-padded, 4-col-padded, MMA-swizzled
+    [E, rows_padded, cols_padded] (the exact inverse of the repo's
+    ``unswizzle_block_scale``). The two layouts are NOT interchangeable, so
+    the stock view is built from this converted tensor while the
+    specialized view keeps the row-major original."""
+    e, rows, cb = sf.shape
+    rows_p = (rows + 127) // 128 * 128
+    cb_p = (cb + 3) // 4 * 4
+    padded = torch.zeros(e, rows_p, cb_p, dtype=torch.uint8, device=sf.device)
+    padded[:, :rows, :cb] = sf.view(torch.uint8)
+    r = padded.reshape(e, rows_p // 128, 4, 32, cb_p // 4, 4)
+    s = r.permute(0, 1, 4, 3, 2, 5).contiguous()
+    return s.reshape(e, rows_p, cb_p).view(torch.float8_e4m3fn)
+
+
+def _unified_layer_and_weight_pack(weights, t, backends=None, stock_view=None):
+    """MoELayer over the b12x/specialized W4A16 backend candidates.
+
+    Each candidate gets its OWN prepared view through its public
+    ``prepare_weights`` (the specialized view is row-major unpadded; the
+    stock b12x view takes the swizzled 128-row-padded scales): the views
+    carry different layouts and neither aliases the other."""
     from flashinfer.fused_moe import (
         B12xW4A16Config,
         MoELayer,
         MoEWeightPack,
+        SpecializedW4A16Config,
     )
     from flashinfer.fused_moe.api import (
         BackendOptions,
@@ -242,20 +265,42 @@ def _unified_layer_and_weight_pack(weights, t, backends=None):
     )
 
     w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha = weights
-    prepared = B12xW4A16Config.prepare_weights(
-        w1,
-        w1_sf,
-        w1_alpha,
-        w2,
-        w2_sf,
-        w2_alpha,
-        activation=ReLU2(),
-        source_format="modelopt",
-    )
-    weight_pack = MoEWeightPack()
-    weight_pack.prepare_for("b12x_w4a16", prepared)
     if backends is None:
         backends = (B12xW4A16Config(),)
+    weight_pack = MoEWeightPack()
+    if any(isinstance(b, SpecializedW4A16Config) for b in backends):
+        weight_pack.prepare_for(
+            "specialized_w4a16",
+            SpecializedW4A16Config.prepare_weights(
+                w1,
+                w1_sf,
+                w1_alpha,
+                w2,
+                w2_sf,
+                w2_alpha,
+                activation=ReLU2(),
+                source_format="modelopt",
+            ),
+        )
+    if stock_view is None:
+        stock_view = any(
+            isinstance(b, B12xW4A16Config) and not isinstance(b, SpecializedW4A16Config)
+            for b in backends
+        )
+    if stock_view:
+        weight_pack.prepare_for(
+            "b12x_w4a16",
+            B12xW4A16Config.prepare_weights(
+                w1,
+                _stock_swizzled_scales(w1_sf),
+                w1_alpha,
+                w2,
+                _stock_swizzled_scales(w2_sf),
+                w2_alpha,
+                activation=ReLU2(),
+                source_format="modelopt",
+            ),
+        )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=E, top_k=TOPK),
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
@@ -390,3 +435,190 @@ def test_cuda_graph_replay_matches_eager(weights):
     tol = BF16_ULP_REL * eager.float().abs().max().clamp(min=1.0).item()
     max_abs = (out.float() - eager.float()).abs().max().item()
     assert max_abs <= tol, f"graphed vs eager max_abs {max_abs} > {tol}"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial numerics: the low-precision accumulation/conversion findings.
+# Each case builds a sparse weight/activation pattern whose exact answer is
+# known, so a packed-BF16 FMA accumulator (which rounds every partial sum to
+# 8 significand bits) or a half-precision staging conversion (which clamps at
+# 65504) produces a visibly wrong output, while the FP32-accumulation paths
+# reproduce the fp32-dequant reference exactly.
+# ---------------------------------------------------------------------------
+
+_E2M1_ONE = 0x02  # low nibble = even element, +1.0; 0x20 = odd element, +1.0
+
+
+def _zero_pack():
+    w1 = torch.zeros(E, I, H // 2, dtype=torch.uint8, device=DEVICE)
+    w2 = torch.zeros(E, H, I // 2, dtype=torch.uint8, device=DEVICE)
+    w1_sf = torch.ones(E, I, H // 16).to(torch.float8_e4m3fn).to(DEVICE)
+    w2_sf = torch.ones(E, H, I // 16).to(torch.float8_e4m3fn).to(DEVICE)
+    w1_alpha = torch.ones(E, dtype=torch.float32, device=DEVICE)
+    w2_alpha = torch.ones(E, dtype=torch.float32, device=DEVICE)
+    return w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha
+
+
+def _run_specialized_direct(x, ids, tw, pack):
+    from flashinfer.fused_moe import specialized_moe_nvfp4_w4a16_sm120 as spec
+
+    w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha = pack
+    out = torch.empty(x.shape[0], H, dtype=torch.bfloat16, device=DEVICE)
+    spec.run_specialized_moe_nvfp4_w4a16(
+        x, w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha, ids, tw, out
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+@pytest.mark.parametrize("t", [1, 4, 16, 64])
+def test_small_contribution_survives_large_cancelling_partials(t):
+    """A packed-BF16 dot-product accumulator loses a unit contribution
+    between two large cancelling values (256 + 1 - 256 accumulates to 0,
+    not 1, because 257 rounds back to 256 in BF16). The kernels must keep
+    FP32 partial sums so the exact answer, 1.0, comes out at every
+    allowlisted token count (T=1, 4, 16 and 64 take different kernels)."""
+    pack = _zero_pack()
+    w1, _, _, w2, _, _ = pack
+    # Within one 16-element group (elements 0, 2, 4 of group 0 -> inter[0]).
+    w1[0, 0, 0] = _E2M1_ONE
+    w1[0, 0, 1] = _E2M1_ONE
+    w1[0, 0, 2] = _E2M1_ONE
+    # Across groups that one T=1 reduction lane owns (groups 1, 33, 65 ->
+    # elements 16, 528, 1040 -> inter[1]): the running per-lane sum crosses
+    # group boundaries, so it must also stay FP32.
+    w1[0, 1, 8] = _E2M1_ONE
+    w1[0, 1, 264] = _E2M1_ONE
+    w1[0, 1, 520] = _E2M1_ONE
+    # FC2 reads the two intermediates straight through to out[0] and out[1].
+    w2[0, 0, 0] = _E2M1_ONE
+    w2[0, 1, 0] = 0x20
+    x = torch.zeros(t, H, dtype=torch.bfloat16, device=DEVICE)
+    x[0, 0], x[0, 2], x[0, 4] = 256.0, 1.0, -256.0
+    x[0, 16], x[0, 528], x[0, 1040] = 1024.0, 1.0, -1024.0
+    ids = torch.zeros(t, TOPK, dtype=torch.int32, device=DEVICE)
+    tw = torch.zeros(t, TOPK, dtype=torch.float32, device=DEVICE)
+    tw[:, 0] = 1.0
+    out = _run_specialized_direct(x, ids, tw, pack)
+    ref = _reference(x, ids, tw, pack)
+    assert torch.isfinite(out.float()).all()
+    # ReLU^2(256*1 + 1*1 + (-256)*1) = 1 exactly; same for the across-group
+    # coordinate. BF16 represents 1.0 exactly, so the tolerance is slack.
+    assert abs(out[0, 0].item() - 1.0) < 1e-2, f"within-group: {out[0, 0].item()}"
+    assert abs(out[0, 1].item() - 1.0) < 1e-2, f"across-group: {out[0, 1].item()}"
+    assert (out.float() - ref.float()).abs().max().item() < 1e-2
+
+
+@pytest.mark.parametrize("t", [1, 4, 16, 64])
+def test_relu2_intermediate_above_half_range_stays_finite(t):
+    """An admitted input can legally produce a ReLU^2 intermediate above the
+    half-precision maximum of 65504 (here (1 * 300)^2 = 90000). Converting
+    the FC2 input to half turns it into infinity; the BF16/FP32 path must
+    carry it through to a finite output matching the fp32-dequant
+    reference."""
+    pack = _zero_pack()
+    w1, _, w1_alpha, w2, _, _ = pack
+    w1[0, 0, 0] = _E2M1_ONE
+    w1_alpha[0] = 300.0
+    w2[0, 0, 0] = _E2M1_ONE
+    x = torch.zeros(t, H, dtype=torch.bfloat16, device=DEVICE)
+    x[:, 0] = 1.0
+    ids = torch.zeros(t, TOPK, dtype=torch.int32, device=DEVICE)
+    tw = torch.zeros(t, TOPK, dtype=torch.float32, device=DEVICE)
+    tw[:, 0] = 1.0
+    out = _run_specialized_direct(x, ids, tw, pack)
+    ref = _reference(x, ids, tw, pack)
+    assert torch.isfinite(out.float()).all(), "half-range overflow reached the output"
+    scale = ref.float().abs().max().clamp(min=1.0)
+    assert (out.float() - ref.float()).abs().max().item() < 0.02 * scale.item()
+
+
+# ---------------------------------------------------------------------------
+# Public weight-preparation contract and workspace-retention bounds (the two
+# review P1s): the specialized view is row-major/unpadded and NOT
+# interchangeable with the stock swizzled view, and eager token-count growth
+# must not retain unbounded workspace.
+# ---------------------------------------------------------------------------
+
+
+def test_public_prepare_rejects_swizzled_scales(weights):
+    """The specialized prepare path refuses the stock 128-row-padded
+    swizzled storage at preparation time (not at the first forward)."""
+    from flashinfer.fused_moe import SpecializedW4A16Config
+    from flashinfer.fused_moe.api import ReLU2
+
+    w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha = weights
+    with pytest.raises(ValueError, match="row-major"):
+        SpecializedW4A16Config.prepare_weights(
+            w1,
+            _stock_swizzled_scales(w1_sf),
+            w1_alpha,
+            w2,
+            _stock_swizzled_scales(w2_sf),
+            w2_alpha,
+            activation=ReLU2(),
+            source_format="modelopt",
+        )
+
+
+def test_stock_only_pack_leaves_specialized_ineligible(weights):
+    """A pack carrying only the b12x (swizzled) view must leave the
+    specialized candidate ineligible — excluded before the shootout
+    profiles it — instead of raising mid-profiling."""
+    from flashinfer.fused_moe import B12xW4A16Config, SpecializedW4A16Config
+
+    x, ids, tw = _routing(16, seed=77)
+    layer, weight_pack = _unified_layer_and_weight_pack(
+        weights,
+        16,
+        backends=(B12xW4A16Config(), SpecializedW4A16Config()),
+    )
+    del weight_pack.native_views["specialized_w4a16"]
+    act = _act_pack(x, ids, tw)
+    eligible = layer._eligible_runners(act, weight_pack)
+    assert [layer.runners[i].backend_key for i in eligible] == ["b12x_w4a16"]
+    out = layer(act, weight_pack)
+    assert layer.winner_backend == "b12x_w4a16"
+    assert torch.isfinite(out.float()).all()
+
+
+def test_workspace_retention_bounded_across_token_growth(weights):
+    """Twelve eager calls at strictly increasing large token counts
+    (T=4097..4108 after warming T=4096) must not retain one workspace per
+    call: geometric per-device growth bounds the retained total near the
+    live capacity instead of ~12x a single workspace."""
+    from flashinfer.fused_moe import specialized_moe_nvfp4_w4a16_sm120 as spec
+
+    w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha = weights
+    ts = [4096] + list(range(4097, 4109))
+    inputs = {}
+    for t in ts:
+        x, ids, tw = _routing(t, seed=1000 + t)
+        out = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
+        inputs[t] = (x, ids, tw, out)
+
+    def run_t(t):
+        x, ids, tw, out = inputs[t]
+        spec.run_specialized_moe_nvfp4_w4a16(
+            x, w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha, ids, tw, out
+        )
+
+    run_t(4096)  # warm the large-T family and its workspace
+    torch.cuda.synchronize()
+    free0, _ = torch.cuda.mem_get_info()
+    run_t(4097)  # the one admitted geometric growth step
+    torch.cuda.synchronize()
+    free1, _ = torch.cuda.mem_get_info()
+    growth_step = free0 - free1
+    for t in range(4098, 4109):
+        run_t(t)
+    torch.cuda.synchronize()
+    free2, _ = torch.cuda.mem_get_info()
+    tail_growth = free1 - free2
+    # Pre-fix behavior retained ~one full workspace per call (11 more
+    # allocations here); geometric growth admits none for +11 tokens.
+    assert tail_growth <= max(64 << 20, growth_step // 2), (
+        f"workspace retention grew by {tail_growth} bytes across eleven "
+        f"+1-token calls (first growth step was {growth_step} bytes): "
+        "retention is not bounded"
+    )

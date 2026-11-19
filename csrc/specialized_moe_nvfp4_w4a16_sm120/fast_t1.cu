@@ -84,6 +84,14 @@ __device__ __forceinline__ bf2 bmul(bf2 a, bf2 b) {
 __device__ __forceinline__ float blow(bf2 v) { return __uint_as_float(v << 16); }
 __device__ __forceinline__ float bhigh(bf2 v) { return __uint_as_float(v & 0xffff0000u); }
 __device__ __forceinline__ float2 b2f2(bf2 v) { return make_float2(blow(v), bhigh(v)); }
+// FP32 dot-product step over one bf16x2 pair: both bf16 x bf16 products are
+// exact in FP32 and the running sum never rounds back to BF16, so a small
+// contribution is not absorbed between large cancelling partials the way a
+// chained fma.rn.bf16x2 accumulator absorbs it (e.g. 256 + 1 - 256).
+__device__ __forceinline__ float bffma(bf2 a, bf2 b, float f) {
+  f = fmaf(blow(a), blow(b), f);
+  return fmaf(bhigh(a), bhigh(b), f);
+}
 
 __device__ __forceinline__ uint32_t ldcg32(const void* p) {
   uint32_t r;
@@ -291,7 +299,7 @@ __global__ __launch_bounds__(256) void prep_direct(__nv_bfloat16* __restrict__ o
         const bf2* xp = reinterpret_cast<const bf2*>(&xv[u]);                      \
         _Pragma("unroll") for (int r = 0; r < RR; ++r)                             \
             _Pragma("unroll") for (int j = 0; j < 4; ++j) acc[tb + u][r] =         \
-                bfma(wq[r][j], xp[j], acc[tb + u][r]);                             \
+                bffma(wq[r][j], xp[j], acc[tb + u][r]);                            \
       }                                                                            \
     }                                                                              \
   }
@@ -329,11 +337,11 @@ __device__ __forceinline__ void gemv_body(
   const uint8_t* wp = Wp + ((size_t)e * N + n0) * KB;
   const uint8_t* wg = Wg + ((size_t)e * N + n0) * KG;
 
-  bf2 acc[BT][RR];
+  float acc[BT][RR];
 #pragma unroll
   for (int t = 0; t < BT; ++t)
 #pragma unroll
-    for (int r = 0; r < RR; ++r) acc[t][r] = 0u;
+    for (int r = 0; r < RR; ++r) acc[t][r] = 0.0f;
 
   uint32_t wa[RR], wb[RR];
   uint32_t sa = 0u, sb = 0u;
@@ -351,7 +359,7 @@ __device__ __forceinline__ void gemv_body(
 #pragma unroll
   for (int t = 0; t < BT; ++t)
 #pragma unroll
-    for (int r = 0; r < RR; ++r) v[t * RR + r] = blow(acc[t][r]) + bhigh(acc[t][r]);
+    for (int r = 0; r < RR; ++r) v[t * RR + r] = acc[t][r];
   {
     int cntv = NV;
 #pragma unroll
@@ -500,12 +508,11 @@ __global__ __launch_bounds__(NWARP * 32, MINB) void moe_gemv_group16_direct(
         bf2 wq[8];
         dq8(uint32_t(q8), wq);
         dq8(uint32_t(q8 >> 32), wq + 4);
-        bf2 sum = 0u;
+        float sum = 0.0f;
 #pragma unroll
-        for (int p = 0; p < 8; ++p) sum = bfma(wq[p], xp[p], sum);
-        const float2 pair = b2f2(sum);
+        for (int p = 0; p < 8; ++p) sum = bffma(wq[p], xp[p], sum);
         const float sf = blow(sc2(ldcg8(wg + (size_t)r * KG + group)));
-        acc[r] = fmaf(pair.x + pair.y, sf, acc[r]);
+        acc[r] = fmaf(sum, sf, acc[r]);
       }
     }
   }
@@ -593,21 +600,19 @@ __device__ __forceinline__ void g16_body(
         dq8(uint32_t(q16.x >> 32), wq + 4);
 #pragma unroll
         for (int t = 0; t < BT; ++t) {
-          bf2 sum = 0u;
+          float sum = 0.0f;
 #pragma unroll
-          for (int p = 0; p < 8; ++p) sum = bfma(wq[p], xv[t][p], sum);
-          const float2 pair = b2f2(sum);
-          acc[t][r] = fmaf(pair.x + pair.y, sf0, acc[t][r]);
+          for (int p = 0; p < 8; ++p) sum = bffma(wq[p], xv[t][p], sum);
+          acc[t][r] = fmaf(sum, sf0, acc[t][r]);
         }
         dq8(uint32_t(q16.y), wq);
         dq8(uint32_t(q16.y >> 32), wq + 4);
 #pragma unroll
         for (int t = 0; t < BT; ++t) {
-          bf2 sum = 0u;
+          float sum = 0.0f;
 #pragma unroll
-          for (int p = 0; p < 8; ++p) sum = bfma(wq[p], xv[t][8 + p], sum);
-          const float2 pair = b2f2(sum);
-          acc[t][r] = fmaf(pair.x + pair.y, sf1, acc[t][r]);
+          for (int p = 0; p < 8; ++p) sum = bffma(wq[p], xv[t][8 + p], sum);
+          acc[t][r] = fmaf(sum, sf1, acc[t][r]);
         }
       }
     }
@@ -680,31 +685,41 @@ __global__ __launch_bounds__(NWARP * 32, MINB) void moe_gemv_group16(
 
 // Device scratch arena (workspace only - never holds results between calls).
 // Buffers retired by growth stay alive for the process lifetime: a CUDA graph
-// captured earlier may still replay kernels holding the old address. Growth
-// is monotone, so the retained total stays bounded (< 2x the final capacity).
-static void* g_ws = nullptr;
-static size_t g_ws_bytes = 0;
-static int g_ws_device = -1;
+// captured earlier may still replay kernels holding the old address. One slot
+// per device (a device switch retires nothing; an allocation is only valid on
+// the device it was made on), and growth at least doubles a slot's capacity,
+// so every retired buffer is at most half its replacement and the retained
+// total stays below the live per-device capacity.
+constexpr int kWsMaxDevices = 64;
+struct FastWs {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+  int device = -1;
+};
+static FastWs g_ws_by_device[kWsMaxDevices];
 static std::vector<void*> g_retired_ws;
 static void* ws_get(size_t bytes) {
-  // The allocation is only valid on the device it was made on: an unchanged
-  // byte requirement must not reuse another device's workspace (peer access
-  // is not guaranteed), so the current device keys the cache alongside size.
   int device = -1;
   cudaGetDevice(&device);
-  if (bytes > g_ws_bytes || device != g_ws_device) {
-    if (g_ws) g_retired_ws.push_back(g_ws);
-    g_ws = nullptr;
-    g_ws_bytes = 0;
-    g_ws_device = -1;
-    cudaError_t err = cudaMalloc(&g_ws, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && g_ws != nullptr)
+  // Devices beyond the per-device table share one slot with the old
+  // retire-on-switch policy (bounded by how rarely such devices occur).
+  static FastWs overflow;
+  FastWs& ws = (device >= 0 && device < kWsMaxDevices) ? g_ws_by_device[device] : overflow;
+  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
+    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
+    g_retired_ws.push_back(ws.ptr);
+    ws.ptr = nullptr;
+    ws.bytes = 0;
+  }
+  if (ws.ptr == nullptr) {
+    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
-    g_ws_bytes = bytes;
-    g_ws_device = device;
+    ws.bytes = bytes;
+    ws.device = device;
   }
-  return g_ws;
+  return ws.ptr;
 }
 
 template <int NWARP, int RR, int MINB>

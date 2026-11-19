@@ -275,14 +275,14 @@ def specialized_support_reasons(
     # --- device checks
     if list(torch.cuda.get_device_capability(x.device)) != _C["compute_capability"]:
         reasons.append("compute_capability")
-    # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.1-line ptxas (the shared b12x
+    # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.2-line ptxas (the shared b12x
     # gate only requires CUDA 13); refuse here so ``auto`` keeps the stock
-    # path on a 13.0 toolkit instead of failing the JIT build.
+    # path on a 13.0/13.1 toolkit instead of failing the JIT build.
     try:
         from ..jit.cpp_ext import get_cuda_version
 
         _v = get_cuda_version()
-        if (_v.major, _v.minor) < (13, 1):
+        if (_v.major, _v.minor) < (13, 2):
             reasons.append(f"cuda_version:{_v.major}.{_v.minor}")
     except Exception:  # noqa: BLE001
         reasons.append("cuda_version:unknown")

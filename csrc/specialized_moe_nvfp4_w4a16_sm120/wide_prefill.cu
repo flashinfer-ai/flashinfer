@@ -50,8 +50,6 @@ struct Workspace {
   std::mutex mutex;
 };
 
-Workspace g_workspace;
-
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 // Persistent-grid sizes depend on the launch device's SM count and occupancy;
@@ -60,28 +58,40 @@ inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1)
 // blocks waiting at the grid barrier).
 constexpr int kMaxCachedDevices = 64;
 
-// Buffers retired by workspace growth or a device change stay alive for the
-// process lifetime: a CUDA graph captured earlier may still replay kernels
-// holding the old address. Growth is monotone along the warmup ladder, so
-// the retained total stays bounded (under 2x the final capacity per device).
+// Buffers retired by workspace growth stay alive for the process lifetime:
+// a CUDA graph captured earlier may still replay kernels holding the old
+// address. One workspace slot per device (a device switch retires nothing),
+// and growth at least doubles a slot's capacity, so every retired buffer is
+// at most half its replacement and the retained total stays below the live
+// per-device capacity across arbitrary admitted token-count sequences.
 std::vector<void*> g_retired_workspaces;
+Workspace g_workspaces_by_device[kMaxCachedDevices];
 
 void* ensure_workspace(size_t bytes, int device) {
-  if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
-    g_retired_workspaces.push_back(g_workspace.ptr);
-    g_workspace.ptr = nullptr;
-    g_workspace.bytes = 0;
+  // Devices beyond the per-device table share one slot with the old
+  // retire-on-switch policy (bounded by how rarely such devices occur).
+  static Workspace overflow;
+  Workspace& ws =
+      (device >= 0 && device < kMaxCachedDevices) ? g_workspaces_by_device[device] : overflow;
+  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
+    // Geometric growth: never grow a slot by less than 2x, so each retired
+    // buffer is at most half its replacement and the retained total is
+    // bounded by the live capacity.
+    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
+    g_retired_workspaces.push_back(ws.ptr);
+    ws.ptr = nullptr;
+    ws.bytes = 0;
   }
-  if (g_workspace.ptr == nullptr) {
+  if (ws.ptr == nullptr) {
     cudaSetDevice(device);
-    cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
+    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
-    g_workspace.bytes = bytes;
-    g_workspace.device = device;
+    ws.bytes = bytes;
+    ws.device = device;
   }
-  return g_workspace.ptr;
+  return ws.ptr;
 }
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {
@@ -165,6 +175,16 @@ __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
   for (int d = 16; d != 0; d >>= 1) x += __shfl_down_sync(0xffffffffu, x, d);
   return x;
+}
+
+// FP32 dot-product step over one packed bf16x2 pair: each bf16 x bf16
+// product is exact in FP32 and the running sum never rounds to a narrow
+// type, so the path neither overflows half range (65504) on large ReLU^2
+// intermediates nor absorbs small contributions between large cancelling
+// partials.
+__device__ __forceinline__ float ffma_bf16x2(uint32_t a, uint32_t b, float acc) {
+  acc = fmaf(__uint_as_float(a << 16), __uint_as_float(b << 16), acc);
+  return fmaf(__uint_as_float(a & 0xffff0000u), __uint_as_float(b & 0xffff0000u), acc);
 }
 
 __device__ __forceinline__ uint32_t fp4_byte_to_bf16x2(uint8_t q) {
@@ -609,9 +629,14 @@ __global__ __launch_bounds__(32, 16) void decode_fc2_combine_mma_kernel(
   }
 }
 
+// Keeps the activation in BF16 end to end (shared staging stores the raw
+// bf16 bits; the group dot product accumulates bf16-exact products in FP32):
+// the FC2 input is the ReLU^2 intermediate, which can legally exceed the
+// half maximum of 65504, so a half-precision staging conversion would turn
+// it into infinity.
 template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST, bool ORDERED = false,
           bool ROUTE_OUTPUT = false, bool GRID_2D = false>
-__global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
+__global__ __launch_bounds__(256, 2) void decode_group16_bf16_kernel(
     const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
     const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
     const int32_t* __restrict__ ids, const int32_t* __restrict__ route_order,
@@ -641,7 +666,7 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
     return;
   }
 
-  __shared__ __align__(16) __half sx[STAGE_K];
+  __shared__ __align__(16) __nv_bfloat16 sx[STAGE_K];
   float acc[OPW];
 #pragma unroll
   for (int j = 0; j < OPW; ++j) acc[j] = 0.0f;
@@ -660,7 +685,7 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
       const int logical_segment = group * 2 + (in_group >> 2);
       const int physical_segment = logical_segment ^ (group & 7);
       const int physical_pair = physical_segment * 4 + (in_group & 3);
-      reinterpret_cast<__half2*>(sx)[physical_pair] = __float22half2_rn(__bfloat1622float2(xb));
+      reinterpret_cast<__nv_bfloat162*>(sx)[physical_pair] = xb;
     }
     __syncthreads();
 
@@ -668,12 +693,12 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
     for (int group_base = 0; group_base < groups; group_base += 32) {
       const int group = group_base + lane;
       if (group < groups) {
-        __half2 xv[8];
+        uint32_t xv[8];
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
           const int logical_segment = group * 2 + (p >> 2);
           const int physical_segment = logical_segment ^ (group & 7);
-          xv[p] = reinterpret_cast<const __half2*>(sx)[physical_segment * 4 + (p & 3)];
+          xv[p] = reinterpret_cast<const uint32_t*>(sx)[physical_segment * 4 + (p & 3)];
         }
 
 #pragma unroll
@@ -683,14 +708,13 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
           const int kg = (kt >> 4) + group;
           const uint64_t q8 =
               *reinterpret_cast<const uint64_t*>(packed + row * KHALF + size_t(kg) * 8);
-          __half2 hsum = __float2half2_rn(0.0f);
+          float fsum = 0.0f;
 #pragma unroll
           for (int p = 0; p < 8; ++p) {
-            hsum = __hfma2(xv[p], e2m1x2_to_half2(uint8_t(q8 >> (p * 8))), hsum);
+            fsum = ffma_bf16x2(xv[p], e2m1x2_to_bf16x2(uint8_t(q8 >> (p * 8))), fsum);
           }
-          const float2 pair = __half22float2(hsum);
           const float sf = fp8_e4m3fnx2_to_float2(uint16_t(scales[row * KG + kg])).x;
-          acc[j] = fmaf(pair.x + pair.y, sf, acc[j]);
+          acc[j] = fmaf(fsum, sf, acc[j]);
         }
       }
     }
@@ -2448,10 +2472,10 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
     return;
   }
   if (T == 16) {
-    decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT, true>
+    decode_group16_bf16_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT, true>
         <<<routes*(I / DECODE_NT), THREADS, 0, stream>>>(x, p1, s1, a1, ids, nullptr, tw, routes,
                                                          inter, output_acc);
-    decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT, false, false, true>
+    decode_group16_bf16_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT, false, false, true>
         <<<routes*(H / DECODE_NT), THREADS, 0, stream>>>(inter, p2, s2, a2, ids, nullptr, tw,
                                                          routes, route_out, output_acc);
     const int out_elems = T * (H / 2);

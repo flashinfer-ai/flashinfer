@@ -15,7 +15,7 @@
 """JIT spec for the specialized SM120 NVFP4-W4A16 routed-MoE kernels
 (contract: E=128, top_k=6, hidden=2688, intermediate=1856, non-gated
 ReLU^2, bf16 activations). Exact-architecture module: sm_120a only;
-``cvt.rn.bf16x2.e2m1x2`` requires a CUDA >= 13.1-line ptxas."""
+``cvt.rn.bf16x2.e2m1x2`` requires a CUDA >= 13.2-line ptxas."""
 
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags

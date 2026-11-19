@@ -50,8 +50,6 @@ struct Workspace {
   std::mutex mutex;
 };
 
-Workspace g_workspace;
-
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 // Persistent-grid sizes depend on the launch device's SM count and occupancy;
@@ -60,28 +58,40 @@ inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1)
 // blocks waiting at the grid barrier).
 constexpr int kMaxCachedDevices = 64;
 
-// Buffers retired by workspace growth or a device change stay alive for the
-// process lifetime: a CUDA graph captured earlier may still replay kernels
-// holding the old address. Growth is monotone along the warmup ladder, so
-// the retained total stays bounded (under 2x the final capacity per device).
+// Buffers retired by workspace growth stay alive for the process lifetime:
+// a CUDA graph captured earlier may still replay kernels holding the old
+// address. One workspace slot per device (a device switch retires nothing),
+// and growth at least doubles a slot's capacity, so every retired buffer is
+// at most half its replacement and the retained total stays below the live
+// per-device capacity across arbitrary admitted token-count sequences.
 std::vector<void*> g_retired_workspaces;
+Workspace g_workspaces_by_device[kMaxCachedDevices];
 
 void* ensure_workspace(size_t bytes, int device) {
-  if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
-    g_retired_workspaces.push_back(g_workspace.ptr);
-    g_workspace.ptr = nullptr;
-    g_workspace.bytes = 0;
+  // Devices beyond the per-device table share one slot with the old
+  // retire-on-switch policy (bounded by how rarely such devices occur).
+  static Workspace overflow;
+  Workspace& ws =
+      (device >= 0 && device < kMaxCachedDevices) ? g_workspaces_by_device[device] : overflow;
+  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
+    // Geometric growth: never grow a slot by less than 2x, so each retired
+    // buffer is at most half its replacement and the retained total is
+    // bounded by the live capacity.
+    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
+    g_retired_workspaces.push_back(ws.ptr);
+    ws.ptr = nullptr;
+    ws.bytes = 0;
   }
-  if (g_workspace.ptr == nullptr) {
+  if (ws.ptr == nullptr) {
     cudaSetDevice(device);
-    cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
+    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
-    g_workspace.bytes = bytes;
-    g_workspace.device = device;
+    ws.bytes = bytes;
+    ws.device = device;
   }
-  return g_workspace.ptr;
+  return ws.ptr;
 }
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {

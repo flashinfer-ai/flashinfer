@@ -9603,16 +9603,13 @@ class B12xW4A16Runner(_B12xRunner):
     (``ExpertConfig.local_expert_offset`` / ``local_num_experts``): each rank
     computes a zero-filled partial that the caller sums across the EP group.
 
-    Accepts the layout-identical ``specialized_w4a16`` weight view as an
-    alias (the reciprocal of :class:`SpecializedW4A16Runner` accepting
-    ``b12x_w4a16``), so a pack prepared under either key serves both
-    candidates — in particular token counts the specialized runner declines
-    still have this stock runner eligible. The native ``b12x_w4a16`` view
-    keeps precedence when both are registered.
+    Weights: the ``b12x_w4a16`` view only (swizzled 128-row-padded block
+    scales). The ``specialized_w4a16`` view stores scales row-major and
+    unpadded, so it is NOT an alias: each candidate needs its own prepared
+    view.
     """
 
     backend_key = "b12x_w4a16"
-    weight_view_aliases = ("specialized_w4a16",)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
@@ -9639,7 +9636,7 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
 
     The runner serves EXACTLY the kernels' measured domain:
     ``check_support`` gates the fixed contract (E=128, top_k=6, hidden=2688,
-    intermediate=1856, ReLU^2, SM120, CUDA >= 13.1 toolkit) and
+    intermediate=1856, ReLU^2, SM120, CUDA >= 13.2 toolkit) and
     ``_accepts_shape`` admits only the allowlisted token counts, so
     ``MoELayer``'s ``backend=auto`` per-token-bucket shootout times the
     specialized kernels on matching buckets — as a first-class named
@@ -9651,13 +9648,24 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
 
     The ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` kill switch rejects the
     runner at support-check time and makes ``_accepts_shape`` decline every
-    call. Weights: the ``specialized_w4a16`` view, or the layout-identical
-    ``b12x_w4a16`` view as an alias (one prepared pack serves both
-    candidates, no second weight copy).
+    call. Weights: the ``specialized_w4a16`` view only (row-major group-16
+    scales at the exact unpadded geometry, from
+    :meth:`SpecializedW4A16Config.prepare_weights`). The stock
+    ``b12x_w4a16`` view stores scales swizzled and 128-row-padded, so it is
+    NOT an alias; ``accepts`` additionally verifies the registered view's
+    shapes/dtypes/contiguity so an incompatible pack leaves this candidate
+    ineligible instead of raising while the shootout profiles it.
+
+    CUDA graphs captured over this runner replay under the module's
+    SINGLE-FLIGHT contract (no concurrent replay of two captured graphs; no
+    workspace growth while a captured graph may replay) — see
+    :class:`SpecializedW4A16Config` and the module docstring.
     """
 
     backend_key = "specialized_w4a16"
-    weight_view_aliases = ("b12x_w4a16",)
+    # Baked process-global workspace addresses: captured graphs must not
+    # replay concurrently (surfaced on the public config docstring).
+    single_flight_graph_replay: ClassVar[bool] = True
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     # The kernels' contract is the non-gated ReLU^2 geometry only.
@@ -9704,7 +9712,7 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
                 f"the specialized W4A16 kernels require "
                 f"SM{_C['compute_capability'][0]}{_C['compute_capability'][1]}."
             )
-        # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.1-line ptxas: reject the
+        # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.2-line ptxas: reject the
         # backend here so MoELayer reports the reason and auto selects among
         # the remaining candidates instead of failing the JIT build later.
         try:
@@ -9716,9 +9724,9 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
                 f"{type(self).__name__}: CUDA toolkit version probe failed "
                 f"({type(exc).__name__})."
             ) from exc
-        if (_v.major, _v.minor) < (13, 1):
+        if (_v.major, _v.minor) < (13, 2):
             raise RuntimeError(
-                f"{type(self).__name__} requires a CUDA >= 13.1 toolkit "
+                f"{type(self).__name__} requires a CUDA >= 13.2 toolkit "
                 f"(cvt.rn.bf16x2.e2m1x2); got {_v.major}.{_v.minor}."
             )
         if not self.config.finalize.do_finalize:
@@ -9742,6 +9750,47 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
                 f"{type(self).__name__}: specialized module build failed "
                 f"({type(exc).__name__}: {exc})."
             ) from exc
+
+    @staticmethod
+    def _view_matches_contract(view: Any) -> bool:
+        """Cheap metadata check that ``view`` carries the kernels' documented
+        row-major unpadded layout (shapes, dtypes, contiguity). Memory
+        contents are unverifiable from metadata for any backend; this
+        excludes every structurally incompatible view (in particular the
+        swizzled 128-row-padded ``b12x_w4a16`` storage) at eligibility time."""
+        from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        c = _spec._C
+        E, H, I = c["num_experts"], c["hidden_size"], c["intermediate_size"]
+
+        def _ok(t: Any, shape: tuple, dtype: torch.dtype) -> bool:
+            return (
+                isinstance(t, torch.Tensor)
+                and tuple(t.shape) == shape
+                and t.dtype == dtype
+                and t.is_contiguous()
+            )
+
+        try:
+            return (
+                _ok(view["w1_weight"], (E, I, H // 2), torch.uint8)
+                and _ok(view["w1_weight_sf"], (E, I, H // 16), torch.float8_e4m3fn)
+                and _ok(view["w1_alpha"], (E,), torch.float32)
+                and _ok(view["w2_weight"], (E, H, I // 2), torch.uint8)
+                and _ok(view["w2_weight_sf"], (E, H, I // 16), torch.float8_e4m3fn)
+                and _ok(view["w2_alpha"], (E,), torch.float32)
+            )
+        except (KeyError, TypeError):
+            return False
+
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """Eligible only with a registered, layout-compatible
+        ``specialized_w4a16`` view: an absent or incompatible view declines
+        the candidate before the cross-backend shootout profiles it."""
+        view = weights.native_views.get(self.backend_key)
+        if view is None or not self._view_matches_contract(view):
+            return False
+        return self._accepts_shape(act)
 
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
