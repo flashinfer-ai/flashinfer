@@ -290,3 +290,280 @@ def test_quantizer_refuses_inputs_off_a_32_byte_boundary(offset: int) -> None:
             sage_fp8_quantize_sm100(_offset_view(q, offset), k, k, impl=impl)
         with pytest.raises(ValueError, match="v must start on a 32-byte boundary"):
             sage_fp8_quantize_sm100(q, k, _offset_view(k, offset), impl=impl)
+
+
+def _fp8(shape) -> torch.Tensor:
+    return torch.zeros(shape, device="cuda").to(torch.float8_e4m3fn)
+
+
+def _f32(shape) -> torch.Tensor:
+    return torch.ones(shape, device="cuda")
+
+
+def _i32(shape) -> torch.Tensor:
+    return torch.zeros(shape, dtype=torch.int32, device="cuda")
+
+
+_IMAX = backend.MAX_FLAT_ELEMENTS
+
+
+def _refusal_table(ops: dict):
+    """``(case, replaced operands, exception type, message)`` of pre-quantized calls the
+    checks refuse.  ``ops``: valid operands with B=2, H=4, Hkv=2, Sq=128, Sk=256 (2 query
+    blocks, 16 K-scale groups).  A message ending in ``...`` is a prefix (it holds an
+    address).  Cases with several faults pin the order of the checks."""
+    q, k, v = ops["q"], ops["k"], ops["v"]
+    dev = q.device
+    kv = (2, 256, 2, _HEAD_DIM)
+    bf16 = torch.bfloat16
+    rank4 = "{} must be a rank-4 BSHD tensor"
+    ratio = "num_heads must be a positive multiple of num_kv_heads"
+    v_scale_shape = (
+        "v_scale must be [Hkv,128]=(2, 128) or [B,Hkv,128]=(2, 2, 128), got {}"
+    )
+    index_shape = "q2k_block_index must be int32 [B,H,2,capacity]"
+    big = (2, 2**22, 2, _HEAD_DIM)
+    big_msg = (
+        "{} has 2147483648 elements (shape (2, 4194304, 2, 128)); the kernels index it "
+        f"with 32-bit element offsets, so it may hold at most {_IMAX} elements"
+    )
+    return [
+        ("q_none", dict(q=None), ValueError, rank4.format("q")),
+        ("k_rank3", dict(k=k[0]), ValueError, rank4.format("k")),
+        ("v_list", dict(v=[1]), ValueError, rank4.format("v")),
+        ("k_rank3_q_bf16", dict(k=k[0], q=q.to(bf16)), ValueError, rank4.format("k")),
+        ("q_cpu", dict(q=q.cpu()), ValueError, "q must be a CUDA tensor"),
+        (
+            "head_dim_64",
+            dict(
+                q=_fp8((2, 128, 4, 64)),
+                k=_fp8((2, 256, 2, 64)),
+                v=_fp8((2, 256, 2, 64)),
+            ),
+            ValueError,
+            "head_dim must be 128, got 64",
+        ),
+        (
+            "gqa_ratio",
+            dict(k=_fp8((2, 256, 3, 128)), v=_fp8((2, 256, 3, 128))),
+            ValueError,
+            ratio,
+        ),
+        (
+            "no_kv_heads",
+            dict(k=_fp8((2, 256, 0, 128)), v=_fp8((2, 256, 0, 128))),
+            ValueError,
+            ratio,
+        ),
+        (
+            "q_bf16",
+            dict(q=q.to(bf16)),
+            TypeError,
+            "q must use torch.float8_e4m3fn, got torch.bfloat16",
+        ),
+        (
+            "q_strided",
+            dict(q=_fp8((2, 4, 128, 128)).transpose(1, 2)),
+            ValueError,
+            "q must be contiguous",
+        ),
+        (
+            "q_bf16_k_batch",
+            dict(q=q.to(bf16), k=_fp8((1, 256, 2, 128))),
+            TypeError,
+            "q must use torch.float8_e4m3fn, got torch.bfloat16",
+        ),
+        (
+            "k_batch",
+            dict(k=_fp8((1, 256, 2, 128))),
+            ValueError,
+            f"k must have shape {kv}, got (1, 256, 2, 128)",
+        ),
+        ("k_cpu", dict(k=k.cpu()), ValueError, f"k must live on {dev}"),
+        (
+            "v_seqlen",
+            dict(v=_fp8((2, 255, 2, 128))),
+            ValueError,
+            f"v must have shape {kv}, got (2, 255, 2, 128)",
+        ),
+        (
+            "v_bf16",
+            dict(v=v.to(bf16)),
+            TypeError,
+            "v must use torch.float8_e4m3fn, got torch.bfloat16",
+        ),
+        (
+            "q_scale_none",
+            dict(q_scale=None),
+            TypeError,
+            "q_scale must be a torch.Tensor",
+        ),
+        (
+            "q_scale_shape",
+            dict(q_scale=_f32((2, 4, 127))),
+            ValueError,
+            "q_scale must have shape (2, 4, 128), got (2, 4, 127)",
+        ),
+        (
+            "q_scale_fp16",
+            dict(q_scale=ops["q_scale"].half()),
+            TypeError,
+            "q_scale must use torch.float32, got torch.float16",
+        ),
+        (
+            "q_scale_strided",
+            dict(q_scale=_f32((2, 128, 4)).transpose(1, 2)),
+            ValueError,
+            "q_scale must be contiguous",
+        ),
+        (
+            "k_scale_groups",
+            dict(k_scale=_f32((2, 2, 15))),
+            ValueError,
+            "k_scale must have shape (2, 2, 16), got (2, 2, 15)",
+        ),
+        (
+            "k_scale_cpu",
+            dict(k_scale=ops["k_scale"].cpu()),
+            ValueError,
+            f"k_scale must live on {dev}",
+        ),
+        (
+            "k_scale_groups_v_scale_bf16",
+            dict(k_scale=_f32((2, 2, 15)), v_scale=ops["v_scale"].to(bf16)),
+            ValueError,
+            "k_scale must have shape (2, 2, 16), got (2, 2, 15)",
+        ),
+        (
+            "v_scale_bf16",
+            dict(v_scale=ops["v_scale"].to(bf16)),
+            TypeError,
+            "v_scale must use torch.float32, got torch.bfloat16",
+        ),
+        (
+            "v_scale_strided",
+            dict(v_scale=_f32((2, 128, 2)).transpose(1, 2)),
+            ValueError,
+            "v_scale must be contiguous",
+        ),
+        (
+            "v_scale_shape",
+            dict(v_scale=_f32((3, 128))),
+            ValueError,
+            v_scale_shape.format("(3, 128)"),
+        ),
+        (
+            "q_misaligned",
+            dict(q=_offset_view(q, 8)),
+            ValueError,
+            "q must start on a 16-byte boundary, got address ...",
+        ),
+        (
+            "v_scale_misaligned",
+            dict(v_scale=_offset_view(ops["v_scale"], 4)),
+            ValueError,
+            "v_scale must start on a 16-byte boundary, got address ...",
+        ),
+        (
+            "q_misaligned_v_scale_shape",
+            dict(q=_offset_view(q, 8), v_scale=_f32((3, 128))),
+            ValueError,
+            "q must start on a 16-byte boundary, got address ...",
+        ),
+        ("index_rank3", dict(q2k_block_index=_i32((2, 4, 2))), ValueError, index_shape),
+        (
+            "index_q_blocks",
+            dict(q2k_block_index=_i32((2, 4, 3, 2))),
+            ValueError,
+            index_shape,
+        ),
+        (
+            "index_int64",
+            dict(q2k_block_index=_i32((2, 4, 2, 2)).long()),
+            TypeError,
+            "q2k_block_index must use torch.int32, got torch.int64",
+        ),
+        (
+            "index_strided",
+            dict(q2k_block_index=_i32((2, 4, 2, 4))[..., ::2]),
+            ValueError,
+            "q2k_block_index must be contiguous",
+        ),
+        (
+            "index_cpu",
+            dict(q2k_block_index=_i32((2, 4, 2, 2)).cpu()),
+            ValueError,
+            f"q2k_block_index must live on {dev}",
+        ),
+        (
+            "index_empty",
+            dict(q2k_block_index=_i32((2, 4, 2, 0))),
+            ValueError,
+            "q2k_block_index must have positive capacity",
+        ),
+        (
+            "v_scale_shape_index_int64",
+            dict(v_scale=_f32((3, 128)), q2k_block_index=_i32((2, 4, 2, 2)).long()),
+            ValueError,
+            v_scale_shape.format("(3, 128)"),
+        ),
+        (
+            "q_2pow31",
+            dict(
+                q=torch.empty(big, dtype=torch.float8_e4m3fn, device=dev),
+                q_scale=_f32((2, 2, 1)),
+            ),
+            ValueError,
+            big_msg.format("q"),
+        ),
+        (
+            "k_2pow31_k_scale_groups",
+            dict(k=torch.empty(big, dtype=torch.float8_e4m3fn, device=dev)),
+            ValueError,
+            big_msg.format("k"),
+        ),
+    ]
+
+
+def _raises(exc, message: str, fn, *args, **kwargs) -> None:
+    with pytest.raises(exc) as info:
+        fn(*args, **kwargs)
+    assert type(info.value) is exc
+    if message.endswith("..."):
+        assert str(info.value).startswith(message[:-3]), str(info.value)
+    else:
+        assert str(info.value) == message
+
+
+def test_attention_refuses_invalid_operands_in_check_order() -> None:
+    """Every refusal of a pre-quantized call: the exception type and full message, the
+    first failing check when a call has several faults, ``None`` from the dispatcher's
+    fallback and the same refusal through ``bsa_attn_sm100_blk64_fwd(backend="cake")``."""
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import bsa_attn_sm100_blk64_fwd
+
+    q8, k8, v8, q_scale, k_scale, v_scale, index = _inputs(2, 4, 2, 128, 256, 2, 11)
+    valid = dict(
+        q=q8,
+        k=k8,
+        v=v8,
+        q2k_block_index=index,
+        block_sparse_num=2,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    out, _ = bsa_attn_sm100_sage_fwd_cake(**valid)
+    assert out.shape == (2, 128, 4, _HEAD_DIM) and out.dtype == torch.bfloat16
+    assert out.is_contiguous() and out.device == q8.device
+    dispatch = backend.sm100_sage_fwd_cake_dispatch
+    for case, replaced, exc, message in _refusal_table(valid):
+        ops = {**valid, **replaced}
+        _raises(exc, message, bsa_attn_sm100_sage_fwd_cake, **ops)
+        _raises(exc, message, dispatch, **ops)
+        assert dispatch(**ops, fallback=True) is None, case
+        # The dispatcher reads Q/K/V shapes and requires the three scales itself first.
+        if all(isinstance(ops[name], torch.Tensor) for name in ("q", "k", "v")) and (
+            ops["q_scale"] is not None
+        ):
+            _raises(exc, message, bsa_attn_sm100_blk64_fwd, **ops, backend="cake")
+    torch.cuda.empty_cache()

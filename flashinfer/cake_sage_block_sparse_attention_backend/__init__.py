@@ -92,8 +92,23 @@ def _device_index(device: torch.device) -> int:
     )
 
 
+_CUDA_AVAILABLE = False
+
+
+def _cuda_available() -> bool:
+    """``torch.cuda.is_available()``, remembered once true.
+
+    The torch call reads an environment variable on every call (about a microsecond of
+    host time per dispatched call); a process that has seen a CUDA device keeps it.
+    """
+    global _CUDA_AVAILABLE
+    if not _CUDA_AVAILABLE:
+        _CUDA_AVAILABLE = torch.cuda.is_available()
+    return _CUDA_AVAILABLE
+
+
 def _capability(device: Optional[torch.device]) -> Optional[tuple[int, int]]:
-    if not torch.cuda.is_available():
+    if not _cuda_available():
         return None
     device = torch.device("cuda") if device is None else torch.device(device)
     if device.type != "cuda":
@@ -155,6 +170,33 @@ def _check_tensor(
         raise ValueError(
             f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}"
         )
+
+
+def _check_operands(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    device: torch.device,
+    kv_shape: tuple[int, int, int, int],
+    q_scale_shape: tuple[int, int, int],
+    k_scale_shape: tuple[int, int, int],
+) -> None:
+    """The checks of the attention's FP8 Q/K/V and scales, in order: raises at the first
+    that fails (``kv_shape`` is ``(B, Sk, Hkv, head_dim)``, ``q_scale_shape`` ``(B, H, Sq)``)."""
+    dim, kv_heads, heads = kv_shape[3], kv_shape[2], q_scale_shape[1]
+    if dim != HEAD_DIM:
+        raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
+    if kv_heads < 1 or heads % kv_heads != 0:
+        raise ValueError("num_heads must be a positive multiple of num_kv_heads")
+    _check_tensor("q", q, device, torch.float8_e4m3fn)
+    _check_tensor("k", k, device, torch.float8_e4m3fn, kv_shape)
+    _check_tensor("v", v, device, torch.float8_e4m3fn, kv_shape)
+    _check_tensor("q_scale", q_scale, device, torch.float32, q_scale_shape)
+    _check_tensor("k_scale", k_scale, device, torch.float32, k_scale_shape)
+    _check_tensor("v_scale", v_scale, device, torch.float32)
 
 
 #: Byte alignment of the BF16 Q/K/V the quantizers read with 32-byte vector loads.
@@ -572,7 +614,17 @@ def _attention_operands(
     checks (fake tensors have no data).  ``after_one_launch``: the call follows the
     one-launch quantizer in the same launch sequence (``_TAIL_SPLIT_P3_SERIAL``).
     """
-    if not operands_checked:
+    # Each fast path below is one expression that holds exactly when none of the checks
+    # it guards would raise; when it does not hold, those checks run in their order and
+    # raise the same exception (the host time of the checks is most of a small call's).
+    if not operands_checked and not (
+        isinstance(q, torch.Tensor)
+        and q.ndim == 4
+        and isinstance(k, torch.Tensor)
+        and k.ndim == 4
+        and isinstance(v, torch.Tensor)
+        and v.ndim == 4
+    ):
         for name, t in (("q", q), ("k", k), ("v", v)):
             if not isinstance(t, torch.Tensor) or t.ndim != 4:
                 raise ValueError(f"{name} must be a rank-4 BSHD tensor")
@@ -581,34 +633,60 @@ def _attention_operands(
         raise ValueError("q must be a CUDA tensor")
     device_index = _device_index(device)
     arch = _sm100_arch(device_index)
-    batch, seqlen_q, heads, dim = (int(x) for x in q.shape)
-    seqlen_k, kv_heads = int(k.shape[1]), int(k.shape[2])
+    batch, seqlen_q, heads, dim = map(int, q.shape)
+    k_shape = k.shape
+    seqlen_k, kv_heads = int(k_shape[1]), int(k_shape[2])
     q_blocks = _ceil_div(seqlen_q, BLOCK_M)
     k_blocks = _ceil_div(seqlen_k, KV_BLOCK)
     k_scale_groups = _ceil_div(seqlen_k, K_SCALE_GROUP)
     if not operands_checked:
-        if dim != HEAD_DIM:
-            raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
-        if kv_heads < 1 or heads % kv_heads != 0:
-            raise ValueError("num_heads must be a positive multiple of num_kv_heads")
-        _check_tensor("q", q, device, torch.float8_e4m3fn)
-        _check_tensor(
-            "k", k, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim)
-        )
-        _check_tensor(
-            "v", v, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim)
-        )
-        _check_tensor(
-            "q_scale", q_scale, device, torch.float32, (batch, heads, seqlen_q)
-        )
-        _check_tensor(
-            "k_scale",
-            k_scale,
-            device,
-            torch.float32,
-            (batch, kv_heads, k_scale_groups),
-        )
-        _check_tensor("v_scale", v_scale, device, torch.float32)
+        kv_shape = (batch, seqlen_k, kv_heads, dim)
+        # The element limit of q_scale, k_scale and v follows from those of q and k
+        # and the shapes (head_dim 128, 16 tokens per K scale).
+        if not (
+            dim == HEAD_DIM
+            and kv_heads >= 1
+            and heads % kv_heads == 0
+            and q.dtype == torch.float8_e4m3fn
+            and q.is_contiguous()
+            and q.numel() <= MAX_FLAT_ELEMENTS
+            and k.dtype == torch.float8_e4m3fn
+            and k_shape == kv_shape
+            and k.device == device
+            and k.is_contiguous()
+            and k.numel() <= MAX_FLAT_ELEMENTS
+            and v.dtype == torch.float8_e4m3fn
+            and v.shape == kv_shape
+            and v.device == device
+            and v.is_contiguous()
+            and isinstance(q_scale, torch.Tensor)
+            and q_scale.dtype == torch.float32
+            and q_scale.shape == (batch, heads, seqlen_q)
+            and q_scale.device == device
+            and q_scale.is_contiguous()
+            and isinstance(k_scale, torch.Tensor)
+            and k_scale.dtype == torch.float32
+            and k_scale.shape == (batch, kv_heads, k_scale_groups)
+            and k_scale.device == device
+            and k_scale.is_contiguous()
+            and isinstance(v_scale, torch.Tensor)
+            and v_scale.dtype == torch.float32
+            and v_scale.device == device
+            and v_scale.is_contiguous()
+            and v_scale.numel() <= MAX_FLAT_ELEMENTS
+        ):
+            _check_operands(
+                q,
+                k,
+                v,
+                q_scale,
+                k_scale,
+                v_scale,
+                device,
+                kv_shape,
+                (batch, heads, seqlen_q),
+                (batch, kv_heads, k_scale_groups),
+            )
         if (
             check_addresses
             and (q.data_ptr() | k.data_ptr() | v.data_ptr() | v_scale.data_ptr())
@@ -616,22 +694,32 @@ def _attention_operands(
         ):
             for name, t in (("q", q), ("k", k), ("v", v), ("v_scale", v_scale)):
                 _check_aligned(name, t, ATTENTION_ALIGNMENT)
-    if v_scale.dim() == 3 and tuple(v_scale.shape) == (batch, kv_heads, dim):
+    v_scale_shape = v_scale.shape
+    if v_scale_shape == (batch, kv_heads, dim):
         v_scale_batch_stride = kv_heads * dim
-    elif tuple(v_scale.shape) == (kv_heads, dim):
+    elif v_scale_shape == (kv_heads, dim):
         v_scale_batch_stride = 0
     else:
         raise ValueError(
             f"v_scale must be [Hkv,128]={(kv_heads, dim)} or [B,Hkv,128]={(batch, kv_heads, dim)}, "
-            f"got {tuple(v_scale.shape)}"
+            f"got {tuple(v_scale_shape)}"
         )
-    if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
-        batch,
-        heads,
-        q_blocks,
+    if not (
+        q2k_block_index.ndim == 4
+        and q2k_block_index.shape[:3] == (batch, heads, q_blocks)
+        and isinstance(q2k_block_index, torch.Tensor)
+        and q2k_block_index.dtype == torch.int32
+        and q2k_block_index.device == device
+        and q2k_block_index.is_contiguous()
+        and q2k_block_index.numel() <= MAX_FLAT_ELEMENTS
     ):
-        raise ValueError(f"q2k_block_index must be int32 [B,H,{q_blocks},capacity]")
-    _check_tensor("q2k_block_index", q2k_block_index, device, torch.int32)
+        if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
+            batch,
+            heads,
+            q_blocks,
+        ):
+            raise ValueError(f"q2k_block_index must be int32 [B,H,{q_blocks},capacity]")
+        _check_tensor("q2k_block_index", q2k_block_index, device, torch.int32)
     capacity = int(q2k_block_index.shape[-1])
     if capacity < 1:
         raise ValueError("q2k_block_index must have positive capacity")
@@ -799,7 +887,7 @@ def bsa_attn_sm100_sage_fwd_cake(
     kernel parameters, so the call is CUDA-Graph capturable and shares no device
     state between streams.
     """
-    call, out, lse = _attention_call(
+    record, arch, args, out, lse = _attention_operands(
         q,
         k,
         v,
@@ -816,7 +904,7 @@ def bsa_attn_sm100_sage_fwd_cake(
         lse,
         enable_pdl,
     )
-    _launch(call)
+    _launch((_loader.entry(record, arch), args))
     return out, lse
 
 
