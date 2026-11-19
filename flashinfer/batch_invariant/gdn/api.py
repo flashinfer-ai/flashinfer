@@ -35,7 +35,9 @@ Without ``initial_state`` the call is stateless: every sequence is whole and run
 launch, the rows are the ones the pool calls return for it, and no state is read, written, kept or returned (the form a
 trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it. With
 ``train_states`` the same launch also stores the state every 64-token chunk starts from in that caller-owned buffer
-(:mod:`.train`), in the row layout cuDNN's GDN backward takes as ``state_checkpoints``.
+(:mod:`.train`), in the row layout cuDNN's GDN backward takes as ``state_checkpoints``. As for the pool calls,
+``cu_seqlens_cpu`` must agree with ``cu_seqlens``: only their lengths are compared, the rows without ``train_states``
+follow the device offsets, and with ``train_states`` the rows and the stored states both follow the host ones.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -221,8 +223,10 @@ def _stateless(
         return zero_state_prefill(plain, cu, offs, scale_f, out)
     from .train import check_train_states, zero_state_prefill_with_states
 
-    check_train_states(train_states, int(v.shape[1]), v.device, offs)
-    return zero_state_prefill_with_states(plain, cu, offs, train_states, scale_f, out)
+    others = [("output", output), ("cu_seqlens", cu_seqlens)]
+    others += zip(("q", "k", "v", "g", "beta"), rows, strict=True)
+    check_train_states(train_states, int(v.shape[1]), v.device, offs, others)
+    return zero_state_prefill_with_states(plain, offs, train_states, scale_f, out)
 
 
 def chunk_gated_delta_rule_batch_invariant(

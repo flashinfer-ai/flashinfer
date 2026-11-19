@@ -16,8 +16,8 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 
-from ..support import unsupported
-from .pool import _POOLS, _pinned, pool_key
+from ..support import byte_range, unsupported
+from .pool import _pinned, overlaps_a_pool
 from .spec import CHUNK, CLASS, HEAD_DIM
 
 
@@ -58,7 +58,11 @@ def _checkpoint_rows(
 
 
 def check_train_states(
-    states: torch.Tensor, HV: int, device: torch.device, offs: Sequence[int]
+    states: torch.Tensor,
+    HV: int,
+    device: torch.device,
+    offs: Sequence[int],
+    others: Sequence[Tuple[str, Optional[torch.Tensor]]] = (),
 ) -> None:
     need = training_state_slots([b - a for a, b in zip(offs, offs[1:], strict=False)])
     if (
@@ -83,12 +87,28 @@ def check_train_states(
             "train_states allocated under inference_mode in a call outside it",
             "a buffer allocated in the mode of the call",
         )
-    if pool_key(states) in _POOLS:
+    if states.data_ptr() % 16:
         raise unsupported(
             CLASS,
-            "train_states that is a state pool of the class",
+            "train_states that is not 16-byte aligned",
+            "a 16-byte aligned buffer",
+        )
+    if overlaps_a_pool(states):
+        raise unsupported(
+            CLASS,
+            "train_states that shares memory with a state pool of the class",
             "a buffer of its own",
         )
+    lo, hi = byte_range(states)
+    for name, other in others:
+        if isinstance(other, torch.Tensor) and other.device == device:
+            a, b = byte_range(other)
+            if lo < b and a < hi:
+                raise unsupported(
+                    CLASS,
+                    f"train_states that shares memory with {name}",
+                    "a buffer of its own",
+                )
     if int(states.shape[0]) < need:
         raise unsupported(
             CLASS,
@@ -99,26 +119,24 @@ def check_train_states(
 
 def zero_state_prefill_with_states(
     rows: Tuple[torch.Tensor, ...],
-    cu: Optional[torch.Tensor],
     offs: List[int],
     states: torch.Tensor,
     scale: float,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """The class's term for whole sequences from the zero state, the state each chunk starts from stored in ``states``."""
+    """The class's term for whole sequences from the zero state, the state each chunk starts from stored in ``states``.
+    The rows and the layout both follow the host offsets ``offs``."""
     dev = out.device
     N = len(offs) - 1
     ck_rows, ck_starts, lead = _checkpoint_rows(offs)
     meta = torch.tensor(
-        [-1] * N + (list(offs) if cu is None else []) + ck_starts + ck_rows,
+        [-1] * N + list(offs) + ck_starts + ck_rows,
         dtype=torch.int32,
         device=dev,
     )
     skip = meta[:N]
-    pos = N
-    if cu is None:
-        cu = meta[pos : pos + N + 1]
-        pos += N + 1
+    cu = meta[N : 2 * N + 1]
+    pos = 2 * N + 1
     checkpoints = None
     if any(r >= 0 for r in ck_rows):
         checkpoints = (meta[pos + N + 1 :], meta[pos : pos + N + 1])

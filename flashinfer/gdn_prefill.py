@@ -2007,7 +2007,8 @@ def chunk_gated_delta_rule(
         re-running the state scan. A state is ``[HV, 128 (value), 128 (key)]``,
         one per v head. The output rows are unchanged, and each
         stored state is bit for bit the state the inference prefill of the
-        same prefix leaves in its pool.
+        same prefix leaves in its pool. The buffer must be 16-byte aligned
+        and share no memory with a state pool, the output or an input.
 
     Returns
     -------

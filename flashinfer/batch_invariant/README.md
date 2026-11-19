@@ -465,8 +465,10 @@ rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequen
   48 v heads, four times the output) and is one state per sequence for sequences of at most 64 tokens. Rows past
   `training_state_slots` are left as they are. The call allocates two small index tensors for the layout.
 * The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
-  that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is one of the class's
-  state pools, raises the typed error.
+  that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is not 16-byte aligned
+  or shares memory with one of the class's state pools, the output or an input, raises the typed error.
+* With `train_states`, the rows and the stored states both follow the host offsets (`cu_seqlens_cpu` when given),
+  which must agree with `cu_seqlens` as for the pool calls.
 
 Tests: `tests/gdn/test_batch_invariant_gdn_stateless.py`.
 

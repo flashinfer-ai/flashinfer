@@ -421,6 +421,55 @@ def test_train_states_unsupported_arguments_raise():
 
 
 @needs_device
+def test_train_states_inside_a_pool_are_refused_and_the_pool_is_kept():
+    lens = [130, 70]
+    x = _inputs(200, 4, 8, 11)
+    big = torch.zeros(8, 8, D, D, device="cuda")
+    pool = big[1:7]
+    _infer(x, [0, 1], lens, pool=pool)
+    kept = big.clone()
+    for view in (pool[1:], big[2:], big[:5]):
+        with pytest.raises(BatchInvariantUnsupportedError):
+            _stateless(x, lens, train_states=view)
+    assert torch.equal(big, kept)
+    free = torch.zeros(5, 8, D, D, device="cuda")
+    _stateless(x, lens, train_states=free)
+
+
+@needs_device
+def test_train_states_misaligned_or_sharing_memory_are_refused():
+    lens = [130, 70]
+    x = _inputs(200, 4, 8, 12)
+    flat = torch.zeros(5 * 8 * D * D + 4, device="cuda")
+    for shift in (1, 2, 3):
+        with pytest.raises(BatchInvariantUnsupportedError):
+            _stateless(
+                x,
+                lens,
+                train_states=flat[shift : shift + 5 * 8 * D * D].view(5, 8, D, D),
+            )
+    states = torch.zeros(5, 8, D, D, device="cuda")
+    inside = states.view(-1).view(torch.bfloat16)[: 200 * 8 * D].view(200, 8, D)
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _stateless(x, lens, train_states=states, output=inside)
+    v_inside = states.view(-1).view(torch.bfloat16)[-200 * 8 * D :].view(200, 8, D)
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _stateless((x[0], x[1], v_inside, x[3], x[4]), lens, train_states=states)
+
+
+@needs_device
+def test_train_states_follow_the_host_offsets():
+    host, device = [0, 130, 200, 264], [0, 64, 200, 264]
+    x = _inputs(264, 4, 8, 13)
+    ref, ref_states = _with_states(x, [130, 70, 64])
+    states = torch.full_like(ref_states, float("nan"))
+    got = flashinfer.chunk_gated_delta_rule(
+        *x, cu_seqlens=_i32(device), cu_seqlens_cpu=host, train_states=states, **_KW
+    )
+    assert torch.equal(got, ref) and torch.equal(states, ref_states)
+
+
+@needs_device
 def test_train_states_are_the_series_the_cudnn_backward_takes():
     pytest.importorskip("cudnn")
     gdn = pytest.importorskip("cudnn.linear_attention.ops.gdn")

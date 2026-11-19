@@ -27,7 +27,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from ..support import unsupported
+from ..support import byte_range, unsupported
 from .spec import CHUNK, CLASS, HEAD_DIM
 
 _IO = torch.bfloat16
@@ -52,6 +52,17 @@ def pool_key(pool: torch.Tensor) -> Tuple[int, int, int, torch.device]:
         int(pool.shape[1]),
         pool.device,
     )
+
+
+def overlaps_a_pool(t: torch.Tensor) -> bool:
+    """Whether ``t`` shares memory with any slot of a registered pool on its device."""
+    lo, hi = byte_range(t)
+    for (base, offset, HV, dev), gp in list(_POOLS.items()):
+        start = base + 4 * offset
+        end = start + 4 * gp.slots * HV * HEAD_DIM * HEAD_DIM
+        if dev == t.device and lo < end and start < hi:
+            return True
+    return False
 
 
 def capturing(device: torch.device) -> bool:
@@ -158,6 +169,8 @@ def zero_state_prefill(rows, cu, offs, scale, out) -> torch.Tensor:
             else torch.zeros(1, HV, HEAD_DIM, HEAD_DIM, device=dev)
         )
         skip = torch.full((max(N, 64),), -1, dtype=torch.int32, device=dev)
+        # published only once filled: another stream may use them next
+        torch.cuda.current_stream(dev).synchronize()
         cached = _ZERO[(dev, HV)] = (state, skip)
     state, skip = cached
     if cu is None:
