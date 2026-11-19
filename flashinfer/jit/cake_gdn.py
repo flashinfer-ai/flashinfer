@@ -2028,13 +2028,15 @@ CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
 # (``cake_gdn_nontranspose_fp32_t1_domain_batch_class``).  A listed cell runs the twin only
 # for a state homed as a whole allocation on a device with an SM table; every other call
 # runs the whole route.  The cells are the twin routes of the Cake decode kernel program,
-# where the twin on a homed state ran faster than the whole body on 212-SM boards of both
-# die classes, timed with the L2 flushed by a read before each call (clean lines,
-# ``flashinfer.utils.make_l2_flush``): from 48 rows on.  Below 48 rows the twin was timed
-# at 32, 34, 36, 37, 40 and 44 rows (scale K ** -0.5) and at 32 and 37 rows, and 44 on
-# one board (scale 1.0), and was not faster there; at 47 rows (both scales) it ran
-# faster.  The cells start at 48 rows, so "B32-47" lists no cell; other SM counts
-# (216-SM boards are untimed) list no cell.
+# where the twin on a homed state ran faster than the whole body on 212-SM boards of
+# both die classes, timed through the public call in CUDA graphs with the L2 flushed by
+# a read before each replay (clean lines, ``flashinfer.utils.make_l2_flush``): from 48
+# rows on.  Below 48 rows the twin was timed at 32, 34, 36, 37, 40, 44 and 47 rows (at
+# scale 1.0, 34, 36, 40 and 44 on one board only).  Up to 44 rows it was not faster at
+# most timed batches, in CUDA graphs (read flush before each replay) or in back-to-back
+# eager calls (no flush between calls); at 47 rows it was faster, which the 48-row bound
+# gives up.  So "B32-47" lists no cell.  Other SM counts (216-SM boards are untimed)
+# list no cell.
 CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES: dict[
     tuple[str, int], dict[tuple[str, str, str], str]
 ] = {

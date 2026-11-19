@@ -280,22 +280,24 @@ checks to the TMA-state template's and launches the requested grid
 after the dynamic shared-memory opt-in; 4 CTAs per SM if the query fails).
 `CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES` lists the cells by architecture
 and SM count, die class (even when the dies' SM counts differ by at most 4)
-and batch class: on 212-SM devices both die classes from B = 48 on (timed
-with the L2 flushed by a read before each call, the twin was not faster than
-the whole body at the timed rows below 48: B = 32, 34, 36, 37, 40 and 44 at
-scale `K ** -0.5`, and B = 32 and 37, and 44 on one board, at scale 1.0; at
-B = 47 it ran faster, but the cells start at B = 48, so the `B32-47` class
-lists no cell). The
-public nontranspose decode runs the twin only for a state that is the whole
-homed allocation on a device with an SM table, in a listed cell; it keeps
-those launches in `gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`, keyed
-by the row, the dies' SM counts and the die cut, and every other call runs
-the launch it runs without the twin. The first call on a homed allocation
-binds it to its launch (`_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES`, by the
-allocation's homing record), so later calls on it make no SM table query and
-no launch lookup; an eager twin launch reuses the claim counter pair that
-`cake_locality.launch_counters` gave its thread and stream, and a captured
-one takes its pair from `launch_counters`.
+and batch class: on 212-SM devices both die classes from B = 48 on, where the
+twin on a homed state was faster through the public call, timed in CUDA graphs
+with the L2 flushed by a read before each replay. Below B = 48 it was timed at
+B = 32, 34, 36, 37, 40, 44 and 47 (at scale 1.0, 34, 36, 40 and 44 on one
+board only). Up to B = 44 it was not faster at most timed batches, in CUDA
+graphs (read flush before each replay) or in back-to-back eager calls (no
+flush between calls); at B = 47 it was faster, which the B = 48 bound gives
+up, so the `B32-47` class lists no cell. The public nontranspose decode runs
+the twin only for a state that is the whole homed allocation on a device with
+an SM table, in a listed cell; it keeps those launches in
+`gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`, keyed by the row, the
+dies' SM counts and the die cut, and every other call runs the launch it runs
+without the twin. The first call on a homed allocation binds it to its launch
+(`_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES`, by the allocation's homing record),
+so later calls on it make no SM table query and no launch lookup; an eager
+twin launch reuses the claim counter pair that `cake_locality.launch_counters`
+gave its thread and stream, and a captured one takes its pair from
+`launch_counters`.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)
