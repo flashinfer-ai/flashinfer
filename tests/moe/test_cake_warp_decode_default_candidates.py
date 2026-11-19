@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
     TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import _DEFAULT_BACKEND
+from flashinfer.fused_moe import runners as _runners_module
 from flashinfer.fused_moe.layer import NoEligibleBackend
 from tests.moe.cake_warp_decode_reference import (
     QUANT,
@@ -384,6 +385,14 @@ def test_default_entry_keeps_streams_with_a_workspace_at_the_limit(monkeypatch):
         assert runner.accepts(act, weights)
         runner.pack_inputs(act, weights)
     assert len(runner._workspace_cache) == limit - 1
+    # At the limit a winner selection's warmup stream would not fit: even a
+    # stream with a workspace leaves.
+    stream = SimpleNamespace(cuda_stream=limit)
+    runner.pack_inputs(act, weights)
+    assert len(runner._workspace_cache) == limit
+    for stream_id in (1, limit):
+        stream = SimpleNamespace(cuda_stream=stream_id)
+        assert not runner.accepts(act, weights)
 
 
 def test_default_entry_leaves_after_a_failed_module_load(monkeypatch):
@@ -391,6 +400,7 @@ def test_default_entry_leaves_after_a_failed_module_load(monkeypatch):
     weights, _ = _cpu_weight_pack()
     act = _cpu_activation_pack(topk_ids=torch.zeros((7, 4), dtype=torch.int32))
     runner._module = None
+    monkeypatch.setattr(_runners_module, "_DEFAULT_CAKE_LOAD_ERRORS", {})
     loads = []
 
     def failing_load():
@@ -401,13 +411,18 @@ def test_default_entry_leaves_after_a_failed_module_load(monkeypatch):
     assert not runner.accepts(act, weights)
     assert not runner.accepts(act, weights)
     assert len(loads) == 1, "a failed load is not retried"
-    # An explicit Cake config still loads at build time and reports its errors.
-    explicit, _ = _cpu_runner()
-    assert explicit.accepts(act, weights)
+    assert isinstance(runner._load_error, RuntimeError)
+    # Another layer's default entry on the same architecture does not rebuild.
+    other = _cpu_default_runner()
+    other._module = None
+    monkeypatch.setattr(other, "_load_module", failing_load)
+    assert not other.accepts(act, weights)
+    assert len(loads) == 1
 
 
 def test_default_layer_falls_back_when_the_cake_load_fails(monkeypatch):
     _require_cake_arch()
+    monkeypatch.setattr(_runners_module, "_DEFAULT_CAKE_LOAD_ERRORS", {})
     layer = _layer(_config())
     cake = layer.runners[-1]
     assert isinstance(cake, CakeWarpDecodeRunner) and cake._module is None
@@ -419,6 +434,7 @@ def test_default_layer_falls_back_when_the_cake_load_fails(monkeypatch):
     weights = _weights(_TRTLLM_KEY, "cake")
     activations = _activations(8)
     assert len(layer.runners) - 1 not in layer._eligible_runners(activations, weights)
+    assert isinstance(cake._load_error, RuntimeError)
     output = layer(activations, weights)
     assert layer.winner_backend == _TRTLLM_KEY
     assert_close(output, reference(_fixture(), 8))

@@ -914,6 +914,10 @@ class MoERunner(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
+# Module-load failures of the default Cake warp-decode entry, by SM architecture.
+_DEFAULT_CAKE_LOAD_ERRORS: dict[int, Exception] = {}
+
+
 class CakeWarpDecodeRunner(MoERunner):
     """Exact-SM100/SM103 Cake runner for calibrated NVFP4 decode geometries.
 
@@ -1188,10 +1192,12 @@ class CakeWarpDecodeRunner(MoERunner):
         # before that limit is reached instead of failing the call. One winner
         # selection can add two stream workspaces: the caller stream and the
         # timing warmup stream. A stream that already holds a workspace for
-        # this geometry adds none, so it stays eligible.
-        if (
-            len(self._workspace_cache) > self._MAX_STREAM_WORKSPACES - 2
-            and (self._stream_token(self._current_stream()), geometry)
+        # this geometry adds at most the warmup stream's, so it stays eligible
+        # while one more workspace fits.
+        cached = len(self._workspace_cache)
+        if cached > self._MAX_STREAM_WORKSPACES - 2 and (
+            cached >= self._MAX_STREAM_WORKSPACES
+            or (self._stream_token(self._current_stream()), geometry)
             not in self._workspace_cache
         ):
             return False
@@ -1205,10 +1211,17 @@ class CakeWarpDecodeRunner(MoERunner):
         """Load the default entry's module once; return whether it is loaded."""
         if getattr(self, "_load_error", None) is not None:
             return False
+        # One failed load per architecture leaves every layer's default entry
+        # out, so a model does not rebuild the failing module once per layer.
+        failed = _DEFAULT_CAKE_LOAD_ERRORS.get(self._device_arch)
+        if failed is not None:
+            self._load_error = failed
+            return False
         try:
             self._module = self._load_module()
         except Exception as error:  # noqa: BLE001 - any load failure leaves the entry out
             self._load_error = error
+            _DEFAULT_CAKE_LOAD_ERRORS[self._device_arch] = error
             logger.warning(
                 "The default Cake warp-decode MoE entry is left out: its module "
                 "failed to load (%s: %s).",
