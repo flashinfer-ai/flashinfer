@@ -28,7 +28,7 @@ SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test
 
 # Tests that require torchrun instead of mpirun
 TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py tests/comm/test_mnnvl_cutedsl_h7168.py tests/comm/test_mnnvl_cutedsl_static_fp8.py tests/comm/test_mnnvl_cutedsl_dynamic_fp8.py tests/comm/test_mnnvl_cutedsl_allreduce_api.py"
-SM107_TEST_FILES="tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py tests/moe_ep/test_sm107_routing_graph_multirank.py tests/moe_ep/test_sm107_auto_multirank.py tests/moe_ep/test_sm107_variant_selection_multirank.py tests/moe_ep/test_sm107_shared_expert.py"
+SM107_TEST_FILES="tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py tests/moe_ep/test_sm107_routing_graph_multirank.py tests/moe_ep/test_sm107_auto_multirank.py tests/moe_ep/test_sm107_variant_selection_multirank.py tests/moe_ep/test_sm107_shared_expert.py tests/moe_ep/test_sm107_clamped_relu2_multirank.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
 # BI qualification needs an allocation-wide torchrun, not a one-GPU pytest

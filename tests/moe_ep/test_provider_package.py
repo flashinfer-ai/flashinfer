@@ -2,15 +2,14 @@
 
 import ast
 import hashlib
-from importlib import metadata
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from importlib import metadata
+from pathlib import Path
 
 import pytest
-
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "flashinfer"
 if not _PACKAGE_ROOT.is_dir():
@@ -24,9 +23,16 @@ _ROOT = _PACKAGE_ROOT / "moe_ep/kernels/cutedsl_megamoe"
 
 def test_export_manifest_matches_sources():
     manifest = json.loads((_ROOT / "export_manifest.json").read_text())
+    overlay = json.loads((_ROOT / "activation_overlay_manifest.json").read_text())[
+        "files"
+    ]
     files = manifest["files"]
+    assert set(overlay) <= set(files)
     assert set(files) == {str(path.relative_to(_ROOT)) for path in _ROOT.rglob("*.py")}
     for name, digest in files.items():
+        if name in overlay:
+            assert overlay[name]["upstream_sha256"] == digest, name
+            digest = overlay[name]["overlay_sha256"]
         assert hashlib.sha256((_ROOT / name).read_bytes()).hexdigest() == digest, name
 
 

@@ -147,6 +147,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        if problem_desc.get("gate_activation") == "clamped_relu2":
+            raise ValueError("clamped_relu2 is supported only by GenPhase")
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )

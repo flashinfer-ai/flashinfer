@@ -95,6 +95,7 @@ def sampled_reference(
             apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
             weight_scales_are_swizzled=True,
             return_fp32=True,
+            activation=cfg.activation,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
             swiglu_alpha=getattr(cfg, "swiglu_alpha", None),

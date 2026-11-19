@@ -32,8 +32,10 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol, Tuple
 import torch
 
 from flashinfer.moe_ep._compat import deprecated_aliases
-
 from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import comm
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.activation import (
+    fc1_rows_per_intermediate,
+)
 from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.dependencies import require_sm107_dsl
 from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.kernel_helpers import (
     Mxfp8BlockSize,
@@ -52,7 +54,7 @@ if TYPE_CHECKING:
 Sm107QuantKind = Literal["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
-Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
+Sm107ScheduleMode = Literal["grouped", "phase_interleave", "decode"]
 
 # (act data dtype, act SF dtype, sf_vec_size, 2x-mode instruction K) per kind.
 # The mxf8f6f4 UMMA path has instruction K 32 (64 in 2x mode); the fp4 pair
@@ -141,7 +143,7 @@ class Sm107BlockScaledMoeConfig:
     max_tokens_per_rank: int
     num_topk: int
     hidden: int
-    intermediate: int  # width after activation; the FC1 GEMM N is 2*intermediate
+    intermediate: int  # FC1 N is I for clamped_relu2, otherwise 2*I
     rank: int
     world_size: int
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
@@ -150,7 +152,7 @@ class Sm107BlockScaledMoeConfig:
     # Mixed-CGA launch: alongside the preferred clusters, fill leftover SMs with
     # smaller fallback clusters. None = uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
-    # ("grouped" | "phase_interleave", optional hint); typed loosely so backend
+    # ("grouped" | "phase_interleave" | "decode", optional hint/lead); typed loosely so backend
     # configs can carry it as a plain (str, int|None) tuple.
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Sm107WorkIdMode = "grid_stride"
@@ -165,7 +167,7 @@ class Sm107BlockScaledMoeConfig:
     token_back_mode: Sm107TokenBackMode = "epi_warps"
     apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
-    activation: Literal["swiglu", "situ"] = "swiglu"
+    activation: Literal["swiglu", "situ", "clamped_relu2"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
     swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
@@ -247,8 +249,8 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError(
                 "Two epilogue warpgroups require standard inference with BF16 bulk combine and epi_warps."
             )
-        if self.activation not in ("swiglu", "situ"):
-            raise ValueError("activation must be 'swiglu' or 'situ'.")
+        if self.activation not in ("swiglu", "situ", "clamped_relu2"):
+            raise ValueError("activation must be 'swiglu', 'situ', or 'clamped_relu2'.")
         if self.activation == "situ" and not self.batch_invariant:
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
@@ -294,6 +296,10 @@ class Sm107BlockScaledMoeConfig:
                 f"across world_size ({self.world_size})."
             )
         vec = self.sf_vec_size
+        if fc1_rows_per_intermediate(self.activation) == 1 and self.intermediate % (
+            4 * vec
+        ):
+            raise ValueError("clamped_relu2 intermediate must be a multiple of 128.")
         if self.hidden % (4 * vec) != 0:
             raise ValueError(
                 f"hidden ({self.hidden}) must be a multiple of {4 * vec} "
@@ -392,7 +398,7 @@ class Sm107BlockScaledMoeConfig:
         if len(self.schedule_policy) != 2:
             raise ValueError("schedule_policy requires (mode, hint).")
         mode, hint = self.schedule_policy
-        if mode not in ("grouped", "phase_interleave"):
+        if mode not in ("grouped", "phase_interleave", "decode"):
             raise ValueError(f"unknown schedule mode {mode!r}.")
         if hint is not None and (type(hint) is not int or hint <= 0):
             raise ValueError("schedule hint must be a positive Python integer or None.")
@@ -404,10 +410,21 @@ class Sm107BlockScaledMoeConfig:
             "reuse_dispatch_warps",
         ):
             raise ValueError(f"unknown token_back_mode {self.token_back_mode!r}.")
-        if mode == "phase_interleave" and self.work_id_mode != "atomic_counter":
+        if (
+            mode in ("phase_interleave", "decode")
+            and self.work_id_mode != "atomic_counter"
+        ):
             raise ValueError(
-                "schedule_policy 'phase_interleave' requires "
-                "work_id_mode='atomic_counter'."
+                f"schedule_policy {mode!r} requires work_id_mode='atomic_counter'."
+            )
+        if mode == "decode" and (
+            self.kernel_variant != "genphase"
+            or self.shared_expert is not None
+            or self.batch_invariant
+        ):
+            raise ValueError(
+                "schedule_policy 'decode' requires GenPhase, no shared expert, "
+                "and batch_invariant=False."
             )
         if len(self.epi_flag_batches) != 2:
             raise ValueError("epi_flag_batches requires (FC1, FC2) values.")
@@ -472,14 +489,14 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(
                     "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
                 )
-            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
+            if n64_decode and self.world_size > 1 and mode != "grouped":
                 # EP1 phase-interleave coverage does not establish multirank
                 # liveness: an EP2 dense/replay case stalls with this geometry.
                 # Reject before allocation or compilation; autotune applies
                 # this same config validation through is_valid_sm107.
                 raise ValueError(
                     "GenPhase N64 with world_size > 1 requires grouped scheduling; "
-                    "multirank phase_interleave is not qualified."
+                    "multirank phase_interleave/decode is not qualified."
                 )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
@@ -819,6 +836,10 @@ class Sm107BlockScaledSymmBuffer:
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
+
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
+        )
         from flashinfer.moe_ep.kernels.cutedsl_megamoe import (
             RubinInferenceGenphaseMegaMoE,
             RubinInferenceMegaMoE,
@@ -829,10 +850,6 @@ class Sm107BlockScaledSymmBuffer:
         )
         from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.quant_def import (
             CombineFormat,
-        )
-
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
-            validate_block_scaled_batch_invariant,
         )
 
         validate_block_scaled_batch_invariant(cfg, arch="sm_107")
@@ -894,7 +911,9 @@ class Sm107BlockScaledSymmBuffer:
                     if activation_variant is not None
                     else {}
                 ),
-                "intermediate_gateup_size": 2 * cfg.intermediate,
+                "intermediate_gateup_size": (
+                    fc1_rows_per_intermediate(cfg.activation) * cfg.intermediate
+                ),
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
                 "a_major_mode": OperandMajorMode.K,
@@ -914,6 +933,11 @@ class Sm107BlockScaledSymmBuffer:
                 if activation_variant is not None
                 else cfg.situ_linear_beta,
                 "use_tanh_sigmoid": cfg.use_tanh_sigmoid,
+                **(
+                    {"gate_activation": "clamped_relu2"}
+                    if cfg.activation == "clamped_relu2"
+                    else {}
+                ),
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -1343,7 +1367,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     token_back_mode: Sm107TokenBackMode = "epi_warps",
     apply_routing_weights_before_fc2: bool = True,
     max_sm_count: Optional[int] = None,
-    activation: Literal["swiglu", "situ"] = "swiglu",
+    activation: Literal["swiglu", "situ", "clamped_relu2"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     swiglu_alpha: Optional[float] = None,
@@ -1415,7 +1439,7 @@ def _expected_weight_shapes(
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
     """(fc1 shape, fc2 shape, fc1 SF numel/expert, fc2 SF numel/expert)."""
     experts = cfg.experts_per_rank
-    fc1_out = 2 * cfg.intermediate
+    fc1_out = fc1_rows_per_intermediate(cfg.activation) * cfg.intermediate
     vec = cfg.sf_vec_size
     if cfg.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)

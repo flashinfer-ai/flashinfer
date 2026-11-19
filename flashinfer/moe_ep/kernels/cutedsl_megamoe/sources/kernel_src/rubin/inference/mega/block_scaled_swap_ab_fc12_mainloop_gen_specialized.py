@@ -159,6 +159,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self.acc_dtype = tcgen05_block_scaled_acc_dtype
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+        self.activation_divisor = 1 if problem_desc.get("gate_activation") == "clamped_relu2" else 2
         self._parse_shared_problem(problem_desc)
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
@@ -961,7 +962,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             else intermediate_gateup_size
         )
         self.fc1_k_tile_count = ceil_div(bound_hidden_size, self.mma_tile_k)
-        self.fc2_k_tile_count = ceil_div(bound_intermediate_gateup_size // 2, self.mma_tile_k)
+        self.fc2_k_tile_count = ceil_div(bound_intermediate_gateup_size // self.activation_divisor, self.mma_tile_k)
         self._set_shared_k_tile_counts()
         self.sfb_vmnk_coord = (0, cta_coord_in_cluster[0], cta_coord_in_cluster[1], cta_coord_in_cluster[2])
 

@@ -20,14 +20,14 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from ..validation import validate_routing_values, validate_unit_scalars
 from ..shared_expert import (
     bind_shared_weights,
     prepare_shared_weights,
-    validate_shared_weights,
     stage_shared_inputs,
     validate_shared_inputs,
+    validate_shared_weights,
 )
+from ..validation import validate_routing_values, validate_unit_scalars
 from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, Sm107Mxfp8Kind
 from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
 from .weights import (
@@ -37,12 +37,13 @@ from .weights import (
 )
 
 if TYPE_CHECKING:
-    from ..mxfp4_mxfp4_bf16_cutedsl.config import (
-        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
-    )
-    from ......tensors import MoEEpTensors
     from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
+    )
+
+    from ......tensors import MoEEpTensors
+    from ..mxfp4_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from ..mxfp8_mxfp4_bf16_cutedsl.config import (
         Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -164,6 +165,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
+            activation=self._kernel_config.activation,
         )
         return prepare_shared_weights(
             self._kernel_config, weights, routed, fleet_params
@@ -183,6 +185,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
+            activation=self._kernel_config.activation,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )

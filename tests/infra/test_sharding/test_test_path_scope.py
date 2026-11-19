@@ -101,6 +101,8 @@ def test_megamoe_distributed_files_are_registered() -> None:
         "test_sm107_routing_graph_multirank.py",
         "test_sm107_auto_multirank.py",
         "test_sm107_variant_selection_multirank.py",
+        "test_sm107_shared_expert.py",
+        "test_sm107_clamped_relu2_multirank.py",
     ):
         assert (REPO_ROOT / "tests/moe_ep" / name).is_file()
         assert "tests/moe_ep/" + name in text
@@ -109,9 +111,9 @@ def test_megamoe_distributed_files_are_registered() -> None:
 @pytest.mark.parametrize(
     "cuda,capability,test_path,expected_count",
     [
-        ("13.4", (10, 7), "", 4),
-        ("13.4", (10, 7), "tests/moe_ep", 4),
-        ("13.4", (10, 7), "tests/moe_ep/test_sm107_auto_multirank.py", 1),
+        ("13.4", (10, 7), "", 6),
+        ("13.4", (10, 7), "tests/moe_ep", 6),
+        ("13.4", (10, 7), "tests/moe_ep/test_sm107_clamped_relu2_multirank.py", 1),
         ("12.9", (10, 7), "tests/moe_ep", 0),
         ("13.4", (10, 0), "tests/moe_ep", 0),
         ("13.4", (10, 3), "tests/moe_ep", 0),
@@ -130,6 +132,10 @@ def test_sm107_runner_selects_supported_lanes(
     for name in ("task_test_multi_gpu_comm_kernels.sh", "test_path_scope.sh"):
         shutil.copy(REPO_ROOT / "scripts" / "infra" / name, scripts)
     # Exercise selection through the real wrapper before package setup or launch.
+    # Directory scopes also select the BI qualifier; keep this fixture GPU-free.
+    qualifier = tmp_path / "tests/moe_ep/qualify_batch_invariant.py"
+    qualifier.parent.mkdir(parents=True)
+    qualifier.write_text("import sys\nassert '--plan' in sys.argv\n")
     (scripts / "test_utils.sh").write_text(
         'source "${SCRIPT_DIR}/test_path_scope.sh"\n'
         "test_status_begin() { :; }\n"
