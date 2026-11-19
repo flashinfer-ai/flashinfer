@@ -281,6 +281,16 @@ _TAIL_SPLIT_P3 = {"sm_100a": (24, None), "sm_103a": (24, 64)}
 #: ``attention_sd_tsplit`` with PDL, which is then as fast or faster.  The other
 #: builds, and every build after the other quantizers, keep PDL.
 _TAIL_SPLIT_P3_SERIAL = {"sm_100a": ((3, 3, None), (3, 2, 47))}
+#: Per architecture, the split rows of ``attention_sd_tsplit_p3`` that a combined call
+#: launches without PDL after the one-launch quantizer where ``_TAIL_SPLIT_P3_SERIAL``
+#: keeps PDL.  On SM103 the eager PDL launch behind that quantizer runs up to 14 %
+#: slower below 32 selected blocks a row and on grids of fewer than two waves, and the
+#: launch after the quantizer ends runs at full speed there.  ``(sel, waves, parts)``:
+#: a row below ``sel`` selected blocks a row, or on fewer than ``waves`` waves of the
+#: persistent grid (``total_tiles < waves x SMs``), whose split tiles fill at most
+#: ``1/parts`` of the slots launches without PDL; the other rows keep PDL.  The launch
+#: writes the bits of the attention call.
+_TAIL_SPLIT_P3_SERIAL_BELOW = {"sm_103a": (32, 2, 3)}
 #: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
 #: next tile runs) and, per architecture, the band of selected blocks a row
 #: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
@@ -294,6 +304,12 @@ _P3_BANDS = {"sm_100a": (6, 10, 5), "sm_103a": (8, 22, 2)}
 #: (``< max_waves x SMs``; ``None``: no bound); the tiles per SM may be fractional.
 #: The windows come before ``_P3_BANDS``.  It writes the default bits.
 _SDP3_ROLE = "attention_sdp3"
+#: Per architecture, the unsplit ``attention_sdp3`` calls that a combined call gives up
+#: with PDL after the one-launch quantizer: up to ``sel`` selected blocks a row on fewer
+#: than ``waves`` waves (``total_tiles < waves x SMs``), ``(sel, waves)``.  On SM103 the
+#: eager PDL launch of that build behind the quantizer runs up to 12 % slower there;
+#: the call then launches ``attention_p3`` or the default build (the same bits).
+_SDP3_GIVE_WAY = {"sm_103a": (22, 3)}
 _SDP3_BANDS = {
     "sm_100a": (
         (6, 10, 0, 5),
@@ -409,12 +425,35 @@ def _p3_serial(
     )
 
 
+def _p3_serial_below(
+    arch: str, plan: Tuple[int, int, int], block_sparse_num: int, tiles: int, sms: int
+) -> bool:
+    """After the one-launch quantizer, does the ``attention_sd_tsplit_p3`` plan
+    ``(grid, split_from, items)`` of a call with ``block_sparse_num`` selected blocks a
+    row and ``tiles`` tiles launch without PDL by ``_TAIL_SPLIT_P3_SERIAL_BELOW``?"""
+    rule = _TAIL_SPLIT_P3_SERIAL_BELOW.get(arch)
+    if rule is None:
+        return False
+    sel, waves, parts = rule
+    grid, split_from, items = plan
+    tail = (items - split_from) // 2
+    return (block_sparse_num < sel or tiles < waves * sms) and parts * tail <= grid
+
+
+def _sdp3_gives_way(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
+    """After the one-launch quantizer, does a PDL call give up ``attention_sdp3``
+    (``_SDP3_GIVE_WAY``)?"""
+    rule = _SDP3_GIVE_WAY.get(arch)
+    return rule is not None and block_sparse_num <= rule[0] and tiles < rule[1] * sms
+
+
 #: The launch route of each call key ``(arch, block_sparse_num, total_tiles, device,
 #: pdl, after_one_launch)``: ``(record, items, split, tail)``, where ``items`` is the
 #: ``total_tiles`` argument, ``split`` the tail-split parameters and ``tail`` the PDL
 #: flag and the grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
 #: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES``,
-#: ``_TAIL_SPLIT``, ``_TAIL_SPLIT_P3``, ``_P3_BANDS`` or ``_SDP3_BANDS`` clears it.
+#: ``_TAIL_SPLIT``, ``_TAIL_SPLIT_P3``, ``_TAIL_SPLIT_P3_SERIAL_BELOW``,
+#: ``_SDP3_GIVE_WAY``, ``_P3_BANDS`` or ``_SDP3_BANDS`` clears it.
 _ROUTES: dict = {}
 
 
@@ -443,6 +482,10 @@ def _route(
                 continue
             if p3 and pdl and after_one_launch:
                 launch = _p3_serial(arch, plan, block_sparse_num)
+                if launch is None and _p3_serial_below(
+                    arch, plan, block_sparse_num, total_tiles, sms
+                ):
+                    launch = True
                 if launch is False:
                     continue
                 serial = launch is True
@@ -451,7 +494,11 @@ def _route(
             split = (split_from,)
             break
     if not split:
-        if _sdp3(arch, block_sparse_num, total_tiles, sms):
+        if _sdp3(arch, block_sparse_num, total_tiles, sms) and not (
+            pdl
+            and after_one_launch
+            and _sdp3_gives_way(arch, block_sparse_num, total_tiles, sms)
+        ):
             role = _SDP3_ROLE
         elif _p3(arch, block_sparse_num, total_tiles, sms):
             role = _P3_ROLE

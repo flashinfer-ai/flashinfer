@@ -714,19 +714,23 @@ def test_serial_rule_thresholds():
 
 
 @requires_sm100
-@pytest.mark.parametrize("heads", [3, 5, 7, 8])
-def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads):
+@pytest.mark.parametrize(
+    ("heads", "sel"),
+    [(3, 40), (5, 40), (7, 40), (8, 40), (3, 24), (5, 28), (8, 24)],
+)
+def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads, sel):
     """A combined call whose quantizer is the one-launch program and whose attention
-    routes to ``attention_sd_tsplit_p3`` follows ``_TAIL_SPLIT_P3_SERIAL``: the build
-    without programmatic dependent launch (its PDL flag is 0) where the rule holds,
-    ``attention_sd_tsplit`` with PDL where it does not, the build with PDL on the other
+    routes to ``attention_sd_tsplit_p3`` follows ``_TAIL_SPLIT_P3_SERIAL`` and
+    ``_TAIL_SPLIT_P3_SERIAL_BELOW``: the build without programmatic dependent launch
+    (its PDL flag is 0) where a rule holds, ``attention_sd_tsplit`` with PDL where
+    ``_TAIL_SPLIT_P3_SERIAL`` gives way, the build with PDL on the other rows and
     architectures and outside a combined call; the bits are those of the attention call
     on the quantizer's outputs."""
     device = torch.device("cuda")
     index = torch.cuda.current_device()
     arch = loader.device_arch(index)
     sms = loader.sm_count(index)
-    sel, seqlen = 40, 4096
+    seqlen = 4096
     tiles = heads * _ceil_div(seqlen, _BLOCK)
     plan = pkg._tail_split(arch, tiles, sel, index, True)
     if 8 * heads > sms or plan is None:
@@ -746,6 +750,8 @@ def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads):
     _, (q8, k8, v8, qs, ks, vs), impl = pkg._quantize_program(q, k, v, "auto", None)
     assert impl == "one_launch", impl
     rule = pkg._p3_serial(arch, plan, sel)
+    if rule is None and pkg._p3_serial_below(arch, plan, sel, tiles, sms):
+        rule = True
     for after in (False, True):
         record, _, args, _, _ = pkg._attention_operands(
             q8,
@@ -781,6 +787,122 @@ def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads):
     )
     torch.cuda.synchronize()
     assert torch.equal(out, ref)
+
+
+def test_after_one_launch_rule_thresholds():
+    """``_TAIL_SPLIT_P3_SERIAL_BELOW`` and ``_SDP3_GIVE_WAY`` with their thresholds
+    written out on plans ``(grid, split_from, items)`` of 152 tile slots (SM103): below
+    32 selected blocks a row or two waves, a split row whose split tiles fill at most a
+    third of the slots launches without PDL, the other rows keep PDL;
+    ``attention_sdp3`` is given up to 22 selected blocks a row below three waves.  SM100
+    has neither rule."""
+    assert pkg._TAIL_SPLIT_P3_SERIAL == {"sm_100a": ((3, 3, None), (3, 2, 47))}
+    assert pkg._TAIL_SPLIT_P3_SERIAL_BELOW == {"sm_103a": (32, 2, 3)}
+    assert pkg._SDP3_GIVE_WAY == {"sm_103a": (22, 3)}
+
+    def plan(tiles, slots):
+        full = tiles // slots * slots
+        return min(full + 2 * (tiles - full), slots), full, full + 2 * (tiles - full)
+
+    for sel, tiles, serial in [
+        (24, 160, True),
+        (24, 192, True),
+        (31, 960, True),
+        (24, 1088, True),
+        (40, 192, True),
+        (58, 200, True),
+        (24, 512, False),
+        (28, 512, False),
+        (32, 320, False),
+        (58, 512, False),
+        (64, 1224, False),
+    ]:
+        got = pkg._p3_serial_below("sm_103a", plan(tiles, 152), sel, tiles, 152)
+        assert got is serial, (sel, tiles)
+        got = pkg._p3_serial_below("sm_100a", plan(tiles, 148), sel, tiles, 148)
+        assert got is False
+    for sel, tiles, gives in [
+        (5, 32, True),
+        (6, 455, True),
+        (22, 455, True),
+        (6, 456, False),
+        (23, 152, False),
+    ]:
+        assert pkg._sdp3_gives_way("sm_103a", sel, tiles, 152) is gives, (sel, tiles)
+        assert pkg._sdp3_gives_way("sm_100a", sel, tiles, 148) is False
+
+
+@requires_sm100
+@pytest.mark.parametrize(("heads", "sel"), [(1, 5), (4, 6), (3, 6), (8, 6), (4, 22)])
+def test_combined_call_gives_up_sdp3_by_the_give_way_rule(heads, sel):
+    """After the one-launch quantizer a combined call whose attention routes to an
+    unsplit ``attention_sdp3`` row runs ``attention_p3`` or the default build with PDL
+    where ``_SDP3_GIVE_WAY`` gives the build up, else the same build; the bits are those
+    of the attention call on the quantizer's outputs on every call."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.device_arch(index)
+    sms = loader.sm_count(index)
+    seqlen = 4096
+    tiles = heads * _ceil_div(seqlen, _BLOCK)
+    if 8 * heads > sms:
+        pytest.skip(f"{sms} SMs leave {heads} heads no one-launch quantizer")
+    g = torch.Generator(device=device).manual_seed(7)
+    q, k, v = (
+        torch.randn(
+            (1, seqlen, heads, _HEAD_DIM), device=device, generator=g
+        ).bfloat16()
+        for _ in range(3)
+    )
+    nb = seqlen // _BLOCK
+    scores = torch.rand((1, heads, nb, nb), device=device, generator=g)
+    idx = (
+        scores.argsort(dim=-1, descending=True)[..., :sel].to(torch.int32).contiguous()
+    )
+    _, (q8, k8, v8, qs, ks, vs), impl = pkg._quantize_program(q, k, v, "auto", None)
+    assert impl == "one_launch", impl
+    routes = {}
+    for after in (False, True):
+        record, _, args, _, _ = pkg._attention_operands(
+            q8,
+            k8,
+            v8,
+            idx,
+            sel,
+            qs,
+            ks,
+            vs,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            operands_checked=True,
+            after_one_launch=after,
+        )
+        routes[after] = record, args[-4]
+    plain, comb = routes[False], routes[True]
+    if plain[0] != "attention_sdp3_pdl":
+        pytest.skip(f"{arch} routes {heads} heads at {sel} blocks to {plain[0]}")
+    if pkg._sdp3_gives_way(arch, sel, tiles, sms):
+        assert comb in (("attention_pdl", 1), ("attention_p3_pdl", 1)), comb
+    else:
+        assert comb == plain, (comb, plain)
+    out, lse = pkg.bsa_attn_sm100_sage_quantize_fwd_cake(
+        q, k, v, idx, sel, return_lse=True
+    )
+    again, again_lse = pkg.bsa_attn_sm100_sage_quantize_fwd_cake(
+        q, k, v, idx, sel, return_lse=True
+    )
+    q8, k8, v8, qs, ks, vs = sage_fp8_quantize_sm100(q, k, v)
+    ref, ref_lse = bsa_attn_sm100_sage_fwd_cake(
+        q8, k8, v8, idx, sel, q_scale=qs, k_scale=ks, v_scale=vs, return_lse=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, again) and torch.equal(lse, again_lse)
+    assert torch.equal(out, ref) and torch.equal(lse, ref_lse)
 
 
 @requires_sm100
