@@ -140,15 +140,38 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
     _SmemMiscBudget = 2048
     _TmemColsTotal = 512
 
-    # SMEM-resident transformed A leaves room for 3 B stages at N256; 4 exceeds
-    # the SM100 shared-memory limit at launch.
-    _MaxBStages = {"smem": 3, "tmem": 4}
+    _DefaultBStages = {"smem": 3, "tmem": 4}
 
     _SupportedImplementationConfigs = {
         ((256, 128, 128), "tmem", False, 128),
         ((256, 256, 128), "smem", False, 128),
         ((256, 256, 128), "tmem", True, 64),
     }
+
+    @classmethod
+    def max_b_stages(
+        cls,
+        mma_tiler_mnk: Tuple[int, int, int],
+        transform_buffer: str,
+        accumulator_overlap: bool,
+        transform_k_tile: int,
+    ) -> int:
+        """Largest B depth whose tile buffers fit the SM100 SMEM limit."""
+        stages = cls._derive_pipeline_stages(
+            mma_tiler_mnk,
+            transform_buffer,
+            accumulator_overlap,
+            transform_k_tile,
+        )
+        smem_capacity = 232448
+        # Worst non-tile storage measured across implementations and knobs (N128/tmem).
+        smem_overhead = 10880
+        m, n, k = mma_tiler_mnk
+        cta_m, cta_n = m // 2, n // 2
+        fixed = smem_overhead + stages["a"] * cta_m * k
+        if transform_buffer == "smem":
+            fixed += stages["transformed_a"] * cta_m * k * 2
+        return (smem_capacity - fixed) // (cta_n * k * 2)
 
     @classmethod
     def _derive_pipeline_stages(
@@ -199,7 +222,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             "a": common_depth,
             "scale": common_depth,
             "transformed_a": common_depth,
-            "b": cls._MaxBStages[transform_buffer],
+            "b": cls._DefaultBStages[transform_buffer],
             "acc": 2,
         }
 
@@ -313,15 +336,18 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             )
         if num_activation_stages is not None and num_activation_stages < 2:
             raise ValueError("num_activation_stages must be at least 2.")
-        if (
-            num_activation_stages is not None
-            and num_activation_stages > self._MaxBStages[transform_buffer]
-        ):
-            raise ValueError(
-                f"num_activation_stages must be at most "
-                f"{self._MaxBStages[transform_buffer]} for "
-                f"transform_buffer={transform_buffer!r}."
+        if num_activation_stages is not None:
+            max_stages = self.max_b_stages(
+                mma_tiler_mnk,
+                transform_buffer,
+                accumulator_overlap,
+                transform_k_tile,
             )
+            if num_activation_stages > max_stages:
+                raise ValueError(
+                    f"num_activation_stages must be at most {max_stages} for "
+                    f"{mma_tiler_mnk} with transform_buffer={transform_buffer!r}."
+                )
 
         self.mma_tiler_mnk = mma_tiler_mnk
         self.transform_buffer = transform_buffer
