@@ -98,10 +98,17 @@ __device__ __forceinline__ void cluster_bar() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
 }
-__device__ __forceinline__ void cluster_bar_publish(int writer_threads) {
-  if (static_cast<int>(threadIdx.x) < writer_threads)
-    asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n" ::: "memory");
-  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+// Publish the per-CTA partial records to the whole cluster.  On the
+// owner-push path those records were written with st.shared::cluster into
+// peer CTA windows, which a fence.release.sync_restrict::shared::cta.cluster
+// does NOT cover (it is restricted to the issuing CTA's own shared::cta
+// window).  The release arrival orders every prior shared-memory access of
+// the arriving thread -- remote DSMEM stores included -- at cluster scope,
+// and the paired barrier.cluster.wait below is an acquire, so the token
+// owner's reduction reads the pushed partials with a happens-before edge.
+// The pull path's CTA-local stores are covered by the same release arrival.
+__device__ __forceinline__ void cluster_bar_publish() {
+  asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void cluster_arrive_relaxed() {
@@ -573,7 +580,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(NTH, 1)
         acct[tid * ACCW + 24] = v;
       }
     }
-    cluster_bar_publish(active * ntcount * 8);
+    cluster_bar_publish();
 
     // --------- epilogue on the owning CTA --------------------------------
     {

@@ -86,23 +86,38 @@ __device__ __forceinline__ uint32_t fma_bf2(uint32_t a, uint32_t b, uint32_t c) 
   asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "r"(c));
   return r;
 }
-// Publish local shared memory with the restricted SMEM release fence.  A
-// relaxed cluster barrier is execution-only, so publication needs an explicit
-// release fence by every producer thread.  PublishMode: 0 = lifetime only,
-// 1 = producer warp, 2 = all threads.
+// Cluster rendezvous.  PublishMode: 0 = lifetime only (relaxed arrival),
+// 1 = publish CTA-local shared memory written by thread 0 (restricted
+// release fence by the producer, then a relaxed arrival), 2 = publish
+// owner-push st.shared::cluster stores into peer CTA windows.  Mode 2 must
+// use a release arrival: fence.release.sync_restrict::shared::cta.cluster
+// covers only the issuing CTA's own shared::cta window, so it does not
+// order remote DSMEM stores.  The release arrival orders every prior
+// shared-memory access of the arriving thread at cluster scope, and the
+// barrier.cluster.wait below is an acquire, so the token owner's reduction
+// reads the pushed partials with a happens-before edge.
 template <int PublishMode>
 __device__ __forceinline__ void cluster_bar() {
   if constexpr (PublishMode == 2) {
-    asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n" ::: "memory");
-  } else if constexpr (PublishMode == 1) {
-    if (threadIdx.x == 0)
-      asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n" ::: "memory");
+    asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
+  } else {
+    if constexpr (PublishMode == 1) {
+      if (threadIdx.x == 0)
+        asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n" ::: "memory");
+    }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
   }
-  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void cluster_arrive_relaxed() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+}
+// Release arrival without a wait: orders this thread's prior shared-memory
+// accesses -- reads included -- before anything peers do after their
+// (acquire) cluster_wait().  Used where earlier ldmatrix reads of a staging
+// slab must complete before peers are allowed to reuse that storage.
+__device__ __forceinline__ void cluster_arrive_release() {
+  asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void cluster_wait() {
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
@@ -363,7 +378,12 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(NTH, 1)
 
   // The weight-conversion workspace aliases the later reduction records.
   // All peers must finish staging before any CTA can push into that storage.
-  cluster_arrive_relaxed();
+  // The arrival must be a release so the ldmatrix reads of the staging slab
+  // above are ordered before peers' remote stores reuse it (an unpaired
+  // tile's last weight rows overlap the first token owner's accumulator
+  // records); a relaxed arrival would leave those reads unordered against
+  // the stores after the peers' acquire wait.
+  cluster_arrive_release();
 
   int cnt = 0;
   constexpr int ntl = 1;
