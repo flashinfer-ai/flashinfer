@@ -6,10 +6,10 @@
 closure** as the key files: the transitive closure of relative imports (module- and function-level) from the module's
 root files (:data:`MODULE_ROOTS`) within the mode's directories (:data:`MODE_DIRS`) plus the ``__init__`` of every package on
 the way. A change to any file a kernel's
-generated code depends on therefore invalidates the module's cached objects, while the API module stays outside the
-closure and can change freely. Sources the walk reaches that are host-side selection code, not kernel code (the dispatcher's
-chunk rule and ranking heuristic: they choose a kernel, they never enter one), are excluded per module (:data:`MODULE_NON_KERNEL_SOURCES`)
-so an edit to them keeps every compiled object valid. Everything else (module directory, ``meta.json``, locking,
+generated code depends on therefore invalidates the module's cached objects, while the API module, the dispatcher (chunk
+rule, ranking heuristic: they choose a kernel, they never enter one) and the other surfaces of the mode stay outside the
+closure and can change freely: an import resolves to the file it names, and a package ``__init__`` enters the key without
+its own imports being followed (:func:`_relative_imports`). Everything else (module directory, ``meta.json``, locking,
 ``FLASHINFER_DISABLE_JIT``, ``FLASHINFER_CUTE_DSL_DISABLE_CACHE``) is FlashInfer's.
 """
 
@@ -96,40 +96,19 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
-#: Sources within the mode's directories that the closure walk reaches but that no kernel binary depends on (host-side
-#: selection code: the dispatcher's chunk rule and ranking heuristic), relative to the flashinfer package; removed from the key after
-#: the walk, so an edit to them (or recalibrated constants) does not recompile the module's kernels.
-MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_gemm": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_gemm_blockscaled": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_gemm_blockscaled_mixed": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
-    "batch_invariant_moe": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-    "batch_invariant_gemm_fp8_blockscale": (
-        "gemm/batch_invariant/schedule.py",
-        "gemm/batch_invariant/heuristic.py",
-    ),
-}
-
-
 def _in_mode(path: Path) -> bool:
     return any(path == d or d in path.parents for d in MODE_DIRS)
 
 
 def _relative_imports(path: Path) -> set:
-    """Files named by the relative imports of ``path`` (module- and function-level)."""
+    """Files named by the relative imports of ``path`` (module- and function-level).
+
+    ``from .m import a`` names the module ``m.py``; from a package ``p``, ``from .p import a`` names the submodule
+    ``p/a.py`` (or ``p/a/__init__.py``) when it exists and the package's ``__init__.py`` only when ``a`` is a symbol
+    defined there. A package's ``__init__`` is thus followed only for the symbols it defines: its own imports (the
+    surfaces it re-exports) are not part of a kernel the package's submodules build. The ``__init__`` files on the
+    way to every key file still enter the key, unfollowed (:func:`module_sources`).
+    """
     out: set = set()
     try:
         tree = ast.parse(path.read_text())
@@ -144,10 +123,17 @@ def _relative_imports(path: Path) -> set:
         parts = node.module.split(".") if node.module else []
         target = base.joinpath(*parts) if parts else base
         cands = []
-        if parts:
-            cands += [target.with_suffix(".py"), target / "__init__.py"]
-        cands += [target / f"{a.name}.py" for a in node.names]
-        cands += [target / a.name / "__init__.py" for a in node.names]
+        if parts and not (target / "__init__.py").exists():
+            cands.append(target.with_suffix(".py"))
+        else:
+            for a in node.names:
+                sub, sub_pkg = target / f"{a.name}.py", target / a.name / "__init__.py"
+                if sub.exists():
+                    cands.append(sub)
+                elif sub_pkg.exists():
+                    cands.append(sub_pkg)
+                else:
+                    cands.append(target / "__init__.py")
         for c in cands:
             if c.exists():
                 r = c.resolve()
@@ -184,15 +170,6 @@ def module_sources(module: str) -> Tuple[Path, ...]:
         if not p.exists():
             raise FileNotFoundError(f"{module}: cache key source {r} is missing")
         seen.add(p)
-    for r in MODULE_NON_KERNEL_SOURCES.get(module, ()):
-        p = (_FI_DIR / r).resolve()
-        if p not in seen:
-            # a listed exclusion that is not in the closure is a stale entry (the file moved, or stopped being imported):
-            # silently ignoring it would let a renamed dispatcher file back into the cache key
-            raise FileNotFoundError(
-                f"{module}: non-kernel source {r} is not in the module's import closure; update MODULE_NON_KERNEL_SOURCES"
-            )
-        seen.discard(p)
     return tuple(sorted(seen))
 
 
