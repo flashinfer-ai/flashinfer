@@ -197,9 +197,9 @@ __global__ void __launch_bounds__(NTHR, MINB)
                  const uint16_t* __restrict__ bt, const int* __restrict__ idx,
                  const int* __restrict__ starts, const int* __restrict__ lens, int stride,
                  uint16_t* __restrict__ out, float* state, uint16_t* state16, int* cnt, float* pref,
-                 uint16_t* Kc, float* Kf, uint16_t* Rc, uint16_t* Uc, uint16_t* Lc, float* stamp,
-                 const float* __restrict__ a_log, const float* __restrict__ dt_bias, float scale,
-                 float half_scale, int H, int S) {
+                 float* phist, int hist_cap, uint16_t* Kc, float* Kf, uint16_t* Rc, uint16_t* Uc,
+                 uint16_t* Lc, float* stamp, const float* __restrict__ a_log,
+                 const float* __restrict__ dt_bias, float scale, float half_scale, int H, int S) {
   extern __shared__ __align__(16) unsigned char smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
   const int h = blockIdx.x % H, b = blockIdx.x / H;
@@ -351,6 +351,8 @@ __global__ void __launch_bounds__(NTHR, MINB)
       const float pv = (p ? pprev : 0.0f) + inc;
       egsm[tid] = ex2a(pv);
       Ppool[tid] = pv;
+      // a verify keeps the prefix after each of its rows
+      if (SPAN && phist && j < hist_cap) phist[(sh * hist_cap + j) * D + tid] = pv;
       pprev = pv;
     }
     if (tid == D) misc[0] = tanha(bf2f(braw) * 0.5f) * 0.5f + 0.5f;
@@ -732,30 +734,32 @@ inline cudaError_t DecodeStep(const uint16_t* q, const uint16_t* k, const uint16
                            static_cast<int>(kSmemBytes));
   if (status != cudaSuccess) return status;
   DecodeKernel<false><<<batch * num_heads, NTHR, kSmemBytes, stream>>>(
-      q, k, v, g, beta, slots, nullptr, nullptr, 0, out, state, state_bf16, cnt, prefix, k_inv_rows,
-      k_inv_f32_rows, rhs_rows, update_rows, l_rows, stamp, a_log, dt_bias, scale,
+      q, k, v, g, beta, slots, nullptr, nullptr, 0, out, state, state_bf16, cnt, prefix, nullptr, 0,
+      k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, l_rows, stamp, a_log, dt_bias, scale,
       half_gate_scale_log2, num_heads, num_slots);
   return cudaGetLastError();
 }
 
 // Rows [starts[i], starts[i] + lens[i]) go to slot slots[i]; starts == nullptr: `stride` rows each.
+// prefix_rows (or nullptr): per (slot, head), the decay prefix after each of the first prefix_cap
+// rows.
 inline cudaError_t DecodeSpan(const uint16_t* q, const uint16_t* k, const uint16_t* v,
                               const uint16_t* g, const uint16_t* beta, const int* slots,
                               const int* starts, const int* lens, int stride, uint16_t* out,
                               float* state, uint16_t* state_bf16, int* cnt, float* prefix,
-                              uint16_t* k_inv_rows, float* k_inv_f32_rows, uint16_t* rhs_rows,
-                              uint16_t* update_rows, uint16_t* l_rows, float* stamp,
-                              const float* a_log, const float* dt_bias, float scale,
-                              float half_gate_scale_log2, int batch, int num_heads, int num_slots,
-                              cudaStream_t stream) {
+                              float* prefix_rows, int prefix_cap, uint16_t* k_inv_rows,
+                              float* k_inv_f32_rows, uint16_t* rhs_rows, uint16_t* update_rows,
+                              uint16_t* l_rows, float* stamp, const float* a_log,
+                              const float* dt_bias, float scale, float half_gate_scale_log2,
+                              int batch, int num_heads, int num_slots, cudaStream_t stream) {
   cudaError_t status =
       cudaFuncSetAttribute(DecodeKernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            static_cast<int>(kSpanSmemBytes));
   if (status != cudaSuccess) return status;
   DecodeKernel<true><<<batch * num_heads, NTHR, kSpanSmemBytes, stream>>>(
       q, k, v, g, beta, slots, starts, lens, stride, out, state, state_bf16, cnt, prefix,
-      k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, l_rows, stamp, a_log, dt_bias, scale,
-      half_gate_scale_log2, num_heads, num_slots);
+      prefix_rows, prefix_cap, k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, l_rows, stamp,
+      a_log, dt_bias, scale, half_gate_scale_log2, num_heads, num_slots);
   return cudaGetLastError();
 }
 

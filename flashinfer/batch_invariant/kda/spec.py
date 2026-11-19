@@ -90,10 +90,10 @@ def append_split(count: int, n: int) -> Tuple[int, int, int]:
 
 
 def verify_split(count: int, n: int) -> Tuple[int, int]:
-    """A verify of ``n`` rows on a slot holding ``count`` open rows leaves ``(count after, saved)``: ``saved`` is ``-1``
-    while the rows stay inside the open chunk (the boundary state and the cached rows below ``count`` are untouched, the
-    snapshot is the count and the decay prefix), else the number of cached rows of the open chunk that the rows after
-    the boundary replace, saved with the boundary state."""
+    """A verify of ``n`` rows (at most a chunk) on a slot holding ``count`` open rows leaves ``(count after, saved)``:
+    ``saved`` is ``-1`` while the rows stay inside the open chunk (the boundary state and the cached rows below
+    ``count`` are untouched, the record is the count and the decay prefix), else the number of cached rows of the open
+    chunk that the rows after the boundary replace, recorded with the boundary state."""
     over = count + n - CHUNK
     return (count + n) % CHUNK, (-1 if over < 0 else min(over, count))
 

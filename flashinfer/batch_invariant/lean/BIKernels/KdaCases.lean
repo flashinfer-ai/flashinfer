@@ -54,8 +54,7 @@ def kdaVerifyCases : List (Nat × Nat × Nat × Nat) := [
   (15, 2, 1, 2),
   (15, 9, 8, 9),
   (5, 16, 5, 6),
-  (7, 20, 11, 8),
-  (15, 31, 14, 16)
+  (15, 16, 15, 16)
 ]
 
 theorem kda_cases_ok : kdaCases.all (fun c =>

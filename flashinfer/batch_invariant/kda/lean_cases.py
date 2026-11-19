@@ -24,7 +24,7 @@ CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "KdaCases.lean")
 #: 4096-token sequence.
 POSITIONS = [0, 1, 15, 16, 17, 31, 32, 33, 1000, 4079, 4080, 4095, 4096]
 COUNTS = list(range(spec.CHUNK))
-#: The verifies ``(open rows, tokens)``: inside a chunk, up to and across its boundary, a whole chunk, two boundaries.
+#: The verifies ``(open rows, tokens)``: inside a chunk, up to and across its boundary, a whole chunk.
 VERIFIES = [
     (0, 1),
     (0, 6),
@@ -37,8 +37,7 @@ VERIFIES = [
     (15, 2),
     (15, 9),
     (5, 16),
-    (7, 20),
-    (15, 31),
+    (15, 16),
 ]
 
 

@@ -55,8 +55,8 @@ HEADS = [
     int(x)
     for x in os.environ.get("FLASHINFER_KDA_BI_VERIFY_HEADS", "64,32,16,8").split(",")
 ]
-#: Tokens per verify: one, the MTP sizes, a whole chunk and more than one.
-SIZES = [1, 2, 6, 9, 16, 20]
+#: Tokens per verify: one, the MTP sizes and a whole chunk (the most a verify takes).
+SIZES = [1, 2, 6, 9, 16]
 #: Start positions on both sides of the first three boundaries.
 STARTS = [0, 3, 11, 15, 16, 21, 37, 47]
 SLOTS = [4, 0, 9, 2, 7, 3, 1, 5]
@@ -190,9 +190,6 @@ def run_rounds(h, n, T, rounds, p, *, call, seed=SEED + 4000, check_twin=True):
     recurrent_kda_batch_invariant_accept(
         pool,
         last,
-        A_log=p["A_log"],
-        dt_bias=p["dt_bias"],
-        lower_bound=LB,
         ssm_state_indices=ints(slots),
     )
     if check_twin:
@@ -283,7 +280,7 @@ def test_verify_adds_no_fingerprint_source():
 def test_verify_split_arithmetic(count):
     """What a verify of ``n`` rows on a slot with ``count`` open rows leaves and saves, and where ``a`` kept rows
     put the slot: the arithmetic the Lean cases pin."""
-    for n in range(1, 2 * spec.CHUNK):
+    for n in range(1, spec.CHUNK + 1):
         after, saved = spec.verify_split(count, n)
         assert after == (count + n) % spec.CHUNK
         crossed = count + n >= spec.CHUNK
@@ -325,7 +322,7 @@ def test_verify_rows_do_not_depend_on_the_batch(n, T):
 
 @needs_device
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("T", [2, 6, 17])
+@pytest.mark.parametrize("T", [2, 6, 16])
 def test_operator_spelling(packed, T):
     """``recurrent_kda(num_spec_tokens=T - 1, num_accepted_tokens=, batch_invariant=True)`` is the same call."""
     h = 16
@@ -365,9 +362,6 @@ def test_explicit_accept_then_other_calls():
         recurrent_kda_batch_invariant_accept(
             pool,
             ints(kept),
-            A_log=p["A_log"],
-            dt_bias=p["dt_bias"],
-            lower_bound=LB,
             ssm_state_indices=ids,
         )
         twin_steps(req, twin, slots, p, kept)
@@ -377,9 +371,6 @@ def test_explicit_accept_then_other_calls():
         recurrent_kda_batch_invariant_accept(
             pool,
             ints([0, 0, 0, 0]),
-            A_log=p["A_log"],
-            dt_bias=p["dt_bias"],
-            lower_bound=LB,
             ssm_state_indices=ids,
         )
         assert_same_state(pool, twin, slots, f"round {r}, settled twice")
@@ -412,16 +403,13 @@ def test_explicit_accept_then_other_calls():
     recurrent_kda_batch_invariant_accept(
         pool,
         ints([0]),
-        A_log=p["A_log"],
-        dt_bias=p["dt_bias"],
-        lower_bound=LB,
         ssm_state_indices=ints([slots[0]]),
     )
     assert same_bits(bi_decode(token(s, 40), pool, [slots[0]], p)[0], refs[0][40])
 
 
 @needs_device
-@pytest.mark.parametrize("T", [3, 6, 17])
+@pytest.mark.parametrize("T", [3, 6, 16])
 def test_graph_replay(T):
     """Settlement and verify captured once as a CUDA graph (nothing is read back) and replayed across chunk
     boundaries with changing kept counts: the rows and the final state are the eager ones."""
@@ -477,9 +465,6 @@ def test_graph_replay(T):
     recurrent_kda_batch_invariant_accept(
         pool,
         accepted,
-        A_log=p["A_log"],
-        dt_bias=p["dt_bias"],
-        lower_bound=LB,
         ssm_state_indices=ids,
     )
     assert_same_state(pool, twin, slots, "after the replays")
@@ -511,7 +496,8 @@ def test_first_verify_inside_a_capture_is_refused():
         capture(small)
     verify(small, pool, [0, 1], None)
     recurrent_kda_batch_invariant_accept(
-        pool, ints([0, 0]), A_log=p["A_log"], dt_bias=p["dt_bias"], lower_bound=LB
+        pool,
+        ints([0, 0]),
     )
     with pytest.raises(BatchInvariantUnsupportedError, match="eager verify"):
         capture(large)
@@ -538,9 +524,6 @@ def test_record_grows_with_a_verify_pending():
     recurrent_kda_batch_invariant_accept(
         pool,
         last,
-        A_log=p["A_log"],
-        dt_bias=p["dt_bias"],
-        lower_bound=LB,
         ssm_state_indices=ints(slots),
     )
     assert_same_state(pool, twin, slots)
@@ -557,7 +540,8 @@ def test_kept_counts_outside_the_verify_are_clamped():
     drafts = req.drafts(T, [T, 0])
     call_api(p)(req.stacked(drafts), pool, slots, None)
     recurrent_kda_batch_invariant_accept(
-        pool, ints([T + 9, -3]), A_log=p["A_log"], dt_bias=p["dt_bias"], lower_bound=LB
+        pool,
+        ints([T + 9, -3]),
     )
     twin_steps(req, twin, slots, p, [T, 0])
     assert_same_state(pool, twin, slots)
@@ -579,7 +563,8 @@ def test_replaced_state_and_reset_drop_the_verify():
     pool[1].copy_(fresh[1]["s0"])
     recurrent_kda_batch_invariant_reset(pool, ints([1]))
     recurrent_kda_batch_invariant_accept(
-        pool, ints([2, 2]), A_log=p["A_log"], dt_bias=p["dt_bias"], lower_bound=LB
+        pool,
+        ints([2, 2]),
     )
     for t in range(20):
         toks = {key: torch.cat([s[key][t : t + 1] for s in fresh], 0) for key in KEYS}
@@ -590,7 +575,7 @@ def test_replaced_state_and_reset_drop_the_verify():
 @needs_device
 def test_verify_into_a_replaced_state():
     """A verify as the first call of a new request in a slot with open rows of the previous one, across a boundary."""
-    h, T = 16, 20
+    h, T = 16, 16
     p = params(h)
     req = Requests(h, 2, 90, SEED + 4800, [9, 9])
     slots = [0, 1]
@@ -599,13 +584,14 @@ def test_verify_into_a_replaced_state():
     twin = new_pool(fresh.true, slots)
     pool[0].copy_(fresh.true[0]["s0"])
     pool[1].copy_(fresh.true[1]["s0"])
-    kept = [3, 18]
+    kept = [3, 14]
     drafts = fresh.drafts(T, kept)
     out = call_api(p)(fresh.stacked(drafts), pool, slots, None)
     for i in range(2):
         assert same_bits(out[i], fresh.reference(i, drafts[i], p))
     recurrent_kda_batch_invariant_accept(
-        pool, ints(kept), A_log=p["A_log"], dt_bias=p["dt_bias"], lower_bound=LB
+        pool,
+        ints(kept),
     )
     twin_steps(fresh, twin, slots, p, kept)
     assert_same_state(pool, twin, slots)
@@ -628,9 +614,6 @@ def test_slot_outside_the_pool(bad):
     recurrent_kda_batch_invariant_accept(
         pool,
         ints(kept),
-        A_log=p["A_log"],
-        dt_bias=p["dt_bias"],
-        lower_bound=LB,
         ssm_state_indices=ints([0, bad, 2]),
     )
     twin_steps(req, twin, [0, 1, 2], p, [2, 0, 4])
@@ -670,21 +653,14 @@ def test_unsupported_verify_inputs_raise_and_nothing_runs():
     for kw in bad:
         with pytest.raises(BatchInvariantUnsupportedError):
             recurrent_kda(*args, **{**base, **kw})
-    long = req.stacked(req.drafts(32, [32, 32]))
-    with pytest.raises(BatchInvariantUnsupportedError, match="fewer than 32"):
+    long = req.stacked(req.drafts(17, [17, 17]))
+    with pytest.raises(BatchInvariantUnsupportedError, match="at most 16"):
         call_api(p)(long, pool, [0, 1], None)
     with pytest.raises(BatchInvariantUnsupportedError):
         recurrent_kda_batch_invariant_accept(
             pool,
             ints([1]),
-            A_log=p["A_log"],
-            dt_bias=p["dt_bias"],
-            lower_bound=LB,
             ssm_state_indices=ints([0, 1]),
-        )
-    with pytest.raises(BatchInvariantUnsupportedError):
-        recurrent_kda_batch_invariant_accept(
-            pool, ints([1, 1]), A_log=p["A_log"], dt_bias=p["dt_bias"], lower_bound=None
         )
     assert_same_state(pool, twin, [0, 1])
 
