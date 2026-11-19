@@ -2782,9 +2782,9 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                 elif kv_meta[0] is not None:
                     # kv_meta may carry lengths without a host indptr (then
                     # the span check runs in prepare, which always has one)
-                    spans = kv_meta[0][1 : batch_size + 1].to(torch.int64) - kv_meta[
-                        0
-                    ][:batch_size].to(torch.int64)
+                    spans = kv_meta[0][1 : batch_size + 1].to(torch.int64) - kv_meta[0][
+                        :batch_size
+                    ].to(torch.int64)
                     if bool(((kv_lens + page_size - 1) // page_size > spans).any()):
                         # explicit seq_lens past their indptr page span would
                         # make the kernel read another request's page ids;
@@ -3070,11 +3070,7 @@ def _gqa_dec_fp8q_sm90_prepare(
                 reason = "kv_len < 1"
             elif bool(
                 (
-                    (
-                        kv_lens.to(torch.int64)
-                        + _GQA_DEC_FP8Q_SM90_PAGE_SIZE
-                        - 1
-                    )
+                    (kv_lens.to(torch.int64) + _GQA_DEC_FP8Q_SM90_PAGE_SIZE - 1)
                     // _GQA_DEC_FP8Q_SM90_PAGE_SIZE
                     > paged_kv_indptr_host[1 : batch_size + 1].to(torch.int64)
                     - paged_kv_indptr_host[:batch_size].to(torch.int64)
@@ -3085,8 +3081,7 @@ def _gqa_dec_fp8q_sm90_prepare(
                 # its paged_kv_indptr span would read another request's (or
                 # out-of-bounds) page ids
                 reason = (
-                    "seq_lens need more KV pages than the paged_kv_indptr "
-                    "span provides"
+                    "seq_lens need more KV pages than the paged_kv_indptr span provides"
                 )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
