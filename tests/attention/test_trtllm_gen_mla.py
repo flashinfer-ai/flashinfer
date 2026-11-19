@@ -2900,7 +2900,9 @@ def test_trtllm_mla_blackwell_reads_no_page_id_past_the_table(
     assert set(blackwell_domains) == {domain}
 
 
-@pytest.mark.parametrize("rows_offset", ["resident", "resident+1", "1024", "1025"])
+@pytest.mark.parametrize(
+    "rows_offset", ["resident", "resident+1", "300", "513", "1024", "1025"]
+)
 @pytest.mark.parametrize("q_len", [1, 2])
 def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
     """The generic CLC launch takes the longest-first order written on the device.
@@ -2912,6 +2914,7 @@ def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
     """
     _skip_unless_blackwell()
     from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _MAX_ORDERED_ROWS,
         _WORK_ORDER_BUFFERS,
         longest_first_order,
         row_metadata,
@@ -2921,6 +2924,8 @@ def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
     total = {
         "resident": resident,
         "resident+1": resident + 1,
+        "300": 300,
+        "513": 513,
         "1024": 1024,
         "1025": 1025,
     }[rows_offset]
@@ -2935,7 +2940,7 @@ def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
     output = _blackwell_decode(query, kv_cache, block_tables, seq_lens, 512)
     stream = int(torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
-    if resident < total <= 1024:
+    if resident < total <= _MAX_ORDERED_ROWS:
         _, row_seq_lens = row_metadata(
             seq_lens, None, batch_size=batch, q_len=q_len, total_q=total
         )
@@ -2944,7 +2949,8 @@ def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
         work_order = _WORK_ORDER_BUFFERS[(torch.cuda.current_device(), stream)]
         assert torch.equal(work_order[:total], expected)
         assert torch.equal(
-            work_order[1024 : 1024 + total], clamped[expected.long()].to(torch.int32)
+            work_order[_MAX_ORDERED_ROWS : _MAX_ORDERED_ROWS + total],
+            clamped[expected.long()].to(torch.int32),
         )
     rows = _query_rows(kv_lens, [q_len] * batch)
     reference = _blackwell_rows_reference(
