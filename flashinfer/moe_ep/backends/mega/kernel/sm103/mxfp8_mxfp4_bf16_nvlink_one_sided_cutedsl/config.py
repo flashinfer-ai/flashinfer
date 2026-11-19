@@ -24,9 +24,10 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig:
     tokens per rank and above that a counter protocol (one all-rank barrier at
     the tail of the fused kernel).
 
-    The top-k reduce needs ``token_hidden_size`` to be a multiple of 1024 and
-    ``top_k`` to be at most 32. The engine's tiling and shared-memory limits
-    are checked when the layer is constructed.
+    Landing rows move in runs of 32 x 16 bytes, so ``token_hidden_size`` must
+    be a multiple of 512, and their reset checks one route per lane of a warp,
+    so ``top_k`` must be at most 32. The engine's tiling and shared-memory
+    limits are checked when the layer is constructed.
 
     ``intermediate_size`` is the width after SwiGLU; FC1 produces
     ``2 * intermediate_size`` columns (gate rows first, then up rows, in the

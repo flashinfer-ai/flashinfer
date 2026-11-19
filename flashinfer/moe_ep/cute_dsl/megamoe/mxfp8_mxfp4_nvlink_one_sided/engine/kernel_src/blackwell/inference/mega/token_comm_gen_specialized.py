@@ -464,8 +464,9 @@ class GenphaseTokenComm(KernelComponent):
     # the sort; every destination then folds one count row per (source, chunk).
     default_exchange_ctas: ClassVar[int] = 8
     # The default exchange CTA count shrinks until a rank's (source, chunk,
-    # expert) list segments stay within this many: every index-copy CTA holds
-    # three words per segment in SMEM and searches them per list position.
+    # expert) list segments stay within this many, unless an exchange CTA's
+    # chunk would then outgrow SMEM: every index-copy CTA holds three words per
+    # segment in SMEM and searches them per list position.
     max_list_segments: ClassVar[int] = 4096
     # Rounds the counter dispatch may split the local experts into.
     supported_dispatch_rounds: ClassVar[tuple] = (1, 2, 4, 8)
@@ -884,11 +885,13 @@ class GenphaseTokenComm(KernelComponent):
         # of gathering them by index; the landing slots then go unused.
         self.fc1_token_pool = bool(impl_desc.get("fc1_token_pool", False))
         # The Sentinel dispatch keeps one exchange CTA per peer; see "Expert-id
-        # lists" for the Fence dispatches.
-        self.exchange_cta_count = self.world_size
+        # lists" for the Fence dispatches, whose default may grow once the SMEM
+        # plan can be priced (``_fit_exchange_ctas``).
+        self.exchange_cta_count = self.default_exchange_cta_count = self.world_size
         if self.dispatch_protocol != "sentinel":
+            self.default_exchange_cta_count = self._default_exchange_ctas()
             self.exchange_cta_count = impl_desc.get(
-                "comm_exchange_ctas", self._default_exchange_ctas()
+                "comm_exchange_ctas", self.default_exchange_cta_count
             )
         # See "Dispatch rounds" above. One round is the whole-payload dispatch.
         self.dispatch_rounds = impl_desc.get("dispatch_rounds", 1)
@@ -1001,6 +1004,13 @@ class GenphaseTokenComm(KernelComponent):
         )
 
         self._validate_configuration()
+        if self.dispatch_protocol != "sentinel":
+            self.default_exchange_cta_count = self._fit_exchange_ctas(
+                self.default_exchange_cta_count
+            )
+            self.exchange_cta_count = impl_desc.get(
+                "comm_exchange_ctas", self.default_exchange_cta_count
+            )
         self._smem_workspace = self._build_smem_workspace()
         # Byte stride between the two landing sets of the symmetric workspace. The
         # owning kernel sets it once its workspace is finalized.
@@ -1278,6 +1288,32 @@ class GenphaseTokenComm(KernelComponent):
         ):
             exchange_ctas -= 1
         return exchange_ctas
+
+    def _fit_exchange_ctas(self, exchange_ctas: int) -> int:
+        """``exchange_ctas``, or more where their chunks of the top-k plane outgrow SMEM.
+
+        An exchange CTA holds its chunk's ids and scores and the lists it sorts
+        them into, about 16 bytes per route, so many routes per rank among many
+        local experts (Kimi-K3's top-16 of 112 per rank at 4096 tokens per rank)
+        outgrow SMEM at the segment bound's count. The plane then splits into one
+        more chunk at a time, for as long as each shrinks the plan.
+        """
+        plan_bytes = self._smem_plan_bytes(exchange_ctas)
+        while plan_bytes > self.smem_limit_bytes:
+            split_bytes = self._smem_plan_bytes(exchange_ctas + 1)
+            if split_bytes >= plan_bytes:
+                break
+            exchange_ctas, plan_bytes = exchange_ctas + 1, split_bytes
+        return exchange_ctas
+
+    def _smem_plan_bytes(self, exchange_ctas: int) -> int:
+        """Bytes of this kernel's SMEM plan with ``exchange_ctas`` Fence exchange CTAs."""
+        resolved = self.exchange_cta_count
+        self.exchange_cta_count = exchange_ctas
+        try:
+            return self._plan_smem_workspace().estimate_total_bytes()
+        finally:
+            self.exchange_cta_count = resolved
 
     @property
     def list_segment_count(self) -> int:
@@ -1744,10 +1780,7 @@ class GenphaseTokenComm(KernelComponent):
                     )
         elif self.dispatch_protocol == "pull":
             parts.append(f"pull{self.pull_chunk_rows}w{self.main_pull_warps}")
-        if (
-            self.dispatch_protocol != "sentinel"
-            and self.exchange_cta_count != self._default_exchange_ctas()
-        ):
+        if self.exchange_cta_count != self.default_exchange_cta_count:
             parts.append(f"exchange{self.exchange_cta_count}")
         if self.dispatch_rounds > 1:
             parts.append(
@@ -2098,7 +2131,13 @@ class GenphaseTokenComm(KernelComponent):
     # ------------------------------------------------------------------
 
     def _build_smem_workspace(self) -> SmemWorkspace:
-        """Place the four role lifetimes on one overlay.
+        """The finalized SMEM plan (``_plan_smem_workspace``) within ``smem_limit_bytes``."""
+        workspace = self._plan_smem_workspace()
+        workspace.finalize(max_bytes=self.smem_limit_bytes)
+        return workspace
+
+    def _plan_smem_workspace(self) -> SmemWorkspace:
+        """Place the four role lifetimes on one overlay, not yet finalized.
 
         Every CTA walks a strict subset of the roles in time order (exchange then
         index copy then refine, exchange then planner, helper then refine or
@@ -2441,7 +2480,6 @@ class GenphaseTokenComm(KernelComponent):
                 byte_alignment=128,
             )
 
-        workspace.finalize(max_bytes=self.smem_limit_bytes)
         return workspace
 
     @property

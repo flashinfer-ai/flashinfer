@@ -199,17 +199,19 @@ def test_engine_config_validation():
 
 
 def test_init_rejections(dist_not_initialized, monkeypatch):
-    """Rows the top-k reduce cannot tile by 1024 columns and top_k above 32 fail at init."""
+    """Rows not in runs of 32 x 16 bytes and top_k above 32 fail at init."""
     import torch
 
     # Host-only: skip the device checks and the engine build of validate_init.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     bootstrap = BootstrapConfig(world_size=4, rank=3, auto_bootstrap=False)
     for capacity in (128, 256):
-        for hidden in (2560, 3584):
-            with pytest.raises(MoEEpConfigError, match="multiple of 1024"):
+        for hidden in (2304, 3840):
+            with pytest.raises(MoEEpConfigError, match="multiple of 512"):
                 _kernel(4).validate_init(bootstrap, _fleet(capacity, hidden))
-        _kernel(4).validate_init(bootstrap, _fleet(capacity, 3072))
+        # Kimi-K3's 3584 among them.
+        for hidden in (2560, 3072, 3584):
+            _kernel(4).validate_init(bootstrap, _fleet(capacity, hidden))
     with pytest.raises(MoEEpConfigError, match="top_k up to 32"):
         _kernel(4, top_k=33).validate_init(bootstrap, _fleet(128))
     _kernel(4, top_k=32).validate_init(bootstrap, _fleet(128))

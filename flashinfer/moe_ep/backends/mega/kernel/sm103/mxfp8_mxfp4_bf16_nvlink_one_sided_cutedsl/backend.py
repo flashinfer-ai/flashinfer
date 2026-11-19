@@ -42,10 +42,12 @@ from .weights import (
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
-# The top-k reduce runs under both combine protocols. Each of its 128 threads
-# owns 8 BF16 columns of an output row, and a landing-row reset checks one
-# route per lane of a warp.
-_REDUCE_HIDDEN_ALIGNMENT = 8 * 128
+# Landing rows move in warp-wide runs of 32 lanes x 16 bytes of E4M3 data with
+# one 16-byte vector of UE8M0 scales per lane: so the Sentinel dispatch, which
+# every capacity up to 128 tokens per rank runs, verifies them and the
+# end-of-round kernel resets them, and the pull dispatch moves whole scale
+# vectors too. The landing-row reset also checks one route per lane of a warp.
+_HIDDEN_ALIGNMENT = 32 * 16
 _MAX_TOP_K = 32
 
 # Engine configurations whose engine has been built on this process.
@@ -141,10 +143,10 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
         if config is not None:
             return config
         k = self._kernel_config
-        if fleet_params.token_hidden_size % _REDUCE_HIDDEN_ALIGNMENT:
+        if fleet_params.token_hidden_size % _HIDDEN_ALIGNMENT:
             raise MoEEpConfigError(
                 f"{KERNEL_NAME} requires token_hidden_size to be a multiple of "
-                f"{_REDUCE_HIDDEN_ALIGNMENT}, got {fleet_params.token_hidden_size}"
+                f"{_HIDDEN_ALIGNMENT}, got {fleet_params.token_hidden_size}"
             )
         if k.top_k > _MAX_TOP_K:
             raise MoEEpConfigError(

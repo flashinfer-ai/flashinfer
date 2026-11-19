@@ -178,10 +178,26 @@ class CombineTopkReduce:
         self.world_size = int(world_size)
         self.capacity = int(capacity)
         self.experts_per_rank = self.num_experts // self.world_size
-        if self.hidden % (self.hidden_per_thread * self.threads) != 0:
+        # Workers index (token, 16-byte tile) flatly, so a row needs whole tiles.
+        if self.hidden % self.hidden_per_thread != 0:
             raise ValueError(
-                f"hidden ({self.hidden}) must be a multiple of {self.hidden_per_thread * self.threads}."
+                f"hidden ({self.hidden}) must be a multiple of {self.hidden_per_thread}."
             )
+        if self.discard_slots and self.hidden % (32 * self.hidden_per_thread) != 0:
+            raise ValueError(
+                f"Slot discards need a warp to hold 32 tiles of one token, so hidden ({self.hidden}) "
+                f"must be a multiple of {32 * self.hidden_per_thread}."
+            )
+        if self.reset_landing:
+            data_bytes = self.hidden * int(token_comm.activation_dtype.width) // 8
+            sf_bytes = (
+                token_comm.hidden_sf * int(token_comm.activation_sf_dtype.width) // 8
+            )
+            if data_bytes % (32 * 16) != 0 or sf_bytes % 16 != 0 or sf_bytes > 32 * 16:
+                raise ValueError(
+                    "Landing reset stores a row's data in runs of 32 lanes x 16 bytes and its scale factors "
+                    f"one 16-byte vector per lane; hidden ({self.hidden}) gives {data_bytes} and {sf_bytes} bytes."
+                )
         if self.num_topk > 32:
             raise ValueError(
                 "Landing reset checks one route per lane, so topk must be at most 32."

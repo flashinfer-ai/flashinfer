@@ -9,7 +9,8 @@ B200)::
 
 (``run_tests.sh mega_sm103_nvlink_one_sided`` runs it at EP2 and EP4, and at EP8 when
 eight such GPUs are visible. The dispatch-round cases need at most 32 local
-experts, so they run at EP8 only and skip at smaller EP sizes.)
+experts, so they run at EP8 only and skip at smaller EP sizes, as do the
+Kimi-K3 cases.)
 
 Problem: DeepSeek-V4-Flash routed experts (hidden 4096, intermediate 2048, 256
 experts, top-6, SwiGLU with clamp 10), MXFP4 weights and MXFP8 activations
@@ -77,6 +78,16 @@ test checks it against the requantized oracle in that order, and against the
 default order's oracle as a control it must miss by more, under every dispatch
 and combine protocol, with the shared expert, and across reruns and CUDA graph
 replays.
+
+Kimi-K3's routed experts (hidden 3584, intermediate 3072, 896 experts, top-16)
+run in a separate EP8 test under perfect and random routing at 1, 16, 256, 1024
+and 4096 tokens per rank: the Sentinel protocols, the counter dispatch with the
+Sentinel combine, and the counter protocols on N192 and N240 token tiles, the
+last with its top-k plane split over more exchange CTAs than the list-segment
+bound allows, since 16 routes per token among 112 local experts would otherwise
+outgrow SMEM. Each output is checked against both oracles, and reruns on both
+landing sets and a CUDA graph replay reproduce it bit for bit.
+
 Every case asserts the engine path it resolves to at EP2, EP4 and EP8 (see
 ``PATHS``), so a change to the capacity defaults that moves a case off its path
 fails instead of leaving that path untested. Host-only registration and config
@@ -99,6 +110,22 @@ EXPERTS = 256
 TOPK = 6
 CLAMP = 10.0
 SF_VEC = 32
+
+
+@dataclass(frozen=True)
+class _Problem:
+    """Routed experts: hidden size, intermediate size (after SwiGLU), experts, top-k."""
+
+    hidden: int
+    intermediate: int
+    experts: int
+    topk: int
+
+
+V4_FLASH = _Problem(HIDDEN, INTERMEDIATE, EXPERTS, TOPK)
+# Kimi-K3's routed experts: a hidden size of seven 512-byte runs, top-16 of 896
+# experts (112 local experts at EP8, about 2.26 routes per reached rank).
+KIMI_K3 = _Problem(hidden=3584, intermediate=3072, experts=896, topk=16)
 # Relative L2 bounds over each rank's valid rows.
 REQUANTIZED_TOLERANCE = 1e-2
 EXACT_TOLERANCE = 6e-2
@@ -288,27 +315,30 @@ class _Batch:
     topk_weights: object  # [T, K] float32
 
 
-def _make_weights(local_experts: int, seed: int) -> _Weights:
+def _make_weights(
+    local_experts: int, seed: int, problem: _Problem = V4_FLASH
+) -> _Weights:
     import torch
 
+    hidden, intermediate = problem.hidden, problem.intermediate
     generator = torch.Generator(device="cuda").manual_seed(seed)
     # FC1 outputs have a standard deviation of about 4, so the clamp at 10 is
     # active on a few percent of the gate and up values.
     w13 = (
         torch.randn(
             local_experts,
-            2 * INTERMEDIATE,
-            HIDDEN,
+            2 * intermediate,
+            hidden,
             device="cuda",
             generator=generator,
         )
-        * (4.0 / HIDDEN**0.5)
+        * (4.0 / hidden**0.5)
     ).bfloat16()
     w2 = (
         torch.randn(
-            local_experts, HIDDEN, INTERMEDIATE, device="cuda", generator=generator
+            local_experts, hidden, intermediate, device="cuda", generator=generator
         )
-        / INTERMEDIATE**0.5
+        / intermediate**0.5
     ).bfloat16()
     q13, s13, d13, q2, s2, d2 = [], [], [], [], [], []
     for expert in range(local_experts):
@@ -391,22 +421,39 @@ def _make_batch(
     holes: bool = False,
     skewed: bool = False,
     unrouted: bool = False,
+    problem: _Problem = V4_FLASH,
+    perfect: Optional[tuple[int, int]] = None,
 ) -> _Batch:
-    """Random routing, with ``skewed`` every route on experts ``0..TOPK-1``, or
-    with ``unrouted`` every route masked."""
+    """Random routing, with ``skewed`` every route on experts ``0..topk-1``, or
+    with ``unrouted`` every route masked.
+
+    ``perfect=(rank, world)`` sends route slot ``s`` (``token * topk + k``) of
+    that EP rank to rank ``(s + rank) % world`` and there to local expert
+    ``(s + rank) // world`` modulo the local experts, so every source rank's
+    routes spread evenly over the ranks and walk each rank's experts in turn.
+    """
     import torch
 
+    topk = problem.topk
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn(count, HIDDEN, device="cuda", generator=generator).bfloat16()
+    x = torch.randn(
+        count, problem.hidden, device="cuda", generator=generator
+    ).bfloat16()
     data, sf = _quantize_mxfp8(x)
-    scores = torch.randn(count, EXPERTS, device="cuda", generator=generator)
-    values, ids = torch.topk(scores, TOPK, dim=-1)
+    scores = torch.randn(count, problem.experts, device="cuda", generator=generator)
+    values, ids = torch.topk(scores, topk, dim=-1)
+    if perfect is not None:
+        rank, world = perfect
+        local = problem.experts // world
+        slots = torch.arange(count * topk, device="cuda") + rank
+        ids = ((slots % world) * local + (slots // world) % local).view(count, topk)
+        values = torch.gather(scores, 1, ids)
     weights = torch.softmax(values, dim=-1).float()
     if skewed:
-        # Experts 0..TOPK-1 all live on EP rank 0; each token visits them in
+        # Experts 0..topk-1 all live on EP rank 0; each token visits them in
         # its own slot order.
         ids = torch.argsort(
-            torch.rand(count, TOPK, device="cuda", generator=generator), dim=-1
+            torch.rand(count, topk, device="cuda", generator=generator), dim=-1
         )
     if holes:
         ids[::3, -1] = -1
@@ -439,6 +486,7 @@ def _reference(
     group,
     shared=None,
     weight_after_fc2=False,
+    problem: _Problem = V4_FLASH,
 ):
     """(requantized-numerics, exact) FP32 outputs of this rank's rows (collective).
 
@@ -457,7 +505,8 @@ def _reference(
 
     world = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    local = EXPERTS // world
+    hidden, intermediate, topk = problem.hidden, problem.intermediate, problem.topk
+    local = problem.experts // world
     count = batch.count
 
     def padded(tensor, fill):
@@ -477,7 +526,7 @@ def _reference(
     ids = gathered(padded(batch.topk_ids, -1))
     routing = gathered(padded(batch.topk_weights, 0.0))
     x = _dequantize_mxfp8(data.view(torch.float8_e4m3fn), _e8m0_to_f32(codes))
-    partial = torch.zeros(2, world * capacity, TOPK, HIDDEN, device="cuda")
+    partial = torch.zeros(2, world * capacity, topk, hidden, device="cuda")
     for expert in range(local):
         token, slot = torch.nonzero(ids == rank * local + expert, as_tuple=True)
         if token.numel() == 0:
@@ -486,8 +535,8 @@ def _reference(
         w2 = weights.w2_dequant[expert].float()
         fc1 = x[token] @ w1.T
         scale = routing[token, slot].unsqueeze(1)
-        gate = fc1[:, :INTERMEDIATE].clamp(max=CLAMP)
-        up = fc1[:, INTERMEDIATE:].clamp(-CLAMP, CLAMP)
+        gate = fc1[:, :intermediate].clamp(max=CLAMP)
+        up = fc1[:, intermediate:].clamp(-CLAMP, CLAMP)
         act = gate * torch.sigmoid(gate) * up
         if weight_after_fc2:
             requantized = _dequantize_mxfp8(*_quantize_mxfp8(act)) @ w2.T
@@ -504,7 +553,7 @@ def _reference(
         fc1 = local_x @ shared.w13_dequant.T
 
         def activation(fc1, rounded):
-            gate, up = fc1[:, :INTERMEDIATE], fc1[:, INTERMEDIATE:]
+            gate, up = fc1[:, :intermediate], fc1[:, intermediate:]
             if rounded:
                 gate, up = gate.bfloat16().float(), up.bfloat16().float()
             if shared.clamp is not None:
@@ -553,6 +602,7 @@ def _oracle_errors(
     label="",
     shared=None,
     weight_after_fc2=False,
+    problem: _Problem = V4_FLASH,
 ):
     """(nonfinite, relL2 vs requantized, relL2 vs exact) over every rank's valid rows.
 
@@ -562,7 +612,7 @@ def _oracle_errors(
     import torch.distributed as dist
 
     requantized, exact = _reference(
-        batch, weights, capacity, group, shared, weight_after_fc2
+        batch, weights, capacity, group, shared, weight_after_fc2, problem
     )
     rows = slice(skip_rows, batch.count)
     error = torch.zeros(3, device="cuda")
@@ -601,6 +651,7 @@ def _check(
     label="",
     shared=None,
     weight_after_fc2=False,
+    problem: _Problem = V4_FLASH,
 ):
     """Collectively assert both oracle bounds on every rank's valid rows."""
     nonfinite, requantized_error, exact_error = _oracle_errors(
@@ -613,6 +664,7 @@ def _check(
         label=label,
         shared=shared,
         weight_after_fc2=weight_after_fc2,
+        problem=problem,
     )
     assert nonfinite == 0, f"{label}: nonfinite output"
     assert requantized_error < REQUANTIZED_TOLERANCE, (
@@ -665,6 +717,7 @@ def _layer(
     die_local_weights=None,
     reduce_topk_in_kernel=False,
     fc1_token_pool_capacity=None,
+    problem: _Problem = V4_FLASH,
     **shared_fields,
 ):
     from flashinfer.moe_ep import (
@@ -678,15 +731,15 @@ def _layer(
     return MoEEpLayer(
         BootstrapConfig(world_size=world, rank=rank, process_group=process_group),
         FleetParams(
-            num_experts=EXPERTS,
+            num_experts=problem.experts,
             max_tokens_per_rank=capacity,
-            token_hidden_size=HIDDEN,
+            token_hidden_size=problem.hidden,
         ),
         weights,
         backend=MegaConfig(
             megakernel=Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig(
-                intermediate_size=INTERMEDIATE,
-                top_k=TOPK,
+                intermediate_size=problem.intermediate,
+                top_k=problem.topk,
                 activation_clamp=CLAMP,
                 knobs=knobs,
                 die_local_weights=die_local_weights,
@@ -779,6 +832,18 @@ PULL_N240_PATH = (
 PULL_POOL_N240_PATH = tuple(f"{path} pool" for path in PULL_N240_PATH)
 # Dispatch rounds need at most 32 local experts, so EP8 only.
 ROUNDS_PATH = (None, None, "counter/counter N240|N128 rounds4 grouped128+pipelined jit")
+# Kimi-K3 runs at EP8 only. Its top-16 reaches a rank with about 2.26 routes,
+# which keeps the pull dispatch out: the Sentinel protocols up to 128 tokens per
+# rank, the counter dispatch with the Sentinel combine at 256, then the counter
+# protocols in one round (112 local experts) on token tiles that grow with the load.
+KIMI_K3_PATHS = {
+    1: (None, None, "sentinel/sentinel N64 rounds1 grouped4096 jit"),
+    16: (None, None, "sentinel/sentinel N64 rounds1 grouped4096 jit"),
+    256: (None, None, "counter/sentinel N64 rounds1 grouped4096"),
+    1024: (None, None, "counter/counter N192|N128 rounds1 grouped256+pipelined jit"),
+    4096: (None, None, "counter/counter N240|N128 rounds1 grouped256+pipelined jit"),
+}
+KIMI_K3_ROUTINGS = ("perfect", "random")
 
 PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
     "test_layer_vs_oracle": {
@@ -846,6 +911,11 @@ PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
         "sentinel_shared_bf16_rounding": SENTINEL_PATH,
         "pull_shared": PULL_PATH,
         "pull_shared_in_kernel_reduce": PULL_PATH,
+    },
+    "test_kimi_k3": {
+        f"t{capacity}_{routing}": path
+        for capacity, path in KIMI_K3_PATHS.items()
+        for routing in KIMI_K3_ROUTINGS
     },
 }
 
@@ -925,7 +995,7 @@ def test_init_builds_engine(dist_not_initialized):
                 token_hidden_size=HIDDEN,
             ),
         )
-        # A multiple of 1024 whose staging rows do not fit in shared memory.
+        # A multiple of 512 whose staging rows do not fit in shared memory.
         with pytest.raises(MoEEpConfigError, match="cannot build its engine"):
             kernel.validate_init(
                 bootstrap,
@@ -2041,6 +2111,95 @@ def test_routing_weights_after_fc2(request, capacity, knobs, fields):
                     f"graph replay {i} differs from the eager launch",
                 )
         del graph
+    finally:
+        torch.cuda.synchronize()
+        layer.destroy()
+        dist.barrier()
+
+
+@pytest.mark.gpu_8
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "capacity, routing",
+    [(capacity, routing) for capacity in KIMI_K3_PATHS for routing in KIMI_K3_ROUTINGS],
+    ids=[
+        f"t{capacity}_{routing}"
+        for capacity in KIMI_K3_PATHS
+        for routing in KIMI_K3_ROUTINGS
+    ],
+)
+def test_kimi_k3(request, capacity, routing):
+    """Kimi-K3 at EP8 matches both oracles and reproduces its output bit for bit.
+
+    Each capacity runs its own engine path (``KIMI_K3_PATHS``) on a full batch,
+    then on counts that differ by rank (rank 0 empty), under perfect or random
+    routing. The full batch then runs again on both landing sets and from a
+    CUDA graph, each giving the first output's bits.
+    """
+    import torch
+    import torch.distributed as dist
+
+    rank, world = _init_distributed()
+    if world != 8:
+        pytest.skip("Kimi-K3 runs at EP8")
+    problem = KIMI_K3
+    group = dist.group.WORLD
+    weights = _make_weights(
+        problem.experts // world, seed=1171 * rank + capacity, problem=problem
+    )
+    seed = 7877 * (rank + 1) + capacity
+    perfect = (rank, world) if routing == "perfect" else None
+    layer = _layer(
+        capacity,
+        _prequantized_pack(weights),
+        rank=rank,
+        world=world,
+        quantize_input=False,
+        problem=problem,
+    )
+    try:
+        _assert_path(request, layer._ensure_workspace().config, world)
+
+        def check(y, batch, label):
+            assert y.shape == (batch.count, problem.hidden)
+            _check(y, batch, weights, capacity, group, label=label, problem=problem)
+
+        batch = _make_batch(capacity, seed, problem=problem, perfect=perfect)
+        y = layer.forward(_tensors(batch, quantize_input=False))
+        check(y, batch, f"{routing} routing, full batch")
+        partial = _make_batch(
+            capacity * rank // world, seed + 1, problem=problem, perfect=perfect
+        )
+        check(
+            layer.forward(_tensors(partial, quantize_input=False)),
+            partial,
+            f"{routing} routing, counts by rank",
+        )
+        reruns = [
+            layer.forward(_tensors(batch, quantize_input=False)) for _ in range(2)
+        ]
+
+        static = _tensors(batch, quantize_input=False)
+        static.output = torch.empty_like(y)
+        layer.warmup(static)
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            layer.forward(static)
+        torch.cuda.current_stream().wait_stream(stream)
+        static.output.zero_()
+        graph.replay()
+        reruns.append(static.output.clone())
+        del graph
+        _assert_all_ranks(
+            all(
+                torch.equal(again.view(torch.int16), y.view(torch.int16))
+                for again in reruns
+            ),
+            group,
+            "a rerun of the full batch differs from its first output",
+        )
     finally:
         torch.cuda.synchronize()
         layer.destroy()
