@@ -193,6 +193,10 @@ def sexpr(t: Term) -> str:
             out = f"(dq4 {A[0]} {A[1]})"  # an NVFP4 K / V leaf: e2m1 values times their e4m3 block scale, exact in bf16
         elif op == "op:sfv":
             out = f"(sfv {A[0]} {A[1]})"  # the V slice's block scales of PV step vt, block db of the head dim
+        elif op == "op:sfk_tok":
+            out = f"(sfk {A[0]})"  # key k's binary32 (token, head) key scale (the attention token-head-scale classes)
+        elif op == "op:sfv_tok":
+            out = f"(sfvt {A[0]})"  # key k's binary32 (token, head) value scale
         elif op == "op:mma_mxfp8_k32":
             out = f"(mma32mx {A[0]} {A[1]})"  # one kind::mxf8f6f4 block-scaled K-step of 32 fp8 elements
         elif op == "op:mma_mxfp8_k64":

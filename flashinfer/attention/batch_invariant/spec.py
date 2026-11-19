@@ -37,6 +37,39 @@ head dim (FlashInfer's NVFP4 paged KV cache and its ``kv_cache_sf``) and the sam
 ``dq4(values, block_scale)`` -- the e2m1 values times their block scale, a product of at most six significant bits within the
 bf16 range, so the leaf is an exact bf16 value and no rounding step enters the term -- and the chain is the fp8-KV classes'
 (the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding).
+
+The token-head-scale classes ``attn.e4m3kv_th.d<D>`` / ``attn.e5m2kv_th.d<D>`` (``TH_KV_FMTS``) take an fp8 cache with one
+binary32 scale per (token, KV head) for K and one for V (FlashInfer's ``use_token_head_sf`` layout). K and V stay exact: every
+K and V leaf is the fp8 value widened to bf16 exactly, as in the fp8-KV classes, and each scale enters ONCE PER KEY, outside
+the element-wise path:
+
+* the score of key ``k`` is ``s'_k = mul(s_k, ks_k)`` (``scaled_score``): the fold over the exactly widened key, then one
+  ``mul.rn`` by the key's scale in binary32. The tile step is the bf16 class's over the scaled scores -- the row maximum,
+  ``alpha``, the probabilities and the row sum -- with ``c = fp32(sm_scale * log2(e))`` (no scale folded into it);
+* the PV operand of key ``k`` is ``P'_k = cvt_bf16(mul(p_k, vs_k))`` (``scaled_prob``): the probability times the key's value
+  scale in binary32, then the single rounding to bf16 that forms the operand. A masked key's operand is ``+0`` whatever its
+  scale. The row sum ``l`` adds the UNSCALED ``p_k``, so the normaliser is the bf16 class's;
+* the epilogue is the bf16 class's, ``cvt_bf16(add(mul(O, div(1, l)), +0))``: no scale after the fold.
+
+The scale of the scores is applied before the mask (a masked key has no score term at all) and before the maximum, so the
+form costs one multiply per key and feeds the unchanged step; folding the scale into a per-key constant ``c_k`` instead
+would need the scaled score for the maximum anyway. With every scale equal to 1 the two multiplies are identities and the
+class's output is the fp8-KV class's with ``k_scale = v_scale = 1``.
+
+The scales are inputs of the class like the cache bytes, and the two multiplies apply to every value: a zero key scale gives
+a zero score, a negative one flips the score's sign; a zero value scale removes the key's contribution to ``O`` (not to
+``l``), a negative one flips it; products below the binary32 or bf16 normal range round to subnormals or to zero by the
+operation that forms them. The class is stated, like the bf16 class, for finite operands: finite scales on visible keys,
+scaled scores whose products with ``c`` are binary32 numbers, and operands ``P'`` that stay finite in bf16 (``|p_k vs_k|``
+below ``(2 - 2^-8) * 2^127``; every ``|vs_k|`` up to the largest bf16 qualifies since ``p_k <= 1``). A non-finite scale on a
+visible key, or an overflow, gives the NaN / infinity the arithmetic gives and is not guarded against; the scales of masked
+keys never enter the term.
+
+Two floors of the term bound what value scales can express, and both are the term's, not a kernel's: ``EX2`` returns ``+0``
+below ``2^-126``, so a key whose scaled score is more than ``126 / c`` below the row's maximum has the operand ``+0`` and
+adds nothing however large its value scale; and an operand below the bf16 normal range (``|p_k vs_k| < 2^-126``) keeps
+at most its subnormal bits. A row whose value scales span more than the weights' ``2^126`` is therefore not the exact sum
+of its keys' scaled values; within those floors every key's contribution carries the bf16 rounding of its operand.
 """
 
 from __future__ import annotations
@@ -70,9 +103,15 @@ KV_FMTS = (
     "e4m3",
     "e5m2",
     "nvfp4",
-)  # the K / V cache formats: the bf16 class, the two fp8-KV classes, the NVFP4-KV class
-LOWBIT_KV_FMTS = ("e4m3", "e5m2", "nvfp4")
+    "e4m3th",
+    "e5m2th",
+)  # the K / V cache formats: the bf16 class, the two fp8-KV classes, the NVFP4-KV class, the two token-head-scale classes
+LOWBIT_KV_FMTS = ("e4m3", "e5m2", "nvfp4", "e4m3th", "e5m2th")
 FP8_KV_FMTS = ("e4m3", "e5m2")
+TH_KV_FMTS = {
+    "e4m3th": "e4m3",
+    "e5m2th": "e5m2",
+}  # the token-head-scale classes and the fp8 format of their cache
 SF_BLOCK = (
     16  # NVFP4: elements per e4m3 block scale along the head dim (one MMA K-step)
 )
@@ -111,10 +150,20 @@ def d_steps(D: int) -> int:
     return D // MMA_K
 
 
-def class_name(kv_fmt: str = "bf16") -> str:
-    """The class family behind a KV format: ``attention.bf16``, ``attention.e4m3kv``, ``attention.e5m2kv``."""
+def kv_tag(kv_fmt: str) -> str:
+    """The class tag of a KV format: ``bf16``, ``e4m3kv``, ``e5m2kv``, ``nvfp4kv``, ``e4m3kv_th``, ``e5m2kv_th``."""
     assert kv_fmt in KV_FMTS, kv_fmt
-    return "attention.bf16" if kv_fmt == "bf16" else f"attention.{kv_fmt}kv"
+    if kv_fmt == "bf16":
+        return "bf16"
+    if kv_fmt in TH_KV_FMTS:
+        return f"{TH_KV_FMTS[kv_fmt]}kv_th"
+    return f"{kv_fmt}kv"
+
+
+def class_name(kv_fmt: str = "bf16") -> str:
+    """The class family behind a KV format: ``attention.bf16``, ``attention.e4m3kv``, ``attention.e5m2kv``,
+    ``attention.nvfp4kv``, ``attention.e4m3kv_th``, ``attention.e5m2kv_th``."""
+    return f"attention.{kv_tag(kv_fmt)}"
 
 
 def scale_log2(sm_scale: float, k_scale: float = 1.0) -> float:
@@ -246,6 +295,23 @@ def kv_dq4(fp, leaf, sf_leaf):
     return fp.op("kv_dq4", leaf, sf_leaf)
 
 
+def leaf_fmt(kv_fmt: str) -> str:
+    """The format of the class's K / V leaves: the token-head-scale classes read their fp8 cache as the fp8-KV classes do."""
+    return TH_KV_FMTS.get(kv_fmt, kv_fmt)
+
+
+def scaled_score(fp, score, k: int):
+    """The token-head-scale classes' score of key ``k``: ``mul(s_k, ks_k)``, one ``mul.rn`` of the fold over the exactly
+    widened key by the key's binary32 scale. The tile step takes these scores (maximum, ``alpha``, probabilities, row sum)."""
+    return fp.mul(score, fp.op("sfk_tok", k))
+
+
+def scaled_prob(fp, prob, k: int):
+    """The token-head-scale classes' PV operand of key ``k``: ``cvt_bf16(mul(p_k, vs_k))``, the probability times the key's
+    binary32 value scale, then the operand's single rounding to bf16. The row sum keeps the unscaled ``p_k``."""
+    return fp.cvt_out(fp.mul(prob, fp.op("sfv_tok", k)), "bf16")
+
+
 def k_leaf(fp, t: int, k: int, kv_fmt: str):
     """The K (B) slice of score step ``t`` of key ``k`` in the class's format."""
     leaf = fp.op("b_cols", t, k)
@@ -277,7 +343,9 @@ def score_term(fp, row: RowSpec, k: int, D: int, kv_fmt: str = "bf16"):
         identity_note="the same opaque bf16 K-step as gemm.bf16.kfold over exactly dequantized low-bit keys (no padded step: "
         "D is a multiple of 16)",
     )
-    return Reduction(f"attn.{kv_fmt}kv.score[K={D}]", (kstep,), leaf).canonical(fp)
+    return Reduction(f"attn.{kv_tag(kv_fmt)}.score[K={D}]", (kstep,), leaf).canonical(
+        fp
+    )
 
 
 def alpha_term(fp, m_old, m_new, c, nc):
@@ -333,7 +401,7 @@ def pv_fold(fp, o_scaled, probs_bf16: Sequence[Any], v_slice: Callable[[int], An
 
 
 def v_leaf(fp, vt: int, d: int, kv_fmt: str = "bf16"):
-    """The V slice of PV step ``vt`` for output column ``d``: the cache's bf16 values, the fp8 values widened exactly, or the
+    """The V slice of PV step ``vt`` for output column ``d``: the cache's bf16 values, the fp8 values widened exactly, the
     NVFP4 values times the keys' block scales of block ``d // 16``."""
     leaf = fp.op("v_slice", vt, d)
     if kv_fmt == "bf16":
@@ -349,17 +417,31 @@ def tile_step(
     """One tile of the per-chunk fold (the ``tile`` digit's step). ``tile`` = ``{"t": abs tile index,
     "keys": visible absolute keys, "row": RowSpec}``."""
     row, t, keys, T = tile["row"], tile["t"], tile["keys"], tile["T"]
+    th = kv_fmt in TH_KV_FMTS
+    fmt = leaf_fmt(kv_fmt)
     scores = [
-        score_term(fp, row, t * T + k, D, kv_fmt) if (t * T + k) in keys else None
+        score_term(fp, row, t * T + k, D, fmt) if (t * T + k) in keys else None
         for k in range(T)
     ]
+    if th:
+        scores = [
+            None if s is None else scaled_score(fp, s, t * T + k)
+            for k, s in enumerate(scores)
+        ]
     m_new, alpha, probs, l_new = tile_stats(fp, st.m, st.l, scores, c, nc)
-    probs_bf16 = [fp.cvt_out(q, "bf16") for q in probs]
+    if th:
+        # a masked key's operand is +0 (its scale is not read); the row sum above took the unscaled probabilities
+        probs_bf16 = [
+            fp.cvt_out(q, "bf16") if s is None else scaled_prob(fp, q, t * T + k)
+            for k, (q, s) in enumerate(zip(probs, scores, strict=True))
+        ]
+    else:
+        probs_bf16 = [fp.cvt_out(q, "bf16") for q in probs]
     o_new = pv_fold(
         fp,
         fp.mul(st.o, alpha),
         probs_bf16,
-        lambda j: v_leaf(fp, t * (T // MMA_K) + j, d, kv_fmt),
+        lambda j: v_leaf(fp, t * (T // MMA_K) + j, d, fmt),
     )
     return State(m_new, l_new, o_new)
 
@@ -429,8 +511,7 @@ def attention_reduction(
         step=lambda fp, a, b: merge(fp, a, b, c, nc),
         identity_note="absent chunks are dropped (never merged)",
     )
-    tag = "bf16" if kv_fmt == "bf16" else f"{kv_fmt}kv"
-    return Reduction(f"attn.{tag}.d{D}[T={T},C={C}]", (tile, chunk), leaf)
+    return Reduction(f"attn.{kv_tag(kv_fmt)}.d{D}[T={T},C={C}]", (tile, chunk), leaf)
 
 
 def fold_placement(red: Reduction) -> canon.Placement:
@@ -469,8 +550,13 @@ class AttentionSpec:
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
         self.c, self.nc = self.alg.sym("c"), self.alg.sym("nc")
-        # the fp8-KV classes' value scale: a runtime scalar the epilogue multiplies by once (the key scale is inside c)
-        self.v_scale = None if kv_fmt == "bf16" else self.alg.sym("v_scale")
+        # the per-tensor-scale classes' value scale: a runtime scalar the epilogue multiplies by once (the key scale is inside
+        # c); the bf16 and the token-head-scale classes have none (the latter's scales enter per key, inside the tile step)
+        self.v_scale = (
+            None
+            if kv_fmt == "bf16" or kv_fmt in TH_KV_FMTS
+            else self.alg.sym("v_scale")
+        )
 
     def reduction(self, row: RowSpec, d: int) -> Reduction:
         return attention_reduction(
@@ -502,7 +588,8 @@ def spec_fingerprint(D: int = 128, window_left: int = -1, kv_fmt: str = "bf16") 
     input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
     is the digest of the no-window sample row; ``window_left`` here only selects another sample row. ``kv_fmt`` names the KV
     cache format: the fp8-KV classes (``attn-e4m3kv-d<D>-...`` / ``attn-e5m2kv-d<D>-...``) hash their widened leaves and
-    scaled epilogue; the bf16 class's digest is the one recorded before they existed."""
+    scaled epilogue, the token-head-scale classes (``attn-e4m3kv_th-d<D>-...`` / ``attn-e5m2kv_th-d<D>-...``) their scaled
+    scores and scaled PV operands; the bf16 class's digest is the one recorded before they existed."""
     assert kv_fmt in KV_FMTS, kv_fmt
     key = (D, window_left, kv_fmt)
     if key not in _FINGERPRINTS:
@@ -522,9 +609,8 @@ def spec_fingerprint(D: int = 128, window_left: int = -1, kv_fmt: str = "bf16") 
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
-        tag = "bf16" if kv_fmt == "bf16" else f"{kv_fmt}kv"
         _FINGERPRINTS[key] = (
-            f"attn-{tag}-d{D}-"
+            f"attn-{kv_tag(kv_fmt)}-d{D}-"
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]
