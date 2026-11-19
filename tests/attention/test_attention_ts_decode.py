@@ -7155,19 +7155,40 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
         _get_compiled_decode.cache_clear()
 
 
-@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed-q", "packed-q"))
-def test_attention_ts_decode_fixed_q_compiles_exact_q_length(packed_query: bool):
-    """Fixed-Q plans key the kernel on the exact Q length; packed Q does not."""
+@pytest.mark.parametrize(
+    ("packed_query", "runtime_q_lengths", "seq_len_q", "batch_size", "expect_fixed"),
+    (
+        # Complete grouped Q tiles drop the inactive-row score mask.
+        (False, False, 4, 16, True),
+        # Packed Q keeps one kernel across lengths.
+        (True, True, 4, 16, False),
+        # A partial final token band still needs the mask: no gain, keep reuse.
+        (False, False, 3, 16, False),
+        # One-request tiles are already full without the exact length.
+        (False, False, 4, 1, False),
+        # Callers that do not opt in (prepared sparse plans) are unchanged.
+        (False, True, 4, 16, False),
+    ),
+    ids=("fixed-q4", "packed-q4", "fixed-q3", "fixed-q4-b1", "default-runtime-q"),
+)
+def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
+    packed_query: bool,
+    runtime_q_lengths: bool,
+    seq_len_q: int,
+    batch_size: int,
+    expect_fixed: bool,
+):
+    """Fixed-Q plans key the kernel on the Q length only when it drops a mask."""
 
     def compile_items(seq_len_q: int) -> dict[str, object]:
         spec = _resolve_decode_launch_spec(
             torch.cuda.current_device(),
-            16,
+            batch_size,
             32,
             4,
             128,
             32,
-            4096,
+            1024 if batch_size == 1 else 4096,
             seq_len_q,
             "float8_e4m3fn",
             "float8_e4m3fn",
@@ -7190,15 +7211,16 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(packed_query: bool)
             v_dtype_key="float8_e4m3fn",
             out_dtype_key="bfloat16",
             packed_query=packed_query,
+            runtime_q_lengths=runtime_q_lengths,
         )
         assert compile_spec.packed_query == packed_query
         return dict(compile_spec.config_items)
 
-    items = compile_items(4)
-    assert items["exact_seq_len_q"] is not packed_query
-    assert ("max_seq_len_q" in items) is not packed_query
-    if not packed_query:
-        assert items["max_seq_len_q"] == 4
+    items = compile_items(seq_len_q)
+    assert items["fixed_seqlen_q"] is expect_fixed
+    assert ("max_seq_len_q" in items) is expect_fixed
+    if expect_fixed:
+        assert items["max_seq_len_q"] == seq_len_q
         assert not FmhaDecodeConfig(**items).q_score_rows_need_mask
 
 

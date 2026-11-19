@@ -687,13 +687,12 @@ class FmhaDecodeConfig:
     use_variable_seqlens_q: bool = False
     # Derived from the affine metadata view; lengths themselves stay runtime.
     uniform_query_offsets: bool = False
-    # Fixed-Q launches whose runtime Q length always equals ``max_seq_len_q``
-    # (one compiled kernel per query length, as ahead-of-time catalogs build
-    # them). K/V lengths may stay runtime. The Q geometry then decides at
-    # compile time whether Q tiles are full, so complete grouped tiles drop the
-    # per-tile inactive-row score mask. ``max_seq_len_q`` stays in the compile
-    # signature.
-    exact_seq_len_q: bool = False
+    # The Q-only half of ``fixed_seqlen``: every request's Q length equals
+    # ``max_seq_len_q`` while K/V lengths stay runtime (one compiled kernel per
+    # query length). The Q geometry then decides at compile time whether Q
+    # tiles are full, so complete grouped tiles drop the per-tile inactive-row
+    # score mask. ``max_seq_len_q`` stays in the compile signature.
+    fixed_seqlen_q: bool = False
     # Select the private sparse-block route. This explicit discriminator keeps
     # ordinary storage-subpage callers on the generic paged-KV path. Grouped
     # sparse routes consume query membership from a separate packed-word table;
@@ -2390,7 +2389,7 @@ class FmhaDecodeConfig:
         if not self.fixed_seqlen:
             policy = replace(self, fixed_seqlen=True)
             for name in LENGTH_DERIVED_FIELDS:
-                if name == "max_seq_len_q" and self.exact_seq_len_q:
+                if name == "max_seq_len_q" and self.fixed_seqlen_q:
                     continue
                 del items[name]
             items.update(
@@ -2674,10 +2673,9 @@ class FmhaDecodeConfig:
             and self.heads_q_per_kv % self.tile_size_q == 0
         ):
             return True
-        # A fixed-Q plan launched through the flattened-Q ABI has packed
-        # offsets but one exact length for every request, so its Q geometry
-        # decides fullness just as in the fixed layout.
-        if not self.exact_seq_len_q and (
+        # Exact Q length outranks the packed-Q ABI: fixed-Q wrapper plans launch
+        # through packed offsets, but every request still owns max_seq_len_q rows.
+        if not self.fixed_seqlen_q and (
             self.use_variable_seqlens_q or not self.fixed_seqlen
         ):
             return False
