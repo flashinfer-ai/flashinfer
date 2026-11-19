@@ -511,6 +511,148 @@ def test_cake_sage_sm100_cuda_graph_replay_matches_eager():
     assert torch.equal(lse_graph, lse_eager)
 
 
+#: GPU clock cycles the stream tests keep a stream busy before it rewrites the inputs
+#: (about 0.1 s): a launch on any other stream runs long before the rewrite.
+_SLEEP_CYCLES = 200_000_000
+
+
+def _stream_cases(device):
+    """``{name: (inputs, call)}``: each host entry on small rows, ``call()`` returning
+    its output tensors; ``inputs`` are the tensors it reads."""
+    c = _make_case(
+        ("stream_b1_h4", 1, 4, 4, 320, 640, 5, False, False, 0, None, True, 1.0),
+        device,
+    )
+    g = torch.Generator(device=device).manual_seed(17)
+    # small rows take the one-launch quantizer; 8 x 8 x 8 clusters exceed one wave of
+    # the device and take the TMA or the two-launch quantizer
+    q, k, v = (
+        torch.randn((1, 320, 4, _HEAD_DIM), device=device, generator=g).bfloat16()
+        for _ in range(3)
+    )
+    qw, kw, vw = (
+        torch.randn((8, 256, 8, _HEAD_DIM), device=device, generator=g).bfloat16()
+        for _ in range(3)
+    )
+    index = c["index"]
+    index_wide = torch.zeros((8, 8, 4, 2), dtype=torch.int32, device=device)
+    index_wide[..., 1] = 1
+    fp8 = [c[n] for n in ("q8", "k8", "v8", "q_scale", "k_scale", "v_scale")]
+    scales = dict(q_scale=c["q_scale"], k_scale=c["k_scale"], v_scale=c["v_scale"])
+    return {
+        "attention": (
+            fp8,
+            lambda: _run(c),
+        ),
+        "dispatch": (
+            fp8,
+            lambda: pkg.sm100_sage_fwd_cake_dispatch(
+                c["q8"],
+                c["k8"],
+                c["v8"],
+                index,
+                c["sel"],
+                return_lse=True,
+                fallback=True,
+                **scales,
+            ),
+        ),
+        "combined_one_launch": (
+            [q, k, v],
+            lambda: pkg.bsa_attn_sm100_sage_quantize_fwd_cake(
+                q, k, v, index, c["sel"], return_lse=True
+            ),
+        ),
+        "combined_wide": (
+            [qw, kw, vw],
+            lambda: pkg.bsa_attn_sm100_sage_quantize_fwd_cake(
+                qw, kw, vw, index_wide, 2, return_lse=True
+            ),
+        ),
+        "quantize": ([q, k, v], lambda: sage_fp8_quantize_sm100(q, k, v)),
+    }
+
+
+def _outputs(result):
+    return [t for t in result if t is not None]
+
+
+def _after_stream_work(stream, inputs, call, device=None):
+    """Run ``call`` on ``stream`` after the stream sleeps and then rewrites ``inputs``
+    (zeroed before) with their values; return clones of its outputs taken on the stream.
+    A launch on any other stream reads the zeros.  ``device``: the current device while
+    ``call`` runs (another device than the stream's)."""
+    inputs = [t.view(torch.uint8) for t in inputs]
+    real = [t.clone() for t in inputs]
+    for t in inputs:
+        t.zero_()
+    torch.cuda.synchronize(stream.device)
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(_SLEEP_CYCLES)
+        for t, r in zip(inputs, real, strict=True):
+            t.copy_(r)
+        if device is None:
+            result = call()
+        else:
+            with torch.cuda.device(device):
+                result = call()
+        got = [t.clone() for t in _outputs(result)]
+    stream.synchronize()
+    return got
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "name",
+    ["attention", "dispatch", "combined_one_launch", "combined_wide", "quantize"],
+)
+def test_host_entries_launch_on_the_current_stream(name):
+    """Each host entry launches on torch's current stream: on a side stream it runs
+    after the work queued before it there (and writes the bits of the call on the
+    default stream), and it captures into a CUDA graph on a side stream."""
+    device = torch.device("cuda")
+    inputs, call = _stream_cases(device)[name]
+    ref = [t.clone() for t in _outputs(call())]  # eager on the default stream
+    torch.cuda.synchronize()
+    got = _after_stream_work(torch.cuda.Stream(), inputs, call)
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        call()  # warm-up on the capture stream
+        stream.synchronize()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = _outputs(call())
+    for t in captured:
+        t.view(torch.uint8).fill_(255)
+    graph.replay()
+    torch.cuda.synchronize()
+    for a, b in zip(captured, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@requires_sm100
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second CUDA device")
+@pytest.mark.parametrize(
+    "name", ["attention", "combined_one_launch", "combined_wide", "quantize"]
+)
+def test_host_entries_launch_on_the_current_stream_of_the_inputs_device(name):
+    """With another device current, a call on device 1 tensors launches on device 1's
+    current stream (a side stream here), as torch kernels do."""
+    if not is_cake_sage_sm100_supported(torch.device("cuda", 1)):
+        pytest.skip("device 1 is not an SM100 / SM103 device")
+    device = torch.device("cuda", 1)
+    with torch.cuda.device(device):
+        inputs, call = _stream_cases(device)[name]
+        ref = [t.clone() for t in _outputs(call())]
+        torch.cuda.synchronize()
+    got = _after_stream_work(torch.cuda.Stream(device), inputs, call, device=0)
+    for a, b in zip(got, ref, strict=True):
+        assert a.device == device
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
 #: The build of each unsplit case of the routed-bits test: (sel, wide) -> {arch: role}.
 #: A narrow case has fewer tiles than half the SMs, a wide one two to two and a half
 #: times as many.

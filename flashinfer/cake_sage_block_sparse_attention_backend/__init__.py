@@ -195,19 +195,21 @@ def _softmax_scale(softmax_scale: Optional[float], dim: int) -> float:
 def _ffi_takes_torch_stream() -> bool:
     """Whether tvm-ffi launches on torch's current stream without a stream context.
 
-    From apache-tvm-ffi 0.1.16 a call whose arguments include CUDA torch tensors exported
-    through torch's DLPack exchange API (``torch.Tensor.__c_dlpack_exchange_api__``) sets
-    the call's environment stream to the producer's current work stream, i.e. what
-    ``tvm_ffi.use_torch_stream()`` sets; the context costs a few microseconds of host
-    time per call, which the small Sage-FP8 rows pay end to end.
+    From apache-tvm-ffi 0.1.11 (FlashInfer's minimum) a call whose arguments include a
+    CUDA torch tensor sets the environment stream of that tensor's device to torch's
+    current stream there (the capture stream inside a CUDA-graph capture) for the call's
+    duration: through the DLPack exchange API's ``current_work_stream`` when torch has
+    one (``__dlpack_c_exchange_api__``, native or installed by ``import tvm_ffi``), else
+    through ``torch._C._cuda_getCurrentRawStream``.  Every launch here passes Q (or the
+    quantizer's BF16 Q) first, so it runs on the current stream of Q's device, as torch
+    kernels do; a ``tvm_ffi.use_torch_stream()`` context around it costs several
+    microseconds of host time per call, which the small Sage-FP8 rows pay end to end.
     """
-    if getattr(torch.Tensor, "__c_dlpack_exchange_api__", None) is None:
-        return False
     try:
         version = tuple(int(x) for x in tvm_ffi.__version__.split(".")[:3])
     except (AttributeError, ValueError):
         return False
-    return version >= (0, 1, 16)
+    return version >= (0, 1, 11)
 
 
 _FFI_TAKES_TORCH_STREAM = _ffi_takes_torch_stream()
