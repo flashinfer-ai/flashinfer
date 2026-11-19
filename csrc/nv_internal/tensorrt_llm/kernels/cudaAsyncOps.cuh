@@ -18,9 +18,11 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels {
 
 // ============================================================================
@@ -197,4 +199,5 @@ __device__ __forceinline__ void smemBarWait(uint64_t* smemBar, uint32_t* phasePa
 }
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END
