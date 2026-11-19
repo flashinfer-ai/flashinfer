@@ -100,20 +100,22 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
   auto stream = get_stream(logits.device());
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(output.dtype(), IdType, [&] {
-    cudaError_t status = sampling::SamplingFromLogits<float, IdType>(
-        static_cast<float*>(logits.data_ptr()), static_cast<IdType*>(output.data_ptr()),
-        maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
-                                  : nullptr,
-        batch_size, vocab_size, deterministic,
-        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
-                                   : nullptr,
-        seed_val,
-        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(logits.dtype(), LogitsT, [&] {
+      cudaError_t status = sampling::SamplingFromLogits<float, IdType, LogitsT>(
+          static_cast<LogitsT*>(logits.data_ptr()), static_cast<IdType*>(output.data_ptr()),
+          maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
+                                    : nullptr,
+          batch_size, vocab_size, deterministic,
+          maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream, rng_strides.seed, rng_strides.offset);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "SamplingFromLogits failed with error code " << cudaGetErrorString(status);
-    return true;
+          seed_val,
+          maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+                                       : nullptr,
+          offset_val, stream, rng_strides.seed, rng_strides.offset);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "SamplingFromLogits failed with error code " << cudaGetErrorString(status);
+      return true;
+    });
   });
 }
 
