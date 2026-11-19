@@ -200,6 +200,31 @@ def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("n", [192, 200])
+def test_fp8_groupwise_gemm_sm12x_cutlass_n_alignment_requirement(n):
+    """SM12x cutlass backend requires N alignment based on scale granularity."""
+    from flashinfer.gemm.gemm_base import _cutlass_gemm_fp8_nt_groupwise_requirement
+
+    m, k = 128, 256
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty((k // 128, m), dtype=torch.float32)
+    b_scale = torch.empty((k // 128, (n + 127) // 128), dtype=torch.float32)
+
+    # On non-SM12x, the check is skipped
+    if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
+        # Should pass on non-SM12x regardless of N alignment
+        assert _cutlass_gemm_fp8_nt_groupwise_requirement(
+            a, b, a_scale, b_scale, "MN", scale_granularity_mnk=(1, 128, 128)
+        )
+    else:
+        # On SM12x, N must be multiple of 128
+        with pytest.raises(ValueError, match=f"N must be a multiple of 128"):
+            _cutlass_gemm_fp8_nt_groupwise_requirement(
+                a, b, a_scale, b_scale, "MN", scale_granularity_mnk=(1, 128, 128)
+            )
+
+
 @pytest.mark.parametrize(
     "k,supported", [(256, True), (384, False), (512, True), (640, False)]
 )
