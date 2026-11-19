@@ -43,7 +43,8 @@ def _is_sm120_exactly():
 def _has_min_cuda_toolkit():
     # Require the actual nvcc the JIT build uses: get_cuda_version() falls
     # back to torch.version.cuda when nvcc is absent, which would enable
-    # these JIT tests on a host that cannot compile the module.
+    # these JIT tests on a host that cannot compile the module.  The Ninja
+    # build honors FLASHINFER_NVCC, so probe the same compiler it selects.
     try:
         import os
         import re
@@ -53,7 +54,9 @@ def _has_min_cuda_toolkit():
 
         from flashinfer.jit.cpp_ext import get_cuda_path
 
-        nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
+        nvcc = os.environ.get(
+            "FLASHINFER_NVCC", os.path.join(get_cuda_path(), "bin", "nvcc")
+        )
         txt = subprocess.check_output([nvcc, "--version"], text=True)
         matches = re.findall(r"release (\d+\.\d+),", txt)
         return bool(matches) and Version(matches[0]) >= Version("13.3")
@@ -66,12 +69,30 @@ pytestmark = [
         not _is_sm120_exactly(),
         reason="the specialized SSD prefill backend is SM120-only",
     ),
-    pytest.mark.skipif(
-        not _has_min_cuda_toolkit(),
-        reason="the specialized backend JIT-builds an sm_120a module "
-        "(CUDA >= 13.3 toolkit required)",
-    ),
 ]
+
+# Only the tests that actually launch the kernel JIT-build the sm_120a
+# module; the construction/refusal tests run without a toolkit.
+requires_toolkit = pytest.mark.skipif(
+    not _has_min_cuda_toolkit(),
+    reason="the specialized backend JIT-builds an sm_120a module "
+    "(CUDA >= 13.3 toolkit required)",
+)
+
+
+def _skip_unless_resident(nheads):
+    # The NH128 variant is one cooperative launch of nheads + 8 CTAs at one
+    # CTA per SM; a device with fewer SMs refuses it (insufficient_sm_count)
+    # while NH64 remains fully supported there.
+    if nheads >= 96:
+        sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        if sms < nheads + 8:
+            pytest.skip(
+                f"NH{nheads} needs {nheads + 8} resident CTAs, device has {sms} SMs"
+            )
+
 
 DEVICE = "cuda"
 HD, DS, NG, CHUNK = 64, 128, 8, 128
@@ -154,10 +175,12 @@ def _rel_max(out, ref):
     return ((out.double() - ref).abs().max() / (ref.abs().max() + 1e-9)).item()
 
 
+@requires_toolkit
 @pytest.mark.parametrize("t,nheads", [(120, 64), (500, 128)])
 def test_auto_constructs_specialized_and_matches_reference(t, nheads):
     from flashinfer.mamba import specialized_ssd_prefill_stats
 
+    _skip_unless_resident(nheads)
     ssd = _make_ssd(nheads)
     p = _make_inputs(t, nheads, seed=t)
     before = specialized_ssd_prefill_stats()["specialized_dispatches"]
@@ -169,6 +192,7 @@ def test_auto_constructs_specialized_and_matches_reference(t, nheads):
     assert rel <= REL_TOL, f"rel {rel} at T={t} nheads={nheads}"
 
 
+@requires_toolkit
 @pytest.mark.parametrize("nheads", [64, 128])
 @pytest.mark.parametrize("t,step_pos", [(3, 0), (129, 0), (129, 64)])
 def test_large_step_decay_protection(nheads, t, step_pos):
@@ -177,6 +201,7 @@ def test_large_step_decay_protection(nheads, t, step_pos):
     every following decay to exp(0)=1, silently returning [1, 1, 1] where the
     recurrence gives [1, 0.5, 0.25] (Codex review on the 64-head path; also
     exercised across a chunk boundary and on the protected 128-head path)."""
+    _skip_unless_resident(nheads)
     ssd = _make_ssd(nheads)
     dt = torch.zeros(t, nheads, dtype=torch.bfloat16, device=DEVICE)
     dt[step_pos] = 2.0**30
@@ -254,6 +279,7 @@ def test_kill_switch(monkeypatch):
         _run(ssd, p, 128, 64)
 
 
+@requires_toolkit
 def test_cuda_graph_replay_matches_eager():
     from flashinfer.mamba import specialized_ssd_prefill_warmup
 
