@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from .plan import (
+    ArrayPlan,
     COUNT_FIELDS,
     DESC_FIELDS,
     GRID_SEARCH_ARCHES,
@@ -510,7 +511,8 @@ class FixedLaunch:
         ]
         self._staged = [[0, 0, 0], [0, 0, 0]]  # live ints per section of each block
         self._on_device = [0, 0, 0]  # live ints per section of the device tables
-        self.last_plan = None  # the plan in the tables: the next one of the same shape rewrites its KV lengths
+        # the plan in the tables: the next one of the same shape rewrites its KV lengths
+        self.last_plan: Optional[ArrayPlan] = None
         self._copied: List[Optional[torch.cuda.Event]] = [None, None]
         self._turn = 0
 
