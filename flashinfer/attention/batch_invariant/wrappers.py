@@ -19,8 +19,15 @@ row's last chunk; the LSE includes it. A call without sinks is the class without
 are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
-the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
-metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
+the plan's), and a new ``plan()`` needs a new capture -- unless the wrapper is the decode wrapper built with
+``use_cuda_graph=True``, whose contract is the regular wrappers': the batch size and ``q_len_per_req`` are fixed for the wrapper's
+lifetime, as are the head counts, the head dim, the page size, the window, ``sm_scale`` and, from the first ``run()``, whether
+the LSE and sinks are asked for; ``plan()`` (or ``flashinfer.decode.fast_decode_plan``) before every replay refreshes the KV
+lengths and the page table, which a captured ``run()`` then follows. The launch of such a wrapper is fixed at its first plan
+(``engine.FixedLaunch``: the kernel, the grid, the tables' addresses and capacities); every plan is written into the same
+tables and held to their capacity by fusing units, a placement like every other planner choice, so a replay's bits are those of
+an eager call on the same batch. A request without pages (a padded slot) is a null request there: its output rows are zeros and
+its LSE ``-inf``, with or without sinks. The prefill wrappers refuse ``use_cuda_graph=True``.
 
 A plan's execution state (the split-KV partials in the workspace, the arrival counters) is single-use per launch: two ``run()``
 calls of one plan must be stream-ordered, as with every FlashInfer wrapper's workspace; the counters reset themselves at every
@@ -66,11 +73,12 @@ class BatchInvariantAttention:
         use_cuda_graph: bool = False,
     ) -> None:
         assert kind in ("decode", "prefill", "ragged"), kind
-        if use_cuda_graph:
+        if use_cuda_graph and kind != "decode":
             raise unsupported(
                 CLASS,
-                "use_cuda_graph=True with batch_invariant=True",
-                "capturing run() after plan(): a replay reproduces the planned batch, a new plan() needs a new capture",
+                "use_cuda_graph=True with batch_invariant=True on a prefill wrapper",
+                "capturing run() after plan(): a replay reproduces the planned batch, a new plan() needs a new capture "
+                "(the decode wrapper takes use_cuda_graph=True)",
             )
         if backend != "auto":
             raise unsupported(
@@ -104,6 +112,46 @@ class BatchInvariantAttention:
         self._page = 1
         self._max_page = -1  # the largest page index the plan references (paged kinds)
         self._total_kv = 0  # the planned packed token count (ragged)
+        # use_cuda_graph=True (decode): the caller's persistent page-table buffers, the fixed launch of the first plan and
+        # what the first run() asked for
+        self.graph = bool(use_cuda_graph)
+        self._kv_buffers: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
+            None
+        )
+        self._fixed: Optional[engine.FixedLaunch] = None
+        self._frozen_plan: Optional[tuple] = None
+        self._frozen_run: Optional[tuple] = None
+
+    def bind_graph_buffers(
+        self,
+        paged_kv_indptr_buffer: torch.Tensor,
+        paged_kv_indices_buffer: torch.Tensor,
+        paged_kv_last_page_len_buffer: torch.Tensor,
+    ) -> None:
+        """The decode wrapper's ``paged_kv_*_buffer`` arguments under ``use_cuda_graph=True``: ``plan()`` refreshes them and the
+        captured kernels read the first two in place, so they are int32 tensors on the wrapper's device."""
+        assert self.graph
+        for name, t in (
+            ("paged_kv_indptr_buffer", paged_kv_indptr_buffer),
+            ("paged_kv_indices_buffer", paged_kv_indices_buffer),
+            ("paged_kv_last_page_len_buffer", paged_kv_last_page_len_buffer),
+        ):
+            if (
+                t.dtype != torch.int32
+                or t.device != self.device
+                or t.dim() != 1
+                or not t.is_contiguous()
+            ):
+                raise unsupported(
+                    CLASS,
+                    f"{name} of dtype {t.dtype}, shape {tuple(t.shape)} on {t.device}",
+                    f"a contiguous one-dimensional int32 buffer on {self.device}",
+                )
+        self._kv_buffers = (
+            paged_kv_indptr_buffer,
+            paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer,
+        )
 
     def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
         """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
@@ -113,6 +161,12 @@ class BatchInvariantAttention:
                 CLASS,
                 f"a float workspace buffer on {float_workspace_buffer.device}",
                 f"a workspace on the wrapper's device {self.device}",
+            )
+        if getattr(self, "_fixed", None) is not None:
+            raise unsupported(
+                CLASS,
+                "a new float workspace buffer after the first plan() of a use_cuda_graph=True wrapper",
+                "the workspace the fixed launch was built in (a captured graph holds its address)",
             )
         if float_workspace_buffer.data_ptr() % 16:
             raise unsupported(
@@ -226,8 +280,17 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        kv_indptr_host: Optional[torch.Tensor] = None,
+        fast: bool = False,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``disable_split_kv`` plans
+        fused units and ``fixed_split_size`` of ``None`` / ``-1`` is the wrappers' "no fixed size" (both placements); a positive
+        ``fixed_split_size`` is refused -- the chunk length is a class constant -- except under ``use_cuda_graph=True``, where
+        it is accepted and not used, as serving engines pass it on every replan. ``seq_lens`` (decode) must be the KV
+        lengths of the page table. ``fast`` (``flashinfer.decode.fast_decode_plan``): the replan of a ``use_cuda_graph=True``
+        wrapper without device readbacks -- ``kv_indptr_host`` is the host copy of ``kv_indptr`` when given, every last-page
+        length is 1 at page size 1 (as that function assumes), and the page indices are not range-checked."""
         D = int(head_dim_qk)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -297,11 +360,15 @@ class BatchInvariantAttention:
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
-        if fixed_split_size is not None or disable_split_kv:
+        if (
+            fixed_split_size is not None
+            and int(fixed_split_size) > 0
+            and not self.graph
+        ):
             raise unsupported(
                 CLASS,
-                "fixed_split_size / disable_split_kv",
-                "the class's own split rule (a function of the SM count only)",
+                f"fixed_split_size={fixed_split_size}",
+                "the class's own chunk length (a class constant); None or -1",
             )
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
@@ -334,6 +401,34 @@ class BatchInvariantAttention:
                     "at least one query token per request",
                 )
             batch = int(kv_indptr.numel()) - 1
+            if self.graph:
+                # the regular wrappers' frozen shape, with their errors
+                if self._kv_buffers is None:
+                    raise RuntimeError(
+                        "use_cuda_graph=True needs the wrapper's paged_kv_*_buffer tensors"
+                    )
+                fixed_batch = self._kv_buffers[2].numel()
+                if batch != fixed_batch:
+                    raise ValueError(
+                        "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                        " mismatches the batch size set during initialization {}".format(
+                            batch, fixed_batch
+                        )
+                    )
+                if kv_indices is not None and kv_indices.numel() > (
+                    self._kv_buffers[1].numel()
+                ):
+                    raise ValueError(
+                        "The size of indices should be less than or equal to the allocated buffer"
+                    )
+                if self._fixed is not None and (
+                    self._fixed.q_len_per_req != int(q_len_per_req)
+                ):
+                    raise ValueError(
+                        "q_len_per_req is part of the frozen cudagraph shape: "
+                        f"this wrapper was planned with {self._fixed.q_len_per_req}, got "
+                        f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
+                    )
             qo_indptr = torch.arange(
                 0, batch + 1, dtype=torch.int32, device="cpu"
             ) * int(q_len_per_req)
@@ -342,7 +437,11 @@ class BatchInvariantAttention:
                 raise unsupported(
                     CLASS, "a plan without qo_indptr", "the packed query offsets"
                 )
-        kv_indptr_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        kv_indptr_host = (
+            (kv_indptr if kv_indptr_host is None else kv_indptr_host)
+            .to("cpu", non_blocking=False)
+            .to(torch.int64)
+        )
         qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
         if bool((kv_indptr_host < 0).any()):
             raise unsupported(
@@ -380,7 +479,12 @@ class BatchInvariantAttention:
                     "a paged plan without kv_indices / kv_last_page_len",
                     "the paged KV CSR triple",
                 )
-            last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
+            if fast and page_size == 1:
+                last_host = torch.ones(kv_spans.numel(), dtype=torch.int64)
+            else:
+                last_host = kv_last_page_len.to("cpu", non_blocking=False).to(
+                    torch.int64
+                )
             if last_host.numel() != kv_spans.numel():
                 raise unsupported(
                     CLASS,
@@ -400,7 +504,7 @@ class BatchInvariantAttention:
                     f"kv_indices of {kv_indices.numel()} entries for kv_indptr[-1] = {n_pages}",
                     "one page index per referenced page",
                 )
-            if n_pages:
+            if n_pages and not fast:
                 used = kv_indices[:n_pages]
                 bounds = torch.aminmax(used)
                 # Only two scalars cross from CUDA; one readback waits for both bounds.
@@ -425,13 +529,47 @@ class BatchInvariantAttention:
                     f"request {i} with a decreasing qo_indptr / kv_indptr",
                     "non-decreasing offsets",
                 )
-            if ql > kl:
+            if ql > kl and not (self.graph and kl == 0):
                 raise unsupported(
                     CLASS,
                     f"request {i} with {ql} query tokens over {kl} keys",
                     "kv_len >= q_len per request (the causal class)",
                 )
+        if seq_lens is not None:
+            given = seq_lens.to("cpu", non_blocking=False).to(torch.int64).tolist()
+            if self.kind != "decode" or given != kv_lens:
+                raise unsupported(
+                    CLASS,
+                    "seq_lens",
+                    self._PLAN_ARGS_OUTSIDE_THE_CLASS["seq_lens"]
+                    + " (on the decode wrapper, seq_lens equal to them)",
+                )
         config = engine.default_config(D=D)
+        if disable_split_kv:
+            from dataclasses import replace
+
+            config = replace(config, split_policy="fused")
+        if self.graph:
+            self._plan_fixed(
+                config,
+                qo_host,
+                kv_indptr_host,
+                last_host,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                D,
+                page_size,
+                int(window_left),
+                float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D),
+                int(q_len_per_req),
+                non_blocking,
+                max_page,
+                fast,
+            )
+            return
         if (
             D in engine.Q2_DEFAULT_DIMS
             and self.kind != "decode"
@@ -518,6 +656,103 @@ class BatchInvariantAttention:
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
+
+    def _plan_fixed(
+        self,
+        config: engine.AttnConfig,
+        qo_host: torch.Tensor,
+        kv_indptr_host: torch.Tensor,
+        last_host: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        Hq: int,
+        Hkv: int,
+        D: int,
+        page: int,
+        window_left: int,
+        sm_scale: float,
+        q_len_per_req: int,
+        non_blocking: bool,
+        max_page: int,
+        fast: bool,
+    ) -> None:
+        """The plan of a ``use_cuda_graph=True`` decode wrapper: the first builds the fixed launch, every one is written into its
+        tables and the wrapper's page-table buffers (``engine.FixedLaunch``), after the frozen options are checked."""
+        assert self._kv_buffers is not None
+        indptr_buf, indices_buf, last_buf = self._kv_buffers
+        c = scale_log2(sm_scale)
+        frozen = (Hq, Hkv, D, page, window_left, c)
+        if self._frozen_plan is not None and frozen != self._frozen_plan:
+            names = (
+                "num_qo_heads",
+                "num_kv_heads",
+                "head_dim",
+                "page_size",
+                "window_left",
+                "sm_scale (its binary32 log2 scale)",
+            )
+            changed = ", ".join(
+                f"{n} {new} after {old}"
+                for n, new, old in zip(names, frozen, self._frozen_plan, strict=True)
+                if new != old
+            )
+            raise unsupported(
+                CLASS,
+                f"a plan() of a use_cuda_graph=True wrapper with {changed}",
+                "the options of the wrapper's first plan (a captured graph holds them); only the KV lengths and the page "
+                "table may change",
+            )
+        if self._fixed is None:
+            self._fixed = engine.FixedLaunch(
+                qo_host.numel() - 1,
+                q_len_per_req,
+                Hq,
+                Hkv,
+                D,
+                page,
+                config,
+                self.workspace,
+                self.device,
+            )
+        planned = engine.plan_attention(
+            qo_host,
+            kv_indptr_host,
+            last_host,
+            Hq,
+            Hkv,
+            D,
+            page,
+            window_left,
+            config,
+            fixed=self._fixed,
+            non_blocking=non_blocking,
+        )
+        # the captured kernels read the page table from the wrapper's buffers: refreshed here unless the caller's tensors are
+        # those buffers
+        for buf, src in (
+            (indptr_buf, kv_indptr),
+            (indices_buf, kv_indices),
+            (last_buf, None if fast else kv_last_page_len),
+        ):
+            if src is None or (
+                src.device == buf.device and src.data_ptr() == buf.data_ptr()
+            ):
+                continue
+            buf[: src.numel()].copy_(src, non_blocking=non_blocking)
+        self._planned = planned
+        self._config = config
+        self._kv_indptr = indptr_buf
+        self._kv_indices = indices_buf
+        self._max_page = max_page
+        self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
+        self._sm_scale = sm_scale
+        self._scale_log2 = c
+        self._window_left = window_left
+        self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
+        self._heads = (Hq, Hkv, D)
+        self._page = page
+        self._frozen_plan = frozen
 
     def validate_forward_options(
         self,
@@ -746,6 +981,21 @@ class BatchInvariantAttention:
                 if lse is not None and lse_layout == "NH"
                 else torch.empty(nh_shape, dtype=torch.float32, device=self.device)
             )
+        if self.graph:
+            asked = (
+                bool(return_lse),
+                lse_base if return_lse else None,
+                sinks is not None,
+            )
+            if self._frozen_run is None:
+                self._frozen_run = asked
+            elif asked != self._frozen_run:
+                raise unsupported(
+                    CLASS,
+                    f"run() of a use_cuda_graph=True wrapper with (return_lse, lse_base, sinks given) = {asked} after "
+                    f"{self._frozen_run}",
+                    "the LSE mode and the presence of sinks of the wrapper's first run() (they select the captured kernels)",
+                )
         if sinks is not None:
             bad = engine.check_sinks(sinks, Hq, self.device, (out, lse_nh))
             if bad is not None:
