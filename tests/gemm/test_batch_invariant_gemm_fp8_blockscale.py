@@ -521,9 +521,9 @@ def test_k_native_scale_staging_is_a_placement():
     seen = []
     real = compile_fp8bs.get_compiled_fp8bs
 
-    def recording(cfg, clusters, out_fmt="bf16", family="", native_k=False):
+    def recording(cfg, out_fmt="bf16", family="", native_k=False):
         seen.append(native_k)
-        return real(cfg, clusters, out_fmt, family, native_k)
+        return real(cfg, out_fmt, family, native_k)
 
     compile_fp8bs.get_compiled_fp8bs = recording
     try:
