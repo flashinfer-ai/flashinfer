@@ -832,6 +832,11 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const configs = bmm.getBatchedGemmConfigs();
 
   BatchedGemmData gemmData{};
+  // Match getValidConfigIndices: this shape-only placeholder is never dereferenced or launched.
+  float const clampLimitPlaceholder = 1.0f;
+  if (mOptions.eltwiseActType == EltwiseActType::ClampedRelu2) {
+    gemmData.mInputBuffers.mPtrClampLimit = &clampLimitPlaceholder;
+  }
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
