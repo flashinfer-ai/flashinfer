@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fp8-KV classes of the batch-invariant attention (``attention.e4m3kv`` / ``attention.e5m2kv``): bitwise tests only (the
 mode's acceptance criterion), the device-free checks of the fingerprints and the configuration space, and the "unsupported
-raises, nothing falls back" rule for what the classes do not cover (per-(token, head) scales, NVFP4 caches, q / o scales).
+raises, nothing falls back" rule for what the classes do not cover (per-(token, head) scales, scaled queries and outputs); then
+the NVFP4-KV class (``attention.nvfp4kv``) with its two V block-scale layouts, every code of the formats, and the argument lists
+serving engines call the wrappers with.
 
 The caches are quantized per tensor as a serving engine's fp8 KV cache is written (``append_paged_kv_cache`` on an fp8 pool: the
 elementwise ``cvt.rn`` of ``x / scale``): the paged pool and the packed (ragged) copy of a problem are quantized with the same
@@ -24,6 +26,9 @@ from tests.attention.test_batch_invariant_attention import (
     Problem,
     bits,
     workspace,
+)
+from tests.attention.test_batch_invariant_attention import (
+    run_paged_prefill as bf16_paged_prefill,
 )
 
 needs_device = pytest.mark.skipif(
@@ -1665,3 +1670,274 @@ def test_nvfp4_v_scale_layout_refusals():
         flashinfer.BatchDecodeWithPagedKVCacheWrapper._plan_impl(
             regular, *plan_args[1:], v_sf_swizzled=True
         )
+
+
+# ------------------------------------------------------------------------------------------------------ every code of the formats
+def fp8_value(code: int, fmt: str) -> float:
+    """One fp8 byte decoded from the format's definition (no torch conversion)."""
+    sign = -1.0 if code & 0x80 else 1.0
+    if fmt == "e4m3":
+        e, m = (code >> 3) & 0xF, code & 7
+        if e == 15 and m == 7:
+            return float("nan")
+        return sign * (m / 8 * 2.0**-6 if e == 0 else (1 + m / 8) * 2.0 ** (e - 7))
+    e, m = (code >> 2) & 0x1F, code & 3
+    if e == 31:
+        return sign * float("inf") if m == 0 else float("nan")
+    return sign * (m / 4 * 2.0**-14 if e == 0 else (1 + m / 4) * 2.0 ** (e - 15))
+
+
+def widened_problem(pr: Problem, k_nhd, v_nhd) -> Problem:
+    """``pr`` with its paged pools replaced by the bf16 values ``k_nhd`` / ``v_nhd`` (the bf16-class oracle of a low-bit cache)."""
+    w = Problem.__new__(Problem)
+    w.__dict__.update(pr.__dict__)
+    w.k_nhd, w.v_nhd = k_nhd.to(torch.bfloat16), v_nhd.to(torch.bfloat16)
+    return w
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [E4, E5], ids=["e4m3", "e5m2"])
+def test_every_finite_fp8_code_is_widened_exactly(D, dtype):
+    """Caches drawn from every finite code of the format (both zeros, the subnormals, the largest magnitudes): the class's bits
+    are the bf16 class's over the widened cache with ``k_scale`` folded into ``sm_scale``. The non-finite codes (e4m3 NaN,
+    e5m2 infinities and NaNs) are outside the class, as non-finite values are outside the bf16 class: they are widened like any
+    code and propagate as the fp32 arithmetic propagates them; nothing on the device checks for them."""
+    fmt = FMT_OF[dtype]
+    values = torch.tensor([fp8_value(c, fmt) for c in range(256)])
+    finite = torch.isfinite(values)
+    codes = torch.arange(256, dtype=torch.uint8)
+    # torch's widening (the oracle's) is the format's definition, on the host and on the device
+    for dev in ("cpu", "cuda"):
+        w = codes.to(dev).view(dtype).to(torch.bfloat16).float().cpu()
+        assert torch.equal(w[finite], values[finite])
+        assert not torch.isfinite(w[~finite]).any()
+    assert int(finite.sum()) == (254 if fmt == "e4m3" else 248)
+    fin = codes[finite]
+    pr = Problem([40, 1, 300], [1100, 2500, 300], 8, 2, D, 16, seed=D)
+    g = torch.Generator().manual_seed(D)
+    shape = pr.k_nhd.shape
+
+    def pool():
+        x = fin[torch.randint(0, len(fin), shape, generator=g)]
+        assert len(torch.unique(x)) == len(fin)  # every finite code is in the cache
+        return x.to(pr.device).view(dtype)
+
+    lp = LowbitProblem.__new__(LowbitProblem)
+    lp.pr, lp.dtype, lp.v_scale = pr, dtype, 1.0
+    lp.k_nhd, lp.v_nhd = pool(), pool()
+    oracle = widened_problem(pr, lp.k_nhd, lp.v_nhd)
+    sm = 1.0 / math.sqrt(D)
+    for k_scale in (1.0, 4.0 / FP8_MAX[dtype]):
+        lp.k_scale = k_scale
+        got = run_paged_prefill(lp)
+        assert torch.isfinite(got.float()).all()
+        want = bf16_paged_prefill(oracle, sm_scale=sm * k_scale)
+        assert torch.equal(bits(got), bits(want)), k_scale
+    dec, last = run_decode(lp)
+    assert torch.equal(bits(dec), bits(got[last]))
+
+
+def signed_fp4_problem(q_lens, kv_lens, Hq, Hkv, D, page, seed, sf_codes, k_scale):
+    """An NVFP4 problem over every nibble (the eight negative e2m1 codes included: ``create_nvfp4_kv`` clears the sign bits)
+    with block scales drawn from ``sf_codes`` (e4m3 bytes)."""
+    fp = Fp4Problem.__new__(Fp4Problem)
+    pr = Problem(q_lens, kv_lens, Hq, Hkv, D, page, seed=seed)
+    g = torch.Generator().manual_seed(seed)
+    lead = tuple(pr.k_nhd.shape[:-1])
+    codes = torch.tensor(sf_codes, dtype=torch.uint8)
+
+    def data():
+        x = torch.randint(0, 256, lead + (D // 2,), generator=g, dtype=torch.uint8)
+        return x.to(pr.device)
+
+    def scales():
+        idx = torch.randint(0, len(codes), lead + (D // 16,), generator=g)
+        return codes[idx].to(pr.device)
+
+    fp.pr, fp.k_scale, fp.v_scale = pr, k_scale, 1.0
+    fp.k_nhd, fp.v_nhd, fp.k_sf, fp.v_sf = data(), data(), scales(), scales()
+    fp.k_rag, fp.v_rag = fp._gather(fp.k_nhd), fp._gather(fp.v_nhd)
+    fp.k_sf_rag, fp.v_sf_rag = fp._gather(fp.k_sf), fp._gather(fp.v_sf)
+    return fp
+
+
+E4M3_FINITE_CODES = [c for c in range(256) if c not in (0x7F, 0xFF)]
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize(
+    "name,sf_codes,k_scale",
+    [
+        ("moderate", [56, 48, 40, 32, 60, 44], 1.0),
+        ("every_finite_scale_code", E4M3_FINITE_CODES, 1.0 / 256),
+        ("extreme", [0x7E, 0xFE, 0x01, 0x81, 0x00, 0x80, 0x08, 0x07], 1.0 / 256),
+    ],
+)
+def test_nvfp4_signed_values_and_every_scale_code(D, name, sf_codes, k_scale):
+    """Negative e2m1 values and block scales over the whole finite e4m3 range (negative scales, both zeros, the smallest subnormal
+    and the largest magnitude): every product is an exact bf16 value, and the class's bits are the bf16 class's over the products
+    with ``k_scale`` folded into ``sm_scale``; decode rows are prefill rows, the ragged pool the paged one."""
+    fp = signed_fp4_problem(
+        [40, 1, 300], [1100, 2500, 300], 8, 2, D, 16, 100 + D, sf_codes, k_scale
+    )
+    pr = fp.pr
+    assert bool((fp.k_nhd & 0x88).any()) and bool((fp.v_nhd & 0x88).any())
+    k_dq, v_dq = nvfp4_dequant(fp.k_nhd, fp.k_sf), nvfp4_dequant(fp.v_nhd, fp.v_sf)
+    for x in (k_dq, v_dq):
+        assert torch.equal(x.to(torch.bfloat16).float(), x)  # exact bf16 leaves
+    assert bool((k_dq < 0).any()) and bool((v_dq < 0).any())
+    got = fp4_run_paged_prefill(fp)
+    assert torch.isfinite(got.float()).all()
+    want = bf16_paged_prefill(
+        widened_problem(pr, k_dq, v_dq), sm_scale=(1.0 / math.sqrt(D)) * k_scale
+    )
+    assert torch.equal(bits(got), bits(want))
+    dec, last = fp4_run_decode(fp)
+    assert torch.equal(bits(dec), bits(got[last]))
+    assert torch.equal(bits(fp4_run_ragged_prefill(fp)), bits(got))
+
+
+# ------------------------------------------------------------------------------------------------------ serving call shapes
+@needs_device
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_serving_call_shape_fp8(layout):
+    """The argument list a serving engine passes on every call: K and V as the two halves of one cache tensor, ``q_scale`` 1.0,
+    the K / V scales as 1-element tensors, the output buffer, and ``None`` for the features that are off. The bits are the
+    minimal call's."""
+    lp = problem([64, 1, 300], [700, 2500, 300], 32, 8, 128, 16, 21, E4)
+    pr = lp.pr
+    ref = bits(run_paged_prefill(lp, layout)).clone()
+    k, v = lp.cache(layout)
+    cache = torch.stack(
+        [k, v], dim=1
+    )  # (pages, 2, ...): one allocation, K and V its halves
+    ks = torch.tensor([lp.k_scale], dtype=torch.float32, device=pr.device)
+    vs = torch.tensor(lp.v_scale, dtype=torch.float32)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=E4,
+        o_data_type=torch.bfloat16,
+    )
+    out = torch.empty_like(pr.q)
+    ret = w.run(
+        pr.q, cache, q_scale=1.0, k_scale=ks, v_scale=vs, out=out, kv_cache_sf=None
+    )
+    assert ret is out and torch.equal(bits(out), ref)
+    last = torch.tensor(
+        [int(pr.qo_indptr[i + 1]) - 1 for i in range(len(pr.q_lens))], device=pr.device
+    )
+    d = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    d.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=E4,
+        o_data_type=torch.bfloat16,
+    )
+    dout = torch.empty_like(pr.q[last])
+    d.run(
+        pr.q[last].contiguous(),
+        cache,
+        q_scale=torch.ones(1, device=pr.device),
+        k_scale=ks,
+        v_scale=vs,
+        out=dout,
+        kv_cache_sf=None,
+        sinks=None,
+    )
+    assert torch.equal(bits(dout), ref[last])
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_serving_page_layout_nvfp4(D):
+    """A serving engine's NVFP4 page: one byte tensor per block, ``[K data | K scales | V data | V scales]`` (HND), read through
+    four strided views of the one allocation, with the V scales in the 4-token swizzle its writer stores. The bits are those of
+    the separate contiguous tensors with linear scales."""
+    fp = fp4_problem([64, 1, 300], [700, 2501, 303], 32, 8, D, 16, 22)
+    pr = fp.pr
+    ref = bits(fp4_run_paged_prefill(fp)).clone()
+    H, N, row = pr.Hkv, pr.page, D // 2 + D // 16
+    pages = fp.k_nhd.shape[0]
+    cache = torch.zeros(pages, 2 * H, N, row, dtype=torch.uint8, device=pr.device)
+    side = (
+        H * N * row
+    )  # bytes of the K (or V) half of a page: the data of all heads, then their scales
+
+    def views(half):
+        base = cache.storage_offset() + half * side
+        data = torch.as_strided(
+            cache,
+            (pages, H, N, D // 2),
+            (cache.stride(0), N * (D // 2), D // 2, 1),
+            base,
+        )
+        scales = torch.as_strided(
+            cache,
+            (pages, H, N, D // 16),
+            (cache.stride(0), N * (D // 16), D // 16, 1),
+            base + H * N * (D // 2),
+        )
+        return data, scales
+
+    (k, k_sf), (v, v_sf) = views(0), views(1)
+    k_hnd, v_hnd = fp.cache("HND")
+    ksf_hnd, vsf_hnd = fp.sf("HND")
+    k.copy_(k_hnd)
+    v.copy_(v_hnd)
+    k_sf.copy_(ksf_hnd)
+    v_sf.copy_(swizzle_v_sf(vsf_hnd, "HND", live=live_tokens(pr), seed=D))
+    e4 = torch.float8_e4m3fn
+    got = fp4_run_paged_prefill(
+        fp, "HND", sf=(k_sf.view(e4), v_sf.view(e4)), v_sf_swizzled=True
+    )
+    assert torch.equal(bits(got), ref)  # the scale views alone, next to contiguous data
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "HND", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        D,
+        16,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+        v_sf_swizzled=True,
+    )
+    out = torch.empty_like(pr.q)
+    w.run(
+        pr.q,
+        (k, v),
+        q_scale=1.0,
+        k_scale=torch.tensor([fp.k_scale], device=pr.device),
+        v_scale=torch.tensor([fp.v_scale], device=pr.device),
+        out=out,
+        kv_cache_sf=(k_sf.view(e4), v_sf.view(e4)),
+    )
+    assert torch.equal(bits(out), ref)
