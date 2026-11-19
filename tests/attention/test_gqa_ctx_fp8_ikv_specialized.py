@@ -19,7 +19,11 @@ backend-dispatch semantics (auto / explicit / kill switch / allowlist
 boundary), and CUDA-graph replay == eager.
 """
 
+import functools
+import gc
 import os
+import traceback
+import weakref
 
 import pytest
 import torch
@@ -109,11 +113,9 @@ def _reference(inp):
     return torch.cat(outs, 0).to(torch.bfloat16)
 
 
-def _api(inp, out, backend="auto"):
-    # the generic front is the ONLY surface exposing the specialized
-    # backend (vendor-named entries stay stock)
+def _kwargs(inp):
     kv = inp["kv_buf"]
-    return batch_context_with_kv_cache(
+    return dict(
         query=inp["q"],
         kv_cache=(kv[:, :, 0, :].unsqueeze(1), kv[:, :, 1, :].unsqueeze(1)),
         workspace_buffer=_ws(),
@@ -127,9 +129,11 @@ def _api(inp, out, backend="auto"):
         cum_seq_lens_q=inp["cu_q"],
         cum_seq_lens_kv=inp["cu_kv"],
         window_left=-1,
-        out=out,
-        backend=backend,
     )
+
+
+def _api(inp, out, backend="auto"):
+    return batch_context_with_kv_cache(out=out, backend=backend, **_kwargs(inp))
 
 
 _WS = {}
@@ -152,6 +156,7 @@ def _out_like(inp):
         ([2] * 8, [2] * 8),  # tiny-KV batch (census class B8 q2 kv2)
         ([2] * 64, [2] * 64),  # tiny-KV batch, large B
         ([128], [128]),  # single-page single request
+        ([128, 128], [128, 128]),  # uniform narrow-table attn_coop_b7
         ([2, 1, 1, 1], [100, 1, 1, 1]),  # ragged, deep-context causal row
         ([1], [3]),  # tiny-cap route
         ([2], [4]),
@@ -216,6 +221,266 @@ def test_specialized_wide_block_table(q_lens, kv_lens):
     out2 = _out_like(inp)
     _api(inp, out2)
     assert torch.equal(out, out2)
+
+
+def test_failed_load_does_not_retain_dispatch_arguments(monkeypatch):
+    attempts = 0
+
+    def fail():
+        nonlocal attempts
+        attempts += 1
+        raise FileNotFoundError("missing artifact")
+
+    monkeypatch.setattr(spec_mod, "_MODULE_LOAD_FAILURE", None)
+    monkeypatch.setattr(spec_mod, "get_gqa_ctx_fp8_ikv_module", fail)
+    monkeypatch.setattr(spec_mod, "supported_with_reasons", lambda *args: [])
+
+    def retry():
+        q = torch.empty(1)
+        with pytest.raises(
+            RuntimeError, match="FileNotFoundError: missing artifact"
+        ) as err:
+            spec_mod.maybe_dispatch_specialized(
+                "specialized",
+                q,
+                None,
+                None,
+                None,
+                1,
+                1,
+                SCALE,
+                1.0,
+                1,
+                None,
+                None,
+                None,
+                {},
+            )
+        return weakref.ref(q), len(traceback.extract_tb(err.value.__traceback__))
+
+    results = [retry() for _ in range(8)]
+    gc.collect()
+    assert attempts == 1
+    assert all(ref() is None for ref, _ in results)
+    assert len({depth for _, depth in results}) == 1
+
+
+@requires_sm103
+def test_missing_specialized_artifact_uses_cached_stock(monkeypatch):
+    inp = _make_inputs([2, 2], [2, 2])
+    expected = trtllm_batch_context_with_kv_cache(
+        backend="trtllm-gen", out=_out_like(inp), **_kwargs(inp)
+    )
+    attempts = 0
+
+    def missing():
+        nonlocal attempts
+        attempts += 1
+        raise FileNotFoundError("no specialized artifact")
+
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    monkeypatch.setattr(spec_mod, "_MODULE_LOAD_FAILURE", None)
+    monkeypatch.setattr(spec_mod, "get_gqa_ctx_fp8_ikv_module", missing)
+    before = dict(spec_mod.DISPATCH_STATS)
+    for _ in range(2):
+        assert torch.equal(_api(inp, _out_like(inp)), expected)
+        assert spec_mod.LAST_FALLBACK_REASONS == [
+            "specialized_module_unavailable:FileNotFoundError"
+        ]
+    with pytest.raises(RuntimeError, match="no specialized artifact"):
+        _api(inp, _out_like(inp), backend="specialized")
+    assert attempts == 1
+    assert {
+        "specialized": before["specialized"],
+        "fallback": before["fallback"] + 2,
+    } == spec_mod.DISPATCH_STATS
+
+
+def _offset_copy(t):
+    backing = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    view = backing[1:].view_as(t)
+    view.copy_(t)
+    assert view.data_ptr() % 16 != 0
+    return view
+
+
+def _direct(inp, out):
+    k = inp["kv_buf"][:, :, 0, :].unsqueeze(1)
+    spec_mod.get_gqa_ctx_fp8_ikv_module().gqa_ctx_fp8_ikv_run(
+        inp["q"],
+        k,
+        inp["bt"],
+        inp["cu_q"],
+        inp["cu_kv"],
+        inp["seq_lens"],
+        inp["max_q"],
+        inp["max_kv"],
+        out,
+    )
+
+
+@requires_sm103
+@pytest.mark.parametrize("offset", [None, "q", "kv_buf", "out"])
+def test_direct_ffi_alignment(offset):
+    inp = _make_inputs([2, 2], [2, 2])
+    out = _out_like(inp)
+    if offset is None:
+        _direct(inp, out)
+        torch.testing.assert_close(
+            out.float(), _reference(inp).float(), atol=0.005, rtol=0.05
+        )
+        return
+    if offset == "out":
+        out = _offset_copy(out)
+    else:
+        inp[offset] = _offset_copy(inp[offset])
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _direct(inp, out)
+
+
+@requires_sm103
+@pytest.mark.parametrize("empty", ["batch", "rows", "bound"])
+def test_direct_no_work(empty):
+    inp = _make_inputs([1], [1])
+    capacity = _out_like(inp).fill_(-7)
+    out = capacity
+    inp["cu_q"].zero_()
+    if empty == "batch":
+        for key in ("bt", "seq_lens"):
+            inp[key] = inp[key][:0]
+        for key in ("cu_q", "cu_kv"):
+            inp[key] = inp[key][:1]
+    elif empty == "rows":
+        inp["q"], out = inp["q"][:0], capacity[:0]
+    else:
+        inp["max_q"] = 0
+    _direct(inp, out)
+    # A checked torch launch immediately after Run also surfaces a pending
+    # synchronous launch-configuration error (not just an async device fault).
+    assert (capacity == -7).all().item()
+    torch.cuda.synchronize()
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("q", "query_not_16B_aligned"),
+        ("kv_buf", "kv_not_16B_aligned"),
+        ("out", "out_not_16B_aligned"),
+        ("out_shape", "out_not_bf16_contiguous"),
+        ("out_stride", "out_not_bf16_contiguous"),
+        ("v_shape", "kv_layout_not_token_interleaved"),
+        ("v_stride", "kv_layout_not_token_interleaved"),
+        ("page_stride", "kv_layout_not_token_interleaved"),
+        ("table_stride", "block_tables_geometry"),
+        ("table_rows", "block_tables_geometry"),
+        ("batch_size", "seq_lens_shape"),
+        ("seq_stride", "seq_lens_not_contiguous"),
+        ("cu_q_short", "cum_seq_lens_q_shape"),
+        ("cu_kv_short", "cum_seq_lens_kv_shape"),
+        ("cu_stride", "cum_seq_lens_q_not_int32_cuda_contiguous"),
+    ],
+)
+def test_invalid_layout_routing(monkeypatch, case, reason):
+    import flashinfer.prefill as prefill
+
+    inp = _make_inputs([2, 2], [2, 2], btw_pad=1)
+    out = _out_like(inp)
+    if case in ("q", "kv_buf"):
+        inp[case] = _offset_copy(inp[case])
+    elif case == "out":
+        out = _offset_copy(out)
+    elif case == "out_shape":
+        out = out[:-1]
+    elif case == "out_stride":
+        out = torch.empty_like(out.transpose(0, 1).contiguous()).transpose(0, 1)
+    elif case == "page_stride":
+        inp["kv_buf"] = inp["kv_buf"].repeat_interleave(2, dim=0)[::2]
+    kwargs = _kwargs(inp)
+    k, v = kwargs["kv_cache"]
+    if case == "v_shape":
+        kwargs["kv_cache"] = k, v[..., :-1]
+    elif case == "v_stride":
+        kwargs["kv_cache"] = k, v[..., :1].expand_as(v)
+    elif case == "table_stride":
+        kwargs["block_tables"] = inp["bt"][:, :1]
+    elif case == "table_rows":
+        kwargs["block_tables"] = inp["bt"][:1]
+    elif case == "batch_size":
+        kwargs["batch_size"] += 1
+    elif case == "seq_stride":
+        kwargs["seq_lens"] = inp["seq_lens"].repeat_interleave(2)[::2]
+    elif case == "cu_q_short":
+        kwargs["cum_seq_lens_q"] = inp["cu_q"][:-1]
+    elif case == "cu_kv_short":
+        kwargs["cum_seq_lens_kv"] = inp["cu_kv"][:-1]
+    elif case == "cu_stride":
+        kwargs["cum_seq_lens_q"] = inp["cu_q"].repeat_interleave(2)[::2]
+
+    calls = []
+
+    @functools.wraps(trtllm_batch_context_with_kv_cache)
+    def stock(**kw):
+        calls.append(kw["backend"])
+        return kw["out"]
+
+    monkeypatch.setattr(prefill, "trtllm_batch_context_with_kv_cache", stock)
+    monkeypatch.setattr(
+        spec_mod, "_load_module_or_failure", lambda: pytest.fail("eligible")
+    )
+    assert batch_context_with_kv_cache(out=out, **kwargs) is out
+    assert reason in spec_mod.LAST_FALLBACK_REASONS
+    with pytest.raises(ValueError, match=reason):
+        batch_context_with_kv_cache(out=out, backend="specialized", **kwargs)
+    assert calls == ["trtllm-gen"]
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "option,value,error,reason",
+    [
+        ("window_left", -1.0, TypeError, "dense_window"),
+        ("o_sf_vec_size", 16, AssertionError, "no_o_sf_vec_size"),
+    ],
+)
+def test_stock_invalid_options(monkeypatch, option, value, error, reason):
+    inp = _make_inputs([2], [2])
+    kwargs = _kwargs(inp)
+    kwargs[option] = value
+    monkeypatch.setattr(
+        spec_mod, "_load_module_or_failure", lambda: pytest.fail("eligible")
+    )
+    with pytest.raises(error) as stock:
+        trtllm_batch_context_with_kv_cache(
+            out=_out_like(inp), backend="trtllm-gen", **kwargs
+        )
+    with pytest.raises(error) as auto:
+        batch_context_with_kv_cache(out=_out_like(inp), **kwargs)
+    assert str(auto.value) == str(stock.value)
+    assert reason in spec_mod.LAST_FALLBACK_REASONS
+    with pytest.raises(ValueError, match=reason):
+        batch_context_with_kv_cache(out=_out_like(inp), backend="specialized", **kwargs)
+
+
+@requires_sm103
+def test_u2_inactive_v_padding():
+    inp = _make_inputs([2, 2], [2, 2])
+    # Keep the U2 physical capacity and launch bounds, shorten request 0.
+    inp["cu_q"].sub_(inp["cu_q"].new_tensor([0, 1, 1]))
+    inp["cu_kv"].copy_(inp["cu_q"])
+    inp["seq_lens"][0] = 1
+    inactive = inp["kv_buf"][0, 1:, 1, :].view(torch.uint8)
+    gold = _reference(inp).float()
+    outputs = []
+    for byte in (0, 0x7F):  # E4M3 zero versus NaN
+        inactive.fill_(byte)
+        out = _out_like(inp).fill_(-7)
+        _api(inp, out, backend="specialized")
+        torch.testing.assert_close(out[:3].float(), gold, atol=0.005, rtol=0.05)
+        assert (out[3] == -7).all().item()
+        outputs.append(out)
+    assert torch.equal(*outputs)
 
 
 def _make_padded_q128_inputs(B, q_len, seed=0):
@@ -350,10 +615,13 @@ def test_kill_switch_restores_stock():
 
 @requires_sm103
 def test_cuda_graph_replay_matches_eager():
-    inp = _make_inputs([2] * 8, [2] * 8, seed=5)
+    inp = _make_inputs([2, 2], [2, 4], seed=5)
     out = _out_like(inp)
-    _api(inp, out)  # eager warmup also builds the module before capture
+    _api(inp, out, backend="specialized")  # build before capture
     eager = out.clone()
+    torch.testing.assert_close(
+        eager.float(), _reference(inp).float(), atol=0.005, rtol=0.05
+    )
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -361,12 +629,20 @@ def test_cuda_graph_replay_matches_eager():
         _api(inp, out)
     torch.cuda.current_stream().wait_stream(stream)
     with torch.cuda.graph(g):
-        _api(inp, out)
+        _api(inp, out, backend="specialized")
     for _ in range(3):
         out.zero_()
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
+    # Change only the per-request KV lengths, not the launch bounds or buffers.
+    inp["seq_lens"].copy_(inp["seq_lens"].flip(0))
+    inp["cu_kv"][1:].copy_(inp["seq_lens"].cumsum(0))
+    out.fill_(float("nan"))
+    g.replay()
+    torch.testing.assert_close(
+        out.float(), _reference(inp).float(), atol=0.005, rtol=0.05
+    )
     # replay with mutated inputs: the graph must read the live buffers
     kv = inp["kv_buf"]
     kv.copy_((torch.randn_like(kv.to(torch.float32)) * 0.5).to(torch.float8_e4m3fn))
@@ -393,22 +669,7 @@ def test_generalized_entry_parity_and_dispatch():
 
     assert BATCH_CONTEXT_BACKENDS == ("auto", "specialized", "trtllm", "cake")
     inp = _make_inputs([2] * 8, [2] * 8, seed=11)
-    kv = inp["kv_buf"]
-    kwargs = dict(
-        query=inp["q"],
-        kv_cache=(kv[:, :, 0, :].unsqueeze(1), kv[:, :, 1, :].unsqueeze(1)),
-        workspace_buffer=_ws(),
-        block_tables=inp["bt"],
-        seq_lens=inp["seq_lens"],
-        max_q_len=inp["max_q"],
-        max_kv_len=inp["max_kv"],
-        bmm1_scale=SCALE,
-        bmm2_scale=1.0,
-        batch_size=int(inp["seq_lens"].shape[0]),
-        cum_seq_lens_q=inp["cu_q"],
-        cum_seq_lens_kv=inp["cu_kv"],
-        window_left=-1,
-    )
+    kwargs = _kwargs(inp)
     # "auto" selects "specialized" on its allowlist (dispatch stats move)
     before = dict(spec_mod.DISPATCH_STATS)
     gen_out = batch_context_with_kv_cache(out=_out_like(inp), **kwargs)
@@ -428,31 +689,20 @@ def test_generalized_entry_parity_and_dispatch():
     gen_stock = batch_context_with_kv_cache(
         out=_out_like(inp), backend="trtllm", **kwargs
     )
-    direct_stock = _api(inp, _out_like(inp), backend="trtllm")
+    direct_stock = trtllm_batch_context_with_kv_cache(
+        out=_out_like(inp), backend="trtllm-gen", **kwargs
+    )
     assert torch.equal(gen_stock, direct_stock)
     # off-allowlist: auto selects "trtllm"; explicit "specialized" raises
     big = _make_inputs([2] * 2, [600] * 2, seed=13)  # multi-page KV
-    bkv = big["kv_buf"]
-    bkwargs = dict(
-        query=big["q"],
-        kv_cache=(bkv[:, :, 0, :].unsqueeze(1), bkv[:, :, 1, :].unsqueeze(1)),
-        workspace_buffer=_ws(),
-        block_tables=big["bt"],
-        seq_lens=big["seq_lens"],
-        max_q_len=big["max_q"],
-        max_kv_len=big["max_kv"],
-        bmm1_scale=SCALE,
-        bmm2_scale=1.0,
-        batch_size=int(big["seq_lens"].shape[0]),
-        cum_seq_lens_q=big["cu_q"],
-        cum_seq_lens_kv=big["cu_kv"],
-        window_left=-1,
-    )
+    bkwargs = _kwargs(big)
     before = dict(spec_mod.DISPATCH_STATS)
     auto_out = batch_context_with_kv_cache(out=_out_like(big), **bkwargs)
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
-    trt_out = batch_context_with_kv_cache(
-        out=_out_like(big), backend="trtllm", **bkwargs
+    assert spec_mod.DISPATCH_STATS["fallback"] == before["fallback"] + 1
+    assert "multi_page_regime" in spec_mod.LAST_FALLBACK_REASONS
+    trt_out = trtllm_batch_context_with_kv_cache(
+        out=_out_like(big), backend="trtllm-gen", **bkwargs
     )
     assert torch.equal(auto_out, trt_out)
     with pytest.raises(ValueError, match="fallback_reasons"):

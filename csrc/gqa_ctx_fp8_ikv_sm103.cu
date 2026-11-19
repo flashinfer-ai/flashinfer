@@ -2368,10 +2368,13 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
   const int total_B = static_cast<int>(seq_lens.shape()[0]);
   const int btw = static_cast<int>(block_table.shape()[1]);
   const int max_q = static_cast<int>(max_q_len);
-  // No query rows: nothing to attend or write.  Every route below would
-  // compute a zero grid.x, and a zero-width launch is an invalid
-  // configuration whose error surfaces at an unrelated later call.
-  if (max_q <= 0 || q.shape()[0] == 0) return;
+  // Reserved rows need not imply any requests. Never launch an empty grid.
+  if (total_B == 0 || max_q <= 0 || q.shape()[0] == 0) return;
+  if ((reinterpret_cast<uintptr_t>(q.data_ptr()) | reinterpret_cast<uintptr_t>(kv_buf.data_ptr()) |
+       reinterpret_cast<uintptr_t>(out.data_ptr())) &
+      15) {
+    TVM_FFI_THROW(ValueError) << "q, kv_buf and out must be 16-byte aligned";
+  }
   const bool uniform128 =
       max_q == 128 && max_kv_len == 128 && q.shape()[0] == (int64_t)total_B * 128;
 

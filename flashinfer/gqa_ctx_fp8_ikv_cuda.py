@@ -34,15 +34,15 @@ def get_gqa_ctx_fp8_ikv_module():
 # A failed module build/load (e.g. a cache-only deployment without the
 # compiled artifact) is cached -- functools.cache does not cache exceptions,
 # so without this every allowlisted "auto" call would retry the build before
-# falling back.  Published atomically as one (reason_string, exception)
-# tuple under _MODULE_LOAD_LOCK, which also serializes the first load.
-_MODULE_LOAD_FAILURE: "tuple | None" = None
+# falling back. Cache text only: an exception's traceback retains callers.
+# _MODULE_LOAD_LOCK also serializes the first load.
+_MODULE_LOAD_FAILURE: "tuple[str, str] | None" = None
 _MODULE_LOAD_LOCK = threading.Lock()
 
 
 def _load_module_or_failure():
     """Load (and cache) the specialized module; return None on success or
-    the cached (reason, exception) tuple when it cannot be built/loaded."""
+    the cached (reason, diagnostic) tuple when it cannot be built/loaded."""
     global _MODULE_LOAD_FAILURE
     failure = _MODULE_LOAD_FAILURE
     if failure is not None:
@@ -54,7 +54,7 @@ def _load_module_or_failure():
         try:
             get_gqa_ctx_fp8_ikv_module()
         except Exception as e:  # pragma: no cover - environment-dependent
-            failure = ("specialized_module_unavailable:" + type(e).__name__, e)
+            failure = ("specialized_module_unavailable:" + type(e).__name__, str(e))
             _MODULE_LOAD_FAILURE = failure
             return failure
     return None
@@ -85,6 +85,7 @@ def supported_with_reasons(
     bmm2_scale,
     out,
     extras,
+    batch_size,
 ):
     """Guard order: GPU-free (kill switch, API-surface flags, dtype,
     geometry allowlist) -> layout guards -> device guards. Returns [] when
@@ -100,6 +101,7 @@ def supported_with_reasons(
         ("no_sinks", extras.get("sinks") is None),
         ("no_kv_cache_sf", extras.get("kv_cache_sf") is None),
         ("no_o_sf", extras.get("o_sf_scale") is None),
+        ("no_o_sf_vec_size", extras.get("o_sf_vec_size") is None),
         ("no_skip_softmax", extras.get("skip_softmax") is None),
         ("shared_paged_kv_idx", bool(extras.get("uses_shared_paged_kv_idx"))),
         ("no_multi_ctas_buf", extras.get("multi_ctas") is None),
@@ -107,7 +109,10 @@ def supported_with_reasons(
         ("hnd_layout", extras.get("kv_layout") == "HND"),
         (
             "dense_window",
-            extras.get("window_left") == -1 and extras.get("window_right", -1) == -1,
+            all(
+                isinstance(w, int) and w == -1
+                for w in (extras.get("window_left"), extras.get("window_right", -1))
+            ),
         ),
         ("no_fp16_softmax", not extras.get("use_fp16_softmax")),
         ("no_spcompress", not extras.get("uses_spcompress")),
@@ -154,17 +159,21 @@ def supported_with_reasons(
         r.append("multi_page_regime")  # stock path wins there (measured)
     if (
         block_tables.dim() != 2
+        or block_tables.shape[0] != batch_size
+        or (batch_size > 0 and block_tables.shape[1] == 0)
         or block_tables.dtype != torch.int32
         or not block_tables.is_contiguous()
         or block_tables.device != query.device
     ):
         r.append("block_tables_geometry")
-    if (
-        seq_lens.dtype != torch.int32
-        or not seq_lens.is_contiguous()
-        or seq_lens.device != query.device
-    ):
+    if seq_lens.shape != (batch_size,):
+        r.append("seq_lens_shape")
+    if seq_lens.dtype != torch.int32:
         r.append("seq_lens_dtype")
+    if not seq_lens.is_contiguous():
+        r.append("seq_lens_not_contiguous")
+    if seq_lens.device != query.device:
+        r.append("seq_lens_device")
     for _name, _t in (
         ("cum_seq_lens_q", cum_seq_lens_q),
         ("cum_seq_lens_kv", cum_seq_lens_kv),
@@ -176,6 +185,8 @@ def supported_with_reasons(
             or _t.device != query.device
         ):
             r.append(_name + "_not_int32_cuda_contiguous")
+        elif _t.shape != (batch_size + 1,):
+            r.append(_name + "_shape")
     # the kernel's cp.async / vectorized paths need 16-byte-aligned bases;
     # contiguity alone does not establish that (e.g. backing[1:].view(...))
     for _name, _t in (("query", query), ("kv", k), ("out", out)):
@@ -191,6 +202,9 @@ def supported_with_reasons(
         or k.stride(3) != 1
         or k.stride(2) != 256
         or k.stride(0) != 128 * 256
+        or v.shape != k.shape
+        or v.device != k.device
+        or v.stride(3) != 1
         or v.stride(2) != 256
         or v.stride(0) != 128 * 256
         or k.device != query.device
@@ -238,6 +252,7 @@ def maybe_dispatch_specialized(
         bmm2_scale,
         out,
         extras,
+        batch_size,
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
@@ -247,7 +262,7 @@ def maybe_dispatch_specialized(
             # take down "auto": the first failure is cached (one build
             # attempt, not one per call) and kept as a fallback reason.
             if backend == "specialized":
-                raise failure[1]
+                raise RuntimeError(f"{failure[0]}: {failure[1]}")
             LAST_FALLBACK_REASONS[:] = [failure[0]]
             DISPATCH_STATS["fallback"] += 1
             return None

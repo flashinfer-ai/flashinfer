@@ -9931,6 +9931,7 @@ def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
                 sinks=a["sinks"],
                 kv_cache_sf=a["kv_cache_sf"],
                 o_sf_scale=a["o_sf_scale"],
+                o_sf_vec_size=a["o_sf_vec_size"],
                 skip_softmax=a["skip_softmax_threshold_scale_factor"],
                 uses_shared_paged_kv_idx=a["uses_shared_paged_kv_idx"],
                 multi_ctas=a["multi_ctas_kv_counter_buffer"],
