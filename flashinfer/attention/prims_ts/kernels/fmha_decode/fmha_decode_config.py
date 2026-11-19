@@ -1602,15 +1602,22 @@ class FmhaDecodeConfig:
         tile into registers and releases the stage before waiting for its BF16
         destination, so loading the next tile overlaps the conversion.
         """
-        # Separate-scale (SW128 payload) rings also capture with several raw
-        # stages: holding a raw stage until the BF16 destination frees (after
-        # the previous QK/PV) starved the loader; releasing it right after the
-        # LDS lets the ring run a full tile further ahead. Interleaved rows
-        # measured slower with capture.
+        # Grouped separate-scale (SW128 payload) rings also capture with
+        # several raw stages: holding a raw stage until the BF16 destination
+        # frees (after the previous QK/PV) starved the loader; releasing it
+        # right after the LDS lets the ring run a full tile further ahead.
+        # Interleaved rows, and G1 routes (2.5-4% on GB300), measured slower
+        # with capture.
         return (
             self.uses_keeps_transformed_kv
             and self.q_dtype_bytes == 2
-            and (self.kv_stages == 1 or self.uses_sw128_nvfp4_raw_payload)
+            and (
+                self.kv_stages == 1
+                or (
+                    self.uses_sw128_nvfp4_raw_payload
+                    and self.uses_q_token_kv_block_sparse_page_membership
+                )
+            )
         )
 
     @property

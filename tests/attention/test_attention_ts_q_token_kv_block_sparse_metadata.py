@@ -4305,8 +4305,9 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     stage 128-byte SW128 payload rows and a separate scale stage.
 
     ``packed`` passes the same queries as packed ``[total_q, Hq, D]`` rows
-    with ``qo_indptr``: FP8 Q up to G4 (8-32 Q rows per KV head) runs the
-    TMEM-transformed Swaps recipe, FP8 G5 and BF16 Q run the Keeps transform.
+    with ``qo_indptr``: FP8 Q up to G4 with at most 16 Q rows per KV head runs
+    the TMEM-transformed Swaps recipe; FP8 G4 with 32 rows (eight Q heads per
+    KV head), FP8 G5 and BF16 Q run the Keeps transform.
 
     ``geometry`` is (Q heads per KV head, G). Sixteen Q heads per KV head
     give 64-128 Q rows per group, more than any Swaps Q tile holds, so G4

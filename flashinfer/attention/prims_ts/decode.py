@@ -3272,9 +3272,9 @@ def _resolve_q_token_kv_block_sparse_decode_config(
 
     NVFP4 K/V is transformed into Q's compute dtype before MMA. The transform
     targets TMEM on the SwapsMmaAb recipe, or SMEM K/V rings on the KeepsMmaAb
-    recipe where ``prefers_nvfp4_keeps`` selects it (from Q's dtype, the
-    group's rows and the route count). The cache layout (interleaved rows or
-    separate scale tensors) does not affect the choice.
+    recipe where ``prefers_nvfp4_keeps`` selects it (from Q's dtype and the
+    group's size and rows). The cache layout (interleaved rows or separate
+    scale tensors) does not affect the choice.
     """
 
     from .kernels.fmha_decode.fmha_decode_config import (
@@ -3354,12 +3354,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         nvfp4_kv=use_nvfp4_kv,
     )
     nvfp4_keeps = use_nvfp4_kv and _sparse_policy.prefers_nvfp4_keeps(
-        q_dtype_key,
-        group_size,
-        heads_q_per_kv,
-        num_routes=batch_size,
-        num_kv_heads=num_kv_heads,
-        multi_processor_count=max_active_clusters,
+        q_dtype_key, group_size, heads_q_per_kv
     )
     if nvfp4_keeps:
         # The Keeps target follows Q's dtype policy, preferring Keeps even
@@ -3533,13 +3528,15 @@ def suggest_q_token_kv_block_sparse_group_size(
     """Suggest a QToken-KvBlock-Sparse-Attention group (G1-G8, G16 or G32).
 
     This pure host-side policy uses the caller-provided SM count; it never
-    queries device properties or reads tensors. For every legal group it
-    estimates the call's latency: the group's expected K/V union (from
-    ``union_exponent``) under the selected recipe's split fanout gives the KV
-    tiles per work item and the number of SM waves; grouped metadata (G >= 2)
-    and the split reduction add fixed costs. The cheapest group wins; ties
-    prefer the smaller group. Explicit G passed to plan/run is never
-    overridden.
+    queries device properties or reads tensors. For NVFP4 K/V
+    (``nvfp4_kv=True``) it estimates every legal group's call latency: the
+    group's expected K/V union (from ``union_exponent``) under the selected
+    recipe's split fanout gives the KV tiles per work item and the number of
+    SM waves; grouped metadata (G >= 2) and the split reduction add fixed
+    costs. The cheapest group wins; ties prefer the smaller group. BF16/FP8
+    caches keep the G1-G8 coverage rule (the largest group that fills the
+    SMs, shrunk only for better SM coverage); the latency constants were
+    fitted on NVFP4 only. Explicit G passed to plan/run is never overridden.
 
     Query lengths need not be divisible by the result. Packed prefill may end
     each request with a shorter route. Fixed-shape decode may pad its final
@@ -3586,27 +3583,30 @@ def suggest_q_token_kv_block_sparse_group_size(
         Growth of a G-query group's K/V union, estimated as
         ``selected * G ** union_exponent``; in [0, 1]. The default is fitted
         to latency on real sparse-indexer outputs, whose unions grow about
-        1.4x per doubling of G.
+        1.4x per doubling of G. Used with ``nvfp4_kv=True`` only.
     nvfp4_kv : bool
         Plan for NVFP4 K/V with the recipes ``plan`` takes for it (BF16 Q
         always takes KeepsMmaAb). For BF16 K/V that the caller converted from NVFP4 (see
-        ``QTokenKvBlockSparsePagedTSWrapper.run``), pass ``False``; the
-        conversion only pays with TileQ128 groups.
+        ``QTokenKvBlockSparsePagedTSWrapper.run``), pass ``False``; that
+        suggestion stays within G1-G8, while the conversion only pays with
+        TileQ128 groups, which the caller then selects explicitly.
     seq_len_kv : int, optional
         KV length of the longest request (its context including these
         queries). A group's union cannot exceed it, so short contexts (e.g. a
         prefill from an empty prefix) favor larger groups; pass it whenever it
-        is known. ``None`` keeps the uncapped union estimate.
+        is known. ``None`` keeps the uncapped union estimate. Used with
+        ``nvfp4_kv=True`` only.
     packed_query : bool
         Whether the launch passes packed queries (``qo_indptr``). G16 and G32
-        are suggested only when True and ``kv_block_size`` is at most 16;
-        ``plan`` rejects them for fixed-shape queries. Default False (G1-G8).
+        are suggested only for NVFP4 K/V when True and ``kv_block_size`` is at
+        most 16; ``plan`` rejects them for fixed-shape queries. Default False
+        (G1-G8).
 
     Returns
     -------
     int
-        One of G1--G8, or G16/G32 for packed queries, subject to the TileQ128
-        head-capacity bound.
+        One of G1--G8, or G16/G32 for packed NVFP4 queries, subject to the
+        TileQ128 head-capacity bound.
     """
 
     from .q_token_kv_block_sparse_metadata import _validate_sparse_block_size

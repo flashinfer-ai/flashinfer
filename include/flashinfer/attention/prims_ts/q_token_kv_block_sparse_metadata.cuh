@@ -669,6 +669,16 @@ __host__ __device__ constexpr int QTokenKvBlockSparseBitmapThreads() {
   return GroupSize > 16 ? 1024 : kQTokenKvBlockSparseBitmapBlockThreads;
 }
 
+// Minimum resident bit-map CTAs per SM the compiler must allow. G <= 4 routes
+// keep four 512-thread CTAs (at most 32 registers): at three, 1K routes need a
+// third wave (GB300, G4, 4K queries: 14.6 -> 24.6 us). Zero leaves larger
+// groups to the compiler's default (an explicit 1 raised G8 from 40 to 56
+// registers, one CTA fewer per SM).
+template <int GroupSize>
+__host__ __device__ constexpr int QTokenKvBlockSparseBitmapMinBlocks() {
+  return GroupSize <= 4 ? 4 : 0;
+}
+
 template <int GroupSize>
 struct QTokenKvBlockSparseBitmapSharedStorage {
   static constexpr int kMaxUnionPages = GroupSize * (kQTokenKvBlockSparseMaxBlockTopK + 1);
@@ -877,9 +887,10 @@ enum QTokenKvBlockSparseMapMode : int { kMapPerRoute = 0, kMapEntryOnly = 1, kMa
 
 template <typename PositionType, int GroupSize, bool PackedQuery, bool QueryMajor = false,
           bool WordRank = true, int MapMode = kMapPerRoute>
-__global__
-__launch_bounds__(QTokenKvBlockSparseBitmapThreads<GroupSize>()) void QTokenKvBlockSparseBitmapMetadataKernel(
-    const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
+__global__ void __launch_bounds__(QTokenKvBlockSparseBitmapThreads<GroupSize>(),
+                                  QTokenKvBlockSparseBitmapMinBlocks<GroupSize>())
+    QTokenKvBlockSparseBitmapMetadataKernel(
+        const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
   const uint32_t group = blockIdx.x / params.pattern_heads;
   const uint32_t head = blockIdx.x % params.pattern_heads;
   constexpr int kBlockThreads = QTokenKvBlockSparseBitmapThreads<GroupSize>();

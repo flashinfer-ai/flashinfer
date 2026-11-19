@@ -200,7 +200,7 @@ def test_q_token_sparse_recommendation_uses_caller_capacity(monkeypatch):
         group = suggest_prims_ts_q_token_kv_block_sparse_group_size(
             batch, sq, 2051, ratio * 2, 2, 148, head_dim=128
         )
-        assert 1 <= group <= min(32, sq, 128 // ratio)
+        assert 1 <= group <= min(8, sq, 128 // ratio)
 
 
 @pytest.mark.parametrize(

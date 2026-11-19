@@ -65,38 +65,25 @@ MAX_SWAPS_TILE_SIZE_Q = 32
 SWAPS_MAX_ROWS_D256 = 16
 
 
-def prefers_nvfp4_keeps(
-    q_dtype_key: str,
-    group_size: int,
-    heads_q_per_kv: int,
-    *,
-    num_routes: int,
-    num_kv_heads: int,
-    multi_processor_count: int,
-) -> bool:
+def prefers_nvfp4_keeps(q_dtype_key: str, group_size: int, heads_q_per_kv: int) -> bool:
     """Whether NVFP4 K/V should take the KeepsMmaAb transform target.
 
     ``group_size * heads_q_per_kv`` Q rows share one KV head. Wider groups than
-    the widest Swaps Q tile need Keeps for either Q dtype. BF16 Q always takes
-    it: its full-D256 BF16 stages measured faster than the TMEM-transformed
-    Swaps recipe on GB300 for both cache layouts. FP8 Q takes the Swaps
-    recipe for groups of at most ``SWAPS_MAX_ROWS_D256`` rows whose
-    ``num_routes * num_kv_heads`` work items fit one wave of
-    ``multi_processor_count`` CTAs, and Keeps otherwise: Swaps' per-K-row
-    softmax wins small, latency-bound launches (interleaved rows by up to
-    ~15%), while Keeps wins wider groups, larger launches and separate scale
-    tensors. The choice does not depend on the cache layout, which plan()
-    does not see.
+    the widest Swaps Q tile, and groups beyond G8, need Keeps for either Q
+    dtype. BF16 Q always takes it: its full-D256 BF16 stages measured faster
+    than the TMEM-transformed Swaps recipe on GB300. FP8 Q takes it from five
+    grouped tokens, where its per-Q-row softmax measured faster than the Swaps
+    recipe's per-K-row softmax over transformed NVFP4, and for groups of more
+    than ``SWAPS_MAX_ROWS_D256`` rows. The choice cannot depend on the scale
+    layout, which plan() does not see; below that row bound neither recipe
+    wins for both layouts.
     """
     rows = group_size * heads_q_per_kv
     if rows > MAX_SWAPS_TILE_SIZE_Q or group_size > 8:
         # Swaps reads one membership byte plane (at most eight queries).
         return True
     if q_dtype_key == "float8_e4m3fn":
-        return (
-            rows > SWAPS_MAX_ROWS_D256
-            or num_routes * num_kv_heads > multi_processor_count
-        )
+        return group_size >= 5 or rows > SWAPS_MAX_ROWS_D256
     return q_dtype_key == "bfloat16"
 
 
@@ -113,6 +100,7 @@ def select_sparse_launch(
     split_kv: bool = True,
     prefer_keeps_mma_ab: bool = False,
     nvfp4_kv: bool = False,
+    cap_swaps_rows: bool = True,
 ) -> SparseLaunch:
     """Choose the smallest fitting dense Q recipe, then useful one-wave splits.
 
@@ -121,7 +109,8 @@ def select_sparse_launch(
     ``prefer_keeps_mma_ab`` takes the one-instance Keeps recipe for wide-head
     groups even when the Swaps recipe would split KV. ``nvfp4_kv`` marks the
     NVFP4 transform path, whose recipe ``prefers_nvfp4_keeps`` already chose;
-    the raw-dtype D256 rules below then do not apply.
+    the raw-dtype D256 rule below then does not apply. ``cap_swaps_rows=False``
+    skips that rule too (the coverage G rule scores groups without it).
     """
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
@@ -195,16 +184,15 @@ def select_sparse_launch(
     # A caller preferring Keeps (the NVFP4 Keeps transform target) takes it
     # for either Q dtype.
     use_keeps = prefer_keeps_mma_ab or (q_dtype_key == "float8_e4m3fn" and splits == 1)
-    if head_dim == 256 and not nvfp4_kv:
-        # Measured D256 raw-dtype rules (GB300, see SWAPS_MAX_ROWS_D256): FP8
-        # and BF16 Swaps stop at 16 rows, and BF16 Swaps, like FP8, pays off
-        # only while split-KV is active (few routes). BF16 previously took
-        # Swaps for every group of up to 32 rows, up to 1.9x slower.
-        rows = group_size * heads_q_per_kv
-        if q_dtype_key == "float8_e4m3fn":
-            use_keeps = use_keeps or rows > SWAPS_MAX_ROWS_D256
-        elif q_dtype_key == "bfloat16":
-            use_keeps = use_keeps or rows > SWAPS_MAX_ROWS_D256 or splits == 1
+    if head_dim == 256 and not nvfp4_kv and cap_swaps_rows:
+        # Measured D256 raw-dtype rule (GB300, see SWAPS_MAX_ROWS_D256): FP8
+        # and BF16 Swaps stop at 16 rows. BF16 previously took Swaps for every
+        # group of up to 32 rows, up to 1.9x slower.
+        if group_size * heads_q_per_kv > SWAPS_MAX_ROWS_D256 and q_dtype_key in (
+            "float8_e4m3fn",
+            "bfloat16",
+        ):
+            use_keeps = True
     if head_dim in (192, 256) and candidate.tile_size_q < 64 and use_keeps:
         candidate = recipe(64)
         instances = 1
@@ -333,8 +321,10 @@ def suggest_sparse_group(
     (``prefers_nvfp4_keeps``, else one-instance Swaps). G16/G32 are
     candidates only for ``packed_query`` launches with blocks of at most
     ``MAX_WIDE_GROUP_BLOCK_SIZE`` tokens, the routes ``plan`` accepts for them.
-    Bounds and dtype validation belong to the public caller. No SQ % G
-    divisibility is required. Ties prefer the smaller G.
+    BF16/FP8 caches (``nvfp4_kv=False``) keep the coverage rule of
+    ``_suggest_sparse_group_by_coverage`` (G1-G8). Bounds and dtype validation
+    belong to the public caller. No SQ % G divisibility is required. Ties
+    prefer the smaller G.
     """
     from .kernels.fmha_decode.fmha_decode_config import (
         compute_runtime_active_splits_kv,
@@ -342,6 +332,21 @@ def suggest_sparse_group(
 
     if not 0.0 <= union_exponent <= 1.0:
         raise ValueError("union_exponent must be in [0, 1]")
+    if not nvfp4_kv:
+        # The latency constants were fitted on NVFP4 K/V only; on BF16/FP8
+        # caches they picked up to 8% slower groups than the coverage rule.
+        return _suggest_sparse_group_by_coverage(
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            selected_kv_tokens=selected_kv_tokens,
+            heads_q_per_kv=heads_q_per_kv,
+            num_kv_heads=num_kv_heads,
+            multi_processor_count=multi_processor_count,
+            head_dim=head_dim,
+            q_dtype_key=q_dtype_key,
+            split_kv=split_kv,
+            block_size=block_size,
+        )
     largest = min(MAX_GROUP_SIZE, seq_len_q, MAX_TILE_SIZE_Q // heads_q_per_kv)
     best_group, best_cost = 1, None
     candidates = sorted({g for g in _CANDIDATE_GROUPS if g <= largest} | {largest})
@@ -356,14 +361,7 @@ def suggest_sparse_group(
         groups_per_request = full_groups + int(tail > 0)
         routes = batch_size * groups_per_request
         capacity = candidate_union_tokens(group, selected_kv_tokens, block_size)
-        keeps = nvfp4_kv and prefers_nvfp4_keeps(
-            q_dtype_key,
-            group,
-            heads_q_per_kv,
-            num_routes=routes,
-            num_kv_heads=num_kv_heads,
-            multi_processor_count=multi_processor_count,
-        )
+        keeps = nvfp4_kv and prefers_nvfp4_keeps(q_dtype_key, group, heads_q_per_kv)
         launch = select_sparse_launch(
             group_size=group,
             heads_q_per_kv=heads_q_per_kv,
@@ -403,4 +401,92 @@ def suggest_sparse_group(
         cost += _REDUCE_US if active_splits > 1 else 0.0
         if best_cost is None or cost < best_cost - 1e-9:
             best_group, best_cost = group, cost
+    return best_group
+
+
+def _suggest_sparse_group_by_coverage(
+    *,
+    batch_size: int,
+    seq_len_q: int,
+    selected_kv_tokens: int,
+    heads_q_per_kv: int,
+    num_kv_heads: int,
+    multi_processor_count: int,
+    head_dim: int,
+    q_dtype_key: str,
+    split_kv: bool,
+    block_size: int,
+) -> int:
+    """Prefer grouping, then splitting; shrink G only for better SM coverage.
+
+    The G1-G8 rule for BF16/FP8 caches. A final short Q group contributes only
+    its live rows. A fully-shared per-query KV proxy estimates useful active
+    splits, rather than counting every capacity-based split as active. Padding
+    breaks ties in wave coverage; it must not keep an otherwise under-filled
+    GPU grouped.
+    """
+    from .kernels.fmha_decode.fmha_decode_config import (
+        compute_runtime_active_splits_kv,
+        enumerate_grouped_q_mma_candidates,
+    )
+
+    largest = min(8, seq_len_q, MAX_TILE_SIZE_Q // heads_q_per_kv)
+    dense_candidates = enumerate_grouped_q_mma_candidates(
+        heads_q_per_kv=heads_q_per_kv, seq_len_q=largest
+    )
+    # Retain the largest group fitting each dense Q tile. Smaller groups
+    # sharing that tile only add partially occupied CTAs. At the smallest
+    # tile, still allow further ungrouping to expose otherwise idle SMs.
+    groups = {
+        min(largest, candidate.q_tokens_per_cta) for candidate in dense_candidates
+    }
+    smallest_capacity = min(
+        candidate.q_tokens_per_cta for candidate in dense_candidates
+    )
+    groups.update(range(1, min(largest, smallest_capacity) + 1))
+    best_group, best_coverage, best_density = largest, -1.0, -1.0
+    for group in sorted(groups, reverse=True):
+        full_groups, tail = divmod(seq_len_q, group)
+        routes = batch_size * (full_groups + int(tail > 0))
+        length = candidate_union_tokens(group, selected_kv_tokens, block_size)
+        # Score with the uncapped Swaps recipes, as before the 16-row Swaps
+        # bound: the bound only speeds up the group chosen here, while scoring
+        # its one-instance Keeps fanout picked smaller, slower groups.
+        launch = select_sparse_launch(
+            group_size=group,
+            heads_q_per_kv=heads_q_per_kv,
+            head_dim=head_dim,
+            q_dtype_key=q_dtype_key,
+            num_routes=routes,
+            num_kv_heads=num_kv_heads,
+            route_kv_tokens=length,
+            multi_processor_count=multi_processor_count,
+            split_kv=split_kv,
+            cap_swaps_rows=False,
+        )
+
+        # Score active work, not the configured union-capacity split grid.
+        active_splits = compute_runtime_active_splits_kv(
+            valid_k=length // group,
+            tile_size_kv=TILE_SIZE_KV,
+            num_insts_kv=launch.num_insts_kv,
+            configured_splits_kv=launch.splits_kv,
+        )
+        per_request = (full_groups + int(tail > 0)) * active_splits
+        grid = batch_size * num_kv_heads * per_request
+        waves = (grid + multi_processor_count - 1) // multi_processor_count
+        coverage = grid / waves
+        # A short final group still pays for the full Q tile. Prefer less
+        # padding only when active SM coverage is equal.
+        live_rows = batch_size * num_kv_heads * seq_len_q * heads_q_per_kv
+        density = live_rows / (routes * num_kv_heads * launch.tile_size_q)
+        if coverage > best_coverage or (
+            coverage == best_coverage and density > best_density
+        ):
+            best_group, best_coverage, best_density = group, coverage, density
+        if group == largest and grid >= multi_processor_count:
+            # The grouped Q grid already supplies a full first wave.
+            break
+        if coverage == multi_processor_count:
+            break
     return best_group
