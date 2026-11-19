@@ -927,15 +927,26 @@ def _e4m3_decode_table_values() -> tuple[float, ...]:
     return tuple(values)
 
 
+# FP8 E4M3 decode table per device; it is also the placeholder sink pointer of every
+# aligned launch.  It lives outside the LRU workspace cache, so a captured graph never
+# reads it after later workspace insertions evicted it.
+_FP8_LUTS: dict[torch.device, torch.Tensor] = {}
+
+
 def _fp8_lut(device: torch.device) -> torch.Tensor:
-    return _workspace(
-        ("fp8_lut", device),
-        lambda: {
-            "lut": torch.tensor(
-                _e4m3_decode_table_values(), dtype=torch.float32, device=device
-            )
-        },
-    )["lut"]
+    lut = _FP8_LUTS.get(device)
+    if lut is not None:
+        return lut
+    if torch.cuda.is_current_stream_capturing():
+        # Creating it copies from the host, which a stream capture cannot record.
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell: run one call on this device before CUDA graph "
+            "capture (its FP8 decode table is created on the first call)"
+        )
+    return _FP8_LUTS.setdefault(
+        device,
+        torch.tensor(_e4m3_decode_table_values(), dtype=torch.float32, device=device),
+    )
 
 
 def row_metadata(
