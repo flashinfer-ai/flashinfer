@@ -9834,6 +9834,20 @@ _BATCH_CONTEXT_DEFAULTS = dict(
 )
 
 
+@functools.cache
+def _batch_context_param_info():
+    """Stock-signature metadata for the generic front: (all parameter
+    names, required parameter names, positional index of ``backend``)."""
+    import inspect
+
+    params = inspect.signature(trtllm_batch_context_with_kv_cache).parameters
+    names = frozenset(params)
+    required = frozenset(
+        n for n, p in params.items() if p.default is inspect.Parameter.empty
+    )
+    return names, required, list(params).index("backend")
+
+
 def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
     """Generalized batch-context (chunked-prefill) attention over paged KV.
 
@@ -9857,6 +9871,15 @@ def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
         raise ValueError(
             f"backend must be one of {BATCH_CONTEXT_BACKENDS}, got {backend!r}"
         )
+    param_names, required, backend_pos = _batch_context_param_info()
+    if len(args) > backend_pos:
+        # The stock signature's positional backend slot would be silently
+        # overridden by this front's own (keyword-only) ``backend`` and then
+        # passed twice on the fallback call.
+        raise TypeError(
+            "batch_context_with_kv_cache() takes backend by keyword only; "
+            "do not pass it (or later parameters) positionally"
+        )
     if backend in ("auto", "specialized"):
         from .gqa_ctx_fp8_ikv_cuda import maybe_dispatch_specialized as _mds
 
@@ -9871,7 +9894,20 @@ def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
             a = dict(bound.arguments)
         else:
             # keyword usage (the serving call form): defaults + kwargs,
-            # no inspect machinery on the hot path
+            # no inspect machinery on the hot path.  Reject calls the stock
+            # entry would reject, so dispatch never changes error behavior.
+            unknown = kwargs.keys() - param_names
+            if unknown:
+                raise TypeError(
+                    "batch_context_with_kv_cache() got unexpected keyword "
+                    f"argument(s): {sorted(unknown)}"
+                )
+            missing = required - kwargs.keys()
+            if missing:
+                raise TypeError(
+                    "batch_context_with_kv_cache() missing required "
+                    f"argument(s): {sorted(missing)}"
+                )
             a = dict(_BATCH_CONTEXT_DEFAULTS)
             a.update(kwargs)
         served = _mds(

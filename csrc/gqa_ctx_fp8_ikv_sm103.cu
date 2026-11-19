@@ -425,8 +425,8 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny(const uint8_t* __restric
                                                         const int* __restrict__ cu_q,
                                                         const int* __restrict__ seq_lens,
                                                         __nv_bfloat16* __restrict__ out, int btw) {
-  __shared__ __half Vh[8 * VSTRH];
-  __shared__ uint16_t Ost[WARPS * 16 * OSTRH];
+  __shared__ __align__(16) __half Vh[8 * VSTRH];
+  __shared__ __align__(16) uint16_t Ost[WARPS * 16 * OSTRH];
 
   const int r = blockIdx.y;
   // one dependent round trip for all per-request metadata: issued together,
@@ -588,7 +588,7 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny_async(
     const int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ out, int btw) {
   __shared__ __align__(16) uint8_t Vstage[RAWV ? (2 * (DH / DS)) : (8 * VSTRH * sizeof(__half))];
   __half* Vh = reinterpret_cast<__half*>(Vstage);
-  __shared__ uint16_t Ost[WARPS * 16 * OSTRH];
+  __shared__ __align__(16) uint16_t Ost[WARPS * 16 * OSTRH];
   __shared__ __align__(128) uint8_t Qraw[WARPS * HQD];
   __shared__ __align__(128) uint8_t Kraw[8 * DH];
 
@@ -654,8 +654,11 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny_async(
       constexpr int VCH = (DH / DS) / 16;
       if (tid < 2 * VCH) {
         const int l = tid / VCH, ch = tid - l * VCH;
-        cpasync16(smemu32(Vstage) + (uint32_t)((l * VCH + ch) * 16),
-                  vbase + (size_t)l * KVTOK + dpart * (DH / DS) + ch * 16);
+        // Like K above: zero-fill the slot at or beyond kvlen so masked
+        // (zero-weight) PV terms never multiply raw cache bytes (0 * NaN
+        // is NaN and would make the output depend on inactive data).
+        cpasync16z(smemu32(Vstage) + (uint32_t)((l * VCH + ch) * 16),
+                   vbase + (size_t)l * KVTOK + dpart * (DH / DS) + ch * 16, (l < kvlen) ? 16 : 0);
       }
     }
     asm volatile("cp.async.commit_group;\n" ::);
@@ -2365,6 +2368,10 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
   const int total_B = static_cast<int>(seq_lens.shape()[0]);
   const int btw = static_cast<int>(block_table.shape()[1]);
   const int max_q = static_cast<int>(max_q_len);
+  // No query rows: nothing to attend or write.  Every route below would
+  // compute a zero grid.x, and a zero-width launch is an invalid
+  // configuration whose error surfaces at an unrelated later call.
+  if (max_q <= 0 || q.shape()[0] == 0) return;
   const bool uniform128 =
       max_q == 128 && max_kv_len == 128 && q.shape()[0] == (int64_t)total_B * 128;
 
