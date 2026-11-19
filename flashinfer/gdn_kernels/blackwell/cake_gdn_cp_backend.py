@@ -1796,14 +1796,16 @@ def _assert_paged_slots(
     *,
     page_size: int,
     pool_size: int,
+    max_seqlen: int,
 ) -> None:
     """Check the paged rows on the device without a host synchronization.
 
     Every row read or written is ``-1`` or in ``[0, pool_size)``, and no row
     is written twice: sequence ``b`` writes ``output_state_indices[b]`` and
     the ``checkpoint_state_indices`` entries from ``checkpoint_cu_starts[b]``
-    on, one per page boundary its new tokens cross.  Only active when
-    ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``.
+    on, one per page boundary its new tokens cross.  Every sequence with new
+    tokens has a 64-aligned prefix, and none has more than ``max_seqlen`` new
+    tokens.  Only active when ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``.
     """
 
     if not _VALIDATE_SLOTS:
@@ -1811,6 +1813,16 @@ def _assert_paged_slots(
     num_entries = int(checkpoint_state_indices.shape[0])
     prefix = prefix_lens.long()
     new_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    # The fixup fills the rows of a misaligned prefix with NaN; an empty span
+    # writes nothing, so its prefix may be anything.
+    torch._assert_async(
+        ((new_lens == 0) | (prefix % 64 == 0)).all(),
+        'GDN paged prefill backend="cake_gdn" needs 64-aligned prefix lengths',
+    )
+    torch._assert_async(
+        (new_lens <= max_seqlen).all(),
+        "GDN paged prefill max_seqlen is smaller than a sequence's new tokens",
+    )
     crossed = (prefix + new_lens) // page_size - prefix // page_size
     starts = checkpoint_cu_starts.long()
     torch._assert_async(
@@ -2075,6 +2087,7 @@ def chunk_gated_delta_rule_gdn_cp_paged_sm100(
         prefix_lens,
         page_size=page_size,
         pool_size=int(state_pool.shape[0]),
+        max_seqlen=plan.max_seqlen,
     )
 
     if plan.cu_seqlens_dtype == torch.int64:

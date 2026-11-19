@@ -358,13 +358,19 @@ def test_paged_prefill_ragged(page_size, state_dtype, dtype, heads):
     _run_paged_prefill_case(prefix_lens, new_lens, L, heads, dtype, state_dtype)
 
 
-def _skip_unless_cake_cp():
+def _skip_unless_cake_cp(*, needs_nvcc=True):
     major, minor = get_compute_capability(torch.device("cuda"))
     if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("the Cake GDN CP route needs SM100, SM103 or SM107")
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     if cuda_major < 13:
         pytest.skip("the Cake GDN CP route needs CUDA 13+")
+    if needs_nvcc and (major, minor) == (10, 7):
+        from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+        # The route rejects sm_107a below a CUDA 13.4 nvcc.
+        if not is_cuda_version_at_least("13.4"):
+            pytest.skip("the Cake GDN CP route needs CUDA 13.4+ on SM107")
 
 
 @pytest.mark.parametrize("page_size", [64, 128, 1024])
@@ -394,9 +400,10 @@ def test_paged_prefill_cake_cp_ragged(page_size, dtype, heads, max_seqlen_hint):
     )
 
 
+@pytest.mark.parametrize("page_size", [1024, 4096])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("prefix", [0, 64, 1024, 1088])
-def test_paged_prefill_cake_cp_long_padded_pool(index_dtype, prefix):
+def test_paged_prefill_cake_cp_long_padded_pool(index_dtype, prefix, page_size):
     """One long sequence whose CP chunks end on and between page boundaries,
     over a pool with padded rows."""
     _skip_if_unsupported()
@@ -406,7 +413,7 @@ def test_paged_prefill_cake_cp_long_padded_pool(index_dtype, prefix):
     _run_paged_prefill_case(
         [prefix],
         [16384 - 64],
-        1024,
+        page_size,
         (2, 2, 4),
         torch.bfloat16,
         torch.float32,
@@ -949,24 +956,53 @@ def test_paged_prefill_cake_cp_utcmma_fixups(
         assert plans[0].cp_chunk_len == cp_chunk_len
 
 
-@pytest.mark.parametrize(
-    "prefix_lens, new_lens",
-    [([32, 0], [96, 128]), ([0, 32], [128, 100])],
-    ids=["page_end", "mid_page"],
-)
-def test_paged_prefill_cake_cp_misaligned_prefix_poisons_its_rows(
-    prefix_lens, new_lens
-):
-    """A prefix that is not 64-aligned fills every row its sequence writes
-    with NaN; the aligned sequence of the batch is unaffected."""
+def test_paged_prefill_cake_cp_sm107_three_cta_fixup(monkeypatch):
+    """On sm_107a, equal sequences whose 32 row CTAs per state exceed two
+    CTAs per SM run the paged 3-CTA-per-SM SIMT fixup."""
     _skip_if_unsupported()
     _skip_unless_cake_cp()
+    fixup = "state_fixup_simt_row4_mb3_paged"
+    if _skip_unless_cake_cp_kernels(fixup) != "sm_107a":
+        pytest.skip("the 3-CTA-per-SM SIMT fixup is sm_107a only")
+    plans = _record_cake_cp_plans(monkeypatch)
+    _run_cake_cp_against_flashinfer(
+        [64, 1024],
+        [2048, 2048],
+        1024,
+        (16, 16, 64),
+        torch.bfloat16,
+        max_seqlen=2048,
+    )
+    assert [plan.fixup_kernel for plan in plans] == [fixup]
+
+
+@pytest.mark.parametrize(
+    "prefix_lens, new_lens, page_size, heads, fixup",
+    [
+        ([32, 0], [96, 128], 64, (2, 2, 4), None),
+        ([0, 32], [128, 100], 64, (2, 2, 4), None),
+        ([32, 64], [2048, 2048], 1024, (16, 16, 64), "state_fixup_utcmma128_paged"),
+    ],
+    ids=["page_end", "mid_page", "utcmma128"],
+)
+def test_paged_prefill_cake_cp_misaligned_prefix_poisons_its_rows(
+    monkeypatch, prefix_lens, new_lens, page_size, heads, fixup
+):
+    """A prefix that is not 64-aligned fills every row its sequence writes
+    with NaN; the aligned sequence of the batch is unaffected.  The SIMT and
+    the UTCMMA paged fixups both do so."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    if fixup is not None:
+        if _skip_unless_cake_cp_kernels(fixup) == "sm_107a":
+            pytest.skip("sm_107a runs the SIMT fixups only")
+        plans = _record_cake_cp_plans(monkeypatch)
     torch.manual_seed(11)
     random.seed(11)
-    L = 64
+    L = page_size
     dtype = torch.bfloat16
     totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
-    streams = Streams(totals, 2, 2, 4, dtype)
+    streams = Streams(totals, *heads, dtype)
     batch = PagedBatch(totals, L, streams.num_sab_heads, torch.float32)
     _, prefix_final, _ = _oracle(streams, prefix_lens)
     for b, p in enumerate(prefix_lens):
@@ -991,10 +1027,14 @@ def test_paged_prefill_cake_cp_misaligned_prefix_poisons_its_rows(
         last_page_len=last,
         output=out,
         backend="cake_gdn",
+        # Equal lengths under their own bound pick the UTCMMA fixup.
+        max_seqlen=None if fixup is None else max(new_lens),
     )
     torch.cuda.synchronize()
     _assert_output_guard(guard)
     batch.guarded.assert_guards()
+    if fixup is not None:
+        assert [plan.fixup_kernel for plan in plans] == [fixup]
 
     ref_out, ref_final, ref_ckpts = _oracle(streams, totals)
     good = next(b for b, p in enumerate(prefix_lens) if p % CHUNK == 0)
@@ -1129,7 +1169,8 @@ def test_cake_cp_paged_rejection_reason_needs_cuda_13_4_on_sm107(
     """The sm_107a programs need a CUDA 13.4 nvcc; the other architectures keep
     the CUDA 12.8 floor."""
     _skip_if_unsupported()
-    _skip_unless_cake_cp()
+    # The nvcc version is patched, so the check runs with any installed nvcc.
+    _skip_unless_cake_cp(needs_nvcc=False)
     gdn_cp = _cake_cp_backend()
 
     def at_least(version):
@@ -1160,13 +1201,15 @@ def _misaligned(shape, dtype):
         ("one_row_pool", "row stride of whole 16-byte groups"),
         ("grid_y", "at most 1 sequences"),
         ("tensor_map_offset", "tensor-map offsets"),
+        ("max_seqlen_below_mean", "cannot be smaller"),
     ],
 )
 def test_paged_prefill_cake_cp_rejects_before_any_launch(monkeypatch, case, match):
     """What stage 4 would reject only after the fixup has written the pool
     (misaligned q/k/v or output, a one-row pool whose row stride is not whole
-    16-byte groups), and grids past the launch or 32-bit tensor-map offset
-    limits, raise before any launch: the pool is unchanged."""
+    16-byte groups), grids past the launch or 32-bit tensor-map offset
+    limits, and a ``max_seqlen`` below ``ceil(total / num_seqs)`` raise
+    before any launch: the pool is unchanged."""
     _skip_if_unsupported()
     _skip_unless_cake_cp()
     gdn_cp = _cake_cp_backend()
@@ -1211,6 +1254,7 @@ def test_paged_prefill_cake_cp_rejects_before_any_launch(monkeypatch, case, matc
             ),
             output=output,
             backend="cake_gdn",
+            max_seqlen=127 if case == "max_seqlen_below_mean" else None,
         )
     torch.cuda.synchronize()
     assert torch.equal(pool, before)
@@ -1229,11 +1273,25 @@ pages = {
     "duplicate": [0, 0],
     "out_of_pool": [0, 4],
     "overlapping_starts": [0, 1],
+    "misaligned_prefix": [0, 1],
+    "ragged": [0, 1, 2],
+    "short_max_seqlen": [0, 1, 2],
 }[case]
-cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
+# Two sequences of one page each, except "ragged" and "short_max_seqlen": 32
+# and 96 new tokens (seq 1 over two pages); "short_max_seqlen" passes
+# max_seqlen=64, which meets the host bound ceil(128 / 2) but is less than
+# seq 1's new tokens.
+short = case in ("ragged", "short_max_seqlen")
+cu_seqlens = torch.tensor(
+    [0, 32, 128] if short else [0, 64, 128], dtype=torch.int32, device="cuda"
+)
 page_indices = torch.tensor(pages, dtype=torch.int32, device="cuda")
-page_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-last_page_len = torch.tensor([64, 64], dtype=torch.int32, device="cuda")
+page_indptr = torch.tensor(
+    [0, 1, 3] if short else [0, 1, 2], dtype=torch.int32, device="cuda"
+)
+last_page_len = torch.tensor(
+    [32, 32] if short else [64, 64], dtype=torch.int32, device="cuda"
+)
 slots = gdn_paged_prefill_slots(
     cu_seqlens, page_indices, page_indptr, 64, last_page_len
 )
@@ -1241,6 +1299,9 @@ if case == "overlapping_starts":
     # Both sequences write their page-end checkpoint to entry 0 (row 0).
     starts = torch.zeros_like(slots.checkpoint_cu_starts)
     slots = slots._replace(checkpoint_cu_starts=starts)
+if case == "misaligned_prefix":
+    # Rows and checkpoint ranges stay valid; only the prefix is not 64-aligned.
+    slots = slots._replace(prefix_lens=torch.full_like(slots.prefix_lens, 32))
 chunk_gated_delta_rule_paged(
     q,
     q,
@@ -1253,19 +1314,30 @@ chunk_gated_delta_rule_paged(
     last_page_len=last_page_len,
     slots=slots,
     backend="cake_gdn",
+    max_seqlen=64 if case == "short_max_seqlen" else None,
 )
 torch.cuda.synchronize()
 """
 
 
 @pytest.mark.parametrize(
-    "case", ["valid", "duplicate", "out_of_pool", "overlapping_starts"]
+    "case",
+    [
+        "valid",
+        "duplicate",
+        "out_of_pool",
+        "overlapping_starts",
+        "misaligned_prefix",
+        "ragged",
+        "short_max_seqlen",
+    ],
 )
 def test_paged_prefill_cake_cp_invalid_rows_fail_in_isolated_process(case):
     """With FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1 a row written by two sequences
     (through duplicate page ids or overlapping checkpoint ranges) or past the
-    pool fails a device assert (in a child: it poisons CUDA), and distinct rows
-    pass."""
+    pool, a prefix that is not 64-aligned, or a sequence with more new tokens
+    than ``max_seqlen`` fails a device assert (in a child: it poisons CUDA),
+    and distinct rows pass, also for a ragged batch without the hint."""
     _skip_if_unsupported()
     _skip_unless_cake_cp()
     repo_root = Path(__file__).resolve().parents[2]
@@ -1282,7 +1354,7 @@ def test_paged_prefill_cake_cp_invalid_rows_fail_in_isolated_process(case):
         env=env,
     )
     combined = completed.stdout + completed.stderr
-    if case == "valid":
+    if case in ("valid", "ragged"):
         assert completed.returncode == 0, combined
         return
     assert completed.returncode != 0, combined
@@ -2333,8 +2405,8 @@ def _capture(fn):
 def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
     """A captured paged prefill derives its rows from the page table at replay
     (no host synchronization): the same graph serves different prefixes,
-    including an unaligned one (64-aligned for the Cake CP route), and
-    different page ids."""
+    including an unaligned one (64-aligned for the Cake CP route), different
+    page ids, and different new lengths of the same total."""
     _skip_if_unsupported()
     if backend == "cake_gdn":
         _skip_unless_cake_cp()
@@ -2351,10 +2423,18 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
     indptr = torch.empty(3, dtype=torch.int32, device="cuda")
     last = torch.empty(2, dtype=torch.int32, device="cuda")
     guard, out = _guarded_output(sum(new_lens), 4, q.dtype)
-    # (page ids, page counts, last_page_len): prefixes 0 / 256, then 100 / 0.
+    # (page ids, page counts, last_page_len, new lengths): prefixes 0 / 256,
+    # then 100 / 0 (128 / 0 for the Cake CP route), then new lengths 130 / 70
+    # after prefixes 64 / 128.
     steps = [
-        ([4, 7, 1, 12, 3], [1, 4], [70, 2]),
-        ([6, 9, 2, 11, 15], [2, 2], [42 if backend == "flashinfer" else 70, 2]),
+        ([4, 7, 1, 12, 3], [1, 4], [70, 2], new_lens),
+        (
+            [6, 9, 2, 11, 15],
+            [2, 2],
+            [42 if backend == "flashinfer" else 70, 2],
+            new_lens,
+        ),
+        ([5, 8, 0, 10, 13], [2, 2], [66, 70], [130, 70]),
     ]
 
     def call(state_pool, output):
@@ -2376,10 +2456,11 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
         )
 
     def set_tables(step):
-        page_ids, counts, last_lens = step
+        page_ids, counts, last_lens, lens = step
         indices.copy_(torch.tensor(page_ids, dtype=torch.int32))
         indptr.copy_(_cu(counts, "cpu"))
         last.copy_(torch.tensor(last_lens, dtype=torch.int32))
+        cu.copy_(_cu(lens, "cpu"))
 
     set_tables(steps[0])
     graph = _capture(lambda warmup: call(scratch if warmup else pool, out))
@@ -2399,6 +2480,69 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables(backend):
         )
         torch.testing.assert_close(
             pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"step {i}: pool"
+        )
+
+
+def test_paged_prefill_cake_cp_cuda_graph_interleaved_plans():
+    """Two captured Cake CP calls with different plans (batch shapes, heads and
+    page sizes) replay in turn, A, B, A, each matching an eager call of its
+    own inputs: neither graph depends on the other's workspaces."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    torch.manual_seed(12)
+    random.seed(12)
+
+    def setup(new_lens, heads, page_size, page_ids, counts, last_lens):
+        streams = Streams(new_lens, *heads, torch.bfloat16)
+        q, k, v, g, beta = streams.slices([0] * len(new_lens), new_lens)
+        cu = _cu(new_lens, "cuda")
+        pool = torch.randn(
+            16, streams.num_sab_heads, HEAD_SIZE, HEAD_SIZE, device="cuda"
+        )
+        indices = torch.tensor(page_ids, dtype=torch.int32, device="cuda")
+        indptr = _cu(counts, "cuda")
+        last = torch.tensor(last_lens, dtype=torch.int32, device="cuda")
+        guard, out = _guarded_output(sum(new_lens), streams.num_sab_heads, q.dtype)
+
+        def call(state_pool, output):
+            return chunk_gated_delta_rule_paged(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                1.0 / math.sqrt(HEAD_SIZE),
+                cu_seqlens=cu,
+                state_pool=state_pool,
+                page_indices=indices,
+                page_indptr=indptr,
+                page_size=page_size,
+                last_page_len=last,
+                output=output,
+                backend="cake_gdn",
+            )
+
+        scratch = pool.clone()
+        graph = _capture(lambda warmup: call(scratch if warmup else pool, out))
+        return graph, call, pool, guard, out
+
+    # A: two sequences after prefixes 128 / 0 on 128-token pages.
+    a = setup([70, 130], (4, 4, 4), 128, [4, 7, 1, 12], [2, 2], [70, 2])
+    # B: one sequence after a 256-token prefix on 64-token pages.
+    b = setup([256], (2, 2, 4), 64, [3, 9, 11, 2, 6, 14, 0, 8], [8], [64])
+    for i, (graph, call, pool, guard, out) in enumerate((a, b, a)):
+        expected_pool = pool.clone()
+        expected_out = torch.empty_like(out)
+        call(expected_pool, expected_out)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_output_guard(guard)
+        torch.testing.assert_close(
+            out, expected_out, atol=1e-3, rtol=1e-3, msg=f"replay {i}: output"
+        )
+        torch.testing.assert_close(
+            pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"replay {i}: pool"
         )
 
 

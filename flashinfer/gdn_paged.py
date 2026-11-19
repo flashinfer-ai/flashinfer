@@ -408,10 +408,12 @@ def chunk_gated_delta_rule_paged(
         inside the split; it needs SM100, SM103 or SM107, a float32
         ``state_pool`` whose row stride is a multiple of 4 elements, and every
         prefix length (the tokens before ``cu_seqlens[b]``) a multiple of 64.
-        The caller must keep the prefixes 64-aligned; they are not checked.
-        For a sequence whose prefix is not, every page row it would write (the
-        page of each page boundary it crosses and its last page) is filled
-        with NaN instead of a state; the other sequences are unaffected. Its
+        The caller must keep the prefixes 64-aligned; they are checked only
+        with ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``, where a misaligned
+        prefix fails a device assert. Otherwise, for a sequence whose prefix
+        is not, every page row it would write (the page of each page boundary
+        it crosses and its last page) is filled with NaN instead of a state;
+        the other sequences are unaffected. Its
         results are not bitwise those of
         ``"flashinfer"`` (about 4e-3 relative on the states), and its
         checkpoint bits depend on the batch shape. It helps when few states
@@ -421,7 +423,11 @@ def chunk_gated_delta_rule_paged(
         slower (0.4-0.8x) at 64 or more.
     max_seqlen : int, optional
         With ``backend="cake_gdn"``, an upper bound of the new tokens of any
-        sequence; it sizes the split. Without it the bound is the total.
+        sequence; it sizes the split. Without it the bound is the total, and
+        a larger value is clamped to the total. A value smaller than the new
+        tokens of a sequence is undefined behavior; it is checked only with
+        ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``, where it fails a device
+        assert.
 
     Returns
     -------
