@@ -236,6 +236,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     global_sum[group][0] = global_sum[group][1] = 0.f;
   }
 
+  const auto copy_rope_a = cute::make_tiled_copy_A(
+      cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, uint16_t>{}, cute::make_tiled_mma(RopeMma{}));
   uint32_t raw_ready_phase = 0;
   uint32_t vt_ready_phase[STREAMING_VT_PIPE_STAGES] = {};
   int raw_consumer_slot = 0;
@@ -276,9 +278,12 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
         auto rA = cute::make_tensor<uint32_t>(cute::make_layout(cute::_4{}));
-        const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
-        const int col = ks * 16 + (lane >> 4) * 8;
-        cute_ldsm4(sm.q_rope(group) + CutePrefillQRopeLayout{}(row, col), rA);
+        // Partition the swizzled [head,RoPE feature] tile directly.
+        auto sQ =
+            cute::make_tensor(cute::make_smem_ptr(sm.q_rope(group)), CutePrefillQRopeLayout{});
+        auto sQTile = cute::local_tile(sQ, cute::Shape<cute::_16, cute::_16>{},
+                                       cute::make_coord(cute::_0{}, ks));
+        copy_mma_operand<uint16_t, 8>(copy_rope_a, cute::recast<uint16_t>(sQTile), rA, lane);
         auto rC = cute::make_tensor(&qk[group][0][0], cute::make_layout(cute::_4{}));
         cute::MMA_Atom<RopeMma>{}.call(rA, rB, rC);
       }
@@ -493,7 +498,11 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
         auto rAg = rA(cute::_, group);
-        cute_load_rope_a(sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane, rAg);
+        auto sP = cute::make_tensor(
+            cute::make_smem_ptr(sm.p_full(group) + ks * 16),
+            cute::Layout<cute::Shape<cute::_16, cute::_16>,
+                         cute::Stride<cute::Int<STREAMING_P_STRIDE>, cute::_1>>{});
+        copy_mma_operand<uint16_t, 8>(copy_rope_a, cute::recast<uint16_t>(sP), rAg, lane);
       }
 #pragma unroll
       for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
