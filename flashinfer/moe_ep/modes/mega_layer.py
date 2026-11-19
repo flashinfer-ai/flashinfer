@@ -431,10 +431,6 @@ class MoEEpMegaLayer(nn.Module):
         """
         if self._destroyed:
             raise MoEEpConfigError("MegaMoE layer has been destroyed")
-        return self._get_transformed_weights()
-
-    def _get_transformed_weights(self) -> Any:
-        """Return this layer's one-time backend weight transformation."""
         if self._transformed is None:
             if not self._mega_config.preprocess_weights:
                 raise MoEEpConfigError(
@@ -685,7 +681,7 @@ class MoEEpMegaLayer(nn.Module):
             assert validation_key is not None
             self._forward_signatures[validation_key] = signature
 
-        transformed_weights = self._get_transformed_weights()
+        transformed_weights = self.get_transformed_weights()
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             kernel.validate_capture_ready(
                 backend_workspace,
