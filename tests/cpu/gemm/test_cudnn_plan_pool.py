@@ -370,6 +370,7 @@ def test_child_forked_during_a_build_exits_without_hanging(fake_cmd, monkeypatch
         with pool._lock:
             pid = os.fork()
             if pid == 0:
+                pool.disable("child")
                 pool.shutdown()
                 pool_mod._shutdown_pool()
                 os._exit(0)

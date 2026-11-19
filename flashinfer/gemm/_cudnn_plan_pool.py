@@ -222,6 +222,8 @@ class CudnnPlanBuildPool:
 
     def disable(self, reason) -> None:
         """Stop the workers and build in-process from now on (e.g. a result failed to load)."""
+        if os.getpid() != self._owner_pid:
+            return
         with self._lock:
             if not self._broken:
                 self._fail(reason)
