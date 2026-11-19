@@ -1,6 +1,12 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
+"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>`` and its soft-capped variant.
+
+The logits soft cap is a class dimension: under the capped class every score leaf ``s`` is ``tanh(mul(s, ca))``
+(``capped_score``; the capped logit ``cap * tanh(s * sm_scale / cap)`` in natural units) and the rest of the dataflow -- the row
+maximum, the rescale, the exponentials, the merge -- is unchanged, read with ``c = fp32(cap * log2(e))``. The cap's value enters
+through the runtime scalars ``ca`` and ``c`` only (symbolic leaves, as ``sm_scale`` is), so one capped class per head dim covers
+every cap. Without a cap the terms and the fingerprints are the uncapped class's.
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -95,6 +101,42 @@ def scale_log2(sm_scale: float) -> float:
             f"sm_scale {sm_scale}: sm_scale * log2(e) is outside the binary32 range"
         )
     return to_f32(c)
+
+
+def check_soft_cap(logits_soft_cap: Optional[float]) -> float:
+    """The cap of a call as a float: ``0.0`` for ``None`` / ``0`` (the uncapped class), the value for a positive finite cap;
+    ``ValueError`` for anything else (a negative, infinite or NaN cap names no class)."""
+    if logits_soft_cap is None:
+        return 0.0
+    cap = float(logits_soft_cap)
+    if not (math.isfinite(cap) and cap >= 0.0):
+        raise ValueError(
+            f"logits_soft_cap {logits_soft_cap}: the class takes a positive finite cap, or 0 / None for no cap"
+        )
+    return cap
+
+
+def soft_cap_scales(sm_scale: float, logits_soft_cap: float) -> tuple:
+    """The two runtime scalars of the capped class, each formed on the host in double precision and rounded ONCE to binary32:
+
+    * ``ca = fp32(sm_scale / cap)``: the factor that takes a raw score ``s`` to the argument of its capped value
+      (``capped_score``: ``tanh(mul(s, ca))``);
+    * ``c = fp32(cap * log2(e))``: the log2 scale of the capped scores (``cap * tanh(.)`` in natural units), which takes the place
+      of ``fp32(sm_scale * log2(e))`` in every later step (and ``nc = -c``).
+
+    ``OverflowError`` when either is not a binary32 number; the caller refuses a zero."""
+    cap = float(logits_soft_cap)
+    ca = float(sm_scale) / cap
+    c = cap * (1.0 / math.log(2.0))
+    for name, v in (
+        ("sm_scale / logits_soft_cap", ca),
+        ("logits_soft_cap * log2(e)", c),
+    ):
+        if not abs(v) <= FLT_MAX:
+            raise OverflowError(
+                f"sm_scale {sm_scale}, logits_soft_cap {logits_soft_cap}: {name} is outside the binary32 range"
+            )
+    return to_f32(ca), to_f32(c)
 
 
 # ----------------------------------------------------------------------------- the row and its tiles
@@ -206,6 +248,24 @@ def score_term(fp, row: RowSpec, k: int, D: int):
     return gemm_kfold(D, row.row, k).canonical(fp)
 
 
+def capped_score(fp, s, ca):
+    """The soft-capped score leaf ``t = tanh(mul(s, ca))`` in ``[-1, 1]``, with ``ca = fp32(sm_scale / cap)``: one ``mul.rn`` and
+    the class's opaque ``tanh`` (PTX ``tanh.approx.f32``, deterministic per architecture -- a hardware primitive of the capped
+    class as ``ex2`` is of both). The capped logit in natural units is ``cap * t``; the later steps take ``t`` where the uncapped
+    class takes the raw score, with ``c = fp32(cap * log2(e))`` (``soft_cap_scales``), so the running maximum, the rescale and the
+    exponentials are all over the capped scores. Saturation needs no special case: ``tanh`` returns exactly ``+-1`` for large
+    arguments and for the infinities an overflowing ``mul`` gives. A masked key has no leaf at all: the mask is applied after the
+    cap."""
+    return fp.tanh(fp.mul(s, ca))
+
+
+def capped_scores2(fp, s0, s1, ca):
+    """``(capped_score(s0), capped_score(s1))`` with the two ``mul.rn`` issued as one ``mul.rn.f32x2``: a packing placement of
+    the same two leaves."""
+    x0, x1 = fp.mul2((s0, s1), (ca, ca))
+    return fp.tanh(x0), fp.tanh(x1)
+
+
 def alpha_term(fp, m_old, m_new, c, nc):
     """``alpha = EX2(add(mul(m_old, c), mul(m_new, nc)))``: the rescale from the two ROUNDED products
     (``nc = -c`` exactly, so this is ``ms_old - ms_new``); an unchanged maximum gives ``add = +0`` and
@@ -262,8 +322,15 @@ def tile_step(fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int) -> Sta
     """One tile of the per-chunk fold (the ``tile`` digit's step). ``tile`` = ``{"t": abs tile index,
     "keys": visible absolute keys, "row": RowSpec}``."""
     row, t, keys, T = tile["row"], tile["t"], tile["keys"], tile["T"]
+    ca = tile.get("ca")  # the capped class: every score leaf is its capped value
     scores = [
-        score_term(fp, row, t * T + k, D) if (t * T + k) in keys else None
+        (
+            score_term(fp, row, t * T + k, D)
+            if ca is None
+            else capped_score(fp, score_term(fp, row, t * T + k, D), ca)
+        )
+        if (t * T + k) in keys
+        else None
         for k in range(T)
     ]
     m_new, alpha, probs, l_new = tile_stats(fp, st.m, st.l, scores, c, nc)
@@ -297,13 +364,21 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
 
 
 def attention_reduction(
-    row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS, C: Optional[int] = None
+    row: RowSpec,
+    D: int,
+    d: int,
+    c,
+    nc,
+    T: int = TILE_KEYS,
+    C: Optional[int] = None,
+    ca=None,
 ) -> Reduction:
     """The per-row dataflow as an engine ``Reduction`` with two ``fold`` digits: ``tile`` (radix
     ``C/T``, the online softmax inside a chunk) and ``chunk`` (radix = chunks of the prefix, the
     merge). Leaves are tile descriptors; absent tiles (no visible key) are ``None`` and dropped, an
     all-absent chunk folds to ``None`` and is dropped by the chunk fold. ``T`` and ``C`` may be
-    shrunk for the Lean cases; the class uses the module constants."""
+    shrunk for the Lean cases; the class uses the module constants. ``ca`` (the capped class, ``None`` otherwise): the score
+    leaves are ``capped_score(s, ca)``; a masked key stays absent, so the mask is applied after the cap by construction."""
     C = chunk_len(D, row.L) if C is None else C
     assert C % T == 0
     n_chunks = max(1, -(-row.L // C))
@@ -311,7 +386,12 @@ def attention_reduction(
     def leaf(fp, idx):
         t = idx["chunk"] * (C // T) + idx["tile"]
         keys = visible_keys(row, t, T)
-        return {"t": t, "keys": keys, "row": row, "T": T} if keys else None
+        if not keys:
+            return None
+        tl = {"t": t, "keys": keys, "row": row, "T": T}
+        if ca is not None:
+            tl["ca"] = ca
+        return tl
 
     tile = Digit(
         "tile",
@@ -330,7 +410,11 @@ def attention_reduction(
         step=lambda fp, a, b: merge(fp, a, b, c, nc),
         identity_note="absent chunks are dropped (never merged)",
     )
-    return Reduction(f"attn.bf16.d{D}[T={T},C={C}]", (tile, chunk), leaf)
+    return Reduction(
+        f"attn.bf16.d{D}{'' if ca is None else '.softcap'}[T={T},C={C}]",
+        (tile, chunk),
+        leaf,
+    )
 
 
 def fold_placement(red: Reduction) -> canon.Placement:
@@ -362,14 +446,21 @@ class AttentionSpec:
         T: int = TILE_KEYS,
         C: Optional[int] = None,
         out_fmt: str = "bf16",
+        soft_cap: bool = False,
     ):
         self.D, self.T, self.out_fmt = D, T, out_fmt
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
         self.c, self.nc = self.alg.sym("c"), self.alg.sym("nc")
+        # the capped class: the cap's value enters through two runtime scalars, ``ca`` and the ``c`` / ``nc`` the caller passes
+        # (``soft_cap_scales``), all symbolic leaves like the uncapped class's ``c`` -- one class covers every cap value
+        self.soft_cap = bool(soft_cap)
+        self.ca = self.alg.sym("ca") if soft_cap else None
 
     def reduction(self, row: RowSpec, d: int) -> Reduction:
-        return attention_reduction(row, self.D, d, self.c, self.nc, self.T, self.C)
+        return attention_reduction(
+            row, self.D, d, self.c, self.nc, self.T, self.C, self.ca
+        )
 
     def state(self, row: RowSpec, d: int) -> State:
         return self.reduction(row, d).canonical(self.alg)
@@ -387,19 +478,29 @@ FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
+# the capped classes (``spec_fingerprint(D, soft_cap=True)``): the same term with every score leaf through ``capped_score``
+FINGERPRINTS_SOFT_CAP = {
+    64: "attn-bf16-d64-sc-d2f04f0d951ad108",
+    128: "attn-bf16-d128-sc-4d20bafe3df5e7bb",
+    256: "attn-bf16-d256-sc-e5998570166e4b31",
+}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
+def spec_fingerprint(
+    D: int = 128, window_left: int = -1, soft_cap: bool = False
+) -> str:
     """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
     spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
     masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
     input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row."""
-    key = (D, window_left)
+    is the digest of the no-window sample row; ``window_left`` here only selects another sample row. The soft cap IS a class
+    dimension: under ``soft_cap`` every score leaf of the sample row is ``capped_score`` (name ``attn-bf16-d<D>-sc-*``); the cap's
+    value, like ``sm_scale``, is a runtime input of that class and does not enter the digest."""
+    key = (D, window_left, bool(soft_cap))
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
-        spec = AttentionSpec(D)
+        spec = AttentionSpec(D, soft_cap=soft_cap)
         row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
         parts = [
             f"D={D}",
@@ -409,8 +510,11 @@ def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
+        if soft_cap:
+            parts.insert(3, "score=softcap")
         _FINGERPRINTS[key] = (
             f"attn-bf16-d{D}-"
+            + ("sc-" if soft_cap else "")
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]

@@ -90,10 +90,14 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
-    from ..attention.batch_invariant.spec import spec_fingerprint
+def _attention_fingerprint(
+    head_dim: int, logits_soft_cap: Optional[float] = None
+) -> str:
+    """The attention class at ``head_dim``; ``logits_soft_cap`` as given to ``plan()``: ``None`` / ``0`` the uncapped class, a
+    positive finite cap the capped class (one class for every cap value: the value is a runtime input)."""
+    from ..attention.batch_invariant.spec import check_soft_cap, spec_fingerprint
 
-    return spec_fingerprint(head_dim)
+    return spec_fingerprint(head_dim, soft_cap=check_soft_cap(logits_soft_cap) > 0)
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -610,15 +614,17 @@ CLASSES: Dict[str, ClassInfo] = {
         ("arch",),
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class. `logits_soft_cap` (as given to
+    # plan()) is an optional dimension: a positive cap names the capped class, whose score leaves are cap * tanh(score / cap);
+    # the cap's value is an input of that class, like sm_scale, and does not enter the identifier
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("logits_soft_cap",)
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("logits_soft_cap",)
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("logits_soft_cap",)
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -721,12 +727,19 @@ def fingerprint(op: str, **dims) -> str:
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    class's no-window sample row and covers windowed calls too. ``logits_soft_cap`` (optional, the value given to ``plan()``)
+    selects the capped class: with a positive finite cap every score is ``cap * tanh(score * sm_scale / cap)``, a different
+    term with its own fingerprint (``attn-bf16-d<D>-sc-*``); the cap's value is a runtime input of that class, as ``sm_scale``
+    is, so every positive cap gives the same fingerprint, and ``None`` / ``0`` give the uncapped class's.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128)  # doctest: +SKIP
+    'attn-bf16-d128-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, logits_soft_cap=50.0)  # doctest: +SKIP
+    'attn-bf16-d128-sc-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
