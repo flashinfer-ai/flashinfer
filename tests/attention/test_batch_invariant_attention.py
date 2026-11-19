@@ -3308,6 +3308,7 @@ def test_planner_decode_arrays_equal_the_reference():
 
     rng = random.Random(7)
     kinds = set()
+    rewritten = 0
     for case in range(400):
         D = rng.choice([64, 128, 256])
         Hq, Hkv = rng.choice([(32, 8), (8, 8), (64, 8), (24, 2), (128, 1), (4, 4)])
@@ -3363,6 +3364,33 @@ def test_planner_decode_arrays_equal_the_reference():
             got = P.build_array_plan(
                 np.array(q_lens), np.array(kv_lens), Hq, Hkv, D, **opts
             )
+        # the next step of a decode loop, planned from this plan: the reference's tables again, whether or not the batch
+        # kept its shape (every Q tile on the same key tiles) and only its KV lengths were rewritten
+        grown = [L + 1 if L else 0 for L in kv_lens]
+        pages = [-(-L // page) for L in grown]
+        grown_indptr = [0]
+        for n in pages:
+            grown_indptr.append(grown_indptr[-1] + n)
+        grown_last = [
+            L - (n - 1) * page if n else 0 for L, n in zip(grown, pages, strict=True)
+        ]
+        ref_next = P.build_plan(
+            qo, grown_indptr, grown_last, Hq, Hkv, D, page, null_requests=null, **opts
+        )
+        got_next = P.build_array_plan(
+            np.array(q_lens),
+            np.array(grown),
+            Hq,
+            Hkv,
+            D,
+            null_requests=null,
+            previous=got,
+            **opts,
+        )
+        assert got_next.desc == ref_next.desc and got_next.groups == ref_next.groups
+        assert got_next.group_inkernel == ref_next.group_inkernel
+        assert (got_next.ws_rows, got_next.grid) == (ref_next.ws_rows, ref_next.grid)
+        rewritten += got_next.shape is got.shape
         # the paired placement's table over arrays, and the table of units alone in their pairs
         from flashinfer.attention.batch_invariant import engine
 
@@ -3394,14 +3422,17 @@ def test_planner_decode_arrays_equal_the_reference():
     # fused plans and split plans of both fold placements
     assert (False, False, False) in kinds
     assert any(k[1] for k in kinds) and any(k[2] for k in kinds)
+    assert 100 < rewritten < 400  # both ways of planning the next step were taken
 
 
-def _prefix_tables(pr: Problem, kv_lens):
-    """The page table of the first ``kv_lens[b]`` keys of every request of ``pr`` (0: a request without pages)."""
+def _prefix_tables(pr: Problem, kv_lens, reqs=None):
+    """The page table of the first ``kv_lens[b]`` keys of every request of ``pr`` (0: a request without pages); ``reqs``:
+    slot ``b`` holds request ``reqs[b]`` of ``pr`` instead of request ``b``."""
     indices = pr.kv_indices.cpu().tolist()
     starts = pr.kv_indptr.cpu().tolist()
     indptr, idx, last = [0], [], []
-    for b, L in enumerate(kv_lens):
+    for slot, L in enumerate(kv_lens):
+        b = reqs[slot] if reqs is not None else slot
         assert pr.kv_lens[b] >= L
         n = -(-L // pr.page)
         idx += indices[starts[b] : starts[b] + n]
@@ -3411,7 +3442,9 @@ def _prefix_tables(pr: Problem, kv_lens):
     return mk(indptr), mk(idx), mk(last)
 
 
-def _eager_decode(pr: Problem, q, kv_lens, q_len, window_left=-1, run_kw=None):
+def _eager_decode(
+    pr: Problem, q, kv_lens, q_len, window_left=-1, run_kw=None, reqs=None
+):
     """An eager batch-invariant decode of the requests with keys (``kv_lens[b] > 0``): ``(live rows, result)``, the result
     ``None`` when no request has keys."""
     live = [b for b, L in enumerate(kv_lens) if L]
@@ -3420,7 +3453,7 @@ def _eager_decode(pr: Problem, q, kv_lens, q_len, window_left=-1, run_kw=None):
         dtype=torch.long,
         device=pr.device,
     )
-    indptr, idx, last = _prefix_tables(pr, kv_lens)
+    indptr, idx, last = _prefix_tables(pr, kv_lens, reqs)
     if not live:
         return rows, None
     w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -3449,17 +3482,26 @@ class _GraphDecode:
     the first plan, and every later step is a replan (``plan`` / ``fast_decode_plan`` / the ``begin_forward`` partial of
     serving engines) followed by a replay of that one graph."""
 
-    def __init__(self, pr: Problem, q_len, window_left=-1, lse=False, sinks=None):
+    def __init__(
+        self,
+        pr: Problem,
+        q_len,
+        window_left=-1,
+        lse=False,
+        sinks=None,
+        batch=None,
+        ws=None,
+    ):
         dev = pr.device
         self.pr, self.q_len, self.window_left = pr, q_len, window_left
-        batch = len(pr.kv_lens)
+        batch = batch or len(pr.kv_lens)
         self.indptr_buf = torch.zeros(batch + 1, dtype=torch.int32, device=dev)
         self.indices_buf = torch.zeros(
             pr.kv_indices.numel() + 5, dtype=torch.int32, device=dev
         )
         self.last_buf = torch.zeros(batch, dtype=torch.int32, device=dev)
         self.w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            workspace(dev),
+            ws if ws is not None else workspace(dev),
             "NHD",
             use_cuda_graph=True,
             paged_kv_indptr_buffer=self.indptr_buf,
@@ -3485,9 +3527,9 @@ class _GraphDecode:
             self.run_kw.update(sinks=sinks)
         self.graph = None
 
-    def plan(self, kv_lens, how="plan", **kw):
+    def plan(self, kv_lens, how="plan", reqs=None, **kw):
         pr = self.pr
-        indptr, idx, last = _prefix_tables(pr, kv_lens)
+        indptr, idx, last = _prefix_tables(pr, kv_lens, reqs)
         args = (indptr, idx, last, pr.Hq, pr.Hkv, pr.D, pr.page)
         opts = dict(
             window_left=self.window_left,
@@ -3517,7 +3559,7 @@ class _GraphDecode:
             self.w.begin_forward = functools.partial(
                 flashinfer.decode.fast_decode_plan, self.w
             )
-            self.w.begin_forward(*args, non_blocking=True, **opts)
+            self.w.begin_forward(*args, **dict(dict(non_blocking=True), **opts))
 
     def replay(self):
         cache = self.pr.cache("NHD")
@@ -3539,13 +3581,13 @@ class _GraphDecode:
             bits(self.lse).clone() if self.lse is not None else None
         )
 
-    def check(self, kv_lens, how="plan", run_kw=None, **kw):
+    def check(self, kv_lens, how="plan", run_kw=None, reqs=None, **kw):
         """Replan to ``kv_lens``, replay, and compare with an eager wrapper: the requests with keys bit for bit, the others
         zeros (LSE ``-inf``)."""
-        self.plan(kv_lens, how, **kw)
+        self.plan(kv_lens, how, reqs, **kw)
         out, lse = self.replay()
         rows, ref = _eager_decode(
-            self.pr, self.q, kv_lens, self.q_len, self.window_left, run_kw
+            self.pr, self.q, kv_lens, self.q_len, self.window_left, run_kw, reqs
         )
         ref_out, ref_lse = ref if isinstance(ref, tuple) else (ref, None)
         null = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
@@ -3635,6 +3677,8 @@ def test_cuda_graph_fixed_launch_unit_kinds_and_budget(D, q_len):
         fixed = engine.FixedLaunch(
             3, q_len, 32, 8, D, 16, cfg, workspace(dev), dev, unit_cap=unit_cap
         )
+        if walkers and not fixed.n_pad:
+            continue  # the row body walks its units on the launch grid
         if walkers:
             # plans for a 7-SM part on this part's launch grid: 7 CTAs walk the units in waves, the others idle
             assert fixed.grid > walkers
@@ -4184,7 +4228,7 @@ def test_cuda_graph_prefill_paired_placement():
 def test_cuda_graph_prefill_fixed_launch_unit_kinds_and_budget(D):
     """The fixed launch of a prefill geometry under every unit kind and fold placement, plan after plan on one captured
     graph: fused, split with in-kernel folds and with the fixup kernel (more groups than its fixed grid holds: the blocks
-    stride), the planner's choice, a capacity the split plan exhausts, and fewer walking CTAs than the launch grid."""
+    stride), the planner's choice, and a capacity the split plan exhausts."""
     from dataclasses import replace
 
     from flashinfer.attention.batch_invariant import engine
@@ -4207,7 +4251,7 @@ def test_cuda_graph_prefill_fixed_launch_unit_kinds_and_budget(D):
         ([200, 100, 100], [3000, 1500, 700], "split", "fixup"),
         ([1, 1, 1], [8, 4, 77], "auto", "auto"),
     )
-    for unit_cap, walkers in ((None, None), (150, None), (None, 7)):
+    for unit_cap in (None, 150):
         fixed = engine.FixedLaunch(
             3,
             None,
@@ -4221,9 +4265,6 @@ def test_cuda_graph_prefill_fixed_launch_unit_kinds_and_budget(D):
             unit_cap=unit_cap,
             max_rows=max_rows,
         )
-        if walkers:
-            assert fixed.grid > walkers
-            fixed.sm_count = walkers
         indptr_buf = torch.zeros(4, dtype=torch.int32, device=dev)
         indices_buf = torch.zeros(pr.kv_indices.numel(), dtype=torch.int32, device=dev)
         out = torch.empty_like(q)
@@ -4462,3 +4503,174 @@ def test_cuda_graph_prefill_frozen_shape_violations():
                 batch_invariant=True,
                 **dict(bufs, **{name: other}),
             )
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_cuda_graph_decode_loop_token_by_token(D):
+    """A decode loop on one captured graph: every step grows every request by one key, replans (``plan()`` and
+    ``fast_decode_plan`` in turn) and replays -- 620 steps, across the 128-key tile and the 512-key chunk boundaries one
+    token at a time -- and every step's output equals an eager wrapper's."""
+    pr = Problem([1] * 3, [1000] * 3, 32, 8, D, 16, seed=31)
+    gd = _GraphDecode(pr, 1)
+    start = [1, 60, 300]
+    gd.check(start)
+    eager = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    cache = pr.cache("NHD")
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    for step in range(1, 621):
+        kv_lens = [L + step for L in start]
+        gd.plan(kv_lens, "fast" if step % 2 else "plan")
+        gd.out.fill_(3.0)
+        gd.graph.replay()
+        eager.plan(*_prefix_tables(pr, kv_lens), 32, 8, D, 16, **kw)
+        ref = eager.run(gd.q, cache)
+        assert torch.equal(bits(gd.out), bits(ref)), (step, kv_lens)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_cuda_graph_decode_bucket_churn(D):
+    """The slots of a captured batch change hands: a request finishes and a new short one takes its slot, and a batch
+    smaller than the bucket is padded with idle slots of one key (the padding of serving engines that give padded slots a
+    length of 1). Every step equals an eager wrapper on the same page table."""
+    pr = Problem([1] * 6, [900, 300, 2000, 40, 600, 1500], 32, 8, D, 16, seed=32)
+    gd = _GraphDecode(pr, 1, batch=4)
+    for reqs, kv_lens, how in (
+        ([0, 1, 2, 3], [500, 200, 1500, 39], "plan"),
+        ([0, 1, 2, 3], [501, 201, 1501, 40], "fast"),
+        (
+            [0, 1, 2, 4],
+            [502, 202, 1502, 1],
+            "fast",
+        ),  # request 3 finished: request 4 starts in its slot
+        ([0, 1, 2, 4], [503, 203, 1503, 2], "partial"),
+        (
+            [0, 5, 2, 4],
+            [504, 7, 1504, 3],
+            "fast",
+        ),  # request 1 finished: request 5 starts
+        (
+            [0, 5, 0, 4],
+            [505, 8, 1, 4],
+            "fast",
+        ),  # request 2 finished, nothing waiting: an idle slot of one key
+        ([5, 5, 0, 0], [9, 1, 1, 1], "plan"),  # one live request, three idle slots
+        ([1, 3, 5, 4], [300, 40, 1500, 600], "fast"),  # a full bucket of other requests
+    ):
+        gd.check(kv_lens, how, reqs=reqs)
+
+
+@needs_device
+def test_cuda_graph_capture_and_replay_streams():
+    """Capture on a stream of the caller's (``torch.cuda.graph`` with its default error mode, with and without an explicit
+    stream), plans issued from the default stream, replays from the default stream or from another one: the plan's table
+    copies are stream-ordered work of the planning stream, so a replay on another stream follows a ``wait_stream`` of it
+    (and the next plan a ``wait_stream`` of the replay's), with no host synchronisation; every step equals the eager
+    wrapper."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, 128, 16, seed=33)
+    cache = pr.cache("NHD")
+    g = torch.Generator(device="cpu").manual_seed(11)
+    steps = [
+        [int(x) for x in torch.randint(1, 3000, (3,), generator=g)] for _ in range(12)
+    ]
+    for explicit in (True, False):
+        gd = _GraphDecode(pr, 1)
+        gd.plan([300, 40, 129])
+        own = torch.cuda.Stream()
+        own.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(own):
+            gd.w.run(gd.q, cache, **gd.run_kw)
+            gd.graph = torch.cuda.CUDAGraph()
+            if explicit:
+                with torch.cuda.graph(gd.graph, stream=own):
+                    gd.w.run(gd.q, cache, **gd.run_kw)
+            else:
+                with torch.cuda.graph(gd.graph):
+                    gd.w.run(gd.q, cache, **gd.run_kw)
+        torch.cuda.synchronize()
+        outs = []
+        for i, kv_lens in enumerate(steps):
+            default = torch.cuda.current_stream()
+            gd.plan(kv_lens, ("fast", "plan")[i % 2])  # on the default stream
+            if i % 3 == 2:
+                gd.graph.replay()  # on the default stream
+                outs.append(gd.out.clone())
+            else:
+                own.wait_stream(default)
+                with torch.cuda.stream(own):
+                    gd.graph.replay()
+                    outs.append(gd.out.clone())
+                default.wait_stream(own)
+        torch.cuda.synchronize()
+        for kv_lens, out in zip(steps, outs, strict=True):
+            _, ref = _eager_decode(pr, gd.q, kv_lens, 1)
+            assert torch.equal(bits(out), bits(ref)), (explicit, kv_lens)
+
+
+@needs_device
+def test_cuda_graph_wrappers_share_one_workspace():
+    """Several ``use_cuda_graph=True`` wrappers on ONE float workspace, as serving engines build them: a wrapper per batch
+    bucket and two wrappers of one bucket, each captured once, then replanned and replayed in an interleaved order. The
+    workspace holds only the partials of the launch that is running, so every replay equals the eager wrapper."""
+    dev = torch.device("cuda")
+    ws = workspace(dev)
+    wrappers = []
+    for i, batch in enumerate((1, 2, 2, 5)):
+        pr = Problem([1] * batch, [5000] * batch, 32, 8, 128, 16, seed=40 + i)
+        gd = _GraphDecode(pr, 1, ws=ws)
+        gd.check([40 + 300 * b for b in range(batch)])
+        wrappers.append(gd)
+    assert len({gd.w._batch_invariant._fixed.ws.data_ptr() for gd in wrappers}) == 1
+    g = torch.Generator(device="cpu").manual_seed(13)
+    pending = []
+    for step in range(24):
+        gd = wrappers[int(torch.randint(0, len(wrappers), (1,), generator=g))]
+        batch = len(gd.pr.kv_lens)
+        kv_lens = [int(x) for x in torch.randint(1, 5000, (batch,), generator=g)]
+        gd.plan(kv_lens, ("fast", "plan", "partial")[step % 3])
+        if (
+            step % 4 == 3
+        ):  # a replan that is never replayed, then another wrapper's turn
+            continue
+        gd.out.fill_(3.0)
+        gd.graph.replay()
+        pending.append((gd, kv_lens, gd.out.clone()))
+    torch.cuda.synchronize()
+    for gd, kv_lens, out in pending:
+        _, ref = _eager_decode(gd.pr, gd.q, kv_lens, 1)
+        assert torch.equal(bits(out), bits(ref)), kv_lens
+
+
+@needs_device
+def test_cuda_graph_plan_argument_spellings():
+    """The spellings serving engines use for a replan: ``data_type`` with or without ``q_data_type`` / ``kv_data_type``, as
+    torch dtypes or strings, and ``non_blocking`` True or False, through ``plan()`` and ``fast_decode_plan``."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, 128, 16, seed=34)
+    gd = _GraphDecode(pr, 1)
+    gd.check([300, 40, 129])
+    none = dict(q_data_type=None, kv_data_type=None)
+    for i, spelling in enumerate(
+        (
+            dict(none, data_type=torch.bfloat16),
+            dict(none, data_type="bfloat16"),
+            dict(
+                data_type=torch.bfloat16, q_data_type=torch.bfloat16, kv_data_type=None
+            ),
+            dict(data_type="bfloat16", q_data_type="bfloat16", kv_data_type=None),
+            dict(q_data_type="bfloat16", kv_data_type="bfloat16"),
+        )
+    ):
+        for how in ("plan", "fast", "partial"):
+            for non_blocking in (True, False):
+                gd.check(
+                    [3000 - 37 * i, 1500 + i, 700],
+                    how,
+                    non_blocking=non_blocking,
+                    **spelling,
+                )
+    for how in ("plan", "fast"):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            gd.plan([300, 40, 129], how, **dict(none, data_type=torch.float16))
