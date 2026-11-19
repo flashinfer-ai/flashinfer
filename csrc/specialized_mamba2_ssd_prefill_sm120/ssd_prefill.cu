@@ -227,7 +227,9 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
       float dtnext = __uint_as_float((uint32_t)dtnext_bits << 16);
       float z = dtnext + dtb_h;
       float dtf = dtnext_active ? softplus_fast(z) : 0.f;
-      if (dtf > 4096.f) *sPrec = 1;
+      // Atomic: up to 128 threads (and prolog_scan's lane 31) can escalate
+      // concurrently; plain stores of the same value are still a data race.
+      if (dtf > 4096.f) atomicOr(sPrec, 1);
       dtf_reg = dtf;
       sCum[buf * 128 + tid] = dtf * A_h;
     }
@@ -252,7 +254,7 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
         p[lane * 4 + i] = acc;
       }
       // Lane 31's final acc is the whole chunk's cumulative log-decay.
-      if (lane == 31 && fabsf(acc) > 65536.f) *sPrec = 1;
+      if (lane == 31 && fabsf(acc) > 65536.f) atomicOr(sPrec, 1);
     }
   };
   auto prolog_sc = [&](int buf) {
@@ -744,7 +746,10 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
   }
 }
 
-static int g_init[2] = {0, 0};
+// Atomic: the Python wrapper does not serialize calls, so two host threads
+// can reach the first-call attribute setup concurrently.  The setup itself is
+// idempotent; the atomic only removes the unsynchronized int data race.
+static std::atomic<int> g_init[2] = {0, 0};
 
 void RunPeer(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorView Bmat,
              ffi::TensorView Cmat, ffi::TensorView D, ffi::TensorView dt_bias, ffi::TensorView y) {
@@ -2478,8 +2483,17 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
           cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
       TVM_FFI_CHECK_CUDA_ERROR(
           cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, threads, smem));
+      // Validate this first launch before committing the state: an exception
+      // here leaves the once-flag retriable, so a failed first use (e.g. a
+      // device that cannot hold the whole cooperative grid) does not pin the
+      // kernel's launch state to a device it never launched on.
+      const int capacity = blocks_per_sm * sms;
+      TVM_FFI_ICHECK_LE(grid, capacity)
+          << "SSD cooperative grid exceeds whole-grid residency capacity";
+      TVM_FFI_ICHECK_GT(2 * grid, capacity)
+          << "SSD ring is unsafe when two cooperative grids can co-reside";
       state.device = device;
-      state.resident_capacity = blocks_per_sm * sms;
+      state.resident_capacity = capacity;
     });
     TVM_FFI_ICHECK_EQ(state.device, device)
         << "SSD cooperative launch state was initialized on another device";
@@ -2556,19 +2570,35 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
   // "native_state_other_device" — instead of launching against state that
   // was configured for a different device.
   static std::atomic<int> bound_device{-1};
-  int expected = -1;
-  if (!bound_device.compare_exchange_strong(expected, dev.device_id)) {
-    TVM_FFI_ICHECK_EQ(expected, dev.device_id)
-        << "SSD prefill native launch state is bound to CUDA device " << expected
-        << "; run other devices from a separate process";
+  static std::mutex bind_mutex;
+  auto launch = [&] {
+    // Launches below use this device's stream; make it current first (a
+    // launch whose stream belongs to a non-current device is rejected).
+    ffi::CUDADeviceGuard device_guard(dev.device_id);
+    if ((int)x.shape()[1] >= 96)
+      regx::Run(x, dt, A, Bmat, Cmat, D, dt_bias, y);
+    else
+      RunPeer(x, dt, A, Bmat, Cmat, D, dt_bias, y);
+  };
+  int bound = bound_device.load(std::memory_order_acquire);
+  if (bound == -1) {
+    // First-use path: validate and submit the launch under the lock, and
+    // commit the binding only after submission succeeds.  A failed
+    // first-launch validation (e.g. the cooperative residency check) must
+    // leave the device unbound so a later call on an eligible device is not
+    // refused by a binding that never launched anything.
+    std::lock_guard<std::mutex> lock(bind_mutex);
+    bound = bound_device.load(std::memory_order_relaxed);
+    if (bound == -1) {
+      launch();
+      bound_device.store(dev.device_id, std::memory_order_release);
+      return;
+    }
   }
-  // Launches below use this device's stream; make it current first (a
-  // launch whose stream belongs to a non-current device is rejected).
-  ffi::CUDADeviceGuard device_guard(dev.device_id);
-  if ((int)x.shape()[1] >= 96)
-    regx::Run(x, dt, A, Bmat, Cmat, D, dt_bias, y);
-  else
-    RunPeer(x, dt, A, Bmat, Cmat, D, dt_bias, y);
+  TVM_FFI_ICHECK_EQ(bound, dev.device_id)
+      << "SSD prefill native launch state is bound to CUDA device " << bound
+      << "; run other devices from a separate process";
+  launch();
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
