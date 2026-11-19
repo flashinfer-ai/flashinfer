@@ -2779,6 +2779,20 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                     reason = "kv_len < q_len (not a verify-decode batch)"
                 elif int(kv_lens.max()) > _GQA_DEC_FP8Q_SM90_MAX_KV_LEN:
                     reason = f"kv_len={int(kv_lens.max())} above measured envelope"
+                elif kv_meta[0] is not None:
+                    # kv_meta may carry lengths without a host indptr (then
+                    # the span check runs in prepare, which always has one)
+                    spans = kv_meta[0][1 : batch_size + 1].to(torch.int64) - kv_meta[
+                        0
+                    ][:batch_size].to(torch.int64)
+                    if bool(((kv_lens + page_size - 1) // page_size > spans).any()):
+                        # explicit seq_lens past their indptr page span would
+                        # make the kernel read another request's page ids;
+                        # keep such a plan on the stock resolution
+                        reason = (
+                            "seq_lens need more KV pages than the "
+                            "paged_kv_indptr span provides"
+                        )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
@@ -2981,9 +2995,25 @@ def _gqa_dec_fp8q_sm90_prepare(
             q_lens_host = qo_indptr_host[1 : batch_size + 1].to(
                 torch.int64
             ) - qo_indptr_host[:batch_size].to(torch.int64)
-            wrapper._gqa_dec_fp8q_sm90_row_seq = torch.repeat_interleave(
+            row_map = torch.repeat_interleave(
                 torch.arange(batch_size, dtype=torch.int64), q_lens_host
-            ).to(wrapper.device, non_blocking=True)
+            )
+            # A CUDA graph that captured the fallback's q_scale gather baked
+            # this buffer's device address in, so a replan must refresh the
+            # map IN PLACE: the wrapper keeps one monotonically growing
+            # device buffer and copies each plan's row indices into it. A
+            # growth re-allocation changes the address and invalidates prior
+            # captures (re-capture required), exactly like the specialized
+            # owned buffers; the old buffer is never freed while the wrapper
+            # lives, so a stale replay reads intact (previous-plan) indices.
+            buf = getattr(wrapper, "_gqa_dec_fp8q_sm90_row_seq_buf", None)
+            n = int(row_map.numel())
+            if buf is None or buf.numel() < n or buf.device != wrapper.device:
+                buf = torch.empty(n, dtype=torch.int64, device=wrapper.device)
+                wrapper._gqa_dec_fp8q_sm90_row_seq_buf = buf
+            buf[:n].copy_(row_map, non_blocking=True)
+            wrapper._gqa_dec_fp8q_sm90_row_seq = buf[:n]
+            wrapper._gqa_dec_fp8q_sm90_row_seq_batch = batch_size
         except Exception:  # best-effort map; never break the stock plan
             wrapper._gqa_dec_fp8q_sm90_row_seq = None
     if _gqa_dec_fp8q_sm90_disabled():
@@ -3038,6 +3068,26 @@ def _gqa_dec_fp8q_sm90_prepare(
                 reason = f"kv_len={int(kv_lens.max())} above measured envelope"
             elif int(kv_lens.min()) < 1:
                 reason = "kv_len < 1"
+            elif bool(
+                (
+                    (
+                        kv_lens.to(torch.int64)
+                        + _GQA_DEC_FP8Q_SM90_PAGE_SIZE
+                        - 1
+                    )
+                    // _GQA_DEC_FP8Q_SM90_PAGE_SIZE
+                    > paged_kv_indptr_host[1 : batch_size + 1].to(torch.int64)
+                    - paged_kv_indptr_host[:batch_size].to(torch.int64)
+                ).any()
+            ):
+                # the kernel reads ceil(kv_len / page_size) page ids from the
+                # request's block-table row; an explicit seq_lens entry past
+                # its paged_kv_indptr span would read another request's (or
+                # out-of-bounds) page ids
+                reason = (
+                    "seq_lens need more KV pages than the paged_kv_indptr "
+                    "span provides"
+                )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
@@ -3305,16 +3355,19 @@ def _gqa_dec_fp8q_sm90_dispatch(
     skip_softmax_threshold_scale_factor: Optional[float],
     extra_args: tuple,
     enable_pdl: bool,
-) -> Optional[torch.Tensor]:
-    """Run-time half: launch the specialized kernel and return its output, or
-    return None (nothing launched) so the caller dequantises Q and runs the
-    stock fa2 kernel. Capture-safe: no sync, no compilation; the only
-    allocation is the output tensor when the caller did not pass one (the
-    stock path allocates it in the same place)."""
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Run-time half: launch the specialized kernel and return (output, None),
+    or return (None, reason) — nothing launched — so the caller dequantises Q
+    and runs the stock fa2 kernel. The reason is THIS call's refusal (the
+    module-level _gqa_dec_fp8q_sm90_last_fallback stays a process-wide
+    diagnostic only: another wrapper may overwrite it concurrently).
+    Capture-safe: no sync, no compilation; the only allocation is the output
+    tensor when the caller did not pass one (the stock path allocates it in
+    the same place)."""
     global _gqa_dec_fp8q_sm90_announced
     state = getattr(wrapper, "_gqa_dec_fp8q_sm90_state", None)
     if state is None:
-        return None
+        return None, getattr(wrapper, "_gqa_dec_fp8q_sm90_plan_refusal", None)
     counters = _gqa_dec_fp8q_sm90_counters
     if _gqa_dec_fp8q_sm90_disabled():
         counters["runs_disabled"] += 1
@@ -3326,7 +3379,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
             _SPECIALIZED_KERNEL_DISABLE_ENV,
             _GQA_DEC_FP8Q_SM90_DISABLE_ENV,
         )
-        return None
+        return None, "run: kill switch"
     try:
         from .autotuner.autotuner import is_in_profile_measurement
 
@@ -3334,7 +3387,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
             # never shadow a tactic the autotuner is timing
             counters["runs_autotune_bail"] += 1
             _gqa_dec_fp8q_sm90_fallback("run: autotuner measurement window")
-            return None
+            return None, "run: autotuner measurement window"
     except Exception:
         pass
     try:
@@ -3368,7 +3421,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
             "the dequant + stock fa2 path serves it",
             reason,
         )
-        return None
+        return None, f"run: {reason}"
     module = _gqa_dec_fp8q_sm90_module
     capturing = bool(
         hasattr(torch.cuda, "is_current_stream_capturing")
@@ -3379,7 +3432,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
         # happens if the module was dropped behind our back
         counters["runs_capture_unready" if capturing else "runs_ineligible"] += 1
         _gqa_dec_fp8q_sm90_fallback("run: module unavailable")
-        return None
+        return None, "run: module unavailable"
     if out is None:
         out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     module.run(
@@ -3415,7 +3468,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
             state.total_q,
             wrapper.is_cuda_graph_enabled,
         )
-    return out
+    return out, None
 
 
 def _gqa_dec_fp8q_sm90_dequant_q(
@@ -3433,6 +3486,22 @@ def _gqa_dec_fp8q_sm90_dequant_q(
             raise ValueError(
                 "gqa_decode_fp8_paged_sm90: a per-sequence q_scale tensor "
                 "requires the plan-time row->request map; re-plan this wrapper"
+            )
+        # Metadata-only validation (no device sync): a short scale tensor
+        # would turn the gather below into a sticky device-side assert that
+        # corrupts the CUDA context. The dtype is NOT constrained: the fp32
+        # multiply below promotes lower-precision scales exactly.
+        planned_batch = getattr(wrapper, "_gqa_dec_fp8q_sm90_row_seq_batch", None)
+        if planned_batch is not None and q_scale.numel() != planned_batch:
+            raise ValueError(
+                "gqa_decode_fp8_paged_sm90: a per-sequence q_scale tensor "
+                f"must hold one value per planned request ({planned_batch}); "
+                f"got {q_scale.numel()} values (shape {tuple(q_scale.shape)})"
+            )
+        if q_scale.device != q.device:
+            raise ValueError(
+                "gqa_decode_fp8_paged_sm90: the per-sequence q_scale tensor "
+                f"must be on the query device ({q.device}); got {q_scale.device}"
             )
         scale_rows = q_scale.reshape(-1)[row_seq].view(-1, 1, 1)
         return (q.to(torch.float32) * scale_rows).to(torch.bfloat16), None
@@ -5047,7 +5116,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``backend="auto"`` routes to it only on the dispatch allowlist
             (8 query heads / 1 KV head / head_dim 128, page size 16, NHD,
             causal, uniform q_len == 6 per request, per-sequence float32
-            descales, batch <= 128, kv_len <= 262144). The kernel partitions
+            descales, batch <= 128, kv_len <= 262144). The specialized kernel
+            reads K and V as SEPARATE paged tensors whose pages are
+            contiguous 2048-byte lines (``page_size * head_dim`` elements per
+            page); the combined contiguous 5-D ``paged_kv_cache`` tensor that
+            ``run()`` otherwise accepts gives its K/V views a doubled page
+            stride, which the specialized path refuses at run time (auto:
+            composable fallback; explicit ``backend="specialized"``: raise).
+            The combined 5-D layout stays fully supported by the stock
+            backends. The kernel partitions
             KV with its own proportional whole-tile split: a plan that sets
             ``fixed_split_size`` or ``disable_split_kv=True`` is never
             admitted under ``backend="auto"`` and raises under
@@ -6552,7 +6629,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"route; got q.dtype={q.dtype}. Pass an fp8 e4m3 query "
                     "or re-plan with the intended dtype."
                 )
-            res = _gqa_dec_fp8q_sm90_dispatch(
+            # SM107-only trtllm-gen options are not applied by the
+            # specialized SM90 kernel (nor by its composable fallback):
+            # reject truthy values here, before the specialized return,
+            # exactly as the stock route below does.
+            check_trtllm_gen_sm107_only_feature(
+                use_fp16_softmax, "use_fp16_softmax", q.device
+            )
+            check_trtllm_gen_sm107_only_feature(
+                uses_spcompress, "uses_spcompress", q.device
+            )
+            res, _specialized_refusal = _gqa_dec_fp8q_sm90_dispatch(
                 self,
                 q,
                 k_cache,
@@ -6578,7 +6665,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='specialized' (SM90 fp8-Q paged verify-decode "
                     "kernel) cannot serve this call "
-                    f"({_gqa_dec_fp8q_sm90_last_fallback or 'not dispatched'}); "
+                    f"({_specialized_refusal or 'not dispatched'}); "
                     "an explicitly selected backend never falls back — use "
                     "backend='auto' for guarded routing"
                 )
