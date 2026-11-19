@@ -87,7 +87,7 @@ def _assert_tol(got, want):
 
 
 @requires_sm103
-@pytest.mark.parametrize("T", [1, 3, 37, 64, 128, 256, 333, 512, 1024, 4096])
+@pytest.mark.parametrize("T", [1, 3, 37, 64, 128, 256, 333, 512, 1024, 2048, 4096])
 def test_specialized_matches_reference(T):
     inputs = _make_inputs(T, seed=T)
     out = mhc_pre(*inputs, backend="specialized")
@@ -132,7 +132,7 @@ def test_big_fuse_projection_unaffected_by_autocast(backend):
 
 
 @requires_sm103
-@pytest.mark.parametrize("T", [1, 37, 64, 128, 256, 512])
+@pytest.mark.parametrize("T", [1, 37, 64, 128, 256, 512, 1024, 2048])
 def test_back_to_back_determinism(T):
     """Three back-to-back pairs on the same inputs must be bitwise equal.
     T=256/512 exercise the programmatic-dependent-launch (overlapped) arms,
@@ -149,7 +149,7 @@ def test_back_to_back_determinism(T):
 
 
 @requires_sm103
-@pytest.mark.parametrize("T", [1, 37, 64, 128])
+@pytest.mark.parametrize("T", [1, 37, 64, 128, 1024, 2048])
 def test_graph_replay_determinism(T):
     """Capture one specialized call in a CUDA graph and replay it 20 times,
     checking every replay bitwise against the eager result on the same

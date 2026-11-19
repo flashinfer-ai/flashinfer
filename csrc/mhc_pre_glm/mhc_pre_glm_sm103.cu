@@ -1249,16 +1249,10 @@ __global__ __launch_bounds__(kThreads) void mhc_project_pipe_kernel(
           residual + static_cast<long long>(token0 + row) * kK + k0 + block * 64 + segment * 8;
       const int byte = (segment * 16) ^ ((row & 7) << 4);
       const uint32_t dst = tc_smem_addr(dst_base + block * kABlockBytes + row * kRowBytes + byte);
-      if constexpr (kResidualEvictLast) {
-        asm volatile(
-            "cp.async.cg.shared::cta.global.L2::cache_hint "
-            "[%0], [%1], 16, %2;" ::"r"(dst),
-            "l"(src), "l"(residual_evict_last_policy)
-            : "memory");
-      } else {
-        asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(dst), "l"(src)
-                     : "memory");
-      }
+      // Keep the cache policy on the weight load only. The hinted residual
+      // copy traps on affected SM103 builds at T=1024/2048.
+      asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(dst), "l"(src)
+                   : "memory");
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
   };
