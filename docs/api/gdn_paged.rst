@@ -104,13 +104,16 @@ Backends
   needs a float32 pool and every prefix length a multiple of 64; a sequence
   with a misaligned prefix gets NaN in the page rows it writes. Its results are
   not bitwise those of ``"flashinfer"``.
-- ``"auto"`` picks ``"cake_gdn"`` when that route accepts the call, few
-  states run in parallel (at most 12 to 48, by device) and the longest sequence
-  is long enough (2048 to 6144 new tokens, more for more states), and
-  ``"flashinfer"`` otherwise. Whenever it may pick ``"cake_gdn"``, it has
-  the same 64-aligned prefix contract. The choice reads only shapes, dtypes and
-  the device, so it is safe in a CUDA graph. The ``backend`` parameter of the
-  function gives the exact rule.
+- ``"auto"`` picks ``"cake_gdn"`` only when the caller passes
+  ``aligned_prefixes=True`` (its promise that every prefix length is a multiple
+  of 64), that route accepts the call, few states run in parallel (at most 12
+  to 48, by device) and the longest sequence is long enough (2048 to 6144 new
+  tokens, more for more states); otherwise it runs ``"flashinfer"``. Without
+  ``aligned_prefixes=True``, ``"auto"`` always runs ``"flashinfer"``. The
+  choice reads only host metadata: shapes, dtypes, the device, the layout and
+  address of an ``output`` buffer, ``max_seqlen`` and ``aligned_prefixes``. It
+  does not synchronize, so it is safe in a CUDA graph. The ``backend``
+  parameter of the function gives the exact rule.
 
 Slot arguments of ``chunk_gated_delta_rule``
 --------------------------------------------

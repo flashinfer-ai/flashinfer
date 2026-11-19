@@ -23,10 +23,12 @@ import pytest
 import torch
 
 import flashinfer.gdn_kernels.blackwell as blackwell
+import flashinfer.gdn_paged as gdn_paged
 from flashinfer.gdn_paged import (
     _CAKE_GDN_PAGED_AUTO_BANDS,
     _cake_cp_paged_rejection_reason,
     _paged_auto_picks_cake,
+    _paged_auto_uses_cake,
 )
 from flashinfer.gdn_prefill import _cake_gdn_cp_band_max_seqlen
 
@@ -46,11 +48,12 @@ def _picks(capability, num_seqs, num_sab_heads, seqlen_bound, io_dtype=torch.bfl
 @pytest.mark.cpu_only
 def test_band_constants():
     for dtype in (torch.bfloat16, torch.float16):
-        for capability in (SM100, SM103):
-            assert _CAKE_GDN_PAGED_AUTO_BANDS[(capability, dtype)] == (
-                (12, 2048),
-                (32, 4096),
-            )
+        assert _CAKE_GDN_PAGED_AUTO_BANDS[(SM100, dtype)] == (
+            (12, 2048),
+            (24, 4096),
+            (32, 6144),
+        )
+        assert _CAKE_GDN_PAGED_AUTO_BANDS[(SM103, dtype)] == ((12, 2048), (32, 4096))
         assert _CAKE_GDN_PAGED_AUTO_BANDS[(SM107, dtype)] == (
             (12, 2048),
             (32, 4096),
@@ -58,45 +61,51 @@ def test_band_constants():
         )
 
 
-# (parallel states, length bound, picks on SM100/SM103, picks on SM107)
+# (parallel states, length bound, picks on SM100, on SM103, on SM107)
 _TABLE = [
     # Tier (12, 2048) on every capability.
-    (12, 2048, True, True),
-    (12, 2047, False, False),
-    (13, 2048, False, False),
-    (1, 2048, True, True),
-    (1, 2047, False, False),
-    # Tier (32, 4096) on every capability.
-    (13, 4096, True, True),
-    (32, 4096, True, True),
-    (32, 4095, False, False),
-    (33, 4096, False, False),
+    (12, 2048, True, True, True),
+    (12, 2047, False, False, False),
+    (13, 2048, False, False, False),
+    (1, 2048, True, True, True),
+    (1, 2047, False, False, False),
+    # Tier (24, 4096) on SM100; (32, 4096) covers it on SM103 and SM107.
+    (13, 4096, True, True, True),
+    (24, 4096, True, True, True),
+    (24, 4095, False, False, False),
+    (25, 4096, False, True, True),
+    # Tier (32, 6144) on SM100.
+    (25, 6144, True, True, True),
+    (32, 6144, True, True, True),
+    (32, 6143, False, True, True),
+    (33, 6144, False, False, True),
+    # Tier (32, 4096) on SM103 and SM107.
+    (32, 4096, False, True, True),
+    (32, 4095, False, False, False),
+    (33, 4096, False, False, False),
     # Tier (48, 6144) on SM107 only.
-    (33, 6144, False, True),
-    (48, 6144, False, True),
-    (48, 6143, False, False),
-    (49, 6144, False, False),
-    (49, 65536, False, False),
-    (32, 65536, True, True),
+    (48, 6144, False, False, True),
+    (48, 6143, False, False, False),
+    (49, 6144, False, False, False),
+    (49, 65536, False, False, False),
+    (32, 65536, True, True, True),
     # No sequence or no tokens.
-    (0, 4096, False, False),
-    (4, 0, False, False),
+    (0, 4096, False, False, False),
+    (4, 0, False, False, False),
 ]
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("capability", [SM100, SM103, SM107])
 @pytest.mark.parametrize(
-    ("parallel_states", "seqlen_bound", "picks_sm100", "picks_sm107"), _TABLE
+    ("parallel_states", "seqlen_bound", "sm100", "sm103", "sm107"), _TABLE
 )
-def test_band(
-    capability, parallel_states, seqlen_bound, picks_sm100, picks_sm107, io_dtype
-):
-    picks = picks_sm107 if capability == SM107 else picks_sm100
-    # The band reads N * Hs only: N sequences of one head and one sequence of N heads.
-    assert _picks(capability, parallel_states, 1, seqlen_bound, io_dtype) is picks
-    assert _picks(capability, 1, parallel_states, seqlen_bound, io_dtype) is picks
+def test_band(parallel_states, seqlen_bound, sm100, sm103, sm107, io_dtype):
+    for capability, picks in ((SM100, sm100), (SM103, sm103), (SM107, sm107)):
+        # The band reads N * Hs only: N sequences of one head, one of N heads.
+        for num_seqs, heads in ((parallel_states, 1), (1, parallel_states)):
+            got = _picks(capability, num_seqs, heads, seqlen_bound, io_dtype)
+            assert got is picks, (capability, num_seqs, heads, seqlen_bound)
 
 
 @pytest.mark.cpu_only
@@ -160,4 +169,72 @@ def test_rejection_gate(monkeypatch):
     monkeypatch.setattr(blackwell, "_chunk_gated_delta_rule_gdn_cp_paged_sm100", None)
     assert _cake_cp_paged_rejection_reason(q, q, q, pool, 64) == (
         "needs the Cake GDN CP programs"
+    )
+
+
+class _FakeCudaTensor:
+    """Host metadata of a CUDA tensor; the auto choice reads nothing else."""
+
+    def __init__(self, *shape, dtype=torch.bfloat16):
+        self.shape, self.dtype, self.device = shape, dtype, torch.device("cuda")
+
+    def size(self, dim):
+        return self.shape[dim]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("aligned_prefixes", "max_seqlen", "picks"),
+    [
+        # 2 x 4 = 8 states and 2 x 2048 new tokens: inside the band.
+        (True, None, True),
+        (False, None, False),
+        (True, 2048, True),
+        (True, 4096, True),
+        (False, 4096, False),
+        # A hint below ceil(total / num_seqs), which the Cake route rejects.
+        (True, 2047, False),
+        (True, 0, False),
+        (True, 2048.0, False),
+    ],
+)
+def test_auto_needs_aligned_prefixes_and_a_valid_hint(
+    monkeypatch, aligned_prefixes, max_seqlen, picks
+):
+    monkeypatch.setattr(gdn_paged, "get_compute_capability", lambda device: SM103)
+    monkeypatch.setattr(gdn_paged, "_cake_cp_paged_rejection_reason", lambda *a: None)
+    q = _FakeCudaTensor(4096, 4, 128)
+    v = _FakeCudaTensor(4096, 4, 128)
+    pool = _FakeCudaTensor(8, 4, 128, 128, dtype=torch.float32)
+    got = _paged_auto_uses_cake(
+        q,
+        q,
+        v,
+        pool,
+        None,
+        num_seqs=2,
+        page_size=1024,
+        max_seqlen=max_seqlen,
+        aligned_prefixes=aligned_prefixes,
+    )
+    assert got is picks
+
+
+@pytest.mark.cpu_only
+def test_auto_falls_back_when_the_route_rejects(monkeypatch):
+    monkeypatch.setattr(gdn_paged, "get_compute_capability", lambda device: SM103)
+    monkeypatch.setattr(
+        gdn_paged, "_cake_cp_paged_rejection_reason", lambda *a: "rejected"
+    )
+    q = _FakeCudaTensor(4096, 4, 128)
+    assert not _paged_auto_uses_cake(
+        q,
+        q,
+        q,
+        q,
+        None,
+        num_seqs=2,
+        page_size=1024,
+        max_seqlen=None,
+        aligned_prefixes=True,
     )

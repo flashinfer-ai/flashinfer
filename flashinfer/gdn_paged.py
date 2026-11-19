@@ -238,19 +238,19 @@ def gdn_paged_decode_slots(
 # longest sequence's new tokens is at least ``min_seqlen``. A pair that is not
 # listed keeps "flashinfer". The tiers come from measurements against
 # "flashinfer" on B200, GB300 and VR200 (CUDA graph replay, page size 1024,
-# prefixes 0 and 4096, bf16 and fp16): the Cake route was faster in every
-# measured row inside them except at the B200 edge of 32 states, 4096 tokens
-# and a 4096-token prefix (0.985x bf16, 0.997x fp16). On SM107, 49 or more
-# states lose at 4096 tokens.
-_CAKE_GDN_PAGED_AUTO_SM100_TIERS = ((12, 2048), (32, 4096))
+# prefixes 0 and 4096, bf16 and fp16): every measured row inside them was
+# faster with the Cake route (worst 1.065x on B200, 1.07x on GB300, 1.04x on
+# VR200).
+_CAKE_GDN_PAGED_AUTO_SM100_TIERS = ((12, 2048), (24, 4096), (32, 6144))
+_CAKE_GDN_PAGED_AUTO_SM103_TIERS = ((12, 2048), (32, 4096))
 _CAKE_GDN_PAGED_AUTO_SM107_TIERS = ((12, 2048), (32, 4096), (48, 6144))
 _CAKE_GDN_PAGED_AUTO_BANDS: dict[
     tuple[tuple[int, int], torch.dtype], tuple[tuple[int, int], ...]
 ] = {
     ((10, 0), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
     ((10, 0), torch.float16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
-    ((10, 3), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
-    ((10, 3), torch.float16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
+    ((10, 3), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM103_TIERS,
+    ((10, 3), torch.float16): _CAKE_GDN_PAGED_AUTO_SM103_TIERS,
     ((10, 7), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM107_TIERS,
     ((10, 7), torch.float16): _CAKE_GDN_PAGED_AUTO_SM107_TIERS,
 }
@@ -313,10 +313,17 @@ def _paged_auto_uses_cake(
     num_seqs: int,
     page_size: int,
     max_seqlen: Optional[int],
+    aligned_prefixes: bool,
 ) -> bool:
-    """The route of ``backend="auto"``: the Cake route inside the measured
-    band when it accepts the call. No host synchronization."""
-    if q.device.type != "cuda" or num_seqs <= 0:
+    """The route of ``backend="auto"``: the Cake route when the caller
+    promises 64-aligned prefixes, the batch is inside the measured band and the
+    route accepts the call. Reads host metadata only: no synchronization."""
+    if not aligned_prefixes or q.device.type != "cuda" or num_seqs <= 0:
+        return False
+    # The Cake route rejects a hint below the mean new tokens per sequence.
+    if max_seqlen is not None and (
+        type(max_seqlen) is not int or max_seqlen < -(-q.size(0) // num_seqs)
+    ):
         return False
     if not _paged_auto_picks_cake(
         capability=get_compute_capability(q.device),
@@ -449,6 +456,7 @@ def chunk_gated_delta_rule_paged(
     slots: Optional[GDNPagedPrefillSlots] = None,
     backend: Literal["flashinfer", "cake_gdn", "auto"] = "flashinfer",
     max_seqlen: Optional[int] = None,
+    aligned_prefixes: bool = False,
 ) -> torch.Tensor:
     r"""Chunked GDN prefill that reads and writes a paged recurrent-state pool.
 
@@ -520,31 +528,49 @@ def chunk_gated_delta_rule_paged(
         slower (0.4-0.8x) at 64 or more.
         ``"auto"`` (opt-in) picks ``"cake_gdn"`` where it measured faster
         than ``"flashinfer"``, and ``"flashinfer"`` everywhere else. It picks
-        ``"cake_gdn"`` only when that route accepts the call (the device,
-        dtypes, state pool and page size above, and an ``output``, if given,
-        that is contiguous and 16-byte aligned) and the batch has few states
-        in parallel and a long sequence. With ``S = num_seqs *
-        num_sab_heads`` and ``L`` the new tokens of the longest sequence,
-        that is ``S <= 12`` and ``L >= 2048``, or ``S <= 32`` and ``L >=
-        4096``, on SM100, SM103 and SM107; SM107 also takes ``S <= 48`` and
-        ``L >= 6144``. ``L`` is ``max_seqlen`` when given, else
-        ``ceil(total_seq_len / num_seqs)``. The choice reads only shapes,
-        dtypes and the device, so it does not synchronize and is safe in a
-        CUDA graph. Whenever it may pick ``"cake_gdn"``, ``"auto"`` has the
-        same contract: every prefix must be a multiple of 64, or that
-        sequence's page rows are NaN, and the results are not bitwise those
-        of ``"flashinfer"``. The default stays ``"flashinfer"`` because the
-        choice cannot check the prefix lengths without a host
-        synchronization.
+        ``"cake_gdn"`` only when all of these hold:
+
+        - ``aligned_prefixes=True``: the caller promises the prefix contract
+          of ``"cake_gdn"`` above. Without it, ``"auto"`` always runs
+          ``"flashinfer"``, so ``"auto"`` alone never risks NaN rows.
+        - The route accepts the call: the device, dtypes, state pool and page
+          size above, a CUDA 12.8 or newer toolkit (13.4 on SM107), an
+          ``output``, if given, that is contiguous and 16-byte aligned, and a
+          ``max_seqlen``, if given, of at least ``ceil(total_seq_len /
+          num_seqs)``.
+        - The batch has few states in parallel and a long sequence. With
+          ``S = num_seqs * num_sab_heads`` and ``L`` the new tokens of the
+          longest sequence: ``S <= 12`` and ``L >= 2048`` on SM100, SM103 and
+          SM107; on SM100 also ``S <= 24`` and ``L >= 4096``, or ``S <= 32``
+          and ``L >= 6144``; on SM103 also ``S <= 32`` and ``L >= 4096``; on
+          SM107 also ``S <= 32`` and ``L >= 4096``, or ``S <= 48`` and ``L >=
+          6144``. ``L`` is ``max_seqlen`` when given, else
+          ``ceil(total_seq_len / num_seqs)``.
+
+        The choice reads only host metadata (shapes, dtypes, the device, the
+        ``output`` buffer's layout and address, ``max_seqlen`` and
+        ``aligned_prefixes``), so it does not synchronize and is safe in a
+        CUDA graph. When it picks ``"cake_gdn"``, the results are not bitwise
+        those of ``"flashinfer"``.
     max_seqlen : int, optional
         With ``backend="cake_gdn"``, an upper bound of the new tokens of any
         sequence; it sizes the split. Without it the bound is the total, and
         a larger value is clamped to the total. A value smaller than the new
         tokens of a sequence is undefined behavior; it is checked only with
         ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``, where it fails a device
-        assert. With ``backend="auto"`` it also sets the length that the
-        choice reads, under the same contract when the choice is
-        ``"cake_gdn"``.
+        assert, and a value below ``ceil(total_seq_len / num_seqs)`` raises.
+        With ``backend="auto"`` it also sets the length the choice reads; a
+        value below ``ceil(total_seq_len / num_seqs)`` runs ``"flashinfer"``.
+        When ``"auto"`` may pick ``"cake_gdn"`` (``aligned_prefixes=True``),
+        a given value must be a true upper bound, as for ``"cake_gdn"``.
+        ``"flashinfer"`` ignores it.
+    aligned_prefixes : bool
+        The caller's promise that every prefix length (the tokens before
+        ``cu_seqlens[b]``) is a multiple of 64. ``backend="auto"`` picks
+        ``"cake_gdn"`` only with this promise. ``backend="cake_gdn"`` carries
+        the same contract whatever this value, and ``"flashinfer"`` ignores
+        it. It is not checked; a wrong promise under ``"auto"`` gives the NaN
+        rows described for ``"cake_gdn"``.
 
     Returns
     -------
@@ -582,6 +608,7 @@ def chunk_gated_delta_rule_paged(
                 num_seqs=num_seqs,
                 page_size=page_size,
                 max_seqlen=max_seqlen,
+                aligned_prefixes=aligned_prefixes,
             )
             else "flashinfer"
         )

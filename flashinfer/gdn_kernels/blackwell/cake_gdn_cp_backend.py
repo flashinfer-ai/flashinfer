@@ -1941,6 +1941,10 @@ def gdn_cp_paged_rejection_reason(
     )
     if cuda_version < (12, 8):
         return "requires CUDA 12.8 or newer"
+    # The paged programs compile on first use, so the toolkit (nvcc) must meet
+    # the same floor as the torch runtime.
+    if not is_cuda_version_at_least("12.8"):
+        return "requires a CUDA 12.8 or newer toolkit"
     # The sm_107a programs need CUDA 13.4, as tinygemm2_sm100 does on SM107.
     if arch == "sm_107a" and not is_cuda_version_at_least("13.4"):
         return "requires CUDA 13.4 or newer on sm_107a"

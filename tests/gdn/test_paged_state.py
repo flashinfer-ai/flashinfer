@@ -1160,29 +1160,35 @@ def test_cake_cp_paged_rejection_reason(case, match):
 
 
 @pytest.mark.parametrize(
-    "arch, nvcc_134, rejected",
-    [("sm_107a", False, True), ("sm_107a", True, False), ("sm_103a", False, False)],
+    "arch, nvcc, reason",
+    [
+        ("sm_107a", (13, 3), "requires CUDA 13.4 or newer on sm_107a"),
+        ("sm_107a", (13, 4), None),
+        ("sm_103a", (13, 0), None),
+        ("sm_103a", (12, 8), None),
+        ("sm_103a", (12, 6), "requires a CUDA 12.8 or newer toolkit"),
+        ("sm_107a", (12, 6), "requires a CUDA 12.8 or newer toolkit"),
+    ],
 )
 def test_cake_cp_paged_rejection_reason_needs_cuda_13_4_on_sm107(
-    monkeypatch, arch, nvcc_134, rejected
+    monkeypatch, arch, nvcc, reason
 ):
-    """The sm_107a programs need a CUDA 13.4 nvcc; the other architectures keep
-    the CUDA 12.8 floor."""
+    """The paged programs compile with the installed nvcc: it needs CUDA 12.8,
+    and 13.4 for the sm_107a programs."""
     _skip_if_unsupported()
     # The nvcc version is patched, so the check runs with any installed nvcc.
     _skip_unless_cake_cp(needs_nvcc=False)
     gdn_cp = _cake_cp_backend()
 
     def at_least(version):
-        assert version == "13.4"
-        return nvcc_134
+        assert version in ("12.8", "13.4")
+        return nvcc >= tuple(int(part) for part in version.split("."))
 
     monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: arch)
     monkeypatch.setattr(gdn_cp, "is_cuda_version_at_least", at_least)
     q = torch.zeros(128, 2, HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
     pool = torch.zeros(4, 2, HEAD_SIZE, HEAD_SIZE, device="cuda")
-    reason = gdn_cp.gdn_cp_paged_rejection_reason(q, q, q, pool, page_size=64)
-    assert reason == ("requires CUDA 13.4 or newer on sm_107a" if rejected else None)
+    assert gdn_cp.gdn_cp_paged_rejection_reason(q, q, q, pool, page_size=64) == reason
 
 
 def _misaligned(shape, dtype):
@@ -2584,6 +2590,7 @@ def _run_auto_against(
     heads,
     *,
     max_seqlen=None,
+    aligned_prefixes=True,
     state_dtype=torch.float32,
     page_size=1024,
     seed=0,
@@ -2621,6 +2628,7 @@ def _run_auto_against(
             last_page_len=last,
             backend=name,
             max_seqlen=max_seqlen,
+            aligned_prefixes=aligned_prefixes,
         )
         torch.cuda.synchronize()
         results[name] = (out, pool, len(calls))
@@ -2632,26 +2640,36 @@ def _run_auto_against(
 
 
 @pytest.mark.parametrize(
-    ("new_lens", "heads", "max_seqlen", "backend"),
+    ("new_lens", "heads", "max_seqlen", "aligned_prefixes", "backend"),
     [
         # 2 x 4 states and a longest sequence of about 4128 tokens: in the band.
-        ([4096, 4160], (2, 2, 4), None, "cake_gdn"),
+        ([4096, 4160], (2, 2, 4), None, True, "cake_gdn"),
+        # The same batch without the caller's aligned-prefix promise.
+        ([4096, 4160], (2, 2, 4), None, False, "flashinfer"),
+        # A hint below ceil(total / num_seqs), which the Cake route rejects.
+        ([4096, 4160], (2, 2, 4), 4096, True, "flashinfer"),
         # The hint lifts a balanced batch of 1024-token sequences into the band.
-        ([1024, 1024], (2, 2, 4), 2048, "cake_gdn"),
+        ([1024, 1024], (2, 2, 4), 2048, True, "cake_gdn"),
         # Without the hint the mean estimate (1024) keeps it out.
-        ([1024, 1024], (2, 2, 4), None, "flashinfer"),
+        ([1024, 1024], (2, 2, 4), None, True, "flashinfer"),
         # Long sequences, but 16 x 4 = 64 states run in parallel.
-        ([4096] * 16, (2, 2, 4), None, "flashinfer"),
+        ([4096] * 16, (2, 2, 4), None, True, "flashinfer"),
     ],
 )
 def test_paged_prefill_auto_backend_choice(
-    monkeypatch, new_lens, heads, max_seqlen, backend
+    monkeypatch, new_lens, heads, max_seqlen, aligned_prefixes, backend
 ):
     _skip_if_unsupported()
     if backend == "cake_gdn":
         _skip_unless_cake_cp()
     _run_auto_against(
-        monkeypatch, backend, new_lens, heads, max_seqlen=max_seqlen, seed=11
+        monkeypatch,
+        backend,
+        new_lens,
+        heads,
+        max_seqlen=max_seqlen,
+        aligned_prefixes=aligned_prefixes,
+        seed=11,
     )
 
 
@@ -2721,6 +2739,7 @@ def test_paged_prefill_auto_cuda_graph(monkeypatch):
             last_page_len=last,
             output=output,
             backend="auto",
+            aligned_prefixes=True,
         )
 
     def set_tables(step):
