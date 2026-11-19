@@ -53,6 +53,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -2253,6 +2254,13 @@ def _clear_cuda_last_error() -> None:
     keeps it as the calling thread's last error, which the next PyTorch launch check would raise once.  The
     bindings share the process's ``libcudart`` with PyTorch (cuda-python's runtime module may load another
     copy), so this calls ``cudaGetLastError`` in every ``libcudart`` the process has loaded."""
+    if sys.platform == "win32":
+        # No /proc and no RTLD_NOLOAD: loading the DLL by name returns the copy the process already holds.
+        try:
+            ctypes.CDLL(f"cudart64_{(torch.version.cuda or '').split('.')[0]}.dll").cudaGetLastError()
+        except OSError:
+            pass
+        return
     paths = set()
     try:
         with open("/proc/self/maps") as maps:
