@@ -3202,3 +3202,702 @@ def test_hardware_row_max_is_a_head_dim_placement():
         == engine.hw_row_max_enabled(dev)
     )
     assert engine.hw_row_max_enabled(torch.device("cpu"), 64) is False
+
+
+def test_fixed_launch_kernels_have_their_own_names():
+    """The kernels of a fixed launch (``use_cuda_graph=True``) read their unit and group counts from the plan's table and are
+    compiled under their own names: every other call loads the kernels it always did."""
+    from flashinfer.attention.batch_invariant.blocks import compile as row
+    from flashinfer.attention.batch_invariant.swaps import compile as swaps
+
+    assert row.kernel_name(128, 4, 16, 4, fixed=True) == "attn_d128_g4_p16_s4_w1_cg"
+    assert row.kernel_name(128, 4, 16, 4, sinks=True, fixed=True) == (
+        "attn_d128_g4_p16_s4_w1_sink_cg"
+    )
+    plain = swaps.kernel_name(128, 8, 16, 8, False, 228 << 10, True)
+    assert swaps.kernel_name(128, 8, 16, 8, False, 228 << 10, True, fixed=True) == (
+        plain + "_cg"
+    )
+    assert swaps.kernel_name(128, 8, 16, 8, False, 228 << 10, True, True, True) == (
+        plain + "_sink_cg"
+    )
+
+
+def test_planner_fixed_capacity_budget():
+    """The planner held to a fixed capacity (``build_plan(unit_budget=, row_budget=)``, a launch captured in a CUDA graph):
+    within the budgets the plan is the unbudgeted plan; beyond them the split tiles are fused longest class first until the
+    rest fits (placements: the row work -- which rows over which chunks -- is the same multiset either way); a request
+    without keys gets no unit under ``null_requests``."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    def row_work(plan):
+        # (request, kv head, first token, rows, chunk) of every unit, a split or fused unit alike
+        return sorted(
+            (d[P.F_REQ], d[P.F_KVHEAD], d[P.F_QTOK0], d[P.F_ROWS], c)
+            for d in plan.desc
+            for c in range(d[P.F_CHUNK_LO], d[P.F_CHUNK_HI])
+        )
+
+    kv = [0, 256, 320, 330]  # 4096, 1024 and 160 keys at page 16
+    last = [16, 16, 16]
+    qo = [0, 1, 2, 3]
+    for D, heads, swap in (
+        (128, (32, 8), True),
+        (256, (32, 8), False),
+        (64, (8, 8), True),
+    ):
+        kw = dict(sm_count=148, small_swap=swap, swap_max_rows=8)
+        free = P.build_plan(qo, kv, last, *heads, D, 16, split_policy="split", **kw)
+        fused = P.build_plan(qo, kv, last, *heads, D, 16, split_policy="fused", **kw)
+        assert free.num_units > fused.num_units == 24 and not fused.groups
+        roomy = P.build_plan(
+            qo,
+            kv,
+            last,
+            *heads,
+            D,
+            16,
+            split_policy="split",
+            unit_budget=free.num_units,
+            row_budget=free.ws_rows,
+            **kw,
+        )
+        assert roomy.desc == free.desc and roomy.groups == free.groups
+        assert roomy.group_inkernel == free.group_inkernel
+        # one unit or one partial row short of the whole plan: the shortest split class stays fused, the longer ones split
+        for budget in (
+            dict(unit_budget=free.num_units - 1),
+            dict(row_budget=free.ws_rows - 1),
+        ):
+            part = P.build_plan(
+                qo, kv, last, *heads, D, 16, split_policy="split", **budget, **kw
+            )
+            assert fused.num_units < part.num_units < free.num_units
+            assert part.ws_rows < free.ws_rows and row_work(part) == row_work(free)
+            longest = max(d[P.F_KVLEN] for d in part.desc)
+            assert all(
+                (d[P.F_MODE] == 1) == (d[P.F_KVLEN] == longest) for d in part.desc
+            )
+        # no room for the longest class: everything fused, whatever shorter class would still fit
+        for budget in (dict(unit_budget=fused.num_units + 8), dict(row_budget=0)):
+            none = P.build_plan(
+                qo, kv, last, *heads, D, 16, split_policy="split", **budget, **kw
+            )
+            assert none.desc == fused.desc and not none.groups and none.ws_rows == 0
+    assert P.budget_unit_kinds([True, False], [3, 9], [1, 3], [4, 4]) == [True, False]
+    assert P.budget_unit_kinds([False, False], [9, 9], [3, 3], [4, 4], 5) == [True] * 2
+    # a request without keys: refused by the planner, no unit under null_requests
+    with pytest.raises(AssertionError):
+        P.build_plan(qo, [0, 256, 256, 266], last, 32, 8, 128, 16)
+    null = P.build_plan(
+        qo, [0, 256, 256, 266], last, 32, 8, 128, 16, null_requests=True
+    )
+    assert sorted({d[P.F_REQ] for d in null.desc}) == [0, 2]
+
+
+def test_planner_decode_arrays_equal_the_reference():
+    """``plan.build_decode_plan`` (the array planner a ``use_cuda_graph=True`` replan runs) gives the tables of
+    ``plan.build_plan`` entry for entry: random decode batches over head dims, GQA groups, tokens per request, windows, unit
+    kinds, fold placements, SM counts, grids, the grid search, budgets and null requests."""
+    import random
+
+    import numpy as np
+
+    from flashinfer.attention.batch_invariant import plan as P
+
+    rng = random.Random(7)
+    kinds = set()
+    for case in range(400):
+        D = rng.choice([64, 128, 256])
+        Hq, Hkv = rng.choice([(32, 8), (8, 8), (64, 8), (24, 2), (128, 1), (4, 4)])
+        q_len = rng.choice([1, 1, 1, 2, 4, 9, 40, 200])
+        batch = rng.choice([1, 2, 3, 7, 30])
+        top = rng.choice([q_len, 300, 1100, 5000, 20000])
+        kv_lens = [
+            0 if rng.random() < 0.15 else rng.randint(q_len, max(q_len, top))
+            for _ in range(batch)
+        ]
+        if rng.random() < 0.3:
+            kv_lens = [kv_lens[0]] * batch
+        sm = rng.choice([1, 8, 148, 224])
+        opts = dict(
+            window_left=rng.choice([-1, -1, 0, 100, 3000]),
+            split_policy=rng.choice(["auto", "auto", "split", "fused"]),
+            sm_count=sm,
+            merge=rng.choice(["auto", "auto", "fixup", "inkernel"]),
+            small_swap=rng.random() < 0.8,
+            swap_max_rows=8,
+            grid=rng.choice([0, 0, 1, 5, sm]),
+            grid_search=rng.random() < 0.5,
+            unit_budget=rng.choice([0, 1, 64, 4 * sm, 10**9]),
+            row_budget=rng.choice([-1, 0, 100, 5000]),
+        )
+        page = 16
+        pages = [-(-L // page) for L in kv_lens]
+        indptr = [0]
+        for n in pages:
+            indptr.append(indptr[-1] + n)
+        last = [
+            L - (n - 1) * page if n else 0 for L, n in zip(kv_lens, pages, strict=True)
+        ]
+        qo = [b * q_len for b in range(batch + 1)]
+        ref = P.build_plan(
+            qo, indptr, last, Hq, Hkv, D, page, null_requests=True, **opts
+        )
+        got = P.build_decode_plan(np.array(kv_lens), q_len, Hq, Hkv, D, **opts)
+        assert got.desc == ref.desc, (case, kv_lens, opts)
+        assert got.groups == ref.groups and got.group_inkernel == ref.group_inkernel
+        assert got.fixup_groups == ref.fixup_groups and got.ws_rows == ref.ws_rows
+        assert (got.num_units, got.num_groups, got.num_fixup_groups) == (
+            ref.num_units,
+            ref.num_groups,
+            ref.num_fixup_groups,
+        )
+        assert (got.tokens_per_tile, got.g, got.ws_row, got.grid) == (
+            ref.tokens_per_tile,
+            ref.g,
+            ref.ws_row,
+            ref.grid,
+        )
+        kinds.add((bool(ref.groups), bool(ref.fixup_groups), any(ref.group_inkernel)))
+    # fused plans and split plans of both fold placements
+    assert (False, False, False) in kinds
+    assert any(k[1] for k in kinds) and any(k[2] for k in kinds)
+
+
+def _prefix_tables(pr: Problem, kv_lens):
+    """The page table of the first ``kv_lens[b]`` keys of every request of ``pr`` (0: a request without pages)."""
+    indices = pr.kv_indices.cpu().tolist()
+    starts = pr.kv_indptr.cpu().tolist()
+    indptr, idx, last = [0], [], []
+    for b, L in enumerate(kv_lens):
+        assert pr.kv_lens[b] >= L
+        n = -(-L // pr.page)
+        idx += indices[starts[b] : starts[b] + n]
+        indptr.append(indptr[-1] + n)
+        last.append(L - (n - 1) * pr.page if n else 0)
+    mk = lambda x: torch.tensor(x, dtype=torch.int32, device=pr.device)  # noqa: E731
+    return mk(indptr), mk(idx), mk(last)
+
+
+def _eager_decode(pr: Problem, q, kv_lens, q_len, window_left=-1, run_kw=None):
+    """An eager batch-invariant decode of the requests with keys (``kv_lens[b] > 0``): ``(live rows, result)``, the result
+    ``None`` when no request has keys."""
+    live = [b for b, L in enumerate(kv_lens) if L]
+    rows = torch.tensor(
+        [b * q_len + t for b in live for t in range(q_len)],
+        dtype=torch.long,
+        device=pr.device,
+    )
+    indptr, idx, last = _prefix_tables(pr, kv_lens)
+    if not live:
+        return rows, None
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    keep = torch.tensor(live, dtype=torch.long, device=pr.device)
+    spans = (indptr[1:] - indptr[:-1])[keep]
+    w.plan(
+        torch.cat([spans.new_zeros(1), torch.cumsum(spans, 0)]).to(torch.int32),
+        idx,
+        last[keep],
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+    )
+    return rows, w.run(q[rows].contiguous(), pr.cache("NHD"), **(run_kw or {}))
+
+
+class _GraphDecode:
+    """A ``use_cuda_graph=True`` batch-invariant decode wrapper over persistent buffers: ``run()`` is captured once, after
+    the first plan, and every later step is a replan (``plan`` / ``fast_decode_plan`` / the ``begin_forward`` partial of
+    serving engines) followed by a replay of that one graph."""
+
+    def __init__(self, pr: Problem, q_len, window_left=-1, lse=False, sinks=None):
+        dev = pr.device
+        self.pr, self.q_len, self.window_left = pr, q_len, window_left
+        batch = len(pr.kv_lens)
+        self.indptr_buf = torch.zeros(batch + 1, dtype=torch.int32, device=dev)
+        self.indices_buf = torch.zeros(
+            pr.kv_indices.numel() + 5, dtype=torch.int32, device=dev
+        )
+        self.last_buf = torch.zeros(batch, dtype=torch.int32, device=dev)
+        self.w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace(dev),
+            "NHD",
+            use_cuda_graph=True,
+            paged_kv_indptr_buffer=self.indptr_buf,
+            paged_kv_indices_buffer=self.indices_buf,
+            paged_kv_last_page_len_buffer=self.last_buf,
+            batch_invariant=True,
+        )
+        g = torch.Generator(device="cpu").manual_seed(77)
+        self.q = (
+            (torch.randn(batch * q_len, pr.Hq, pr.D, generator=g) * 1.5)
+            .to(torch.bfloat16)
+            .to(dev)
+        )
+        self.out = torch.empty_like(self.q)
+        self.run_kw = dict(out=self.out)
+        self.lse = None
+        if lse:
+            self.lse = torch.empty(
+                self.q.shape[0], pr.Hq, dtype=torch.float32, device=dev
+            )
+            self.run_kw.update(lse=self.lse, return_lse=True)
+        if sinks is not None:
+            self.run_kw.update(sinks=sinks)
+        self.graph = None
+
+    def plan(self, kv_lens, how="plan", **kw):
+        pr = self.pr
+        indptr, idx, last = _prefix_tables(pr, kv_lens)
+        args = (indptr, idx, last, pr.Hq, pr.Hkv, pr.D, pr.page)
+        opts = dict(
+            window_left=self.window_left,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            q_len_per_req=self.q_len,
+        )
+        opts.update(kw)
+        if how == "plan":
+            self.w.plan(*args, **opts)
+        elif how == "fast":
+            flashinfer.decode.fast_decode_plan(
+                self.w,
+                *args,
+                **dict(
+                    dict(
+                        fixed_split_size=-1,
+                        disable_split_kv=False,
+                        global_override_indptr_cpu=indptr.cpu(),
+                    ),
+                    **opts,
+                ),
+            )
+        else:  # the serving engines' replacement of the wrapper's planner
+            import functools
+
+            self.w.begin_forward = functools.partial(
+                flashinfer.decode.fast_decode_plan, self.w
+            )
+            self.w.begin_forward(*args, non_blocking=True, **opts)
+
+    def replay(self):
+        cache = self.pr.cache("NHD")
+        if self.graph is None:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                self.w.run(self.q, cache, **self.run_kw)
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph, stream=s):
+                    self.w.run(self.q, cache, **self.run_kw)
+            torch.cuda.synchronize()
+        self.out.fill_(3.0)  # every row is rewritten by the replay
+        if self.lse is not None:
+            self.lse.fill_(3.0)
+        self.graph.replay()
+        torch.cuda.synchronize()
+        return bits(self.out).clone(), (
+            bits(self.lse).clone() if self.lse is not None else None
+        )
+
+    def check(self, kv_lens, how="plan", run_kw=None, **kw):
+        """Replan to ``kv_lens``, replay, and compare with an eager wrapper: the requests with keys bit for bit, the others
+        zeros (LSE ``-inf``)."""
+        self.plan(kv_lens, how, **kw)
+        out, lse = self.replay()
+        rows, ref = _eager_decode(
+            self.pr, self.q, kv_lens, self.q_len, self.window_left, run_kw
+        )
+        ref_out, ref_lse = ref if isinstance(ref, tuple) else (ref, None)
+        null = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+        null[rows] = False
+        assert ref is None or torch.equal(out[rows], bits(ref_out)), kv_lens
+        assert not out[null].any(), kv_lens
+        if lse is not None:
+            assert ref is None or torch.equal(lse[rows], bits(ref_lse)), kv_lens
+            assert bool((self.lse[null] == float("-inf")).all()), kv_lens
+        return self.w._batch_invariant._planned.plan
+
+
+GRAPH_STEPS = (
+    # (KV lengths, replan entry point): short, long over several 512-key chunks, lengths around the chunk and tile
+    # boundaries, short again
+    ([300, 40, 129], "plan"),
+    ([3000, 1500, 700], "fast"),
+    ([513, 2049, 64], "partial"),
+    ([5120, 5120, 5120], "fast"),
+    ([1024, 512, 4097], "partial"),
+    ([8, 4, 77], "plan"),
+    ([3000, 1500, 700], "fast"),
+)
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "D,Hq,Hkv,q_len,page",
+    [
+        (64, 32, 8, 1, 16),
+        (128, 32, 8, 1, 16),
+        (256, 32, 8, 1, 16),
+        (128, 8, 8, 1, 1),
+        (128, 64, 8, 1, 16),
+        (64, 8, 8, 2, 16),
+        (128, 32, 8, 4, 16),
+        (256, 32, 8, 3, 1),
+    ],
+)
+def test_cuda_graph_decode_replan_equals_eager(D, Hq, Hkv, q_len, page):
+    """``use_cuda_graph=True`` on the decode wrapper: one capture of ``run()``, then replans with changing KV lengths (through
+    ``plan``, ``fast_decode_plan`` and the ``begin_forward`` partial) each followed by a replay, give the bits of an eager
+    wrapper on the same batch -- the Swaps body (at most 8 live rows per unit) and the row body, pages of 1 and 16."""
+    pr = Problem([1, 1, 1], [5120, 5120, 5120], Hq, Hkv, D, page, seed=11)
+    gd = _GraphDecode(pr, q_len)
+    fixed = None
+    for kv_lens, how in GRAPH_STEPS:
+        plan = gd.check(kv_lens, how)
+        launch = gd.w._batch_invariant._fixed
+        assert fixed is None or launch is fixed  # one launch for the wrapper's lifetime
+        fixed = launch
+        assert plan.num_units <= fixed.unit_cap and len(plan.groups) <= fixed.group_cap
+        assert len(plan.fixup_groups) <= fixed.fixup_cap
+    assert gd.w.is_cuda_graph_enabled
+
+
+@needs_device
+@pytest.mark.parametrize("D,q_len", [(64, 1), (128, 1), (256, 1), (128, 4), (256, 4)])
+def test_cuda_graph_fixed_launch_unit_kinds_and_budget(D, q_len):
+    """The fixed launch under every unit kind and fold placement, plan after plan on one captured graph: all fused, all split
+    (in-kernel folds, the fixup kernel, both), the planner's choice, a capacity that the split plan exhausts (it fuses), and
+    a plan walked by fewer CTAs than the launch grid; the fixup node replays with and without groups to fold. Every replay
+    equals the eager engine."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant import plan as P
+
+    pr = Problem([1, 1, 1], [3000, 3000, 3000], 32, 8, D, 16, seed=12)
+    dev = pr.device
+    k, v = pr.cache("NHD")
+    q = pr.q[:1].repeat(3 * q_len, 1, 1).contiguous()
+    q[1::2] = pr.q[1]
+    sm_scale = 1.0 / math.sqrt(D)
+    qo = torch.arange(4, dtype=torch.int32) * q_len
+    cfg = engine.default_config(D=D)
+    steps = (
+        ([3000, 1500, 700], "split", "auto"),
+        ([300, 40, 129], "split", "fixup"),
+        ([3000, 3000, 3000], "fused", "auto"),
+        ([513, 2049, 64], "split", "inkernel"),
+        ([1024, 512, 2000], "auto", "auto"),
+        ([3000, 1500, 700], "split", "fixup"),
+        ([8, 4, 77], "auto", "auto"),
+    )
+    for unit_cap, walkers in ((None, None), (64, None), (None, 7)):
+        fixed = engine.FixedLaunch(
+            3, q_len, 32, 8, D, 16, cfg, workspace(dev), dev, unit_cap=unit_cap
+        )
+        if walkers:
+            # plans for a 7-SM part on this part's launch grid: 7 CTAs walk the units in waves, the others idle
+            assert fixed.grid > walkers
+            fixed.sm_count = walkers
+        indptr_buf = torch.zeros(4, dtype=torch.int32, device=dev)
+        indices_buf = torch.zeros(pr.kv_indices.numel(), dtype=torch.int32, device=dev)
+        out = torch.empty_like(q)
+        graph = None
+        kinds = set()
+        for kv_lens, policy, merge in steps:
+            step_cfg = replace(cfg, split_policy=policy, merge=merge)
+            indptr, idx, last = _prefix_tables(pr, kv_lens)
+            planned = engine.plan_attention(
+                qo, indptr, last, 32, 8, D, 16, config=step_cfg, fixed=fixed
+            )
+            indptr_buf.copy_(indptr)
+            indices_buf[: idx.numel()].copy_(idx)
+            plan = planned.plan
+            assert plan.num_units <= fixed.unit_cap
+            if unit_cap and (kv_lens, policy) == ([3000, 1500, 700], "split"):
+                # room for the six chunks of the longest request's units only: the others stay fused
+                assert plan.num_units == 64 and len(plan.groups) == 8
+            kinds.add(
+                (
+                    any(d[P.F_MODE] == 1 for d in plan.desc),
+                    bool(plan.fixup_groups),
+                    any(plan.group_inkernel),
+                )
+            )
+            run = lambda: engine.run_attention(  # noqa: E731
+                planned, q, k, v, indptr_buf, indices_buf, sm_scale, out=out
+            )
+            if graph is None:
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    run()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=s):
+                        run()
+                torch.cuda.synchronize()
+            out.fill_(3.0)
+            graph.replay()
+            torch.cuda.synchronize()
+            ref = engine.attention_paged(
+                q, k, v, qo.to(dev), indptr, idx, last, config=step_cfg
+            )
+            assert torch.equal(bits(out), bits(ref)), (unit_cap, kv_lens, policy, merge)
+            if walkers:
+                assert 1 <= int(fixed.counts[P.N_WALK]) <= walkers < plan.num_units
+        if unit_cap is None:
+            # split and fused plans, fixup and in-kernel folds, all through the one graph
+            assert {kd[0] for kd in kinds} == {True, False}
+            assert any(kd[1] for kd in kinds) and any(kd[2] for kd in kinds)
+        else:
+            assert fixed.unit_cap == 64 and any(kd[0] for kd in kinds)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_cuda_graph_split_budget_exhausted(D, monkeypatch):
+    """A batch whose split plan exceeds the wrapper's unit capacity is planned fused (the same bits), and the next, shorter
+    batch splits again -- on the same captured graph. The capacity is lowered to one unit per SM so that a small batch
+    exhausts it."""
+    from flashinfer.attention.batch_invariant import engine
+
+    monkeypatch.setattr(engine, "GRAPH_UNIT_WAVES", 1)
+    pr = Problem([1, 1], [16000, 16000], 32, 8, D, 16, seed=13)
+    gd = _GraphDecode(pr, 1)
+    gd.check([700, 300], "plan")
+    fixed = gd.w._batch_invariant._fixed
+    assert fixed.unit_cap == engine.device_sm_count(pr.device)
+    long = gd.check([16000, 15000], "fast")
+    # the eager planner is free to split these 16 units into their 32 and 30 chunks; the fixed launch has no room for the
+    # longer class, so every unit stays fused
+    free = engine.plan_attention(
+        torch.arange(3, dtype=torch.int32),
+        *_prefix_tables(pr, [16000, 15000])[::2],
+        32,
+        8,
+        D,
+        16,
+        device=pr.device,
+    ).plan
+    if free.groups:
+        assert free.num_units > fixed.unit_cap
+        assert long.num_units == 16 and not long.groups
+    gd.check([3000, 1500], "fast")
+    gd.check([16000, 2000], "partial")
+    assert gd.check([16000, 16000], "plan").num_units == 16
+
+
+@needs_device
+@pytest.mark.parametrize("D,q_len", [(64, 1), (128, 1), (256, 1), (128, 3)])
+@pytest.mark.parametrize("lse", [False, True])
+def test_cuda_graph_null_requests(D, q_len, lse):
+    """Padded slots of a captured batch -- requests without pages -- are null requests under ``use_cuda_graph=True``: their
+    output rows are zeros (LSE ``-inf``) and the other requests keep the bits of an eager call on the live sub-batch; the
+    slots change from replan to replan. A request with fewer keys than query tokens is still refused."""
+    pr = Problem([1] * 4, [2100, 1300, 1300, 2100], 32, 8, D, 16, seed=14)
+    gd = _GraphDecode(pr, q_len, lse=lse)
+    kw = dict(run_kw=LSE) if lse else {}
+    for kv_lens, how in (
+        ([700, 0, 1300, 0], "plan"),
+        ([0, 50, 0, 2100], "fast"),
+        ([0, 0, 0, 0], "fast"),
+        ([2100, 1300, 1300, 2100], "partial"),
+        ([0, 0, 0, 3], "plan"),
+    ):
+        gd.check(kv_lens, how, **kw)
+    if q_len > 1:
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            gd.plan([700, q_len - 1, 0, 9])
+    # outside graph mode a request without keys is refused, as before
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(
+            *_prefix_tables(pr, [700, 0, 1300, 0]),
+            32,
+            8,
+            D,
+            16,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+
+
+@needs_device
+@pytest.mark.parametrize("D,q_len", [(64, 1), (128, 1), (256, 1), (128, 4)])
+def test_cuda_graph_lse_and_sinks_replay(D, q_len):
+    """The LSE member and the sink member under replan and replay: the caller's LSE buffer and sinks tensor are captured by
+    address, the sinks are read in place at every replay, and every replay equals the eager wrapper's ``(out, lse)``; a null
+    request's rows are zeros and ``-inf`` with sinks too."""
+    pr = Problem([1] * 3, [5120, 5120, 5120], 32, 8, D, 16, seed=15)
+    first, second = sink_logits(pr, seed=3), sink_logits(pr, seed=4)
+    sinks = first.clone()
+    gd = _GraphDecode(pr, q_len, lse=True, sinks=sinks)
+    for kv_lens, how, values in (
+        ([300, 40, 129], "plan", first),
+        ([3000, 1500, 700], "fast", first),
+        ([3000, 1500, 700], "fast", second),
+        ([513, 0, 64], "partial", second),
+        ([5120, 5120, 5120], "fast", first),
+    ):
+        sinks.copy_(values)
+        gd.check(kv_lens, how, run_kw=dict(LSE, sinks=values))
+
+
+@needs_device
+def test_cuda_graph_sliding_window_and_serving_arguments():
+    """A sliding window under replan and replay, and the arguments serving engines pass on every plan: ``seq_lens`` equal to
+    the page table's KV lengths, ``fixed_split_size`` (-1, or a positive value under ``use_cuda_graph=True``: accepted and not
+    used) and ``disable_split_kv`` (fused units). None of them changes a bit."""
+    pr = Problem([1] * 3, [5120, 5120, 5120], 32, 8, 128, 16, seed=16)
+    gd = _GraphDecode(pr, 1, window_left=700)
+    seq = lambda lens: torch.tensor(lens, dtype=torch.int32)  # noqa: E731
+    gd.check([300, 40, 129], seq_lens=seq([300, 40, 129]), fixed_split_size=-1)
+    gd.check([3000, 1500, 700], "fast")
+    split = gd.check([5120, 5120, 2049], fixed_split_size=2048)
+    fused = gd.check([5120, 5120, 2049], fixed_split_size=2048, disable_split_kv=True)
+    assert not fused.groups and fused.num_units == 24 <= split.num_units
+    gd.check([5120, 800, 2049], "fast", fixed_split_size=2048, disable_split_kv=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gd.plan([300, 40, 129], seq_lens=seq([300, 41, 129]))
+    # the same arguments on an eager wrapper: a positive fixed_split_size is refused there
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    tables = _prefix_tables(pr, [3000, 1500, 700])
+    args = (*tables, 32, 8, 128, 16)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    q = gd.q
+    w.plan(*args, **kw)
+    ref = bits(w.run(q, pr.cache("NHD"))).clone()
+    w.plan(
+        *args,
+        seq_lens=seq([3000, 1500, 700]),
+        fixed_split_size=-1,
+        disable_split_kv=True,
+        **kw,
+    )
+    assert torch.equal(bits(w.run(q, pr.cache("NHD"))), ref)
+    flashinfer.decode.fast_decode_plan(w, *args, fixed_split_size=-1, **kw)
+    assert torch.equal(bits(w.run(q, pr.cache("NHD"))), ref)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(*args, fixed_split_size=2048, **kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(*args, seq_lens=seq([3000, 1500, 701]), **kw)
+
+
+@needs_device
+def test_cuda_graph_frozen_shape_violations():
+    """What a ``use_cuda_graph=True`` wrapper fixes for its lifetime: the batch size, ``q_len_per_req`` and the size of the
+    page-index buffer raise ``ValueError`` as on the other backends; the head counts, head dim, page size, window, ``sm_scale``
+    and -- from the first ``run()`` -- the LSE mode and the presence of sinks raise the class's typed error. A refused plan
+    leaves the wrapper on its last plan. The prefill wrappers still refuse the flag."""
+    pr = Problem([1] * 3, [3000, 3000, 3000], 32, 8, 128, 16, seed=17)
+    dev = pr.device
+    gd = _GraphDecode(pr, 1)
+    gd.check([300, 40, 129])
+    ref = gd.replay()[0]
+    indptr, idx, last = _prefix_tables(pr, [3000, 1500, 700])
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    too_many = torch.zeros(gd.indices_buf.numel() + 1, dtype=torch.int32, device=dev)
+    for bad_args, bad_kw in (
+        ((indptr[:3], idx, last[:2], 32, 8, 128, 16), {}),  # batch size
+        ((indptr, too_many, last, 32, 8, 128, 16), {}),  # more indices than the buffer
+        ((indptr, idx, last, 32, 8, 128, 16), dict(q_len_per_req=2)),
+    ):
+        for planner in (
+            gd.w.plan,
+            lambda *a, **k: flashinfer.decode.fast_decode_plan(gd.w, *a, **k),
+        ):
+            with pytest.raises(ValueError) as err:
+                planner(*bad_args, **kw, **bad_kw)
+            assert not isinstance(err.value, bi.BatchInvariantUnsupportedError)
+    for bad_args, bad_kw in (
+        ((indptr, idx, last, 32, 8, 128, 16), dict(window_left=64)),
+        ((indptr, idx, last, 32, 8, 128, 16), dict(sm_scale=0.5)),
+        ((indptr, idx, last, 16, 8, 128, 16), {}),
+        ((indptr, idx, last, 32, 4, 128, 16), {}),
+        ((indptr, idx, last, 32, 8, 64, 16), {}),
+        ((indptr, idx, last, 32, 8, 128, 8), {}),
+    ):
+        for planner in (
+            gd.w.plan,
+            lambda *a, **k: flashinfer.decode.fast_decode_plan(gd.w, *a, **k),
+        ):
+            with pytest.raises(bi.BatchInvariantUnsupportedError):
+                planner(*bad_args, **kw, **bad_kw)
+    assert torch.equal(gd.replay()[0], ref)  # the refused plans changed nothing
+    gd.check([3000, 1500, 700], "fast")
+    cache = pr.cache("NHD")
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gd.w.run(gd.q, cache, return_lse=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gd.w.run(gd.q, cache, sinks=sink_logits(pr))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gd.w.reset_workspace_buffer(workspace(dev), gd.w._int_workspace_buffer)
+    # the constructor: the page-table buffers are required, int32 and on the device
+    ws = workspace(dev)
+    bufs = dict(
+        paged_kv_indptr_buffer=gd.indptr_buf,
+        paged_kv_indices_buffer=gd.indices_buf,
+        paged_kv_last_page_len_buffer=gd.last_buf,
+    )
+    for name, other in (
+        ("paged_kv_indptr_buffer", None),
+        ("paged_kv_indices_buffer", gd.indices_buf.to(torch.int64)),
+        ("paged_kv_last_page_len_buffer", gd.last_buf.cpu()),
+    ):
+        with pytest.raises(ValueError):
+            flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                ws,
+                "NHD",
+                use_cuda_graph=True,
+                batch_invariant=True,
+                **dict(bufs, **{name: other}),
+            )
+    for wrapper in (
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper,
+        flashinfer.BatchPrefillWithRaggedKVCacheWrapper,
+    ):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            wrapper(ws, "NHD", use_cuda_graph=True, batch_invariant=True)
+
+
+@needs_device
+@pytest.mark.parametrize("D,q_len", [(128, 1), (256, 4)])
+def test_cuda_graph_replans_without_synchronization(D, q_len):
+    """A decode loop as serving engines run it: replan and replay step after step with no synchronisation in between (the
+    plan's table copies are asynchronous and stream-ordered with the replays). Every step's output, cloned on the stream,
+    equals the eager wrapper's."""
+    pr = Problem([1] * 4, [4200] * 4, 32, 8, D, 16, seed=18)
+    gd = _GraphDecode(pr, q_len)
+    gd.check([300, 40, 129, 2000])
+    g = torch.Generator(device="cpu").manual_seed(5)
+    steps = [
+        [int(x) for x in torch.randint(q_len, 4200, (4,), generator=g)]
+        for _ in range(24)
+    ]
+    steps[5][2] = steps[11][0] = steps[11][3] = 0  # padded slots come and go
+    outs = []
+    for i, kv_lens in enumerate(steps):
+        gd.plan(kv_lens, ("fast", "partial", "plan")[i % 3])
+        gd.out.fill_(3.0)
+        gd.graph.replay()
+        outs.append(gd.out.clone())
+    torch.cuda.synchronize()
+    for kv_lens, out in zip(steps, outs, strict=True):
+        rows, ref = _eager_decode(pr, gd.q, kv_lens, q_len)
+        null = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+        null[rows] = False
+        assert torch.equal(bits(out[rows]), bits(ref)), kv_lens
+        assert not bits(out[null]).any(), kv_lens
