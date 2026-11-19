@@ -222,6 +222,10 @@ def gen_cutlass_fused_moe_sm90_module(
     (the default), an H20 (which takes precedence) or a measured H100 SXM
     selects its prebuilt-D module variant; every other device or
     ``enable_prebuilt_d=False`` gets the generic module.
+
+    Raises:
+        ValueError: If ``use_prebuilt_d_descriptor=True`` conflicts with
+            ``enable_prebuilt_d=False``.
     """
     if use_prebuilt_d_descriptor and not enable_prebuilt_d:
         raise ValueError(
