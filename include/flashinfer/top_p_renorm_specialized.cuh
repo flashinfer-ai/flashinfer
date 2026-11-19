@@ -92,10 +92,17 @@ constexpr float BIG_MASS = 64.0f;                  // a row this heavy never tak
 typedef unsigned long long u64;
 
 // Fixed-point mass of p in units of 2^-q, 2^q = scale * scale2 (two factors, so that q can exceed
-// a float's exponent range for a row of tiny entries; each product is exact); 0 for p <= 0 and
-// NaN (the conversion saturates at 0).
+// a float's exponent range for a row of tiny entries; each product is exact); 0 for p <= 0 (the
+// conversion saturates at 0). A NaN converts to 2^63, not 0: the callers drop NaN entries first
+// (head_fix, hist_add, tail_fix).
 __device__ __forceinline__ u64 to_fix(float p, float scale = FIX_SCALE, float scale2 = 1.f) {
   return __float2ull_rn(p * scale * scale2);
+}
+
+// 2^-56 fixed-point mass of a gathered head entry (p >= 2^-8 or NaN): 0 for a NaN, which has no
+// mass and is never kept (x >= threshold is false for it).
+__device__ __forceinline__ u64 head_fix(float p) {
+  return (__float_as_uint(p) <= 0x7f800000u) ? to_fix(p) : 0ULL;
 }
 
 // 2^k as a float, for k in [-126, 127].
@@ -145,7 +152,7 @@ __device__ __forceinline__ void cl_wait() {
 __device__ __forceinline__ void hist_add(float x, int mode, int prefix, float scale, float scale2,
                                          u64* lmass, unsigned* lcnt) {
   int bits = __float_as_int(x);
-  if (bits <= 0) return;
+  if (bits <= 0 || bits > 0x7f800000) return;  // zero, negative or NaN: no mass, never kept
   bool f;
   int key;
   if (mode == 0) {
@@ -168,9 +175,10 @@ __device__ __forceinline__ void hist_add(float x, int mode, int prefix, float sc
 }
 
 // The radix path's rewrite predicate: x is at or above the threshold's bit prefix and is not a NaN.
-// A NaN has no mass anywhere in this kernel (to_fix and the float32 slice sums count it as 0) and
-// is never kept, as on the head paths (x >= thr is false for it); its bit pattern sorts above every
-// finite value, so the prefix test alone would keep it.
+// A NaN has no mass anywhere in this kernel (it is never a head entry or in a histogram bin, and
+// the float32 slice sums add fmaxf(NaN, 0) = 0) and is never kept, as on the head paths (x >= thr
+// is false for it); its bit pattern sorts above every finite value, so the prefix test alone would
+// keep it.
 __device__ __forceinline__ bool radix_keep(float x, int kshift, int kprefix) {
   const int bits = __float_as_int(x);
   return bits <= 0x7f800000 && (bits >> kshift) >= kprefix;
@@ -182,11 +190,14 @@ __device__ __forceinline__ double kept_f64(float x, int kshift, int kprefix) {
   return (bits > 0 && bits < 0x7f800000 && (bits >> kshift) >= kprefix) ? (double)x : 0.0;
 }
 
-// Fixed-point mass of an entry below the fallback's level-0 range (0 for p >= 2^-16 and p <= 0).
+// Fixed-point mass of an entry below the fallback's level-0 range (0 for p >= 2^-16, p <= 0 and
+// NaN, including a NaN with the sign bit set).
 __device__ __forceinline__ u64 tail_fix(float x, float scale, float scale2) {
-  return (__float_as_int(x) < LBITS) ? to_fix(x, scale, scale2) : 0ULL;
+  return (__float_as_uint(x) - 1u < (unsigned)(LBITS - 1)) ? to_fix(x, scale, scale2) : 0ULL;
 }
 
+// A head entry: bits >= those of 2^-8. A +NaN passes this test (its bits sort above every finite
+// value) and is neutralised after the gather (head_fix), which keeps the streaming loop as it is.
 __device__ __forceinline__ void cand_add(float x, int gi, int* s_n, float* s_cv, int* s_ci) {
   if (__float_as_int(x) >= CBITS) {
     int k = atomicAdd(s_n, 1);
@@ -353,7 +364,7 @@ __global__ void __launch_bounds__(NT, MINB)
         s_all[t] = v;
       }
       if (ntot >= 2) {
-        const u64 fv = (t < ntot) ? to_fix(v) : 0ULL;
+        const u64 fv = (t < ntot) ? head_fix(v) : 0ULL;
         u64 wtot = fv, excl = 0;
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) wtot += __shfl_xor_sync(0xffffffffu, wtot, off);
@@ -387,7 +398,7 @@ __global__ void __launch_bounds__(NT, MINB)
 
   // One-entry nucleus (the common serving case): every CTA holds the same sole head entry,
   // so its exact fixed-point mass decides without further block reductions or atomics.
-  if (!big && ntot == 1 && to_fix(s_all[0]) >= thi) {
+  if (!big && ntot == 1 && head_fix(s_all[0]) >= thi) {
     if (s_n == 1 && t == 0) {
       const float x = s_cv[0];
       out[(long long)row * V + s_ci[0]] = x / x;
@@ -422,7 +433,7 @@ __global__ void __launch_bounds__(NT, MINB)
       v = s_all[t];
       for (int j = 0; j < ntot; ++j) {
         const float y = s_all[j];
-        const u64 fy = to_fix(y);
+        const u64 fy = head_fix(y);
         tot += fy;
         if (y > v || (y == v && j < t)) excl += fy;
       }
