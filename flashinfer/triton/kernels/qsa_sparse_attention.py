@@ -360,12 +360,14 @@ def _query_pair(qr, FIXED32: tl.constexpr = False):
 
 @triton.jit
 def _qk(qh, ql, kt, USEQL: tl.constexpr = True):
-    if qh.dtype == tl.bfloat16:
-        # Native query; widening the finite E4M3 key is exact.
-        return tl.dot(qh, kt.to(tl.bfloat16), out_dtype=tl.float32)
-    s = tl.dot(qh, kt, out_dtype=tl.float32)
-    if USEQL:
-        s = tl.dot(ql, kt, s, out_dtype=tl.float32)
+    if qh.dtype == tl.float8e4nv:
+        s = tl.dot(qh, kt, out_dtype=tl.float32)
+        if USEQL:
+            s = tl.dot(ql, kt, s, out_dtype=tl.float32)
+    else:
+        # Native BF16 query; widening the finite E4M3 key is exact.
+        # Keep the incompatible FP8 dot in a separate compile-time branch.
+        s = tl.dot(qh.to(tl.bfloat16), kt.to(tl.bfloat16), out_dtype=tl.float32)
     return s
 
 
