@@ -207,10 +207,10 @@ jobs:
       # instead of silently un-scheduling later targeted A10G/T4 runs.
       - name: Validate bare-run coverage parse
         run: |
-          python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
-            --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh
-          python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
-            --scripts scripts/task_jit_run_tests_t4.sh
+          python3 scripts/infra/pr_checks/targeted_lane_scope.py --coverage-only \
+            --scripts scripts/infra/task_jit_run_tests_part{1,2,3,4,5}.sh
+          python3 scripts/infra/pr_checks/targeted_lane_scope.py --coverage-only \
+            --scripts scripts/infra/task_jit_run_tests_t4.sh
 
       - name: Get Docker Tag
         id: get-tag
@@ -285,13 +285,13 @@ jobs:
           A10G_SCOPES=(); T4_SCOPE=""; H100_SCOPE=""
           if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
             for shard in 1 2 3 4 5; do
-              A10G_SCOPES[$shard]=$(python3 scripts/pr_checks/targeted_lane_scope.py \
-                --scripts "scripts/task_jit_run_tests_part${shard}.sh" \
+              A10G_SCOPES[$shard]=$(python3 scripts/infra/pr_checks/targeted_lane_scope.py \
+                --scripts "scripts/infra/task_jit_run_tests_part${shard}.sh" \
                 --targets "${REQUESTED_TEST_PATH}")
               echo "A10G shard ${shard} targeted scope: ${A10G_SCOPES[$shard]:-<none: shard not scheduled>}"
             done
-            T4_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
-              --scripts scripts/task_jit_run_tests_t4.sh \
+            T4_SCOPE=$(python3 scripts/infra/pr_checks/targeted_lane_scope.py \
+              --scripts scripts/infra/task_jit_run_tests_t4.sh \
               --targets "${REQUESTED_TEST_PATH}")
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
             # tests/cpu belongs to the CPU Unittest lane, which runs on every run.
@@ -389,7 +389,7 @@ jobs:
               # brace group, which is piped into jq and so runs in a subshell.
               #
               # A10G runs its bare-run shard scripts, restricted to the scope through
-              # JIT_TEST_SCOPE (see scripts/jit_test_logging.sh). T4 and H100 use
+              # JIT_TEST_SCOPE (see scripts/infra/jit_test_logging.sh). T4 and H100 use
               # task_run_unit_tests.sh, the script that forwards "$@" into TEST_PATH.
               #
               # This step does NOT parse the PR body. Turning a declared scope into paths
@@ -566,7 +566,7 @@ jobs:
           git submodule update --init --recursive
 
       - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
+        run: ./scripts/infra/task_show_node_info.sh
         env:
           NODE_NAME: ${{ runner.name }}
           WORKSPACE: ${{ github.workspace }}
@@ -596,7 +596,7 @@ jobs:
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
             -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
-            --no-gpu "./scripts/${TEST_SCRIPT}"
+            --no-gpu "./scripts/infra/${TEST_SCRIPT}"
 
       - name: Configure compile cache
         if: matrix.kind != 'aot' && matrix.kind != 'cpu'
@@ -656,7 +656,7 @@ jobs:
           # ci/bash.sh options must precede the command. The credentials are
           # forwarded by name so ci/bash.sh never echoes their values.
           DOCKER_ARGS=()
-          LANE_COMMAND=("./scripts/${TEST_SCRIPT}")
+          LANE_COMMAND=("./scripts/infra/${TEST_SCRIPT}")
           if [ "${GPU_TEST_SCCACHE}" = "1" ]; then
             mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
             DOCKER_ARGS+=(
@@ -666,7 +666,7 @@ jobs:
               -e AWS_SECRET_ACCESS_KEY
               -e SCCACHE_STATS_DIR /workspace/sccache-stats
             )
-            LANE_COMMAND=(./scripts/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
+            LANE_COMMAND=(./scripts/infra/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
           fi
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
@@ -796,8 +796,8 @@ jobs:
         if: always() && matrix.kind != 'aot'
         run: |
           if command -v python3 >/dev/null; then
-            python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
-            python3 scripts/summarize_jit_builds.py --markdown \
+            python3 scripts/infra/summarize_jit_builds.py junit/jit-builds.jsonl || true
+            python3 scripts/infra/summarize_jit_builds.py --markdown \
               junit/jit-builds.jsonl >> "${GITHUB_STEP_SUMMARY}" || true
           else
             echo "::warning::python3 unavailable on runner; JIT build summary skipped"
@@ -902,7 +902,7 @@ jobs:
           persist-credentials: false
 
       - name: Lint provider spec CUDA targets
-        run: bash ci/bash.sh "${DOCKER_IMAGE}" --no-gpu ./scripts/task_check_jit_spec_gencodes.sh
+        run: bash ci/bash.sh "${DOCKER_IMAGE}" --no-gpu ./scripts/infra/task_check_jit_spec_gencodes.sh
 
   # ---------------------------------------------------------------------------
   # Test Results Summary
@@ -1120,7 +1120,7 @@ jobs:
           fi
 
           SKIP_ALL_EXIT=0
-          REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
+          REPORT=$(python3 scripts/infra/pr_checks/check_skip_all.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
             $SHARD_ARGS \
@@ -1190,7 +1190,7 @@ jobs:
         if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
         run: |
           TRACE_EXIT=0
-          REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
+          REPORT=$(python3 scripts/infra/pr_checks/check_trace_coverage.py \
             --github-actions 2>&1) || TRACE_EXIT=$?
           echo "$REPORT"
 

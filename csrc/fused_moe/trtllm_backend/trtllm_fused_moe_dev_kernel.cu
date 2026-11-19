@@ -1048,13 +1048,13 @@ __global__ void permuteKernel(KernelParams params) {
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
       // Load chunk of token into registers
-      const Type data = params.inPtr[tokenIdx * params.hiddenDim + hiddenIdx];
+      const Type data = params.inPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx];
 
       // Write to topK places
       for (int k = 0; k < params.topK; k++) {
         int const expandedIdx = tokenIdx * params.topK + k;
         int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-        params.outPtr[permutedIdx * params.hiddenDim + hiddenIdx] = data;
+        params.outPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDim + hiddenIdx] = data;
       }
     }
     if (params.useDeepSeekFp8) {
@@ -1129,8 +1129,10 @@ __global__ void finalizeKernel(KernelParams params) {
 
         if constexpr (KernelParams::UseSecondInput) {
           float const input =
-              float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]} +
-              float{params.inPtr2[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+              float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                 hiddenIdx]} +
+              float{params.inPtr2[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                  hiddenIdx]};
           if (params.expertWeightsPtr != nullptr) {
             TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
             data += float{scale} * input;
@@ -1141,14 +1143,17 @@ __global__ void finalizeKernel(KernelParams params) {
           if (params.expertWeightsPtr != nullptr) {
             TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
             data += float{scale} *
-                    float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+                    float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                       hiddenIdx]};
           } else {
-            data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+            data += float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                       hiddenIdx]};
           }
         }
       }
 
-      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
+      params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] =
+          static_cast<Type>(data);
     }
   }
 }
@@ -1332,7 +1337,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
     permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
   }
 
-  auto const offset = tokenIdx * params.hiddenDim;
+  int64_t const offset = static_cast<int64_t>(tokenIdx) * params.hiddenDim;
   Type* outputPtr = params.outPtr + offset;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
@@ -1589,7 +1594,8 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
         acc[e] += partialSmem[g * blockDim.x + threadIdx.x][e];
       }
     }
-    reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim)[vecIdx] =
+    reinterpret_cast<VecElem*>(params.outPtr +
+                               static_cast<int64_t>(tokenIdx) * params.hiddenDim)[vecIdx] =
         arrayConvert<ComputeElem, VecElem>(acc);
   }
 }
@@ -1631,8 +1637,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
         float const expertProb = (float)params.expertWeightsPtr[tokenIdx * params.topK + k];
 
         float const scale = expertProb * blockScale;
-        acc += scale *
-               static_cast<float>(params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]);
+        acc += scale * static_cast<float>(
+                           params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                        hiddenIdx]);
       }
 
       // The largest (finite) value that can be represented using E4m3.
@@ -1653,7 +1660,8 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
       __syncthreads();
       float const scaleOut = s_scaleOut;
       __syncthreads();
-      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = (Type)(acc / scaleOut);
+      params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] =
+          (Type)(acc / scaleOut);
     }
   }
 }

@@ -16,6 +16,7 @@
 
 #include <driver_types.h>
 
+#include <cstdint>
 #include <flashinfer/gemm/bmm_fp8.cuh>
 #include <unordered_map>
 
@@ -44,10 +45,27 @@ cublasLtHandle_t get_cublaslt_handle(int device_id) {
   return handle;
 }
 
+// The bias has one value per output column, in the output dtype, and is added to every batch.
+template <typename DT>
+const DT* get_bias_ptr(const ffi::Optional<TensorView>& bias, const TensorView& D) {
+  if (!bias.has_value()) {
+    return nullptr;
+  }
+  const TensorView& tensor = bias.value();
+  CHECK_INPUT(tensor);
+  CHECK_DEVICE(tensor, D);
+  CHECK_DIM(1, tensor);
+  CHECK_SAME_DTYPE(tensor, D);
+  TVM_FFI_ICHECK_EQ(tensor.size(0), D.size(2)) << "bias must have one value per output column";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0)
+      << "bias must be 16-byte aligned";
+  return static_cast<const DT*>(tensor.data_ptr());
+}
+
 }  // namespace
 
 void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
-             TensorView workspace_buffer) {
+             TensorView workspace_buffer, ffi::Optional<TensorView> bias) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -80,7 +98,7 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
             static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
             static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
             static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()),
-            lt_handle, stream);
+            get_bias_ptr<d_type>(bias, D), lt_handle, stream);
         TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS)
             << "bmm_fp8_internal_cublaslt failed: " << cublasGetStatusString(status);
         return true;
@@ -93,7 +111,7 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
 // algo_m rows, into a CPU uint8 tensor. Returns the number of algorithms written.
 int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A_scale,
                           TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer,
-                          int64_t algo_m) {
+                          int64_t algo_m, ffi::Optional<TensorView> bias) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -124,7 +142,7 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
                                          flashinfer::bmm_fp8::kAlgoBytes);
         result = flashinfer::bmm_fp8::get_fp8_algorithms<b_type, a_type, d_type>(
             batch_size, n, m, k, static_cast<float*>(B_scale.data_ptr()),
-            static_cast<float*>(A_scale.data_ptr()),
+            static_cast<float*>(A_scale.data_ptr()), get_bias_ptr<d_type>(bias, D),
             workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle,
             algo_buffer.data_ptr(), max_algos);
         return true;
@@ -139,7 +157,8 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
 // apply to this problem. Returns 1 if algo_desc ran, 0 if the heuristic default ran.
 int64_t bmm_fp8_run_with_descriptor(TensorView A, TensorView B, TensorView D, TensorView A_scale,
                                     TensorView B_scale, TensorView workspace_buffer,
-                                    ffi::Optional<TensorView> algo_desc) {
+                                    ffi::Optional<TensorView> algo_desc,
+                                    ffi::Optional<TensorView> bias) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -181,7 +200,8 @@ int64_t bmm_fp8_run_with_descriptor(TensorView A, TensorView B, TensorView D, Te
             static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
             static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
             static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()),
-            lt_handle, stream, A.device().device_id, algo_desc_ptr, &used_descriptor);
+            get_bias_ptr<d_type>(bias, D), lt_handle, stream, A.device().device_id, algo_desc_ptr,
+            &used_descriptor);
         TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS)
             << "bmm_fp8_run_with_descriptor failed: " << cublasGetStatusString(status);
         return true;

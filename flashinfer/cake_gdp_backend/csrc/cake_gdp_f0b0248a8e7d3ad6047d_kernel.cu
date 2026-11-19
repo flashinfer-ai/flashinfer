@@ -50,7 +50,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
 #define LAUNCH_MIN_BLOCKS 1
+#else
+#define LAUNCH_MIN_BLOCKS 2
+#endif
 
 #include <math_constants.h>
 
@@ -610,7 +614,11 @@ kernel_cake_gdp_f0b0248a8e7d3ad6047d(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         S2[15] = make_float2(S[30], S[31]);
 #endif
         if (use_ssm_state_indices != 0) {
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
             #pragma unroll 1
+#else
+            #pragma unroll 2
+#endif
             for (int t = 0; t < 6; t++) {
                 float alpha = sAlpha[t];
 #if __CUDA_ARCH__ == 900
@@ -1872,7 +1880,11 @@ kernel_cake_gdp_f0b0248a8e7d3ad6047d(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             }
         }
         if (use_ssm_state_indices == 0) {
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
             #pragma unroll 1
+#else
+            #pragma unroll 2
+#endif
             for (int t_1 = 0; t_1 < 6; t_1++) {
                 float alpha_1 = sAlpha[t_1];
 #if __CUDA_ARCH__ == 900

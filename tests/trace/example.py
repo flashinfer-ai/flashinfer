@@ -37,6 +37,7 @@ alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 cute_dsl_fused_moe_topk2_e3_h768.json
+decode_cp_a2a_lse_reduce_tokens_d512.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
@@ -121,6 +122,7 @@ prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4_scales_tf.json
+prims_ts_decode_mla_one_shot_kv_bounds_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -255,6 +257,7 @@ from flashinfer.cake_minimax_h3 import (
 from flashinfer.comm import (
     PcieIpcAllGatherWorkspace,
     PcieIpcReduceScatterWorkspace,
+    decode_cp_a2a_lse_reduce,
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
@@ -296,6 +299,20 @@ batch_decode_with_kv_cache_mla_swa.fi_trace(
     sm_scale=0.0625,
 )
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# DCP schema tracing needs tensor metadata, not a collective workspace.
+fi_trace(
+    decode_cp_a2a_lse_reduce,
+    partial_o=torch.empty((4, 8, 2, 512), dtype=torch.bfloat16, device="meta"),
+    partial_lse=torch.empty((4, 8, 2), dtype=torch.float32, device="meta"),
+    workspace=torch.empty(16, dtype=torch.uint8, device="meta"),
+    cp_rank=0,
+    cp_size=8,
+    lse_mode="base2",
+    mask=torch.empty(4, dtype=torch.bool, device="meta"),
+    save_dir=SAVE_DIR,
+)
+
 
 # PCIe traces need only world_size and tensor metadata, not an IPC allocation
 # or peer GPUs. Real collective execution must construct the workspace normally.
@@ -3074,6 +3091,22 @@ with contextlib.suppress(Exception):
         _pmla_num_pages, dtype=torch.int32, device=device
     ).reshape(_pmla_B, _pmla_pages_per_request)
     _pmla_seq_lens = torch.full((_pmla_B,), _pmla_SK, dtype=torch.int32, device=device)
+
+    _attention_ts_mla_decode.fi_trace(
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        max_q_len=_pmla_SQ,
+        max_kv_len=_pmla_SK,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        kv_bounds=torch.arange(
+            _pmla_SK - _pmla_SQ + 1, _pmla_SK + 1, dtype=torch.int32, device=device
+        ).repeat(_pmla_B),
+        zero_empty_rows=True,
+    )
 
     _attention_ts_mla_decode(
         _pmla_q,

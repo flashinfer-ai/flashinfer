@@ -226,7 +226,11 @@ def test_worker_builds_fp8_persistent_and_splitk_contract(monkeypatch, tactic):
 
 def test_worker_budget_respects_cpu_and_cgroup(monkeypatch):
     monkeypatch.setenv("FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS", "8")
-    monkeypatch.setattr(precompile.os, "sched_getaffinity", lambda _: {0, 1, 2, 3})
+    # raising=False: Windows has no sched_getaffinity (the code under test
+    # checks hasattr first).
+    monkeypatch.setattr(
+        precompile.os, "sched_getaffinity", lambda _: {0, 1, 2, 3}, raising=False
+    )
     monkeypatch.setattr(precompile, "_available_host_memory_bytes", lambda: 2 << 30)
     assert precompile._get_mm_mxfp8_compile_workers() == 2
     monkeypatch.setattr(precompile, "_available_host_memory_bytes", lambda: 0)
