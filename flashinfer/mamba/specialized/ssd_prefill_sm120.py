@@ -437,8 +437,7 @@ def warmup(nheads: int, device=None) -> None:
     # NH128 variant on a device that cannot hold the whole grid would raise.
     if (
         nheads >= 96
-        and torch.cuda.get_device_properties(device).multi_processor_count
-        < nheads + 8
+        and torch.cuda.get_device_properties(device).multi_processor_count < nheads + 8
     ):
         return
     run = _kernel_entry()
