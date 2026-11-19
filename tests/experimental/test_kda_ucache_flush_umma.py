@@ -574,8 +574,87 @@ def test_umma_persistent_concurrent_launches(mode, monkeypatch):
             for i in range(2):
                 for a, b in zip(ref[i], _pz_snapshot(cases[i], outs[i]), strict=True):
                     assert torch.equal(a, b)
+
     for c in pzm._COUNTERS.values():
-        assert int(c.abs().sum()) == 0
+        assert c.tolist() == [0, 0]
     for a in pzm._ARENA.values():
         for c in a["chunks"]:
             assert int(c.abs().sum()) == 0
+
+
+def test_umma_persistent_dirty_counter_recovery(monkeypatch):
+    """A completed persistent launch leaves its claim counter at zero; a counter left
+    non-zero (a launch that did not complete, or any corruption) is recovered by
+    persistent_counter_reset(): every launch after it is bitwise equal to the one-item
+    kernel and leaves the counter at zero again."""
+    from flashinfer.experimental.kda_ucache_flush import kda_replay_mtp_umma as um
+    from flashinfer.experimental.kda_ucache_flush import (
+        kda_replay_mtp_umma_persistent as pzm,
+    )
+
+    t = 4
+    monkeypatch.setattr(um, "_FORCE_PERSISTENT", False)
+    c = _pz_cases(1, t, 9300)[0]
+    ref = _pz_snapshot(c, _call(tuple(c), "umma", t=t))
+    monkeypatch.setattr(um, "_FORCE_PERSISTENT", True)
+    _call(tuple(_pz_cases(1, t, 9300)[0]), "umma", t=t)  # creates this stream's counter
+    torch.cuda.synchronize()
+    key = (torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream)
+    word = pzm._COUNTERS[key]
+    assert word.tolist() == [0, 0]
+    for gv in ([5, 0], [0, 3], [7, 2], [100000, 0], [-1, -1]):
+        word.copy_(torch.tensor(gv, dtype=torch.int32))
+        pzm.persistent_counter_reset()
+        for _ in range(2):
+            c = _pz_cases(1, t, 9300)[0]
+            got = _pz_snapshot(c, _call(tuple(c), "umma", t=t))
+            torch.cuda.synchronize()
+            for a, b in zip(ref, got, strict=True):
+                assert torch.equal(a, b), f"wrong results after counter {gv} + reset"
+            assert word.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("nh", [129, 160, 256])
+def test_umma_persistent_large_h_bitwise(nh, monkeypatch):
+    """H > 128: the persistent kernel's SMEM A_log table holds every head (it held 128 and
+    read past the end for heads >= 128). Persistent == one-item kernel, bitwise, for
+    verify and fold rows; H > 256 never takes the persistent kernel."""
+    from flashinfer.experimental.kda_ucache_flush import kda_replay_mtp_umma as um
+
+    monkeypatch.setattr(_base, "H", nh)
+    t, B = 4, 24
+    res = {}
+    for pz in (False, True):
+        monkeypatch.setattr(um, "_FORCE_PERSISTENT", pz)
+        assert um._use_persistent(B, t, nh, 16, torch.device("cuda")) is pz
+        case, _, _ = _random_case(B, t, 16, "fold", seed=777 + nh)
+        y = _call(case, "umma", t=t)
+        torch.cuda.synchronize()
+        res[pz] = [y.clone()] + [case[i].clone() for i in (7, 8, 9, 10)]
+    for a, b in zip(res[False], res[True], strict=True):
+        assert torch.equal(a, b)
+    monkeypatch.setattr(um, "_FORCE_PERSISTENT", True)
+    assert not um._use_persistent(B, t, 257, 16, torch.device("cuda"))
+
+
+def test_umma_one_item_grid_limit_raises(monkeypatch):
+    """The one-item kernel puts the request on grid.y (<= 65535): larger batches on that
+    path raise a clear ValueError instead of a launch failure."""
+    from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush as f
+
+    t, B, pool = 1, 65536, 4
+    case = list(_make_case(pool, [0] * pool, seed=5, t=t, pool_size=pool))
+    for i in (0, 1, 2, 3, 4):  # q, k, v, g, b: B rows (inputs only read for live rows)
+        case[i] = case[i][:1].expand(B, *case[i].shape[1:]).contiguous()
+    idx = torch.full((B,), -1, dtype=torch.int32, device="cuda")
+    idx[:pool] = torch.arange(pool, dtype=torch.int32, device="cuda")
+    hl = torch.zeros(B, dtype=torch.int32, device="cuda")
+    cb = torch.zeros(B, dtype=torch.int32, device="cuda")
+    q, k, v, g, b, A_log, dt_bias, st, kc, uc, gc = case[:11]
+    with pytest.raises(ValueError, match="65535"):
+        f(
+            A_log, g, dt_bias, q=q, k=k, v=v, b=b, initial_state_source=st,
+            initial_state_indices=idx, k_cache=kc, u_cache=uc, g_cache=gc,
+            hist_len=hl, cache_base=cb, w_ring=32, flush_min=17,
+            restart_hist_on_flush=False, backend="umma",
+        )  # fmt: skip

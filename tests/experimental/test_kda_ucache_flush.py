@@ -1415,3 +1415,48 @@ def test_input_validation_raises_value_error():
             call(**over)
             pytest.fail(f"{name}: accepted")
     call()  # the unmodified case is accepted
+
+
+@pytest.mark.parametrize("kind", ["strided", "fp32"])
+def test_output_not_aliasable_keeps_padded_rows(kind):
+    """An ``output`` the kernel cannot write in place (strided, or not bf16) receives only
+    the live rows; padded rows (index -1) keep their contents."""
+    mod = _load_flush()
+    B = 6
+    case = list(_make_case(B, [0, 13, 5, 0, 13, 7], seed=91))
+    idx = case[13].clone()
+    idx[[1, 4]] = -1
+    case[13] = idx
+    ref = _run(mod, tuple(c.clone() for c in case)).clone()
+    if kind == "strided":
+        out = torch.full((T, B, H, V), 7.0, dtype=torch.bfloat16, device=DEV)
+        out = out.transpose(0, 1)  # [B, T, H, V], not contiguous
+    else:
+        out = torch.full((B, T, H, V), 7.0, dtype=torch.float32, device=DEV)
+    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    mod.kda_delta_rule_mtp_ucache_flush(
+        A_log, g, dt_bias, lower_bound=LOWER_BOUND, q=q, k=k, v=v, b=b,
+        initial_state_source=pool, initial_state_indices=idx, k_cache=kc,
+        u_cache=uc, g_cache=gc, hist_len=hl, cache_base=cb, scale=SCALE,
+        flush_min=FLUSH_MIN, restart_hist_on_flush=False, output=out,
+    )  # fmt: skip
+    live = idx >= 0
+    assert torch.equal(out[live].to(torch.bfloat16), ref[live])
+    assert bool((out[~live] == 7.0).all())
+
+
+def test_restart_commit_skips_padded_rows():
+    """restart_hist_on_flush=True commits cursors of processed flush rows only: padded
+    rows (index -1) keep their hist_len / cache_base."""
+    mod = _load_flush()
+    B = 4
+    case = list(_make_case(B, [13, 13, 5, 13], seed=92, bases=[3, 9, 1, 30]))
+    idx = case[13].clone()
+    idx[1] = -1
+    case[13] = idx
+    hl0, cb0 = case[11].clone(), case[12].clone()
+    _run(mod, tuple(case), restart=True)
+    hl, cb = case[11], case[12]
+    assert hl.tolist() == [0, 13, 5, 0]
+    assert cb.tolist() == [(3 + 13) % RING, 9, 1, (30 + 13) % RING]
+    assert hl0[1] == hl[1] and cb0[1] == cb[1]

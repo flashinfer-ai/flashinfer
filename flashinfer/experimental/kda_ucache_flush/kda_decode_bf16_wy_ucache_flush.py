@@ -2905,7 +2905,14 @@ def kda_delta_rule_mtp_ucache_flush(
         _out_aliased = True
     else:
         # Padded rows (index -1) are never written by the kernel; callers
-        # that pad must pass a preallocated ``output``.
+        # that pad must pass a preallocated ``output``. A non-aliasable
+        # ``output`` (strided or another dtype) only receives the live rows.
+        if output is not None:
+            _check(
+                tuple(output.shape) == (B, T_in, HV, V_dim),
+                f"output must have shape {(B, T_in, HV, V_dim)}; got "
+                f"{tuple(output.shape)}.",
+            )
         out_t = torch.empty(B, T_in, HV, V_dim, dtype=IO_TORCH, device=dev)
 
     if backend not in _BACKENDS:
@@ -3038,12 +3045,15 @@ def kda_delta_rule_mtp_ucache_flush(
     # semantics). restart_hist_on_flush=False hands the commit to the caller
     # (vLLM serving: N layers share one cursor set within a step).
     if restart_hist_on_flush:
-        _flushed = hist_len >= flush_min
+        # padded rows (index < 0) were not processed: their cursors stay as they are
+        _flushed = (hist_len >= flush_min) & (initial_state_indices >= 0)
         cache_base.copy_((cache_base + hist_len * _flushed) & (RING_SLOTS - 1))
         hist_len.masked_fill_(_flushed, 0)
 
     if output is not None and not _out_aliased:
-        output.copy_(out_t)
+        # live rows only: padded rows of ``output`` stay untouched (no host sync)
+        _live = (initial_state_indices >= 0).view(B, 1, 1, 1)
+        output.copy_(torch.where(_live, out_t.to(output.dtype), output))
         return output
     return out_t
 

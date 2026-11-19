@@ -16,8 +16,9 @@ limitations under the License.
 ---------------------------------------------------------------------------
 KDA (Kimi K3) ReplaySSM verify + ring append + per-request flush on
 tcgen05 / UMMA / TMEM (SM10x): the PERSISTENT variant of ``kda_replay_mtp_umma``,
-launched by its ``launch_umma`` for T <= 4 when the (request, head) items outnumber the
-resident CTA slots (4 per SM). Same math, same results (bitwise).
+launched by its ``launch_umma`` (``_use_persistent``) for w_ring = 16 and H <= 256 when
+there are at least 4 (T <= 6) or 16 (T >= 7) (request, head) items per resident CTA slot
+(4 per SM). Same math, same results (bitwise).
 
 Persistent layout (study log: /home/scratch.ameyn_gpu_3/kda_umma_dram_log.md):
   * grid = 4 CTAs / SM. Work items = (request, head), item = request * H + head. CTA c
@@ -38,8 +39,9 @@ Persistent layout (study log: /home/scratch.ameyn_gpu_3/kda_umma_dram_log.md):
     trip of every item; selection in ``kda_replay_mtp_umma._use_persistent``.
   * concurrency: eager launches use one counter per (device, stream); every launch captured
     into a CUDA graph gets a counter slot of its own (``_work_counters``), so graphs replayed
-    concurrently on different streams never share one. ``persistent_counter_reset`` re-zeroes
-    them after an aborted launch.
+    concurrently on different streams never share one, and a completed launch always leaves
+    its counter at zero. ``persistent_counter_reset`` re-zeroes every counter (recovery from
+    a launch that did not complete, or from any other corruption).
 
 The original single-item description follows.
 
@@ -720,6 +722,9 @@ def _lds_i32(addr: Int32, *, loc=None, ip=None) -> Int32:
 
 
 _MBOX = 4  # work-item mailbox slots (warp 0 -> issuer + consumers)
+# Largest H the persistent kernel builds (s_alog holds every head's A_log in SMEM;
+# kda_replay_mtp_umma._use_persistent routes larger H to the one-item kernel).
+_MAX_H = 256
 
 
 @dsl_user_op
@@ -1099,9 +1104,9 @@ class KdaReplayMtpUmma:
         )
         s_coef = smem.allocate_tensor(Float32, cute.make_layout(136), byte_alignment=16)
         s_gp = smem.allocate_tensor(Float32, cute.make_layout(K_DIM), byte_alignment=16)
-        # A_log of every head (H <= 128), filled once by the consumers
+        # A_log of every head (H <= _MAX_H), filled once by the consumers
         s_alog = smem.allocate_tensor(
-            Float32, cute.make_layout(K_DIM), byte_alignment=16
+            Float32, cute.make_layout(max(K_DIM, (NH + 3) // 4 * 4)), byte_alignment=16
         )
         # bdec = e^{G_P} per channel (flush RMW)
         s_bdec = smem.allocate_tensor(
@@ -1481,8 +1486,11 @@ class KdaReplayMtpUmma:
             )
             if cutlass.const_expr(not VLATE):
                 vv = _load_v(v, b0, h0, row, T)
-            if ct < NH:
-                s_alog[ct] = Float32(a_log[ct])  # published by the first P1 barrier
+            # A_log of every head (128 per pass; H > 128 needs several), published by
+            # the first P1 barrier
+            for hp in cutlass.range_constexpr((NH + 127) // 128):
+                if ct + hp * 128 < NH:
+                    s_alog[ct + hp * 128] = Float32(a_log[ct + hp * 128])
             # G_P and the K~ ring words of the first item (later items': one item ahead)
             it = Int32(0)
             fit = Int32(0)
@@ -1713,6 +1721,8 @@ class KdaReplayMtpUmma:
                             _kt_block1(
                                 kc_row, gc_row, gp_addr, kt_addr, base, P, jr, c8
                             )
+                    # K~ is read by the fold UMMA (async proxy): every writer fences
+                    cute.arch.fence_view_async_shared()
                     _bar_sync_ua(1, 128)
                     _ik_pop(IK)
                     _ik_push(IK, "c_p4")
@@ -1867,7 +1877,10 @@ class KdaReplayMtpUmma:
                         if P > 16:
                             _d_block1(USE_SMEM_U, u_ptr, base, P, ct, tbase)
                     if cutlass.const_expr(USE_SMEM_U):
-                        # the window has been read: warp 0 may copy the next head's
+                        # the window has been read (the LDS values are consumed above):
+                        # order those generic-proxy reads before warp 0's next bulk copy
+                        # (async proxy) into the window, then release it
+                        cute.arch.fence_view_async_shared()
                         cute.arch.mbarrier_arrive(u_free)
                     U.tmem_wait_st()
                     U.fence_before_sync()

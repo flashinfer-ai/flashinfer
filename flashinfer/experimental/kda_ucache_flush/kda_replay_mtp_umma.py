@@ -1268,12 +1268,15 @@ def _u_src(w_ring: int) -> str:
 
 
 def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> bool:
-    """The persistent kernel where it measured faster (B200, H = 12, w_ring = 16, ncu
-    kernel time vs one item per CTA): T <= 6 with 4+ (request, head) items per resident
-    CTA slot (4 per SM; at 1.3-2.6 items per slot, B = 64 / 128, it lost 5-16 %):
-    T = 4 / 6 +9-20 % at B >= 512; T = 8 only with 16+ items per slot (+2-3 % at
-    B >= 1024, -3.5 % at B = 512). w_ring = 32 (u ring
-    read per row, 32-slot K~) measured 30 % slower: never."""
+    """The persistent kernel (kda_replay_mtp_umma_persistent) where it measured faster
+    (B200, H = 12, ncu kernel time vs one item per CTA): w_ring = 16 and H <= 256 only,
+    with at least 4 (T <= 6) or 16 (T >= 7) (request, head) items per resident CTA slot
+    (4 per SM). At 1.3-2.6 items per slot (B = 64 / 128) it lost 5-16 %; T = 8 at
+    B = 256 / 512 loses up to 6 %; w_ring = 32 (u ring read per row, 32-slot K~) measured
+    30 % slower. H > 256 does not fit its SMEM A_log table. _FORCE_PERSISTENT (test hook)
+    overrides everything but the H limit."""
+    if H > 256:
+        return False
     if _FORCE_PERSISTENT is not None:
         return bool(_FORCE_PERSISTENT)
     if w_ring != 16:
@@ -1338,6 +1341,14 @@ def launch_umma(
         )
         _LAUNCHES += 1
         return
+    if q.shape[0] > 65535:
+        # one CTA per (head, request): the request index is grid.y (at most 65535)
+        raise ValueError(
+            "kda_delta_rule_mtp_ucache_flush (umma): this configuration launches one CTA "
+            f"per request on grid.y, which allows at most 65535 requests; got B={q.shape[0]}. "
+            "Split the batch (w_ring = 16 at this size uses the persistent kernel, which has "
+            "no such limit)."
+        )
     fn = _get_kernel(q.device, T, H, int(w_ring), _u_src(int(w_ring)))
     fn(
         q,
