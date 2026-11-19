@@ -25,6 +25,7 @@ dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates i
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
    ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space,
+   ``BIK.gemm_fp8bs_space_ok, ``BIK.gemm_fp8bs_dispatch_in_space,
    ``BIK.gemm_mx8_space_ok, ``BIK.gemm_mx8_space_c4_ok, ``BIK.gemm_mx8_space_c4_cta_twins, ``BIK.gemm_mx8_dispatch_in_space,
    ``BIK.gemm_mx8_space_decode_ok, ``BIK.gemm_mx8_space_c2_ok,
    ``BIK.gemm_mx8k64_space_ok, ``BIK.gemm_mx8k64_space_c4_ok, ``BIK.gemm_mx8k64_space_c4_cta_twins, ``BIK.gemm_mx8k64_dispatch_in_space,
@@ -37,6 +38,10 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mx4_space_decode_ok, ``BIK.gemm_mx4_space_c2_ok,
    ``BIK.gemm_mx4k128_space_ok, ``BIK.gemm_mx4k128_space_c4_ok, ``BIK.gemm_mx4k128_space_c4_cta_twins, ``BIK.gemm_mx4k128_dispatch_in_space,
    ``BIK.gemm_mx4k128_space_decode_ok, ``BIK.gemm_mx4k128_space_c2_ok,
+   ``BIK.gemm_mxw48_space_ok, ``BIK.gemm_mxw48_space_c4_ok, ``BIK.gemm_mxw48_space_c4_cta_twins, ``BIK.gemm_mxw48_dispatch_in_space,
+   ``BIK.gemm_mxw48_space_decode_ok, ``BIK.gemm_mxw48_space_c2_ok,
+   ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
+   ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
    ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok,
    ``BIK.attn_space_lowbit_d64_size, ``BIK.attn_space_lowbit_d64_ok, ``BIK.attn_space_lowbit_d128_size, ``BIK.attn_space_lowbit_d128_ok, ``BIK.attn_space_lowbit_d256_size, ``BIK.attn_space_lowbit_d256_ok,
    ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_kv, ``BIK.Attn.output_depends_on_kv_fmt, ``BIK.Attn.output_depends_on_kv_nvfp4]

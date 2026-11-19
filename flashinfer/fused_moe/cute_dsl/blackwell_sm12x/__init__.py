@@ -18,12 +18,17 @@ from .moe_dispatch import (
 )
 from .moe_fp8_gemm import cute_dsl_sm12x_moe_gemm_fp8
 from .moe_mxfp8_mxfp4_gemm import cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4
+from .moe_fp4_gemm import cute_dsl_sm12x_moe_gemm_nvfp4
 from .moe_fp8_fc1_act import cute_dsl_sm12x_fc1_act_fp8
 from .moe_mxfp8_mxfp4_fc1_act import cute_dsl_sm12x_fc1_act_mxfp8_mxfp4
+from .moe_fp4_fc1_act import cute_dsl_sm12x_fc1_act_nvfp4
 from .moe_fp8_fc1_act_q1 import cute_dsl_sm12x_fc1_act_q1_fp8
 from .moe_mxfp8_mxfp4_fc1_act_q1 import cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4
+from .moe_fp4_fc1_act_q1 import cute_dsl_sm12x_fc1_act_q1_nvfp4
 from .moe_fp8_fc2_finalize import cute_dsl_sm12x_fc2_finalize_fp8
 from .moe_mxfp8_mxfp4_fc2_finalize import cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+from .moe_fp4_fc2_finalize import cute_dsl_sm12x_fc2_finalize_nvfp4
+from .moe_fp4_q0_route_triton import nvfp4_q0_route_triton
 
 __all__ = [
     "MoEStaticKernel",
@@ -41,10 +46,15 @@ __all__ = [
     "launch_sm120_moe",
     "cute_dsl_sm12x_moe_gemm_fp8",
     "cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4",
+    "cute_dsl_sm12x_moe_gemm_nvfp4",
     "cute_dsl_sm12x_fc1_act_fp8",
     "cute_dsl_sm12x_fc1_act_mxfp8_mxfp4",
+    "cute_dsl_sm12x_fc1_act_nvfp4",
     "cute_dsl_sm12x_fc1_act_q1_fp8",
     "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
+    "cute_dsl_sm12x_fc1_act_q1_nvfp4",
     "cute_dsl_sm12x_fc2_finalize_fp8",
     "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
+    "cute_dsl_sm12x_fc2_finalize_nvfp4",
+    "nvfp4_q0_route_triton",
 ]

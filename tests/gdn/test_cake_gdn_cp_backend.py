@@ -26,7 +26,7 @@ import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
 from flashinfer.jit import cake_gdn_cp_backend as gdn_cp_jit
 from flashinfer.utils import is_sm100a_supported
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 from .reference_delta_rule import blockwise_delta_rule, delta_rule
 

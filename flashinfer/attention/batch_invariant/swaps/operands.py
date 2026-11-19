@@ -22,6 +22,7 @@ one-slot smem hand-off per direction (the online softmax's `m` is a serial state
 
 from __future__ import annotations
 
+import functools
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -136,15 +137,23 @@ def shared_storage_struct(
 def arch_smem_cap(device=None) -> int:
     """The dynamic shared memory one CTA may allocate on the compile target of ``device`` (default: the current device): the DSL's
     per-architecture table (328 KB on sm_107, 228 KB on sm_100 / sm_103; the CUDA device attribute under-reports sm_107),
-    ``SMEM_CAP`` when the target is not in the table."""
+    ``SMEM_CAP`` when the target is not in the table. Cached per device: it is read on every launch."""
     import torch
-
-    from ....cute_dsl.availability import cute_dsl_compile_arch
-    from ....utils import get_compute_capability
 
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    major, minor = get_compute_capability(torch.device(device))
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _arch_smem_cap(device)
+
+
+@functools.cache
+def _arch_smem_cap(device) -> int:
+    from ....cute_dsl.availability import cute_dsl_compile_arch
+    from ....utils import get_compute_capability
+
+    major, minor = get_compute_capability(device)
     arch = cute_dsl_compile_arch(int(major), int(minor))  # "sm_107a", "sm_100f", ...
     key = "sm_" + arch[3:].rstrip("af")
     try:
