@@ -5,6 +5,7 @@ import BIKernels.GEMMConfig
 import BIKernels.Attention
 import BIKernels.Export
 import BIKernels.Cases
+import BIKernels.AttentionFp16Cases
 import BIKernels.Canon
 import BIKernels.Semantics
 import BIKernels.Support

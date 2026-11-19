@@ -40,7 +40,18 @@ def test_generated_cases_are_current():
         assert f"theorem {name} " in committed
     with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
         axioms = f.read()
-    for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
+    with open(lean_cases.ATTN_FP16_CASES_PATH) as f:
+        fp16 = f.read()
+    assert fp16 == lean_cases.render_attention_fp16(), (
+        "regenerate with: python -m flashinfer.batch_invariant.lean_cases"
+    )
+    assert "sorry" not in fp16
+    assert fp16.count("native_decide") == len(lean_cases.ATTN_FP16_DECIDED_THEOREMS)
+    for name in (
+        lean_cases.DECIDED_THEOREMS
+        + lean_cases.MODULE_DECIDED_THEOREMS
+        + lean_cases.ATTN_FP16_DECIDED_THEOREMS
+    ):
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
@@ -186,9 +197,10 @@ def test_lean_model_matches_python_engine_and_spec():
     for KB, sx in lean_cases.fp8bs_loop_cases():
         assert lean[("gemmfp8bsloop", KB)] == sx, ("e4m3_bs loop", KB)
         checked += 1
-    for name, *_, sx in lean_cases.attn_cases():
-        assert lean[("attn", name)] == sx, name
-        checked += 1
+    for fmt in ("bf16", "f16"):
+        for name, *_, sx in lean_cases.attn_cases(fmt):
+            assert lean[("attn", name)] == sx, (fmt, name)
+            checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 
@@ -198,7 +210,9 @@ def test_axioms_policy():
     r = _lake("exe", "axioms", timeout=600)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "0 with sorry, 0 violations" in r.stdout, r.stdout
-    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(
-        lean_cases.MODULE_DECIDED_THEOREMS
+    n_decided = (
+        len(lean_cases.DECIDED_THEOREMS)
+        + len(lean_cases.MODULE_DECIDED_THEOREMS)
+        + len(lean_cases.ATTN_FP16_DECIDED_THEOREMS)
     )
     assert f"{n_decided} named table theorems" in r.stdout, r.stdout
