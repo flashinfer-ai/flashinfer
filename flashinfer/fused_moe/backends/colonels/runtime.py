@@ -5,11 +5,34 @@ import os
 import torch
 
 from ...cute_dsl.moe_utils import (
+    _get_moe_utils_module,
     allocate_moe_sort_buffers,
     get_max_num_tiles,
     moe_sort,
 )
 from ....jit.colonels import gen_colonels_module
+
+
+@cache
+def get_num_sm_ids(device_index):
+    # SM identifiers may be sparse; the physical SM count is not an index bound.
+    with torch.cuda.device(device_index):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm the Colonels workspace before CUDA graph capture")
+        count = torch.empty((), dtype=torch.int32, device="cuda")
+        _get_moe_utils_module().read_num_sm_ids(
+            count.data_ptr(), torch.cuda.current_stream().cuda_stream
+        )
+        return count.item()
+
+
+def allocate_scratch(intermediate_size, device):
+    with torch.cuda.device(device):
+        return torch.empty(
+            get_num_sm_ids(torch.cuda.current_device()) * 128 * intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
 
 
 def precompile_kernels(tactics, activation, arch):
@@ -58,7 +81,6 @@ class Workspace:
         top_k,
         block_sizes,
         device,
-        num_sms,
         needs_scratch,
         scratch=None,
     ):
@@ -70,9 +92,7 @@ class Workspace:
         }
         self.scratch = scratch
         if self.scratch is None and needs_scratch:
-            self.scratch = torch.empty(
-                num_sms * 128 * intermediate_size, dtype=torch.bfloat16, device=device
-            )
+            self.scratch = allocate_scratch(intermediate_size, device)
 
     def sort(self, ids, weights, num_experts, block_m):
         with torch.cuda.device(ids.device):
@@ -201,4 +221,5 @@ def launch(
             clamp,
             tactic.cluster_fallback,
             torch.cuda.current_stream(device).cuda_stream,
+            get_num_sm_ids(device.index) if "gmem" in tactic.variant else 0,
         )

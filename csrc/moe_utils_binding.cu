@@ -34,6 +34,10 @@
 using namespace tensorrt_llm::kernels::cute_dsl;
 
 namespace {
+__global__ void read_num_sm_ids_kernel(int* output) {
+  asm volatile("mov.u32 %0, %%nsmid;" : "=r"(*output));
+}
+
 // Helper function to compute log2 of a value (returns -1 if not power of 2)
 inline int32_t computeLog2(int32_t val) {
   int32_t n = val;
@@ -47,6 +51,15 @@ inline int32_t computeLog2(int32_t val) {
   return out;
 }
 }  // namespace
+
+void read_num_sm_ids(int64_t output_ptr, int64_t stream_ptr) {
+  read_num_sm_ids_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream_ptr)>>>(
+      reinterpret_cast<int*>(output_ptr));
+  auto status = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(read_num_sm_ids, read_num_sm_ids);
 
 // ============================ moePermute bindings ============================
 

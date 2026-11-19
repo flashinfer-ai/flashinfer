@@ -592,7 +592,7 @@ def test_non_power_of_two_sort_padding(block_m):
         [[0, 1], [1, -1], [0, 2], [2, 1]], device="cuda", dtype=torch.int32
     )
     weights = torch.ones_like(ids, dtype=torch.float32)
-    workspace = Workspace(4, 128, 128, 3, 2, (block_m,), ids.device, 1, False)
+    workspace = Workspace(4, 128, 128, 3, 2, (block_m,), ids.device, False)
     sorted_ids, experts, padded = workspace.sort(ids, weights, 3, block_m)
     padded = padded.item()
     assert padded == 3 * block_m

@@ -841,11 +841,11 @@ template <int BM, int STAGES, int CLUSTERS, bool RED_STORE, moe_activation::Kind
           bool PREFERRED_CLUSTERS, bool WEIGHT_EVICTION, int EPILOGUE_WARPS, int PRODUCER_WARPS,
           int EXTRA_BARRIERS>
 bool launch_fused_moe_kernel_up_down_acc_impl(
-    const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, const int* sorted_token_ids,
-    const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights,
-    const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m,
-    float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params,
-    cudaStream_t stream) {
+    const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, int num_sm_ids,
+    const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded,
+    const float* topk_weights, const int top_k, int M, int N, int K, int num_experts,
+    int sorted_num, int block_m, float scaling_factor,
+    typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream) {
   using C = constants<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, BM == 256 ? 2 : 1, BM,
                       WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, EXTRA_BARRIERS>;
   using F = constants<PREFERRED_CLUSTERS ? 128 : BM, STAGES,
@@ -862,8 +862,6 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
   dim3 dimBlock(C::BLOCK_THREADS, 1, 1);
   int device;
   gpuErrchk(cudaGetDevice(&device));
-  int num_sms;
-  gpuErrchk(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
   // CLC steals pending CTAs from the full work grid.
   const int block_count = (sorted_num + block_m - 1) / block_m;
   if (block_count == 0) return false;
@@ -938,7 +936,7 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
 
     static_assert(C::TMEM_COLS == 512);
     static_assert(C::SCRATCH_ROWS_PER_SM == F::SCRATCH_ROWS_PER_SM);
-    const size_t scratch_rows = size_t(num_sms) * C::SCRATCH_ROWS_PER_SM;
+    const size_t scratch_rows = size_t(num_sm_ids) * C::SCRATCH_ROWS_PER_SM;
     CUtensorMap tensor_map_s{}, tensor_map_s_fallback{}, tensor_map_s_partial{};
     CUtensorMap* scratch_maps[] = {&tensor_map_s_partial, &tensor_map_s, &tensor_map_s_fallback};
     const uint32_t scratch_box_rows[] = {C::X_BLOCK_SIZE, C::LOCAL_M, F::LOCAL_M};
@@ -992,24 +990,24 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
 
 // clang-format off
 template <int BM, int STAGES, int CLUSTERS, bool RED_STORE, moe_activation::Kind ACTIVATION, bool WEIGHT_EVICTION = false, int EPILOGUE_WARPS = 4, int PRODUCER_WARPS = 4, int EXTRA_BARRIERS = 64>
-bool launch_fused_moe_kernel_up_down_acc(const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights, const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m, float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream, bool cluster_fallback = false) {
+bool launch_fused_moe_kernel_up_down_acc(const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, int num_sm_ids, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights, const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m, float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream, bool cluster_fallback = false) {
     if (cluster_fallback) {
         if constexpr (BM == 256 && CLUSTERS >= 4) {
-            return launch_fused_moe_kernel_up_down_acc_impl<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, true, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, EXTRA_BARRIERS>(x, w, w2, out, scratchpad, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream);
+            return launch_fused_moe_kernel_up_down_acc_impl<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, true, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, EXTRA_BARRIERS>(x, w, w2, out, scratchpad, num_sm_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream);
         } else {
             return false;
         }
     }
-    return launch_fused_moe_kernel_up_down_acc_impl<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, false, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, EXTRA_BARRIERS>(x, w, w2, out, scratchpad, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream);
+    return launch_fused_moe_kernel_up_down_acc_impl<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, false, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, EXTRA_BARRIERS>(x, w, w2, out, scratchpad, num_sm_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream);
 }
 
 template <int BM, int STAGES, int CLUSTERS, bool RED_STORE, moe_activation::Kind ACTIVATION, bool WEIGHT_EVICTION = false, int EPILOGUE_WARPS = 4, int PRODUCER_WARPS = 4>
-bool dispatch_barriers(const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights, const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m, float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream, bool cluster_fallback = false) {
+bool dispatch_barriers(const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, int num_sm_ids, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights, const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m, float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream, bool cluster_fallback = false) {
     // The fallback has fewer N groups, so each CTA may publish more tiles.
     const int groups = cluster_fallback ? CLUSTERS / 4 : CLUSTERS / (BM == 256 ? 2 : 1);
     const int barriers = (N - 1) / (256 * groups) + 1;
     auto launch = [&]<int capacity>() {
-        return launch_fused_moe_kernel_up_down_acc<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, capacity>(x, w, w2, out, scratchpad, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream, cluster_fallback);
+        return launch_fused_moe_kernel_up_down_acc<BM, STAGES, CLUSTERS, RED_STORE, ACTIVATION, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS, capacity>(x, w, w2, out, scratchpad, num_sm_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream, cluster_fallback);
     };
     if (barriers <= 16)
         return launch.template operator()<16>();
@@ -1019,16 +1017,16 @@ bool dispatch_barriers(const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratc
 }
 
 template <int BM, int CLUSTERS, bool RED_STORE, moe_activation::Kind ACTIVATION, bool WEIGHT_EVICTION = false, int EPILOGUE_WARPS = 4, int PRODUCER_WARPS = 4>
-bool dispatch_stages(int stages, const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights, const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m, float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream, bool cluster_fallback = false) {
+bool dispatch_stages(int stages, const bf16* x, bf16* w, bf16* w2, bf16* out, bf16* scratchpad, int num_sm_ids, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_post_padded, const float* topk_weights, const int top_k, int M, int N, int K, int num_experts, int sorted_num, int block_m, float scaling_factor, typename moe_activation::Traits<ACTIVATION>::Params activation_params, cudaStream_t stream, bool cluster_fallback = false) {
     using C = constants<BM, 1, CLUSTERS, RED_STORE, ACTIVATION, BM == 256 ? 2 : 1, BM, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS>;
     constexpr int MAX_STAGES = C::MAX_STAGES;
     if constexpr (MAX_STAGES > 0) {
         if (stages == MAX_STAGES)
-            return dispatch_barriers<BM, MAX_STAGES, CLUSTERS, RED_STORE, ACTIVATION, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS>(x, w, w2, out, scratchpad, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream, cluster_fallback);
+            return dispatch_barriers<BM, MAX_STAGES, CLUSTERS, RED_STORE, ACTIVATION, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS>(x, w, w2, out, scratchpad, num_sm_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream, cluster_fallback);
     }
     if constexpr (MAX_STAGES > 1) {
         if (stages == MAX_STAGES - 1)
-            return dispatch_barriers<BM, MAX_STAGES - 1, CLUSTERS, RED_STORE, ACTIVATION, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS>(x, w, w2, out, scratchpad, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream, cluster_fallback);
+            return dispatch_barriers<BM, MAX_STAGES - 1, CLUSTERS, RED_STORE, ACTIVATION, WEIGHT_EVICTION, EPILOGUE_WARPS, PRODUCER_WARPS>(x, w, w2, out, scratchpad, num_sm_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, top_k, M, N, K, num_experts, sorted_num, block_m, scaling_factor, activation_params, stream, cluster_fallback);
     }
     return false;
 }

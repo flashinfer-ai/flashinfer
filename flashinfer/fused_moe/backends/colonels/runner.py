@@ -48,9 +48,6 @@ class ColonelsRunner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         major, minor = torch.cuda.get_device_capability(self.device)
         self.arch = major * 10 + minor
-        self.num_sms = torch.cuda.get_device_properties(
-            self.device
-        ).multi_processor_count
         self.kind = activation_kind(config.activation)
         self.local_experts = (
             config.experts.local_num_experts or config.routing.num_experts
@@ -161,10 +158,8 @@ class ColonelsRunner(MoERunner):
             needs_scratch = any("gmem" in t.variant for t in self.tactics)
             stream = key[2]
             if needs_scratch and stream not in self._scratch:
-                self._scratch[stream] = torch.empty(
-                    self.num_sms * 128 * self.config.experts.intermediate_size,
-                    dtype=torch.bfloat16,
-                    device=self.device,
+                self._scratch[stream] = self.runtime.allocate_scratch(
+                    self.config.experts.intermediate_size, self.device
                 )
             self._workspaces[key] = self.runtime.Workspace(
                 capacity,
@@ -174,7 +169,6 @@ class ColonelsRunner(MoERunner):
                 self.top_k,
                 {t.block_m for t in self.tactics if t.variant != "bf16_gemv"},
                 self.device,
-                self.num_sms,
                 needs_scratch,
                 scratch=self._scratch.get(stream),
             )
