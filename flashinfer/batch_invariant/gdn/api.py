@@ -36,8 +36,9 @@ launch, the rows are the ones the pool calls return for it, and no state is read
 trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it. With
 ``train_states`` the same launch also stores the state every 64-token chunk starts from in that caller-owned buffer
 (:mod:`.train`), in the row layout cuDNN's GDN backward takes as ``state_checkpoints``. As for the pool calls,
-``cu_seqlens_cpu`` must agree with ``cu_seqlens``: only their lengths are compared, the rows without ``train_states``
-follow the device offsets, and with ``train_states`` the rows and the stored states both follow the host ones.
+only the lengths of ``cu_seqlens`` and ``cu_seqlens_cpu`` are compared; the stateless call then runs from the host
+offsets (one small tensor per call), so the two cannot disagree in it. Its ``output`` and ``train_states`` may share
+no memory with an input, the offsets, each other or a state pool, and ``output``'s autograd version is bumped.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -45,12 +46,13 @@ Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvari
 from __future__ import annotations
 
 import math
+import operator
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
 from ..support import check_device, unsupported
-from .pool import capturing, get_pool, zero_state_prefill
+from .pool import capturing, get_pool, refuse_shared, zero_state_prefill
 from .spec import CHUNK, CLASS, GDN_ARCHS, HEAD_DIM, uses_step_kernel
 
 _IO = torch.bfloat16
@@ -150,7 +152,18 @@ def _host_offsets(
     if cu_seqlens is None and cu_seqlens_cpu is None:
         return [0, T]
     src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
-    cu = [int(x) for x in (src.tolist() if isinstance(src, torch.Tensor) else src)]
+    if isinstance(src, torch.Tensor):
+        whole = src.ndim == 1 and not (src.is_floating_point() or src.is_complex())
+        cu = src.tolist() if whole and src.dtype != torch.bool else None
+    else:
+        try:
+            cu = [operator.index(x) for x in src]
+        except TypeError:
+            cu = None
+    if cu is None:
+        raise unsupported(
+            CLASS, "offsets that are not 1-D integers", "1-D integer offsets"
+        )
     return _checked_offsets(cu, T)
 
 
@@ -182,6 +195,12 @@ def _check_output(output: Optional[torch.Tensor], v: torch.Tensor) -> None:
         raise unsupported(CLASS, "an output on another device", "the inputs' device")
     if output.requires_grad:
         raise unsupported(CLASS, "an output that requires grad", "a plain buffer")
+    if output.is_inference() and not torch.is_inference_mode_enabled():
+        raise unsupported(
+            CLASS,
+            "an output allocated under inference_mode in a call outside it",
+            "a buffer allocated in the mode of the call",
+        )
 
 
 def _stateless(
@@ -207,26 +226,38 @@ def _stateless(
     if cu_seqlens is not None and (cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2):
         raise unsupported(CLASS, "a malformed cu_seqlens", "a 1-D [N + 1] tensor")
     offs = _host_offsets(cu_seqlens, cu_seqlens_cpu, int(v.shape[0]))
-    cu = cu_seqlens
-    if cu is not None and (cu.dtype != torch.int32 or cu.device != v.device):
-        cu = None
-    if cu is not None and cu.numel() != len(offs):
+    if cu_seqlens is not None and cu_seqlens.numel() != len(offs):
         raise unsupported(
             CLASS,
             "cu_seqlens and cu_seqlens_cpu of different lengths",
             "the same offsets on the device and on the host",
         )
+    cu = cu_seqlens
+    if cu_seqlens_cpu is not None or not (
+        cu is not None
+        and cu.dtype == torch.int32
+        and cu.device == v.device
+        and cu.is_contiguous()
+    ):
+        cu = None
+    named = [("cu_seqlens", cu_seqlens), ("cu_seqlens_cpu", cu_seqlens_cpu)]
+    named += zip(("q", "k", "v", "g", "beta"), rows, strict=True)
+    if output is not None:
+        refuse_shared("an output", output, named)
     scale_f = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(HEAD_DIM)
     out = output if output is not None else torch.empty_like(v)
     plain = tuple(x.detach() for x in rows)
     if train_states is None:
-        return zero_state_prefill(plain, cu, offs, scale_f, out)
-    from .train import check_train_states, zero_state_prefill_with_states
+        zero_state_prefill(plain, cu, offs, scale_f, out)
+    else:
+        from .train import check_train_states, zero_state_prefill_with_states
 
-    others = [("output", output), ("cu_seqlens", cu_seqlens)]
-    others += zip(("q", "k", "v", "g", "beta"), rows, strict=True)
-    check_train_states(train_states, int(v.shape[1]), v.device, offs, others)
-    return zero_state_prefill_with_states(plain, offs, train_states, scale_f, out)
+        named.append(("output", output))
+        check_train_states(train_states, int(v.shape[1]), v.device, offs, named)
+        zero_state_prefill_with_states(plain, offs, train_states, scale_f, out)
+    if output is not None and not output.is_inference():
+        torch.autograd.graph.increment_version(output)
+    return out
 
 
 def chunk_gated_delta_rule_batch_invariant(

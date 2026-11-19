@@ -412,13 +412,18 @@ flashinfer.chunk_gated_delta_rule(
 * No pool, no state next to a pool, no state returned: `state_indices`, `prefix_lens`, `output_state` and
   `output_final_state=True` raise the typed error without `initial_state`. A sequence that has to continue later is a
   pool call.
-* With `output=` and an int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and adds no
-  allocation of its own; `cu_seqlens_cpu` (which must hold the same offsets) spares the read of the offsets. The
+* With `output=` and a contiguous int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and
+  adds no allocation of its own, and reads the offsets back to check them. With `cu_seqlens_cpu` it runs from those
+  host offsets instead (no read; one small offsets tensor per call), so device and host offsets cannot disagree in it;
+  only their lengths are compared. Offsets that are not 1-D integers raise the typed error. The
   prefill underneath allocates, as in every prefill of the class, the normalized `q` and `k` (`2 * T * HQ * 256`
   bytes), the linear gates (`4 * T * HV` bytes) and a small kernel workspace, all freed at return. Per device and
   v-head count the class keeps one state tensor the kernel is pointed at and never reads or writes (3.1 MB at 48 v
   heads) and an index tensor of one int32 per sequence, allocated at the first stateless call and regrown when a call
-  brings more sequences than any before.
+  brings more sequences than any before (the replaced ones are kept, a few bytes per sequence).
+* `output` may share no memory with an input, the offsets, `train_states` or one of the class's state pools, and an
+  `output` allocated under `inference_mode` is refused in a call outside it (typed errors, before anything is
+  written). Its autograd version is bumped by the call.
 * It cannot be captured in a CUDA graph (it raises).
 * **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
   `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
@@ -466,9 +471,9 @@ rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequen
   `training_state_slots` are left as they are. The call allocates two small index tensors for the layout.
 * The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
   that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is not 16-byte aligned
-  or shares memory with one of the class's state pools, the output or an input, raises the typed error.
-* With `train_states`, the rows and the stored states both follow the host offsets (`cu_seqlens_cpu` when given),
-  which must agree with `cu_seqlens` as for the pool calls.
+  or shares memory with one of the class's state pools, the output, an input or the offsets, raises the typed error.
+  A pool owns its storage from its first slot to the storage's end, so a buffer carved from the same allocation
+  after a pool is refused too: give `train_states` an allocation of its own.
 
 Tests: `tests/gdn/test_batch_invariant_gdn_stateless.py`.
 

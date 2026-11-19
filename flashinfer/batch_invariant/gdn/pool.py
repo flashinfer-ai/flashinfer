@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import functools
 import weakref
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -52,6 +52,26 @@ def pool_key(pool: torch.Tensor) -> Tuple[int, int, int, torch.device]:
         int(pool.shape[1]),
         pool.device,
     )
+
+
+def refuse_shared(name: str, buffer: torch.Tensor, others) -> None:
+    """A buffer the call writes may share no memory with another argument: ``others`` are ``(name, value)`` pairs."""
+    lo, hi = byte_range(buffer)
+    for other_name, other in others:
+        if isinstance(other, torch.Tensor) and other.device == buffer.device:
+            a, b = byte_range(other)
+            if lo < b and a < hi:
+                raise unsupported(
+                    CLASS,
+                    f"{name} that shares memory with {other_name}",
+                    "a buffer of its own",
+                )
+    if overlaps_a_pool(buffer):
+        raise unsupported(
+            CLASS,
+            f"{name} that shares memory with a state pool of the class",
+            "a buffer of its own",
+        )
 
 
 def overlaps_a_pool(t: torch.Tensor) -> bool:
@@ -155,6 +175,8 @@ def _pinned(
 
 
 _ZERO: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+#: replaced index tensors, kept so that a launch still queued on another stream never reads freed memory
+_RETIRED: List[torch.Tensor] = []
 
 
 def zero_state_prefill(rows, cu, offs, scale, out) -> torch.Tensor:
@@ -168,7 +190,9 @@ def zero_state_prefill(rows, cu, offs, scale, out) -> torch.Tensor:
             if cached is not None
             else torch.zeros(1, HV, HEAD_DIM, HEAD_DIM, device=dev)
         )
-        skip = torch.full((max(N, 64),), -1, dtype=torch.int32, device=dev)
+        if cached is not None:
+            _RETIRED.append(cached[1])
+        skip = torch.full((max(2 * N, 64),), -1, dtype=torch.int32, device=dev)
         # published only once filled: another stream may use them next
         torch.cuda.current_stream(dev).synchronize()
         cached = _ZERO[(dev, HV)] = (state, skip)

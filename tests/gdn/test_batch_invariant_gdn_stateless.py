@@ -429,7 +429,7 @@ def test_train_states_inside_a_pool_are_refused_and_the_pool_is_kept():
     _infer(x, [0, 1], lens, pool=pool)
     kept = big.clone()
     for view in (pool[1:], big[2:], big[:5]):
-        with pytest.raises(BatchInvariantUnsupportedError):
+        with pytest.raises(BatchInvariantUnsupportedError, match="state pool"):
             _stateless(x, lens, train_states=view)
     assert torch.equal(big, kept)
     free = torch.zeros(5, 8, D, D, device="cuda")
@@ -442,7 +442,7 @@ def test_train_states_misaligned_or_sharing_memory_are_refused():
     x = _inputs(200, 4, 8, 12)
     flat = torch.zeros(5 * 8 * D * D + 4, device="cuda")
     for shift in (1, 2, 3):
-        with pytest.raises(BatchInvariantUnsupportedError):
+        with pytest.raises(BatchInvariantUnsupportedError, match="16-byte aligned"):
             _stateless(
                 x,
                 lens,
@@ -450,11 +450,92 @@ def test_train_states_misaligned_or_sharing_memory_are_refused():
             )
     states = torch.zeros(5, 8, D, D, device="cuda")
     inside = states.view(-1).view(torch.bfloat16)[: 200 * 8 * D].view(200, 8, D)
-    with pytest.raises(BatchInvariantUnsupportedError):
+    with pytest.raises(BatchInvariantUnsupportedError, match="shares memory"):
         _stateless(x, lens, train_states=states, output=inside)
     v_inside = states.view(-1).view(torch.bfloat16)[-200 * 8 * D :].view(200, 8, D)
-    with pytest.raises(BatchInvariantUnsupportedError):
+    with pytest.raises(BatchInvariantUnsupportedError, match="shares memory"):
         _stateless((x[0], x[1], v_inside, x[3], x[4]), lens, train_states=states)
+    shifted = torch.zeros(6, 8, D, D, device="cuda")[1:]
+    _stateless(x, lens, train_states=shifted)
+
+
+def _inside(holder, like, at=0):
+    flat = holder.view(-1).view(torch.uint8)[at : at + like.nbytes]
+    return flat.view(like.dtype).view(like.shape).copy_(like)
+
+
+@needs_device
+def test_an_output_sharing_memory_is_refused_before_anything_is_written():
+    lens = [130, 70]
+    x = _inputs(200, 8, 8, 14)
+    ref = _stateless(x, lens)
+    cu = _i32(_offsets(lens))
+    for i in range(5):
+        for at in (0, 4096):
+            holder = torch.zeros(264, 8, D, dtype=torch.bfloat16, device="cuda")
+            xi = list(x)
+            xi[i] = _inside(holder, x[i], at)
+            with pytest.raises(BatchInvariantUnsupportedError, match="shares memory"):
+                _stateless(xi, lens, output=holder[:200])
+            assert torch.equal(xi[i], x[i])
+    holder = torch.zeros(264, 8, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(BatchInvariantUnsupportedError, match="shares memory"):
+        flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens=_inside(holder, cu, 64), output=holder[:200], **_KW
+        )
+    pool = torch.zeros(4, 8, D, D, device="cuda")
+    _infer(x, [0, 1], lens, pool=pool)
+    in_pool = _inside(pool, x[2], 1 << 16)
+    kept = pool.clone()
+    with pytest.raises(BatchInvariantUnsupportedError, match="state pool"):
+        _stateless(x, lens, output=in_pool)
+    assert torch.equal(pool, kept)
+    with torch.inference_mode():
+        made_in_inference_mode = torch.empty_like(x[2])
+    with pytest.raises(BatchInvariantUnsupportedError, match="inference_mode"):
+        _stateless(x, lens, output=made_in_inference_mode)
+    out = torch.empty_like(x[2])
+    version = out._version
+    assert torch.equal(_stateless(x, lens, output=out), ref) and out._version > version
+
+
+@needs_device
+def test_rows_follow_the_host_offsets_when_given():
+    host = [0, 130, 200, 264]
+    x = _inputs(264, 4, 8, 15)
+    ref = _stateless(x, [130, 70, 64])
+    for device in ([0, 64, 200, 264], [0, 100, 150, 264], [0, 1, 2, 264]):
+        big = torch.full((328, 8, D), 5.0, dtype=torch.bfloat16, device="cuda")
+        got = flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens=_i32(device), cu_seqlens_cpu=host, output=big[32:296], **_KW
+        )
+        assert torch.equal(got, ref)
+        assert bool((big[:32] == 5).all()) and bool((big[296:] == 5).all())
+    strided = _i32([0, 9, 130, 9, 200, 9, 264])[::2]
+    assert torch.equal(
+        flashinfer.chunk_gated_delta_rule(*x, cu_seqlens=strided, **_KW), ref
+    )
+    for bad in (
+        [0, 129.9, 200, 264],
+        torch.tensor([0.0, 130.0, 200.0, 264.0]),
+        [[0, 264]],
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError, match="1-D integers"):
+            flashinfer.chunk_gated_delta_rule(*x, cu_seqlens_cpu=bad, **_KW)
+    with pytest.raises(BatchInvariantUnsupportedError, match="1-D integers"):
+        flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens=torch.tensor([0.0, 264.0], device="cuda"), **_KW
+        )
+
+
+@needs_device
+def test_replaced_index_rows_are_kept():
+    x = _inputs(4 * 9000, 2, 34, 16)
+    small = _stateless(_cut(x, 0, 12), [4, 4, 4])
+    first = gdn_pool._ZERO[(x[2].device, 34)][1]
+    out = _stateless(x, [4] * 9000)
+    assert any(t is first for t in gdn_pool._RETIRED)
+    assert torch.equal(out[:12], small) and bool((first == -1).all())
 
 
 @needs_device

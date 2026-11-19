@@ -16,8 +16,8 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 
-from ..support import byte_range, unsupported
-from .pool import _pinned, overlaps_a_pool
+from ..support import unsupported
+from .pool import _pinned, refuse_shared
 from .spec import CHUNK, CLASS, HEAD_DIM
 
 
@@ -93,22 +93,7 @@ def check_train_states(
             "train_states that is not 16-byte aligned",
             "a 16-byte aligned buffer",
         )
-    if overlaps_a_pool(states):
-        raise unsupported(
-            CLASS,
-            "train_states that shares memory with a state pool of the class",
-            "a buffer of its own",
-        )
-    lo, hi = byte_range(states)
-    for name, other in others:
-        if isinstance(other, torch.Tensor) and other.device == device:
-            a, b = byte_range(other)
-            if lo < b and a < hi:
-                raise unsupported(
-                    CLASS,
-                    f"train_states that shares memory with {name}",
-                    "a buffer of its own",
-                )
+    refuse_shared("train_states", states, others)
     if int(states.shape[0]) < need:
         raise unsupported(
             CLASS,
