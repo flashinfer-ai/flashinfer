@@ -20,9 +20,11 @@ def test_bmm_fp8_valid_scalar_scale():
         torch.float8_e4m3fn
     )
     # B must be column-major: create (b, n, k) then transpose to (b, k, n)
-    B = torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    ).transpose(-2, -1)
+    B = (
+        torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+        .transpose(-2, -1)
+    )
     A_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     B_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
@@ -37,7 +39,9 @@ def test_bmm_fp8_valid_scalar_scale():
     torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
 
 
-def test_bmm_fp8_per_row_scale_rejected():
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("scale_name", ["A_scale", "B_scale"])
+def test_bmm_fp8_per_row_scale_rejected(scale_name, batch_invariant):
     """Test that per-row scale (wrong shape) is rejected."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for bmm_fp8 test")
@@ -47,14 +51,44 @@ def test_bmm_fp8_per_row_scale_rejected():
     A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    B = torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    ).transpose(-2, -1)
-    A_scale = torch.ones(b, m, 1, dtype=torch.float32, device="cuda")  # Wrong: per-row
-    B_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    B = (
+        torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+        .transpose(-2, -1)
+    )
+    scalar = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    nonscalar = torch.ones(b, m, 1, dtype=torch.float32, device="cuda")
+    A_scale, B_scale = (
+        (nonscalar, scalar) if scale_name == "A_scale" else (scalar, nonscalar)
+    )
+    with pytest.raises(ValueError, match=f"{scale_name} must be a scalar"):
+        bmm_fp8(
+            A,
+            B,
+            A_scale,
+            B_scale,
+            torch.bfloat16,
+            backend="auto",
+            batch_invariant=batch_invariant,
+        )
 
+
+def test_bmm_fp8_rejects_bad_scale_before_backend_selection(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for bmm_fp8 test")
+
+    from flashinfer.gemm import gemm_base
+
+    def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("auto backend heuristic ran before scale validation")
+
+    monkeypatch.setattr(gemm_base, "_match_sm_version", unexpected_dispatch)
+    A = torch.empty((2, 16, 16), device="cuda", dtype=torch.float8_e4m3fn)
+    B = torch.empty_like(A).transpose(-2, -1)
+    invalid = torch.ones(2, dtype=torch.float32, device="cuda")
+    scalar = torch.ones((), dtype=torch.float32, device="cuda")
     with pytest.raises(ValueError, match="A_scale must be a scalar"):
-        bmm_fp8(A, B, A_scale, B_scale, torch.bfloat16, backend="cublas")
+        bmm_fp8(A, B, invalid, scalar, torch.bfloat16, backend="auto")
 
 
 def test_bmm_fp8_wrong_dtype_rejected():
@@ -67,9 +101,11 @@ def test_bmm_fp8_wrong_dtype_rejected():
     A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    B = torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    ).transpose(-2, -1)
+    B = (
+        torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+        .transpose(-2, -1)
+    )
     A_scale = torch.tensor(1.0, dtype=torch.float16, device="cuda")  # Wrong: float16
     B_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
@@ -87,9 +123,11 @@ def test_bmm_fp8_wrong_device_rejected():
     A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    B = torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    ).transpose(-2, -1)
+    B = (
+        torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+        .transpose(-2, -1)
+    )
 
     # Test with scale on CPU while operands are on CUDA
     A_scale_cpu = torch.tensor(1.0, dtype=torch.float32, device="cpu")
@@ -109,9 +147,11 @@ def test_bmm_fp8_one_element_scalar_accepted():
     A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    B = torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    ).transpose(-2, -1)
+    B = (
+        torch.randn(b, n, k, device="cuda", dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+        .transpose(-2, -1)
+    )
 
     # Test shape (1,)
     A_scale_1 = torch.tensor([1.0], dtype=torch.float32, device="cuda")

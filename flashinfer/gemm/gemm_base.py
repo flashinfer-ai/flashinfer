@@ -10784,6 +10784,32 @@ def _cute_dsl_bmm_fp8_requirement(
     return True
 
 
+def _validate_bmm_fp8_scales(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+) -> None:
+    for scale_name, scale_tensor, operand in [
+        ("A_scale", A_scale, A),
+        ("B_scale", B_scale, B),
+    ]:
+        if scale_tensor.numel() != 1:
+            raise ValueError(
+                f"{scale_name} must be a scalar (tensorwide FP32), got shape {scale_tensor.shape}. "
+                "For groupwise scaling, use gemm_fp8_nt_groupwise instead."
+            )
+        if scale_tensor.dtype != torch.float32:
+            raise ValueError(
+                f"{scale_name} must be torch.float32, got {scale_tensor.dtype}"
+            )
+        if scale_tensor.device != operand.device:
+            raise ValueError(
+                f"{scale_name} must be on the same CUDA device as the operand, "
+                f"got {scale_tensor.device} vs {operand.device}"
+            )
+
+
 @supported_compute_capability([100, 103, 107])
 def _check_bmm_fp8_problem_size(
     A: torch.Tensor,
@@ -10796,6 +10822,7 @@ def _check_bmm_fp8_problem_size(
     batch_invariant: bool = False,
 ):
     _validate_fp8_output_dtype(dtype)
+    _validate_bmm_fp8_scales(A, B, A_scale, B_scale)
     return True
 
 
@@ -10972,27 +10999,8 @@ def bmm_fp8(
     torch.bfloat16
     """
 
-    # Validate tensorwide scalar scale contract
-    for scale_name, scale_tensor, operand in [
-        ("A_scale", A_scale, A),
-        ("B_scale", B_scale, B),
-    ]:
-        if scale_tensor.numel() != 1:
-            raise ValueError(
-                f"{scale_name} must be a scalar (tensorwide FP32), got shape {scale_tensor.shape}. "
-                "For groupwise scaling, use gemm_fp8_nt_groupwise instead."
-            )
-        if scale_tensor.dtype != torch.float32:
-            raise ValueError(
-                f"{scale_name} must be torch.float32, got {scale_tensor.dtype}"
-            )
-        if scale_tensor.device != operand.device:
-            raise ValueError(
-                f"{scale_name} must be on the same CUDA device as the operand, "
-                f"got {scale_tensor.device} vs {operand.device}"
-            )
-
     if batch_invariant:
+        _validate_bmm_fp8_scales(A, B, A_scale, B_scale)
         from .batch_invariant.tuning import bmm_fp8_batch_invariant_auto
 
         return bmm_fp8_batch_invariant_auto(A, B, A_scale, B_scale, dtype, out, backend)
