@@ -64,6 +64,7 @@ class ColonelsRunner(MoERunner):
         self._workspaces = {}
         self._scratch = {}
         self._valid = {}
+        self._default_tactics = {}
 
     def _get_tactics(self):
         raise NotImplementedError
@@ -365,25 +366,28 @@ class ColonelsRunner(MoERunner):
             else 0.5,
         )
 
+    def _candidate_tactics(self, num_tokens, hidden_size):
+        return (
+            t
+            for t in self.tactics
+            if t.supports_shape(
+                hidden_size,
+                self.config.experts.intermediate_size,
+                self.config.activation.is_gated,
+            )
+            and (
+                t.variant != "bf16_gemv"
+                or not self.automatic_tactics
+                or num_tokens <= 16
+            )
+        )
+
     def get_valid_tactics(self, inputs, profile):
         key = tuple(inputs[1].shape)
         if key not in self._valid:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm Colonels before CUDA graph capture")
-            candidates = [
-                t
-                for t in self.tactics
-                if t.supports_shape(
-                    key[1],
-                    self.config.experts.intermediate_size,
-                    self.config.activation.is_gated,
-                )
-                and (
-                    t.variant != "bf16_gemv"
-                    or not self.automatic_tactics
-                    or key[0] <= 16
-                )
-            ]
+            candidates = list(self._candidate_tactics(*key))
             if key[0]:
                 self.runtime.precompile_kernels(candidates, self.kind, self.arch)
             self._valid[key] = [
@@ -400,12 +404,30 @@ class ColonelsRunner(MoERunner):
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         self._require_built()
         if tactic == -1:
-            tactics = self.get_valid_tactics(inputs, None)
-            if not tactics:
-                raise NotImplementedError(
-                    "No Colonels tactic supports this shape and device"
+            num_tokens, hidden_size = inputs[1].shape
+            # Empty batches do not test kernel resource limits; keep them separate.
+            bucket = (
+                map_to_hybrid_bucket(
+                    num_tokens, self.config.execution.tune_max_num_tokens
                 )
-            tactic = tactics[0]
+                if num_tokens
+                else 0
+            )
+            key = (bucket, hidden_size)
+            cached = self._default_tactics.get(key)
+            if cached is not None:
+                if self._run(inputs, cached):
+                    return inputs[0]
+                del self._default_tactics[key]
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm Colonels before CUDA graph capture")
+            for candidate in self._candidate_tactics(num_tokens, hidden_size):
+                if candidate != cached and self._run(inputs, candidate):
+                    self._default_tactics[key] = candidate
+                    return inputs[0]
+            raise NotImplementedError(
+                "No Colonels tactic supports this shape and device"
+            )
         tactic = ColonelsTactic(*tactic)
         if not self._run(inputs, tactic):
             raise RuntimeError(f"Selected Colonels tactic cannot launch: {tactic}")
