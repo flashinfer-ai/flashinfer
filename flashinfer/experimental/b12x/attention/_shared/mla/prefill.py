@@ -160,6 +160,11 @@ def run_unified_prefill(
     FlashInfer-shaped multi-group (MG) prefill kernel (``run_unified_prefill_mg``).
     Unsupported shapes HARD-FAIL (raise-not-fallback); there is no decode-reuse path.
 
+    ``lse_scale="natural"`` uses the direct launcher because the registered
+    ``torch.ops.b12x`` prefill operators have a fixed base-2 contract. Unlike
+    those operators, the direct path is not an opaque ``torch.compile`` op;
+    use the explicit prepared API for CUDA graph capture.
+
     Routes DSV4 (q_head_dim==512, UE8M0 footer, V_HAS_ROPE), GLM_NSA
     (q_head_dim==576, ARBITRARY_FP32 inline scales, V==nope), and explicit
     GLM_NEXT (q_head_dim==512, ARBITRARY_FP32 inline scales, no RoPE) through the SAME kernel

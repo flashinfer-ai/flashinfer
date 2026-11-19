@@ -7,7 +7,7 @@ from b12x.attention import sparse_mla as smla
 from b12x.preparation import PreparationSession, PreparedCall
 
 dev = torch.device("cuda", 0)
-D, PAGE, WIDTH, INTERLEAVE = 512, 256, 2051, 4
+D, PAGE, WIDTH = 512, 256, 2051
 SCALE = 256**-0.5
 _keep = []
 
@@ -60,9 +60,21 @@ def write_cache(kv_c, record_bytes):
     return kv
 
 
+def change_replay_inputs(q, sel, lens, step, tokens):
+    q.mul_(0.5)
+    sel[:, :tokens] = (
+        PAGE
+        + (torch.arange(tokens, device=dev, dtype=torch.int32) + step * 37) % tokens
+    )
+    lengths = torch.tensor(
+        [0, 1, 63, 129, 511, 1024, 1537, tokens], device=dev, dtype=torch.int32
+    )
+    lens.copy_(lengths.roll(step))
+
+
 def attend(mode, q, kv, sel, lens, lse_scale="natural", graph=False):
     if graph:
-        q = q.clone()
+        q, sel, lens = q.clone(), sel.clone(), lens.clone()
     rows, heads = q.shape[:2]
     plan = smla.plan(caps(heads, rows, mode, lse_scale))
     cache_lens = torch.full((rows,), kv.shape[0] * PAGE, dtype=torch.int32, device=dev)
@@ -102,14 +114,15 @@ def attend(mode, q, kv, sel, lens, lse_scale="natural", graph=False):
         capture = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture):
             out, lse = smla.run(binding)
-        q.mul_(0.5)
-        for _ in range(3):
+        for step in range(1, 4):
+            change_replay_inputs(q, sel, lens, step, 2048)
             capture.replay()
     return out.float().clone(), lse.float().clone()
 
 
 def merge_natural(outs, lses):
-    w = torch.softmax(torch.stack(lses), dim=0)  # [ranks, rows, heads]
+    # Every shard of an empty row has LSE=-inf and contributes zero output.
+    w = torch.softmax(torch.stack(lses), dim=0).nan_to_num(0)
     return (w.unsqueeze(-1) * torch.stack(outs)).sum(0)
 
 
@@ -128,17 +141,88 @@ def test_prepared_extend_lse_units(heads, graph):
     q = (torch.randn(rows, heads, D, device=dev) * 2).to(torch.bfloat16)
     sel = torch.full((rows, WIDTH), -1, device=dev, dtype=torch.int32)
     sel[:, :tokens] = PAGE + torch.arange(tokens, device=dev, dtype=torch.int32)
-    lens = torch.full((rows,), tokens, device=dev, dtype=torch.int32)
+    lens = torch.tensor(
+        [0, 1, 63, 129, 511, 1024, 1537, tokens], device=dev, dtype=torch.int32
+    )
     try:
         out2, lse2 = attend("extend", q, cache, sel, lens, "base2", graph)
         oute, lsee = attend("extend", q, cache, sel, lens, "natural", graph)
-        outd, lsed = attend(
-            "decode", q * (0.5 if graph else 1.0), cache, sel, lens, "natural"
-        )
+        if graph:
+            for step in range(1, 4):
+                change_replay_inputs(q, sel, lens, step, tokens)
+        outd, lsed = attend("decode", q, cache, sel, lens, "natural")
         torch.testing.assert_close(oute, out2, atol=0, rtol=0)
-        torch.testing.assert_close(lsee, lse2 * math.log(2), atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(lsee, lsed, atol=0.05, rtol=0)
+        torch.testing.assert_close(lsee, lse2 * math.log(2), atol=0, rtol=0)
+        assert torch.isneginf(lsee[lens == 0]).all()
+        assert torch.isneginf(lse2[lens == 0]).all()
+        torch.testing.assert_close(lsee, lsed, atol=1e-4, rtol=0)
         torch.testing.assert_close(oute, outd, atol=0.02, rtol=0.02)
+    finally:
+        _keep.clear()
+
+
+@pytest.mark.parametrize("shards", [2, 4])
+def test_prepared_extend_natural_shard_merge(shards):
+    require_b12x()
+    torch.manual_seed(7)
+    rows, heads, tokens = 8, 8, 2048
+    latent = (torch.randn(tokens, D, device=dev) * 0.5).to(torch.bfloat16)
+    cache = write_cache(latent, int(caps(heads, rows, "extend").cache_record_bytes))
+    q = (torch.randn(rows, heads, D, device=dev) * 2).to(torch.bfloat16)
+    sel = torch.full((rows, WIDTH), -1, device=dev, dtype=torch.int32)
+    sel[:, :tokens] = PAGE + torch.arange(tokens, device=dev, dtype=torch.int32)
+    lens = torch.tensor(
+        [0, 1, 63, 129, 511, 1024, 1537, tokens], device=dev, dtype=torch.int32
+    )
+    outs, lses = [], []
+    try:
+        reference, full_lse = attend("extend", q, cache, sel, lens)
+        for rank in range(shards):
+            shard_sel = torch.full_like(sel, -1)
+            shard_sel[:, : tokens // shards] = sel[:, rank:tokens:shards]
+            shard_lens = ((lens - rank + shards - 1) // shards).clamp_min(0)
+            out, lse = attend("extend", q, cache, shard_sel, shard_lens)
+            outs.append(out)
+            lses.append(lse)
+        merged = merge_natural(outs, lses)
+        assert rel(merged, reference) < 0.005
+        torch.testing.assert_close(
+            torch.logsumexp(torch.stack(lses), dim=0), full_lse, atol=0.01, rtol=0
+        )
+        assert torch.isneginf(full_lse[lens == 0]).all()
+        assert torch.count_nonzero(merged[lens == 0]) == 0
+    finally:
+        _keep.clear()
+
+
+@pytest.mark.parametrize("lse_scale", ["base2", "natural"])
+def test_prepared_extend_rejects_lse_unit_mismatch(lse_scale):
+    require_b12x()
+    from b12x._lib.compile_plan import compile_only_launches
+    from b12x.attention._shared.mla.prefill import run_unified_prefill
+
+    rows, heads, tokens = 1, 8, 2048
+    latent = torch.randn(tokens, D, device=dev).to(torch.bfloat16)
+    cache = write_cache(latent, int(caps(heads, rows, "extend").cache_record_bytes))
+    q = torch.randn(rows, heads, D, device=dev, dtype=torch.bfloat16)
+    sel = torch.full((rows, WIDTH), -1, device=dev, dtype=torch.int32)
+    sel[:, :tokens] = PAGE + torch.arange(tokens, device=dev, dtype=torch.int32)
+    kwargs = dict(
+        q=q,
+        kv_cache=cache,
+        topk_indices=sel,
+        topk_length=torch.full((rows,), tokens, device=dev, dtype=torch.int32),
+        page_block_size=PAGE,
+        sm_scale=SCALE,
+        model_type=int(smla.ModelType.GLM_NEXT),
+    )
+    try:
+        with compile_only_launches():
+            prepared = run_unified_prefill(**kwargs, lse_scale=lse_scale)
+        run_unified_prefill(**kwargs, prepared=prepared, lse_scale=lse_scale)
+        other_scale = "base2" if lse_scale == "natural" else "natural"
+        with pytest.raises(ValueError, match="different lse_scale"):
+            run_unified_prefill(**kwargs, prepared=prepared, lse_scale=other_scale)
     finally:
         _keep.clear()
 

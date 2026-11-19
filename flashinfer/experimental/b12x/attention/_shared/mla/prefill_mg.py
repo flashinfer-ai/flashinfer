@@ -4143,10 +4143,15 @@ def _sparse_mla_prefill_mg_flat_launch(
     )
     entry = kernel.call_dual if has_extra else kernel
     if prepared is not None:
+        if getattr(prepared, "__b12x_mla_lse_scale__", None) != lse_scale:
+            raise ValueError("prepared prefill launcher has a different lse_scale")
         return run_compiled(prepared, args)
-    return b12x_launch(
+    compiled = b12x_launch(
         entry, compile_spec=compile_spec, compile_args=args, runtime_args=args
     )
+    if compile_only_launches_enabled():
+        compiled.__b12x_mla_lse_scale__ = lse_scale
+    return compiled
 
 
 @torch.library.custom_op(

@@ -52,7 +52,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x.attention._shared.cute.ops import LOG2_E
+from b12x.attention._shared.cute.ops import LN_2, LOG2_E
 from b12x._lib.intrinsics import (
     atomic_max_shared_f32,
     byte_perm,
@@ -3090,6 +3090,9 @@ def s7_epilogue(
     ``out *= sigmoid(lse_e - sink)`` + log-sum-exp LSE fold the prefill reference
     cross-checks. ``lse_natural`` optionally converts the final stored LSE to
     natural-log units; its default preserves all split/decode base-2 stores."""
+    assert not lse_natural or epilogue_mode == EPILOGUE_FINAL_BF16, (
+        "natural LSE requires the final epilogue; split merges require base-2 LSE"
+    )
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
 
@@ -3284,8 +3287,8 @@ def s7_epilogue(
                 else:
                     lse1 = sink1
         if cutlass.const_expr(lse_natural):
-            lse0 = lse0 * Float32(0.6931471805599453)
-            lse1 = lse1 * Float32(0.6931471805599453)
+            lse0 = lse0 * Float32(LN_2)
+            lse1 = lse1 * Float32(LN_2)
         out_lse[gid] = lse0
         if cutlass.const_expr(valid_hpb > 8):
             out_lse[gid + Int32(8)] = lse1
