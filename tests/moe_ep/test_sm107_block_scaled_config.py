@@ -207,3 +207,28 @@ class TestSm107ArchGate:
             apply_routing_weights_before_fc2=True,
         )
         assert cfg.in_kernel_fc2_reduce and cfg.apply_routing_weights_before_fc2
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"kernel_variant": "inference"},
+        {"batch_invariant": True},
+        {"kind": "mxfp8_e5m2"},
+        {"gate_up_clamp": 16.0},
+    ],
+)
+def test_clamped_relu2_rejects_unsupported_modes(override):
+    kwargs = dict(activation="clamped_relu2", kernel_variant="genphase")
+    kwargs.update(override)
+    with pytest.raises(ValueError, match="clamped_relu2"):
+        _config(Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, **kwargs)
+
+
+def test_clamped_relu2_explicit_activation():
+    config = _config(
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        activation="clamped_relu2",
+        kernel_variant="genphase",
+    )
+    assert config.activation == "clamped_relu2"

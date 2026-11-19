@@ -1,0 +1,22 @@
+{
+  "base_flashinfer_revision": "d3f59f09106185147e2d0d09ac9dc6452f6712b0",
+  "description": "Clamped squared ReLU overlay; export_manifest.json describes the pristine export.",
+  "files": {
+    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": {
+      "upstream_sha256": "fa332cee54c546a26fc09e74adb801ab567436b686ca7db351a7883fbdcdc6e8",
+      "overlay_sha256": "42c1cd77e8ec4e219296fb97998e68e25292376df9cf0669550c0fcf4e8a1902"
+    },
+    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py": {
+      "upstream_sha256": "1d3eaee25abb383f62558138ac11aa3c83b72895701c4afa2e7fdfa1607a98a0",
+      "overlay_sha256": "3b01f0b2a09edb2e75e25d3caa3cbaea9dc31cef30696542379fb10b363f43d0"
+    },
+    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": {
+      "upstream_sha256": "6fdd3aadc13f65f857c289ffaf64d54b75d9964ae2356318e6e71ec49e3379a9",
+      "overlay_sha256": "ffb63c7898c113991b25fe0f1f9651ff10bf1f64083363964273d34fe845b67a"
+    },
+    "sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py": {
+      "upstream_sha256": "75d660ed62d5f35c7f72e95093698b4890c211297788b9693c559ee2c6252260",
+      "overlay_sha256": "a2af3b8f0222a77c8dd382ca63e6f42c1b5a1b26f2f4a6dcb36f173f9e900c55"
+    }
+  }
+}

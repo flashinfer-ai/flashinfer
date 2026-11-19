@@ -164,6 +164,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
+            gated=self._kernel_config.activation != "clamped_relu2",
         )
         return prepare_shared_weights(
             self._kernel_config, weights, routed, fleet_params
@@ -183,6 +184,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
+            gated=self._kernel_config.activation != "clamped_relu2",
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )

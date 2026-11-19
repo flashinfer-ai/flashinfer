@@ -134,7 +134,7 @@ class Sm107BlockScaledMoeConfig:
     max_tokens_per_rank: int
     num_topk: int
     hidden: int
-    intermediate: int  # width after activation; the FC1 GEMM N is 2*intermediate
+    intermediate: int  # FC1 N is I for clamped_relu2, otherwise 2*I
     rank: int
     world_size: int
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
@@ -158,7 +158,7 @@ class Sm107BlockScaledMoeConfig:
     token_back_mode: Sm107TokenBackMode = "epi_warps"
     apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
-    activation: Literal["swiglu", "situ"] = "swiglu"
+    activation: Literal["swiglu", "situ", "clamped_relu2"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
     swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
@@ -240,8 +240,8 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError(
                 "Two epilogue warpgroups require standard inference with BF16 bulk combine and epi_warps."
             )
-        if self.activation not in ("swiglu", "situ"):
-            raise ValueError("activation must be 'swiglu' or 'situ'.")
+        if self.activation not in ("swiglu", "situ", "clamped_relu2"):
+            raise ValueError("activation must be 'swiglu', 'situ', or 'clamped_relu2'.")
         if self.activation == "situ" and not self.batch_invariant:
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
@@ -287,6 +287,8 @@ class Sm107BlockScaledMoeConfig:
                 f"across world_size ({self.world_size})."
             )
         vec = self.sf_vec_size
+        if self.activation == "clamped_relu2" and self.intermediate % (4 * vec):
+            raise ValueError("clamped_relu2 intermediate must be a multiple of 128.")
         if self.hidden % (4 * vec) != 0:
             raise ValueError(
                 f"hidden ({self.hidden}) must be a multiple of {4 * vec} "
@@ -882,7 +884,11 @@ class Sm107BlockScaledSymmBuffer:
                     if activation_variant is not None
                     else {}
                 ),
-                "intermediate_gateup_size": 2 * cfg.intermediate,
+                "intermediate_gateup_size": (
+                    cfg.intermediate
+                    if cfg.activation == "clamped_relu2"
+                    else 2 * cfg.intermediate
+                ),
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
                 "a_major_mode": OperandMajorMode.K,
@@ -902,6 +908,9 @@ class Sm107BlockScaledSymmBuffer:
                 if activation_variant is not None
                 else cfg.situ_linear_beta,
                 "use_tanh_sigmoid": cfg.use_tanh_sigmoid,
+                "gate_activation": (
+                    "clamped_relu2" if cfg.activation == "clamped_relu2" else "swiglu"
+                ),
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -1329,7 +1338,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     token_back_mode: Sm107TokenBackMode = "epi_warps",
     apply_routing_weights_before_fc2: bool = True,
     max_sm_count: Optional[int] = None,
-    activation: Literal["swiglu", "situ"] = "swiglu",
+    activation: Literal["swiglu", "situ", "clamped_relu2"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     swiglu_alpha: Optional[float] = None,
@@ -1401,7 +1410,9 @@ def _expected_weight_shapes(
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
     """(fc1 shape, fc2 shape, fc1 SF numel/expert, fc2 SF numel/expert)."""
     experts = cfg.experts_per_rank
-    fc1_out = 2 * cfg.intermediate
+    fc1_out = (
+        cfg.intermediate if cfg.activation == "clamped_relu2" else 2 * cfg.intermediate
+    )
     vec = cfg.sf_vec_size
     if cfg.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)

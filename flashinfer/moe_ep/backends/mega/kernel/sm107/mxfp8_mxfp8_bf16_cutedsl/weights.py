@@ -52,6 +52,7 @@ def preprocess_mega_weights(
     intermediate_size: int,
     hidden_size: int,
     kind: Sm107Mxfp8Kind = "mxfp8_e4m3",
+    gated: bool = True,
 ) -> TransformedMegaWeights:
     """Canonical BF16 or prequantized MXFP8 weights -> SM107 kernel layout."""
     if isinstance(weights, PrequantizedMoEWeights):
@@ -67,6 +68,7 @@ def preprocess_mega_weights(
             quant_kind=kind,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            gated=gated,
         )
 
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
@@ -77,7 +79,7 @@ def preprocess_mega_weights(
     if w13.ndim != 3 or w2.ndim != 3:
         raise MoEEpConfigError("canonical w13 and w2 must both be 3D tensors")
     num_local_experts = w13.shape[0]
-    fc1_out = 2 * intermediate_size
+    fc1_out = (2 if gated else 1) * intermediate_size
     if tuple(w13.shape) != (num_local_experts, fc1_out, hidden_size):
         raise MoEEpConfigError(
             f"w13 shape {tuple(w13.shape)} != "
@@ -91,7 +93,7 @@ def preprocess_mega_weights(
 
     _data_dtype(kind)
     return preprocess_block_scaled_weights(
-        w13, w2, quant_kind=kind, intermediate_size=intermediate_size
+        w13, w2, quant_kind=kind, intermediate_size=intermediate_size, gated=gated
     )
 
 
@@ -103,6 +105,7 @@ def validate_transformed_mega_weights(
     kind: Sm107Mxfp8Kind,
     world_size: int,
     num_experts: int,
+    gated: bool = True,
 ) -> None:
     """Structure/shape/dtype checks for user-supplied transformed weights."""
     import torch
@@ -114,7 +117,7 @@ def validate_transformed_mega_weights(
 
     check_transformed_mega_weights_structure(transformed)
     num_local_experts = num_experts // world_size
-    fc1_out = 2 * intermediate_size
+    fc1_out = (2 if gated else 1) * intermediate_size
     check_transformed_weight_pair(
         transformed[0],
         label="fc1",

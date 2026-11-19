@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
+# Activation/layout adaptation: https://github.com/mathemakitten/flashinfer/tree/52e7da3f4791f059b5840d4ec210c7556b70c421 (BSD-3-Clause).
 """Autonomous Rubin epilogue for the fused FC1+FC2 swap-AB MegaMoE kernel.
 
 Per-thread RMEM tensors flow between the transpose / SwiGLU / quantize / fc2
@@ -117,8 +118,12 @@ class QuantImpl:
                 raise ValueError(f"The paired direction needs an even sf_vec, got {self.sf_vec_size}.")
             if self.lane_idx is None or self.warp_idx is None or self.pair_exchange_barrier is None:
                 raise ValueError("The paired direction needs lane_idx, warp_idx and pair_exchange_barrier.")
-        elif not isinstance(self.quant_kind, CombineFormat) and self.sf_vec_size != 16:
-            # A wider orthodox block cannot be reduced inside one thread: see the paired direction.
+        elif (
+            not isinstance(self.quant_kind, CombineFormat)
+            and self.sf_vec_size != 16
+            and not (self.sf_vec_size == 32 and self.sf_vec_direction == "regs_in_thread")
+        ):
+            # Gated FC1 splits a wider block between paired warps.
             raise ValueError(f"Orthodox sf_vec {self.sf_vec_size} needs the paired direction.")
 
     @property
@@ -177,6 +182,8 @@ class QuantImpl:
         if cutlass.const_expr(not self._is_combine):
             if cutlass.const_expr(self.sf_vec_direction == "regs_in_pair_threads"):
                 return self.mx_quant_regs_in_pair_threads_impl(prequant_reg, smem_intermediate)
+            if cutlass.const_expr(self.sf_vec_size == 32):
+                return self.mx_quant_regs_in_thread_impl(prequant_reg)
             return self.nvfp4_quant_impl(prequant_reg, norm_const=norm_const)
         if cutlass.const_expr(self.batch_invariant):
             from flashinfer.moe_ep.batch_invariant.quantized_combine_device import quantize_combine_wire
@@ -196,6 +203,32 @@ class QuantImpl:
         return self.mxfp8_combine_quant_threads_with_the_same_reg_impl(prequant_reg)
 
     # -- impls ----------------------------------------------------------------
+
+    @cute.jit
+    def mx_quant_regs_in_thread_impl(
+        self, prequant_reg: cute.Tensor
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # Nongated FC1: one full FP32 block of 32 values per thread.
+        vec = self.sf_vec_size
+        n_blocks = cute.size(prequant_reg) // vec
+        data = cute.make_rmem_tensor((cute.size(prequant_reg),), self.data_dtype)
+        sf = cute.make_rmem_tensor((n_blocks,), cutlass.Float8E8M0FNU)
+        in_blocks = cute.zipped_divide(prequant_reg, (vec,))  # ((vec,), (n_blocks,))
+        data_blocks = []
+        sf_values = []
+        for vec_block_idx in cutlass.range_constexpr(n_blocks):
+            block = in_blocks[None, vec_block_idx]
+            # Preserve the ordinary MXFP8 scale encoding.
+            scale_e8m0, scale_f32 = self._e8m0(
+                cutlass.Float32(self._amax_thread_fp32(block))
+            )
+            sf_values.append(scale_e8m0)
+            data_blocks.append(
+                self._scale_to_data_ssa(block, self._enc_mxfp8(scale_f32))
+            )
+        self._store_packed_blocks(data, data_blocks)
+        sf.store(self._values_to_ssa(sf_values, cutlass.Float8E8M0FNU))
+        return data, sf
 
     # regs_in_thread only; fc1 promises the vec direction via its TMEM transpose.
     @cute.jit
@@ -960,6 +993,8 @@ class SwapABGatedActEpilogue(KernelComponent):
     # Default for subclasses with their own __init__ (local_mega): the plain combine plane. The
     # gen-phase kernel opts into the bit-inverted, self-validating plane through impl_desc.
     combine_ll_encoded: bool = False
+    nongated_relu2: bool = False
+    activation_divisor: int = 2
 
     _EpilogueSyncWaitBarId = 1  # Arrive and wait only
     _EpilogueAsyncBarIdBase = 4  # Some arrive, the others arrive and wait
@@ -1062,7 +1097,18 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.use_tanh_sigmoid = problem_desc.get("use_tanh_sigmoid", False)
         # The Blackwell epilogue accepts gate_activation="quick_geglu"; this one has not been
         # ported yet. Refuse rather than silently computing SwiGLU for a quick_geglu descriptor.
-        if problem_desc.get("gate_activation") not in (None, "swiglu"):
+        self.nongated_relu2 = problem_desc.get("gate_activation") == "clamped_relu2"
+        self.activation_divisor = 1 if self.nongated_relu2 else 2
+        if self.nongated_relu2:
+            if (
+                self.quant_kind != QuantKind("mxfp8_e4m3")
+                or self.batch_invariant
+                or impl_desc.get("epilogue_warpgroups", 1) != 1
+            ):
+                raise ValueError("clamped ReLU2 epilogue requires MXFP8 E4M3, one warpgroup, and no BI")
+            self._EpilogueFc1IntermediateDownTileSize = 128
+            self._EpilogueFc1IntermediateDownPerWarp = 32
+        if problem_desc.get("gate_activation") not in (None, "swiglu", "clamped_relu2"):
             raise NotImplementedError(
                 f"Rubin epilogue does not support gate_activation={problem_desc.get('gate_activation')!r} yet."
             )
@@ -1149,7 +1195,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             self.fc2_hidden_needs_predicate: bool = True
 
         if isinstance(self.intermediate_gateup_size, int):
-            self.intermediate_downproj: Optional[int] = self.intermediate_gateup_size // 2
+            self.intermediate_downproj: Optional[int] = self.intermediate_gateup_size // self.activation_divisor
         else:
             self.intermediate_downproj: Optional[int] = None
 
@@ -1933,29 +1979,46 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             wrap_into_copy_standard_layout(up_token_32_64),
         )
 
-        # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
-        token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(gate_token_0_32, up_token_0_32, alpha_val)
+        if cutlass.const_expr(self.nongated_relu2):
+            # All four fragments were loaded before either transpose reuses TMEM.
+            trans_32 = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator,
+                reg_tensor_top=gate_token_32_64,
+                reg_tensor_bot=up_token_32_64,
+            )
+            lo_32, hi_32 = trans_32.from_r1_perm_until_last_store()
+            token_32_64_pre_quant = self.clamped_relu2(lo_32, hi_32, alpha_val)
+            trans_0 = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator,
+                reg_tensor_top=gate_token_0_32,
+                reg_tensor_bot=up_token_0_32,
+            )
+            lo_0, hi_0 = trans_0.from_r1_perm_until_last_store()
+            token_0_32_pre_quant = self.clamped_relu2(lo_0, hi_0, alpha_val)
+        else:
+            # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
+            token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(gate_token_0_32, up_token_0_32, alpha_val)
 
-        # gate_token_32_64 / up_token_32_64 are already in the transpose input
-        # distribution documented by TmemTranspose16x32.
-        token_32_64_tmem_trans = TmemTranspose32x32Inplace(
-            tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
-        )
+            # gate_token_32_64 / up_token_32_64 are already in the transpose input
+            # distribution documented by TmemTranspose16x32.
+            token_32_64_tmem_trans = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
+            )
 
-        # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
-        # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
-        gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
-            token_32_64_tmem_trans.from_r1_perm_until_last_store()
-        )
+            # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
+            # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
+            gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
+                token_32_64_tmem_trans.from_r1_perm_until_last_store()
+            )
 
-        token_32_64_pre_quant = self.alpha_swiglu_clamp(
-            gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act, alpha_val
-        )
+            token_32_64_pre_quant = self.alpha_swiglu_clamp(
+                gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act, alpha_val
+            )
 
-        token_0_32_tmem_trans = TmemTranspose16x32(
-            tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
-        )
-        token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
+            token_0_32_tmem_trans = TmemTranspose16x32(
+                tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
+            )
+            token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
         return (token_0_32_pre_quant, token_32_64_pre_quant)
 
     @cute.jit
@@ -2027,7 +2090,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # (token_64, intermeidate_64)
         fc1_smem = self.smem_tensor[None, None, subtile_idx]
         # (token, intermediate_down, l=1) -> (cta_token, cta_intermediate_down)
-        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // 2))[
+        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // self.activation_divisor))[
             None, None, work_tile_info.tile_n_idx, work_tile_info.tile_m_idx, 0
         ]
         # (cta_token, cta_intermediate_down) -> (token_64, intermediate_64)
@@ -2122,7 +2185,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # Both warpgroups write their token rows of this subtile's stage; one TMA store takes the whole stage once
         # both are in (barrier 4 + subtile over the 256 threads of both warpgroups).
         fc1_smem = self.smem_tensor[None, None, subtile_idx]
-        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // 2))[
+        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // self.activation_divisor))[
             None, None, work_tile_info.tile_n_idx, work_tile_info.tile_m_idx, 0
         ]
         fc1_gmem_subtile_view = cute.flat_divide(
@@ -2190,7 +2253,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             quant = QuantImpl(self.quant_kind, "regs_in_thread", batch_invariant=self.batch_invariant)
 
         intermediate_idx = (
-            work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
+            work_tile_info.tile_m_idx * (self.cta_tile_m // self.activation_divisor)
             + self.warp_idx * self._EpilogueFc1IntermediateDownPerWarp
         )
         if cutlass.const_expr(self.needs_pair_amax_exchange):
@@ -2204,7 +2267,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         store_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.fc1_output_dtype,
-            num_bits_per_copy=values_per_token * self.fc1_output_dtype.width,
+            num_bits_per_copy=min(128, values_per_token * self.fc1_output_dtype.width),
         )
 
         weighted = cute.make_rmem_tensor((values_per_token,), cutlass.Float32)
@@ -2237,6 +2300,23 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         smem_thread_row = smem_tiled[(0, None), (self.lane_idx + token_col_base, self.warp_idx)]
         cute.copy(store_atom, cute.coalesce(data_regs), cute.coalesce(smem_thread_row))
+
+    @cute.jit
+    def clamped_relu2(
+        self, lo: cute.Tensor, hi: cute.Tensor, alpha_val: Optional[cutlass.Float32]
+    ) -> cute.Tensor:
+        out = cute.make_rmem_tensor((32,), cutlass.Float32)
+        limit = cutlass.Float32(16.0)
+        for half in cutlass.range_constexpr(2):
+            frag = lo if cutlass.const_expr(half == 0) else hi
+            for i in cutlass.range_constexpr(16):
+                value = frag[i]
+                if cutlass.const_expr(alpha_val is not None):
+                    value = value * alpha_val
+                value = cute.arch.fmax(value, cutlass.Float32(0.0))
+                value = limit * cute.math.tanh(value / limit, approx=True)
+                out[half * 16 + i] = value * value
+        return out
 
     @cute.jit
     def alpha_swiglu_clamp(
@@ -2474,7 +2554,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # plane folds any coordinate inside a block onto that block's slot, so the per-warp base
         # addresses the right entry for either vec size.
         intermediate_idx = (
-            work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
+            work_tile_info.tile_m_idx * (self.cta_tile_m // self.activation_divisor)
             + self.warp_idx * self._EpilogueFc1IntermediateDownPerWarp
         )
         if cutlass.const_expr(self.needs_pair_amax_exchange):
@@ -2493,7 +2573,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         store_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.fc1_output_dtype,
-            num_bits_per_copy=values_per_token * self.fc1_output_dtype.width,
+            num_bits_per_copy=min(128, values_per_token * self.fc1_output_dtype.width),
         )
 
         # 1) topk-weight pre-multiply (Path A) into a weighted scratch, both tokens back to back.

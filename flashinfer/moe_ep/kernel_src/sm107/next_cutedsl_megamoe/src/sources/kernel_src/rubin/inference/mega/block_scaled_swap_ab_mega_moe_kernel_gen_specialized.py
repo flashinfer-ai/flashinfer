@@ -248,6 +248,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+        self.activation_divisor = 1 if problem_desc.get("gate_activation") == "clamped_relu2" else 2
+        if self.activation_divisor == 1 and ((impl_desc.get("die_aware") or "off") != "off" or problem_desc.get("shared_expert", False)):
+            raise ValueError("clamped ReLU2 clamped_relu2 currently requires unlocalized routed experts")
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.a_dtype = self.quant_kind.weight_dtype
@@ -609,7 +612,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     # ------------------------------------------------------------------
 
     def _build_device_workspace(self) -> DeviceWorkspace:
-        intermediate_downproj = self.intermediate_gateup_size // 2
+        intermediate_downproj = self.intermediate_gateup_size // self.activation_divisor
         sf_column_count = round_up(ceil_div(intermediate_downproj, self.sf_vec_size), 4)
         max_sf_rows = self.token_comm.worst_case_sf_rows
         # One slot per token block across every local expert, which is the space
@@ -754,6 +757,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 else ""
             )
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
+            + ("_clamped_relu2_16_hw_tanh" if self.activation_divisor == 1 else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -779,7 +783,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         tokens = self.max_tokens_per_rank
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
-        intermediate_downproj = intermediate_gateup // 2
+        intermediate_downproj = intermediate_gateup // self.activation_divisor
         experts = self.local_expert_count
         sf_vec_size = self.sf_vec_size
         # n_split: die-major weight (2E, K, N/2) and SF (2E, cols/2) tensors, expert' = half * E + e.
@@ -972,7 +976,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         experts = self.local_expert_count
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
-        intermediate_downproj = intermediate_gateup // 2
+        intermediate_downproj = intermediate_gateup // self.activation_divisor
         # n_split: die-major weight and SF views; the extension adds half * E to the expert coordinate and rebases the
         # row block into the half, so the scheduler and epilogues still address the full (E, N) problem.
         weight_experts = 2 * experts if self.n_split else experts
@@ -1441,7 +1445,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         fc1_output_sf = cute.make_tensor(
             fc1_output_sf_storage.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (fc1_output_sf_storage.shape[0], intermediate_gateup // 2, cutlass.Int32(1)), self.epilogue.sf_vec_size
+                (fc1_output_sf_storage.shape[0], intermediate_gateup // self.activation_divisor, cutlass.Int32(1)), self.epilogue.sf_vec_size
             ),
         )
         shared_fc1_done_counter_pointer, shared_fc2_spin_threshold = self._shared_counter_bindings()
