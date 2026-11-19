@@ -723,6 +723,1298 @@ def test_trtllm_allreduce_fusion_twoshot_growing_grid(world_size, hidden_dim):
     )
 
 
+# ---------------------------------------------------------------------------
+# The specialized backend of allreduce_fusion:
+# create_allreduce_fusion_workspace(backend="specialized"), which backend="auto" builds
+# first when it can, holds the specialized two-rank kernel for kARResidualRMSNorm
+# (compute capability 10.3, world size 2, hidden size 6144, bf16, fp32_acc=True,
+# allowlisted weight_bias and token counts). Every other call on that workspace runs its
+# fallback backend, the stock backend "auto" would otherwise pick; backend="trtllm" and
+# backend="mnnvl" never run the specialized kernel.
+# ---------------------------------------------------------------------------
+
+_WS2_HIDDEN = 6144
+# The workspace vLLM creates for this hidden size (64 MiB of bf16 per rank).
+_WS2_MAX_TOKENS = 5461
+_WS2_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+_WS2_EPS = 1e-6
+# Odd sizes, the vLLM one-shot / two-shot switch (2730 / 2731), served sizes and the
+# capacity; the edges of the allowlisted ranges are added from the allowlist.
+_WS2_BASE_TOKEN_NUMS = [1, 7, 513, 2730, 2731, 3706, 4097, 5373, 5445, 5461]
+_WS2_ALIASINGS = ["separate", "residual_out_is_input", "norm_out_is_input"]
+# Token counts a served two-rank prefill worker sends to the same workspace below the
+# kernel's range (its CUDA-graph sizes): they must run exactly the fallback backend.
+_WS2_OUTSIDE_TOKEN_NUMS = [1, 4, 16, 64, 128, 256, 512]
+
+
+def _ws2_stats():
+    from flashinfer.comm._allreduce_fusion_ws2_specialized import (
+        _allreduce_fusion_ws2_specialized_stats,
+    )
+
+    return _allreduce_fusion_ws2_specialized_stats()
+
+
+def _ws2_ranges():
+    """The allowlisted inclusive ``[min, max]`` token-count ranges."""
+    return [tuple(r) for r in _ws2_stats()["allowlist_num_tokens"]]
+
+
+def _ws2_allowed(token_num):
+    return any(lo <= token_num <= hi for lo, hi in _ws2_ranges())
+
+
+def _ws2_token_nums():
+    """Base sizes plus both sides of every guard edge, up to the workspace size."""
+    nums = set(_WS2_BASE_TOKEN_NUMS)
+    for lo, hi in _ws2_ranges():
+        nums.update(
+            t
+            for t in (lo - 1, lo, lo + 1, hi - 1, hi, hi + 1)
+            if 1 <= t <= _WS2_MAX_TOKENS
+        )
+    return sorted(nums)
+
+
+def _ws2_inside(frac):
+    """A dispatched token count at fraction ``frac`` of the first range."""
+    lo, hi = _ws2_ranges()[0]
+    hi = min(hi, _WS2_MAX_TOKENS)
+    return lo + int((hi - lo) * frac)
+
+
+def _ws2_outside():
+    """A token count outside every range (the one just below the first), or None."""
+    for t in [_ws2_ranges()[0][0] - 1, *range(_WS2_MAX_TOKENS, 0, -1)]:
+        if t >= 1 and not _ws2_allowed(t):
+            return t
+    return None
+
+
+def _ws2_is_target(device_index: int = 0) -> bool:
+    from flashinfer.utils import get_compute_capability
+
+    return torch.cuda.is_available() and get_compute_capability(
+        torch.device(f"cuda:{device_index}")
+    ) == (10, 3)
+
+
+def _ws2_skip_unless_target(world_size: int = 2) -> None:
+    if not torch.cuda.is_available() or not _ws2_is_target():
+        pytest.skip("the specialized two-rank kernel targets compute capability 10.3")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs, have {torch.cuda.device_count()}")
+
+
+def _ws2_setup(world_size, rank, distributed_init_port, gpu_offset):
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    return device
+
+
+def _ws2_workspace(
+    world_size,
+    rank,
+    backend="specialized",
+    hidden_dim=_WS2_HIDDEN,
+    dtype=torch.bfloat16,
+    max_token_num=None,
+):
+    return comm.create_allreduce_fusion_workspace(
+        backend=backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=_WS2_MAX_TOKENS if max_token_num is None else max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        comm_backend=TorchDistBackend(),
+    )
+
+
+def _ws2_stock_backend(world_size):
+    """The backend ``auto`` picked before the specialized backend existed: ``mnnvl`` when
+    every rank supports NVLink multicast, else ``trtllm`` (collective)."""
+    from flashinfer.comm.mnnvl import is_multicast_supported
+
+    flags = [None] * world_size
+    dist.all_gather_object(flags, is_multicast_supported(torch.cuda.current_device()))
+    return "mnnvl" if all(flags) else "trtllm"
+
+
+def _ws2_state(workspace):
+    return getattr(workspace, "_ar_ws2", None)
+
+
+def _ws2_open(world_size, rank, backend):
+    """``(workspace, trtllm, fallback)``: the workspace under test (``backend`` is
+    ``specialized``, or ``auto``, which must pick it here), a TRT-LLM workspace (the stock
+    numerics the specialized kernel reproduces) and a plain workspace of the fallback
+    backend (the exact results of every call the kernel does not serve)."""
+    workspace = _ws2_workspace(world_size, rank, backend)
+    assert isinstance(workspace, comm.SpecializedAllReduceFusionWorkspace), type(
+        workspace
+    )
+    assert workspace.backend == "specialized"
+    assert workspace.has_specialized_kernels, _ws2_stats()["last_state_rejection"]
+    assert workspace.fallback_backend == _ws2_stock_backend(world_size)
+    trtllm = _ws2_workspace(world_size, rank, "trtllm")
+    assert _ws2_state(trtllm) is None
+    if workspace.fallback_backend == "trtllm":
+        fallback = trtllm
+    else:
+        fallback = _ws2_workspace(world_size, rank, workspace.fallback_backend)
+    assert type(fallback) is type(workspace.fallback)
+    return workspace, trtllm, fallback
+
+
+def _ws2_close(*workspaces):
+    done = set()
+    for workspace in workspaces:
+        if workspace is not None and id(workspace) not in done:
+            done.add(id(workspace))
+            workspace.destroy()
+
+
+def _ws2_inputs(
+    token_num, rank, seed, device, hidden_dim=_WS2_HIDDEN, dtype=torch.bfloat16
+):
+    """Rank-specific ``x``; ``residual`` and ``gamma`` identical on every rank (as in TP).
+    Row 0 holds -0 / +0 / subnormal / large values, row 2 is all zero on every rank."""
+    gen_rank = torch.Generator(device=device).manual_seed(100003 * seed + 7 * rank + 1)
+    gen_shared = torch.Generator(device=device).manual_seed(100003 * seed + 99991)
+    x = torch.randn(token_num, hidden_dim, generator=gen_rank, device=device).to(dtype)
+    residual = torch.randn(
+        token_num, hidden_dim, generator=gen_shared, device=device
+    ).to(dtype)
+    gamma = (0.1 * torch.randn(hidden_dim, generator=gen_shared, device=device)).to(
+        dtype
+    )
+    x[0, :256] = -0.0
+    x[0, 256:512] = 0.0
+    x[0, 512:520] = 1e-39 if dtype == torch.bfloat16 else 1e-7
+    x[0, 520:528] = (3e4 if dtype == torch.bfloat16 else 3e2) * (rank + 1)
+    if token_num > 2:
+        x[2] = 0.0
+        residual[2] = 0.0
+    return x, residual, gamma
+
+
+def _ws2_ordered(t):
+    """bf16/fp16 bit patterns mapped to integers whose difference counts ulps (+0 == -0)."""
+    i = t.contiguous().view(torch.int16).to(torch.int32)
+    return torch.where(i < 0, -(i & 0x7FFF), i)
+
+
+def _ws2_assert_match(got, ref, what, exact_min, ulp1_min):
+    assert got.shape == ref.shape, (
+        f"{what}: shape {tuple(got.shape)} != {tuple(ref.shape)}"
+    )
+    assert not torch.isnan(got).any().item(), f"{what}: NaN in output"
+    diff = (_ws2_ordered(got) - _ws2_ordered(ref)).abs()
+    n = diff.numel()
+    exact = (diff == 0).sum().item() / n
+    within1 = (diff <= 1).sum().item() / n
+    assert exact >= exact_min and within1 >= ulp1_min, (
+        f"{what}: bit-exact {exact:.6f} (min {exact_min}), within 1 ulp {within1:.6f} "
+        f"(min {ulp1_min}), max ulp {diff.max().item()}"
+    )
+    g, r = got.float(), ref.float()
+    torch.testing.assert_close(
+        g, r, atol=1e-3, rtol=1.6e-2, msg=lambda m: f"{what}: {m}"
+    )
+    # Per-row scale: no row deviates by more than ~1 ulp of its largest value.
+    row_err = (g - r).abs().amax(dim=-1)
+    row_scale = r.abs().amax(dim=-1)
+    assert bool((row_err <= row_scale * 2.0**-7 + 1e-6).all()), f"{what}: row scale"
+    cos = torch.nn.functional.cosine_similarity(g.flatten(), r.flatten(), dim=0).item()
+    assert cos >= 0.999 or r.abs().max().item() == 0, f"{what}: cosine {cos}"
+
+
+def _ws2_assert_bitwise(got, ref, what):
+    """The same bits: the call ran exactly the reference's kernels."""
+    for g, r in zip(got, ref, strict=True):
+        assert g.shape == r.shape and g.dtype == r.dtype, what
+        assert torch.equal(g.view(torch.uint8), r.view(torch.uint8)), (
+            f"{what}: differs from the fallback backend's own result"
+        )
+
+
+def _ws2_assert_close_loose(got, ref, what):
+    """A stock backend's result against the torch reference (stock rounding may differ)."""
+    torch.testing.assert_close(
+        got.float(), ref.float(), atol=0.1, rtol=3e-2, msg=lambda m: f"{what}: {m}"
+    )
+
+
+def _ws2_assert_rank_identical(tensors, what):
+    for t in tensors:
+        gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, t.contiguous())
+        for r in range(1, len(gathered)):
+            assert torch.equal(
+                gathered[0].view(torch.int16), gathered[r].view(torch.int16)
+            ), f"{what}: rank 0 and rank {r} outputs differ"
+
+
+def _ws2_torch_reference(x_all, residual, gamma, weight_bias):
+    """fp32 sum -> bf16, + residual -> bf16, RMSNorm in fp32 -> bf16."""
+    s = torch.stack([x.float() for x in x_all]).sum(0).to(residual.dtype)
+    h = (s.float() + residual.float()).to(residual.dtype)
+    hf = h.float()
+    rstd = torch.rsqrt(hf.pow(2).mean(-1, keepdim=True) + _WS2_EPS)
+    return s, h, (hf * rstd * (weight_bias + gamma.float())).to(residual.dtype)
+
+
+def _ws2_alias(aliasing, x, residual):
+    """``(residual_out, norm_out)`` for an aliasing form; separate outputs are NaN-filled."""
+    if aliasing == "separate":
+        return torch.full_like(x, float("nan")), torch.full_like(x, float("nan"))
+    if aliasing == "residual_out_is_input":  # vLLM 0.27 MiniMax-M3
+        return x, torch.full_like(x, float("nan"))
+    if aliasing == "norm_out_is_input":
+        return residual, x
+    raise ValueError(aliasing)
+
+
+def _ws2_call(
+    workspace,
+    x,
+    residual,
+    gamma,
+    residual_out,
+    norm_out,
+    weight_bias=1.0,
+    use_oneshot=None,
+    launch_with_pdl=True,
+    fp32_acc=True,
+):
+    return comm.allreduce_fusion(
+        input=x,
+        workspace=workspace,
+        pattern=comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        launch_with_pdl=launch_with_pdl,
+        trigger_completion_at_end=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        residual_in=residual,
+        rms_gamma=gamma,
+        rms_eps=_WS2_EPS,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+        weight_bias=weight_bias,
+    )
+
+
+def _ws2_vllm_oneshot(token_num):
+    return token_num * _WS2_HIDDEN * 2 <= 32 * 1024 * 1024
+
+
+def _ws2_expect_dispatch(workspace, token_num, weight_bias=1.0, fp32_acc=True):
+    state = _ws2_state(workspace)
+    stats = _ws2_stats()
+    return (
+        state is not None
+        and fp32_acc is True
+        and weight_bias in stats["allowlist_weight_bias"]
+        and token_num <= state.capacity
+        and any(lo <= token_num <= hi for lo, hi in stats["allowlist_num_tokens"])
+    )
+
+
+def _ws2_run(workspace, aliasing, x, residual, gamma, disable=False, **kwargs):
+    """One call on copies of the inputs (``disable``: with the kill switch). Returns
+    ``((residual_out, norm_out), specialized launches)``."""
+    import os
+
+    xc, rc = x.clone(), residual.clone()
+    residual_out, norm_out = _ws2_alias(aliasing, xc, rc)
+    before = _ws2_stats()["dispatch_count"]
+    if disable:
+        os.environ[_WS2_DISABLE_ENV] = "1"
+    try:
+        ret = _ws2_call(workspace, xc, rc, gamma, residual_out, norm_out, **kwargs)
+    finally:
+        os.environ.pop(_WS2_DISABLE_ENV, None)
+    assert ret is norm_out
+    torch.cuda.synchronize()
+    return (residual_out, norm_out), _ws2_stats()["dispatch_count"] - before
+
+
+def _run_ws2_correctness_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    backend,
+    aliasing,
+    token_nums,
+    gpu_offset=0,
+):
+    """Every call on the specialized (or auto) workspace: a dispatched call matches the
+    TRT-LLM kernels, every other call and every kill-switched call gives exactly the
+    fallback backend's result; outputs are bitwise identical across ranks."""
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspace = trtllm = fallback = None
+    try:
+        workspace, trtllm, fallback = _ws2_open(world_size, rank, backend)
+        oneshots = [None, True, False]
+        case = 0
+        for token_num in token_nums:
+            for weight_bias in (1.0, 0.0):
+                for launch_with_pdl in (True, False):
+                    case += 1
+                    use_oneshot = oneshots[case % 3]
+                    if token_num <= world_size and use_oneshot is False:
+                        use_oneshot = True
+                    x, residual, gamma = _ws2_inputs(token_num, rank, case, device)
+                    what = (
+                        f"rank {rank} {backend} T={token_num} wb={weight_bias} "
+                        f"pdl={launch_with_pdl} use_oneshot={use_oneshot} {aliasing}"
+                    )
+                    kwargs = dict(
+                        weight_bias=weight_bias,
+                        use_oneshot=use_oneshot,
+                        launch_with_pdl=launch_with_pdl,
+                    )
+                    run = lambda ws, disable=False: _ws2_run(  # noqa: E731
+                        ws, aliasing, x, residual, gamma, disable=disable, **kwargs
+                    )
+                    got, dispatched = run(workspace)
+                    expected = _ws2_expect_dispatch(workspace, token_num, weight_bias)
+                    assert dispatched == int(expected), (
+                        f"{what}: dispatched {dispatched}"
+                    )
+                    killed, killed_dispatched = run(workspace, disable=True)
+                    assert killed_dispatched == 0, f"{what}: kill switch did not hold"
+                    stock, _ = run(fallback)
+                    _ws2_assert_bitwise(killed, stock, f"{what} kill switch")
+                    if expected:
+                        ref, _ = run(trtllm)
+                        _ws2_assert_match(
+                            got[0], ref[0], f"{what} residual_out", 0.995, 0.9999
+                        )
+                        _ws2_assert_match(
+                            got[1], ref[1], f"{what} norm_out", 0.95, 0.999
+                        )
+                    else:
+                        _ws2_assert_bitwise(got, stock, f"{what} outside the envelope")
+                    _ws2_assert_rank_identical(got, what)
+        stats = _ws2_stats()
+        assert stats["guard_error"] is None, stats["guard_error"]
+        assert stats["dispatch_count"] > 0
+    finally:
+        dist.barrier()
+        _ws2_close(workspace, trtllm, fallback)
+        dist.destroy_process_group()
+
+
+def _run_ws2_back_to_back_worker(
+    world_size, rank, dtype, hidden_dim, distributed_init_port, num_calls, gpu_offset=0
+):
+    """Serving pattern: one workspace, many calls back to back without synchronisation, the
+    token count changing every call, mixing specialized calls (two aliasing forms) with
+    fallback one-shot / two-shot pattern-1 calls and pattern-0 calls; fresh inputs every
+    call."""
+    import random
+
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspace = None
+    try:
+        workspace = _ws2_workspace(world_size, rank, "specialized")
+        state = _ws2_state(workspace)
+        assert state is not None, _ws2_stats()["last_state_rejection"]
+        rng = random.Random(20261112)  # same schedule on both ranks
+        inside = [
+            (lo, min(hi, state.capacity))
+            for lo, hi in _ws2_ranges()
+            if lo <= state.capacity
+        ]
+        outside = [t for t in range(1, _WS2_MAX_TOKENS + 1) if not _ws2_allowed(t)]
+        kinds = ["spec", "spec_alias", "allreduce"]
+        if [t for t in outside if t > world_size]:
+            kinds += ["stock_oneshot", "stock_twoshot"]
+        calls = []
+        expected_dispatch = 0
+        before = _ws2_stats()["dispatch_count"]
+        for i in range(num_calls):
+            kind = kinds[i % len(kinds)] if i < len(kinds) else rng.choice(kinds)
+            if kind.startswith("spec"):
+                token_num = rng.randint(*rng.choice(inside))
+            elif kind == "stock_oneshot":
+                token_num = rng.choice(outside)
+            elif kind == "stock_twoshot":
+                token_num = rng.choice([t for t in outside if t > world_size])
+            else:
+                token_num = rng.randint(1, _WS2_MAX_TOKENS)
+            x, residual, gamma = _ws2_inputs(token_num, rank, 1000 + i, device)
+            x_copy, residual_copy = x.clone(), residual.clone()
+            if kind == "allreduce":
+                out = torch.full_like(x, float("nan"))
+                comm.allreduce_fusion(
+                    input=x,
+                    workspace=workspace,
+                    pattern=comm.AllReduceFusionPattern.kAllReduce,
+                    launch_with_pdl=True,
+                    output=out,
+                    use_oneshot=_ws2_vllm_oneshot(token_num) or token_num <= world_size,
+                    fp32_acc=True,
+                )
+                calls.append((kind, token_num, x_copy, residual_copy, gamma, (out,)))
+                continue
+            aliasing = "residual_out_is_input" if kind == "spec_alias" else "separate"
+            residual_out, norm_out = _ws2_alias(aliasing, x, residual)
+            use_oneshot = {
+                "stock_oneshot": True,
+                "stock_twoshot": False,
+            }.get(kind, _ws2_vllm_oneshot(token_num))
+            _ws2_call(
+                workspace,
+                x,
+                residual,
+                gamma,
+                residual_out,
+                norm_out,
+                use_oneshot=use_oneshot,
+                launch_with_pdl=bool(i % 2),
+            )
+            expected_dispatch += int(_ws2_expect_dispatch(workspace, token_num))
+            calls.append(
+                (
+                    kind,
+                    token_num,
+                    x_copy,
+                    residual_copy,
+                    gamma,
+                    (residual_out, norm_out),
+                )
+            )
+        torch.cuda.synchronize()
+        assert _ws2_stats()["dispatch_count"] - before == expected_dispatch
+        assert expected_dispatch >= 10
+
+        for i, (kind, token_num, x_copy, residual_copy, gamma, outs) in enumerate(
+            calls
+        ):
+            what = f"rank {rank} call {i} ({kind}, T={token_num})"
+            x_all = [torch.empty_like(x_copy) for _ in range(world_size)]
+            dist.all_gather(x_all, x_copy)
+            s, h, norm = _ws2_torch_reference(x_all, residual_copy, gamma, 1.0)
+            if kind == "allreduce":
+                _ws2_assert_close_loose(outs[0], s, f"{what} output")
+            elif kind.startswith("spec"):
+                _ws2_assert_match(outs[0], h, f"{what} residual_out", 0.99, 0.9999)
+                _ws2_assert_match(outs[1], norm, f"{what} norm_out", 0.98, 0.999)
+            else:
+                assert not torch.isnan(outs[1]).any().item(), f"{what}: NaN"
+                _ws2_assert_close_loose(outs[0], h, f"{what} residual_out")
+                _ws2_assert_close_loose(outs[1], norm, f"{what} norm_out")
+            _ws2_assert_rank_identical(outs, what)
+    finally:
+        dist.barrier()
+        _ws2_close(workspace)
+        dist.destroy_process_group()
+
+
+def _run_ws2_cuda_graph_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    backend,
+    num_replays,
+    gpu_offset=0,
+):
+    """Capture specialized, fallback and specialized (vLLM aliasing) calls in one graph,
+    replay with inputs changed in place; every replay matches eager calls (TRT-LLM
+    numerics for the specialized calls, the fallback backend's exact bits for the other)."""
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspace = trtllm = fallback = None
+    try:
+        workspace, trtllm, fallback = _ws2_open(world_size, rank, backend)
+        # (token_num, aliasing); the middle call is out of range (fallback).
+        plan = [(_ws2_inside(0.25), "separate")]
+        if _ws2_outside() is not None:
+            plan.append((_ws2_outside(), "separate"))
+        plan.append((_ws2_inside(0.75), "residual_out_is_input"))
+        static = []
+        for j, (token_num, aliasing) in enumerate(plan):
+            x, residual, gamma = _ws2_inputs(token_num, rank, 7000 + j, device)
+            residual_out, norm_out = _ws2_alias(aliasing, x, residual)
+            static.append([x, residual, gamma, residual_out, norm_out])
+
+        def run_all():
+            for (token_num, _), (x, residual, gamma, residual_out, norm_out) in zip(
+                plan, static, strict=True
+            ):
+                _ws2_call(
+                    workspace,
+                    x,
+                    residual,
+                    gamma,
+                    residual_out,
+                    norm_out,
+                    use_oneshot=_ws2_vllm_oneshot(token_num),
+                )
+
+        run_all()  # eager warm-up
+        torch.cuda.synchronize()
+        dist.barrier()
+        before = _ws2_stats()["dispatch_count"]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_all()
+        torch.cuda.synchronize()
+        captured = _ws2_stats()["dispatch_count"] - before
+        expected = sum(
+            int(_ws2_expect_dispatch(workspace, token_num)) for token_num, _ in plan
+        )
+        assert captured == expected == 2, f"captured {captured} specialized launches"
+        dist.barrier()
+
+        for rep in range(num_replays):
+            fresh = []
+            for j, ((token_num, _), buffers) in enumerate(
+                zip(plan, static, strict=True)
+            ):
+                x, residual, gamma = _ws2_inputs(
+                    token_num, rank, 8000 + 10 * rep + j, device
+                )
+                buffers[0].copy_(
+                    x
+                )  # also refills the aliased residual_out of the last call
+                buffers[1].copy_(residual)
+                if buffers[3] is not buffers[0]:
+                    buffers[3].fill_(float("nan"))
+                buffers[4].fill_(float("nan"))
+                fresh.append((x, residual))
+            graph.replay()
+            torch.cuda.synchronize()
+            for j, ((token_num, aliasing), buffers) in enumerate(
+                zip(plan, static, strict=True)
+            ):
+                x, residual = fresh[j]
+                dispatched = _ws2_expect_dispatch(workspace, token_num)
+                ref, _ = _ws2_run(
+                    trtllm if dispatched else fallback,
+                    aliasing,
+                    x,
+                    residual,
+                    buffers[2],
+                    use_oneshot=_ws2_vllm_oneshot(token_num),
+                )
+                what = f"rank {rank} replay {rep} call {j} (T={token_num}, {aliasing})"
+                got = (buffers[3], buffers[4])
+                if dispatched:
+                    _ws2_assert_match(
+                        got[0], ref[0], f"{what} residual_out", 0.995, 0.9999
+                    )
+                    _ws2_assert_match(got[1], ref[1], f"{what} norm_out", 0.95, 0.999)
+                else:
+                    _ws2_assert_bitwise(got, ref, f"{what} fallback")
+                _ws2_assert_rank_identical(got, what)
+        del graph
+    finally:
+        dist.barrier()
+        _ws2_close(workspace, trtllm, fallback)
+        dist.destroy_process_group()
+
+
+def _run_ws2_kill_switch_worker(
+    world_size, rank, dtype, hidden_dim, distributed_init_port, gpu_offset=0
+):
+    import os
+
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspaces = []
+    try:
+        # Call time: the env var switches between the kernel and the fallback backend on the
+        # same workspace; the kill-switched call is exactly the fallback backend's.
+        enabled, trtllm, fallback = _ws2_open(world_size, rank, "specialized")
+        workspaces += [enabled, trtllm, fallback]
+        stock_backend = enabled.fallback_backend
+        x, residual, gamma = _ws2_inputs(_ws2_inside(0.5), rank, 1, device)
+        on, n_on = _ws2_run(enabled, "separate", x, residual, gamma)
+        off, n_off = _ws2_run(enabled, "separate", x, residual, gamma, disable=True)
+        stock, _ = _ws2_run(fallback, "separate", x, residual, gamma)
+        ref, _ = _ws2_run(trtllm, "separate", x, residual, gamma)
+        assert (n_on, n_off) == (1, 0)
+        _ws2_assert_bitwise(off, stock, "kill switch")
+        _ws2_assert_match(on[0], ref[0], "kill switch residual_out", 0.995, 0.9999)
+        _ws2_assert_match(on[1], ref[1], "kill switch norm_out", 0.95, 0.999)
+        assert _ws2_stats()["fallback_reasons"].get("kill_switch", 0) >= 1
+
+        # Creation time: an explicit "specialized" workspace without the kernel's state or
+        # extra device memory (every call on the fallback, also once the env var is unset
+        # again), and "auto" builds the stock backend.
+        rejections = _ws2_stats()["state_rejections"].get("kill_switch", 0)
+        torch.cuda.synchronize()
+        free_0 = torch.cuda.mem_get_info(device)[0]
+        os.environ[_WS2_DISABLE_ENV] = "1"
+        try:
+            killed = _ws2_workspace(world_size, rank, "specialized")
+            workspaces.append(killed)
+            torch.cuda.synchronize()
+            free_1 = torch.cuda.mem_get_info(device)[0]
+            killed_auto = _ws2_workspace(world_size, rank, "auto")
+            workspaces.append(killed_auto)
+        finally:
+            os.environ.pop(_WS2_DISABLE_ENV, None)
+        assert isinstance(killed, comm.SpecializedAllReduceFusionWorkspace)
+        assert not killed.has_specialized_kernels and _ws2_state(killed) is None
+        assert killed.fallback_backend == stock_backend
+        assert not isinstance(killed_auto, comm.SpecializedAllReduceFusionWorkspace)
+        assert killed_auto.backend == stock_backend
+        assert _ws2_stats()["state_rejections"].get("kill_switch", 0) == rejections + 2
+        torch.cuda.synchronize()
+        free_1b = torch.cuda.mem_get_info(device)[0]
+        again = _ws2_workspace(world_size, rank, "specialized")
+        workspaces.append(again)
+        torch.cuda.synchronize()
+        free_2 = torch.cuda.mem_get_info(device)[0]
+        assert _ws2_state(again) is not None
+        region = _ws2_state(again).region_bytes
+        extra = (free_1b - free_2) - (free_0 - free_1)
+        assert region > (64 << 20) and abs(extra - region) <= (64 << 20), (
+            f"extra device memory of an enabled workspace {extra}, region {region}"
+        )
+        killed_out, n_killed = _ws2_run(killed, "separate", x, residual, gamma)
+        assert n_killed == 0
+        _ws2_assert_bitwise(killed_out, stock, "kill switch at creation")
+    finally:
+        dist.barrier()
+        _ws2_close(*workspaces)
+        dist.destroy_process_group()
+
+
+def _run_ws2_guard_worker(
+    world_size, rank, dtype, hidden_dim, distributed_init_port, gpu_offset=0
+):
+    """Calls the guard must send to the fallback, on a workspace that has the state."""
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspace = None
+    try:
+        workspace = _ws2_workspace(world_size, rank, "specialized")
+        assert _ws2_state(workspace) is not None, _ws2_stats()["last_state_rejection"]
+        token_num = _ws2_inside(0.5)
+        x, residual, gamma = _ws2_inputs(token_num, rank, 3, device)
+        for reason, kwargs in [
+            ("fp32_acc", {"fp32_acc": False}),
+            ("weight_bias", {"weight_bias": 0.5}),
+        ]:
+            before = _ws2_stats()
+            residual_out, norm_out = _ws2_alias("separate", x, residual)
+            _ws2_call(
+                workspace,
+                x.clone(),
+                residual.clone(),
+                gamma,
+                residual_out,
+                norm_out,
+                **kwargs,
+            )
+            torch.cuda.synchronize()
+            after = _ws2_stats()
+            assert after["dispatch_count"] == before["dispatch_count"], reason
+            assert (
+                after["fallback_reasons"].get(reason, 0)
+                == before["fallback_reasons"].get(reason, 0) + 1
+            ), reason
+            assert not torch.isnan(norm_out).any().item(), reason
+
+        # Out-of-range token counts.
+        for t_out in {t for t in (_ws2_outside(), 1) if t and not _ws2_allowed(t)}:
+            xs, rs, gs = _ws2_inputs(t_out, rank, 4, device)
+            before = _ws2_stats()
+            residual_out, norm_out = _ws2_alias("separate", xs, rs)
+            _ws2_call(workspace, xs, rs, gs, residual_out, norm_out, use_oneshot=True)
+            torch.cuda.synchronize()
+            after = _ws2_stats()
+            assert after["dispatch_count"] == before["dispatch_count"]
+            assert (
+                after["fallback_reasons"].get("num_tokens", 0)
+                == before["fallback_reasons"].get("num_tokens", 0) + 1
+            )
+
+        # Pattern 0 on the same workspace never reaches the guard.
+        before = _ws2_stats()["calls"]
+        out = torch.empty_like(x)
+        comm.allreduce_fusion(
+            input=x.clone(),
+            workspace=workspace,
+            pattern=comm.AllReduceFusionPattern.kAllReduce,
+            output=out,
+            use_oneshot=False,
+        )
+        torch.cuda.synchronize()
+        assert _ws2_stats()["calls"] == before
+
+        # Non-contiguous tensors go to the fallback backend (which may reject them).
+        before = _ws2_stats()
+        wide = torch.empty(
+            token_num, 2 * _WS2_HIDDEN, dtype=torch.bfloat16, device=device
+        )
+        strided_out = wide[:, :_WS2_HIDDEN]
+        try:
+            _ws2_call(
+                workspace,
+                x.clone(),
+                residual.clone(),
+                gamma,
+                strided_out,
+                torch.empty_like(x),
+            )
+            torch.cuda.synchronize()
+        except (ValueError, RuntimeError, TypeError):
+            pass
+        after = _ws2_stats()
+        assert after["dispatch_count"] == before["dispatch_count"]
+        assert (
+            after["fallback_reasons"].get("non_contiguous", 0)
+            == before["fallback_reasons"].get("non_contiguous", 0) + 1
+        )
+    finally:
+        dist.barrier()
+        _ws2_close(workspace)
+        dist.destroy_process_group()
+
+
+def _run_ws2_fallback_equivalence_worker(
+    world_size, rank, dtype, hidden_dim, distributed_init_port, backend, gpu_offset=0
+):
+    """Calls outside the envelope on the specialized (auto) workspace: the decode-sized
+    and other out-of-range token counts, pattern-1 arguments the kernel does not serve,
+    pattern 0 and an FP8 quant pattern give bitwise the result of a plain workspace of the
+    fallback backend, i.e. of what "auto" built before the specialized backend existed."""
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspace = trtllm = fallback = None
+    try:
+        workspace, trtllm, fallback = _ws2_open(world_size, rank, backend)
+        inside = _ws2_inside(0.5)
+        cases = [
+            (t, aliasing, {"use_oneshot": _ws2_vllm_oneshot(t) or None})
+            for t in _WS2_OUTSIDE_TOKEN_NUMS
+            if not _ws2_allowed(t)
+            for aliasing in ("separate", "residual_out_is_input")
+        ]
+        cases += [
+            (t, "separate", {"use_oneshot": None})
+            for t in _WS2_OUTSIDE_TOKEN_NUMS
+            if not _ws2_allowed(t)
+        ]
+        cases += [
+            (inside, "separate", {"fp32_acc": False}),
+            (inside, "residual_out_is_input", {"weight_bias": 0.0}),
+        ]
+        before = _ws2_stats()["dispatch_count"]
+        for i, (token_num, aliasing, kwargs) in enumerate(cases):
+            what = f"rank {rank} T={token_num} {aliasing} {kwargs}"
+            x, residual, gamma = _ws2_inputs(token_num, rank, 500 + i, device)
+            got, n = _ws2_run(workspace, aliasing, x, residual, gamma, **kwargs)
+            ref, _ = _ws2_run(fallback, aliasing, x, residual, gamma, **kwargs)
+            assert n == 0, what
+            _ws2_assert_bitwise(got, ref, what)
+
+        for i, token_num in enumerate((16, inside)):
+            x, _, _ = _ws2_inputs(token_num, rank, 600 + i, device)
+            outs = []
+            for ws in (workspace, fallback):
+                out = torch.full_like(x, float("nan"))
+                comm.allreduce_fusion(
+                    input=x.clone(),
+                    workspace=ws,
+                    pattern=comm.AllReduceFusionPattern.kAllReduce,
+                    launch_with_pdl=True,
+                    output=out,
+                )
+                outs.append(out)
+            torch.cuda.synchronize()
+            _ws2_assert_bitwise(
+                [outs[0]], [outs[1]], f"rank {rank} kAllReduce T={token_num}"
+            )
+
+        for i, token_num in enumerate((64, inside)):
+            x, residual, gamma = _ws2_inputs(token_num, rank, 700 + i, device)
+            outs = []
+            for ws in (workspace, fallback):
+                residual_out = torch.full_like(x, float("nan"))
+                quant_out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+                ret = comm.allreduce_fusion(
+                    input=x.clone(),
+                    workspace=ws,
+                    pattern=comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+                    launch_with_pdl=True,
+                    residual_in=residual.clone(),
+                    residual_out=residual_out,
+                    quant_out=quant_out,
+                    rms_gamma=gamma,
+                    rms_eps=_WS2_EPS,
+                    scale_factor=torch.ones(1, dtype=torch.float32, device=device),
+                    layout_code=comm.QuantizationSFLayout.SWIZZLED_128x4,
+                    fp32_acc=True,
+                    weight_bias=1.0,
+                )
+                assert ret is quant_out
+                outs.append((residual_out, quant_out))
+            torch.cuda.synchronize()
+            _ws2_assert_bitwise(
+                outs[0],
+                outs[1],
+                f"rank {rank} kARResidualRMSNormFP8Quant T={token_num}",
+            )
+        assert _ws2_stats()["dispatch_count"] == before
+    finally:
+        dist.barrier()
+        _ws2_close(workspace, trtllm, fallback)
+        dist.destroy_process_group()
+
+
+def _run_ws2_inert_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    backend,
+    max_token_num,
+    token_num,
+    gpu_offset=0,
+):
+    """Outside the creation-time envelope: "auto" builds exactly the stock backend it
+    picked before (no state, no extra allocation, no dispatch), an explicit
+    "specialized" raises on every rank, and "trtllm" never runs the kernel."""
+    device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
+    workspace = None
+    try:
+        created = _ws2_stats()["states_created"]
+        if backend == "specialized":
+            with pytest.raises(ValueError, match="no kernel for this workspace"):
+                _ws2_workspace(
+                    world_size,
+                    rank,
+                    backend,
+                    hidden_dim=hidden_dim,
+                    dtype=dtype,
+                    max_token_num=max_token_num,
+                )
+            assert _ws2_stats()["states_created"] == created
+            return
+        expected_backend = (
+            _ws2_stock_backend(world_size) if backend == "auto" else backend
+        )
+        workspace = _ws2_workspace(
+            world_size,
+            rank,
+            backend,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            max_token_num=max_token_num,
+        )
+        assert not isinstance(workspace, comm.SpecializedAllReduceFusionWorkspace)
+        assert workspace.backend == expected_backend
+        assert _ws2_state(workspace) is None
+        assert _ws2_stats()["states_created"] == created
+        x, residual, gamma = _ws2_inputs(token_num, rank, 5, device, hidden_dim, dtype)
+        x_copy, residual_copy = x.clone(), residual.clone()
+        residual_out, norm_out = _ws2_alias("separate", x, residual)
+        before = _ws2_stats()
+        _ws2_call(workspace, x, residual, gamma, residual_out, norm_out)
+        torch.cuda.synchronize()
+        after = _ws2_stats()
+        assert after["dispatch_count"] == before["dispatch_count"]
+        assert after["calls"] == before["calls"]  # the guard is never consulted
+        x_all = [torch.empty_like(x_copy) for _ in range(world_size)]
+        dist.all_gather(x_all, x_copy)
+        _, h, norm = _ws2_torch_reference(x_all, residual_copy, gamma, 1.0)
+        _ws2_assert_close_loose(residual_out, h, "residual_out")
+        _ws2_assert_close_loose(norm_out, norm, "norm_out")
+    finally:
+        dist.barrier()
+        _ws2_close(workspace)
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "backend,aliasing",
+    [("specialized", aliasing) for aliasing in _WS2_ALIASINGS]
+    + [("auto", "residual_out_is_input")],
+)
+def test_trtllm_allreduce_fusion_ws2_specialized(backend, aliasing):
+    """Specialized (and auto, which picks it) vs the TRT-LLM kernels and vs the fallback
+    backend on the same inputs across the guard edges, with NaN-prefilled outputs, the
+    aliasing forms, the kill switch and bitwise-identical outputs across ranks."""
+    _ws2_skip_unless_target()
+    multi_process_parallel(
+        2,
+        torch.bfloat16,
+        _WS2_HIDDEN,
+        _run_ws2_correctness_worker,
+        target_args=(backend, aliasing, _ws2_token_nums()),
+    )
+
+
+def test_trtllm_allreduce_fusion_ws2_specialized_back_to_back():
+    _ws2_skip_unless_target()
+    multi_process_parallel(
+        2, torch.bfloat16, _WS2_HIDDEN, _run_ws2_back_to_back_worker, target_args=(60,)
+    )
+
+
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+def test_trtllm_allreduce_fusion_ws2_specialized_cuda_graph(backend):
+    _ws2_skip_unless_target()
+    multi_process_parallel(
+        2,
+        torch.bfloat16,
+        _WS2_HIDDEN,
+        _run_ws2_cuda_graph_worker,
+        target_args=(backend, 4),
+    )
+
+
+def test_trtllm_allreduce_fusion_ws2_specialized_kill_switch():
+    _ws2_skip_unless_target()
+    multi_process_parallel(2, torch.bfloat16, _WS2_HIDDEN, _run_ws2_kill_switch_worker)
+
+
+def test_trtllm_allreduce_fusion_ws2_specialized_guards():
+    _ws2_skip_unless_target()
+    multi_process_parallel(2, torch.bfloat16, _WS2_HIDDEN, _run_ws2_guard_worker)
+
+
+def test_trtllm_allreduce_fusion_ws2_specialized_fallback_equivalence():
+    """Calls outside the envelope on an auto workspace run exactly what auto ran before."""
+    _ws2_skip_unless_target()
+    multi_process_parallel(
+        2,
+        torch.bfloat16,
+        _WS2_HIDDEN,
+        _run_ws2_fallback_equivalence_worker,
+        target_args=("auto",),
+    )
+
+
+def test_trtllm_allreduce_fusion_ws2_specialized_gpu_offset():
+    """Device index != rank (e.g. the second TP2 instance of a 4-GPU tray)."""
+    _ws2_skip_unless_target()
+    gpu_offset = torch.cuda.device_count() - 2
+    if gpu_offset <= 0:
+        pytest.skip("needs more than 2 GPUs")
+    multi_process_parallel(
+        2,
+        torch.bfloat16,
+        _WS2_HIDDEN,
+        _run_ws2_correctness_worker,
+        target_args=(
+            "specialized",
+            "residual_out_is_input",
+            [_ws2_inside(0.0), _ws2_inside(0.6)],
+        ),
+        gpu_offset=gpu_offset,
+    )
+
+
+@pytest.mark.parametrize("backend", ["auto", "specialized", "trtllm"])
+@pytest.mark.parametrize(
+    "world_size,hidden_dim,dtype,capacity",
+    [
+        (2, 6144, torch.float16, "served"),
+        (2, 7168, torch.bfloat16, "served"),
+        (4, 6144, torch.bfloat16, "served"),
+        # max_token_num below the smallest allowlisted token count.
+        (2, 6144, torch.bfloat16, "below_min"),
+        # The target configuration: outside the envelope on every compute capability but
+        # 10.3 (B200); on 10.3 only backend="trtllm" is checked here (it stays stock).
+        (2, 6144, torch.bfloat16, "served"),
+    ],
+)
+def test_trtllm_allreduce_fusion_ws2_specialized_inert(
+    backend, world_size, hidden_dim, dtype, capacity
+):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs")
+    t_min = min(lo for lo, _ in _ws2_ranges())
+    if capacity == "below_min":
+        if t_min <= 1:
+            pytest.skip("the allowlist starts at one token")
+        max_token_num = t_min - 1
+        token_num = max_token_num
+    else:
+        # The vLLM workspace size (64 MiB of activations) and a token count that would
+        # dispatch in the target configuration.
+        max_token_num = (64 << 20) // (hidden_dim * 2)
+        token_num = min(_ws2_inside(0.5), max_token_num)
+    if (
+        backend != "trtllm"
+        and _ws2_is_target()
+        and (world_size, hidden_dim, dtype) == (2, 6144, torch.bfloat16)
+        and max_token_num >= t_min
+    ):
+        pytest.skip("the target configuration dispatches on compute capability 10.3")
+    multi_process_parallel(
+        world_size,
+        dtype,
+        hidden_dim,
+        _run_ws2_inert_worker,
+        target_args=(backend, max_token_num, token_num),
+    )
+
+
+def test_trtllm_allreduce_fusion_ws2_specialized_guard_order():
+    """GPU-free: allowlist content, the static creation envelope (no collective outside
+    it) and the guard order (token count, semantics, shape/layout, device last)."""
+    from flashinfer.comm import _allreduce_fusion_ws2_specialized as ws2
+
+    allowlist = ws2._load_allowlist()
+    assert ws2._allowlist_error is None, ws2._allowlist_error
+    assert 1.0 in allowlist.weight_bias
+    assert allowlist.num_tokens and allowlist.t_min >= 1
+    assert allowlist.t_max <= _WS2_MAX_TOKENS
+
+    assert (
+        ws2.creation_envelope_reason(2, 6144, torch.bfloat16, _WS2_MAX_TOKENS, True)
+        is None
+    )
+    for args, needle in [
+        ((4, 6144, torch.bfloat16, 4096, True), "world_size=4"),
+        ((2, 7168, torch.bfloat16, 4096, True), "hidden_dim=7168"),
+        ((2, 6144, torch.float16, 4096, True), "dtype"),
+        ((2, 6144, torch.bfloat16, 4096, False), "symmetric device memory"),
+        ((2, 6144, torch.bfloat16, allowlist.t_min - 1, True), "max_token_num"),
+        ((2, 6144, torch.bfloat16, None, True), "max_token_num"),
+    ]:
+        reason = ws2.creation_envelope_reason(*args)
+        assert reason is not None and needle in reason, (args, reason)
+
+    state = ws2._State(
+        handle=None,
+        own_ptr=1,
+        peer_ptr=2,
+        epoch=torch.zeros(1, dtype=torch.int32),
+        capacity=allowlist.t_max,
+        grid=1,
+        device_idx=0,
+        rank=0,
+        region_bytes=0,
+    )
+    t = allowlist.t_min
+    x = torch.zeros(t, _WS2_HIDDEN, dtype=torch.bfloat16)
+    g = torch.zeros(_WS2_HIDDEN, dtype=torch.bfloat16)
+
+    def reason(state=state, x=x, r=None, ro=None, no=None, g=g, wb=1.0, fp32_acc=True):
+        r = torch.zeros_like(x) if r is None else r
+        ro = torch.zeros_like(x) if ro is None else ro
+        no = torch.zeros_like(x) if no is None else no
+        return ws2._reject_reason(state, x, r, ro, no, g, wb, fp32_acc)
+
+    import os
+
+    os.environ[_WS2_DISABLE_ENV] = "1"
+    try:
+        assert reason() == "kill_switch"
+    finally:
+        os.environ.pop(_WS2_DISABLE_ENV, None)
+    assert reason(state=None) == "no_state"
+    for t_out in (allowlist.t_min - 1, allowlist.t_max + 1):
+        if t_out >= 1:
+            xo = torch.zeros(t_out, _WS2_HIDDEN, dtype=torch.bfloat16)
+            # the token count is checked before the semantics
+            assert reason(x=xo, fp32_acc=False) == "num_tokens"
+    assert reason(x=torch.zeros(1, t, _WS2_HIDDEN, dtype=torch.bfloat16)) == "shape"
+    assert reason(fp32_acc=False) == "fp32_acc"
+    assert reason(wb=0.5) == "weight_bias"
+    assert ws2._reject_reason(state, x, None, x, x, g, 1.0, True) == "missing_tensor"
+    assert reason(x=x.half()) == "dtype"
+    assert reason(g=torch.zeros(_WS2_HIDDEN + 8, dtype=torch.bfloat16)) == "shape"
+    assert reason(ro=torch.zeros(t, 2 * _WS2_HIDDEN, dtype=torch.bfloat16)[:, ::2]) == (
+        "non_contiguous"
+    )
+    # CPU tensors pass every check but the device one, which comes last.
+    assert reason() == "device"
+
+    # The cheap pre-check of allreduce_fusion: token count against the state's ranges only.
+    class _Ws:
+        _ar_ws2 = state
+
+    assert state.token_ranges == tuple(
+        (lo, min(hi, state.capacity)) for lo, hi in allowlist.num_tokens
+    )
+    before = ws2._allreduce_fusion_ws2_specialized_stats()["fallback_reasons"]
+    for t_out in (allowlist.t_min - 1, allowlist.t_max + 1):
+        if t_out >= 1:
+            xo = torch.zeros(t_out, _WS2_HIDDEN, dtype=torch.bfloat16)
+            assert ws2.outside_token_ranges(_Ws(), xo)
+    after = ws2._allreduce_fusion_ws2_specialized_stats()["fallback_reasons"]
+    assert after.get("num_tokens", 0) > before.get("num_tokens", 0)
+    assert not ws2.outside_token_ranges(_Ws(), x)
+    assert not ws2.outside_token_ranges(_Ws(), torch.zeros(1, t, _WS2_HIDDEN))
+
+    class _NoState:
+        _ar_ws2 = None
+
+    assert not ws2.outside_token_ranges(_NoState(), x)
+
+
+class _FakeStockWorkspace(comm.AllReduceFusionWorkspace):
+    """Stands in for a stock workspace in the GPU-free selection tests."""
+
+    created: list = []
+
+    def __init__(self, name, **kwargs):
+        world_size = kwargs.get("tp_size") or kwargs["mapping"].world_size
+        rank = kwargs.get("tp_rank")
+        if rank is None:
+            rank = kwargs["mapping"].rank
+        super().__init__(world_size, rank)
+        self.name = name
+        self.destroyed = False
+        _FakeStockWorkspace.created.append(self)
+
+    @property
+    def backend(self):
+        return self.name
+
+    def is_buffer_size_sufficient(self, *args, **kwargs):
+        return True
+
+    def destroy(self):
+        self.destroyed = True
+        self._destroyed = True
+
+
+def _ws2_patch_factory(monkeypatch, multicast, state_result):
+    """Patch the stock workspaces, the multicast probe and the specialized vote so that
+    create_allreduce_fusion_workspace runs on a machine without GPUs. Returns the list of
+    vote calls."""
+    import flashinfer.comm.allreduce as ar
+    from flashinfer.comm import _allreduce_fusion_ws2_specialized as ws2
+
+    _FakeStockWorkspace.created = []
+    monkeypatch.setattr(
+        ar,
+        "TRTLLMAllReduceFusionWorkspace",
+        lambda **kw: _FakeStockWorkspace("trtllm", **kw),
+    )
+
+    class _Mnnvl:
+        get_required_buffer_size_bytes = staticmethod(lambda *a, **k: 1 << 20)
+
+        def __new__(cls, **kw):
+            return _FakeStockWorkspace("mnnvl", **kw)
+
+    monkeypatch.setattr(ar, "MNNVLAllReduceFusionWorkspace", _Mnnvl)
+    monkeypatch.setattr(ar, "is_multicast_supported", lambda device: multicast)
+    monkeypatch.setattr(
+        ar, "all_ranks_support_mnnvl", lambda local, ws, cb, group: local
+    )
+    monkeypatch.setattr(ar, "is_confidential_compute", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    votes = []
+
+    def create_state(**kwargs):
+        votes.append(kwargs)
+        return state_result
+
+    monkeypatch.setattr(ws2, "create_state", create_state)
+    return votes
+
+
+def _ws2_factory(backend, world_size=2, hidden_dim=6144, dtype=torch.bfloat16, **kw):
+    return comm.create_allreduce_fusion_workspace(
+        backend=backend,
+        world_size=world_size,
+        rank=0,
+        max_token_num=kw.pop("max_token_num", _WS2_MAX_TOKENS),
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        gpus_per_node=4,
+        comm_backend=object(),
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("multicast", [True, False])
+def test_trtllm_allreduce_fusion_ws2_specialized_auto_selection(monkeypatch, multicast):
+    """GPU-free: auto picks the specialized backend first inside the creation envelope,
+    with the stock pick as its fallback; outside the envelope or on a veto, auto returns
+    exactly the stock pick (mnnvl with multicast, else trtllm); trtllm / mnnvl never
+    consult the specialized backend."""
+    stock = "mnnvl" if multicast else "trtllm"
+    fake_state = object()
+
+    votes = _ws2_patch_factory(monkeypatch, multicast, (fake_state, None))
+    ws = _ws2_factory("auto")
+    assert isinstance(ws, comm.SpecializedAllReduceFusionWorkspace)
+    assert ws.backend == "specialized" and ws.fallback_backend == stock
+    assert ws.has_specialized_kernels and len(votes) == 1
+    assert [w.name for w in _FakeStockWorkspace.created] == [stock]
+
+    for backend in ("trtllm", "mnnvl"):
+        votes = _ws2_patch_factory(monkeypatch, multicast, (fake_state, None))
+        ws = _ws2_factory(backend)
+        assert ws.backend == backend and not votes
+
+    # Outside the static envelope: no vote (no collective) and the stock pick.
+    for kwargs in (
+        dict(world_size=4),
+        dict(hidden_dim=7168),
+        dict(dtype=torch.float16),
+        dict(max_token_num=512),
+    ):
+        votes = _ws2_patch_factory(monkeypatch, multicast, (fake_state, None))
+        ws = _ws2_factory("auto", **kwargs)
+        assert isinstance(ws, _FakeStockWorkspace) and ws.backend == stock, kwargs
+        assert not votes, kwargs
+
+    # A veto (e.g. another compute capability, the kill switch): the stock pick itself.
+    for rejection in (("compute_capability", "rank 0"), ("kill_switch", "rank 1")):
+        votes = _ws2_patch_factory(monkeypatch, multicast, (None, rejection))
+        ws = _ws2_factory("auto")
+        assert isinstance(ws, _FakeStockWorkspace) and ws.backend == stock
+        assert len(votes) == 1 and not ws.destroyed
+
+
+@pytest.mark.parametrize("multicast", [True, False])
+def test_trtllm_allreduce_fusion_ws2_specialized_explicit_selection(
+    monkeypatch, multicast
+):
+    """GPU-free: an explicit specialized workspace has the stock pick as its fallback,
+    has no kernel state with the kill switch, and raises (after releasing its fallback)
+    when the kernel cannot serve the workspace."""
+    stock = "mnnvl" if multicast else "trtllm"
+    fake_state = object()
+
+    _ws2_patch_factory(monkeypatch, multicast, (fake_state, None))
+    ws = _ws2_factory("specialized")
+    assert isinstance(ws, comm.SpecializedAllReduceFusionWorkspace)
+    assert ws.fallback_backend == stock and ws.has_specialized_kernels
+
+    _ws2_patch_factory(monkeypatch, multicast, (None, ("kill_switch", "rank 0")))
+    ws = _ws2_factory("specialized")
+    assert isinstance(ws, comm.SpecializedAllReduceFusionWorkspace)
+    assert ws.fallback_backend == stock and not ws.has_specialized_kernels
+    ws.destroy()
+    assert ws.fallback.destroyed
+
+    _ws2_patch_factory(monkeypatch, multicast, (None, ("compute_capability", "rank 1")))
+    with pytest.raises(ValueError, match="compute_capability"):
+        _ws2_factory("specialized")
+    assert [w.destroyed for w in _FakeStockWorkspace.created] == [True]
+
+    votes = _ws2_patch_factory(monkeypatch, multicast, (fake_state, None))
+    with pytest.raises(ValueError, match="world_size=4"):
+        _ws2_factory("specialized", world_size=4)
+    assert not votes and not _FakeStockWorkspace.created
+
+
 if __name__ == "__main__":
     # Test both legacy and unified APIs, both standard and Gemma RMSNorm.
     for wb in (0.0, 1.0):

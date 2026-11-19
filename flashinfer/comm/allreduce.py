@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 Unified AllReduce Fusion API
 
 This module provides a unified interface for AllReduce + RMSNorm fusion operations
-across different backends (TensorRT-LLM, MNNVL, MNNVL CuTe DSL).
+across different backends (TensorRT-LLM, MNNVL, MNNVL CuTe DSL, specialized).
 
 Example usage:
     >>> # Auto-select best backend based on topology
@@ -74,6 +74,8 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
+from . import _allreduce_fusion_ws2_specialized as _ar_ws2
+
 from .mnnvl import (
     CommBackend,
     SymmDeviceMemory,
@@ -100,6 +102,8 @@ from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
 # - TRTLLMAllReduceFusionWorkspace: Wraps trtllm_create_ipc_workspace_for_all_reduce_fusion
 # - MNNVLAllReduceFusionWorkspace: Wraps MNNVL workspace (see trtllm_mnnvl_ar.py)
 # - MNNVLCuteDSLAllReduceFusionWorkspace: Shared LL/BT/HT backend workspace
+# - SpecializedAllReduceFusionWorkspace: State of FlashInfer's specialized kernels
+#   plus a fallback workspace (TRT-LLM or MNNVL) for every other call
 #
 # Each workspace:
 # 1. Calls the backend-specific workspace creation function in __init__
@@ -277,6 +281,113 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self._destroyed = True
 
 
+class SpecializedAllReduceFusionWorkspace(AllReduceFusionWorkspace):
+    """Workspace of the ``"specialized"`` backend.
+
+    Holds the state of FlashInfer's specialized all-reduce fusion kernels and a
+    fallback workspace: the stock workspace (TRT-LLM or MNNVL) that
+    ``create_allreduce_fusion_workspace(backend="auto")`` would otherwise build.
+    :func:`allreduce_fusion` runs a specialized kernel for a call inside its
+    envelope and the fallback backend, with the same arguments, for every other
+    call, so a call outside the envelopes runs exactly what ``auto`` ran before
+    the specialized backend existed.
+
+    Today it holds one kernel: ``kARResidualRMSNorm`` with ``fp32_acc=True`` on
+    two ranks of one node, hidden size 6144, bfloat16, compute capability 10.3,
+    for the allowlisted ``weight_bias`` values and token counts. Its state is
+    one more peer-mapped buffer per rank (about 135.6 MB for 5461 tokens) next
+    to the fallback workspace.
+
+    Create it with :func:`create_allreduce_fusion_workspace`; with
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` at creation an explicit
+    ``backend="specialized"`` workspace holds no kernel state, and every call
+    runs the fallback backend (the A/B arm of the kill switch).
+    """
+
+    def __init__(self, fallback: AllReduceFusionWorkspace, ar_ws2_state: Any = None):
+        """Wrap ``fallback`` (it is destroyed with this workspace) and the agreed
+        state of the two-rank kernel (``None``: no specialized kernel)."""
+        super().__init__(fallback.world_size, fallback.rank)
+        self.fallback = fallback
+        self._ar_ws2 = ar_ws2_state
+
+    @property
+    def backend(self) -> str:
+        return "specialized"
+
+    @property
+    def fallback_backend(self) -> str:
+        """Backend of the fallback workspace (``"trtllm"`` or ``"mnnvl"``): it serves
+        every call no specialized kernel serves, so per-call options that depend on
+        the backend (such as ``use_oneshot``) follow it."""
+        return self.fallback.backend
+
+    @property
+    def has_specialized_kernels(self) -> bool:
+        """Whether any specialized kernel can serve calls on this workspace."""
+        return self._ar_ws2 is not None
+
+    def is_buffer_size_sufficient(
+        self,
+        tp_size: int,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        use_oneshot: Optional[Any] = None,
+    ) -> bool:
+        if use_oneshot is None:
+            return self.fallback.is_buffer_size_sufficient(
+                tp_size, num_tokens, hidden_dim, dtype
+            )
+        return self.fallback.is_buffer_size_sufficient(
+            tp_size, num_tokens, hidden_dim, dtype, use_oneshot
+        )
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach physical backing of the fallback workspace and of the specialized
+        kernels' buffers; repeated successful calls are no-ops."""
+        prepare = getattr(self.fallback, "checkpoint_prepare", None)
+        if prepare is None:
+            raise NotImplementedError(
+                f"the {self.fallback_backend} fallback workspace has no checkpoint lifecycle"
+            )
+        prepare()
+        if _ar_ws2.checkpoint_prepare_state(self):
+            # Do not return until every rank has released the specialized buffers.
+            self._ar_ws2.handle.comm_backend.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend) -> None:
+        """Restore physical backing; repeated successful calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange workspace
+            memory handles. It must have the same rank and world size as the
+            original allocation.
+        """
+        restore = getattr(self.fallback, "checkpoint_restore", None)
+        if restore is None:
+            raise NotImplementedError(
+                f"the {self.fallback_backend} fallback workspace has no checkpoint lifecycle"
+            )
+        restore(comm_backend)
+        if _ar_ws2.checkpoint_restore_state(self, comm_backend):
+            torch.cuda.synchronize()
+            comm_backend.barrier()
+
+    def destroy(self) -> None:
+        """Destroy the specialized kernels' state and the fallback workspace."""
+        if getattr(self, "_destroyed", False):
+            return  # Already destroyed, nothing to do
+
+        _ar_ws2.release_state(self)
+        self.fallback.destroy()
+        self._destroyed = True
+
+
 # ============================================================================
 # BACKEND CHECKS - Hard requirements for backend selection
 # ============================================================================
@@ -359,7 +470,9 @@ def _workspace_creation_heuristic(
 
 @flashinfer_api
 def create_allreduce_fusion_workspace(
-    backend: Literal["trtllm", "mnnvl", "mnnvl-cutedsl", "auto"] = "auto",
+    backend: Literal[
+        "trtllm", "mnnvl", "mnnvl-cutedsl", "specialized", "auto"
+    ] = "auto",
     world_size: int = None,
     rank: int = None,
     max_token_num: int = None,
@@ -397,11 +510,28 @@ def create_allreduce_fusion_workspace(
 
     Parameters
     ----------
-    backend : Literal["trtllm", "mnnvl", "mnnvl-cutedsl", "auto"]
-        Backend to use. ``"auto"`` uses a topology-based heuristic to pick
-        between ``"trtllm"`` and ``"mnnvl"``; it never selects
-        ``"mnnvl-cutedsl"``, which must be requested explicitly and builds an
+    backend : Literal["trtllm", "mnnvl", "mnnvl-cutedsl", "specialized", "auto"]
+        Backend to use. ``"auto"`` builds a ``"specialized"`` workspace first
+        when one of FlashInfer's specialized kernels covers the workspace (see
+        below), else uses a topology-based heuristic to pick between
+        ``"trtllm"`` and ``"mnnvl"``; it never selects ``"mnnvl-cutedsl"``,
+        which must be requested explicitly and builds an
         :class:`~flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace`.
+
+        ``"specialized"`` builds a :class:`SpecializedAllReduceFusionWorkspace`:
+        the state of FlashInfer's specialized kernels plus a fallback workspace
+        of the stock backend ``"auto"`` would otherwise pick, which serves every
+        call outside the kernels' envelope with the same arguments. Today one
+        kernel: ``kARResidualRMSNorm`` on two ranks of one node, hidden size
+        6144, bfloat16, compute capability 10.3 (``max_token_num`` must reach
+        its smallest token count); it costs one more peer-mapped buffer of
+        about 135.6 MB per rank at 5461 tokens. The ranks agree collectively at
+        creation (compute capability, one node, free memory, JIT build, the
+        kill switch): ``"auto"`` then falls back to the stock pick, while an
+        explicit ``"specialized"`` raises ``ValueError``, except that with
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (set identically on every
+        rank) it returns a workspace whose calls all run the fallback.
+        ``"trtllm"`` and ``"mnnvl"`` never run a specialized kernel.
     world_size : int
         Number of ranks in the process group.
     rank : int
@@ -479,15 +609,17 @@ def create_allreduce_fusion_workspace(
     -------
     AllReduceFusionWorkspace
         A ``TRTLLMAllReduceFusionWorkspace``,
-        ``MNNVLAllReduceFusionWorkspace`` or
-        ``MNNVLCuteDSLAllReduceFusionWorkspace``. The workspace type determines
+        ``MNNVLAllReduceFusionWorkspace``,
+        ``MNNVLCuteDSLAllReduceFusionWorkspace`` or
+        ``SpecializedAllReduceFusionWorkspace``. The workspace type determines
         which backend :func:`allreduce_fusion` will dispatch to.
 
     Raises
     ------
     ValueError
         If no suitable backend is available for the requested configuration,
-        or if the problem size is not supported by the chosen backend.
+        if the problem size is not supported by the chosen backend, or if
+        ``backend="specialized"`` has no kernel for the workspace.
     RuntimeError
         If an explicit ``backend`` argument is passed that does not match
         any known backend implementation.
@@ -505,6 +637,17 @@ def create_allreduce_fusion_workspace(
     ...     dtype=torch.bfloat16,
     ... )
     >>> print(workspace.backend)  # "trtllm"
+
+    >>> # Specialized backend: the two-rank kernel of compute capability 10.3,
+    >>> # the stock "auto" pick (workspace.fallback_backend) for every other call
+    >>> workspace = create_allreduce_fusion_workspace(
+    ...     backend="specialized",
+    ...     world_size=2,
+    ...     rank=rank,
+    ...     max_token_num=5461,
+    ...     hidden_dim=6144,
+    ...     dtype=torch.bfloat16,
+    ... )
 
     >>> # Explicit backend selection
     >>> workspace = create_allreduce_fusion_workspace(
@@ -583,44 +726,142 @@ def create_allreduce_fusion_workspace(
 
     if gpus_per_node is None:
         gpus_per_node = min(torch.cuda.device_count(), world_size)
-    # Determine the actual backend to use
-    if backend == "auto":
-        # Find suitable backends (any compute capability check needs to be checked at kernel runtime, since there are no tensor available at this point)
-        suitable_backends = []
-        if _trtllm_workspace_check(
-            backend=backend,
+
+    if backend not in ("auto", "specialized"):
+        return _create_stock_workspace(
+            backend,
             world_size=world_size,
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
-        ):
-            suitable_backends.append("trtllm")
-        local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
-        if all_ranks_support_mnnvl(
-            local_mnnvl_supported, world_size, comm_backend, group
-        ):
-            suitable_backends.append("mnnvl")
-
-        if not suitable_backends:
-            raise ValueError("No suitable backend found. ")
-
-        # Apply heuristic to select best backend
-        selected = _workspace_creation_heuristic(
-            suitable_backends=suitable_backends,
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
+            gpus_per_node=gpus_per_node,
+            comm_backend=comm_backend,
+            force_oneshot_support=force_oneshot_support,
+            group=group,
         )
-        actual_backend = selected[0]
-    else:
-        actual_backend = backend
 
-    # Create workspace for selected backend using workspace constructors
-    if actual_backend == "trtllm":
+    # "specialized" and "auto": the static part of the specialized kernels' envelope
+    # reads only arguments every rank passes identically, so either every rank or no
+    # rank runs the collectives below.
+    specialized_miss = _ar_ws2.creation_envelope_reason(
+        world_size,
+        hidden_dim,
+        dtype,
+        max_token_num,
+        use_symm_dev_mem=not is_confidential_compute(),
+    )
+    if backend == "specialized" and specialized_miss is not None:
+        raise ValueError(
+            "backend='specialized' has no kernel for this workspace: "
+            f"{specialized_miss}. Use backend='auto' to fall back to the stock backends."
+        )
+    # The fallback is the stock backend "auto" picks without the specialized backend,
+    # so a call outside the specialized kernels' envelope runs exactly what it ran
+    # before the specialized backend existed.
+    stock_backend = _select_stock_backend(
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        comm_backend=comm_backend,
+        group=group,
+    )
+    stock_workspace = _create_stock_workspace(
+        stock_backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        gpus_per_node=gpus_per_node,
+        comm_backend=comm_backend,
+        force_oneshot_support=force_oneshot_support,
+        group=group,
+    )
+    if specialized_miss is not None:
+        return stock_workspace  # "auto" outside the envelope: unchanged
+
+    # Collective vote of the ranks (compute capability, one node, kill switch, JIT
+    # build, free memory); the outcome is the same on every rank. Never raises.
+    state, rejection = _ar_ws2.create_state(
+        tp_rank=rank,
+        max_token_num=max_token_num,
+        comm_backend=comm_backend,
+        group=group,
+    )
+    if state is not None:
+        return SpecializedAllReduceFusionWorkspace(stock_workspace, state)
+    if backend == "auto":
+        return stock_workspace
+    assert rejection is not None
+    if rejection[0] == "kill_switch":
+        # The A/B arm: the specialized backend with every call on its fallback.
+        return SpecializedAllReduceFusionWorkspace(stock_workspace, None)
+    stock_workspace.destroy()
+    raise ValueError(
+        "backend='specialized' has no kernel for this workspace: "
+        f"{rejection[0]} ({rejection[1]}). Use backend='auto' to fall back to the "
+        "stock backends."
+    )
+
+
+def _select_stock_backend(
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    comm_backend: Optional[CommBackend],
+    group: Optional[ProcessGroup],
+) -> str:
+    """The stock backend ``auto`` picks ("trtllm" or "mnnvl"); collective (MNNVL vote)."""
+    # Find suitable backends (any compute capability check needs to be checked at kernel runtime, since there are no tensor available at this point)
+    suitable_backends = []
+    if _trtllm_workspace_check(
+        backend="auto",
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+    ):
+        suitable_backends.append("trtllm")
+    local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
+    if all_ranks_support_mnnvl(local_mnnvl_supported, world_size, comm_backend, group):
+        suitable_backends.append("mnnvl")
+
+    if not suitable_backends:
+        raise ValueError("No suitable backend found. ")
+
+    # Apply heuristic to select best backend
+    selected = _workspace_creation_heuristic(
+        suitable_backends=suitable_backends,
+        backend="auto",
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+    )
+    return selected[0]
+
+
+def _create_stock_workspace(
+    backend: str,
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    gpus_per_node: int,
+    comm_backend: Optional[CommBackend],
+    force_oneshot_support: bool,
+    group: Optional[ProcessGroup],
+) -> AllReduceFusionWorkspace:
+    """Create the workspace of a stock backend ("trtllm" or "mnnvl")."""
+    if backend == "trtllm":
         return TRTLLMAllReduceFusionWorkspace(
             tp_size=world_size,
             tp_rank=rank,
@@ -631,7 +872,7 @@ def create_allreduce_fusion_workspace(
             group=group,
         )
 
-    elif actual_backend == "mnnvl":
+    elif backend == "mnnvl":
         if is_confidential_compute():
             raise ValueError(
                 "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
@@ -665,7 +906,7 @@ def create_allreduce_fusion_workspace(
             buffer_size_in_bytes=buffer_size_in_bytes,
         )
     else:
-        raise RuntimeError(f"Unknown backend: {actual_backend}")
+        raise RuntimeError(f"Unknown backend: {backend}")
 
 
 def is_mnnvl_cutedsl_supported(
@@ -878,6 +1119,20 @@ def allreduce_fusion(
         ``workspace.is_buffer_size_sufficient(tp_size, num_tokens, hidden_dim, dtype)``
         returns ``True``.
 
+    .. note::
+
+        On a :class:`SpecializedAllReduceFusionWorkspace` (``backend="specialized"``,
+        or ``backend="auto"`` when it picks it), a call inside the envelope of one of
+        FlashInfer's specialized kernels runs that kernel, and every other call runs
+        the workspace's fallback backend (``workspace.fallback_backend``) with the
+        same arguments. Today: ``kARResidualRMSNorm`` with ``fp32_acc=True`` on two
+        ranks of one node, hidden size 6144, bfloat16, compute capability 10.3, for
+        the allowlisted ``weight_bias`` values and token counts.
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time and at
+        workspace creation; set it identically on every rank) sends every call to
+        the fallback backend. Per-call options that depend on the backend, such as
+        ``use_oneshot``, follow ``workspace.fallback_backend``.
+
     Parameters
     ----------
     input : torch.Tensor
@@ -888,7 +1143,9 @@ def allreduce_fusion(
         determined by ``residual_in``.
     workspace : AllReduceFusionWorkspace
         Workspace object created by the generic factory or a backend-specific
-        constructor. Its concrete type determines the backend.
+        constructor. Its concrete type determines the backend; a
+        :class:`SpecializedAllReduceFusionWorkspace` runs its fallback
+        workspace's backend for every call its specialized kernels do not serve.
     pattern : int
         Fusion pattern (``AllReduceFusionPattern`` constant):
 
@@ -1061,6 +1318,30 @@ def allreduce_fusion(
     ...     rms_gamma=norm_weight,
     ... )
     """
+    if isinstance(workspace, SpecializedAllReduceFusionWorkspace):
+        # The specialized backend: a FlashInfer specialized kernel when the call is inside
+        # its envelope, else the workspace's fallback backend below (the stock backend
+        # ``auto`` would otherwise have chosen), with the same arguments.
+        if (
+            pattern == AllReduceFusionPattern.kARResidualRMSNorm
+            and not _ar_ws2.outside_token_ranges(workspace, input)
+        ):
+            specialized_out = _ar_ws2.try_dispatch(
+                workspace,
+                input,
+                residual_in=residual_in,
+                residual_out=residual_out,
+                norm_out=norm_out,
+                rms_gamma=rms_gamma,
+                rms_eps=rms_eps,
+                weight_bias=weight_bias,
+                fp32_acc=fp32_acc,
+                launch_with_pdl=launch_with_pdl,
+            )
+            if specialized_out is not None:
+                return specialized_out
+        workspace = workspace.fallback
+
     if moe_finalize_backend == "cake" and not isinstance(
         workspace, TRTLLMAllReduceFusionWorkspace
     ):
@@ -1602,6 +1883,7 @@ def allreduce_fusion(
         raise TypeError(
             f"Unknown workspace type: {type(workspace)}. "
             "Expected TRTLLMAllReduceFusionWorkspace, "
-            "MNNVLAllReduceFusionWorkspace, or "
-            "MNNVLCuteDSLAllReduceFusionWorkspace"
+            "MNNVLAllReduceFusionWorkspace, "
+            "MNNVLCuteDSLAllReduceFusionWorkspace, or "
+            "SpecializedAllReduceFusionWorkspace"
         )

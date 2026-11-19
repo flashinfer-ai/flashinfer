@@ -197,6 +197,30 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+``create_allreduce_fusion_workspace(backend="specialized", ...)`` builds a
+:class:`SpecializedAllReduceFusionWorkspace`: the state of FlashInfer's
+specialized all-reduce fusion kernels plus a fallback workspace of the stock
+backend that ``backend="auto"`` would otherwise pick.  :func:`allreduce_fusion`
+runs a specialized kernel for a call inside its envelope and the fallback
+backend, with the same arguments, for every other call;
+``workspace.fallback_backend`` names the fallback, and per-call options that
+depend on the backend (such as ``use_oneshot``) follow it.  ``backend="auto"``
+builds this workspace first whenever the ranks agree that a specialized kernel
+covers the workspace, and the stock pick otherwise; ``"trtllm"`` and
+``"mnnvl"`` never run a specialized kernel.  Today it holds one kernel:
+``kARResidualRMSNorm`` with ``fp32_acc=True`` on two ranks of one node, hidden
+size 6144, bfloat16, compute capability 10.3, for the allowlisted
+``weight_bias`` values and token counts.  ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
+(read at call time and at workspace creation; set it identically on every rank)
+sends every call to the fallback.  The checkpoint lifecycle above covers both
+the workspace's own buffers and its fallback's.
+
+.. autoclass:: SpecializedAllReduceFusionWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
 MNNVL CuTe DSL backend
 ~~~~~~~~~~~~~~~~~~~~~~
 
