@@ -3460,6 +3460,10 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
     def forward(self, inputs, tactic: Any = -1, do_preparation: bool = False, **kwargs):
         from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
+        if do_preparation:
+            # get_valid_tactics already built the programs (_ready); the tuner's
+            # preparation call must not launch the decode.
+            return None
         query, block_tables, seq_lens, out = inputs[:4]
         return trtllm_mla_blackwell_decode(
             query=query,
@@ -3528,8 +3532,10 @@ class _MlaStageOneWinnerRunner(TunableRunner):
     first-stage tactic)``.
 
     It offers a profile only when the first stage holds a winner for it, looked
-    up exactly as the first stage looks it up. Its cache key covers the
-    first-stage runners and their cache-key extras.
+    up exactly as the first stage looks it up, and ``cake`` serves the
+    profile's bucket: a profile without Cake has nothing to compare, so it is
+    not timed. Its cache key covers the first-stage runners and their
+    cache-key extras.
     """
 
     def __init__(
@@ -3537,10 +3543,12 @@ class _MlaStageOneWinnerRunner(TunableRunner):
         runners: Sequence[TunableRunner],
         tuning_config: TuningConfig,
         inputs: List[torch.Tensor],
+        cake: Optional["_CakeTrtllmMlaBlackwellRunner"] = None,
     ) -> None:
         self._runners = list(runners)
         self._config = tuning_config
         self._inputs = inputs
+        self._cake = cake
 
     def _winner(self, shapes, profile) -> Optional[Tuple[str, Any]]:
         from ..autotuner.autotuner import _ProfilingCandidates
@@ -3580,7 +3588,12 @@ class _MlaStageOneWinnerRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs, profile) -> List[Tuple[str, Any]]:
         winner = self.profile_winner(profile)
-        return [] if winner is None else [winner]
+        if winner is None or (
+            self._cake is not None
+            and not self._cake._serves_bucket(inputs, inputs[0].size(0), profile)
+        ):
+            return []
+        return [winner]
 
     def validate_tactic_for_profile(self, inputs, tactic, profile) -> bool:
         """A reused bucket stays valid while the first stage keeps its winner.
@@ -3609,10 +3622,15 @@ class _MlaStageOneWinnerRunner(TunableRunner):
 def _mla_cake_margin_tuning_config(
     config: TuningConfig, batch_ranges: Tuple[Tuple[int, int], ...]
 ) -> Optional[TuningConfig]:
-    """The second stage's tuning config: the first stage's, profiling only the
+    """The second stage's tuning config: the first stage's, generating only the
     buckets within ``batch_ranges`` and the bucket after each of them, which
-    bounds its profile's batches. Its batch mapping, and so every cache key,
-    is the first stage's. ``None`` when no bucket is within the ranges."""
+    bounds its profile's batches (no candidate offers a tactic there, so it
+    is not timed). Its batch mapping, and so every cache key, is the first
+    stage's. ``None`` when no bucket is within the ranges.
+
+    ``autotune(tuning_buckets=...)`` replaces the generated buckets with its
+    own; the candidates then still offer tactics only in the offered buckets,
+    so only those are timed."""
     spec, *others = config.dynamic_tensor_specs
     buckets = tuple(sorted(set(spec.gen_tuning_buckets)))
     kept = set()
@@ -3641,20 +3659,25 @@ def _mla_cake_stage_two(
 ) -> Tuple[TunableRunner, Any]:
     """The second selection stage: Cake when it beat the first stage's winner
     for this call's bucket and launches now, else ``selected``, the first
-    stage's runner and tactic (also on every Cake miss).
+    stage's runner and tactic (also on every Cake miss, and when tuning the
+    second stage fails).
 
-    While tuning outside stream capture it profiles every bucket within
-    ``batch_ranges``; otherwise, and during capture, it only looks up.
+    While tuning outside stream capture it times the buckets within
+    ``batch_ranges``; otherwise, and during capture, it only looks up. The
+    first stage's lookup records the call in ``autotune_v2`` replay
+    diagnostics; the second stage's lookups are not recorded, and a miss
+    under strict replay runs the first stage's winner instead of raising.
     """
     if {_MLA_DECODE_OP, _MLA_CAKE_MARGIN_OP} & tuner._effective_skip_ops:
         return selected
     capturing = torch.cuda.is_current_stream_capturing()
-    if not tuner.is_tuning_mode or capturing:
+    lookup_only = not tuner.is_tuning_mode or capturing
+    if lookup_only:
         batch_size = inputs[0].size(0)
         if not any(first <= batch_size <= last for first, last in batch_ranges):
             return selected
     # autotune(round_up=True) rebuilds the batch mapping from the profiled
-    # buckets, so the second stage then profiles the first stage's buckets.
+    # buckets, so the second stage then generates the first stage's buckets.
     config = (
         tuning_config
         if tuner._override_round_up
@@ -3662,27 +3685,55 @@ def _mla_cake_stage_two(
     )
     if config is None:
         return selected
-    incumbent = _MlaStageOneWinnerRunner(runners, tuning_config, inputs)
+    incumbent = _MlaStageOneWinnerRunner(runners, tuning_config, inputs, cake)
     cake._incumbent = incumbent
     pair: List[TunableRunner] = [incumbent, cake]
-    if tuner.is_tuning_mode and capturing:
-        # Profiling cannot run during capture: look up only.
+    # A Cake choice runs only in place of the first-stage selection it beat
+    # (also where replay diagnostics made the first stage's lookup miss).
+    beaten = (type(selected[0]).__name__, selected[1])
+    if not lookup_only:
+        from ..autotuner.autotuner import _StickyCudaError, _TuningGroupError
+
+        try:
+            runner, tactic = tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
+        except (_StickyCudaError, _TuningGroupError):
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[MLA] tuning the Cake candidate failed; the call runs the "
+                "first-stage selection: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return selected
+        if runner is not cake or tactic != beaten:
+            return selected
+        try:
+            cake_ok = cake.validate_tactic(inputs, tactic)
+        except Exception:
+            cake_ok = False
+        return (cake, tactic) if cake_ok else selected
+    # Lookup only, without choose_one's untuned-shape warning: a miss runs the
+    # tuned first-stage winner, not the default.
+    local = tuner._v2_local
+    saved = local.replay_report, local.strict_replay
+    local.replay_report, local.strict_replay = None, False
+    try:
         hit, runner_id, tactic, _ = tuner.search_cache(
             _MLA_CAKE_MARGIN_OP,
             pair,
             tuner._get_input_sizes(inputs),
             _mla_effective_tuning_config(tuner, config),
             inputs=inputs,
+            # Strict replay still requires the requested measurement policy.
+            require_profiling_policy=saved[1],
         )
-        runner = pair[runner_id] if hit else incumbent
-    else:
-        runner, tactic = tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
-    if runner is not cake:
-        return selected
-    try:
-        cake_ok = cake.validate_tactic(inputs, tactic)
+        cake_ok = hit and pair[runner_id] is cake and tactic == beaten
+        cake_ok = cake_ok and cake.validate_tactic(inputs, tactic)
     except Exception:
         cake_ok = False
+    finally:
+        local.replay_report, local.strict_replay = saved
     return (cake, tactic) if cake_ok else selected
 
 
@@ -4549,8 +4600,11 @@ def _mla_with_kv_cache_impl(
     bucket. An untuned call never selects Cake. Every Cake miss runs the first
     stage's selection: a cached Cake choice that cannot launch for the actual
     batch, whose first-stage winner changed, or whose program is not yet loaded
-    during CUDA-graph capture, and every request or setting that leaves Cake
-    out, including ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``. Explicit
+    during CUDA-graph capture, a failure while tuning Cake, and every request
+    or setting that leaves Cake out, including
+    ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``. ``autotune_v2`` replay
+    diagnostics record the first stage only; under strict replay a missing
+    second-stage entry runs the first stage's selection. Explicit
     ``backend="cake"`` is unaffected. Unlike explicit ``backend="cake"``, the
     candidate never reads ``seq_lens`` on the host and keeps no per-input plan
     or cached scratch, so in-place input updates and CUDA-graph replay with

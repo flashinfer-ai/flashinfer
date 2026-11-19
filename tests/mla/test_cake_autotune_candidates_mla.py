@@ -35,6 +35,7 @@ from flashinfer.autotuner import (
     autotune,
     cake_auto_candidate_open,
 )
+from flashinfer.autotune_cache import ReplayCoverage
 from flashinfer.autotuner import autotuner as autotuner_module
 from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
 from flashinfer.mla import _core as core
@@ -52,8 +53,7 @@ EXPERIMENTAL_ENV = "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS"
 QK_DIM, LATENT, NUM_HEADS = 576, 512, 128
 TOLERANCE = {torch.bfloat16: 1e-2, torch.float8_e4m3fn: 1e-1}
 TUNING_BUCKETS = (1, 2, 4, 8, 64)
-# The first-stage winner a forced or stubbed Cake choice beat.
-FORCED = ("forced first-stage winner", -1)
+# The first-stage winner a stubbed Cake choice beat.
 WINNER = ("_FakeCuteDsl", -1)
 
 _workspace_buffer = None
@@ -174,15 +174,27 @@ class _NoLaunch:
 
 def _candidate_calls(monkeypatch, case, *, tune=False):
     """``(op, candidate names, tuning config)`` of every selection one call
-    makes; the call launches nothing."""
+    makes (a second stage that only looks up is recorded from its lookup);
+    the call launches nothing."""
     calls = []
 
     def choose_one(self, op, runners, config, inputs, **kwargs):
         calls.append((op, [_name(runner) for runner in runners], config))
         return _NoLaunch(), -1
 
+    original_search_cache = core.AutoTuner.search_cache
+
+    def search_cache(self, op, runners, input_shapes, config, *args, **kwargs):
+        if op != core._MLA_CAKE_MARGIN_OP:
+            return original_search_cache(
+                self, op, runners, input_shapes, config, *args, **kwargs
+            )
+        calls.append((op, [_name(runner) for runner in runners], config))
+        return False, 0, -1, None
+
     with monkeypatch.context() as patch:
         patch.setattr(core.AutoTuner, "choose_one", choose_one)
+        patch.setattr(core.AutoTuner, "search_cache", search_cache)
         with autotune(tune):
             _decode(case)
     return calls
@@ -1130,12 +1142,13 @@ class _Stages:
             if key.custom_op == op
         }
 
-    def cake_profiled(self):
+    def cake_profiled(self, runner=core._CAKE_MLA_RUNNER):
         return sorted(
-            batch
-            for profiled, _, batch in self.profiled
-            if profiled == core._CAKE_MLA_RUNNER
+            batch for profiled, _, batch in self.profiled if profiled == runner
         )
+
+    def incumbent_profiled(self):
+        return self.cake_profiled("_MlaStageOneWinnerRunner")
 
 
 @pytest.fixture
@@ -1143,20 +1156,14 @@ def stages(monkeypatch, fresh_tuner, cake_families, synthetic_offers):
     return _Stages(monkeypatch, fresh_tuner)
 
 
-_CAKE_WINS = {
-    1: (core._CAKE_MLA_RUNNER, WINNER),
-    2: (core._CAKE_MLA_RUNNER, WINNER),
-    4: (core._CAKE_MLA_RUNNER, WINNER),
-    8: (core._CAKE_MLA_RUNNER, WINNER),
-    # Bucket 16 bounds bucket 8; Cake is not offered there.
-    16: ("_MlaStageOneWinnerRunner", WINNER),
-}
+# Bucket 16 bounds bucket 8; Cake is not offered there, so it is not timed.
+_CAKE_WINS = {bucket: (core._CAKE_MLA_RUNNER, WINNER) for bucket in (1, 2, 4, 8)}
 
 
 def test_two_stages_keep_first_stage_entries(monkeypatch, stages):
     """The first stage tunes and stores exactly what it stores alone; the
-    second stage adds entries of its own op only, for the offered buckets and
-    the bucket after each. No GPU needed."""
+    second stage times and stores entries of its own op only, for the offered
+    buckets. No GPU needed."""
     stages.stage_one(_cpu_inputs(torch.bfloat16, 4), tune=True)
     alone = stages.entries(core._MLA_DECODE_OP)
     alone_profiled = list(stages.profiled)
@@ -1176,6 +1183,19 @@ def test_two_stages_keep_first_stage_entries(monkeypatch, stages):
     ] == alone_profiled
     assert stages.entries(core._MLA_CAKE_MARGIN_OP) == _CAKE_WINS
     assert stages.cake_profiled() == [1, 2, 4, 8]
+    assert stages.incumbent_profiled() == [1, 2, 4, 8]
+
+
+def test_second_stage_times_only_offered_buckets_under_overrides(monkeypatch, stages):
+    """``autotune(tuning_buckets=...)`` replaces the second stage's buckets with
+    its own; still only the offered buckets are timed. No GPU needed."""
+    monkeypatch.setattr(
+        AutoTuner, "_override_tuning_buckets", property(lambda self: stages.BUCKETS)
+    )
+    stages.select(4, tune=True)
+    assert stages.cake_profiled() == [1, 2, 4, 8]
+    assert stages.incumbent_profiled() == [1, 2, 4, 8]
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == _CAKE_WINS
 
 
 def test_cake_selected_where_it_beat_the_first_stage(stages):
@@ -1308,19 +1328,10 @@ def test_cake_miss_runs_the_first_stage_winner(
     built_before = list(built)
     assert stages.select(inputs=inputs) == first_stage
     assert built == built_before
-
-
-def test_switched_off_cake_runs_the_first_stage_winner(monkeypatch, stages):
-    """``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` with cached Cake entries:
-    the dispatcher skips the second stage, and the first stage still holds its
-    tuned winner for the buckets Cake won. No GPU needed."""
-    stages.select(4, tune=True)
-    monkeypatch.setenv(DISABLE_ENV, "1")
-    assert stages.tuner.may_select_runner_class(core._CAKE_MLA_RUNNER)
-    assert not cake_auto_candidate_open(core._CAKE_MLA_RUNNER)
-    for batch_size in (1, 4, 8):
-        inputs = _cpu_inputs(torch.bfloat16, batch_size)
-        assert stages.stage_one(inputs) == (stages.runners[1], -1)
+    # A second-stage miss is no untuned shape: no fallback warning.
+    assert not any(
+        op == core._MLA_CAKE_MARGIN_OP for op, _ in stages.tuner._logged_cache_miss_oor
+    )
 
 
 def test_second_stage_only_looks_up_during_capture(monkeypatch, stages, cake_families):
@@ -1337,6 +1348,47 @@ def test_second_stage_only_looks_up_during_capture(monkeypatch, stages, cake_fam
     state["capturing"] = True
     runner, tactic = stages.select(4, tune=True, selected=selected)
     assert _name(runner) == "cake" and tactic == WINNER and not stages.profiled
+
+
+def test_second_stage_is_outside_replay_diagnostics(monkeypatch, stages):
+    """Under strict ``autotune_v2`` replay the first stage records the call; the
+    second stage records nothing, and its miss runs the first stage's winner
+    instead of raising. No GPU needed."""
+    stages.select(4, tune=True)
+    local = stages.tuner._v2_local
+    report = ReplayCoverage()
+    monkeypatch.setattr(local, "replay_report", report)
+    monkeypatch.setattr(local, "strict_replay", True)
+    runner, tactic = stages.select(4)
+    assert _name(runner) == "cake" and tactic == WINNER
+
+    winners = stages.tuner._winner_cache()
+    for key in [key for key in winners if key.custom_op == core._MLA_CAKE_MARGIN_OP]:
+        del winners[key]
+    assert stages.select(4) == (stages.runners[1], -1)
+    assert [record["op"] for record in report.records] == [core._MLA_DECODE_OP] * 2
+    assert (report.hits, report.misses) == (2, 0)
+    assert (local.replay_report, local.strict_replay) == (report, True)
+
+
+def test_failed_second_stage_tuning_runs_the_first_stage_winner(monkeypatch, stages):
+    """An error while tuning the second stage (here the FP8 decode table)
+    runs the first stage's winner instead of failing the call. No GPU
+    needed."""
+
+    def fail(device):
+        raise RuntimeError("no FP8 decode table")
+
+    monkeypatch.setattr(cake_module, "_fp8_lut", fail)
+    assert stages.select(4, tune=True) == (stages.runners[1], -1)
+    assert not stages.cake_profiled()
+
+
+def test_cake_preparation_launches_nothing():
+    """The tuner's preparation call does not launch the decode (``_ready``
+    built the programs). No GPU needed."""
+    inputs = _cpu_inputs(torch.bfloat16, 4)
+    assert _cpu_runner().forward(inputs, do_preparation=True) is None
 
 
 def test_untuned_auto_keeps_first_candidate(monkeypatch, clean_tuner):
@@ -1389,10 +1441,12 @@ def test_autotuned_auto_matches_reference(
     )
     _offer_case(monkeypatch, case)
     calls = _spy_choose_one(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
 
     with autotune(True, tuning_buckets=TUNING_BUCKETS):
         tuned = _decode(case)
     tuned_calls = len(calls)
+    tuned_results = len(results)
     with autotune(False):
         cached = _decode(case)
 
@@ -1405,9 +1459,10 @@ def test_autotuned_auto_matches_reference(
         else:
             assert names == ["incumbent", "cake"]
     assert any(profiled), "the Cake candidate was never profiled"
-    # The cached call makes the second selection while the tuner holds a Cake
-    # winner.
-    assert (core._MLA_CAKE_MARGIN_OP in ops[tuned_calls:]) == (
+    # The cached call makes the first selection, and the second (a lookup)
+    # while the tuner holds a Cake winner.
+    assert ops[tuned_calls:] == [core._MLA_DECODE_OP]
+    assert (len(results) > tuned_results) == (
         clean_tuner.may_select_runner_class(core._CAKE_MLA_RUNNER)
     )
     for label, output in (("tuned", tuned), ("cached", cached)):
@@ -1436,7 +1491,7 @@ def test_forced_cake_selection_matches_reference(
     _assert_cake_launched(seen, launches)
     cake, inputs = seen[0]
     direct = torch.zeros_like(forced)
-    cake(inputs=[*inputs[:3], direct], tactic=FORCED)
+    cake(inputs=[*inputs[:3], direct], tactic=_forced_tactic(cake))
     explicit = _decode(dict(case, backend="cake"))
 
     for label, output in (
@@ -1474,7 +1529,7 @@ def test_unlaunchable_cake_choice_falls_back(monkeypatch, clean_tuner):
 
     cake, inputs = selected[0]
     assert _name(cake) == "cake" and not cake.supports(inputs)
-    assert not launches and _name(results[-1][0]) == "trtllm-gen"
+    assert not launches and results[-1] == selected.first_stage
     _assert_matches_reference(output, case, "fallback")
 
 
@@ -1502,14 +1557,15 @@ def test_unavailable_cake_family_falls_back(monkeypatch, clean_tuner):
     monkeypatch.setattr(core, "_CAKE_MLA_UNAVAILABLE_FAMILIES", {family})
     selected = _force_cake(monkeypatch, case)
     launches = _spy_cake_forward(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
 
     output = _decode(case)
 
     cake, inputs = selected[0]
     assert _name(cake) == "cake" and cake.supports(inputs)
     assert cake._domain(inputs, num_sms) == cake_module.DOMAIN_BF16_VQUARTER
-    assert not cake.validate_tactic(inputs, FORCED)
-    assert not launches
+    assert not cake.validate_tactic(inputs, _forced_tactic(cake))
+    assert not launches and results[-1] == selected.first_stage
     _assert_matches_reference(output, case, "unavailable family fallback")
 
 
@@ -1522,9 +1578,14 @@ def test_cake_choice_not_built_during_capture(monkeypatch, clean_tuner):
     case["out"] = torch.zeros(
         batch_size, q_len, NUM_HEADS, LATENT, dtype=torch.bfloat16, device="cuda"
     )
-    # Eager warm-up of the untuned default (TRTLLM-GEN) only.
+    selected = _force_cake(monkeypatch, case)
+    # Eager warm-up of the first stage's selection only: switched off, Cake is
+    # skipped.
+    monkeypatch.setenv(DISABLE_ENV, "1")
     _decode(case)
+    monkeypatch.delenv(DISABLE_ENV)
     torch.cuda.synchronize()
+    assert not selected
 
     builds = []
 
@@ -1535,8 +1596,8 @@ def test_cake_choice_not_built_during_capture(monkeypatch, clean_tuner):
     monkeypatch.setattr(core, "_CAKE_MLA_LOADED_FAMILIES", set())
     monkeypatch.setattr(core, "_CAKE_MLA_UNAVAILABLE_FAMILIES", set())
     monkeypatch.setattr(cake_module, "get_cake_trtllm_mla_blackwell_family", build)
-    selected = _force_cake(monkeypatch, case)
     launches = _spy_cake_forward(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1545,7 +1606,7 @@ def test_cake_choice_not_built_during_capture(monkeypatch, clean_tuner):
 
     cake, inputs = selected[-1]
     assert _name(cake) == "cake" and cake.supports(inputs)
-    assert not builds and not launches
+    assert not builds and not launches and results[-1] == selected.first_stage
     assert not core._CAKE_MLA_UNAVAILABLE_FAMILIES
     case["out"].zero_()
     graph.replay()
@@ -1553,35 +1614,59 @@ def test_cake_choice_not_built_during_capture(monkeypatch, clean_tuner):
     _assert_matches_reference(case["out"], case, "capture fallback replay")
 
 
+class _Forced(list):
+    """``(runner, inputs)`` of every forced Cake choice, and the first-stage
+    selection of the last call."""
+
+    first_stage = None
+
+
 def _force_cake(monkeypatch, case):
-    """Offer the unit of ``case``, then make the second stage pick Cake without
-    tuning, as the winner over the first-stage winner ``FORCED``; the first
-    stage selects its default. Records ``(runner, inputs)`` of every forced
-    choice."""
+    """Offer the unit of ``case``, then make the second stage find, without
+    tuning, a Cake entry that beat the first-stage selection; the first stage
+    selects its last candidate (CuTe DSL where it serves the request, not the
+    default TRTLLM-GEN) with the default tactic."""
     _offer_case(monkeypatch, case)
-    selected = []
+    forced = _Forced()
+    original_search_cache = core.AutoTuner.search_cache
+
+    def beaten():
+        runner, tactic = forced.first_stage
+        return type(runner).__name__, tactic
 
     def choose_one(self, op, runners, config, inputs, **kwargs):
-        if op == core._MLA_CAKE_MARGIN_OP:
-            selected.append((runners[-1], list(inputs)))
-            return runners[-1], FORCED
-        return runners[0], -1
+        assert op == core._MLA_DECODE_OP, op
+        forced.first_stage = (runners[-1], -1)
+        return forced.first_stage
+
+    def search_cache(self, op, runners, *args, **kwargs):
+        if op != core._MLA_CAKE_MARGIN_OP:
+            return original_search_cache(self, op, runners, *args, **kwargs)
+        forced.append((runners[-1], list(kwargs["inputs"])))
+        return True, len(runners) - 1, beaten(), None
 
     monkeypatch.setattr(
         core.AutoTuner, "may_select_runner_class", lambda self, name: True
     )
     monkeypatch.setattr(core.AutoTuner, "choose_one", choose_one)
+    monkeypatch.setattr(core.AutoTuner, "search_cache", search_cache)
     monkeypatch.setattr(
-        core._MlaStageOneWinnerRunner, "call_winner", lambda self, inputs: FORCED
+        core._MlaStageOneWinnerRunner, "call_winner", lambda self, inputs: beaten()
     )
-    return selected
+    return forced
+
+
+def _forced_tactic(cake):
+    """The Cake tactic of a forced choice: the first-stage selection it beat."""
+    return cake._incumbent.call_winner(None)
 
 
 def _assert_cake_launched(selected, launches):
     """The last forced Cake choice was validated and its forward ran (eagerly
     or recorded into a graph), not the first stage's selection."""
     cake, inputs = selected[-1]
-    assert _name(cake) == "cake" and cake.validate_tactic(inputs, FORCED)
+    assert _name(cake) == "cake"
+    assert cake.validate_tactic(inputs, _forced_tactic(cake))
     assert launches and all(_name(runner) == "cake" for runner in launches)
     launches.clear()
 
