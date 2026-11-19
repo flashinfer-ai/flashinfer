@@ -2414,14 +2414,12 @@ def trtllm_nvfp4_sm80_weights(
         ``(w1, s1, w2, s2)`` as ``cutlass_nvfp4_sm80_weights`` returns them with ``dtype`` BF16, or
         with ``records`` ``(r1, r2)``.
     """
-    from .core import (
-        _maybe_get_cached_w3_w1_permute_indices, get_w2_permute_indices_with_cache,
-    )  # fmt: skip
+    from . import core
 
-    p1 = _maybe_get_cached_w3_w1_permute_indices(
+    p1 = core._maybe_get_cached_w3_w1_permute_indices(
         _TRTLLM_PERMUTE_CACHE, w1[0].view(torch.uint8), 128, is_gated_act_gemm=gated
     )
-    p2 = get_w2_permute_indices_with_cache(
+    p2 = core.get_w2_permute_indices_with_cache(
         _TRTLLM_PERMUTE_CACHE, w2[0].view(torch.uint8), 128, is_gated_act_gemm=gated
     )
     fc1_rows = _trtllm_fc1_rows(

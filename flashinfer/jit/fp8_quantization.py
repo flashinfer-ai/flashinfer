@@ -53,11 +53,3 @@ def gen_mxfp8_quantization_sm100_module(device_arch: str = "100") -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
         ],
     )
-
-
-def gen_mxfp8_quantization_sm80_module() -> JitSpec:
-    return gen_mxfp8_quantization_sm100_module("80")
-
-
-def gen_mxfp8_quantization_sm90_module() -> JitSpec:
-    return gen_mxfp8_quantization_sm100_module("90")

@@ -86,7 +86,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
     gemm1_beta: torch.Tensor | None = None,
     gemm1_clamp_limit: torch.Tensor | None = None,
 ):
-    _skip_unless_sm10x(torch.device("cuda"))
+    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -1828,7 +1828,7 @@ def test_fp8_block_scale_moe_fused_shared_routing_replay_cuda_graph():
 @pytest.mark.parametrize("num_shared", [1, 2])
 def test_fp4_block_scale_moe_fused_shared_routing_replay(num_tokens, num_shared):
     """FP4 sibling of the fused-shared routed-only replay contract."""
-    _skip_unless_sm10x(torch.device("cuda"))
+    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
     hidden_size = 1024
     intermediate_size = 512
     num_experts = 16

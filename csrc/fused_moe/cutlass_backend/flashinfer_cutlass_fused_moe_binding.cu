@@ -385,8 +385,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_CONTIGUOUS(input);
     CHECK_CONTIGUOUS(output);
     CHECK_CONTIGUOUS(token_selected_experts);
+#if defined(FLASHINFER_FP4_SW_CVT)  // FP4 weights: K padded to 64 (cutlass_nvfp4_sm80_weights)
+    for (auto const& [w, name] : {std::pair{fc1_expert_weights, "fc1_expert_weights"},
+                                  std::pair{fc2_expert_weights, "fc2_expert_weights"}}) {
+      int64_t const row = (w.size(2) + 3) / 4 * 4;
+      TVM_FFI_ICHECK(mInnerDimMultiplier == 16
+                         ? w.stride(2) == 1 && w.stride(1) == row &&
+                               (w.size(0) == 1 || w.stride(0) == w.size(1) * row)
+                         : w.IsContiguous())
+          << name << " must be contiguous, below SM100 FP4 rows with K padded to 64";
+    }
+#else
     CHECK_CONTIGUOUS(fc1_expert_weights);
     CHECK_CONTIGUOUS(fc2_expert_weights);
+#endif
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {

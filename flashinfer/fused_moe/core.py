@@ -107,9 +107,7 @@ from .prepare import (
 from .prepare import _TRTLLM_PERMUTE_CACHE, _check_sm80_nvfp4_operands, _trtllm_fc1_rows
 from .prepare import W4A16_SM80_TACTICS, _sm80_records, _w4a16_records_geometry
 from .prepare import cutlass_nvfp4_sm80_weights, trtllm_nvfp4_sm80_weights
-from .trtllm_gen_routing import _check_trtllm_gen_routing_supported
-from .trtllm_gen_routing import _max_num_ctas_in_batch_dim
-from .trtllm_gen_routing import get_trtllm_gen_routing_module
+from . import trtllm_gen_routing as tgr
 from ..utils import (
     check_shape_dtype_device,
     device_support_pdl,
@@ -124,7 +122,6 @@ from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
     NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP44Over6Config,
-    current_nvfp4_4over6_config,
     env_flag_enabled,
     nvfp4_4over6_code,
     nvfp4_4over6_from_code,
@@ -1874,20 +1871,21 @@ def cutlass_fused_moe(
         return _cake_situ_fused_moe(locals())
     if backend != "cutlass":
         raise ValueError(f"unsupported fused MoE backend: {backend!r}")
+    major, minor = get_compute_capability(input.device)
+    fp4_below_sm100 = major < 10 and fc1_expert_weights.dtype == torch.int64
     # Reject packed-layout violations before autotuning can read the operands.
     for name, tensor in (
         ("input", input),
         ("token_selected_experts", token_selected_experts),
         ("token_final_scales", token_final_scales),
-        ("fc1_expert_weights", fc1_expert_weights),
-        ("fc2_expert_weights", fc2_expert_weights),
+        ("fc1_expert_weights", None if fp4_below_sm100 else fc1_expert_weights),
+        ("fc2_expert_weights", None if fp4_below_sm100 else fc2_expert_weights),
         ("fc1_expert_biases", fc1_expert_biases),
         ("fc2_expert_biases", fc2_expert_biases),
         ("output", output),
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    major, minor = get_compute_capability(input.device)
     if int(activation_type) == int(ActivationType.ClampedRelu2):
         if clamped_relu2_limit is None:
             raise ValueError(
@@ -1939,7 +1937,6 @@ def cutlass_fused_moe(
 
     device_arch = f"{major * 10 + minor}"
 
-    fp4_below_sm100 = major < 10 and fc1_expert_weights.dtype == torch.int64
     if fp4_below_sm100 and is_nvfp4 and quant_scales[1].dtype == torch.int32:
         # NVFP4 below SM100 runs on the SM80 kernels; cutlass_nvfp4_sm80_weights converts once.
         fc1_expert_weights, s1, fc2_expert_weights, s2 = cutlass_nvfp4_sm80_weights(
@@ -8086,7 +8083,7 @@ def trtllm_fp4_block_scale_routed_moe(
             if per_token_scale is not None and (
                 act != ActivationType.Relu2 or per_token_scale.dtype != torch.float32
                 or per_token_scale.numel() != num_tokens or not per_token_scale.is_contiguous()
-                or current_nvfp4_4over6_config() is not None
+                or resolve_nvfp4_4over6(nvfp4_4over6) is not None
                 or any(map(env_flag_enabled, ("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
                                               "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")))
             ):  # fmt: skip
@@ -8225,14 +8222,14 @@ def _trtllm_routing_sm80(
     each (token, k)'s permuted slot its own CTA tile, so one gather gives its expert; without
     ``gather``, the slots, weights and each slot's expert."""
     method = RoutingMethodType(routing_method_type)
-    _check_trtllm_gen_routing_supported(routing_logits, routing_bias, method, top_k)
+    tgr._check_trtllm_gen_routing_supported(routing_logits, routing_bias, method, top_k)
     device, (tokens, experts) = routing_logits.device, routing_logits.shape
     k, all_experts = top_k + num_fused_shared_experts, experts + num_fused_shared_experts  # fmt: skip
-    ctas = _max_num_ctas_in_batch_dim(tokens, k, all_experts, 1)
+    ctas = tgr._max_num_ctas_in_batch_dim(tokens, k, all_experts, 1)
     i32 = functools.partial(torch.empty, dtype=torch.int32, device=device)
     slots, expert_of_slot = i32(tokens * k), i32(ctas)
     weights = torch.empty((tokens, k), dtype=torch.bfloat16, device=device)
-    get_trtllm_gen_routing_module().trtllm_gen_routing(
+    tgr.get_trtllm_gen_routing_module().trtllm_gen_routing(
         routing_logits, routing_bias, i32(tokens * k), weights, i32(max(2 * all_experts, 512)),
         i32(1), slots, i32(ctas), expert_of_slot, i32(ctas), i32(1), top_k,
         num_fused_shared_experts, n_group or 0, topk_group or 0, 0, experts,
@@ -8327,8 +8324,7 @@ def _trtllm_fp4_routed_moe_sm80(
         alpha = ones() if mxfp8 else torch.full_like(ones(), 8.0)
         quant_scales = [s1, alpha, s2, alpha]
     else:
-        # The FP4 rows are quantized: CUTLASS takes an FC1 activation global scale only as
-        # W4A4's mark (none is W4A16) and reads no value, so any FP32 scalar does.
+        # CUTLASS reads only the presence of an FC1 activation scale (W4A4): any FP32 scalar does.
         quant_scales = [
             fc1_dequant.reshape(-1)[0], s1, fc1_dequant, fc2_scale, s2, fc2_dequant,
         ] + ([] if per_token_scale is None else [per_token_scale.float().contiguous()])  # fmt: skip

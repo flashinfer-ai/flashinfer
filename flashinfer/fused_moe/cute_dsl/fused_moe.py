@@ -1948,8 +1948,7 @@ def _cute_dsl_fused_moe_sm80(
     code = NVFP4_4OVER6_CODE_STANDARD
     quant_scales = [s1, alpha1, s2, alpha2]  # W4A8 as W4A16, x_sf holding MXFP8 scales
     if not (w4a16 or w4a8):
-        # The FP4 rows are quantized: CUTLASS takes an FC1 activation global scale only as
-        # W4A4's mark (none is W4A16) and reads no value, so any FP32 scalar does.
+        # CUTLASS reads only the presence of an FC1 activation scale (W4A4): any FP32 scalar does.
         fc1_act = alpha1.reshape(-1)[0]
         quant_scales = [fc1_act, s1, alpha1, fc2_scale.reshape(-1)[0], s2, alpha2]
         quant_scales += inputs[11:-1]  # per-token activation scales
