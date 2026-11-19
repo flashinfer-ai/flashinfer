@@ -157,12 +157,13 @@ def normalize_elems(rM, inv, rOut):
         rOut[e + 1] = z1.to(IN_DTYPE)
 
 
-def store_out_piece(rOut, mO, out_row, i, CT, D):
-    """Piece ``i`` of the output row (bf16) to ``mO``."""
+def store_out_piece(rOut, mO, out_row, i, CT, D, o_off=0):
+    """Piece ``i`` of the output row (bf16) to ``mO``; ``o_off``: the first output column of the unit's part of the head dim."""
     cute.autovec_copy(
         rOut,
         cute.make_tensor(
-            mO.iterator + cute.assume(out_row.to(Int64) * D + i * CT, divby=8),
+            mO.iterator
+            + cute.assume(out_row.to(Int64) * D + (i * CT + o_off), divby=8),
             cute.make_layout((cute.size(rOut),)),
         ),
     )
@@ -310,6 +311,7 @@ def merge_global_to_output(
     n_pieces: cutlass.Constexpr,
     CT: cutlass.Constexpr,
     D: cutlass.Constexpr,
+    o_off=0,
 ):
     """``merge_global_pipelined``'s merge of the unit's last chunk with the running state in the global scratch, normalised into the
     output rows piece by piece instead of written back: the fused unit's epilogue when ``O_m`` is not in TMEM."""
@@ -323,7 +325,7 @@ def merge_global_to_output(
             merge_elems(rO, rMa, a1, a2, True)
             normalize_elems(rMa, inv, rOut)
             if row_valid:
-                store_out_piece(rOut, mO, out_row, i, CT, D)
+                store_out_piece(rOut, mO, out_row, i, CT, D, o_off)
     else:
         for i in cutlass.range_constexpr(min(depth - 1, n_pieces)):
             cute.autovec_copy(om_piece(gOm, i, CT), rMs[i % depth])
@@ -339,7 +341,7 @@ def merge_global_to_output(
             merge_elems(rO, cur, a1, a2, False)
             normalize_elems(cur, inv, rOut)
             if row_valid:
-                store_out_piece(rOut, mO, out_row, i, CT, D)
+                store_out_piece(rOut, mO, out_row, i, CT, D, o_off)
 
 
 @cute.jit
@@ -417,8 +419,11 @@ def epilogue(
     CT: cutlass.Constexpr,
     om_tmem: cutlass.Constexpr,
     WS: cutlass.Constexpr,
+    o_off=0,
 ):
-    """The unit's end. Mode 0 with ``O_m`` in TMEM: the accumulator is folded into ``O_m`` (the last chunk's merge when the unit has
+    """The unit's end. ``o_off``: the first column of the unit's part of the head dim (output rows and partial rows alike; 0 unless
+    the body splits the head dim, D = 512: the unit's ``n_pieces`` pieces are its part's columns, ``D`` the row pitch).
+    Mode 0 with ``O_m`` in TMEM: the accumulator is folded into ``O_m`` (the last chunk's merge when the unit has
     several chunks, a copy otherwise), the accumulator stage is RELEASED -- the next unit's first PV may start -- and the output rows
     are normalised from ``O_m`` (``cvt_bf16(add(mul(O, div(1, l)), +0))``) afterwards: the same values through the same ops, only the
     home of the unit's final fp32 state differs (a placement), and the tensor core no longer waits for the normalisation and the
@@ -487,6 +492,7 @@ def epilogue(
                         n_pieces,
                         CT,
                         D,
+                        o_off,
                     )
                 else:
                     for i in cutlass.range_constexpr(n_pieces):
@@ -497,7 +503,7 @@ def epilogue(
                         )
                         normalize_elems(rO, inv, rOut)
                         if row_valid:
-                            store_out_piece(rOut, mO, out_row, i, CT, D)
+                            store_out_piece(rOut, mO, out_row, i, CT, D, o_off)
             cute.arch.fence_view_async_tmem_load()
             oh.release()
     else:
@@ -512,7 +518,8 @@ def epilogue(
                         cute.make_tensor(
                             mWs.iterator
                             + cute.assume(
-                                (slot_base + row).to(Int64) * WS + i * CT, divby=4
+                                (slot_base + row).to(Int64) * WS + (i * CT + o_off),
+                                divby=4,
                             ),
                             cute.make_layout((cute.size(rO),)),
                         ),
@@ -553,9 +560,12 @@ def correction_loop(
     tile_hi: Int32,
     mode: Int32,
     slot_base: Int32,
+    o_off=0,
 ):
-    """``tOtOm`` is the TMEM ``O_m`` (``None`` at D = 256, whose ``O_m`` is row ``(cta, lane)`` of ``mScratch``)."""
-    D, g, TPC = st.D, st.g, st.tpc
+    """``tOtOm`` is the TMEM ``O_m`` (``None`` at D >= 256, whose ``O_m`` is row ``(cta, lane)`` of ``mScratch``). ``o_off``: the first
+    head-dim column of the unit's output part (D = 512: the accumulator, the scratch block and the pieces below are the part's
+    ``Dk`` columns; the output and partial rows keep the class pitch)."""
+    D, g, TPC = st.Dk, st.g, st.tpc
     CT = st.ct
     om_tmem = st.om_tmem
     WS = st.ws_row
@@ -612,7 +622,7 @@ def correction_loop(
     gOm = cute.make_tensor(
         mScratch.iterator
         + cute.assume(
-            cta * (om_scratch_blocks(D) * Q_ROWS * D) + row * OM_VEC, divby=OM_VEC
+            cta * (om_scratch_blocks(st.D) * Q_ROWS * D) + row * OM_VEC, divby=OM_VEC
         ),
         cute.make_layout((OM_VEC, D // OM_VEC), stride=(1, OM_VEC * Q_ROWS)),
     )  # divby: 16-byte vector copies per lane
@@ -718,11 +728,12 @@ def correction_loop(
         mWs,
         out_row,
         slot_base,
-        D,
+        st.D,
         n_pieces,
         CT,
         om_tmem,
         WS,
+        o_off,
     )
     return o_cons, stats_cons
 
@@ -769,7 +780,8 @@ def fold_group(
             )
         cute.arch.barrier(barrier_id=BAR_FOLD, number_of_threads=128)
         arrived = s_fold[0]
-        if arrived == n_chunks - 1:
+        # every output part of every chunk arrives (o_parts units per chunk)
+        if arrived == n_chunks * st.o_parts - 1:
             thr_per_row = st.D // VEC
             rows_per_pass = 128 // thr_per_row
             d0 = (thread_idx % thr_per_row) * VEC

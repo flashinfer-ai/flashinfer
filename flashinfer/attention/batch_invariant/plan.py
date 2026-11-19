@@ -42,6 +42,8 @@ DESC_FIELDS = 16
     F_QBASE,
     F_GROUP,
 ) = range(14)
+F_OPART = 14  # the unit's output part: which ``O_PART_DIMS``-wide slice of the head dim this CTA accumulates (``o_parts(D)`` units per
+# Q tile and chunk range at D = 512, always 0 below)
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
@@ -54,6 +56,7 @@ STREAM_SAT_FRACTION = {
     64: 0.78,
     128: 0.42,
     256: 0.30,
+    512: 0.30,
 }  # per head dim: the fraction of the SMs whose CTAs, each walking one unit, together reach the HBM rate (the HBM rate over a lone
 # CTA's stream rate, over the SM count): a wave of fewer CTAs is bound by the per-CTA rate, a fuller wave by the HBM rate
 GRID_SEARCH_ARCHES = (
@@ -70,6 +73,7 @@ UNIT_BUBBLE = {
     64: 0.6,
     128: 2.0,
     256: 2.0,
+    512: 2.0,
 }  # per head dim: a CTA's stream pauses at every unit boundary (the next unit's opening tiles and the epilogue hand-off), a fixed
 # cost per unit on the per-CTA-bound side, hidden while the wave is bound by the HBM rate
 FIXUP_BASE_COST = 2.9  # the fixup kernel's cost on the critical path beyond the attention kernel's end: a fixed part ...
@@ -83,7 +87,8 @@ INKERNEL_MAX_CHUNKS_OF = {
     64: INKERNEL_MAX_CHUNKS,
     128: INKERNEL_MAX_CHUNKS,
     256: 0,
-}  # D = 256: the fixup kernel folds every group (the fixup placement measured faster at B = 1 for 256-wide rows;
+    512: 0,
+}  # D >= 256: the fixup kernel folds every group (the fixup placement measured faster at B = 1 for 256-wide rows;
 # the in-kernel fold is 64 threads per row there)
 # units: 128 rows x up to 8 chunks per last arriver) and longer chains take the fixup kernel: the fold runs in
 # the last arriver's correction warpgroup and stalls that CTA's MMA and softmax through the stats ring, and every
@@ -112,7 +117,7 @@ WS_ROW = 132  # fp32 per partial row AT D = 128: O[0..D) then m at [D], l at [D+
 
 def ws_row(D: int) -> int:
     """fp32 per partial row of the split workspace at head dim ``D``: ``D + 2`` rounded up to a multiple of 4 (16 bytes):
-    68 / 132 / 260 for D = 64 / 128 / 256. ``WS_ROW`` is this value at D = 128 (kept for the D = 128 call sites)."""
+    68 / 132 / 260 / 516 for D = 64 / 128 / 256 / 512. ``WS_ROW`` is this value at D = 128 (kept for the D = 128 call sites)."""
     return -(-(D + 2) // 4) * 4
 
 
@@ -157,6 +162,18 @@ def om_in_tmem(D: int) -> bool:
     it lives in a per-CTA global scratch, so a fused multi-chunk unit pays one L2 round trip of its 128 x D fp32 state per chunk end -- which
     is why the planner's ``auto`` splits decode-sized units there (``build_plan``). The body (``blocks/operands.py``) reads the same rule."""
     return 128 + 64 + 2 * D <= 512
+
+
+O_PART_DIMS = 256  # the widest PV accumulator a CTA keeps in TMEM next to its S stages (``256 + 2 x 128 = 512`` columns)
+
+
+def o_parts(D: int) -> int:
+    """Output parts of the head dim: the row body's CTA accumulates ``O_PART_DIMS`` columns of ``O`` (a 512-column accumulator would
+    take every TMEM column and leave none for ``S`` and ``P``), so at D = 512 a Q tile over a chunk range is ``2`` work units, one per
+    256-column half of ``O`` and ``V``. Each recomputes the tile's scores and softmax -- the same instructions on the same operands,
+    hence the same ``P`` and ``(m, l)`` -- and folds its own half of ``P V``; an output element belongs to exactly one unit. A
+    placement: the class term of an element never mentions the other half. 1 at D <= 256."""
+    return max(1, D // O_PART_DIMS)
 
 
 def kv_lengths(
@@ -385,7 +402,7 @@ def build_plan(
     the grid of integral waves, or every multi-chunk unit split). Otherwise a multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows
     (a decode unit) splits when the fused unit count would leave the machine underfilled (``< 2 x SM``), a wider tile (a prefill
     unit) only when the fused units would fill under ``1 / WIDE_SPLIT_SM_FRACTION`` of the SMs -- and, at head dims whose merged state
-    is not in TMEM (D = 256), every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused
+    is not in TMEM (D >= 256), every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused
     decode unit there merges a 128 x 256 fp32 state through the global scratch at every chunk end, and the split kind measured
     faster at long KV lengths -- except the TWO-chunk decode-sized units of at least ``FUSE2_MIN_ROWS`` live rows in a batch whose
     fused unit count exceeds half the SM count, which stay fused (one in-kernel merge against two unit ramps and the fixup node);
@@ -401,6 +418,7 @@ def build_plan(
     assert 1 <= g <= q_rows, g
     tpt = q_rows // g
     T, C = TILE_KEYS, chunk_len(D)
+    parts = o_parts(D)  # work units per (Q tile, chunk range): one per output part
     B = len(qo_indptr) - 1
     kv_lens = kv_lengths(kv_indptr, kv_last_page_len, page)
     tiles = []  # (b, h, tok0, ntok, chunk_lo, chunk_hi, tile_lo, tile_hi, kv_len, q_len)
@@ -440,8 +458,8 @@ def build_plan(
     elif split_policy == "fused":
         do_split_narrow = do_split_wide = False
     else:
-        do_split_narrow = len(tiles) < 2 * sm_count
-        do_split_wide = WIDE_SPLIT_SM_FRACTION * len(tiles) < sm_count
+        do_split_narrow = len(tiles) * parts < 2 * sm_count
+        do_split_wide = WIDE_SPLIT_SM_FRACTION * len(tiles) * parts < sm_count
     # the merged chunk state's home decides the D = 256 rules below: the row body keeps it in a global scratch at D = 256, the Swaps-AB
     # kernel (every unit of the batch <= 32 rows under small = "swap") in TMEM at every D -- those batches take the D = 128 rules
     swap_batch = (
@@ -456,7 +474,7 @@ def build_plan(
     # whatever the live rows), measured fused faster with several live rows per unit and slower with one live row -- D = 256;
     # with fewer units the split kind's parallelism wins (B = 1). A placement (R3)
     fuse_two_chunk = (
-        split_policy == "auto" and not om_tmem and 2 * len(tiles) > sm_count
+        split_policy == "auto" and not om_tmem and 2 * len(tiles) * parts > sm_count
     )
     inkernel_max_chunks = INKERNEL_MAX_CHUNKS if om_tmem else INKERNEL_MAX_CHUNKS_OF[D]
     plan = Plan(tokens_per_tile=tpt, g=g, ws_row=ws_row(D))
@@ -494,26 +512,27 @@ def build_plan(
                 or not (do_split or (split_small and rows <= INKERNEL_MAX_ROWS))
             )
         if fused_unit:
-            plan.desc.append(
-                [
-                    b,
-                    tok0,
-                    rows,
-                    h,
-                    clo,
-                    chi,
-                    0,
-                    0,
-                    kv_len,
-                    q_len,
-                    tlo,
-                    thi,
-                    qo_indptr[b],
-                    -1,
-                    0,
-                    0,
-                ]
-            )
+            for part in range(parts):
+                plan.desc.append(
+                    [
+                        b,
+                        tok0,
+                        rows,
+                        h,
+                        clo,
+                        chi,
+                        0,
+                        0,
+                        kv_len,
+                        q_len,
+                        tlo,
+                        thi,
+                        qo_indptr[b],
+                        -1,
+                        part,
+                        0,
+                    ]
+                )
             continue
         base = plan.ws_rows
         n = chi - clo
@@ -530,26 +549,28 @@ def build_plan(
                 max(tlo, j * tpc),
                 min(thi, (j + 1) * tpc),
             )  # the chunk's tiles present for the row block
-            plan.desc.append(
-                [
-                    b,
-                    tok0,
-                    rows,
-                    h,
-                    j,
-                    j + 1,
-                    1,
-                    base + (j - clo) * rows,
-                    kv_len,
-                    q_len,
-                    tl,
-                    th,
-                    qo_indptr[b],
-                    grp,
-                    0,
-                    0,
-                ]
-            )
+            # every output part of the chunk writes its own columns of the SAME partial rows (and the same (m, l))
+            for part in range(parts):
+                plan.desc.append(
+                    [
+                        b,
+                        tok0,
+                        rows,
+                        h,
+                        j,
+                        j + 1,
+                        1,
+                        base + (j - clo) * rows,
+                        kv_len,
+                        q_len,
+                        tl,
+                        th,
+                        qo_indptr[b],
+                        grp,
+                        part,
+                        0,
+                    ]
+                )
         plan.ws_rows += n * rows
     # longest units first, then the waves of ``grid`` units alternate direction (``snake_order``): the persistent CTAs walk units
     # u = bidx, bidx + grid, ..., so CTA j takes the j-th unit of every wave and the alternation pairs a wave's long units with the

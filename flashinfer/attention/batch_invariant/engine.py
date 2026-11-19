@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""FlashInfer-shaped entry points for the RL-ready paged attention (classes ``attn.bf16.d64`` / ``d128`` / ``d256``:
+"""FlashInfer-shaped entry points for the RL-ready paged attention (classes ``attn.bf16.d64`` / ``d128`` / ``d256`` / ``d512``:
 one class per head dim, ``spec.HEAD_DIMS``).
 
 * ``attention_paged(q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len, ...)``: the
@@ -84,7 +84,8 @@ def check_sm_scale(sm_scale: float) -> float:
 
 def valid_kv_slots(D: int = 128) -> tuple:
     """The ring depths of the FMHA body at head dim ``D``: ``2 .. 512 / D`` (``blocks.operands.max_kv_slots``: 128 KB of K/V in
-    flight at every D), i.e. 2..8 at D = 64, 2..4 at D = 128, {2} at D = 256."""
+    flight at every D), i.e. 2..8 at D = 64, 2..4 at D = 128, {2} at D = 256; at D = 512 {2} ring slots of the part's slot
+    geometry (``blocks.operands.slot_geometry``)."""
     from .blocks.operands import max_kv_slots
 
     return tuple(range(2, max_kv_slots(D) + 1))
@@ -153,6 +154,9 @@ def _part_has_hw_row_max(device: torch.device) -> bool:
     return int(major) == 10 and int(minor) >= 3
 
 
+SOFTMAX_WGS_OF = {512: (1,)}  # softmax warpgroup counts per head dim (default: 1 or 2)
+
+
 @dataclass(frozen=True)
 class AttnConfig:
     """A configuration of the kernel: every member of the space computes the class (R3)."""
@@ -185,11 +189,12 @@ class AttnConfig:
 
     def well_formed(self, D: int = 128) -> bool:
         """The body's static knob constraints at head dim ``D`` (mirror of ``BIK.Attn.ConfigOKD``: ``2 <= kv_slots``,
-        ``kv_slots * D <= 512``, ``small <= 1``)."""
+        ``kv_slots * D <= 512`` -- or exactly 2 ring slots at D = 512 --, ``small <= 1``; one softmax warpgroup at D = 512, whose
+        128 KB Q stage leaves no shared memory for the second warpgroup's payloads on a 228 KB part)."""
         return (
             self.kv_slots in valid_kv_slots(D)
             and self.split_policy in ("auto", "split", "fused")
-            and self.softmax_wgs in (1, 2)
+            and self.softmax_wgs in SOFTMAX_WGS_OF.get(D, (1, 2))
             and self.grid >= 0
             and self.merge in ("auto", "fixup", "inkernel")
             and self.small in ("rep", "swap")
@@ -206,13 +211,13 @@ class AttnConfig:
 
 def all_valid_configs(D: int = 128) -> list:
     """The enumerated space at head dim ``D`` (R3 is claimed over it): ring ``valid_kv_slots(D)`` x unit kind x softmax warpgroups x
-    merge placement x small-unit placement = 252 / 108 / 36 points at D = 64 / 128 / 256."""
+    merge placement x small-unit placement = 252 / 108 / 36 / 18 points at D = 64 / 128 / 256 / 512."""
     assert D in HEAD_DIMS, D
     return [
         AttnConfig(s, p, 0, w, merge=m, small=sm)
         for sm in ("rep", "swap")
         for m in ("auto", "fixup", "inkernel")
-        for w in (1, 2)
+        for w in SOFTMAX_WGS_OF.get(D, (1, 2))
         for s in valid_kv_slots(D)
         for p in ("auto", "split", "fused")
     ]
@@ -222,7 +227,11 @@ SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB ker
 # (n_pad = 8) kernel beats the row body; the 16-row kernel (24/2 heads, g = 12) measured slower than
 # the row body at every D (its per-row chains and register spills), so 9-32-row units keep the row
 # body's replicated placement (the 16 / 32-row kernels stay built and IR-pinned as retired placements)
-SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
+SWAPS_DIMS = (
+    64,
+    128,
+    256,
+)  # head dims the Swaps-AB kernel implements; D = 512 decode units take the row body's replicated-row placement (same bits)
 
 
 Q2_MIN_UNITS_PER_SM = {
@@ -307,6 +316,7 @@ DEFAULT_RING = {
     64: 4,
     128: 4,
     256: 2,
+    512: 2,
 }  # ring depth per head dim: D = 64 and 128 keep 4 (the D = 64 ring-8 candidate of the
 # page-16 search was a noise-selected maximum: a same-GPU interleaved A/B found no difference beyond
 # the noise), D = 256 has only 2
@@ -465,13 +475,13 @@ def plan_attention(
         ws = workspace.view(torch.uint8).reshape(-1)[: need * 4].view(torch.float32)
     # the per-CTA O_m scratch of fused multi-chunk units when O_m is not in TMEM (D = 256: blocks/operands.om_scratch_blocks); one 128 x D fp32
     # block per CTA in the row-interleaved layout of operands.OM_VEC, touched once per chunk end, L2-resident (26 MB at 204 CTAs x D = 256)
-    from .blocks.operands import om_scratch_blocks
+    from .blocks.operands import om_scratch_blocks, part_dims
 
     multi = any(d[6] == 0 and d[5] - d[4] > 1 for d in plan.desc)
     scr = 1
     if om_scratch_blocks(D) and multi:
         n_cta = max(1, min(plan.num_units, max(sm, config.grid)))
-        scr = n_cta * om_scratch_blocks(D) * 128 * D
+        scr = n_cta * om_scratch_blocks(D) * 128 * part_dims(D)
     # the in-kernel fold's arrival counters: one per group, zero at every launch (the last arriver resets its group's counter)
     planned = _Planned(
         plan,
@@ -781,11 +791,15 @@ def _run_attention_validated(
         if (
             planned.scratch.numel() > 1
         ):  # O_m in the per-CTA global scratch: om_scratch_blocks(D) blocks per CTA
-            from .blocks.operands import om_scratch_blocks
+            from .blocks.operands import om_scratch_blocks, part_dims
 
             grid = max(
                 1,
-                min(grid, planned.scratch.numel() // (om_scratch_blocks(D) * 128 * D)),
+                min(
+                    grid,
+                    planned.scratch.numel()
+                    // (om_scratch_blocks(D) * 128 * part_dims(D)),
+                ),
             )
         kernel(
             q_view,

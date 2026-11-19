@@ -1507,7 +1507,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
+            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256 / 512,
             non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture

@@ -253,6 +253,7 @@ class SwapsPlan:
         self.M_pv = self.slot_dims  # 128, or 64 at D = 64
         self.q_stages, self.p_stages, self.s_stages = Q_STAGES, P_STAGES, S_STAGES
         self.ws_row = ws_row(D)
+        self.o_parts = 1  # work units per chunk of a split group (the in-kernel fold's arrivals: blocks/correction.fold_group)
         # the Q box: (64 d, g heads, tokens_box tokens) per 64-wide half; tokens_box x g = rows_box <= n_pad rows of the B operand
         self.tokens_box = n_pad // g
         self.rows_box = self.tokens_box * g

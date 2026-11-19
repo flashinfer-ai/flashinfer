@@ -33,9 +33,11 @@ def issue_slot(
     kv_ptr0: Int32,
     n_pages: Int32,
     kv_head: Int32,
+    half0=0,
 ):
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``): acquire it, issue ``boxes_per_slot x halves`` TMA
-    boxes (a box is ``box_rows = min(page, slot_keys)`` keys of one page).
+    boxes (a box is ``box_rows = min(page, slot_keys)`` keys of one page). ``half0``: the slot's first 64-wide box of the head dim
+    (0 unless the slot holds a part of the head dim: D = 512).
     Under ``st.ragged`` the pool is one page of ``total_kv`` tokens and the box starts at the request's token offset plus the key
     (the domain shifted by ``kv_indptr[req]``, a token offset, in ``load_loop``); coordinates past the pool are zero-filled by the TMA and keys past the
     request's length are masked / zeroed exactly as the junk of a paged pool's pages is."""
@@ -47,7 +49,7 @@ def issue_slot(
             for half in cutlass.range_constexpr(st.halves):
                 cute.copy(
                     atom,
-                    tg[(None, (half, k0 // st.box_rows, kv_head, 0))],
+                    tg[(None, (half0 + half, k0 // st.box_rows, kv_head, 0))],
                     ts[(None, i, half, h.index)],
                     tma_bar_ptr=h.barrier,
                 )
@@ -63,7 +65,7 @@ def issue_slot(
             for half in cutlass.range_constexpr(st.halves):
                 cute.copy(
                     atom,
-                    tg[(None, (half, box_in_page, kv_head, page_id))],
+                    tg[(None, (half0 + half, box_in_page, kv_head, page_id))],
                     ts[(None, i, half, h.index)],
                     tma_bar_ptr=h.barrier,
                 )
@@ -82,21 +84,55 @@ def issue_tile(
     kv_ptr0: Int32,
     n_pages: Int32,
     kv_head: Int32,
+    o_part=None,
 ):
-    """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order."""
+    """One K or V tile = ``slots_per_tile`` consecutive key ranges in key order, each one ring slot -- or, when a slot holds a part
+    of the head dim (D = 512): ``qk_parts`` slots per key range for K (the parts ascending: the score fold's K-step order) and the
+    ``pv_parts`` slots of the unit's output part ``o_part`` for V (``None``: a K tile)."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
-        kv_prod = issue_slot(
-            st,
-            t * st.T + sl * st.slot_keys,
-            kv_prod,
-            atom,
-            tg,
-            ts,
-            mKvIndices,
-            kv_ptr0,
-            n_pages,
-            kv_head,
-        )
+        if cutlass.const_expr(st.qk_parts == 1):
+            kv_prod = issue_slot(
+                st,
+                t * st.T + sl * st.slot_keys,
+                kv_prod,
+                atom,
+                tg,
+                ts,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+        if cutlass.const_expr(st.qk_parts > 1 and o_part is None):
+            for dp in cutlass.range_constexpr(st.qk_parts):
+                kv_prod = issue_slot(
+                    st,
+                    t * st.T + sl * st.slot_keys,
+                    kv_prod,
+                    atom,
+                    tg,
+                    ts,
+                    mKvIndices,
+                    kv_ptr0,
+                    n_pages,
+                    kv_head,
+                    dp * st.halves,
+                )
+        if cutlass.const_expr(st.qk_parts > 1 and o_part is not None):
+            for vp in cutlass.range_constexpr(st.pv_parts):
+                kv_prod = issue_slot(
+                    st,
+                    t * st.T + sl * st.slot_keys,
+                    kv_prod,
+                    atom,
+                    tg,
+                    ts,
+                    mKvIndices,
+                    kv_ptr0,
+                    n_pages,
+                    kv_head,
+                    (o_part * st.pv_parts + vp) * st.halves,
+                )
     return kv_prod
 
 
@@ -124,7 +160,9 @@ def load_loop(
     rows_valid: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    o_part=None,
 ):
+    """``o_part``: the unit's output part (D = 512: the 256-dim half of V this CTA folds), ``None`` when the body has one part."""
     LA = st.qk_ahead  # K tiles issued ahead of V: 1 (the MMA issues QK(n+1), PV(n)) or 2 (PV(n), QK(n+2))
     kv_ptr0 = mKvIndptr[req]
     n_pages = mKvIndptr[req + 1] - kv_ptr0
@@ -164,7 +202,7 @@ def load_loop(
     if cutlass.const_expr(st.rep_ok):
         if rows_valid <= st.rep_rows:
             for quad in cutlass.range_constexpr(Q_ROWS // REP_ROWS):
-                for half in cutlass.range_constexpr(st.halves):
+                for half in cutlass.range_constexpr(st.q_halves):
                     cute.copy(
                         atom_q_rep,
                         tQgQr[(None, (half, kv_head, 0))],
@@ -172,7 +210,7 @@ def load_loop(
                         tma_bar_ptr=qh.barrier,
                     )
         else:
-            for half in cutlass.range_constexpr(st.halves):
+            for half in cutlass.range_constexpr(st.q_halves):
                 cute.copy(
                     atom_q,
                     tQgQ[(None, (half, kv_head, 0))],
@@ -180,7 +218,7 @@ def load_loop(
                     tma_bar_ptr=qh.barrier,
                 )
     else:
-        for half in cutlass.range_constexpr(st.halves):
+        for half in cutlass.range_constexpr(st.q_halves):
             cute.copy(
                 atom_q,
                 tQgQ[(None, (half, kv_head, 0))],
@@ -218,6 +256,7 @@ def load_loop(
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                o_part,
             )
             if n + 2 < N:
                 kv_prod = issue_tile(
@@ -258,6 +297,7 @@ def load_loop(
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                o_part,
             )
     return q_prod, kv_prod
 
@@ -292,7 +332,7 @@ def load_q_tile(
     if cutlass.const_expr(st.rep_ok):
         if rows_valid <= st.rep_rows:
             for quad in cutlass.range_constexpr(Q_ROWS // REP_ROWS):
-                for half in cutlass.range_constexpr(st.halves):
+                for half in cutlass.range_constexpr(st.q_halves):
                     cute.copy(
                         atom_q_rep,
                         tQgQr[(None, (half, kv_head, 0))],
@@ -300,7 +340,7 @@ def load_q_tile(
                         tma_bar_ptr=qh.barrier,
                     )
         else:
-            for half in cutlass.range_constexpr(st.halves):
+            for half in cutlass.range_constexpr(st.q_halves):
                 cute.copy(
                     atom_q,
                     tQgQ[(None, (half, kv_head, 0))],
@@ -308,7 +348,7 @@ def load_q_tile(
                     tma_bar_ptr=qh.barrier,
                 )
     else:
-        for half in cutlass.range_constexpr(st.halves):
+        for half in cutlass.range_constexpr(st.q_halves):
             cute.copy(
                 atom_q,
                 tQgQ[(None, (half, kv_head, 0))],

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
+"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>`` (D = 64 / 128 / 256 / 512).
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -48,7 +48,8 @@ HEAD_DIMS = (
     64,
     128,
     256,
-)  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
+    512,
+)  # the classes attn.bf16.d64 / d128 / d256 / d512 (one class per (D, C(D)))
 NEG_INF = float("-inf")
 
 
@@ -57,6 +58,7 @@ CHUNK_LEN_OF = {
     64: CHUNK_LEN,
     128: CHUNK_LEN,
     256: CHUNK_LEN,
+    512: CHUNK_LEN,
 }  # C(D): the chunk length per head dim (a class parameter per D; all 512)
 
 
@@ -72,7 +74,10 @@ def chunk_len(D: int, L: Optional[int] = None) -> int:
     (``RLK.Attn.output_depends_on_C``); the fingerprint records it. ``C`` is a class parameter PER HEAD DIM
     (``CHUNK_LEN_OF``): D = 64 and D = 256 take the same 512 (the D = 256 body's merged chunk state
     lives in a per-CTA global scratch because TMEM holds no second 256-column accumulator, which made a longer
-    C a candidate there; the common constant was kept)."""
+    C a candidate there; the common constant was kept). D = 512 takes ``(T, C) = (128, 512)`` too: ``T`` is the N extent of the
+    QK^T instruction and the softmax's row of scores at every head dim, and the chunk merge of the D = 512 body moves a 256-column
+    accumulator half per CTA (``blocks/operands.py``: one CTA per half), the D = 256 body's traffic, against a tile that carries
+    twice the QK^T K-steps -- a longer ``C`` buys less there than at D = 256 and would halve the work units of a B = 1 decode step."""
     assert D in HEAD_DIMS, D
     return CHUNK_LEN_OF[D]
 
@@ -386,7 +391,15 @@ FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
 # score, a D-wide PV accumulator), C(D) = 512 for both; pinned by the same test
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
-FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
+# the D = 512 class: 32 MMA K-steps per score and a 512-wide PV accumulator (issued as two 256-column instructions per
+# key step: the per-element fold is the same), C(512) = 512
+FINGERPRINT_D512 = "attn-bf16-d512-fc404189e70bebba"
+FINGERPRINTS = {
+    64: FINGERPRINT_D64,
+    128: FINGERPRINT_D128,
+    256: FINGERPRINT_D256,
+    512: FINGERPRINT_D512,
+}
 
 
 def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
