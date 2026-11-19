@@ -556,11 +556,28 @@ def test_unhomed_state_launches_the_whole_route_as_before(monkeypatch) -> None:
         assert not any(_TWIN in name for name in device.loads)
 
 
-def test_unaligned_inputs_raise_before_any_launch(monkeypatch) -> None:
+@pytest.mark.parametrize("backend", [None, "auto", "cake_gdn"])
+def test_unaligned_inputs_raise_before_any_launch(monkeypatch, backend) -> None:
     # Contiguous views at an unaligned storage offset: the kernels read q and k in
     # 8-byte vectors and the state in 16-byte copies, so the call raises before it
-    # resolves or launches anything, homed or not.
+    # resolves or launches anything, homed or not.  Through the public call
+    # (``backend`` not None) backend="auto" raises too: it does not fall back to the
+    # FlashInfer kernel.
     device = _Device(monkeypatch)
+
+    def flashinfer_kernel(*args, **kwargs):
+        raise AssertionError("fell back to the FlashInfer kernel")
+
+    monkeypatch.setattr(gdn_decode, "run_nontranspose_decode", flashinfer_kernel)
+
+    def run(inputs):
+        if backend is None:
+            return _run(inputs)
+        output, _ = gdn_decode.gated_delta_rule_decode(
+            **inputs, scale=_SCALE, backend=backend
+        )
+        return output
+
     for homed in (False, True):
         for name, address in (
             ("q", 2),
@@ -575,13 +592,25 @@ def test_unaligned_inputs_raise_before_any_launch(monkeypatch) -> None:
             if homed:
                 device.home(inputs["state"])
             with pytest.raises(ValueError, match="aligned"):
-                _run(inputs)
+                run(inputs)
     assert device.calls == [] and device.loads == []
-    # 8-byte aligned q and k and a 16-byte aligned state launch as before.
+    # 8-byte aligned q and k and a 16-byte aligned state launch as before; the other
+    # tensors, read and written one element at a time, need only their element
+    # alignment.
     inputs = _decode_inputs(64)
-    for name, address in (("q", 8), ("k", 1032), ("state", 16)):
+    for name, address in (
+        ("q", 8),
+        ("k", 1032),
+        ("state", 16),
+        ("v", 2),
+        ("a", 2),
+        ("b", 6),
+        ("output", 2),
+        ("A_log", 4),
+        ("dt_bias", 12),
+    ):
         inputs[name] = _fake(inputs[name].shape, inputs[name].dtype, address)
-    assert _run(inputs) is inputs["output"]
+    assert run(inputs) is inputs["output"]
     ((route, args),) = device.calls
     assert _TWIN not in route and args[:9] == _whole_args(inputs, 0)[:9]
 

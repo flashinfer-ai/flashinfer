@@ -27,7 +27,8 @@ cells its route table lists
 launch over both dies whose CTAs take the (batch row, value head) items of their
 own die's rows first. Its output and updated state are those of the whole-GPU
 body bit for bit. Every other call that the Cake kernels serve runs the whole-GPU
-route; one they do not serve runs the FlashInfer kernel under ``backend="auto"``.
+route; one they do not serve runs the FlashInfer kernel under ``backend="auto"``
+and raises ``CakeGDNUnsupportedError`` under ``backend="cake_gdn"``.
 """
 
 from __future__ import annotations
@@ -146,22 +147,25 @@ def localize_gdn_decode_state(
     freed: drop the last reference to it after this call so that the state is not
     held twice.
 
-    Returns ``state`` itself, unhomed, when the call is under CUDA graph capture,
-    or when no call of this row would run the twin: ``state`` is not FP32 with
-    ``K = V = 128`` on an SM107a device, the call row (``B``, ``num_q_heads``,
-    ``HV``, ``scale``) has no twin listed for the device's SM count in any die
-    class (the twin covers ``H=16``, ``HV=32`` from ``B=48`` on, at
-    ``scale`` ``K ** -0.5`` or ``1.0``, on 212-SM devices), the device has no SM
-    table (:func:`flashinfer.cake_locality.sm_table` is ``None``: a CUDA 13.5
-    toolkit and driver are needed), the row is not listed for the die class of
-    the device, or the cut is not a multiple of the allocation granularity of
-    locality-domain memory. The checks that need no device work come first: a
-    refused row is returned before the SM table is probed or anything is
-    allocated. ``localize_gdn_decode_state(state, H, scale) is state`` therefore means
-    that every decode call on the state runs the whole-GPU body. Raises
-    ``ValueError`` for a ``state`` that is not a contiguous
-    4-D CUDA tensor, a non-positive ``num_q_heads`` or a ``rows0`` outside
-    ``[0, B]``.
+    Returns ``state`` itself, without a copy, when the call is under CUDA graph
+    capture, or when it does not home the state: ``state`` is not FP32 with
+    ``K = V = 128`` on an SM107a device, ``state`` is a ``__torch_dispatch__``
+    wrapper subclass, the call row (``B``, ``num_q_heads``, ``HV``, ``scale``) has
+    no twin listed for the device's SM count in any die class (the twin covers
+    ``H=16``, ``HV=32`` from ``B=48`` on, at ``scale`` ``K ** -0.5`` or ``1.0``, on
+    212-SM devices), the device has no SM table
+    (:func:`flashinfer.cake_locality.sm_table` is ``None``: a CUDA 13.5 toolkit and
+    driver are needed), the row is not listed for the die class of the device, or
+    the cut is not a multiple of the allocation granularity of locality-domain
+    memory. The checks that need no device work come first: a refused row is
+    returned before the SM table is probed or anything is allocated. A result other
+    than ``state`` is therefore a new homed copy, and ``state`` itself as the result
+    means only that no copy was made, not which kernel a decode call runs: a call
+    on a ``state`` that was never homed never runs the twin, but a ``state`` that
+    was already homed (for example by an earlier call of this helper) stays homed,
+    and a call of a listed row on it can still run the twin. Raises ``ValueError``
+    for a ``state`` that is not a contiguous 4-D CUDA tensor, a non-positive
+    ``num_q_heads`` or a ``rows0`` outside ``[0, B]``.
 
     Only the whole returned allocation is homed: the tensor itself and every
     alias of it with the same shape (a ``detach()``, a view of the same shape).

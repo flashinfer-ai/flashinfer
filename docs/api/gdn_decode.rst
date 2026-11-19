@@ -69,13 +69,22 @@ toolkit and driver. Two fallbacks apply:
   FlashInfer kernel under ``backend="auto"`` and raises
   ``CakeGDNUnsupportedError`` under ``backend="cake_gdn"``.
 
-A call on the Cake path raises ``ValueError`` if q or k does not start at an
-8-byte aligned address or the state does not start at a 16-byte aligned one.
+A T=1 call with the contiguous BF16 and FP32 tensors listed above and
+K = V = 128 raises ``ValueError``, under ``backend="auto"`` as under
+``backend="cake_gdn"`` and for every row and GPU, if q or k does not start at
+an 8-byte aligned address or the state does not start at a 16-byte aligned
+one. ``backend="auto"`` does not fall back to the FlashInfer kernel here: it
+needs aligned inputs too. The other tensors need only the alignment of their
+element type.
 
-The helper returns the state itself, unhomed, where no call of its row would
-run the twin: ``localize_gdn_decode_state(state, H, scale) is state`` means that every
-call on it runs the whole-GPU kernel. The homed copy is a new allocation that
-the CUDA driver makes outside PyTorch's caching allocator
+The helper returns ``state`` itself, without a copy, under CUDA graph capture
+and wherever it does not home the state (for example a row the twin does not
+cover); otherwise it returns a new homed copy. So
+``localize_gdn_decode_state(state, H, scale) is state`` means only that no copy
+was made, not which kernel a call runs: a call on a state that was never homed
+never runs the twin, but a state that was already homed stays homed, and a call
+of a listed row on it can still run the twin. The homed copy is a new
+allocation that the CUDA driver makes outside PyTorch's caching allocator
 (``torch.cuda.memory_allocated()`` does not count it); the input state stays
 allocated until the caller drops it. Make one eager call before a CUDA graph
 capture, and keep the state alive as long as a graph that reads it.
