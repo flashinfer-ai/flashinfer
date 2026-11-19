@@ -12,6 +12,12 @@ or -- on the prefill wrappers -- base e (``lse_base="ln"``, the declared in-kern
 output: the output bits are the same with and without it, and its receipt is its own
 (``fingerprint(<wrapper>, head_dim=..., lse_base=...)``).
 
+``sinks`` (``run(..., sinks=)`` on the paged wrappers, the ``_sinks`` attribute of the ragged one), an fp32 ``(num_qo_heads,)``
+tensor of per-head sink logits, selects the class's sink member (``spec.sink_merge``): head ``h``'s rows get one virtual key
+of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
+row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
+are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
@@ -597,7 +603,8 @@ class BatchInvariantAttention:
     ):
         """Validate changing run-time inputs once, then launch with the fixed plan. ``return_lse``: ``(out, lse)`` with the LSE
         member in ``lse_base`` (``"log2"`` | ``"ln"``) and ``lse_layout`` (``"NH"`` | ``"HN"``), written to ``lse`` when given (as
-        on the other backends, an ``lse`` buffer without ``return_lse`` is not used)."""
+        on the other backends, an ``lse`` buffer without ``return_lse`` is not used). ``sinks``: the fp32 ``(num_qo_heads,)``
+        per-head sink logits of the sink member."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
         if use_fp16_softmax or uses_spcompress:
@@ -619,8 +626,6 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
             )
-        if sinks is not None:
-            raise unsupported(CLASS, "attention sinks", "plain softmax")
         if kv_cache_sf is not None:
             raise unsupported(CLASS, "a scaled (fp8 / fp4) KV cache", "a bf16 KV cache")
         if skip_softmax_threshold_scale_factor is not None:
@@ -741,6 +746,14 @@ class BatchInvariantAttention:
                 if lse is not None and lse_layout == "NH"
                 else torch.empty(nh_shape, dtype=torch.float32, device=self.device)
             )
+        if sinks is not None:
+            bad = engine.check_sinks(sinks, Hq, self.device, (out, lse_nh))
+            if bad is not None:
+                raise unsupported(
+                    CLASS,
+                    f"sinks {bad}",
+                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out nor lse",
+                )
         engine._run_attention_validated(
             self._planned,
             q,
@@ -757,6 +770,7 @@ class BatchInvariantAttention:
             enable_pdl=enable_pdl,
             lse=lse_nh,
             lse_mode=engine.LSE_MODES[lse_base] if return_lse else 0,
+            sinks=sinks,
         )
         if not return_lse:
             return out

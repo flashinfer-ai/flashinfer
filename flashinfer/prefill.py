@@ -3250,7 +3250,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
             non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
-            the class's LSE member (fp32; the output bits are the same with and without it). CUDA graphs: capture
+            the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
+            fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
+            denominator, merged once after the row's last chunk; the LSE includes it). CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -6022,7 +6024,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
             non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
-            the class's LSE member (fp32; the output bits are the same with and without it). CUDA graphs: capture
+            the class's LSE member (fp32; the output bits are the same with and without it). Attention sinks set on the
+            wrapper (``_sinks``, an fp32 ``[num_qo_heads]`` tensor) run the class's sink member (one virtual key per head
+            in the softmax denominator, merged once after the row's last chunk; the LSE includes it). CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
