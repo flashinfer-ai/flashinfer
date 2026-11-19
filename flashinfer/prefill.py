@@ -2706,6 +2706,8 @@ def _gqa_dec_fp8q_sm90_auto_admits(
     token_pos_in_items_len: int,
     has_jit_module: bool,
     kv_meta_fn: Any,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
 ) -> Tuple[bool, Optional[str], Optional[tuple]]:
     """Complete plan-time auto-admission for ``backend="auto"``: route to
     "specialized" only when the WHOLE plan — geometry allowlist, plan options,
@@ -2756,6 +2758,13 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                 reason = f"token_pos_in_items_len={token_pos_in_items_len}"
             elif has_jit_module:
                 reason = "jit_module"
+            elif disable_split_kv:
+                # batch-invariance/determinism controls: the specialized
+                # kernel's proportional split partition reads neither, so a
+                # plan that sets them keeps the stock resolution
+                reason = "disable_split_kv=True"
+            elif fixed_split_size not in (None, -1):
+                reason = f"fixed_split_size={fixed_split_size}"
         if reason is None:
             q_lens = qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
             if bool((q_lens != _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
@@ -2953,6 +2962,9 @@ def _gqa_dec_fp8q_sm90_prepare(
     counters = _gqa_dec_fp8q_sm90_counters
     wrapper._gqa_dec_fp8q_sm90_state = None
     wrapper._gqa_dec_fp8q_sm90_row_seq = None
+    # THIS call's refusal reason (the module-level _gqa_dec_fp8q_sm90_last_fallback
+    # is a process-wide diagnostic another wrapper/plan may have written since).
+    wrapper._gqa_dec_fp8q_sm90_plan_refusal = None
     counters["plans_seen"] += 1
     capturing = bool(
         hasattr(torch.cuda, "is_current_stream_capturing")
@@ -2976,6 +2988,7 @@ def _gqa_dec_fp8q_sm90_prepare(
             wrapper._gqa_dec_fp8q_sm90_row_seq = None
     if _gqa_dec_fp8q_sm90_disabled():
         counters["plans_disabled"] += 1
+        wrapper._gqa_dec_fp8q_sm90_plan_refusal = "plan: kill switch"
         _gqa_dec_fp8q_sm90_fallback("plan: kill switch")
         logger.info_once(
             "gqa_decode_fp8_paged_sm90: disabled (%s, or its deprecated "
@@ -3029,6 +3042,7 @@ def _gqa_dec_fp8q_sm90_prepare(
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         counters["plans_ineligible"] += 1
+        wrapper._gqa_dec_fp8q_sm90_plan_refusal = f"plan: {reason}"
         _gqa_dec_fp8q_sm90_fallback(f"plan: {reason}")
         logger.info_once(
             "gqa_decode_fp8_paged_sm90: not dispatched for this plan (%s); "
@@ -3040,9 +3054,13 @@ def _gqa_dec_fp8q_sm90_prepare(
     if capturing:
         # never compile or allocate inside a capture; the stock path is baked
         counters["runs_capture_unready"] += 1
+        wrapper._gqa_dec_fp8q_sm90_plan_refusal = "plan: inside CUDA-graph capture"
         return
     module = _get_gqa_dec_fp8q_sm90_module()
     if module is None:
+        reason = f"plan: JIT build failed ({_gqa_dec_fp8q_sm90_module_error})"
+        wrapper._gqa_dec_fp8q_sm90_plan_refusal = reason
+        _gqa_dec_fp8q_sm90_fallback(reason)
         return
     device = wrapper.device
     device_index = (
@@ -3286,6 +3304,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
     kv_cache_sf: Any,
     skip_softmax_threshold_scale_factor: Optional[float],
     extra_args: tuple,
+    enable_pdl: bool,
 ) -> Optional[torch.Tensor]:
     """Run-time half: launch the specialized kernel and return its output, or
     return None (nothing launched) so the caller dequantises Q and runs the
@@ -3374,6 +3393,7 @@ def _gqa_dec_fp8q_sm90_dispatch(
         vds,
         out,
         state.workspace,
+        enable_pdl,
     )
     counters["runs_dispatched"] += 1
     _gqa_dec_fp8q_sm90_backend_dispatches["specialized"] += 1
@@ -4720,6 +4740,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"backends: {GQA_DEC_FP8Q_SM90_BACKENDS}; use "
                     "backend='auto' or a stock backend for other contracts."
                 )
+            if disable_split_kv or fixed_split_size not in (None, -1):
+                _offending = (
+                    "disable_split_kv=True"
+                    if disable_split_kv
+                    else f"fixed_split_size={fixed_split_size}"
+                )
+                raise ValueError(
+                    "backend='specialized' (SM90 fp8-Q paged verify-decode "
+                    f"kernel) cannot honor the split-KV control {_offending}: "
+                    "the specialized kernel partitions KV with its own "
+                    "proportional whole-tile split and reads neither option. "
+                    "Drop the option or use backend='auto' / a stock backend."
+                )
             q_data_type = torch.bfloat16
             _gqa_fp8q_backend_override = "fa2"
         # (the backend="auto" admission runs below, once the host metadata it
@@ -4748,7 +4781,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
             # Same complete auto-admission as plan(): size the composable
             # fa2/bf16 plan only for plans auto would actually arm; an
-            # off-domain fp8-Q plan is sized for the stock auto resolution.
+            # off-domain fp8-Q plan is sized for the stock auto
+            # resolution. The admission inputs mirror plan()'s exactly:
+            # the retained custom-mask buffer counts as a custom mask, and
+            # host KV metadata is withheld when max_sequence_kv is set.
+            # (bound to a local first: the method dels max_sequence_kv below)
+            _gqa_fp8q_size_kv_meta = (
+                None
+                if max_sequence_kv is not None
+                else (
+                    paged_kv_indptr_host,
+                    paged_kv_last_page_len_host,
+                    kv_lens_arr_host,
+                )
+            )
             _auto_routed, _, _ = _gqa_dec_fp8q_sm90_auto_admits(
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
@@ -4758,7 +4804,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 kv_layout=self._kv_layout,
                 causal=causal,
                 has_custom_mask=(
-                    custom_mask is not None or packed_custom_mask is not None
+                    custom_mask is not None
+                    or packed_custom_mask is not None
+                    or self._custom_mask_buf is not None
                 ),
                 pos_encoding_mode=pos_encoding_mode,
                 use_fp16_qk_reduction=use_fp16_qk_reduction,
@@ -4770,11 +4818,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 prefix_len_ptr=prefix_len_ptr,
                 token_pos_in_items_len=token_pos_in_items_len,
                 has_jit_module=self._jit_module is not None,
-                kv_meta_fn=lambda: (
-                    paged_kv_indptr_host,
-                    paged_kv_last_page_len_host,
-                    kv_lens_arr_host,
-                ),
+                kv_meta_fn=lambda: _gqa_fp8q_size_kv_meta,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
             )
             if _auto_routed and self._cuda_graph_backend in (None, "fa2"):
                 q_data_type = torch.bfloat16
@@ -5001,7 +5047,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``backend="auto"`` routes to it only on the dispatch allowlist
             (8 query heads / 1 KV head / head_dim 128, page size 16, NHD,
             causal, uniform q_len == 6 per request, per-sequence float32
-            descales, batch <= 128, kv_len <= 262144). Under
+            descales, batch <= 128, kv_len <= 262144). The kernel partitions
+            KV with its own proportional whole-tile split: a plan that sets
+            ``fixed_split_size`` or ``disable_split_kv=True`` is never
+            admitted under ``backend="auto"`` and raises under
+            ``backend="specialized"``. Under
             ``backend="auto"`` a call the specialized kernel cannot serve
             falls back to the composable path — exact dequantisation (bf16
             holds every e4m3 value exactly) into the stock fa2 kernel — never
@@ -5009,7 +5059,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             such a plan or call raises with the refusal reason (an explicitly
             selected backend never falls back), and a caller who names a
             stock backend (``fa2``, ``fa3``, ...) is never served by the
-            specialized kernel.
+            specialized kernel. The composable fallback takes keyword
+            ``q_scale``/``k_scale``/``v_scale`` only: positional ``*args``
+            scale tensors are rejected rather than silently dropped, and
+            per-sequence ``k_scale``/``v_scale`` tensors are served only by
+            the specialized kernel itself — callers who need the stock
+            positional-scale fp8 route should name a stock backend (e.g.
+            ``backend="fa3"``), which is never served by the specialized
+            kernel.
             ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at plan and run
             time) disables the kernel (auto: composable path; explicit:
             raise);
@@ -5157,9 +5214,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"{GQA_DEC_FP8Q_SM90_BACKENDS}; use backend='auto' or a "
                     "stock backend for other contracts."
                 )
+            if disable_split_kv or fixed_split_size not in (None, -1):
+                _offending = (
+                    "disable_split_kv=True"
+                    if disable_split_kv
+                    else f"fixed_split_size={fixed_split_size}"
+                )
+                raise ValueError(
+                    "backend='specialized' (SM90 fp8-Q paged verify-decode "
+                    f"kernel) cannot honor the split-KV control {_offending}: "
+                    "the specialized kernel partitions KV with its own "
+                    "proportional whole-tile split and reads neither option. "
+                    "Drop the option or use backend='auto' / a stock backend."
+                )
             _gqa_dec_fp8q_sm90_armed = True
             self._gqa_dec_fp8q_sm90_requested = True
             self._gqa_dec_fp8q_sm90_explicit = True
+            self._gqa_dec_fp8q_sm90_plan_refusal = None
             q_data_type = torch.bfloat16
             # the underlying plan is made on the stock fa2 route
             self._backend = "fa2"
@@ -5205,6 +5276,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     token_pos_in_items_len=token_pos_in_items_len,
                     has_jit_module=self._jit_module is not None,
                     kv_meta_fn=_gqa_fp8q_kv_meta_fn,
+                    fixed_split_size=fixed_split_size,
+                    disable_split_kv=disable_split_kv,
                 )
             )
             if _auto_routed and self._cuda_graph_backend not in (None, "fa2"):
@@ -5221,6 +5294,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 _gqa_dec_fp8q_sm90_armed = True
                 self._gqa_dec_fp8q_sm90_requested = True
                 self._gqa_dec_fp8q_sm90_explicit = False
+                self._gqa_dec_fp8q_sm90_plan_refusal = None
                 q_data_type = torch.bfloat16
                 self._backend = "fa2"
             else:
@@ -5951,7 +6025,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             raise NotImplementedError(
                 "backend='specialized' (SM90 fp8-Q paged verify-decode "
                 "kernel) cannot serve this plan "
-                f"({_gqa_dec_fp8q_sm90_last_fallback or 'plan not prepared'}); "
+                f"({getattr(self, '_gqa_dec_fp8q_sm90_plan_refusal', None) or 'plan not prepared'}); "
                 "an explicitly selected backend never falls back — use "
                 "backend='auto' for guarded routing"
             )
@@ -5964,7 +6038,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # wrapper captured them: the capture is invalidated (replays
             # keep computing the previous plan — never a mix).
             _gqa_dec_fp8q_sm90_warn_stale_capture(
-                self, _gqa_dec_fp8q_sm90_last_fallback or "plan not prepared"
+                self,
+                getattr(self, "_gqa_dec_fp8q_sm90_plan_refusal", None)
+                or "plan not prepared",
             )
 
         self._causal = causal
@@ -6465,6 +6541,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # kernel accumulates P.V in fp16 on power-of-two prescaled e4m3
             # operands (exact per element, range-bounded by the split tiling);
             # see the dispatcher section's precision note.
+            if q.dtype != torch.float8_e4m3fn:
+                # e5m2 passes is_float8 but is NOT the planned external dtype:
+                # the specialized guard would decline it and the composable
+                # fallback would silently reinterpret it as e4m3-quantized
+                # data. Stock planning rejects the mismatch; so do we.
+                raise ValueError(
+                    "this wrapper's plan intercepted q_data_type="
+                    "torch.float8_e4m3fn for the SM90 fp8-Q verify-decode "
+                    f"route; got q.dtype={q.dtype}. Pass an fp8 e4m3 query "
+                    "or re-plan with the intended dtype."
+                )
             res = _gqa_dec_fp8q_sm90_dispatch(
                 self,
                 q,
@@ -6480,6 +6567,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 kv_cache_sf,
                 skip_softmax_threshold_scale_factor,
                 args,
+                enable_pdl,
             )
             if res is not None:
                 return res
@@ -6503,7 +6591,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "positional fp8 scale arguments (*args) are not served by "
                     "the composable fallback of the specialized SM90 fp8-Q "
                     "verify-decode route; pass q_scale/k_scale/v_scale "
-                    "keywords instead"
+                    "keywords instead, or keep the stock positional-scale "
+                    "route by planning with a stock backend (e.g. "
+                    "backend='fa3')"
                 )
             if isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
                 # the stock fa2 path folds scalar k_scale into sm_scale and
