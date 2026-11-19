@@ -298,6 +298,19 @@ class SSDCombined:
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the specialized
     backend (checked at construction for routing and again at call time).
 
+    The specialized backend's call contract is stricter than the generic
+    dtype table above: bf16 ``x``/``dt``/``B``/``C``/``D``/``dt_bias``
+    (fp32 ``A``), ``D`` and ``dt_bias`` required (``D`` per head, no hdim),
+    ``dt_softplus=True``, the default ``dt_limit``, no ``z``, no initial
+    states, ``return_final_states=False``, and a single sequence per call.
+    It writes and returns the token-major ``[1, seqlen, nheads, headdim]``
+    output directly (never the CuTe chunked buffer).  The module JIT-builds
+    for ``sm_120a`` on first use, which requires a CUDA >= 13.3 toolkit.
+    For CUDA-graph capture, warm each head-count variant on the capture
+    device first — one eager ``run`` call, or
+    ``flashinfer.mamba.specialized.ssd_prefill_sm120.warmup(nheads,
+    device)`` — because an unwarmed variant never dispatches under capture.
+
     Usage::
 
         ssd = SSDCombined(chunk_size=128, nheads=8, headdim=64,
@@ -324,7 +337,12 @@ class SSDCombined:
     ):
         from ..utils import get_compute_capability
 
-        major, minor = get_compute_capability(torch.device("cuda"))
+        # Key the (cached) capability lookup by the current ordinal: an
+        # unindexed torch.device("cuda") would share one cache entry across
+        # every current device in a mixed-architecture process.
+        major, minor = get_compute_capability(
+            torch.device("cuda", torch.cuda.current_device())
+        )
         if backend not in SSD_BACKENDS:
             raise ValueError(
                 f"SSDCombined backend must be one of {SSD_BACKENDS}, got {backend!r}"
