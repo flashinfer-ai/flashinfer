@@ -20,7 +20,7 @@ Why copy engines rather than SM stores: the fused-transpose kernel behind `backe
 | Input | Contiguous 4-D CUDA tensor with a 1-, 2- or 4-byte element type (FP16/BF16/FP32, FP8, INT8/UINT8); any batch size on the all-P2P route |
 | Execution | P2P enqueues asynchronously on the caller stream; the RDMA routes block the host until every rank reaches the barrier (unbounded) and until RDMA completes (fixed 10 s deadline); one in-flight operation per communicator, bound to the stream of the first call |
 | CUDA Graphs | All-P2P: capturable when every output comes from `allocate_output`; hybrid/all-RDMA: refused |
-| Workspaces | None: `workspace=`, `create_workspace` and the head-chunk primitives are refused at world size above one; `allocate_output` registers outputs instead |
+| Workspaces | None: `workspace=`, `create_workspace` and the head-chunk primitives are refused at world size above one; `allocate_output` registers outputs instead. Prepared Sage2 QKV workspaces view one communicator-owned registration ([below](#prepared-sage2-qkv)) |
 
 Full-group CUDA P2P is required even on the RDMA routes because every exchange's opening and closing epoch barriers read CUDA-mapped signals from all ranks.
 
@@ -80,6 +80,15 @@ comm.gather_heads(attn_out, out=output)
 An output is overwritten by its next operation; use a different output for every result that must coexist. Outputs stay registered until `close()` — dropping the Python view frees nothing — and must not be passed to another communicator or overlap the input.
 
 On the RDMA routes each output also owns a landing buffer of the same capacity, and every exchange copies the operand into it before the NIC reads it: registering caller memory instead would require `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` on the whole backing allocation (for a PyTorch tensor, a caching-allocator segment shared with unrelated tensors) for the lifetime of the MR. The all-P2P route reads the operand in place.
+
+## Prepared Sage2 QKV
+
+`prepare_qkv` / `scatter_qkv` ([Lowp design](ulysses_lowp.md)) run on this backend at world size 2, 4 or 8. The statistics AllGather still uses NCCL on the communicator's group, so that group must support CUDA collectives even though this backend does not otherwise need it; the packed payload crosses the selected route as one `exchange_chunks` operand, so the batch-size-1 limit of the RDMA routes never binds a Q/K/V batch.
+
+- **One registration per communicator.** The first `prepare_qkv` registers one uint8 `exchange_chunks` output, collectively and only after the payload has been checked against `max_bytes`. Every later workspace views it, whatever its shape or live length, because each exchange rebinds a slot's geometry within its capacity. Like every registration it holds `max_bytes` bytes, plus an equal landing buffer on the RDMA routes, until `close()`. The Lowp guidance of `3 * q.nbytes` is about twice the payload, roughly `1.5 * q.nbytes` for FP16/BF16 inputs plus scales and alignment; size `max_bytes` to the largest payload and prepare during warmup. A registration failure is fail-stop, as for any registration.
+- **No staging copy.** On the RDMA routes the quantizer writes the payload straight into the slot's landing buffer (the buffer `input_buffer` exposes), which the exchange recognizes by pointer identity; the all-P2P route reads the quantizer's buffer in place.
+- **Same collective contract.** `scatter_qkv` is bound to the communicator's stream and refuses capture on the RDMA routes, both checked before the statistics AllGather is enqueued. Until the rank has enqueued its exchange, a rejection or failure follows the [failure envelope](#failure-envelope): an ordinary error on the RDMA routes, BROKEN with teardown poisoned on all-P2P.
+- **Overlapped pipelines.** Input and output communication that may be in flight together, as in a head-chunk pipeline, need separate communicators; each PCIe communicator then has its own registrations and stream, and each can size `max_bytes` to its own direction. The RDMA routes block the host for an exchange, first waiting for the quantizer on the caller stream and then for the barrier and the completions, so a single host thread issuing several streams loses overlap on those routes; the all-P2P route enqueues asynchronously.
 
 ## CUDA Graphs
 

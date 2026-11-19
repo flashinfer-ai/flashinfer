@@ -881,7 +881,8 @@ def _make_ulysses_scatter_qkv_trace(layout):
         description=(
             "Distributed SageAttention2 QKV preparation: local statistics, one "
             "FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, "
-            "one uint8 NCCL AllToAll through exchange_chunks, and unpack. "
+            "one uint8 AllToAll through exchange_chunks (NCCL, or the selected route "
+            "of the experimental PCIe backend), and unpack. "
             "Requires an existing communicator "
             "and prepare_qkv workspace on every rank, in the same collective order. "
             "This schema describes a distributed operation; it has no single-GPU "
@@ -967,6 +968,7 @@ def _make_ulysses_scatter_qkv_trace(layout):
             "stage:comm",
             "distributed:multi-rank",
             "transport:nccl",
+            "transport:pcie",
             "quantization:sage2",
             f"layout:{layout}",
         ],

@@ -751,19 +751,25 @@ The last input dimension is dense and each row must be 16-byte aligned;
 projection views need not be fully contiguous. The input padding after the
 used global prefix must already be zero.
 
-Statistics use NCCL on the communicator's group. The packed payload goes
-through ``exchange_chunks``; its current NCCL and NVLink backend implementations
-both use NCCL without another layout conversion or payload copy.
-``workspace.transport`` reports that actual transport. Preparation checks NCCL
-capability even for an NVLink communicator. The prepared Lowp API accepts
-NCCL and NVLink communicators; it collectively rejects the experimental PCIe
-backend before JIT or workspace allocation.
+Statistics use NCCL on the communicator's group, so preparation checks NCCL
+capability on every backend. The packed payload goes through
+``exchange_chunks`` without another layout conversion or payload copy: the
+NCCL and NVLink backends use NCCL, and the experimental multi-rank PCIe backend
+uses its selected route. ``workspace.transport`` reports that actual transport
+(``"nccl"`` or ``"pcie"``). On PCIe, the first preparation collectively
+registers one chunk output that every later workspace of the communicator
+shares until ``close()``, and ``scatter_qkv`` follows the backend's stream,
+capture and failure contract; see the `PCIe Ulysses design note
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/ulysses_pcie.md#prepared-sage2-qkv>`_.
 ``max_bytes`` must cover the full combined Q/K/V payload, including scales and
 chunk alignment. Preparation computes and validates the exact requirement;
 one floating Q tensor's byte size is generally insufficient. The example's
 ``3 * q.nbytes`` covers both supported layouts. NCCL preparation allocates the
-actual payload size, not the full budget. Statistics and final outputs are
-additional allocations, so ``max_bytes`` is not a total memory budget.
+actual payload size, not the full budget. PCIe registers the full budget (twice
+it on the hybrid and all-RDMA routes), so there size ``max_bytes`` to the
+largest payload, about ``1.5 * q.nbytes`` plus scales and alignment.
+Statistics and final outputs are additional allocations, so ``max_bytes`` is
+not a total memory budget.
 
 ``out=None`` returns independent storage. ``out=`` requires matching tensor
 geometry and metadata, including the exact used length and original dtype.
