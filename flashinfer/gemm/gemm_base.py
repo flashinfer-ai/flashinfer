@@ -10984,6 +10984,17 @@ def bmm_fp8(
     return out
 
 
+class Sm12xGroupwiseShapeError(ValueError, RuntimeError):
+    """128-unaligned N rejected on sm120/sm121 (#9555).
+
+    Derives from ValueError so automatic backend selection catches it and
+    skips the cutlass backend, and from RuntimeError so explicit
+    ``backend="cutlass"`` callers see the same exception type the sm120
+    launcher raises for an unimplementable problem (the contract
+    ``test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises`` asserts).
+    """
+
+
 @supported_compute_capability([100, 103, 107, 120, 121])
 def _cutlass_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
@@ -11005,9 +11016,9 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     # but returns silently wrong output there (#9555). Reject it so the call
     # fails loudly instead of computing garbage.
     if is_sm12x_supported(a.device) and b.shape[0] % 128 != 0:
-        raise ValueError(
+        raise Sm12xGroupwiseShapeError(
             "N must be a multiple of 128 for the cutlass fp8 groupwise "
-            f"backend on SM120/121 (got N={b.shape[0]}); see issue #9555"
+            f"backend on sm120/sm121 (got N={b.shape[0]}); see issue #9555"
         )
 
     return True
