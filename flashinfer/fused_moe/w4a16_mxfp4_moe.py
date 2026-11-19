@@ -484,9 +484,8 @@ def w4a16_mxfp4_latent_routed_moe(
         (x.data_ptr() | out.data_ptr()) % 16 == 0,
         "x and out must be 16-byte aligned",
     )
-    # the specialized prefill host clears `out` before FC1 reads `x`, so an
-    # `out` that shares storage with any input is a refusal (the reference
-    # path reads every input before its single write to `out`)
+    # Keep the specialized no-overlap contract. The reference reads every
+    # input before its single write to `out`.
     if _spec_reason is None:
         out_lo = out.data_ptr()
         out_hi = out_lo + out.numel() * out.element_size()

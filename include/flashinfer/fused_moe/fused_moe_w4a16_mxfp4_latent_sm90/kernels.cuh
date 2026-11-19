@@ -31,12 +31,12 @@
  *   T  > 64  : prefill path, routing kernel + two tensor-core GEMM stages.
  * The guard, the CUDA-graph rules and the kill switch live in
  * flashinfer/fused_moe/w4a16_mxfp4_moe.py; this file validates nothing.
- * The device code and the decode/prefill launch heuristic are kept verbatim
- * from the measured artifact; only the host binding differs.
+ * Both paths combine weighted FC2 results in FP32 scratch, then launch a
+ * final cast to the caller's BF16 output.
  */
 //
 // Framework-independent device code: the kernels, device helpers and their
-// launch-geometry constants/macros, relocated verbatim from the former csrc
+// launch-geometry constants/macros, relocated from the former csrc
 // kernel TU. Included by exactly one binding TU,
 // csrc/fused_moe_w4a16_mxfp4_latent_sm90.cu,
 // which keeps the host-side launch glue and dispatch. File-scope geometry
@@ -605,7 +605,7 @@ __global__ __launch_bounds__(256) void fc2_m_k(
     const __nv_bfloat16* __restrict__ hbuf, const uint8_t* __restrict__ wp,
     const uint8_t* __restrict__ ws, const int* __restrict__ eoff, const int* __restrict__ moff,
     const int* __restrict__ mex, const int* __restrict__ ptok, const float* __restrict__ pw,
-    __nv_bfloat16* __restrict__ out) {
+    float* __restrict__ out) {
   extern __shared__ char smem[];
   __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem);
   __nv_bfloat16* Bs = As + MMM * MSTR;  // 2*MNT rows
@@ -730,12 +730,11 @@ __global__ __launch_bounds__(256) void fc2_m_k(
 #pragma unroll
             for (int nb = 0; nb < 2; ++nb) {
               const int n = n0 + nbase + nb * 8 + (lane & 3) * 2;
-              __nv_bfloat162 v0 =
-                  __floats2bfloat162_rn(a0[mb][nb][h * 2] * sw, a0[mb][nb][h * 2 + 1] * sw);
-              atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + n), v0);
-              __nv_bfloat162 v1 =
-                  __floats2bfloat162_rn(a1[mb][nb][h * 2] * sw, a1[mb][nb][h * 2 + 1] * sw);
-              atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + n + MNT), v1);
+#pragma unroll
+              for (int c = 0; c < 2; ++c) {
+                atomicAdd(out + ob + n + c, a0[mb][nb][h * 2 + c] * sw);
+                atomicAdd(out + ob + n + MNT + c, a1[mb][nb][h * 2 + c] * sw);
+              }
             }
           }
         }
@@ -1018,7 +1017,7 @@ __global__ __launch_bounds__(512, 2) void moe_dec_k(
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ wp1,
     const uint8_t* __restrict__ ws1, const uint8_t* __restrict__ wp2,
     const uint8_t* __restrict__ ws2, const int* __restrict__ ids, const float* __restrict__ tw,
-    __half* __restrict__ hbuf, int T, __nv_bfloat16* __restrict__ out) {
+    __half* __restrict__ hbuf, int T, float* __restrict__ out) {
   extern __shared__ char smem_raw[];
   __half* xs = reinterpret_cast<__half*>(smem_raw);
   int* smeta = reinterpret_cast<int*>(smem_raw + LH * 2);
@@ -1114,12 +1113,6 @@ __global__ __launch_bounds__(512, 2) void moe_dec_k(
       }
     }
   }
-  {
-    uint4* out4 = reinterpret_cast<uint4*>(out);
-    const int n4 = T * (LH / 8);
-    for (int i = blockIdx.x * blockDim.x + tid; i < n4; i += gridDim.x * blockDim.x)
-      out4[i] = make_uint4(0, 0, 0, 0);
-  }
   cooperative_groups::this_grid().sync();
   {
     constexpr int WOFF = (IH / 2) / 16;
@@ -1175,11 +1168,14 @@ __global__ __launch_bounds__(512, 2) void moe_dec_k(
       if (lane == 0) {
         const float w = sw[p0];
         const size_t ob = (size_t)(meta >> 6) * LH + row0;
-        __nv_bfloat162 v01 = __floats2bfloat162_rn(acc[0] * w, acc[1] * w);
-        __nv_bfloat162 v23 = __floats2bfloat162_rn(acc[2] * w, acc[3] * w);
-        atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob), v01);
-        atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + 2), v23);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) atomicAdd(out + ob + q, acc[q] * w);
       }
     }
   }
+}
+
+__global__ void finalize_k(const float* __restrict__ acc, __nv_bfloat16* __restrict__ out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16_rn(acc[i]);
 }

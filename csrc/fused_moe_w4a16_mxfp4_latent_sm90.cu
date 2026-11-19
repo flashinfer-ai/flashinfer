@@ -67,7 +67,9 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
   size_t off_p = off_x + (cap + EL) * sizeof(int);
   size_t off_w = off_p + cap * sizeof(int);
   size_t off_h = off_w + cap * sizeof(float);
-  size_t need = off_h + cap * IH * sizeof(__half);
+  size_t off_acc = off_h + cap * IH * sizeof(__half);
+  int nout = T * LH;
+  size_t need = off_acc + (size_t)nout * sizeof(float);
   WorkspaceSlot* slot = nullptr;
   {
     std::lock_guard<std::mutex> registry(g_ws_registry_mu);
@@ -119,6 +121,15 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
     check_cuda(cudaMallocAsync(&fallback, need, st), "cudaMallocAsync(workspace)");
     ws_ptr = fallback;
   }
+  // On an enqueue exception, queue the release after any work already
+  // submitted. Cleanup must not replace the original exception.
+  struct FallbackRelease {
+    void* ptr;
+    cudaStream_t stream;
+    ~FallbackRelease() {
+      if (ptr) static_cast<void>(cudaFreeAsync(ptr, stream));
+    }
+  } release{fallback, st};
   char* b = static_cast<char*>(ws_ptr);
   int* eoff = reinterpret_cast<int*>(b + off_e);
   int* moff = reinterpret_cast<int*>(b + off_m);
@@ -128,11 +139,13 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
   __half* hbuf = reinterpret_cast<__half*>(b + off_h);
   __nv_bfloat16* hbufb = reinterpret_cast<__nv_bfloat16*>(b + off_h);
 
+  float* acc = reinterpret_cast<float*>(b + off_acc);
+  check_cuda(cudaMemsetAsync(acc, 0, (size_t)nout * sizeof(float), st), "cudaMemsetAsync(acc)");
   if (MT != 1) {
-    cudaMemsetAsync(out.data_ptr(), 0, (size_t)T * LH * 2, st);
     route_k<false><<<1, 256, 0, st>>>(static_cast<const int*>(ids.data_ptr()),
                                       static_cast<const float*>(tw.data_ptr()), T, MT, eoff, moff,
-                                      mex, ptok, pw, static_cast<__nv_bfloat16*>(out.data_ptr()));
+                                      mex, ptok, pw, nullptr);
+    check_cuda(cudaGetLastError(), "route_k<false>");
   }
 
   if (MT == 1) {
@@ -160,9 +173,8 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
     const uint8_t* a4 = static_cast<const uint8_t*>(w2s.data_ptr());
     const int* a5 = static_cast<const int*>(ids.data_ptr());
     const float* a6 = static_cast<const float*>(tw.data_ptr());
-    __nv_bfloat16* a7 = static_cast<__nv_bfloat16*>(out.data_ptr());
     void* args[] = {(void*)&xp, (void*)&a1, (void*)&a2,   (void*)&a3, (void*)&a4,
-                    (void*)&a5, (void*)&a6, (void*)&hbuf, (void*)&T,  (void*)&a7};
+                    (void*)&a5, (void*)&a6, (void*)&hbuf, (void*)&T,  (void*)&acc};
     check_cuda(cudaLaunchCooperativeKernel((const void*)moe_dec_k, dim3(coop), dim3(512), args,
                                            (size_t)(LH * 2 + RCAP * 8), st),
                "cudaLaunchCooperativeKernel(moe_dec_k)");
@@ -173,11 +185,19 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
                                    static_cast<const uint8_t*>(w13p.data_ptr()),
                                    static_cast<const uint8_t*>(w13s.data_ptr()), eoff, moff, mex,
                                    ptok, hbufb);
+    check_cuda(cudaGetLastError(), "fc1_m_k");
     fc2_m_k<<<528, 256, sm2, st>>>(hbufb, static_cast<const uint8_t*>(w2p.data_ptr()),
                                    static_cast<const uint8_t*>(w2s.data_ptr()), eoff, moff, mex,
-                                   ptok, pw, static_cast<__nv_bfloat16*>(out.data_ptr()));
+                                   ptok, pw, acc);
+    check_cuda(cudaGetLastError(), "fc2_m_k");
   }
-  if (fallback) cudaFreeAsync(fallback, st);
+  finalize_k<<<(nout + 255) / 256, 256, 0, st>>>(acc, static_cast<__nv_bfloat16*>(out.data_ptr()),
+                                                 nout);
+  check_cuda(cudaGetLastError(), "finalize_k");
+  if (fallback) {
+    release.ptr = nullptr;  // Do not attempt a second free on an ambiguous CUDA error.
+    check_cuda(cudaFreeAsync(fallback, st), "cudaFreeAsync(workspace)");
+  }
 }
 
 // Exported by csrc/flashinfer_fused_moe_w4a16_mxfp4_latent_sm90_binding.cu

@@ -108,12 +108,10 @@ def test_specialized_matches_reference_backend():
     assert stats["backend_dispatches"]["reference"] == 1, stats
     assert stats["backend_dispatches"]["specialized"] == 1, stats
     assert _matched(y_spec, y_ref) >= 0.99
-    # determinism contract (as documented): bitwise on the decode launch
-    # path (T <= 64); the prefill path's bf16 atomic combine order is
-    # disclosed nondeterministic and is tolerance-checked instead.
+    # FP32 atomic sums need not be bitwise repeatable on either launch path.
     y2 = w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
     if not torch.equal(y_spec, y2):
-        # the op's documented rerun contract: the bf16 atomic combine order
+        # the op's documented rerun contract: the atomic combine order
         # is nondeterministic (disclosed in the PR); reruns must still agree
         # within the package gate band
         assert _matched(y2, y_spec, rtol=0.03, atol=0.02) >= 0.999, (
@@ -334,7 +332,7 @@ def test_unified_config_registered_and_default_visible():
 
 
 def test_unified_prepare_weights_validation():
-    x, w13p, w13s, w2p, w2s, ids, w = _cpu_case(T=2)
+    _, w13p, w13s, w2p, w2s, _, _ = _cpu_case(T=2, el=2, l=64, i=32, k=2)
     view = W4A16MxFp4LatentConfig.prepare_weights(w13p, w13s, w2p, w2s)
     assert set(view) == {"w13_packed", "w13_scale", "w2_packed", "w2_scale"}
     assert all(v.is_contiguous() for v in view.values())
@@ -559,6 +557,86 @@ def test_unified_runner_pack_rejections(monkeypatch):
 # ---- GPU (SM90) tests ------------------------------------------------------
 
 
+def _combine_case(T):
+    # One active intermediate. Gate and up each see 256, so SiTU rounds
+    # to exactly 4 * 25 = 100 in BF16. Code 2 in the low nibble is +1.
+    def bytes_(shape, value):
+        return torch.full(shape, value, dtype=torch.uint8, device="cuda")
+
+    x = torch.zeros(T, L, device="cuda", dtype=torch.bfloat16)
+    x[:, 0] = 256
+    w13p = bytes_((EL, 2 * I, L // 2), 0)
+    w13p[:3, 0, 0] = w13p[:3, I, 0] = 2
+    w13s = bytes_((EL, 2 * I, L // G), 127)
+    w2p = bytes_((EL, L, I // 2), 0)
+    w2p[:3, :, 0] = 2
+    w2s = bytes_((EL, L, I // G), 127)
+    ids = torch.arange(K, device="cuda", dtype=torch.int32).repeat(T, 1)
+    w = torch.zeros(T, K, device="cuda")
+    w[:, 0], w[:, 1], w[:, 2] = 16, 1 / 16, -16
+    # Two terms instead of three: rounding either weighted contribution to
+    # BF16 before combining now fails regardless of atomic scheduling.
+    w[1, 0], w[1, 1] = 16 + 1 / 16, 0
+    w[2, 1:3] = 0
+    expected = torch.full_like(x, 6.25)
+    expected[2] = 1600
+    return (x, w13p, w13s, w2p, w2s, ids, w), expected
+
+
+@pytest.mark.parametrize("T", [64, 65])
+def test_weighted_combine_single_final_round(T):
+    _sm90_or_skip()
+    args, expected = _combine_case(T)
+    x, w13p, w13s, w2p, w2s, ids, w = args
+    partial = ids.clone()
+    partial[:, 3:] += EL
+    partial[-1, :3] += EL
+    partial_expected = expected.clone()
+    partial_expected[-1].zero_()
+    out = torch.full_like(x, float("nan"))
+    for routes, oracle in ((ids, expected), (partial, partial_expected)):
+        y = w4a16_mxfp4_latent_routed_moe(*args[:5], routes, w, out=out, backend="auto")
+        torch.testing.assert_close(y, oracle, rtol=0, atol=0)
+    assert _w4a16_mxfp4_latent_moe_stats()["backend_dispatches"] == {
+        "specialized": 2,
+        "reference": 0,
+    }
+    layer = MoELayer(_unified_config())
+    _reset_w4a16_mxfp4_latent_moe_stats()
+    y = layer(_act_pack(x, ids, w), _weight_pack(w13p, w13s, w2p, w2s))
+    torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    assert layer.winner_backend == "w4a16_mxfp4_latent"
+    dispatches = _w4a16_mxfp4_latent_moe_stats()["backend_dispatches"]
+    assert dispatches["specialized"] >= 1 and dispatches["reference"] == 0
+
+
+@pytest.mark.parametrize("T", [64, 65])
+def test_graph_workspace_ordered_and_independent(T):
+    _sm90_or_skip()
+    args, expected = _combine_case(T)
+    # Distinct scores and outputs expose accidental cross-stream reuse.
+    cases = [args, (*args[:-1], -args[-1])]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    outputs = [torch.empty_like(expected) for _ in streams]
+    for s, graph, inputs, out in zip(streams, graphs, cases, outputs, strict=True):
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            w4a16_mxfp4_latent_routed_moe(*inputs, out=out, backend="specialized")
+        with torch.cuda.graph(graph, stream=s):
+            w4a16_mxfp4_latent_routed_moe(*inputs, out=out, backend="specialized")
+    for s, graph, inputs, out in zip(streams, graphs, cases, outputs, strict=True):
+        with torch.cuda.stream(s):
+            graph.replay()
+            w4a16_mxfp4_latent_routed_moe(*inputs, out=out, backend="specialized")
+            out.fill_(float("nan"))
+            graph.replay()
+    for s in streams:
+        torch.cuda.current_stream().wait_stream(s)
+    for y, oracle in zip(outputs, (expected, -expected), strict=True):
+        torch.testing.assert_close(y, oracle, rtol=0, atol=0)
+
+
 def test_unified_layer_ep_rejected_sm90():
     _sm90_or_skip()
     config = _unified_config(
@@ -592,7 +670,7 @@ def test_unified_layer_matches_flat_specialized():
     assert stats["backend_dispatches"]["reference"] == 0, stats
     assert layer.winner_backend == "w4a16_mxfp4_latent"
     assert y_layer.shape == y_flat.shape and y_layer.dtype == y_flat.dtype
-    # The kernel's bf16 atomic combine order is disclosed nondeterministic
+    # The kernel's FP32 atomic combine order is disclosed nondeterministic
     # (see the flat rerun hedge above), so two dispatches of the same kernel
     # live in a tolerance band, not at bitwise equality.
     assert _matched(y_layer, y_flat) >= 0.99
@@ -629,7 +707,7 @@ def test_unified_layer_prefill_path_matches_flat():
     y_ref = w4a16_mxfp4_latent_routed_moe(
         x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
     )
-    # The prefill path's bf16 atomic combine order is disclosed
+    # The prefill path's FP32 atomic combine order is disclosed
     # nondeterministic; gate layer-vs-flat within that band and the
     # reference comparison relative to the flat path (see the decode test
     # for why the absolute 0.99 reference band does not transfer here).
