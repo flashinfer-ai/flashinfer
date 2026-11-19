@@ -4495,19 +4495,30 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     ids=("bf16-d128", "bf16-d256", "nvfp4-d256"),
 )
 @pytest.mark.parametrize(
-    ("num_qo_heads", "num_kv_heads", "group_size", "block_size", "page_size"),
     (
-        (4, 1, 16, 4, 64),
-        (4, 1, 32, 4, 64),
-        (16, 2, 16, 4, 64),
-        (2, 1, 32, 4, 64),
+        "num_qo_heads",
+        "num_kv_heads",
+        "group_size",
+        "block_size",
+        "page_size",
+        "share_pattern",
+    ),
+    (
+        (4, 1, 16, 4, 64, True),
+        (4, 1, 32, 4, 64, True),
+        (16, 2, 16, 4, 64, True),
+        (2, 1, 32, 4, 64, True),
         # One Q head per KV head: rows 16-63 of the Keeps Q64 tile are padding,
         # read through the preloaded (4-token) and on-demand (8-token) paths.
-        (1, 1, 16, 4, 64),
-        (1, 1, 16, 8, 8),
+        (1, 1, 16, 4, 64, True),
+        (1, 1, 16, 8, 8, True),
         # 32-token blocks on 4-token pages: 4-token fragments, one membership
         # byte each, which G16/G32 support.
-        (4, 1, 16, 32, 4),
+        (4, 1, 16, 32, 4, True),
+        # Per-KV-head patterns: each head's planes stay inside its own row
+        # (Keeps Q64 and Q128 tiles).
+        (8, 2, 16, 4, 64, False),
+        (16, 2, 16, 4, 64, False),
     ),
 )
 def test_wide_group_packed_attention_matches_reference(
@@ -4516,6 +4527,7 @@ def test_wide_group_packed_attention_matches_reference(
     group_size: int,
     block_size: int,
     page_size: int,
+    share_pattern: bool,
     kv_dtype: torch.dtype,
     head_dim: int,
     split_kv: bool,
@@ -4571,21 +4583,30 @@ def test_wide_group_packed_attention_matches_reference(
             for data, scale in zip(caches, scales, strict=True)
         )
     positions = torch.arange(prefix, seq_len, dtype=torch.int32, device="cuda")
-    blocks = torch.full((num_queries, block_topk), -1, dtype=torch.int32, device="cuda")
-    pool = torch.randperm(prefix // block_size, generator=generator, device="cuda")[
-        : 2 * block_topk
-    ]
-    for token in range(num_queries):
-        bound = (int(positions[token]) + 1) // block_size
-        shared = pool[
-            torch.randperm(pool.numel(), generator=generator, device="cuda")[
-                : block_topk // 2
-            ]
+    # One selection per query and KV head; a shared pattern keeps head 0's.
+    blocks = torch.full(
+        (num_queries, num_kv_heads, block_topk), -1, dtype=torch.int32, device="cuda"
+    )
+    for kv_head in range(num_kv_heads):
+        pool = torch.randperm(prefix // block_size, generator=generator, device="cuda")[
+            : 2 * block_topk
         ]
-        private = torch.randperm(bound, generator=generator, device="cuda")
-        private = private[~torch.isin(private, shared)][: block_topk - shared.numel()]
-        selected = torch.cat((shared, private))
-        blocks[token, : selected.numel()] = selected.to(torch.int32)
+        for token in range(num_queries):
+            bound = (int(positions[token]) + 1) // block_size
+            shared = pool[
+                torch.randperm(pool.numel(), generator=generator, device="cuda")[
+                    : block_topk // 2
+                ]
+            ]
+            private = torch.randperm(bound, generator=generator, device="cuda")
+            private = private[~torch.isin(private, shared)][
+                : block_topk - shared.numel()
+            ]
+            selected = torch.cat((shared, private))
+            blocks[token, kv_head, : selected.numel()] = selected.to(torch.int32)
+    if share_pattern:
+        blocks = blocks[:, :1].expand(-1, num_kv_heads, -1)
+    run_blocks = blocks[:, 0].contiguous() if share_pattern else blocks.contiguous()
     query = torch.randn(
         (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
     ).to(torch.bfloat16)
@@ -4608,6 +4629,7 @@ def test_wide_group_packed_attention_matches_reference(
             group_size=group_size,
             kv_block_size=block_size,
             split_kv=split_kv,
+            share_pattern_across_kv_heads=share_pattern,
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -4627,6 +4649,7 @@ def test_wide_group_packed_attention_matches_reference(
         group_size=group_size,
         packed_query=True,
         split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern,
         q_dtype=torch.bfloat16,
         kv_dtype=kv_dtype,
         out_dtype=torch.bfloat16,
@@ -4636,7 +4659,7 @@ def test_wide_group_packed_attention_matches_reference(
         query,
         caches,
         table,
-        blocks,
+        run_blocks,
         requests,
         positions,
         qo_indptr=qo_indptr,
@@ -4653,26 +4676,26 @@ def test_wide_group_packed_attention_matches_reference(
     heads_q_per_kv = num_qo_heads // num_kv_heads
     for token in range(num_queries):
         visible = int(positions[token]) + 1
-        live = blocks[token][blocks[token] >= 0].long()
-        token_ids = (
-            live[:, None] * block_size + torch.arange(block_size, device="cuda")
-        ).flatten()
-        if visible % block_size:
+        tail = torch.arange(visible - visible % block_size, visible, device="cuda")
+        for kv_head in range(num_kv_heads):
+            selected = blocks[token, kv_head]
+            live = selected[selected >= 0].long()
             token_ids = torch.cat(
                 (
-                    token_ids,
-                    torch.arange(
-                        visible - visible % block_size, visible, device="cuda"
-                    ),
+                    (
+                        live[:, None] * block_size
+                        + torch.arange(block_size, device="cuda")
+                    ).flatten(),
+                    tail,
                 )
             )
-        grouped_query = query[token].float().view(num_kv_heads, heads_q_per_kv, -1)
-        scores = torch.einsum("hgd,nhd->hgn", grouped_query, keys[token_ids])
-        reference = torch.einsum(
-            "hgn,nhd->hgd", (scores / head_dim**0.5).softmax(-1), values[token_ids]
-        ).reshape(num_qo_heads, head_dim)
-        error = (output[token].float() - reference).norm() / reference.norm()
-        assert error < 0.01, (token, token % group_size, float(error))
+            heads = slice(kv_head * heads_q_per_kv, (kv_head + 1) * heads_q_per_kv)
+            scores = query[token, heads].float() @ keys[token_ids, kv_head].T
+            reference = (scores / head_dim**0.5).softmax(-1) @ values[
+                token_ids, kv_head
+            ]
+            error = (output[token, heads].float() - reference).norm() / reference.norm()
+            assert error < 0.01, (token, token % group_size, kv_head, float(error))
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION

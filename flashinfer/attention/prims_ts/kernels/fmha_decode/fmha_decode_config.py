@@ -1036,6 +1036,16 @@ class FmhaDecodeConfig:
         return self.share_pattern_across_kv_heads
 
     @property
+    def widens_sparse_metadata_rows_per_head(self) -> bool:
+        """Whether a nonpersistent CTA offsets per-head metadata to its KV head
+        and widens the row strides to ``Hkv`` rows (one row per batch)."""
+        return (
+            self.use_q_token_kv_block_sparse_route
+            and not self.shares_sparse_pattern
+            and not self.use_persistent_scheduler
+        )
+
+    @property
     def uses_q_token_kv_block_sparse_page_membership(self) -> bool:
         """Whether grouped sparse attention uses a packed-membership table."""
         return self.uses_q_token_kv_block_sparse_page_route and (

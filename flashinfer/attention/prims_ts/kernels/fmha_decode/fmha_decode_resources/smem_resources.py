@@ -1700,6 +1700,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     page_table_stride: cutlass.Int64 = None
     num_heads_kv: Int32 = None
     q_token_kv_block_sparse_page_membership_stride: Int32 = None
+    # G9-G32: words between consecutive membership planes of one route row.
+    q_token_kv_block_sparse_page_membership_plane_stride: Int32 | None = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
     b_idx: Int32 = None
@@ -2050,13 +2052,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 row = row * cutlass.Int64(self.num_heads_kv) + cutlass.Int64(head)
             plane_offset = cutlass.Int64(0)
             if cutlass.const_expr(cfg.page_membership_planes > 1):
-                # Queries 8p..8p+7 read byte plane p, p / planes of a row later.
-                # Callers pass ``wrap_membership_plane_query`` indices.
+                # Queries 8p..8p+7 read byte plane p, p plane strides into the
+                # row. Callers pass ``wrap_membership_plane_query`` indices.
                 assert query_idx is not None
-                plane_shift = {2: 1, 4: 2}[cfg.page_membership_planes]
-                plane_offset = cutlass.Int64(query_idx >> Int32(3)) * (
-                    cutlass.Int64(self.q_token_kv_block_sparse_page_membership_stride)
-                    >> cutlass.Int64(plane_shift)
+                plane_offset = cutlass.Int64(query_idx >> Int32(3)) * cutlass.Int64(
+                    self.q_token_kv_block_sparse_page_membership_plane_stride
                 )
             word = Uint32(
                 self.q_token_kv_block_sparse_page_memberships[
