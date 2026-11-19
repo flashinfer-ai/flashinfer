@@ -50,6 +50,7 @@ def get_compiled_sage_prepare(
     layout: _SageScaleLayout,
     num_qo_heads: int,
     num_kv_heads: int,
+    enable_pdl: bool = False,
 ) -> Callable[..., None]:
     """Compile the launch that writes a plan's prepared Sage scales.
 
@@ -57,6 +58,7 @@ def get_compiled_sage_prepare(
     torch tensors (``v_mean`` is ``None`` for a recipe without one) and runs on
     the current stream. The batch size is a runtime extent, as for the
     attention kernel, so plans of one layout share the compilation.
+    ``enable_pdl`` compiles the PDL launch of ``_PrepareSageScales``.
     """
 
     import cutlass
@@ -65,7 +67,9 @@ def get_compiled_sage_prepare(
 
     from .prepare import _PrepareSageScales
 
-    prepare = _PrepareSageScales(layout=layout, num_kv_heads=num_kv_heads)
+    prepare = _PrepareSageScales(
+        layout=layout, num_kv_heads=num_kv_heads, enable_pdl=enable_pdl
+    )
 
     @cute.jit
     def prepare_adapter(
@@ -112,8 +116,13 @@ def build_sage_prepared_scales(
     head_dim: int,
     device: torch.device,
     device_index: int,
+    enable_pdl: bool = False,
 ) -> SagePreparedScales:
-    """Allocate a plan's prepared scale buffer and compile its prepare launch."""
+    """Allocate a plan's prepared scale buffer and compile its prepare launch.
+
+    ``enable_pdl`` launches the prepare with programmatic dependent launch; a
+    plan passes the flag its attention launch uses.
+    """
 
     scale_shapes = sage_scale_shapes(
         sage,
@@ -130,7 +139,7 @@ def build_sage_prepared_scales(
         device=device,
     )
     prepare = get_compiled_sage_prepare(
-        device_index, layout, num_qo_heads, num_kv_heads
+        device_index, layout, num_qo_heads, num_kv_heads, enable_pdl
     )
     return SagePreparedScales(
         layout=layout,

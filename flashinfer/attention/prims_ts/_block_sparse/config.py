@@ -97,6 +97,8 @@ class _BlockSparseCompileKey:
     sage: SageAttentionConfig | None = None
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
     scale_types: tuple[bool, bool] = (False, False)
+    # Launch every kernel of the plan with programmatic dependent launch.
+    enable_pdl: bool = False
 
 
 @dataclass(frozen=True)
@@ -565,6 +567,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
         # Block-sparse and Sage plans compile for their exact lengths.
         "fixed_seqlen": True,
+        "use_pdl": key.enable_pdl,
     }
     if key.use_block_sparse:
         config_args.update(
@@ -649,6 +652,7 @@ def _resolve_block_sparse_launch_spec(
     sage: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
     scale_types: tuple[bool, bool] = (False, False),
+    enable_pdl: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -715,6 +719,7 @@ def _resolve_block_sparse_launch_spec(
         sage=sage,
         scale_types=scale_types,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        enable_pdl=enable_pdl,
     )
     try:
         config = _make_block_sparse_config(compile_key)

@@ -701,4 +701,5 @@ def test_window_delegates_k0_output_only(workspace_host, monkeypatch):
         1.0,
         None,
         "HND",
+        enable_pdl=None,
     )

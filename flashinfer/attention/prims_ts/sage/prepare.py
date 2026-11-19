@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda_drv
+from cutlass.experimental import primitives as prims
 
 from flashinfer.utils import ceil_div
 
@@ -248,17 +249,33 @@ class _PrepareSageScales:
     order, the K sections and the V rows.
 
     The buffer covers ``batch_size * num_kv_heads`` sequences
-    (``_SageScaleLayout``); the grid gives each of its float4s one thread. The kernel is an ordinary launch on the plan's
-    stream. A dense plan's attention launch follows it in stream order; a
-    block-sparse plan's route prepare follows it as a programmatic dependent
-    launch that acquires this grid before exiting, and attention follows the
-    route prepare in stream order.
+    (``_SageScaleLayout``); the grid gives each of its float4s one thread.
+    The kernel is the first launch of a run on the plan's stream. Attention
+    follows it directly in a context plan or a dense ``BlockSparseTSWrapper``
+    plan; a block-sparse plan launches its route prepare in between.
+
+    ``enable_pdl`` (part of the compiled kernel) launches the kernel with
+    programmatic dependent launch (PDL): every thread waits for the
+    preceding grid before it reads the source scales or writes the buffer,
+    and each CTA releases the dependent grid after its stores. A plan
+    compiles attention, and a block-sparse plan its route prepare, with the
+    same flag. Under PDL the route prepare waits in-kernel for the grid
+    launched before it ahead of its first global access, and attention ahead
+    of its first read of memory an earlier grid may write, so attention reads
+    a complete buffer; without PDL every launch is stream ordered.
     """
 
-    def __init__(self, *, layout: _SageScaleLayout, num_kv_heads: int) -> None:
+    def __init__(
+        self,
+        *,
+        layout: _SageScaleLayout,
+        num_kv_heads: int,
+        enable_pdl: bool = False,
+    ) -> None:
         self.layout = layout
         self.num_kv_heads = num_kv_heads
         self.sequence_float4s = layout.sequence_words // _FLOAT4_WORDS
+        self.enable_pdl = enable_pdl
 
     @cute.jit
     def __call__(
@@ -277,6 +294,7 @@ class _PrepareSageScales:
             grid=[ceil_div(num_float4s, _THREADS_PER_CTA), 1, 1],
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
     @cute.kernel
@@ -291,6 +309,10 @@ class _PrepareSageScales:
     ) -> None:
         """Write this thread's float4 of a K section, the Q rows or the V rows, if any."""
 
+        if cutlass.const_expr(self.enable_pdl):
+            # The preceding grid may write the source scales or still read
+            # the buffer this kernel overwrites.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
         float4_idx = block_idx * cutlass.Int32(_THREADS_PER_CTA) + thread_idx
@@ -338,6 +360,9 @@ class _PrepareSageScales:
                     kv_head_idx=head_idx,
                     float4_in_section=float4_in_sequence - q_rows_first_float4,
                 )
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.sync_threads()
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
 
 __all__ = ["_PrepareSageScales"]

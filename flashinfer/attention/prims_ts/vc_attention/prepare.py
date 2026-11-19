@@ -35,11 +35,15 @@ from __future__ import annotations
 
 import functools
 import math
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
+from cutlass.experimental import primitives as prims
+
+from flashinfer.utils import resolve_enable_pdl
 
 from . import (
     E4M3_MAX,
@@ -264,7 +268,12 @@ def _scale_slot(
 
 
 class _Shape:
-    """Compile-time geometry shared by the kernels of one preparation."""
+    """Compile-time geometry shared by the kernels of one preparation.
+
+    With ``enable_pdl`` every pass launches with programmatic dependent launch,
+    waits for the preceding grid before its first global memory access and
+    releases its dependent at its end.
+    """
 
     def __init__(
         self,
@@ -273,7 +282,10 @@ class _Shape:
         seq_len_kv: int,
         num_heads: int,
         repair_tiles: int,
+        *,
+        enable_pdl: bool,
     ):
+        self.enable_pdl = enable_pdl
         self.is_bf16 = is_bf16
         self.batch = batch
         self.seq_len_kv = seq_len_kv
@@ -296,9 +308,24 @@ class _Shape:
 
 class VcKvPass1(_Shape):
     def __init__(
-        self, is_bf16, batch, seq_len_kv, num_heads, repair_tiles, demean: bool
+        self,
+        is_bf16,
+        batch,
+        seq_len_kv,
+        num_heads,
+        repair_tiles,
+        demean: bool,
+        *,
+        enable_pdl: bool,
     ):
-        super().__init__(is_bf16, batch, seq_len_kv, num_heads, repair_tiles)
+        super().__init__(
+            is_bf16,
+            batch,
+            seq_len_kv,
+            num_heads,
+            repair_tiles,
+            enable_pdl=enable_pdl,
+        )
         self.demean = demean
 
     @cute.kernel
@@ -324,6 +351,10 @@ class VcKvPass1(_Shape):
         t, bh, b, h, rg, col0 = _coords(self.num_heads)
         smem = cutlass.utils.SmemAllocator()
         col_sums = smem.allocate_array(Float32, _ROW_GROUPS * VC_K_BLOCK_SIZE)
+        if cutlass.const_expr(self.enable_pdl):
+            # The preceding grid may write the inputs or still read the
+            # memory the outputs reuse.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         k_base = _row_base(
             mK.iterator.toint(), b, self.seq_len_kv, h, col0, 2, self.row_bytes
         )
@@ -449,6 +480,9 @@ class VcKvPass1(_Shape):
                     sign_bit=False,
                 )
 
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     @cute.jit
     def __call__(self, mK, mV, mPerm, mKPerm, mMean, mKSum, mStats, stream):
         self.kernel(mK, mV, mPerm, mKPerm, mMean, mKSum, mStats).launch(
@@ -456,6 +490,7 @@ class VcKvPass1(_Shape):
             block=[_THREADS, 1, 1],
             smem=_ROW_GROUPS * VC_K_BLOCK_SIZE * 4,
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
 
@@ -498,6 +533,10 @@ class VcKvPass2(_Shape):
         )
         smem = cutlass.utils.SmemAllocator()
         energy_part = smem.allocate_array(Float32, _THREADS * _ROWS_PER_THREAD)
+        if cutlass.const_expr(self.enable_pdl):
+            # The preceding grid may write the inputs or still read the
+            # memory the outputs reuse.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
         # Step 1. The V scale of this thread's channels from the residual amax.
         vmax_base = _stats_addr(mStats, bh, 1, 0)
@@ -679,6 +718,9 @@ class VcKvPass2(_Shape):
                             dst + k_per_core * 2, mem_space=1, dtype=Int32
                         ).store(val1)
 
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     @cute.jit
     def __call__(
         self, mV, mPerm, mMean, mKSum, mStats, mVScale, mV8, mMu, mEnergy, stream
@@ -688,6 +730,7 @@ class VcKvPass2(_Shape):
             block=[_THREADS, 1, 1],
             smem=_THREADS * _ROWS_PER_THREAD * 4,
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
 
@@ -709,8 +752,17 @@ class VcQKPass(_Shape):
         repair_tiles,
         seq_len_q: int,
         repair_tokens: int = 0,
+        *,
+        enable_pdl: bool,
     ):
-        super().__init__(is_bf16, batch, seq_len_kv, num_heads, repair_tiles)
+        super().__init__(
+            is_bf16,
+            batch,
+            seq_len_kv,
+            num_heads,
+            repair_tiles,
+            enable_pdl=enable_pdl,
+        )
         self.seq_len_q = seq_len_q
         self.repair_tokens = repair_tokens
         self.blocks_q = (seq_len_q + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE
@@ -872,6 +924,10 @@ class VcQKPass(_Shape):
         nb = co[0]
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_array(Float32, _THREADS // 32)
+        if cutlass.const_expr(self.enable_pdl):
+            # The preceding grid may write the inputs or still read the
+            # memory the outputs reuse.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         kb = nb - self.blocks_q
         if nb < self.blocks_q:
             self._block(
@@ -919,6 +975,9 @@ class VcQKPass(_Shape):
                 self.seq_len_kv,
             )
 
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     @cute.jit
     def __call__(
         self, mQ, mK, mPerm, mIndex, mStats, mQ8, mK8, mQScale, mKScale, stream
@@ -932,6 +991,7 @@ class VcQKPass(_Shape):
             block=[_THREADS, 1, 1],
             smem=(_THREADS // 32) * 4,
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
 
@@ -944,9 +1004,24 @@ class VcSelectPass(_Shape):
     """
 
     def __init__(
-        self, is_bf16, batch, seq_len_kv, num_heads, repair_tiles, repair_tokens: int
+        self,
+        is_bf16,
+        batch,
+        seq_len_kv,
+        num_heads,
+        repair_tiles,
+        repair_tokens: int,
+        *,
+        enable_pdl: bool,
     ):
-        super().__init__(is_bf16, batch, seq_len_kv, num_heads, repair_tiles)
+        super().__init__(
+            is_bf16,
+            batch,
+            seq_len_kv,
+            num_heads,
+            repair_tiles,
+            enable_pdl=enable_pdl,
+        )
         self.repair_tokens = repair_tokens
 
     @cute.kernel
@@ -969,6 +1044,10 @@ class VcSelectPass(_Shape):
         # The threshold prefix, the count still wanted at it, the count stored
         # above it and the count seen at it.
         state = smem.allocate_array(Int32, 4)
+        if cutlass.const_expr(self.enable_pdl):
+            # The preceding grid may write the inputs or still read the
+            # memory the outputs reuse.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         e_base = mEnergy.iterator.toint() + Int64(bh) * self.seq_len_kv * 4
         out_base = mIndex.iterator.toint() + Int64(bh) * self.repair_tokens * 4
         # One CTA streams the whole row, so four loads per thread and
@@ -1065,6 +1144,9 @@ class VcSelectPass(_Shape):
                             dtype=Int32,
                         ).store(i)
 
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     @cute.jit
     def __call__(self, mEnergy, mIndex, stream):
         self.kernel(mEnergy, mIndex).launch(
@@ -1072,6 +1154,7 @@ class VcSelectPass(_Shape):
             block=[_THREADS, 1, 1],
             smem=((_THREADS // 32) * _SELECT_BINS + _THREADS // 32 + 4) * 4,
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
 
@@ -1084,9 +1167,24 @@ class VcRepairRowsPass(_Shape):
     """
 
     def __init__(
-        self, is_bf16, batch, seq_len_kv, num_heads, repair_tiles, repair_tokens: int
+        self,
+        is_bf16,
+        batch,
+        seq_len_kv,
+        num_heads,
+        repair_tiles,
+        repair_tokens: int,
+        *,
+        enable_pdl: bool,
     ):
-        super().__init__(is_bf16, batch, seq_len_kv, num_heads, repair_tiles)
+        super().__init__(
+            is_bf16,
+            batch,
+            seq_len_kv,
+            num_heads,
+            repair_tiles,
+            enable_pdl=enable_pdl,
+        )
         self.repair_tokens = repair_tokens
 
     @cute.kernel
@@ -1107,6 +1205,10 @@ class VcRepairRowsPass(_Shape):
         past the selected count and the padding rows are zero.
         """
         j, bh, b, h, rg, col0 = _coords(self.num_heads)
+        if cutlass.const_expr(self.enable_pdl):
+            # The preceding grid may write the inputs or still read the
+            # memory the outputs reuse.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         v_base = _row_base(
             mV.iterator.toint(), b, self.seq_len_kv, h, col0, 2, self.row_bytes
         )
@@ -1189,6 +1291,9 @@ class VcRepairRowsPass(_Shape):
                             zeros.data_ptr().load(count=4, alignment=16), alignment=16
                         )
 
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     @cute.jit
     def __call__(self, mK, mV, mIndex, mStats, mKOut, mV8, stream):
         self.kernel(mK, mV, mIndex, mStats, mKOut, mV8).launch(
@@ -1196,6 +1301,7 @@ class VcRepairRowsPass(_Shape):
             block=[_THREADS, 1, 1],
             smem=0,
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
 
@@ -1223,9 +1329,11 @@ def _compiled(
     repair_tiles: int,
     seq_len_q: int,
     repair_tokens: int,
+    enable_pdl: bool,
 ):
     """The kernels of one geometry. ``seq_len_q`` is 0 under QK16 and ``repair_tokens`` is 0
     without repair. Absent operands are ``None`` at compile time as at run time.
+    ``enable_pdl`` compiles every pass for programmatic dependent launch.
 
     Each kernel goes through the PrimTS on-disk CuTe DSL cache like the context
     kernels, keyed by this geometry and the attention source tree, so a process
@@ -1241,6 +1349,7 @@ def _compiled(
         repair_tiles,
         seq_len_q,
         repair_tokens,
+        enable_pdl,
     )
 
     def build(kind, compile_fn):
@@ -1262,7 +1371,7 @@ def _compiled(
         "p1": build(
             "p1",
             lambda: cute.compile(
-                VcKvPass1(*shape, demean),
+                VcKvPass1(*shape, demean, enable_pdl=enable_pdl),
                 x16(),
                 x16(),
                 perm,
@@ -1277,7 +1386,7 @@ def _compiled(
         "p2": build(
             "p2",
             lambda: cute.compile(
-                VcKvPass2(*shape),
+                VcKvPass2(*shape, enable_pdl=enable_pdl),
                 x16(),
                 perm,
                 f32(),
@@ -1296,7 +1405,7 @@ def _compiled(
         k["select"] = build(
             "select",
             lambda: cute.compile(
-                VcSelectPass(*shape, repair_tokens),
+                VcSelectPass(*shape, repair_tokens, enable_pdl=enable_pdl),
                 f32(),
                 i32(),
                 stream,
@@ -1306,7 +1415,7 @@ def _compiled(
         k["rows"] = build(
             "rows",
             lambda: cute.compile(
-                VcRepairRowsPass(*shape, repair_tokens),
+                VcRepairRowsPass(*shape, repair_tokens, enable_pdl=enable_pdl),
                 None if qk8 else x16(),
                 x16(),
                 i32(),
@@ -1321,7 +1430,7 @@ def _compiled(
         k["qk"] = build(
             "qk",
             lambda: cute.compile(
-                VcQKPass(*shape, seq_len_q, repair_tokens),
+                VcQKPass(*shape, seq_len_q, repair_tokens, enable_pdl=enable_pdl),
                 x16(),
                 x16(),
                 perm,
@@ -1340,13 +1449,25 @@ def _compiled(
 
 @torch.no_grad()
 def vc_prepare(
-    k: torch.Tensor, v: torch.Tensor, perm: torch.Tensor, *, demean: bool = True
+    k: torch.Tensor,
+    v: torch.Tensor,
+    perm: torch.Tensor,
+    *,
+    demean: bool = True,
+    enable_pdl: Optional[bool] = None,
 ):
     """VC-Attention-QK16 operands ``(k_perm, v8, v_scale, mean, mu)`` of
     contiguous ``[B, S, H, D]`` K and V in ``perm`` order."""
-    return _prepare(None, k, v, perm, demean=demean, repair_tiles=0, repair_tokens=0)[
-        :5
-    ]
+    return _prepare(
+        None,
+        k,
+        v,
+        perm,
+        demean=demean,
+        repair_tiles=0,
+        repair_tokens=0,
+        enable_pdl=enable_pdl,
+    )[:5]
 
 
 @torch.no_grad()
@@ -1357,6 +1478,7 @@ def vc_prepare_fp8(
     perm: torch.Tensor,
     *,
     demean: bool = True,
+    enable_pdl: Optional[bool] = None,
 ):
     """VC-Attention-QK8 operands ``(q8, k8, v8, q_scale, k_scale, v_scale, mean,
     mu)`` of contiguous ``[B, S, H, D]`` Q, K and V, K and V in ``perm`` order."""
@@ -1365,7 +1487,14 @@ def vc_prepare_fp8(
             f"VC fused preparation needs contiguous head_dim {VC_HEAD_DIM} Q"
         )
     k8, v8, v_scale, mean, mu, q8, q_scale, k_scale = _prepare(
-        q, k, v, perm, demean=demean, repair_tiles=0, repair_tokens=0
+        q,
+        k,
+        v,
+        perm,
+        demean=demean,
+        repair_tiles=0,
+        repair_tokens=0,
+        enable_pdl=enable_pdl,
     )
     return q8, k8, v8, q_scale, k_scale, v_scale, mean, mu
 
@@ -1378,6 +1507,7 @@ def vc_prepare_repair(
     *,
     repair_tiles: int,
     repair_tokens: int,
+    enable_pdl: Optional[bool] = None,
 ):
     """V repair operands ``(q8, k_all, v_all, q_scale, k_scale, v_scale)`` in
     input order plus ``repair_tiles`` tiles of the ``repair_tokens`` largest-residual
@@ -1396,13 +1526,30 @@ def vc_prepare_repair(
         demean=False,
         repair_tiles=repair_tiles,
         repair_tokens=repair_tokens,
+        enable_pdl=enable_pdl,
     )
     return q8, k_all, v_all, q_scale, k_scale, v_scale
 
 
-def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, repair_tokens: int):
+def _prepare(
+    q,
+    k,
+    v,
+    perm,
+    *,
+    demean: bool,
+    repair_tiles: int,
+    repair_tokens: int,
+    enable_pdl: Optional[bool],
+):
     """Run the passes and return ``(k_out, v8, v_scale, mean, mu, q8, q_scale,
-    k_scale)``. ``q`` selects QK8 and the QK8 outputs are ``None`` without it."""
+    k_scale)``. ``q`` selects QK8 and the QK8 outputs are ``None`` without it.
+
+    ``enable_pdl`` (``None``: where the device supports it) launches every pass
+    with programmatic dependent launch. Each pass waits for the preceding grid
+    before its first global memory access, so the passes stay ordered as on a
+    plain stream.
+    """
     b, s_k, h, d = k.shape
     if d != VC_HEAD_DIM:
         raise ValueError(f"VC fused preparation supports head_dim {VC_HEAD_DIM} only")
@@ -1413,9 +1560,18 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, repair_tokens: i
     repair = repair_tiles > 0
     rows = vc_repair_kv_len(s_k, repair_tiles) if repair else s_k
     s_q = 0 if q is None else q.shape[1]
+    enable_pdl = resolve_enable_pdl(enable_pdl, dev)
     with torch.cuda.device(dev):
         ker = _compiled(
-            k.dtype, bool(demean), b, s_k, h, repair_tiles, s_q, repair_tokens
+            k.dtype,
+            bool(demean),
+            b,
+            s_k,
+            h,
+            repair_tiles,
+            s_q,
+            repair_tokens,
+            enable_pdl,
         )
     if not repair and (
         perm is None or tuple(perm.shape) != (b, h, s_k) or perm.device != dev

@@ -3,6 +3,8 @@
 
 """Support checks and autotune cache behavior for the dense PrimsTS GEMM."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -130,6 +132,7 @@ def test_fallback_cluster_and_default_config():
         head_dim=None,
         is_neox=None,
         has_qkv_scale=False,
+        enable_pdl=True,
     )
     assert fp8 == PrimsTsGemmConfig(
         100, "fp8_e4m3", "bf16", "linear", False, None, None
@@ -144,10 +147,24 @@ def test_fallback_cluster_and_default_config():
         head_dim=None,
         is_neox=None,
         has_qkv_scale=False,
+        enable_pdl=True,
     )
     assert fp4 == PrimsTsGemmConfig(
         100, "nvfp4_e2m1", "bf16", "linear", False, None, None, tile_k=256
     )
+    fp4_no_pdl = fallback_config(
+        arch=100,
+        operand_format="nvfp4_e2m1",
+        output_format="bf16",
+        epilogue="linear",
+        has_bias=False,
+        head_dim=None,
+        is_neox=None,
+        has_qkv_scale=False,
+        enable_pdl=False,
+    )
+    assert fp4_no_pdl == replace(fp4, enable_pdl=False)
+    assert fp4_no_pdl != fp4
 
 
 def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
@@ -249,12 +266,14 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
         head_dim=None,
         is_neox=None,
         has_qkv_scale=False,
+        enable_pdl=False,
         tactic=(2, 2, 256, 128, False, 5, 64, False, 8, True),
     )
     assert narrowed.ab_stages == 5
     assert narrowed.epilogue_warps == 8
     assert narrowed.scheduler == "static"
     assert narrowed.use_tma_store is True
+    assert narrowed.enable_pdl is False
 
 
 def test_explicit_config_does_not_call_the_tuner(monkeypatch):
@@ -297,14 +316,23 @@ def test_autotune_second_call_hits_cache_and_epilogues_stay_separate(monkeypatch
     a_scale = torch.ones((m,), device=device)
     weight_scale = torch.ones((n,), device=device)
     with autotune(True, tuning_buckets=(32,)):
-        fp8_linear(a, weight, a_scale, weight_scale)
+        fp8_linear(a, weight, a_scale, weight_scale, enable_pdl=True)
         assert calls["n"] == 1
-        fp8_linear(a, weight, a_scale, weight_scale)
+        fp8_linear(a, weight, a_scale, weight_scale, enable_pdl=True)
         assert calls["n"] == 1
         ops = {key.custom_op for key in AutoTuner.get().profiling_cache}
         assert "prims_ts_fp8_linear" in ops
         assert "prims_ts_fp8_swiglu" not in ops
-        fp8_linear_swiglu(a, weight, a_scale, weight_scale)
+        fp8_linear_swiglu(a, weight, a_scale, weight_scale, enable_pdl=True)
         ops = {key.custom_op for key in AutoTuner.get().profiling_cache}
         assert "prims_ts_fp8_swiglu" in ops
         assert calls["n"] == 2
+        # PDL keys its own record: the same shape with PDL off tunes again.
+        fp8_linear(a, weight, a_scale, weight_scale, enable_pdl=False)
+        assert calls["n"] == 3
+        modes = {
+            key.extras[-1]
+            for key in AutoTuner.get().profiling_cache
+            if key.custom_op == "prims_ts_fp8_linear"
+        }
+        assert modes == {("enable_pdl", True), ("enable_pdl", False)}
