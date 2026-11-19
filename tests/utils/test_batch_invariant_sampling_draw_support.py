@@ -1665,6 +1665,44 @@ def test_determinism_graph_replay_and_pdl():
 
 
 @needs_device
+def test_scalar_filter_cache_is_ordered_across_streams():
+    """The per-row tensor of a Python-scalar filter is cached on its first use; a call on ANOTHER stream must not read it
+    before the creating stream's fill has run (the review of #9695 reproduced 521 of 601 wrong rows with the fill queued
+    behind busy work on the creating stream). The entry carries its fill's event and other streams wait on it, device side.
+    The (value, rows) pair is this test's own, so its first use is here."""
+    N, M, k = 1000, 601, 43
+    p = weights(M, N, torch.bfloat16)
+    s, o = keys(M, 11)
+    k_rows = torch.full(
+        (M,), k, dtype=torch.int32, device="cuda"
+    )  # a per-row tensor: no cache involved
+    ref = flashinfer.sampling.top_k_sampling_from_probs(
+        p, k_rows, seed=s, offset=o, batch_invariant=True
+    )
+    torch.cuda.synchronize()
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(a):
+        busy = torch.randn(8192, 8192, device="cuda")
+        for _ in range(
+            4
+        ):  # tens of milliseconds: the scalar's fill queues behind it on this stream
+            busy = busy @ busy / 128.0
+        out_a = flashinfer.sampling.top_k_sampling_from_probs(
+            p, k, seed=s, offset=o, batch_invariant=True
+        )
+    with torch.cuda.stream(b):  # the cached tensor, before the fill on stream a has run
+        out_b = flashinfer.sampling.top_k_sampling_from_probs(
+            p, k, seed=s, offset=o, batch_invariant=True
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(out_a, ref)
+    assert torch.equal(out_b, ref), (
+        f"{int((out_b != ref).sum())} of {M} rows read the scalar filter before its fill"
+    )
+    del busy
+
+
+@needs_device
 def test_preallocated_outputs():
     """Caller-owned output buffers on the public entries (``out=`` on every truncated sampler; ``logprob_out=`` /
     ``kept_logprob_out=`` on the logits one, implying their ``return_*``): written in place and returned as given, bit

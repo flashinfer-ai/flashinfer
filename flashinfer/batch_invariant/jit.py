@@ -215,9 +215,16 @@ def precompile(module: str, kernel: str, compile_fn: Callable[[], Any]) -> None:
     path the GEMM and MoE precompilers use). The entry for precompile pools: ``build_and_load`` holds the lock for the whole
     build, which makes a pool of workers compiling DIFFERENT kernels of one family serial -- 579 truncated-sampler kernels on
     8 workers measured 1565 s through it against 259 s through this path (2026-11-18). A kernel already in the cache is left
-    alone."""
-    from ..jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
+    alone; with the disk cache disabled (``FLASHINFER_CUTE_DSL_DISABLE_CACHE=1``) there is nothing to persist and nothing is
+    compiled."""
+    from ..jit.cute_dsl_core import (
+        JitSpecCuteDsl,
+        _hash_source_files,
+        cute_dsl_cache_disabled,
+    )
 
+    if cute_dsl_cache_disabled():
+        return  # nothing to persist: with the disk cache disabled the serving path compiles in-process
     key_files = [str(p) for p in module_sources(module)]
     spec = JitSpecCuteDsl(
         module, kernel, compile_fn, _hash_source_files(tuple(key_files))

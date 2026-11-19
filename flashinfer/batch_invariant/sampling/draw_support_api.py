@@ -58,24 +58,43 @@ def _check_input(x: torch.Tensor, name: str) -> int:
     return check_input(x, name, CLASS, SUPPORT_ARCHS)
 
 
-_CONST_ROWS: Dict[tuple, torch.Tensor] = {}
+#: (device, dtype, value, rows) -> [the tensor, the event of its fill (None once that fill is known complete)]
+_CONST_ROWS: Dict[tuple, list] = {}
 _CONST_ROWS_MAX = 256
 
 
 def _const_rows(device, dtype: torch.dtype, v, M: int) -> torch.Tensor:
     """The per-row tensor of a Python-scalar filter value, cached per (device, dtype, value, rows): the kernel only reads
     it, so one fill serves every call with that scalar (a fill kernel and an allocation per scalar filter per call before
-    2026-11-18). A tensor made inside a CUDA-graph capture belongs to the graph's pool and is not cached; the cache is
-    bounded (past the bound a call fills a fresh tensor, as before)."""
+    2026-11-18). The fill runs on the creating call's stream and the entry carries its event: a call on another stream
+    waits on that event, device side, until the fill is known complete, after which the entry is used as it stands (the
+    review of #9695 read the tensor from a second stream before its fill had run). Inside a CUDA-graph capture on the
+    tensor's device the cache is not consulted: the call fills its own tensor into the graph, as every call did before (an
+    event recorded outside a capture cannot be waited on inside it). The cache is bounded (past the bound a call fills a
+    fresh tensor)."""
+    dev = torch.device(device)
+    if dev.index is not None and dev.index != torch.cuda.current_device():
+        with torch.cuda.device(dev):
+            capturing = torch.cuda.is_current_stream_capturing()
+    else:
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        return torch.full((M,), v, dtype=dtype, device=device)
     key = (device, dtype, v, M)
-    t = _CONST_ROWS.get(key)
-    if t is None:
+    entry = _CONST_ROWS.get(key)
+    if entry is None:
         t = torch.full((M,), v, dtype=dtype, device=device)
-        if (
-            len(_CONST_ROWS) < _CONST_ROWS_MAX
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            _CONST_ROWS[key] = t
+        if len(_CONST_ROWS) < _CONST_ROWS_MAX:
+            fill_done = torch.cuda.Event()
+            fill_done.record(torch.cuda.current_stream(dev))
+            _CONST_ROWS[key] = [t, fill_done]
+        return t
+    t, fill_done = entry
+    if fill_done is not None:
+        if fill_done.query():
+            entry[1] = None  # the fill is complete: no ordering needed from here on
+        else:
+            torch.cuda.current_stream(dev).wait_event(fill_done)
     return t
 
 
