@@ -4,7 +4,9 @@
 ``BatchPrefillWithRaggedKVCacheWrapper``: the wrappers' ``plan`` / ``run`` hand their arguments here, the class's typed checks raise
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for everything the class does not cover (nothing falls back), and the
 engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
-its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
+its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token. The operand format
+is a class dimension: ``plan()`` with bf16 queries, keys, values and output runs ``attention.bf16``, with fp16 (IEEE binary16) for
+all four ``attention.fp16`` (binary16 leaves and MMA steps, the probabilities and the output rounded to binary16); mixed formats raise.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -24,9 +26,13 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, class_name, scale_log2
 
 CLASS = "attention.bf16"
+#: The operand formats of the class family (``spec.OPERAND_FMTS``): q, K, V and the output of one plan share one of them, and it
+#: names the class -- ``attention.bf16`` or ``attention.fp16``. A mixed plan is in neither class.
+OPERAND_DTYPES = engine.OPERAND_DTYPES
+_FMT_NAME = {"bf16": "bf16", "f16": "fp16"}
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 ATTENTION_ARCHS = ((10, 0), (10, 3), (10, 7))
 _MAX_PAGE = 128
@@ -40,7 +46,8 @@ def _dtype(x) -> torch.dtype:
 
 class BatchInvariantAttention:
     """One instance per wrapper: ``kind`` is ``"decode"`` (paged KV, one or more query tokens per request), ``"prefill"`` (paged
-    KV) or ``"ragged"`` (the K / V of every request packed along the token dimension)."""
+    KV) or ``"ragged"`` (the K / V of every request packed along the token dimension). ``CLASS`` is the planned class: the bf16
+    class until a ``plan()`` with fp16 queries, keys, values and output selects ``attention.fp16``."""
 
     CLASS = CLASS
 
@@ -80,6 +87,9 @@ class BatchInvariantAttention:
         self.device = float_workspace_buffer.device
         self.workspace = float_workspace_buffer
         self.reset_workspace(float_workspace_buffer)
+        self._dtype = (
+            torch.bfloat16
+        )  # the planned operand dtype (q, K, V and the output)
         self._planned: Optional[engine._Planned] = None
         self._config: Optional[engine.AttnConfig] = None
         self._kv_indptr: Optional[torch.Tensor] = None
@@ -240,64 +250,73 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"a GQA group of {g}", "at most 128 query heads per KV head"
             )
-        for name, dt in (
-            ("q_data_type", q_data_type),
-            ("kv_data_type", kv_data_type),
-            ("o_data_type", o_data_type),
-        ):
-            if _dtype(dt) != torch.bfloat16:
+        # one operand format per plan: the query's (bf16 when not given), which the KV cache and the output take when theirs is not
+        # given (the wrappers' own default); bf16 is the class attention.bf16, fp16 the class attention.fp16, anything else and
+        # every mix of the two is outside both
+        q_dtype = _dtype(q_data_type)
+        if q_dtype not in OPERAND_DTYPES:
+            raise unsupported(
+                CLASS,
+                f"q_data_type {q_dtype}",
+                "bf16 or fp16 queries, keys, values and output (one format for all four)",
+            )
+        cls = class_name(OPERAND_DTYPES[q_dtype])
+        fmt_name = _FMT_NAME[OPERAND_DTYPES[q_dtype]]
+        for name, dt in (("kv_data_type", kv_data_type), ("o_data_type", o_data_type)):
+            if dt is not None and _dtype(dt) != q_dtype:
                 raise unsupported(
-                    CLASS,
-                    f"{name} {_dtype(dt)}",
-                    "bf16 queries, keys, values and output",
+                    cls,
+                    f"{name} {_dtype(dt)} with q_data_type {q_dtype}",
+                    f"{fmt_name} queries, keys, values and output (the class has one operand format; mixed fp16 / bf16 "
+                    "operands are not a class of the mode)",
                 )
         if self.kind == "ragged":
             page_size = 1
         if page_size < 1 or page_size > _MAX_PAGE or page_size & (page_size - 1):
             raise unsupported(
-                CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
+                cls, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
             )
         if self.kind != "decode" and not causal:
             raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+                cls, "non-causal attention", "causal attention (bottom-right aligned)"
             )
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
-                CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
+                cls, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
             )
         if pos_encoding_mode not in ("NONE", 0, None):
             raise unsupported(
-                CLASS,
+                cls,
                 f"pos_encoding_mode {pos_encoding_mode!r}",
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         if rope_scale is not None or rope_theta is not None:
-            raise unsupported(CLASS, "rope_scale / rope_theta", "no fused RoPE")
+            raise unsupported(cls, "rope_scale / rope_theta", "no fused RoPE")
         if custom_mask is not None or packed_custom_mask is not None:
             raise unsupported(
-                CLASS,
+                cls,
                 "a custom mask",
                 "the causal mask with an optional sliding window",
             )
         if use_fp16_qk_reduction:
             raise unsupported(
-                CLASS,
+                cls,
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
         if fixed_split_size is not None or disable_split_kv:
             raise unsupported(
-                CLASS,
+                cls,
                 "fixed_split_size / disable_split_kv",
                 "the class's own split rule (a function of the SM count only)",
             )
         if use_token_head_sf:
-            raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
+            raise unsupported(cls, "use_token_head_sf", f"unscaled {fmt_name} K / V")
         if window_left is None:
             window_left = -1
         if window_left < -1:
             raise unsupported(
-                CLASS,
+                cls,
                 f"window_left {window_left}",
                 "window_left >= 0, or -1 for no window",
             )
@@ -310,14 +329,14 @@ class BatchInvariantAttention:
                     ok = False
             if not ok:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"sm_scale {sm_scale}",
                     "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
                 )
         if self.kind == "decode":
             if q_len_per_req < 1:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"q_len_per_req {q_len_per_req}",
                     "at least one query token per request",
                 )
@@ -328,32 +347,32 @@ class BatchInvariantAttention:
         else:
             if qo_indptr is None:
                 raise unsupported(
-                    CLASS, "a plan without qo_indptr", "the packed query offsets"
+                    cls, "a plan without qo_indptr", "the packed query offsets"
                 )
         kv_indptr_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
         qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
         if bool((kv_indptr_host < 0).any()):
             raise unsupported(
-                CLASS,
+                cls,
                 f"a negative kv_indptr entry ({int(kv_indptr_host.min())})",
                 "non-negative KV offsets",
             )
         if qo_host.numel() != kv_indptr_host.numel():
             raise unsupported(
-                CLASS,
+                cls,
                 f"{qo_host.numel() - 1} query requests over {kv_indptr_host.numel() - 1} KV requests",
                 "one KV range per request",
             )
         kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
         if qo_host.numel() and int(qo_host[0]) != 0:
             raise unsupported(
-                CLASS,
+                cls,
                 f"qo_indptr starting at {int(qo_host[0])}",
                 "qo_indptr[0] == 0 (the packed query rows start at row 0)",
             )
         if kv_indptr_host.numel() and int(kv_indptr_host[-1]) >= 2**31:
             raise unsupported(
-                CLASS,
+                cls,
                 f"kv_indptr[-1] = {int(kv_indptr_host[-1])}",
                 "page-table offsets below 2^31 (the kernels read them as int32)",
             )
@@ -364,27 +383,27 @@ class BatchInvariantAttention:
         else:
             if kv_last_page_len is None or kv_indices is None:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     "a paged plan without kv_indices / kv_last_page_len",
                     "the paged KV CSR triple",
                 )
             last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
             if last_host.numel() != kv_spans.numel():
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"kv_last_page_len of {last_host.numel()} entries for {kv_spans.numel()} requests",
                     "one last-page length per request",
                 )
             if bool(((last_host < 0) | (last_host > page_size)).any()):
                 raise unsupported(
-                    CLASS,
+                    cls,
                     "a kv_last_page_len outside 0..page_size",
                     f"last-page lengths in 0..{page_size}",
                 )
             n_pages = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
             if kv_indices.numel() < n_pages:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"kv_indices of {kv_indices.numel()} entries for kv_indptr[-1] = {n_pages}",
                     "one page index per referenced page",
                 )
@@ -398,7 +417,7 @@ class BatchInvariantAttention:
                     lo, hi = int(bounds.min), int(bounds.max)
                 if lo < 0:
                     raise unsupported(
-                        CLASS, "a negative page index", "page indices in 0..num_pages-1"
+                        cls, "a negative page index", "page indices in 0..num_pages-1"
                     )
                 max_page = hi  # checked against the cache at run()
             # a request without pages has no keys, whatever its last-page entry (the planner's rule)
@@ -409,13 +428,13 @@ class BatchInvariantAttention:
         for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
             if ql < 0 or kl < 0:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"request {i} with a decreasing qo_indptr / kv_indptr",
                     "non-decreasing offsets",
                 )
             if ql > kl:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"request {i} with {ql} query tokens over {kl} keys",
                     "kv_len >= q_len per request (the causal class)",
                 )
@@ -474,7 +493,7 @@ class BatchInvariantAttention:
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
-                    CLASS,
+                    cls,
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
@@ -495,6 +514,8 @@ class BatchInvariantAttention:
             else torch.zeros(1, dtype=torch.int32, device=self.device)
         )
         self._planned = planned
+        self._dtype = q_dtype
+        self.CLASS = cls
         self._config = config
         self._kv_indptr = kv_indptr_dev
         self._kv_indices = kv_indices_dev
@@ -529,41 +550,43 @@ class BatchInvariantAttention:
             c = engine.check_sm_scale(effective_scale)
         except ValueError:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"sm_scale {sm_scale}",
                 "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
             ) from None
         # The kernel consumes a binary32 log2 scale, not the caller's Python float.
         if c != self._scale_log2:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"sm_scale {effective_scale} at forward() after planning {self._sm_scale}",
                 "the planned binary32 log2 scale",
             )
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
-                CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
+                self.CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
             )
         if pos_encoding_mode not in ("NONE", 0, None):
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"pos_encoding_mode {pos_encoding_mode!r}",
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
         if causal is not None and not causal and self.kind != "decode":
             raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+                self.CLASS,
+                "non-causal attention",
+                "causal attention (bottom-right aligned)",
             )
         if use_fp16_qk_reduction:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
         if window_left is not None and int(window_left) != self._window_left:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"window_left {window_left} at forward() after planning {self._window_left}",
                 "the planned window",
             )
@@ -590,33 +613,38 @@ class BatchInvariantAttention:
         """Validate changing run-time inputs once, then launch with the fixed plan."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        fmt_name = _FMT_NAME[OPERAND_DTYPES[self._dtype]]
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "use_fp16_softmax / uses_spcompress",
                 "the fp32 softmax of the class",
             )
         if return_lse or lse is not None:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "return_lse",
                 "the attention output alone (the class has no LSE member yet)",
             )
         if any(s is not None for s in scales):
             raise unsupported(
-                CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
+                self.CLASS,
+                "q_scale / k_scale / v_scale / o_scale",
+                f"unscaled {fmt_name} operands",
             )
         if sinks is not None:
-            raise unsupported(CLASS, "attention sinks", "plain softmax")
+            raise unsupported(self.CLASS, "attention sinks", "plain softmax")
         if kv_cache_sf is not None:
-            raise unsupported(CLASS, "a scaled (fp8 / fp4) KV cache", "a bf16 KV cache")
+            raise unsupported(
+                self.CLASS, "a scaled (fp8 / fp4) KV cache", f"a {fmt_name} KV cache"
+            )
         if skip_softmax_threshold_scale_factor is not None:
             raise unsupported(
-                CLASS, "skip_softmax_threshold_scale_factor", "the full softmax"
+                self.CLASS, "skip_softmax_threshold_scale_factor", "the full softmax"
             )
         if window_left is not None and int(window_left) != self._window_left:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"window_left {window_left} at run() after planning {self._window_left}",
                 "the planned window",
             )
@@ -625,19 +653,17 @@ class BatchInvariantAttention:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
         if q.dim() != 3 or q.shape[1] != Hq or q.shape[2] != D:
             raise unsupported(
-                CLASS, f"q of shape {tuple(q.shape)}", f"(total_q, {Hq}, {D})"
+                self.CLASS, f"q of shape {tuple(q.shape)}", f"(total_q, {Hq}, {D})"
             )
         if q.shape[0] != self._total_q:
             raise unsupported(
-                CLASS, f"{q.shape[0]} query rows", f"the planned {self._total_q}"
+                self.CLASS, f"{q.shape[0]} query rows", f"the planned {self._total_q}"
             )
-        if (
-            q.dtype != torch.bfloat16
-            or k.dtype != torch.bfloat16
-            or v.dtype != torch.bfloat16
-        ):
+        if q.dtype != self._dtype or k.dtype != self._dtype or v.dtype != self._dtype:
             raise unsupported(
-                CLASS, f"dtypes ({q.dtype}, {k.dtype}, {v.dtype})", "bf16 q, k and v"
+                self.CLASS,
+                f"dtypes ({q.dtype}, {k.dtype}, {v.dtype})",
+                f"{fmt_name} q, k and v (the planned operand format)",
             )
         if (
             q.device != self.device
@@ -645,7 +671,7 @@ class BatchInvariantAttention:
             or v.device != self.device
         ):
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"q / k / v on ({q.device}, {k.device}, {v.device})",
                 f"tensors on the wrapper's device {self.device}",
             )
@@ -678,7 +704,7 @@ class BatchInvariantAttention:
                 want += " 16-byte aligned (base address and outer strides: the TMA descriptors)"
             if not ok:
                 raise unsupported(
-                    CLASS,
+                    self.CLASS,
                     f"{name} of shape {tuple(t.shape)} (strides {tuple(t.stride())}) at run()",
                     f"the planned {self.kv_layout} geometry {want}",
                 )
@@ -686,7 +712,7 @@ class BatchInvariantAttention:
             q = q.contiguous()
         if q.data_ptr() % 16:
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "a q whose base address is not 16-byte aligned",
                 "a 16-byte-aligned q (the TMA descriptor's requirement)",
             )
@@ -694,19 +720,19 @@ class BatchInvariantAttention:
             out = torch.empty_like(q)
         elif (
             out.shape != q.shape
-            or out.dtype != torch.bfloat16
+            or out.dtype != self._dtype
             or out.device != self.device
             or not out.is_contiguous()
             or out.data_ptr() % 16
         ):
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 f"out {tuple(out.shape)} {out.dtype} on {out.device}",
-                f"a contiguous bf16 ({q.shape[0]}, {Hq}, {D}) output on {self.device}",
+                f"a contiguous {fmt_name} ({q.shape[0]}, {Hq}, {D}) output on {self.device}",
             )
         elif engine._output_overlaps_kv(out, k, v):
             raise unsupported(
-                CLASS,
+                self.CLASS,
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
