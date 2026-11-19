@@ -55,7 +55,8 @@ CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
 
 # attention toy cases: (name, D, T, C, p, window_left, row id, d, kv format) -- T = 16 (one PV step per tile) and C = 32 keep the
 # printed terms small; D = 64 / 128 / 256 are the three head-dim classes (4 / 8 / 16 MMA steps per score); the KV format "bf16"
-# is the bf16 class, "e4m3" / "e5m2" the fp8-KV classes (widened leaves, the scaled epilogue)
+# is the bf16 class, "e4m3" / "e5m2" the fp8-KV classes (widened leaves, the scaled epilogue), "nvfp4" the NVFP4-KV class,
+# "e4m3th" / "e5m2th" the token-head-scale classes (exact leaves, per-key scaled scores and PV operands, the bf16 epilogue)
 ATTN_CASES = [
     ("a0", 64, 16, 32, 40, -1, 0, 0, "bf16"),
     ("a1", 64, 16, 32, 40, 20, 0, 1, "bf16"),
@@ -111,6 +112,29 @@ ATTN_CASES = [
         17,
         "nvfp4",
     ),  # the NVFP4-KV class: dq4 leaves (output column 17: block 1 of the V scales)
+    (
+        "a14",
+        64,
+        16,
+        32,
+        33,
+        5,
+        1,
+        2,
+        "e4m3th",
+    ),  # the e4m3 token-head-scale class: scaled scores and scaled PV operands under the bf16 chain (two chunks merged)
+    ("a15", 128, 16, 32, 33, 5, 1, 2, "e5m2th"),  # the e5m2 one at D = 128
+    (
+        "a16",
+        64,
+        32,
+        64,
+        40,
+        20,
+        0,
+        1,
+        "e4m3th",
+    ),  # two PV slices per tile: the scales of both slices' keys
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
 
@@ -498,6 +522,10 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_kv",
     "Attn.output_depends_on_kv_fmt",
     "Attn.output_depends_on_kv_nvfp4",
+    "Attn.output_depends_on_kv_th",
+    "Attn.output_depends_on_kv_th_fmt",
+    "Attn.output_depends_on_kv_th_bf16",
+    "Attn.masked_scales_absent",
 )
 
 
