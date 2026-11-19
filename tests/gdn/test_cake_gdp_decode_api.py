@@ -123,6 +123,15 @@ def test_signature_follows_gated_delta_rule_mtp() -> None:
     assert supported.default is torch.float32
 
 
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Bitwise equality of two 2-byte tensors of the same dtype and shape (a signed zero differs)."""
+    return (
+        a.dtype == b.dtype
+        and a.shape == b.shape
+        and torch.equal(a.view(torch.int16), b.view(torch.int16))
+    )
+
+
 def _inputs(n: int, T: int, generator: torch.Generator) -> dict:
     device = _device()
     B, H = 4, 6
@@ -203,8 +212,8 @@ def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
     pool_facade = pool.clone()
     inputs["initial_state"].copy_(pool_before)
     out_backend, _ = backend.cake_gated_delta_product_mtp(**inputs)
-    assert torch.equal(out, out_backend)
-    assert torch.equal(pool_facade, inputs["initial_state"])
+    assert _same_bits(out, out_backend)
+    assert _same_bits(pool_facade, inputs["initial_state"])
     assert not torch.equal(pool_facade, pool_before)
 
 

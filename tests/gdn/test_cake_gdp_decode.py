@@ -110,6 +110,8 @@ PHILOX_KAT = (0x6627E8D5, 0xE169C58D, 0xBC57AC4C, 0x9B00DBD8)
 # At most this many stored state heads of one call are compared with the rounding model (a deterministic sample of
 # larger calls); every stored element is still checked against the FP32 twin and every untouched slot bitwise.
 MODEL_MAX_HEADS = 4096
+# State heads per evaluation of the rounding model (bounds its host memory; the sample and the result are unchanged).
+MODEL_CHUNK_HEADS = 512
 # Stored slots per gather of the all-slot rounding check (bounds its device memory).
 CHECK_SLOTS = 64
 
@@ -608,6 +610,18 @@ def _expected_fp16_bits(
     return bits.reshape(len(slots), H, V, K)
 
 
+_SAME_WIDTH_INT = {2: torch.int16, 4: torch.int32}
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Bitwise equality of two tensors of the same dtype and shape (compared as same-width integers): a signed zero
+    differs from the other zero, a NaN equals the same NaN bits."""
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    width = _SAME_WIDTH_INT[a.element_size()]
+    return torch.equal(a.view(width), b.view(width))
+
+
 def _check_stored_roundings(
     c16: Case, c32: Case, slots: list[int], *, stochastic: bool, what: str
 ) -> None:
@@ -672,8 +686,9 @@ def _run_fp16(
     without a seed) and over its FP32 twin; check the FP32 twin against the FP64 reference, the FP16 call's output
     against the twin's bit for bit, the FP16 pool's untouched slots, padding and guard slots bitwise, every stored
     FP16 element against the twin's stored element (:func:`_check_stored_roundings`) and the stored elements of at
-    most ``MODEL_MAX_HEADS`` state heads (a deterministic sample of larger calls) bitwise against the rounding model
-    of the twin's stored state."""
+    most ``MODEL_MAX_HEADS`` state heads (a deterministic sample of larger calls, evaluated ``MODEL_CHUNK_HEADS`` at a
+    time) bitwise against the rounding model of the twin's stored state.  Bitwise checks compare same-width integer
+    views (:func:`_same_bits`)."""
 
     what = what or f"B={c.B} T={c.T} H={c.H} n={c.n} seed={seed} rounds={rounds}"
     c16, c32 = _fp16_twins(c)
@@ -683,30 +698,31 @@ def _run_fp16(
     out16, _ = _run(c16)
     out32, _ = _run(c32)
     _check(c32, out32, what=f"{what}: FP32 twin")
-    assert out16.dtype == out32.dtype and torch.equal(out16, out32), (
-        f"{what}: the output differs from the FP32 twin's"
-    )
+    assert _same_bits(out16, out32), f"{what}: the output differs from the FP32 twin's"
     stores = _stores(c16)
     stored = sorted({slot for slot, _ in stores})
     untouched = torch.ones(c16.pool.shape[0], dtype=torch.bool, device=_device())
     untouched[stored] = False
-    assert torch.equal(c16.pool[untouched], c16.pool_before[untouched]), (
+    assert _same_bits(c16.pool[untouched], c16.pool_before[untouched]), (
         f"{what}: untouched slots changed"
     )
     if c16.backing is not None:
-        assert torch.equal(c16.backing[:, 1::2], c16.backing_before[:, 1::2]), (
+        assert _same_bits(c16.backing[:, 1::2], c16.backing_before[:, 1::2]), (
             f"{what}: pool padding changed"
         )
     if c16.guards is not None:
-        assert torch.equal(c16.guards[[0, -1]], c16.guards_before), (
+        assert _same_bits(c16.guards[[0, -1]], c16.guards_before), (
             f"{what}: a guard slot around the FP16 pool changed"
         )
     _check_stored_roundings(c16, c32, stored, stochastic=seed is not None, what=what)
     if len(stores) > MODEL_MAX_HEADS // c.H:
         step = len(stores) / (MODEL_MAX_HEADS // c.H)
         stores = [stores[int(i * step)] for i in range(MODEL_MAX_HEADS // c.H)]
-    if stores:
-        slots, rows = [slot for slot, _ in stores], [b for _, b in stores]
+    mismatched = modelled = 0
+    per_chunk = max(1, MODEL_CHUNK_HEADS // c.H)
+    for start in range(0, len(stores), per_chunk):
+        part = stores[start : start + per_chunk]
+        slots, rows = [slot for slot, _ in part], [b for _, b in part]
         expected = _expected_fp16_bits(c16, c32, slots, rows, seed, rounds)
         got = (
             c16.pool[torch.tensor(slots, device=_device())]
@@ -715,10 +731,11 @@ def _run_fp16(
             .numpy()
             .view(np.uint16)
         )
-        mismatched = int((got != expected).sum())
-        assert mismatched == 0, (
-            f"{what}: {mismatched} of {got.size} stored FP16 elements differ from the rounding model"
-        )
+        mismatched += int((got != expected).sum())
+        modelled += got.size
+    assert mismatched == 0, (
+        f"{what}: {mismatched} of {modelled} stored FP16 elements differ from the rounding model"
+    )
     return c16, out16, c32, out32
 
 
@@ -1239,7 +1256,7 @@ def _fp16_store_paths(
             assert launched == [name], (what, launched)
             assert c16.guards is not None, what
             if skipped:
-                assert torch.equal(c16.pool[skipped], c16.pool_before[skipped]), (
+                assert _same_bits(c16.pool[skipped], c16.pool_before[skipped]), (
                     what,
                     skipped,
                 )
@@ -1456,7 +1473,7 @@ def test_fp16_pool_rounds_the_fp32_state(
     rounds = SR_ROUNDS if rounding in ("rne", "sr10") else int(rounding[2:])
     c16, _, _, _ = _run_fp16(c, seed=seed, rounds=rounds)
     if holes:
-        assert torch.equal(c16.pool[skipped], c16.pool_before[skipped]), skipped
+        assert _same_bits(c16.pool[skipped], c16.pool_before[skipped]), skipped
 
 
 @pytest.mark.parametrize("rounding", ("rne", "sr10"))
@@ -1502,7 +1519,7 @@ def test_fp16_seed_contract() -> None:
     ):
         c16, _, _, _ = _run_fp16(c, seed=seed, rounds=rounds, what=label)
         pools[label] = c16.pool.clone()
-    assert torch.equal(pools["a"], pools["a_again"])
+    assert _same_bits(pools["a"], pools["a_again"])
     for other in ("b", "a_r5", "rne"):
         assert not torch.equal(pools["a"], pools[other]), other
     written = c.read.long()
@@ -1542,7 +1559,7 @@ def test_fp16_graph_replay_reads_the_seed_on_the_device() -> None:
         c16.rand_seed.fill_(seed)
         graph.replay()
         torch.cuda.synchronize(_device())
-        assert torch.equal(c16.pool, expected[seed]), seed
+        assert _same_bits(c16.pool, expected[seed]), seed
 
 
 def test_fp16_pool_layout() -> None:
@@ -1558,14 +1575,46 @@ def test_fp16_pool_layout() -> None:
     shifted.copy_(c16.pool_before)
     c.pool, c.pool_before = shifted, shifted.clone()
     _run_fp16(c, seed=SR_SEED, what="8-byte aligned FP16 pool view")
-    assert torch.equal(flat[:4], torch.zeros_like(flat[:4]))
-    assert torch.equal(flat[4 + numel :], torch.zeros_like(flat[4 + numel :]))
+    assert _same_bits(flat[:4], torch.zeros_like(flat[:4]))
+    assert _same_bits(flat[4 + numel :], torch.zeros_like(flat[4 + numel :]))
     misaligned = flat[2 : 2 + numel].view(c16.pool.shape)  # a 4-byte offset
     with pytest.raises(ValueError, match="aligned"):
         _run(Case(**{**c16.__dict__, "pool": misaligned}))
     wide = torch.zeros(9, 6, V, K + 2, dtype=torch.float16, device=_device())
     with pytest.raises(ValueError, match="multiples"):
         _run(Case(**{**c16.__dict__, "pool": wide[..., :K]}))
+
+
+def test_fp16_pool_on_an_unaligned_storage_base() -> None:
+    """An FP16 pool whose storage base is 2 bytes past an 8-byte boundary (an ``UntypedStorage`` slice) and whose view
+    starts 3 elements into it, so the view's base is 8-byte aligned again: its storage offset admits no int64 view of
+    its first elements, so the round-to-nearest call passes a one-element placeholder as the never-read seed (the
+    helper checked directly; an ordinary pool keeps the zero-copy view).  The call runs, and its output and stored
+    state equal bit for bit those of the same call on an ordinary pool holding the same values; the bytes around
+    the view stay untouched."""
+    _skip_unless_route(3, 4, state_dtype=torch.float16)
+    c = _make(5, 4, 6, 3, generator=_generator(49), pool_size=9)
+    c16, _ = _fp16_twins(c)
+    shape, numel = c16.pool.shape, c16.pool.numel()
+    buffer = torch.zeros(numel + 8, dtype=torch.float16, device=_device())
+    storage = buffer.untyped_storage()[2:]  # base 2 bytes past the buffer's
+    pool = torch.empty(0, dtype=torch.float16, device=_device())
+    pool.set_(storage, 3, shape)
+    assert storage.data_ptr() % 8 == 2 and pool.storage_offset() == 3
+    assert pool.data_ptr() == buffer[4:].data_ptr() and pool.is_contiguous()
+    pool.copy_(c16.pool_before)
+    seed, rounds = pkg._rounding(pool, None, SR_ROUNDS)
+    assert rounds == 0 and seed.dtype == torch.int64 and seed.numel() == 1
+    assert seed.data_ptr() != pool.data_ptr()
+    seed, rounds = pkg._rounding(c16.pool, None, SR_ROUNDS)
+    assert rounds == 0 and seed.data_ptr() == c16.pool.data_ptr()
+    shifted = Case(**{**c16.__dict__, "pool": pool, "pool_before": pool.clone()})
+    out, _ = _run(shifted)
+    out_ordinary, _ = _run(c16)
+    assert not _same_bits(c16.pool, c16.pool_before)
+    assert _same_bits(out, out_ordinary) and _same_bits(pool, c16.pool)
+    assert _same_bits(buffer[:4], torch.zeros_like(buffer[:4]))
+    assert _same_bits(buffer[4 + numel :], torch.zeros_like(buffer[4 + numel :]))
 
 
 def test_fp16_rejects_invalid_rounding_arguments() -> None:
@@ -1593,7 +1642,7 @@ def test_fp16_rejects_invalid_rounding_arguments() -> None:
         args, kwargs = c16.arguments()
         with pytest.raises(error):
             cake_gated_delta_product_mtp(*args, **{**kwargs, **changes})
-        assert torch.equal(c16.pool, c16.pool_before), changes
+        assert _same_bits(c16.pool, c16.pool_before), changes
     args, kwargs = c16.arguments()  # a zero-dimensional seed is one element too
     cake_gated_delta_product_mtp(*args, **kwargs, rand_seed=seed.reshape(()))
 
@@ -1611,7 +1660,7 @@ def test_fp16_pool_is_refused_without_fp16_programs() -> None:
     c16.philox_rounds = SR_ROUNDS
     with pytest.raises(ValueError, match="float16"):
         _run(c16)
-    assert torch.equal(c16.pool, c16.pool_before)
+    assert _same_bits(c16.pool, c16.pool_before)
 
 
 def _twin_key(record: dict) -> tuple:

@@ -172,11 +172,13 @@ def cake_gated_delta_product_mtp(
     output_state_indices : torch.Tensor, optional
         Write slots ``[B]`` (int32 or int64); ``initial_state_indices`` when
         ``None``.  A negative entry skips the writeback of that row only (its
-        output is still computed and stored).
+        output is still computed and stored).  The write slot of a row that
+        writes back must not be another row's read or write slot (see Notes).
     rand_seed : torch.Tensor, optional
         Stochastic rounding of a float16 pool: a one-element int64 tensor on
         the pool's device, read by the kernel on the device (a captured CUDA
-        graph sees in-place updates).  Each stored element adds 13 random
+        graph sees in-place updates).  It must not overlap ``initial_state``.
+        Each stored element adds 13 random
         bits below its float16 precision and truncates.  The bits come from
         Philox-4x32 of ``philox_rounds`` rounds keyed by the seed's 64 bits.
         One draw serves the columns ``k .. k + 3`` and ``k + 64 .. k + 67``
@@ -214,14 +216,28 @@ def cake_gated_delta_product_mtp(
     - The call reads no tensor contents on the host and synchronizes nothing.
       With bfloat16 activations, float32 ``A_log`` / ``dt_bias``, int32
       indices and a bfloat16 ``output`` it launches the kernel alone; it
-      allocates only the output (when ``output`` is ``None``) and, when
-      ``ssm_state_indices`` is ``None``, an uninitialized ``[B, T]`` int32
-      scatter table the kernel never reads.  It is CUDA-graph safe.
-    - Every batch row is independent of the others and three launches on the
-      same inputs (the same seed included) are bitwise identical.  A float16
-      pool runs the twin of the program a float32 pool would run, with the
-      same arithmetic: the output equals the float32 pool's bit for bit when
-      both pools hold the same values.
+      allocates only the output (when ``output`` is ``None``), when
+      ``ssm_state_indices`` is ``None`` an uninitialized ``[B, T]`` int32
+      scatter table the kernel never reads, and, for a float16 pool without
+      ``rand_seed`` whose storage offset is not a multiple of four elements,
+      a one-element int64 seed placeholder the kernel never reads.  It is
+      CUDA-graph safe.
+    - Batch rows run concurrently in no fixed order.  A row writes its write
+      slot (``output_state_indices[b]``, which defaults to
+      ``initial_state_indices[b]``) or, with ``ssm_state_indices``, its
+      scatter slots; no other row of the same call may read or write those
+      slots, otherwise the stored states and outputs of the rows involved are
+      undefined.  So when rows write back without ``output_state_indices``,
+      the live read slots must be unique; with distinct write slots, with
+      ``ssm_state_indices`` or with ``disable_state_update=True``, read slots
+      may repeat (those rows start from the same state and share their random
+      bits).  This is a caller precondition, not checked on the host (no
+      synchronization).  Given it, a row's output and stores do not depend on
+      the other rows, and repeated launches on the same inputs (the same seed
+      included) are bitwise identical.  A float16 pool runs the twin of the
+      program a float32 pool would run, with the same arithmetic: the output
+      equals the float32 pool's bit for bit when both pools hold the same
+      values.
     """
 
     return _backend.cake_gated_delta_product_mtp(

@@ -291,11 +291,18 @@ def _rounding(
     """The seed tensor and round count of a float16 pool's launch.  With ``rand_seed`` the stores round
     stochastically with ``philox_rounds`` Philox rounds (an ``int`` from :data:`PHILOX_ROUNDS_MIN` to
     :data:`PHILOX_ROUNDS_MAX`); the seed is a one-element int64 tensor on the pool's device, read by the kernel.
-    Without one they round to nearest even (0 rounds), and the seed argument is the pool's first eight bytes viewed
-    as int64: no allocation, never read."""
+    Without one they round to nearest even (0 rounds), and the seed argument is never read: the pool's first eight
+    bytes viewed as int64 when the pool's storage offset allows it (no allocation), else a one-element int64
+    placeholder."""
 
     if rand_seed is None:
-        return pool.as_strided((4,), (1,)).view(torch.int64), 0
+        # The kernel loads the seed only when philox_rounds != 0, so this argument is never read.  The int64 view
+        # of the pool's first four elements relies on the 8-byte base alignment _state_pool has checked; torch
+        # also needs the storage offset to be a multiple of four elements, which fails only for a storage whose
+        # own base is not 8-byte aligned (an UntypedStorage slice, DLPack): that pool gets a per-call placeholder.
+        if pool.storage_offset() % 4 == 0:
+            return pool.as_strided((4,), (1,)).view(torch.int64), 0
+        return pool.new_empty((1,), dtype=torch.int64), 0
     if not isinstance(rand_seed, torch.Tensor):
         raise TypeError("rand_seed must be a torch.Tensor")
     if rand_seed.dtype != torch.int64 or rand_seed.numel() != 1:
