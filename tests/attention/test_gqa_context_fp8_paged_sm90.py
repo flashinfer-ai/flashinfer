@@ -548,11 +548,15 @@ def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
     with torch.cuda.graph(g):
         w.run(q, kv, out=out)
 
+    # kv_indices is also the wrapper's writable graph buffer. Freeze the
+    # requested order before even the injected common-planner refusal.
+    replan_indices = b["kv_indices"].clone().flip(0)
+
     def plan(rows, **opts):
         w.plan(
             b["qo_indptr"].new_tensor([0, rows]),
             b["kv_indptr"],
-            b["kv_indices"].flip(0),
+            replan_indices,
             b["last_page_len"],
             H_QO,
             H_KV,
@@ -610,7 +614,12 @@ def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
     assert torch.equal(out, eager)
 
     plan(24)
-    ref = dict(b, q=q[:24], block_table=b["block_table"].flip(1))
+    ref = dict(
+        b,
+        q=q[:24],
+        qo_indptr=b["qo_indptr"].new_tensor([0, 24]),
+        block_table=replan_indices.view(1, -1),
+    )
     out.fill_(17)
     g.replay()
     assert torch.equal(out[:24], w.run(q[:24], kv))
@@ -777,12 +786,13 @@ def test_graph_mode_replan_never_swaps_buffer_pointers():
     seq_lens_before = bufs2["seq_lens"].clone()
     block_table_before = bufs2["block_table"].clone()
     # fits the stock graph buffers, not the retained plan buffers: the
-    # explicit plan refuses loudly (never falls back) and mutates nothing
+    # explicit plan refuses loudly without refreshing the retained buffers
     with pytest.raises(NotImplementedError, match="never falls back"):
         _plan2(wide)
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 1, stats  # only the narrow plan armed
-    assert wrapper2._gqa_ctx_fp8q_sm90_state is not None
+    # No run was captured on wrapper2: refusal leaves it unarmed.
+    assert wrapper2._gqa_ctx_fp8q_sm90_state is None
     assert "plan: graph-retained workspace capacity" in stats["fallback_reasons"]
     assert {
         name: wrapper2._gqa_ctx_fp8q_sm90_bufs[name].data_ptr() for name in ptrs2

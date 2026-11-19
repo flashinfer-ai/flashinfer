@@ -583,6 +583,9 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
       }
     }
     float sumA = 0.f, sumB = 0.f;
+    // Bound the FP8 WGMMA accumulation to one tile. Promote its retired
+    // result into the running numerator with ordinary FP32 additions.
+    float tile_acc[16][4] = {};
     uint32_t sv[BN / 8];
     /* Pack P straight into the fp8 wgmma A fragment.  Accumulator group j
        owns keys 8j+2u, 8j+2u+1 of lane u; the matching A slot is the bit
@@ -610,7 +613,7 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
         const int slice = j >> 2;
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
         const uint64_t desc = make_wgmma_desc_sw128(Vb + slice * 32, 1, 8 * 128);
-        wgmma_pv8(acc, sv + slice * 4, desc);
+        wgmma_pv8(tile_acc, sv + slice * 4, desc);
       }
     }
     lA += sumA;
@@ -619,13 +622,18 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     /* ---- final PV slice; all slices retire in the same group. ---- */
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
     const uint64_t desc1 = make_wgmma_desc_sw128(Vb + (BN / 32 - 1) * 32, 1, 8 * 128);
-    wgmma_pv8(acc, sv + (BN / 32 - 1) * 4, desc1);
+    wgmma_pv8(tile_acc, sv + (BN / 32 - 1) * 4, desc1);
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     /* Inline PTX operands are compiler-synchronous even though WGMMA is not.
        Keep all register-A fragments live through the covering wait. */
     asm volatile("" ::"r"(sv[0]), "r"(sv[1]), "r"(sv[2]), "r"(sv[3]), "r"(sv[4]), "r"(sv[5]),
                  "r"(sv[6]), "r"(sv[7]), "r"(sv[8]), "r"(sv[9]), "r"(sv[10]), "r"(sv[11]));
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[j][i] += tile_acc[j][i];
+    }
   }
 
   /* Denominator lanes share the same lagging reference max and rescale, so
