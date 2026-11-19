@@ -614,7 +614,8 @@ def run_attention(
     ragged: bool = False,
 ) -> torch.Tensor:
     """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
-    runs with its own snapshot, a differing array is rejected); ``kv_indices`` is read at run time."""
+    runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
