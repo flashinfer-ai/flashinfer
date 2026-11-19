@@ -225,9 +225,11 @@ static void LaunchGenericScopeSafe(ffi::TensorView qi, ffi::TensorView ck_cache,
       static_cast<const int*>(cu_seqlens.data_ptr()), static_cast<int*>(packed.data_ptr()),
       total_tokens, batch, kPackV4, rows_per_cta);
 
-  // Upper bound on the sum of request-local post-FASTPOS tiles.  Retain the
-  // same overlaunch so fast and safe-slow kernels use identical mapping.
-  const int num_tiles = (total_tokens + 15) / 16 + batch;
+  // One CTA per fixed 16-row range of packed rows; the fast and safe-slow
+  // kernels share this mapping (each CTA finds its request with one binary
+  // search) and complementary visMax gates, so every scored row keeps
+  // exactly one writer and no CTA scans the batch.
+  const int num_tiles = (total_tokens + 15) / 16;
   split_impl::qsa_topk_fast<<<static_cast<unsigned>(num_tiles), 256, 0, stream>>>(
       static_cast<const split_impl::u8*>(qi.data_ptr()),
       static_cast<const split_impl::u8*>(ck_cache.data_ptr()),

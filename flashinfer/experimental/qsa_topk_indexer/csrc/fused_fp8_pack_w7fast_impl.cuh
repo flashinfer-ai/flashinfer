@@ -14,32 +14,34 @@ extern "C" __global__ void __launch_bounds__(NTK, 4)
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
 
-  int total = 0;
-  for (int rr = 0; rr < B; ++rr) {
-    int n = cu[rr + 1] - cu[rr] - FASTPOS;
-    if (n > 0) total += (n + TM - 1) / TM;
-  }
-  if ((int)blockIdx.x >= total) return;
-  int rem = total - 1 - (int)blockIdx.x, r = -1, tile = 0;
-  for (int rr = 0; rr < B; ++rr) {
-    int n = cu[rr + 1] - cu[rr] - FASTPOS;
-    if (n <= 0) continue;
-    int ntl = (n + TM - 1) / TM;
-    if (rem < ntl) {
-      r = rr;
-      tile = rem;
-      break;
-    }
-    rem -= ntl;
-  }
-  if (r < 0) return;
-  const int cu0 = cu[r], len = cu[r + 1] - cu0;
-  const int pos0 = FASTPOS + tile * TM;
-  const int t0 = cu0 + pos0;
-  int nTok = len - pos0;
-  if (nTok > TM) nTok = TM;
+  // Fixed-range CTA mapping: CTA i owns packed rows [i*TM, i*TM + TM).  Every
+  // scored row sits at request-local pos >= FASTPOS > TM, so one range never
+  // holds scored rows of two requests: they all belong to the request of the
+  // range's first row, found with one warp binary search instead of a
+  // full-batch scan.  Rows below FASTPOS stay with the store kernel, and the
+  // fast and slow scorers share this mapping and complementary visMax gates,
+  // so each scored row keeps exactly one writer.
+  // Reverse launch order (last range first) keeps the heaviest tiles — the
+  // large-vis tails of each request — scheduled at the front of the wave,
+  // matching the retired batch-scan mapping's schedule.
+  const int t_begin = ((int)gridDim.x - 1 - (int)blockIdx.x) * TM;
+  if (t_begin >= cu[B]) return;
+  const int r = findReqWarp(cu, B, t_begin);
+  const int cu0 = cu[r];
+  int tile_end = t_begin + TM;
+  if (tile_end > cu[r + 1]) tile_end = cu[r + 1];
+  int t0 = cu0 + FASTPOS;
+  if (t0 < t_begin) t0 = t_begin;
+  const int nTok = tile_end - t0;
+  if (nTok <= 0) return;
+  const int pos0 = t0 - cu0;
   const int visMax = (pos0 + nTok) >> 2;
-  if (visMax > VCAP) return;
+  // Row-level ownership: this kernel scores the rows whose own vis fits the
+  // shared-score budget (vis <= VCAP) and the slow scorer owns the rest, so a
+  // boundary tile can hold both kinds.  The tile exits only when even its
+  // first (smallest-vis) row exceeds the budget.
+  if (((pos0 + 1) >> 2) > VCAP) return;
+  const int visEnd = visMax > VCAP ? VCAP : visMax;
   const u8* kbase = ck + (size_t)cpb[r] * CPAGE * IDXD;
   float* sc = reinterpret_cast<float*>(packed) + (size_t)t0 * SCSTR;
 
@@ -58,9 +60,9 @@ extern "C" __global__ void __launch_bounds__(NTK, 4)
   const int row0 = group, row1 = group + 8;
   const u8* q0base = reinterpret_cast<const u8*>(qtile[row0]);
   const u8* q1base = reinterpret_cast<const u8*>(qtile[row1]);
-  for (int blockBase = warp * 8; blockBase < visMax; blockBase += 64) {
+  for (int blockBase = warp * 8; blockBase < visEnd; blockBase += 64) {
     const int keyCol = blockBase + group;
-    const bool keyValid = keyCol < visMax;
+    const bool keyValid = keyCol < visEnd;
     const u8* key = keyValid ? kbase + (size_t)keyCol * IDXD : kbase;
     float sum0 = 0.f, sum1 = 0.f, sum2 = 0.f, sum3 = 0.f;
 #pragma unroll
@@ -85,8 +87,12 @@ extern "C" __global__ void __launch_bounds__(NTK, 4)
       sum3 += qsa_relu_exact(d3);
     }
     const int col = blockBase + quad * 2;
-    const int vis0 = (pos0 + row0 + 1) >> 2;
-    const int vis1 = (pos0 + row1 + 1) >> 2;
+    // A row past the budget belongs to the slow scorer: never touch its
+    // packed row (sc aliases it) or its histogram.
+    const int v0 = (pos0 + row0 + 1) >> 2;
+    const int v1 = (pos0 + row1 + 1) >> 2;
+    const int vis0 = v0 <= VCAP ? v0 : 0;
+    const int vis1 = v1 <= VCAP ? v1 : 0;
     if (row0 < nTok && col < vis0) {
       sc[(size_t)row0 * SCSTR + col] = sum0;
       atomicAdd(&hist[row0 * 256 + (qsa_score_key_exact(sum0) >> 24)], 1);
@@ -112,6 +118,7 @@ extern "C" __global__ void __launch_bounds__(NTK, 4)
   for (int m = warp; m < nTok; m += 8) {
     const int pos = pos0 + m;
     const int vis = (pos + 1) >> 2;
+    if (vis > VCAP) continue;  // slow-scorer row (uniform across the warp)
     const float* scm = sc + (size_t)m * SCSTR;
     int* hw = hist + m * 256;
 

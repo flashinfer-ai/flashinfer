@@ -218,30 +218,25 @@ extern "C" __global__ void __launch_bounds__(NTK, 2)
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
 
-  int total = 0;
-  for (int rr = 0; rr < B; ++rr) {
-    int n = cu[rr + 1] - cu[rr] - FASTPOS;
-    if (n > 0) total += (n + TM - 1) / TM;
-  }
-  if ((int)blockIdx.x >= total) return;
-  int rem = total - 1 - (int)blockIdx.x, r = -1, tile = 0;
-  for (int rr = 0; rr < B; ++rr) {
-    int n = cu[rr + 1] - cu[rr] - FASTPOS;
-    if (n <= 0) continue;
-    int ntl = (n + TM - 1) / TM;
-    if (rem < ntl) {
-      r = rr;
-      tile = rem;
-      break;
-    }
-    rem -= ntl;
-  }
-  if (r < 0) return;
-  const int cu0 = cu[r], len = cu[r + 1] - cu0;
-  const int pos0 = FASTPOS + tile * TM;
-  const int t0 = cu0 + pos0;
-  int nTok = len - pos0;
-  if (nTok > TM) nTok = TM;
+  // Fixed-range CTA mapping shared with qsa_topk_fast: CTA i owns packed
+  // rows [i*TM, i*TM + TM).  Every scored row sits at request-local
+  // pos >= FASTPOS > TM, so one range never holds scored rows of two
+  // requests: they all belong to the request of the range's first row, found
+  // with one warp binary search instead of a full-batch scan.
+  // Reverse launch order (last range first) keeps the heaviest tiles — the
+  // large-vis tails of each request — scheduled at the front of the wave,
+  // matching the retired batch-scan mapping's schedule.
+  const int t_begin = ((int)gridDim.x - 1 - (int)blockIdx.x) * TM;
+  if (t_begin >= cu[B]) return;
+  const int r = findReqWarp(cu, B, t_begin);
+  const int cu0 = cu[r];
+  int tile_end = t_begin + TM;
+  if (tile_end > cu[r + 1]) tile_end = cu[r + 1];
+  int t0 = cu0 + FASTPOS;
+  if (t0 < t_begin) t0 = t_begin;
+  const int nTok = tile_end - t0;
+  if (nTok <= 0) return;
+  const int pos0 = t0 - cu0;
   const int visMax = (pos0 + nTok) >> 2;
   if (visMax <= VCAP) return;
   const u8* kbase = ck + (size_t)cpb[r] * CPAGE * IDXD;
@@ -319,6 +314,7 @@ extern "C" __global__ void __launch_bounds__(NTK, 2)
   for (int m = warp; m < nTok; m += 8) {
     const int pos = pos0 + m;
     const int vis = (pos + 1) >> 2;
+    if (vis <= VCAP) continue;  // fast-scorer row (uniform across the warp)
     const float* scm = sc + (size_t)m * SCSTR;
     const u8* qg = qi + (size_t)(t0 + m) * (IDXH * IDXD);
     int* hw = hist + m * 256;

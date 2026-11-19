@@ -142,6 +142,30 @@ def test_correctness(lengths):
     assert torch.equal(out, ref)
 
 
+def test_generic_path_identity_only_large_batch():
+    """T > 65535 routes to the generic scope-safe launcher, whose scoring CTAs
+    map fixed 16-row ranges to requests. 4096 requests of 16 tokens keep every
+    row inside the trivial prefix: the identity writer owns the whole batch and
+    the scoring CTAs must all exit without writing anything."""
+    lengths = (16,) * 4096  # T = 65536
+    qi, ck, cu, cpage_base = make_inputs(lengths, seed=21)
+    out = qsa_topk_indexer(qi, ck, cu, cpage_base)
+    ref = ref_qsa_topk_indexer(qi, ck, cu, cpage_base)
+    assert torch.equal(out, ref)
+
+
+def test_generic_path_mixed_requests_and_boundary_ctas():
+    """Generic-path CTA mapping regression: unequal requests, empty requests,
+    request boundaries off the 16-row range grid, scored runs starting and
+    ending mid-range, and one request crossing the shared-score capacity bound
+    so the fast and slow scorers split its rows (single-writer ownership)."""
+    lengths = (9000, 0, 2600, 7, 0) + (16,) * 3375  # T = 65607 > 65535
+    qi, ck, cu, cpage_base = make_inputs(lengths, seed=23)
+    out = qsa_topk_indexer(qi, ck, cu, cpage_base)
+    ref = ref_qsa_topk_indexer(qi, ck, cu, cpage_base)
+    assert torch.equal(out, ref)
+
+
 def test_preallocated_out_and_determinism():
     qi, ck, cu, cpage_base = make_inputs((2600,), seed=7)
     out = torch.full((qi.shape[0], PWIDTH), 123, dtype=torch.int32, device=qi.device)

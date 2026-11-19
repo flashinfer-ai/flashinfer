@@ -18,38 +18,31 @@ extern "C" __global__ void __launch_bounds__(NTK, 2)
   const int lane = tid & 31;
   const int warp = tid >> 5;
 
-  // Preserve the legacy reverse tile mapping so the fast and slow kernels
-  // continue to partition the exact same rows.
-  int total = 0;
-  for (int rr = 0; rr < B; ++rr) {
-    const int n = cu[rr + 1] - cu[rr] - FASTPOS;
-    if (n > 0) total += (n + TM - 1) / TM;
-  }
-  if (static_cast<int>(blockIdx.x) >= total) return;
-
-  int rem = total - 1 - static_cast<int>(blockIdx.x);
-  int r = -1;
-  int tile = 0;
-  for (int rr = 0; rr < B; ++rr) {
-    const int n = cu[rr + 1] - cu[rr] - FASTPOS;
-    if (n <= 0) continue;
-    const int ntl = (n + TM - 1) / TM;
-    if (rem < ntl) {
-      r = rr;
-      tile = rem;
-      break;
-    }
-    rem -= ntl;
-  }
-  if (r < 0) return;
-
+  // Fixed-range CTA mapping shared with the fast scorer: CTA i owns packed
+  // rows [i*TM, i*TM + TM).  Every scored row sits at request-local
+  // pos >= FASTPOS > TM, so one range never holds scored rows of two
+  // requests: they all belong to the request of the range's first row, found
+  // with one warp binary search instead of a full-batch scan.  The fast and
+  // slow scorers share this mapping and complementary visMax gates, so each
+  // scored row keeps exactly one writer.
+  // Reverse launch order (last range first) keeps the heaviest tiles — the
+  // large-vis tails of each request — scheduled at the front of the wave,
+  // matching the retired batch-scan mapping's schedule.
+  const int t_begin = (static_cast<int>(gridDim.x) - 1 - static_cast<int>(blockIdx.x)) * TM;
+  if (t_begin >= cu[B]) return;
+  const int r = findReqWarp(cu, B, t_begin);
   const int cu0 = cu[r];
-  const int len = cu[r + 1] - cu0;
-  const int pos0 = FASTPOS + tile * TM;
-  const int t0 = cu0 + pos0;
-  int nTok = len - pos0;
-  if (nTok > TM) nTok = TM;
+  int tile_end = t_begin + TM;
+  if (tile_end > cu[r + 1]) tile_end = cu[r + 1];
+  int t0 = cu0 + FASTPOS;
+  if (t0 < t_begin) t0 = t_begin;
+  const int nTok = tile_end - t0;
+  if (nTok <= 0) return;
+  const int pos0 = t0 - cu0;
   const int visMax = (pos0 + nTok) >> 2;
+  // Row-level ownership, complementary to the fast scorer: this kernel owns
+  // the rows whose own vis exceeds the shared-score budget (vis > VCAP); a
+  // boundary tile can hold both kinds, so the gates are per row.
   if (visMax <= VCAP) return;
 
   const u8* kbase = ck + static_cast<size_t>(cpb[r]) * CPAGE * IDXD;
@@ -64,6 +57,7 @@ extern "C" __global__ void __launch_bounds__(NTK, 2)
   for (int m = warp; m < nTok; m += 8) {
     const int pos = pos0 + m;
     const int vis = (pos + 1) >> 2;
+    if (vis <= VCAP) continue;  // fast-scorer row (uniform across the warp)
     const u8* qg = qi + static_cast<size_t>(t0 + m) * (IDXH * IDXD);
     int* hw = hist + m * 256;
 

@@ -139,8 +139,8 @@ static void LaunchGeneric(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::Ten
       static_cast<const int*>(cu_seqlens.data_ptr()), static_cast<int*>(packed.data_ptr()),
       total_tokens, batch, kPackV4, rows_per_cta);
 
-  // This is an upper bound on the sum of request-local post-FASTPOS tiles.
-  const int num_tiles = (total_tokens + 15) / 16 + batch;
+  // One CTA per fixed 16-row range of packed rows (shared fast/slow mapping).
+  const int num_tiles = (total_tokens + 15) / 16;
   split_impl::qsa_topk_fast<<<static_cast<unsigned>(num_tiles), 256, 0, stream>>>(
       static_cast<const split_impl::u8*>(qi.data_ptr()),
       static_cast<const split_impl::u8*>(ck_cache.data_ptr()),
