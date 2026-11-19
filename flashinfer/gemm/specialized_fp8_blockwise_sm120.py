@@ -82,6 +82,7 @@ def get_specialized_gemm_fp8_blockwise_sm120_module():
     return gen_specialized_gemm_fp8_blockwise_sm120_module().build_and_load()
 
 
+@functools.cache
 def _is_sm120_exactly(device: torch.device) -> bool:
     major, minor = torch.cuda.get_device_capability(device)
     return major == 12 and minor == 0
@@ -152,25 +153,28 @@ def is_specialized_supported(
     # base 4B aligned (offset storage views can violate this; fresh torch
     # allocations are always 256B aligned). Scales are read as f32 and are
     # naturally aligned for any fp32 tensor.
-    if a.data_ptr() % 32 != 0 or b.data_ptr() % 32 != 0:
+    a0, b0 = a.data_ptr(), b.data_ptr()
+    if a0 % 32 != 0 or b0 % 32 != 0:
         return _no("layout:operand_alignment")
-    if out is not None and out.data_ptr() % 4 != 0:
-        return _no("layout:out_alignment")
     # The kernel reads its operands through raw pointers while it writes Y:
     # an ``out`` that shares storage bytes with any input could be clobbered
     # mid-read. The composable fallback reads inputs before writing out, so
     # route overlapping calls there. All five tensors are contiguous here,
     # so byte-interval overlap is exact.
     if out is not None:
-
-        def _overlap(x, y):
-            x0, y0 = x.data_ptr(), y.data_ptr()
-            return (
-                x0 < y0 + y.numel() * y.element_size()
-                and y0 < x0 + x.numel() * x.element_size()
-            )
-
-        if any(_overlap(out, t) for t in (a, b, a_scale, b_scale)):
+        o0 = out.data_ptr()
+        if o0 % 4 != 0:
+            return _no("layout:out_alignment")
+        # Dtypes and contiguous shapes checked above: bf16 out, byte FP8
+        # operands and fp32 scales. Use B's actual byte length here.
+        o1 = o0 + 2 * M * N
+        sa0, sb0 = a_scale.data_ptr(), b_scale.data_ptr()
+        if (
+            (a0 < o1 and o0 < a0 + M * K)
+            or (b0 < o1 and o0 < b0 + b.numel())
+            or (sa0 < o1 and o0 < sa0 + 4 * M * KB)
+            or (sb0 < o1 and o0 < sb0 + 4 * NB * KB)
+        ):
             return _no("layout:out_overlaps_input")
     # 256-bit global loads need PTX ISA 8.8, first shipped with CUDA 12.9;
     # older toolkits would fail JIT compilation instead of running.
@@ -189,13 +193,12 @@ def is_specialized_supported(
             return _no("autotune_mode")
     except Exception:  # noqa: BLE001 - autotuner surface moved: be safe
         return _no("autotune_probe_failed")
-    # The launch happens on A's device; is_current_stream_capturing() reads
-    # the CURRENT device's stream, so query inside A's device context (a
-    # no-op context switch when A is already current).
-    with torch.cuda.device(a.device):
-        capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and (a.device.index, M, N, K) not in _warmed:
-        return _no("capture:unwarmed")
+    # A warmed exact shape is admissible on either kind of stream. Only
+    # a miss needs the live capture state, queried on the launch device.
+    if (a.device.index, M, N, K) not in _warmed:
+        with torch.cuda.device(a.device):
+            if torch.cuda.is_current_stream_capturing():
+                return _no("capture:unwarmed")
     return True
 
 
