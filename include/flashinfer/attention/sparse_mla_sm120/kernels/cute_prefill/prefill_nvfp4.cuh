@@ -96,7 +96,14 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   constexpr int ROPE_DIMS_PER_WARP = D_ROPE / STREAMING_N_WARPS;
   constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;
   constexpr int ROPE_K_ITERS = STREAMING_CAND_WINDOW / 16;
-  constexpr int REDUCE_GROUP_STRIDE = STREAMING_N_WARPS * HPB;
+  using namespace cute;
+  using Head = Int<HPB>;
+  using HeadGroup = Int<VALID_HEAD_GROUPS>;
+  using Candidate = Int<STREAMING_CAND_WINDOW>;
+  using MathWarp = Int<STREAMING_N_WARPS>;
+  using PStride = Int<STREAMING_P_STRIDE>;
+  using HeadGroupStride = Int<HPB * STREAMING_P_STRIDE>;
+  using Feature = Int<D_V>;
   const int token_idx = blockIdx.x;
   const int head_block = blockIdx.y;
   if (token_idx >= num_tokens || head_block >= HEAD_BLOCKS) return;
@@ -119,7 +126,25 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
   extern __shared__ __align__(16) char smem_raw[];
   auto sm = StreamingNVFP4Smem::init(smem_raw);
-  const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
+  auto gIndices = make_tensor(
+      make_gmem_ptr(indices),
+      make_layout(make_shape(Int<TOPK>{}, num_tokens), make_stride(_1{}, size_t(TOPK))));
+  auto gIndexRow = gIndices(_, token_idx);
+  auto gLse = make_tensor(
+      make_gmem_ptr(out_lse),
+      make_layout(make_shape(Int<NUM_HEADS>{}, num_tokens), make_stride(_1{}, size_t(NUM_HEADS))));
+  auto gO = make_tensor(make_gmem_ptr(output),
+                        make_layout(make_shape(Int<D_V>{}, Int<NUM_HEADS>{}, num_tokens),
+                                    make_stride(_1{}, Int<D_V>{}, size_t(NUM_HEADS) * D_V)));
+  auto gQ = make_tensor(make_gmem_ptr(q),
+                        make_layout(make_shape(Int<D_QK>{}, Int<NUM_HEADS>{}, num_tokens),
+                                    make_stride(_1{}, Int<D_QK>{}, size_t(NUM_HEADS) * D_QK)));
+  auto extra_index_row = [&] {
+    auto gExtra = make_tensor(
+        make_gmem_ptr(extra_indices),
+        make_layout(make_shape(extra_topk, num_tokens), make_stride(_1{}, size_t(extra_topk))));
+    return gExtra(_, token_idx);
+  };
 
   // Phase 0 — Initialize handoffs and handle an empty selection.
   // Raw KV: two slots. One transactional arrival publishes each gathered tile;
@@ -145,17 +170,17 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
       for (int i = threadIdx.x; i < HEADS_PER_CTA * D_V; i += STREAMING_MATH_THREADS) {
         const int head = i / D_V;
         const int dim = i - head * D_V;
-        const size_t offset = ((size_t)token_idx * NUM_HEADS + h_start + head) * D_V + dim;
         if constexpr (Mega) {
+          const size_t offset = gO.layout()(dim, h_start + head, token_idx);
           mega.output[offset] = 0;
           if ((dim & 31) == 0) mega.scales[offset / 32] = 105;
         } else {
-          output[offset] = __float2bfloat16(0.f);
+          gO(dim, h_start + head, token_idx) = __float2bfloat16(0.f);
         }
       }
       if (threadIdx.x < HEADS_PER_CTA) {
         const int h = h_start + threadIdx.x;
-        out_lse[(size_t)token_idx * NUM_HEADS + h] =
+        gLse(h, token_idx) =
             scale_output_lse(attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY, lse_scale);
       }
     }
@@ -165,10 +190,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   auto issue_gather = [&](int chunk, int buf) {
     cute_gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, STREAMING_KV_SMEM_STRIDE,
                      STREAMING_GATHER_WARPS * 32>(
-        kv_cache, idx_base, chunk, topk_len, false, page_block_size, page_stride_bytes,
-        (warp_id - STREAMING_N_WARPS) * 32 + lane, sm.kv_fp4(buf), sm.kv_rope(buf), sm.kv_sc(buf),
-        sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
-        DUAL_CACHE ? extra_indices + size_t(token_idx) * extra_topk : nullptr,
+        kv_cache, raw_pointer_cast(gIndexRow.data()), chunk, topk_len, false, page_block_size,
+        page_stride_bytes, (warp_id - STREAMING_N_WARPS) * 32 + lane, sm.kv_fp4(buf),
+        sm.kv_rope(buf), sm.kv_sc(buf), sm.mbar_full(buf), num_main_chunks, extra_topk_len,
+        extra_kv_cache, DUAL_CACHE ? raw_pointer_cast(extra_index_row().data()) : nullptr,
         extra_page_block_size, extra_page_stride_bytes);
   };
 
@@ -218,8 +243,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   const int tid = lane & 3;
 #pragma unroll
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-    const bf16* q_base =
-        q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)(h_start + group * HPB) * D_QK;
+    auto gQHead = gQ(_, h_start + group * HPB, token_idx);
+    const bf16* q_base = raw_pointer_cast(gQHead.data());
     cute_quantize_prefill_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
                                           STREAMING_Q_SCALE_STRIDE>(
         sm.q_fp4(group), sm.q_sc(group), sm.q_rope(group), q_base, HPB,
@@ -228,12 +253,25 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
   float acc_nope[STREAMING_HEAD_GROUPS][PV_GROUPS_PER_WARP][PV_N8_TILES_PER_GROUP][4] = {0};
   float acc_rope[STREAMING_HEAD_GROUPS][ROPE_N_TILES][4] = {0};
-  float global_max[STREAMING_HEAD_GROUPS][2];
-  float global_sum[STREAMING_HEAD_GROUPS][2];
+  // Each lane owns two heads (gid and gid+8) in every head group.
+  auto lane_head_shape = Shape<_2, HeadGroup>{};
+  auto rMax = make_tensor<float>(lane_head_shape);
+  auto rSum = make_tensor<float>(lane_head_shape);
+  // MMA C stores two adjacent feature values for each of those heads.
+  auto rONope = make_tensor(
+      &acc_nope[0][0][0][0],
+      make_layout(Shape<_2, _2, Int<PV_N8_TILES_PER_GROUP>, Int<PV_GROUPS_PER_WARP>, HeadGroup>{}));
+  auto rORope =
+      make_tensor(&acc_rope[0][0][0], make_layout(Shape<_2, _2, Int<ROPE_N_TILES>, HeadGroup>{}));
+  auto sReduce = make_tensor(make_smem_ptr(sm.reduce_scratch()),
+                             make_layout(Shape<Head, MathWarp, HeadGroup>{}));
+  auto sP = make_tensor(
+      make_smem_ptr(sm.p_full(0)),
+      make_layout(Shape<Head, Candidate, HeadGroup>{}, Stride<PStride, _1, HeadGroupStride>{}));
 #pragma unroll
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-    global_max[group][0] = global_max[group][1] = -1e30f;
-    global_sum[group][0] = global_sum[group][1] = 0.f;
+    rMax(0, group) = rMax(1, group) = -1e30f;
+    rSum(0, group) = rSum(1, group) = 0.f;
   }
 
   const auto copy_rope_a = cute::make_tiled_copy_A(
@@ -245,12 +283,12 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     const int buf = (chunk - chunk_lo) % STREAMING_KV_BUF_COUNT;
     int section_chunk = chunk;
     int section_len = topk_len;
-    const int32_t* section_indices = idx_base;
+    const int32_t* section_indices = raw_pointer_cast(gIndexRow.data());
     if constexpr (DUAL_CACHE) {
       if (chunk >= num_main_chunks) {
         section_chunk = chunk - num_main_chunks;
         section_len = extra_topk_len;
-        section_indices = extra_indices + (size_t)token_idx * extra_topk;
+        section_indices = raw_pointer_cast(extra_index_row().data());
       }
     }
     const int chunk_start = section_chunk * STREAMING_CAND_WINDOW;
@@ -264,17 +302,23 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     // Phase 3 — QK: each math warp computes S[H,8] for its candidates,
     // accumulating the seven FP4 K=64 steps and four BF16 RoPE K=16 steps.
     float qk[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4] = {0};
+    // Lane-local score coordinates: (candidate in pair, head in pair, head group).
+    static_assert(STREAMING_QK_N_TILES == 1);
+    auto lane_score_shape = Shape<_2, _2, HeadGroup>{};
+    auto rScore = make_tensor(&qk[0][0][0], make_layout(lane_score_shape));
     cute_qk_nvfp4<VALID_HEAD_GROUPS, STREAMING_Q_FP4_STRIDE, STREAMING_Q_SCALE_STRIDE,
                   STREAMING_KV_SMEM_STRIDE, STREAMING_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
         qk, sm.q_fp4(0), sm.q_sc(0), sm_kv_fp4, sm_kv_sc, warp_first_cand, lane);
 
 #pragma unroll
     for (int ks = 0; ks < D_ROPE / 16; ++ks) {
-      const int cand_row_base = warp_first_cand;
-      const bf16* rope_row = sm_kv_rope + (size_t)(cand_row_base + gid) * D_ROPE + ks * 16;
+      auto sK = make_tensor(make_smem_ptr(sm_kv_rope), make_layout(Shape<Candidate, Int<D_ROPE>>{},
+                                                                   Stride<Int<D_ROPE>, _1>{}));
+      const int candidate = warp_first_cand + gid;
+      const int feature = ks * 16 + tid * 2;
       auto rB = cute::make_tensor<uint32_t>(cute::make_layout(cute::_2{}));
-      rB(0) = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2);
-      rB(1) = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2 + 8);
+      rB(0) = *reinterpret_cast<const uint32_t*>(&sK(candidate, feature));
+      rB(1) = *reinterpret_cast<const uint32_t*>(&sK(candidate, feature + 8));
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
         auto rA = cute::make_tensor<uint32_t>(cute::make_layout(cute::_4{}));
@@ -284,7 +328,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
         auto sQTile = cute::local_tile(sQ, cute::Shape<cute::_16, cute::_16>{},
                                        cute::make_coord(cute::_0{}, ks));
         copy_mma_operand<uint16_t, 8>(copy_rope_a, cute::recast<uint16_t>(sQTile), rA, lane);
-        auto rC = cute::make_tensor(&qk[group][0][0], cute::make_layout(cute::_4{}));
+        auto rC = group_modes<0, 2>(rScore(_, _, group));
         cute::MMA_Atom<RopeMma>{}.call(rA, rB, rC);
       }
     }
@@ -292,10 +336,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     // Phase 4 — Mask and online softmax. Tail/negative indices contribute
     // zero probability. Reduce across all eight candidate-owning warps
     // before rescaling the persistent O and publishing this tile's P.
-    float local_max[STREAMING_HEAD_GROUPS][2];
-    float local_sum[STREAMING_HEAD_GROUPS][2];
-    float p[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4];
-    float block_max_value[STREAMING_HEAD_GROUPS][2];
+    auto rWarpMax = make_tensor<float>(lane_head_shape);
+    auto rWarpSum = make_tensor<float>(lane_head_shape);
+    auto rP = make_tensor<float>(lane_score_shape);
+    auto rTileMax = make_tensor<float>(lane_head_shape);
     const int c0 = warp_first_cand + tid * 2;
     const int c1 = c0 + 1;
     const int abs_c0 = chunk_start + c0;
@@ -307,35 +351,34 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     const float qk_scale = sm_scale * LOG2E;
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-      qk[group][0][0] = valid_c0 ? qk[group][0][0] * qk_scale : -1e30f;
-      qk[group][0][2] = valid_c0 ? qk[group][0][2] * qk_scale : -1e30f;
-      qk[group][0][1] = valid_c1 ? qk[group][0][1] * qk_scale : -1e30f;
-      qk[group][0][3] = valid_c1 ? qk[group][0][3] * qk_scale : -1e30f;
+      rScore(0, 0, group) = valid_c0 ? rScore(0, 0, group) * qk_scale : -1e30f;
+      rScore(0, 1, group) = valid_c0 ? rScore(0, 1, group) * qk_scale : -1e30f;
+      rScore(1, 0, group) = valid_c1 ? rScore(1, 0, group) * qk_scale : -1e30f;
+      rScore(1, 1, group) = valid_c1 ? rScore(1, 1, group) * qk_scale : -1e30f;
 
-      local_max[group][0] = fmaxf(qk[group][0][0], qk[group][0][1]);
-      local_max[group][1] = fmaxf(qk[group][0][2], qk[group][0][3]);
+      rWarpMax(0, group) = fmaxf(rScore(0, 0, group), rScore(1, 0, group));
+      rWarpMax(1, group) = fmaxf(rScore(0, 1, group), rScore(1, 1, group));
 #pragma unroll
       for (int s = 2; s >= 1; s >>= 1) {
-        local_max[group][0] =
-            fmaxf(local_max[group][0], __shfl_xor_sync(0xffffffff, local_max[group][0], s));
-        local_max[group][1] =
-            fmaxf(local_max[group][1], __shfl_xor_sync(0xffffffff, local_max[group][1], s));
+        rWarpMax(0, group) =
+            fmaxf(rWarpMax(0, group), __shfl_xor_sync(0xffffffff, rWarpMax(0, group), s));
+        rWarpMax(1, group) =
+            fmaxf(rWarpMax(1, group), __shfl_xor_sync(0xffffffff, rWarpMax(1, group), s));
       }
-      p[group][0][0] = valid_c0 ? exp2f(qk[group][0][0] - local_max[group][0]) : 0.f;
-      p[group][0][1] = valid_c1 ? exp2f(qk[group][0][1] - local_max[group][0]) : 0.f;
-      p[group][0][2] = valid_c0 ? exp2f(qk[group][0][2] - local_max[group][1]) : 0.f;
-      p[group][0][3] = valid_c1 ? exp2f(qk[group][0][3] - local_max[group][1]) : 0.f;
-      local_sum[group][0] = p[group][0][0] + p[group][0][1];
-      local_sum[group][1] = p[group][0][2] + p[group][0][3];
+      rP(0, 0, group) = valid_c0 ? exp2f(rScore(0, 0, group) - rWarpMax(0, group)) : 0.f;
+      rP(1, 0, group) = valid_c1 ? exp2f(rScore(1, 0, group) - rWarpMax(0, group)) : 0.f;
+      rP(0, 1, group) = valid_c0 ? exp2f(rScore(0, 1, group) - rWarpMax(1, group)) : 0.f;
+      rP(1, 1, group) = valid_c1 ? exp2f(rScore(1, 1, group) - rWarpMax(1, group)) : 0.f;
+      rWarpSum(0, group) = rP(0, 0, group) + rP(1, 0, group);
+      rWarpSum(1, group) = rP(0, 1, group) + rP(1, 1, group);
 #pragma unroll
       for (int s = 2; s >= 1; s >>= 1) {
-        local_sum[group][0] += __shfl_xor_sync(0xffffffff, local_sum[group][0], s);
-        local_sum[group][1] += __shfl_xor_sync(0xffffffff, local_sum[group][1], s);
+        rWarpSum(0, group) += __shfl_xor_sync(0xffffffff, rWarpSum(0, group), s);
+        rWarpSum(1, group) += __shfl_xor_sync(0xffffffff, rWarpSum(1, group), s);
       }
       if (tid == 0) {
-        const int base = (group * STREAMING_N_WARPS + warp_id) * HPB;
-        sm.reduce_scratch()[base + gid] = local_max[group][0];
-        sm.reduce_scratch()[base + gid + 8] = local_max[group][1];
+        sReduce(gid, warp_id, group) = rWarpMax(0, group);
+        sReduce(gid + 8, warp_id, group) = rWarpMax(1, group);
       }
     }
     cutlass::arch::NamedBarrier::sync(
@@ -348,10 +391,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
       float block_max = -1e30f;
 #pragma unroll
       for (int w = 0; w < STREAMING_N_WARPS; ++w)
-        block_max =
-            fmaxf(block_max, sm.reduce_scratch()[(group * STREAMING_N_WARPS + w) * HPB + head]);
-      const int group_base = group * REDUCE_GROUP_STRIDE;
-      sm.reduce_scratch()[group_base + head] = block_max;
+        block_max = fmaxf(block_max, sReduce(head, w, group));
+      sReduce(head, 0, group) = block_max;
     }
     cutlass::arch::NamedBarrier::sync(
         STREAMING_MATH_THREADS,
@@ -359,9 +400,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-      const int group_base = group * REDUCE_GROUP_STRIDE;
-      block_max_value[group][0] = sm.reduce_scratch()[group_base + gid];
-      block_max_value[group][1] = sm.reduce_scratch()[group_base + gid + 8];
+      rTileMax(0, group) = sReduce(gid, 0, group);
+      rTileMax(1, group) = sReduce(gid + 8, 0, group);
     }
     // All warps must retain block max in registers before warp 0's slots are
     // recycled for the rescaled local sums.
@@ -372,11 +412,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
       if (tid == 0) {
-        const int base = (group * STREAMING_N_WARPS + warp_id) * HPB;
-        sm.reduce_scratch()[base + gid] =
-            local_sum[group][0] * exp2f(local_max[group][0] - block_max_value[group][0]);
-        sm.reduce_scratch()[base + gid + 8] =
-            local_sum[group][1] * exp2f(local_max[group][1] - block_max_value[group][1]);
+        sReduce(gid, warp_id, group) =
+            rWarpSum(0, group) * exp2f(rWarpMax(0, group) - rTileMax(0, group));
+        sReduce(gid + 8, warp_id, group) =
+            rWarpSum(1, group) * exp2f(rWarpMax(1, group) - rTileMax(1, group));
       }
     }
     cutlass::arch::NamedBarrier::sync(
@@ -388,9 +427,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
       const int head = threadIdx.x % HPB;
       float block_sum = 0.f;
 #pragma unroll
-      for (int w = 0; w < STREAMING_N_WARPS; ++w)
-        block_sum += sm.reduce_scratch()[(group * STREAMING_N_WARPS + w) * HPB + head];
-      sm.reduce_scratch()[group * REDUCE_GROUP_STRIDE + head] = block_sum;
+      for (int w = 0; w < STREAMING_N_WARPS; ++w) block_sum += sReduce(head, w, group);
+      sReduce(head, 0, group) = block_sum;
     }
     cutlass::arch::NamedBarrier::sync(
         STREAMING_MATH_THREADS,
@@ -398,21 +436,18 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-      const int group_base = group * REDUCE_GROUP_STRIDE;
-      const float block_max0 = block_max_value[group][0];
-      const float block_max1 = block_max_value[group][1];
-      const float block_sum0 = sm.reduce_scratch()[group_base + gid];
-      const float block_sum1 = sm.reduce_scratch()[group_base + gid + 8];
-      const float new_max0 = fmaxf(global_max[group][0], block_max0);
-      const float new_max1 = fmaxf(global_max[group][1], block_max1);
-      const float alpha0 =
-          global_max[group][0] > -1e29f ? exp2f(global_max[group][0] - new_max0) : 0.f;
-      const float alpha1 =
-          global_max[group][1] > -1e29f ? exp2f(global_max[group][1] - new_max1) : 0.f;
+      const float block_max0 = rTileMax(0, group);
+      const float block_max1 = rTileMax(1, group);
+      const float block_sum0 = sReduce(gid, 0, group);
+      const float block_sum1 = sReduce(gid + 8, 0, group);
+      const float new_max0 = fmaxf(rMax(0, group), block_max0);
+      const float new_max1 = fmaxf(rMax(1, group), block_max1);
+      const float alpha0 = rMax(0, group) > -1e29f ? exp2f(rMax(0, group) - new_max0) : 0.f;
+      const float alpha1 = rMax(1, group) > -1e29f ? exp2f(rMax(1, group) - new_max1) : 0.f;
       const float block_rescale0 = exp2f(block_max0 - new_max0);
       const float block_rescale1 = exp2f(block_max1 - new_max1);
-      const float warp_rescale0 = exp2f(local_max[group][0] - new_max0);
-      const float warp_rescale1 = exp2f(local_max[group][1] - new_max1);
+      const float warp_rescale0 = exp2f(rWarpMax(0, group) - new_max0);
+      const float warp_rescale1 = exp2f(rWarpMax(1, group) - new_max1);
 
       if (chunk > chunk_lo) {
 #pragma unroll
@@ -421,38 +456,35 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
           for (int nt = 0; nt < PV_N8_TILES_PER_GROUP; ++nt) {
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
-              acc_nope[group][slot][nt][i] *= alpha0;
-              acc_nope[group][slot][nt][i + 2] *= alpha1;
+              rONope(i, 0, nt, slot, group) *= alpha0;
+              rONope(i, 1, nt, slot, group) *= alpha1;
             }
           }
         }
 #pragma unroll
         for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
-          acc_rope[group][nt][0] *= alpha0;
-          acc_rope[group][nt][1] *= alpha0;
-          acc_rope[group][nt][2] *= alpha1;
-          acc_rope[group][nt][3] *= alpha1;
+          rORope(0, 0, nt, group) *= alpha0;
+          rORope(1, 0, nt, group) *= alpha0;
+          rORope(0, 1, nt, group) *= alpha1;
+          rORope(1, 1, nt, group) *= alpha1;
         }
-        global_sum[group][0] = global_sum[group][0] * alpha0 + block_sum0 * block_rescale0;
-        global_sum[group][1] = global_sum[group][1] * alpha1 + block_sum1 * block_rescale1;
+        rSum(0, group) = rSum(0, group) * alpha0 + block_sum0 * block_rescale0;
+        rSum(1, group) = rSum(1, group) * alpha1 + block_sum1 * block_rescale1;
       } else {
-        global_sum[group][0] = block_sum0 * block_rescale0;
-        global_sum[group][1] = block_sum1 * block_rescale1;
+        rSum(0, group) = block_sum0 * block_rescale0;
+        rSum(1, group) = block_sum1 * block_rescale1;
       }
-      global_max[group][0] = new_max0;
-      global_max[group][1] = new_max1;
+      rMax(0, group) = new_max0;
+      rMax(1, group) = new_max1;
 
-      const float w0 = p[group][0][0] * warp_rescale0;
-      const float w1 = p[group][0][1] * warp_rescale0;
-      const float w2 = p[group][0][2] * warp_rescale1;
-      const float w3 = p[group][0][3] * warp_rescale1;
-      const int c0 = tid * 2;
-      const int c1 = c0 + 1;
-      bf16* p_group = sm.p_full(group);
-      p_group[gid * STREAMING_P_STRIDE + warp_first_cand + c0] = __float2bfloat16(w0);
-      p_group[gid * STREAMING_P_STRIDE + warp_first_cand + c1] = __float2bfloat16(w1);
-      p_group[(gid + 8) * STREAMING_P_STRIDE + warp_first_cand + c0] = __float2bfloat16(w2);
-      p_group[(gid + 8) * STREAMING_P_STRIDE + warp_first_cand + c1] = __float2bfloat16(w3);
+      const float w0 = rP(0, 0, group) * warp_rescale0;
+      const float w1 = rP(1, 0, group) * warp_rescale0;
+      const float w2 = rP(0, 1, group) * warp_rescale1;
+      const float w3 = rP(1, 1, group) * warp_rescale1;
+      sP(gid, c0, group) = __float2bfloat16(w0);
+      sP(gid, c1, group) = __float2bfloat16(w1);
+      sP(gid + 8, c0, group) = __float2bfloat16(w2);
+      sP(gid + 8, c1, group) = __float2bfloat16(w3);
     }
 
     // Math warps form P while IO warps transpose and requantize the
@@ -463,17 +495,20 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
     // Phase 5 — PV: quantize P along candidates, then reuse each head group
     // across the feature-split warps. Keep BF16 P for the RoPE-value tail.
-    for (int task = threadIdx.x; task < HEADS_PER_CTA * NVFP4_VT_SCALE_GROUPS;
-         task += STREAMING_MATH_THREADS) {
-      const int head = task / NVFP4_VT_SCALE_GROUPS;
-      const int group = head / HPB;
-      const int head_in_group = head % HPB;
-      const int cand_group = task % NVFP4_VT_SCALE_GROUPS;
-      cute_quantize_prefill_group16(
-          sm.p_full(group) + head_in_group * STREAMING_P_STRIDE + cand_group * SF_VEC_SIZE,
-          sm.p_fp4(group) + head_in_group * STREAMING_W_PACKED_STRIDE +
-              cand_group * FP4_PACKED_PER_GROUP,
-          sm.w_sc(group) + head_in_group * NVFP4_VT_SCALE_GROUPS + cand_group);
+    using CandidateGroup = Int<NVFP4_VT_SCALE_GROUPS>;
+    auto sPQuant =
+        make_tensor(make_smem_ptr(sm.p_fp4(0)),
+                    make_layout(Shape<Head, CandidateGroup, HeadGroup>{},
+                                Stride<Int<STREAMING_W_PACKED_STRIDE>, Int<FP4_PACKED_PER_GROUP>,
+                                       Int<HPB * STREAMING_W_PACKED_STRIDE>>{}));
+    auto sPScale = make_tensor(make_smem_ptr(sm.w_sc(0)),
+                               make_layout(Shape<CandidateGroup, Head, HeadGroup>{}));
+    auto quant_tasks = make_layout(Shape<CandidateGroup, Head, HeadGroup>{});
+    for (int task = threadIdx.x; task < size(quant_tasks); task += STREAMING_MATH_THREADS) {
+      auto [candidate_group, head, group] = quant_tasks.get_flat_coord(task);
+      cute_quantize_prefill_group16(&sP(head, candidate_group * SF_VEC_SIZE, group),
+                                    &sPQuant(head, candidate_group, group),
+                                    &sPScale(candidate_group, head, group));
     }
     cutlass::arch::NamedBarrier::sync(
         STREAMING_MATH_THREADS,
@@ -502,16 +537,12 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
       // A=(head, candidate, head group), B=(feature, candidate),
       // C=(head, feature). V stays candidate-major in the raw KV slot.
-      auto sP = recast<Bf16>(make_tensor(
-          make_smem_ptr(sm.p_full(0)),
-          make_layout(Shape<_16, Int<STREAMING_CAND_WINDOW>, Int<VALID_HEAD_GROUPS>>{},
-                      Stride<Int<STREAMING_P_STRIDE>, _1, Int<HPB * STREAMING_P_STRIDE>>{})));
       auto sV = recast<Bf16>(make_tensor(
           make_smem_ptr(sm_kv_rope), make_layout(Shape<Int<D_ROPE>, Int<STREAMING_CAND_WINDOW>>{},
                                                  Stride<_1, Int<D_ROPE>>{})));
       auto sVWarp = local_tile(sV, Shape<Int<ROPE_DIMS_PER_WARP>, Int<STREAMING_CAND_WINDOW>>{},
                                make_coord(warp_id, _0{}));
-      auto tPsP = thr_copy_p.partition_S(sP);
+      auto tPsP = thr_copy_p.partition_S(recast<Bf16>(sP));
       auto tVsV = thr_copy_v.partition_S(sVWarp);
 
       // Allocate one K=16 fragment per head group so the same V fragment
@@ -525,7 +556,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
       auto c_shape =
           shape(thr_mma.partition_C(make_identity_tensor(Shape<_16, Int<ROPE_DIMS_PER_WARP>>{})));
       auto tOrO =
-          make_tensor(&acc_rope[0][0][0], make_layout(append(c_shape, Int<VALID_HEAD_GROUPS>{})));
+          make_tensor(rORope.data(), make_layout(append(c_shape, Int<VALID_HEAD_GROUPS>{})));
 
 #pragma unroll
       for (int k = 0; k < ROPE_K_ITERS; ++k) {
@@ -551,15 +582,14 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   // Phase 6 — Epilogue. WG0 warp 0 writes LSE and sink normalization;
   // all math warps normalize their O fragments. Mega reuses dead raw-KV
   // storage for one BF16 [16,512] context group before inverse RoPE/casting.
-  float* final_output_scale = reinterpret_cast<float*>(sm.p_full(0));
+  auto sOutputScale = make_tensor(make_smem_ptr(reinterpret_cast<float*>(sm.p_full(0))),
+                                  make_layout(Shape<Head, HeadGroup>{}));
   if (warp_id == 0 && tid == 0) {
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
       constexpr float empty_lse = -INFINITY;
-      float lse0 = global_sum[group][0] > 0.f ? log2f(global_sum[group][0]) + global_max[group][0]
-                                              : empty_lse;
-      float lse1 = global_sum[group][1] > 0.f ? log2f(global_sum[group][1]) + global_max[group][1]
-                                              : empty_lse;
+      float lse0 = rSum(0, group) > 0.f ? log2f(rSum(0, group)) + rMax(0, group) : empty_lse;
+      float lse1 = rSum(1, group) > 0.f ? log2f(rSum(1, group)) + rMax(1, group) : empty_lse;
       float output_scale0 = 1.f;
       float output_scale1 = 1.f;
       const int h0 = h_start + group * HPB + gid;
@@ -571,10 +601,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
         lse0 = norm0.y;
         lse1 = norm1.y;
       }
-      final_output_scale[group * HPB + gid] = output_scale0;
-      final_output_scale[group * HPB + gid + 8] = output_scale1;
-      out_lse[(size_t)token_idx * NUM_HEADS + h0] = scale_output_lse(lse0, lse_scale);
-      out_lse[(size_t)token_idx * NUM_HEADS + h0 + 8] = scale_output_lse(lse1, lse_scale);
+      sOutputScale(gid, group) = output_scale0;
+      sOutputScale(gid + 8, group) = output_scale1;
+      gLse(h0, token_idx) = scale_output_lse(lse0, lse_scale);
+      gLse(h0 + 8, token_idx) = scale_output_lse(lse1, lse_scale);
     }
   }
   cutlass::arch::NamedBarrier::sync(
@@ -583,18 +613,16 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 
 #pragma unroll
   for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-    const float inv_sum0 = global_sum[group][0] > 0.f
-                               ? final_output_scale[group * HPB + gid] / global_sum[group][0]
-                               : 0.f;
-    const float inv_sum1 = global_sum[group][1] > 0.f
-                               ? final_output_scale[group * HPB + gid + 8] / global_sum[group][1]
-                               : 0.f;
+    const float inv_sum0 = rSum(0, group) > 0.f ? sOutputScale(gid, group) / rSum(0, group) : 0.f;
+    const float inv_sum1 =
+        rSum(1, group) > 0.f ? sOutputScale(gid + 8, group) / rSum(1, group) : 0.f;
     const int group_h_start = h_start + group * HPB;
-    bf16* destination = output + ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V;
-    constexpr size_t head_stride = D_V;
+    auto gHead = gO(_, group_h_start, token_idx);
+    bf16* destination = raw_pointer_cast(gHead.data());
     // Producers have finished the final VT tile; raw KV is no longer live.
     static_assert(2 * StreamingNVFP4Smem::SMEM_KV_FP4_BUF >= HPB * D_V * sizeof(bf16));
     if constexpr (Mega) destination = reinterpret_cast<bf16*>(sm.kv_fp4(0));
+    auto mO = make_tensor(destination, make_layout(Shape<Head, Feature>{}, Stride<Feature, _1>{}));
 #pragma unroll
     for (int slot = 0; slot < PV_GROUPS_PER_WARP; ++slot) {
       const int scale_group = slot * STREAMING_N_WARPS + warp_id;
@@ -602,31 +630,33 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
 #pragma unroll
       for (int nt = 0; nt < PV_N8_TILES_PER_GROUP; ++nt) {
         const int d0 = scale_group * SF_VEC_SIZE + nt * 8 + tid * 2;
-        const __nv_bfloat162 lo = __floats2bfloat162_rn(acc_nope[group][slot][nt][0] * inv_sum0,
-                                                        acc_nope[group][slot][nt][1] * inv_sum0);
-        const __nv_bfloat162 hi = __floats2bfloat162_rn(acc_nope[group][slot][nt][2] * inv_sum1,
-                                                        acc_nope[group][slot][nt][3] * inv_sum1);
-        *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)gid * head_stride + d0]) = lo;
-        *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
+        const __nv_bfloat162 lo = __floats2bfloat162_rn(rONope(0, 0, nt, slot, group) * inv_sum0,
+                                                        rONope(1, 0, nt, slot, group) * inv_sum0);
+        const __nv_bfloat162 hi = __floats2bfloat162_rn(rONope(0, 1, nt, slot, group) * inv_sum1,
+                                                        rONope(1, 1, nt, slot, group) * inv_sum1);
+        *reinterpret_cast<__nv_bfloat162*>(&mO(gid, d0)) = lo;
+        *reinterpret_cast<__nv_bfloat162*>(&mO(gid + 8, d0)) = hi;
       }
     }
 #pragma unroll
     for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
       const int d0 = D_NOPE + warp_id * ROPE_DIMS_PER_WARP + nt * 8 + tid * 2;
-      const __nv_bfloat162 lo = __floats2bfloat162_rn(acc_rope[group][nt][0] * inv_sum0,
-                                                      acc_rope[group][nt][1] * inv_sum0);
-      const __nv_bfloat162 hi = __floats2bfloat162_rn(acc_rope[group][nt][2] * inv_sum1,
-                                                      acc_rope[group][nt][3] * inv_sum1);
-      *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)gid * head_stride + d0]) = lo;
-      *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
+      const __nv_bfloat162 lo = __floats2bfloat162_rn(rORope(0, 0, nt, group) * inv_sum0,
+                                                      rORope(1, 0, nt, group) * inv_sum0);
+      const __nv_bfloat162 hi = __floats2bfloat162_rn(rORope(0, 1, nt, group) * inv_sum1,
+                                                      rORope(1, 1, nt, group) * inv_sum1);
+      *reinterpret_cast<__nv_bfloat162*>(&mO(gid, d0)) = lo;
+      *reinterpret_cast<__nv_bfloat162*>(&mO(gid + 8, d0)) = hi;
     }
     if constexpr (Mega) {
       cutlass::arch::NamedBarrier::sync(
           STREAMING_MATH_THREADS,
           static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
       for (int i = threadIdx.x; i < HPB * D_V / 8; i += STREAMING_MATH_THREADS) {
-        mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
-                    ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V + i * 8, token_idx, mega);
+        const int head = i / (D_V / 8);
+        const int feature = (i % (D_V / 8)) * 8;
+        mega_store8(*reinterpret_cast<const uint4*>(&mO(head, feature)),
+                    gO.layout()(feature, group_h_start + head, token_idx), token_idx, mega);
       }
       // Release epilogue scratch before the next head group reuses raw KV.
       cutlass::arch::NamedBarrier::sync(
