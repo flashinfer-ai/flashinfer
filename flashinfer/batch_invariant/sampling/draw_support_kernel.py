@@ -90,15 +90,15 @@ from .support_spec import FIX_SCALE, Filters
 DRAW_SUPPORT_MODULE = "batch_invariant_sampling_draw_support"
 
 
-# The per-call switches of the K5 kernels (a flag word, runtime; never a kernel variant): each one select or one predicated
-# store per ROW, the bits of every row those of the specialised kernels they replace (2026-11-18). `return_logprob` is NOT a
-# flag: the full distribution's log-probability needs the row-sum pass, which the top-k forms do not otherwise run. The INDEX
-# GATHER is a compile-time variant (16 -> 2 kernels, not 16 -> 1): as a runtime flag, the row base built from a loaded index
-# instead of the blockIdx-derived row cost 50-90 registers on the 256-thread cluster picks (one CTA per SM fewer: 0.59-0.92x at
-# bf16 top-k 128256 / 152064 x 16 and top-p 128256 x 48-128 in #9695's review) and the per-thread values carried across the
-# passes a spill elsewhere; re-deriving them at the end cured only the non-cluster pick (2026-11-19).
-FLAG_TEMP_ROWS = 1  # the temperature per row (mTemp) instead of the constant c_const
-FLAG_KEPT_LOGPROB = 2  # the drawn token's log-probability over the kept set is written (logits kernels; the score form always)
+# PDL is the only runtime convenience argument of the truncated samplers' kernels (2026-11-19; the `griddepcontrol` instructions
+# are always emitted and inert without the launch attribute). Every other convenience dimension is compile-time, each for a
+# measured reason (the review of #9695): the INDEX GATHER as a runtime flag cost 50-90 registers on the 256-thread cluster picks
+# (the row base from a loaded index instead of the blockIdx-derived row: one CTA per SM fewer, 0.59-0.92x); the TEMPERATURE FORM
+# and the KEPT-SET LOG-PROBABILITY as runtime flags put the chain and the per-row scale into every logits kernel -- 122 -> 140-150
+# registers at the T256 C2 picks of 32769-65536 x 80-144 rows (0.6x), the `return_logprob` kernels 1.7-2.2x on B200, the plain
+# logits entry 2-8 % everywhere. The probability kernels have neither the temperature nor the kept chain: 2 variants per key
+# (the gather); the logits kernels 8. `return_logprob` adds the row-sum pass to the k-only / kept-shortcut forms and was never a
+# flag.
 
 
 class DrawSupportKernel:
@@ -132,10 +132,11 @@ class DrawSupportKernel:
         assert not score or (from_logits and not has_indices), (
             "the score form takes logits (the kept-set log-probability is its output) and gathers no source rows"
         )
-        # temp_rows / return_kept_logprob are runtime flags of the kernel (FLAG_*): accepted here and ignored; the index gather
-        # is a compile-time variant (the module header)
         self.score = score
-        self.has_indices = has_indices
+        self.has_indices, self.temp_rows = has_indices, temp_rows
+        self.return_kept_logprob = (
+            return_kept_logprob or score
+        )  # the score form's output is the kept-set value
         self.early_finish, self.study = early_finish, ""
         self.dtype, self.N, self.Kp, self.cfg = dtype, N, Kp, cfg
         self.from_logits, self.filters, self.return_logprob = (
@@ -247,7 +248,6 @@ class DrawSupportKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        flags: Int32,
         enable_pdl: Int32,
         stream,
     ):
@@ -271,7 +271,6 @@ class DrawSupportKernel:
             M,
             Msrc,
             N,
-            flags,
             self._tv_layout(self.vec),
             (1, BLOCK),
         )
@@ -315,15 +314,12 @@ class DrawSupportKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        flags: Int32,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         fp = CuteF32
         bidx, _, _ = cute.arch.block_idx()
         cute.arch.griddepcontrol_wait()  # no effect unless the launch carried the PDL attribute (a runtime launch argument)
-        flag_temp = (flags & Int32(FLAG_TEMP_ROWS)) != Int32(0)
-        flag_lpk = (flags & Int32(FLAG_KEPT_LOGPROB)) != Int32(0)
         W, C = self.W, self.C
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -410,10 +406,10 @@ class DrawSupportKernel:
                 t
             )
         idX = cute.make_identity_tensor(mX.shape)
-        # the scale: the row's temperature (the dummy read at 0 when the flag is off) or the constant
-        c = _select(
-            flag_temp, scale(fp, mTemp[_select(flag_temp, row_c, Int64(0))]), c_const
-        )
+        if cutlass.const_expr(self.temp_rows):
+            c = scale(fp, mTemp[row_c])
+        else:
+            c = c_const
         pad = NEG_INF if self.from_logits else 0.0
         cta_base = c_rank * self.cfg.blocks_per_cta(self.N)
         loader = _DrawLoader(
@@ -673,15 +669,16 @@ class DrawSupportKernel:
             token = _select(valid, tok, Int32(-1))
             lp = Float32(NAN)
             lpk = Float32(NAN)
-            if cutlass.const_expr(
-                self.from_logits
-            ):  # the token's log-probabilities: the chains per row, the kept one's store on the flag
+            if cutlass.const_expr(self.return_logprob or self.return_kept_logprob):
                 tok_c = _select(valid, token, Int32(0))
                 xt = mX[src_c, tok_c].to(Float32)
                 zt = shifted(fp, xt, nm, c)
                 if cutlass.const_expr(self.return_logprob):
                     lp = _select(valid, logp(fp, zt, fp.neg(lg2(fp, S))), Float32(NAN))
-                lpk = _select(valid, logp(fp, zt, fp.neg(lg2(fp, mass))), Float32(NAN))
+                if cutlass.const_expr(self.return_kept_logprob):
+                    lpk = _select(
+                        valid, logp(fp, zt, fp.neg(lg2(fp, mass))), Float32(NAN)
+                    )
         if t == 0:
             if w == 0:
                 if c_rank == 0:
@@ -694,11 +691,8 @@ class DrawSupportKernel:
                         mMass[row] = mass
                         if cutlass.const_expr(self.return_logprob):
                             mLogp[row] = lp
-                        if cutlass.const_expr(self.score):
+                        if cutlass.const_expr(self.return_kept_logprob):
                             mLogpK[row] = lpk
-                        else:
-                            if flag_lpk:
-                                mLogpK[row] = lpk
         peers.finish()
         cute.arch.griddepcontrol_launch_dependents()
 
@@ -879,12 +873,13 @@ def kernel_name(
     score: bool = False,
     count_list: Optional[bool] = None,
 ) -> str:
-    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, with / without the index gather,
-    the full-distribution log-probability, the selection's placements, the score form)."""
-    # the temperature form, the kept log-probability output and PDL are runtime arguments (FLAG_*, enable_pdl): not in the name
+    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, the index
+    gather, the two log-probability outputs, the selection's placements, the score form); PDL is a runtime launch argument
+    (``enable_pdl`` is accepted and ignored)."""
     return jit.sanitize_symbol_name(
         f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}"
-        f"{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
+        f"_{'trow' if temp_rows else 'tconst'}{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
+        f"{'_lpk' if return_kept_logprob else ''}"
         f"{f'_ef{early_finish}' if early_finish else ''}"
         f"{'' if count_list is None else ('_cl1' if count_list else '_cl0')}"
     )
@@ -942,8 +937,8 @@ def _key(
     score=False,
     count_list=None,
 ):
-    """The compile key of the kernel serving ``N``; temp_rows / enable_pdl / return_kept_logprob are runtime arguments and
-    leave it, the index gather is a compile dimension."""
+    """The compile key of the kernel serving ``N``: PDL is a runtime launch argument and leaves it; the probability kernels
+    have neither the temperature nor the kept chain, so those two dimensions are keyed False for them."""
     from .schedule import padded_blocks
 
     return (
@@ -952,12 +947,12 @@ def _key(
         cfg,
         from_logits,
         filters,
-        False,
+        bool(temp_rows and from_logits),
         bool(has_indices),
         return_logprob,
         False,
         early_finish,
-        False,
+        bool((return_kept_logprob or score) and from_logits),
         score,
         count_list,
     )
@@ -1094,7 +1089,6 @@ def _spec(
             Int64(1),
             Int64(1),
             Int32(1),
-            Int32(0),
             Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",

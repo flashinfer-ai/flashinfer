@@ -618,11 +618,11 @@ IR_CASES = [
 def test_draw_support_ir_uses_only_declared_forms(
     tmp_path, dtype, N, cfg, from_logits, fset, trow, idx, lp, lpk
 ):
-    """Compile one kernel per code path with no GPU visible and check the PTX: `.rn` arithmetic only, `ex2.approx` and
-    `lg2.approx` iff logits (the kept-set log-probability chain is compiled on every logits kernel; its store is on the
-    runtime flag), the declared `cvt.rzi.s64.f32` iff top-p, the divisions declared (`div(2^44, S)` for top-p, the scale's
-    `LOG2E / T` on logits kernels: the temperature form is a runtime flag), the shared-memory integer adds of the
-    histograms, the cluster forms only in cluster members, `griddepcontrol` in every kernel, no fast-math anywhere."""
+    """Compile one kernel per code path with no GPU visible and check the PTX: `.rn` arithmetic only, `ex2.approx` iff
+    logits and `lg2.approx` iff a log-probability is formed, the declared `cvt.rzi.s64.f32` iff top-p, the divisions declared
+    (`div(2^44, S)` for top-p, the per-row temperature's), the shared-memory integer adds of the histograms, the cluster
+    forms only in cluster members, `griddepcontrol` in every kernel (PDL is a runtime launch argument), no fast-math
+    anywhere."""
     pytest.importorskip("cutlass")
     f = SETS[fset]
     code = (
@@ -639,9 +639,9 @@ def test_draw_support_ir_uses_only_declared_forms(
         "lg2.approx.ftz.f32", ""
     )
     assert ("ex2.approx.ftz.f32" in ptx) == from_logits
-    assert ("lg2.approx.ftz.f32" in ptx) == from_logits
+    assert ("lg2.approx.ftz.f32" in ptx) == (lp or lpk)
     assert ("cvt.rzi.s64.f32" in ptx) == (f.top_p is not None)
-    divs = (1 if from_logits else 0) + (1 if f.top_p is not None else 0)
+    divs = (1 if trow else 0) + (1 if f.top_p is not None else 0)
     assert ptx.count("div.rn.f32") == divs, (ptx.count("div.rn.f32"), divs)
     assert "griddepcontrol.wait" in ptx and "griddepcontrol.launch_dependents" in ptx
     assert "red.shared.add.u32" in ptx
@@ -697,23 +697,19 @@ def _spec(
     ef="mass",
     cl=None,
 ):
-    del (
-        trow,
-        pdl,
-        lpk,
-    )  # runtime arguments of one kernel (FLAG_*, enable_pdl): not a compile dimension; the gather is one
+    del pdl  # a runtime launch argument: not a compile dimension
     return (
         ds,
         N,
         _cfg_tuple(cfg),
         from_logits,
         _fset(SETS[fset]),
-        False,
+        trow,
         idx,
         lp,
         False,
         ef,
-        False,
+        lpk,
         score,
         cl,
     )

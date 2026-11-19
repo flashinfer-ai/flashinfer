@@ -227,11 +227,7 @@ def draw_support(
     ``"all"``, ``""``) and ``count_list`` (``None``: the kernel's rule) are the selection's placements, pinned against each
     other by the suite. ``out`` (int32), ``logprob_out`` and ``kept_logprob_out`` (fp32; each
     implies its ``return_*``) are caller-owned buffers of the output shape, written in place and returned as given."""
-    from .draw_support_kernel import (
-        FLAG_KEPT_LOGPROB,
-        FLAG_TEMP_ROWS,
-        get_compiled_kernel,
-    )
+    from .draw_support_kernel import get_compiled_kernel
 
     name = "logits" if from_logits else "probs"
     N = _check_input(x, name)
@@ -388,8 +384,6 @@ def draw_support(
             M,
             Msrc,
             N,
-            (FLAG_TEMP_ROWS if temp_t is not None else 0)
-            | (FLAG_KEPT_LOGPROB if return_kept_logprob else 0),
             int(bool(enable_pdl)),
         )
     elif M > 0:
@@ -439,11 +433,7 @@ def kept_log_probs(
     ``return_logprob``: the full distribution's, ``log_probs`` at the token)``}``. One id per row; ``top_k`` / ``top_p`` /
     ``min_p`` (at least one) and ``order`` as :func:`draw_support` takes them. ``out`` / ``logprob_out`` are caller-owned
     fp32 buffers of the row shape, written in place and returned as given."""
-    from .draw_support_kernel import (
-        FLAG_KEPT_LOGPROB,
-        FLAG_TEMP_ROWS,
-        get_compiled_kernel,
-    )
+    from .draw_support_kernel import get_compiled_kernel
 
     N = _check_input(logits, "logits")
     if order not in ORDERS:
@@ -571,7 +561,6 @@ def kept_log_probs(
             M,
             M,
             N,
-            (FLAG_TEMP_ROWS if temp_t is not None else 0) | FLAG_KEPT_LOGPROB,
             int(bool(enable_pdl)),
         )
     res = {"kept_logp": kb if kb is not None else lpk.view(lead)}
