@@ -482,13 +482,18 @@ def _non_nccl_group_body(rank, world, group, backend):
     metadata_group = dist.new_group(backend="gloo")
     try:
         x = torch.full((1, 4, world, 64), rank + 1, dtype=torch.bfloat16, device="cuda")
-        with pytest.raises((ValueError, RuntimeError), match="NCCL|nccl"):
+        with pytest.raises((ValueError, RuntimeError)) as rejected:
             UlyssesCommunicator(
                 metadata_group,
                 max_bytes=x.nbytes,
                 dtype=x.dtype,
                 backend=backend,
             )
+        if isinstance(rejected.value, UlyssesBackendError):
+            # Without NVLink the forced topology check rejects first; the
+            # runner reports that as a skip.
+            raise rejected.value
+        assert "nccl" in str(rejected.value).lower(), rejected.value
     finally:
         dist.destroy_process_group(metadata_group)
     return "ok", f"Gloo-only groups are rejected before {backend} resources are armed"
