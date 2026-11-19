@@ -89,8 +89,13 @@ def get_cuda_version() -> Version:
         return Version(torch.version.cuda)
 
 
+@functools.cache
+def _cuda_version_requirement(version_str: str) -> Version:
+    return Version(version_str)
+
+
 def is_cuda_version_at_least(version_str: str) -> bool:
-    return get_cuda_version() >= Version(version_str)
+    return get_cuda_version() >= _cuda_version_requirement(version_str)
 
 
 def get_nvcc_parallelism_flags() -> List[str]:
