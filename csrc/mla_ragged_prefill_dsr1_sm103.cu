@@ -17,6 +17,7 @@
 #include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -2333,17 +2334,23 @@ static CUtensorMap mk_map(void* p, uint64_t d0, uint64_t d1, uint64_t d2, uint64
   return m;
 }
 
-static int g_nsm = 0;
-
+// SM count of the CURRENT device, cached per device: the first workspace
+// query may run with a different device current than later Run calls, and
+// one device's count must not plan another device's splits (the split plan
+// and the exported workspace size share this value, so both follow the
+// caller's device scope).
 static int num_sms() {
-  static std::once_flag nsm_once;
-  std::call_once(nsm_once, []() {
-    int dev = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&g_nsm, cudaDevAttrMultiProcessorCount, dev);
-    if (g_nsm <= 0) g_nsm = 148;
-  });
-  return g_nsm;
+  static std::atomic<int> nsm_cache[64];
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (dev < 0 || dev >= 64) return 148;
+  int n = nsm_cache[dev].load(std::memory_order_relaxed);
+  if (n <= 0) {
+    cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+    if (n <= 0) n = 148;
+    nsm_cache[dev].store(n, std::memory_order_relaxed);
+  }
+  return n;
 }
 
 // Split-count model, shared by Run and the exported workspace-size query so

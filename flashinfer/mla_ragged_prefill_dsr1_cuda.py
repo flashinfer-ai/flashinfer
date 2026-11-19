@@ -271,16 +271,20 @@ def supported_with_reasons(
     if load_reasons:
         return load_reasons
     mod = get_mla_ragged_prefill_dsr1_module()
-    need = int(
-        mod.mla_ragged_prefill_dsr1_workspace_bytes(
-            int(batch_size),
-            int(query.shape[0]),
-            int(key.shape[0]),
-            int(max_q_len),
-            int(max_kv_len),
-            int(bool(extras.get("is_causal"))),
+    # The size model depends on the SM count, so scope the query to the
+    # query tensor's device: a different current device must not plan this
+    # call's splits (Run re-derives the same plan under its device guard).
+    with torch.cuda.device(query.device):
+        need = int(
+            mod.mla_ragged_prefill_dsr1_workspace_bytes(
+                int(batch_size),
+                int(query.shape[0]),
+                int(key.shape[0]),
+                int(max_q_len),
+                int(max_kv_len),
+                int(bool(extras.get("is_causal"))),
+            )
         )
-    )
     if workspace_buffer.shape[0] < need:
         return [f"workspace_too_small_need_{need}_bytes"]
     return []
