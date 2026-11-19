@@ -359,7 +359,13 @@ void trtllm_paged_attention_launcher(
           is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
     }
     runner_params.mKernelType = FmhaKernelType::Context;
-    runner_params.mTileScheduler = TileScheduler::Persistent;
+    // On SM103 the persistent paged-context kernels can deadlock when one CTA processes more than
+    // one tile (grid > #SMs): compute-sanitizer synccheck reports "Missing wait" on the softmax
+    // warpgroup barriers at tile transitions, and serving workloads hang in this kernel. The
+    // static scheduler (one tile per CTA) selects the matching *StaticContext kernel, gives
+    // bit-identical outputs and has no measurable cost on real prefill batches. See #9700.
+    runner_params.mTileScheduler =
+        fmha_runner->smVersion() == kSM_103 ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = false;
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
