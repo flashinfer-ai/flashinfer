@@ -59,7 +59,7 @@ def _compiled_fp8bs(cfg: Knobs, out_fmt: str, family: str, native_k: bool):
     out_dt, oal = OUT_DT[out_fmt], ALIGN[out_fmt]
     name = kernel_name(cfg, out_fmt, native_k)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         # K a multiple of 128 (one whole scale block per smem stage), the operand rows 16-byte aligned; the scale tensors
         # with free strides (the kernel's producer warp gathers them element by element, or four at a time from a
         # 16-byte-aligned base with the K-native staging)
@@ -111,6 +111,7 @@ def _compiled_fp8bs(cfg: Knobs, out_fmt: str, family: str, native_k: bool):
             RASTER_PLACEHOLDER,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)

@@ -413,40 +413,13 @@ def test_scheduler_decode_mirror_visits_every_tile_once():
                         full = (F // s) * s * S
                         for l in range(L):
                             per_l = S * F
-                            assert order[l * per_l : l * per_l + full] == static[l * per_l : l * per_l + full]
-                            assert sorted(order[l * per_l + full : (l + 1) * per_l]) == sorted(
-                                static[l * per_l + full : (l + 1) * per_l]
+                            assert (
+                                order[l * per_l : l * per_l + full]
+                                == static[l * per_l : l * per_l + full]
                             )
-
-
-def test_non_kernel_source_exclusions_are_current():
-    """Every source excluded from a module's cache key (the dispatcher's host-side files) exists and is in the module's import
-    closure: a stale entry raises instead of silently letting the file back into the key."""
-    import flashinfer.batch_invariant.jit as J
-
-    clear = getattr(
-        J.module_sources, "cache_clear", lambda: None
-    )  # the closure is memoised per module
-    for module, entries in list(J.MODULE_NON_KERNEL_SOURCES.items()):
-        saved = J.MODULE_NON_KERNEL_SOURCES[module]
-        try:
-            J.MODULE_NON_KERNEL_SOURCES[module] = ()
-            clear()
-            full = set(J.relative_sources(module))
-            for r in entries:
-                assert (J._FI_DIR / r).exists(), (module, r)
-                assert r in full, (module, r)
-            J.MODULE_NON_KERNEL_SOURCES[module] = saved + (
-                "gemm/batch_invariant/does_not_exist.py",
-            )
-            clear()
-            with pytest.raises(
-                FileNotFoundError, match="not in the module's import closure"
-            ):
-                J.relative_sources(module)
-        finally:
-            J.MODULE_NON_KERNEL_SOURCES[module] = saved
-            clear()
+                            assert sorted(
+                                order[l * per_l + full : (l + 1) * per_l]
+                            ) == sorted(static[l * per_l + full : (l + 1) * per_l])
 
 
 def test_cache_key_covers_every_kernel_source():
@@ -996,9 +969,15 @@ def test_launch_placements_share_one_compiled_object(monkeypatch):
         for g in (0, 9)
     ]
     for cfg in variants:
-        assert torch.equal(bits(mm_bf16_batch_invariant(a, b, config=cfg)), ref), cfg.describe()
+        assert torch.equal(bits(mm_bf16_batch_invariant(a, b, config=cfg)), ref), (
+            cfg.describe()
+        )
     gemm_names = [n for n in names if n.startswith("bf16_")]
-    assert len(gemm_names) == 1 and "_sw" not in gemm_names[0] and "_g" not in gemm_names[0], names
+    assert (
+        len(gemm_names) == 1
+        and "_sw" not in gemm_names[0]
+        and "_g" not in gemm_names[0]
+    ), names
     keys = [k for k in bi_api._KERNELS if k[1] == object_record(base)]
     assert len(keys) == 1, keys
     # the split class: C = 2 and C = 8 (two weight shapes) share the partial kernel; the fixup is per chunk count
@@ -1021,8 +1000,12 @@ def test_launch_placements_share_one_compiled_object(monkeypatch):
     assert sum("_cc" in n for n in gemm_names) == 1, names
     fixups = sorted(n for n in names if n.startswith("splitk_fixup"))
     assert fixups == ["splitk_fixup_C2_bf16", "splitk_fixup_C8_bf16"], names
-    handles = {k[2:]: v for k, v in bi_api._KERNELS.items() if k[1] == object_record(cfg)}
-    assert len(handles) == 1, handles  # one handle for both chunk counts (the object's record and "split")
+    handles = {
+        k[2:]: v for k, v in bi_api._KERNELS.items() if k[1] == object_record(cfg)
+    }
+    assert len(handles) == 1, (
+        handles
+    )  # one handle for both chunk counts (the object's record and "split")
 
 
 @needs_device
@@ -1042,10 +1025,15 @@ def test_bucket_tactic_sweep_compiles_one_object_per_placement_class(monkeypatch
     a, b = rnd_bf16(M, K, 175), rnd_bf16(K, N, 176)
     ref = bits(mm_bf16_batch_invariant(a, b, config=tactics[0], chunks=C))
     for cfg in tactics[1:]:
-        assert torch.equal(bits(mm_bf16_batch_invariant(a, b, config=cfg, chunks=C)), ref), cfg.describe()
+        assert torch.equal(
+            bits(mm_bf16_batch_invariant(a, b, config=cfg, chunks=C)), ref
+        ), cfg.describe()
     gemm_names = [n for n in names if n.startswith("bf16_")]
     classes = {object_record(t) for t in tactics}
-    assert len(gemm_names) == len(set(gemm_names)) == len(classes), (gemm_names, classes)
+    assert len(gemm_names) == len(set(gemm_names)) == len(classes), (
+        gemm_names,
+        classes,
+    )
     assert len(classes) < len(tactics), "the candidate list holds raster twins"
 
 

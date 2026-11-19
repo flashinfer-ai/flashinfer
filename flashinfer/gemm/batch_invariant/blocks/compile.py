@@ -126,7 +126,7 @@ def _compiled_gemm(
     nal = al if b_major == "n" else oal
     name = kernel_name(cfg, b_major, 2 if split else 1, in_fmt, out_fmt, batched, bias)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_m, sym_n, sym_kc = (
             cute.sym_int(32),
             cute.sym_int(32, divisibility=nal),
@@ -176,6 +176,7 @@ def _compiled_gemm(
                 bias_fake,
                 *tail,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if not scaled:
             return cute.compile(
@@ -185,6 +186,7 @@ def _compiled_gemm(
                 c_fake,
                 *tail,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         sa_fake = cute.runtime.make_fake_tensor(
             cutlass.Float32, (1,), (1,), assumed_align=4
@@ -201,6 +203,7 @@ def _compiled_gemm(
             sb_fake,
             *tail,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)

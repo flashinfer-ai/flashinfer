@@ -131,7 +131,7 @@ def compile_blockscaled(
     oal = ALIGN[out_fmt] if direct else ALIGN["f32"]
     name = kernel_name(cfg, chunks, in_fmt, out_fmt, enable_pdl)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         # the operands' batch extent: the K chunk of the split views, a runtime value (1 for the unsplit class and the
         # in-cluster split, which folds whole operands)
         L = cute.sym_int(32) if (chunks > 1 and not in_cluster) else 1
@@ -206,6 +206,7 @@ def compile_blockscaled(
                 alpha_fake,
                 *tail,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         return cute.compile(
             BlockScaledGemm(
@@ -223,6 +224,7 @@ def compile_blockscaled(
             c_fake,
             *tail,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(module, name, compile_fn)
