@@ -16,6 +16,14 @@ BF16 GEMM
     mm_bf16
     bmm_bf16
 
+TF32 GEMM
+---------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_tf32
+
 FP4 GEMM
 --------
 

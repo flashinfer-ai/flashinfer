@@ -258,6 +258,53 @@ mm_bf16_trace = TraceTemplate(
 )
 
 
+def _mm_tf32_init(
+    *,
+    M: int,
+    N: int = 256,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_tf32`` (``B`` column-major [K, N])."""
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.float32, device=device)
+    b = torch.randn(N, K, dtype=torch.float32, device=device).T  # [K, N] col-major
+    return {"a": a, "b": b}
+
+
+cast(Any, _mm_tf32_init)._trace_init_const_axes = ("N", "K")
+
+
+mm_tf32_trace = TraceTemplate(
+    op_type="gemm_tf32",
+    description=(
+        "General matrix multiply C = A @ B with fp32 inputs, TF32 MMAs and fp32 "
+        "output (B is column-major [K, N])."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a"),
+        "B": Tensor(
+            ["K", "N"],
+            param="b",
+            description="Weight matrix in column-major layout (physical shape [K, N]).",
+        ),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified"],
+    reference=_mm_reference,
+    check=_gemm_check,
+    init=_mm_tf32_init,
+)
+
+
 def _mm_fp8_init(
     *,
     M: int,

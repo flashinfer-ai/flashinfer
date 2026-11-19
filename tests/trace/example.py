@@ -76,6 +76,7 @@ fused_kda_decode_h12_d128.json
 packed_fused_kda_decode_t3_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
+gemm_tf32_N256_K8192.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 mm_bf16_fp8_N4096_K4096.json
@@ -817,6 +818,13 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── GEMM tf32 ─────────────────────────────────────────────────────────────────
+# MoE router logits with fp32 weights (256 experts x 8192 hidden), M tokens.
+a = torch.randn(16, 8192, dtype=torch.float32, device=device)
+b = torch.randn(256, 8192, dtype=torch.float32, device=device).T  # [K, N] col-major
+with contextlib.suppress(Exception):
+    flashinfer.mm_tf32(a, b)
 
 # ── W8A16 FP8 GEMM (bf16 activation, e4m3 weight [N, K], per-tensor scale) ────
 # Trace is dumped before kernel launch; suppress Hopper/Blackwell-only failures.
