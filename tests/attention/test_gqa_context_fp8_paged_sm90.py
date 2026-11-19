@@ -512,6 +512,111 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "q_len,kv_len", [(4, 4096), (12, 4096), (32, 4096), (8192, 32768)]
+)
+def test_raw_score_range_and_unit_pv(q_len, kv_len):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    b = _make_batch([q_len], [kv_len], device)
+    for name in ("q", "k_cache"):
+        b[name].view(torch.uint8).fill_(0x60)  # 32; raw QK = 131072
+    b["v_cache"].view(torch.uint8).fill_(0x38)  # constant 1
+    w = _plan_wrapper(b, device, backend="auto")
+    if q_len == 8192:
+        assert w._gqa_ctx_fp8q_sm90_state.psplit == 1
+    scale = torch.tensor([[1 / 32]], device=device)
+    out = w.run(b["q"], (b["k_cache"], b["v_cache"]), q_scale=scale, k_scale=scale)
+    torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)
+    assert _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "composable": 0,
+    }
+
+
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    b = _make_batch([32], [64], device)
+    w = _plan_wrapper(b, device, use_cuda_graph=True, backend=backend)
+    q = b["q"]
+    kv = (b["k_cache"], b["v_cache"])
+    eager = w.run(q, kv)
+    out = torch.empty_like(eager)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        w.run(q, kv, out=out)
+
+    def plan(rows, **opts):
+        w.plan(
+            b["qo_indptr"].new_tensor([0, rows]),
+            b["kv_indptr"],
+            b["kv_indices"].flip(0),
+            b["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+            **opts,
+        )
+
+    state = w._gqa_ctx_fp8q_sm90_state
+    for rows, disabled, opts, reason in (
+        (16, False, {}, "launch schedule"),
+        (24, True, {}, "kill switch"),
+        (24, False, {"disable_split_kv": True}, "disable_split_kv"),
+    ):
+        with monkeypatch.context() as patch:
+            if disabled:
+                patch.setenv(DISABLE_ENV, "1")
+            with pytest.raises(NotImplementedError, match=reason):
+                plan(rows, **opts)
+        assert w._gqa_ctx_fp8q_sm90_state is state
+        assert torch.equal(w.run(q, kv), eager)
+        out.fill_(17)
+        g.replay()
+        assert torch.equal(out, eager)
+
+    # Admission succeeds, then the common FA2 planner refuses. Private
+    # captured metadata and the last accepted eager plan must both survive.
+    from types import SimpleNamespace
+
+    def refuse_common_plan(*args):
+        raise RuntimeError("injected common planner refusal")
+
+    with monkeypatch.context() as patch:
+        module = w._cached_module
+        patch.setattr(w, "_cached_module", SimpleNamespace(plan=refuse_common_plan))
+        # The planner cache lookup must return the same injected module.
+        import flashinfer.prefill as prefill
+
+        patch.setattr(
+            prefill,
+            "get_batch_prefill_module",
+            lambda *args, **kwargs: w._cached_module,
+        )
+        with pytest.raises(RuntimeError, match="injected common planner refusal"):
+            plan(24)
+        patch.setattr(w, "_cached_module", module)
+    assert w._gqa_ctx_fp8q_sm90_state is state
+    assert torch.equal(w.run(q, kv), eager)
+    out.fill_(17)
+    g.replay()
+    assert torch.equal(out, eager)
+
+    plan(24)
+    ref = dict(b, q=q[:24], block_table=b["block_table"].flip(1))
+    out.fill_(17)
+    g.replay()
+    assert torch.equal(out[:24], w.run(q[:24], kv))
+    assert _matched_ratio(out[:24], _reference(ref)) >= MATCHED
+
+
 def test_uniform_large_negative_scores_keep_softmax_weight():
     """Rows whose scores are a constant -16384 must return the value row
     (softmax is uniform), not 0: the renormaliser clamps in scaled units, not
@@ -621,7 +726,9 @@ def test_graph_mode_replan_never_swaps_buffer_pointers():
     assert wrapper._gqa_ctx_fp8q_sm90_state is not None
     # every retained buffer keeps its pointer (new names may be added: a
     # buffer that never existed has no captured pointer to preserve)
-    assert {name: bufs[name].data_ptr() for name in ptrs} == ptrs
+    assert {
+        name: wrapper._gqa_ctx_fp8q_sm90_bufs[name].data_ptr() for name in ptrs
+    } == ptrs
     out = wrapper.run(narrow["q"], (wide["k_cache"], wide["v_cache"]))
     assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 2
     small_ref = dict(narrow)
@@ -675,9 +782,11 @@ def test_graph_mode_replan_never_swaps_buffer_pointers():
         _plan2(wide)
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 1, stats  # only the narrow plan armed
-    assert wrapper2._gqa_ctx_fp8q_sm90_state is None
+    assert wrapper2._gqa_ctx_fp8q_sm90_state is not None
     assert "plan: graph-retained workspace capacity" in stats["fallback_reasons"]
-    assert {name: bufs2[name].data_ptr() for name in ptrs2} == ptrs2
+    assert {
+        name: wrapper2._gqa_ctx_fp8q_sm90_bufs[name].data_ptr() for name in ptrs2
+    } == ptrs2
     # the refusal happened before any in-place refresh: a capture from the
     # accepted plan still reads a consistent seq_lens / block_table pair
     assert torch.equal(bufs2["seq_lens"], seq_lens_before)

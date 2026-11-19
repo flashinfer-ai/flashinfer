@@ -22,7 +22,7 @@
 // normalisation).
 //
 // Algorithm: a Hopper warpgroup kernel. QK^T runs as fp8 wgmma
-// (m64n64k32 e4m3 x e4m3, packed f16 accumulate — see OPERAND RANGE below)
+// (m64n96k32 e4m3 x e4m3, fp32 accumulate)
 // over K-major staged Q and K tiles
 // (register-resident Q, cp.async two-stage K/V pipeline through dynamic
 // shared memory, BN=96 key tiles); softmax statistics are fp32 online-softmax
@@ -30,12 +30,12 @@
 // P.V product runs as fp8 wgmma (m64n128k32) against a keys-contiguous V^T
 // scratch that a small pass (`vt_build`) builds from the paged V cache (every
 // covered physical page exactly once per call, also emitting the exact
-// long-query tile list); the packed f16 O accumulator (wgmma_pv8_h) is
+// long-query tile list); the fp32 O accumulator (wgmma_pv8) is
 // renormalised in fp32 and rounded once to bf16. Short-query (decode-like, q_len <= 16) requests
 // run split-KV with an fp32 partial-state merge (`combine_kernel`) — packed q_len <= 8 rows in a
 // 128-thread kernel, the rest at full width; long-query requests run one CTA per 16-token query
 // tile, optionally split over the KV axis for wave balance (plan-time `psplit`, compiled as a
-// static specialisation, with fp16 partial states merged by `combine_prefill`). A single-request
+// static specialisation, with fp32 partial states merged by `combine_prefill`). A single-request
 // prefill step skips the decode-side kernels entirely.
 //
 // OUTPUT PRECISION (disclosed in the Python dispatcher's docstring): the P.V
@@ -45,16 +45,8 @@
 // a higher-precision input contract. The error is deterministic (the kernel is
 // atomics-free and bit-stable) and scales with input magnitude.
 //
-// OPERAND RANGE (f16 accumulation): the QK^T scores and the unnormalised P.V
-// partial sums accumulate in packed f16 (the measured kernel's
-// register-budget choice; wgmma_qk16_r / wgmma_pv8_h below). Raw per-row dot
-// products (sum over the 128 dims of q_k * k_k, before the descales fold in)
-// and per-split unnormalised P.V sums must therefore stay inside f16 range
-// (|x| <= 65504); operands quantised to exploit the full e4m3 range (values
-// up to 448) can push either past it and saturate to +-inf. The measured
-// serving contract (calibrated per-sequence descales over O(1)-magnitude
-// quantised operands) sits well inside the bound; widening both accumulators
-// to fp32 is a different (slower) kernel, not a patch to this one.
+// Keep the row reference in raw dot-product units through the split merge.
+// Only a centered difference needs to be multiplied by the descales.
 //
 // Host contract of the device code (asserted by the Python dispatcher at plan
 // time, never read back from the device):
@@ -232,19 +224,30 @@ __device__ __forceinline__ unsigned short cvt2_e4m3(float hi, float lo) {
   return r;
 }
 
-/* fp8 PV: A = quantised P in registers, B = V^T (K-major, 128B swizzle) */
-__device__ __forceinline__ void wgmma_qk16_r(uint32_t (&d)[24], const uint32_t* a,
-                                             uint64_t desc_b) {
+__device__ __forceinline__ void wgmma_qk_r(float (&d)[48], const uint32_t* a, uint64_t b) {
   asm volatile(
-      "wgmma.mma_async.sync.aligned.m64n96k32.f16.e4m3.e4m3 "
+      "wgmma.mma_async.sync.aligned.m64n96k32.f32.e4m3.e4m3 "
       "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
-      "%16,%17,%18,%19,%20,%21,%22,%23},{%24,%25,%26,%27},%28,1,1,1;\n"
-      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]), "+r"(d[4]), "+r"(d[5]), "+r"(d[6]),
-        "+r"(d[7]), "+r"(d[8]), "+r"(d[9]), "+r"(d[10]), "+r"(d[11]), "+r"(d[12]), "+r"(d[13]),
-        "+r"(d[14]), "+r"(d[15]), "+r"(d[16]), "+r"(d[17]), "+r"(d[18]), "+r"(d[19]), "+r"(d[20]),
-        "+r"(d[21]), "+r"(d[22]), "+r"(d[23])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b)
+      "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"
+      "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47},"
+      "{%48,%49,%50,%51},%52,1,1,1;\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),
+        "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]),
+        "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b)
       : "memory");
+}
+
+__device__ __forceinline__ double score_scale(float q, float k) {
+  return (0.08838834764831845 * 1.4426950408889634) * q * k;
+}
+
+__device__ __forceinline__ float weight(float s, float ref, double magnitude) {
+  return s == -INFINITY ? 0.f : exp2f(static_cast<float>((s - ref) * magnitude));
 }
 
 __device__ __forceinline__ void wgmma_pv8(float (&d)[16][4], const uint32_t* a, uint64_t desc_b) {
@@ -349,7 +352,7 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     const uint8_t* __restrict__ vcp, const int* __restrict__ btp, const int* __restrict__ slp,
     const int* __restrict__ cup, const float* __restrict__ qds, const float* __restrict__ kds,
     const float* __restrict__ vds, __nv_bfloat16* __restrict__ outp, float* __restrict__ po,
-    float2* __restrict__ pml, int NB, int B, __half* __restrict__ po2, float2* __restrict__ pml2,
+    float2* __restrict__ pml, int NB, int B, float* __restrict__ po2, float2* __restrict__ pml2,
     int TQ, int PSPLIT, const int2* __restrict__ tasks) {
   constexpr bool PACK = (MODE == 3);
   constexpr bool SPLIT = (MODE >= 2);
@@ -411,20 +414,8 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
   const int hA = PACK ? 2 * warp : warp;
   const int hB = PACK ? hA + 1 : warp;
 
-  /* Clamp the folded softmax scale from below at the smallest positive f16
-     value (2^-24): the packed-f16 softmax multiplies scores by this scale,
-     and a pathologically small q/k descale product would otherwise round the
-     packed scale to +0 and turn the masked -inf scores into NaN (-inf * 0).
-     exp2 of a score scaled by <= 2^-24 is ~1 either way (f16 scores are
-     bounded by +-65504, so the exponent magnitude stays <= 2^-8), making the
-     clamp the correct uniform-softmax limit of scale -> 0. Clamp from above
-     at 60000 symmetrically: the packed scale must stay f16-finite, and as
-     scale -> inf softmax tends to its one-hot argmax limit, which a clamped
-     scale of 60000 already realises exactly ((s - m) * 60000 <= -60000
-     underflows exp2 to 0 for every non-maximal key). */
-  const float scale = fminf(
-      fmaxf(0.08838834764831845f * 1.4426950408889634f * qds[r] * kds[r], 5.9604644775390625e-8f),
-      60000.f);
+  const double scale = score_scale(qds[r], kds[r]);
+  const double magnitude = fabs(scale);
   const float vdsc = vds[r];
 
   /* ---- load loop-invariant Q into the wgmma A register fragment ---- */
@@ -453,22 +444,8 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
   const int vsh0 = (vdim >> 3) * 1024 + vx * 128;
   const uint32_t vbyte = (uint32_t)vdim << 4;
 
-  uint32_t acc[32];
-#pragma unroll
-  for (int i = 0; i < 32; ++i) acc[i] = 0u;
-  float mA = -1e30f, mB = -1e30f, lA = 0.f, lB = 0.f;
-  const float capd = 8.0f / scale; /* allow p up to 2^8 before refreshing */
-  /* These packed constants only change when the lagging row maximum moves.
-     rnA/rnB hold the NEGATED lagging row maximum in the raw f16 score
-     domain (p = exp2((s + rn) * scale)): subtracting the reference before
-     the scale folds in keeps the exponent argument exact for any finite
-     descale, where the former s*scale - clamp(m*scale) form broke once
-     |m * scale| crossed its f16-budget clamp. Before the first refresh every
-     score this row has seen is -inf, so rn = 0 keeps (s + rn) = -inf and
-     p = 0 (a +inf rn would make it NaN). */
-  const uint32_t rsc = pack_h2(scale);
-  uint32_t thrA = 0xfc00fc00u, thrB = 0xfc00fc00u;
-  uint32_t rnA = 0u, rnB = 0u;
+  float acc[16][4] = {};
+  float mA = -INFINITY, mB = -INFINITY, lA = 0.f, lB = 0.f;
 
   /* ---- prologue: stage the first K/V tile (prefetch distance 1) ---- */
   if (te > tb) {
@@ -529,15 +506,12 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
 
-    /* ---- QK: Hopper FP8 WGMMA, packed f16 accumulator ---- */
-    uint32_t sv[24];
-#pragma unroll
-    for (int j = 0; j < 24; ++j) sv[j] = 0u;
+    float scores[48] = {};
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
     const uint64_t desc_b0 = make_wgmma_desc_sw128(Kb, 1, 8 * 128);
 #pragma unroll
     for (int kb = 0; kb < 4; ++kb) {
-      wgmma_qk16_r(sv, qa + kb * 4, desc_b0 + 2ull * kb);
+      wgmma_qk_r(scores, qa + kb * 4, desc_b0 + 2ull * kb);
     }
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 
@@ -567,93 +541,61 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
 
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 
-    /* ---- mask + packed f16x2 softmax ---- */
-    const int boundA = base + p0 + rowA;
-    const int boundB = base + p0 + rowB;
-    const bool domask = (kv0 + BN - 1) > minbound;
-    uint32_t mxA = thrA, mxB = thrB;
+    const bool domask = kv0 + BN - 1 > minbound;
+    float mxA = mA, mxB = mB;
 #pragma unroll
     for (int j = 0; j < BN / 8; ++j) {
-      const int k0 = kv0 + j * 8 + (lane & 3) * 2;
-      if (domask) {
-        if (k0 > boundA) sv[2 * j] = (sv[2 * j] & 0xffff0000u) | 0x0000fc00u;
-        if (k0 + 1 > boundA) sv[2 * j] = (sv[2 * j] & 0x0000ffffu) | 0xfc000000u;
-        if (k0 > boundB) sv[2 * j + 1] = (sv[2 * j + 1] & 0xffff0000u) | 0x0000fc00u;
-        if (k0 + 1 > boundB) sv[2 * j + 1] = (sv[2 * j + 1] & 0x0000ffffu) | 0xfc000000u;
-      }
-      asm("max.f16x2 %0, %0, %1;\n" : "+r"(mxA) : "r"(sv[2 * j]));
-      asm("max.f16x2 %0, %0, %1;\n" : "+r"(mxB) : "r"(sv[2 * j + 1]));
-    }
-    /* Lagging reference max: mA/mB are only refreshed when this tile would
-       push a probability past 2^PCAP, which keeps p inside f16 range with a
-       wide margin.  The common path compares packed values against the
-       persistent threshold and recovers the exact maximum only on refresh. */
-    if (__any_sync(0xffffffffu, ((mxA ^ thrA) | (mxB ^ thrB)) != 0u)) {
-      uint32_t tmA = 0xfc00fc00u, tmB = 0xfc00fc00u;
 #pragma unroll
-      for (int j = 0; j < BN / 8; ++j) {
-        asm("max.f16x2 %0, %0, %1;\n" : "+r"(tmA) : "r"(sv[2 * j]));
-        asm("max.f16x2 %0, %0, %1;\n" : "+r"(tmB) : "r"(sv[2 * j + 1]));
+      for (int i = 0; i < 2; ++i) {
+        int key = kv0 + j * 8 + (lane & 3) * 2 + i;
+        float& a = scores[4 * j + i];
+        float& b = scores[4 * j + 2 + i];
+        a = domask && key > minbound + rowA ? -INFINITY : (scale < 0 ? -a : a);
+        b = domask && key > minbound + rowB ? -INFINITY : (scale < 0 ? -b : b);
+        mxA = fmaxf(mxA, a);
+        mxB = fmaxf(mxB, b);
       }
-      const float2 fmA = __half22float2(*(__half2*)&tmA);
-      const float2 fmB = __half22float2(*(__half2*)&tmB);
-      float rmA = fmaxf(fmA.x, fmA.y), rmB = fmaxf(fmB.x, fmB.y);
-      rmA = fmaxf(rmA, __shfl_xor_sync(0xffffffffu, rmA, 1));
-      rmA = fmaxf(rmA, __shfl_xor_sync(0xffffffffu, rmA, 2));
-      rmB = fmaxf(rmB, __shfl_xor_sync(0xffffffffu, rmB, 1));
-      rmB = fmaxf(rmB, __shfl_xor_sync(0xffffffffu, rmB, 2));
-      const float nmA = fmaxf(fmaxf(mA, rmA), -1e30f);
-      const float nmB = fmaxf(fmaxf(mB, rmB), -1e30f);
-      const float cA = exp2f((mA - nmA) * scale);
-      const float cB = exp2f((mB - nmB) * scale);
-      mA = nmA;
-      mB = nmB;
-      lA *= cA;
-      lB *= cB;
-      const uint32_t pcA = pack_h2(cA), pcB = pack_h2(cB);
-#pragma unroll
-      for (int ii = 0; ii < 16; ++ii) {
-        asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(acc[2 * ii]) : "r"(pcA));
-        asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(acc[2 * ii + 1]) : "r"(pcB));
-      }
-      thrA = pack_h2(fminf(mA + capd, 60000.f));
-      thrB = pack_h2(fminf(mB + capd, 60000.f));
-      /* The renormaliser is the negated lagging maximum in the raw score
-         domain: the maximum of f16 scores is itself f16-exact, so (s - m)
-         never overflows upward and the subsequent scale multiply is bounded
-         by capd's 2^8 probability budget for any finite descale. (The former
-         -clamp(m*scale, +-30000) form returned 0 instead of the softmax
-         value once |m * scale| crossed the clamp, e.g. per-sequence descale
-         products > ~3.6 over full-range scores.) A row that is still
-         all-masked keeps mA at its -1e30 sentinel; rn = 0 then keeps
-         (s + rn) = -inf and p = 0 instead of packing a non-finite -1e30. */
-      rnA = pack_h2(mA > -1e29f ? -mA : 0.f);
-      rnB = pack_h2(mB > -1e29f ? -mB : 0.f);
     }
-    uint32_t sumA = 0u, sumB = 0u;
+#pragma unroll
+    for (int delta = 1; delta <= 2; delta *= 2) {
+      mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, delta));
+      mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, delta));
+    }
+    // Retain the lagging reference while weights fit the 2^8 budget.
+    if (mxA > mA && (mA == -INFINITY || (mxA - mA) * magnitude > 8)) {
+      float c = weight(mA, mxA, magnitude);
+      mA = mxA;
+      lA *= c;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        acc[j][0] *= c;
+        acc[j][1] *= c;
+      }
+    }
+    if (mxB > mB && (mB == -INFINITY || (mxB - mB) * magnitude > 8)) {
+      float c = weight(mB, mxB, magnitude);
+      mB = mxB;
+      lB *= c;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        acc[j][2] *= c;
+        acc[j][3] *= c;
+      }
+    }
+    float sumA = 0.f, sumB = 0.f;
+    uint32_t sv[BN / 8];
     /* Pack P straight into the fp8 wgmma A fragment.  Accumulator group j
        owns keys 8j+2u, 8j+2u+1 of lane u; the matching A slot is the bit
        permutation s=[k0,k3,k1,k2,k4,k5], which V^T is pre-built to match. */
-    /* The packed P fragments overwrite score registers whose pairs have
-       already been consumed.  This keeps the eight WGMMA-A registers from
-       extending the 128-register live set. */
 #pragma unroll
     for (int j = 0; j < BN / 8; ++j) {
-      uint32_t tA, tB;
-      /* subtract the raw-domain reference max first, then fold the scale:
-         (s - m) <= 0 + the capd budget, so the product never overflows f16
-         regardless of the descale magnitude */
-      asm("add.f16x2 %0, %1, %2;\n" : "=r"(tA) : "r"(sv[2 * j]), "r"(rnA));
-      asm("add.f16x2 %0, %1, %2;\n" : "=r"(tB) : "r"(sv[2 * j + 1]), "r"(rnB));
-      asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(tA) : "r"(rsc));
-      asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(tB) : "r"(rsc));
-      asm("ex2.approx.f16x2 %0, %0;\n" : "+r"(tA));
-      asm("ex2.approx.f16x2 %0, %0;\n" : "+r"(tB));
-      asm("add.f16x2 %0, %0, %1;\n" : "+r"(sumA) : "r"(tA));
-      asm("add.f16x2 %0, %0, %1;\n" : "+r"(sumB) : "r"(tB));
-      unsigned short qa, qb;
-      asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(qa) : "r"(tA));
-      asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(qb) : "r"(tB));
+      float a0 = weight(scores[4 * j], mA, magnitude);
+      float a1 = weight(scores[4 * j + 1], mA, magnitude);
+      float b0 = weight(scores[4 * j + 2], mB, magnitude);
+      float b1 = weight(scores[4 * j + 3], mB, magnitude);
+      sumA += a0 + a1;
+      sumB += b0 + b1;
+      unsigned short qa = cvt2_e4m3(a1, a0), qb = cvt2_e4m3(b1, b0);
       const int c = j >> 2, g = ((j >> 1) & 1) * 2;
       if ((j & 1) == 0) {
         sv[c * 4 + g + 0] = (uint32_t)qa;
@@ -668,18 +610,16 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
         const int slice = j >> 2;
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
         const uint64_t desc = make_wgmma_desc_sw128(Vb + slice * 32, 1, 8 * 128);
-        wgmma_pv8_h(acc, sv + slice * 4, desc);
+        wgmma_pv8(acc, sv + slice * 4, desc);
       }
     }
-    const float2 fsA = __half22float2(*(__half2*)&sumA);
-    const float2 fsB = __half22float2(*(__half2*)&sumB);
-    lA += fsA.x + fsA.y;
-    lB += fsB.x + fsB.y;
+    lA += sumA;
+    lB += sumB;
 
     /* ---- final PV slice; all slices retire in the same group. ---- */
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
     const uint64_t desc1 = make_wgmma_desc_sw128(Vb + (BN / 32 - 1) * 32, 1, 8 * 128);
-    wgmma_pv8_h(acc, sv + (BN / 32 - 1) * 4, desc1);
+    wgmma_pv8(acc, sv + (BN / 32 - 1) * 4, desc1);
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     /* Inline PTX operands are compiler-synchronous even though WGMMA is not.
@@ -697,20 +637,20 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
 
   /* ---- epilogue ---- */
   if (SPLIT) {
-    /* partial results: unnormalised acc + (scaled max, denom) per row/head */
+    /* partial results: unnormalised acc + (raw reference, denom) per row/head */
     float* oA = po + ((((size_t)bx * B + r) * BQ + rowA) * HQ + hA) * DIMH + (lane & 3) * 2;
     float* oB = po + ((((size_t)bx * B + r) * BQ + rowB) * HQ + hB) * DIMH + (lane & 3) * 2;
 #pragma unroll
     for (int nt = 0; nt < 16; ++nt) {
-      const float2 aA = __half22float2(*(__half2*)&acc[2 * nt]);
-      const float2 aB = __half22float2(*(__half2*)&acc[2 * nt + 1]);
+      const float2 aA = make_float2(acc[nt][0], acc[nt][1]);
+      const float2 aB = make_float2(acc[nt][2], acc[nt][3]);
       if (rowA < qlen) *(float2*)(oA + nt * 8) = aA;
       if (rowB < qlen) *(float2*)(oB + nt * 8) = aB;
     }
     if ((lane & 3) == 0) {
       size_t mbase = (((size_t)bx * B + r) * BQ) * HQ;
-      if (rowA < qlen) pml[mbase + (size_t)rowA * HQ + hA] = make_float2(mA * scale, lA);
-      if (rowB < qlen) pml[mbase + (size_t)rowB * HQ + hB] = make_float2(mB * scale, lB);
+      if (rowA < qlen) pml[mbase + (size_t)rowA * HQ + hA] = make_float2(mA, lA);
+      if (rowB < qlen) pml[mbase + (size_t)rowB * HQ + hB] = make_float2(mB, lB);
     }
     return;
   }
@@ -718,20 +658,20 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     const int gA0 = p0 + rowA, gB0 = p0 + rowB;
     const size_t rowbase = (size_t)zs * TQ + q0;
     if (gA0 < qlen) {
-      __half* oA = po2 + ((rowbase + gA0) * HQ + hA) * DIMH + (lane & 3) * 2;
+      float* oA = po2 + ((rowbase + gA0) * HQ + hA) * DIMH + (lane & 3) * 2;
 #pragma unroll
       for (int nt = 0; nt < 16; ++nt) {
-        *(__half2*)(oA + nt * 8) = *(__half2*)&acc[2 * nt];
+        *(float2*)(oA + nt * 8) = make_float2(acc[nt][0], acc[nt][1]);
       }
-      if ((lane & 3) == 0) pml2[(rowbase + gA0) * HQ + hA] = make_float2(mA * scale, lA);
+      if ((lane & 3) == 0) pml2[(rowbase + gA0) * HQ + hA] = make_float2(mA, lA);
     }
     if (gB0 < qlen) {
-      __half* oB = po2 + ((rowbase + gB0) * HQ + hB) * DIMH + (lane & 3) * 2;
+      float* oB = po2 + ((rowbase + gB0) * HQ + hB) * DIMH + (lane & 3) * 2;
 #pragma unroll
       for (int nt = 0; nt < 16; ++nt) {
-        *(__half2*)(oB + nt * 8) = *(__half2*)&acc[2 * nt + 1];
+        *(float2*)(oB + nt * 8) = make_float2(acc[nt][2], acc[nt][3]);
       }
-      if ((lane & 3) == 0) pml2[(rowbase + gB0) * HQ + hB] = make_float2(mB * scale, lB);
+      if ((lane & 3) == 0) pml2[(rowbase + gB0) * HQ + hB] = make_float2(mB, lB);
     }
     return;
   }
@@ -743,12 +683,12 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
 #pragma unroll
   for (int nt = 0; nt < 16; ++nt) {
     if (gA < qlen) {
-      const float2 a = __half22float2(*(__half2*)&acc[2 * nt]);
+      const float2 a = make_float2(acc[nt][0], acc[nt][1]);
       __nv_bfloat162 v = __floats2bfloat162_rn(a.x * iA, a.y * iA);
       *(__nv_bfloat162*)(oA + nt * 8) = v;
     }
     if (gB < qlen) {
-      const float2 a = __half22float2(*(__half2*)&acc[2 * nt + 1]);
+      const float2 a = make_float2(acc[nt][2], acc[nt][3]);
       __nv_bfloat162 v = __floats2bfloat162_rn(a.x * iB, a.y * iB);
       *(__nv_bfloat162*)(oB + nt * 8) = v;
     }
@@ -757,12 +697,10 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
 
 /* combine split-KV partials for the long-query (prefill) rows */
 template <int PS>
-__global__ __launch_bounds__(256, 2) void combine_prefill(const __half* __restrict__ po2,
-                                                          const float2* __restrict__ pml2,
-                                                          const int* __restrict__ cup,
-                                                          const float* __restrict__ vds,
-                                                          __nv_bfloat16* __restrict__ outp, int TQ,
-                                                          int B, const int2* __restrict__ tasks) {
+__global__ __launch_bounds__(256, 2) void combine_prefill(
+    const float* __restrict__ po2, const float2* __restrict__ pml2, const int* __restrict__ cup,
+    const float* __restrict__ qds, const float* __restrict__ kds, const float* __restrict__ vds,
+    __nv_bfloat16* __restrict__ outp, int TQ, int B, const int2* __restrict__ tasks) {
   const int tid = threadIdx.x;
   const int h = tid >> 5;
   const int lane = tid & 31;
@@ -779,7 +717,7 @@ __global__ __launch_bounds__(256, 2) void combine_prefill(const __half* __restri
   float M = ml.x;
   for (int delta = 4; delta; delta >>= 1) M = fmaxf(M, __shfl_down_sync(0xffffffffu, M, delta));
   M = __shfl_sync(0xffffffffu, M, 0);
-  float wl = lane < PS && ml.x > -1e29f ? exp2f(ml.x - M) : 0.f;
+  float wl = weight(ml.x, M, fabs(score_scale(qds[rr], kds[rr])));
   float den = wl * ml.y;
   for (int delta = 4; delta; delta >>= 1) den += __shfl_down_sync(0xffffffffu, den, delta);
   den = __shfl_sync(0xffffffffu, den, 0);
@@ -787,13 +725,11 @@ __global__ __launch_bounds__(256, 2) void combine_prefill(const __half* __restri
 #pragma unroll
   for (int z = 0; z < PS; ++z) {
     float w = __shfl_sync(0xffffffffu, wl, z);
-    const __half2* pv = (const __half2*)(po2 + (moff + (size_t)z * mstride) * DIMH + d);
-    const float2 v01 = __half22float2(pv[0]);
-    const float2 v23 = __half22float2(pv[1]);
-    num0 = fmaf(w, v01.x, num0);
-    num1 = fmaf(w, v01.y, num1);
-    num2 = fmaf(w, v23.x, num2);
-    num3 = fmaf(w, v23.y, num3);
+    const float4 v = *(const float4*)(po2 + (moff + (size_t)z * mstride) * DIMH + d);
+    num0 = fmaf(w, v.x, num0);
+    num1 = fmaf(w, v.y, num1);
+    num2 = fmaf(w, v.z, num2);
+    num3 = fmaf(w, v.w, num3);
   }
   float inv = lane == 0 ? (den > 0.f ? 1.f / den : 0.f) * vds[rr] : 0.f;
   inv = __shfl_sync(0xffffffffu, inv, 0);
@@ -805,8 +741,8 @@ __global__ __launch_bounds__(256, 2) void combine_prefill(const __half* __restri
 /* combine split-KV partials for the short-query (decode) requests */
 extern "C" __global__ __launch_bounds__(256, 2) void combine_kernel(
     const float* __restrict__ po, const float2* __restrict__ pml, const int* __restrict__ slp,
-    const int* __restrict__ cup, const float* __restrict__ vds, __nv_bfloat16* __restrict__ outp,
-    int B) {
+    const int* __restrict__ cup, const float* __restrict__ qds, const float* __restrict__ kds,
+    const float* __restrict__ vds, __nv_bfloat16* __restrict__ outp, int B) {
   const int r = blockIdx.y;
   const int q0 = cup[r], q1 = cup[r + 1];
   const int qlen = q1 - q0;
@@ -832,8 +768,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void combine_kernel(
   float M = fmaxf(ml0.x, ml1.x);
   for (int delta = 16; delta; delta >>= 1) M = fmaxf(M, __shfl_down_sync(0xffffffffu, M, delta));
   M = __shfl_sync(0xffffffffu, M, 0);
-  float w0 = z0 < ns ? exp2f(ml0.x - M) : 0.f;
-  float w1 = z1 < ns ? exp2f(ml1.x - M) : 0.f;
+  const double magnitude = fabs(score_scale(qds[r], kds[r]));
+  float w0 = weight(ml0.x, M, magnitude);
+  float w1 = weight(ml1.x, M, magnitude);
   float den = fmaf(w0, ml0.y, w1 * ml1.y);
   for (int delta = 16; delta; delta >>= 1) den += __shfl_down_sync(0xffffffffu, den, delta);
   den = __shfl_sync(0xffffffffu, den, 0);
@@ -917,7 +854,7 @@ void gqa_context_fp8_paged_sm90_init(int64_t device_id) {
   ffi::CUDADeviceGuard device_guard(static_cast<int>(device_id));
   using AttnFn = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const int*, const int*,
                           const int*, const float*, const float*, const float*, __nv_bfloat16*,
-                          float*, float2*, int, int, __half*, float2*, int, int, const int2*);
+                          float*, float2*, int, int, float*, float2*, int, int, const int2*);
   const AttnFn fns[] = {
       attn_kernel<0, false>,    attn_kernel<1, false>,    attn_kernel<2, false>,
       attn_kernel<3, false>,    attn_kernel<0, true>,     attn_kernel<1, true>,
@@ -942,7 +879,7 @@ void gqa_context_fp8_paged_sm90_init(int64_t device_id) {
 // attn_kernel<3>/<2> (split-KV decode-like rows, packed and regular — skipped
 // on a pure single-request prefill step), then either attn_kernel<0> (direct
 // prefill tiles) or the statically-split attn_kernel<1, ·, psplit> +
-// combine_prefill<psplit> (KV-split prefill tiles, fp16 partial states), and
+// combine_prefill<psplit> (KV-split prefill tiles, fp32 partial states), and
 // combine_kernel (split-KV merge, skipped with the decode kernels). No
 // allocation, no sync, no attribute queries: CUDA-graph capturable. All
 // workspace buffers are plan-allocated by the Python dispatcher; psplit comes
@@ -1030,10 +967,6 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   TVM_FFI_ICHECK_GE(psplit, 1);
   TVM_FFI_ICHECK_LE(psplit, 8);
   if (psplit > 1) {
-    // The split-prefill partial states are fp16 (po2) / 2xfp32 (pml2) on the
-    // device side; the dispatcher plan-allocates both as fp32 with the same
-    // element counts (ABI kept stable across candidate generations), so the
-    // fp16 payload is over-provisioned 2x by construction.
     TVM_FFI_ICHECK_GE(po2.numel(), (int64_t)psplit * TQ * HQ * DIMH);
     TVM_FFI_ICHECK_GE(pml2.numel(), (int64_t)psplit * TQ * HQ * 2);
   }
@@ -1069,7 +1002,7 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   uint8_t* g_vt = static_cast<uint8_t*>(vt.data_ptr());
   float* g_po = static_cast<float*>(po.data_ptr());
   float2* g_pml = reinterpret_cast<float2*>(pml.data_ptr());
-  __half* g_po2 = reinterpret_cast<__half*>(po2.data_ptr());
+  float* g_po2 = static_cast<float*>(po2.data_ptr());
   float2* g_pml2 = reinterpret_cast<float2*>(pml2.data_ptr());
   int2* g_tasks = reinterpret_cast<int2*>(tasks.data_ptr());
   const size_t smem = kSmemBytes;
@@ -1099,7 +1032,7 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
           qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B, g_po2, g_pml2, TQ, PVAL, \
           g_tasks);                                                                              \
     combine_prefill<PVAL>                                                                        \
-        <<<dim3(npt, BQ), 256, 0, s>>>(g_po2, g_pml2, cu, vs, op, TQ, B, g_tasks);               \
+        <<<dim3(npt, BQ), 256, 0, s>>>(g_po2, g_pml2, cu, qs, ks, vs, op, TQ, B, g_tasks);       \
   } while (0)
 
   /* One pass over the covered physical pages turns V into the
@@ -1138,7 +1071,8 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   } else {
     LAUNCH_ATTN(0, dim3(npt), NTHREAD, smem);
   }
-  if (!all_prefill) combine_kernel<<<dim3(BQ, B), 256, 0, s>>>(g_po, g_pml, sl, cu, vs, op, B);
+  if (!all_prefill)
+    combine_kernel<<<dim3(BQ, B), 256, 0, s>>>(g_po, g_pml, sl, cu, qs, ks, vs, op, B);
 #undef LAUNCH_ATTN
 #undef LAUNCH_PART
   cudaError_t status = cudaGetLastError();

@@ -2533,19 +2533,7 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # record (bit-determinism, fresh-seed matched-ratio, x4/heavy-tail
 # perturbation) is carried in the PR's verification report.
 #
-# OPERAND RANGE (part of the same contract; see the kernel header's OPERAND
-# RANGE section): the QK^T scores and unnormalised P.V partial sums accumulate
-# in packed f16, so raw per-row dot products (before the descales fold in) and
-# per-split P.V sums must stay inside f16 range (|x| <= 65504). Calibrated
-# fp8 attention inputs (the serving contract this kernel was measured on, with
-# O(1)-magnitude quantised operands and per-sequence descales) sit well inside
-# the bound; operands quantised to exploit the full e4m3 range (|values| up to
-# 448) can push a 128-dim dot product past it and saturate. The guards check
-# shapes, dtypes, strides and descale plumbing — they cannot check tensor
-# VALUES without a device sync on every call, which would defeat the
-# dispatch-overhead contract, so staying inside the documented range is the
-# caller's side of the contract (as it is for the stock fp8 paths' own
-# quantisation envelopes).
+# QK and PV use fp32 accumulators, including the split partial states.
 #
 # All allocation, compilation and device queries happen at plan time, outside
 # CUDA-graph capture; run() only launches on the current stream (re-queried
@@ -2613,20 +2601,7 @@ _gqa_ctx_fp8q_sm90_announced = False
 
 
 class _GqaCtxFp8qSm90Capacity(Exception):
-    """A CUDA-graph-mode replan needed a bigger plan-owned buffer than the
-    retained one a capture may already hold a pointer to; the plan declines
-    the specialized kernel instead of swapping the pointer.
-
-    Contract: ANY graph-mode replan that does not arm the specialized state
-    — a capacity decline, a launch-schedule decline, the kill switch, or any
-    other plan-time ineligibility — INVALIDATES every CUDA graph captured
-    against an earlier specialized plan. ``graph.replay()`` never re-enters
-    Python, so no runtime guard can stop a stale capture from replaying the
-    old metadata (a declined replan deliberately mutates none of it, so the
-    capture keeps computing the LAST ACCEPTED plan, not the new one); callers
-    whose replan declines must discard and re-capture their graphs, mirroring
-    the invalidation rule stock FlashInfer wrappers document for
-    geometry-growing replans."""
+    """A graph-mode workspace cannot grow without replacing a retained pointer."""
 
 
 def _gqa_ctx_fp8q_sm90_disabled() -> bool:
@@ -2915,12 +2890,6 @@ def _gqa_ctx_fp8q_sm90_prepare(
         wrapper._gqa_ctx_fp8q_sm90_row_seq = None
         wrapper._gqa_ctx_fp8q_sm90_row_seq_batch = None
     if _gqa_ctx_fp8q_sm90_disabled():
-        # A kill-switch replan is a declined replan: nothing below runs, so
-        # the retained specialized metadata is NOT refreshed and any CUDA
-        # graph captured against an earlier plan keeps replaying that plan's
-        # page table and lengths. _GqaCtxFp8qSm90Capacity's contract applies:
-        # the caller must re-capture (replay never re-enters Python, so the
-        # switch cannot be honored or the stale capture guarded at replay).
         counters["plans_disabled"] += 1
         _gqa_ctx_fp8q_sm90_fallback("plan: kill switch")
         logger.info_once(
@@ -3072,10 +3041,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
     psplit = int(module.plan_psplit(int(total_num_rows), max_seqlen_q, batch_size))
     npt = int(module.plan_num_tasks(cap_rows, batch_size))
 
-    bufs = getattr(wrapper, "_gqa_ctx_fp8q_sm90_bufs", None)
-    if bufs is None:
-        bufs = {}
-        wrapper._gqa_ctx_fp8q_sm90_bufs = bufs
+    bufs = dict(getattr(wrapper, "_gqa_ctx_fp8q_sm90_bufs", {}))
 
     graph_mode = bool(getattr(wrapper, "is_cuda_graph_enabled", False))
 
@@ -3150,6 +3116,10 @@ def _gqa_ctx_fp8q_sm90_prepare(
         vt = _buf("vt", vt_pages * 2048, torch.uint8)[: vt_pages * 2048]
         tasks = _buf("tasks", 2 * npt, torch.int32)
         seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
+        if graph_mode:
+            cu = _buf("qo_indptr", batch_size + 1, torch.int32)[: batch_size + 1]
+        else:
+            cu = wrapper._qo_indptr_buf
 
         nb = 0
         if batch_size:
@@ -3191,10 +3161,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
     except torch.cuda.OutOfMemoryError as exc:
         # the specialized scratch is optional: an OOM here declines the
         # specialized route and lets the already-complete FA2 plan serve the
-        # call instead of aborting plan(). Buffers earlier _buf calls grew
-        # stay retained (monotone workspace; captures may hold them), and an
-        # explicit backend="specialized" plan raises through the fail-closed
-        # gate with this reason.
+        # call instead of aborting an auto plan. Discard candidate allocations.
         counters["plans_ineligible"] += 1
         _gqa_ctx_fp8q_sm90_fallback(f"plan: workspace allocation failed: {exc}"[:300])
         logger.info_once(
@@ -3209,21 +3176,31 @@ def _gqa_ctx_fp8q_sm90_prepare(
     # last accepted plan keeps reading a mutually consistent seq_lens /
     # block_table pair (never new lengths against an old table).
     seq_lens_dev = seq_lens_buf[:batch_size]
-    seq_lens_dev.copy_(kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True)
-    block_table = _build_block_tables_from_paged_kv_indices(
-        paged_kv_indptr_host,
-        paged_kv_indices,
-        batch_size,
-        device,
-        out=bt[:batch_size],
-    )
-    unit_descale.fill_(1.0)
+    block_table = bt[:batch_size]
+
+    def refresh_metadata():
+        _build_block_tables_from_paged_kv_indices(
+            paged_kv_indptr_host, paged_kv_indices, batch_size, device, out=block_table
+        )
+        seq_lens_dev.copy_(kv_lens_arr_host[:batch_size], non_blocking=True)
+        if graph_mode:
+            cu.copy_(qo_indptr_host, non_blocking=True)
+        unit_descale.fill_(1.0)
+
+    # For an existing capture, defer *all* writes through retained pointers
+    # until the common planner has accepted the preflighted candidate.
+    if getattr(wrapper, "defer_metadata", False):
+        wrapper.refresh_metadata = refresh_metadata
+    else:
+        refresh_metadata()
+    wrapper._gqa_ctx_fp8q_sm90_bufs = bufs
 
     wrapper._gqa_ctx_fp8q_sm90_state = SimpleNamespace(
         batch_size=batch_size,
         total_q=int(total_num_rows),
         max_seqlen_q=max_seqlen_q,
         psplit=psplit,
+        qo_indptr=cu,
         vt_pages=vt_pages,
         block_table=block_table,
         seq_lens=seq_lens_dev,
@@ -3365,7 +3342,7 @@ def _gqa_ctx_fp8q_sm90_run_eligibility(
         return (
             f"v_cache pages {v_cache.shape[0]} < planned V^T coverage {state.vt_pages}"
         )
-    buf = wrapper._qo_indptr_buf
+    buf = state.qo_indptr
     if (
         not torch.is_tensor(buf)
         or buf.dtype != torch.int32
@@ -3491,7 +3468,7 @@ def _gqa_ctx_fp8q_sm90_dispatch(
         v_cache,
         state.block_table,
         state.seq_lens,
-        wrapper._qo_indptr_buf,
+        state.qo_indptr,
         qds,
         kds,
         vds,
@@ -3509,6 +3486,11 @@ def _gqa_ctx_fp8q_sm90_dispatch(
     _gqa_ctx_fp8q_sm90_backend_dispatches["specialized"] += 1
     if capturing:
         counters["runs_dispatched_capturing"] += 1
+        if wrapper.is_cuda_graph_enabled:
+            wrapper._gqa_ctx_fp8q_sm90_capture_rows = min(
+                state.total_q,
+                getattr(wrapper, "_gqa_ctx_fp8q_sm90_capture_rows", state.total_q),
+            )
     if not _gqa_ctx_fp8q_sm90_announced:
         # one line per process so a measurement can name the kernel behind
         # its numbers (normal operation, hence INFO)
@@ -5153,17 +5135,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             matrix P once to e4m3 and accumulates P.V as an fp8 wgmma — the
             same in-class P-quantisation as the FA3-style fp8q kernels that
             serve this contract, not a downgrade of a higher-precision input
-            contract; the tail is deterministic (atomics-free, bit-stable),
-            scales with input magnitude, and its measured verification record
-            (bit-determinism rerun, fresh-seed matched-ratio, x4/heavy-tail
-            perturbation above the 0.98 gate) accompanies the change.
-            Its QK^T scores and unnormalised P.V partial sums accumulate in
-            packed f16: raw 128-dim dot products (before descales fold in)
-            and per-split P.V sums must stay inside f16 range (|x| <= 65504),
-            which calibrated fp8 attention inputs satisfy by construction;
-            operands quantised to exploit the full e4m3 range can exceed it
-            and saturate (the guards check shapes and plumbing, not tensor
-            values — a value scan per call would cost a device sync).
+            contract. Raw QK scores and PV numerators accumulate in fp32.
+            Once a specialized run is captured in graph mode, a replan that
+            cannot refresh that capture raises before installing the new plan,
+            including under ``auto``. Use a separate wrapper for the new plan.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
@@ -5266,6 +5241,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # arming decision is tracked in locals and only committed to the
         # wrapper after validation, so a rejected replan leaves the
         # previously accepted plan's state and run() behavior unchanged.
+        capture_rows = getattr(self, "_gqa_ctx_fp8q_sm90_capture_rows", None)
+        if (capture_rows is not None or q_data_type == torch.float8_e4m3fn) and (
+            self.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError("paged FP8 planning must run outside CUDA graph capture")
         _gqa_ctx_fp8q_sm90_armed = False
         _gqa_ctx_fp8q_sm90_armed_explicit = False
         _gqa_ctx_fp8q_sm90_armed_q_dtype = None
@@ -5511,6 +5491,79 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
 
+        candidate = None
+        if capture_rows is not None:
+            # The graph bypasses Python. Test the actual prepare decision,
+            # not just its geometry allowlist, before common plan state or
+            # the caller's graph buffers are touched.
+            reason = None
+            if not _gqa_ctx_fp8q_sm90_armed or planned_backend != "fa2":
+                reason = "graph-retained specialized provider"
+            elif _gqa_ctx_fp8q_sm90_disabled():
+                reason = "kill switch"
+            elif batch_size != self._fixed_batch_size:
+                reason = "graph-retained batch size"
+            elif (
+                batch_size == 1 and total_num_rows > _GQA_CTX_FP8Q_SM90_BQ
+            ) != getattr(self, "_gqa_ctx_fp8q_sm90_sched", None):
+                reason = "graph-retained launch schedule"
+            elif total_num_rows > capture_rows:
+                reason = "graph-retained query/output capacity"
+            elif len(paged_kv_indices) > len(self._paged_kv_indices_buf):
+                reason = "graph-retained index capacity"
+            if reason is not None:
+                _gqa_ctx_fp8q_sm90_fallback(f"plan: {reason}")
+                raise NotImplementedError(f"{reason}; use a new CUDA graph wrapper")
+            if kv_lens_arr_host is None:
+                paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                    _paged_kv_host_metadata(
+                        paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+                    )
+                )
+            candidate = SimpleNamespace(
+                device=self.device,
+                is_cuda_graph_enabled=True,
+                defer_metadata=True,
+                _kv_layout=self._kv_layout,
+                _jit_module=self._jit_module,
+                _gqa_ctx_fp8q_sm90_sched=getattr(
+                    self, "_gqa_ctx_fp8q_sm90_sched", None
+                ),
+                _gqa_ctx_fp8q_sm90_bufs=getattr(self, "_gqa_ctx_fp8q_sm90_bufs", {}),
+            )
+            _gqa_ctx_fp8q_sm90_prepare(
+                candidate,
+                causal,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo,
+                page_size,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                window_left,
+                logits_soft_cap,
+                sm_scale,
+                batch_size,
+                total_num_rows,
+                self._max_total_num_rows,
+                qo_indptr_host,
+                kv_lens_arr_host,
+                paged_kv_indptr_host,
+                paged_kv_indices.contiguous(),
+                custom_mask is not None
+                or packed_custom_mask is not None
+                or self._custom_mask_buf is not None,
+                prefix_len_ptr,
+                token_pos_in_items_len,
+                disable_split_kv,
+            )
+            if candidate._gqa_ctx_fp8q_sm90_state is None:
+                raise NotImplementedError(
+                    f"{_gqa_ctx_fp8q_sm90_last_fallback or 'plan not prepared'}; "
+                    "use a new CUDA graph wrapper"
+                )
+
         # Commit the specialized arming decision (set or clear) only after the
         # plan passed backend validation: a rejected replan leaves the
         # previously accepted plan's flags and run() behavior unchanged.
@@ -5524,8 +5577,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._gqa_ctx_fp8q_sm90_requested = False
             self._gqa_ctx_fp8q_sm90_explicit = False
         self._eagle_verify_fp8kv_sm90_state = None
-        self._gqa_ctx_fp8q_sm90_state = None
-        self._gqa_ctx_fp8q_sm90_row_seq = None
+        # A candidate replan is committed only after the common planner succeeds.
+        # Keep the accepted specialized plan available if that planner refuses.
+        if candidate is None:
+            self._gqa_ctx_fp8q_sm90_state = None
+            self._gqa_ctx_fp8q_sm90_row_seq = None
         self._head_dim_qk = head_dim_qk
         self._head_dim_vo = head_dim_vo
 
@@ -6022,7 +6078,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # specialized SM90 fp8-Q context kernel: eligibility, JIT
                 # build, block table and workspace are settled here, outside
                 # the hot path (and outside any CUDA-graph capture)
-                if (
+                if candidate is not None:
+                    candidate.refresh_metadata()
+                    self._gqa_ctx_fp8q_sm90_state = candidate._gqa_ctx_fp8q_sm90_state
+                    self._gqa_ctx_fp8q_sm90_bufs = candidate._gqa_ctx_fp8q_sm90_bufs
+                    self._gqa_ctx_fp8q_sm90_row_seq = (
+                        candidate._gqa_ctx_fp8q_sm90_row_seq
+                    )
+                    self._gqa_ctx_fp8q_sm90_row_seq_batch = (
+                        candidate._gqa_ctx_fp8q_sm90_row_seq_batch
+                    )
+                elif (
                     getattr(self, "_gqa_ctx_fp8q_sm90_requested", False)
                     and kv_lens_arr_host is not None
                 ):
