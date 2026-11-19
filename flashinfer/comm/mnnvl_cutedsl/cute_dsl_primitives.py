@@ -820,6 +820,23 @@ def atomic_add_global_i32(address: Int64, value: Int32, *, loc=None, ip=None) ->
 
 
 @dsl_user_op
+def load_relaxed_gpu_u64(address: Int64, *, loc=None, ip=None) -> Int64:
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [Int64(address).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.u64 $0, [$1];",
+            "=l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_gpu_u64(address: Int64, value: Int64, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,

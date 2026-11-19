@@ -50,7 +50,7 @@ from .device_kernels import (
     ACTIVE_STAGE,
     LAMPORT_GENERATIONS,
     NEXT_STAGE,
-    PUSH_PLANE_PHASE_WORD,
+    push_plane_phase,
 )
 from ..symmetric_buffer import SymmetricBuffer
 from .protocol import (
@@ -159,8 +159,7 @@ def poll_owned_fragment(
     source_rank = fragment // local_fragments
     local_fragment = fragment % local_fragments
     if cutlass.const_expr(lamport_2slot):
-        # A plain load: it follows the PDL wait, after the last writer completed.
-        phase = Uint32(stage_state[PUSH_PLANE_PHASE_WORD]) & Uint32(1)
+        phase = push_plane_phase(stage_state)
         m, _, _ = cute.arch.grid_dim()
         # half[phase]: [tp, m, hidden_local]
         source_element = (

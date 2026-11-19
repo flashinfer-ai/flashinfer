@@ -39,6 +39,7 @@ from ..cute_dsl_primitives import (
     load_global_bf16_as_f32_predicated,
     load_global_u32x2,
     load_global_u32x4,
+    load_relaxed_gpu_u64,
     load_volatile_u32,
     map_shared_to_peer,
     mark_zero_u32x4,
@@ -62,9 +63,14 @@ from ..static_fp8_epilogue import store_rmsnorm_output
 LAMPORT_GENERATIONS = 3
 NEXT_STAGE = 0
 ACTIVE_STAGE = 1
-# Push plane: its 64-bit epoch counter viewed as int32x2; bit 0 of the high
-# word is the phase.
-PUSH_PLANE_PHASE_WORD = 1
+
+
+@cute.jit
+def push_plane_phase(epoch: cute.Tensor) -> Uint32:
+    """The push plane's phase, bit 32 of its 64-bit epoch counter (``epoch`` viewed
+    as int32x2). Read after the PDL wait, with the commits' width and scope."""
+    word = load_relaxed_gpu_u64(Int64(epoch.iterator.toint()))
+    return Uint32(word >> Int64(32)) & Uint32(1)
 
 
 @cute.jit
@@ -729,8 +735,7 @@ class _SharedOnlyPublishDeviceKernel:
                     )
 
         if cutlass.const_expr(self.lamport_2slot):
-            # A plain load: it follows the PDL wait, after the last writer completed.
-            stage = Uint32(stage_state[PUSH_PLANE_PHASE_WORD]) & Uint32(1)
+            stage = push_plane_phase(stage_state)
         else:
             stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
         if cutlass.const_expr(self.release_before_store):
