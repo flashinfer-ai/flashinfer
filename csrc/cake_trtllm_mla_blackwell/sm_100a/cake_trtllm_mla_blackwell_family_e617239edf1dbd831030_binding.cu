@@ -20,8 +20,9 @@
 // ('cake_trtllm_mla_blackwell_family_35f852e8fbf6c5633089'): one binding source per domain, compiled
 // once per family with that family's own tokens.
 // The program writes the longest-first work order of a generic CLC launch: work_order[p] is the
-// query row at position p of a stable descending sort by KV tiles. It reads seq_lens and writes
-// work_order only after griddepcontrol.wait, so it follows the previous launch on the stream.
+// query row at position p of a stable descending sort by KV tiles, and work_order[1024 + p] is that
+// row's clamped KV length. It reads seq_lens and writes work_order only after griddepcontrol.wait,
+// so it follows the previous launch on the stream.
 // dispatch-policy-revision: unpinned
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -71,8 +72,8 @@ void Run(TensorView arg_seq_lens, TensorView arg_work_order, int64_t arg_q_len, 
       << "scalar 'q_len' value " << arg_q_len << " must be a positive i32";
   TVM_FFI_CHECK(arg_total_rows >= 1 && arg_total_rows <= 1024, ValueError)
       << "scalar 'total_rows' value " << arg_total_rows << " must be in [1, 1024]";
-  TVM_FFI_CHECK(arg_work_order.numel() >= arg_total_rows, ValueError)
-      << "work_order holds " << arg_work_order.numel() << " entries, fewer than total_rows "
+  TVM_FFI_CHECK(arg_work_order.numel() >= 1024 + arg_total_rows, ValueError)
+      << "work_order holds " << arg_work_order.numel() << " entries, fewer than 1024 + total_rows "
       << arg_total_rows;
   TVM_FFI_CHECK(arg_seq_lens.numel() * arg_q_len >= arg_total_rows, ValueError)
       << "seq_lens holds " << arg_seq_lens.numel() << " requests, fewer than total_rows "
@@ -90,7 +91,7 @@ void Run(TensorView arg_seq_lens, TensorView arg_work_order, int64_t arg_q_len, 
   void* kargs[] = {&p_seq_lens, &p_work_order, &v_q_len, &v_total_rows};
 
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
-  dim3 block(64u, 1u, 1u);
+  dim3 block(512u, 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
   cudaLaunchAttribute attrs[1]{};
@@ -101,7 +102,7 @@ void Run(TensorView arg_seq_lens, TensorView arg_work_order, int64_t arg_q_len, 
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 4096u;
+  config.dynamicSmemBytes = 8192u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;

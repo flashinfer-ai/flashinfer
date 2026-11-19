@@ -298,8 +298,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   TVM_FFI_CHECK(arg_enable_sink >= -2147483648LL && arg_enable_sink <= 2147483647LL, ValueError)
       << "scalar 'enable_sink' value " << arg_enable_sink
       << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_use_work_order == 0 || arg_work_order.numel() >= arg_total_work_items, ValueError)
-      << "work_order holds " << arg_work_order.numel() << " entries, fewer than total_work_items "
+  // An ordered launch reads the row at work_order[p] and its KV length at work_order[1024 + p].
+  TVM_FFI_CHECK(arg_use_work_order == 0 || arg_work_order.numel() >= 1024 + arg_total_work_items, ValueError)
+      << "work_order holds " << arg_work_order.numel() << " entries, fewer than 1024 + total_work_items "
       << arg_total_work_items;
   check_same_device(arg_tmap_k, arg_tmap_q, "tmap_k", "tmap_q");
   check_same_device(arg_tmap_v, arg_tmap_q, "tmap_v", "tmap_q");
