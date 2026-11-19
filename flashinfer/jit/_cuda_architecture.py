@@ -106,6 +106,9 @@ def cuda_targets_from_nvcc_flags(flags: Iterable[str]) -> tuple[list[str], list[
     other non-numeric spellings request nothing statically known and are skipped.
     """
     flag_list = list(flags)
+    has_code_option = any(
+        flag.partition("=")[0] in _NVCC_CODE_FLAGS for flag in flag_list
+    )
     sass: set[str] = set()
     ptx: set[str] = set()
 
@@ -121,17 +124,18 @@ def cuda_targets_from_nvcc_flags(flags: Iterable[str]) -> tuple[list[str], list[
 
     for index, flag in enumerate(flag_list):
         name, separator, value = flag.partition("=")
-        if name in _NVCC_GENCODE_FLAGS:
+        if name in (*_NVCC_GENCODE_FLAGS, *_NVCC_CODE_FLAGS, *_NVCC_ARCH_FLAGS):
             if not separator:
                 if index + 1 >= len(flag_list):
                     continue
                 value = flag_list[index + 1]
+        if name in _NVCC_GENCODE_FLAGS:
             code_match = re.search(r"(?:^|,)code=(.*)$", value)
             if code_match is not None:
                 add_code_list(code_match.group(1))
-        elif name in _NVCC_CODE_FLAGS and separator:
+        elif name in _NVCC_CODE_FLAGS:
             add_code_list(value)
-        elif name in _NVCC_ARCH_FLAGS and separator:
+        elif name in _NVCC_ARCH_FLAGS and not has_code_option:
             match = _NVCC_TARGET_PATTERN.fullmatch(value.strip())
             if match is None:
                 continue

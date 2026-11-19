@@ -65,6 +65,14 @@ def lint_script():
         ),
         (['-gencode=arch=compute_89,code="sm_89,compute_89"'], ["sm89"], ["compute89"]),
         (["-arch=sm_90a"], ["sm90a"], ["compute90a"]),
+        (["-arch", "sm_80"], ["sm80"], ["compute80"]),
+        (["-arch=compute_90a", "-code", "sm_90a"], ["sm90a"], []),
+        (["-arch=compute_90a", "-code=sm_90a"], ["sm90a"], []),
+        (
+            ["--gpu-architecture", "compute_90a", "--gpu-code", "sm_90a"],
+            ["sm90a"],
+            [],
+        ),
         (["--gpu-architecture=compute_80"], [], ["compute80"]),
         (["-arch=native"], [], []),
         (["-gencode=arch=compute_80,code=lto_80"], [], []),
@@ -83,6 +91,7 @@ def test_cuda_targets_from_nvcc_flags(cuda_architecture, flags, sass, ptx):
         ("sm89", ["-O3"], []),
         ("sm89", ["-gencode=arch=compute_89,code=sm_89"], []),
         ("sm90a", ["-gencode=arch=compute_90a,code=sm_90a"], []),
+        ("sm90a", ["-arch=compute_90a", "-code=sm_90a"], []),
         # An unsuffixed or family target runs on newer parts of its major.
         ("sm86", ["-gencode=arch=compute_80,code=sm_80"], []),
         ("sm121a", ["-gencode=arch=compute_120f,code=sm_120f"], []),
