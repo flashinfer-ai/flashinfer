@@ -1436,6 +1436,32 @@ def test_list_validation_during_capture_and_arrays_in_refused_slots():
 
 
 @needs_device
+@pytest.mark.parametrize("cfg", [CONFIGS[1], CONFIGS[4]], ids=["e4m3", "bf16"])
+def test_an_unvalidated_live_count_above_the_width_stays_in_its_row(cfg):
+    """Without list validation a live count above the list width reads as the width: the row is its full-width row,
+    whatever the next row's list holds, and the last row reads nothing past the index tensor."""
+    pool, targets, _ = shared(cfg)
+    plan = make_wrapper(cfg).plan
+    flat = pool.kv.view(-1, cfg[1])
+    rows = targets.take([8, 9, 8])
+    width = 128
+    indices = rows.indices[:, :width].contiguous()
+    full = torch.full((3,), width, dtype=torch.int32, device="cuda")
+    ref = plan.run(rows.q, flat, indices, full, return_lse=True)
+    over = torch.tensor(
+        [width + 1, 5 * width, 2**31 - 1], dtype=torch.int32, device="cuda"
+    )
+    got = plan.run(rows.q, flat, indices, over, return_lse=True, validate=False)
+    assert same_bits(got[0], ref[0]) and same_bits(got[1], ref[1])
+    other = indices.clone()
+    other[1:] = torch.flip(indices[1:], dims=[1])
+    moved = plan.run(rows.q, flat, other, over, return_lse=True, validate=False)
+    assert same_bits(moved[0][:1], ref[0][:1]) and same_bits(moved[1][:1], ref[1][:1])
+    with pytest.raises(ValueError, match="list length"):
+        plan.run(rows.q, flat, indices, over)
+
+
+@needs_device
 def test_kept_buffers_are_filled_before_another_stream_reads_them():
     """A row count first used on a busy stream: its kept buffers are complete when a second stream uses them."""
     from flashinfer.batch_invariant.mla import engine

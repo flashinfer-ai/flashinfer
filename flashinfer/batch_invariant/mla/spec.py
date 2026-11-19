@@ -70,7 +70,7 @@ COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 #: The ``prims_ts`` commit the kernel copy was taken from.
 KERNEL_BASE = "25bc267eb84dd1b28997f62aa4c282a09184c952"
 #: sha256 over the kernel copy (:func:`source_digest`); a device-free test pins it, so an edit is a decision.
-KERNEL_DIGEST = "52ed2727e4dedf29e7843620fc827e0d4385ad4e035f952ee670ff5da0906932"
+KERNEL_DIGEST = "728e4f247d107dd8b7b52ba15c6de0c0166f011015a0fa6ea2d465aaf43bbaf8"
 
 
 def dtype_name(dtype) -> str:

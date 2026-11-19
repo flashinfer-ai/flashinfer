@@ -1958,9 +1958,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
             output_scale = output_scale[0]
         if cutlass.const_expr(self.direct_sparse):
+            from ..helpers.live_counts import LiveCounts
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sinks, ks = block_split_kvs
+            sl = LiveCounts((sl, Int32(si.shape[-1])))
             if cutlass.const_expr(isinstance(ks, cute.Tensor)):
                 ks = ks[0]
             capacity = ((Int32(si.shape[-1]) + 127) // 128) * 128
