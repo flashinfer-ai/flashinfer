@@ -311,7 +311,6 @@ def _unified_layer_and_weight_pack(weights, t, backends=None, stock_view=None):
     )
     layer = MoELayer(config)
     assert len(layer.runners) == len(backends)
-    layer._select_winner = lambda *_: (layer.runners[0], -1)
     return layer, weight_pack
 
 
@@ -320,17 +319,17 @@ def _act_pack(x, ids, tw):
 
     return MoEActivationPack(
         hidden_states_q=x,
-        hidden_states_scale=torch.empty(0, device=DEVICE),
+        hidden_states_scale=None,
         topk_ids=ids,
         topk_weights=tw,
     )
 
 
-@pytest.mark.parametrize("t", [4, 16])
-def test_specialized_runner_matches_reference(weights, t):
-    """The specialized candidate serves allowlisted shapes with the
-    specialized kernels (its own module, no b12x hop) and matches the
-    fp32-dequant reference."""
+@pytest.mark.parametrize("t,stock_view", [(1, False), (4, True), (16, False)])
+def test_public_prepared_views_match_reference(weights, t, stock_view):
+    """Configure both runners. A row-major view alone must select specialized;
+    adding the swizzled stock view must let both compete without forcing a winner.
+    """
     from flashinfer.fused_moe import (
         B12xW4A16Config,
         SpecializedW4A16Config,
@@ -340,15 +339,24 @@ def test_specialized_runner_matches_reference(weights, t):
     x, ids, tw = _routing(t, seed=310 + t)
     ref = _reference(x, ids, tw, weights)
     layer, weight_pack = _unified_layer_and_weight_pack(
-        weights, t, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+        weights,
+        t,
+        backends=(B12xW4A16Config(), SpecializedW4A16Config()),
+        stock_view=stock_view,
     )
-    runner = next(r for r in layer.runners if r.backend_key == "specialized_w4a16")
-    layer._select_winner = lambda *_: (runner, -1)
+    act = _act_pack(x, ids, tw)
+    expected = {"specialized_w4a16"}
+    if stock_view:
+        expected.add("b12x_w4a16")
+    eligible = layer._eligible_runners(act, weight_pack)
+    assert {layer.runners[i].backend_key for i in eligible} == expected
     before = spec.dispatch_stats.get("specialized", 0)
-    out = layer(_act_pack(x, ids, tw), weight_pack)
+    out = layer(act, weight_pack)
     torch.cuda.synchronize()
-    assert spec.dispatch_stats.get("specialized", 0) == before + 1
-    assert layer.winner_backend == "specialized_w4a16"
+    # With both views, profiling itself launches the specialized kernel;
+    # the final winner is a timing result, not a correctness requirement.
+    assert spec.dispatch_stats.get("specialized", 0) > before
+    assert layer.winner_backend in expected
     _assert_close_to_reference(out, ref)
 
 
@@ -375,6 +383,7 @@ def test_off_allowlist_declined_and_stock_serves(weights):
     before = spec.dispatch_stats.get("specialized", 0)
     out = layer(act, weight_pack)
     torch.cuda.synchronize()
+    assert layer.winner_backend == "b12x_w4a16"
     assert spec.dispatch_stats.get("specialized", 0) == before
     _assert_close_to_reference(out, ref)
 
