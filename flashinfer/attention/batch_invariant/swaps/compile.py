@@ -28,6 +28,7 @@ def kernel_name(
     cap: int = 0,
     pdl: bool = False,
     sinks: bool = False,
+    fixed: bool = False,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}"
@@ -35,6 +36,7 @@ def kernel_name(
         + (f"_c{cap >> 10}" if cap else "")
         + ("_pdl" if pdl else "")
         + ("_sink" if sinks else "")
+        + ("_cg" if fixed else "")
     )
 
 
@@ -48,14 +50,16 @@ def get_compiled_swaps(
     cap: int = 0,
     pdl: bool = False,
     sinks: bool = False,
+    fixed: bool = False,
 ):
-    """``sinks``: the kernel of the class's sink member, part of its name. ``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
+    """``fixed``: the kernel of a fixed launch (``engine.FixedLaunch``: the unit count and the walking CTAs read from the counts
+    table), part of its name. ``sinks``: the kernel of the class's sink member, part of its name. ``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
     the kernel's identity in this process's cache and on disk; ``pdl``: launched as a programmatic dependent (its load warp waits
     for the preceding grid before the first TMA)."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl, sinks)
+    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl, sinks, fixed)
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -121,8 +125,11 @@ def get_compiled_swaps(
         indices_fake = cute.runtime.make_fake_tensor(
             i32, (s_nidx,), (1,), assumed_align=4
         )
+        counts_fake = cute.runtime.make_fake_tensor(
+            i32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl, sinks)
+        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl, sinks, fixed)
         return cute.compile(
             k,
             q_fake,
@@ -141,6 +148,7 @@ def get_compiled_swaps(
             cutlass.Float32(-1.0),
             cutlass.Int32(-1),
             cutlass.Int32(1),
+            counts_fake,
             cutlass.Int32(1),
             cutlass.Int32(0),
             stream_fake,

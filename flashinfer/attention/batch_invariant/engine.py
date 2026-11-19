@@ -24,12 +24,19 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 
 from .plan import (
+    COUNT_FIELDS,
     DESC_FIELDS,
     GRID_SEARCH_ARCHES,
     GROUP_FIELDS,
+    N_FIXUP_GROUPS,
+    N_GROUPS,
+    N_UNITS,
+    N_WALK,
+    build_decode_plan,
     build_plan,
     snake_order,
     ws_row,
@@ -358,6 +365,186 @@ class WorkspaceTooSmall(RuntimeError):
         self.needed = needed
 
 
+GRAPH_UNIT_WAVES = 32  # the unit capacity of a fixed launch is at least this many units per SM: room for the split kind of
+# the batches that leave the machine underfilled (the planner splits those into one unit per 512-key chunk), bounded so
+# that the tables stay small; a plan beyond it keeps its units fused
+
+
+def plan_counts(plan, walk: int) -> List[int]:
+    """The counts table of a plan under a fixed launch (``plan.COUNT_FIELDS`` int32): what its kernels read at entry in place
+    of launch arguments; ``walk`` CTAs of the launch grid walk the units."""
+    counts = [0] * COUNT_FIELDS
+    counts[N_UNITS] = plan.num_units if plan.num_launch is None else plan.num_launch
+    counts[N_GROUPS] = plan.num_groups
+    counts[N_FIXUP_GROUPS] = plan.num_fixup_groups
+    counts[N_WALK] = walk
+    return counts
+
+
+class FixedLaunch:
+    """The launch of a decode wrapper under ``use_cuda_graph=True``: everything a captured ``run()`` bakes into the graph is
+    fixed here, once, from the frozen query geometry (batch size, query tokens per request, heads, head dim, page size) and the
+    SM count -- the kernel (the Swaps body or the row body, by the live rows per unit), the launch grid (one CTA per SM; a
+    plan's own grid is the count of them that walk units, read from the counts table), the fixup launch and the addresses of
+    the tables the kernels read. ``fill`` writes a new plan into those tables, so a replay follows the last plan. Capacities: ``unit_cap`` units (the fused plan's count, which depends on the query geometry alone, or
+    ``GRAPH_UNIT_WAVES`` units per SM if that is more), ``group_cap`` split groups (one per fused unit at most) and
+    ``fixup_cap`` of them for the fixup kernel (each costs at least one unit of the budget); the partials take the whole float
+    workspace. ``unit_cap`` overrides the unit capacity (never below the fused plan's count). The planner keeps every plan
+    within them by fusing (``plan.budget_unit_kinds``): a placement, as is all of this."""
+
+    def __init__(
+        self,
+        batch: int,
+        q_len_per_req: int,
+        Hq: int,
+        Hkv: int,
+        D: int,
+        page: int,
+        config: "AttnConfig",
+        workspace: torch.Tensor,
+        device: torch.device,
+        sm_count: Optional[int] = None,
+        unit_cap: Optional[int] = None,
+    ):
+        from .blocks.operands import om_scratch_blocks
+        from .swaps.operands import n_pad_for
+
+        check_supported(D, Hq, Hkv, page)
+        assert config.well_formed(D) and not config.q2, config
+        device = torch.device(device)
+        sm = sm_count if sm_count is not None else device_sm_count(device)
+        g = Hq // Hkv
+        tpt = 128 // g
+        self.batch, self.q_len_per_req = int(batch), int(q_len_per_req)
+        self.heads, self.D, self.page, self.config = (
+            (int(Hq), int(Hkv)),
+            D,
+            page,
+            config,
+        )
+        self.sm_count = sm
+        fused_units = self.batch * Hkv * -(-self.q_len_per_req // tpt)
+        self.unit_cap = max(
+            1, fused_units, GRAPH_UNIT_WAVES * sm if unit_cap is None else unit_cap
+        )
+        self.group_cap = max(1, fused_units)
+        self.fixup_cap = min(fused_units, self.unit_cap - fused_units)
+        self.grid = max(1, min(config.grid or sm, self.unit_cap))
+        self.rows_max = min(tpt, self.q_len_per_req) * g  # live rows of the widest unit
+        swaps = config.small == "swap" and D in SWAPS_DIMS
+        self.n_pad = (
+            n_pad_for(self.rows_max)
+            if swaps and 1 <= self.rows_max <= SWAPS_MAX_ROWS
+            else 0
+        )
+        # the split partials: the whole workspace, as rows of ws_row(D) fp32
+        floats = workspace.numel() * workspace.element_size() // 4
+        self.row_budget = floats // ws_row(D)
+        if self.row_budget:
+            self.ws = (
+                workspace.view(torch.uint8)
+                .reshape(-1)[: floats * 4]
+                .view(torch.float32)
+            )
+        else:
+            self.ws = torch.empty(ws_row(D), dtype=torch.float32, device=device)
+        scr = 1
+        if not self.n_pad and om_scratch_blocks(D):
+            scr = self.grid * om_scratch_blocks(D) * 128 * D
+        self.scratch = torch.empty(scr, dtype=torch.float32, device=device)
+        # one int32 block: counts | descriptors | groups | fixup groups, refreshed from a page-locked staging block
+        self._sections = (
+            COUNT_FIELDS,
+            self.unit_cap * DESC_FIELDS,
+            self.group_cap * GROUP_FIELDS,
+            max(1, self.fixup_cap) * GROUP_FIELDS,
+        )
+        self.table = torch.zeros(sum(self._sections), dtype=torch.int32, device=device)
+        self.counts, desc, groups, fixup_groups = self._views(self.table)
+        self.desc = desc.view(self.unit_cap, DESC_FIELDS)
+        self.groups = groups.view(self.group_cap, GROUP_FIELDS)
+        self.fixup_groups = fixup_groups.view(-1, GROUP_FIELDS)
+        self.fold_counters = torch.zeros(
+            self.group_cap, dtype=torch.int32, device=device
+        )
+        self.lse_unused = torch.empty(1, dtype=torch.float32, device=device)
+        # two staging blocks in turn: a block is rewritten only after the copy that last read it has run
+        self._stage = [
+            torch.zeros(sum(self._sections), dtype=torch.int32, pin_memory=True)
+            for _ in range(2)
+        ]
+        self._stage_views = [
+            np.split(block.numpy(), np.cumsum(self._sections)[:-1])
+            for block in self._stage
+        ]
+        self._staged = [[0, 0, 0], [0, 0, 0]]  # live ints per section of each block
+        self._on_device = [0, 0, 0]  # live ints per section of the device tables
+        self._copied: List[Optional[torch.cuda.Event]] = [None, None]
+        self._turn = 0
+
+    def _views(self, block: torch.Tensor) -> tuple:
+        return torch.split(block, self._sections)
+
+    def matches(self, batch, q_len_per_req, Hq, Hkv, D, page) -> bool:
+        return (self.batch, self.q_len_per_req, self.heads, self.D, self.page) == (
+            int(batch),
+            int(q_len_per_req),
+            (int(Hq), int(Hkv)),
+            int(D),
+            int(page),
+        )
+
+    def fill(self, plan, non_blocking: bool = True) -> None:
+        """Write ``plan``'s tables (a ``plan.ArrayPlan``) over the fixed ones; beyond the plan's counts the device tables hold
+        null units and groups."""
+        assert (
+            plan.num_launch is None
+            and plan.num_units <= self.unit_cap
+            and plan.num_groups <= self.group_cap
+            and plan.num_fixup_groups <= self.fixup_cap
+            and plan.ws_rows <= self.row_budget
+        ), "the plan exceeds the fixed launch's capacity"
+        walk = self.config.grid or plan.grid or min(plan.num_units, self.sm_count)
+        i = self._turn
+        self._turn = 1 - i
+        ev = self._copied[i]
+        if ev is not None and not ev.query():
+            ev.synchronize()
+        counts, *sections = self._stage_views[i]
+        counts[:] = plan_counts(plan, max(1, min(walk, self.grid)))
+        extents = []
+        for k, (section, rows) in enumerate(
+            zip(
+                sections,
+                (plan.desc_array, plan.groups_array, plan.fixup_array),
+                strict=True,
+            )
+        ):
+            live = rows.size
+            section[:live] = rows.reshape(-1)
+            if self._staged[i][k] > live:
+                section[live : self._staged[i][k]] = 0
+            self._staged[i][k] = live
+            # what the device copy must cover: the plan's entries and the entries of the last plan they do not overwrite
+            extents.append(max(live, self._on_device[k]))
+            self._on_device[k] = live
+        with torch.cuda.device(self.table.device):
+            # the counts and the descriptors are adjacent: one copy; the group tables only when they hold entries
+            spans = (
+                (0, COUNT_FIELDS + extents[0]),
+                (COUNT_FIELDS + self._sections[1], extents[1]),
+                (COUNT_FIELDS + self._sections[1] + self._sections[2], extents[2]),
+            )
+            for start, n in spans:
+                if n:
+                    self.table[start : start + n].copy_(
+                        self._stage[i][start : start + n], non_blocking=non_blocking
+                    )
+            if ev is None:
+                ev = self._copied[i] = torch.cuda.Event()
+            ev.record()
+
+
 class _Planned:
     def __init__(
         self,
@@ -368,8 +555,12 @@ class _Planned:
         scratch: Optional[torch.Tensor] = None,
         fixup_groups: Optional[torch.Tensor] = None,
         fold_counters: Optional[torch.Tensor] = None,
+        counts: Optional[torch.Tensor] = None,
+        fixed: Optional[FixedLaunch] = None,
     ):
         self.plan, self.desc, self.groups, self.ws = plan, desc, groups, ws
+        self.counts = counts  # the counts table of a fixed launch (plan.COUNT_FIELDS)
+        self.fixed = fixed  # the fixed launch this plan was written into (a wrapper under use_cuda_graph)
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
         self.ragged = False  # the packed-token KV layout (set by plan_attention)
         # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
@@ -382,11 +573,14 @@ class _Planned:
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
-        self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
+        self.n_fixup_groups = plan.num_fixup_groups
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
-        self.lse_unused = torch.empty(
-            1, dtype=torch.float32, device=desc.device
-        )  # the kernels' LSE / sink operand of a launch without LSE / sinks (never written, never read)
+        # the kernels' LSE / sink operand of a launch without LSE / sinks (never written, never read)
+        self.lse_unused = (
+            fixed.lse_unused
+            if fixed is not None
+            else torch.empty(1, dtype=torch.float32, device=desc.device)
+        )
 
 
 def plan_attention(
@@ -403,10 +597,71 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    fixed: Optional[FixedLaunch] = None,
+    non_blocking: bool = True,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
-    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
+    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer.
+    ``fixed``: the plan is held to that launch's capacities and written into its tables (``FixedLaunch``; a request without keys
+    gets no unit); ``workspace`` and ``sm_count`` are the launch's."""
+    if fixed is not None:
+        batch = qo_indptr.numel() - 1
+        assert (
+            not ragged
+            and fixed.matches(batch, fixed.q_len_per_req, Hq, Hkv, D, page)
+            and int(qo_indptr[-1]) == batch * fixed.q_len_per_req
+        ), "the fixed launch was built for another query geometry"
+        from dataclasses import replace
+
+        # the unit kind and the fold placement are the planner's inputs and may differ from plan to plan; the kernel's are fixed
+        config = config or fixed.config
+        assert (
+            replace(
+                config,
+                split_policy=fixed.config.split_policy,
+                merge=fixed.config.merge,
+            )
+            == fixed.config
+        ), (config, fixed.config)
+        spans = np.diff(kv_indptr.cpu().numpy().astype(np.int64, copy=False))
+        last = kv_last_page_len.cpu().numpy().astype(np.int64, copy=False)
+        decode_plan = build_decode_plan(
+            # a request without pages has no keys, whatever its last-page entry
+            np.where(spans > 0, (spans - 1) * page + last, 0),
+            fixed.q_len_per_req,
+            Hq,
+            Hkv,
+            D,
+            window_left,
+            config.split_policy,
+            fixed.sm_count,
+            merge=config.merge,
+            small_swap=config.small == "swap" and D in SWAPS_DIMS,
+            swap_max_rows=SWAPS_MAX_ROWS,
+            grid=config.grid,
+            grid_search=planner_grid_search(fixed.table.device),
+            unit_budget=fixed.unit_cap,
+            row_budget=fixed.row_budget,
+        )
+        fixed.fill(decode_plan, non_blocking)
+        planned = _Planned(
+            decode_plan,
+            fixed.desc,
+            fixed.groups,
+            fixed.ws,
+            fixed.scratch,
+            fixed.fixup_groups,
+            fixed.fold_counters,
+            fixed.counts,
+            fixed,
+        )
+        planned.heads = (int(Hq), int(Hkv))
+        planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
+        planned.window_left = int(window_left)
+        planned.config = config
+        planned.page = int(page)
+        return planned
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -791,9 +1046,16 @@ def _run_attention_validated(
         kv_v = _kv_view(v_cache, kv_layout, Hkv, page, D)
     g = Hq // Hkv
     plan = planned.plan
-    if total_q == 0 or plan.num_units == 0:
+    fixed = planned.fixed
+    if total_q == 0 or (fixed is None and plan.num_units == 0):
         return out  # nothing to compute: no TMA descriptor over an empty query extent
     assert plan.g == g
+    if fixed is not None:
+        # a request without keys has no unit: its rows are zeros and its LSE -inf, written here ahead of the kernels (the
+        # launch is the same for every plan, so the captured graph holds these fills whatever the batch)
+        out.zero_()
+        if lse_mode:
+            lse.fill_(float("-inf"))
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     lse_view = lse.view(-1) if lse_mode else planned.lse_unused
@@ -810,7 +1072,16 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
-    n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
+    # a fixed launch's kernels read their counts from the plan's table; the others take them as arguments and are handed
+    # an int32 tensor they never read
+    counts = planned.counts if fixed is not None else planned.fold_counters
+    is_fixed = fixed is not None
+    if (
+        fixed is not None
+    ):  # the kernel and the grid of the fixed launch, whatever the plan
+        grid, n_pad = fixed.grid, fixed.n_pad
+    else:
+        n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
 
@@ -821,7 +1092,15 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, with_sinks
+            D,
+            g,
+            page,
+            n_pad,
+            ragged,
+            arch_smem_cap(q.device),
+            pdl,
+            with_sinks,
+            is_fixed,
         )
         kernel(
             q_view,
@@ -840,6 +1119,7 @@ def _run_attention_validated(
             float(-c),
             int(window_left),
             int(plan.num_units),
+            counts,
             int(grid),
             int(lse_mode),
         )
@@ -856,7 +1136,17 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, with_sinks
+                D,
+                g,
+                page,
+                DEFAULT_RING[D],
+                1,
+                False,
+                ragged,
+                hwm,
+                cap,
+                with_sinks,
+                is_fixed,
             )
         else:
             kernel = get_compiled_attention(
@@ -870,13 +1160,14 @@ def _run_attention_validated(
                 hwm,
                 cap,
                 with_sinks,
+                is_fixed,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
                 1, min(config.grid if config.grid else min(n_launch, sm), n_launch)
             )
         if (
-            planned.scratch.numel() > 1
+            planned.scratch.numel() > 1 and fixed is None
         ):  # O_m in the per-CTA global scratch: om_scratch_blocks(D) blocks per CTA
             from .blocks.operands import om_scratch_blocks
 
@@ -902,11 +1193,32 @@ def _run_attention_validated(
             float(-c),
             int(window_left),
             int(n_launch if n_launch is not None else plan.num_units),
+            counts,
             int(grid),
             int(lse_mode),
         )
-    fx = getattr(plan, "fixup_groups", plan.groups)
-    if fx:
+    fx = [] if fixed is not None else plan.fixup_groups
+    if fixed is not None:
+        # always launched when a plan of this geometry can hold a fixup group, over the capacity's grid: the blocks beyond
+        # the plan's groups fold nothing
+        if fixed.fixup_cap:
+            get_fixup(D, g, with_sinks, True)(
+                planned.ws,
+                o_view,
+                lse_view,
+                sink_view,
+                planned.fixup_groups,
+                float(c),
+                float(-c),
+                int(window_left),
+                int(Hq),
+                0,
+                counts,
+                int(min(fixed.fixup_cap, MAX_GRID_Y)),
+                int(fixed.rows_max),
+                int(lse_mode),
+            )
+    elif fx:
         max_rows = max(gr[1] for gr in fx)
         get_fixup(D, g, with_sinks)(
             planned.ws,
@@ -919,6 +1231,7 @@ def _run_attention_validated(
             int(window_left),
             int(Hq),
             int(len(fx)),
+            counts,
             int(min(len(fx), MAX_GRID_Y)),
             int(max_rows),
             int(lse_mode),

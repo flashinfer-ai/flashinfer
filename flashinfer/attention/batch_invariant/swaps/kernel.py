@@ -39,6 +39,8 @@ from ..plan import (
     F_SLOT,
     F_TILE_HI,
     F_TILE_LO,
+    N_UNITS,
+    N_WALK,
 )
 from .correction import correction_loop
 from .mma import mma_loop
@@ -75,10 +77,12 @@ class SwapsKernel:
         cap: int = 0,
         pdl: bool = False,
         sinks: bool = False,
+        fixed: bool = False,
     ):
         self.sinks = (
             sinks  # the sink step where a row is completed: a kernel of its own
         )
+        self.fixed = fixed  # a fixed launch: the unit count and the walking CTAs are read from the counts table
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
@@ -102,6 +106,7 @@ class SwapsKernel:
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        mCounts: cute.Tensor,
         grid: Int32,
         lse_mode: Int32,
         stream: cuda.CUstream,
@@ -140,6 +145,7 @@ class SwapsKernel:
             nc,
             window_left,
             num_units,
+            mCounts,
             lse_mode,
             st.qk_tiled_mma,
             st.pv_tiled_mma,
@@ -180,6 +186,7 @@ class SwapsKernel:
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        mCounts: cute.Tensor,
         lse_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
@@ -196,6 +203,15 @@ class SwapsKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
         grid_size, _, _ = cute.arch.grid_dim()
+        first = bidx
+        walk = grid_size
+        if cutlass.const_expr(self.fixed):
+            # a fixed launch: the plan's unit count and the CTAs that walk the units, from its counts table. A CTA beyond
+            # either walks no unit (no TMA load, no global store)
+            num_units = mCounts[N_UNITS]
+            walk = mCounts[N_WALK]
+            if bidx >= walk:
+                first = num_units
         if warp_idx == R.load_warp:
             cpasync.prefetch_descriptor(atom_q)
             cpasync.prefetch_descriptor(atom_k)
@@ -329,7 +345,7 @@ class SwapsKernel:
                 # the preceding grid's stores (Q, the KV cache, the output and workspace it may have produced) are visible from here;
                 # every store of this kernel depends on loads issued after this point. The descriptors are plan constants
                 cute.arch.griddepcontrol_wait()
-            for u in range(bidx, num_units, grid_size):
+            for u in range(first, num_units, walk):
                 q_prod, kv_prod = load_loop(
                     st,
                     atom_q,
@@ -366,7 +382,7 @@ class SwapsKernel:
             pv_low = canon.BlockedFold(
                 "kstep", st.k_steps
             )  # blocks = the tiles of a chunk, reset on the chunk's first step
-            for u in range(bidx, num_units, grid_size):
+            for u in range(first, num_units, walk):
                 q_cons, kv_cons, s_prod, p_cons, o_prod, qk_tiled_mma, pv_tiled_mma = (
                     mma_loop(
                         st,
@@ -409,7 +425,7 @@ class SwapsKernel:
             stats_prod.advance(2 * k)
             hm_prod.advance(k)
             hm_cons.advance(1 - k)
-            for u in range(bidx, num_units, grid_size):
+            for u in range(first, num_units, walk):
                 s_cons, p_prod, stats_prod, hm_prod, hm_cons = unit_loop(
                     st,
                     k,
@@ -450,7 +466,7 @@ class SwapsKernel:
                 for sl in range(st.slots_per_tile)
             )
             s_fold = storage.s_fold
-            for u in range(bidx, num_units, grid_size):
+            for u in range(first, num_units, walk):
                 o_cons, stats_cons = correction_loop(
                     st,
                     pv_thr_mma,

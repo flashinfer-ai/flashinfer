@@ -39,6 +39,7 @@ from .plan import (
     G_ROWS,
     G_SLOT,
     GROUP_FIELDS,
+    N_FIXUP_GROUPS,
     ws_row,
 )
 from .spec import chunk_len
@@ -436,9 +437,19 @@ def fold_row_coop(
 
 
 class SplitKVFixup:
-    def __init__(self, D: int, g: int, pdl: bool = PDL, sinks: bool = False):
+    def __init__(
+        self,
+        D: int,
+        g: int,
+        pdl: bool = PDL,
+        sinks: bool = False,
+        fixed: bool = False,
+    ):
         self.D, self.g, self.pdl = D, g, pdl
         self.sinks = sinks  # the sink step after the fold: a kernel of its own
+        self.fixed = (
+            fixed  # a fixed launch: the group count is read from the counts table
+        )
         self.C = chunk_len(D)
         self.WS = ws_row(D)
 
@@ -455,12 +466,13 @@ class SplitKVFixup:
         window_left: Int32,
         Hq: Int32,
         num_groups: Int32,
+        mCounts: cute.Tensor,
         grid_y: Int32,
         max_rows: Int32,
         lse_mode: Int32,
         stream,
     ):
-        # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows (2 / 2 / 1 at D = 64 / 128 / 256),
+        # grid: (row blocks of a group, min(groups, MAX_GRID_Y)), or a fixed capacity of both; a block handles 128 / (D / V) rows (2 / 2 / 1 at D = 64 / 128 / 256),
         # V = wide_vec(D) output columns per thread, and strides over the groups beyond grid.y
         rows_per_block = THREADS // (self.D // wide_vec(self.D))
         self.kernel(
@@ -474,6 +486,7 @@ class SplitKVFixup:
             window_left,
             Hq,
             num_groups,
+            mCounts,
             lse_mode,
         ).launch(
             grid=[cute.ceil_div(max_rows, rows_per_block), grid_y, 1],
@@ -495,6 +508,7 @@ class SplitKVFixup:
         window_left: Int32,
         Hq: Int32,
         num_groups: Int32,
+        mCounts: cute.Tensor,
         lse_mode: Int32,
     ):
         D, g, C = self.D, self.g, self.C
@@ -520,6 +534,10 @@ class SplitKVFixup:
         sA1 = sbuf[0, ri, None]
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
+        if cutlass.const_expr(self.fixed):
+            # a fixed launch: the plan's count of groups to fold, from its counts table (a plan constant, like the group
+            # table); a block beyond it folds nothing
+            num_groups = mCounts[N_FIXUP_GROUPS]
         for grp in cutlass.range(grp0, num_groups, grid_y):
             rows = mGroups[(grp, G_ROWS)]
             # every thread of the block reaches the fold's barriers: a row past the group's rows folds a clamped (valid) row and stores nothing
@@ -593,10 +611,13 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int, sinks: bool = False):
-    """``sinks``: the kernel that takes the sink step after the fold (its own name)."""
+def get_fixup(D: int, g: int, sinks: bool = False, fixed: bool = False):
+    """``sinks``: the kernel that takes the sink step after the fold (its own name). ``fixed``: the kernel of a fixed launch
+    (``engine.FixedLaunch``), which reads its group count from the counts table (its own name)."""
     name = jit.sanitize_symbol_name(
-        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("_sink" if sinks else "")
+        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}"
+        + ("_sink" if sinks else "")
+        + ("_cg" if fixed else "")
     )
 
     def compile_fn():
@@ -619,9 +640,12 @@ def get_fixup(D: int, g: int, sinks: bool = False):
         groups_fake = cute.runtime.make_fake_tensor(
             i32, (cute.sym_int(32), GROUP_FIELDS), (GROUP_FIELDS, 1), assumed_align=4
         )
+        counts_fake = cute.runtime.make_fake_tensor(
+            i32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            SplitKVFixup(D, g, sinks=sinks),
+            SplitKVFixup(D, g, sinks=sinks, fixed=fixed),
             ws_fake,
             o_fake,
             lse_fake,
@@ -632,6 +656,7 @@ def get_fixup(D: int, g: int, sinks: bool = False):
             Int32(-1),
             Int32(1),
             Int32(1),
+            counts_fake,
             Int32(1),
             Int32(1),
             Int32(0),
