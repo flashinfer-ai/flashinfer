@@ -96,6 +96,12 @@ def _attention_fingerprint(head_dim: int) -> str:
     return spec_fingerprint(head_dim)
 
 
+def _attention_ranges_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(head_dim, ranges=True)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device.
@@ -620,6 +626,11 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
+    # the ranged class: the same dataflow over the causal keys united with one bidirectional key range per query token (its
+    # own receipt: what a row may see is part of the class; a row without a range has the causal class's term and bits)
+    "BatchPrefillWithCausalBidirectionalRangesWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_ranges_fingerprint
+    ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
     "fused_moe_fp8": ClassInfo(
@@ -722,6 +733,10 @@ def fingerprint(op: str, **dims) -> str:
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
     class's no-window sample row and covers windowed calls too.
+    ``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes ``head_dim`` too and names the ranged class
+    (``attn-bf16-d<D>-br-*``): the same tiles, chunks, softmax step and merge over the causal keys united with the token's
+    bidirectional key range. The ranges and the two windows are per-call inputs like the KV position; a token without a
+    range has the causal class's term, so its bits are those of the three wrappers above.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
