@@ -455,7 +455,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 2) void
-kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap tmap_b_rows_1, const __grid_constant__ CUtensorMap tmap_b_rows_2, const __grid_constant__ CUtensorMap tmap_b_rows_3, const __grid_constant__ CUtensorMap tmap_b_rows_4, const __grid_constant__ CUtensorMap tmap_b_rows_5, const __grid_constant__ CUtensorMap tmap_b_rows_6, const __grid_constant__ CUtensorMap tmap_b_rows_7, const __grid_constant__ CUtensorMap tmap_b_rows_8, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles)
+kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap tmap_b_rows_1, const __grid_constant__ CUtensorMap tmap_b_rows_2, const __grid_constant__ CUtensorMap tmap_b_rows_3, const __grid_constant__ CUtensorMap tmap_b_rows_4, const __grid_constant__ CUtensorMap tmap_b_rows_5, const __grid_constant__ CUtensorMap tmap_b_rows_6, const __grid_constant__ CUtensorMap tmap_b_rows_7, const __grid_constant__ CUtensorMap tmap_b_rows_8, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -643,6 +643,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                     unsigned int m_tile = cluster_work % (unsigned int)32;
                     unsigned int n_tile = cluster_work / (unsigned int)32;
                     int expert = tile_expert[n_tile];
+                    expert = (unsigned)expert < (unsigned)num_experts ? expert : 0;
                     float output_scale = scale_c[expert];
                     int mn_limit = tile_mn_limit[n_tile];
                     mbarrier_wait(mma_full_addr + (acc_stage) * 8, _phase_mma_full);
@@ -1210,6 +1211,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                     unsigned int m_tile_1 = cluster_work_6 % (unsigned int)32;
                     unsigned int n_tile_3 = cluster_work_6 / (unsigned int)32;
                     int expert_1 = tile_expert[n_tile_3];
+                    expert_1 = (unsigned)expert_1 < (unsigned)num_experts ? expert_1 : 0;
                     #pragma unroll 1
                     for (int iter_k_5 = 0; iter_k_5 < K_tiles; iter_k_5++) {
                         mbarrier_wait(k_done_addr + (stage_5) * 8, _phase_k_done_3);
@@ -1248,6 +1250,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                     unsigned int m_tile_2 = cluster_work_7 % (unsigned int)32;
                     unsigned int n_tile_4 = cluster_work_7 / (unsigned int)32;
                     int expert_2 = tile_expert[n_tile_4];
+                    expert_2 = (unsigned)expert_2 < (unsigned)num_experts ? expert_2 : 0;
                     #pragma unroll 1
                     for (int iter_k_6 = 0; iter_k_6 < K_tiles; iter_k_6++) {
                         mbarrier_wait(sfa_free_addr + (stage_6) * 8, _phase_sfa_free);
