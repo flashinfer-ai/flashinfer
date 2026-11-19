@@ -1050,6 +1050,7 @@ class KdaReplayMtpUmma:
         lane = tid % 32
         NH = self.h
         CW0 = 4 if self.split else 2  # first consumer warp
+        VLATE = self.persistent and T >= 7  # v loaded at P4 of its own item
         RS = _REGSPLIT
         IK = self.iket
         # work items = (request, head), head fastest; CTA cta runs items cta, cta + ncta, ..
@@ -1478,7 +1479,8 @@ class KdaReplayMtpUmma:
             xw, graw, braw, dtb = _load_x(
                 q, k, g, b, dt_bias, a_log, b0, h0, ct, r8, l16, T
             )
-            vv = _load_v(v, b0, h0, row, T)
+            if cutlass.const_expr(not VLATE):
+                vv = _load_v(v, b0, h0, row, T)
             if ct < NH:
                 s_alog[ct] = Float32(a_log[ct])  # published by the first P1 barrier
             # G_P and the K~ ring words of the first item (later items': one item ahead)
@@ -1714,6 +1716,13 @@ class KdaReplayMtpUmma:
                     _bar_sync_ua(1, 128)
                     _ik_pop(IK)
                     _ik_push(IK, "c_p4")
+                    if cutlass.const_expr(VLATE):
+                        # T >= 7: this item's v rows are issued here. Carried over from the
+                        # previous item, ptxas register-packs the T bf16 values (PRMT) at the
+                        # item top and the pack waits for the load there (~1 us at T = 8)
+                        vcur = _load_v(v, brow, hh, row, T)
+                    else:
+                        vcur = vv
                     # -------- P4: mma.sync Grams. warp cw 0: Gq = X_c . Ktil^T (fp32,
                     # s_gram); warps cw 1, 2: C n-tiles (j 0..7, 8..15) = X_c . K~^T (bf16,
                     # SW32 s_c)
@@ -1896,7 +1905,7 @@ class KdaReplayMtpUmma:
                     uu: list = []
                     for t in cutlass.range_constexpr(T):
                         bt = s_coef[_CO_BETA + t]
-                        acc_u = bt * (vv[t] - hk[t])
+                        acc_u = bt * (vcur[t] - hk[t])
                         for s_ in cutlass.range_constexpr(t):
                             acc_u = acc_u - s_coef[_CO_A + t * 8 + s_] * uu[s_]
                         uu.append(acc_u)
@@ -1923,7 +1932,7 @@ class KdaReplayMtpUmma:
                         cute.arch.mbarrier_arrive(tmem_done)
                         fit = fit + 1
                     it = it + 1
-                    if cutlass.const_expr(self.persistent):
+                    if cutlass.const_expr(self.persistent and not VLATE):
                         vv = _load_v(v, nb, nh, row, T)
                     _ik_pop(IK)  # item
                 else:
@@ -1934,7 +1943,8 @@ class KdaReplayMtpUmma:
                     xw, graw, braw, dtb = _load_x(
                         q, k, g, b, dt_bias, a_log, nb, nh, ct, r8, l16, T
                     )
-                    vv = _load_v(v, nb, nh, row, T)
+                    if cutlass.const_expr(not VLATE):
+                        vv = _load_v(v, nb, nh, row, T)
                 sidx = nsidx
                 P = nP
                 base = nbase
