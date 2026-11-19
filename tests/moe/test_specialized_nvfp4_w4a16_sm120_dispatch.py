@@ -87,7 +87,11 @@ def sm120_env(monkeypatch, record):
     monkeypatch.setattr(_fm_cute_dsl, "B12xMoEWrapper", B12xMoEWrapper, raising=False)
 
     # --- specialized backend: fake the JIT module and the kernel launch
-    monkeypatch.setattr(spec, "_module", lambda: object())
+    from functools import cache
+
+    monkeypatch.setattr(spec, "_module", cache(lambda: object()))
+    monkeypatch.setattr(spec, "_warmed", {})
+    monkeypatch.setattr(spec, "_is_capturing", lambda device: False)
 
     def fake_specialized(x, w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha, ids, tw, output):
         record["spec_calls"] += 1
@@ -480,7 +484,8 @@ class TestUnifiedSurface:
         )
         runner = layer.runners[0]
         packed = runner.pack_inputs(act_pack, weight_pack)
-        monkeypatch.setattr(spec, "_is_capturing", lambda: True)
+        assert spec._module.cache_info().currsize == 1  # built, never launched
+        monkeypatch.setattr(spec, "_is_capturing", lambda device: True)
         with pytest.raises(RuntimeError, match="CUDA-graph capture"):
             runner.forward(packed)
         assert sm120_env["spec_calls"] == 0
@@ -544,3 +549,52 @@ class TestWeightViewEligibility:
             SpecializedW4A16Config.prepare_weights
             is not B12xW4A16Config.prepare_weights
         )
+
+
+@pytest.mark.parametrize(
+    "a,b,same",
+    [
+        (1, 4, False),
+        (4, 16, False),
+        (16, 64, False),
+        (64, 1024, False),
+        (1024, 2048, False),
+        (2048, 8191, True),
+        (8191, 8192, False),
+        (8192, 16384, True),
+    ],
+)
+def test_launch_receipt_domain(a, b, same):
+    d0, d1 = torch.device("cuda:0"), torch.device("cuda:1")
+    assert (spec._launch_key(d0, a) == spec._launch_key(d0, b)) is same
+    assert spec._launch_key(d0, a) != spec._launch_key(d1, a)
+
+
+def test_specialized_packs_are_call_local(sm120_env, weights, monkeypatch):
+    _, cfg = _specialized_configs()
+    layer, act, pack = _make_layer_and_packs(weights, 16, backends=(cfg(),))
+    runner = layer.runners[0]
+    first = runner.pack_inputs(act, pack)
+    second_view = dict(weights, w1_alpha=weights["w1_alpha"].clone())
+    pack.native_views[runner.backend_key] = second_view
+    second = runner.pack_inputs(act, pack)
+    assert len(first) == len(second) == 9
+    assert all(
+        t is weights[k]
+        for t, k in zip(first[3:], runner.required_weight_keys, strict=True)
+    )
+    assert all(
+        t is second_view[k]
+        for t, k in zip(second[3:], runner.required_weight_keys, strict=True)
+    )
+    seen = []
+
+    def launch(x, w1, sf1, alpha1, w2, sf2, alpha2, ids, tw, out):
+        seen.append(alpha1)
+        return out.fill_(len(seen))
+
+    monkeypatch.setattr(spec, "run_specialized_moe_nvfp4_w4a16", launch)
+    a = runner.forward(first)
+    b = layer(act, pack)
+    assert seen[0] is weights["w1_alpha"] and seen[1] is second_view["w1_alpha"]
+    assert a.data_ptr() != b.data_ptr() and (a == 1).all() and (b == 2).all()

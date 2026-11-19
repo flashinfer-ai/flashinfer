@@ -16,7 +16,7 @@ namespace wmma = nvcuda::wmma;
 void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
                    ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
                    ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
-                   ffi::TensorView out, cudaStream_t stream);
+                   ffi::TensorView out, ffi::TensorView scratch, cudaStream_t stream);
 
 namespace {
 
@@ -43,13 +43,6 @@ constexpr int GMMA_N1 = 64;
 constexpr int GMMA_N2 = 128;
 constexpr int MMA_WARPS = MMA_N / 16;
 
-struct Workspace {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-  int device = -1;
-  std::mutex mutex;
-};
-
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 // Persistent-grid sizes depend on the launch device's SM count and occupancy;
@@ -57,42 +50,6 @@ inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1)
 // smaller one (where it could exceed the resident-block capacity and leave
 // blocks waiting at the grid barrier).
 constexpr int kMaxCachedDevices = 64;
-
-// Buffers retired by workspace growth stay alive for the process lifetime:
-// a CUDA graph captured earlier may still replay kernels holding the old
-// address. One workspace slot per device (a device switch retires nothing),
-// and growth at least doubles a slot's capacity, so every retired buffer is
-// at most half its replacement and the retained total stays below the live
-// per-device capacity across arbitrary admitted token-count sequences.
-std::vector<void*> g_retired_workspaces;
-Workspace g_workspaces_by_device[kMaxCachedDevices];
-
-void* ensure_workspace(size_t bytes, int device) {
-  // Devices beyond the per-device table share one slot with the old
-  // retire-on-switch policy (bounded by how rarely such devices occur).
-  static Workspace overflow;
-  Workspace& ws =
-      (device >= 0 && device < kMaxCachedDevices) ? g_workspaces_by_device[device] : overflow;
-  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
-    // Geometric growth: never grow a slot by less than 2x, so each retired
-    // buffer is at most half its replacement and the retained total is
-    // bounded by the live capacity.
-    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
-    g_retired_workspaces.push_back(ws.ptr);
-    ws.ptr = nullptr;
-    ws.bytes = 0;
-  }
-  if (ws.ptr == nullptr) {
-    cudaSetDevice(device);
-    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
-        << "specialized MoE workspace cudaMalloc(" << bytes
-        << ") failed: " << cudaGetErrorString(err);
-    ws.bytes = bytes;
-    ws.device = device;
-  }
-  return ws.ptr;
-}
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {
   const uint32_t sign = uint32_t(x & 0x80) << 24;
@@ -2112,8 +2069,8 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
 void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
                         ffi::TensorView w1_gs, ffi::TensorView w1_alpha, ffi::TensorView w2_packed,
                         ffi::TensorView w2_gs, ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-                        ffi::TensorView topk_weights, ffi::TensorView out, int device,
-                        cudaStream_t stream) {
+                        ffi::TensorView topk_weights, ffi::TensorView out, ffi::TensorView scratch,
+                        int device, cudaStream_t stream) {
   const int T = int(hidden_states.size(0));
   const int routes = T * TOPK;
   size_t bytes = 0;
@@ -2141,7 +2098,8 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed
   // never trusted to hold a prior epoch.
   bytes += align_up(5 * sizeof(unsigned int));
 
-  char* workspace = static_cast<char*>(ensure_workspace(bytes, device));
+  TVM_FFI_ICHECK(size_t(scratch.size(0)) >= bytes);
+  char* workspace = static_cast<char*>(scratch.data_ptr());
   auto* inter = reinterpret_cast<__nv_bfloat16*>(workspace + inter_off);
   auto* output_acc = reinterpret_cast<float*>(workspace + output_scratch_off);
   auto* route_out = reinterpret_cast<__nv_bfloat16*>(workspace + output_scratch_off);
@@ -2166,7 +2124,7 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed
 
   if (T == 64) {
     RunFastDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha, topk_ids,
-                  topk_weights, out, stream);
+                  topk_weights, out, scratch, stream);
     return;
   }
   if (T == 16) {
@@ -2207,7 +2165,7 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed
   }
     if (T <= 4) {
       constexpr int FRPW = 4;
-      static int fused_grid_by_device[kMaxCachedDevices] = {};
+      static thread_local int fused_grid_by_device[kMaxCachedDevices] = {};
       int fused_grid =
           (device >= 0 && device < kMaxCachedDevices) ? fused_grid_by_device[device] : 0;
       if (fused_grid == 0) {
@@ -2236,7 +2194,7 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed
 #define FUSED_GRP(MTV)                                                                           \
   {                                                                                              \
     constexpr int MT_ = MTV;                                                                     \
-    static int fg_by_device[kMaxCachedDevices] = {};                                             \
+    static thread_local int fg_by_device[kMaxCachedDevices] = {};                                \
     int fg = (device >= 0 && device < kMaxCachedDevices) ? fg_by_device[device] : 0;             \
     if (fg == 0) {                                                                               \
       int nb = 0;                                                                                \

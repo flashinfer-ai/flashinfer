@@ -16,22 +16,22 @@ namespace wmma = nvcuda::wmma;
 void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
                    ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
                    ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
-                   ffi::TensorView out, cudaStream_t stream);
+                   ffi::TensorView out, ffi::TensorView scratch, cudaStream_t stream);
 void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
                          ffi::TensorView w1_gs, ffi::TensorView w1_alpha, ffi::TensorView w2_packed,
                          ffi::TensorView w2_gs, ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-                         ffi::TensorView topk_weights, ffi::TensorView out, int device,
-                         cudaStream_t stream);
+                         ffi::TensorView topk_weights, ffi::TensorView out, ffi::TensorView scratch,
+                         int device, cudaStream_t stream);
 void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
                         ffi::TensorView w1_gs, ffi::TensorView w1_alpha, ffi::TensorView w2_packed,
                         ffi::TensorView w2_gs, ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-                        ffi::TensorView topk_weights, ffi::TensorView out, int device,
-                        cudaStream_t stream);
+                        ffi::TensorView topk_weights, ffi::TensorView out, ffi::TensorView scratch,
+                        int device, cudaStream_t stream);
 void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
                     ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
                     ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-                    ffi::TensorView topk_weights, ffi::TensorView out, int device,
-                    cudaStream_t stream);
+                    ffi::TensorView topk_weights, ffi::TensorView out, ffi::TensorView scratch,
+                    int device, cudaStream_t stream);
 
 namespace {
 
@@ -60,57 +60,7 @@ constexpr int GMMA_N2_SMALL = 64;
 constexpr int GMMA_N2_LARGE = 128;
 constexpr int MMA_WARPS = MMA_N / 16;
 
-struct Workspace {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-  int device = -1;
-  std::mutex mutex;
-};
-
-std::mutex g_run_mutex;
-cudaStream_t g_last_stream = nullptr;
-int g_last_stream_device = -1;
-// The default stream is a valid previous stream, so track "have we run"
-// separately instead of using nullptr as the sentinel.
-bool g_have_last_stream = false;
-// Buffers retired by workspace growth stay alive for the process lifetime:
-// a CUDA graph captured earlier may still replay kernels holding the old
-// address. One workspace slot per device (a device switch retires nothing),
-// and growth at least doubles a slot's capacity, so every retired buffer is
-// at most half its replacement and the retained total stays below the live
-// per-device capacity across arbitrary admitted token-count sequences.
-constexpr int kMaxCachedDevices = 64;
-std::vector<void*> g_retired_workspaces;
-Workspace g_workspaces_by_device[kMaxCachedDevices];
-
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
-
-void* ensure_workspace(size_t bytes, int device) {
-  // Devices beyond the per-device table share one slot with the old
-  // retire-on-switch policy (bounded by how rarely such devices occur).
-  static Workspace overflow;
-  Workspace& ws =
-      (device >= 0 && device < kMaxCachedDevices) ? g_workspaces_by_device[device] : overflow;
-  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
-    // Geometric growth: never grow a slot by less than 2x, so each retired
-    // buffer is at most half its replacement and the retained total is
-    // bounded by the live capacity.
-    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
-    g_retired_workspaces.push_back(ws.ptr);
-    ws.ptr = nullptr;
-    ws.bytes = 0;
-  }
-  if (ws.ptr == nullptr) {
-    cudaSetDevice(device);
-    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
-        << "specialized MoE workspace cudaMalloc(" << bytes
-        << ") failed: " << cudaGetErrorString(err);
-    ws.bytes = bytes;
-    ws.device = device;
-  }
-  return ws.ptr;
-}
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {
   const uint32_t sign = uint32_t(x & 0x80) << 24;
@@ -1603,40 +1553,33 @@ __global__ void combine_route_output_kernel(const __nv_bfloat16* __restrict__ ro
 void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
          ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
          ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
-         ffi::TensorView out) {
+         ffi::TensorView out, ffi::TensorView scratch) {
   const int device = hidden_states.device().device_id;
+  TVM_FFI_ICHECK(scratch.device().device_type == kDLCUDA && scratch.device().device_id == device);
+  TVM_FFI_ICHECK(scratch.ndim() == 1 && scratch.IsContiguous() && scratch.dtype().code == kDLUInt &&
+                 scratch.dtype().bits == 8 && scratch.dtype().lanes == 1);
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(scratch.data_ptr()) % 256 == 0);
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
-  // All specialized paths reuse process-global scratch. Serialize their host
-  // launch sequences and order transitions between current CUDA streams.
-  std::lock_guard<std::mutex> run_lock(g_run_mutex);
-  if (g_have_last_stream && (g_last_stream != stream || g_last_stream_device != device)) {
-    cudaSetDevice(g_last_stream_device);
-    cudaStreamSynchronize(g_last_stream);
-    cudaSetDevice(device);
-  }
-  g_last_stream = stream;
-  g_last_stream_device = device;
-  g_have_last_stream = true;
 
   const int T = int(hidden_states.size(0));
   if (T == 1) {
     RunPersistentDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha,
-                        topk_ids, topk_weights, out, device, stream);
+                        topk_ids, topk_weights, out, scratch, device, stream);
     return;
   }
   if (T == 64) {
     RunFastDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha, topk_ids,
-                  topk_weights, out, stream);
+                  topk_weights, out, scratch, stream);
     return;
   }
   if (T == 1024) {
     RunFixedM64Prefill(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha,
-                       topk_ids, topk_weights, out, device, stream);
+                       topk_ids, topk_weights, out, scratch, device, stream);
     return;
   }
   if (T > 64) {
     RunWidePrefill(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha, topk_ids,
-                   topk_weights, out, device, stream);
+                   topk_weights, out, scratch, device, stream);
     return;
   }
   const int routes = T * TOPK;
@@ -1659,7 +1602,8 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorVi
   const size_t tiles2_off = bytes;
   bytes += align_up((E + 1) * sizeof(int32_t));
 
-  char* workspace = static_cast<char*>(ensure_workspace(bytes, device));
+  TVM_FFI_ICHECK(size_t(scratch.size(0)) >= bytes);
+  char* workspace = static_cast<char*>(scratch.data_ptr());
   auto* inter = reinterpret_cast<__nv_bfloat16*>(workspace + inter_off);
   auto* output_acc = reinterpret_cast<float*>(workspace + output_scratch_off);
   auto* route_out = reinterpret_cast<__nv_bfloat16*>(workspace + output_scratch_off);

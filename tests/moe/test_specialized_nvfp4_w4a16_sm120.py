@@ -413,6 +413,47 @@ def test_default_backend_layer_constructs_specialized_candidate(weights):
     assert "specialized_w4a16" in [r.backend_key for r in layer.runners]
 
 
+@pytest.mark.parametrize("t", [1, 16, 64, 1024, 4096])
+def test_public_independent_graph_replays(weights, t):
+    from flashinfer.fused_moe import SpecializedW4A16Config
+
+    layer, pack = _unified_layer_and_weight_pack(
+        weights, t, backends=(SpecializedW4A16Config(),)
+    )
+    buffers = [_routing(t, seed=200 + j) for j in range(2)]
+    acts = [_act_pack(*args) for args in buffers]
+    for act in acts:
+        layer(act, pack)  # resolve the public winner outside capture
+    assert layer.winner_backend == "specialized_w4a16"
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    outs = []
+    # Capture on the SAME stream: keying capture scratch by stream alone
+    # would pass a different-stream capture test but fail these replays.
+    for graph, act in zip(graphs, acts, strict=True):
+        with torch.cuda.graph(graph, stream=streams[0]):
+            outs.append(layer(act, pack))
+    assert outs[0].data_ptr() != outs[1].data_ptr()
+    for iteration in range(2):
+        refs = []
+        for j, args in enumerate(buffers):
+            changed = _routing(t, seed=900 + 2 * iteration + j)
+            for dst, src in zip(args, changed, strict=True):
+                dst.copy_(src)
+            refs.append(_reference(*args, weights))
+        ready = torch.cuda.current_stream().record_event()
+        for stream in streams:
+            stream.wait_event(ready)
+        for _ in range(3):
+            for graph, stream in zip(graphs, streams, strict=True):
+                with torch.cuda.stream(stream):
+                    graph.replay()
+        torch.cuda.synchronize()
+        for out, ref in zip(outs, refs, strict=True):
+            _assert_close_to_reference(out, ref)
+
+
 def test_cuda_graph_replay_matches_eager(weights):
     from flashinfer.fused_moe import SpecializedW4A16Config
     from flashinfer.fused_moe import specialized_moe_nvfp4_w4a16_sm120 as spec

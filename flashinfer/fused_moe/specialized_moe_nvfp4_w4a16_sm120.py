@@ -41,23 +41,11 @@ Weight layout, consumed in place (no repack): ``w1 uint8 [E, I, H/2]``
 float8_e4m3fn [E, I, H/16]`` row-major group-16 (UNswizzled), ``w1_alpha
 float32 [E]``; same pattern for ``w2``.
 
-CUDA-graph contract: call :func:`warmup` (largest T first) on the capture
-stream before capturing — each kernel family keeps its own process-global
-workspace (cudaMalloc growth) and the module synchronizes on stream
-transitions, both illegal inside capture; the guard refuses capture until
-warmup has run, when the captured token count's kernel family has never
-run on the device (``graph_capture_family_not_warmed``), when it exceeds
-the largest token count that family has already run
-(``graph_capture_token_count_exceeds_warmed``), and when the capture
-stream or device differs from the one the backend last ran on
-(``graph_capture_stream_mismatch`` — re-run :func:`warmup` on the capture
-stream). Replay is single-flight: captured graphs bake the shared
-process-global workspace addresses in, so two captured graphs must not
-replay concurrently, and the workspace must not grow (no call with a
-larger token count, on another device) while a captured graph may still
-be replayed. The T=1 path uses a cooperative launch (stream-capturable;
-verified). All launches go to the caller's current stream, re-queried
-per call.
+Build before capture. Scratch is a temporary allocated on the launch
+stream: during torch.cuda.graph capture it belongs to the active graph
+pool. Independent graphs with private pools can replay concurrently;
+as for any PyTorch graph, callers explicitly sharing a pool must order
+its uses. Eager launches do not borrow captured addresses.
 """
 
 import collections
@@ -65,8 +53,7 @@ import functools
 import json
 import os
 import pathlib
-import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -85,57 +72,51 @@ ENV_DISABLE = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 dispatch_stats: collections.Counter = collections.Counter()
 fallback_reasons: collections.deque = collections.deque(maxlen=64)
 
-# Warmup / last-run state for the CUDA-graph capture guard: the largest
-# token count run per kernel family on the current device (each family owns
-# its own process-global native workspace, grown monotonically with T) and
-# the stream/device of the last backend run. One host-side lock serializes
-# capture admission, native execution and the state update (the native
-# mutex does not protect this Python state).
-_state_lock = threading.Lock()
-_warmed: Dict[str, Any] = {
-    "done": False,
-    "family_max_t": {},
-    "device": None,
-    "stream": None,
-}
 
+def _workspace_bytes(t: int) -> int:
+    """Byte slices used by Run's selected family. Native checks the bound before launch."""
+    e, h, i = _C["num_experts"], _C["hidden_size"], _C["intermediate_size"]
+    r = t * _C["top_k"]
 
-def _family(t: int) -> str:
-    """Kernel family of a token count, mirroring the native ``Run()``
-    dispatch. Each family is its own translation unit with its own
-    process-global workspace, so warming one family says nothing about
-    another's capture readiness."""
-    if t == 1:
-        return "t1"
+    def aligned(n: int) -> int:
+        return (n + 255) & ~255
+
     if t == 64:
-        return "fast64"
-    if t == 1024:
-        return "fixed1024"
-    if t > 64:
-        return "wide"
-    return "decode"
-
-
-def _note_run(device: torch.device, t: int) -> None:
-    """Record a successful backend run. Callers hold ``_state_lock``."""
-    if _warmed["device"] != device:
-        # The native workspaces are retired and re-created on a device change.
-        _warmed["family_max_t"] = {}
-    _warmed["device"] = device
-    _warmed["stream"] = torch.cuda.current_stream(device).cuda_stream
-    fam = _family(t)
-    _warmed["family_max_t"][fam] = max(_warmed["family_max_t"].get(fam, 0), t)
+        groups = (r + e) // 2 + 1
+        return r * i * 2 + (r + groups) * 4
+    size = aligned(r * i * 2)
+    if t < 2048:
+        size += aligned(r * h * 2)
+    bins = e if t == 1024 or t >= 2048 else 1
+    size += aligned(r * bins * 4) + 5 * aligned((e + 1) * 4)
+    if t > 64 and t != 1024:
+        mm = 64 if t < 8192 else 96
+        tiles = (r + mm - 1) // mm + e
+        size += sum(aligned(tiles * ((n + 127) // 128) * 4) for n in (i, h))
+    if t == 1 or t > 64:
+        size += 256  # barrier slots
+    return size
 
 
 def _disabled() -> bool:
     return os.environ.get(ENV_DISABLE, "0") == "1"
 
 
-def _is_capturing() -> bool:
-    try:
+def _is_capturing(device) -> bool:
+    with torch.cuda.device(device):
         return torch.cuda.is_current_stream_capturing()
-    except Exception:  # noqa: BLE001
-        return False
+
+
+def _launch_key(device, t):
+    # Mirror native Run, not the autotuner's token buckets.
+    variant = t if t in (1, 4, 16, 64, 1024) else ("wideM64" if t < 8192 else "wideM96")
+    return device, variant
+
+
+# A receipt retains the very module that launched. Capture only reads this
+# table: it never enters the builder, even on a cache miss. Tensor devices
+# here are indexed; an unqualified 'cuda' is not a receipt key.
+_warmed: dict[tuple[torch.device, Union[int, str]], Any] = {}
 
 
 @functools.cache
@@ -273,7 +254,11 @@ def specialized_support_reasons(
     if reasons:
         return False, reasons
     # --- device checks
-    if list(torch.cuda.get_device_capability(x.device)) != _C["compute_capability"]:
+    try:
+        capability = torch.cuda.get_device_capability(x.device)
+    except (AssertionError, ValueError, RuntimeError):
+        return False, ["compute_capability:unavailable"]
+    if list(capability) != _C["compute_capability"]:
         reasons.append("compute_capability")
     # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.2-line ptxas (the shared b12x
     # gate only requires CUDA 13); refuse here so ``auto`` keeps the stock
@@ -286,30 +271,16 @@ def specialized_support_reasons(
             reasons.append(f"cuda_version:{_v.major}.{_v.minor}")
     except Exception:  # noqa: BLE001
         reasons.append("cuda_version:unknown")
-    if _is_capturing():
-        with _state_lock:
-            if not _warmed["done"]:
-                reasons.append("graph_capture_before_warmup")
-            else:
-                fam_max = _warmed["family_max_t"].get(_family(T), 0)
-                if fam_max == 0:
-                    # This T's kernel family has never run: its own native
-                    # workspace is cold and would cudaMalloc inside capture.
-                    # Re-run warmup with this token count included.
-                    reasons.append("graph_capture_family_not_warmed")
-                elif fam_max < T:
-                    # Larger T grows the family's process-global workspace
-                    # (cudaMalloc), which is illegal inside capture.
-                    reasons.append("graph_capture_token_count_exceeds_warmed")
-                if (
-                    _warmed["device"] != x.device
-                    or _warmed["stream"]
-                    != torch.cuda.current_stream(x.device).cuda_stream
-                ):
-                    # The native runner synchronizes the previous stream on a
-                    # stream/device transition, which is illegal inside
-                    # capture. Re-run warmup on the capture stream.
-                    reasons.append("graph_capture_stream_mismatch")
+    if reasons:
+        return False, reasons
+    try:
+        capturing = _is_capturing(x.device)
+    except (ValueError, RuntimeError):
+        return False, ["graph_capture_state_unknown"]
+    if capturing:
+        if _launch_key(x.device, T) not in _warmed:
+            return False, ["graph_capture_before_warmup"]
+        return True, []
     if not reasons:
         # The module must be buildable/loadable (e.g. FLASHINFER_DISABLE_JIT
         # with a cold JIT cache raises); record a refusal so ``auto`` falls
@@ -336,16 +307,56 @@ def run_specialized_moe_nvfp4_w4a16(
     """Run the specialized kernels (DPS: writes ``output`` [T, H] bf16 in
     place). The unified ``SpecializedW4A16Runner`` goes through
     :func:`specialized_support_reasons` first."""
-    tw = token_final_scales
-    if tw.dtype != torch.float32:
-        tw = tw.float()
-    # One critical section covers the native launch and the successful
-    # state update, so a concurrent capture-admission check never reads a
-    # stream/family state that another thread's in-flight run is about to
-    # invalidate (the native mutex only serializes the launches).
-    with _state_lock:
+    return _launch(
+        x,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        token_selected_experts,
+        token_final_scales,
+        output,
+        _warmed,
+    )
+
+
+def _launch(
+    x,
+    w1_weight,
+    w1_weight_sf,
+    w1_alpha,
+    w2_weight,
+    w2_weight_sf,
+    w2_alpha,
+    token_selected_experts,
+    token_final_scales,
+    output,
+    receipts,
+):
+    with torch.cuda.device(x.device):
+        capturing = _is_capturing(x.device)
+        t = int(x.shape[0])
+        key = _launch_key(x.device, t)
+        if capturing:
+            module = _warmed.get(key)
+            if module is None or receipts is not _warmed:
+                raise RuntimeError(
+                    "specialized W4A16: eager warmup required before CUDA-graph capture"
+                )
+        else:
+            module = _module()
+        tw = token_final_scales.float()
+        size = _workspace_bytes(t)
+        # A fresh lease, not a shared tensor. Eager reuse is stream ordered
+        # by the allocator; geometric size classes avoid a new large block
+        # for every +1 token. Capture needs only the actual layout size.
+        if not capturing:
+            size = 1 << (size - 1).bit_length()
+        scratch = torch.empty(size, dtype=torch.uint8, device=x.device)
         output.zero_()
-        _module().run(
+        module.run(
             x,
             w1_weight,
             w1_weight_sf,
@@ -356,8 +367,10 @@ def run_specialized_moe_nvfp4_w4a16(
             token_selected_experts,
             tw,
             output,
+            scratch,
         )
-        _note_run(x.device, int(x.shape[0]))
+        if not capturing:
+            receipts[key] = module
     return output
 
 
@@ -369,37 +382,54 @@ def warmup(
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
     token_counts=(16384, 4096, 1024, 64, 16, 4, 1),
-    device: str = "cuda",
+    device: Union[str, torch.device] = "cuda",
 ) -> None:
-    """Build the module, grow the workspace to its ladder maximum and run
-    each admitted shape once. Call BEFORE CUDA graph capture, on the
-    stream that will be captured (largest T first keeps the workspace
-    monotone)."""
+    """Build the module and exercise the requested admitted shapes before capture."""
     if _disabled():
         raise RuntimeError(
             f"specialized NVFP4-W4A16 SM120 warmup refused: {ENV_DISABLE}=1 "
             "disables the backend entirely"
         )
-    TOPK, H = _C["top_k"], _C["hidden_size"]
-    for T in token_counts:
-        if T not in _T_EXACT and T < _T_MIN_LARGE:
-            continue
-        x = torch.zeros(T, H, dtype=torch.bfloat16, device=device)
-        ids = torch.zeros(T, TOPK, dtype=torch.int32, device=device)
-        tw = torch.full((T, TOPK), 1.0 / TOPK, dtype=torch.float32, device=device)
-        out = torch.empty(T, H, dtype=torch.bfloat16, device=device)
-        run_specialized_moe_nvfp4_w4a16(
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("specialized W4A16 warmup requires a CUDA device")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if _is_capturing(device):
+        raise RuntimeError(
+            "specialized W4A16 warmup is not allowed during CUDA-graph capture"
+        )
+    weights = (w1_weight, w1_weight_sf, w1_alpha, w2_weight, w2_weight_sf, w2_alpha)
+    if not all(isinstance(w, torch.Tensor) and w.device == device for w in weights):
+        raise ValueError(
+            "warmup requires all six weight operands on the requested device"
+        )
+    counts = tuple(t for t in token_counts if t in _T_EXACT or t >= _T_MIN_LARGE)
+    pending: dict[tuple[torch.device, Union[int, str]], Any] = {}
+    top_k, h = _C["top_k"], _C["hidden_size"]
+    # Validate operands even for an empty filtered request, without launching.
+    for t in counts or (1,):
+        x = torch.zeros(t, h, dtype=torch.bfloat16, device=device)
+        ids = torch.zeros(t, top_k, dtype=torch.int32, device=device)
+        tw = torch.full((t, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+        out = torch.empty_like(x)
+        ok, reasons = specialized_support_reasons(
             x,
             w1_weight,
             w1_weight_sf,
-            w1_alpha,
             w2_weight,
             w2_weight_sf,
-            w2_alpha,
             ids,
             tw,
-            out,
+            _C["num_experts"],
+            top_k,
+            w1_alpha=w1_alpha,
+            w2_alpha=w2_alpha,
+            output=out,
         )
-    torch.cuda.synchronize()
-    with _state_lock:
-        _warmed["done"] = True
+        if not ok:
+            raise RuntimeError(f"specialized W4A16 warmup refused: {reasons}")
+        if counts:
+            _launch(x, *weights, ids, tw, out, pending)
+    torch.cuda.synchronize(device)
+    _warmed.update(pending)

@@ -9544,6 +9544,9 @@ class _B12xRunner(MoERunner):
         )
         if act.topk_weights.dtype != torch.float32:
             raise TypeError("b12x topk_weights must use torch.float32.")
+        return self._pack_validated(hidden_states, act, v)
+
+    def _pack_validated(self, hidden_states, act, v):
         self._prepared_weights = v
         self._ensure_inner(hidden_states.shape[1], hidden_states.shape[0])
         return [hidden_states, act.topk_ids, act.topk_weights]
@@ -9656,16 +9659,12 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
     shapes/dtypes/contiguity so an incompatible pack leaves this candidate
     ineligible instead of raising while the shootout profiles it.
 
-    CUDA graphs captured over this runner replay under the module's
-    SINGLE-FLIGHT contract (no concurrent replay of two captured graphs; no
-    workspace growth while a captured graph may replay) — see
-    :class:`SpecializedW4A16Config` and the module docstring.
+    Weights travel with each packed call. Output and scratch are allocated
+    on the forward stream, including in the graph-private pool at capture.
     """
 
     backend_key = "specialized_w4a16"
-    # Baked process-global workspace addresses: captured graphs must not
-    # replay concurrently (surfaced on the public config docstring).
-    single_flight_graph_replay: ClassVar[bool] = True
+    single_flight_graph_replay: ClassVar[bool] = False
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     # The kernels' contract is the non-gated ReLU^2 geometry only.
@@ -9673,10 +9672,6 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
         ReLU2,
     )
     supports_expert_parallelism = False
-
-    def __init__(self, config: MoEConfig, device: torch.device):
-        super().__init__(config, device)
-        self._moe_output: Optional[torch.Tensor] = None
 
     def _check_support(self) -> None:
         # Generic checks only (quant pair, activation class, routing mode,
@@ -9743,6 +9738,10 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
         self._wrapper_cls = None
         from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
 
+        if _spec._is_capturing(self.device):
+            raise RuntimeError(
+                "construct SpecializedW4A16Runner before CUDA-graph capture"
+            )
         try:
             _spec._module()
         except Exception as exc:  # noqa: BLE001
@@ -9812,28 +9811,16 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
         return t in _spec._T_EXACT or t >= _spec._T_MIN_LARGE
 
     def supports_graph_capture_timing(self) -> bool:
-        """Cross-backend graph timing (``bench_gpu_time(use_cuda_graph=True)``)
-        captures on a fresh internal stream, which can never satisfy the
-        specialized module's contract that :func:`warmup` runs on the capture
-        stream itself — the capture guard would refuse and ``forward`` would
-        raise inside the profiling capture. ``MoELayer._select_winner`` times
-        a shootout containing this runner eagerly instead (every candidate in
-        the same mode, so the comparison stays fair)."""
+        """Keep the existing eager cross-backend shootout policy."""
         return False
 
-    def _ensure_inner(self, hidden_size: int, num_tokens: int) -> None:
-        """Size the output buffer; there is no inner wrapper to build."""
-        self._require_built()
-        if (
-            self._moe_output is None
-            or self._moe_output.shape[0] < num_tokens
-            or self._moe_output.shape[1] != hidden_size
-        ):
-            self._moe_output = torch.empty(
-                (max(1, num_tokens), hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
+    def _pack_validated(self, hidden_states, act, v):
+        return [
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            *(v[key] for key in self.required_weight_keys),
+        ]
 
     def forward(
         self,
@@ -9845,17 +9832,11 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
         self._require_built()
         if tactic != -1:
             raise ValueError(f"{self.backend_key} supports only tactic -1.")
-        if self._prepared_weights is None or self._moe_output is None:
-            raise RuntimeError(
-                f"pack_inputs must be called before {self.backend_key} forward."
-            )
-        if len(inputs) != 3:
-            raise ValueError(
-                f"{self.backend_key} runner expects [hidden, expert_ids, weights]."
-            )
-        x, expert_ids, routing_weights = inputs
-        v = self._prepared_weights
-        output = self._moe_output[: x.shape[0]]
+        if len(inputs) != 3 + len(self.required_weight_keys):
+            raise ValueError(f"{self.backend_key}: expected inputs from pack_inputs.")
+        x, expert_ids, routing_weights = inputs[:3]
+        v = dict(zip(self.required_weight_keys, inputs[3:], strict=True))
+        output = torch.empty_like(x)
 
         from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
 
@@ -9897,8 +9878,7 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
                 f"{self.backend_key}: cannot serve this call during CUDA-graph "
                 f"capture ({', '.join(reasons)}); run "
                 "flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120."
-                "warmup(...) on the capture stream (largest token count "
-                "first) before capturing."
+                "warmup(...) before capturing."
             )
         # _accepts_shape and check_support admit only guard-passing calls,
         # so any other refusal here is a call-time state change. Raising

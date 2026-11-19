@@ -2918,14 +2918,13 @@ class SpecializedW4A16Config:
     carries only the b12x view leaves this candidate ineligible instead of
     raising mid-shootout.
 
-    CUDA graphs: the kernels bake process-global workspace addresses into a
-    capture, so captured graphs replay under a SINGLE-FLIGHT contract —
-    two captured graphs must never replay concurrently, and the workspace
-    must not grow while a captured graph may still replay. Callers that
-    capture multiple graphs over layers using this backend must serialize
-    their replays (see ``specialized_moe_nvfp4_w4a16_sm120.warmup``);
-    consumers that cannot guarantee that should not configure this
-    candidate for captured serving.
+    CUDA graphs: before capture, eagerly launch each required kernel family
+    on the input CUDA device, or call ``specialized_moe_nvfp4_w4a16_sm120.warmup``.
+    Loading the module alone is insufficient. The runner allocates output and
+    scratch per call on the launch stream; capture uses the active graph pool.
+    Independent graphs with private pools and independent writable operands
+    can replay concurrently. Callers sharing a graph pool must follow PyTorch's
+    pool replay ordering and lifetime rules.
 
     Determinism: expert partials combine with BF16 atomics, so repeated
     identical calls can differ by a few BF16 ulp in accumulation order.

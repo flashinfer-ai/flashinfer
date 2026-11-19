@@ -32,7 +32,7 @@ _SOURCES = (
 def gen_specialized_moe_nvfp4_w4a16_sm120_module() -> JitSpec:
     src_dir = jit_env.FLASHINFER_CSRC_DIR / "specialized_moe_nvfp4_w4a16_sm120"
     return gen_jit_spec(
-        "specialized_moe_nvfp4_w4a16_sm120",
+        "specialized_moe_nvfp4_w4a16_sm120_ws_v2",
         [src_dir / s for s in _SOURCES],
         extra_cuda_cflags=sm120a_nvcc_flags + ["-std=c++17", "-lineinfo"],
         extra_ldflags=["-lcuda"],

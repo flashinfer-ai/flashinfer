@@ -683,45 +683,6 @@ __global__ __launch_bounds__(NWARP * 32, MINB) void moe_gemv_group16(
 
 // ---------------------------------------------------------------- host
 
-// Device scratch arena (workspace only - never holds results between calls).
-// Buffers retired by growth stay alive for the process lifetime: a CUDA graph
-// captured earlier may still replay kernels holding the old address. One slot
-// per device (a device switch retires nothing; an allocation is only valid on
-// the device it was made on), and growth at least doubles a slot's capacity,
-// so every retired buffer is at most half its replacement and the retained
-// total stays below the live per-device capacity.
-constexpr int kWsMaxDevices = 64;
-struct FastWs {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-  int device = -1;
-};
-static FastWs g_ws_by_device[kWsMaxDevices];
-static std::vector<void*> g_retired_ws;
-static void* ws_get(size_t bytes) {
-  int device = -1;
-  cudaGetDevice(&device);
-  // Devices beyond the per-device table share one slot with the old
-  // retire-on-switch policy (bounded by how rarely such devices occur).
-  static FastWs overflow;
-  FastWs& ws = (device >= 0 && device < kWsMaxDevices) ? g_ws_by_device[device] : overflow;
-  if (ws.ptr != nullptr && (ws.bytes < bytes || ws.device != device)) {
-    if (ws.device == device && bytes < ws.bytes * 2) bytes = ws.bytes * 2;
-    g_retired_ws.push_back(ws.ptr);
-    ws.ptr = nullptr;
-    ws.bytes = 0;
-  }
-  if (ws.ptr == nullptr) {
-    cudaError_t err = cudaMalloc(&ws.ptr, bytes);
-    TVM_FFI_ICHECK(err == cudaSuccess && ws.ptr != nullptr)
-        << "specialized MoE workspace cudaMalloc(" << bytes
-        << ") failed: " << cudaGetErrorString(err);
-    ws.bytes = bytes;
-    ws.device = device;
-  }
-  return ws.ptr;
-}
-
 template <int NWARP, int RR, int MINB>
 static void launch_direct(int T, const __nv_bfloat16* hs, const uint8_t* w1p, const uint8_t* w1g,
                           const float* w1a, const uint8_t* w2p, const uint8_t* w2g,
@@ -773,13 +734,14 @@ static void launch_all(int T, int P, int Gmax, const __nv_bfloat16* hs, const ui
 void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
                    ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
                    ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
-                   ffi::TensorView out, cudaStream_t st) {
+                   ffi::TensorView out, ffi::TensorView scratch, cudaStream_t st) {
   const int T = int(hidden_states.size(0));
   const int P = T * TOPKV;
   // sum_e ceil(count_e / BT) <= (P + (BT - 1) * active_experts) / BT.
   const int Gmax = (P + (T64_BT - 1) * NEXP) / T64_BT + 1;
-  void* ws =
-      ws_get((size_t)P * INTM * sizeof(__nv_bfloat16) + (size_t)P * 4 + (size_t)Gmax * 12 + 1028);
+  const size_t bytes = size_t(P) * INTM * sizeof(__nv_bfloat16) + size_t(P + Gmax) * 4;
+  TVM_FFI_ICHECK(size_t(scratch.size(0)) >= bytes);
+  void* ws = scratch.data_ptr();
 
   const __nv_bfloat16* hs = (const __nv_bfloat16*)hidden_states.data_ptr();
   const uint8_t* w1p = (const uint8_t*)w1_packed.data_ptr();
