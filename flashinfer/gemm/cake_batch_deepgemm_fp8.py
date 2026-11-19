@@ -130,6 +130,12 @@ def serving_config(
     hint, so at ``expected_m=1`` a group can still span several M blocks; with
     ``n_l2_group=1`` the two CTAs of such a group would compute different M
     blocks and the output would be wrong.
+
+    ``cta_reserve`` is a measured schedule choice: the grid is the SM count less
+    the reserve, in whole CTA pairs. On 212-SM devices the full grid (reserve 0)
+    is faster from ``expected_m`` 36 up (by 2-11% at ``expected_m`` 36 to 4096 on
+    every measured shape) and slower at ``expected_m`` 32 and below, which keep
+    the default reserve.
     """
     if k == 7168:
         if expected_m <= 1:
@@ -138,6 +144,8 @@ def serving_config(
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:
             cta_reserve = 8 if arch == "sm_103a" else 20
+        elif sm_count == 212 and expected_m >= 36:
+            cta_reserve = 0
         else:
             cta_reserve = 24
         return 5, 2, "evict_normal", cta_reserve, 8
@@ -145,6 +153,8 @@ def serving_config(
         return 5, 3, "evict_normal", 0, 8
     if expected_m == 2:
         return 5, 2, "evict_normal", 20, 8
+    if sm_count == 212 and expected_m >= 36:
+        return 5, 2, "evict_normal", 0, 8
     return 5, 2, "evict_normal", 24, 8
 
 
