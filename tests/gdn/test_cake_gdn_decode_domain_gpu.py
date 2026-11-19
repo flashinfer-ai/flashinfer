@@ -652,20 +652,33 @@ def test_twin_race_gate(case) -> None:
         pytest.skip(f"a stress gate: set {_RACE_ENV} to the launches per case")
     device, table = _require_domain()
     batch_size, rows0 = case
+    if rows0 is None:
+        rows0 = (batch_size + 1) // 2
     tensors, initial = _inputs(batch_size)
     whole_out, whole_state = _whole(tensors, initial, _SCALE)
-    homed = _home(initial, (batch_size + 1) // 2 if rows0 is None else rows0)
+    homed = _home(initial, rows0)
     out = _empty_out(batch_size)
+
+    def assert_the_twin_runs():
+        # A twin that fails to build, load or launch leaves the call to the whole
+        # body, whose bits pass the comparison too; a launch failure drops the twin
+        # for the rest of the process.
+        twin = _domain_launch(device, batch_size, _SCALE, table, homed)
+        assert twin is not None and twin[0] is not None and twin[2] == rows0
+
     failures = []
     for launch in range(launches):
         homed.copy_(initial)
         out.fill_(float("nan"))
         _public(tensors, homed, _SCALE, out=out)
+        if launch == 0:
+            assert_the_twin_runs()
         if not (_same_bits(out, whole_out) and _same_bits(homed, whole_state)):
             failures.append(launch)
             if len(failures) > 5:
                 break
     assert not failures, f"launches {failures} differ from the whole body's bits"
+    assert_the_twin_runs()
 
 
 # --------------------------------------------------------------------------- public

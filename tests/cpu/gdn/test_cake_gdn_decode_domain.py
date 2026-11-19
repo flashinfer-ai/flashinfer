@@ -330,7 +330,10 @@ def test_nontranspose_domain_variant_follows_the_whole_route() -> None:
 
 
 class _FakeCuda(torch.Tensor):
-    """A meta tensor that the nontranspose host checks take for a tensor of cuda:0."""
+    """A meta tensor that the nontranspose host checks take for a tensor of cuda:0,
+    at base address ``address`` (0 unless set)."""
+
+    address = 0
 
     @property
     def is_cuda(self):
@@ -343,11 +346,16 @@ class _FakeCuda(torch.Tensor):
     def get_device(self):
         return 0
 
+    def data_ptr(self):
+        return self.address
 
-def _fake(shape, dtype) -> torch.Tensor:
-    return torch.Tensor._make_subclass(
+
+def _fake(shape, dtype, address=0) -> torch.Tensor:
+    tensor = torch.Tensor._make_subclass(
         _FakeCuda, torch.empty(shape, dtype=dtype, device="meta")
     )
+    tensor.address = address
+    return tensor
 
 
 class _FakeCudaWrapper(_FakeCuda):
@@ -546,6 +554,36 @@ def test_unhomed_state_launches_the_whole_route_as_before(monkeypatch) -> None:
         assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
         assert gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES == {}
         assert not any(_TWIN in name for name in device.loads)
+
+
+def test_unaligned_inputs_raise_before_any_launch(monkeypatch) -> None:
+    # Contiguous views at an unaligned storage offset: the kernels read q and k in
+    # 8-byte vectors and the state in 16-byte copies, so the call raises before it
+    # resolves or launches anything, homed or not.
+    device = _Device(monkeypatch)
+    for homed in (False, True):
+        for name, address in (
+            ("q", 2),
+            ("q", 4),
+            ("k", 6),
+            ("state", 4),
+            ("state", 8),
+        ):
+            inputs = _decode_inputs(64)
+            tensor = inputs[name]
+            inputs[name] = _fake(tensor.shape, tensor.dtype, address)
+            if homed:
+                device.home(inputs["state"])
+            with pytest.raises(ValueError, match="aligned"):
+                _run(inputs)
+    assert device.calls == [] and device.loads == []
+    # 8-byte aligned q and k and a 16-byte aligned state launch as before.
+    inputs = _decode_inputs(64)
+    for name, address in (("q", 8), ("k", 1032), ("state", 16)):
+        inputs[name] = _fake(inputs[name].shape, inputs[name].dtype, address)
+    assert _run(inputs) is inputs["output"]
+    ((route, args),) = device.calls
+    assert _TWIN not in route and args[:9] == _whole_args(inputs, 0)[:9]
 
 
 @pytest.mark.parametrize("scale", [_SCALE, 1.0])
