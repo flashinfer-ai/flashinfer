@@ -480,14 +480,15 @@ def _accepts_mx(config: Knobs, M: int, N: int, K: int, C: int, in_fmt: str) -> b
     ) and _accepts(config, M, N, K, "k", C, in_fmt)
 
 
-# the compiled kernels by (device index, record, the launch's other compile parameters): the persistent grid is the
-# device's co-resident cluster count for the record, so once that count is final the handle is a function of the key
+# the compiled kernels by (device index, the object's record, the launch's other compile parameters): the persistent
+# grid, the raster order and the swizzle size are launch arguments (``blocks/compile.launch_args``), so the records of one
+# tile / cluster bucket share a handle
 _KERNELS: Dict[tuple, Any] = {}
 
 
 def clear_kernel_cache() -> None:
     """Forget every cached launch handle: the one supported way to drop them (tests; a device re-registration, which also
-    forgets the rankings the grids were sized with)."""
+    forgets the rankings)."""
     _KERNELS.clear()
 
 
@@ -495,22 +496,18 @@ on_rank_cache_clear(clear_kernel_cache)
 
 
 def _kernel(
-    device: torch.device, config: Knobs, key: tuple, build: Callable[[int, str], Any]
+    device: torch.device, config: Knobs, key: tuple, build: Callable[[str], Any]
 ) -> Any:
-    """The compiled kernel of ``config`` on ``device`` for ``key`` (what else selects the compile), from ``build(clusters,
-    family)`` with the device's persistent grid; kept per (device index, record, key) once the grid is final (a device whose
-    occupancy query is still being retried is asked again on the next call, as `persistent_clusters` does)."""
+    """The compiled kernel of ``config`` on ``device`` for ``key`` (what else selects the compile), from ``build(family)``;
+    kept per (device index, the object's record, key)."""
+    from .blocks.compile import object_record
+
     index = _device_key(device)
-    k = (index, config, *key)
+    k = (index, object_record(config), *key)
     kernel = _KERNELS.get(k)
     if kernel is None:
         _sm, fam = part_of(device)
-        kernel = build(persistent_clusters(device, config), fam)
-        if (
-            config.grid_clusters
-            or (index, config.cluster_m * config.cluster_n) in _CO_RESIDENT
-        ):
-            _KERNELS[k] = kernel
+        kernel = _KERNELS[k] = build(fam)
     return kernel
 
 
@@ -539,7 +536,7 @@ def _run(
     the whole fold, in the epilogue of a direct store or in the fixup of the workspace split, whose partials stay
     bias-free). ``out_fresh`` says the entry allocated ``out`` in this call: a fresh buffer aliases no live tensor, so its
     aliasing check is skipped (every caller-provided buffer is checked)."""
-    from .blocks.compile import get_compiled_gemm
+    from .blocks.compile import get_compiled_gemm, launch_args
     from .fixup import MAX_GRID_Y, get_fixup
 
     if not _accepts(config, M, N, K, b_major, C, in_fmt):
@@ -555,11 +552,13 @@ def _run(
     kernel = _kernel(
         a.device,
         config,
-        ("gemm", b_major, C, in_fmt, out_fmt, False, biased),
-        lambda clusters, fam: get_compiled_gemm(
-            config, b_major, C, clusters, in_fmt, out_fmt, family=fam, bias=biased
+        ("gemm", b_major, C > 1, in_fmt, out_fmt, False, biased),
+        lambda fam: get_compiled_gemm(
+            config, b_major, C, in_fmt, out_fmt, family=fam, bias=biased
         ),
     )
+    # the record's placements as the kernel's trailing arguments: the persistent grid, the swizzle size, the raster flag
+    tail = launch_args(config, persistent_clusters(a.device, config))
     extra = (scales if scaled else ()) + ((bias,) if bias is not None else ())
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
@@ -574,7 +573,7 @@ def _run(
         if not out_fresh:
             _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-        kernel(a3, b3, c3, *extra)  # the chain in the epilogue
+        kernel(a3, b3, c3, *extra, *tail)  # the chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
     # applied there, once)
@@ -587,7 +586,7 @@ def _run(
         writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
         _require_disjoint(cls, writes, reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
-    kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
+    kernel(a3, b3, ws, *tail)  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
     get_fixup(C, out_fmt, scaled, bias is not None)(ws, out, *extra, M, N, rows)
     return out
@@ -991,7 +990,7 @@ def _launch_bmm_fp8(
     """The batched fp8 classes' launch on prepared operands (:func:`prepare_bmm_fp8_operands`'s): the unsplit class as one
     launch over the batch, the split classes one launch of the class per element; ``out_fresh`` as in :func:`_run`."""
     if C == 1:
-        from .blocks.compile import get_compiled_gemm
+        from .blocks.compile import get_compiled_gemm, launch_args
 
         if not _accepts(config, M, N, K, b_major, 1, in_fmt):
             raise unsupported(
@@ -1009,9 +1008,9 @@ def _launch_bmm_fp8(
         kernel = _kernel(
             A.device,
             config,
-            ("gemm", b_major, 1, in_fmt, out_fmt, True, False),
-            lambda clusters, fam: get_compiled_gemm(
-                config, b_major, 1, clusters, in_fmt, out_fmt, True, family=fam
+            ("gemm", b_major, False, in_fmt, out_fmt, True, False),
+            lambda fam: get_compiled_gemm(
+                config, b_major, 1, in_fmt, out_fmt, True, family=fam
             ),
         )
         # (m, k, l) / (n, k, l) / (m, n, l) views with l = the batch element
@@ -1021,6 +1020,7 @@ def _launch_bmm_fp8(
             out.permute(1, 2, 0),
             A_scale,
             B_scale,
+            *launch_args(config, persistent_clusters(A.device, config)),
         )
         return out
     if workspace is None:
@@ -1274,6 +1274,7 @@ def _run_mx(
     record (the weights as the kernel's A, the tokens as its B, the output transposed: the block-scaled step is symmetric
     in its two operands) and the workspace split with the dense module's fixup (the fp32 partials folded in chunk order
     from +0, then the chain)."""
+    from .blocks.compile import launch_args
     from .blocks.compile_blockscaled import get_compiled_blockscaled
     from .blocks.compile_blockscaled_mixed import get_compiled_blockscaled_mixed
     from .fixup import MAX_GRID_Y, get_fixup
@@ -1289,9 +1290,9 @@ def _run_mx(
         kernel = _kernel(
             a.device,
             config,
-            ("mx_mixed", C, in_fmt, out_fmt, enable_pdl),
-            lambda clusters, fam: get_compiled_blockscaled_mixed(
-                config, C, clusters, in_fmt, out_fmt, family=fam, enable_pdl=enable_pdl
+            ("mx_mixed", C > 1, in_fmt, out_fmt, enable_pdl),
+            lambda fam: get_compiled_blockscaled_mixed(
+                config, C, in_fmt, out_fmt, family=fam, enable_pdl=enable_pdl
             ),
         )
     else:
@@ -1303,11 +1304,13 @@ def _run_mx(
         kernel = _kernel(
             a.device,
             config,
-            ("mx", C, in_fmt, out_fmt),
-            lambda clusters, fam: get_compiled_blockscaled(
-                config, C, clusters, in_fmt, out_fmt, family=fam
+            ("mx", C > 1, in_fmt, out_fmt),
+            lambda fam: get_compiled_blockscaled(
+                config, C, in_fmt, out_fmt, family=fam
             ),
         )
+    # the record's placements as the kernel's trailing arguments: the persistent grid, the swizzle size, the raster flag
+    tail = launch_args(config, persistent_clusters(a.device, config))
     # each operand's K extent in its own units (bytes for a 4-bit operand: the mixed classes' weight, both operands of the
     # 4-bit formats)
     Kb_a = K * A_ELEM_BITS_OF[in_fmt] // 8
@@ -1333,6 +1336,7 @@ def _run_mx(
             sfa,
             out.as_strided((N, M, 1), (1, out.stride(0), M * N)),
             *extra,
+            *tail,
         )
         return out
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk of the split views (1 for the unsplit class,
@@ -1349,7 +1353,7 @@ def _run_mx(
         if not out_fresh:
             _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-        kernel(a3, b3, sfa, sfb, c3, *extra)  # the chain in the epilogue
+        kernel(a3, b3, sfa, sfb, c3, *extra, *tail)  # the chain in the epilogue
         return out
     # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
     # applied there, once)
@@ -1364,10 +1368,10 @@ def _run_mx(
     if config.swap_ab:
         # the swapped record of a split class (the mixed classes): the exchanged operands' chunk partials P_c^T into the
         # workspace's (N, M, C) view (the kernel's M contiguous), then the same fixup over the (M, N, C) view
-        kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0))
+        kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0), *tail)
     else:
         kernel(
-            a3, b3, sfa, sfb, ws.permute(1, 2, 0)
+            a3, b3, sfa, sfb, ws.permute(1, 2, 0), *tail
         )  # the unscaled body: raw fp32 partials
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     rows = min(M, MAX_GRID_Y)
@@ -1972,6 +1976,7 @@ def _launch_fp8bs(
     """The block-scale class's launch on prepared operands: ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views
     in the layout the staging reads (``native_k``: the caller's K-layout tensors as they are; else M-major views of the
     MN-layout copies); ``out_fresh`` as in :func:`_run`."""
+    from .blocks.compile import launch_args
     from .blocks.compile_fp8bs import get_compiled_fp8bs
 
     cls = CLASS_FP8BS
@@ -1997,9 +2002,16 @@ def _launch_fp8bs(
             a.device,
             config,
             ("fp8bs", out_fmt, native_k),
-            lambda clusters, fam: get_compiled_fp8bs(
-                config, clusters, out_fmt, family=fam, native_k=native_k
+            lambda fam: get_compiled_fp8bs(
+                config, out_fmt, family=fam, native_k=native_k
             ),
         )
-        kernel(a3, b3, sfa, sfb, c3)
+        kernel(
+            a3,
+            b3,
+            sfa,
+            sfb,
+            c3,
+            *launch_args(config, persistent_clusters(a.device, config)),
+        )
     return out

@@ -310,6 +310,18 @@ class Knobs:
             + (f"_kb{self.k_block}" if self.k_block else "")
         )
 
+    def describe_object(self) -> str:
+        """The compile-time identity of the knobs: ``describe()`` without the raster order, the swizzle size and the
+        grid, which are launch arguments of the compiled object (``blocks/scheduler.py``)."""
+        return (
+            f"mma{self.tile_m}x{self.tile_n}_cl{self.cluster_m}x{self.cluster_n}"
+            f"_{'2cta' if self.use_2cta_instrs else '1cta'}_{'tma' if self.use_tma_store else 'st'}"
+            + (f"_ck{self.cluster_k}" if self.cluster_k > 1 else "")
+            + ("_swap" if self.swap_ab else "")
+            + ("_cc" if self.cta_chunks else "")
+            + (f"_kb{self.k_block}" if self.k_block else "")
+        )
+
     def instruction(self, in_fmt: str = "bf16") -> str:
         """The MMA instruction variant these knobs select for the format: the A2 assumption surface."""
         if in_fmt in BLOCK_SCALED:
