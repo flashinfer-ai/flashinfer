@@ -36,8 +36,10 @@ from .plan import (
     N_GROUPS,
     N_UNITS,
     N_WALK,
-    build_decode_plan,
+    build_array_plan,
     build_plan,
+    lone_units_array,
+    pair_units_array,
     snake_order,
     ws_row,
 )
@@ -365,6 +367,7 @@ class WorkspaceTooSmall(RuntimeError):
         self.needed = needed
 
 
+FIXUP_BLOCKS_PER_SM = 8  # the fixup launch of a prefill wrapper's fixed launch: about this many blocks per SM
 GRAPH_UNIT_WAVES = 32  # the unit capacity of a fixed launch is at least this many units per SM: room for the split kind of
 # the batches that leave the machine underfilled (the planner splits those into one unit per 512-key chunk), bounded so
 # that the tables stay small; a plan beyond it keeps its units fused
@@ -395,7 +398,7 @@ class FixedLaunch:
     def __init__(
         self,
         batch: int,
-        q_len_per_req: int,
+        q_len_per_req: Optional[int],
         Hq: int,
         Hkv: int,
         D: int,
@@ -405,17 +408,25 @@ class FixedLaunch:
         device: torch.device,
         sm_count: Optional[int] = None,
         unit_cap: Optional[int] = None,
+        max_rows: Optional[int] = None,
     ):
         from .blocks.operands import om_scratch_blocks
+        from .fixup import MAX_GRID_Y, THREADS, wide_vec
         from .swaps.operands import n_pad_for
 
         check_supported(D, Hq, Hkv, page)
-        assert config.well_formed(D) and not config.q2, config
+        decode = q_len_per_req is not None
+        assert config.well_formed(D) and not (decode and config.q2), config
+        assert decode or max_rows is not None
         device = torch.device(device)
         sm = sm_count if sm_count is not None else device_sm_count(device)
         g = Hq // Hkv
         tpt = 128 // g
-        self.batch, self.q_len_per_req = int(batch), int(q_len_per_req)
+        self.batch = int(batch)
+        self.q_len_per_req = int(q_len_per_req) if decode else None
+        # the packed query rows a plan may hold; a decode wrapper's requests without keys are null requests
+        self.max_rows = self.batch * self.q_len_per_req if decode else int(max_rows)
+        self.null_requests = decode
         self.heads, self.D, self.page, self.config = (
             (int(Hq), int(Hkv)),
             D,
@@ -423,20 +434,40 @@ class FixedLaunch:
             config,
         )
         self.sm_count = sm
-        fused_units = self.batch * Hkv * -(-self.q_len_per_req // tpt)
+        if decode:
+            # every plan has the same Q tiles
+            fused_units = self.batch * Hkv * -(-self.q_len_per_req // tpt)
+            self.rows_max = min(tpt, self.q_len_per_req) * g
+        else:
+            # the Q tiles of any split of max_rows tokens over the request slots: every request rounds up at most once
+            tiles = -(-self.max_rows // tpt) + self.batch - 1 if self.max_rows else 0
+            fused_units = Hkv * tiles
+            self.rows_max = min(tpt, self.max_rows) * g
         self.unit_cap = max(
             1, fused_units, GRAPH_UNIT_WAVES * sm if unit_cap is None else unit_cap
         )
         self.group_cap = max(1, fused_units)
-        self.fixup_cap = min(fused_units, self.unit_cap - fused_units)
-        self.grid = max(1, min(config.grid or sm, self.unit_cap))
-        self.rows_max = min(tpt, self.q_len_per_req) * g  # live rows of the widest unit
-        swaps = config.small == "swap" and D in SWAPS_DIMS
+        swaps = decode and config.small == "swap" and D in SWAPS_DIMS
+        # the body is one for the wrapper's lifetime: the Swaps body when every unit of every plan has at most
+        # SWAPS_MAX_ROWS live rows (a decode geometry), the row body otherwise -- and always for prefill, whose plans differ
         self.n_pad = (
             n_pad_for(self.rows_max)
             if swaps and 1 <= self.rows_max <= SWAPS_MAX_ROWS
             else 0
         )
+        self.grid = max(1, min(config.grid or sm, self.unit_cap))
+        rows_per_block = THREADS // (D // wide_vec(D))
+        if decode:
+            self.fixup_cap = min(fused_units, self.unit_cap - fused_units)
+            self.fixup_grid_y = min(self.fixup_cap, MAX_GRID_Y)
+        else:
+            # a fixup group costs at least one unit beyond its tile's, and the tiles vary: at most half the capacity. Its
+            # launch is bounded too (the blocks stride over the groups beyond grid.y): a prefill group has up to 128 rows
+            self.fixup_cap = min(fused_units, self.unit_cap // 2)
+            self.fixup_grid_y = min(
+                self.fixup_cap,
+                max(1, FIXUP_BLOCKS_PER_SM * sm // -(-self.rows_max // rows_per_block)),
+            )
         # the split partials: the whole workspace, as rows of ws_row(D) fp32
         floats = workspace.numel() * workspace.element_size() // 4
         self.row_budget = floats // ws_row(D)
@@ -455,13 +486,13 @@ class FixedLaunch:
         # one int32 block: counts | descriptors | groups | fixup groups, refreshed from a page-locked staging block
         self._sections = (
             COUNT_FIELDS,
-            self.unit_cap * DESC_FIELDS,
+            self.unit_cap * DESC_FIELDS * (2 if config.q2 else 1),
             self.group_cap * GROUP_FIELDS,
             max(1, self.fixup_cap) * GROUP_FIELDS,
         )
         self.table = torch.zeros(sum(self._sections), dtype=torch.int32, device=device)
         self.counts, desc, groups, fixup_groups = self._views(self.table)
-        self.desc = desc.view(self.unit_cap, DESC_FIELDS)
+        self.desc = desc.view(-1, DESC_FIELDS)
         self.groups = groups.view(self.group_cap, GROUP_FIELDS)
         self.fixup_groups = fixup_groups.view(-1, GROUP_FIELDS)
         self.fold_counters = torch.zeros(
@@ -485,10 +516,9 @@ class FixedLaunch:
     def _views(self, block: torch.Tensor) -> tuple:
         return torch.split(block, self._sections)
 
-    def matches(self, batch, q_len_per_req, Hq, Hkv, D, page) -> bool:
-        return (self.batch, self.q_len_per_req, self.heads, self.D, self.page) == (
+    def matches(self, batch, Hq, Hkv, D, page) -> bool:
+        return (self.batch, self.heads, self.D, self.page) == (
             int(batch),
-            int(q_len_per_req),
             (int(Hq), int(Hkv)),
             int(D),
             int(page),
@@ -496,15 +526,24 @@ class FixedLaunch:
 
     def fill(self, plan, non_blocking: bool = True) -> None:
         """Write ``plan``'s tables (a ``plan.ArrayPlan``) over the fixed ones; beyond the plan's counts the device tables hold
-        null units and groups."""
+        null units and groups. Under the paired placement the unit table is the pair table: real pairs when the batch has
+        the units for it (the eager rule, ``Q2_MIN_UNITS_PER_SM``), else every unit alone in its pair, so the kernel is the
+        paired one for every plan."""
         assert (
-            plan.num_launch is None
-            and plan.num_units <= self.unit_cap
+            plan.num_units <= self.unit_cap
             and plan.num_groups <= self.group_cap
             and plan.num_fixup_groups <= self.fixup_cap
             and plan.ws_rows <= self.row_budget
         ), "the plan exceeds the fixed launch's capacity"
+        units = plan.desc_array
         walk = self.config.grid or plan.grid or min(plan.num_units, self.sm_count)
+        if self.config.q2:
+            if plan.num_units >= Q2_MIN_UNITS_PER_SM[self.D] * self.sm_count:
+                units = pair_units_array(units, self.sm_count)
+                walk = self.config.grid or min(units.shape[0] // 2, self.sm_count)
+            else:
+                units = lone_units_array(units)
+            plan.num_launch = units.shape[0] // 2
         i = self._turn
         self._turn = 1 - i
         ev = self._copied[i]
@@ -516,7 +555,7 @@ class FixedLaunch:
         for k, (section, rows) in enumerate(
             zip(
                 sections,
-                (plan.desc_array, plan.groups_array, plan.fixup_array),
+                (units, plan.groups_array, plan.fixup_array),
                 strict=True,
             )
         ):
@@ -607,10 +646,15 @@ def plan_attention(
     gets no unit); ``workspace`` and ``sm_count`` are the launch's."""
     if fixed is not None:
         batch = qo_indptr.numel() - 1
+        q_lens = np.diff(qo_indptr.cpu().numpy().astype(np.int64, copy=False))
         assert (
             not ragged
-            and fixed.matches(batch, fixed.q_len_per_req, Hq, Hkv, D, page)
-            and int(qo_indptr[-1]) == batch * fixed.q_len_per_req
+            and fixed.matches(batch, Hq, Hkv, D, page)
+            and int(q_lens.sum()) <= fixed.max_rows
+            and (
+                fixed.q_len_per_req is None
+                or bool((q_lens == fixed.q_len_per_req).all())
+            )
         ), "the fixed launch was built for another query geometry"
         from dataclasses import replace
 
@@ -626,10 +670,10 @@ def plan_attention(
         ), (config, fixed.config)
         spans = np.diff(kv_indptr.cpu().numpy().astype(np.int64, copy=False))
         last = kv_last_page_len.cpu().numpy().astype(np.int64, copy=False)
-        decode_plan = build_decode_plan(
+        fixed_plan = build_array_plan(
+            q_lens,
             # a request without pages has no keys, whatever its last-page entry
             np.where(spans > 0, (spans - 1) * page + last, 0),
-            fixed.q_len_per_req,
             Hq,
             Hkv,
             D,
@@ -637,16 +681,17 @@ def plan_attention(
             config.split_policy,
             fixed.sm_count,
             merge=config.merge,
-            small_swap=config.small == "swap" and D in SWAPS_DIMS,
+            small_swap=fixed.n_pad > 0,
             swap_max_rows=SWAPS_MAX_ROWS,
             grid=config.grid,
             grid_search=planner_grid_search(fixed.table.device),
             unit_budget=fixed.unit_cap,
             row_budget=fixed.row_budget,
+            null_requests=fixed.null_requests,
         )
-        fixed.fill(decode_plan, non_blocking)
+        fixed.fill(fixed_plan, non_blocking)
         planned = _Planned(
-            decode_plan,
+            fixed_plan,
             fixed.desc,
             fixed.groups,
             fixed.ws,
@@ -923,7 +968,11 @@ def run_attention(
             assert cache.shape[1:] == (
                 (page, Hkv, D) if kv_layout == "NHD" else (Hkv, page, D)
             ), cache.shape
-    if planned.total_q is not None and int(total_q) != planned.total_q:
+    if planned.total_q is not None and (
+        int(total_q) < planned.total_q
+        if planned.fixed is not None
+        else int(total_q) != planned.total_q
+    ):
         raise ValueError(
             f"{total_q} query rows at run_attention over a plan built for {planned.total_q} (the units write the planned rows)"
         )
@@ -1050,7 +1099,7 @@ def _run_attention_validated(
     if total_q == 0 or (fixed is None and plan.num_units == 0):
         return out  # nothing to compute: no TMA descriptor over an empty query extent
     assert plan.g == g
-    if fixed is not None:
+    if fixed is not None and fixed.null_requests:
         # a request without keys has no unit: its rows are zeros and its LSE -inf, written here ahead of the kernels (the
         # launch is the same for every plan, so the captured graph holds these fills whatever the batch)
         out.zero_()
@@ -1162,7 +1211,9 @@ def _run_attention_validated(
                 with_sinks,
                 is_fixed,
             )
-        if n_launch is not None:  # the paired placement walks pairs of units
+        if (
+            n_launch is not None and fixed is None
+        ):  # the paired placement walks pairs of units
             grid = max(
                 1, min(config.grid if config.grid else min(n_launch, sm), n_launch)
             )
@@ -1214,7 +1265,7 @@ def _run_attention_validated(
                 int(Hq),
                 0,
                 counts,
-                int(min(fixed.fixup_cap, MAX_GRID_Y)),
+                int(fixed.fixup_grid_y),
                 int(fixed.rows_max),
                 int(lse_mode),
             )
