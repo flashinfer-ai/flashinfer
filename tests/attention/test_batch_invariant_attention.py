@@ -156,8 +156,15 @@ def run_paged_prefill(
 
 
 def run_ragged_prefill(
-    pr: Problem, layout="NHD", window_left=-1, ws=None, run_kw=None, **plan_kw
+    pr: Problem,
+    layout="NHD",
+    window_left=-1,
+    ws=None,
+    run_kw=None,
+    sinks=None,
+    **plan_kw,
 ):
+    """``sinks``: set on the wrapper as ``_sinks``, where the ragged ``run()`` reads them."""
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
     )
@@ -174,6 +181,8 @@ def run_ragged_prefill(
         **plan_kw,
     )
     k, v = pr.ragged(layout)
+    if sinks is not None:
+        w._sinks = sinks
     return w.run(pr.q, k, v, **(run_kw or {}))
 
 
@@ -1933,6 +1942,676 @@ def test_lse_buffer_refusals(kind):
             engine.run_attention(*eargs, lse=buf, return_lse=True)
     with pytest.raises(ValueError):
         engine.run_attention(*eargs, return_lse=True, lse_base="e")
+
+
+# ------------------------------------------------------------------------------------------------------ attention sinks
+def sink_logits(pr: Problem, seed=0, spread=2.0):
+    """Per-head sink logits around the LSE of the problems' rows, so a sink holds a visible share of its rows' mass."""
+    g = torch.Generator(device="cpu").manual_seed(1000 + seed)
+    return (8.0 + torch.randn(pr.Hq, generator=g) * spread).to(pr.device)
+
+
+def sink_reference(pr: Problem, sinks, window_left=-1):
+    """The repository's fp32 sink attention (``sink_attention_unified``) for the output and, next to it, the natural-log LSE
+    of the scaled scores with the head's sink logit appended, ``(total_q, Hq)``."""
+    from tests.attention.test_helpers.sink_attention_reference import (
+        sink_attention_unified,
+    )
+
+    out = sink_attention_unified(
+        pr.q,
+        pr.k_rag,
+        pr.v_rag,
+        sinks,
+        window_left,
+        True,
+        1.0 / math.sqrt(pr.D),
+        mode="varlen",
+        qo_indptr=pr.qo_indptr,
+        kv_indptr=pr.kv_indptr_rag,
+    )
+    lses = []
+    tok_q = tok_kv = 0
+    g = pr.Hq // pr.Hkv
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        q = pr.q[tok_q : tok_q + ql].float()
+        k = pr.k_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
+        s = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(pr.D)
+        pos = torch.arange(kl - ql, kl, device=pr.device)[:, None]
+        key = torch.arange(kl, device=pr.device)[None, :]
+        mask = key <= pos
+        if window_left >= 0:
+            mask &= key >= pos - window_left
+        s = s.masked_fill(~mask[None], float("-inf"))
+        s = torch.cat([s, sinks.float()[:, None, None].expand(-1, ql, 1)], dim=-1)
+        lses.append(torch.logsumexp(s, dim=-1).t())
+        tok_q += ql
+        tok_kv += kl
+    return out.float(), torch.cat(lses)
+
+
+def _multi_token_decode(pr, q_len, layout="NHD", **run_kw):
+    """The decode wrapper over the last ``q_len`` tokens of every request; returns the result and the rows."""
+    rows = torch.cat(
+        [
+            torch.arange(
+                int(pr.qo_indptr[i + 1]) - q_len,
+                int(pr.qo_indptr[i + 1]),
+                device=pr.device,
+            )
+            for i in range(len(pr.q_lens))
+        ]
+    )
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+    )
+    return w.run(pr.q[rows].contiguous(), pr.cache(layout), **run_kw), rows
+
+
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_sink_fingerprints_are_pinned(op):
+    """The sink member's receipts (output and LSE, per head dim and base) next to the receipts of the class without sinks,
+    which do not move."""
+    from flashinfer.attention.batch_invariant import spec
+
+    pins = {
+        64: "attn-bf16-d64-sink-a239bf124352c39c",
+        128: "attn-bf16-d128-sink-08ebe33f73cbe897",
+        256: "attn-bf16-d256-sink-97a726a039ac102d",
+    }
+    lse_pins = {
+        (64, "log2"): "attn-bf16-d64-sink-lse-log2-ce5540cea8c9060a",
+        (64, "ln"): "attn-bf16-d64-sink-lse-ln-411e595f84dacdf6",
+        (128, "log2"): "attn-bf16-d128-sink-lse-log2-d06a4faff7897362",
+        (128, "ln"): "attn-bf16-d128-sink-lse-ln-911ada9a2df50aef",
+        (256, "log2"): "attn-bf16-d256-sink-lse-log2-fcdaa847d25ab16a",
+        (256, "ln"): "attn-bf16-d256-sink-lse-ln-8bd8ede7bafb8ca0",
+    }
+    assert pins == spec.SINK_FINGERPRINTS and lse_pins == spec.SINK_LSE_FINGERPRINTS
+    for D, fp in pins.items():
+        assert bi.fingerprint(op, head_dim=D, sinks=True) == fp
+        assert bi.fingerprint(op, head_dim=D, sinks=False) == spec.FINGERPRINTS[D]
+        assert bi.fingerprint(op, head_dim=D) == spec.FINGERPRINTS[D]
+    for (D, base), fp in lse_pins.items():
+        assert bi.fingerprint(op, head_dim=D, lse_base=base, sinks=True) == fp
+        assert (
+            bi.fingerprint(op, head_dim=D, lse_base=base)
+            == spec.LSE_FINGERPRINTS[(D, base)]
+        )
+    with pytest.raises(ValueError):
+        bi.fingerprint(op, head_dim=128, sinks="yes")
+
+
+def test_sink_kernels_have_their_own_names():
+    """The sink step is compiled into kernels of their own: a call without sinks loads the kernels it always did."""
+    from flashinfer.attention.batch_invariant.blocks import compile as row
+    from flashinfer.attention.batch_invariant.swaps import compile as swaps
+
+    assert row.kernel_name(128, 4, 16, 4) == "attn_d128_g4_p16_s4_w1"
+    assert row.kernel_name(128, 4, 16, 4, sinks=True) == "attn_d128_g4_p16_s4_w1_sink"
+    plain = swaps.kernel_name(128, 8, 16, 8, False, 228 << 10, True)
+    assert swaps.kernel_name(128, 8, 16, 8, False, 228 << 10, True, True) == (
+        plain + "_sink"
+    )
+
+
+def test_sink_term_is_declared():
+    """The sink step on the row's final ``(m, l)``: ``m' = fmax(mul(m, c), mul(sink, LOG2E))``, the exponentials of the exact
+    differences to ``m'``, ``l' = fma(l, a, b)``; the epilogue's normaliser is ``mul(a, div(1, l'))`` and the LSE
+    ``add(m', lg2(l'))``. The terms without sinks contain no sink."""
+    import struct
+
+    from flashinfer.attention.batch_invariant import spec
+    from flashinfer.batch_invariant.fp_interface.term import sexpr
+
+    assert struct.unpack("<I", struct.pack("<f", spec.LOG2E))[0] == 0x3FB8AA3B
+
+    def comm(op, *xs):
+        return f"({op} " + " ".join(sorted(xs)) + ")"
+
+    for D, p, win in ((64, 7, -1), (128, 40, -1), (256, 33, 5)):
+        s = spec.AttentionSpec(D, T=16, C=32)
+        row = spec.RowSpec(p=p, window_left=win, row=1)
+        st = s.state(row, 2)
+        m, l, o = sexpr(st.m), sexpr(st.l), sexpr(st.o)
+        ms = comm("mul", m, "(sym c)")
+        s2 = comm("mul", "(sym sink)", f"(const {spec.LOG2E!r})")
+        mx = comm("fmax", ms, s2)
+        nm = comm("mul", mx, "(const -1.0)")
+        a = f"(ex2 {comm('add', ms, nm)})"
+        b = f"(ex2 {comm('add', s2, nm)})"
+        ls = "(fma " + " ".join(sorted([l, a])) + f" {b})"
+        inv = comm("mul", a, f"(div (const 1.0) {ls})")
+        out = f"(cvt bf16 {comm('add', comm('mul', o, inv), '(const 0.0)')})"
+        assert sexpr(s.output(row, 2, sinks=True)) == out
+        lse2 = comm("add", mx, f"(op:lg2 {ls})")
+        assert sexpr(s.lse(row, "log2", sinks=True)) == lse2
+        assert sexpr(s.lse(row, "ln", sinks=True)) == comm(
+            "mul", lse2, f"(const {spec.LN2!r})"
+        )
+        for plain in (s.output(row, 2), s.lse(row, "log2"), s.lse(row, "ln")):
+            assert "sink" not in sexpr(plain)
+        assert s.output(row, 2) is not s.output(row, 2, sinks=True)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
+def test_sinks_match_reference(D, Hq, Hkv):
+    pr = Problem([300, 1000, 64], [700, 2500, 3000], Hq, Hkv, D, 16, seed=1)
+    sinks = sink_logits(pr, seed=D)
+    ref, ref_lse = sink_reference(pr, sinks)
+    out, ln = run_paged_prefill(pr, run_kw=dict(LSE, lse_base="ln", sinks=sinks))
+    _, log2 = run_paged_prefill(pr, run_kw=dict(LSE, sinks=sinks))
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    tol = 1e-3 * max(1.0, ref_lse.abs().max().item())
+    assert (ln - ref_lse).abs().max().item() < tol
+    assert (log2 - ref_lse / math.log(2.0)).abs().max().item() < tol / math.log(2.0)
+    # the sinks are in the result: the same batch without them differs, and by more than the tolerance
+    plain = run_paged_prefill(pr)
+    assert (plain.float() - ref).abs().max().item() > 4 * err
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_sinks_prefill_equals_decode_equals_ragged(D, layout):
+    """R4 with sinks: a token's output and LSE are the same bits as a paged prefill row, a ragged prefill row (the wrapper's
+    ``_sinks``), a decode step and a row of a multi-token decode."""
+    pr = Problem([256, 4, 1024, 33], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=2)
+    sinks = sink_logits(pr, seed=D)
+    kw = dict(LSE, sinks=sinks)
+    out, lse = _both(run_paged_prefill(pr, layout, run_kw=kw))
+    out_r, lse_r = _both(run_ragged_prefill(pr, layout, run_kw=LSE, sinks=sinks))
+    assert torch.equal(out, out_r) and torch.equal(lse, lse_r)
+    (dec, dec_lse), last = run_decode(pr, layout, run_kw=kw)
+    assert torch.equal(bits(dec), out[last]) and torch.equal(bits(dec_lse), lse[last])
+    res, last4 = _multi_token_decode(pr, 4, layout, **kw)
+    mtd, mtd_lse = _both(res)
+    assert torch.equal(mtd, out[last4]) and torch.equal(mtd_lse, lse[last4])
+    assert not torch.equal(out, bits(run_paged_prefill(pr, layout)))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_no_sinks_is_the_class_without_the_sink_step(D, kind):
+    """``sinks=None`` runs the class without sinks: the bits of the wrapper before and after a call with sinks. A sink of
+    ``-inf`` adds ``+0`` to the sum and rescales by ``1.0``: the same bits again, output and LSE."""
+    pr = Problem([1] * 6, [1024, 4096, 33, 700, 2500, 1], 32, 8, D, 16, seed=40)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    plain, plain_lse = _both(w.run(*args, return_lse=True))
+    plain, plain_lse = plain.clone(), plain_lse.clone()
+
+    def run(sinks):
+        if kind == 2:
+            w._sinks = sinks
+            return _both(w.run(*args, return_lse=True))
+        return _both(w.run(*args, return_lse=True, sinks=sinks))
+
+    out, lse = run(sink_logits(pr))
+    assert not torch.equal(out, plain) and not torch.equal(lse, plain_lse)
+    out, lse = run(None)
+    assert torch.equal(out, plain) and torch.equal(lse, plain_lse)
+    out, lse = run(torch.full((pr.Hq,), float("-inf"), device=pr.device))
+    assert torch.equal(out, plain) and torch.equal(lse, plain_lse)
+    if kind == 2:
+        w._sinks = None
+    assert torch.equal(bits(w.run(*args)), plain)
+    # prefill-shaped units (fused multi-chunk, split groups, the paired placement at D = 64)
+    big = Problem([2048, 300, 1], [4096, 700, 3000], 32, 8, D, 16, seed=41)
+    plain = _both(run_paged_prefill(big, run_kw=LSE))
+    off = torch.full((big.Hq,), float("-inf"), device=big.device)
+    got = _both(run_paged_prefill(big, run_kw=dict(LSE, sinks=off)))
+    assert torch.equal(got[0], plain[0]) and torch.equal(got[1], plain[1])
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sinks_batch_permutation_and_subbatch_invariance(D):
+    """R2 with sinks: a request's output and LSE bits do not depend on its neighbours, its position in the batch or the
+    batch size, in prefill and in decode."""
+    q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
+    pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=5)
+    sinks = sink_logits(pr, seed=D)
+    kw = dict(LSE, sinks=sinks)
+    out, full = _both(run_paged_prefill(pr, run_kw=kw))
+    rows = [
+        slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    kv = [
+        slice(int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    for i in (0, 2, 4):
+        single = Problem([q_lens[i]], [kv_lens[i]], 32, 8, D, 16, seed=5)
+        single.q = pr.q[rows[i]].clone()
+        single.k_rag = pr.k_rag[kv[i]].clone()
+        single.v_rag = pr.v_rag[kv[i]].clone()
+        o1, l1 = _both(run_ragged_prefill(single, run_kw=LSE, sinks=sinks))
+        assert torch.equal(l1, full[rows[i]]) and torch.equal(o1, out[rows[i]]), i
+    perm = [3, 0, 4, 1, 2]
+    pp = Problem(
+        [q_lens[i] for i in perm], [kv_lens[i] for i in perm], 32, 8, D, 16, seed=5
+    )
+    pp.q = torch.cat([pr.q[rows[i]] for i in perm]).contiguous()
+    pp.k_rag = torch.cat([pr.k_rag[kv[i]] for i in perm]).contiguous()
+    pp.v_rag = torch.cat([pr.v_rag[kv[i]] for i in perm]).contiguous()
+    p_out, p_lse = _both(run_ragged_prefill(pp, run_kw=LSE, sinks=sinks))
+    off = 0
+    for i in perm:
+        n = q_lens[i]
+        assert torch.equal(p_lse[off : off + n], full[rows[i]]), i
+        assert torch.equal(p_out[off : off + n], out[rows[i]]), i
+        off += n
+    # decode: a request in a batch of eight and alone (a fresh page table)
+    kvd = [1024, 4096, 33, 700, 2500, 8192, 1, 1500]
+    dp = Problem([1] * 8, kvd, 32, 8, D, 16, seed=6)
+    (out8, lse8), _ = run_decode(dp, run_kw=kw)
+    for i in (0, 1, 5, 6):
+        one = Problem([1], [kvd[i]], 32, 8, D, 16, seed=100 + i)
+        one.q = dp.q[i : i + 1].clone()
+        span = slice(int(dp.kv_indptr_rag[i]), int(dp.kv_indptr_rag[i + 1]))
+        one.k_rag = dp.k_rag[span].clone()
+        one.v_rag = dp.v_rag[span].clone()
+        one = _repack(one)
+        (out1, lse1), _ = run_decode(one, run_kw=kw)
+        assert torch.equal(bits(out1), bits(out8[i : i + 1])), i
+        assert torch.equal(bits(lse1), bits(lse8[i : i + 1])), i
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sinks_chunked_prefill_equals_full(D):
+    """R4 for incremental prefill with sinks: the step is taken once per row after its last chunk, however the prefill was
+    cut."""
+    kv = [1700, 1000]
+    cut = [700, 512]
+    full = Problem(kv, kv, 32, 8, D, 16, seed=12)
+    sinks = sink_logits(full, seed=D)
+    kw = dict(LSE, sinks=sinks)
+    out_full, lse_full = _both(run_paged_prefill(full, run_kw=kw))
+    rows = [slice(int(full.qo_indptr[i]), int(full.qo_indptr[i + 1])) for i in range(2)]
+    kv_off = [int(full.kv_indptr_rag[i]) for i in range(2)]
+    c1 = Problem(cut, cut, 32, 8, D, 16, seed=13)
+    c1.q = torch.cat([full.q[rows[i]][: cut[i]] for i in range(2)]).contiguous()
+    c1.k_rag = torch.cat(
+        [full.k_rag[kv_off[i] : kv_off[i] + cut[i]] for i in range(2)]
+    ).contiguous()
+    c1.v_rag = torch.cat(
+        [full.v_rag[kv_off[i] : kv_off[i] + cut[i]] for i in range(2)]
+    ).contiguous()
+    c1 = _repack(c1)
+    c2 = Problem([kv[i] - cut[i] for i in range(2)], kv, 32, 8, D, 16, seed=14)
+    c2.q = torch.cat([full.q[rows[i]][cut[i] :] for i in range(2)]).contiguous()
+    c2.k_rag, c2.v_rag = full.k_rag.clone(), full.v_rag.clone()
+    c2 = _repack(c2)
+    for prob, part in ((c1, 0), (c2, 1)):
+        got_p = _both(run_paged_prefill(prob, run_kw=kw))
+        got_r = _both(run_ragged_prefill(prob, run_kw=LSE, sinks=sinks))
+        off = 0
+        for i in range(2):
+            n = cut[i] if part == 0 else kv[i] - cut[i]
+            sel = slice(0, cut[i]) if part == 0 else slice(cut[i], None)
+            for got in (got_p, got_r):
+                assert torch.equal(got[0][off : off + n], out_full[rows[i]][sel])
+                assert torch.equal(got[1][off : off + n], lse_full[rows[i]][sel])
+            off += n
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sinks_config_agreement(D):
+    """R3 with sinks: every kernel site that completes a row takes the same sink step -- the fused unit's epilogue, the fixup
+    kernel, the in-kernel fold, the Swaps body and (D = 64) the paired placement -- over the configuration space on a
+    prefill-shaped and a decode-shaped batch; the partials of split units carry no sink."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    if D == 64:
+        prefill = Problem([2048, 2048, 1], [4096, 3000, 1000], 32, 8, D, 16, seed=8)
+    else:
+        prefill = Problem(
+            [256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=8
+        )
+    decode = Problem([1] * 6, [1024, 4096, 33, 700, 2500, 1], 32, 8, D, 16, seed=42)
+    sinks = sink_logits(prefill, seed=D)
+    space = engine.all_valid_configs(D)
+    cfgs = list(space[::7] if D == 64 else space)
+    if D == 64:
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        rings = (2, 3) + ((4,) if arch_smem_cap(prefill.device) >= (300 << 10) else ())
+        cfgs += [replace(two, kv_slots=s) for s in rings]
+    sites = set()
+    for pr in (prefill, decode):
+        ref = {
+            base: _both(
+                run_paged_prefill(pr, run_kw=dict(LSE, lse_base=base, sinks=sinks))
+            )
+            for base in ("log2", "ln")
+        }
+        plain = bits(run_paged_prefill(pr))
+        assert not torch.equal(ref["log2"][0], plain)
+        for n, cfg in enumerate(cfgs):
+            planned = engine.plan_attention(
+                pr.qo_indptr,
+                pr.kv_indptr,
+                pr.kv_last,
+                32,
+                8,
+                D,
+                16,
+                -1,
+                cfg,
+                None,
+                pr.device,
+            )
+            plan = planned.plan
+            swaps = cfg.small == "swap" and engine.swaps_n_pad(plan) > 0
+            body = "swaps" if swaps else "row"
+            if any(d[6] == 0 for d in plan.desc):
+                sites.add(f"{body}-fused")
+            if plan.fixup_groups:
+                sites.add(f"{body}-fixup")
+            if any(plan.group_inkernel):
+                sites.add(f"{body}-inkernel")
+            if cfg.q2 and plan.num_launch is not None:
+                sites.add("paired")
+            eargs = (planned, pr.q, pr.k_nhd, pr.v_nhd, pr.kv_indptr, pr.kv_indices)
+            eargs += (1.0 / math.sqrt(D), -1, "NHD", None, cfg)
+            base = "ln" if n % 4 == 0 else "log2"
+            got = engine.run_attention(
+                *eargs, return_lse=True, lse_base=base, sinks=sinks
+            )
+            out, lse = _both(got)
+            assert torch.equal(out, ref[base][0]), (cfg, base)
+            assert torch.equal(lse, ref[base][1]), (cfg, base)
+            if n % 4 == 0:
+                # the same plan without sinks, after a launch with them
+                assert torch.equal(bits(engine.run_attention(*eargs)), plain), cfg
+    want = {
+        f"{b}-{k}" for b in ("row", "swaps") for k in ("fused", "fixup", "inkernel")
+    }
+    if D == 64:
+        want.add("paired")
+    assert sites >= want, want - sites
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sinks_head_subset_invariance(D):
+    """R2 across heads with per-head sinks: a subset of the KV heads (whole GQA groups) with the slice of the sinks gives,
+    head for head, the bits of the run over all heads -- the sink is read by the row's query head."""
+    Hq, Hkv = 32, 8
+    g = Hq // Hkv
+    pr = Problem([300, 1, 1000, 64], [700, 2500, 2500, 3000], Hq, Hkv, D, 16, seed=16)
+    sinks = sink_logits(pr, seed=D, spread=3.0)
+    kw = dict(LSE, sinks=sinks)
+    full_pre = _both(run_paged_prefill(pr, run_kw=kw))
+    res, _ = run_decode(pr, run_kw=kw)
+    full_dec = _both(res)
+    for kv_sel in ([1, 3, 4, 6], [5]):
+        q_sel = [j * g + r for j in kv_sel for r in range(g)]
+        sub = Problem(pr.q_lens, pr.kv_lens, len(q_sel), len(kv_sel), D, 16, seed=17)
+        sub.q = pr.q[:, q_sel].contiguous()
+        sub.k_rag = pr.k_rag[:, kv_sel].contiguous()
+        sub.v_rag = pr.v_rag[:, kv_sel].contiguous()
+        sub = _repack(sub)
+        sub_sinks = sinks[q_sel].contiguous()
+        sub_kw = dict(LSE, sinks=sub_sinks)
+        got = [
+            _both(run_paged_prefill(sub, run_kw=sub_kw)),
+            _both(run_ragged_prefill(sub, run_kw=LSE, sinks=sub_sinks)),
+        ]
+        for out, lse in got:
+            assert torch.equal(out, full_pre[0][:, q_sel]), (D, kv_sel)
+            assert torch.equal(lse, full_pre[1][:, q_sel]), (D, kv_sel)
+        res, _ = run_decode(sub, run_kw=sub_kw)
+        out, lse = _both(res)
+        assert torch.equal(out, full_dec[0][:, q_sel]), (D, kv_sel, "decode")
+        assert torch.equal(lse, full_dec[1][:, q_sel]), (D, kv_sel, "decode")
+    # the sink belongs to the head: permuting the sinks changes the heads whose sink changed, and only those
+    swapped = sinks.clone()
+    swapped[[0, 1]] = sinks[[1, 0]]
+    out, _ = _both(run_paged_prefill(pr, run_kw=dict(LSE, sinks=swapped)))
+    assert torch.equal(out[:, 2:], full_pre[0][:, 2:])
+    assert not torch.equal(out[:, 0], full_pre[0][:, 0])
+
+
+@needs_device
+def test_sinks_sliding_window_gpt_oss_shape():
+    """Head dim 64, 64 query heads over 8 KV heads, a 128-token window and per-head sinks: the sink joins the window's keys
+    after its last chunk; prefill (paged and ragged), decode and multi-token decode agree bit for bit and match the fp32
+    reference."""
+    pr = Problem([700, 1, 300, 128], [700, 2500, 1500, 129], 64, 8, 64, 16, seed=50)
+    sinks = sink_logits(pr, seed=50)
+    win = 128
+    kw = dict(LSE, lse_base="ln", sinks=sinks)
+    res = run_paged_prefill(pr, window_left=win, run_kw=kw)
+    out, lse = _both(res)
+    got_r = _both(
+        run_ragged_prefill(
+            pr, window_left=win, run_kw=dict(LSE, lse_base="ln"), sinks=sinks
+        )
+    )
+    assert torch.equal(got_r[0], out) and torch.equal(got_r[1], lse)
+    _, log2 = _both(
+        run_paged_prefill(pr, window_left=win, run_kw=dict(LSE, sinks=sinks))
+    )
+    (dec, dec_lse), last = run_decode(
+        pr, window_left=win, run_kw=dict(LSE, sinks=sinks)
+    )
+    assert torch.equal(bits(dec), out[last]) and torch.equal(bits(dec_lse), log2[last])
+    ref, ref_lse = sink_reference(pr, sinks, window_left=win)
+    err = (res[0].float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    assert (res[1] - ref_lse).abs().max().item() < 1e-3 * max(
+        1.0, ref_lse.abs().max().item()
+    )
+    assert not torch.equal(out, bits(run_paged_prefill(pr, run_kw=dict(sinks=sinks))))
+    assert not torch.equal(out, bits(run_paged_prefill(pr, window_left=win)))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sinks_lse_natural_log_is_the_declared_multiply(D):
+    from flashinfer.attention.batch_invariant.spec import LN2
+
+    pr = Problem([300, 1, 1000, 64], [700, 2500, 2500, 3000], 32, 8, D, 16, seed=43)
+    sinks = sink_logits(pr, seed=D)
+    ln2 = torch.tensor(LN2, dtype=torch.float32)
+    out2, log2 = run_paged_prefill(pr, run_kw=dict(LSE, sinks=sinks))
+    oute, ln = run_paged_prefill(pr, run_kw=dict(LSE, lse_base="ln", sinks=sinks))
+    assert torch.equal(bits(log2.cpu() * ln2), bits(ln.cpu()))
+    assert torch.equal(bits(out2), bits(oute))
+    plain = bits(run_paged_prefill(pr, run_kw=dict(sinks=sinks)))
+    assert torch.equal(plain, bits(out2))
+    _, hn = run_paged_prefill(pr, run_kw=dict(LSE, sinks=sinks, lse_layout="HN"))
+    assert torch.equal(bits(hn), bits(log2.t().contiguous()))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sinks_edge_values(D):
+    """The step's corner values. A sink far above every score: ``a`` underflows to ``+0``, the outputs are ``+0`` and the
+    base-2 LSE is ``mul(sink, LOG2E)`` (``l' = 1``). A sink far below (or ``-inf``): ``b = +0``, the bits of the row without
+    sinks. A sink whose scaled logit equals the row's scaled maximum: ``a = b = 1``. ``+inf`` and NaN sinks give NaN on
+    their heads only."""
+    from flashinfer.attention.batch_invariant.spec import LOG2E
+    from flashinfer.batch_invariant.sampling.mufu_device import lg2_device
+
+    pr = Problem([300, 1, 700, 1], [700, 2500, 700, 1], 32, 8, D, 16, seed=51)
+    plain, plain_lse = _both(run_paged_prefill(pr, run_kw=LSE))
+    mixed = sink_logits(pr, seed=D)
+    ref, ref_lse = _both(run_paged_prefill(pr, run_kw=dict(LSE, sinks=mixed)))
+    sinks = mixed.clone()
+    sinks[0] = 1.0e4
+    sinks[1] = -1.0e4
+    sinks[2] = float("-inf")
+    sinks[3] = float("inf")
+    sinks[4] = float("nan")
+    res = run_paged_prefill(pr, run_kw=dict(LSE, sinks=sinks))
+    out, lse = _both(res)
+    assert torch.equal(out[:, 5:], ref[:, 5:]) and torch.equal(
+        lse[:, 5:], ref_lse[:, 5:]
+    )
+    assert bool((out[:, 0] == 0).all())  # +0, bit for bit
+    big = torch.tensor(1.0e4, dtype=torch.float32) * torch.tensor(
+        LOG2E, dtype=torch.float32
+    )
+    assert bool((res[1][:, 0].cpu() == big).all())
+    for h in (1, 2):
+        assert torch.equal(out[:, h], plain[:, h])
+        assert torch.equal(lse[:, h], plain_lse[:, h])
+    for h in (3, 4):
+        assert bool(torch.isnan(res[0][:, h].float()).all())
+        assert bool(torch.isnan(res[1][:, h]).all())
+    (dec, dec_lse), last = run_decode(pr, run_kw=dict(LSE, sinks=sinks))
+    keep = [h for h in range(pr.Hq) if h not in (3, 4)]
+    assert torch.equal(bits(dec)[:, keep], out[last][:, keep])
+    assert torch.equal(bits(dec_lse)[:, keep], lse[last][:, keep])
+    # a row with one key has l = 1 and its base-2 LSE without sinks is its scaled maximum mul(m, c), bit for bit; where a
+    # binary32 sink has exactly that scaled logit, the sink step is the merge of two equal maxima
+    one = Problem([1], [1], 32, 8, D, 16, seed=52)
+    (o1, l1), _ = run_decode(one, run_kw=LSE)
+    ms = l1[0].cpu()
+    log2e = torch.tensor(LOG2E, dtype=torch.float32)
+    guess = ms / log2e
+    eq = torch.full((one.Hq,), float("-inf"))
+    for step in (0, 1, -1, 2, -2):
+        cand = guess
+        for _ in range(abs(step)):
+            cand = torch.nextafter(cand, torch.tensor(math.copysign(math.inf, step)))
+        hit = (cand * log2e == ms) & torch.isinf(eq)
+        eq = torch.where(hit, cand, eq)
+    hits = torch.isfinite(eq)
+    assert int(hits.sum()) >= 4, int(hits.sum())
+    (o2, l2), _ = run_decode(one, run_kw=dict(LSE, sinks=eq.to(one.device)))
+    lg2_two = lg2_device(torch.tensor([2.0]))[0].cpu()
+    half = (o1[0].float() * 0.5).to(torch.bfloat16)
+    assert torch.equal(bits(o2[0][hits]), bits(half[hits]))
+    assert torch.equal(bits(l2[0].cpu()[hits]), bits((ms + lg2_two)[hits]))
+    assert torch.equal(bits(o2[0][~hits]), bits(o1[0][~hits]))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_sinks_graph_replay_reads_the_current_sinks(D):
+    """A CUDA graph captured after ``plan()`` holds the sinks tensor, not its values: a replay after an in-place update of
+    the sinks is the launch with the new values (kernel and fixup nodes)."""
+    pr = Problem([512, 7, 1000, 1], [4096, 1025, 1000, 6000], 32, 8, D, 16, seed=4)
+    first, second = sink_logits(pr, seed=1), sink_logits(pr, seed=2)
+    refs = [
+        _both(run_paged_prefill(pr, run_kw=dict(LSE, lse_base="ln", sinks=s)))
+        for s in (first, second)
+    ]
+    assert not torch.equal(refs[0][0], refs[1][0])
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    out = torch.empty_like(pr.q)
+    lse = torch.empty(pr.q.shape[0], pr.Hq, dtype=torch.float32, device=pr.device)
+    sinks = first.clone()
+    kw = dict(out=out, lse=lse, return_lse=True, lse_base="ln", sinks=sinks)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        w.run(pr.q, pr.cache("NHD"), **kw)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            w.run(pr.q, pr.cache("NHD"), **kw)
+    torch.cuda.synchronize()
+    for values, ref in ((first, refs[0]), (second, refs[1]), (first, refs[0])):
+        sinks.copy_(values)
+        out.zero_()
+        lse.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref[0]) and torch.equal(bits(lse), ref[1])
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_sinks_refusals(kind):
+    """``sinks`` must be a contiguous fp32 ``(num_qo_heads,)`` tensor on the wrapper's device; anything else raises and the
+    plan stays usable."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=48)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    dev = pr.device
+    good = sink_logits(pr)
+
+    def run(sinks):
+        if kind == 2:
+            w._sinks = sinks
+            return w.run(*args)
+        return w.run(*args, sinks=sinks)
+
+    expected = bits(run(good)).clone()
+    bad = [
+        good.double(),
+        good.to(torch.bfloat16),
+        good.to(torch.float16),
+        good.to(torch.int32),
+        torch.zeros(9, device=dev),
+        torch.zeros(2, device=dev),
+        torch.zeros(1, 8, device=dev),
+        torch.zeros((), device=dev),
+        torch.zeros(16, device=dev)[::2],
+        good.cpu(),
+        good.tolist(),
+        1.0,
+    ]
+    for sinks in bad:
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            run(sinks)
+    out_buf = torch.empty_like(pr.q)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        if kind == 2:
+            w._sinks = out_buf.view(torch.float32).reshape(-1)[:8]
+            w.run(*args, out=out_buf)
+        else:
+            w.run(*args, out=out_buf, sinks=out_buf.view(torch.float32).reshape(-1)[:8])
+    assert torch.equal(bits(run(good)), expected)
+    from flashinfer.attention.batch_invariant import engine
+
+    planned = engine.plan_attention(
+        pr.qo_indptr, pr.kv_indptr, pr.kv_last, 8, 2, 128, 16, -1, None, None, dev
+    )
+    eargs = (planned, pr.q, pr.k_nhd, pr.v_nhd, pr.kv_indptr, pr.kv_indices)
+    eargs += (128**-0.5,)
+    for sinks in bad[:10]:
+        with pytest.raises(ValueError):
+            engine.run_attention(*eargs, sinks=sinks)
+    assert torch.equal(bits(engine.run_attention(*eargs, sinks=good)), expected)
 
 
 @needs_device
