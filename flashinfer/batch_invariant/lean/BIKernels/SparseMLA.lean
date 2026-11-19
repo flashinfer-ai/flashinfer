@@ -525,14 +525,16 @@ def ConfigOK (b : Config) : Bool :=
     && (b.mmaSplit == 1 || b.mmaSplit == 4)
     && (b.mmaSplit == 1 || b.headBlock == 16)
 
-/-- `config.default_config` (the dispatcher): the in-kernel fold when the partial rows would pass `FIXUP_WORKSPACE_FLOATS = 2^28` floats (`WS_ROW_FLOATS = 516` per head and tile), else the fixup fold with four tiles per unit once `BUSY_UNITS_PER_SM = 16` units per SM are queued, else one. -/
+/-- `config.default_config` (the dispatcher): the in-kernel fold at the widest head block when the partial rows would pass `FIXUP_WORKSPACE_FLOATS = 2^28` floats (`WS_ROW_FLOATS = 516` per head and tile); else the fixup fold at the narrowest head block (16, then 32) whose units number at most the SMs, else the widest, with four tiles per unit once `BUSY_UNITS_PER_SM = 16` units per SM are queued, else one. -/
 def defaultConfig (rows heads width sm : Nat) : Config :=
   let hb := if heads ≤ 16 then 16 else if heads ≤ 32 then 32 else 64
-  let w := if hb = 16 then 4 else 1
   let tiles := (width + 127) / 128
-  if 268435456 < rows * heads * tiles * 516 then ⟨hb, 8, 1, 0, 128, w⟩
-  else if 16 * sm ≤ rows * ((heads + hb - 1) / hb) * tiles then ⟨hb, 8, 0, 4, 128, w⟩
-  else ⟨hb, 8, 0, 1, 128, w⟩
+  if 268435456 < rows * heads * tiles * 516 then ⟨hb, 8, 1, 0, 128, if hb = 16 then 4 else 1⟩
+  else
+    let nb := if 16 < hb ∧ rows * ((heads + 15) / 16) * tiles ≤ sm then 16
+      else if 32 < hb ∧ rows * ((heads + 31) / 32) * tiles ≤ sm then 32 else hb
+    let per := if 16 * sm ≤ rows * ((heads + nb - 1) / nb) * tiles then 4 else 1
+    ⟨nb, 8, 0, per, 128, if nb = 16 then 4 else 1⟩
 
 /-- The nine records the dispatcher can return. -/
 def dispatchRange : List Config :=
