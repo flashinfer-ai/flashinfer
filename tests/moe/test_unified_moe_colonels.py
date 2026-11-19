@@ -322,7 +322,7 @@ def test_token_counts_and_masked_routes(m):
     tactic = (
         ColonelsTactic()
         if arch == 103
-        else ColonelsTactic(variant="bf16", warp_n=8, stages=3)
+        else ColonelsTactic(variant="bf16", warp_n=8, stages=2)
     )
     layer, act, pack, _, source = _case(tactic, m=m)
     if m:
@@ -370,7 +370,7 @@ def test_fp8_block(persistent):
     if _arch() != 90:
         pytest.skip("FP8 requires Hopper")
     tactic = ColonelsTactic(
-        variant="w8a8_persistent" if persistent else "w8a8", warp_n=8, stages=3
+        variant="w8a8_persistent" if persistent else "w8a8", warp_n=8, stages=2
     )
     _, act, _, _, source = _case(ColonelsTactic(variant="bf16", warp_n=8, stages=3))
     backend = ColonelsFp8BlockConfig(tactics=(tactic,))
