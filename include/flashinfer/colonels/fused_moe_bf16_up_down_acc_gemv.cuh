@@ -312,6 +312,7 @@ __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_ac
                                     result, (K / Z_SPLIT) * sizeof(__nv_bfloat16));
 
     cuda::ptx::cp_async_bulk_commit_group();
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
   }
 }
 
