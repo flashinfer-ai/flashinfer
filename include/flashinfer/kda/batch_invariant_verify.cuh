@@ -33,10 +33,21 @@ constexpr int NTHR = 256;
 // state), cached rows saved with the boundary state (-1: no boundary crossed)
 constexpr int META = 4;
 
+// the block moves `bytes` 16 at a time; a thread issues its loads (up to sixteen) before its first
+// store
 __device__ __forceinline__ void copy16(void* dst, const void* src, size_t bytes, int tid) {
-  for (size_t u = (size_t)tid * 16; u < bytes; u += (size_t)NTHR * 16)
-    *reinterpret_cast<uint4*>(static_cast<unsigned char*>(dst) + u) =
-        *reinterpret_cast<const uint4*>(static_cast<const unsigned char*>(src) + u);
+  const unsigned char* s = static_cast<const unsigned char*>(src);
+  unsigned char* d = static_cast<unsigned char*>(dst);
+  const size_t step = (size_t)NTHR * 16;
+  for (size_t u = (size_t)tid * 16; u < bytes; u += 16 * step) {
+    uint4 x[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      if (u + i * step < bytes) x[i] = *reinterpret_cast<const uint4*>(s + u + i * step);
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      if (u + i * step < bytes) *reinterpret_cast<uint4*>(d + u + i * step) = x[i];
+  }
 }
 
 // the step kernel's test for a state the caller replaced
@@ -75,24 +86,25 @@ __global__ void __launch_bounds__(NTHR)
     const int m[META] = {n, (p + n) & (CH - 1), moved ? -1 : p, rows};
     meta[sh * META + tid] = m[tid];
   }
+  // 64 threads per token row: four rows per round
+  const uint16_t* src[4] = {q, k, v, gt};
+  uint16_t* dst[4] = {tq, tk, tv, tg};
+  const int a = (tid >> 4) & 3, c8 = (tid & 15) * 8;
+  for (int j = tid >> 6; j < n; j += NTHR / 64) {
+    const size_t in = ((size_t)b * n + j) * H + h, sv = ((size_t)slot * cap + j) * H + h;
+    *reinterpret_cast<uint4*>(dst[a] + sv * D + c8) =
+        *reinterpret_cast<const uint4*>(src[a] + in * D + c8);
+  }
+  if (tid < n) tb[((size_t)slot * cap + tid) * H + h] = bt[((size_t)b * n + tid) * H + h];
   copy16(vpref + sh * D, pref + sh * D, (size_t)D * 4, tid);
   if (rows >= 0) {
     copy16(vstate + sh * D * D, S32, (size_t)D * D * 4, tid);
-    copy16(vL + sh * CH * CH, Lc + sh * CH * CH, (size_t)CH * CH * 2, tid);
     const size_t r16 = sh * CH * D;
     copy16(vK + r16, Kc + r16, (size_t)rows * D * 2, tid);
     copy16(vF + r16, Kf + r16, (size_t)rows * D * 4, tid);
     copy16(vR + r16, Rc + r16, (size_t)rows * D * 2, tid);
+    copy16(vL + sh * CH * CH, Lc + sh * CH * CH, (size_t)CH * CH * 2, tid);
     copy16(vU + r16, Uc + r16, (size_t)rows * D * 2, tid);
-  }
-  const uint16_t* src[4] = {q, k, v, gt};
-  uint16_t* dst[4] = {tq, tk, tv, tg};
-  for (int j = 0; j < n; ++j) {
-    const size_t in = ((size_t)b * n + j) * H + h, sv = ((size_t)slot * cap + j) * H + h;
-    if (tid < 64)
-      *reinterpret_cast<uint4*>(dst[tid >> 4] + sv * D + (tid & 15) * 8) =
-          *reinterpret_cast<const uint4*>(src[tid >> 4] + in * D + (tid & 15) * 8);
-    if (tid == 64) tb[sv] = bt[in];
   }
 }
 
@@ -138,22 +150,29 @@ __global__ void __launch_bounds__(NTHR)
     float* S32 = state + sh * D * D;
     uint16_t* S16 = state16 + sh * D * D;
     const float* V32 = vstate + sh * D * D;
-    // the boundary state and its bf16 copy as the step header's begin writes it
-    for (int e = tid; e < D * D / 8; e += NTHR) {
-      const float4 x = *reinterpret_cast<const float4*>(V32 + 8 * e),
-                   y = *reinterpret_cast<const float4*>(V32 + 8 * e + 4);
-      *reinterpret_cast<float4*>(S32 + 8 * e) = x;
-      *reinterpret_cast<float4*>(S32 + 8 * e + 4) = y;
-      *reinterpret_cast<uint4*>(S16 + 8 * e) =
-          make_uint4(bi_decode::f2bf_x2(x.x, x.y), bi_decode::f2bf_x2(x.z, x.w),
-                     bi_decode::f2bf_x2(y.x, y.y), bi_decode::f2bf_x2(y.z, y.w));
+    // the boundary state and its bf16 copy as the step header's begin writes it; eight pieces per
+    // thread
+    float4 x[8], y[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      x[i] = *reinterpret_cast<const float4*>(V32 + 8 * (tid + i * NTHR));
+      y[i] = *reinterpret_cast<const float4*>(V32 + 8 * (tid + i * NTHR) + 4);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int e8 = 8 * (tid + i * NTHR);
+      *reinterpret_cast<float4*>(S32 + e8) = x[i];
+      *reinterpret_cast<float4*>(S32 + e8 + 4) = y[i];
+      *reinterpret_cast<uint4*>(S16 + e8) =
+          make_uint4(bi_decode::f2bf_x2(x[i].x, x[i].y), bi_decode::f2bf_x2(x[i].z, x[i].w),
+                     bi_decode::f2bf_x2(y[i].x, y[i].y), bi_decode::f2bf_x2(y[i].z, y[i].w));
     }
     if (tid < STAMP) stamp[sh * STAMP + tid] = V32[tid];
-    copy16(Lc + sh * CH * CH, vL + sh * CH * CH, (size_t)CH * CH * 2, tid);
     const size_t r16 = sh * CH * D;
     copy16(Kc + r16, vK + r16, (size_t)rows * D * 2, tid);
     copy16(Kf + r16, vF + r16, (size_t)rows * D * 4, tid);
     copy16(Rc + r16, vR + r16, (size_t)rows * D * 2, tid);
+    copy16(Lc + sh * CH * CH, vL + sh * CH * CH, (size_t)CH * CH * 2, tid);
     copy16(Uc + r16, vU + r16, (size_t)rows * D * 2, tid);
   }
   if (tid == 0) cnt[sh] = before;
