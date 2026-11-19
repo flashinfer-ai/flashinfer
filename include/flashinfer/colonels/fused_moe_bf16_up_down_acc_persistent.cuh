@@ -71,7 +71,7 @@ __launch_bounds__(WN * 32 + PRODUCER_THREADS, 1) void fused_moe_bf16_wgmma_up_do
   const int k_chunk = blockIdx.y % SPLIT_K;
   const int32_t block_start = blockIdx.y / SPLIT_K;
   const int total_tokens = num_tokens_post_padded[0];
-  const int total_blocks = const_ceil(total_tokens / float(BM));
+  const int total_blocks = total_tokens / BM + (total_tokens % BM != 0);
 
   if constexpr (OVERLAPPED) {
     // Dispatch doorbell. The overlapped fused allreduce spins on the
