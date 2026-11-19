@@ -19,7 +19,6 @@ from ..support import check_device, unsupported
 from . import spec
 
 Scale = Union[float, torch.Tensor]
-_COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _JIT_MODULE = "batch_invariant_mla_sparse"
 _DTYPE_KEYS = {torch.bfloat16: "bf16", torch.float8_e4m3fn: "e4m3"}
 #: Host scales that round to a positive finite fp32.
@@ -287,7 +286,7 @@ def _compile(kernel, device, num_qo_heads, q_dtype, rope_dim, scale_is_tensor):
                 None,
                 cutlass.Int32(0),
                 None,
-                options=_COMPILE_OPTIONS,
+                options=spec.COMPILE_OPTIONS,
             )
 
     identity = (
@@ -296,7 +295,7 @@ def _compile(kernel, device, num_qo_heads, q_dtype, rope_dim, scale_is_tensor):
         _DTYPE_KEYS[q_dtype],
         rope_dim,
         tuple(scale_is_tensor),
-        _COMPILE_OPTIONS,
+        spec.COMPILE_OPTIONS,
     )
     key = hashlib.sha256(repr(identity).encode()).hexdigest()
     root = spec._kernel_dir()

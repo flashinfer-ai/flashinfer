@@ -65,6 +65,8 @@ KERNEL_STATE: Dict[str, object] = dict(
     direct_sparse_capacities=(1, 0),
 )
 
+#: Compiler options of the kernel build (the level the ``prims_ts`` MLA path uses; level 3 is slower here).
+COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 #: The ``prims_ts`` commit the kernel copy was taken from.
 KERNEL_BASE = "25bc267eb84dd1b28997f62aa4c282a09184c952"
 #: sha256 over the kernel copy (:func:`source_digest`); a device-free test pins it, so an edit is a decision.
@@ -167,6 +169,7 @@ def spec_fingerprint(dtype, head_dim: int) -> str:
         "out=bf16",
         "lse=f32.ln",
         "kernel=" + ",".join(f"{k}={KERNEL_STATE[k]}" for k in sorted(KERNEL_STATE)),
+        f"options={COMPILE_OPTIONS}",
         f"cute_dsl={_dsl_version()}",
         f"sources={source_digest()}",
     ]
