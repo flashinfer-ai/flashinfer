@@ -424,7 +424,6 @@ def _validate_slot_args(
 def _validate_checkpoint_cu_starts(
     *,
     cu_seqlens: Optional[torch.Tensor],
-    cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]],
     checkpoint_cu_starts: torch.Tensor,
     checkpoint_every_n_tokens: int,
     state_checkpoints: torch.Tensor,
@@ -439,21 +438,20 @@ def _validate_checkpoint_cu_starts(
     place of checkpoint offsets silently write outside the buffer. Reading the
     values needs a device-to-host copy, hence opt-in like the other
     ``FLASHINFER_VALIDATE_INPUTS`` checks, and skipped during CUDA graph
-    capture.
+    capture. The lengths come from the device ``cu_seqlens`` the kernels
+    read, not from ``cu_seqlens_cpu``, which may be stale.
     """
 
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("", "0"):
         return
     if cu_seqlens is None:
         return
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return
+    if cu_seqlens.is_cuda:
+        with torch.cuda.device(cu_seqlens.device):
+            if torch.cuda.is_current_stream_capturing():
+                return
 
-    offsets = (
-        [int(x) for x in cu_seqlens_cpu]
-        if cu_seqlens_cpu is not None
-        else cu_seqlens.cpu().tolist()
-    )
+    offsets = cu_seqlens.cpu().tolist()
     num_seqs = len(offsets) - 1
     seq_lens = [offsets[i + 1] - offsets[i] for i in range(num_seqs)]
     prefix = [0] * num_seqs if prefix_lens is None else prefix_lens.cpu().tolist()
@@ -471,20 +469,22 @@ def _validate_checkpoint_cu_starts(
             )
         rows, rows_name = int(state_checkpoints.shape[0]), "state_checkpoints"
         got = [starts[i + 1] - starts[i] for i in range(num_seqs)]
-        if got != counts:
+        bad = next((i for i in range(num_seqs) if got[i] != counts[i]), None)
+        if bad is not None:
             hint = (
                 " It looks like token offsets: checkpoint_cu_starts counts "
                 "checkpoints (rows of state_checkpoints), not tokens."
                 if got == seq_lens
                 else ""
             )
-            expected = [starts[0]]
-            for count in counts:
-                expected.append(expected[-1] + count)
             raise ValueError(
                 "checkpoint_cu_starts must hold cumulative checkpoint counts: "
-                f"with checkpoint_every_n_tokens={n} the per-sequence counts are "
-                f"{counts}, so expected {expected}, got {starts}.{hint}"
+                f"sequence {bad} has {seq_lens[bad]} tokens"
+                + (f" after a prefix of {prefix[bad]}" if prefix[bad] else "")
+                + f", so {counts[bad]} checkpoint(s) with "
+                f"checkpoint_every_n_tokens={n}, but checkpoint_cu_starts"
+                f"[{bad + 1}] - checkpoint_cu_starts[{bad}] = "
+                f"{starts[bad + 1]} - {starts[bad]} = {got[bad]}.{hint}"
             )
     else:
         if len(starts) not in (num_seqs, num_seqs + 1):
@@ -2340,7 +2340,6 @@ def chunk_gated_delta_rule(
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
         _validate_checkpoint_cu_starts(
             cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,

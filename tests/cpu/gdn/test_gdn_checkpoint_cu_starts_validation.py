@@ -12,6 +12,9 @@ buffer without an error (issue #9559)."""
 
 from __future__ import annotations
 
+import contextlib
+import types
+
 import pytest
 import torch
 
@@ -38,13 +41,11 @@ def _check(
     rows,
     *,
     every=EVERY,
-    cu_cpu=None,
     indices=None,
     prefix=None,
 ):
     gdn_prefill._validate_checkpoint_cu_starts(
         cu_seqlens=_i64(cu),
-        cu_seqlens_cpu=cu_cpu,
         checkpoint_cu_starts=_i64(starts),
         checkpoint_every_n_tokens=every,
         state_checkpoints=torch.zeros(rows, HV, 1, 1),
@@ -72,9 +73,16 @@ def test_token_offsets_are_rejected_through_the_public_api(validate):
         )
 
 
-def test_message_names_the_expected_offsets(validate):
-    with pytest.raises(ValueError, match=r"expected \[0, 4, 6\], got \[0, 256, 384\]"):
+def test_message_names_the_first_bad_sequence(validate):
+    with pytest.raises(
+        ValueError,
+        match=r"sequence 0 has 256 tokens, so 4 checkpoint\(s\) with "
+        r"checkpoint_every_n_tokens=64, but checkpoint_cu_starts\[1\] - "
+        r"checkpoint_cu_starts\[0\] = 256 - 0 = 256\. It looks like token offsets",
+    ):
         _check([0, 256, 384], [0, 256, 384], rows=6)
+    with pytest.raises(ValueError, match="after a prefix of 32"):
+        _check([0, 96], [0, 1], rows=3, prefix=[32])
 
 
 @pytest.mark.parametrize(
@@ -95,7 +103,7 @@ def test_consistent_offsets_pass(validate, cu, starts, rows, prefix):
 
 
 def test_wrong_counts_are_rejected(validate):
-    with pytest.raises(ValueError, match="per-sequence counts are \\[4, 2\\]"):
+    with pytest.raises(ValueError, match=r"sequence 1 has 128 tokens, so 2 .* = 3\.$"):
         _check([0, 256, 384], [0, 4, 7], rows=8)
 
 
@@ -116,11 +124,24 @@ def test_negative_start_is_rejected(validate):
         _check([0, 128], [-1, 1], rows=4)
 
 
-def test_host_offsets_are_used_when_given(validate):
-    # cu_seqlens_cpu is the source of truth for the lengths when provided.
-    _check([0, 0, 0], [0, 4, 6], rows=6, cu_cpu=[0, 256, 384])
-    with pytest.raises(ValueError, match="per-sequence counts are \\[4, 2\\]"):
-        _check([0, 256, 384], [0, 4, 7], rows=8, cu_cpu=torch.tensor([0, 256, 384]))
+def test_stale_host_offsets_do_not_hide_token_offsets(validate):
+    # The kernels read the device cu_seqlens, so the check does too: a host
+    # copy that disagrees with it must not mask an out-of-bounds write.
+    t = 512
+    q = torch.zeros(t, 2, 128, dtype=torch.bfloat16)
+    v = torch.zeros(t, HV, 128, dtype=torch.bfloat16)
+    cu = _i64([0, 256, t])
+    with pytest.raises(ValueError, match="looks like token offsets"):
+        gdn_prefill.chunk_gated_delta_rule(
+            q,
+            torch.zeros_like(q),
+            v,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=[0, 0, 0],
+            checkpoint_every_n_tokens=EVERY,
+            state_checkpoints=torch.zeros(8, HV, 128, 128),
+            checkpoint_cu_starts=cu.clone(),
+        )
 
 
 def test_checkpoint_state_indices_bounds(validate):
@@ -148,8 +169,24 @@ def test_off_by_default(monkeypatch, value):
 
 
 def test_skipped_during_graph_capture(validate, monkeypatch):
-    monkeypatch.setattr(gdn_prefill.torch.cuda, "is_available", lambda: True)
+    # Reading the values would be a device-to-host copy inside the capture.
+    seen = []
+    monkeypatch.setattr(
+        gdn_prefill.torch.cuda,
+        "device",
+        lambda device: seen.append(device) or contextlib.nullcontext(),
+    )
     monkeypatch.setattr(
         gdn_prefill.torch.cuda, "is_current_stream_capturing", lambda: True
     )
-    _check([0, 256, 384], [0, 256, 384], rows=6)
+    cu = types.SimpleNamespace(is_cuda=True, device="cuda:1")
+    gdn_prefill._validate_checkpoint_cu_starts(
+        cu_seqlens=cu,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=EVERY,
+        state_checkpoints=None,
+        checkpoint_state_indices=None,
+        prefix_lens=None,
+    )
+    # The capture state is read on the device the call runs on.
+    assert seen == ["cuda:1"]
