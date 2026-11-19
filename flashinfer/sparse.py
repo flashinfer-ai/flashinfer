@@ -2830,9 +2830,11 @@ def qsa_sparse_paged_attention(
     on different CUDA streams are not supported: issue all specialized calls (captures and
     replays included) on one stream at a time. CUDA graphs: run one eager call at the same shape before
     capturing — the kernel keeps persistent per-process scratch sized by the input shape, so a
-    warmed-up capture performs no allocation and replay reuses stable pointers; the first
-    specialized call also installs Triton's process-wide launch allocator (importing
-    flashinfer does not). Scratch a capture recorded is retained for the process
+    warmed-up capture performs no allocation and replay reuses stable pointers. Each
+    specialized call installs Triton's launch allocator only for its own launches and
+    restores the previous one afterwards (importing flashinfer installs nothing, and the
+    op's scratch is never reachable by unrelated Triton kernels). Scratch a capture
+    recorded is retained for the process
     lifetime, so later larger eager calls may grow the scratch without invalidating
     earlier captured graphs.
 

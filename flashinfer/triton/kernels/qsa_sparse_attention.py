@@ -13,9 +13,11 @@ QSA stage-1 indexer), softmax scale ``256 ** -0.5``.
 
 Launch-state notes (kept out of import time on purpose):
 
-- Triton's process-wide launch allocator (used for device-side TMA descriptor
-  scratch) is installed lazily by :func:`_ensure_launch_state` on the first
-  call of :func:`run`, never at module import.
+- Triton's launch allocator (used for device-side TMA descriptor scratch) is
+  installed only for the duration of each :func:`run` call and restored
+  afterwards (:func:`_launch_allocator`): the op's private scratch is never
+  left reachable by unrelated Triton kernels launched elsewhere in the
+  process, and importing flashinfer installs nothing.
 - ``_TMA_SCRATCH`` / ``_SCRATCH`` are persistent per-process caches whose
   sizes are pure functions of the input shape. An eager call therefore
   pre-sizes them; CUDA-graph capture requires one same-shape eager warmup
@@ -31,6 +33,8 @@ Launch-state notes (kept out of import time on purpose):
   the public docstring); all calls, captures and replays included, must be
   serialized on one stream at a time.
 """
+
+import contextlib
 
 import torch
 import triton
@@ -84,22 +88,53 @@ def _tma_alloc(size, alignment, stream):
     return _hold_for_graph(buf)
 
 
-_LAUNCH_STATE_READY = False
+try:
+    from triton.runtime import _allocation as _triton_allocation
+except Exception:  # pragma: no cover - Triton without the allocation module
+    _triton_allocation = None
+
+_LEGACY_ALLOC_INSTALLED = False
 
 
-def _ensure_launch_state():
-    """Install the Triton launch allocator on first use (not at import).
+@contextlib.contextmanager
+def _launch_allocator():
+    """Install ``_tma_alloc`` around one call's launches, then restore.
 
-    ``triton.set_allocator`` is process-wide, so importing flashinfer must not
-    set it; it is installed the first time this op actually runs, and the TMA
-    scratch floor is pre-touched eagerly so the allocation never lands inside
-    a CUDA-graph capture that was warmed up correctly.
+    The launch allocator Triton consults for device-side TMA descriptor
+    scratch is process-global state; leaving this op's allocator installed
+    would hand its private scratch to any UNRELATED Triton kernel launched
+    later in the same context (the documented single-stream restriction
+    constrains this op's own calls only, not other libraries' kernels).  The
+    allocator is therefore installed per call and the previous one restored
+    on exit.  Setting it in the calling context on every call also covers
+    threads whose context never saw an install.
     """
-    global _LAUNCH_STATE_READY
-    if not _LAUNCH_STATE_READY:
+    holder = getattr(_triton_allocation, "_allocator", None)
+    if holder is not None and hasattr(holder, "set") and hasattr(holder, "reset"):
+        # Newer Triton: the allocator lives in a ContextVar.
+        token = holder.set(_tma_alloc)
+        try:
+            yield
+        finally:
+            holder.reset(token)
+    elif _triton_allocation is not None:
+        # Older Triton: the allocator is a module-global object; save it and
+        # put it back through the public setter.
+        prev = _triton_allocation._allocator
         triton.set_allocator(_tma_alloc)
-        _tma_alloc(1 << 18, 128, None)  # pre-size the scratch floor eagerly
-        _LAUNCH_STATE_READY = True
+        try:
+            yield
+        finally:
+            triton.set_allocator(prev)
+    else:  # pragma: no cover - very old Triton: no handle on the previous
+        # allocator, so fall back to a one-time process-wide install (the
+        # pre-existing behavior) rather than clobbering a foreign allocator
+        # on every exit.
+        global _LEGACY_ALLOC_INSTALLED
+        if not _LEGACY_ALLOC_INSTALLED:
+            triton.set_allocator(_tma_alloc)
+            _LEGACY_ALLOC_INSTALLED = True
+        yield
 
 NH = 6          # real query heads
 HP = 8          # padded heads (power of two for tl.dot)
@@ -183,52 +218,108 @@ def _mul_rz_h2(a, b):
 
 
 @triton.jit
+def _sigm_f32(g):
+    """Exact-at-tolerance FP32 sigmoid (even/odd exponential form).
+
+    Never cancels: the packed tanh form sigmoid(g) = (tanh(g/2) + 1) / 2
+    loses the small sigmoids of negative gates — tanh(g/2) narrows to within
+    one half-precision ulp of -1, so the sigmoid collapses to 0 or ~2.4e-4
+    where the true value is e.g. 4.5e-5 at g = -10 — and with E4M3 attention
+    values (|att| up to 448 is in-contract) that ABSOLUTE error exceeds the
+    output tolerance on an output that is itself small.  Here m stays in
+    (0, 1], both selections are well-scaled, and underflow for very negative
+    gates rounds to the correct 0.
+    (log2(e) inlined: plain module globals are not visible in @triton.jit.)
+    """
+    gf = g.to(tl.float32)
+    m = tl.exp2(-tl.abs(gf) * 1.4426950408889634)
+    r = 1.0 / (1.0 + m)
+    return tl.where(gf >= 0, r, m * r)
+
+
+@triton.jit
 def _sigm_h2(g):
-    gh = (g * 0.5).to(tl.float16)
-    th = tl.inline_asm_elementwise(
-        "tanh.approx.f16x2 $0, $1;", "=r,r", [gh],
-        dtype=tl.float16, is_pure=True, pack=2)
-    return th.to(tl.float32) * 0.5 + 0.5
+    # Only the small-T kernels consume this form (their epilogues are a few
+    # hundred thousand elements), so it simply computes the exact sigmoid.
+    return _sigm_f32(g)
+
+
+@triton.jit
+def _gate_redo2(att_half, g):
+    """Exact FP32 gate (0.5 folded into att_half); the cold branch of the
+    tile redo (Triton's noinline does not take tensor arguments, so it is
+    inlined under the uniform scalar branch)."""
+    return (att_half.to(tl.float32) * (2.0 * _sigm_f32(g))).to(tl.bfloat16)
+
+
+@triton.jit
+def _gate_redo(att, g):
+    """Exact FP32 sigmoid gate; cold tile-redo branch (see _gate_redo2)."""
+    return (att.to(tl.float32) * _sigm_f32(g)).to(tl.bfloat16)
+
+
+# Guard by attention magnitude, not gate sign: even a small positive-gate
+# sigmoid error can move the result across a BF16 rounding boundary. Keep
+# the packed path for |att| <= 2, where one BF16 step below the maximum
+# output is at most 1/128 (at |att| = 4 it would already exceed 0.01).
 
 
 @triton.jit
 def _gmul(att_half, g):
-    """Rubin packed gate with sigmoid's 0.5 folded into attention."""
-    gh = (g * 0.5).to(tl.float16)
-    th = tl.inline_asm_elementwise(
-        "tanh.approx.f16x2 $0, $1;", "=r,r", [gh],
-        dtype=tl.float16, is_pure=True, pack=2)
-    t1 = th + tl.full(th.shape, 1.0, tl.float16)
-    return tl.inline_asm_elementwise(
-        "mul.bf16x2.bf16x2.f16x2 $0, $1, $2;", "=r,r,r", [att_half, t1],
-        dtype=tl.bfloat16, is_pure=True, pack=2)
+    """Rubin packed gate with sigmoid's 0.5 folded into attention; exact
+    tile redo for large attention values."""
+    bad = tl.abs(att_half) > 1.0
+    if tl.max(bad.to(tl.int32)) > 0:
+        out = _gate_redo2(att_half, g)
+    else:
+        gh = (g * 0.5).to(tl.float16)
+        th = tl.inline_asm_elementwise(
+            "tanh.approx.f16x2 $0, $1;", "=r,r", [gh],
+            dtype=tl.float16, is_pure=True, pack=2)
+        t1 = th + tl.full(th.shape, 1.0, tl.float16)
+        out = tl.inline_asm_elementwise(
+            "mul.bf16x2.bf16x2.f16x2 $0, $1, $2;", "=r,r,r", [att_half, t1],
+            dtype=tl.bfloat16, is_pure=True, pack=2)
+    return out
 
 
 @triton.jit
 def _gmul_bf(att_half, g):
-    """Fully packed BF16 gate with sigmoid's 0.5 already folded into att_half:
-    one bf16x2 multiply, one bf16x2 tanh, one bf16x2 add and one bf16x2
-    multiply replace the FP32 widening, FP32 halving and FP16 narrowing that
-    the mixed-format gate needs."""
-    gh = g * 0.5
-    th = tl.inline_asm_elementwise(
-        "tanh.approx.bf16x2 $0, $1;", "=r,r", [gh],
-        dtype=tl.bfloat16, is_pure=True, pack=2)
-    return att_half * (th + tl.full(th.shape, 1.0, tl.bfloat16))
+    """Fully packed BF16 gate with sigmoid's 0.5 already folded into
+    att_half: one bf16x2 multiply, one bf16x2 tanh, one bf16x2 add and one
+    bf16x2 multiply replace the FP32 widening, FP32 halving and FP16
+    narrowing that the mixed-format gate needs.  Exact tile redo for
+    large attention values."""
+    bad = tl.abs(att_half) > 1.0
+    if tl.max(bad.to(tl.int32)) > 0:
+        out = _gate_redo2(att_half, g)
+    else:
+        gh = g * 0.5
+        th = tl.inline_asm_elementwise(
+            "tanh.approx.bf16x2 $0, $1;", "=r,r", [gh],
+            dtype=tl.bfloat16, is_pure=True, pack=2)
+        out = att_half * (th + tl.full(th.shape, 1.0, tl.bfloat16))
+    return out
 
 
 @triton.jit
 def _gate_bf16(att, g):
-    """Packed sigmoid plus Rubin mixed-format multiply into BF16 output."""
-    gh = (g * 0.5).to(tl.float16)
-    th = tl.inline_asm_elementwise(
-        "tanh.approx.f16x2 $0, $1;", "=r,r", [gh],
-        dtype=tl.float16, is_pure=True, pack=2)
-    half = tl.full(th.shape, 0.5, tl.float16)
-    sig = th * half + half
-    return tl.inline_asm_elementwise(
-        "mul.bf16x2.bf16x2.f16x2 $0, $1, $2;", "=r,r,r", [att, sig],
-        dtype=tl.bfloat16, is_pure=True, pack=2)
+    """Packed sigmoid plus Rubin mixed-format multiply into BF16 output;
+    exact tile redo for large attention values."""
+    bad = tl.abs(att) > 2.0
+    if tl.max(bad.to(tl.int32)) > 0:
+        out = _gate_redo(att, g)
+    else:
+        gh = (g * 0.5).to(tl.float16)
+        th = tl.inline_asm_elementwise(
+            "tanh.approx.f16x2 $0, $1;", "=r,r", [gh],
+            dtype=tl.float16, is_pure=True, pack=2)
+        half = tl.full(th.shape, 0.5, tl.float16)
+        sig = th * half + half
+        out = tl.inline_asm_elementwise(
+            "mul.bf16x2.bf16x2.f16x2 $0, $1, $2;", "=r,r,r", [att, sig],
+            dtype=tl.bfloat16, is_pure=True, pack=2)
+    return out
 
 
 @triton.jit
@@ -256,6 +347,34 @@ def _popc64(x):
 
 
 @triton.jit
+def _query_pair(qr, FIXED32: tl.constexpr = False):
+    qf = qr.to(tl.float32)
+    if FIXED32:
+        sq = 32.0
+    else:
+        sq = 240.0 / tl.maximum(tl.max(tl.abs(qf)), 1e-20)
+    qs = qf * sq
+    qh = qs.to(tl.float8e4nv)
+    return qh, (qs - qh.to(tl.float32)).to(tl.float8e4nv), sq
+
+
+@triton.jit
+def _qk(qh, ql, kt, USEQL: tl.constexpr = True):
+    s = tl.dot(qh, kt, out_dtype=tl.float32)
+    if USEQL:
+        s = tl.dot(ql, kt, s, out_dtype=tl.float32)
+    return s
+
+
+@triton.jit
+def _pv_half_pair(pp16, vt, acc):
+    ph = pp16.to(tl.float8e4nv)
+    pl = (pp16 - ph.to(tl.float16)).to(tl.float8e4nv)
+    return tl.dot(pl, vt, tl.dot(ph, vt, acc, out_dtype=tl.float32),
+                  out_dtype=tl.float32)
+
+
+@triton.jit
 def _blk(qh, ql, emat, mf, rcw, KC, VC, koff, sv, acc, mi, li, cc,
          DC: tl.constexpr, PVB: tl.constexpr, USEQL: tl.constexpr,
          DM: tl.constexpr, BNC: tl.constexpr, RSC: tl.constexpr):
@@ -264,19 +383,11 @@ def _blk(qh, ql, emat, mf, rcw, KC, VC, koff, sv, acc, mi, li, cc,
     ~bf16 accuracy and the shared-memory operands stay 1 byte/element."""
     kt = tl.trans(tl.load(KC + koff, mask=sv[:, None], other=0.0))
     vt = tl.load(VC + koff, mask=sv[:, None], other=0.0)
+    qk = _qk(qh, ql, kt, USEQL)
     if DM:
-        # dense prefix: mask is just a per-row key count, cheaper inline than
-        # as a second accumulator dot
-        s = tl.where(tl.arange(0, BNC)[None, :] < rcw[:, None],
-                     tl.dot(qh, kt, out_dtype=tl.float32), -3.0e38)
-    elif USEQL:
-        s = tl.dot(emat, mf,
-                   tl.dot(ql, kt, tl.dot(qh, kt, out_dtype=tl.float32),
-                          out_dtype=tl.float32),
-                   out_dtype=tl.float32)
+        s = tl.where(tl.arange(0, BNC)[None, :] < rcw[:, None], qk, -3.0e38)
     else:
-        s = tl.dot(emat, mf, tl.dot(qh, kt, out_dtype=tl.float32),
-                   out_dtype=tl.float32)
+        s = tl.dot(emat, mf, qk, out_dtype=tl.float32)
     rmax = tl.max(s, 1)
     if RSC == 2:
         # mi is a reference exponent, not the running maximum: it only has to
@@ -1122,14 +1233,7 @@ def _tpd_step(q8, q8l, KC, VC, base, w0, ii, dd, NSLOT, rcnt, cc, mr,
         koff = slot[:, None] * DC + dd[None, :]
         kt = tl.trans(tl.load(KC + koff))
         vt = tl.load(VC + koff)
-    if QLO:
-        # fp8 value + residual query: the second K dot restores ~bf16 score
-        # accuracy, which the general route needs because its rows are short
-        # enough that per-element fp8 error does not average out.
-        qk = tl.dot(q8l, kt, tl.dot(q8, kt, out_dtype=tl.float32),
-                    out_dtype=tl.float32)
-    else:
-        qk = tl.dot(q8, kt, out_dtype=tl.float32)
+    qk = _qk(q8, q8l, kt, QLO)
     if FULL:
         s = qk
     else:
@@ -1220,9 +1324,9 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     # rm for packed-row membership, but avoid reconstructing the head with
     # div/mod and a masked pointer select on every Q/G/O access.
     qoff = (t0 * NHC + rows)[:, None] * DC + dd[None, :]
-    q8 = tl.load(Q + qoff, mask=rv[:, None],
-                 other=0.0).to(tl.float8e4nv)
-    cc = SC
+    qr = tl.load(Q + qoff, mask=rv[:, None], other=0.0)
+    q8, q8l, sq = _query_pair(qr)
+    cc = SC / sq
     rcnt = tl.where(rv, tl.gather(cnt, rm, 0), 0)
 
     ii = tl.arange(0, BN)
@@ -1243,7 +1347,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             w0 = kw * BN
             kt = tl.trans(KD.load([base + w0, 0]))
             vt = VD.load([base + w0, 0])
-            s = tl.dot(q8, kt, out_dtype=tl.float32)
+            s = _qk(q8, q8l, kt)
             mx = tl.maximum(mx, tl.max(s, 1))
             pp16 = _ex2h(_mul_rz_h2(s, cc))
             li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
@@ -1256,7 +1360,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             w0 = kw * BN
             kt = tl.trans(KD.load([base + w0, 0]))
             vt = VD.load([base + w0, 0])
-            qk = tl.dot(q8, kt, out_dtype=tl.float32)
+            qk = _qk(q8, q8l, kt)
             s = tl.where(ii[None, :] < (rcnt - w0)[:, None],
                          qk, -3.0e38)
             mx = tl.maximum(mx, tl.max(s, 1))
@@ -1276,7 +1380,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                 w0 = kw * BN
                 kt = tl.trans(KD.load([base + w0, 0]))
                 vt = VD.load([base + w0, 0])
-                s = tl.dot(q8, kt, out_dtype=tl.float32)
+                s = _qk(q8, q8l, kt)
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
                 li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
                 ph = pp16.to(tl.float8e4nv)
@@ -1288,7 +1392,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                 w0 = kw * BN
                 kt = tl.trans(KD.load([base + w0, 0]))
                 vt = VD.load([base + w0, 0])
-                qk = tl.dot(q8, kt, out_dtype=tl.float32)
+                qk = _qk(q8, q8l, kt)
                 s = tl.where(ii[None, :] < (rcnt - w0)[:, None],
                              qk, -3.0e38)
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
@@ -1341,7 +1445,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                              mask=si1 < cnt[:, None], other=-1)
             kt = tl.trans(KD.load([base + w0, 0]))
             vt = VD.load([base + w0, 0])
-            qk = tl.dot(q8, kt, out_dtype=tl.float32)
+            qk = _qk(q8, q8l, kt)
             if BN == 128:
                 wr0 = tl.gather(bw0, rm, 0)
                 wr1 = tl.gather(bw1, rm, 0)
@@ -1368,8 +1472,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             mx = tl.maximum(mx, tl.max(s, 1))
             pp16 = _ex2h(_mul_rz_h2(s, cc))
             li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
-            acc = tl.dot(pp16.to(tl.float8e4nv), vt, acc,
-                         out_dtype=tl.float32)
+            acc = _pv_half_pair(pp16, vt, acc)
         dlt = tl.where(rcnt > 0, mx * cc, 0.0)
         if tl.max(tl.abs(dlt)) > 8.0:
             mr = mx * cc
@@ -1409,7 +1512,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                                  mask=si1 < cnt[:, None], other=-1)
                 kt = tl.trans(KD.load([base + w0, 0]))
                 vt = VD.load([base + w0, 0])
-                qk = tl.dot(q8, kt, out_dtype=tl.float32)
+                qk = _qk(q8, q8l, kt)
                 if BN == 128:
                     wr0 = tl.gather(bw0, rm, 0)
                     wr1 = tl.gather(bw1, rm, 0)
@@ -1435,8 +1538,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                     s = tl.where(hit, qk, -3.0e38)
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
                 li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
-                acc = tl.dot(pp16.to(tl.float8e4nv), vt, acc,
-                             out_dtype=tl.float32)
+                acc = _pv_half_pair(pp16, vt, acc)
 
     rl = tl.where(li > 0, 0.5 / tl.where(li > 0, li, 1.0), 0.0)
     gg = tl.load(G + qoff, mask=rv[:, None], other=0.0)
@@ -1444,10 +1546,10 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     tl.store(O + qoff, _gmul_bf(att, gg), mask=rv[:, None])
 @triton.jit
 def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
-         T, B: tl.constexpr, NSLOT, NROW,
+         T, B, NSLOT, NROW,
          BT: tl.constexpr, RW: tl.constexpr, MK: tl.constexpr, BN: tl.constexpr,
          NSUB: tl.constexpr, NB: tl.constexpr, SINGLE: tl.constexpr,
-         PAIRREQ: tl.constexpr,
+         PAIRREQ: tl.constexpr, BC: tl.constexpr,
          PVB: tl.constexpr, NSP: tl.constexpr, USEQL: tl.constexpr,
          MASKFP8: tl.constexpr, RSC: tl.constexpr, SKIPD: tl.constexpr,
          TPD: tl.constexpr, SPV: tl.constexpr, W32: tl.constexpr,
@@ -1458,6 +1560,12 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
          CSPL: tl.constexpr, VSPL: tl.constexpr,
          NHC: tl.constexpr, DC: tl.constexpr,
          PWC: tl.constexpr, SC: tl.constexpr):
+    # The request count is a runtime scalar by default; the dispatcher folds
+    # it into the specialization (BC > 0) only for the first few distinct
+    # batch sizes, so eager serving with a varying B does not JIT-compile a
+    # new kernel per request count (the compile set stays bounded).
+    if BC > 0:
+        B = BC
     if VSPL:
         prog = tl.program_id(0)
         q4 = prog < 80
@@ -1637,14 +1745,7 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
         else:
             q8l = q8
     else:
-        qf = qr.to(tl.float32)
-        sq = 240.0 / tl.maximum(tl.max(tl.abs(qf)), 1e-20)
-        qs = qf * sq
-        q8 = qs.to(tl.float8e4nv)
-        if USEQL:
-            q8l = (qs - q8.to(tl.float32)).to(tl.float8e4nv)
-        else:
-            q8l = q8
+        q8, q8l, sq = _query_pair(qr)
     cc = SC / sq
     if MASKFP8:
         emat = tl.where(rm[:, None] == mt[None, :], 240.0, 0.0).to(tl.float8e4nv)
@@ -1687,13 +1788,13 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
                     sla = tl.minimum(base + wr + tl.zeros([MK], tl.int32),
                                      NSLOT - 1)
                     kta = tl.trans(tl.load(KC + sla[:, None] * DC + dd[None, :]))
-                    sra = tl.dot(q8, kta, out_dtype=tl.float32)
+                    sra = _qk(q8, q8l, kta, USEQL)
                     srf = tl.sum(tl.where(rm[:, None] == mt[None, :], sra, 0.0), 1)
                     mr = tl.where(rcnt > wr, srf * cc, 0.0)
                 else:
                     slr = tl.minimum(base + wr + ii, NSLOT - 1)
                     ktr = tl.trans(tl.load(KC + slr[:, None] * DC + dd[None, :]))
-                    sr = tl.dot(q8, ktr, out_dtype=tl.float32)
+                    sr = _qk(q8, q8l, ktr, USEQL)
                     mr = tl.max(sr, 1) * cc
             mx = tl.full([RW], -1.0e30, tl.float32)
             if PEEL:
@@ -1803,7 +1904,7 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
                 sl0 = base + fid
                 kt0 = tl.trans(tl.load(KC + sl0[:, None] * DC + dd[None, :],
                                        mask=hv[:, None], other=0.0))
-                sra = tl.dot(q8, kt0, out_dtype=tl.float32)
+                sra = _qk(q8, q8l, kt0, USEQL)
                 srf = tl.sum(tl.where(rm[:, None] == mt[None, :], sra, 0.0), 1)
                 mr = tl.where(rcnt > 0, srf * cc, 0.0)
             mx = tl.full([RW], -1.0e30, tl.float32)
@@ -1831,7 +1932,7 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
                 kt = tl.trans(tl.load(KC + koff,
                                       eviction_policy="evict_last"))
                 vt = tl.load(VC + koff, eviction_policy="evict_last")
-                qk = tl.dot(q8, kt, out_dtype=tl.float32)
+                qk = _qk(q8, q8l, kt, USEQL)
                 if MASKFP8:
                     # Each membership word is already token-local. Gather the
                     # owning token's word for every query-head row and apply it
@@ -1847,8 +1948,7 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
                 mx = tl.maximum(mx, tl.max(s, 1))
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
                 li = li + tl.sum(pp16, 1, dtype=tl.float32)
-                ph = pp16.to(tl.float8e4nv)
-                acc = tl.dot(ph, vt, acc, out_dtype=tl.float32)
+                acc = _pv_half_pair(pp16, vt, acc)
             dlt = tl.where(rcnt > 0, mx * cc - mr, 0.0)
             if tl.max(tl.abs(dlt)) > 8.0:
                 mr = mx * cc
@@ -1890,7 +1990,7 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
                     kt = tl.trans(tl.load(KC + koff,
                                           eviction_policy="evict_last"))
                     vt = tl.load(VC + koff, eviction_policy="evict_last")
-                    qk = tl.dot(q8, kt, out_dtype=tl.float32)
+                    qk = _qk(q8, q8l, kt, USEQL)
                     if MASKFP8:
                         br0 = tl.gather(blo, rm, 0)
                         br1 = tl.gather(bhi, rm, 0)
@@ -1902,8 +2002,7 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
                         s = tl.dot(emat, mf, qk, out_dtype=tl.float32)
                     pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
                     li = li + tl.sum(pp16, 1, dtype=tl.float32)
-                    ph = pp16.to(tl.float8e4nv)
-                    acc = tl.dot(ph, vt, acc, out_dtype=tl.float32)
+                    acc = _pv_half_pair(pp16, vt, acc)
             mi = mr / cc
         else:
             for kw in range(0, nw):
@@ -2124,15 +2223,8 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     qo = tl.where(rv, rt, s0) * (NHC * DC) + rh * DC
     qoff = qo[:, None] + dd[None, :]
     qr = tl.load(Q + qoff, mask=rv[:, None], other=0.0)
-    if CAPQ:
-        sq = 32.0
-        q8 = (qr * sq).to(tl.float8e4nv)
-        cc = SC / sq
-    else:
-        # Both descriptor routes can narrow BF16 directly into the FP8 MMA
-        # operand; avoid expanding the full query tile through FP32 first.
-        q8 = qr.to(tl.float8e4nv)
-        cc = SC
+    q8, q8l, sq = _query_pair(qr, CAPQ)
+    cc = SC / sq
     # The packed proof above establishes cnt == token_position + 1 for every
     # valid token, so avoid broadcasting/reducing the count tile in the hot path.
     rcnt = tl.where(rv, rt - s0 + 1, 0)
@@ -2154,19 +2246,19 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
         nfull = (t0 - s0 + 1) // BN
         for kw in tl.range(0, nfull, warp_specialize=True):
             acc, mx, li = _tpd_step(
-                q8, q8, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
-                mr, mx, li, acc, False, DC, 0, FASTEX2, False, True, True,
+                q8, q8l, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
+                mr, mx, li, acc, True, DC, 0, FASTEX2, False, True, True,
                 DEN16, True)
         for kw in tl.range(nfull, nw, warp_specialize=True):
             acc, mx, li = _tpd_step(
-                q8, q8, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
-                mr, mx, li, acc, False, DC, 0, FASTEX2, False, False, True,
+                q8, q8l, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
+                mr, mx, li, acc, True, DC, 0, FASTEX2, False, False, True,
                 DEN16, True)
     else:
         for kw in tl.range(0, nw, warp_specialize=True):
             acc, mx, li = _tpd_step(
-                q8, q8, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
-                mr, mx, li, acc, False, DC, 0, FASTEX2, False, False, True,
+                q8, q8l, KD, VD, base, kw * BN, ii, dd, NSLOT, rcnt, cc,
+                mr, mx, li, acc, True, DC, 0, FASTEX2, False, False, True,
                 DEN16, True)
     den_ok = (li <= 1.0e30) & ((rcnt <= 0) | (
         li >= rcnt.to(tl.float32) * 3.0e-4))
@@ -2191,9 +2283,8 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     if GATEPTX:
         outv = _gmul_bf(att, gg)
     else:
-        # The 4K route's FP8 probabilities already spend most of the error
-        # budget, so its gate keeps the FP32-widened FP16 tanh and its finer
-        # 1 + tanh step.
+        # Both gate helpers carry the same exact-tile-redo guard; the branch
+        # is kept so the operand types match each route's tuning.
         outv = _gmul(att, gg.to(tl.float32))
     tl.store(O + qoff, outv, mask=rv[:, None])
 
@@ -2226,6 +2317,33 @@ _SCRATCH: dict = {}
 # the non-warp-specialized schedule instead of re-attempting a failing compile.
 _NO_WSPEC: dict = {}
 
+# Bound on distinct constexpr-B specializations of the general kernel: the
+# first few request counts seen keep the tuned constant-folded indexing, and
+# every later distinct B runs the runtime-B compilation (BC=0) instead of
+# paying a fresh JIT compile on the request path.
+B_SPEC_CAP = 8
+_B_SPECIALIZED: set = set()
+
+
+def _wspec_compile_failure(exc):
+    """Compile-time failure of a warp-specialized schedule, safe to retry.
+
+    Triton reports the tensor-memory overflow as ``OutOfResources``; some
+    toolchains instead fail inside the warp-specialization lowering with a
+    ``RuntimeError`` (e.g. ConvertWarpSpecializeToLLVM: "function missing
+    'ws_num_warps' attribute").  Both happen at compile time — no launch has
+    run — so falling back to the non-warp-specialized schedule is safe.
+    Anything else propagates.
+    """
+    if isinstance(exc, _TritonOOR):
+        return True
+    msg = str(exc)
+    return (
+        "ws_num_warps" in msg
+        or "WarpSpecialize" in msg
+        or "warp_specialize" in msg
+    )
+
 
 def _desc(k_cache, v_cache, bn, nslot):
     """Build host-side TMA descriptors and avoid per-CTA tensormap setup."""
@@ -2250,7 +2368,15 @@ def _ws(key, nelem, dtype, device):
 
 
 def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
-    _ensure_launch_state()
+    # Pre-size the TMA scratch floor eagerly so the allocation never lands
+    # inside a CUDA-graph capture that was warmed up correctly, then scope
+    # the launch allocator to this call's launches only.
+    _tma_alloc(1 << 18, 128, None)
+    with _launch_allocator():
+        _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out)
+
+
+def _run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
     T = q.shape[0]
     B = page_base.shape[0]
     nslot = k_cache.shape[0] * 64
@@ -2297,10 +2423,13 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
                 num_warps=8, num_stages=2)
             return
-        except _TritonOOR:
-            # This toolchain cannot fit the warp-specialized descriptor
-            # sweep's tensor-memory footprint; the general path below serves
-            # the shape (its T >= 12000 configuration is not warp-specialized).
+        except Exception as exc:
+            if not _wspec_compile_failure(exc):
+                raise
+            # This toolchain cannot compile the warp-specialized descriptor
+            # sweep (tensor-memory overflow, or a failing warp-specialization
+            # lowering); the general path below serves the shape (its
+            # T >= 12000 configuration is not warp-specialized).
             _NO_WSPEC["w7"] = True
     single = B == 1
     mid = single and 512 <= T <= 1024
@@ -2348,10 +2477,13 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
                 num_warps=nwarps, num_stages=2)
             return
-        except _TritonOOR:
-            # Same tensor-memory overflow class as the w7 route: fall through
-            # to the general path, whose own warp-specialization fallback
-            # below covers it.
+        except Exception as exc:
+            if not _wspec_compile_failure(exc):
+                raise
+            # Same warp-specialized compile-failure class as the w7 route
+            # (including toolchains whose lowering raises RuntimeError rather
+            # than OutOfResources): fall through to the general path, whose
+            # own fallback tiers below cover it.
             _NO_WSPEC["w6"] = True
     nsp = 1
     if mid and not dn_mid:
@@ -2398,11 +2530,26 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         and not mid
         and wspec_key not in _NO_WSPEC
     )
+    # Constexpr-B is a bounded privilege (see B_SPEC_CAP): SINGLE/PAIRREQ
+    # already specialize B <= 2, and beyond the cap the general route runs
+    # the runtime-B compilation instead of JIT-compiling per request count.
+    if B <= 2:
+        bconst = 0
+    elif B in _B_SPECIALIZED or len(_B_SPECIALIZED) < B_SPEC_CAP:
+        _B_SPECIALIZED.add(B)
+        bconst = B
+    else:
+        bconst = 0
     qsa_kw = dict(
         BT=bt, RW=rw, MK=mk, BN=bn, NSUB=max(1, bn // 64),
         NB=max(4, triton.next_power_of_2(B)), SINGLE=single,
-        PAIRREQ=(B == 2),
-        PVB=pvb, NSP=max_nsp, USEQL=(QRES == 1 and not mid),
+        PAIRREQ=(B == 2), BC=bconst,
+        # The fp8 query value+residual pair is kept on EVERY general-route
+        # launch, the 512..1024 mid-range split path included: a single
+        # dynamically scaled fp8 query does not preserve cancellation
+        # structure, and dense causal selections at T=512/768/1024 exceed
+        # the 0.01 output error cap on SM107 silicon without the residual.
+        PVB=pvb, NSP=max_nsp, USEQL=(QRES == 1),
         MASKFP8=(T >= 12000),
         RSC=RSC_MODE,
         SKIPD=skipd, TPD=(TPD_MODE == 1 and not skipd),
@@ -2421,23 +2568,60 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         num_warps=nwarps,
         num_stages=(2 if 3000 <= T < 6000 and not mid else nstages),
     )
-    try:
-        _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
-                   packed, cu_seqlens, page_base, out,
-                   ws, wlp, wmp,
-                   T, B, nslot, nrow, **qsa_kw)
-    except _TritonOOR:
-        if not wspec:
-            raise
-        # The warp-specialized schedule overflowed this toolchain's
-        # tensor-memory budget at compile time (no launch happened). Retry
-        # without warp specialization: same loops, same accumulation order.
-        _NO_WSPEC[wspec_key] = True
-        qsa_kw["WSPEC"] = False
-        _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
-                   packed, cu_seqlens, page_base, out,
-                   ws, wlp, wmp,
-                   T, B, nslot, nrow, **qsa_kw)
+    narrow_key = ("narrow",) + wspec_key
+    launched = False
+    if narrow_key not in _NO_WSPEC:
+        try:
+            _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
+                       packed, cu_seqlens, page_base, out,
+                       ws, wlp, wmp,
+                       T, B, nslot, nrow, **qsa_kw)
+            launched = True
+        except Exception as exc:
+            if not _wspec_compile_failure(exc):
+                raise
+            if wspec:
+                # The warp-specialized schedule failed to compile on this
+                # toolchain (no launch happened). Retry without warp
+                # specialization: same loops, same accumulation order.
+                _NO_WSPEC[wspec_key] = True
+                qsa_kw["WSPEC"] = False
+                try:
+                    _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
+                               packed, cu_seqlens, page_base, out,
+                               ws, wlp, wmp,
+                               T, B, nslot, nrow, **qsa_kw)
+                    launched = True
+                except _TritonOOR:
+                    pass
+            elif not isinstance(exc, _TritonOOR):
+                raise
+            if not launched:
+                if mid:
+                    # The mid-range tile IS the narrow shape; a failure here
+                    # is not a budget problem this fallback can solve.
+                    raise
+                _NO_WSPEC[narrow_key] = True
+    if not launched:
+        # Even without warp specialization the tuned tile exceeds this
+        # toolchain's per-CTA tensor-memory budget at compile time (observed
+        # with Triton 3.8 on SM107: 736 columns needed against a 576-column
+        # budget at BT=20/RW=128). Serve the shape on the mid-range path's
+        # narrower tile shape — RW=64 compiles wherever the 512..1024 route
+        # does — with no descriptors and no warp specialization: same loops,
+        # same accumulation order, more KV re-reads.
+        qsa_kw.update(
+            BT=MID_BT, RW=64, MK=16, BN=MID_BN, NSUB=1, PVB=PV_BIG,
+            TMA=0, WSPEC=False, DEN16=False,
+            num_warps=8, num_stages=MID_STAGES,
+        )
+        ntiles = (T + MID_BT - 1) // MID_BT
+        nprog = ntiles if single else ntiles + B - 1
+        _qsa[(nprog * max_nsp,)](
+            q, gate, k_cache, v_cache, k_cache, v_cache,
+            packed, cu_seqlens, page_base, out,
+            ws, wlp, wmp,
+            T, B, nslot, nrow, **qsa_kw)
     if max_nsp > 1:
         rb = 8
         if vsplit:

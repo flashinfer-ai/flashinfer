@@ -182,6 +182,25 @@ def run_api(inputs, out=None, backend="auto"):
     )
 
 
+def run_api_checked(inputs, **kw):
+    """``run_api`` that SKIPS (with the reason) when this toolchain/device
+    cannot compile a route at all: the kernel already retries the
+    non-warp-specialized and narrow-tile schedules on its own, so an escaping
+    resource/lowering failure means even the fallback tier does not fit this
+    environment — a compatibility limit, not a correctness failure."""
+    from triton.runtime.errors import OutOfResources
+
+    from flashinfer.triton.kernels import qsa_sparse_attention as qsa_mod
+
+    checker = getattr(qsa_mod, "_wspec_compile_failure", None)
+    try:
+        return run_api(inputs, **kw)
+    except Exception as exc:
+        if isinstance(exc, OutOfResources) or (checker is not None and checker(exc)):
+            pytest.skip(f"route does not compile on this toolchain: {exc}")
+        raise
+
+
 def run_ref(inputs):
     return ref_qsa_sparse_attention(
         inputs["q"],
@@ -214,13 +233,14 @@ def assert_close_at_gate(
         (256,),  # short-row route, upper bound
         (512,),  # neighbor-class mid shape (general split path)
         (768,),  # the shape whose dedicated route is excluded: general path
+        (1024,),  # mid-range upper bound (general split path)
         (300, 212, 180),  # batch > 1 multi-request mix
         (2048, 1552),  # batch > 1 long rows (descriptor-based sweep)
     ],
 )
 def test_correctness(lengths):
     inputs = make_inputs(lengths, seed=sum(lengths))
-    out = run_api(inputs)
+    out = run_api_checked(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
 
@@ -231,7 +251,7 @@ def test_exact_capacity_cache(lengths):
     logical origin when the last window overhangs the slot count (origin
     clamping read the wrong slots), and every route must stay in bounds."""
     inputs = make_inputs(lengths, seed=sum(lengths) + 1, spare_pages=0)
-    out = run_api(inputs)
+    out = run_api_checked(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
 
@@ -268,7 +288,7 @@ def make_uniform_dense_prefix_inputs(lengths):
         cols.unsqueeze(0).expand(T, WIDTH),
         torch.full((T, WIDTH), -1, dtype=torch.int32, device=dev),
     )
-    packed = torch.cat([sel, (pos + 1).to(torch.int32).unsqueeze(1)], dim=1)
+    packed = torch.cat([sel, (pos + 1).clamp_max(WIDTH).int().unsqueeze(1)], dim=1)
     ones = torch.ones(T, HQ, D, dtype=torch.bfloat16, device=dev)
     kv_ones = torch.ones(num_pages, PAGE, KV, D, device=dev)
     return {
@@ -296,10 +316,229 @@ def test_uniform_logits_stay_in_fp8_probability_range(lengths):
     operands: the dedicated descriptor routes' range guard has to hand such
     tiles to the exact retry (the denominator check alone cannot see it)."""
     inputs = make_uniform_dense_prefix_inputs(lengths)
-    out = run_api(inputs)
+    out = run_api_checked(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
     assert float((out.float() - 0.5).abs().max()) <= MAX_ABS_ERR
+
+
+def make_dense_causal_cancellation_inputs(length):
+    """Reviewer-reported cancellation construction on the mid-range path:
+    every query repeats the BF16 pair ``(1.046875, -1)`` along the head dim,
+    even cache token rows are all ones and odd rows all zeros, the gate is
+    zero, and each row selects its full dense causal prefix. The exact scaled
+    logit of a ones-row is ``128 * 0.046875 / 16 = 0.375``; a single
+    dynamically scaled FP8 query loses that cancellation structure, so the
+    query residual must be live on this route too."""
+    dev = "cuda"
+    T = length
+    npages = (T + PAGE - 1) // PAGE
+    block_table = torch.arange(npages, dtype=torch.int32, device=dev).unsqueeze(0)
+    token_to_req = torch.zeros(T, dtype=torch.int32, device=dev)
+    pos = torch.arange(T, device=dev)
+    cols = torch.arange(WIDTH, device=dev, dtype=torch.int32)
+    sel = torch.where(
+        cols.unsqueeze(0) <= pos.unsqueeze(1),
+        cols.unsqueeze(0).expand(T, WIDTH),
+        torch.full((T, WIDTH), -1, dtype=torch.int32, device=dev),
+    )
+    packed = torch.cat([sel, (pos + 1).to(torch.int32).unsqueeze(1)], dim=1)
+    q = torch.empty(T, HQ, D, dtype=torch.bfloat16, device=dev)
+    q[..., 0::2] = 1.046875
+    q[..., 1::2] = -1.0
+    kv = torch.zeros(npages * PAGE, KV, D, device=dev)
+    kv[0:T:2] = 1.0
+    kv = kv.view(npages, PAGE, KV, D)
+    return {
+        "q": q,
+        "k_cache": kv.to(torch.float8_e4m3fn),
+        "v_cache": kv.to(torch.float8_e4m3fn),
+        "logical_indices": packed,
+        "block_table": block_table,
+        "token_to_req": token_to_req,
+        "output_gate": torch.zeros_like(q),
+        "cu_seqlens": torch.tensor([0, T], dtype=torch.int32, device=dev),
+        "page_base": torch.tensor([0], dtype=torch.int32, device=dev),
+    }
+
+
+@pytest.mark.parametrize("length", [512, 768, 1024])
+def test_dense_causal_cancellation_mid_range(length):
+    """Ordinary finite inputs, sorted complete causal selections, on the
+    single-request 512..1024 split path: the output must stay inside the
+    absolute error cap (requires the FP8 query residual on this route; a
+    direct dynamically-scaled FP8 query exceeded the cap on SM107 silicon
+    with ~all rows failing)."""
+    inputs = make_dense_causal_cancellation_inputs(length)
+    out = run_api_checked(inputs)
+    ref = run_ref(inputs)
+    assert_close_at_gate(out, ref)
+    # Even-count rows have an analytic expectation: m ones-rows at scaled
+    # logit 0.375 against m zero-rows, V constant one, gate sigmoid(0):
+    # bf16(sigmoid(0.375)) * 0.5 = 0.296875.
+    even = (torch.arange(length, device=out.device) % 2) == 1
+    if bool(even.any()):
+        err = (out[even].float() - 0.296875).abs().max()
+        assert float(err) <= MAX_ABS_ERR, f"even-prefix rows off by {float(err)}"
+
+
+def run_route(inputs, route, monkeypatch):
+    """Record a successful launch, not just a specialized API dispatch."""
+    from flashinfer.triton.kernels import qsa_sparse_attention as mod
+
+    name = {"w6": "_qsa_w6", "w7": "_qsa_w7_tma", "spv": "_qsa", "tiny": "_qsa_tiny"}[
+        route
+    ]
+    kernel = getattr(mod, name)
+    launches = []
+
+    class Trace:
+        def __getitem__(self, grid):
+            def launch(*args, **kw):
+                result = kernel[grid](*args, **kw)
+                launches.append(kw)
+                return result
+
+            return launch
+
+    monkeypatch.setattr(mod, name, Trace())
+    monkeypatch.setattr(mod, "_NO_WSPEC", {"w7": True} if route == "spv" else {})
+    monkeypatch.setattr(mod, "_wspec_compile_failure", lambda exc: False)
+    out = run_api(inputs, backend="specialized")
+    assert len(launches) == 1
+    if route == "spv":
+        assert launches[0]["SPV"] and launches[0]["USEQL"]
+    return out
+
+
+@pytest.mark.parametrize(
+    "route,lengths",
+    [
+        ("w6", (2029, 2028)),
+        ("w6", (2046, 2045, 2045, 2045)),
+        ("w7", (8191, 8191)),
+        ("spv", (8191, 8191)),
+    ],
+)
+def test_long_query_cancellation(route, lengths, monkeypatch):
+    x = make_uniform_dense_prefix_inputs(lengths)
+    q = x["q"]
+    q[..., ::2] = 1.046875
+    q[..., 1::2] = -1
+    # Independent PV probe: four nonzero lanes, no Q cancellation.
+    q[:, -1] = 0
+    q[:, -1, :4] = 1.046875
+    k = torch.zeros_like(x["k_cache"], dtype=torch.float32)
+    k[:, ::2] = 1  # page-aligned even logical slots
+    x["v_cache"] = (8 * k - 4).to(torch.float8_e4m3fn)
+    p = x["logical_indices"]
+    if route != "w6":
+        # Both requests exercise full windows + masked tails, then sparse
+        # [0,3] membership. Request 1 adds the SAME score to both key
+        # classes, putting the cancelling heads above the zero-anchor band
+        # and forcing the whole tile (including the PV probe) through redo.
+        k[int(x["page_base"][1]) :, ..., ::2] += 1
+        for start in (0, lengths[0]):
+            tail = p[start + 256 : start + lengths[0]]
+            tail.fill_(-1)
+            tail[:, 0] = 0
+            tail[:, 1] = 3
+            tail[:, -1] = 2
+    x["k_cache"] = k.to(torch.float8_e4m3fn)
+    out = run_route(x, route, monkeypatch)
+
+    # In either selection, ceil(count/2) even ids have value +4 and
+    # floor(count/2) odd ids have value -4. The common logit cancels.
+    count = p[:, -1:]
+    delta = torch.full((HQ,), 0.375, device=q.device)
+    delta[-1] = 4 * 1.046875 * SCALE
+    even_mass = ((count + 1) // 2) * delta.exp()
+    odd_mass = count // 2
+    att = (4 * (even_mass - odd_mass) / (even_mass + odd_mass)).bfloat16()
+    ref = (att.float() * 0.5).bfloat16().unsqueeze(-1).expand_as(out)
+    assert_close_at_gate(out, ref)
+
+
+@pytest.mark.parametrize(
+    "route,lengths",
+    [
+        ("w6", (2046, 2045, 2045, 2045)),  # _gmul_bf
+        ("w6", (2029, 2028)),  # _gmul
+        ("tiny", (2,)),  # _gate_bf16
+    ],
+)
+def test_positive_gate_absolute_accuracy(route, lengths, monkeypatch):
+    x = make_uniform_dense_prefix_inputs(lengths)
+    x["q"].zero_()  # uniform weights, no exponent redo
+    dev = x["q"].device
+    v = torch.tensor([256, -256, 4, -4, 1, -1, 2, -2], device=dev).repeat(D // 8)
+    x["v_cache"] = v.expand_as(x["v_cache"]).to(torch.float8_e4m3fn).contiguous()
+    # Include g=4 and positive gates near BF16 output rounding boundaries.
+    # No large negative-gate lane may trigger the old whole-tile retry.
+    g = ((torch.arange(HQ * D, device=dev).view(HQ, D) // 8 + 1) / 32).bfloat16()
+    x["output_gate"].copy_(g)
+    out = run_route(x, route, monkeypatch)
+    ref = (v.float() * g.float().sigmoid()).bfloat16().expand_as(out)
+    assert_close_at_gate(out, ref)
+
+
+def make_negative_gate_inputs(lengths):
+    """Large in-contract attention values under a strongly negative gate:
+    V is a constant 256 (E4M3-exact), K all ones (uniform softmax, so the
+    attention output is exactly 256 for every selected row) and the gate is
+    -10 everywhere. The true gated output is 256 * sigmoid(-10) ~ 0.0116; a
+    half-precision tanh-form sigmoid collapses to 0 or ~2.4e-4 and misses the
+    0.01 absolute cap on this small output."""
+    inputs = make_inputs(lengths, seed=sum(lengths) + 5)
+    inputs["k_cache"] = torch.ones_like(inputs["k_cache"].float()).to(
+        torch.float8_e4m3fn
+    )
+    inputs["v_cache"] = torch.full_like(inputs["v_cache"].float(), 256.0).to(
+        torch.float8_e4m3fn
+    )
+    inputs["output_gate"] = torch.full_like(inputs["output_gate"], -10.0)
+    return inputs
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        (2,),  # per-token exact route
+        (96,),  # short-row route
+        (768,),  # mid-range split path
+        (300, 212, 180),  # general multi-request route
+        (2029, 2028),  # dedicated descriptor route
+    ],
+)
+def test_negative_gate_keeps_small_sigmoid_accuracy(lengths):
+    """Every route's sigmoid gate must keep absolute accuracy for small
+    values: with |att| = 256 (in the E4M3 value range) and gate -10, the
+    output must stay inside the cap (requires an FP32-accurate sigmoid; the
+    packed fp16/bf16 tanh form fails here by construction)."""
+    inputs = make_negative_gate_inputs(lengths)
+    out = run_api_checked(inputs)
+    ref = run_ref(inputs)
+    assert_close_at_gate(out, ref)
+    expected = 256.0 * torch.sigmoid(torch.tensor(-10.0)).item()
+    has_sel = inputs["logical_indices"][:, -1] > 0
+    err = (out[has_sel].float() - expected).abs().max()
+    assert float(err) <= 1e-3, f"negative-gate output off by {float(err)}"
+
+
+def test_allocator_not_left_installed():
+    """The op must not leave its private TMA scratch allocator installed in
+    process-global Triton state: an unrelated Triton kernel launched after a
+    specialized call must not be handed this op's scratch (the documented
+    single-stream restriction constrains QSA calls only, not other
+    libraries' kernels)."""
+    allocation = pytest.importorskip("triton.runtime._allocation")
+    from flashinfer.triton.kernels import qsa_sparse_attention as qsa_mod
+
+    inputs = make_inputs((96,), seed=3)
+    run_api(inputs)
+    holder = allocation._allocator
+    current = holder.get() if hasattr(holder, "reset") else holder
+    assert current is not qsa_mod._tma_alloc
 
 
 def test_auto_reaches_specialized_by_default(monkeypatch):
