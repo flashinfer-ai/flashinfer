@@ -19,6 +19,7 @@ pinned here without a GPU: the parallel-state and length bounds of every tier
 of each capability, and the ``max_seqlen`` hint against the mean estimate.
 """
 
+import numpy as np
 import pytest
 import torch
 
@@ -27,6 +28,7 @@ import flashinfer.gdn_paged as gdn_paged
 from flashinfer.gdn_paged import (
     _CAKE_GDN_PAGED_AUTO_BANDS,
     _cake_cp_paged_rejection_reason,
+    _chunk_gated_delta_rule_paged_cake_cp,
     _paged_auto_picks_cake,
     _paged_auto_uses_cake,
 )
@@ -195,7 +197,15 @@ class _FakeCudaTensor:
         # A hint below ceil(total / num_seqs), which the Cake route rejects.
         (True, 2047, False),
         (True, 0, False),
+        # Any integer type is a hint; bool and float are not.
+        (True, np.int64(2048), True),
+        (True, np.int32(4096), True),
+        (True, np.int64(2047), False),
+        (False, np.int64(4096), False),
+        (True, True, False),
+        (True, False, False),
         (True, 2048.0, False),
+        (True, np.float64(4096), False),
     ],
 )
 def test_auto_needs_aligned_prefixes_and_a_valid_hint(
@@ -238,3 +248,33 @@ def test_auto_falls_back_when_the_route_rejects(monkeypatch):
         max_seqlen=None,
         aligned_prefixes=True,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_seqlen", [True, False, 2048.0, np.float64(2048), "2048"])
+def test_cake_gdn_rejects_a_non_integer_hint(max_seqlen):
+    """backend="cake_gdn" raises a ValueError for a hint that is not an integer,
+    before it touches any tensor."""
+    q = torch.zeros(64, 2, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="max_seqlen must be an integer"):
+        _chunk_gated_delta_rule_paged_cake_cp(
+            q,
+            q,
+            q,
+            None,
+            None,
+            None,
+            cu_seqlens=torch.tensor([0, 64], dtype=torch.int32),
+            state_pool=torch.zeros(2, 2, 128, 128),
+            page_indices=torch.zeros(1, dtype=torch.int32),
+            page_size=64,
+            slots=None,
+            use_qk_l2norm_in_kernel=False,
+            output=None,
+            gate_domain="linear",
+            use_gate_in_kernel=False,
+            A_log=None,
+            dt_bias=None,
+            beta_is_logit=False,
+            max_seqlen=max_seqlen,
+        )

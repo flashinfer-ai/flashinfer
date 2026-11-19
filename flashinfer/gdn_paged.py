@@ -28,6 +28,7 @@ and write rows; nothing synchronizes with the host.
 """
 
 import math
+import numbers
 from typing import Literal, NamedTuple, Optional
 
 import torch
@@ -303,6 +304,14 @@ def _cake_cp_paged_rejection_reason(
     return _gdn_cp_paged_rejection_reason(q, k, v, state_pool, page_size=page_size)
 
 
+def _integral_hint(max_seqlen: object) -> Optional[int]:
+    """``max_seqlen`` as an ``int`` if it is an integer (any
+    ``numbers.Integral`` but ``bool``, e.g. ``numpy.int64``), else ``None``."""
+    if isinstance(max_seqlen, bool) or not isinstance(max_seqlen, numbers.Integral):
+        return None
+    return int(max_seqlen)
+
+
 def _paged_auto_uses_cake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -320,11 +329,12 @@ def _paged_auto_uses_cake(
     route accepts the call. Reads host metadata only: no synchronization."""
     if not aligned_prefixes or q.device.type != "cuda" or num_seqs <= 0:
         return False
-    # The Cake route rejects a hint below the mean new tokens per sequence.
-    if max_seqlen is not None and (
-        type(max_seqlen) is not int or max_seqlen < -(-q.size(0) // num_seqs)
-    ):
-        return False
+    # The Cake route rejects a hint that is not an integer or is below the
+    # mean new tokens per sequence.
+    if max_seqlen is not None:
+        max_seqlen = _integral_hint(max_seqlen)
+        if max_seqlen is None or max_seqlen < -(-q.size(0) // num_seqs):
+            return False
     if not _paged_auto_picks_cake(
         capability=get_compute_capability(q.device),
         num_seqs=num_seqs,
@@ -362,6 +372,14 @@ def _chunk_gated_delta_rule_paged_cake_cp(
     beta_is_logit: bool,
     max_seqlen: Optional[int],
 ) -> torch.Tensor:
+    if max_seqlen is not None:
+        hint = _integral_hint(max_seqlen)
+        if hint is None:
+            raise ValueError(
+                'backend="cake_gdn": max_seqlen must be an integer, got '
+                f"{type(max_seqlen).__name__}"
+            )
+        max_seqlen = hint
     reason = _cake_cp_paged_rejection_reason(q, k, v, state_pool, page_size)
     if reason is not None:
         raise ValueError(f'backend="cake_gdn": {reason}')
@@ -548,9 +566,10 @@ def chunk_gated_delta_rule_paged(
           ``ceil(total_seq_len / num_seqs)``.
 
         The choice reads only host metadata (shapes, dtypes, the device, the
-        ``output`` buffer's layout and address, ``max_seqlen`` and
-        ``aligned_prefixes``), so it does not synchronize and is safe in a
-        CUDA graph. When it picks ``"cake_gdn"``, the results are not bitwise
+        layouts and addresses of ``q``, ``k``, ``v``, ``state_pool`` and
+        ``output``, ``page_size``, ``max_seqlen``, ``aligned_prefixes`` and
+        the CUDA toolkit version), so it does not synchronize and is safe in
+        a CUDA graph. When it picks ``"cake_gdn"``, the results are not bitwise
         those of ``"flashinfer"``.
     max_seqlen : int, optional
         With ``backend="cake_gdn"``, an upper bound of the new tokens of any
@@ -559,8 +578,10 @@ def chunk_gated_delta_rule_paged(
         tokens of a sequence is undefined behavior; it is checked only with
         ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``, where it fails a device
         assert, and a value below ``ceil(total_seq_len / num_seqs)`` raises.
-        With ``backend="auto"`` it also sets the length the choice reads; a
-        value below ``ceil(total_seq_len / num_seqs)`` runs ``"flashinfer"``.
+        Any integer type (e.g. ``numpy.int64``) is accepted; a ``bool`` or a
+        float raises ``ValueError``. With ``backend="auto"`` it also sets the
+        length the choice reads; a value below ``ceil(total_seq_len /
+        num_seqs)``, a ``bool`` or a float runs ``"flashinfer"``.
         When ``"auto"`` may pick ``"cake_gdn"`` (``aligned_prefixes=True``),
         a given value must be a true upper bound, as for ``"cake_gdn"``.
         ``"flashinfer"`` ignores it.

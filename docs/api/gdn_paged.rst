@@ -110,9 +110,10 @@ Backends
   to 48, by device) and the longest sequence is long enough (2048 to 6144 new
   tokens, more for more states); otherwise it runs ``"flashinfer"``. Without
   ``aligned_prefixes=True``, ``"auto"`` always runs ``"flashinfer"``. The
-  choice reads only host metadata: shapes, dtypes, the device, the layout and
-  address of an ``output`` buffer, ``max_seqlen`` and ``aligned_prefixes``. It
-  does not synchronize, so it is safe in a CUDA graph. The ``backend``
+  choice reads only host metadata: shapes, dtypes, the device, the layouts and
+  addresses of ``q``, ``k``, ``v``, ``state_pool`` and ``output``,
+  ``page_size``, ``max_seqlen``, ``aligned_prefixes`` and the CUDA toolkit
+  version. It does not synchronize, so it is safe in a CUDA graph. The ``backend``
   parameter of the function gives the exact rule.
 
 Slot arguments of ``chunk_gated_delta_rule``

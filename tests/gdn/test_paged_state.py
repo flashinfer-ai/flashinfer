@@ -32,6 +32,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -2650,6 +2651,8 @@ def _run_auto_against(
         ([4096, 4160], (2, 2, 4), 4096, True, "flashinfer"),
         # The hint lifts a balanced batch of 1024-token sequences into the band.
         ([1024, 1024], (2, 2, 4), 2048, True, "cake_gdn"),
+        # Any integer type is a hint, for "auto" and for "cake_gdn" alike.
+        ([1024, 1024], (2, 2, 4), np.int64(2048), True, "cake_gdn"),
         # Without the hint the mean estimate (1024) keeps it out.
         ([1024, 1024], (2, 2, 4), None, True, "flashinfer"),
         # Long sequences, but 16 x 4 = 64 states run in parallel.
