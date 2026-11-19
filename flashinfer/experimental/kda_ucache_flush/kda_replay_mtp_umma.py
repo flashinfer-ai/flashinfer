@@ -53,7 +53,12 @@ a time: S_half <- bf16(bdec . S0_half + F) in place in SMEM (per-channel bdec), 
 TMA store of the half back to the pool slot. Consumer order on flush rows: RMW of half
 0 -> epilogue -> RMW of half 1 (the fold UMMA of half 1 hides behind the epilogue).
 
-Status (stage S3b): T in {4, 8}, w_ring = 16, one head per CTA.
+w_ring = 32 (window up to 28 slots): a second 16-slot j-block (K~ + 4096 B, C + 512 B,
+D cols 40..47) built and multiplied only when P > 16 (CTA-uniform), so shallow
+windows issue exactly the w_ring = 16 work; u is read from the ring per row (ldg)
+by default instead of the SMEM window copy.
+
+Status (stage S3c): T in {4, 8}, w_ring in {16, 32}, one head per CTA.
 """
 
 from __future__ import annotations
@@ -85,7 +90,7 @@ _EPS = 1e-6  # inside the L2-norm rsqrt, as the HMMA kernel
 _TMEM_COLS = 128
 _MIN_BLOCKS_PER_SM = 4  # 128 of the 512 TMEM columns, ~54 KB SMEM, 80 registers
 # TMEM columns: H = R + Y (readout + history) at 0..15, D (raw u, bf16 pairs) at
-# 32..39 for window slots j 0..15.
+# 32..39 for window slots j 0..15 and 40..47 for j 16..31 (w_ring = 32).
 _COL_H = 0
 _COL_D = 32
 _COL_F = 64  # fold F = D . K~ for the current state K half (64 columns)
@@ -100,7 +105,7 @@ _LAUNCHES = 0
 
 # Stage-supported configurations; widened as the kernel grows.
 _SUPPORTED_T: frozenset = frozenset({4, 8})
-_SUPPORTED_W_RING: frozenset = frozenset({16})
+_SUPPORTED_W_RING: frozenset = frozenset({16, 32})
 _KERNEL_IMPLEMENTED = True
 
 
@@ -388,6 +393,89 @@ def _bulk_g2s_if(
     )
 
 
+def _kt_block1(kc_row, gc_row, gp_addr, kt_addr, base, P, jr, c8):
+    """w_ring = 32: K~ j-block 1 (window slots j = 16..31, zero rows past P) into
+    s_kt + 4096, the same per-thread map and arithmetic as block 0. Call only when
+    P > 16 (CTA-uniform); its ring loads are issued here, not hoisted, so the w16 /
+    shallow-window path keeps its registers."""
+    j = 16 + jr
+    kpred = Int32(j < P)
+    kslot = (base + j) & RING_MASK
+    ka_ = kc_row + Int64((kslot * K_DIM + c8 * 8) * 2)
+    kraw = [U.ldg_v4_if(kpred, ka_), U.ldg_v4_if(kpred, ka_ + Int64(128))]
+    ga_ = gc_row + Int64((kslot * K_DIM + c8 * 8) * 4)
+    gj = []
+    for gk in range(2):
+        for i4 in range(2):
+            gj += _ldg_f32x4_if(kpred, ga_ + Int64(gk * 256 + i4 * 16))
+    for gk in range(2):
+        gpv = _lds_f32x4(gp_addr + (gk * 64 + c8 * 8) * 4) + _lds_f32x4(
+            gp_addr + (gk * 64 + c8 * 8 + 4) * 4
+        )
+        kw = []
+        for i in range(4):
+            w0 = _exp(gpv[2 * i] - gj[gk * 8 + 2 * i])
+            w1 = _exp(gpv[2 * i + 1] - gj[gk * 8 + 2 * i + 1])
+            pk = U.pack_bf16x2(
+                U.bf16x2_lo_f32(kraw[gk][i]) * w0,
+                U.bf16x2_hi_f32(kraw[gk][i]) * w1,
+            )
+            kw.append(_sel(kpred != 0, pk, Uint32(0), Uint32))
+        U.sts_v4(
+            kt_addr + 4096 + gk * 2048 + jr * 128 + ((c8 ^ (jr % 8)) * 16),
+            kw[0],
+            kw[1],
+            kw[2],
+            kw[3],
+        )
+
+
+def _c_ntile_block1(nt, lane, a_ln, kt_addr, c_addr):
+    """w_ring = 32: C n-tile nt in {2, 3} (window slots 8 nt .. 8 nt + 7, j-block 1) =
+    X_c . K~^T by mma.sync, packed to bf16 into the SW32 j-block 1 of s_c (+512 B).
+    Same fragment addressing as the block-0 tiles. Call only when P > 16."""
+    grp = lane >> 2
+    c4 = lane & 3
+    acc = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+    jl = 8 * (nt % 2) + (lane % 8)  # row of K~ j-block 1
+    kt_row = kt_addr + 4096 + jl * 128
+    for ks in range(8):
+        fa = _ldmatrix_x4(a_ln + ks * 32)
+        chunk = ks * 2 + ((lane // 8) % 2)
+        fb = _ldmatrix_x2(
+            kt_row + (chunk // 8) * 2048 + (((chunk % 8) ^ (jl % 8)) * 16)
+        )
+        acc = U.mma_bf16_16816(fa[0], fa[1], fa[2], fa[3], fb[0], fb[1], acc)
+    jc = 8 * (nt % 2) + 2 * c4
+    cb = c_addr + 512
+    _sts_u32(cb + _c_sw32_off(grp, jc), U.pack_bf16x2(acc[0], acc[1]))
+    _sts_u32(cb + _c_sw32_off(grp + 8, jc), U.pack_bf16x2(acc[2], acc[3]))
+    cute.arch.fence_view_async_shared()  # read by the j-block 1 history UMMA
+
+
+def _d_block1(use_smem, u_ptr, base, P, ct, tbase):
+    """w_ring = 32: D columns 40..47 = raw u of window slots j = 16..31 (zero past
+    P), from the SMEM window (u_ptr = this row's s_uwin byte address) or the ring
+    (u_ptr = this row's u_cache[sidx, h, 0, row] address). Call only when P > 16."""
+    uv = []
+    for j in range(16, 32):
+        if use_smem:
+            uv.append(U.lds_u16(u_ptr + j * (V_DIM * 2)))
+        else:
+            uv.append(
+                _ldg_u16_if(
+                    Int32(j < P),
+                    u_ptr + Int64(((base + j) & RING_MASK) * (V_DIM * 2)),
+                )
+            )
+    words = []
+    for i in range(8):
+        lo = _sel(16 + 2 * i < P, uv[2 * i], Uint32(0), Uint32)
+        hi = _sel(16 + 2 * i + 1 < P, uv[2 * i + 1], Uint32(0), Uint32)
+        words.append(lo | (hi << Uint32(16)))
+    U.tmem_st_u32(ct, tbase + _COL_D + 8, words)
+
+
 def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone):
     """Flush rows: S_half <- bf16(bdec . S0_half + F) in place on state K half g (TMEM
     F at cols 64..127, this thread's V row = TMEM lane), then publish the half to warp
@@ -428,7 +516,7 @@ def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone):
 class KdaReplayMtpUmma:
     def __init__(self, T: int, h: int, w_ring: int = 16, u_src: str = "smem"):
         assert T in (4, 8), T
-        assert w_ring == 16, w_ring  # w_ring = 32 (NJB = 2) is stage S3
+        assert w_ring in (16, 32), w_ring
         assert u_src in ("smem", "ldg"), u_src
         self.T = T
         self.h = h
@@ -534,6 +622,7 @@ class KdaReplayMtpUmma:
         NP = (T2 + 7) // 8  # row-layout passes (8 X rows per pass)
         WR = self.w_ring
         USE_SMEM_U = self.u_src == "smem"
+        NJB = WR // 16  # 16-slot window j-blocks (2 at w_ring = 32)
 
         tid, _, _ = cute.arch.thread_idx()
         h, brow, _ = cute.arch.block_idx()
@@ -554,9 +643,10 @@ class KdaReplayMtpUmma:
         s_x = smem.allocate_tensor(
             cutlass.Uint16, cute.make_layout(16 * K_DIM), byte_alignment=1024
         )
-        # K~: window keys w_j . k̂_j (j < P, else 0), one 16-row j-block, same layout
+        # K~: window keys w_j . k̂_j (j < P, else 0), NJB 16-row j-blocks 4096 B apart,
+        # same layout
         s_kt = smem.allocate_tensor(
-            cutlass.Uint16, cute.make_layout(16 * K_DIM), byte_alignment=1024
+            cutlass.Uint16, cute.make_layout(NJB * 16 * K_DIM), byte_alignment=1024
         )
         # X_c (16 rows) and Ktil (8 rows), row-major, 272 B pitch (ldmatrix conflict-free)
         s_xc = smem.allocate_tensor(
@@ -565,9 +655,9 @@ class KdaReplayMtpUmma:
         s_ktil = smem.allocate_tensor(
             cutlass.Uint16, cute.make_layout(8 * XC_PITCH // 2), byte_alignment=128
         )
-        # C: history B operand, SW32 [16 x][16 j] bf16
+        # C: history B operand, SW32 [16 x][16 j] bf16 per j-block (512 B apart)
         s_c = smem.allocate_tensor(
-            cutlass.Uint16, cute.make_layout(16 * 16), byte_alignment=256
+            cutlass.Uint16, cute.make_layout(NJB * 16 * 16), byte_alignment=256
         )
         if cutlass.const_expr(USE_SMEM_U):
             # u window [j][V] bf16, rows j < P bulk-copied by warp 0
@@ -743,6 +833,16 @@ class KdaReplayMtpUmma:
             U.fence_after_sync()
             if P > 0:
                 U.umma_ts(tbase + _COL_H, tbase + _COL_D, c_desc, id_r, True)
+            if cutlass.const_expr(WR == 32):
+                # window slots 16..31: D cols 40..47 x C j-block 1
+                if P > 16:
+                    U.umma_ts(
+                        tbase + _COL_H,
+                        tbase + _COL_D + 8,
+                        U.sdesc_sw32(Uint64((c_addr + 512) >> 4)),
+                        id_r,
+                        True,
+                    )
             U.umma_commit(mma_done)
             if is_flush:
                 # fold F = D . K~ per state K half into cols 64..127. The commit of half
@@ -750,6 +850,16 @@ class KdaReplayMtpUmma:
                 # once f_mma_a completes. Half 1 reuses the F columns after the RMW of
                 # half 0 has read them (f_epi_a).
                 U.umma_ts(tbase + _COL_F, tbase + _COL_D, kt_desc, id_f, False)
+                if cutlass.const_expr(WR == 32):
+                    # flush rows at w32 have P >= flush_min > 16 (dispatcher check),
+                    # so j-block 1 (K~ + 4096 B, D cols 40..47) is always live here
+                    U.umma_ts(
+                        tbase + _COL_F,
+                        tbase + _COL_D + 8,
+                        kt_desc + Uint64(4096 >> 4),
+                        id_f,
+                        True,
+                    )
                 U.umma_commit(f_mma_a)
                 cute.arch.mbarrier_wait(f_epi_a, 0)
                 U.fence_after_sync()
@@ -760,6 +870,14 @@ class KdaReplayMtpUmma:
                     id_f,
                     False,
                 )
+                if cutlass.const_expr(WR == 32):
+                    U.umma_ts(
+                        tbase + _COL_F,
+                        tbase + _COL_D + 8,
+                        kt_desc + Uint64((2048 + 4096) >> 4),
+                        id_f,
+                        True,
+                    )
                 U.umma_commit(f_mma_b)
             cute.arch.mbarrier_wait(tmem_done, 0)
             U.fence_after_sync()
@@ -898,6 +1016,9 @@ class KdaReplayMtpUmma:
                     kw[2],
                     kw[3],
                 )
+            if cutlass.const_expr(WR == 32):
+                if P > 16:
+                    _kt_block1(kc_row, gc_row, gp_addr, kt_addr, base, P, jr, c8)
             _bar_sync_ua(1, 128)
 
             # -------- P4: mma.sync Grams. warp cw 0: Gq = X_c . Ktil^T (fp32, s_gram);
@@ -918,6 +1039,9 @@ class KdaReplayMtpUmma:
                 s_gram[grp * 8 + 2 * c4 + 1] = acc[1]
                 s_gram[(grp + 8) * 8 + 2 * c4] = acc[2]
                 s_gram[(grp + 8) * 8 + 2 * c4 + 1] = acc[3]
+                if cutlass.const_expr(WR == 32):
+                    if P > 16:
+                        _c_ntile_block1(3, lane, a_ln, kt_addr, c_addr)
             elif cw < 3:
                 nt = cw - 1
                 acc = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
@@ -939,6 +1063,10 @@ class KdaReplayMtpUmma:
                 )
                 # C is read by the history UMMA (warp 1 issues it after d_ready)
                 cute.arch.fence_view_async_shared()
+            else:
+                if cutlass.const_expr(WR == 32):
+                    if P > 16:
+                        _c_ntile_block1(2, lane, a_ln, kt_addr, c_addr)
             _bar_sync_ua(1, 128)
 
             # -------- P5: intra-step coefficient tables (fp32, masked by select)
@@ -962,12 +1090,14 @@ class KdaReplayMtpUmma:
                 if P > 0:
                     cute.arch.mbarrier_wait(u_full, 0)
                 ub = s_uwin.iterator.toint() + row * 2
+                u_ptr = ub
                 for j in cutlass.range_constexpr(16):
                     uv.append(U.lds_u16(ub + j * (V_DIM * 2)))
             else:
                 ucr = u_cache.iterator.toint() + Int64(
                     cute.crd2idx((sidx, h, 0, row), u_cache.layout)
                 ) * Int64(2)
+                u_ptr = ucr
                 for j in cutlass.range_constexpr(16):
                     uv.append(
                         _ldg_u16_if(
@@ -984,6 +1114,9 @@ class KdaReplayMtpUmma:
             U.fence_after_sync()
             tbase = tmem_addr[0]
             U.tmem_st_u32(ct, tbase + _COL_D, words)
+            if cutlass.const_expr(WR == 32):
+                if P > 16:
+                    _d_block1(USE_SMEM_U, u_ptr, base, P, ct, tbase)
             U.tmem_wait_st()
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(d_ready)

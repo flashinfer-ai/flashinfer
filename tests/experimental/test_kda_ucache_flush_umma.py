@@ -38,22 +38,14 @@ from . import test_kda_ucache_flush as _base
 from .test_kda_ucache_flush import *  # noqa: F401,F403  re-collects all base cases
 from .test_kda_ucache_flush import _load_flush, _make_case
 
-# Base tests the UMMA backend cannot run yet at the current stage. MUST be
-# empty once the kernel covers T in {4, 8} x w_ring in {16, 32} (stage S3).
-# S3b: verify and flush rows at T in {4, 8} / w_ring=16; every w_ring=32 test is
-# pending.
-_PENDING_NAMES: set = {
-    "test_w32_output_and_fold_match_fp32_reference",
-    "test_w32_tma_late_forced",
-    "test_w32_strong_decay_deep_window",
-    "test_w32_equivalence_with_w16_at_shallow_windows",
-    "test_w32_deep_window_repeat_determinism",
-}
+# Base tests the UMMA backend cannot run yet at the current stage. Empty since
+# stage S3c: the kernel covers T in {4, 8} x w_ring in {16, 32}.
+_PENDING_NAMES: set = set()
 
 
 def _PENDING_PARAMS(params: dict) -> bool:
-    """Per-parameter pending filter: w_ring=32 cases (S3b)."""
-    return params.get("w_ring") == 32
+    """Per-parameter pending filter (nothing pending since S3c)."""
+    return False
 
 
 @pytest.fixture(autouse=True)
@@ -319,3 +311,28 @@ def test_umma_u_src_smem_vs_ldg_bitwise(t, monkeypatch):
         strict=True,
     ):
         assert torch.equal(a, b), f"u_src smem vs ldg differ on {name}"
+
+
+@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("w_ring", [16, 32])
+def test_umma_history_dominated_matches_fp32_reference(t, w_ring):
+    """History-dominated case: every live window key is (a normalized copy
+    of) the step's own first key and q = k, so k̂_j . k̂_t ~ 1 and every window
+    slot's u_j reaches y and the u update at full weight. With the random
+    keys of the base cases a dropped window slot moves y by about
+    |u| / sqrt(K) * SCALE, below Y_TOL; here it moves y by O(|u| * SCALE),
+    so a missing or misplaced j-block (w_ring=32: slots 16..31) fails the
+    fp32 oracle check. Shallow / deep verify rows and fold rows."""
+    fm, cap = _fm(t, w_ring), min(w_ring, 32 - t)
+    hist = [0, fm - 1, cap, fm, 3, max(fm - 5, 1)]
+    bases = [30, 0, 27, 5, 31, 12]
+    case = list(_make_case(len(hist), hist, seed=1717 + t + w_ring, bases=bases, t=t))
+    q, k, kc = case[0], case[1], case[8]
+    q.copy_(k)
+    for r, P in enumerate(hist):
+        if P == 0:
+            continue
+        rows = torch.tensor([(bases[r] + j) % 32 for j in range(P)], device=kc.device)
+        kr = torch.nn.functional.normalize(k[r, 0].float(), dim=-1)  # [H, K]
+        kc[r, :, rows] = kr[:, None, :].expand(-1, P, -1).to(kc.dtype)
+    _base._check_case(_load_flush(), tuple(case), bases, t, flush_min=fm, w_ring=w_ring)
