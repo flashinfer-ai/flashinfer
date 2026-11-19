@@ -371,20 +371,88 @@ def test_bf16_query_range_is_preserved(backend, qmag):
     assert (y - expect).abs().max().item() <= 2e-3
 
 
-def test_sparse_mla_sm90_in_aot_collection():
-    # The stable module must ship in the SM90 prebuilt cache: a JIT-disabled
-    # install otherwise silently serves auto calls with the composable
-    # reference path instead of the advertised specialized kernel.
-    from flashinfer.aot import gen_all_modules
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_finite_scaled_logits_select_larger_latent(backend):
+    _sm90_or_skip()
+    q, kv, idx, sl, ws = _make_case(B=1, QL=1, kv_lens=(2,))
+    q.zero_()
+    q[..., 0] = 2.0**120
+    rope = torch.zeros(KPE, device=q.device)
+    _write_token(kv, 0, 256.0, [1.0] * 4, rope)
+    _write_token(kv, 1, 448.0, [1.0] * 4, rope)
+    y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=1 / 32, backend=backend)
+    # Raw dots overflow FP32. The scaled logit gap is 6 * 2^120,
+    # so the BF16 output is exactly the second token's latent.
+    torch.testing.assert_close(y, torch.full_like(y, 448.0), rtol=0, atol=0)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"]["specialized"] == 1
 
-    specs = gen_all_modules(
+
+@pytest.mark.parametrize("nq", [12, 13])
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+@pytest.mark.parametrize("qmag,kmag", [(2.0**-25, 16384.0), (16384.0, 2.0**-25)])
+def test_small_qk_component(nq, backend, qmag, kmag):
+    import math
+
+    _sm90_or_skip()
+    q = torch.zeros((1, nq, H, D), device="cuda", dtype=torch.bfloat16)
+    q[..., CKV + 1] = qmag
+    q[..., CKV + 2] = 65536.0  # unrelated large component with zero key
+    kv = torch.zeros((1, PAGE, BPT), device="cuda", dtype=torch.uint8)
+    rope = torch.zeros(KPE, device="cuda")
+    rope[1] = kmag
+    _write_token(kv, 0, 448.0, [1.0] * 4, rope)
+    _write_token(kv, 1, -448.0, [1.0] * 4, -rope)
+    idx = torch.full((1, nq, TOPK), -1, device="cuda", dtype=torch.int32)
+    idx[..., :2] = torch.arange(2, device="cuda", dtype=torch.int32)
+    sl = torch.full((1,), 2, device="cuda", dtype=torch.int32)
+    ws = torch.empty(
+        get_sparse_mla_sm90_workspace_size_bytes(1, 64),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=1.0, backend=backend)
+    expected = torch.full_like(y, 448.0 * math.tanh(2.0**-11))
+    torch.testing.assert_close(y, expected, rtol=0, atol=0.001)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "reference": 0,
+    }
+
+
+@pytest.mark.parametrize("value,scale", [(2.0**-9, 2.0**17), (448.0, 1e-8)])
+def test_dequant_scales_before_narrowing(value, scale):
+    _sm90_or_skip()
+    kv = torch.full((1, PAGE, BPT), 255, device="cuda", dtype=torch.uint8)
+    _write_token(kv, 1, value, [scale] * 4, torch.zeros(KPE, device="cuda"))
+    y = _single_row_call(kv, [(3, 1)], 0.0, 1.0, "specialized")
+    # One valid token has unit attention weight. Allow final half staging
+    # and BF16 rounding of the small product, but never its loss to zero.
+    torch.testing.assert_close(
+        y.float(), torch.full_like(y.float(), value * scale), rtol=0.01, atol=0
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_sparse_mla_sm90_in_aot_collection(monkeypatch, enabled):
+    from types import SimpleNamespace
+
+    from flashinfer import aot
+
+    # Exercise the collector, not the spec generators' local target flags.
+    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
+    for name in ("spdlog", "mla_swa_sm90", "sparse_mla_sm90", "cudnn_fmha"):
+        monkeypatch.setattr(
+            aot, f"gen_{name}_module", lambda n=name: SimpleNamespace(name=n)
+        )
+
+    specs = aot.gen_all_modules(
         [],
         [],
         [],
         [],
         [False],
         [False],
-        {"sm90": True},
+        {"sm90": enabled},
         False,
         False,
         False,
@@ -393,7 +461,44 @@ def test_sparse_mla_sm90_in_aot_collection():
         False,
         False,
     )
-    assert "sparse_mla_sm90" in [s.name for s in specs]
+    assert ("sparse_mla_sm90" in [s.name for s in specs]) == enabled
+
+
+def test_cold_probe_failure_and_retry(monkeypatch):
+    from flashinfer.mla import _sparse_mla_sm90 as impl
+
+    _sm90_or_skip()
+    args = _make_case(B=1, QL=1, kv_lens=(2,))
+    monkeypatch.setattr(impl, "_device_supported_cache", {})
+    with monkeypatch.context() as cold:
+        # Bypass any warmed module cache, preserving the real capture guard.
+        cold.setattr(impl, "_get_module", impl._get_module.__wrapped__)
+
+        def unavailable():
+            raise RuntimeError("injected build failure")
+
+        cold.setattr(impl, "gen_sparse_mla_sm90_module", unavailable)
+        y = sparse_mla_decode_sm90(*args, backend="auto", sm_scale=SM_SCALE)
+        torch.testing.assert_close(y, _ref(*args[:3]), atol=0.002, rtol=0.005)
+        with pytest.raises(
+            NotImplementedError, match="JIT build failed.*never falls back"
+        ):
+            sparse_mla_decode_sm90(*args, backend="specialized", sm_scale=SM_SCALE)
+        stats = _sparse_mla_sm90_stats()
+        assert stats["fallback_reasons"] == {
+            "auto: JIT build failed (RuntimeError)": 1,
+            "specialized: JIT build failed (RuntimeError)": 1,
+        }
+        assert stats["backend_dispatches"] == {"reference": 1, "specialized": 0}
+        cold.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="Warm up.*before CUDA Graph capture"):
+            sparse_mla_decode_sm90(*args, backend="auto", sm_scale=SM_SCALE)
+
+    sparse_mla_decode_sm90(*args, backend="auto", sm_scale=SM_SCALE)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
+        "reference": 1,
+        "specialized": 1,
+    }
 
 
 def test_specialized_off_envelope_raises():

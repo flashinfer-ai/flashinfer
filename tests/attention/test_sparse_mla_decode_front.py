@@ -204,6 +204,7 @@ def test_specialized_rejects_backend_args():
         sparse_mla_decode(
             q, kv, idx, backend="specialized", backend_args={"kv_layout": "HND"}
         )
+    assert front._sparse_mla_decode_stats()["backend_dispatches"]["specialized"] == 1
 
 
 @pytest.mark.parametrize("name", ["cuda", "cake"])
@@ -265,8 +266,14 @@ def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
     import flashinfer.mla._sparse_mla_sm120 as sm120mod
 
     monkeypatch.setattr(sm120mod, "SparseMLASm120Wrapper", FakeRunner)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0, raising=False)
-    front._sm120_runners.clear()
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    handle = 1
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=handle)
+    )
+    monkeypatch.setattr(front, "_sm120_runners", {})
     topk = torch.full((3,), 16, dtype=torch.int32)
     out1 = sparse_mla_decode(
         q,
@@ -295,4 +302,14 @@ def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
     # Allocated latent-space output: bf16, d_v=512 by default.
     assert out1.shape == (3, 8, 512) and out1.dtype == torch.bfloat16
     assert out2.shape == (3, 8, 512)
-    front._sm120_runners.clear()
+    handle = 2
+    sparse_mla_decode(
+        q,
+        kv,
+        idx,
+        sm_scale=0.0625,
+        backend="cuda",
+        backend_args={"topk_length": topk, "kv_cache_format": "fp8"},
+    )
+    assert len(made) == 2
+    assert len(runner.runs) == 2

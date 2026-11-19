@@ -156,9 +156,8 @@ def _auto_routes(query: torch.Tensor, nq: int) -> Tuple[bool, Optional[str]]:
         return False, f"dispatch allowlist invalid ({type(exc).__name__}: {exc})"
     if not routed:
         return False, "shape off the auto-routing allowlist"
-    if query.device.type != "cuda" or not _device_supported(query.device):
-        return False, "device unsupported (needs SM90 + 94624B smem opt-in)"
-    return True, None
+    reason = _device_refusal(query.device)
+    return reason is None, reason
 
 
 def _backend_order(requested: str, auto_routed: bool) -> Tuple[str, ...]:
@@ -323,6 +322,10 @@ _device_supported_cache: Dict[torch.device, bool] = {}
 
 
 def _device_supported(device: torch.device) -> bool:
+    return _device_refusal(device) is None
+
+
+def _device_refusal(device: torch.device) -> Optional[str]:
     # HW eligibility first (no module build), then the module's own probe.
     # A failed JIT build (e.g. FLASHINFER_DISABLE_JIT=1 with no cached
     # module) reports "unsupported" without settling the verdict: "auto"
@@ -330,12 +333,15 @@ def _device_supported(device: torch.device) -> bool:
     # "specialized" raises with the reason — except under CUDA-graph
     # capture, where the eager-warmup discipline stays loud — and later
     # calls retry the build.
+    unsupported = "device unsupported (needs SM90 + 94624B smem opt-in)"
+    if device.type != "cuda":
+        return unsupported
     cached = _device_supported_cache.get(device)
     if cached is not None:
-        return cached
+        return None if cached else unsupported
     if torch.cuda.get_device_capability(device) != (9, 0):
         _device_supported_cache[device] = False
-        return False
+        return unsupported
     try:
         module = _get_module()
     except Exception as exc:
@@ -348,10 +354,10 @@ def _device_supported(device: torch.device) -> bool:
             type(exc).__name__,
             str(exc)[:300],
         )
-        return False
+        return f"JIT build failed ({type(exc).__name__})"
     supported = bool(module.device_supported(device.index))
     _device_supported_cache[device] = supported
-    return supported
+    return None if supported else unsupported
 
 
 @flashinfer_api
@@ -710,25 +716,19 @@ def sparse_mla_decode_sm90(
     elif backend == "reference":
         chosen = "reference"
     elif backend == "specialized":
-        if (
-            query.ndim == 4
-            and 1 <= nq <= _MAX_NQ
-            and query.device.type == "cuda"
-            and _device_supported(query.device)
-        ):
-            chosen = "specialized"
-        else:
-            # Explicit "specialized" that cannot serve this call RAISES with
-            # the refusal reason — an explicitly selected backend never
-            # falls back; only "auto" routes around a refusal.
-            _fallback("specialized: device or token-row envelope")
+        reason = (
+            _device_refusal(query.device)
+            if 1 <= nq <= _MAX_NQ
+            else f"token-row envelope: needs 1 <= B*q_len <= {_MAX_NQ}"
+        )
+        if reason is not None:
+            _fallback(f"specialized: {reason}")
             raise NotImplementedError(
-                "sparse_mla_decode_sm90: backend='specialized' cannot serve "
-                "this call (device or token-row envelope: needs SM90 with "
-                f"the 94624B smem opt-in and 1 <= B*q_len <= {_MAX_NQ}); an "
-                "explicitly selected backend never falls back — use "
-                "backend='auto' or 'reference'"
+                f"sparse_mla_decode_sm90: backend='specialized' cannot serve "
+                f"this call ({reason}); an explicitly selected backend never "
+                "falls back — use backend='auto' or 'reference'"
             )
+        chosen = "specialized"
     else:  # "auto"
         routed, reason = _auto_routes(query, nq)
         if routed and any(

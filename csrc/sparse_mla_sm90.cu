@@ -23,9 +23,9 @@
 //
 // The device code and launch heuristic are carried from the kernel
 // validated on H200 (same-node two-arm study re-time) with two
-// review-driven numerical hardenings: (1) Q is staged to fp16 range-safely
-// (per-head exact power-of-two descale, compensated after QK), so finite
-// BF16 queries never become fp16 infinities; (2) probabilities are staged
+// numerical hardenings: (1) Q and RoPE keys retain their BF16 bits through
+// staging; QK uses TF32 operands, which represent both BF16 and the staged
+// FP16 latents without further rounding; (2) probabilities are staged
 // as exp2(s - m + 14) plus an fp16 residual plane, so ~22 mantissa bits of
 // every probability reach PV and representable output contributions are not
 // rounded away. The host binding differs only in workspace ownership
@@ -60,16 +60,52 @@ namespace {
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
-__device__ __forceinline__ uint32_t mulh2(uint32_t a, uint32_t b) {
-  uint32_t r;
-  asm("mul.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
-  return r;
-}
 __device__ __forceinline__ uint32_t fp8x2_to_f16x2(uint32_t lo16) {
   uint32_t r;
   asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)lo16));
   return r;
 }
+__device__ __forceinline__ uint32_t dequant_pair(uint32_t bytes, float scale) {
+  const uint32_t h = fp8x2_to_f16x2(bytes);
+  const float x = __half2float(__ushort_as_half(static_cast<unsigned short>(h)));
+  const float y = __half2float(__ushort_as_half(static_cast<unsigned short>(h >> 16)));
+  const __half2 v = __floats2half2_rn(x * scale, y * scale);
+  return __half_as_ushort(__low2half(v)) | (uint32_t(__half_as_ushort(__high2half(v))) << 16);
+}
+
+__device__ __forceinline__ uint32_t tf32(float x) {
+  uint32_t r;
+  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+  return r;
+}
+
+// Each packed K=16 fragment holds pairs of consecutive features. Taking
+// the same half of each pair in A and B gives the lane layout of a K=8
+// TF32 fragment: two MMAs cover the even and odd features respectively.
+template <bool ROPE>
+__device__ __forceinline__ void mma_qk(float* c, const uint32_t* a, const uint32_t* b, float qmul) {
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    uint32_t k[4], q[2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned short bits = static_cast<unsigned short>(a[i] >> (16 * j));
+      k[i] =
+          tf32(ROPE ? __uint_as_float(uint32_t(bits) << 16) : __half2float(__ushort_as_half(bits)));
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const float x = __uint_as_float((b[i] >> (16 * j)) << 16);
+      q[i] = tf32(x * qmul);
+    }
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(k[0]), "r"(k[1]), "r"(k[2]), "r"(k[3]), "r"(q[0]), "r"(q[1]));
+  }
+}
+
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -106,7 +142,7 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
   __half* psl = ps + TILE * 8;             // TILE * 8  (P fp16 residual plane)
   float* red0 = (float*)(psl + TILE * 8);  // 32
   float* red1 = red0 + 32;                 // 32
-  float* hsc = red1 + 32;                  // 8 per-head Q descale factors
+  float* hsc = red1 + 32;                  // 8 inverse Q multipliers
   int* sl = (int*)(hsc + 8);               // tps * TILE
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -156,40 +192,26 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
     }
   }
 
-  // ---- Q -> smem (fp16, one warp per head; score scaling follows QK) ----
-  // Range-safe staging: finite bf16 exceeds fp16 range, so a head whose
-  // magnitude tops 2^15 is staged scaled by an exact power of two and its
-  // scores are descaled right after QK (exact; in-range heads stage
-  // bit-identically to the unscaled path).
-  {
-    const uint32_t* qp = (const uint32_t*)(q + (size_t)row * (8 * DQ)) + warp * (DQ / 2);
-    uint32_t v[9];
-    float amax = 0.f;
+  // Keep packed BF16 in shared memory; scale only after unpacking to FP32.
+  const uint32_t* qp = (const uint32_t*)(q + (size_t)row * (8 * DQ)) + warp * (DQ / 2);
+  float amax = 0.f;
 #pragma unroll
-    for (int it = 0; it < 9; ++it) {
-      v[it] = qp[lane + it * 32];
-      const float f0 = __uint_as_float(v[it] << 16);
-      const float f1 = __uint_as_float(v[it] & 0xffff0000u);
-      amax = fmaxf(amax, fmaxf(fabsf(f0), fabsf(f1)));
-    }
-#pragma unroll
-    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-    float qsc = 1.f, inv = 1.f;
-    const int e = (amax > 0.f) ? ilogbf(amax) : 0;
-    if (e > 15) {
-      qsc = exp2f((float)(15 - e));
-      inv = exp2f((float)(e - 15));
-    }
-    if (lane == 0) hsc[warp] = inv;
-#pragma unroll
-    for (int it = 0; it < 9; ++it) {
-      const int d2 = lane + it * 32;
-      const float f0 = __uint_as_float(v[it] << 16) * qsc;
-      const float f1 = __uint_as_float(v[it] & 0xffff0000u) * qsc;
-      *(__half2*)(&qs[warp * QS + d2 * 2]) = __floats2half2_rn(f0, f1);
-    }
+  for (int it = 0; it < 9; ++it) {
+    const int d2 = lane + it * 32;
+    const uint32_t v = qp[d2];
+    ((uint32_t*)(qs + warp * QS))[d2] = v;
+    amax = fmaxf(amax, fabsf(__uint_as_float(v << 16)));
+    amax = fmaxf(amax, fabsf(__uint_as_float(v & 0xffff0000u)));
   }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  if (lane == 0) hsc[warp] = amax >= 65536.f ? exp2f(float(ilogbf(amax) - 15)) : 1.f;
   __syncthreads();
+
+  // B fragment rows read Q head l4; C columns belong to heads 2*m4 and 2*m4+1.
+  const float qmul = 1.f / hsc[l4];
+  const float qsa = qscale * hsc[2 * m4];
+  const float qsb = qscale * hsc[2 * m4 + 1];
 
   float acc[4][4];
 #pragma unroll
@@ -205,26 +227,21 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
 #pragma unroll
       for (int i = 0; i < TILE / 8; ++i) {
         __half* crow = conv + (warp * (TILE / 8) + i) * CS;
-        uint32_t hs = (uint32_t)__half_as_ushort(__float2half_rn(sc0[i]));
-        hs |= hs << 16;
         const uint32_t vm = (slots[i] < 0) ? 0u : 0xffffffffu;
         const uint4 n = nv[i];
         uint4 o;
-        o.x = mulh2(fp8x2_to_f16x2(n.x & 0xffffu), hs) & vm;
-        o.y = mulh2(fp8x2_to_f16x2(n.x >> 16), hs) & vm;
-        o.z = mulh2(fp8x2_to_f16x2(n.y & 0xffffu), hs) & vm;
-        o.w = mulh2(fp8x2_to_f16x2(n.y >> 16), hs) & vm;
+        o.x = dequant_pair(n.x & 0xffffu, sc0[i]) & vm;
+        o.y = dequant_pair(n.x >> 16, sc0[i]) & vm;
+        o.z = dequant_pair(n.y & 0xffffu, sc0[i]) & vm;
+        o.w = dequant_pair(n.y >> 16, sc0[i]) & vm;
         *(uint4*)(crow + lane * 8) = o;
         uint4 o2;
-        o2.x = mulh2(fp8x2_to_f16x2(n.z & 0xffffu), hs) & vm;
-        o2.y = mulh2(fp8x2_to_f16x2(n.z >> 16), hs) & vm;
-        o2.z = mulh2(fp8x2_to_f16x2(n.w & 0xffffu), hs) & vm;
-        o2.w = mulh2(fp8x2_to_f16x2(n.w >> 16), hs) & vm;
+        o2.x = dequant_pair(n.z & 0xffffu, sc0[i]) & vm;
+        o2.y = dequant_pair(n.z >> 16, sc0[i]) & vm;
+        o2.z = dequant_pair(n.w & 0xffffu, sc0[i]) & vm;
+        o2.w = dequant_pair(n.w >> 16, sc0[i]) & vm;
         *(uint4*)(crow + 256 + lane * 8) = o2;
-        uint32_t rv = rp[i] & vm;
-        float f0 = __uint_as_float(rv << 16);
-        float f1 = __uint_as_float(rv & 0xffff0000u);
-        *(__half2*)(crow + CKV + lane * 2) = __floats2half2_rn(f0, f1);
+        *(uint32_t*)(crow + CKV + lane * 2) = rp[i] & vm;
       }
     }
     __syncthreads();
@@ -247,12 +264,12 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         ldm_x4(A, smem_u32(ab + k * 8));
         B[0] = *(const uint32_t*)(qr + k * 16);
         B[1] = *(const uint32_t*)(qr + k * 16 + 8);
-        mma16816(s, A, B);
+        mma_qk<false>(s, A, B, qmul);
         uint32_t A1[4], B1[2];
         ldm_x4(A1, smem_u32(ab + k * 8 + 8));
         B1[0] = *(const uint32_t*)(qr + k * 16 + 16);
         B1[1] = *(const uint32_t*)(qr + k * 16 + 24);
-        mma16816(s2, A1, B1);
+        mma_qk<false>(s2, A1, B1, qmul);
       }
 #pragma unroll
       for (int k = 0; k < (DQ - CKV) / 16; k += 2) {
@@ -260,18 +277,14 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         ldm_x4(A, smem_u32(abr + k * 16));
         B[0] = *(const uint32_t*)(qr + CKV + k * 16);
         B[1] = *(const uint32_t*)(qr + CKV + k * 16 + 8);
-        mma16816(s, A, B);
+        mma_qk<true>(s, A, B, qmul);
         uint32_t A1[4], B1[2];
         ldm_x4(A1, smem_u32(abr + k * 16 + 16));
         B1[0] = *(const uint32_t*)(qr + CKV + k * 16 + 16);
         B1[1] = *(const uint32_t*)(qr + CKV + k * 16 + 24);
-        mma16816(s2, A1, B1);
+        mma_qk<true>(s2, A1, B1, qmul);
       }
-      // Per-head Q descale (exact power of two; 1.0 for in-range heads)
-      // folded into the softmax scale. C fragment columns are heads 2*m4
-      // and 2*m4+1.
-      const float qsa = qscale * hsc[2 * m4];
-      const float qsb = qscale * hsc[2 * m4 + 1];
+      // Apply the compensated softmax scale, never materializing the raw dot.
       s[0] = (s[0] + s2[0]) * qsa;
       s[1] = (s[1] + s2[1]) * qsb;
       s[2] = (s[2] + s2[2]) * qsa;
@@ -673,7 +686,7 @@ void run(TensorView q, TensorView kv_cache, TensorView indices, TensorView seq_l
   set_max_smem_attrs(static_cast<int>(q.device().device_id));
 
   size_t smem = (size_t)tile * CS * 2 + (size_t)8 * QS * 2 + (size_t)tile * 8 * 2 * 2 + 64 * 4 +
-                8 * 4 + (size_t)tps * tile * 4;
+                8 * sizeof(float) + (size_t)tps * tile * 4;
 
   __half* po = nullptr;
   float* plse = nullptr;

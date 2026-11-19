@@ -102,9 +102,9 @@ _stats: Dict[str, Any] = {
 def _sparse_mla_decode_stats() -> dict:
     """Diagnostics: per-backend dispatch counts and auto-routing census.
 
-    ``backend_dispatches`` counts front-level routing: calls handed to each
-    routed underlying public entry, not which implementation that entry then
-    ran. An SM90 ``"specialized"`` dispatch under the kill switch runs that
+    ``backend_dispatches`` counts routing attempts, including calls rejected
+    by the selected adapter before the underlying public entry is invoked.
+    An SM90 auto route to ``"specialized"`` under the kill switch runs that
     entry's composable reference path; the fused-vs-reference split lives in
     ``_sparse_mla_sm90._sparse_mla_sm90_stats()``.
     """
@@ -464,8 +464,8 @@ def sparse_mla_decode(
 
     Per-backend dispatch counts are visible through
     ``flashinfer.mla._sparse_decode._sparse_mla_decode_stats()``;
-    ``backend_dispatches`` counts front-level routing to each underlying
-    entry, while the SM90 entry's own stats distinguish its fused vs
+    ``backend_dispatches`` counts attempts, even if the adapter rejects the
+    call, while the SM90 entry's own stats distinguish its fused vs
     reference execution (e.g. under the kill switch).
     """
     args = dict(backend_args) if backend_args else {}
