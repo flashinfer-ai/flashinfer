@@ -18,7 +18,9 @@ Offline-generated blocklist of known-invalid CUTLASS tactics.
 This module provides the ``TacticsBlocklist`` class that loads a JSON file
 mapping (custom_op, runner_class) pairs to sets of tactics known to fail on
 a specific GPU.  The autotuner calls ``filter()`` before profiling to skip
-these tactics, saving GPU time and avoiding noisy error logs.
+these tactics, saving GPU time and avoiding noisy error logs, and
+``is_blocked()`` to drop cache-file entries that were tuned before a tactic
+was listed.
 
 When no blocklist is loaded or no entry exists for a given operation,
 all tactics pass through unchanged (zero regression risk).
@@ -106,6 +108,23 @@ class TacticsBlocklist:
     # ------------------------------------------------------------------
     # Runtime filtering
     # ------------------------------------------------------------------
+
+    def is_blocked(self, custom_op: str, runner_name: str, tactic: Any) -> bool:
+        """Whether *tactic* is listed for ``custom_op::runner_name``.
+
+        Args:
+            custom_op: Custom operation name.
+            runner_name: ``TunableRunner`` class name (the form stored in
+                autotuner cache files).
+            tactic: A tactic as returned by ``get_valid_tactics()`` or read
+                back from a cache file.
+        """
+        if not self._invalid:
+            return False
+        invalid_set = self._invalid.get(f"{custom_op}::{runner_name}")
+        return (
+            invalid_set is not None and _tactic_to_json_hashable(tactic) in invalid_set
+        )
 
     def filter(
         self,
