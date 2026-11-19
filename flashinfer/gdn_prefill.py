@@ -421,6 +421,97 @@ def _validate_slot_args(
     return True
 
 
+def _validate_checkpoint_cu_starts(
+    *,
+    cu_seqlens: Optional[torch.Tensor],
+    cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]],
+    checkpoint_cu_starts: torch.Tensor,
+    checkpoint_every_n_tokens: int,
+    state_checkpoints: torch.Tensor,
+    checkpoint_state_indices: Optional[torch.Tensor],
+    prefix_lens: Optional[torch.Tensor],
+) -> None:
+    """Opt-in (``FLASHINFER_VALIDATE_INPUTS=1``) check of ``checkpoint_cu_starts``.
+
+    The kernels write checkpoint ``j`` of sequence ``i`` to row
+    ``checkpoint_cu_starts[i] + j`` of ``state_checkpoints`` (or of
+    ``checkpoint_state_indices``) without bounds checks, so token offsets in
+    place of checkpoint offsets silently write outside the buffer. Reading the
+    values needs a device-to-host copy, hence opt-in like the other
+    ``FLASHINFER_VALIDATE_INPUTS`` checks, and skipped during CUDA graph
+    capture.
+    """
+
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("", "0"):
+        return
+    if cu_seqlens is None:
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+
+    offsets = (
+        [int(x) for x in cu_seqlens_cpu]
+        if cu_seqlens_cpu is not None
+        else cu_seqlens.cpu().tolist()
+    )
+    num_seqs = len(offsets) - 1
+    seq_lens = [offsets[i + 1] - offsets[i] for i in range(num_seqs)]
+    prefix = [0] * num_seqs if prefix_lens is None else prefix_lens.cpu().tolist()
+    n = checkpoint_every_n_tokens
+    counts = [
+        (p + length) // n - p // n for p, length in zip(prefix, seq_lens, strict=True)
+    ]
+    starts = checkpoint_cu_starts.cpu().tolist()
+
+    if checkpoint_state_indices is None:
+        if len(starts) != num_seqs + 1:
+            raise ValueError(
+                f"checkpoint_cu_starts must have num_seqs + 1 = {num_seqs + 1} "
+                f"entries, got {len(starts)}"
+            )
+        rows, rows_name = int(state_checkpoints.shape[0]), "state_checkpoints"
+        got = [starts[i + 1] - starts[i] for i in range(num_seqs)]
+        if got != counts:
+            hint = (
+                " It looks like token offsets: checkpoint_cu_starts counts "
+                "checkpoints (rows of state_checkpoints), not tokens."
+                if got == seq_lens
+                else ""
+            )
+            expected = [starts[0]]
+            for count in counts:
+                expected.append(expected[-1] + count)
+            raise ValueError(
+                "checkpoint_cu_starts must hold cumulative checkpoint counts: "
+                f"with checkpoint_every_n_tokens={n} the per-sequence counts are "
+                f"{counts}, so expected {expected}, got {starts}.{hint}"
+            )
+    else:
+        if len(starts) not in (num_seqs, num_seqs + 1):
+            raise ValueError(
+                f"checkpoint_cu_starts must have num_seqs = {num_seqs} or "
+                f"num_seqs + 1 entries, got {len(starts)}"
+            )
+        rows = int(checkpoint_state_indices.numel())
+        rows_name = "checkpoint_state_indices"
+        pool = int(state_checkpoints.shape[0])
+        if rows:
+            ids = checkpoint_state_indices.cpu()
+            if bool(((ids < -1) | (ids >= pool)).any()):
+                raise ValueError(
+                    "checkpoint_state_indices must contain -1 or rows in "
+                    f"[0, {pool}) of state_checkpoints"
+                )
+
+    for i, (start, count) in enumerate(zip(starts[:num_seqs], counts, strict=True)):
+        if count and (start < 0 or start + count > rows):
+            raise ValueError(
+                f"sequence {i} writes {count} checkpoint(s) at rows "
+                f"[{start}, {start + count}) of {rows_name}, which has {rows} "
+                "rows; checkpoint_cu_starts counts checkpoints, not tokens"
+            )
+
+
 def _cake_gdn_prefill_dtype_name(dtype: torch.dtype) -> str:
     names = {
         torch.float32: "float32",
@@ -1689,7 +1780,18 @@ def chunk_gated_delta_rule(
         ``checkpoint_every_n_tokens > 0``. Without ``checkpoint_state_indices``
         the values must be monotonic and consistent with ``cu_seqlens``; this
         caller precondition is not checked at launch to avoid a device-to-host
-        synchronization.
+        synchronization. Set ``FLASHINFER_VALIDATE_INPUTS=1`` to check it
+        (and the rows it addresses) on every eager call; the check is skipped
+        during CUDA graph capture.
+
+        The unit is checkpoints (rows of ``state_checkpoints``), not tokens:
+        sequence ``i`` writes its ``j``-th checkpoint to row
+        ``checkpoint_cu_starts[i] + j``. For example, two sequences of 256
+        and 128 tokens (``cu_seqlens = [0, 256, 384]``) with
+        ``checkpoint_every_n_tokens=64`` take 4 and 2 checkpoints, so
+        ``checkpoint_cu_starts = [0, 4, 6]`` and ``state_checkpoints`` has 6
+        rows. Passing the token offsets ``[0, 256, 384]`` instead writes the
+        second sequence's checkpoints to rows 256..257, outside the buffer.
     checkpoint_every_n_tokens : int
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
@@ -2234,6 +2336,17 @@ def chunk_gated_delta_rule(
         use_cp=use_cp,
         cp_chunk_len=_cp_chunk_len,
     )
+    if checkpoint_every_n_tokens > 0:
+        assert state_checkpoints is not None and checkpoint_cu_starts is not None
+        _validate_checkpoint_cu_starts(
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_checkpoints=state_checkpoints,
+            checkpoint_state_indices=checkpoint_state_indices,
+            prefix_lens=prefix_lens,
+        )
     if slot_args:
         # The native non-CP kernels serve these arguments; never auto-route
         # the call to CP or cuDNN, which would drop them.
