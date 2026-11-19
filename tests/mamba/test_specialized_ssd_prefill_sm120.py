@@ -157,6 +157,33 @@ def test_auto_constructs_specialized_and_matches_reference(t, nheads):
     assert rel <= REL_TOL, f"rel {rel} at T={t} nheads={nheads}"
 
 
+@pytest.mark.parametrize("nheads", [64, 128])
+@pytest.mark.parametrize("t,step_pos", [(3, 0), (129, 0), (129, 64)])
+def test_large_step_decay_protection(nheads, t, step_pos):
+    """A dt step that dominates the fp32 mantissa (2**30) must not erase the
+    later tokens' decays: subtracting its cumulative prefix used to collapse
+    every following decay to exp(0)=1, silently returning [1, 1, 1] where the
+    recurrence gives [1, 0.5, 0.25] (Codex review on the 64-head path; also
+    exercised across a chunk boundary and on the protected 128-head path)."""
+    ssd = _make_ssd(nheads)
+    dt = torch.zeros(t, nheads, dtype=torch.bfloat16, device=DEVICE)
+    dt[step_pos] = 2.0**30
+    bc = torch.zeros(t, NG, DS, dtype=torch.bfloat16, device=DEVICE)
+    bc[:, :, 0] = 1.0
+    p = dict(
+        x=torch.full((t, nheads, HD), 2.0**-30, dtype=torch.bfloat16, device=DEVICE),
+        dt=dt,
+        A=torch.full((nheads,), -1.0, device=DEVICE),
+        B=bc,
+        C=bc.clone(),
+        D=torch.zeros(nheads, dtype=torch.bfloat16, device=DEVICE),
+        dt_bias=torch.zeros(nheads, dtype=torch.bfloat16, device=DEVICE),
+    )
+    out = _run(ssd, p, t, nheads)
+    rel = _rel_max(out.float(), _reference(p, t, nheads))
+    assert rel <= REL_TOL, f"rel {rel} at T={t} nheads={nheads} step at {step_pos}"
+
+
 def test_backends_declared_and_bogus_backend_raises():
     from flashinfer.mamba import SSD_BACKENDS
 

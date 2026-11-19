@@ -109,6 +109,15 @@ DEVI float softplus_fast(float z) {
   return z > 8.f ? z : (z < -5.f ? __expf(z) : __logf(1.f + __expf(z)));
 }
 
+// Rare large-magnitude fp32 replay of the chunked SSD formula for one head's
+// p-columns [p0, p0+pcnt).  Defined below (after the regx kernels); shared by
+// the NH128 (regx) and NH64 escalation paths.
+__device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfloat16* dt,
+                                          const float* A, const __nv_bfloat16* B,
+                                          const __nv_bfloat16* C, const __nv_bfloat16* D,
+                                          const __nv_bfloat16* bias, __nv_bfloat16* y, int T,
+                                          int NH, int h, int p0, int pcnt, char* scratch);
+
 // HD_BLK: p-values handled per block (64 -> whole head, 32 -> half head)
 template <int HD_BLK, bool FULL_T = false, bool ONE_CHUNK = false, bool DIRECT_DECAY = false>
 __global__ __launch_bounds__(256, 1) void ssd_kernel(
@@ -168,6 +177,19 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
   const float dtb_h = __bfloat162float(dtbg[h]);
   const float D_h = __bfloat162float(Dg[h]);
 
+  // Large-magnitude escalation flag, mirroring the NH128 path's DT_SCAN
+  // detection: a large step amplifies operand narrowing, and a large chunk
+  // prefix swallows small later increments in the fp32 scan, so subtracted
+  // cumulative values collapse later decays to exp(0) = 1.  Either condition
+  // reroutes this block's own p-columns through precise_head at the end.
+  // The flag rides in sSc's unused upper half (prolog_sc's 128 bf16 weights
+  // fill only 64 of its 128 floats per buffer): the dynamic allocation is
+  // already at the sm_120 per-block opt-in cap, so static __shared__ would
+  // push cudaFuncSetAttribute over the limit.
+  int* sPrec = reinterpret_cast<int*>(sSc + 64);
+  if (tid == 0) *sPrec = 0;
+  __syncthreads();
+
   constexpr size_t xstride = (size_t)HEADS * 64;
   const bf16* xbase = xg + (size_t)h * 64 + pslot * HD_BLK;
   bf16* ybase = yg + (size_t)h * 64 + pslot * HD_BLK;
@@ -205,6 +227,7 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
       float dtnext = __uint_as_float((uint32_t)dtnext_bits << 16);
       float z = dtnext + dtb_h;
       float dtf = dtnext_active ? softplus_fast(z) : 0.f;
+      if (dtf > 4096.f) *sPrec = 1;
       dtf_reg = dtf;
       sCum[buf * 128 + tid] = dtf * A_h;
     }
@@ -228,6 +251,8 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
         acc += v[i];
         p[lane * 4 + i] = acc;
       }
+      // Lane 31's final acc is the whole chunk's cumulative log-decay.
+      if (lane == 31 && fabsf(acc) > 65536.f) *sPrec = 1;
     }
   };
   auto prolog_sc = [&](int buf) {
@@ -707,6 +732,15 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
     if (!EARLY_B) issue_B(c + 1);  // y staging lived in the B buffer
     if constexpr (!DIRECT_DECAY)
       if (!ONE_CHUNK && has_next) load_decay(qb);
+  }
+  // Rare large-magnitude replay, the same escalation the NH128 path takes
+  // through regx's DT_SCAN flag: rewrite this block's own p-columns with the
+  // fp32 chunk formula.  Both half-head CTAs trip on the same dt stream, so
+  // the whole head is rewritten consistently, each block within its own
+  // disjoint columns (no cross-CTA write ordering is needed).
+  __syncthreads();
+  if (*sPrec) {
+    precise_head(xg, dtg, Ag, Bg, Cg, Dg, dtbg, yg, T, NH, h, pslot * HD_BLK, HD_BLK, smem);
   }
 }
 
@@ -1271,15 +1305,18 @@ __device__ __forceinline__ void gram_producer(const CUtensorMap* tmaB, const CUt
   }
 }
 
+}  // namespace regx
+
 // -------------------------------------------------------------------------
-// Rare large-step replay of the same 128-token SSD formula.  Keep the
-// intermediates in fp32 rather than narrowing Gram/weighted-x/state operands
-// to bf16 when that narrowing can dominate the absolute error bound.
+// Rare large-step replay of the same 128-token SSD formula for one head's
+// p-columns [p0, p0+pcnt).  Keep the intermediates in fp32 rather than
+// narrowing Gram/weighted-x/state operands to bf16 when that narrowing can
+// dominate the absolute error bound.
 __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfloat16* dt,
                                           const float* A, const __nv_bfloat16* B,
                                           const __nv_bfloat16* C, const __nv_bfloat16* D,
                                           const __nv_bfloat16* bias, __nv_bfloat16* y, int T,
-                                          int NH, int h, char* scratch) {
+                                          int NH, int h, int p0, int pcnt, char* scratch) {
   // Retain the incumbent path for overlapping input/output views.  A
   // post-pass cannot reread input bytes that the original pass overwrote.
   const uint64_t dst = (uint64_t)y;
@@ -1295,15 +1332,17 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
       overlaps(D, (size_t)NH * sizeof(__nv_bfloat16)) ||
       overlaps(bias, (size_t)NH * sizeof(__nv_bfloat16)))
     return;
-  // 99,328 bytes, within the PT=64 consumer's existing 99,352-byte allocation.
-  float* state = (float*)scratch;   // 64 x 128
-  float* score = state + 64 * 128;  // 128 x 128
+  // At pcnt=64: 99,328 bytes, within the PT=64 consumer's existing
+  // 99,352-byte allocation.  At the NH64 kernels' pcnt=32: 82,944 bytes,
+  // within their 101,376-byte allocation.
+  float* state = (float*)scratch;     // pcnt x 128
+  float* score = state + pcnt * 128;  // 128 x 128
   float* steps = score + 128 * 128;
   float* prefix = steps + 128;
   const int tid = threadIdx.x, g = h / (NH / 8);
   const float ah = A[h], db = __bfloat162float(bias[h]);
   const float dh = __bfloat162float(D[h]);
-  for (int q = tid; q < 64 * 128; q += blockDim.x) state[q] = 0.f;
+  for (int q = tid; q < pcnt * 128; q += blockDim.x) state[q] = 0.f;
   __syncthreads();
   for (int start = 0; start < T; start += 128) {
     int count = min(128, T - start);
@@ -1358,8 +1397,8 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
       score[i * 128 + j] = s;
     }
     __syncthreads();
-    for (int q = tid; q < count * 64; q += blockDim.x) {
-      int i = q / 64, p = q % 64;
+    for (int q = tid; q < count * pcnt; q += blockDim.x) {
+      int i = q / pcnt, pl = q % pcnt, p = p0 + pl;
       float diag = 0.f, off = 0.f;
       for (int j = 0; j < count; ++j) {
         float xv = __bfloat162float(x[((size_t)(start + j) * NH + h) * 64 + p]);
@@ -1367,7 +1406,7 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
       }
       const __nv_bfloat16* ci = C + ((size_t)(start + i) * 8 + g) * 128;
       for (int n = 0; n < 128; ++n)
-        off = __fmaf_rn(__bfloat162float(ci[n]), state[p * 128 + n], off);
+        off = __fmaf_rn(__bfloat162float(ci[n]), state[pl * 128 + n], off);
       off = __fmul_rn(off, __nv_expf(prefix[i]));
       size_t out = ((size_t)(start + i) * NH + h) * 64 + p;
       float skip = __fmul_rn(dh, __bfloat162float(x[out]));
@@ -1387,8 +1426,8 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
       }
     }
     __syncthreads();
-    for (int q = tid; q < 64 * 128; q += blockDim.x) {
-      int p = q / 128, n = q % 128;
+    for (int q = tid; q < pcnt * 128; q += blockDim.x) {
+      int p = p0 + q / 128, n = q % 128;
       float update = 0.f;
       for (int j = 0; j < count; ++j) {
         float w = __fmul_rn(steps[j], __nv_expf(prefix[j]));
@@ -1401,6 +1440,8 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
     __syncthreads();
   }
 }
+
+namespace regx {
 
 template <int PT, bool FULL_T = false, int CHUNK_UNROLL = 1, bool TRACK_PROGRESS = true,
           bool SPEC = false>
@@ -2349,7 +2390,7 @@ __global__ __launch_bounds__(8 * PT, 1) void ssd_kernel(
     if constexpr (PT == 64) {
       if (precise_output) {
         __syncthreads();
-        precise_head(gx, gdt, gA, gB, gC, gD, gdtb, gy, T, NH, h, smem_raw);
+        precise_head(gx, gdt, gA, gB, gC, gD, gdtb, gy, T, NH, h, 0, 64, smem_raw);
       }
     }
     if (tid == 0) atomicAdd(g_gdone + g, 1u);
