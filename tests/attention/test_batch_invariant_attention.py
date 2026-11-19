@@ -1500,7 +1500,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         dict(num_qo_heads=0, num_kv_heads=8),
         dict(sm_scale=float("inf")),
         dict(sm_scale=3e38),
-        dict(seq_lens=torch.tensor([700], dtype=torch.int32, device=pr.device)),
+        # seq_lens that contradict the page table (the request has 700 keys)
+        dict(seq_lens=torch.tensor([699], dtype=torch.int32, device=pr.device)),
         dict(prefix_len_ptr=torch.zeros(1, dtype=torch.int32, device=pr.device)),
     ):
         args = dict(num_qo_heads=32, num_kv_heads=8, causal=True, **kw)

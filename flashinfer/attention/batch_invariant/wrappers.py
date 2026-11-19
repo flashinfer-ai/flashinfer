@@ -13,6 +13,12 @@ metadata a captured graph reads) is not offered: there is no device-side planner
 A plan's execution state (the split-KV partials in the workspace, the arrival counters) is single-use per launch: two ``run()``
 calls of one plan must be stream-ordered, as with every FlashInfer wrapper's workspace; the counters reset themselves at every
 launch, so sequential reuse on one stream needs nothing more.
+
+Call shapes of serving engines: an engine passes one argument list on every ``plan()`` / ``run()``, with neutral values where
+a feature is off. The arguments the class does not consume are accepted at the values that ask for nothing (``neutral.py``
+states the rule of each: unit ``q_scale`` / ``k_scale`` / ``v_scale`` / ``o_scale``, ``seq_lens`` / ``seq_lens_q`` /
+``block_tables`` that restate the CSR metadata, ``fixed_split_size``, ``disable_split_kv``) and refused at every other value;
+none of them changes an output bit.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from typing import Optional, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
-from . import engine
+from . import engine, neutral
 from .spec import HEAD_DIMS, scale_log2
 
 CLASS = "attention.bf16"
@@ -110,7 +116,9 @@ class BatchInvariantAttention:
             )
         self.workspace = float_workspace_buffer
 
-    #: The wrappers' ``plan()`` arguments the class does not take, with what the class takes instead: any of them set is refused.
+    #: The wrappers' ``plan()`` arguments the class does not take, with what the class takes instead: any of them set is refused
+    #: by ``refuse()``. ``seq_lens`` / ``seq_lens_q`` / ``block_tables`` go to ``plan()`` instead, which accepts them when they
+    #: restate what the CSR metadata already says (``neutral.py``).
     _PLAN_ARGS_OUTSIDE_THE_CLASS = {
         "window_right": "window_right 0 (the causal mask)",
         "seq_lens": "the KV lengths of the page table (indptr / last_page_len) or of kv_indptr",
@@ -214,8 +222,18 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work.
+
+        Arguments the class does not consume, at the values serving engines pass on every call (``neutral.py``):
+        ``fixed_split_size`` of ``None`` / ``-1`` or any positive size is accepted and not used (the chunk length is a class
+        constant, which is what a fixed split asks for); ``disable_split_kv`` plans fused units (the same bits, no partials
+        in the workspace); ``seq_lens`` / ``seq_lens_q`` must equal the KV / query lengths of the CSR metadata and
+        ``block_tables`` must list the pages of the CSR triple -- host tensors are compared on the host, and the block-table
+        comparison shares the one readback of the page-index bounds."""
         D = int(head_dim_qk)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -285,12 +303,7 @@ class BatchInvariantAttention:
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
-        if fixed_split_size is not None or disable_split_kv:
-            raise unsupported(
-                CLASS,
-                "fixed_split_size / disable_split_kv",
-                "the class's own split rule (a function of the SM count only)",
-            )
+        fused = neutral.check_split_request(CLASS, fixed_split_size, disable_split_kv)
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
         if window_left is None:
@@ -359,7 +372,14 @@ class BatchInvariantAttention:
             )
         last_host = None
         max_page = -1
+        kv_lens_alt = None  # paged kinds: the lengths `flashinfer.page.get_seq_lens` states (they differ on pageless requests)
         if self.kind == "ragged":
+            if block_tables is not None:
+                raise unsupported(
+                    CLASS,
+                    "block_tables on the ragged wrapper",
+                    self._PLAN_ARGS_OUTSIDE_THE_CLASS["block_tables"],
+                )
             kv_lens = kv_spans.tolist()
         else:
             if kv_last_page_len is None or kv_indices is None:
@@ -388,22 +408,42 @@ class BatchInvariantAttention:
                     f"kv_indices of {kv_indices.numel()} entries for kv_indptr[-1] = {n_pages}",
                     "one page index per referenced page",
                 )
+            if block_tables is not None:
+                neutral.check_block_table_shape(CLASS, block_tables, kv_spans)
             if n_pages:
                 used = kv_indices[:n_pages]
                 bounds = torch.aminmax(used)
-                # Only two scalars cross from CUDA; one readback waits for both bounds.
-                if used.is_cuda:
-                    lo, hi = torch.stack(bounds).to("cpu", non_blocking=False).tolist()
+                scalars = [bounds.min, bounds.max]
+                if block_tables is not None and not bool((kv_spans < 0).any()):
+                    scalars.append(
+                        neutral.block_table_mismatches(
+                            block_tables, kv_indices, kv_indptr_host, kv_spans
+                        )
+                    )
+                # Only these scalars cross from CUDA; one readback waits for all of them.
+                on = next((s.device for s in scalars if s.is_cuda), None)
+                if on is not None:
+                    values = (
+                        torch.stack([s.to(on, torch.int64) for s in scalars])
+                        .to("cpu", non_blocking=False)
+                        .tolist()
+                    )
                 else:
-                    lo, hi = int(bounds.min), int(bounds.max)
+                    values = [int(s) for s in scalars]
+                lo, hi = values[:2]
                 if lo < 0:
                     raise unsupported(
                         CLASS, "a negative page index", "page indices in 0..num_pages-1"
                     )
+                if len(values) > 2 and values[2]:
+                    raise neutral.block_table_mismatch_error(CLASS, values[2])
                 max_page = hi  # checked against the cache at run()
             # a request without pages has no keys, whatever its last-page entry (the planner's rule)
             kv_lens = torch.where(
                 kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
+            ).tolist()
+            kv_lens_alt = torch.where(
+                kv_spans > 0, (kv_spans - 1) * page_size + last_host, last_host
             ).tolist()
         q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
         for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
@@ -419,7 +459,28 @@ class BatchInvariantAttention:
                     f"request {i} with {ql} query tokens over {kl} keys",
                     "kv_len >= q_len per request (the causal class)",
                 )
+        if seq_lens is not None:
+            neutral.check_lengths(
+                CLASS,
+                "seq_lens",
+                seq_lens,
+                kv_lens,
+                "kv_indptr" if self.kind == "ragged" else "the page table",
+                kv_lens_alt,
+            )
+        if seq_lens_q is not None:
+            if self.kind == "decode":
+                raise unsupported(
+                    CLASS,
+                    "seq_lens_q on the decode wrapper",
+                    "q_len_per_req query tokens per request",
+                )
+            neutral.check_lengths(CLASS, "seq_lens_q", seq_lens_q, q_lens, "qo_indptr")
         config = engine.default_config(D=D)
+        if fused:
+            from dataclasses import replace
+
+            config = replace(config, split_policy="fused")
         if (
             D in engine.Q2_DEFAULT_DIMS
             and self.kind != "decode"
@@ -587,7 +648,9 @@ class BatchInvariantAttention:
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
     ) -> torch.Tensor:
-        """Validate changing run-time inputs once, then launch with the fixed plan."""
+        """Validate changing run-time inputs once, then launch with the fixed plan. ``scales`` are the wrappers' ``q_scale`` /
+        ``k_scale`` / ``v_scale`` (/ ``o_scale``), in that order: ``None`` or exactly ``1.0`` (the unscaled class); ``sinks``
+        and ``kv_cache_sf`` of ``None`` likewise ask for nothing."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
         if use_fp16_softmax or uses_spcompress:
@@ -602,10 +665,7 @@ class BatchInvariantAttention:
                 "return_lse",
                 "the attention output alone (the class has no LSE member yet)",
             )
-        if any(s is not None for s in scales):
-            raise unsupported(
-                CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
-            )
+        neutral.check_unit_scales(CLASS, scales)
         if sinks is not None:
             raise unsupported(CLASS, "attention sinks", "plain softmax")
         if kv_cache_sf is not None:

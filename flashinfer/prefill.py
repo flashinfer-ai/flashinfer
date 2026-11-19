@@ -3248,11 +3248,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            non-causal prefill, logits soft cap, custom masks, RoPE, non-unit scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
+
+            Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
+            nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` of ``None`` or exactly
+            ``1.0``, ``seq_lens`` / ``seq_lens_q`` / ``block_tables`` that restate the CSR metadata,
+            ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
+            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            changes an output bit.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -4068,15 +4075,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 token_pos_in_items_len=token_pos_in_items_len,
                 max_item_len_ptr=max_item_len_ptr,
-                seq_lens=seq_lens,
-                seq_lens_q=seq_lens_q,
-                block_tables=block_tables,
             )
             self._batch_invariant.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=paged_kv_indptr,
                 kv_indices=paged_kv_indices,
                 kv_last_page_len=paged_kv_last_page_len,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
+                block_tables=block_tables,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim_qk,
@@ -4106,7 +4113,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._window_left = window_left
             self._sm_scale = sm_scale
             self._pos_encoding_mode = pos_encoding_mode
-            self._logits_soft_cap = logits_soft_cap
+            # the state the regular plans leave: callers compare it with their own settings
+            self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             self._cached_q_data_type = q_data_type
@@ -6007,11 +6015,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            non-causal prefill, logits soft cap, custom masks, RoPE, non-unit scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
+
+            Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
+            nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` / ``o_scale`` of ``None`` or exactly
+            ``1.0``, ``seq_lens`` / ``seq_lens_q`` that restate ``kv_indptr`` / ``qo_indptr``,
+            ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
+            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            changes an output bit.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -6448,8 +6463,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 token_pos_in_items_len=token_pos_in_items_len,
                 max_item_len_ptr=max_item_len_ptr,
-                seq_lens=seq_lens,
-                seq_lens_q=seq_lens_q,
                 v_indptr=v_indptr,
                 o_indptr=o_indptr,
             )
@@ -6458,6 +6471,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 kv_indptr=kv_indptr,
                 kv_indices=None,
                 kv_last_page_len=None,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim_qk,
@@ -6487,7 +6502,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._window_left = window_left
             self._sm_scale = sm_scale
             self._pos_encoding_mode = pos_encoding_mode
-            self._logits_soft_cap = logits_soft_cap
+            # the state the regular plans leave: callers compare it with their own settings
+            self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             self._cached_q_data_type = q_data_type

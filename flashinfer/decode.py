@@ -1508,11 +1508,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            non-causal prefill, logits soft cap, custom masks, RoPE, non-unit scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
+
+            Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
+            nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` of ``None`` or exactly
+            ``1.0``, ``seq_lens`` / ``block_tables`` that restate the page table,
+            ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
+            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            changes an output bit.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2345,9 +2352,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if self._batch_invariant is not None:
             # the class's own checks run in the delegate; the arguments it does not take are refused there, before the plan
-            self._batch_invariant.refuse(
-                window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
-            )
+            # (seq_lens / block_tables are accepted when they restate the page table)
+            self._batch_invariant.refuse(window_right=window_right)
             if is_causal is not None and is_causal != (q_len_per_req > 1):
                 from .batch_invariant.support import unsupported
 
@@ -2381,6 +2387,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
             )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
@@ -2391,7 +2399,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._q_len_per_req = q_len_per_req
             self._sm_scale = sm_scale
             self._pos_encoding_mode = pos_encoding_mode
-            self._logits_soft_cap = logits_soft_cap
+            # the state the regular plans leave: callers compare it with their own settings
+            self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             return
