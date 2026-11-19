@@ -157,7 +157,7 @@ def _auto_routes(query: torch.Tensor, nq: int) -> Tuple[bool, Optional[str]]:
     if not routed:
         return False, "shape off the auto-routing allowlist"
     if query.device.type != "cuda" or not _device_supported(query.device):
-        return False, "device unsupported (needs SM90 + 93568B smem opt-in)"
+        return False, "device unsupported (needs SM90 + 94624B smem opt-in)"
     return True, None
 
 
@@ -369,7 +369,7 @@ def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
     Returns
     -------
     bool
-        True only on compute capability 9.0 devices with at least 93568
+        True only on compute capability 9.0 devices with at least 94624
         bytes of opt-in dynamic shared memory per block, and only while the
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` kill switch (and its
         deprecated alias ``FLASHINFER_DISABLE_SPARSE_MLA_SM90``) is unset.
@@ -487,7 +487,7 @@ def _validate(
     if fused and not _device_supported(query.device):
         raise NotImplementedError(
             "sparse_mla_decode_sm90 requires an SM90 device with at least "
-            "93568 bytes of opt-in shared memory"
+            "94624 bytes of opt-in shared memory"
         )
 
 
@@ -725,7 +725,7 @@ def sparse_mla_decode_sm90(
             raise NotImplementedError(
                 "sparse_mla_decode_sm90: backend='specialized' cannot serve "
                 "this call (device or token-row envelope: needs SM90 with "
-                f"the 93568B smem opt-in and 1 <= B*q_len <= {_MAX_NQ}); an "
+                f"the 94624B smem opt-in and 1 <= B*q_len <= {_MAX_NQ}); an "
                 "explicitly selected backend never falls back — use "
                 "backend='auto' or 'reference'"
             )

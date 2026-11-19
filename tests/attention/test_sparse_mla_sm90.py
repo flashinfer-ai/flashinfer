@@ -250,6 +250,123 @@ def test_kill_switch_forces_the_composable_path(env, monkeypatch):
         )
 
 
+# --------------------------------------------------------------------------
+# Numerical-contract regressions (review constructions): probability
+# precision through PV, and range-safe BF16 query staging.
+# --------------------------------------------------------------------------
+
+
+def _write_token(kv_cache, slot, nope_val, scales, rope, device="cuda"):
+    """Write one 656-byte fp8_ds_mla token row: 512 x fp8(nope_val), 4 fp32
+    tile scales, 64 bf16 RoPE values."""
+    row = kv_cache.view(-1, BPT)[slot]
+    fp8 = torch.full((CKV,), nope_val, dtype=torch.float32, device=device).to(
+        torch.float8_e4m3fn
+    )
+    row[:CKV] = fp8.view(torch.uint8)
+    row[CKV : CKV + 16] = torch.tensor(scales, dtype=torch.float32, device=device).view(
+        torch.uint8
+    )
+    row[CKV + 16 :] = rope.to(torch.bfloat16).view(torch.uint8)
+
+
+def _single_row_call(kv_cache, idx_slots, q_rope0, sm_scale, backend):
+    """One B=1, q_len=1 call: q is zero except q[..., 512] = q_rope0, the
+    index row holds ``idx_slots`` at the given positions (-1 elsewhere)."""
+    device = kv_cache.device
+    q = torch.zeros((1, 1, H, D), dtype=torch.bfloat16, device=device)
+    q[..., CKV] = q_rope0
+    idx = torch.full((1, 1, TOPK), -1, dtype=torch.int32, device=device)
+    for pos, slot in idx_slots:
+        idx[0, 0, pos] = slot
+    sl = torch.tensor([len(idx_slots)], dtype=torch.int32, device=device)
+    ws = torch.zeros(
+        (get_sparse_mla_sm90_workspace_size_bytes(1, 1) or 1,),
+        dtype=torch.uint8,
+        device=device,
+    )
+    return sparse_mla_decode_sm90(
+        q, kv_cache, idx, sl, ws, sm_scale=sm_scale, backend=backend
+    )
+
+
+@pytest.mark.parametrize("second_pos", [1, 48])
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+def test_probability_differences_survive_pv(backend, second_pos):
+    # Review construction: two tokens with logits +/- 2^-13 and V = +/- 448.
+    # exp(-2^-12) rounds to 1 in an 11-bit P store, cancelling the output to
+    # exactly 0 instead of 448 * tanh(2^-13); the probability staging must
+    # keep the difference. second_pos=48 is the padding-only split control
+    # (same mathematical input through the split combine).
+    _sm90_or_skip()
+    import math
+
+    device = "cuda"
+    kv = torch.zeros((1, PAGE, BPT), dtype=torch.uint8, device=device)
+    rope = torch.zeros(KPE, device=device)
+    rope[0] = 2.0**-9
+    _write_token(kv, 0, 448.0, [1.0] * 4, rope)
+    _write_token(kv, 1, -448.0, [1.0] * 4, -rope)
+    y = _single_row_call(
+        kv, [(0, 0), (second_pos, 1)], 1.0, 1.0 / 16.0, backend
+    ).float()
+    expect = 448.0 * math.tanh(2.0**-13)
+    assert torch.isfinite(y).all()
+    assert (y - expect).abs().max().item() <= 2e-3, y.flatten()[:4]
+
+
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+def test_tail_probabilities_survive_p_staging(backend):
+    # Large-gap tail contributions: one dominant token (V=0) plus 2047
+    # tokens 18 nats below the max (per-token probability ~2^-26, below the
+    # fp16 denormal floor) with V=448. An unshifted 11-bit P store flushes
+    # the whole tail to zero; the reference keeps 448 * 2047*e^-18 / (1 +
+    # 2047*e^-18) ~ 0.01397.
+    _sm90_or_skip()
+    import math
+
+    device = "cuda"
+    ntail = 2047
+    npages = (1 + ntail + PAGE - 1) // PAGE
+    kv = torch.zeros((npages, PAGE, BPT), dtype=torch.uint8, device=device)
+    rope_dom = torch.zeros(KPE, device=device)
+    rope_dom[0] = 1.0
+    _write_token(kv, 0, 0.0, [1.0] * 4, rope_dom)
+    rope_tail = torch.zeros(KPE, device=device)
+    rope_tail[0] = 1.0 - 18.0
+    for s in range(1, 1 + ntail):
+        _write_token(kv, s, 448.0, [1.0] * 4, rope_tail)
+    slots = [(i, i) for i in range(1 + ntail)]
+    y = _single_row_call(kv, slots, 16.0, 1.0 / 16.0, backend).float()
+    w = ntail * math.exp(-18.0)
+    expect = 448.0 * w / (1.0 + w)
+    assert torch.isfinite(y).all()
+    assert (y - expect).abs().max().item() <= 1e-3
+
+
+@pytest.mark.parametrize("qmag", [65536.0, 2.0**24])
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+def test_bf16_query_range_is_preserved(backend, qmag):
+    # Review construction: the public API advertises BF16 queries, whose
+    # range exceeds FP16 — a finite 65536 (or larger) query component must
+    # not become an FP16 infinity on the way into QK. Two tokens with K
+    # rope0 = 1/qmag and 0, V = 1 and 0: logits are exactly 1/16 and 0, so
+    # every output element is sigmoid(1/16) ~ 0.5156.
+    _sm90_or_skip()
+    import math
+
+    device = "cuda"
+    kv = torch.zeros((1, PAGE, BPT), dtype=torch.uint8, device=device)
+    rope_a = torch.zeros(KPE, device=device)
+    rope_a[0] = 1.0 / qmag
+    _write_token(kv, 0, 1.0, [1.0] * 4, rope_a)
+    _write_token(kv, 1, 0.0, [1.0] * 4, torch.zeros(KPE, device=device))
+    y = _single_row_call(kv, [(0, 0), (1, 1)], qmag, 1.0 / 16.0, backend).float()
+    expect = math.exp(1.0 / 16.0) / (math.exp(1.0 / 16.0) + 1.0)
+    assert torch.isfinite(y).all(), "finite BF16 query produced non-finite output"
+    assert (y - expect).abs().max().item() <= 2e-3
+
+
 def test_specialized_off_envelope_raises():
     _sm90_or_skip()
     # token rows above the qualified envelope (65 > 64): explicit

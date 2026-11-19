@@ -21,10 +21,16 @@
 //   GEMM1  S[16 tok][8 head] = K[16 tok][16 d] * Q^T[16 d][8 head]
 //   GEMM2  O[16 d][8 head]   = V^T[16 d][16 tok] * P^T[16 tok][8 head]
 //
-// The device code and launch heuristic are carried verbatim from the
-// kernel validated on H200 (same-node two-arm study re-time); the host
-// binding differs only in workspace ownership (caller-provided buffer in
-// place of a cudaMalloc'd static) and FlashInfer TVM-FFI conventions.
+// The device code and launch heuristic are carried from the kernel
+// validated on H200 (same-node two-arm study re-time) with two
+// review-driven numerical hardenings: (1) Q is staged to fp16 range-safely
+// (per-head exact power-of-two descale, compensated after QK), so finite
+// BF16 queries never become fp16 infinities; (2) probabilities are staged
+// as exp2(s - m + 14) plus an fp16 residual plane, so ~22 mantissa bits of
+// every probability reach PV and representable output contributions are not
+// rounded away. The host binding differs only in workspace ownership
+// (caller-provided buffer in place of a cudaMalloc'd static) and FlashInfer
+// TVM-FFI conventions.
 // Launches are plain per-stream kernel launches (no cooperative launch, no
 // allocation, no host sync), so calls are CUDA-graph capturable once the
 // module is built and warmed eagerly.
@@ -94,12 +100,14 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
     __nv_bfloat16* __restrict__ outp, int nsplits, int tps, float qscale) {
   static_assert(STATIC_TPS == 0 || STATIC_TPS == 1, "unsupported static TPS");
   extern __shared__ __align__(16) unsigned char smem[];
-  __half* conv = (__half*)smem;           // TILE * CS
-  __half* qs = conv + TILE * CS;          // 8 * QS
-  __half* ps = qs + 8 * QS;               // TILE * 8
-  float* red0 = (float*)(ps + TILE * 8);  // 32
-  float* red1 = red0 + 32;                // 32
-  int* sl = (int*)(red1 + 32);            // tps * TILE
+  __half* conv = (__half*)smem;            // TILE * CS
+  __half* qs = conv + TILE * CS;           // 8 * QS
+  __half* ps = qs + 8 * QS;                // TILE * 8  (P, exp2(s - m + 14))
+  __half* psl = ps + TILE * 8;             // TILE * 8  (P fp16 residual plane)
+  float* red0 = (float*)(psl + TILE * 8);  // 32
+  float* red1 = red0 + 32;                 // 32
+  float* hsc = red1 + 32;                  // 8 per-head Q descale factors
+  int* sl = (int*)(hsc + 8);               // tps * TILE
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int m4 = lane & 3, l4 = lane >> 2;
@@ -149,14 +157,35 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
   }
 
   // ---- Q -> smem (fp16, one warp per head; score scaling follows QK) ----
+  // Range-safe staging: finite bf16 exceeds fp16 range, so a head whose
+  // magnitude tops 2^15 is staged scaled by an exact power of two and its
+  // scores are descaled right after QK (exact; in-range heads stage
+  // bit-identically to the unscaled path).
   {
     const uint32_t* qp = (const uint32_t*)(q + (size_t)row * (8 * DQ)) + warp * (DQ / 2);
+    uint32_t v[9];
+    float amax = 0.f;
+#pragma unroll
+    for (int it = 0; it < 9; ++it) {
+      v[it] = qp[lane + it * 32];
+      const float f0 = __uint_as_float(v[it] << 16);
+      const float f1 = __uint_as_float(v[it] & 0xffff0000u);
+      amax = fmaxf(amax, fmaxf(fabsf(f0), fabsf(f1)));
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    float qsc = 1.f, inv = 1.f;
+    const int e = (amax > 0.f) ? ilogbf(amax) : 0;
+    if (e > 15) {
+      qsc = exp2f((float)(15 - e));
+      inv = exp2f((float)(e - 15));
+    }
+    if (lane == 0) hsc[warp] = inv;
 #pragma unroll
     for (int it = 0; it < 9; ++it) {
       const int d2 = lane + it * 32;
-      uint32_t v = qp[d2];
-      float f0 = __uint_as_float(v << 16);
-      float f1 = __uint_as_float(v & 0xffff0000u);
+      const float f0 = __uint_as_float(v[it] << 16) * qsc;
+      const float f1 = __uint_as_float(v[it] & 0xffff0000u) * qsc;
       *(__half2*)(&qs[warp * QS + d2 * 2]) = __floats2half2_rn(f0, f1);
     }
   }
@@ -238,8 +267,15 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         B1[1] = *(const uint32_t*)(qr + CKV + k * 16 + 24);
         mma16816(s2, A1, B1);
       }
-#pragma unroll
-      for (int i = 0; i < 4; ++i) s[i] = (s[i] + s2[i]) * qscale;
+      // Per-head Q descale (exact power of two; 1.0 for in-range heads)
+      // folded into the softmax scale. C fragment columns are heads 2*m4
+      // and 2*m4+1.
+      const float qsa = qscale * hsc[2 * m4];
+      const float qsb = qscale * hsc[2 * m4 + 1];
+      s[0] = (s[0] + s2[0]) * qsa;
+      s[1] = (s[1] + s2[1]) * qsb;
+      s[2] = (s[2] + s2[2]) * qsa;
+      s[3] = (s[3] + s2[3]) * qsb;
       va = (sl[tbase + t0 + l4] >= 0);
       vb = (sl[tbase + t0 + l4 + 8] >= 0);
       float mx0 = fmaxf(va ? s[0] : -INFINITY, vb ? s[2] : -INFINITY);
@@ -265,12 +301,26 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
     const float mn0 = fmaxf(m0, mt0), mn1 = fmaxf(m1, mt1);
     if (warp < TILE / 16) {
       const int t0 = warp * 16;
-      float p0 = va ? exp2f(s[0] - mn0) : 0.f;
-      float p1 = va ? exp2f(s[1] - mn1) : 0.f;
-      float p2 = vb ? exp2f(s[2] - mn0) : 0.f;
-      float p3 = vb ? exp2f(s[3] - mn1) : 0.f;
-      *(__half2*)(ps + (t0 + l4) * 8 + 2 * m4) = __floats2half2_rn(p0, p1);
-      *(__half2*)(ps + (t0 + l4 + 8) * 8 + 2 * m4) = __floats2half2_rn(p2, p3);
+      // P is staged as exp2(s - m + 14): the exact power-of-two shift rides
+      // the O accumulators and the row sums alike and cancels in every O/l
+      // normalization (split LSEs all carry the same +14), while
+      // probabilities down to 2^-38 of the row max survive fp16 staging.
+      // A second fp16 plane holds the staging residual, so ~22 mantissa
+      // bits of every probability reach PV: differences that remain
+      // significant after multiplying V are preserved instead of rounding
+      // away at 11 bits.
+      float p0 = va ? exp2f(s[0] - mn0 + 14.f) : 0.f;
+      float p1 = va ? exp2f(s[1] - mn1 + 14.f) : 0.f;
+      float p2 = vb ? exp2f(s[2] - mn0 + 14.f) : 0.f;
+      float p3 = vb ? exp2f(s[3] - mn1 + 14.f) : 0.f;
+      const __half2 h01 = __floats2half2_rn(p0, p1);
+      const __half2 h23 = __floats2half2_rn(p2, p3);
+      *(__half2*)(ps + (t0 + l4) * 8 + 2 * m4) = h01;
+      *(__half2*)(ps + (t0 + l4 + 8) * 8 + 2 * m4) = h23;
+      *(__half2*)(psl + (t0 + l4) * 8 + 2 * m4) = __floats2half2_rn(
+          p0 - __half2float(__low2half(h01)), p1 - __half2float(__high2half(h01)));
+      *(__half2*)(psl + (t0 + l4 + 8) * 8 + 2 * m4) = __floats2half2_rn(
+          p2 - __half2float(__low2half(h23)), p3 - __half2float(__high2half(h23)));
       float ls0 = p0 + p2, ls1 = p1 + p3;
 #pragma unroll
       for (int o = 4; o <= 16; o <<= 1) {
@@ -309,13 +359,15 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
       const int acol_o = (((lane >> 3) & 1) << 8);
 #pragma unroll
       for (int kt = 0; kt < TILE / 16; ++kt) {
-        uint32_t B[2];
+        uint32_t B[2], Bl[2];
         ldm_x2t(B, smem_u32(ps + (kt * 16 + (lane & 15)) * 8));
+        ldm_x2t(Bl, smem_u32(psl + (kt * 16 + (lane & 15)) * 8));
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
           uint32_t A[4];
           ldm_x4t(A, smem_u32(conv + (kt * 16 + arow_o) * CS + gb0 + p * 8 + acol_o));
           mma16816(acc[p], A, B);
+          mma16816(acc[p], A, Bl);
         }
       }
     }
@@ -530,7 +582,7 @@ bool device_supported(int64_t device) {
                     cudaSuccess);
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
                     cudaSuccess);
-  return major == 9 && minor == 0 && smem >= 93568;
+  return major == 9 && minor == 0 && smem >= 94624;
 }
 
 int64_t get_workspace_bytes(int64_t nq) {
@@ -549,7 +601,7 @@ int64_t get_workspace_bytes(int64_t nq) {
 }
 
 void set_max_smem_attrs(int device) {
-  // Opt-in dynamic shared memory: 48-tile path 74688 B, 64-tile path 93568 B.
+  // Opt-in dynamic shared memory: 48-tile path 75488 B, 64-tile path 94624 B.
   // cudaFuncSetAttribute applies to the calling thread's current device, so
   // the opt-in is tracked per device ordinal (not per process): set once per
   // device, before any launch there (and therefore before any CUDA-graph
@@ -558,10 +610,10 @@ void set_max_smem_attrs(int device) {
   const bool trackable = device >= 0 && device < 64;
   const uint64_t bit = trackable ? (uint64_t(1) << device) : 0;
   if (trackable && (done_mask.load(std::memory_order_acquire) & bit)) return;
-  cudaFuncSetAttribute(mla_main<48, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 74688);
-  cudaFuncSetAttribute(mla_main<48, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 74688);
-  cudaFuncSetAttribute(mla_main<64, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 93568);
-  cudaFuncSetAttribute(mla_main<64, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 93568);
+  cudaFuncSetAttribute(mla_main<48, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75488);
+  cudaFuncSetAttribute(mla_main<48, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75488);
+  cudaFuncSetAttribute(mla_main<64, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 94624);
+  cudaFuncSetAttribute(mla_main<64, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 94624);
   if (trackable) done_mask.fetch_or(bit, std::memory_order_release);
 }
 
@@ -606,7 +658,7 @@ void run(TensorView q, TensorView kv_cache, TensorView indices, TensorView seq_l
         << "tensors require 16-byte alignment";
   }
   TVM_FFI_ICHECK(device_supported(q.device().device_id))
-      << "Requires SM90 with at least 93568 bytes opt-in shared memory";
+      << "Requires SM90 with at least 94624 bytes opt-in shared memory";
 
   const int nq = static_cast<int>(b * ql);
   TVM_FFI_ICHECK(nq >= 1) << "batch * q_len must be positive";
@@ -620,8 +672,8 @@ void run(TensorView q, TensorView kv_cache, TensorView indices, TensorView seq_l
   ffi::CUDADeviceGuard guard(q.device().device_id);
   set_max_smem_attrs(static_cast<int>(q.device().device_id));
 
-  size_t smem = (size_t)tile * CS * 2 + (size_t)8 * QS * 2 + (size_t)tile * 8 * 2 + 64 * 4 +
-                (size_t)tps * tile * 4;
+  size_t smem = (size_t)tile * CS * 2 + (size_t)8 * QS * 2 + (size_t)tile * 8 * 2 * 2 + 64 * 4 +
+                8 * 4 + (size_t)tps * tile * 4;
 
   __half* po = nullptr;
   float* plse = nullptr;
