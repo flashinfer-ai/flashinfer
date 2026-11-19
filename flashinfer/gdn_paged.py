@@ -239,7 +239,9 @@ def gdn_paged_decode_slots(
 # listed keeps "flashinfer". The tiers come from measurements against
 # "flashinfer" on B200, GB300 and VR200 (CUDA graph replay, page size 1024,
 # prefixes 0 and 4096, bf16 and fp16): the Cake route was faster in every
-# measured row inside them. On SM107, 49 or more states lose at 4096 tokens.
+# measured row inside them except at the B200 edge of 32 states, 4096 tokens
+# and a 4096-token prefix (0.985x bf16, 0.997x fp16). On SM107, 49 or more
+# states lose at 4096 tokens.
 _CAKE_GDN_PAGED_AUTO_SM100_TIERS = ((12, 2048), (32, 4096))
 _CAKE_GDN_PAGED_AUTO_SM107_TIERS = ((12, 2048), (32, 4096), (48, 6144))
 _CAKE_GDN_PAGED_AUTO_BANDS: dict[
