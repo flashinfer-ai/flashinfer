@@ -3908,6 +3908,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        v_sf_swizzled: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -4043,6 +4045,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        v_sf_swizzled : bool
+            Keyword-only, read under ``batch_invariant=True`` with a packed NVFP4 KV cache (``kv_data_type=torch.uint8``): the
+            layout of the V block scales that :meth:`run` receives in ``kv_cache_sf``. ``False`` (default): linear, what
+            :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache` writes. ``True``: TRT-LLM's 4-token interleaved
+            layout (what the ``trtllm-gen`` backend reads, and what serving engines write for it); ``page_size`` must then be
+            a multiple of four. The K block scales are linear in both. The layout cannot be detected from the tensors, so
+            the caller must state it: scales read in the other layout give wrong outputs with no error. Without
+            ``batch_invariant=True`` the layout is fixed by the backend and ``True`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4055,6 +4065,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if v_sf_swizzled and self._batch_invariant is None:
+            raise ValueError(
+                "v_sf_swizzled is an option of batch_invariant=True; the regular backends fix the layout of the NVFP4 V "
+                "block scales (fa2: linear, trtllm-gen: the 4-token interleaved layout)"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -4112,6 +4127,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                v_sf_swizzled=v_sf_swizzled,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal

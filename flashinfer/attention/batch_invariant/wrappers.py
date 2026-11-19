@@ -131,6 +131,7 @@ class BatchInvariantAttention:
         self._total_kv = 0  # the planned packed token count (ragged)
         self._kv_fmt = "bf16"  # the planned KV cache format (spec.KV_FMTS): the class the plan belongs to
         self._kv_dtype = torch.bfloat16
+        self._v_sf_swizzled = False  # the planned layout of an NVFP4 cache's V block scales (engine.check_v_sf_layout)
 
     def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
         """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
@@ -259,8 +260,14 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        v_sf_swizzled: bool = False,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work.
+
+        ``v_sf_swizzled`` (the NVFP4-KV class on the paged wrappers) states the layout of the V block scales ``run()`` will be
+        given, which the bytes cannot tell: ``False`` is the linear layout ``nvfp4_quantize_append_paged_kv_cache`` writes,
+        ``True`` the 4-token swizzle trtllm-gen reads (``engine.check_v_sf_layout``). The K block scales are linear either way.
+        The layout is an address of the same scale bytes: the class, its terms and its fingerprint do not depend on it."""
         D = int(head_dim_qk)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -313,6 +320,18 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
             )
+        try:
+            engine.check_v_sf_layout(
+                v_sf_swizzled, kv_fmt, self.kind == "ragged", page_size
+            )
+        except ValueError as e:
+            raise unsupported(
+                cls,
+                f"v_sf_swizzled={v_sf_swizzled!r}",
+                "False (linear V block scales, the layout nvfp4_quantize_append_paged_kv_cache writes) for every class, or "
+                "True (the 4-token swizzle of trtllm-gen) for a packed NVFP4 cache on the paged wrappers with a page size "
+                f"that is a multiple of {engine.V_SF_SWIZZLE_TOKENS} ({e})",
+            ) from None
         if self.kind != "decode" and not causal:
             raise unsupported(
                 CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
@@ -567,6 +586,7 @@ class BatchInvariantAttention:
         self._page = page_size
         self._kv_fmt = kv_fmt
         self._kv_dtype = kv_dtype
+        self._v_sf_swizzled = v_sf_swizzled
         self.CLASS = cls  # the planned class names the typed errors from here on
 
     def validate_forward_options(
@@ -835,6 +855,7 @@ class BatchInvariantAttention:
             k_sf=k_sf,
             v_sf=v_sf,
             enable_pdl=enable_pdl,
+            v_sf_swizzled=self._v_sf_swizzled,
         )
         return out
 

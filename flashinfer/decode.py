@@ -2260,6 +2260,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        v_sf_swizzled : bool
+            Keyword-only, read under ``batch_invariant=True`` with a packed NVFP4 KV cache (``kv_data_type=torch.uint8``): the
+            layout of the V block scales that :meth:`run` receives in ``kv_cache_sf``. ``False`` (default): linear, what
+            :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache` writes. ``True``: TRT-LLM's 4-token interleaved
+            layout (what the ``trtllm-gen`` backend reads, and what serving engines write for it); ``page_size`` must then be
+            a multiple of four. The K block scales are linear in both. The layout cannot be detected from the tensors, so
+            the caller must state it: scales read in the other layout give wrong outputs with no error. Without
+            ``batch_invariant=True`` the layout is fixed by the backend and ``True`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2336,8 +2344,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        v_sf_swizzled: bool = False,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
+        if v_sf_swizzled and self._batch_invariant is None:
+            raise ValueError(
+                "v_sf_swizzled is an option of batch_invariant=True; the regular backends fix the layout of the NVFP4 V "
+                "block scales (fa2: linear, trtllm-gen: the 4-token interleaved layout)"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2387,6 +2401,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                v_sf_swizzled=v_sf_swizzled,
             )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
