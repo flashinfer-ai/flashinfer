@@ -343,6 +343,11 @@ def _matched_ratio(y, ref):
         [1500, 658, 76, 341, 341, 863, 2030],
         [584, 727],
         [64, 640, 6400, 1280, 320, 960, 2048, 128, 333, 77],
+        # FP32 carry boundary: 128 x 5761 gives ~4-5 CTAs per request, so at
+        # least one split exceeds 24 tiles and takes the carry path; 128 x
+        # 4608 (96 tiles, at most 24 per split) is the no-carry control.
+        [5761] * 128,
+        [4608] * 128,
     ],
 )
 def test_specialized_matches_reference_and_stock(kv_lens, monkeypatch):
@@ -547,8 +552,11 @@ def test_per_sequence_v_descale_is_applied_in_fp32():
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([6, 640], device)
-    # drive request 0's V to the e4m3 max; its kv fits one page (page id 0)
-    batch["v_cache"][0] = torch.full_like(batch["v_cache"][0].float(), 448.0).to(
+    # drive EVERY V page to the e4m3 max: request 0 (one page) exercises the
+    # large-descale overflow, and request 1's constant V makes its expected
+    # output exactly 448 * 2^-12 — random V scaled by 2^-12 would sit inside
+    # ATOL of zero, so a kernel that drops the request would still pass
+    batch["v_cache"][:] = torch.full_like(batch["v_cache"].float(), 448.0).to(
         torch.float8_e4m3fn
     )
     qd = torch.tensor([1.25, 0.5], dtype=torch.float32, device=device)
@@ -567,6 +575,12 @@ def test_per_sequence_v_descale_is_applied_in_fp32():
     assert torch.isfinite(out.float()).all()
     ref = _reference(batch, q_descale=qd, k_descale=kd, v_descale=vd)
     assert _matched_ratio(out, ref) >= MATCHED
+    # the small-descale request asserts its known nonzero value separately
+    # (attention over constant V returns V): 448 * 2^-12 with a tolerance far
+    # below that value, so a zeroed second request cannot pass
+    expected_small = 448.0 * 2.0**-12
+    small = out[6:12].float()
+    assert torch.all((small - expected_small).abs() <= 0.05 * expected_small), small
 
 
 def test_kill_switch_still_serves_per_sequence_q_scale(monkeypatch):
