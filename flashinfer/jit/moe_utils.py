@@ -20,6 +20,8 @@ from .core import (
     gen_jit_spec,
     current_compilation_context,
 )
+from .cpp_ext import is_windows
+from .windows_header_overlay import get_windows_header_overlay
 
 
 def gen_moe_utils_module() -> JitSpec:
@@ -58,15 +60,29 @@ def gen_moe_utils_module() -> JitSpec:
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
-    symlink_path = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
-    )
-    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
-    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+    canonical_export_path = jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path
+    if is_windows:
+        # On Windows the export headers come from a patched overlay instead of
+        # a symlink (see windows_header_overlay.py); it must come first on the
+        # include path.
+        verify_symlinked_headers(canonical_export_path, BMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = get_windows_header_overlay(
+            canonical_export_path,
+            "moe_utils",
+            BMM_EXPORT_HEADERS,
+            ("flashinfer", "trtllm", "batched_gemm", "trtllmGen_bmm_export"),
+        )
+    else:
+        symlink_path = (
+            jit_env.FLASHINFER_GEN_SRC_DIR
+            / "flashinfer"
+            / "trtllm"
+            / "batched_gemm"
+            / "trtllmGen_bmm_export"
+        )
+        ensure_symlink(symlink_path, canonical_export_path)
+        verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = None
     nvcc_flags = [
         "-DTLLM_GEN_EXPORT_INTERFACE",  # Use relative includes in downloaded headers
         "-DENABLE_BF16",
@@ -115,6 +131,7 @@ def gen_moe_utils_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[
+            *([windows_header_overlay] if windows_header_overlay is not None else []),
             jit_env.FLASHINFER_CSRC_DIR,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",

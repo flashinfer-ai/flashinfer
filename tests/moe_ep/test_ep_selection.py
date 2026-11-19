@@ -565,15 +565,16 @@ def test_numerical_contract_covers_activation_recipe_and_combine(monkeypatch):
     )
     mega = MegaConfig(Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 4))
     assert numerical_contract(mega, prototype, None) == contract
+    base_native = native
     for overrides in (
         {"apply_routing_weights_before_fc2": True},
         {"combine_dtype": "nvfp4"},
+        {"use_tanh_sigmoid": True},
+        {"epilogue_warpgroups": 2, "fc2_use_bulk": True},
     ):
-        native = dataclasses.replace(native, **overrides)
+        native = dataclasses.replace(base_native, **overrides)
         assert numerical_contract(mega, prototype, None) != contract
-        native = dataclasses.replace(
-            native, apply_routing_weights_before_fc2=False, combine_dtype="bf16"
-        )
+    native = base_native
     split.kernel.moe_config = dataclasses.replace(
         cfg, quant=dataclasses.replace(cfg.quant, per_token_scale=True)
     )
@@ -1116,7 +1117,7 @@ def test_fixed_mega_preparation_is_coordinated_before_launch(monkeypatch, peer_f
         _bootstrap=object(),
         _workspace=object(),
         _megakernel_config=SimpleNamespace(knobs={}),
-        _get_transformed_weights=lambda: (),
+        get_transformed_weights=lambda: (),
         _kernel=SimpleNamespace(ep_prepare_fixed=lambda *a: events.append("compile")),
         stage_inputs=lambda t: events.append("stage"),
         compute_staged=lambda **kwargs: events.append("launch"),
@@ -1140,7 +1141,7 @@ def test_skipping_outer_tuning_preserves_explicit_mega_knobs(monkeypatch):
         _mega_config=MegaConfig(kernel),
         _kernel=Mock(),
         _bootstrap=BootstrapConfig(1, 0),
-        _get_transformed_weights=lambda: (),
+        get_transformed_weights=lambda: (),
     )
     construct = Mock()
     monkeypatch.setattr(selection, "MoEEpMegaLayer", construct)

@@ -222,7 +222,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_55b2995635e0b6aa2b52(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_warp_decode_55b2995635e0b6aa2b52(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -413,6 +413,7 @@ kernel_cake_warp_decode_55b2995635e0b6aa2b52(const __grid_constant__ CUtensorMap
                 unsigned int tile_work_id = m_tile * (unsigned int)grid_n + n_tile;
                 bool tile_profile = _tile_iter < 2;
                 int expert = tile_expert[n_tile];
+                expert = (unsigned)expert < (unsigned)num_experts ? expert : 0;
                 int valid_rows = (unsigned int)tile_mn_limit[n_tile] - n_tile * (unsigned int)BLOCK_N;
                 float sc = scale_c[expert];
                 float sg = scale_gate[expert];
@@ -882,6 +883,7 @@ kernel_cake_warp_decode_55b2995635e0b6aa2b52(const __grid_constant__ CUtensorMap
                     break;
                 }
                 int expert_1 = tile_expert[n_tile_4];
+                expert_1 = (unsigned)expert_1 < (unsigned)num_experts ? expert_1 : 0;
                 mbarrier_wait(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty);
                 mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
                 throttle_stage += 1;
@@ -933,6 +935,7 @@ kernel_cake_warp_decode_55b2995635e0b6aa2b52(const __grid_constant__ CUtensorMap
                     break;
                 }
                 int expert_2 = tile_expert[n_tile_5];
+                expert_2 = (unsigned)expert_2 < (unsigned)num_experts ? expert_2 : 0;
                 #pragma unroll 1
                 for (int iter_k_3 = 0; iter_k_3 < K_tiles; iter_k_3++) {
                     mbarrier_wait(sfa_free_addr + (stage_4) * 8, _phase_sfa_free);

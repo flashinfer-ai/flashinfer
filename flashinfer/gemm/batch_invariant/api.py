@@ -45,7 +45,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -120,9 +120,10 @@ _ONES: Dict[
 
 def _layout_of_b(b: torch.Tensor, K: int, N: int, cls: str = CLASS) -> str:
     """The layout of a (K, N) weight: ``"n"`` row-major, ``"k"`` the transpose of a row-major (N, K) tensor."""
-    if b.stride(1) == 1 and b.stride(0) == N:
+    s0, s1 = b.stride()
+    if s1 == 1 and s0 == N:
         return "n"
-    if b.stride(0) == 1 and b.stride(1) == K:
+    if s0 == 1 and s1 == K:
         return "k"
     raise unsupported(
         cls,
@@ -325,10 +326,12 @@ def prepare_operands(
 def _aligned_rows(a: torch.Tensor, M: int, K: int, align: int) -> torch.Tensor:
     """A's row placement: the kernel reads 16-byte-aligned rows from a 16-byte-aligned base (a single row's row stride is
     immaterial); a placement, not numerics."""
-    if a.stride(1) != 1 or a.stride(0) % align or a.data_ptr() % _ALIGN_BYTES:
+    s0, s1 = a.stride()
+    aligned_base = a.data_ptr() % _ALIGN_BYTES == 0
+    if s1 != 1 or s0 % align or not aligned_base:
         a = (
             a.as_strided((1, K), (K, 1), a.storage_offset())
-            if (M == 1 and a.stride(1) == 1 and a.data_ptr() % _ALIGN_BYTES == 0)
+            if (M == 1 and s1 == 1 and aligned_base)
             else a.clone(memory_format=torch.contiguous_format)
         )
     return a
@@ -365,13 +368,14 @@ def _prepare_out(
     if out.device != device:
         raise unsupported(cls, "out on another device", "the output on A's device")
     _check_base(out, "out", cls, "output")
-    if out.stride(1) != 1 or (M > 1 and out.stride(0) != N):
+    s0, s1 = out.stride()
+    if s1 != 1 or (M > 1 and s0 != N):
         raise unsupported(
             cls,
-            f"out with strides {tuple(out.stride())}",
+            f"out with strides {(s0, s1)}",
             "a row-major contiguous output",
         )
-    if M == 1 and out.stride(0) != N:
+    if M == 1 and s0 != N:
         out = out.as_strided(
             (1, N), (N, 1), out.storage_offset()
         )  # the same elements, an aligned row stride
@@ -455,9 +459,54 @@ def _check_scale(
     return s.reshape(1)
 
 
+@functools.lru_cache(maxsize=8192)
+def _accepts(
+    config: Knobs, M: int, N: int, K: int, b_major: str, C: int, in_fmt: str
+) -> bool:
+    """The body's acceptance of a record at a shape (`blocks.operands.can_implement`), memoised: a pure function of its
+    arguments."""
+    from .blocks.operands import can_implement
+
+    return can_implement(config, M, N, K, b_major, C, in_fmt)
+
+
+@functools.lru_cache(maxsize=8192)
+def _accepts_mx(config: Knobs, M: int, N: int, K: int, C: int, in_fmt: str) -> bool:
+    """Membership of a record in a block-scaled class's enumerated space at a shape: the knob product (the grid size is a
+    launch parameter, not a record) and the body's acceptance; memoised like :func:`_accepts`."""
+    return dataclasses.replace(config, grid_clusters=0) in _knob_set(
+        in_fmt, C > 1
+    ) and _accepts(config, M, N, K, "k", C, in_fmt)
+
+
+# the compiled kernels by (device index, record, the launch's other compile parameters): the persistent grid is the
+# device's co-resident cluster count for the record, so once that count is final the handle is a function of the key
+_KERNELS: Dict[tuple, Any] = {}
+
+
+def _kernel(
+    device: torch.device, config: Knobs, key: tuple, build: Callable[[int, str], Any]
+) -> Any:
+    """The compiled kernel of ``config`` on ``device`` for ``key`` (what else selects the compile), from ``build(clusters,
+    family)`` with the device's persistent grid; kept per (device index, record, key) once the grid is final (a device whose
+    occupancy query is still being retried is asked again on the next call, as `persistent_clusters` does)."""
+    index = _device_key(device)
+    k = (index, config, *key)
+    kernel = _KERNELS.get(k)
+    if kernel is None:
+        _sm, fam = part_of(device)
+        kernel = build(persistent_clusters(device, config), fam)
+        if (
+            config.grid_clusters
+            or (index, config.cluster_m * config.cluster_n) in _CO_RESIDENT
+        ):
+            _KERNELS[k] = kernel
+    return kernel
+
+
 def _run(
     a: torch.Tensor,
-    b_nk: torch.Tensor,
+    b: torch.Tensor,
     out: torch.Tensor,
     b_major: str,
     M: int,
@@ -471,16 +520,19 @@ def _run(
     workspace: Optional[torch.Tensor],
     cls: str,
     bias: Optional[torch.Tensor] = None,
+    *,
+    out_fresh: bool = False,
 ) -> torch.Tensor:
-    """The launch shared by the classes for one (M, K) x (K, N) product: ``b_nk`` is the (N, K) view of the weight (strides
-    (1, N) for the ``n`` layout, (K, 1) for ``k``); ``scales`` the fp8 classes' two per-tensor scale tensors (empty for
-    bf16); ``bias`` the bf16 class's (N,) bias (the biased chain: added once after the whole fold, in the epilogue of a
-    direct store or in the fixup of the workspace split, whose partials stay bias-free)."""
+    """The launch shared by the classes for one (M, K) x (K, N) product: ``b`` is the (K, N) weight as the API takes it
+    (strides (N, 1) for the ``n`` layout, (1, K) for ``k``; the kernel reads its (N, K) view); ``scales`` the fp8 classes'
+    two per-tensor scale tensors (empty for bf16); ``bias`` the bf16 class's (N,) bias (the biased chain: added once after
+    the whole fold, in the epilogue of a direct store or in the fixup of the workspace split, whose partials stay
+    bias-free). ``out_fresh`` says the entry allocated ``out`` in this call: a fresh buffer aliases no live tensor, so its
+    aliasing check is skipped (every caller-provided buffer is checked)."""
     from .blocks.compile import get_compiled_gemm
-    from .blocks.operands import can_implement
     from .fixup import MAX_GRID_Y, get_fixup
 
-    if not can_implement(config, M, N, K, b_major, C, in_fmt):
+    if not _accepts(config, M, N, K, b_major, C, in_fmt):
         raise unsupported(
             cls,
             f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks and a "
@@ -489,29 +541,28 @@ def _run(
         )
     scaled = is_scaled(in_fmt)
     direct = C == 1 or config.cta_chunks
-    kernel = get_compiled_gemm(
+    biased = bias is not None and direct
+    kernel = _kernel(
+        a.device,
         config,
-        b_major,
-        C,
-        persistent_clusters(a.device, config),
-        in_fmt,
-        out_fmt,
-        family=part_of(a.device)[1],
-        bias=bias is not None and direct,
+        ("gemm", b_major, C, in_fmt, out_fmt, False, biased),
+        lambda clusters, fam: get_compiled_gemm(
+            config, b_major, C, clusters, in_fmt, out_fmt, family=fam, bias=biased
+        ),
     )
     extra = (scales if scaled else ()) + ((bias,) if bias is not None else ())
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
     Kc = K // C
     a3 = a.as_strided((M, Kc, C), (a.stride(0), 1, Kc))
-    b3 = b_nk.as_strided(
-        (N, Kc, C), (b_nk.stride(0), b_nk.stride(1), Kc * b_nk.stride(1))
-    )
-    reads = [(a, "A"), (b_nk, "B"), *((sc, "a scale") for sc in scales)]
+    sb_k, sb_n = b.stride()  # the (N, K) view's strides are (sb_n, sb_k)
+    b3 = b.as_strided((N, Kc, C), (sb_n, sb_k, Kc * sb_k))
+    reads = [(a, "A"), (b, "B"), *((sc, "a scale") for sc in scales)]
     if bias is not None:
         reads.append((bias, "the bias"))
     if direct:
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
@@ -519,10 +570,12 @@ def _run(
     # applied there, once)
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
+        writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
+        _require_disjoint(cls, writes, reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
@@ -580,6 +633,7 @@ def mm_bf16_batch_invariant(
     configuration (a member of the enumerated space: the bits never depend on it); ``chunks`` forces the class's
     chunk count (tests); ``workspace`` (fp32, at least ``chunks * M * N`` elements) is the split class's partials
     buffer, otherwise allocated per call from the caching allocator (stream-ordered)."""
+    out_fresh = out is None
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
     bias = prepare_bias(bias, N, a)
     if M == 0:
@@ -597,7 +651,7 @@ def mm_bf16_batch_invariant(
         config = default_config(M, N, K, C, b_major, *part_of(a.device))
     return _run(
         a,
-        b.t(),
+        b,
         out,
         b_major,
         M,
@@ -611,6 +665,7 @@ def mm_bf16_batch_invariant(
         workspace,
         CLASS,
         bias=bias,
+        out_fresh=out_fresh,
     )
 
 
@@ -701,6 +756,7 @@ def mm_fp8_batch_invariant(
     (N, K) tensor (:func:`flashinfer.bmm_fp8`'s column-major layout) or row-major; the scales are 1-element fp32 tensors;
     ``out_dtype`` bf16 / fp16 (fp32 exposes the fp32 chain input for tests). ``config``, ``chunks`` and ``workspace`` as in
     :func:`mm_bf16_batch_invariant`. :func:`bmm_fp8_batch_invariant` is the batched entry behind the FlashInfer API."""
+    out_fresh = out is None
     a, a_scale, b_scale, out, in_fmt, b_major, M, N, K = prepare_fp8_operands(
         a, b, a_scale, b_scale, out, out_dtype
     )
@@ -720,7 +776,7 @@ def mm_fp8_batch_invariant(
         config = default_config(M, N, K, C, b_major, *part_of(a.device), in_fmt)
     return _run(
         a,
-        b.t(),
+        b,
         out,
         b_major,
         M,
@@ -733,6 +789,7 @@ def mm_fp8_batch_invariant(
         (a_scale, b_scale),
         workspace,
         cls,
+        out_fresh=out_fresh,
     )
 
 
@@ -862,6 +919,7 @@ def bmm_fp8_batch_invariant(
     as ONE launch whose third operand mode is the batch, the split classes run the batch elements one after another
     (bit-equal by construction: each element is one launch of the class). ``config``, ``chunks`` and ``workspace`` (the
     split class's partials buffer, reused per element) as in :func:`mm_bf16_batch_invariant`."""
+    out_fresh = out is None
     A, A_scale, B_scale, out, in_fmt, b_major, b, M, N, K = prepare_bmm_fp8_operands(
         A, B, A_scale, B_scale, dtype, out
     )
@@ -879,27 +937,72 @@ def bmm_fp8_batch_invariant(
         )
     if config is None:
         config = default_config(M, N, K, C, b_major, *part_of(A.device), in_fmt)
-    out_fmt = OUT_FMT_OF_DTYPE[dtype]
+    return _launch_bmm_fp8(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        in_fmt,
+        b_major,
+        b,
+        M,
+        N,
+        K,
+        C,
+        config,
+        OUT_FMT_OF_DTYPE[dtype],
+        workspace,
+        cls,
+        out_fresh=out_fresh,
+    )
+
+
+def _launch_bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out: torch.Tensor,
+    in_fmt: str,
+    b_major: str,
+    b: int,
+    M: int,
+    N: int,
+    K: int,
+    C: int,
+    config: Knobs,
+    out_fmt: str,
+    workspace: Optional[torch.Tensor],
+    cls: str,
+    *,
+    out_fresh: bool = False,
+) -> torch.Tensor:
+    """The batched fp8 classes' launch on prepared operands (:func:`prepare_bmm_fp8_operands`'s): the unsplit class as one
+    launch over the batch, the split classes one launch of the class per element; ``out_fresh`` as in :func:`_run`."""
     if C == 1:
         from .blocks.compile import get_compiled_gemm
-        from .blocks.operands import can_implement
 
-        if not can_implement(config, M, N, K, b_major, 1, in_fmt):
+        if not _accepts(config, M, N, K, b_major, 1, in_fmt):
             raise unsupported(
                 cls,
                 f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with a "
                 f"{'K' if b_major == 'k' else 'N'}-major weight",
                 "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
             )
-        kernel = get_compiled_gemm(
+        if not out_fresh:  # the one launch over the batch reads every operand while it writes a caller's output
+            _require_disjoint(
+                cls,
+                [(out, "the output")],
+                [(A, "A"), (B, "B"), (A_scale, "a scale"), (B_scale, "a scale")],
+            )
+        kernel = _kernel(
+            A.device,
             config,
-            b_major,
-            1,
-            persistent_clusters(A.device, config),
-            in_fmt,
-            out_fmt,
-            True,
-            family=part_of(A.device)[1],
+            ("gemm", b_major, 1, in_fmt, out_fmt, True, False),
+            lambda clusters, fam: get_compiled_gemm(
+                config, b_major, 1, clusters, in_fmt, out_fmt, True, family=fam
+            ),
         )
         # (m, k, l) / (n, k, l) / (m, n, l) views with l = the batch element
         kernel(
@@ -917,7 +1020,7 @@ def bmm_fp8_batch_invariant(
     for i in range(b):  # the split classes: one launch of the class per batch element
         _run(
             A[i],
-            B[i].t(),
+            B[i],
             out[i],
             b_major,
             M,
@@ -930,6 +1033,7 @@ def bmm_fp8_batch_invariant(
             (A_scale, B_scale),
             workspace,
             cls,
+            out_fresh=out_fresh,
         )
     return out
 
@@ -968,7 +1072,7 @@ def _flat_sf(
     if sf.device != device:
         raise unsupported(cls, f"{name} on another device", f"{name} on A's device")
     if sf.is_contiguous():
-        flat = sf.reshape(-1)
+        flat = sf if sf.dim() == 1 else sf.reshape(-1)
     elif sf.dim() == 2 and sf.t().is_contiguous():
         flat = sf.t().reshape(-1)
     else:
@@ -1086,6 +1190,7 @@ def mm_mxfp8_batch_invariant(
     (:func:`flashinfer.mm_mxfp8`'s column-major layout); the scales are the 1-D swizzled uint8 buffers of
     :func:`flashinfer.mxfp8_quantize`; ``out_dtype`` bf16 / fp16 (fp32 exposes the fp32 chain input for tests).
     ``config``, ``chunks`` and ``workspace`` as in :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests)."""
+    out_fresh = out is None
     a, sfa, sfb, out, M, N, K = prepare_mxfp8_operands(
         a, b, a_descale, b_descale, out, out_dtype
     )
@@ -1106,7 +1211,7 @@ def mm_mxfp8_batch_invariant(
         config = default_config(M, N, K, C, "k", *part_of(a.device), in_fmt)
     return _run_mx(
         a,
-        b.t(),
+        b,
         sfa,
         sfb,
         out,
@@ -1119,6 +1224,7 @@ def mm_mxfp8_batch_invariant(
         OUT_FMT_OF_DTYPE[out_dtype],
         workspace,
         cls,
+        out_fresh=out_fresh,
     )
 
 
@@ -1133,7 +1239,7 @@ def _knob_set(in_fmt: str, cta_chunks: bool) -> frozenset:
 
 def _run_mx(
     a: torch.Tensor,
-    b_nk: torch.Tensor,
+    b: torch.Tensor,
     sfa: torch.Tensor,
     sfb: torch.Tensor,
     out: torch.Tensor,
@@ -1148,23 +1254,21 @@ def _run_mx(
     cls: str,
     alpha: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    *,
+    out_fresh: bool = False,
 ) -> torch.Tensor:
-    """The launch of the block-scaled classes for one product: ``b_nk`` the (N, K) row-major view of the weight (in bytes
-    for the 4-bit formats: (N, K / 2)), the scale buffers flat, ``alpha`` the 4-bit classes' scalar. Four placements of one
-    class: the direct store (the unsplit class; the in-CTA chunk fold and the in-cluster split of the split class), the
-    swapped decode record (the weights as the kernel's A, the tokens as its B, the output transposed: the block-scaled step
-    is symmetric in its two operands) and the workspace split with the dense module's fixup (the fp32 partials folded in
-    chunk order from +0, then the chain)."""
+    """The launch of the block-scaled classes for one product: ``b`` the weight as the API takes it, the (K, N) transpose of
+    a row-major (N, K) tensor (in bytes for the 4-bit formats: (K / 2, N); the kernel reads its (N, K) view), the scale
+    buffers flat, ``alpha`` the 4-bit classes' scalar, ``out_fresh`` as in :func:`_run`. Four placements of one class: the
+    direct store (the unsplit class; the in-CTA chunk fold and the in-cluster split of the split class), the swapped decode
+    record (the weights as the kernel's A, the tokens as its B, the output transposed: the block-scaled step is symmetric
+    in its two operands) and the workspace split with the dense module's fixup (the fp32 partials folded in chunk order
+    from +0, then the chain)."""
     from .blocks.compile_blockscaled import get_compiled_blockscaled
     from .blocks.compile_blockscaled_mixed import get_compiled_blockscaled_mixed
-    from .blocks.operands import can_implement
     from .fixup import MAX_GRID_Y, get_fixup
 
-    # membership in the enumerated space = the knob product (the grid size is a launch parameter, not a record) and the
-    # body's acceptance of the record at the shape
-    if dataclasses.replace(config, grid_clusters=0) not in _knob_set(
-        in_fmt, C > 1
-    ) or not can_implement(config, M, N, K, "k", C, in_fmt):
+    if not _accepts_mx(config, M, N, K, C, in_fmt):
         raise unsupported(
             cls,
             f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks",
@@ -1172,14 +1276,13 @@ def _run_mx(
         )
     if in_fmt in MX_MIXED_FMTS:
         # the mixed classes' kernels compile as a programmatic dependent launch on request (a placement)
-        kernel = get_compiled_blockscaled_mixed(
+        kernel = _kernel(
+            a.device,
             config,
-            C,
-            persistent_clusters(a.device, config),
-            in_fmt,
-            out_fmt,
-            family=part_of(a.device)[1],
-            enable_pdl=enable_pdl,
+            ("mx_mixed", C, in_fmt, out_fmt, enable_pdl),
+            lambda clusters, fam: get_compiled_blockscaled_mixed(
+                config, C, clusters, in_fmt, out_fmt, family=fam, enable_pdl=enable_pdl
+            ),
         )
     else:
         if enable_pdl:
@@ -1187,30 +1290,34 @@ def _run_mx(
                 "enable_pdl is wired for the mixed classes only; the mxfp8 and fp4 classes launch without programmatic "
                 "dependent launch"
             )
-        kernel = get_compiled_blockscaled(
+        kernel = _kernel(
+            a.device,
             config,
-            C,
-            persistent_clusters(a.device, config),
-            in_fmt,
-            out_fmt,
-            family=part_of(a.device)[1],
+            ("mx", C, in_fmt, out_fmt),
+            lambda clusters, fam: get_compiled_blockscaled(
+                config, C, clusters, in_fmt, out_fmt, family=fam
+            ),
         )
     # each operand's K extent in its own units (bytes for a 4-bit operand: the mixed classes' weight, both operands of the
     # 4-bit formats)
     Kb_a = K * A_ELEM_BITS_OF[in_fmt] // 8
     Kb_b = K * B_ELEM_BITS_OF[in_fmt] // 8
     extra = (alpha,) if alpha is not None else ()
+    sb_n = b.stride(
+        1
+    )  # the (N, K) view's row stride (its K stride is 1: the K-major layout)
     if config.swap_ab and C == 1:
         # the decode specialisation: C^T = B^T A^T with the operands exchanged; the kernel's A is the weight (N rows), its B
         # the tokens (any count, one tile), its C the M-major (N, M) view of the output
-        _require_disjoint(
-            cls,
-            [(out, "the output")],
-            [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
-            + ([(alpha, "alpha")] if alpha is not None else []),
-        )
+        if not out_fresh:
+            _require_disjoint(
+                cls,
+                [(out, "the output")],
+                [(a, "A"), (b, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
+                + ([(alpha, "alpha")] if alpha is not None else []),
+            )
         kernel(
-            b_nk.as_strided((N, Kb_b, 1), (b_nk.stride(0), 1, Kb_b)),
+            b.as_strided((N, Kb_b, 1), (sb_n, 1, Kb_b)),
             a.as_strided((M, Kb_a, 1), (a.stride(0), 1, Kb_a)),
             sfb,
             sfa,
@@ -1224,12 +1331,13 @@ def _run_mx(
     L = 1 if config.cluster_k > 1 else C
     KL_a, KL_b = Kb_a // L, Kb_b // L
     a3 = a.as_strided((M, KL_a, L), (a.stride(0), 1, KL_a))
-    b3 = b_nk.as_strided((N, KL_b, L), (b_nk.stride(0), 1, KL_b))
-    reads = [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
+    b3 = b.as_strided((N, KL_b, L), (sb_n, 1, KL_b))
+    reads = [(a, "A"), (b, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
     if alpha is not None:
         reads.append((alpha, "alpha"))
     if C == 1 or config.cta_chunks or config.cluster_k > 1:
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, sfa, sfb, c3, *extra)  # the chain in the epilogue
         return out
@@ -1237,10 +1345,12 @@ def _run_mx(
     # applied there, once)
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
+        writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
+        _require_disjoint(cls, writes, reads)
     if config.swap_ab:
         # the swapped record of a split class (the mixed classes): the exchanged operands' chunk partials P_c^T into the
         # workspace's (N, M, C) view (the kernel's M contiguous), then the same fixup over the (M, N, C) view
@@ -1437,6 +1547,7 @@ def mm_fp4_batch_invariant(
             f"block_size={block_size} with use_nvfp4={use_nvfp4}",
             "block_size 16 for NVFP4 and 32 for MXFP4 (the formats' block scales)",
         )
+    out_fresh = out is None
     a, b, sfa, sfb, alpha, out, M, N, K = prepare_fp4_operands(
         a, b, a_descale, b_descale, alpha, out, out_dtype, use_nvfp4
     )
@@ -1457,7 +1568,7 @@ def mm_fp4_batch_invariant(
         config = default_config(M, N, K, C, "k", *part_of(a.device), in_fmt)
     return _run_mx(
         a,
-        b.t(),
+        b,
         sfa,
         sfb,
         out,
@@ -1471,6 +1582,7 @@ def mm_fp4_batch_invariant(
         workspace,
         cls,
         alpha=alpha,
+        out_fresh=out_fresh,
     )
 
 
@@ -1603,6 +1715,7 @@ def mm_mxfp8_mxfp4_batch_invariant(
     its dependents once its loads are issued -- a placement, the same bits as the plain launch)."""
     from ...utils import device_support_pdl
 
+    out_fresh = out is None
     a, b, sfa, sfb, alpha, out, M, N, K = prepare_mxfp4w8a_operands(
         a, b, a_descale, b_descale, alpha, out, out_dtype
     )
@@ -1633,7 +1746,7 @@ def mm_mxfp8_mxfp4_batch_invariant(
         config = default_config(M, N, K, C, "k", *part_of(a.device), in_fmt)
     return _run_mx(
         a,
-        b.t(),
+        b,
         sfa,
         sfb,
         out,
@@ -1648,6 +1761,7 @@ def mm_mxfp8_mxfp4_batch_invariant(
         cls,
         alpha=alpha,
         enable_pdl=bool(enable_pdl),
+        out_fresh=out_fresh,
     )
 
 
@@ -1792,23 +1906,15 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     ``config`` forces a record of the class's space (the dispatcher's pick by default: every record computes the same
     bits), ``native_k`` the ``K`` layout's scale staging (:func:`native_k_staging` by default; a placement). One launch,
     no split, no workspace."""
+    out_fresh = out is None
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
         a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
     )
-    cls = CLASS_FP8BS
     if M == 0:
         return out  # no rows: nothing to launch
-    from .blocks.compile_fp8bs import get_compiled_fp8bs
-    from .blocks.operands import can_implement
-
-    in_fmt = FP8_BLOCKSCALE_FMTS[0]
     if config is None:
-        config = default_config(M, N, K, 1, "k", *part_of(a.device), in_fmt)
-    if not can_implement(config, M, N, K, "k", 1, in_fmt):
-        raise unsupported(
-            cls,
-            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
-            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        config = default_config(
+            M, N, K, 1, "k", *part_of(a.device), FP8_BLOCKSCALE_FMTS[0]
         )
     # the K layout's staging (a placement: the fold never changes): the K-native ring at a few rows, the tensors read as they
     # are from 16-byte-aligned bases (the four-block copies); the MN-major copy and the per-block ring otherwise
@@ -1822,23 +1928,68 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     )
     if scale_major_mode == "K" and not native_k:
         sfa = sfa.t().contiguous().t()
-    _require_disjoint(
-        cls,
-        [(out, "the output")],
-        [(a, "A"), (b, "B"), (sfa, "a_scale"), (sfb, "b_scale")],
+    return _launch_fp8bs(
+        a,
+        b,
+        sfa,
+        sfb,
+        out,
+        M,
+        N,
+        K,
+        config,
+        native_k,
+        OUT_FMT_OF_DTYPE[out_dtype],
+        out_fresh=out_fresh,
     )
+
+
+def _launch_fp8bs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    out: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    config: Knobs,
+    native_k: bool,
+    out_fmt: str,
+    *,
+    out_fresh: bool = False,
+) -> torch.Tensor:
+    """The block-scale class's launch on prepared operands: ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views
+    in the layout the staging reads (``native_k``: the caller's K-layout tensors as they are; else M-major views of the
+    MN-layout copies); ``out_fresh`` as in :func:`_run`."""
+    from .blocks.compile_fp8bs import get_compiled_fp8bs
+
+    cls = CLASS_FP8BS
+    if not _accepts(config, M, N, K, "k", 1, FP8_BLOCKSCALE_FMTS[0]):
+        raise unsupported(
+            cls,
+            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
+            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        )
+    if not out_fresh:
+        _require_disjoint(
+            cls,
+            [(out, "the output")],
+            [(a, "A"), (b, "B"), (sfa, "a_scale"), (sfb, "b_scale")],
+        )
     # the kernel sees (m, k, l) / (n, k, l) / (m, n, l) operands with l = 1 and the scale views with their own strides
     a3 = a.as_strided((M, K, 1), (a.stride(0), 1, K))
     b3 = b.as_strided((N, K, 1), (b.stride(0), 1, K))
     c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
     # the compile's architecture query and the launch follow A's device, not the current one
     with torch.cuda.device(a.device):
-        kernel = get_compiled_fp8bs(
+        kernel = _kernel(
+            a.device,
             config,
-            persistent_clusters(a.device, config),
-            OUT_FMT_OF_DTYPE[out_dtype],
-            family=part_of(a.device)[1],
-            native_k=native_k,
+            ("fp8bs", out_fmt, native_k),
+            lambda clusters, fam: get_compiled_fp8bs(
+                config, clusters, out_fmt, family=fam, native_k=native_k
+            ),
         )
         kernel(a3, b3, sfa, sfb, c3)
     return out

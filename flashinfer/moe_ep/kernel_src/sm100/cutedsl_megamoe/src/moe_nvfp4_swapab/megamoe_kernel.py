@@ -1491,6 +1491,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
             world_size=self.world_size,
             local_rank=peer_rank_ptr_mapper_host.rank_idx,
+            # POC (multimem barrier): multicast VA of nvlink_barrier_signal, a
+            # plain i64 scalar carried on SymBufferHost (0 when the gate is off).
+            nvlink_barrier_mc_base=peer_rank_ptr_mapper_host.mc_base,
             num_total_experts=self.num_total_experts,
             num_experts_per_rank=self.num_experts_per_rank,
             num_topk=self.num_topk,

@@ -42,7 +42,10 @@ if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
     )
 elif (
     torch.cuda.is_available()
-    and is_sm100a_supported(torch.device("cuda"))
+    and (
+        is_sm100a_supported(torch.device("cuda"))
+        or get_compute_capability(torch.device("cuda"))[0] == 11
+    )
     and torch.version.cuda is not None
     and int(torch.version.cuda.split(".")[0]) >= 13
 ):
@@ -95,11 +98,11 @@ if torch.cuda.is_available() and get_compute_capability(torch.device("cuda"))[0]
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if is_sm100a_supported(device):
+    if is_sm100a_supported(device) or get_compute_capability(device)[0] == 11:
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         if cuda_major < 13:
             pytest.skip(
-                f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+                f"SM100/SM110 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
         return
     if not (
@@ -107,7 +110,7 @@ def _skip_if_cp_unsupported():
         or is_sm90a_supported(device)
         or is_sm12x_supported(device)
     ):
-        pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, or SM12x")
+        pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, SM110, or SM12x")
 
 
 def _seed_all(seed):
