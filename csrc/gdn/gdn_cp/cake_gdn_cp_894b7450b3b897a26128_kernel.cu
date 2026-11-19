@@ -54,7 +54,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, float* __restrict__ local_state, float* __restrict__ initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* __restrict__ output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads, int* __restrict__ state_indices, int* __restrict__ output_state_indices, int* __restrict__ checkpoint_state_indices, int* __restrict__ checkpoint_cu_starts, int* __restrict__ prefix_lens, long long state_stride0, int page_size)
+kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, float* __restrict__ local_state, float* initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads, int* __restrict__ state_indices, int* __restrict__ output_state_indices, int* __restrict__ checkpoint_state_indices, int* __restrict__ checkpoint_cu_starts, int* __restrict__ prefix_lens, long long state_stride0, int page_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -113,27 +113,32 @@ kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, floa
     int final_row = output_state_indices[seq_idx];
     int checkpoint_start = checkpoint_cu_starts[seq_idx];
     long long pool_head_offset = (long long)head_idx * 16384ll;
+    float r_initial[4];
+    #pragma unroll
+    for (int row_in_cta = 0; row_in_cta < 4; row_in_cta++) {
+        r_initial[row_in_cta] = 0.0f;
+        if (read_row >= 0) {
+            r_initial[row_in_cta] = initial_state[(long long)read_row * state_stride0 + pool_head_offset + (long long)((row_base + row_in_cta) * 128) + (long long)col];
+        }
+    }
     __syncthreads();
     float r_acc[4];
     float r_acc_next[4];
     float r_ring[64];
     if (num_chunks > 0) {
         #pragma unroll
-        for (int row_in_cta = 0; row_in_cta < 4; row_in_cta++) {
-            int row = row_base + row_in_cta;
+        for (int row_in_cta_1 = 0; row_in_cta_1 < 4; row_in_cta_1++) {
+            int row = row_base + row_in_cta_1;
             long long state_index = state_head_base + (long long)(row * 128) + (long long)col;
-            float value = 0.0f;
-            if (read_row >= 0) {
-                value = initial_state[(long long)read_row * state_stride0 + pool_head_offset + (long long)(row * 128) + (long long)col];
-            }
-            shared_state[row_in_cta * 128 + col] = value;
+            float value = r_initial[row_in_cta_1];
+            shared_state[row_in_cta_1 * 128 + col] = value;
             initial_state_workspace[state_index] = value;
         }
         __syncthreads();
         #pragma unroll
-        for (int row_in_cta_1 = 0; row_in_cta_1 < 4; row_in_cta_1++) {
-            long long local_index = chunk_head_base + (long long)((row_base + row_in_cta_1) * 128) + (long long)col;
-            r_acc[row_in_cta_1] = local_state[local_index];
+        for (int row_in_cta_2 = 0; row_in_cta_2 < 4; row_in_cta_2++) {
+            long long local_index = chunk_head_base + (long long)((row_base + row_in_cta_2) * 128) + (long long)col;
+            r_acc[row_in_cta_2] = local_state[local_index];
         }
         #pragma unroll
         for (int pre_k = 0; pre_k < 3; pre_k++) {
@@ -164,18 +169,18 @@ kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, floa
             int current_k_base = iter_k * 16;
             int use_slot = iter_k % 4 * 16;
             #pragma unroll
-            for (int row_in_cta_2 = 0; row_in_cta_2 < 4; row_in_cta_2++) {
+            for (int row_in_cta_3 = 0; row_in_cta_3 < 4; row_in_cta_3++) {
                 #pragma unroll
                 for (int frag_col_2 = 0; frag_col_2 < 16; frag_col_2++) {
-                    r_acc[row_in_cta_2] = r_acc[row_in_cta_2] + shared_state[row_in_cta_2 * 128 + current_k_base + frag_col_2] * r_ring[use_slot + frag_col_2];
+                    r_acc[row_in_cta_3] = r_acc[row_in_cta_3] + shared_state[row_in_cta_3 * 128 + current_k_base + frag_col_2] * r_ring[use_slot + frag_col_2];
                 }
             }
         }
         if (next_chunk_idx < num_chunks) {
             #pragma unroll
-            for (int row_in_cta_3 = 0; row_in_cta_3 < 4; row_in_cta_3++) {
-                long long local_index_1 = next_chunk_head_base + (long long)((row_base + row_in_cta_3) * 128) + (long long)col;
-                r_acc_next[row_in_cta_3] = local_state[local_index_1];
+            for (int row_in_cta_4 = 0; row_in_cta_4 < 4; row_in_cta_4++) {
+                long long local_index_1 = next_chunk_head_base + (long long)((row_base + row_in_cta_4) * 128) + (long long)col;
+                r_acc_next[row_in_cta_4] = local_state[local_index_1];
             }
         }
         #pragma unroll
@@ -192,10 +197,10 @@ kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, floa
             int tail_k_base = tail_k * 16;
             int tail_slot = tail_k % 4 * 16;
             #pragma unroll
-            for (int row_in_cta_4 = 0; row_in_cta_4 < 4; row_in_cta_4++) {
+            for (int row_in_cta_5 = 0; row_in_cta_5 < 4; row_in_cta_5++) {
                 #pragma unroll
                 for (int frag_col_4 = 0; frag_col_4 < 16; frag_col_4++) {
-                    r_acc[row_in_cta_4] = r_acc[row_in_cta_4] + shared_state[row_in_cta_4 * 128 + tail_k_base + frag_col_4] * r_ring[tail_slot + frag_col_4];
+                    r_acc[row_in_cta_5] = r_acc[row_in_cta_5] + shared_state[row_in_cta_5 * 128 + tail_k_base + frag_col_4] * r_ring[tail_slot + frag_col_4];
                 }
             }
         }
@@ -210,32 +215,32 @@ kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, floa
         long long checkpoint_base = (long long)checkpoint_row * state_stride0 + pool_head_offset;
         __syncthreads();
         #pragma unroll
-        for (int row_in_cta_5 = 0; row_in_cta_5 < 4; row_in_cta_5++) {
-            float value_1 = r_acc[row_in_cta_5];
-            shared_state[row_in_cta_5 * 128 + col] = value_1;
-            long long fixed_index = current_chunk_head_base + (long long)((row_base + row_in_cta_5) * 128) + (long long)col;
+        for (int row_in_cta_6 = 0; row_in_cta_6 < 4; row_in_cta_6++) {
+            float value_1 = r_acc[row_in_cta_6];
+            shared_state[row_in_cta_6 * 128 + col] = value_1;
+            long long fixed_index = current_chunk_head_base + (long long)((row_base + row_in_cta_6) * 128) + (long long)col;
             fixed_state[fixed_index] = value_1;
             if (checkpoint_row >= 0) {
-                output_state[checkpoint_base + (long long)((row_base + row_in_cta_5) * 128) + (long long)col] = value_1;
+                output_state[checkpoint_base + (long long)((row_base + row_in_cta_6) * 128) + (long long)col] = value_1;
             }
         }
         __syncthreads();
         if (next_chunk_idx < num_chunks) {
             #pragma unroll
-            for (int row_in_cta_6 = 0; row_in_cta_6 < 4; row_in_cta_6++) {
-                r_acc[row_in_cta_6] = r_acc_next[row_in_cta_6];
+            for (int row_in_cta_7 = 0; row_in_cta_7 < 4; row_in_cta_7++) {
+                r_acc[row_in_cta_7] = r_acc_next[row_in_cta_7];
             }
         }
     }
     if (num_chunks > 0 && final_row >= 0) {
         long long final_base = (long long)final_row * state_stride0 + pool_head_offset;
         #pragma unroll
-        for (int row_in_cta_7 = 0; row_in_cta_7 < 4; row_in_cta_7++) {
-            float final_value = shared_state[row_in_cta_7 * 128 + col];
+        for (int row_in_cta_8 = 0; row_in_cta_8 < 4; row_in_cta_8++) {
+            float final_value = shared_state[row_in_cta_8 * 128 + col];
             if ((prefix_len & 63) != 0) {
                 final_value = __uint_as_float(2143289344);
             }
-            output_state[final_base + (long long)((row_base + row_in_cta_7) * 128) + (long long)col] = final_value;
+            output_state[final_base + (long long)((row_base + row_in_cta_8) * 128) + (long long)col] = final_value;
         }
     }
     if (num_chunks > 0 && (prefix_len & 63) != 0) {
@@ -246,8 +251,8 @@ kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, floa
             if (nan_row >= 0) {
                 long long nan_base = (long long)nan_row * state_stride0 + pool_head_offset;
                 #pragma unroll
-                for (int row_in_cta_8 = 0; row_in_cta_8 < 4; row_in_cta_8++) {
-                    output_state[nan_base + (long long)((row_base + row_in_cta_8) * 128) + (long long)col] = __uint_as_float(2143289344);
+                for (int row_in_cta_9 = 0; row_in_cta_9 < 4; row_in_cta_9++) {
+                    output_state[nan_base + (long long)((row_base + row_in_cta_9) * 128) + (long long)col] = __uint_as_float(2143289344);
                 }
             }
         }
@@ -257,8 +262,8 @@ kernel_cake_gdn_cp_894b7450b3b897a26128(float* __restrict__ local_transfer, floa
         int gap_head_linear = gap_idx * num_heads + head_idx;
         long long gap_head_base = (long long)gap_head_linear * 16384ll;
         #pragma unroll
-        for (int row_in_cta_9 = 0; row_in_cta_9 < 4; row_in_cta_9++) {
-            long long fixed_index_1 = gap_head_base + (long long)((row_base + row_in_cta_9) * 128) + (long long)col;
+        for (int row_in_cta_10 = 0; row_in_cta_10 < 4; row_in_cta_10++) {
+            long long fixed_index_1 = gap_head_base + (long long)((row_base + row_in_cta_10) * 128) + (long long)col;
             fixed_state[fixed_index_1] = 0.0f;
         }
     }

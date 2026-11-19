@@ -138,7 +138,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_cp_42e7e45cc878f75497c8(const __grid_constant__ CUtensorMap local_transfer, const __grid_constant__ CUtensorMap local_state, float* __restrict__ initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* __restrict__ output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads, int* __restrict__ state_indices, int* __restrict__ output_state_indices, int* __restrict__ checkpoint_state_indices, int* __restrict__ checkpoint_cu_starts, int* __restrict__ prefix_lens, long long state_stride0, int page_size)
+kernel_cake_gdn_cp_42e7e45cc878f75497c8(const __grid_constant__ CUtensorMap local_transfer, const __grid_constant__ CUtensorMap local_state, float* initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads, int* __restrict__ state_indices, int* __restrict__ output_state_indices, int* __restrict__ checkpoint_state_indices, int* __restrict__ checkpoint_cu_starts, int* __restrict__ prefix_lens, long long state_stride0, int page_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

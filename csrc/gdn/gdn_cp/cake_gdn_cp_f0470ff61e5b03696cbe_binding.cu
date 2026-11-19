@@ -21,7 +21,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_gdn_cp_f0470ff61e5b03696cbe(float* __restrict__ local_transfer, float* __restrict__ local_state, float* __restrict__ initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* __restrict__ output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads, int* __restrict__ state_indices, int* __restrict__ output_state_indices, int* __restrict__ checkpoint_state_indices, int* __restrict__ checkpoint_cu_starts, int* __restrict__ prefix_lens, long long state_stride0, int page_size);
+extern "C" __global__ void kernel_cake_gdn_cp_f0470ff61e5b03696cbe(float* __restrict__ local_transfer, float* __restrict__ local_state, float* initial_state, float* __restrict__ initial_state_workspace, float* __restrict__ fixed_state, float* output_state, long long* __restrict__ cu_seqlens, int chunk_len, int total_cp_chunks, int num_seqs, int num_heads, int* __restrict__ state_indices, int* __restrict__ output_state_indices, int* __restrict__ checkpoint_state_indices, int* __restrict__ checkpoint_cu_starts, int* __restrict__ prefix_lens, long long state_stride0, int page_size);
 
 namespace cake_binding_kernel_cake_gdn_cp_f0470ff61e5b03696cbe {
 
