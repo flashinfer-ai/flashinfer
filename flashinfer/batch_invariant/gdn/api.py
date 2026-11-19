@@ -35,10 +35,10 @@ Without ``initial_state`` the call is stateless: every sequence is whole and run
 launch, the rows are the ones the pool calls return for it, and no state is read, written, kept or returned (the form a
 trainer's forward pass takes). The rows carry no ``grad_fn``. The other state arguments are refused with it. With
 ``train_states`` the same launch also stores the state every 64-token chunk starts from in that caller-owned buffer
-(:mod:`.train`), in the row layout cuDNN's GDN backward takes as ``state_checkpoints``. As for the pool calls,
-only the lengths of ``cu_seqlens`` and ``cu_seqlens_cpu`` are compared; the stateless call then runs from the host
-offsets (one small tensor per call), so the two cannot disagree in it. Its ``output`` and ``train_states`` may share
-no memory with an input, the offsets, each other or a state pool, and ``output``'s autograd version is bumped.
+(:mod:`.train`), in the row layout cuDNN's GDN backward takes as ``state_checkpoints``. Given both
+``cu_seqlens`` and ``cu_seqlens_cpu``, the stateless call compares their lengths and runs from the host offsets (copied
+to the device once per distinct offsets), so the two cannot disagree in it. Its ``output`` and ``train_states`` may
+share no memory with an input, the offsets, each other or a state pool, and ``output``'s autograd version is bumped.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -148,23 +148,35 @@ def _host_offsets(
     cu_seqlens: Optional[torch.Tensor],
     cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]],
     T: int,
+    integers_only: bool = False,
 ) -> List[int]:
     if cu_seqlens is None and cu_seqlens_cpu is None:
         return [0, T]
     src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    if integers_only:
+        return _checked_offsets(_integers(src), T)
+    cu = [int(x) for x in (src.tolist() if isinstance(src, torch.Tensor) else src)]
+    return _checked_offsets(cu, T)
+
+
+def _integers(src: Union[Sequence[int], torch.Tensor]) -> List[int]:
+    cu = None
     if isinstance(src, torch.Tensor):
         whole = src.ndim == 1 and not (src.is_floating_point() or src.is_complex())
-        cu = src.tolist() if whole and src.dtype != torch.bool else None
+        if whole and src.dtype != torch.bool:
+            cu = src.tolist()
     else:
         try:
-            cu = [operator.index(x) for x in src]
+            values = list(src)
+            if not any(isinstance(x, bool) for x in values):
+                cu = [operator.index(x) for x in values]
         except TypeError:
-            cu = None
+            pass
     if cu is None:
         raise unsupported(
             CLASS, "offsets that are not 1-D integers", "1-D integer offsets"
         )
-    return _checked_offsets(cu, T)
+    return cu
 
 
 def _checked_offsets(cu: List[int], T: int) -> List[int]:
@@ -195,12 +207,6 @@ def _check_output(output: Optional[torch.Tensor], v: torch.Tensor) -> None:
         raise unsupported(CLASS, "an output on another device", "the inputs' device")
     if output.requires_grad:
         raise unsupported(CLASS, "an output that requires grad", "a plain buffer")
-    if output.is_inference() and not torch.is_inference_mode_enabled():
-        raise unsupported(
-            CLASS,
-            "an output allocated under inference_mode in a call outside it",
-            "a buffer allocated in the mode of the call",
-        )
 
 
 def _stateless(
@@ -223,9 +229,23 @@ def _stateless(
             "a call without initial_state inside a CUDA graph capture",
             "an eager call",
         )
-    if cu_seqlens is not None and (cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2):
+    if cu_seqlens is not None and (
+        not isinstance(cu_seqlens, torch.Tensor)
+        or cu_seqlens.ndim != 1
+        or cu_seqlens.numel() < 2
+    ):
         raise unsupported(CLASS, "a malformed cu_seqlens", "a 1-D [N + 1] tensor")
-    offs = _host_offsets(cu_seqlens, cu_seqlens_cpu, int(v.shape[0]))
+    if (
+        output is not None
+        and output.is_inference()
+        and not torch.is_inference_mode_enabled()
+    ):
+        raise unsupported(
+            CLASS,
+            "an output allocated under inference_mode in a call outside it",
+            "a buffer allocated in the mode of the call",
+        )
+    offs = _host_offsets(cu_seqlens, cu_seqlens_cpu, int(v.shape[0]), True)
     if cu_seqlens is not None and cu_seqlens.numel() != len(offs):
         raise unsupported(
             CLASS,

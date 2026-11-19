@@ -414,16 +414,20 @@ flashinfer.chunk_gated_delta_rule(
   pool call.
 * With `output=` and a contiguous int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and
   adds no allocation of its own, and reads the offsets back to check them. With `cu_seqlens_cpu` it runs from those
-  host offsets instead (no read; one small offsets tensor per call), so device and host offsets cannot disagree in it;
-  only their lengths are compared. Offsets that are not 1-D integers raise the typed error. The
+  host offsets instead (no read of a device tensor), so device and host offsets cannot disagree in it; only their lengths are compared.
+  The host offsets are copied to the device once and the last 16 copies are kept (across streams, devices and the
+  two forms of the call; a few int32 per sequence, and per stored state with `train_states`), so a call that repeats
+  the offsets of an earlier one on the same stream copies nothing. Offsets that are not 1-D integers raise the typed error. The
   prefill underneath allocates, as in every prefill of the class, the normalized `q` and `k` (`2 * T * HQ * 256`
   bytes), the linear gates (`4 * T * HV` bytes) and a small kernel workspace, all freed at return. Per device and
   v-head count the class keeps one state tensor the kernel is pointed at and never reads or writes (3.1 MB at 48 v
-  heads) and an index tensor of one int32 per sequence, allocated at the first stateless call and regrown when a call
-  brings more sequences than any before (the replaced ones are kept, a few bytes per sequence).
-* `output` may share no memory with an input, the offsets, `train_states` or one of the class's state pools, and an
-  `output` allocated under `inference_mode` is refused in a call outside it (typed errors, before anything is
-  written). Its autograd version is bumped by the call.
+  heads) and, for the call without `train_states`, an int32 index tensor, allocated at the first stateless call and
+  regrown to twice the sequence count when a call brings more sequences than it holds (the replaced ones are kept,
+  a few bytes per sequence).
+* `output` may share no memory with an input, the offsets, `train_states` or one of the class's state pools (a pool
+  owns its storage from its first slot to the storage's end), and an `output` allocated under `inference_mode` is
+  refused in a call outside it (typed errors, before anything is written). The call bumps its autograd version (an
+  inference tensor has none).
 * It cannot be captured in a CUDA graph (it raises).
 * **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
   `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
@@ -468,7 +472,7 @@ rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequen
   other sequences of the call. The output rows are the rows of the call without `train_states`.
 * 64 KiB per v head and chunk, which approaches 1 KiB per token and v head for long sequences (48 KiB per token at
   48 v heads, four times the output) and is one state per sequence for sequences of at most 64 tokens. Rows past
-  `training_state_slots` are left as they are. The call allocates two small index tensors for the layout.
+  `training_state_slots` are left as they are. The layout's index tensors are kept with the offsets' copies.
 * The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
   that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is not 16-byte aligned
   or shares memory with one of the class's state pools, the output, an input or the offsets, raises the typed error.

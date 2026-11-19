@@ -17,7 +17,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 
 from ..support import unsupported
-from .pool import _pinned, refuse_shared
+from .pool import _pinned, index_tensors, refuse_shared
 from .spec import CHUNK, CLASS, HEAD_DIM
 
 
@@ -113,18 +113,19 @@ def zero_state_prefill_with_states(
     The rows and the layout both follow the host offsets ``offs``."""
     dev = out.device
     N = len(offs) - 1
-    ck_rows, ck_starts, lead = _checkpoint_rows(offs)
-    meta = torch.tensor(
-        [-1] * N + list(offs) + ck_starts + ck_rows,
-        dtype=torch.int32,
-        device=dev,
-    )
+
+    def build():
+        ck_rows, ck_starts, lead = _checkpoint_rows(offs)
+        stored = ck_rows if any(r >= 0 for r in ck_rows) else []
+        return [-1] * N + list(offs) + ck_starts + stored, lead
+
+    kinds = (torch.int32, torch.int64)
+    meta, lead = index_tensors("train", offs, dev, build, kinds)
     skip = meta[:N]
     cu = meta[N : 2 * N + 1]
-    pos = 2 * N + 1
     checkpoints = None
-    if any(r >= 0 for r in ck_rows):
-        checkpoints = (meta[pos + N + 1 :], meta[pos : pos + N + 1])
+    if meta.numel() > 3 * N + 2:
+        checkpoints = (meta[3 * N + 2 :], meta[2 * N + 1 : 3 * N + 2])
     _pinned(
         rows,
         cu,
@@ -136,5 +137,5 @@ def zero_state_prefill_with_states(
         output=out,
         checkpoints=checkpoints,
     )
-    states.index_fill_(0, torch.tensor(lead, device=dev), 0.0)
+    states.index_fill_(0, lead, 0.0)
     return out

@@ -21,7 +21,9 @@ kernels compute the class's term:
 from __future__ import annotations
 
 import functools
+import threading
 import weakref
+from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -179,26 +181,60 @@ _ZERO: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 _RETIRED: List[torch.Tensor] = []
 
 
+_ZERO_LOCK = threading.Lock()
+_INDEX: "OrderedDict[tuple, Tuple[torch.Tensor, ...]]" = OrderedDict()
+_INDEX_LOCK = threading.Lock()
+
+
+def index_tensors(
+    kind: str, offs: Sequence[int], dev: torch.device, build, dtypes=(torch.int32,)
+):
+    """Device index tensors derived from the host offsets (``build()`` returns one list per dtype), complete when
+    returned and never written. The last 16 are kept, keyed by stream, so a call with the offsets of an earlier one
+    copies nothing."""
+    key = (kind, dev, torch.cuda.current_stream(dev).cuda_stream, tuple(offs))
+    with _INDEX_LOCK:
+        got = _INDEX.get(key)
+        if got is not None:
+            _INDEX.move_to_end(key)
+            return got
+    got = tuple(
+        torch.tensor(values, dtype=dtype, device=dev)
+        for values, dtype in zip(build(), dtypes, strict=True)
+    )
+    with _INDEX_LOCK:
+        _INDEX[key] = got
+        while len(_INDEX) > 16:
+            _INDEX.popitem(last=False)
+    return got
+
+
+def _grown(cached, dev, HV, N) -> Tuple[torch.Tensor, torch.Tensor]:
+    if cached is not None:
+        state = cached[0]
+    else:
+        state = torch.zeros(1, HV, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=dev)
+    skip = torch.full((max(2 * N, 64),), -1, dtype=torch.int32, device=dev)
+    if cached is not None:
+        _RETIRED.append(cached[1])
+    # returned only once filled: another stream may use them next
+    torch.cuda.current_stream(dev).synchronize()
+    return state, skip
+
+
 def zero_state_prefill(rows, cu, offs, scale, out) -> torch.Tensor:
     """The class's term for whole sequences from the zero state: one pinned launch, no pool read or written."""
     v = rows[2]
     dev, HV, N = v.device, int(v.shape[1]), len(offs) - 1
     cached = _ZERO.get((dev, HV))
     if cached is None or cached[1].numel() < N:
-        state = (
-            cached[0]
-            if cached is not None
-            else torch.zeros(1, HV, HEAD_DIM, HEAD_DIM, device=dev)
-        )
-        if cached is not None:
-            _RETIRED.append(cached[1])
-        skip = torch.full((max(2 * N, 64),), -1, dtype=torch.int32, device=dev)
-        # published only once filled: another stream may use them next
-        torch.cuda.current_stream(dev).synchronize()
-        cached = _ZERO[(dev, HV)] = (state, skip)
+        with _ZERO_LOCK:
+            cached = _ZERO.get((dev, HV))
+            if cached is None or cached[1].numel() < N:
+                cached = _ZERO[(dev, HV)] = _grown(cached, dev, HV, N)
     state, skip = cached
     if cu is None:
-        cu = torch.tensor(offs, dtype=torch.int32, device=dev)
+        (cu,) = index_tensors("cu", offs, dev, lambda: (offs,))
     return _pinned(rows, cu, list(offs), state, skip[:N], skip[:N], scale, output=out)
 
 

@@ -459,6 +459,18 @@ def test_train_states_misaligned_or_sharing_memory_are_refused():
     _stateless(x, lens, train_states=shifted)
 
 
+def _infer_out(x, lens, out):
+    pool = torch.zeros(len(lens), x[2].shape[1], D, D, device="cuda")
+    return flashinfer.chunk_gated_delta_rule(
+        *x,
+        initial_state=pool,
+        state_indices=_i32(list(range(len(lens)))),
+        cu_seqlens=_i32(_offsets(lens)),
+        output=out,
+        **_KW,
+    )
+
+
 def _inside(holder, like, at=0):
     flat = holder.view(-1).view(torch.uint8)[at : at + like.nbytes]
     return flat.view(like.dtype).view(like.shape).copy_(like)
@@ -497,6 +509,19 @@ def test_an_output_sharing_memory_is_refused_before_anything_is_written():
     out = torch.empty_like(x[2])
     version = out._version
     assert torch.equal(_stateless(x, lens, output=out), ref) and out._version > version
+    states = torch.zeros(5, 8, D, D, device="cuda")
+    version = out._version
+    _stateless(x, lens, output=out, train_states=states)
+    assert out._version > version
+    arena = torch.zeros(3 * x[0].numel(), dtype=torch.bfloat16, device="cuda")
+    shared = [_inside(arena, t, i * t.nbytes) for i, t in enumerate(x[:2])]
+    tail = arena[2 * x[0].numel() :].view(200, 8, D)
+    got = _stateless((shared[0], shared[1], *x[2:]), lens, output=tail)
+    assert got is tail and torch.equal(got, ref)
+    with torch.inference_mode():
+        inside = _stateless(x, lens, output=torch.empty_like(x[2]))
+    assert torch.equal(inside, ref)
+    assert torch.equal(_infer_out(x, lens, made_in_inference_mode), ref)
 
 
 @needs_device
@@ -519,6 +544,7 @@ def test_rows_follow_the_host_offsets_when_given():
         [0, 129.9, 200, 264],
         torch.tensor([0.0, 130.0, 200.0, 264.0]),
         [[0, 264]],
+        [False, 264],
     ):
         with pytest.raises(BatchInvariantUnsupportedError, match="1-D integers"):
             flashinfer.chunk_gated_delta_rule(*x, cu_seqlens_cpu=bad, **_KW)
@@ -526,16 +552,101 @@ def test_rows_follow_the_host_offsets_when_given():
         flashinfer.chunk_gated_delta_rule(
             *x, cu_seqlens=torch.tensor([0.0, 264.0], device="cuda"), **_KW
         )
+    with pytest.raises(BatchInvariantUnsupportedError, match="malformed"):
+        flashinfer.chunk_gated_delta_rule(*x, cu_seqlens=host, **_KW)
+    with pytest.raises(BatchInvariantUnsupportedError, match="different lengths"):
+        flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens=_i32([0, 264]), cu_seqlens_cpu=host, **_KW
+        )
+    for key, same in (
+        ("cu_seqlens_cpu", torch.tensor(host)),
+        ("cu_seqlens_cpu", torch.tensor(host, dtype=torch.int16)),
+        ("cu_seqlens_cpu", tuple(host)),
+        ("cu_seqlens", _i32([9] + host)[1:]),
+        ("cu_seqlens", torch.tensor(host, device="cuda")),
+    ):
+        got = flashinfer.chunk_gated_delta_rule(*x, **{key: same}, **_KW)
+        assert torch.equal(got, ref)
+
+
+@needs_device
+def test_a_float64_default_dtype_does_not_enter_the_call():
+    lens = [130, 70]
+    x = _inputs(200, 2, 38, 19)
+    ref, ref_states = _with_states(x, lens)
+    gdn_pool._ZERO.pop((x[2].device, 38), None)
+    torch.set_default_dtype(torch.float64)
+    try:
+        got = _stateless(x, lens)
+        states = torch.zeros_like(ref_states)
+        with_states = _stateless(x, lens, train_states=states)
+    finally:
+        torch.set_default_dtype(torch.float32)
+    assert gdn_pool._ZERO[(x[2].device, 38)][0].dtype == torch.float32
+    assert torch.equal(got, ref) and torch.equal(with_states, ref)
+    assert torch.equal(states, ref_states)
+    assert torch.equal(_stateless(x, lens), ref)
+
+
+@needs_device
+def test_repeated_host_offsets_copy_nothing():
+    a, b = [0, 130, 200, 264], [0, 64, 200, 264]
+    x = _inputs(264, 4, 8, 18)
+    refs = {
+        tuple(o): _with_states(x, [q - p for p, q in zip(o, o[1:], strict=False)])
+        for o in (a, b)
+    }
+    out = torch.empty_like(x[2])
+    states = torch.empty_like(refs[tuple(a)][1])
+    for offs in (a, b, a, b):
+        got = flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens_cpu=offs, output=out, **_KW
+        )
+        assert torch.equal(got, refs[tuple(offs)][0])
+        flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens_cpu=offs, output=out, train_states=states, **_KW
+        )
+        assert torch.equal(out, refs[tuple(offs)][0])
+        want = refs[tuple(offs)][1]
+        assert torch.equal(states[: want.shape[0]], want)
+    torch.cuda.synchronize()
+    held, kept = torch.cuda.memory_allocated(), dict(gdn_pool._INDEX)
+    assert sum(key[3] == tuple(a) for key in kept) == 2
+    for offs in (a, b):
+        flashinfer.chunk_gated_delta_rule(*x, cu_seqlens_cpu=offs, output=out, **_KW)
+        flashinfer.chunk_gated_delta_rule(
+            *x, cu_seqlens_cpu=offs, output=out, train_states=states, **_KW
+        )
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == held
+    assert all(gdn_pool._INDEX[key] is entry for key, entry in kept.items())
+    for n in range(1, 40):
+        flashinfer.chunk_gated_delta_rule(*_cut(x, 0, n), cu_seqlens_cpu=[0, n], **_KW)
+    assert len(gdn_pool._INDEX) <= 16
+    assert not any(key[3] == tuple(a) for key in gdn_pool._INDEX)
+    flashinfer.chunk_gated_delta_rule(
+        *x, cu_seqlens_cpu=a, output=out, train_states=states, **_KW
+    )
+    assert torch.equal(out, refs[tuple(a)][0])
+    assert torch.equal(states[:6], refs[tuple(a)][1])
+    got = flashinfer.chunk_gated_delta_rule(*x, cu_seqlens_cpu=iter(a), **_KW)
+    assert torch.equal(got, refs[tuple(a)][0])
 
 
 @needs_device
 def test_replaced_index_rows_are_kept():
-    x = _inputs(4 * 9000, 2, 34, 16)
+    x = _inputs(4 * 9001, 2, 34, 16)
+    key = (x[2].device, 34)
+    gdn_pool._ZERO.pop(key, None)
     small = _stateless(_cut(x, 0, 12), [4, 4, 4])
-    first = gdn_pool._ZERO[(x[2].device, 34)][1]
-    out = _stateless(x, [4] * 9000)
-    assert any(t is first for t in gdn_pool._RETIRED)
+    first = gdn_pool._ZERO[key][1]
+    retired = len(gdn_pool._RETIRED)
+    out = _stateless(_cut(x, 0, 36000), [4] * 9000)
+    assert first.numel() == 64 and gdn_pool._ZERO[key][1].numel() == 18000
+    assert len(gdn_pool._RETIRED) == retired + 1 and gdn_pool._RETIRED[-1] is first
     assert torch.equal(out[:12], small) and bool((first == -1).all())
+    _stateless(x, [4] * 9001)
+    assert len(gdn_pool._RETIRED) == retired + 1
 
 
 @needs_device
