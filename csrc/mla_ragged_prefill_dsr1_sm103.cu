@@ -2463,6 +2463,16 @@ static size_t split_workspace_bytes(int NSPLIT, int TQ) {
          (size_t)NSPLIT * TQ * HQ * sizeof(float2) + 1024;
 }
 
+// Launch-submission check.  CUDA can reject a launch (invalid
+// configuration, driver state) with no later call on this path surfacing
+// it: an unreported rejection would return out/lse tensors the kernel
+// never wrote, or submit a reducer that reads unwritten partials.
+static void throw_on_launch_error(const char* what) {
+  const cudaError_t rc = cudaGetLastError();
+  if (rc != cudaSuccess)
+    throw std::runtime_error(std::string(what) + " launch failed: " + cudaGetErrorString(rc));
+}
+
 static double wave_eff(int n, int nsm) {
   int waves = (n + nsm - 1) / nsm;
   return (double)n / (double)(waves * nsm);
@@ -2779,6 +2789,9 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
   // different runtime split count, so leave those on the dynamic producer /
   // reducer pair rather than mismatching their row stride.
   const bool interleaved384 = exact_q384 && full_q && NSPLIT == 8;
+  // A stale sticky error from an unrelated earlier call must not be
+  // charged to this call's launches.
+  (void)cudaGetLastError();
   float* lsep = (float*)lse.data_ptr();
 #define LAUNCH_P(C, E)                                                                           \
   mla_kernel2<C, E><<<grid, NTHREADS2, (C) ? SMEM2_C : SMEM2_NC, stream>>>(                      \
@@ -2939,6 +2952,9 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
     LAUNCH_ATTN(false, false);
 #undef LAUNCH_ATTN
 #undef LAUNCH_P
+  // Checked BEFORE the reducer: a rejected attention launch must not be
+  // followed by a reducer that reads the unwritten workspace partials.
+  throw_on_launch_error("attention kernel");
 
   if (NSPLIT > 1) {
     int nj = TQ * HQ;
@@ -3112,12 +3128,17 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
       LAUNCH_COMBINE(0);
     }
 #undef LAUNCH_COMBINE
+    // Covers both the cudaLaunchKernelEx returns and the <<<...>>> forms:
+    // every rejected submission sets the thread's last error, and nothing
+    // between the launches and this check can overwrite it.
+    throw_on_launch_error("split-combine kernel");
   }
   if (max_kv_len <= 256) {
     exact_small_lse_kernel<<<TQ * HQ, 128, 0, stream>>>(
         (const uint8_t*)q.data_ptr(), (const uint8_t*)k.data_ptr(), (const int*)q_lens.data_ptr(),
         (const int*)kv_lens.data_ptr(), (const int*)cu_q.data_ptr(), (const int*)cu_kv.data_ptr(),
         B, TQ, causal, lsep);
+    throw_on_launch_error("exact-small-LSE kernel");
   }
 }
 
