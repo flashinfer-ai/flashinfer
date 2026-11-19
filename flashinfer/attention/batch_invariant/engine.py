@@ -358,6 +358,24 @@ class WorkspaceTooSmall(RuntimeError):
         self.needed = needed
 
 
+_UNUSED_OPERAND: Dict[torch.device, torch.Tensor] = {}
+
+
+def unused_operand(device: torch.device) -> torch.Tensor:
+    """The one-element fp32 tensor a launch passes for the LSE operand it does not write (``lse_mode`` 0: every LSE store is
+    under ``lse_mode > 0``) and the sink operand it does not read (a kernel without the sink step has no sink load): one per
+    device, kept for the process. Inside a CUDA-graph capture an uncached tensor is returned instead (it would come from
+    the graph's private pool)."""
+    device = _resolve_device(device)
+    t = _UNUSED_OPERAND.get(device)
+    if t is None:
+        t = torch.empty(1, dtype=torch.float32, device=device)
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return t
+        t = _UNUSED_OPERAND.setdefault(device, t)
+    return t
+
+
 class _Planned:
     def __init__(
         self,
@@ -384,9 +402,8 @@ class _Planned:
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
         self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
-        self.lse_unused = torch.empty(
-            1, dtype=torch.float32, device=desc.device
-        )  # the kernels' LSE / sink operand of a launch without LSE / sinks (never written, never read)
+        # the kernels' LSE / sink operand of a launch without LSE / sinks; this reference keeps it alive for a captured graph
+        self.lse_unused = unused_operand(desc.device)
         # the plan's sinks declaration (set by plan_attention)
         self.has_sinks: Optional[bool] = None
 

@@ -2811,6 +2811,34 @@ def test_has_sinks_is_a_trailing_keyword_of_plan(op):
     assert last.kind is inspect.Parameter.KEYWORD_ONLY
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=needs_device)])
+def test_unused_operand_placeholder_is_one_per_device(device, monkeypatch):
+    """The operand a launch without LSE / sinks passes for them is one tensor per device: two plans share it and a
+    ``plan()`` allocates none."""
+    from flashinfer.attention.batch_invariant import engine
+
+    first, _ = _cpu_plan(engine, device)
+    shared = engine.unused_operand(device)
+    assert first.lse_unused is shared
+    assert shared.shape == (1,) and shared.dtype == torch.float32
+    assert shared.device == first.desc.device
+    cached = dict(engine._UNUSED_OPERAND)
+    made = []
+    real_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        made.append(real_empty(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(torch, "empty", empty)
+    second, _ = _cpu_plan(engine, device)
+    monkeypatch.undo()
+    assert second.lse_unused is shared
+    assert all(t is not shared for t in made)
+    assert set(engine._UNUSED_OPERAND) == set(cached)
+    assert engine._UNUSED_OPERAND[engine._resolve_device(device)] is shared
+
+
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     pr = Problem([64], [700], 32, 8, 128, 16, seed=10)
