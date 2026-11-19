@@ -4433,12 +4433,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
-    DTypeO* o_ptr_base =
-        o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h;
-    float* tmp_v_ptr_base = (partition_kv && tmp_v != nullptr)
-                                ? tmp_v + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
-                                      (kv_head_idx * group_size) * o_stride_h
-                                : nullptr;
+    // POD callers provide their split partials buffer through params.o, without tmp_v.
+    const bool fp32_partials = partition_kv && tmp_v != nullptr;
+    const auto output_offset =
+        o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h;
+    const auto chunk_offset = partition_kv ? kv_tile_idx * o_stride_n : 0;
+    DTypeO* o_ptr_base = o + output_offset + (fp32_partials ? 0 : chunk_offset);
+    float* tmp_v_ptr_base = fp32_partials ? tmp_v + output_offset + chunk_offset : nullptr;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -4905,14 +4906,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       const uint32_t num_kv_chunks =
           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
 
+      const uint32_t out_stride_n = partition_kv ? num_kv_chunks * o_stride_n : o_stride_n;
+
       if constexpr (KTraits::USE_VO_SPLIT) {
-        if (partition_kv) {
+        if (fp32_partials) {
           vosplit_write_o<KTraits, float>(
-              o_frag, d, tmp_v_ptr_base, qo_packed_idx_base, qo_len, num_kv_chunks * o_stride_n,
-              o_stride_h, get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
-              group_size, lane_idx);
+              o_frag, d, tmp_v_ptr_base, qo_packed_idx_base, qo_len, out_stride_n, o_stride_h,
+              get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP, group_size,
+              lane_idx);
         } else {
-          vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len, o_stride_n,
+          vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len, out_stride_n,
                                    o_stride_h,
                                    get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
                                    group_size, lane_idx);
@@ -4927,15 +4930,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                           kv_head_idx, group_size);
 
         // write_back (o_ptr_base offset to this VO tile's columns: d_base mma * 16 elems)
-        if (partition_kv) {
+        if (fp32_partials) {
           write_o_reg_gmem<KTraits, float>(o_frag, &qo_smem, tmp_v_ptr_base + d_base * 16,
                                            qo_packed_idx_base, qo_len,
-                                           /*o_stride_n=*/num_kv_chunks * o_stride_n,
+                                           /*o_stride_n=*/out_stride_n,
                                            /*o_stride_h=*/o_stride_h, group_size, tid);
         } else {
           write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
                                     qo_len,
-                                    /*o_stride_n=*/o_stride_n,
+                                    /*o_stride_n=*/out_stride_n,
                                     /*o_stride_h=*/o_stride_h, group_size, tid);
         }
       }
