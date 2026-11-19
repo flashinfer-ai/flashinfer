@@ -91,6 +91,8 @@ ATTN_CASES = [
 ATTN_HEAD_DIMS = (64, 128, 256)
 # the toy cases whose LSE member (bases 2 and e) is checked too: one chunk, a window across chunks, every head dim
 ATTN_LSE_CASES = ("a2", "a3", "a5", "a7", "a8")
+# the toy cases whose sink member (the output and the LSE in both bases, with the sink step) is checked too
+ATTN_SINK_CASES = ("a2", "a3", "a5", "a7", "a8")
 
 GEMM_CASES = [
     (64, 1),
@@ -546,6 +548,11 @@ DECIDED_THEOREMS = (
     + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
     + tuple(f"attn_{n}_{m}" for n in ATTN_LSE_CASES for m in ("lse2", "lseE"))
     + tuple(
+        f"attn_{n}_{m}"
+        for n in ATTN_SINK_CASES
+        for m in ("sink", "sink_lse2", "sink_lseE")
+    )
+    + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
     )
 )
@@ -555,6 +562,7 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_C",
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
+    "Attn.output_depends_on_sink",
 )
 
 
@@ -660,6 +668,27 @@ def attn_lse_cases() -> List[Tuple[str, str, str]]:
             continue
         spec, row = AttentionSpec(D, T=T, C=C), RowSpec(p=p, window_left=win, row=rid)
         out.append((name, sexpr(spec.lse(row, "log2")), sexpr(spec.lse(row, "ln"))))
+    return out
+
+
+def attn_sink_cases() -> List[Tuple[str, str, str, str]]:
+    """``(name, output, base-2 LSE, base-e LSE)`` S-expressions of the sink member of the toy cases in ``ATTN_SINK_CASES``."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, p, win, rid, d in ATTN_CASES:
+        if name not in ATTN_SINK_CASES:
+            continue
+        spec, row = AttentionSpec(D, T=T, C=C), RowSpec(p=p, window_left=win, row=rid)
+        out.append(
+            (
+                name,
+                sexpr(spec.output(row, d, sinks=True)),
+                sexpr(spec.lse(row, "log2", sinks=True)),
+                sexpr(spec.lse(row, "ln", sinks=True)),
+            )
+        )
     return out
 
 
@@ -1193,6 +1222,32 @@ def _render_attention(L: List[str]) -> None:
     )
     L.append("")
     L.append(
+        "/-! The sink member (`spec.sink_merge`: the output and the LSE in bases 2 and e) of the toy rows, node for node, and the "
+        "split kernel's equality to it. -/"
+    )
+    for name, sx, sx2, sxe in attn_sink_cases():
+        L.append(
+            f"theorem attn_{name}_sink : (Attn.outputSink attnP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_sink_lse2 : Attn.lse2Sink attnP_{name} = {lean_str(sx2)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_sink_lseE : Attn.lseESink attnP_{name} = {lean_str(sxe)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_sink_split : ∀ σ : Nat → Nat, Attn.splitKernelSink attnP_{name} σ = Attn.outputSink attnP_{name} ∧ "
+            f"Attn.splitLse2Sink attnP_{name} σ = Attn.lse2Sink attnP_{name} ∧ "
+            f"Attn.splitLseESink attnP_{name} σ = Attn.lseESink attnP_{name} := "
+            f"fun σ => ⟨Attn.splitKernelSink_eq_fused _ σ, Attn.splitLseSink_eq_fused _ σ⟩"
+        )
+    L.append(
+        "def attnSinkCases : List (String × Attn.Params) := ["
+        + ", ".join(f'("{n}", attnP_{n})' for n in ATTN_SINK_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
         "/-! The attention kernel's configuration space per head dim (`engine.all_valid_configs(D)`): every knob record checked "
         "against the static constraints (`ConfigOKD`), counted, and `space_invariant` instantiated on it (R3). -/"
     )
@@ -1259,7 +1314,7 @@ def summary() -> str:
         + f"; {FP8BS_FMT}: specs={2 * len(GEMM_FP8BS_OUT_CASES)} loops={len(GEMM_FP8BS_LOOP_CASES)} "
         f"space={len(fp8bs_space())} dispatch={len(fp8bs_dispatch_cases())}"
         + f"; native_decide theorems={len(DECIDED_THEOREMS)}"
-        + f"; attention cases={len(ATTN_CASES)} attention LSE cases={len(ATTN_LSE_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
+        + f"; attention cases={len(ATTN_CASES)} attention LSE cases={len(ATTN_LSE_CASES)} attention sink cases={len(ATTN_SINK_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
     )
 
 

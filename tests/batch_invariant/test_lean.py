@@ -113,6 +113,7 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, r.stderr[-2000:]
     kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
     kinds.update({"attnlse2": "attnlse", "attnlseE": "attnlse"})
+    kinds.update({k: "attnlse" for k in ("attnsink", "attnsinklse2", "attnsinklseE")})
     # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
     kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
@@ -197,6 +198,11 @@ def test_lean_model_matches_python_engine_and_spec():
         assert lean[("attnlse2", name)] == sx2, name
         assert lean[("attnlseE", name)] == sxe, name
         checked += 2
+    for name, sx, sx2, sxe in lean_cases.attn_sink_cases():
+        assert lean[("attnsink", name)] == sx, name
+        assert lean[("attnsinklse2", name)] == sx2, name
+        assert lean[("attnsinklseE", name)] == sxe, name
+        checked += 3
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 
