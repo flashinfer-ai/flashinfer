@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the specialized CuTe-DSL sm90 backend of per_token_group_quant_8bit."""
 
-import functools
+import logging
 
 import pytest
 import torch
@@ -28,39 +28,19 @@ requires_fast_path = pytest.mark.skipif(
 )
 
 
-@functools.cache
-def _stock_cutile_usable() -> bool:
-    """Whether the stock cutile backend can actually serve a call here.
-
-    The cuda.tile JIT needs the ``tileiras`` compiler at run time; CI images
-    without a full CTK (13.1+) or the ``cuda-tile[tileiras]`` extra import
-    ``cuda.tile`` fine (so ``is_cuda_tile_available()`` is True) but fail at
-    the first compile. The tests that exercise the stock cutile route — the
-    same route the upstream cutile test module runs — skip there, exactly
-    like that module does on machines without cuda.tile."""
-    if not torch.cuda.is_available() or not is_cuda_tile_available():
-        return False
-    try:
-        x = torch.ones((1, 128), device="cuda", dtype=torch.bfloat16)
-        per_token_group_quant_8bit(x, 128, backend="cutile")
-        return True
-    except Exception:
-        return False
-
-
 def _skip_unless_stock_cutile_usable() -> None:
-    if not _stock_cutile_usable():
-        pytest.skip("stock cutile backend unavailable (cuda.tile cannot compile here)")
+    if not is_cuda_tile_available():
+        pytest.skip("needs cuda.tile")
 
 
 def _reference(x: torch.Tensor, eps: float = 1e-10):
-    # Scale convention of the kernels: multiply by the reciprocal of 448
-    # (what PyTorch itself does for a CUDA tensor divided by a Python
-    # scalar), not the IEEE quotient.
+    # Evaluate the IEEE quotient in FP64, then round once to FP32.
+    # A Python scalar division of an FP32 CUDA tensor can use reciprocal multiply.
     grouped = x.reshape(-1, 128).float()
     absmax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
-    scale = absmax / 448.0
-    q = (grouped / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scale = (absmax.double() / 448.0).float()
+    inv_scale = scale.double().reciprocal().float()
+    q = (grouped * inv_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     return (
         q.reshape(x.shape),
         scale.reshape(x.shape[:-1] + (x.shape[-1] // 128,)),
@@ -101,10 +81,7 @@ def test_specialized_matches_reference(shape, backend):
     assert actual_q.dtype == torch.float8_e4m3fn
     assert actual_s.shape == shape[:-1] + (shape[-1] // 128,)
     torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
-    # The kernel multiplies by rcp.approx of the scale instead of dividing;
-    # allow one-ulp fp8 differences on a vanishing fraction of elements.
-    exact = (actual_q.view(torch.uint8) == expected_q.view(torch.uint8)).float()
-    assert exact.mean().item() >= 0.999
+    assert torch.equal(actual_q.view(torch.uint8), expected_q.view(torch.uint8))
     ng = shape[-1] // 128
     deq = actual_q.float().view(-1, ng, 128) * actual_s.view(-1, ng, 1)
     deq_ref = expected_q.float().view(-1, ng, 128) * expected_s.view(-1, ng, 1)
@@ -162,10 +139,7 @@ def test_kill_switches_match_stock(monkeypatch, env):
     assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
     assert _ptgq_stats["fallback_reasons"] == {"kill_switch": 1}
 
-    # Scales: bit-identical on the cutile build the measurement used; across
-    # cuda-tile versions the stock scale can differ by one fp32 ulp (the
-    # kernels agree on absmax/448 up to reciprocal-vs-division rounding).
-    torch.testing.assert_close(fast_s, stock_s, rtol=2e-7, atol=0)
+    torch.testing.assert_close(fast_s, stock_s, rtol=0, atol=0)
     exact = (fast_q.view(torch.uint8) == stock_q.view(torch.uint8)).float()
     assert exact.mean().item() >= 0.999
 
@@ -248,6 +222,51 @@ def test_misaligned_input_stays_on_stock_path():
     assert exact.mean().item() >= 0.999
 
 
+@requires_fast_path
+def test_eager_failure_memo_is_auto_only(monkeypatch, caplog):
+    from flashinfer.quantization import fp8_quantization as dispatch
+    from flashinfer.quantization.kernels.cute_dsl import (
+        per_token_group_quant_8bit_cute_dsl as kernel,
+    )
+
+    _skip_unless_stock_cutile_usable()
+    x = torch.randn((8, 256), device="cuda", dtype=torch.bfloat16)
+    stock_q, stock_s = per_token_group_quant_8bit(x, 128, backend="cutile")
+    attempts = []
+
+    def fail(*args):
+        attempts.append(1)
+        raise RuntimeError("injected launch failure")
+
+    monkeypatch.setattr(kernel, "per_token_group_quant_fp8_g128_cute_dsl", fail)
+    monkeypatch.setattr(dispatch, "_ptgq_specialized_failed", False)
+    _reset_per_token_group_quant_stats()
+    with pytest.raises(NotImplementedError, match="jit_or_launch_failure"):
+        per_token_group_quant_8bit(x, 128, backend="specialized")
+    assert len(attempts) == 1
+    assert not dispatch._ptgq_specialized_failed
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 0}
+
+    with caplog.at_level(logging.WARNING, logger=dispatch.__name__):
+        for _ in range(2):
+            q, s = per_token_group_quant_8bit(x, 128)
+            assert torch.equal(q.view(torch.uint8), stock_q.view(torch.uint8))
+            assert torch.equal(s, stock_s)
+        with pytest.raises(NotImplementedError, match="jit_or_launch_failure"):
+            per_token_group_quant_8bit(x, 128, backend="specialized")
+    assert len(attempts) == 2  # first explicit call, then first auto only
+    assert dispatch._ptgq_specialized_failed
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 2}
+    assert _ptgq_stats["fallback_reasons"] == {"jit_or_launch_failure": 4}
+    assert (
+        sum(
+            r.name == dispatch.__name__ and "kernel failed" in r.getMessage()
+            for r in caplog.records
+        )
+        == 1
+    )
+
+
 def test_dispatch_table_present_and_well_formed():
     table = _ptgq_specialized_dispatch_table()
     assert table is not None, "packaged allowlist must load"
@@ -290,7 +309,10 @@ def test_specialized_cuda_graph_matches_eager():
 
 
 @requires_fast_path
-def test_cold_graph_capture_auto_falls_back_with_dedicated_reason(monkeypatch):
+@pytest.mark.parametrize("different_device", [False, True])
+def test_cold_graph_capture_auto_falls_back_with_dedicated_reason(
+    monkeypatch, different_device
+):
     """A not-yet-compiled specialized variant cannot JIT under CUDA graph
     capture; backend='auto' records the stock cutile kernel into the graph
     under the dedicated reason 'capturing_before_jit' (not a generic
@@ -301,6 +323,13 @@ def test_cold_graph_capture_auto_falls_back_with_dedicated_reason(monkeypatch):
         per_token_group_quant_8bit_cute_dsl as _mod,
     )
 
+    caller = torch.cuda.current_device()
+    if different_device:
+        if torch.cuda.device_count() < 2:
+            pytest.skip("needs a second CUDA device for the calling context")
+        caller = (caller + 1) % torch.cuda.device_count()
+        with torch.cuda.device(caller):
+            torch.cuda.current_stream()  # initialize the caller context before capture
     torch.manual_seed(9)
     x = torch.empty((8, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-2, 2)
     # Warm the stock path so the capture below replays a compiled kernel.
@@ -311,10 +340,15 @@ def test_cold_graph_capture_auto_falls_back_with_dedicated_reason(monkeypatch):
     monkeypatch.setattr(_mod, "_CACHE", {})
     _reset_per_token_group_quant_stats()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with torch.cuda.graph(g), torch.cuda.device(caller):
+        if different_device:
+            assert caller != x.device.index
+            assert not torch.cuda.is_current_stream_capturing()
+        with pytest.raises(NotImplementedError, match="capturing_before_jit"):
+            per_token_group_quant_8bit(x, 128, backend="specialized")
         graph_q, graph_s = per_token_group_quant_8bit(x, 128, backend="auto")
     assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
-    assert _ptgq_stats["fallback_reasons"] == {"capturing_before_jit": 1}
+    assert _ptgq_stats["fallback_reasons"] == {"capturing_before_jit": 2}
 
     x.uniform_(-3, 3)
     g.replay()

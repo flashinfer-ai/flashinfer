@@ -18,3 +18,7 @@ Modules in this package require the optional ``nvidia-cutlass-dsl`` runtime
 (``import cutlass``); import them lazily behind
 :func:`flashinfer.cute_dsl.availability.is_cute_dsl_available`.
 """
+
+
+class _ColdJITDuringCapture(RuntimeError):
+    """A kernel cache miss on the capturing input stream; not a JIT failure."""

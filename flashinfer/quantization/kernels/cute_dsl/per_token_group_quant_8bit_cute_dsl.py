@@ -60,8 +60,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 
-
-INV_FP8_MAX = 1.0 / 448.0
+from . import _ColdJITDuringCapture
 
 
 @dsl_user_op
@@ -194,12 +193,29 @@ def _fmax(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def _div_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _rcp(a: Float32, *, loc=None, ip=None) -> Float32:
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip)],
-            "rcp.approx.f32 $0, $1;",
+            "rcp.rn.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
             is_align_stack=False,
@@ -322,7 +338,7 @@ def _build(lanes_per_group, threads):
             offset *= 2
 
         amax = _hmax_bf16x2(packed_max)
-        scale = _fmax(amax, eps) * Float32(INV_FP8_MAX)
+        scale = _div_rn(_fmax(amax, eps), Float32(448.0))
         inv_scale = _rcp(scale)
 
         packed_q = []
@@ -365,7 +381,7 @@ def _compiled(lanes_per_group, threads, x, q_bytes, s):
     fn = _CACHE.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
+            raise _ColdJITDuringCapture(
                 "Warm up per_token_group_quant_8bit (CuTe-DSL sm90 fast path) "
                 "before CUDA graph capture: the kernel variant for this problem "
                 "size is not compiled yet and JIT compilation is not allowed "

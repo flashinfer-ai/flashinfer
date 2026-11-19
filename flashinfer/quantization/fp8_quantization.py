@@ -42,6 +42,7 @@ from ..utils import (
     register_fake_op,
 )
 from ..tllm_enums import SfLayout
+from .kernels.cute_dsl import _ColdJITDuringCapture
 
 
 def _round_up(x: int, y: int) -> int:
@@ -1404,8 +1405,8 @@ def per_token_group_quant_8bit(
         CUDA graph capture: a not-yet-compiled variant cannot JIT under
         capture, so ``"auto"`` records the stock ``cutile`` kernel into the
         graph (fallback reason ``capturing_before_jit``) and
-        ``"specialized"`` raises. A JIT or launch failure outside capture
-        disables the specialized path for the rest of the process, so later
+        ``"specialized"`` raises. A JIT or launch failure in ``"auto"`` outside
+        capture disables the specialized path for the rest of the process, so later
         ``"auto"`` calls skip the compile attempt. ``"specialized"``
         requests that kernel explicitly;
         a call it cannot serve (off-contract, kill switch, JIT or launch
@@ -1422,12 +1423,9 @@ def per_token_group_quant_8bit(
         specialized kernel: ``"auto"`` keeps the stock paths, explicit
         ``"specialized"`` raises. The stock backends compute the scale with
         IEEE float32 division and, for ``dst_dtype=torch.int8``, round half
-        up (``floor(x + 0.5)``); the specialized kernel matches the
-        ``"cutile"`` outputs up to one-ulp rounding differences — it
-        multiplies by the rounded reciprocal of 448 where the stock
-        backends divide, so fp32 scales can differ by one ulp (e.g. for a
-        group absmax of 255), as can fp8 payloads on a vanishing fraction
-        of elements.
+        up (``floor(x + 0.5)``); the specialized kernel computes the scale with IEEE division
+        by 448 and multiplies inputs by the correctly rounded reciprocal
+        of that scale, matching the stock scale-rounding contract.
 
     Returns
     -------
@@ -1466,10 +1464,8 @@ def per_token_group_quant_8bit(
                 _ptgq_stats["backend_dispatches"]["specialized"] += 1
                 return out
             except Exception as exc:
-                capturing = torch.cuda.is_current_stream_capturing()
-                reason = (
-                    "capturing_before_jit" if capturing else "jit_or_launch_failure"
-                )
+                cold = isinstance(exc, _ColdJITDuringCapture)
+                reason = "capturing_before_jit" if cold else "jit_or_launch_failure"
                 if backend == "specialized":
                     # An explicitly selected backend never falls back.
                     _ptgq_record_fallback(reason)
@@ -1481,7 +1477,7 @@ def per_token_group_quant_8bit(
                     ) from exc
                 import logging
 
-                if capturing:
+                if cold:
                     # A not-yet-compiled variant refuses to JIT under CUDA
                     # graph capture; the graph then records the stock cutile
                     # kernel, under a dedicated reason so the substitution is
@@ -1496,11 +1492,12 @@ def per_token_group_quant_8bit(
                     )
                 else:
                     global _ptgq_specialized_failed
-                    _ptgq_specialized_failed = True
+                    with torch.cuda.device(x.device):
+                        if not torch.cuda.is_current_stream_capturing():
+                            _ptgq_specialized_failed = True
                     logging.getLogger(__name__).warning(
                         "specialized per_token_group_quant_8bit kernel failed; "
-                        "falling back to the stock cutile backend and skipping "
-                        "the specialized path for the rest of the process",
+                        "falling back to the stock cutile backend",
                         exc_info=True,
                     )
         _ptgq_record_fallback(reason)
@@ -1512,6 +1509,20 @@ def per_token_group_quant_8bit(
                 f"serve this call ({reason}); an explicitly selected backend "
                 "never falls back — use backend='auto', 'cutile' or 'cuda'"
             )
+        if reason == "capturing_before_jit":
+            # Record cuTile on the input's capturing stream even if the caller
+            # has another device current when the specialized guard unwinds.
+            with torch.cuda.device(x.device):
+                return per_token_group_quant_8bit(
+                    x,
+                    group_size,
+                    eps,
+                    dst_dtype,
+                    column_major_scales,
+                    scale_tma_aligned,
+                    scale_ue8m0,
+                    backend="cutile",
+                )
         backend = "cutile"
 
     _ptgq_stats["backend_dispatches"]["stock"] += 1
