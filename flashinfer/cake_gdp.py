@@ -50,6 +50,7 @@ from typing import Optional
 import torch
 
 from . import cake_gdp_backend as _backend
+from . import gdp_decode_rowsplit as _rowsplit
 from .api_logging import flashinfer_api
 from .cake_gdp_backend import (  # noqa: F401
     ARCHES,
@@ -184,8 +185,54 @@ def cake_gated_delta_product_mtp(
       scatter table the kernel never reads.  It is CUDA-graph safe.
     - Every batch row is independent of the others and three launches on the
       same inputs are bitwise identical.
+    - On SM103, kernel-ready calls with a small ``B x HV`` (the measured band of
+      :data:`flashinfer.gdp_decode_rowsplit.ROUTED_BAND`) run a row-split
+      kernel that spreads each head's 64 state rows over several CTAs instead
+      of one CTA per batch row and head.  Its outputs and stored states are
+      bitwise equal to the Cake program's.  Set
+      ``FLASHINFER_DISABLE_GDP_DECODE_ROWSPLIT=1`` to keep every call on the
+      Cake programs.
     """
 
+    plan = _rowsplit.route(
+        q,
+        k,
+        v,
+        initial_state,
+        initial_state_indices,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        output=output,
+        ssm_state_indices=ssm_state_indices,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm=use_qk_l2norm,
+        output_state_indices=output_state_indices,
+    )
+    if plan is not None:
+        lanes, rows_per_cta, rows_per_lane = plan
+        return _rowsplit.gdp_decode_rowsplit_mtp(
+            q,
+            k,
+            v,
+            initial_state,
+            initial_state_indices,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale=scale,
+            output=output,
+            ssm_state_indices=ssm_state_indices,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm=use_qk_l2norm,
+            output_state_indices=output_state_indices,
+            lanes=lanes,
+            rows_per_cta=rows_per_cta,
+            rows_per_lane=rows_per_lane,
+            _checked=True,
+        )
     return _backend.cake_gated_delta_product_mtp(
         q,
         k,
