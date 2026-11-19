@@ -86,7 +86,7 @@ fi
 if [[ ${USE_GPU} == "true" ]]; then
     # Keep CPU-only sharding infrastructure tests out of GPU CI collection.
     # Forward by name so Docker preserves spaces in existing pytest options.
-    export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/test_sharding"
+    export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/infra/test_sharding"
     DOCKER_ENV="${DOCKER_ENV} -e PYTEST_ADDOPTS"
 
     # Forward CI_GPU_NAME so summary.py can record the lane without a torch import.

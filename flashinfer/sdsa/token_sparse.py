@@ -7,18 +7,24 @@ token attends to its own list of keys. trtllm-gen's token-sparse kernels
 slot list per token. Dense attention kernels that take a mask can instead attend
 over a group of tokens' union of keys, with a bitmask per token."""
 
+import functools
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+
 import torch
 
 from ..api_logging import flashinfer_api
 from ..cute_dsl.launch import launch
 from ..topk_varlen.kernels import block_scan
 from ..trace.templates.sdsa import (
+    compact_nvfp4_kv_cache_trace,
+    gather_nvfp4_kv_cache_by_position_trace,
     group_union_masks_trace,
     token_sparse_kv_indices_trace,
 )
+from ..utils import get_compute_capability
 
 # A thread loads LOAD key positions at a time (16 bytes), and THREADS threads read
 # a token's list in passes of PASS positions, so lists are whole passes long.
@@ -404,4 +410,644 @@ def group_union_masks(
             (group, words, top_k),
             module="token_sparse_union",
             key_files=(__file__, block_scan.__file__),
+        )
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 KV cache -> FP8 attention workspace, from key positions
+# ---------------------------------------------------------------------------
+
+
+def _nvfp4_cache_dim(paged_kv_cache, kv_cache_sf, v_sf_swizzled: bool) -> int:
+    """Check K/V NVFP4 data and scale pages, and return the head dim."""
+    k = paged_kv_cache[0]
+    if any(t.device != k.device for t in (*paged_kv_cache, *kv_cache_sf)):
+        raise ValueError("K/V pages and scales must be on one device")
+    from ._token_sparse_nvfp4 import (
+        FP4_VALUES_PER_BYTE,
+        HEAD_DIM_ALIGNMENT,
+        NVFP4_SCALE_BLOCK_SIZE,
+        V_SCALE_SWIZZLE_TOKENS,
+    )
+
+    k, v = paged_kv_cache
+    ks, vs = kv_cache_sf
+    if any(t.ndim != 4 for t in (k, v, ks, vs)):
+        raise ValueError("Expected rank-four HND K/V data and scale pages")
+    dim = k.shape[-1] * FP4_VALUES_PER_BYTE.value
+    if k.shape[2] <= 0 or dim <= 0:
+        raise ValueError("Expected positive page_size and head_dim")
+    if k.dtype != torch.uint8 or v.dtype != torch.uint8:
+        raise ValueError("NVFP4 data must be uint8")
+    if ks.dtype != torch.float8_e4m3fn or vs.dtype != ks.dtype:
+        raise ValueError("NVFP4 block scales must be FP8 E4M3")
+    if k.shape != v.shape or k.stride() != v.stride() or k.shape[1] != 1:
+        raise ValueError("Expected matching HND MQA K/V pages")
+    if (
+        ks.shape != vs.shape
+        or ks.stride() != vs.stride()
+        or ks.shape != (*k.shape[:-1], dim // NVFP4_SCALE_BLOCK_SIZE.value)
+    ):
+        raise ValueError("Expected matching K/V scale pages")
+    if dim < HEAD_DIM_ALIGNMENT.value or dim & (dim - 1):
+        # The conversion kernels' lane extents (tl.arange) need a power of two.
+        raise ValueError(
+            f"head_dim must be a power of two, {HEAD_DIM_ALIGNMENT.value} or more"
+        )
+    if (
+        (v_sf_swizzled and k.shape[2] % V_SCALE_SWIZZLE_TOKENS.value)
+        or dim % HEAD_DIM_ALIGNMENT.value
+        or k.stride(-2) != dim // FP4_VALUES_PER_BYTE.value
+        or k.stride(-1) != 1
+        or ks.stride(-2) != dim // NVFP4_SCALE_BLOCK_SIZE.value
+        or ks.stride(-1) != 1
+    ):
+        raise ValueError(
+            "Expected contiguous token data and HND four-token scale swizzle"
+        )
+    if get_compute_capability(k.device)[0] not in (10, 11, 12):
+        raise NotImplementedError(
+            "NVFP4 to FP8 conversion needs a Blackwell GPU (compute capability "
+            "10.x, 11.x or 12.x)"
+        )
+    return dim
+
+
+def _check_selection(
+    positions, block_table, out, block_tables, seq_lens, rows, dim, device
+):
+    """Shared checks of key positions, block table and outputs (on ``device``,
+    the cache's)."""
+    if any(
+        t.device != device
+        for t in (positions, block_table, out, block_tables, seq_lens)
+    ):
+        raise ValueError(
+            "Positions, block table and outputs must be on the cache's device"
+        )
+    top_k = positions.shape[1] if positions.ndim == 2 else 0
+    if (
+        positions.ndim != 2
+        or positions.dtype != torch.int32
+        or positions.stride(-1) != 1
+        or top_k <= 0
+        or top_k & (top_k - 1)
+    ):
+        raise ValueError(
+            "Expected int32 key positions [rows, top_k], top_k a power of two, "
+            "contiguous in the last dimension"
+        )
+    if (
+        block_table.ndim != 2
+        or block_table.dtype != torch.int32
+        or block_table.stride(-1) != 1
+        or block_table.shape[1] < 1
+    ):
+        raise ValueError(
+            "Expected an int32 block table [requests, pages], at least one page"
+        )
+    if (
+        out.ndim != 4
+        or out.shape[1:] != (1, 1, 2 * dim)
+        or not out.is_contiguous()
+        or out.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("Expected contiguous FP8 K/V output rows [N, 1, 1, 2 * D]")
+    if (
+        block_tables.ndim != 3
+        or block_tables.shape[0] < rows
+        or block_tables.shape[1:] != (2, top_k)
+        or not block_tables.is_contiguous()
+        or block_tables.dtype != torch.int32
+        or seq_lens.ndim != 1
+        or seq_lens.shape[0] < rows
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError(
+            "Expected contiguous int32 block_tables [>= rows, 2, top_k] and "
+            "seq_lens [>= rows]"
+        )
+    return top_k
+
+
+# compact_nvfp4_kv_cache's looping conversion grid per SM: enough programs to
+# keep a large region parallel, few enough that small groups' programs do not
+# run idle over the largest region's tiles (GB300: flat from about 100 to 400).
+_CONVERT_PROGRAMS_PER_SM = 256
+# The full grid (groups x the largest region's tiles) is used up to this many
+# times the looping grid: below it, idle programs cost less than the loop
+# (GB300: decode unions of 128 requests x 3-6 rows, 49K-98K programs, are 2-6%
+# faster on the full grid); above it, most of the grid would be idle (e.g. one
+# long dense prefill group next to short union groups).
+_LOOP_ABOVE_FACTOR = 4
+
+
+@functools.cache
+def _sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _convert_programs(device: torch.device) -> int:
+    return _CONVERT_PROGRAMS_PER_SM * _sm_count(device)
+
+
+def _check_lengths(lengths, rows, device) -> None:
+    if lengths is not None:
+        _check_vector("lengths", lengths, rows, torch.int32, device)
+
+
+def _check_vector(name, t, n, dtype, device) -> None:
+    """A contiguous 1-D ``dtype`` tensor on ``device`` with ``n`` elements or
+    more."""
+    if (
+        t.ndim != 1
+        or t.dtype != dtype
+        or t.device != device
+        or t.shape[0] < n
+        or (t.shape[0] > 1 and t.stride(0) != 1)
+    ):
+        raise ValueError(
+            f"Expected {name}: contiguous 1-D {dtype} on {device}, "
+            f"at least {n} elements"
+        )
+
+
+def _check_launch(requests_per_row, tokens_per_program, num_warps) -> None:
+    if requests_per_row < 1:
+        raise ValueError("requests_per_row must be positive")
+    if tokens_per_program < 1 or tokens_per_program & (tokens_per_program - 1):
+        raise ValueError("tokens_per_program must be a power of two")
+    if num_warps < 1 or num_warps & (num_warps - 1):
+        raise ValueError("num_warps must be a power of two")
+
+
+@flashinfer_api(trace=gather_nvfp4_kv_cache_by_position_trace)
+def gather_nvfp4_kv_cache_by_position(
+    paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
+    kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
+    positions: torch.Tensor,
+    requests: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lengths: torch.Tensor | None = None,
+    requests_per_row: int = 1,
+    v_sf_swizzled: bool = True,
+    tokens_per_program: int = 32,
+    num_warps: int = 4,
+) -> None:
+    """Convert the NVFP4 K/V tokens at the given key positions into FP8
+    attention workspace and write their K/V index lists, in one launch.
+
+    Row ``r``'s key ``j`` (cache slot ``block_table[requests[r], key // P] * P
+    + key % P``, ``P`` the page size) becomes FP8 row ``r * top_k + j`` of
+    ``out`` (see Notes); a negative key gives a zero row. Each of the row's ``requests_per_row``
+    attention requests (rows ``r * requests_per_row + i`` of ``block_tables``
+    and ``seq_lens``) gets index lists ``r * top_k + j`` and the row's count of
+    nonnegative keys: the ``block_tables`` and ``seq_lens`` that
+    ``trtllm_batch_decode_with_kv_cache(..., sparse_top_k=top_k,
+    uses_shared_paged_kv_idx=False)`` takes over ``out`` as a cache of
+    one-token pages.
+
+    Parameters
+    ----------
+    paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
+        K/V uint8 HND pages, each shaped
+        ``[pages, 1, page_size, head_dim // 2]`` (two E2M1 values per byte),
+        with matching strides and contiguous token data. ``page_size`` is
+        positive, and a multiple of four for swizzled V scales; ``head_dim`` is
+        a power of two, 64 or more.
+    kv_cache_sf : tuple[torch.Tensor, torch.Tensor]
+        K/V FP8 E4M3 block-scale pages, each shaped
+        ``[pages, 1, page_size, head_dim // 16]``, with matching strides.
+        K scales are linear. V scales follow ``v_sf_swizzled``.
+    v_sf_swizzled : bool
+        Whether V scales use TRT-LLM's HND four-token swizzle, as in caches
+        written for trtllm-gen attention; ``page_size`` must then be a
+        multiple of four. Pass False for linear V scales, as written by
+        :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache`.
+    positions : torch.Tensor
+        int32 ``[rows, top_k]`` key positions, valid ones first, then -1;
+        ``top_k`` a power of two (512, 2048), a multiple of
+        ``tokens_per_program``.
+    requests : torch.Tensor
+        int32 ``[rows]``: each row's row of ``block_table``.
+    block_table : torch.Tensor
+        int32 ``[requests, pages]``.
+    out : torch.Tensor
+        FP8 E4M3 ``[rows * top_k or more, 1, 1, 2 * head_dim]``, K then V.
+    block_tables, seq_lens : torch.Tensor
+        int32 outputs ``[rows * requests_per_row, 2, top_k]`` and
+        ``[rows * requests_per_row]`` (or more rows).
+    lengths : torch.Tensor, optional
+        int32 ``[rows]``: each row's count of valid keys, when entries past it
+        may hold stale values; those then give zero rows. Entries within the
+        count must be valid keys: a negative one gives a zero row that the count
+        still includes, so attention weights a zero token. None: count the
+        nonnegative keys.
+    requests_per_row : int
+        Attention requests per row: row ``r``'s lists and count go to rows
+        ``r * requests_per_row`` to ``(r + 1) * requests_per_row - 1`` of
+        ``block_tables`` and ``seq_lens``.
+    tokens_per_program, num_warps : int
+        Launch tuning (powers of two): the tokens each program converts, and
+        its warps.
+
+    Graph safe: one launch, no host synchronization.
+
+    Notes
+    -----
+    All tensors must be on the same CUDA device. Outputs are written in place.
+    An FP8 row holds the token's decoded NVFP4 values (each E2M1 value times its
+    E4M3 block scale) divided by six, excluding the global scales: multiply
+    BMM1's K scale and BMM2's V scale by six. This covers NVFP4's full
+    normalized range without FP8 saturation. The result is rounded to E4M3:
+    products of E2M1 values and E4M3 scales can need more mantissa bits, and
+    small scales can become subnormal or zero. Requires a Blackwell GPU
+    (compute capability 10.x, 11.x or 12.x); validated on SM103.
+    """
+    from ._token_sparse_nvfp4 import position_gather_kernel
+
+    dim = _nvfp4_cache_dim(paged_kv_cache, kv_cache_sf, v_sf_swizzled)
+    _check_launch(requests_per_row, tokens_per_program, num_warps)
+    device = paged_kv_cache[0].device
+    rows = positions.shape[0]
+    top_k = _check_selection(
+        positions,
+        block_table,
+        out,
+        block_tables,
+        seq_lens,
+        rows * requests_per_row,
+        dim,
+        device,
+    )
+    if out.shape[0] < rows * top_k or top_k % tokens_per_program:
+        raise ValueError("out needs rows * top_k rows; top_k whole programs")
+    _check_vector("requests", requests, rows, torch.int32, device)
+    _check_lengths(lengths, rows, device)
+    if not rows:
+        return
+    k, v = paged_kv_cache
+    ks, vs = kv_cache_sf
+    with torch.cuda.device(k.device):
+        position_gather_kernel[(rows, top_k // tokens_per_program)](
+            k,
+            v,
+            ks,
+            vs,
+            k.stride(0),
+            ks.stride(0),
+            positions,
+            positions.stride(0),
+            positions if lengths is None else lengths,
+            requests,
+            block_table,
+            block_table.stride(0),
+            out,
+            block_tables,
+            seq_lens,
+            TOP_K=top_k,
+            PAGE=k.shape[2],
+            DIM=dim,
+            TOKENS=tokens_per_program,
+            V_SF_SWIZZLED=v_sf_swizzled,
+            REPEAT=requests_per_row,
+            HAS_LENGTHS=lengths is not None,
+            num_warps=num_warps,
+        )
+
+
+def compact_nvfp4_scratch_numel(groups: int, max_keys: int, out_rows: int) -> int:
+    """int32 elements of :func:`compact_nvfp4_kv_cache`'s ``scratch``: a prefix
+    row per group, the groups' sizes and key ends, and a key per output row.
+
+    Parameters
+    ----------
+    groups : int
+        Groups of the launch.
+    max_keys : int
+        The launch's ``max_keys``.
+    out_rows : int
+        Rows of the launch's ``out``.
+
+    Returns
+    -------
+    int
+        The workspace size in int32 elements.
+    """
+    return groups * (-(-max_keys // 32) + 2) + out_rows
+
+
+def compact_nvfp4_bitmap_numel(groups: int, max_keys: int) -> int:
+    """int32 elements of :func:`compact_nvfp4_kv_cache`'s ``bitmap``: a bit per
+    key and a key end per group.
+
+    Parameters
+    ----------
+    groups : int
+        Groups of the launch.
+    max_keys : int
+        The launch's ``max_keys``.
+
+    Returns
+    -------
+    int
+        The workspace size in int32 elements.
+    """
+    return groups * (-(-max_keys // 32) + 1)
+
+
+@flashinfer_api(trace=compact_nvfp4_kv_cache_trace)
+def compact_nvfp4_kv_cache(
+    paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
+    kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
+    positions: torch.Tensor,
+    row_groups: torch.Tensor,
+    group_requests: torch.Tensor,
+    block_table: torch.Tensor,
+    group_offsets: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scratch: torch.Tensor,
+    bitmap: torch.Tensor,
+    max_keys: int,
+    max_capacity: int,
+    zero_row: int,
+    group_base: int = 0,
+    group_dense: torch.Tensor | None = None,
+    lengths: torch.Tensor | None = None,
+    requests_per_row: int = 1,
+    v_sf_swizzled: bool = True,
+    tokens_per_program: int = 32,
+    num_warps: int = 4,
+) -> None:
+    """Convert each selected NVFP4 token once per group of rows, and point the
+    rows' K/V index lists at the converted tokens.
+
+    Rows that share a request (its prefill tokens, or its 1 + k MTP verify
+    tokens) select mostly the same keys. This converts each group's union of
+    selected keys once,
+    into the group's region of ``out`` (rows ``group_offsets[g]`` on), and
+    writes each row's lists as indices into that region. A dense group
+    (``group_dense[g] != 0``) instead converts every key below its last
+    selected key, key ``p`` to region row ``p``: no bitmap, worth it when its
+    rows select more keys in all than its context holds.
+
+    Every FP8 row holds its cache token's converted values (see Notes), the same
+    bits as :func:`gather_nvfp4_kv_cache_by_position` writes for that token,
+    and entry ``j`` of a row's lists holds the same key as entry ``j`` of its
+    positions, so token-sparse attention over either result computes on the
+    same values in the same order. Entries that are not live (negative keys,
+    entries past the row's count, keys at or past ``max_keys``) point at
+    ``zero_row``, which is zeroed. Each row's count is its number of nonnegative keys.
+
+    Parameters
+    ----------
+    paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
+        K/V uint8 HND pages, each shaped
+        ``[pages, 1, page_size, head_dim // 2]`` (two E2M1 values per byte),
+        with matching strides and contiguous token data. ``page_size`` is
+        positive, and a multiple of four for swizzled V scales; ``head_dim`` is
+        a power of two, 64 or more.
+    kv_cache_sf : tuple[torch.Tensor, torch.Tensor]
+        K/V FP8 E4M3 block-scale pages, each shaped
+        ``[pages, 1, page_size, head_dim // 16]``, with matching strides.
+        K scales are linear. V scales follow ``v_sf_swizzled``.
+    v_sf_swizzled : bool
+        Whether V scales use TRT-LLM's HND four-token swizzle, as in caches
+        written for trtllm-gen attention; ``page_size`` must then be a
+        multiple of four. Pass False for linear V scales, as written by
+        :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache`.
+    positions : torch.Tensor
+        int32 ``[rows, top_k]`` key positions, valid ones first, then -1;
+        ``top_k`` a power of two.
+    row_groups : torch.Tensor
+        int32 ``[rows]``: each row's group plus ``group_base``. A negative value
+        marks a padding row: its lists point at ``zero_row``. Rows of groups
+        outside ``[0, groups)`` (other than padding) are skipped, their lists and
+        counts left as they are, so launches over different group ranges
+        (``group_base``) can share ``positions`` and the output tables.
+    group_requests : torch.Tensor
+        int32 ``[groups]``: each group's row of ``block_table``.
+    block_table : torch.Tensor
+        int32 ``[requests, pages]``.
+    group_offsets : torch.Tensor
+        int64 ``[groups]``: each group's first row of ``out``. A union group's
+        region must hold its union (at most its rows times ``top_k``, at most
+        its keys); a dense group's must hold its keys up to the last selected.
+        Regions must not overlap each other or ``zero_row``.
+    out : torch.Tensor
+        FP8 E4M3 ``[N, 1, 1, 2 * head_dim]``, K then V.
+    block_tables, seq_lens : torch.Tensor
+        int32 outputs ``[rows * requests_per_row, 2, top_k]`` and
+        ``[rows * requests_per_row]`` (or more rows); row ``r``'s lists and
+        count go to its ``requests_per_row`` consecutive rows.
+    scratch : torch.Tensor
+        int32 workspace of :func:`compact_nvfp4_scratch_numel` ``(groups,
+        max_keys, N)`` elements or more; its contents do not matter.
+    bitmap : torch.Tensor
+        int32 workspace of :func:`compact_nvfp4_bitmap_numel` ``(groups,
+        max_keys)`` elements or more, all zero; every call leaves it all zero
+        (zero it once, and do not share it with other uses).
+    max_keys : int
+        Keys at or past it are not live (they point at ``zero_row``, and the
+        row's count still includes them); sizes the bitmap.
+    max_capacity : int
+        Sizes the conversion grid: at least every group's region size (a union
+        group's union of live keys, a dense group's last live key plus one).
+        Region rows at or past it are not converted.
+    zero_row : int
+        A row of ``out`` outside every region.
+    group_dense : torch.Tensor, optional
+        int32 ``[groups]``, nonzero for dense groups; None: all union groups.
+    lengths : torch.Tensor, optional
+        int32 ``[rows]``: each row's count of valid keys, when entries past it
+        may hold stale values (they are then not live). Entries within the count
+        must be valid keys: a negative one points at ``zero_row`` and is still
+        counted, so attention weights a zero token. None: count the nonnegative
+        keys.
+    group_base : int
+        The ``row_groups`` value of this launch's group 0 (see ``row_groups``).
+    requests_per_row : int
+        Attention requests per row (see ``block_tables``).
+    tokens_per_program, num_warps : int
+        Launch tuning (powers of two): the region rows each conversion program
+        converts at a time, and its warps.
+
+    Graph safe: four launches, no host synchronization.
+
+    Notes
+    -----
+    All tensors must be on the same CUDA device. Outputs are written in place.
+    An FP8 row holds the token's decoded NVFP4 values (each E2M1 value times its
+    E4M3 block scale) divided by six, excluding the global scales: multiply
+    BMM1's K scale and BMM2's V scale by six. This covers NVFP4's full
+    normalized range without FP8 saturation. The result is rounded to E4M3:
+    products of E2M1 values and E4M3 scales can need more mantissa bits, and
+    small scales can become subnormal or zero. Requires a Blackwell GPU
+    (compute capability 10.x, 11.x or 12.x); validated on SM103.
+    """
+    from ._token_sparse_nvfp4 import (
+        compact_convert_kernel,
+        compact_mark_kernel,
+        compact_number_kernel,
+        compact_remap_kernel,
+    )
+
+    dim = _nvfp4_cache_dim(paged_kv_cache, kv_cache_sf, v_sf_swizzled)
+    _check_launch(requests_per_row, tokens_per_program, num_warps)
+    device = paged_kv_cache[0].device
+    if group_offsets.ndim != 1:
+        raise ValueError("Expected int64 group_offsets [groups]")
+    rows, groups = positions.shape[0], group_offsets.shape[0]
+    top_k = _check_selection(
+        positions,
+        block_table,
+        out,
+        block_tables,
+        seq_lens,
+        rows * requests_per_row,
+        dim,
+        device,
+    )
+    _check_vector("row_groups", row_groups, rows, torch.int32, device)
+    _check_vector("group_requests", group_requests, groups, torch.int32, device)
+    _check_vector("group_offsets", group_offsets, groups, torch.int64, device)
+    if group_dense is not None:
+        _check_vector("group_dense", group_dense, groups, torch.int32, device)
+    _check_lengths(lengths, rows, device)
+    if not 0 <= zero_row < out.shape[0] or max_keys <= 0 or max_capacity < 0:
+        raise ValueError(
+            "zero_row must be a row of out; max_keys positive; max_capacity >= 0"
+        )
+    words = -(-max_keys // 32)
+    numel = compact_nvfp4_scratch_numel(groups, max_keys, out.shape[0])
+    if (
+        scratch.dtype != torch.int32
+        or scratch.numel() < numel
+        or not scratch.is_contiguous()
+        or scratch.device != device
+    ):
+        raise ValueError(f"scratch needs {numel} contiguous int32 elements")
+    bitmap_numel = compact_nvfp4_bitmap_numel(groups, max_keys)
+    if (
+        bitmap.dtype != torch.int32
+        or bitmap.numel() < bitmap_numel
+        or not bitmap.is_contiguous()
+        or bitmap.device != device
+    ):
+        raise ValueError(f"bitmap needs {bitmap_numel} contiguous int32 elements")
+    if groups > 65535:
+        raise ValueError("At most 65535 groups")
+    max_tiles = max(1, -(-max_capacity // tokens_per_program))
+    if not rows:
+        return
+    # A grid of every group times the largest region's tiles is mostly idle
+    # programs when regions differ; above _LOOP_ABOVE_FACTOR times
+    # _convert_programs(device), that many programs loop over their group's own
+    # tiles instead. A launch without groups only remaps (padding rows point at
+    # the zero row) and zeroes the zero row.
+    cap = _convert_programs(device)
+    loop = groups > 0 and max_tiles * groups > _LOOP_ABOVE_FACTOR * cap
+    tiles = min(max_tiles, max(1, -(-cap // groups))) if loop else max_tiles
+    if tiles >= 1 << 31:
+        raise ValueError("At most 2**31 - 1 conversion tiles per group")
+    scratch, bitmap = scratch.view(-1), bitmap.view(-1)[:bitmap_numel]
+    prefix = scratch[: groups * words]
+    sizes = scratch[groups * words : groups * (words + 1)]
+    ends = scratch[groups * (words + 1) : groups * (words + 2)]
+    union_keys = scratch[groups * (words + 2) : numel]
+    has_dense, has_lengths = group_dense is not None, lengths is not None
+    dense = group_dense if has_dense else sizes  # unread without dense groups
+    row_lengths = lengths if has_lengths else positions  # unread without lengths
+    k, v = paged_kv_cache
+    ks, vs = kv_cache_sf
+    with torch.cuda.device(k.device):
+        if groups:
+            compact_mark_kernel[(rows,)](
+                positions,
+                positions.stride(0),
+                row_lengths,
+                row_groups,
+                group_base,
+                groups,
+                dense,
+                bitmap,
+                words,
+                max_keys,
+                TOP_K=top_k,
+                HAS_DENSE=has_dense,
+                HAS_LENGTHS=has_lengths,
+                num_warps=4,
+            )
+            compact_number_kernel[(groups,)](
+                bitmap,
+                prefix,
+                sizes,
+                ends,
+                dense,
+                words,
+                HAS_DENSE=has_dense,
+                num_warps=4,
+            )
+        compact_remap_kernel[(rows,)](
+            positions,
+            positions.stride(0),
+            row_lengths,
+            row_groups,
+            group_base,
+            groups,
+            # without groups, padding rows read none of these (non-empty stand-ins)
+            dense if groups else positions,
+            group_offsets if groups else positions,
+            bitmap if groups else positions,
+            prefix if groups else positions,
+            words,
+            max_keys,
+            block_tables,
+            seq_lens,
+            union_keys,
+            zero_row,
+            TOP_K=top_k,
+            REPEAT=requests_per_row,
+            HAS_DENSE=has_dense,
+            HAS_LENGTHS=has_lengths,
+            num_warps=4,
+        )
+        if not groups:
+            out[zero_row].zero_()
+            return
+        compact_convert_kernel[(tiles, groups)](
+            k,
+            v,
+            ks,
+            vs,
+            k.stride(0),
+            ks.stride(0),
+            block_table,
+            block_table.stride(0),
+            group_requests,
+            group_offsets,
+            dense,
+            sizes,
+            union_keys,
+            bitmap,
+            words,
+            ends,
+            out,
+            out[zero_row],
+            PAGE=k.shape[2],
+            DIM=dim,
+            TOKENS=tokens_per_program,
+            MAX_CAPACITY=max_capacity,
+            V_SF_SWIZZLED=v_sf_swizzled,
+            HAS_DENSE=has_dense,
+            LOOP=loop,
+            num_warps=num_warps,
         )
