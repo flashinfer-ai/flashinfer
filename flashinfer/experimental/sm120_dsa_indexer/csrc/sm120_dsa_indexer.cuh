@@ -2504,7 +2504,14 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
               if (ws_n[qi] > kWarpCap - 16) flush_row(qi);
             }
           }
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+          asm volatile(
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::
+                  : "memory");
+#else
           fence_proxy_async();  // order this stage's generic reads before its TMA refill
+#endif
           mbar_arrive(empty_k + st);
         }
         if constexpr (kMode == Mode::kScan) {
@@ -2515,7 +2522,14 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
         if constexpr (kMode == Mode::kExact) {
           if (x_active && phase < 6) exact_unit_done(p, phase, row0 + only_qi, shist, tid);
         }
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        asm volatile(
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::
+                : "memory");
+#else
         fence_proxy_async();
+#endif
         mbar_arrive(empty_q + qs);
         if constexpr (kMode == Mode::kResident) {
           // Each row's order-key range over the block: per warp, then over the
