@@ -32,7 +32,8 @@
 # at commit ef34db4 (2026-09-22). FlashInfer-specific adaptations are marked
 # with "flashinfer" comments: the ActivationType import, the `enable_pdl` /
 # `ugpu_half_gemm` constructor aliases, the SiTU request convention shared with
-# the Blackwell kernel, and the optional `situ_linear_beta`.
+# the Blackwell kernel, the optional `situ_linear_beta`, and custom SwiGLU
+# alpha/beta support.
 
 import argparse
 import os
@@ -239,6 +240,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
     :param topk: Experts selected per token.
     :param raster_along_m: If True, raster tiles along M first.
     :param a_path: "cpasync" or "tma" — A load implementation.
+    :param swiglu_alpha: Sigmoid multiplier for SwiGLU, after expert scaling/clamp.
+    :param swiglu_beta: Bias added to the scaled/clamped SwiGLU up branch.
     """
 
     def __init__(
@@ -259,6 +262,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         swiglu_limit: float = float("inf"),
         enable_pdl: Optional[bool] = None,
         ugpu_half_gemm: Optional[bool] = None,
+        # flashinfer: match the parameterized SwiGLU supported by Blackwell.
+        swiglu_alpha: float = 1.0,
+        swiglu_beta: float = 0.0,
     ):
         # flashinfer dispatcher compatibility: the pre-sync kernel took
         # `enable_pdl`; TRT-LLM renamed it to `use_pdl`. Explicit enable_pdl
@@ -307,6 +313,17 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
             swiglu_limit = float("inf")
         self.swiglu_limit = float(swiglu_limit)
         self.has_swiglu_limit = self.swiglu_limit != float("inf")
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.has_swiglu_alpha = self.swiglu_alpha != 1.0
+        self.has_swiglu_beta = self.swiglu_beta != 0.0
+        if (
+            self.has_swiglu_alpha or self.has_swiglu_beta
+        ) and self.activation_type != ActivationType.Swiglu:
+            raise ValueError(
+                "swiglu_alpha/swiglu_beta apply to ActivationType.Swiglu only; "
+                f"got {self.activation_type.name}."
+            )
         if self.has_swiglu_limit and self.activation_type != ActivationType.Swiglu:
             raise ValueError(
                 "swiglu_limit applies to ActivationType.Swiglu only; "
@@ -3345,13 +3362,17 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         alpha_val,
         tCompute: cute.Tensor,
     ):
-        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``.
+        """SwiGLU: ``g * sigmoid(swiglu_alpha * g) * (u + swiglu_beta)``.
 
-        With ``has_swiglu_limit`` the scaled gate is capped at ``+swiglu_limit`` and
-        the scaled up is clipped to ``[-swiglu_limit, swiglu_limit]`` first.
+        Expert scaling precedes the optional gate cap and symmetric up clamp.
+        The bias is added after clamping; the sigmoid multiplier does not scale
+        the gate factor outside the sigmoid.
         """
         if cutlass.const_expr(self.vectorized_f32):
             LOG2_E = cutlass.Float32(1.4426950408889634)
+            if cutlass.const_expr(self.has_swiglu_alpha):
+                # Match Blackwell's f32 coefficient; keep the default path intact.
+                LOG2_E = cutlass.Float32(self.swiglu_alpha) * LOG2_E
             for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
                 acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
                     (acc_vec_up[i], acc_vec_up[i + 1]),
@@ -3369,6 +3390,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                     acc_vec_up_alpha = (
                         fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit),
                         fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit),
+                    )
+                if cutlass.const_expr(self.has_swiglu_beta):
+                    acc_vec_up_alpha = cute.arch.add_packed_f32x2(
+                        acc_vec_up_alpha,
+                        (
+                            cutlass.Float32(self.swiglu_beta),
+                            cutlass.Float32(self.swiglu_beta),
+                        ),
                     )
                 tCompute_log2e = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
@@ -3407,7 +3436,21 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                 if cutlass.const_expr(self.has_swiglu_limit):
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit, nan=True)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
-                tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+                if cutlass.const_expr(self.has_swiglu_beta):
+                    acc_vec_up_alpha += cutlass.Float32(self.swiglu_beta)
+                if cutlass.const_expr(self.has_swiglu_alpha):
+                    tCompute[i] = (
+                        acc_vec_up_alpha
+                        * acc_vec_gate_alpha
+                        * sigmoid_f32(
+                            acc_vec_gate_alpha * cutlass.Float32(self.swiglu_alpha),
+                            fastmath=True,
+                        )
+                    )
+                else:
+                    tCompute[i] = acc_vec_up_alpha * silu_f32(
+                        acc_vec_gate_alpha, fastmath=True
+                    )
 
     @cute.jit
     def _apply_situ_epilogue(
