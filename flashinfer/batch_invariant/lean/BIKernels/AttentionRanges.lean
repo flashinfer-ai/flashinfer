@@ -1,0 +1,185 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
+import BIKernels.Attention
+
+/-!
+# Paged-KV attention with bidirectional ranges: the ranged class of `attention.bf16`
+
+Mirrors the ranged rows of `flashinfer/attention/batch_invariant/spec.py` (`RowSpec.brange`). A row of the ranged class has
+one more input than a row of the causal class (`Attention.lean`): a key range `[ra, rb)` of its request. It sees its causal
+keys `[lo, p]` (`lo` from the sliding window) united with the range, and everything else is the causal class's dataflow: the
+same tile step over the visible keys (`Attn.tileStepV`), the same chunks on the absolute grid, the same merge in chunk order
+from the init state, the same epilogue. A tile without a visible key is absent and a chunk without a present tile is absent,
+so a range behind the window or ahead of the position leaves absent tiles and chunks between the two parts.
+
+What the module states:
+
+* a row without a range (`rb ≤ ra`), and a row whose range lies inside its causal keys, have the causal class's term
+  (`no_range_is_causal`, `range_inside_causal_is_causal`): tokens outside every range are unaffected by the class;
+* the split kernel computes the fused term for every chunk-to-CTA assignment, and every configuration computes the term;
+* the launch model: a row's term is a function of its own position, window, range and identity (R1, R2);
+* the range is an input that reaches the term (decided on toy rows): the ranged class is not the causal class.
+-/
+namespace BIK.AttnR
+open BIK.Attn
+
+/-- The fixed data of one logical row of the ranged class: `Attn.Params` and the row's key range `[ra, rb)`
+(`rb ≤ ra`: no range). -/
+structure Params where
+  steps : Nat
+  tbits : Nat
+  C : Nat
+  p : Nat
+  win : Int
+  ra : Nat
+  rb : Nat
+  row : Nat
+  d : Nat
+
+/-- The causal class's row at the same position, window and identity. -/
+def Params.causal (P : Params) : Attn.Params := ⟨P.steps, P.tbits, P.C, P.p, P.win, P.row, P.d⟩
+
+/-! The geometry of a ranged row as functions of `(tbits, C, p, win, ra, rb)` alone. -/
+
+def visibleG (p : Nat) (win : Int) (ra rb k : Nat) : Bool := Attn.visibleG p win k || decide (ra ≤ k ∧ k < rb)
+
+/-- One past the last visible key: `p + 1`, or the range's end when the range reaches further. -/
+def endG (p ra rb : Nat) : Nat := if ra < rb then max (p + 1) rb else p + 1
+
+def tilePresentV (tbits : Nat) (vis : Nat → Bool) (t : Nat) : Bool :=
+  (List.range (2 ^ tbits)).any (fun i => vis (t * 2 ^ tbits + i))
+
+def tilesOfChunkV (tbits C : Nat) (vis : Nat → Bool) (j : Nat) : List Nat :=
+  ((List.range (C / 2 ^ tbits)).map (fun i => j * (C / 2 ^ tbits) + i)).filter (tilePresentV tbits vis)
+
+def presentChunksV (tbits C L : Nat) (vis : Nat → Bool) : List Nat :=
+  (List.range ((L + C - 1) / C)).filter (fun j => !(tilesOfChunkV tbits C vis j).isEmpty)
+
+def Params.visible (P : Params) (k : Nat) : Bool := visibleG P.p P.win P.ra P.rb k
+def Params.tilesOfChunk (P : Params) (j : Nat) : List Nat := tilesOfChunkV P.tbits P.C P.visible j
+def Params.presentChunks (P : Params) : List Nat := presentChunksV P.tbits P.C (endG P.p P.ra P.rb) P.visible
+
+/-- The per-chunk fold: the present tiles of chunk `j`, ascending, from the init state. -/
+def chunkState (P : Params) (j : Nat) : State :=
+  (P.tilesOfChunk j).foldl (tileStepV P.steps P.tbits P.row P.d P.visible) initState
+
+/-- The fused path: present chunks merged in index order from the init state. -/
+def fused (P : Params) : State := P.presentChunks.foldl (fun acc j => merge acc (chunkState P j)) initState
+
+def output (P : Params) : ATerm := epilogue (fused P)
+
+/-! ## The split kernel -/
+
+def workspace (P : Params) (_σ : Nat → Nat) (j : Nat) : State := chunkState P j
+
+/-- The fixup folds the present slots in index order (`Attn.fixup`): under the ranged class the present chunks of a row
+are those whose slot holds a key of the row, which is the list `presentChunks`. -/
+def splitKernel (P : Params) (σ : Nat → Nat) : ATerm := epilogue (fixup (workspace P σ) P.presentChunks)
+
+theorem splitKernel_eq_fused (P : Params) (σ : Nat → Nat) : splitKernel P σ = output P := rfl
+
+theorem splitKernel_assignment_irrelevant (P : Params) (σ τ : Nat → Nat) : splitKernel P σ = splitKernel P τ := rfl
+
+/-! ## Rows whose range adds no key are rows of the causal class -/
+
+theorem tilesOfChunkV_causal (tbits C p : Nat) (win : Int) (j : Nat) :
+    tilesOfChunkV tbits C (Attn.visibleG p win) j = Attn.tilesOfChunkG tbits C p win j := rfl
+
+theorem presentChunksV_causal (tbits C p : Nat) (win : Int) :
+    presentChunksV tbits C (p + 1) (Attn.visibleG p win) = Attn.presentChunksG tbits C p win := rfl
+
+/-- A ranged row whose visible keys and last key are the causal row's has the causal row's term. -/
+theorem output_eq_causal (P : Params) (hv : P.visible = Attn.visibleG P.p P.win) (hL : endG P.p P.ra P.rb = P.p + 1) :
+    output P = Attn.output P.causal := by
+  unfold output Attn.output fused Attn.fused chunkState Attn.chunkState Params.presentChunks Params.tilesOfChunk
+    Attn.Params.presentChunks Attn.Params.tilesOfChunk
+  rw [hv, hL]
+  rfl
+
+/-- **No range, the causal class**: a row with `rb ≤ ra` has the term of the causal class's row at the same position,
+window and identity. Tokens outside every range keep the causal class's bits. -/
+theorem no_range_is_causal (P : Params) (h : P.rb ≤ P.ra) : output P = Attn.output P.causal := by
+  apply output_eq_causal
+  · funext k
+    have hk : ¬ (P.ra ≤ k ∧ k < P.rb) := by omega
+    simp [Params.visible, visibleG, hk]
+  · have hlt : ¬ (P.ra < P.rb) := by omega
+    simp [endG, hlt]
+
+/-- **A range inside the causal keys adds nothing**: the same term again. -/
+theorem range_inside_causal_is_causal (P : Params) (hlo : Attn.loOf P.p P.win ≤ P.ra) (hhi : P.rb ≤ P.p + 1) :
+    output P = Attn.output P.causal := by
+  apply output_eq_causal
+  · funext k
+    simp only [Params.visible, visibleG, Attn.visibleG]
+    by_cases hk : P.ra ≤ k ∧ k < P.rb
+    · have hc : Attn.loOf P.p P.win ≤ k ∧ k < P.p + 1 := by omega
+      simp [hk, hc]
+    · simp [hk]
+  · unfold endG
+    split <;> omega
+
+/-! ## The launch model -/
+
+/-- A row of a launch: the token's absolute position, its range, its head and its identity. -/
+structure Row where
+  p : Nat
+  ra : Nat
+  rb : Nat
+  h : Nat
+  row : Nat
+  deriving DecidableEq, Repr
+
+def rowOutput (steps tbits C : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
+  output ⟨steps, tbits, C, r.p, win, r.ra, r.rb, r.row, d⟩
+
+def launch (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
+  rowOutput steps tbits C win d (rows r)
+
+/-- **Batch invariance (R2)**: equal rows -- position, range, head, identity -- give equal outputs whatever the batch
+size, the row's place in it or the other rows' ranges. -/
+theorem batch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    launch M₁ rows₁ steps tbits C win d r₁ = launch M₂ rows₂ steps tbits C win d r₂ := by
+  simp only [launch, h]
+
+theorem permutation_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M : Nat} (rows : Fin M → Row) (σ : Fin M → Fin M) (r : Fin M) :
+    launch M (rows ∘ σ) steps tbits C win d r = launch M rows steps tbits C win d (σ r) := rfl
+
+theorem subbatch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M k : Nat} (rows : Fin M → Row) (sel : Fin k → Fin M) (i : Fin k) :
+    launch k (rows ∘ sel) steps tbits C win d i = launch M rows steps tbits C win d (sel i) := rfl
+
+/-- A row without a range in a ranged launch is the causal launch's row, whatever ranges the other rows carry. -/
+theorem launch_row_without_range (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M)
+    (h : (rows r).rb ≤ (rows r).ra) :
+    launch M rows steps tbits C win d r = Attn.rowOutput steps tbits C win d ⟨(rows r).p, (rows r).h, (rows r).row⟩ :=
+  no_range_is_causal ⟨steps, tbits, C, (rows r).p, win, (rows r).ra, (rows r).rb, (rows r).row, d⟩ h
+
+/-! ## The range reaches the term -/
+
+/-- **The ranged class is not the causal class**: a range ahead of the position is a different term (a toy row, decided). -/
+theorem output_depends_on_range :
+    output ⟨1, 2, 8, 9, -1, 12, 14, 0, 0⟩ ≠ Attn.output ⟨1, 2, 8, 9, -1, 0, 0⟩ := by native_decide
+
+/-- A row inside its range with no window sees the prefix up to the range's last key: the term of the causal row at that
+key, for the same query row (a toy row, decided). -/
+theorem range_around_position_is_causal_at_end :
+    output ⟨1, 2, 8, 5, -1, 3, 12, 0, 0⟩ = Attn.output ⟨1, 2, 8, 11, -1, 0, 0⟩ := by native_decide
+
+/-! ## The configuration space -/
+
+/-- A ranged row's output under a configuration (`Attn.Config`): the fused fold or the split kernel, as for the causal
+class; the range table, the row body and the fold's rule for present chunks are placements of this term. -/
+def kernel (b : Config) (fusedAuto : Bool) (P : Params) (σ : Nat → Nat) : ATerm :=
+  if b.policy == 2 || (b.policy == 0 && fusedAuto) then output P else splitKernel P σ
+
+theorem kernel_eq_output (b : Config) (f : Bool) (P : Params) (σ : Nat → Nat) : kernel b f P σ = output P := by
+  unfold kernel
+  split <;> rfl
+
+/-- **Configuration invariance (R3)** of the ranged class. -/
+theorem config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat) :
+    kernel b₁ f₁ P σ = kernel b₂ f₂ P τ := by
+  rw [kernel_eq_output, kernel_eq_output]
+
+end BIK.AttnR

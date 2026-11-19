@@ -21,7 +21,8 @@ def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 def decidedAxiom : Name := ``Lean.ofReduceBool
 /-- The named `native_decide` theorems: the exhaustive checks over the generators' configuration spaces and the GEMM
 dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time), the attention spec cases
-(terms of tens of kilobytes) and the attention class-separation theorems. -/
+(terms of tens of kilobytes), the attention class-separation theorems and the ranged attention class's spec cases and
+toy-row theorems. -/
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
    ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space,
@@ -42,7 +43,8 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mxw48_space_decode_ok, ``BIK.gemm_mxw48_space_c2_ok,
    ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
    ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
-   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64]
+   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64,
+   ``BIK.attnr_r0_spec, ``BIK.attnr_r1_spec, ``BIK.attnr_r2_spec, ``BIK.attnr_r3_spec, ``BIK.attnr_r4_spec, ``BIK.attnr_r5_spec, ``BIK.attnr_r6_spec, ``BIK.AttnR.output_depends_on_range, ``BIK.AttnR.range_around_position_is_causal_at_end]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?

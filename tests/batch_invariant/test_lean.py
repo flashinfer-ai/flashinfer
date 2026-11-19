@@ -40,8 +40,25 @@ def test_generated_cases_are_current():
         assert f"theorem {name} " in committed
     with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
         axioms = f.read()
-    for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
+    for name in (
+        lean_cases.DECIDED_THEOREMS
+        + lean_cases.MODULE_DECIDED_THEOREMS
+        + lean_cases.RANGES_DECIDED_THEOREMS
+    ):
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
+
+
+def test_generated_ranges_cases_are_current():
+    """The ranged attention class's cases (their own module): byte for byte what the Python spec emits."""
+    with open(lean_cases.RANGES_CASES_PATH) as f:
+        committed = f.read()
+    assert committed == lean_cases.render_ranges(), (
+        "regenerate with: python -m flashinfer.batch_invariant.lean_cases"
+    )
+    assert "sorry" not in committed
+    assert committed.count("native_decide") == len(lean_cases.RANGES_DECIDED_THEOREMS)
+    for name in lean_cases.RANGES_DECIDED_THEOREMS:
+        assert f"theorem {name} " in committed
 
 
 def test_rendering_takes_the_nominal_parts():
@@ -111,7 +128,12 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    kinds = {
+        "gemmbias": "spec",
+        "fp4class": "fp4class",
+        "attn": "attn",
+        "attnr": "attn",
+    }
     # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
     kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
@@ -142,7 +164,7 @@ def test_lean_model_matches_python_engine_and_spec():
             lean[("fp4class", int(N), int(K))] = bool(int(b))
         elif kind == "attn":
             _, name, sx = line.split(" ", 2)
-            lean[("attn", name)] = sx
+            lean[(tag, name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -189,6 +211,9 @@ def test_lean_model_matches_python_engine_and_spec():
     for name, *_, sx in lean_cases.attn_cases():
         assert lean[("attn", name)] == sx, name
         checked += 1
+    for name, *_, sx in lean_cases.attn_range_cases():
+        assert lean[("attnr", name)] == sx, name
+        checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 
@@ -198,7 +223,9 @@ def test_axioms_policy():
     r = _lake("exe", "axioms", timeout=600)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "0 with sorry, 0 violations" in r.stdout, r.stdout
-    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(
-        lean_cases.MODULE_DECIDED_THEOREMS
+    n_decided = (
+        len(lean_cases.DECIDED_THEOREMS)
+        + len(lean_cases.MODULE_DECIDED_THEOREMS)
+        + len(lean_cases.RANGES_DECIDED_THEOREMS)
     )
     assert f"{n_decided} named table theorems" in r.stdout, r.stdout

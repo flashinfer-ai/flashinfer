@@ -138,20 +138,26 @@ def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
     let slice := (pbf.drop (16 * j)).take 16
     .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
 
-/-- `spec.tile_step` on a present tile `t`. -/
-def tileStep (P : Params) (st : State) (t : Nat) : State :=
+/-- `spec.tile_step` on a present tile `t` of a row whose visible keys are `vis`: the step is written once over the
+visible set, so the classes that differ only in what a row sees (`AttentionRanges.lean`) share it. -/
+def tileStepV (steps tbits row d : Nat) (vis : Nat → Bool) (st : State) (t : Nat) : State :=
+  let T := 2 ^ tbits
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.row (t * P.T + i) P.steps) else none)
-  let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
+    (List.range T).map (fun i => if vis (t * T + i) then some (.score row (t * T + i) steps) else none)
+  let mT := (ptree ATerm.fmax tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
   let nms := ATerm.mul mNew nc
   let probs : List (Option ATerm) := scores.map (fun s => s.map (fun s => .ex2 (.fma s c nms)))
-  let rT := (ptree ATerm.add P.tbits probs).getD (.const "0.0")
+  let rT := (ptree ATerm.add tbits probs).getD (.const "0.0")
   let lNew := ATerm.fma st.l alpha rT
   let pbf := probs.map (fun q => ATerm.cvt "bf16" (q.getD (.const "0.0")))
-  let oNew := pvFold (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
+  let oNew := pvFold (.mul st.o alpha) pbf (t * (T / 16)) d
   ⟨mNew, lNew, oNew⟩
+
+/-- `spec.tile_step` on a present tile `t`. -/
+def tileStep (P : Params) (st : State) (t : Nat) : State :=
+  tileStepV P.steps P.tbits P.row P.d P.visible st t
 
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
 def merge (a b : State) : State :=
