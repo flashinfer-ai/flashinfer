@@ -6,6 +6,11 @@
 engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
 its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
 
+Custom masks (``custom_mask`` / ``packed_custom_mask`` on the two prefill wrappers' ``plan()``) run the explicit-key-set class
+(``attention.bf16.mask``): a token's output bits depend on its own mask row (ANDed with the window), its head and its request's
+keys alone. The semantics are the regular wrappers': the mask replaces the causal mask (``causal`` is ignored), ``window_left``
+is ANDed in, a row without a visible key outputs zeros. The masks are snapshotted at ``plan()``.
+
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
@@ -92,6 +97,7 @@ class BatchInvariantAttention:
         self._page = 1
         self._max_page = -1  # the largest page index the plan references (paged kinds)
         self._total_kv = 0  # the planned packed token count (ragged)
+        self._masked = False  # the current plan runs the explicit-key-set class
 
     def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
         """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
@@ -150,9 +156,11 @@ class BatchInvariantAttention:
         page_size: int,
         window_left: int = -1,
         q_len_per_req: int = 1,
+        masked: bool = False,
     ) -> int:
         """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
-        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits)."""
+        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits). ``masked``: the
+        plan will take a custom mask (the explicit-key-set class spans every request's whole key range)."""
         D = int(head_dim)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -181,6 +189,7 @@ class BatchInvariantAttention:
             engine.default_config(D=D),
             self.device,
             ragged=self.kind == "ragged",
+            masked=masked and self.kind != "decode",
         )
 
     # ------------------------------------------------------------------ plan
@@ -257,9 +266,19 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
             )
-        if self.kind != "decode" and not causal:
+        masked = custom_mask is not None or packed_custom_mask is not None
+        if masked and self.kind == "decode":
             raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+                CLASS,
+                "a custom mask on the decode wrapper",
+                "the causal mask with an optional sliding window",
+            )
+        # a custom mask replaces the causal mask, as in the regular kernels: ``causal`` is not read with one
+        if self.kind != "decode" and not causal and not masked:
+            raise unsupported(
+                CLASS,
+                "non-causal attention",
+                "causal attention (bottom-right aligned), or a custom mask",
             )
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
@@ -273,12 +292,6 @@ class BatchInvariantAttention:
             )
         if rope_scale is not None or rope_theta is not None:
             raise unsupported(CLASS, "rope_scale / rope_theta", "no fused RoPE")
-        if custom_mask is not None or packed_custom_mask is not None:
-            raise unsupported(
-                CLASS,
-                "a custom mask",
-                "the causal mask with an optional sliding window",
-            )
         if use_fp16_qk_reduction:
             raise unsupported(
                 CLASS,
@@ -413,12 +426,45 @@ class BatchInvariantAttention:
                     f"request {i} with a decreasing qo_indptr / kv_indptr",
                     "non-decreasing offsets",
                 )
-            if ql > kl:
+            if masked:
+                if ql > 0 and kl == 0:
+                    raise unsupported(
+                        CLASS,
+                        f"request {i} with {ql} query tokens over no key",
+                        "at least one key per request with query tokens (a custom mask selects among the request's keys)",
+                    )
+            elif ql > kl:
                 raise unsupported(
                     CLASS,
                     f"request {i} with {ql} query tokens over {kl} keys",
                     "kv_len >= q_len per request (the causal class)",
                 )
+        key_sets = None
+        if masked:
+            # the rows' key sets in the kernels' layout, from a snapshot of the caller's mask (a later in-place change cannot reach
+            # the plan); the window is ANDed into the sets here
+            for name, t in (
+                ("custom_mask", custom_mask),
+                ("packed_custom_mask", packed_custom_mask),
+            ):
+                if t is not None and not isinstance(t, torch.Tensor):
+                    raise unsupported(
+                        CLASS, f"{name} of type {type(t).__name__}", "a torch.Tensor"
+                    )
+            try:
+                key_sets = engine.pack_key_sets(
+                    q_lens,
+                    kv_lens,
+                    custom_mask if packed_custom_mask is None else None,
+                    packed_custom_mask,
+                    window_left,
+                )
+            except ValueError as e:
+                raise unsupported(
+                    CLASS,
+                    str(e),
+                    "a custom_mask of sum(q_len * kv_len) elements, or its segment_packbits(bitorder='little') bytes",
+                ) from None
         config = engine.default_config(D=D)
         if (
             D in engine.Q2_DEFAULT_DIMS
@@ -450,6 +496,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                key_sets=key_sets,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -471,6 +518,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    key_sets=key_sets,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -506,6 +554,7 @@ class BatchInvariantAttention:
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
+        self._masked = masked
 
     def validate_forward_options(
         self,
@@ -551,9 +600,16 @@ class BatchInvariantAttention:
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
-        if causal is not None and not causal and self.kind != "decode":
+        if (
+            causal is not None
+            and not causal
+            and self.kind != "decode"
+            and not self._masked
+        ):
             raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+                CLASS,
+                "non-causal attention",
+                "causal attention (bottom-right aligned), or a custom mask",
             )
         if use_fp16_qk_reduction:
             raise unsupported(
