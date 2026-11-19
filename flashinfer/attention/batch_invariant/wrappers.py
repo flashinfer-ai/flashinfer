@@ -339,18 +339,14 @@ class BatchInvariantAttention:
                 "window_left >= 0, or -1 for no window",
             )
         if sm_scale is not None:
-            ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
-            if ok:
-                try:
-                    ok = scale_log2(float(sm_scale)) != 0.0
-                except OverflowError:
-                    ok = False
-            if not ok:
+            try:
+                engine.check_sm_scale(sm_scale)
+            except (ValueError, TypeError):
                 raise unsupported(
                     CLASS,
                     f"sm_scale {sm_scale}",
-                    "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
-                )
+                    "a positive finite sm_scale whose log2 scale is a normal binary32 number",
+                ) from None
         if self.kind == "decode":
             if q_len_per_req < 1:
                 raise unsupported(
@@ -574,7 +570,7 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS,
                 f"sm_scale {sm_scale}",
-                "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
+                "a positive finite sm_scale whose log2 scale is a normal binary32 number",
             ) from None
         # The kernel consumes a binary32 log2 scale, not the caller's Python float.
         if c != self._scale_log2:
@@ -795,7 +791,8 @@ class BatchInvariantAttention:
                 raise unsupported(
                     cls,
                     f"k_scale {k_scale} / v_scale {v_scale}",
-                    f"a positive finite k_scale whose log2 scale with sm_scale is a nonzero binary32 number and a finite v_scale ({e})",
+                    "a positive k_scale within the binary32 range whose log2 scale with sm_scale is a normal binary32 number, "
+                    f"and a finite v_scale that is nonzero in binary32 ({e})",
                 ) from None
         engine._run_attention_validated(
             self._planned,

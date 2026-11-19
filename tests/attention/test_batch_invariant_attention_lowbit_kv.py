@@ -701,8 +701,14 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     for bad in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(bi.BatchInvariantUnsupportedError):
             w.run(pr.q, (k, v), k_scale=bad)
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.run(pr.q, (k, v), v_scale=float("inf"))
+    # a key scale beyond binary32, and one whose constant c = fp32(sm_scale * k_scale * log2 e) is subnormal
+    for bad in (1e39, 1e-44, torch.tensor(1e-44, dtype=torch.float64)):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="k_scale"):
+            w.run(pr.q, (k, v), k_scale=bad)
+    # a value scale that is not finite, or is zero in binary32
+    for bad in (float("inf"), float("nan"), 1e39, 0.0, 1e-50):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="v_scale"):
+            w.run(pr.q, (k, v), k_scale=lp.k_scale, v_scale=bad)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
     ):  # a scale tensor of more than one element
@@ -739,6 +745,17 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi.BatchInvariantUnsupportedError
     ):  # an fp8 cache over a bf16 plan
         wb.run(pr.q, (k, v))
+    # an sm_scale whose constant is subnormal in binary32 is refused at plan(), for every class
+    for kv in (torch.bfloat16, E4):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="sm_scale"):
+            wb.plan(
+                *plan_args,
+                causal=True,
+                q_data_type=torch.bfloat16,
+                kv_data_type=kv,
+                sm_scale=1e-40,
+            )
+    assert torch.equal(bits(wb.run(pr.q, pr.cache("NHD"))), bref)  # the plan survived
     # the functional API: a plan of one format cannot run another; scales with a bf16 cache raise
     planned = engine.plan_attention(
         pr.qo_indptr,
@@ -1312,3 +1329,37 @@ def test_nvfp4_refusals():
             pr.kv_indices,
             1.0 / math.sqrt(128),
         )
+
+
+# ------------------------------------------------------------------------------------------------------ scale edge cases
+def test_scale_constants_outside_binary32_are_refused():
+    """``engine.check_sm_scale`` / ``engine.check_v_scale`` are the one place the scales of the chain are checked: the constant
+    ``c = fp32(sm_scale * k_scale * log2 e)`` is a normal binary32 number, the key scale a binary32 number, the value scale
+    finite and nonzero in binary32."""
+    sm = 1.0 / math.sqrt(128)
+    assert engine.check_sm_scale(sm, 0.25) == spec.scale_log2(sm, 0.25)
+    assert engine.check_sm_scale(1e-37) == spec.scale_log2(1e-37) >= spec.FLT_MIN
+    for ks in (0.0, -1.0, float("inf"), float("nan"), 1e39, 2 * spec.FLT_MAX):
+        with pytest.raises(ValueError, match="k_scale"):
+            engine.check_sm_scale(sm, ks)
+    # a key scale beyond binary32 is refused even when sm_scale brings the constant back into range
+    assert spec.scale_log2(1e-10, 1e39) < spec.FLT_MAX
+    with pytest.raises(ValueError, match="k_scale"):
+        engine.check_sm_scale(1e-10, 1e39)
+    for s, ks in (
+        (sm, 1e-60),  # c rounds to zero
+        (sm, 1e-44),  # c subnormal
+        (1e-40, 1.0),  # c subnormal, the bf16 class
+        (1e25, 1e25),  # c beyond binary32
+        (float("inf"), 1.0),
+        (float("nan"), 1.0),
+        (0.0, 1.0),
+        (-sm, 1.0),
+    ):
+        with pytest.raises(ValueError):
+            engine.check_sm_scale(s, ks)
+    for v in (float("inf"), -float("inf"), float("nan"), 1e39, 0.0, -0.0, 1e-50):
+        with pytest.raises(ValueError, match="v_scale"):
+            engine.check_v_scale(v)
+    assert engine.check_v_scale(-1.5) == -1.5  # a signed scale is an input of the chain
+    assert engine.check_v_scale(0.1) == spec.to_f32(0.1)

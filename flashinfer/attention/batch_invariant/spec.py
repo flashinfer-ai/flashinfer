@@ -58,6 +58,7 @@ from ...batch_invariant.fp_interface.term import Term, TermAlgebra
 TILE_KEYS = 128  # T: keys per KV tile (the N extent of one QK^T MMA tile)
 MMA_K = 16  # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
 FLT_MAX = 3.4028234663852886e38  # the largest binary32 number
+FLT_MIN = 1.1754943508222875e-38  # the smallest normal binary32 number
 MMA_OP = _GEMM_MMA_OP  # "mma_bf16_k16": the same opaque instruction family as the GEMM
 HEAD_DIMS = (
     64,

@@ -32,7 +32,7 @@ from .plan import (
     snake_order,
     ws_row,
 )
-from .spec import FLT_MAX, HEAD_DIMS, KV_FMTS, scale_log2
+from .spec import FLT_MAX, FLT_MIN, HEAD_DIMS, KV_FMTS, scale_log2
 from ...batch_invariant.fp_interface.term import to_f32
 
 #: The KV cache dtypes of the attention classes: bf16 (the bf16 class) and the two fp8 formats (the fp8-KV classes).
@@ -98,18 +98,20 @@ def check_supported(D: int, Hq: int, Hkv: int, page: int) -> None:
 
 
 def check_sm_scale(sm_scale: float, k_scale: float = 1.0) -> float:
-    """``scale_log2(sm_scale, k_scale)`` for a positive, finite ``sm_scale`` (and ``k_scale``: the fp8-KV classes' per-tensor key
-    scale, 1.0 for the bf16 class) whose log2 scale is a nonzero binary32 number; ``ValueError`` otherwise (the kernel forms every
-    exp2 argument with this constant)."""
+    """``scale_log2(sm_scale, k_scale)`` for a positive, finite ``sm_scale`` (and ``k_scale``: the low-bit-KV classes' per-tensor
+    key scale, 1.0 for the bf16 class) whose log2 scale ``c = fp32(sm_scale * k_scale * log2 e)`` is a normal binary32 number;
+    ``ValueError`` otherwise (the kernel forms every exp2 argument with this constant). The key scale itself must be a binary32
+    number (the scale of a serving engine's fp32 scale tensor): one beyond the binary32 range is refused even when a small
+    ``sm_scale`` brings the product back into range."""
     s = float(sm_scale)
     if not (math.isfinite(s) and s > 0.0):
         raise ValueError(
             f"sm_scale {sm_scale}: the class takes a positive finite scale"
         )
     ks = float(k_scale)
-    if not (math.isfinite(ks) and ks > 0.0):
+    if not (math.isfinite(ks) and 0.0 < ks <= FLT_MAX):
         raise ValueError(
-            f"k_scale {k_scale}: the class takes a positive finite key scale"
+            f"k_scale {k_scale}: the class takes a positive finite key scale within the binary32 range"
         )
     try:
         c = scale_log2(s, ks)
@@ -117,20 +119,26 @@ def check_sm_scale(sm_scale: float, k_scale: float = 1.0) -> float:
         raise ValueError(
             f"sm_scale {sm_scale}, k_scale {k_scale}: sm_scale * k_scale * log2(e) is outside the binary32 range"
         ) from None
-    if c == 0.0:
+    if not FLT_MIN <= c <= FLT_MAX:
         raise ValueError(
-            f"sm_scale {sm_scale}, k_scale {k_scale}: sm_scale * k_scale * log2(e) rounds to zero in binary32"
+            f"sm_scale {sm_scale}, k_scale {k_scale}: sm_scale * k_scale * log2(e) is zero, subnormal or not finite in binary32"
         )
     return c
 
 
 def check_v_scale(v_scale: float) -> float:
-    """The fp8-KV classes' per-tensor value scale as the binary32 value the epilogue multiplies by (rounded once from the caller's
-    double); ``ValueError`` unless finite."""
+    """The low-bit-KV classes' per-tensor value scale as the binary32 value the epilogue multiplies by (rounded once from the
+    caller's double); ``ValueError`` unless it is finite and nonzero in binary32 (a scale that rounds to zero would make every
+    output a zero)."""
     v = float(v_scale)
     if not (math.isfinite(v) and abs(v) <= FLT_MAX):
         raise ValueError(f"v_scale {v_scale}: the class takes a finite value scale")
-    return to_f32(v)
+    vs = to_f32(v)
+    if vs == 0.0:
+        raise ValueError(
+            f"v_scale {v_scale}: the value scale is zero in binary32 (the class takes a nonzero value scale)"
+        )
+    return vs
 
 
 def valid_kv_slots(D: int = 128) -> tuple:
