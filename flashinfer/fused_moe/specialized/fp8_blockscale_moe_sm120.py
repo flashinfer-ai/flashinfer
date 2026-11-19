@@ -36,16 +36,12 @@ kernels take an explicit workspace tensor sized by the module's
 ``plan_workspace_bytes``; nothing mutable is cached per device inside the
 CUDA module. Eager calls use one workspace per (device index, CUDA stream)
 — the native kernels launch on the caller's current stream, so two streams
-sharing one buffer would overwrite each other's intermediates. A CUDA-graph
-capture owns its own workspace, keyed by (device index, capture-sequence
-id): the capture stream is NOT an ownership key, because ``torch.cuda.graph``
-reuses one default capture stream across independent captures — a stream
-key would hand two independent graphs the same scratch, correct in
-isolation and corrupted under concurrent replay. Capture-time workspaces
-are allocated inside the capture (they come from that graph's private
-memory pool, which independent captures never share) and are kept
-referenced for the process lifetime, as are eager buffers replaced by
-growth, since an earlier capture may still replay into their addresses.
+sharing one buffer would overwrite each other's intermediates. During
+capture each call allocates scratch on the current stream and submits all
+uses on that stream. PyTorch's graph pool preserves replay addresses and
+manages ordered reuse; no Python workspace owner survives the call. If the
+caller explicitly shares a pool between graphs, the usual PyTorch replay
+ordering and non-concurrency requirements apply.
 """
 
 import functools
@@ -83,20 +79,11 @@ _stats: Dict[str, Any] = {
     "fallback_dispatches": 0,
     "fallback_reasons": {},
     "workspace_allocs": 0,  # eager per-(device, stream) (re)allocations
-    "graph_workspace_allocs": 0,  # per-capture allocations
+    "graph_workspace_allocs": 0,  # captured-call allocations
 }
 
-# Mutable kernel scratch, owned here (see the module docstring). Eager
-# workspaces are keyed by (device index, CUDA stream handle); graph
-# workspaces by (device index, capture-sequence id), one per independent
-# capture. Buffers replaced by growth are retained in _retired_workspaces
-# for the process lifetime: a CUDA graph captured earlier may still replay
-# into the old tensor's address, so releasing it to the allocator would let
-# unrelated allocations alias a buffer a replay still writes. The retained
-# total is bounded by the finite num_tokens allowlist.
+# Eager only: captured calls never look up or retain tensors in this cache.
 _workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
-_graph_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
-_retired_workspaces: List[torch.Tensor] = []
 
 # The workspace's first bytes are the kernels' barrier/epoch counter region
 # (kWorkspaceDataOffset in the CUDA sources — keep in sync). It is zeroed
@@ -126,63 +113,21 @@ def _new_workspace(need: int, device: torch.device) -> torch.Tensor:
     return ws
 
 
-def _current_capture_id(device: torch.device) -> Optional[int]:
-    """Unique id of the capture sequence the current stream is recording
-    into, or ``None`` when it cannot be established. ``cudaStreamGetCaptureInfo``
-    is explicitly legal during capture; the id is unique per capture within
-    the process, which is exactly the ownership boundary graph scratch
-    needs (the capture stream is reused across independent captures)."""
-    try:
-        from ...cuda_utils import runtime
-
-        stream = torch.cuda.current_stream(device).cuda_stream
-        res = runtime.cudaStreamGetCaptureInfo(stream)
-        if int(res[0]) != 0:
-            return None
-        status, capture_id = res[1], res[2]
-        if status != runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
-            return None
-        return int(capture_id)
-    except Exception:
-        return None
-
-
 def _get_workspace(
     device: torch.device,
     dev_index: int,
     stream_handle: int,
     need: int,
     capturing: bool,
-) -> Optional[torch.Tensor]:
-    """The workspace the current call owns, or ``None`` when ownership
-    cannot be established under capture (the caller then declines)."""
+) -> torch.Tensor:
     if capturing:
-        capture_id = _current_capture_id(device)
-        if capture_id is None:
-            return None
-        graph_key = (dev_index, capture_id)
-        ws = _graph_workspaces.get(graph_key)
-        if ws is None or ws.numel() < need or ws.device != device:
-            # Allocated INSIDE the capture: the tensor comes from this
-            # graph's private memory pool, which independent captures never
-            # share, so per-capture isolation holds by construction. The
-            # reference kept here (plus the graph object itself) keeps the
-            # pool block alive for every later replay.
-            ws = _new_workspace(need, device)
-            old = _graph_workspaces.get(graph_key)
-            if old is not None:
-                _retired_workspaces.append(old)
-            _graph_workspaces[graph_key] = ws
-            _stats["graph_workspace_allocs"] += 1
+        ws = _new_workspace(need, device)
+        _stats["graph_workspace_allocs"] += 1
         return ws
     ws_key = (dev_index, stream_handle)
     ws = _workspaces.get(ws_key)
     if ws is None or ws.numel() < need or ws.device != device:
-        old = _workspaces.get(ws_key)
         ws = _new_workspace(need, device)
-        if old is not None:
-            # a captured graph may still replay into the old buffer
-            _retired_workspaces.append(old)
         _workspaces[ws_key] = ws
         _stats["workspace_allocs"] += 1
     return ws
@@ -274,6 +219,29 @@ def _kernel_entry():
     return _get_cuda_module().run
 
 
+def _weight_guard(device, w13, w2, quant_scales) -> Optional[str]:
+    if len(quant_scales) != 2:
+        return "quant_scales_count"
+    for t, shape, dtype, reason in (
+        (w13, (_E, 2 * _I, _H), torch.float8_e4m3fn, "fc1_weights_form"),
+        (w2, (_E, _H, _I), torch.float8_e4m3fn, "fc2_weights_form"),
+        (
+            quant_scales[0],
+            (_E, 2 * _I // 128, _H // 128),
+            torch.float32,
+            "fc1_scales_form",
+        ),
+        (quant_scales[1], (_E, _H // 128, _I // 128), torch.float32, "fc2_scales_form"),
+    ):
+        if t.device != device:
+            return "operand_device"
+        if t.data_ptr() % 16:
+            return "operand_alignment"
+        if t.shape != shape or t.dtype != dtype or not t.is_contiguous():
+            return reason
+    return None
+
+
 def _guard(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -300,26 +268,13 @@ def _guard(
     # wrong-device) pointer straight to the GPU.
     if not input.is_cuda:
         return "operand_device"
-    for t in (
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc2_expert_weights,
-        *quant_scales,
-    ):
+    for t in (token_selected_experts, token_final_scales):
         if t is not None and t.device != input.device:
             return "operand_device"
     # Tensor-map (TMA) descriptors and vectorized loads require 16-byte
     # base alignment; a contiguous view at an odd storage offset passes the
     # shape checks but must be refused.
-    for t in (
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc2_expert_weights,
-        *quant_scales,
-    ):
+    for t in (input, token_selected_experts, token_final_scales):
         if t is not None and t.data_ptr() % 16 != 0:
             return "operand_alignment"
     T = input.shape[0]
@@ -340,33 +295,11 @@ def _guard(
         or not token_final_scales.is_contiguous()
     ):
         return "topk_scales_form"
-    if (
-        fc1_expert_weights.shape != (_E, 2 * _I, _H)
-        or fc1_expert_weights.dtype != torch.float8_e4m3fn
-        or not fc1_expert_weights.is_contiguous()
-    ):
-        return "fc1_weights_form"
-    if (
-        fc2_expert_weights.shape != (_E, _H, _I)
-        or fc2_expert_weights.dtype != torch.float8_e4m3fn
-        or not fc2_expert_weights.is_contiguous()
-    ):
-        return "fc2_weights_form"
-    if len(quant_scales) != 2:
-        return "quant_scales_count"
-    w13_s, w2_s = quant_scales
-    if (
-        w13_s.shape != (_E, (2 * _I) // 128, _H // 128)
-        or w13_s.dtype != torch.float32
-        or not w13_s.is_contiguous()
-    ):
-        return "fc1_scales_form"
-    if (
-        w2_s.shape != (_E, _H // 128, _I // 128)
-        or w2_s.dtype != torch.float32
-        or not w2_s.is_contiguous()
-    ):
-        return "fc2_scales_form"
+    reason = _weight_guard(
+        input.device, fc1_expert_weights, fc2_expert_weights, quant_scales
+    )
+    if reason is not None:
+        return reason
     # --- device guards ---
     cc = get_compute_capability(input.device)
     if not (allow["min_cc"] <= tuple(cc) <= allow["max_cc"]):
@@ -444,11 +377,6 @@ def maybe_run_specialized(
         ws = _get_workspace(
             input.device, dev_index, stream.cuda_stream, need, capturing
         )
-        if ws is None:
-            # Scratch ownership cannot be established for this capture
-            # (capture-id query failed): decline rather than share live
-            # scratch with another execution.
-            return None, _bump_fallback("capture_workspace_unavailable")
         output.zero_()  # kernels may accumulate partials into the output
         # StreamContext syncs the FFI environment stream to the caller's
         # current stream for this call (what tvm_ffi.use_torch_stream does,
@@ -496,7 +424,9 @@ def warmup(
     allow = _load_allowlist()
     if allow is None:
         return
-    device = torch.device(device or fc1_expert_weights.device)
+    device = torch.device(fc1_expert_weights.device if device is None else device)
+    if device.type != "cuda":
+        raise ValueError("warmup requires a CUDA device")
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
@@ -524,30 +454,11 @@ def warmup(
             f"kernels are validated only for the {allow['sm_count']}-SM "
             "profile."
         )
-    for name, t, shape, dtype in (
-        (
-            "fc1_expert_weights",
-            fc1_expert_weights,
-            (_E, 2 * _I, _H),
-            torch.float8_e4m3fn,
-        ),
-        ("fc2_expert_weights", fc2_expert_weights, (_E, _H, _I), torch.float8_e4m3fn),
-        (
-            "quant_scales[0]",
-            quant_scales[0],
-            (_E, (2 * _I) // 128, _H // 128),
-            torch.float32,
-        ),
-        ("quant_scales[1]", quant_scales[1], (_E, _H // 128, _I // 128), torch.float32),
-    ):
-        # The kernels dereference every pointer (scales included) on the GPU.
-        if not t.is_cuda or t.device != warm_device:
-            raise ValueError(f"{name} must live on {warm_device} for warmup.")
-        if t.shape != shape or t.dtype != dtype or not t.is_contiguous():
-            raise ValueError(
-                f"{name} must be a contiguous {dtype} tensor of shape "
-                f"{shape}; got {t.dtype} {tuple(t.shape)}."
-            )
+    reason = _weight_guard(
+        warm_device, fc1_expert_weights, fc2_expert_weights, quant_scales
+    )
+    if reason is not None:
+        raise ValueError(f"invalid warmup operands: {reason}")
     with torch.cuda.device(device_index):
         # Warmup ends with a device synchronization and exists to make
         # capture legal later; it must itself run eagerly.

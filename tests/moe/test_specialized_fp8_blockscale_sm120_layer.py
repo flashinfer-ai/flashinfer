@@ -371,6 +371,59 @@ def test_moe_layer_kill_switch_fallback(weights, monkeypatch):
 
 @requires_sm120
 @requires_toolkit
+@pytest.mark.parametrize("fork_join", [False, True], ids=["serial", "two-stream"])
+def test_layer_same_graph_workspace_isolation(weights, fork_join):
+    # Share only read-only weights. For x filled with a=1 or 2, every
+    # up/gate dot is H*a/64 = 32*a. SiLU rounds to the gate itself here,
+    # FC2 sums I copies with scale 1/256, and the route weights sum to 1.
+    w13, w2, s13, s2 = weights
+    pack = _weight_pack(
+        (
+            torch.ones_like(w13),
+            torch.ones_like(w2),
+            torch.full_like(s13, 1 / 64),
+            torch.full_like(s2, 1 / 256),
+        )
+    )
+    layers = [MoELayer(_contract_config()) for _ in range(2)]
+    acts = []
+    refs = []
+    for a, expected in ((1, 2048), (2, 8192)):
+        x, ids, tw = _routing(256, seed=9573 + a)
+        acts.append(MoEActivationPack(x.fill_(a), None, ids, tw.fill_(1 / TOPK)))
+        refs.append(torch.full_like(x, expected))
+
+    main = torch.cuda.Stream()
+    side = torch.cuda.Stream() if fork_join else main
+    # Prime both public layers outside capture, serially, so setup/JIT is
+    # neither part of the race nor a reason to skip a failed dispatch.
+    for layer, act, stream in zip(layers, acts, (main, side), strict=True):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            layer(act, pack)
+        stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=main):
+        if fork_join:
+            side.wait_stream(main)  # capture the fork before either forward
+        left = layers[0](acts[0], pack)
+        with torch.cuda.stream(side):
+            right = layers[1](acts[1], pack)
+        if fork_join:
+            main.wait_stream(side)  # rejoin the origin before ending capture
+
+    assert left.data_ptr() != right.data_ptr()
+    for _ in range(30):
+        left.fill_(float("nan"))
+        right.fill_(float("nan"))
+        graph.replay()
+        for out, ref in zip((left, right), refs, strict=True):
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@requires_sm120
+@requires_toolkit
 @pytest.mark.parametrize("t", [4, 256])
 def test_layer_matches_module_dispatch(weights, t):
     """Numerics parity: the layer route serves the same kernels as the

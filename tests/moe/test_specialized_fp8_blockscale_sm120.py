@@ -263,6 +263,40 @@ def test_kill_switch_declines(weights, monkeypatch):
     assert out is None and reason == "kill_switch"
 
 
+@pytest.mark.parametrize(
+    "case", ["weight_offset", "scale_offset", "short", "long", "cpu"]
+)
+def test_bad_warmup_never_enters_kernel(weights, monkeypatch, case):
+    from flashinfer.fused_moe.specialized import fp8_blockscale_moe_sm120 as mod
+
+    monkeypatch.setattr(mod, "_kernel_entry", lambda: pytest.fail("entered kernel"))
+    monkeypatch.delenv(mod._DISABLE_ENV, raising=False)
+    receipts = set(mod._warmed)
+    w13, w2, s13, s2 = weights
+    scales = [s13, s2]
+    device = w13.device
+    if case in ("weight_offset", "scale_offset"):
+        src = w2 if case == "weight_offset" else s2
+        offset = torch.empty(src.numel() + 1, dtype=src.dtype, device=device)[
+            1:
+        ].view_as(src)
+        assert offset.is_contiguous() and offset.data_ptr() % 16
+        if case == "weight_offset":
+            w2 = offset
+        else:
+            scales[1] = offset
+        reason = "operand_alignment"
+    elif case == "cpu":
+        device = "cpu"
+        reason = "CUDA device"
+    else:
+        scales = scales[:1] if case == "short" else scales + [s2]
+        reason = "quant_scales_count"
+    with pytest.raises(ValueError, match=reason):
+        mod.warmup(w13, w2, scales, device=device, t_values=(256,))
+    assert mod._warmed == receipts
+
+
 def test_cuda_graph_replay_matches_eager(weights):
     from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
         warmup,
@@ -389,8 +423,8 @@ def test_concurrent_streams_isolated_scratch(analytic_weights, t):
 
 def test_independent_graph_captures_replay_concurrently(analytic_weights):
     """Two separately captured CUDA graphs (no shared memory pool), replayed
-    concurrently on two streams: each capture owns its own scratch (keyed by
-    capture id, allocated from that graph's private pool), so both outputs
+    concurrently on two streams: scratch is allocated from independent
+    graph pools, even on the same capture stream, so both outputs
     stay exact under concurrent replay — the reviewer's T=256 wrong-result
     reproduction."""
     from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import warmup
@@ -442,6 +476,52 @@ def test_independent_graph_captures_replay_concurrently(analytic_weights):
     assert failures == 0, f"{failures}/60 concurrent replays wrong, max abs err {worst}"
 
 
+def test_recapture_releases_live_workspace(analytic_weights):
+    import gc
+
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import warmup
+
+    w13, w2, s13, s2 = analytic_weights
+    warmup(w13, w2, [s13, s2], t_values=(16, 256))
+    small = _analytic_inputs(16, 1)
+    large = _analytic_inputs(256, 2)
+    small_out = torch.empty_like(small[0])
+    large_out = torch.empty_like(large[0])
+
+    def capture(inputs, out):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _, reason = _dispatch(*inputs, analytic_weights, output=out)
+            assert reason is None
+        return graph
+
+    keep = capture(small, small_out)
+    keep.replay()
+    torch.cuda.synchronize()
+    gc.collect()
+
+    def live():
+        stats = torch.cuda.memory_stats(small_out.device)
+        return stats["allocated_bytes.all.current"], stats["allocation.all.current"]
+
+    baseline_bytes, baseline_entries = live()
+    for _ in range(20):
+        graph = capture(large, large_out)
+        graph.replay()
+        torch.cuda.synchronize()
+        del graph
+        gc.collect()
+        nbytes, entries = live()
+        assert nbytes <= baseline_bytes and entries <= baseline_entries, (
+            nbytes - baseline_bytes,
+            entries - baseline_entries,
+        )
+    small_out.zero_()
+    keep.replay()
+    torch.cuda.synchronize()
+    _assert_exact(small_out, 1, "surviving small graph")
+
+
 def test_persistent_decode_residency_fails_closed(analytic_weights):
     """The T<=16 persistent kernels spin in software grid barriers sized for
     a fully resident grid. On an execution context that cannot co-schedule
@@ -464,14 +544,20 @@ def test_persistent_decode_residency_fails_closed(analytic_weights):
     out = torch.empty(t, H, dtype=torch.bfloat16, device=DEVICE)
     stream = streams[0]
     stream.wait_stream(torch.cuda.current_stream())
-    refused = False
     with torch.cuda.stream(stream):
         try:
             res, reason = _dispatch(x, ids, tw, analytic_weights, output=out)
-            assert reason is None
-        except Exception:
-            refused = True  # cooperative launch failed closed: acceptable
-    if not refused:
-        _sync_with_deadline([stream])
-        _assert_exact(out, 1, "constrained-context t=16")
-    torch.cuda.synchronize()
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if not (
+                "persistent decode t=16 cooperative launch failed" in message
+                and "too large" in message
+            ):
+                raise
+        else:
+            assert reason is None and res is out
+            _sync_with_deadline([stream])
+            _assert_exact(out, 1, "constrained-context t=16")
+    probe = torch.ones(1, device=dev).add_(1)
+    torch.cuda.synchronize(dev)
+    assert probe.item() == 2

@@ -36,11 +36,14 @@ size_t PrefillFlatWorkspaceBytes(int tokens);
 static constexpr int kMaxDevices = 64;
 
 static int g_persistent_sms[kMaxDevices] = {};
-static int g_persistent_13_ok = -1;
+static int g_persistent_13_ok[kMaxDevices];
 static int g_t4_pair_cluster_ok[kMaxDevices];
 static struct DecodeCacheInit {
   DecodeCacheInit() {
-    for (int i = 0; i < kMaxDevices; ++i) g_t4_pair_cluster_ok[i] = -1;
+    for (int i = 0; i < kMaxDevices; ++i) {
+      g_persistent_13_ok[i] = -1;
+      g_t4_pair_cluster_ok[i] = -1;
+    }
   }
 } g_decode_cache_init;
 
@@ -97,12 +100,12 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13
   if (T <= 16) {
     if (g_persistent_sms[dev] == 0)
       cudaDeviceGetAttribute(&g_persistent_sms[dev], cudaDevAttrMultiProcessorCount, dev);
-    if (g_persistent_13_ok < 0) {
+    if (g_persistent_13_ok[dev] < 0) {
       int occ = 0;
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_persistent_decode<13, true>, 416, 0);
-      g_persistent_13_ok = occ >= 2;
+      g_persistent_13_ok[dev] = occ >= 2;
     }
-    const bool use_two = T == 4 && g_persistent_13_ok;
+    const bool use_two = T == 4 && g_persistent_13_ok[dev];
     const int blocks = use_two ? 2 * g_persistent_sms[dev] : g_persistent_sms[dev];
     const int work_blocks = use_two ? blocks / T : blocks;
     const int w1 = (use_two ? TOPK : T * TOPK) * (I_DIM / 2);
@@ -176,6 +179,7 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13
       const cudaError_t t4_status =
           cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_persistent_decode<13, true>),
                                       dim3(blocks), dim3(416), t4_args, 0, stream);
+      if (t4_status != cudaSuccess) (void)cudaGetLastError();
       TVM_FFI_ICHECK(t4_status == cudaSuccess)
           << "persistent decode T=4 cooperative launch failed (no residency guarantee; refusing "
              "the unsafe plain launch): "
@@ -186,6 +190,7 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13
       const cudaError_t t16_status =
           cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_persistent_decode<22, 2>),
                                       dim3(blocks), dim3(704), t16_args, 0, stream);
+      if (t16_status != cudaSuccess) (void)cudaGetLastError();
       TVM_FFI_ICHECK(t16_status == cudaSuccess)
           << "persistent decode T=16 cooperative launch failed (no residency guarantee; refusing "
              "the unsafe plain launch): "
@@ -196,6 +201,7 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13
       const cudaError_t gen_status =
           cudaLaunchCooperativeKernel(reinterpret_cast<void*>(k_persistent_decode<22>),
                                       dim3(blocks), dim3(704), gen_args, 0, stream);
+      if (gen_status != cudaSuccess) (void)cudaGetLastError();
       TVM_FFI_ICHECK(gen_status == cudaSuccess)
           << "persistent decode cooperative launch failed (no residency guarantee; refusing the "
              "unsafe plain launch): "
