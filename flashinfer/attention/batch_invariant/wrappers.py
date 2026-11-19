@@ -33,7 +33,7 @@ from typing import Optional, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
-from . import engine
+from . import engine, neutral
 from .spec import HEAD_DIMS, scale_log2
 from .spec import class_name as _class_name
 
@@ -647,21 +647,14 @@ class BatchInvariantAttention:
             )
         cls = self.CLASS
         lowbit = self._kv_fmt != "bf16"
-        q_scale = scales[0] if len(scales) > 0 else None
-        k_scale = scales[1] if len(scales) > 1 else None
-        v_scale = scales[2] if len(scales) > 2 else None
-        if q_scale is not None or any(s is not None for s in scales[3:]):
-            raise unsupported(
-                cls, "q_scale / o_scale", "an unscaled bf16 query and output"
-            )
-        if not lowbit and (k_scale is not None or v_scale is not None):
-            raise unsupported(
-                cls,
-                "k_scale / v_scale with a bf16 KV cache",
-                "unscaled bf16 K / V (the fp8-KV classes take the per-tensor scales)",
-            )
-        k_scale = self._scalar(k_scale, "k_scale", cls)
-        v_scale = self._scalar(v_scale, "v_scale", cls)
+        # the query and the output are unscaled bf16 for every class, K / V for a bf16 cache: a scale of None or exactly 1.0 is
+        # that operand (serving engines pass 1.0 on every call), any other value is refused; the low-bit KV classes take the
+        # per-tensor K / V scales as operands
+        neutral.check_unit_scales(
+            cls, scales, free=("k_scale", "v_scale") if lowbit else ()
+        )
+        k_scale = self._scalar(scales[1] if len(scales) > 1 else None, "k_scale", cls)
+        v_scale = self._scalar(scales[2] if len(scales) > 2 else None, "v_scale", cls)
         if sinks is not None:
             raise unsupported(cls, "attention sinks", "plain softmax")
         fp4 = self._kv_fmt == "nvfp4"
@@ -882,20 +875,4 @@ class BatchInvariantAttention:
     def _scalar(x, name: str, cls: str) -> float:
         """A per-tensor scale as FlashInfer's wrappers take it: None (1.0), a Python number, or a 1-element floating-point tensor
         (read on the host: a synchronisation, so a captured CUDA graph should pass numbers)."""
-        if x is None:
-            return 1.0
-        if isinstance(x, (int, float)) and not isinstance(x, bool):
-            return float(x)
-        if isinstance(x, torch.Tensor):
-            if x.numel() != 1 or not x.dtype.is_floating_point:
-                raise unsupported(
-                    cls,
-                    f"a {name} tensor of shape {tuple(x.shape)} and dtype {x.dtype}",
-                    f"{name} as a Python number or a 1-element floating-point tensor",
-                )
-            return float(x.item())
-        raise unsupported(
-            cls,
-            f"{name} of type {type(x).__name__}",
-            f"{name} as a Python number or a 1-element tensor",
-        )
+        return neutral.scale_value(x, name, cls)
