@@ -54,7 +54,7 @@ die). Pass the returned tensor as ``state`` from then on. A T=1 call on it with
 ``backend="auto"`` or ``backend="cake_gdn"`` runs the locality-domain twin of
 the Cake nontranspose kernel: one launch over both dies whose CTAs take the
 batch rows of their own die first. The output and the updated state are bitwise
-equal to the whole-GPU kernel's. The twin covers H=16 / HV=32 from B=32 on
+equal to the whole-GPU kernel's. The twin covers H=16 / HV=32 from B=48 on
 (scale ``K ** -0.5`` or 1.0) on 212-SM devices and needs a CUDA 13.5 toolkit
 and driver; other calls, a view of part of the state and a copy of it run the
 whole-GPU kernel. The helper returns the state unhomed where no call of its row

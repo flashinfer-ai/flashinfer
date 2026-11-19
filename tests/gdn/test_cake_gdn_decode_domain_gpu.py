@@ -254,9 +254,10 @@ def _domain_launch(device: int, batch_size: int, scale: float, table, homed):
 
 # --------------------------------------------------------------------------- bits
 
-# The shape list: the batch classes' edges (32 / 63 / 64 / 127 / 128 / 255 / 256), the
-# wave-fit edge (36 / 37, odd), a row inside each class and B = 1024, at both scales.
-_TWIN_BATCHES = [32, 33, 36, 37, 48, 63, 64, 127, 128, 255, 256, 512, 1024]
+# The shape list: the listed batch classes' edges (48 / 63 / 64 / 127 / 128 / 255 / 256),
+# a row inside the first and the last class (56 / 512) and B = 1024, at both scales.
+# Below 48 rows no cell is listed (test_states_the_twin_does_not_serve_run_the_whole_body).
+_TWIN_BATCHES = [48, 56, 63, 64, 127, 128, 255, 256, 512, 1024]
 
 
 @pytest.mark.parametrize("scale", [_SCALE, 1.0])
@@ -299,7 +300,7 @@ def test_twin_matches_the_whole_body_bitwise(
 
 
 @pytest.mark.parametrize("scale", [_SCALE, 1.0])
-@pytest.mark.parametrize("batch_size", [37, 64, 128, 256, 512])
+@pytest.mark.parametrize("batch_size", [48, 64, 128, 256, 512])
 def test_twin_bits_do_not_depend_on_the_cut(batch_size: int, scale: float) -> None:
     # Every row on die 0, every row on die 1, the byte cut, the SM-count cut and two
     # uneven cuts: the same bits as the whole body.
@@ -451,10 +452,11 @@ def test_homed_state_rows_live_on_their_dies() -> None:
 
 def test_states_the_twin_does_not_serve_run_the_whole_body(monkeypatch) -> None:
     # An ordinary state, a copy of a homed state, a prefix view of a homed allocation,
-    # a homed state below 32 rows (B 9 / 10 too, where the whole route changes body;
-    # both scales), a homed state without an SM table, a homed state of the H4 / HV8
-    # rows and a homed state of a row without a Cake route each run what an ordinary
-    # state runs, bit for bit.
+    # a homed state below 48 rows (B 9 / 10 too, where the whole route changes body,
+    # and B 32 / 37 / 47 of the large band, which lists no twin below 48 rows; both
+    # scales), a homed state without an SM table, a homed state of the H4 / HV8 rows
+    # and a homed state of a row without a Cake route each run what an ordinary state
+    # runs, bit for bit.
     device, table = _require_domain()
     batch_size = 64
     tensors, initial = _inputs(batch_size)
@@ -484,7 +486,7 @@ def test_states_the_twin_does_not_serve_run_the_whole_body(monkeypatch) -> None:
     with monkeypatch.context() as patch:
         patch.setattr(cake_locality, "sm_table", lambda device=None: None)
         check_whole(homed, whole_out, whole_state)
-    for small in (9, 10, 16, 31):
+    for small in (9, 10, 16, 31, 32, 37, 47):
         for scale in (_SCALE, 1.0):
             small_tensors, small_initial = _inputs(small)
             small_out, small_state = _whole(small_tensors, small_initial, scale)
@@ -593,7 +595,7 @@ def test_twin_cuda_graph_capture_and_replay() -> None:
 
 def test_localize_gdn_decode_state_homes_or_returns_the_state() -> None:
     device, table = _require_domain()
-    for batch_size in (37, 64):
+    for batch_size in (48, 63, 64):
         _, initial = _inputs(batch_size)
         homed = localize_gdn_decode_state(initial, _H)
         record = cake_locality.tensor_homing(homed)
@@ -610,8 +612,9 @@ def test_localize_gdn_decode_state_homes_or_returns_the_state() -> None:
         assert localize_gdn_decode_state(initial, *args) is initial
     half = initial.half()
     assert localize_gdn_decode_state(half, _H) is half
-    _, small = _inputs(16)
-    assert localize_gdn_decode_state(small, _H) is small
+    for small_batch in (16, 32, 47):
+        _, small = _inputs(small_batch)
+        assert localize_gdn_decode_state(small, _H) is small
     for rows0 in (-1, 65):
         with pytest.raises(ValueError, match="rows0"):
             localize_gdn_decode_state(initial, _H, rows0=rows0)

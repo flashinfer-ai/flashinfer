@@ -142,7 +142,7 @@ def localize_gdn_decode_state(
     or when no call of this row would run the twin: ``state`` is not FP32 with
     ``K = V = 128`` on an SM107a device, the call row (``B``, ``num_q_heads``,
     ``HV``, ``scale``) has no twin listed for the device's SM count in any die
-    class (the twin covers ``H=16``, ``HV=32`` from ``B=32`` on, at
+    class (the twin covers ``H=16``, ``HV=32`` from ``B=48`` on, at
     ``scale`` ``K ** -0.5`` or ``1.0``, on 212-SM devices), the device has no SM
     table (:func:`flashinfer.cake_locality.sm_table` is ``None``: a CUDA 13.5
     toolkit and driver are needed), the row is not listed for the die class of

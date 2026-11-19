@@ -39,7 +39,7 @@ _TWIN = "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
 _TEMPLATE = "host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in"
 _SCALE = 128**-0.5
 _ROW_BYTES = 32 * 128 * 128 * 4
-_BATCH_CLASSES = ("B32-63", "B64-127", "B128-255", "B>=256")
+_BATCH_CLASSES = ("B48-63", "B64-127", "B128-255", "B>=256")
 
 
 def _records(schedule: str) -> list[dict]:
@@ -210,8 +210,8 @@ def test_twin_shim_checks_its_arguments_and_caps_the_grid_by_residency() -> None
 
 def test_twin_routes_mirror_the_cake_program_cells() -> None:
     # 212-SM sm_107a devices route hqsplit_tma3 to its twin in both die classes for
-    # every batch class from 32 rows on; no other architecture, SM count, schedule or
-    # batch class is listed.
+    # every batch class from 48 rows on; no other architecture, SM count, schedule or
+    # batch class (B<32 and B32-47 included) is listed.
     cells = {
         (_WHOLE, die, batch_class): _TWIN
         for die in ("even", "uneven")
@@ -225,10 +225,12 @@ def test_twin_routes_mirror_the_cake_program_cells() -> None:
         (9, "B<32"),
         (10, "B<32"),
         (31, "B<32"),
-        (32, "B32-63"),
-        (36, "B32-63"),
-        (37, "B32-63"),
-        (63, "B32-63"),
+        (32, "B32-47"),
+        (36, "B32-47"),
+        (37, "B32-47"),
+        (47, "B32-47"),
+        (48, "B48-63"),
+        (63, "B48-63"),
         (64, "B64-127"),
         (127, "B64-127"),
         (128, "B128-255"),
@@ -262,9 +264,9 @@ def test_twin_selector_names_the_twin_of_the_listed_cells_only(scale: float) -> 
         )
 
     for die in ("even", "uneven"):
-        for batch_size in (32, 36, 37, 48, 63, 64, 127, 128, 255, 256, 512, 1024):
+        for batch_size in (48, 49, 56, 63, 64, 127, 128, 255, 256, 512, 1024):
             assert twin(die=die, batch_size=batch_size) == _twin_name(scale)
-        for batch_size in (1, 9, 10, 21, 31):
+        for batch_size in (1, 9, 10, 21, 31, 32, 36, 37, 44, 47):
             assert twin(die=die, batch_size=batch_size) is None
     # Unlisted SM counts (216-SM boards are untimed) and architectures.
     for sm_count in (216, 211, 213, 148, 160):
@@ -284,9 +286,9 @@ def test_twin_selector_names_the_twin_of_the_listed_cells_only(scale: float) -> 
 
 
 def test_nontranspose_domain_variant_follows_the_whole_route() -> None:
-    # The row's whole route decides: the twin of hqsplit_tma3 from 32 rows on for
+    # The row's whole route decides: the twin of hqsplit_tma3 from 48 rows on for
     # H16 / HV32 at the two shipped scales; every other row (another head geometry or
-    # scale, no l2norm, the small bands, B200 / B300, 216 SMs) has none.
+    # scale, no l2norm, the small bands, 32 to 47 rows, B200 / B300, 216 SMs) has none.
     def variant(**overrides):
         row = dict(
             arch="sm_107a",
@@ -303,9 +305,13 @@ def test_nontranspose_domain_variant_follows_the_whole_route() -> None:
 
     assert variant() == _twin_name(_SCALE)
     assert variant(scale=1.0) == _twin_name(1.0)
-    assert variant(batch_size=32, die_class="even") == _twin_name(_SCALE)
+    assert variant(batch_size=48, die_class="even") == _twin_name(_SCALE)
     assert variant(batch_size=1024) == _twin_name(_SCALE)
     for overrides in (
+        dict(batch_size=47),
+        dict(batch_size=47, scale=1.0),
+        dict(batch_size=32, die_class="even"),
+        dict(batch_size=32, scale=1.0),
         dict(batch_size=31),
         dict(batch_size=9),
         dict(scale=0.5),
@@ -519,7 +525,7 @@ def test_homed_state_launches_the_twin_in_a_listed_cell(
     # table by value and a B * HV grid.  The whole launch table keeps its value; the
     # twin is loaded once, and the stream's counter pair is taken once and reused.
     device = _Device(monkeypatch, counts=counts)
-    for batch_size, rows0 in ((32, 16), (37, 19), (64, 13), (512, 256)):
+    for batch_size, rows0 in ((48, 24), (63, 31), (64, 13), (512, 256)):
         inputs = _decode_inputs(batch_size)
         device.home(inputs["state"], rows0=rows0)
         loads = device.loads.count(_twin_name(scale))
@@ -572,8 +578,9 @@ def test_homed_state_rows0_is_the_row_nearest_the_cut(monkeypatch) -> None:
 
 def test_homed_state_falls_back_to_the_whole_launch(monkeypatch) -> None:
     # A part of a homed allocation, a homing record of another device, no SM table, a
-    # row below 32, an untimed SM count and B200 run the whole launch, bit for bit the
-    # unhomed call's; a row without a twin is remembered as such (not resolved again).
+    # row below 48 (B16 of the small band, B32 / B47 of the large band), an untimed SM
+    # count and B200 run the whole launch, bit for bit the unhomed call's; a row
+    # without a twin is remembered as such (not resolved again).
     def whole_call(device, inputs):
         _run(inputs)
         ((name, args),) = device.calls
@@ -593,12 +600,15 @@ def test_homed_state_falls_back_to_the_whole_launch(monkeypatch) -> None:
     assert whole_call(device, inputs) == _whole_args(inputs, 64 * 32)
     assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
     device.table = device.make_table((106, 106))
-    small = _decode_inputs(16)
-    device.home(small["state"])
-    for _ in range(2):
-        assert whole_call(device, small) == _whole_args(small, 16 * 32)
-    (launch,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.values()
-    assert launch[0] is None
+    for batch_size in (16, 32, 47):
+        small = _decode_inputs(batch_size)
+        device.home(small["state"])
+        for _ in range(2):
+            assert whole_call(device, small) == _whole_args(small, batch_size * 32)
+    launches = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES
+    assert sorted(key[1] for key in launches) == [16, 32, 47]
+    assert all(launch[0] is None for launch in launches.values())
+    assert not any(_TWIN in name for name in device.loads)
     assert device.counter_calls == []
     for capability, sm_count in (((10, 7), 216), ((10, 0), 148)):
         device = _Device(monkeypatch, capability=capability, sm_count=sm_count)
@@ -868,9 +878,9 @@ def test_localize_refuses_bad_arguments() -> None:
 
 
 def test_localize_refuses_before_probing(monkeypatch) -> None:
-    # Rows no die class routes, another dtype or head size, a __torch_dispatch__
-    # subclass, capture and another architecture are returned unhomed before the SM
-    # table is probed.
+    # Rows no die class routes (below 48: the small band and 32 to 47 rows), another
+    # dtype or head size, a __torch_dispatch__ subclass, capture and another
+    # architecture are returned unhomed before the SM table is probed.
     def refused(helper, state, *args, **kwargs):
         assert locality.localize_gdn_decode_state(state, *args, **kwargs) is state
         assert not helper.probed and helper.allocations == [] and helper.reserves == []
@@ -878,8 +888,9 @@ def test_localize_refuses_before_probing(monkeypatch) -> None:
     helper = _Helper(monkeypatch)
     refused(helper, _fake((64, 32, 128, 128), torch.float16), 16)
     refused(helper, _fake((64, 32, 64, 64), torch.float32), 16)
-    for batch_size in (1, 9, 16, 31):
+    for batch_size in (1, 9, 16, 31, 32, 37, 47):
         refused(helper, _fake((batch_size, 32, 128, 128), torch.float32), 16)
+        refused(helper, _fake((batch_size, 32, 128, 128), torch.float32), 16, 1.0)
     state = _fake((64, 32, 128, 128), torch.float32)
     refused(helper, state, 4)
     refused(helper, state, 16, scale=0.5)
@@ -921,7 +932,7 @@ def test_localize_homes_by_the_byte_cut(monkeypatch, counts) -> None:
     helper.allow_probe = True
     for batch_size, scale, rows0, expected in (
         (64, None, None, 32),
-        (37, None, None, 19),
+        (63, None, None, 32),
         (512, 1.0, None, 256),
         (64, _SCALE, 13, 13),
         (64, None, 0, 0),

@@ -2024,17 +2024,20 @@ CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
 # Routes: (architecture, SM count) -> (whole schedule, die class, batch class) -> the twin
 # schedule run in its place.  Die class: "even" when the two dies' SM counts differ by at
 # most 4, else "uneven" (``flashinfer.cake_locality.die_class``); batch class: "B<32",
-# "B32-63", "B64-127", "B128-255" or "B>=256"
+# "B32-47", "B48-63", "B64-127", "B128-255" or "B>=256"
 # (``cake_gdn_nontranspose_fp32_t1_domain_batch_class``).  A listed cell runs the twin only
 # for a state homed as a whole allocation on a device with an SM table; every other call
 # runs the whole route.  The cells are the twin routes of the Cake decode kernel program,
 # where the twin on a homed state ran faster than the whole body on 212-SM boards of both
-# die classes; other SM counts (216-SM boards are untimed) list no cell.
+# die classes, timed with the L2 flushed by a read before each call (clean lines,
+# ``flashinfer.utils.make_l2_flush``): from 48 rows on.  The twin ran slower at 32 to 44
+# rows (45 to 47 are untimed), so "B32-47" lists no cell; other SM counts (216-SM boards
+# are untimed) list no cell.
 CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES: dict[
     tuple[str, int], dict[tuple[str, str, str], str]
 ] = {
     ("sm_107a", 212): {
-        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B32-63"): (
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B48-63"): (
             "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
         ),
         ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B64-127"): (
@@ -2046,7 +2049,7 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES: dict[
         ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B>=256"): (
             "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
         ),
-        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B32-63"): (
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B48-63"): (
             "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
         ),
         ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B64-127"): (
@@ -2117,13 +2120,15 @@ def cake_gdn_nontranspose_fp32_t1_ctas_per_state(variant_name: str) -> int:
 
 
 def cake_gdn_nontranspose_fp32_t1_domain_batch_class(batch_size: int) -> str:
-    """Batch class of ``batch_size`` rows in the locality-domain routes: ``B<32``, ``B32-63``, ``B64-127``, ``B128-255`` or ``B>=256``."""
+    """Batch class of ``batch_size`` rows in the locality-domain routes: ``B<32``, ``B32-47``, ``B48-63``, ``B64-127``, ``B128-255`` or ``B>=256``."""
 
     batch_size = int(batch_size)
     if batch_size < 32:
         return "B<32"
+    if batch_size < 48:
+        return "B32-47"
     if batch_size < 64:
-        return "B32-63"
+        return "B48-63"
     if batch_size < 128:
         return "B64-127"
     if batch_size < 256:
