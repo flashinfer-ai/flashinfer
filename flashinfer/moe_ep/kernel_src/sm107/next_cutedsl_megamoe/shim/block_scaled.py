@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 Sm107QuantKind = Literal["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
-Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
+Sm107ScheduleMode = Literal["grouped", "phase_interleave", "decode"]
 
 # (act data dtype, act SF dtype, sf_vec_size, 2x-mode instruction K) per kind.
 # The mxf8f6f4 UMMA path has instruction K 32 (64 in 2x mode); the fp4 pair
@@ -144,7 +144,7 @@ class Sm107BlockScaledMoeConfig:
     # Mixed-CGA launch: alongside the preferred clusters, fill leftover SMs with
     # smaller fallback clusters (upstream commit a5b4d33). None = uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
-    # ("grouped" | "phase_interleave", optional hint); typed loosely so backend
+    # ("grouped" | "phase_interleave" | "decode", optional hint/lead); typed loosely so backend
     # configs can carry it as a plain (str, int|None) tuple.
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Sm107WorkIdMode = "grid_stride"
@@ -390,7 +390,7 @@ class Sm107BlockScaledMoeConfig:
         if len(self.schedule_policy) != 2:
             raise ValueError("schedule_policy requires (mode, hint).")
         mode, hint = self.schedule_policy
-        if mode not in ("grouped", "phase_interleave"):
+        if mode not in ("grouped", "phase_interleave", "decode"):
             raise ValueError(f"unknown schedule mode {mode!r}.")
         if hint is not None and (type(hint) is not int or hint <= 0):
             raise ValueError("schedule hint must be a positive Python integer or None.")
@@ -402,10 +402,21 @@ class Sm107BlockScaledMoeConfig:
             "reuse_dispatch_warps",
         ):
             raise ValueError(f"unknown token_back_mode {self.token_back_mode!r}.")
-        if mode == "phase_interleave" and self.work_id_mode != "atomic_counter":
+        if (
+            mode in ("phase_interleave", "decode")
+            and self.work_id_mode != "atomic_counter"
+        ):
             raise ValueError(
-                "schedule_policy 'phase_interleave' requires "
-                "work_id_mode='atomic_counter'."
+                f"schedule_policy {mode!r} requires work_id_mode='atomic_counter'."
+            )
+        if mode == "decode" and (
+            self.kernel_variant != "genphase"
+            or self.shared_expert is not None
+            or self.batch_invariant
+        ):
+            raise ValueError(
+                "schedule_policy 'decode' requires GenPhase, no shared expert, "
+                "and batch_invariant=False."
             )
         if len(self.epi_flag_batches) != 2:
             raise ValueError("epi_flag_batches requires (FC1, FC2) values.")
@@ -470,14 +481,14 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(
                     "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
                 )
-            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
+            if n64_decode and self.world_size > 1 and mode != "grouped":
                 # EP1 phase-interleave coverage does not establish multirank
                 # liveness: an EP2 dense/replay case stalls with this geometry.
                 # Reject before allocation or compilation; autotune applies
                 # this same config validation through is_valid_sm107.
                 raise ValueError(
                     "GenPhase N64 with world_size > 1 requires grouped scheduling; "
-                    "multirank phase_interleave is not qualified."
+                    "multirank phase_interleave/decode is not qualified."
                 )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(

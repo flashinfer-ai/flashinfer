@@ -114,3 +114,37 @@ def test_clamped_relu2_rejects_unaligned_intermediate():
             cluster_shape_mn=(4, 1),
             fc2_use_bulk=True,
         )
+
+
+def test_genphase_decode_schedule_validation():
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        Sm107BlockScaledMoeConfig,
+    )
+
+    cfg_cls = Sm107BlockScaledMoeConfig
+    kwargs = dict(
+        num_total_experts=8,
+        max_tokens_per_rank=128,
+        num_topk=4,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+    )
+    decode = dict(
+        **kwargs,
+        kernel_variant="genphase",
+        cluster_shape_mn=(4, 1),
+        fc2_use_bulk=True,
+        schedule_policy=("decode", None),
+        work_id_mode="atomic_counter",
+    )
+    assert cfg_cls(**decode).schedule_policy == ("decode", None)
+    for overrides in (
+        {"work_id_mode": "grid_stride"},
+        {"kernel_variant": "inference"},
+        {"batch_invariant": True},
+        {"world_size": 2, "mma_tiler_mnk": (256, 64, 128)},
+    ):
+        with pytest.raises(ValueError, match="decode"):
+            cfg_cls(**{**decode, **overrides})

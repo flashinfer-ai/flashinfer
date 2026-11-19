@@ -1,6 +1,7 @@
 """clamped ReLU2 public-layer EP4 regression; run under torchrun --nproc_per_node=4."""
 
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -8,7 +9,8 @@ import torch
 pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_rubin]
 
 
-def test_clamped_relu2_layer_ep4():
+@pytest.mark.parametrize("decode", [False, True], ids=["grouped-n64", "decode-n128"])
+def test_clamped_relu2_layer_ep4(decode):
     capacity = 65
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("Requires torchrun with four ranks")
@@ -30,7 +32,7 @@ def test_clamped_relu2_layer_ep4():
     boot = BootstrapConfig(rank=rank, world_size=4)
     ensure_moe_ep_cuda_device(boot)
     torch.manual_seed(146 + rank)
-    experts, hidden, intermediate, topk = 32, 512, 1024, 4
+    experts, hidden, intermediate, topk = 32, 768 if decode else 512, 1024, 4
     # Canonical quantized checkpoint weights exercise the no-requantization path.
     w1 = (
         torch.randn(experts // 4, intermediate, hidden, device="cuda") / hidden**0.5
@@ -55,7 +57,11 @@ def test_clamped_relu2_layer_ep4():
                 activation="clamped_relu2",
                 kernel_variant="genphase",
                 cluster_shape_mn=(4, 1),
-                mma_tiler_mnk=(256, 64, 128),
+                mma_tiler_mnk=(256, 128 if decode else 64, 128),
+                schedule_policy=("decode" if decode else "grouped", None),
+                work_id_mode="atomic_counter" if decode else "grid_stride",
+                epi_flag_batches=(1, 4) if decode else (4, 2),
+                apply_routing_weights_before_fc2=not decode,
                 fc2_use_bulk=True,
             ),
             quantize_input=True,
@@ -69,7 +75,13 @@ def test_clamped_relu2_layer_ep4():
         ).int()
         scores = torch.softmax(torch.randn(capacity, topk, device="cuda"), dim=-1)
         t = MoEEpTensors(x, ids, scores)
-        layer.forward(t)
+        from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as staging_pkg
+
+        with patch.object(
+            staging_pkg, "fused_quant_stage", wraps=staging_pkg.fused_quant_stage
+        ) as stage:
+            layer.forward(t)
+            assert stage.call_count == 1
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
