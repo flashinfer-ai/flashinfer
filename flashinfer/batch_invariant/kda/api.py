@@ -25,7 +25,8 @@ pool (:mod:`.pool`). Call shapes:
   checkpoint slots (``ssm_state_indices`` of shape ``[N, 1 + S]`` is refused). ``num_accepted_tokens`` (int32 ``[N]``)
   settles each slot's previous verify first: a slot that kept ``a`` of its rows continues from position ``p + a``, in
   the state ``a`` single decode steps leave (at most 16 tokens per verify). :func:`recurrent_kda_batch_invariant_accept` is the same settlement as
-  its own call. A verify that is never settled counts as kept in full.
+  its own call. ``num_accepted_tokens=None`` and a verify that is never settled count as kept in full (today's
+  operator reads ``None`` as "start from checkpoint slot 0"; the class has no checkpoint slots).
 
 A prefill into a slot discards whatever open rows the slot had (its state is taken as a chunk boundary), which is why
 a chunked prefill cuts at multiples of 16. A slot whose state the caller replaced since the class last wrote it (a new
@@ -233,6 +234,8 @@ def recurrent_kda_batch_invariant(
         if value is None or value is False or (isinstance(value, int) and value == 0):
             continue
         raise unsupported(CLASS, f"{name}={value!r}", "the class's own inputs")
+    if num_spec_tokens == 0 and not isinstance(num_spec_tokens, bool):
+        num_spec_tokens = None
     if num_spec_tokens is None and num_accepted_tokens is not None:
         raise unsupported(
             CLASS,
@@ -821,13 +824,16 @@ def recurrent_kda_batch_invariant_verify(
     ``num_accepted_tokens`` on the slot's next verify, which settles before it runs) leaves the slot at position
     ``p + a`` in the state ``a`` single decode steps leave: its count and prefix become those of the kept position,
     and the boundary state and cached rows come back from the record when the kept rows stop before a boundary the
-    launch crossed. No row is run again. A verify that is not settled counts as kept in full. The settlement refers to the slot's latest
-    verify and has to come before any other call on the slot: it is dropped when the slot's open-row count or state
-    has moved since (a prefill and a reset drop it explicitly), which a run of exactly 16 decode steps does not show.
+    launch crossed. No row is run again. A verify that is not settled counts as kept in full. On a slot whose state
+    the caller had replaced (or that was never begun) keeping no row leaves the slot begun at that state: the same
+    rows follow, the count is 0 where an untouched slot's is unset. The settlement refers to the slot's latest verify
+    and has to come before any other call on the slot: it is dropped when the slot's open-row count, state or decay
+    prefix is no longer what the verify left (decode steps and multi-token steps in between move them; a prefill and
+    a reset drop it explicitly).
 
     Nothing is read back to the host, so the call is one node sequence of a captured CUDA graph (its slots are
-    unchecked, as in a decode step); the first verify on a pool, and the first one with more tokens than any before,
-    must be eager. The record costs ``HV * (64 KB + 21 KB)`` per slot plus ``HV * 0.5 KB`` per token."""
+    unchecked, as in a decode step); the first verify on a pool must be eager (it allocates the record:
+    ``HV * (64 KB + 21 KB + 8 KB)`` per slot)."""
     rows = _verify(
         q,
         k,
@@ -855,7 +861,7 @@ def recurrent_kda_batch_invariant_accept(
     """Settle the latest verify of each listed slot with ``num_accepted_tokens[i]`` of its rows kept (int32 ``[N]``;
     ``None`` or a count of at least the verify's tokens keeps all, a count below 0 keeps none): the slot is left in
     the state that many single decode steps from the verify's start leave. A slot without a verify to settle is
-    left as it is. One launch, nothing read back."""
+    left as it is. One launch, nothing read back; inside a graph capture the pool must have run a verify before."""
     check_device(initial_state.device, CLASS, KDA_ARCHS)
     HV = int(initial_state.shape[1]) if initial_state.ndim == 4 else 0
     _check_pool(initial_state, HV, initial_state.device)

@@ -141,9 +141,8 @@ class ExactPool:
         self.rhs_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.update_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.l_rows = zeros(S, HV, CHUNK, CHUNK)
-        #: The verify record (snapshot and token rows), allocated by the first verify on the pool.
+        #: The verify record, allocated by the first verify on the pool.
         self.record: Optional[VerifyRecord] = None
-        self._outgrown: List[VerifyRecord] = []
 
     def mutable(self) -> Tuple[torch.Tensor, ...]:
         """The tensors a step may change besides the pool and the cached rows of the row it writes."""
@@ -280,24 +279,17 @@ class ExactPool:
             float(lower_bound) * GATE_LOG2_E * 0.5,
         )
 
-    def verify_record(self, tokens: int) -> "VerifyRecord":
-        """The pool's verify record with room for ``tokens`` rows per slot (grown outside a graph capture only)."""
-        rec = self.record
-        if rec is not None and rec.cap >= tokens:
-            return rec
-        if torch.cuda.is_current_stream_capturing():
-            raise unsupported(
-                CLASS,
-                f"a verify of {tokens} tokens first run inside a CUDA graph capture",
-                "one eager verify of at least as many tokens on the pool before the capture",
-            )
-        new = VerifyRecord(self.slots, self.H, tokens, self.device)
-        if rec is not None:
-            # the pending verifies stay settleable; a graph captured on the smaller record may still write it
-            new.adopt(rec)
-            self._outgrown.append(rec)
-        self.record = new
-        return new
+    def verify_record(self) -> "VerifyRecord":
+        """The pool's verify record: allocated once, outside a graph capture, with room for a whole chunk of rows."""
+        if self.record is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise unsupported(
+                    CLASS,
+                    "a verify or a settlement first run on a pool inside a CUDA graph capture",
+                    "one eager verify on the pool before the capture",
+                )
+            self.record = VerifyRecord(self.slots, self.H, CHUNK, self.device)
+        return self.record
 
     def settle(
         self,
@@ -308,9 +300,11 @@ class ExactPool:
     ) -> None:
         """Settle each slot's pending verify with ``accepted[i]`` of its rows kept (``None``: all of them) and, for
         ``tokens > 0``, record what a span of that many rows will overwrite. One launch, nothing read back; a no-op
-        on a pool without a record."""
+        on a pool that never ran a verify (refused inside a capture, where the graph would stay empty)."""
         rec = self.record
         if rec is None:
+            if torch.cuda.is_current_stream_capturing():
+                self.verify_record()
             return
         _verify_module().kda_batch_invariant_verify_settle(
             slot_ids,
@@ -345,7 +339,7 @@ class ExactPool:
     ) -> None:
         """The slots' pending verifies settled with ``accepted``, then ``tokens`` packed rows per sequence appended
         behind a record; their rows go to ``out``. Two launches, nothing read back."""
-        rec = self.verify_record(tokens)
+        rec = self.verify_record()
         self.settle(pool, slot_ids, accepted, tokens)
         self.span(
             pool,
@@ -363,7 +357,7 @@ class ExactPool:
 
 class VerifyRecord:
     """Per slot: what the last verify's span overwrote, and the decay prefix after each of its rows (``cap`` rows of
-    room)."""
+    room: a chunk)."""
 
     def __init__(self, S: int, HV: int, cap: int, dev: torch.device) -> None:
         self.cap = cap
@@ -394,10 +388,3 @@ class VerifyRecord:
             self.update_rows,
             self.l_rows,
         )
-
-    def adopt(self, old: "VerifyRecord") -> None:
-        for mine, theirs in zip(self.buffers(), old.buffers(), strict=True):
-            if mine is self.prefix_rows:
-                mine[:, :, : old.cap].copy_(theirs)
-            else:
-                mine.copy_(theirs)

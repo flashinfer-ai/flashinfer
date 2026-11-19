@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate ``lean/BIKernels/KdaCases.lean`` from the Python side: the replay arithmetic of the class ``kda.bf16.c16``
 (:mod:`.spec`) on a set of positions (chunk boundaries, their neighbours, a long position and the chunk before it), the
-pool's count transitions and the snapshot rule of the multi-token verify, pinned in Lean by kernel ``decide`` against the model of ``Kda.lean``. No ``native_decide``:
+pool's count transitions and the record rule of the multi-token verify, pinned in Lean by kernel ``decide`` against the model of ``Kda.lean``. No ``native_decide``:
 the file adds nothing to the axiom policy.
 
     python -m flashinfer.batch_invariant.kda.lean_cases     # rewrite lean/BIKernels/KdaCases.lean
@@ -95,7 +95,7 @@ def render() -> str:
     L += [
         "]",
         "",
-        "/-- `(open rows, verify rows, open rows after, saved rows + 1)` of the verify's snapshot rule. -/",
+        "/-- `(open rows, verify rows, open rows after, saved rows + 1)` of the verify's record rule. -/",
         "def kdaVerifyCases : List (Nat × Nat × Nat × Nat) := [",
     ]
     L += [

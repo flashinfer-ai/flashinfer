@@ -16,9 +16,8 @@
 #ifndef FLASHINFER_KDA_BATCH_INVARIANT_VERIFY_CUH_
 #define FLASHINFER_KDA_BATCH_INVARIANT_VERIFY_CUH_
 
-// Bookkeeping of the multi-token verify of kda.bf16.c16: the record of what a span of draft rows
-// overwrites, and the settlement that puts a slot where the kept rows leave it. No row arithmetic:
-// every row and every prefix value comes from batch_invariant_decode.cuh.
+// Record and settlement of the multi-token verify of kda.bf16.c16: bytes and counts, no row
+// arithmetic.
 
 #include <flashinfer/kda/batch_invariant_decode.cuh>
 
@@ -30,12 +29,10 @@ using bi_decode::CH;
 using bi_decode::D;
 using bi_decode::STAMP;
 constexpr int NTHR = 256;
-// per (slot, head): draft rows pending, count after them, count before them, cached rows recorded
-// with the boundary state (-1: no boundary crossed)
+// per (slot, head): rows pending, count after, count before, cached rows recorded (-1: none)
 constexpr int META = 4;
 
-// the block moves `bytes` 16 at a time; a thread issues its loads (up to sixteen) before its first
-// store
+// 16 bytes at a time; a thread issues up to sixteen loads before its first store
 __device__ __forceinline__ void copy16(void* dst, const void* src, size_t bytes, int tid) {
   const unsigned char* s = static_cast<const unsigned char*>(src);
   unsigned char* d = static_cast<unsigned char*>(dst);
@@ -61,10 +58,7 @@ __device__ __forceinline__ bool replaced(const float* S32, const float* Stamp, i
   return c0 < 0 || d != 0u;
 }
 
-// One launch per verify or settlement. First each slot's pending verify is settled with
-// accepted[b] of its rows kept (nullptr: all): a slot that keeps fewer gets the count and the decay
-// prefix of the kept position, and the boundary state and cached rows the dropped rows replaced.
-// Then, for n > 0 (at most CH), what a span of n rows will overwrite is recorded.
+// Settle each slot's pending verify with accepted[b] rows kept, then record for a span of n rows.
 __global__ void __launch_bounds__(NTHR)
     SettleKernel(const int* __restrict__ idx, const int* __restrict__ accepted, int n, float* state,
                  uint16_t* state16, int* cnt, float* pref, uint16_t* Kc, float* Kf, uint16_t* Rc,
@@ -81,12 +75,14 @@ __global__ void __launch_bounds__(NTHR)
   const int pending = m[0], after = m[1], before = m[2], saved = m[3];
   const int c0 = cnt[sh];
   const bool moved = replaced(S32, stamp + sh * STAMP, c0);
-  // the record stands only while the slot is where the verify left it
-  const bool live = pending > 0 && c0 == after && !moved;
+  // the record stands only while count, state and prefix are as the verify left them
+  const bool live =
+      pending > 0 && c0 == after && !moved &&
+      !replaced(pref + sh * D, phist + (sh * cap + (pending > 0 ? pending - 1 : 0)) * D, 0);
   const int a = accepted ? (accepted[b] < 0 ? 0 : accepted[b]) : pending;
   const bool back = live && a < pending;
   const int pos = before + a;
-  // kept rows that stop before the boundary the verify crossed: its state and rows come back
+  // kept rows stop before the boundary the verify crossed: its state and rows come back
   const bool undo = back && saved >= 0 && pos < CH;
   float pv = 0.0f;
   if (tid < D)
@@ -96,8 +92,7 @@ __global__ void __launch_bounds__(NTHR)
   if (back && tid < D) pref[sh * D + tid] = pv;
   if (undo) {
     uint16_t* S16 = state16 + sh * D * D;
-    // the boundary state and its bf16 copy as the step header's begin writes it; eight pieces per
-    // thread
+    // the state and its bf16 copy as the step header's begin writes it
     float4 x[8], y[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {

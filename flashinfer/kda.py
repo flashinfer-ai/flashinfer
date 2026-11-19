@@ -498,8 +498,10 @@ def recurrent_kda(
             checkpoint form is refused) returns the rows ``1 + S`` single
             decode steps give, in one launch of the step kernel, and
             ``num_accepted_tokens`` (int32 ``[N]``, the count kept of each
-            slot's previous verify) first takes a slot that kept fewer back
-            to the state that many decode steps leave; see
+            slot's previous verify; ``None`` keeps all, where the backends
+            read it as checkpoint slot 0) first takes a slot that kept fewer
+            back to the state that many decode steps leave; at most 16
+            tokens per sequence; see
             ``recurrent_kda_batch_invariant_verify`` and
             ``recurrent_kda_batch_invariant_accept`` in
             ``flashinfer.batch_invariant.kda.api``. Unsupported inputs raise

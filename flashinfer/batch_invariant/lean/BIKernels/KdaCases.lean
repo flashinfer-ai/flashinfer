@@ -41,7 +41,7 @@ def kdaCountCases : List (Nat × Nat) := [
   (15, 0)
 ]
 
-/-- `(open rows, verify rows, open rows after, saved rows + 1)` of the verify's snapshot rule. -/
+/-- `(open rows, verify rows, open rows after, saved rows + 1)` of the verify's record rule. -/
 def kdaVerifyCases : List (Nat × Nat × Nat × Nat) := [
   (0, 1, 1, 0),
   (0, 6, 6, 0),

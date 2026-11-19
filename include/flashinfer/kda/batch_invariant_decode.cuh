@@ -741,8 +741,6 @@ inline cudaError_t DecodeStep(const uint16_t* q, const uint16_t* k, const uint16
 }
 
 // Rows [starts[i], starts[i] + lens[i]) go to slot slots[i]; starts == nullptr: `stride` rows each.
-// prefix_rows (or nullptr): per (slot, head), the decay prefix after each of the first prefix_cap
-// rows.
 inline cudaError_t DecodeSpan(const uint16_t* q, const uint16_t* k, const uint16_t* v,
                               const uint16_t* g, const uint16_t* beta, const int* slots,
                               const int* starts, const int* lens, int stride, uint16_t* out,

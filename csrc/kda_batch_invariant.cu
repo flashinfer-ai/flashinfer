@@ -105,8 +105,7 @@ void kda_batch_invariant_decode_step(TensorView q, TensorView k, TensorView v, T
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(kda_batch_invariant_decode_step, kda_batch_invariant_decode_step);
 
-// stride > 0: every sequence appends `stride` rows from row i * stride (starts / lens unused);
-// prefix_cap > 0: prefix_rows [slots, heads, prefix_cap, 128] receives the prefix after each row
+// stride > 0: every sequence appends `stride` rows from row i * stride (starts / lens unused)
 void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, TensorView g,
                                      TensorView beta, TensorView slots, TensorView starts,
                                      TensorView lens, int64_t stride, TensorView out,

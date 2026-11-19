@@ -15,7 +15,7 @@ What is proved: the prefill of a sequence is the fold of `step` over its 16-row 
 (`stateAfter`, the states at the boundaries); the replay decode of position `p` (the step from the boundary state at
 `16 * (p / 16)` over the rows since it and the new row) gives the prefill's row `p`; the pool's commit rule (a slot's
 boundary state advances when its 16th row arrives) carries exactly the prefill's boundary states; the positional
-arithmetic of `spec.py`, including the count and snapshot rule of the multi-token verify. No configuration space is modelled (R3 is not claimed for this class). The generated
+arithmetic of `spec.py`, including the count and record rule of the multi-token verify. No configuration space is modelled (R3 is not claimed for this class). The generated
 `KdaCases.lean` pins the arithmetic on the Python specification's cases by kernel `decide`.
 
 The shipped decode step does not re-run the open chunk: it is a kernel that computes row `p` of that replay from the
@@ -138,10 +138,11 @@ theorem pool_eq_stateAfter (step : S → List R → S × List R) (s0 : S) (xs : 
 /-! ## The multi-token verify (`spec.py`: `verify_split`, `accepted_count`, `accepted_commits`)
 
 A verify appends `n` rows to a slot with `count` open rows in one launch and is settled with `a ≤ n` of them kept. The
-slot then has to be where `a` single decode steps from the verify's start leave it. The launch is `n` steps of the pool
-rule, so settling goes back to the state before it (the snapshot) and appends the kept rows again; what the snapshot
-must hold is the arithmetic below: the count, and, when the launch crosses a boundary, the boundary state and the
-cached rows of the open chunk that rows after the boundary replace. -/
+slot then has to be where `a` single decode steps from the verify's start leave it. What is stated here is the
+arithmetic of that settlement only (a verify is at most 16 rows, so it crosses one boundary at most): the count after
+the kept rows, and what the record must hold when the launch crosses a boundary, namely the boundary state and the
+cached rows of the open chunk that the rows after the boundary replace. The kernel that applies it (and the decay
+prefix it keeps per row) is not modelled; the device tests compare its result with single decode steps bit for bit. -/
 
 /-- The open rows after `n` rows appended to a slot with `count` open rows. -/
 def countAfter (count n : Nat) : Nat := (count + n) % 16
@@ -149,7 +150,7 @@ def countAfter (count n : Nat) : Nat := (count + n) % 16
 /-- The boundaries `n` appended rows cross. -/
 def commitsIn (count n : Nat) : Nat := (count + n) / 16
 
-/-- The snapshot of a verify of `n` rows, as `saved rows + 1`: `0` while the rows stay inside the open chunk, else
+/-- The record of a verify of `n ≤ 16` rows, as `saved rows + 1`: `0` while the rows stay inside the open chunk, else
 one more than the number of the open chunk's cached rows that the rows after the boundary replace. -/
 def verifySaved (count n : Nat) : Nat := if count + n < 16 then 0 else min count (count + n - 16) + 1
 
@@ -177,8 +178,8 @@ theorem verifySaved_covers (count n j : Nat) (hcross : 16 ≤ count + n)
     rw [Nat.lt_min]; exact ⟨hj, hover⟩
   omega
 
-/-- The pool rule over a verify settled with `a` rows kept: the boundary state is the prefill's at the kept position,
-whatever the rows that were run and dropped. -/
+/-- The pool rule at the kept position `p + a` (`pool_eq_stateAfter` there): the boundary state a settled slot has to
+hold is the prefill's. That the settlement produces it is the device tests' statement, not this one. -/
 theorem settled_pool_eq_stateAfter (step : S → List R → S × List R) (s0 : S) (xs : List R) (p a : Nat) :
     poolState step s0 xs (p + a) = stateAfter step s0 xs ((p + a) / 16) :=
   pool_eq_stateAfter step s0 xs (p + a)

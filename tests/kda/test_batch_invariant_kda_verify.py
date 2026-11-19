@@ -264,8 +264,8 @@ def call_operator(p, packed):
 
 
 def test_verify_adds_no_fingerprint_source():
-    """The verify's kernels hold no row arithmetic and are not sources of the class: its fingerprint is the one of
-    the class without the verify."""
+    """The verify's own kernel holds no row arithmetic and is not a source of the class (the store it needs lives in
+    the step kernel's header, which is one)."""
     sources = spec.TERM_SOURCES + spec.TERM_INCLUDES + spec.TERM_CSRC
     assert sources == (
         "kda_kernels/kda_chunked_bt16.py",
@@ -470,42 +470,182 @@ def test_graph_replay(T):
     assert_same_state(pool, twin, slots, "after the replays")
 
 
+def _capture(fn):
+    s_ = torch.cuda.Stream()
+    s_.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(s_), torch.cuda.graph(g, stream=s_):
+            out = fn()
+    finally:
+        torch.cuda.current_stream().wait_stream(s_)
+        torch.cuda.synchronize()
+    return g, out
+
+
 @needs_device
-def test_first_verify_inside_a_capture_is_refused():
+def test_first_verify_or_settlement_inside_a_capture_is_refused():
+    """The record is allocated by an eager verify: a verify or a settlement captured before it would be a graph that
+    misses it (an empty one for the settlement)."""
     h = 16
     p = params(h)
     req = Requests(h, 2, 80, SEED + 4300, [4, 9])
     pool, _ = start_pools(req, [0, 1], p)
     verify = call_api(p)
-    ids = ints([0, 1])
+    ids, counts = ints([0, 1]), ints([1, 1])
     small = req.stacked(req.drafts(3, [3, 3]))
-    large = req.stacked(req.drafts(7, [7, 7]))
-
-    def capture(tokens):
-        s_ = torch.cuda.Stream()
-        s_.wait_stream(torch.cuda.current_stream())
-        g = torch.cuda.CUDAGraph()
-        try:
-            with torch.cuda.stream(s_), torch.cuda.graph(g, stream=s_):
-                verify(tokens, pool, ids, None)
-        finally:
-            torch.cuda.current_stream().wait_stream(s_)
-            torch.cuda.synchronize()
-
     with pytest.raises(BatchInvariantUnsupportedError, match="eager verify"):
-        capture(small)
-    verify(small, pool, [0, 1], None)
+        _capture(lambda: verify(small, pool, ids, None))
+    with pytest.raises(BatchInvariantUnsupportedError, match="eager verify"):
+        _capture(lambda: recurrent_kda_batch_invariant_accept(pool, counts))
     recurrent_kda_batch_invariant_accept(
-        pool,
-        ints([0, 0]),
-    )
-    with pytest.raises(BatchInvariantUnsupportedError, match="eager verify"):
-        capture(large)
+        pool, counts
+    )  # eager, nothing to settle: a no-op
+    verify(small, pool, ids, None)
+    _capture(lambda: recurrent_kda_batch_invariant_accept(pool, counts))
 
 
 @needs_device
-def test_record_grows_with_a_verify_pending():
-    """A longer verify than any before grows the record; the pending shorter verify is still settled from it."""
+def test_graph_stays_valid_across_verifies_of_other_sizes():
+    """A graph captured for 3 tokens, an eager verify of 6 that settles the graph's verify, then the graph again
+    settling the eager one: one record serves every size."""
+    h, n = 16, 2
+    p = params(h)
+    req = Requests(h, n, 120, SEED + 5200, [2, 12])
+    slots = [1, 0]
+    pool, twin = start_pools(req, slots, p)
+    ids, accepted = ints(slots), ints([3, 3])
+    verify = call_api(p)
+    static = {key: t.clone() for key, t in req.stacked(req.drafts(3, [3, 3])).items()}
+    out_buf = torch.empty(n, 3, h, D, dtype=torch.bfloat16, device="cuda")
+
+    def step():
+        return recurrent_kda_batch_invariant_verify(
+            *(static[key] for key in KEYS),
+            A_log=p["A_log"],
+            dt_bias=p["dt_bias"],
+            initial_state=pool,
+            lower_bound=LB,
+            ssm_state_indices=ids,
+            num_accepted_tokens=accepted,
+            output=out_buf,
+        )
+
+    step()  # eager: allocates the record; three true tokens, kept below
+    g, out = _capture(step)
+    last = [3, 3]
+    plan = [
+        ("eager", 6, [2, 5]),
+        ("graph", 3, [1, 3]),
+        ("eager", 9, [0, 9]),
+        ("graph", 3, [2, 2]),
+    ]
+    for r, (how, T, kept) in enumerate(plan):
+        twin_steps(req, twin, slots, p, last)
+        req.pos = [q0 + a for q0, a in zip(req.pos, last, strict=True)]
+        drafts = req.drafts(T, kept)
+        if how == "graph":
+            accepted.copy_(ints(last))
+            for key, t in req.stacked(drafts).items():
+                static[key].copy_(t)
+            g.replay()
+            torch.cuda.synchronize()
+            rows = out
+        else:
+            rows = verify(req.stacked(drafts), pool, ids, ints(last))
+        for i in range(n):
+            assert same_bits(rows[i], req.reference(i, drafts[i], p)), (
+                f"round {r}, request {i}"
+            )
+        last = kept
+    recurrent_kda_batch_invariant_accept(pool, ints(last), ssm_state_indices=ids)
+    twin_steps(req, twin, slots, p, last)
+    assert_same_state(pool, twin, slots)
+
+
+@needs_device
+@pytest.mark.parametrize("between", ["decode", "extend"])
+@pytest.mark.parametrize("start", [3, 13])
+def test_stale_verify_is_not_settled(start, between):
+    """A verify left unsettled, then 16 tokens through decode steps or one multi-token step (the count is back where
+    the verify left it): a late settlement must not touch the slot."""
+    from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_extend
+
+    h, T = 16, 6
+    p = params(h)
+    req = Requests(h, 2, 120, SEED + 5300, [start, start])
+    slots = [0, 1]
+    pool, twin = start_pools(req, slots, p)
+    call_api(p)(req.stacked(req.drafts(T, [T, T])), pool, slots, None)
+    twin_steps(req, twin, slots, p, [T, T])
+    req.pos = [q0 + T for q0 in req.pos]
+    if between == "decode":
+        for t in range(16):
+            toks = {
+                key: torch.cat(
+                    [
+                        s[key][q0 + t : q0 + t + 1]
+                        for s, q0 in zip(req.true, req.pos, strict=True)
+                    ],
+                    0,
+                )
+                for key in KEYS
+            }
+            bi_decode(toks, pool, slots, p)
+    else:
+        recurrent_kda_batch_invariant_extend(
+            *(
+                torch.stack(
+                    [
+                        s[key][q0 : q0 + 16]
+                        for s, q0 in zip(req.true, req.pos, strict=True)
+                    ],
+                    0,
+                )
+                for key in KEYS
+            ),
+            A_log=p["A_log"],
+            dt_bias=p["dt_bias"],
+            initial_state=pool,
+            lower_bound=LB,
+        )
+    twin_steps(req, twin, slots, p, [16, 16])
+    recurrent_kda_batch_invariant_accept(pool, ints([1, 0]))
+    assert_same_state(pool, twin, slots)
+
+
+@needs_device
+def test_no_row_kept_on_a_fresh_slot():
+    """A verify as a slot's first call with no row kept: the slot is begun at its state and decodes the same rows as
+    an untouched one."""
+    h, T = 16, 5
+    p = params(h)
+    req = Requests(h, 2, 60, SEED + 5400, [0, 0])
+    slots = [0, 1]
+    pool, twin = start_pools(req, slots, p)
+    call_api(p)(req.stacked(req.drafts(T, [0, 0])), pool, slots, None)
+    recurrent_kda_batch_invariant_accept(pool, ints([0, 0]))
+    assert same_bits(pool, twin)
+    for t in range(20):
+        toks = {
+            key: torch.cat([s[key][t : t + 1] for s in req.true], 0) for key in KEYS
+        }
+        assert same_bits(
+            bi_decode(toks, pool, slots, p), bi_decode(toks, twin, slots, p)
+        )
+    assert_same_state(pool, twin, slots)
+
+
+@needs_device
+@pytest.mark.parametrize("h", [3, 12])
+def test_heads_off_a_multiple_of_eight(h):
+    p = params(h)
+    run_rounds(h, 4, 6, 4, p, call=call_api(p))
+
+
+@needs_device
+def test_verifies_of_changing_sizes():
+    """Each verify settles the one before, whatever their sizes."""
     h = 16
     p = params(h)
     req = Requests(h, 3, 120, SEED + 4400, [2, 14, 20])

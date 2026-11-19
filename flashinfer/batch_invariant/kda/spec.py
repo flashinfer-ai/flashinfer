@@ -93,7 +93,8 @@ def verify_split(count: int, n: int) -> Tuple[int, int]:
     """A verify of ``n`` rows (at most a chunk) on a slot holding ``count`` open rows leaves ``(count after, saved)``:
     ``saved`` is ``-1`` while the rows stay inside the open chunk (the boundary state and the cached rows below
     ``count`` are untouched, the record is the count and the decay prefix), else the number of cached rows of the open
-    chunk that the rows after the boundary replace, recorded with the boundary state."""
+    chunk that the rows after the boundary replace, recorded with the boundary state (``count + n - 16``, which is at
+    most ``count`` for ``n <= 16``)."""
     over = count + n - CHUNK
     return (count + n) % CHUNK, (-1 if over < 0 else min(over, count))
 

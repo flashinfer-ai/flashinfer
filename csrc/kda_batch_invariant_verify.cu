@@ -37,7 +37,7 @@ void check(std::initializer_list<TensorView> tensors, DLDataTypeCode code, int b
   }
 }
 
-// both kernels move these 16 bytes at a time
+// the kernel moves these 16 bytes at a time
 void check_aligned(std::initializer_list<TensorView> tensors) {
   for (TensorView t : tensors) {
     TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0)
@@ -47,8 +47,7 @@ void check_aligned(std::initializer_list<TensorView> tensors) {
 
 }  // namespace
 
-// Settle each slot's pending verify with accepted[i] rows kept (has_accepted == 0: all of them),
-// then record what a span of n rows per slot will overwrite (n == 0: settle only).
+// has_accepted == 0: every pending verify is kept in full; n == 0: settle only
 void kda_batch_invariant_verify_settle(TensorView slots, TensorView accepted, int64_t has_accepted,
                                        int64_t n, TensorView state, TensorView state_bf16,
                                        TensorView cnt, TensorView prefix, TensorView k_inv_rows,
