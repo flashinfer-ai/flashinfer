@@ -49,16 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_PREFIX_OFF 0
-#define SMEM_PREFIX_STAGE_BYTES 16384
-#define SMEM_PREFIX_STRIDE 16384
-#define SMEM_WARP_SUMS_OFF 16384
-#define SMEM_WARP_SUMS_STAGE_BYTES 32
-#define SMEM_WARP_SUMS_STRIDE 32
-#define SMEM_TOTAL 16512
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -79,7 +69,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_f91d5cd744783557f500(int* __restrict
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* prefix = reinterpret_cast<int*>(smem_raw + 0);
     const int prefix_addr = smem + 0;
     int* warp_sums = reinterpret_cast<int*>(smem_raw + 16384);
@@ -106,8 +96,8 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_f91d5cd744783557f500(int* __restrict
     #pragma unroll
     for (int i_1 = 0; i_1 < 16; i_1++) {
         unsigned int num = (unsigned int)(ctx[i_1] + split_kv - 1);
-        unsigned int q0 = (unsigned int)((unsigned long long)num * (unsigned long long)inv >> 32);
-        int quo = (int)(((num - q0 * divisor >= divisor) ? q0 + 1 : q0));
+        unsigned int q0 = (unsigned int)((unsigned long long)num * (unsigned long long)inv >> 32ull);
+        int quo = (int)((num - q0 * divisor >= divisor) ? q0 + 1 : q0);
         int segs = ((row_base + i_1 < batch_size) ? quo : 0);
         running += segs;
         local_incl[i_1] = running;
@@ -147,7 +137,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_f91d5cd744783557f500(int* __restrict
     if (total == 0) {
         #pragma unroll 1
         for (int sm0 = tid_1; sm0 < num_sms + 1; sm0 += 256) {
-            *(reinterpret_cast<int*>(schedule_meta + (sm0 * 2)) + (0)) = sentinel;
+            *(reinterpret_cast<int*>(schedule_meta + sm0 * 2) + (0)) = sentinel;
             *(reinterpret_cast<int*>(schedule_meta + (sm0 * 2 + 1)) + (0)) = 0;
         }
     } else {
@@ -180,11 +170,11 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_f91d5cd744783557f500(int* __restrict
             int atom_idx = ((num_segs_q > 0) ? offset_in_q / num_segs_q : 0);
             int kv_split_idx = ((num_segs_q > 0) ? offset_in_q % num_segs_q : 0);
             int q_atom_idx = q_idx * num_next_n_atoms + atom_idx;
-            *(reinterpret_cast<int*>(schedule_meta + (sm * 2)) + (0)) = q_atom_idx;
+            *(reinterpret_cast<int*>(schedule_meta + sm * 2) + (0)) = q_atom_idx;
             *(reinterpret_cast<int*>(schedule_meta + (sm * 2 + 1)) + (0)) = kv_split_idx;
         }
         if (tid_1 == 0) {
-            *(reinterpret_cast<int*>(schedule_meta + (num_sms * 2)) + (0)) = sentinel;
+            *(reinterpret_cast<int*>(schedule_meta + num_sms * 2) + (0)) = sentinel;
             *(reinterpret_cast<int*>(schedule_meta + (num_sms * 2 + 1)) + (0)) = 0;
         }
     }

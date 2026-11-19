@@ -364,6 +364,31 @@ void trtllm_paged_attention_launcher(
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
+
+    // With a few query tokens and small KV, context schedules one CTA per query head.
+    // Grouping query tokens and heads in the generation kernel avoids those mostly
+    // empty tiles. Retain the context workspace contract (no split-KV scratch or
+    // counters are needed) and keep all query rows together in the initial tile.
+    bool const use_tiny_gqa_generation =
+        fmha_runner->smVersion() == kSM_103 && q_data_type == kv_data_type &&
+        (q_data_type == DATA_TYPE_BF16 || q_data_type == DATA_TYPE_E4M3) &&
+        o_data_type == DATA_TYPE_BF16 && batch_size >= 4 && batch_size <= 256 && max_q_len >= 1 &&
+        max_q_len <= 3 && sum_seq_q == max_q_len * batch_size && max_kv_len >= 1 &&
+        max_kv_len <= 32 && num_qo_heads == 16 && num_kv_heads == 1 && head_dim_qk == 128 &&
+        head_dim_vo == 128 && page_size == 128 && q_stride_tokens == 16 * 128 &&
+        q_stride_heads == 128 && kv_stride_keys_values == 128 && kv_stride_heads == 128 * 128 &&
+        kv_stride_batch == 2 * 128 * 128 && max_num_blocks_per_seq == 1 &&
+        uses_shared_paged_kv_idx && is_causal && window_left == -1 &&
+        (window_right == -1 || window_right == 0) && variable_window_token_starts == nullptr &&
+        attention_sinks == nullptr && lse == nullptr && k_block_scales_ptr == nullptr &&
+        v_block_scales_ptr == nullptr && out_scale_factor == nullptr && !skips_softmax &&
+        !use_fp16_softmax && !uses_spcompress;
+    if (use_tiny_gqa_generation) {
+      runner_params.mKernelType = FmhaKernelType::Generation;
+      // Keep all query rows in one CTA, including fully masked leading rows.
+      runner_params.mKeepGqaGenerationQueryTile = true;
+      runner_params.cumSeqLensKvPtr = nullptr;
+    }
   } else {
     // Generation.
     // Note that kernel names are still labeled as using a dense mask even when maskType is

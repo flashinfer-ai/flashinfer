@@ -623,13 +623,14 @@
    "path": "frost/compiled_cache.py",
    "source": "python/cudnn/frost/compiled_cache.py",
    "source_sha256": "d450f143f84e64f6ffecf9270f43660699004a0c64def557bee5cfc1e6087aa8",
-   "vendored_sha256": "a5e61c038d3acb647402aaffa229f93d9738a59e5b688111803d47885b9d5851",
+   "vendored_sha256": "863782ec53afad29b63141c9c2ea8492f90042bb90a27e7fe002ddbff5615d8c",
    "license": "Apache-2.0",
    "rewritten_imports": 4,
    "patches": [
+    "P7",
     "P3"
    ],
-   "bytes": 40513
+   "bytes": 40527
   },
   {
    "path": "frost/device.py",
@@ -1828,7 +1829,7 @@
   "rewritten_imports": 640,
   "files_with_rewrites": 91,
   "string_sites": 33,
-  "patches": 33
+  "patches": 35
  },
  "dangling_imports": {
   "engines/manifest.py (string site)": [
@@ -1867,6 +1868,14 @@
   [
    "P1",
    "engines/manifest.py"
+  ],
+  [
+   "P7",
+   "frost/compiled_cache.py"
+  ],
+  [
+   "P7",
+   "frost/compiled_cache.py"
   ],
   [
    "P3",

@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -56,7 +54,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_ecc887263394f9e50152(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M)
+kernel_cake_warp_decode_ecc887263394f9e50152(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M, int* __restrict__ route_experts, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -73,17 +71,28 @@ kernel_cake_warp_decode_ecc887263394f9e50152(__nv_bfloat16* __restrict__ route_o
     int token = blockIdx.y;
     int route_base = token * 10;
     float weights[10];
+    bool oks[10];
     if (feature < M && token < num_tokens) {
         weights[0] = (float)route_weights[route_base];
+        oks[0] = (unsigned int)route_experts[route_base] < (unsigned int)num_experts;
         weights[1] = (float)route_weights[route_base + 1];
+        oks[1] = (unsigned int)route_experts[route_base + 1] < (unsigned int)num_experts;
         weights[2] = (float)route_weights[route_base + 2];
+        oks[2] = (unsigned int)route_experts[route_base + 2] < (unsigned int)num_experts;
         weights[3] = (float)route_weights[route_base + 3];
+        oks[3] = (unsigned int)route_experts[route_base + 3] < (unsigned int)num_experts;
         weights[4] = (float)route_weights[route_base + 4];
+        oks[4] = (unsigned int)route_experts[route_base + 4] < (unsigned int)num_experts;
         weights[5] = (float)route_weights[route_base + 5];
+        oks[5] = (unsigned int)route_experts[route_base + 5] < (unsigned int)num_experts;
         weights[6] = (float)route_weights[route_base + 6];
+        oks[6] = (unsigned int)route_experts[route_base + 6] < (unsigned int)num_experts;
         weights[7] = (float)route_weights[route_base + 7];
+        oks[7] = (unsigned int)route_experts[route_base + 7] < (unsigned int)num_experts;
         weights[8] = (float)route_weights[route_base + 8];
+        oks[8] = (unsigned int)route_experts[route_base + 8] < (unsigned int)num_experts;
         weights[9] = (float)route_weights[route_base + 9];
+        oks[9] = (unsigned int)route_experts[route_base + 9] < (unsigned int)num_experts;
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature < M && token < num_tokens) {
@@ -99,16 +108,16 @@ kernel_cake_warp_decode_ecc887263394f9e50152(__nv_bfloat16* __restrict__ route_o
         partials[8] = route_outputs[(route_base + 8) * route_stride + feature];
         partials[9] = route_outputs[(route_base + 9) * route_stride + feature];
         float value = 0.0f;
-        value = __fmaf_rn((float)partials[0], weights[0], value);
-        value = __fmaf_rn((float)partials[1], weights[1], value);
-        value = __fmaf_rn((float)partials[2], weights[2], value);
-        value = __fmaf_rn((float)partials[3], weights[3], value);
-        value = __fmaf_rn((float)partials[4], weights[4], value);
-        value = __fmaf_rn((float)partials[5], weights[5], value);
-        value = __fmaf_rn((float)partials[6], weights[6], value);
-        value = __fmaf_rn((float)partials[7], weights[7], value);
-        value = __fmaf_rn((float)partials[8], weights[8], value);
-        value = __fmaf_rn((float)partials[9], weights[9], value);
+        value = ((oks[0]) ? __fmaf_rn((float)partials[0], weights[0], value) : value);
+        value = ((oks[1]) ? __fmaf_rn((float)partials[1], weights[1], value) : value);
+        value = ((oks[2]) ? __fmaf_rn((float)partials[2], weights[2], value) : value);
+        value = ((oks[3]) ? __fmaf_rn((float)partials[3], weights[3], value) : value);
+        value = ((oks[4]) ? __fmaf_rn((float)partials[4], weights[4], value) : value);
+        value = ((oks[5]) ? __fmaf_rn((float)partials[5], weights[5], value) : value);
+        value = ((oks[6]) ? __fmaf_rn((float)partials[6], weights[6], value) : value);
+        value = ((oks[7]) ? __fmaf_rn((float)partials[7], weights[7], value) : value);
+        value = ((oks[8]) ? __fmaf_rn((float)partials[8], weights[8], value) : value);
+        value = ((oks[9]) ? __fmaf_rn((float)partials[9], weights[9], value) : value);
         *(reinterpret_cast<__nv_bfloat16*>(output + (token * M + feature)) + (0)) = (__nv_bfloat16)value;
     }
 }

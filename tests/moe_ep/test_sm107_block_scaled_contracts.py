@@ -47,6 +47,98 @@ def _config(**kw):
     )
 
 
+@pytest.mark.parametrize(
+    "kind", ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+)
+def test_inference_grid_covers_uniform_phase_launches(kind):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        is_valid_sm107,
+        sm107_candidates,
+    )
+
+    candidates = sm107_candidates(kind)
+    assert (
+        len(candidates)
+        == len({json.dumps(c, sort_keys=True) for c in candidates})
+        == 32
+    )
+    depth = 256 if kind in ("nvfp4", "mxfp4") else 128
+    expected_legacy = [
+        (tile, cluster, epi, bulk)
+        for tile in ((256, 128, depth), (256, 256, depth))
+        for cluster, epi in (
+            ((2, 1), (1, 4)),
+            ((2, 1), (2, 4)),
+            ((4, 1), (1, 4)),
+            ((4, 1), (2, 4)),
+        )
+        for bulk in (False, True)
+    ]
+    legacy = [
+        c
+        for c in candidates
+        if c["schedule_policy"] == ("grouped", None)
+        or c["fallback_cluster_shape_mn"] is not None
+    ]
+    assert {
+        (
+            c["mma_tiler_mnk"],
+            c["cluster_shape_mn"],
+            c["epi_flag_batches"],
+            c["fc2_use_bulk"],
+        )
+        for c in legacy
+    } == set(expected_legacy)
+    assert [
+        (
+            c["mma_tiler_mnk"][1:],
+            c["cluster_shape_mn"],
+            c["fc2_use_bulk"],
+        )
+        for c in candidates[:8]
+    ] == [
+        ((256, depth), (2, 1), True),
+        ((128, depth), (2, 1), True),
+        ((64, depth), (4, 1), True),
+        ((128, depth), (4, 1), True),
+        ((256, depth), (4, 1), True),
+        ((64, 2 * depth), (2, 1), True),
+        ((64, 2 * depth), (4, 1), True),
+        ((64, depth), (4, 1), False),
+    ]
+    added = [c for c in candidates if c not in legacy]
+    assert {c["mma_tiler_mnk"] for c in added} == {
+        (256, 64, depth),
+        (256, 64, 2 * depth),
+        (256, 128, depth),
+        (256, 256, depth),
+    }
+    for c in added:
+        assert c["fallback_cluster_shape_mn"] is None
+        assert c["schedule_policy"] == ("phase_interleave", None)
+        assert c["work_id_mode"] == "atomic_counter"
+        assert c["epi_flag_batches"] == (2, 4)
+        assert c["fc2_tma_stages"] == (
+            (1 if c["mma_tiler_mnk"][1] == 64 else 2) if c["fc2_use_bulk"] else None
+        )
+    for tile in {c["mma_tiler_mnk"] for c in added}:
+        assert {
+            (c["cluster_shape_mn"], c["fc2_use_bulk"])
+            for c in added
+            if c["mma_tiler_mnk"] == tile
+        } == {((2, 1), False), ((2, 1), True), ((4, 1), False), ((4, 1), True)}
+    with_ikr = sm107_candidates(kind, allow_in_kernel_fc2_reduce=True)
+    assert len(with_ikr) == 64
+    assert [c for c in with_ikr if not c["reduce_topk_in_kernel"]] == candidates
+    assert [
+        dict(c, reduce_topk_in_kernel=False)
+        for c in with_ikr
+        if c["reduce_topk_in_kernel"]
+    ] == candidates
+    base = _config(quant_kind=kind, hidden=512, intermediate=256, world_size=4)
+    assert all(is_valid_sm107(c, base) for c in with_ikr)
+
+
 @pytest.mark.parametrize("rubin", [False, True])
 def test_route_staging_fallback_preserves_architecture_score_policy(rubin):
     from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared
@@ -154,6 +246,10 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     from flashinfer.moe_ep.core.kernel import registry
     from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
 
+    def gather(results, value, **kwargs):
+        results[:] = [value] * len(results)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     args = tune._parse_args(
         [
             "--dtype",
@@ -183,6 +279,13 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     create = mock.Mock(return_value=backend)
     resolve = mock.Mock(return_value=({}, "default"))
     execution = mock.Mock()
+
+    def gather(results, result, *, group):
+        assert group is backend.ep_comm_group
+        results[:] = [result] * len(results)
+
+    exchange = mock.Mock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
     monkeypatch.setattr(registry, "create_mega_kernel", create)
     monkeypatch.setattr(tuning, "_dummy_transformed_weights", lambda *a: (None, None))
     monkeypatch.setattr(
@@ -196,6 +299,8 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     monkeypatch.setattr(tuning, "finish_sweep", finish)
 
     assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
+    exchange.assert_called_once()
+    assert finish.call_args.args[8] == [{}]
     config = create.call_args.args[0]
     assert isinstance(config, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig)
     assert config.kernel_variant == variant
@@ -204,7 +309,7 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     assert resolve.call_args.kwargs["kernel_variant"] == variant
     assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
     assert execution.call_args.kwargs["quantize_input"] is True
-    backend._allocate_workspace.return_value.destroy.assert_called_once()
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
 
 
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
@@ -695,3 +800,180 @@ def test_ikr_requires_early_weighting():
             reduce_topk_in_kernel=True,
             apply_routing_weights_before_fc2=False,
         )
+
+
+@pytest.mark.parametrize("tanh_sigmoid,warpgroups", [(False, 1), (True, 1), (True, 2)])
+def test_rubin_execution_options_reach_kernel(monkeypatch, tanh_sigmoid, warpgroups):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        block_scaled,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cfg = block_scaled.Sm107BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=65,
+        num_topk=3,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        fc2_use_bulk=True,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        use_tanh_sigmoid=tanh_sigmoid,
+        epilogue_warpgroups=warpgroups,
+    )
+    kernel = block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    assert kernel.epilogue.use_tanh_sigmoid == tanh_sigmoid
+    assert kernel.epilogue.epilogue_warpgroups == warpgroups
+
+
+def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    common = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=3584,
+        intermediate=3072,
+        num_experts=896,
+        topk=16,
+        max_tokens=64,
+        device="test-device",
+    )
+    for index, (tanh_sigmoid, warpgroups) in enumerate(
+        ((False, 1), (True, 1), (True, 2))
+    ):
+        entry = knob_cache.make_record(
+            {"marker": index},
+            **common,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+        )
+        knob_cache.write_record(entry)
+    for index, (tanh_sigmoid, warpgroups) in enumerate(
+        ((False, 1), (True, 1), (True, 2))
+    ):
+        result = knob_cache.lookup_knobs(
+            **common,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+        )
+        assert result == {"marker": index}
+
+
+def _native_inference_kernel(monkeypatch, **overrides):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import src
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.api import (
+        ImplDesc,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cls = src.RubinInferenceMegaMoE
+    initialize = cls.__init__
+
+    def build(instance, problem, implementation):
+        initialize(instance, problem, ImplDesc(dict(implementation) | overrides))
+
+    cfg = _config(
+        hidden=384, intermediate=256, quant_kind="mxfp8_e4m3", fc2_use_bulk=True
+    )
+    with mock.patch.object(cls, "__init__", build):
+        return block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+
+
+def test_native_communication_settings_have_distinct_compiled_names(monkeypatch):
+    base = dict(
+        comm_clusters=1,
+        comm_warps=(4, 4),
+        token_back_mode="standalone_warps",
+        work_id_mode="atomic_counter",
+    )
+    kernel = _native_inference_kernel(monkeypatch, **base)
+    changes = [
+        {},
+        dict(comm_clusters=2),
+        dict(token_back_on_compute_ctas=True),
+        dict(comm_warps=(5, 4)),
+        dict(comm_stage_depths=(1, 2)),
+        dict(token_back_chunk_bytes=kernel.token_back_chunk_bytes * 2),
+        dict(dispatch_sf_group=4),
+        dict(token_back_schedule_mode="atomic_counter"),
+    ]
+    kernels = [
+        _native_inference_kernel(monkeypatch, **(base | change)) for change in changes
+    ]
+    assert len({kernel.name() for kernel in kernels}) == len(changes)
+    assert len({kernel._aot_symbol_name() for kernel in kernels}) == len(changes)
+
+
+def test_native_fused_token_back_schedule_has_distinct_compiled_name(monkeypatch):
+    base = dict(work_id_mode="atomic_counter", token_back_mode="standalone_warps")
+    default = _native_inference_kernel(monkeypatch, **base)
+    static = _native_inference_kernel(
+        monkeypatch, **base, token_back_schedule_mode="static"
+    )
+    assert default.name() != static.name()
+
+
+def test_native_inference_rejects_clc_before_launch(monkeypatch):
+    with pytest.raises(
+        ValueError, match="inference requires grid_stride or atomic_counter"
+    ):
+        _native_inference_kernel(monkeypatch, work_id_mode="cluster_launch_control")
+
+
+def test_native_dedup_build_has_its_own_compiled_identity(monkeypatch):
+    ordinary = _native_inference_kernel(
+        monkeypatch, token_back_mode="reuse_dispatch_warps"
+    )
+    dedup = _native_inference_kernel(
+        monkeypatch, token_back_mode="reuse_dispatch_warps", combine_dedup=True
+    )
+    assert ordinary.name() != dedup.name()
+    assert ordinary._aot_symbol_name() != dedup._aot_symbol_name()
+
+
+@pytest.mark.parametrize("world", [1, 4, 16, 32, 64])
+@pytest.mark.parametrize("early", [False, True])
+def test_genphase_ll_halves_have_disjoint_storage(monkeypatch, world, early):
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cfg = _config(
+        num_total_experts=world * 4,
+        world_size=world,
+        hidden=512,
+        intermediate=256,
+        max_tokens_per_rank=17,
+        num_topk=3,
+        quant_kind="mxfp8_e4m3",
+        kernel_variant="genphase",
+        cluster_shape_mn=(4, 1),
+        fc2_use_bulk=True,
+        apply_routing_weights_before_fc2=early,
+    )
+    kernel = Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    workspace, communication = kernel._device_workspace, kernel.token_comm
+    regions = [
+        communication.topk_index_inbox_region,
+        communication.count_ll_inbox_region,
+        communication.plain_sf_ll_region,
+        communication.refine_row_source_ll_region,
+    ]
+    if early:
+        regions.append(communication.topk_score_inbox_region)
+    for name in regions:
+        region = workspace.region(name)
+        assert region.shape[0] == 2
+        assert region.reset == "zero_on_first_allocate"
+        half_bytes = workspace.stride(name)[0] * 8
+        assert workspace.nbytes(name) == 2 * half_bytes
+        assert workspace.offset(name) >= workspace.tail_reset_bytes(region.buffer_space)
+    assert workspace.region(communication.refine_work_counter_region).shape == (2,)
+    ready = workspace.region(communication.ll_reset_ready_region)
+    done = workspace.region(communication.ll_reset_done_region)
+    assert ready.reset == "tail_reset"
+    assert done.reset == "zero_on_first_allocate"
+    assert workspace.offset(done.name) >= workspace.tail_reset_bytes("local")
+    assert "_llparity" in kernel.name()

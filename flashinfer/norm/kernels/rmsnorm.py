@@ -42,6 +42,7 @@ from ..utils import (
     has_hw_fp8_cvt,
     get_ptr_as_int64,
     get_sm_version,
+    max_cluster_n,
     row_reduce_sum_multirow,
     predicate_k,
     make_tv_layout,
@@ -117,9 +118,12 @@ class RMSNormKernel:
         max_smem_bytes = props.shared_memory_per_block_optin
         occupancy_target = max_smem_bytes // 2
         elem_size = dtype.width // 8
+        max_cluster = max_cluster_n(sm_version)
 
         best_fit = 1
         for cluster_n in [1, 2, 4, 8, 16]:
+            if cluster_n > max_cluster:
+                break
             if H % cluster_n != 0:
                 continue
             smem_needed = RMSNormKernel._estimate_smem_bytes(H, cluster_n, elem_size)
@@ -129,7 +133,7 @@ class RMSNormKernel:
                 best_fit = cluster_n
 
         # Widest split, but only when it divides H; otherwise the best divisor.
-        return 16 if H % 16 == 0 else best_fit
+        return max_cluster if H % max_cluster == 0 else best_fit
 
     @staticmethod
     def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:

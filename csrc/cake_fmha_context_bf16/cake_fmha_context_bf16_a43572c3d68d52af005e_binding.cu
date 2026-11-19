@@ -295,10 +295,10 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_V, TensorView a_O_ptr, Ten
   check_same_device(a_dynamic_counter, a_Q, "dynamic_counter", "Q");
   TVM_FFI_CHECK((a_m_blocks >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (m_blocks >= 1)";
-  TVM_FFI_CHECK((CheckedMul(a_full_sections, 8LL) <= static_cast<int64_t>(static_cast<uint32_t>(a_total_bh))), ValueError)
-      << KERNEL_NAME << ": requires ((full_sections * 8) <= static_cast<int64_t>(static_cast<uint32_t>(total_bh)))";
-  TVM_FFI_CHECK((static_cast<int64_t>(static_cast<uint32_t>(a_total_bh)) < CheckedMul(CheckedAdd(a_full_sections, 1LL), 8LL)), ValueError)
-      << KERNEL_NAME << ": requires (static_cast<int64_t>(static_cast<uint32_t>(total_bh)) < ((full_sections + 1) * 8))";
+  TVM_FFI_CHECK((CheckedMul((a_full_sections & 2147483647LL), 8LL) <= static_cast<int64_t>(static_cast<uint32_t>(a_total_bh))), ValueError)
+      << KERNEL_NAME << ": requires (((full_sections & 2147483647) * 8) <= static_cast<int64_t>(static_cast<uint32_t>(total_bh)))";
+  TVM_FFI_CHECK((static_cast<int64_t>(static_cast<uint32_t>(a_total_bh)) < CheckedMul(CheckedAdd((a_full_sections & 2147483647LL), 1LL), 8LL)), ValueError)
+      << KERNEL_NAME << ": requires (static_cast<int64_t>(static_cast<uint32_t>(total_bh)) < (((full_sections & 2147483647) + 1) * 8))";
   TVM_FFI_CHECK((a_bh_units >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (bh_units >= 1)";
   TVM_FFI_CHECK((static_cast<int64_t>(static_cast<uint32_t>(a_q_heads)) == CheckedMul(a_bh_units, 4LL)), ValueError)

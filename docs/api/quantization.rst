@@ -123,7 +123,7 @@ three cases, but only one public type:
         that default rather than picking up the environment's value.
 
 The four ``FLASHINFER_NVFP4_4OVER6*`` variables are documented in the
-repository's ``CLAUDE.md``. They remain supported as a compatibility shim but
+repository's ``AGENTS.md``. They remain supported as a compatibility shim but
 are deprecated: being process-wide, they cannot express two models served in
 one process under different recipes. When the shim is retired the default of
 ``nvfp4_4over6=`` becomes ``None`` and no signature changes.
@@ -216,6 +216,24 @@ kernels that do not read NVFP4 K/V directly.
 
     nvfp4_kv_materialize_fp8
 
+.. autoclass:: NVFP4KVMaterializer
+    :members: run
+
+CSF Block Scales
+----------------
+
+Block-scale matrices compressed per 16-row slab (CSF), such as NVFP4 MoE expert
+scales kept compressed on the GPU and expanded into the fused MoE scale layout
+before each call.
+
+.. currentmodule:: flashinfer.quantization
+
+.. autosummary::
+    :toctree: ../generated
+
+    encode_csf_scales
+    expand_csf_scales
+
 FP8 Quantization
 ----------------
 
@@ -237,14 +255,3 @@ FP8 Quantization
     ``mxfp8_grouped_quantize`` requires ``cuda.tile`` (a ``requirements.txt``
     dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
     ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
-
-Fused gated-activation MXFP8 quantization
------------------------------------------
-
-.. currentmodule:: flashinfer.gated_act_mxfp8
-
-.. autosummary::
-    :toctree: ../generated
-
-    silu_and_mul_mxfp8_quantize
-    silu_and_mul_mxfp8_quantize_backward

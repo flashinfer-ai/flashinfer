@@ -2,16 +2,18 @@
 
 Routes each operation / shape class to the backend that serves it: the Cake
 programs of ``cake_hopper_sm90`` or the Hopper CuTe DSL backends in
-``cute_dsl/*_sm90.py``. Selection is on capability, never on measured shape
-thresholds: a Cake program is chosen where one exists for the class
-(``*_route_available``), and the surface's raise rules apply before any
-backend is reached.
+``cute_dsl/*_sm90.py``. Selection is on capability: a Cake program is chosen
+where one exists for the class (``*_route_available``), and the surface's
+raise rules apply before any backend is reached. Two measured rules send a
+class to the CuTe DSL kernels instead: fp8 proxy-score decode
+(``_cute_proxy_decode_preferred``) and long sparse-prefill chunks
+(``_CUTE_PREFILL_MIN_SQ``).
 
 Cake-served classes:
 
 * sparse decode: every admitted coordinate;
-* proxy score, decode regime (``max_seqlen_q <= 4``): fp8 and bf16 q with a
-  one-head index cache, Hq in {1, 2, 4};
+* proxy score, decode regime (``max_seqlen_q <= 4``): bf16 q with a one-head
+  index cache, Hq in {1, 2, 4};
 * proxy score, prefill regime: fp8 q with a one-head index cache, in both
   accumulation precisions (``use_fp32_acc``);
 * top-k select: every (Hq, max_k_tiles, total_q) whose planner coordinate
@@ -31,6 +33,41 @@ index cache with a one-head page stride and select no KV head, so an fp8
 index cache with several heads raises in both regimes instead of scoring the
 wrong pages. Both proxy-score prefill backends support f32 accumulation by
 default and explicit f16 accumulation through ``use_fp32_acc=False``.
+
+Measured shapes on which a class served by Cake is not faster than the CuTe
+DSL kernel (H100 SXM, sm_90a, kernel time; CuTe DSL kernels as of commit
+df4d2b03, later CuTe changes not re-measured). Each entry with a ratio gives
+CuTe time / Cake time, then the CuTe and Cake times; below 1 means CuTe is
+faster. Parity entries without numbers were recorded only as within 0.06 us.
+The top-k, proxy-score and sparse-decode shapes below still route to Cake.
+K = 1024 tokens.
+
+* top-k select, topk 16, random fp32 scores. Shapes are
+  (Hq, max_k_tiles, total_q); "masked" adds a per-token
+  ``num_valid_pages``, ``force_begin_blocks=1`` and ``force_end_blocks=2``.
+
+  - slower: plain (1, 2048, 256) 0.92 (5.09 / 5.55 us); masked (1, 64, 32)
+    0.93 (2.29 / 2.46 us); plain (1, 2048, 32) 0.94 (3.79 / 4.02 us);
+    masked (1, 64, 256) 0.95 (2.42 / 2.55 us); masked (1, 2048, 256) 0.96
+    (5.47 / 5.71 us); plain (1, 2048, 1) 0.97 (2.67 / 2.76 us); masked
+    (1, 512, 4096) 0.97 (9.76 / 10.02 us).
+  - parity, the two times within 0.06 us: plain (1, 64, 32), (1, 64, 256),
+    (1, 512, 1) and (4, 512, 1); masked (1, 512, 1), (1, 2048, 1) 0.99
+    (2.80 / 2.83 us), (1, 2048, 32) 0.99 (3.90 / 3.94 us) and (4, 512, 1).
+
+* proxy score, prefill regime: fp8, one index head, batch 1, Cake with the
+  default f32 accumulation against the CuTe kernel with f16 accumulation.
+  Shapes are (Hq, query tokens, context tokens): (1, 8K, 8K) 0.61
+  (10.1 / 16.6 us); (1, 8K, 64K) 0.78 (81 / 104 us); (4, 8K, 64K) 0.83
+  (341 / 411 us); (4, 32K, 256K) 0.87 (5808 / 6642 us); (1, 32K, 256K)
+  0.91 (1515 / 1662 us).
+
+* sparse decode: Hq 8, one KV head, one query token, batch 16. By context
+  length: 100K 0.989 (9.19 / 9.30 us); 200K 0.989 (9.26 / 9.37 us); 256K
+  0.987 (9.29 / 9.42 us).
+
+* sparse prefill: the measured threshold ``_CUTE_PREFILL_MIN_SQ`` already
+  sends the shapes where the CuTe union schedule is faster to it.
 """
 
 import functools
@@ -526,8 +563,10 @@ def sparse_decode_sm90(
     and validates the paged metadata before reaching this function.  The
     program consumes bf16 ``q`` only, so any other ``q`` dtype raises here.
 
-    The Cake program is the default: it is 2-10% faster than the CuTe DSL
-    schedule on every measured shape and needs no dense-packed rebuild. The
+    The Cake program is the default: it is up to 10% faster than the CuTe
+    DSL schedule on most measured shapes, about 1% slower at batch 16 with
+    100K-256K tokens of context (module docstring), and needs no
+    dense-packed rebuild. The
     CuTe schedule is kept as the fallback for geometries Cake does not admit,
     so this op is not single-sourced.
     """

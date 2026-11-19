@@ -409,38 +409,37 @@
       "top_k": 4
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 8,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_e98099346bd1fa80",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_132b3c7375ec35b2"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_c052248eb2c125fa",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551"
-      ],
       "hidden": 4096,
       "intermediate": 14336,
+      "top_k": 2,
       "tokens": 1,
-      "top_k": 2
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551"
+      ]
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 8,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_421f3b27936b47c9",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_1599ea252bb32522"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_c052248eb2c125fa"
-      ],
       "hidden": 4096,
       "intermediate": 14336,
+      "top_k": 2,
       "tokens": 16,
-      "top_k": 2
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_965f6739889697a7",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
     },
     {
       "activation": "swiglu",
@@ -494,38 +493,37 @@
       "top_k": 2
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 8,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_650c97af9a90ea47",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_e4b6abb9d5d6a58d"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_fa8dfdb851d96f50"
-      ],
       "hidden": 4096,
       "intermediate": 14336,
+      "top_k": 2,
       "tokens": 4096,
-      "top_k": 2
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 8,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_650c97af9a90ea47",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_e4b6abb9d5d6a58d"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_fa8dfdb851d96f50",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711"
-      ],
       "hidden": 4096,
       "intermediate": 14336,
+      "top_k": 2,
       "tokens": 8192,
-      "top_k": 2
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_c62afe5551c1ceb1"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
     },
     {
       "activation": "swiglu",
@@ -545,38 +543,37 @@
       "top_k": 2
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 64,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_88af2afd5f152b65",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_c3c7b976ebadfb9a"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_1032f37d20b71ef9",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551"
-      ],
       "hidden": 2048,
       "intermediate": 1408,
+      "top_k": 6,
       "tokens": 1,
-      "top_k": 6
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551"
+      ]
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 64,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_41a2255abf1fc93b",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_18f257f60adf37c9"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_31f870c746158b94",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_ba9bc483fd613604"
-      ],
       "hidden": 2048,
       "intermediate": 1408,
+      "top_k": 6,
       "tokens": 16,
-      "top_k": 6
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_1ee5f076d5383de6",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_1032f37d20b71ef9"
+      ]
     },
     {
       "activation": "swiglu",
@@ -630,38 +627,37 @@
       "top_k": 6
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 64,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_e4b6abb9d5d6a58d",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_650c97af9a90ea47"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_fa8dfdb851d96f50"
-      ],
       "hidden": 2048,
       "intermediate": 1408,
+      "top_k": 6,
       "tokens": 4096,
-      "top_k": 6
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711"
+      ]
     },
     {
-      "activation": "swiglu",
       "arch": "sm_107a",
+      "activation": "swiglu",
       "experts": 64,
-      "fc1": [
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_e4b6abb9d5d6a58d",
-        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_650c97af9a90ea47"
-      ],
-      "fc2": [
-        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711",
-        "sm107_cudnn_frost_grouped_gemm2_bf16_fa8dfdb851d96f50"
-      ],
       "hidden": 2048,
       "intermediate": 1408,
+      "top_k": 6,
       "tokens": 8192,
-      "top_k": 6
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5"
+      ]
     },
     {
       "activation": "swiglu",
@@ -13599,6 +13595,1109 @@
       "intermediate": 1408,
       "tokens": 12288,
       "top_k": 6
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 8,
+      "hidden": 4096,
+      "intermediate": 14336,
+      "top_k": 2,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 8,
+      "hidden": 4096,
+      "intermediate": 14336,
+      "top_k": 2,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_38edd9bd31e965fe",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_55a4fb90f2e5e316"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 8,
+      "hidden": 4096,
+      "intermediate": 14336,
+      "top_k": 2,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_874a8722975e4308"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_6559956b620a5d4b",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_c85ea045c3f1521d"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 8,
+      "hidden": 4096,
+      "intermediate": 14336,
+      "top_k": 2,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_706477d299a3aa17",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_cbdf21af3ae9b3ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 8,
+      "hidden": 4096,
+      "intermediate": 14336,
+      "top_k": 2,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_eb56537b6874bca1"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 1,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_43ba637e8908f28d"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_535afc4934d7c6d2",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a1a2634a05267d9"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 16,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_580595cc439b40ec",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_1032f37d20b71ef9"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6914cbe180dd6fc1",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ddc505948798f732"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_20c3df431bdfc016"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7f7eb060c0697ac1"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_9a1299fed16cd6d6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_cbdf21af3ae9b3ec",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_98ae08832a299773"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 4096,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f21948b3822e9232"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2dc41f0db8a7b78a"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 8192,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f21948b3822e9232"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_706477d299a3aa17"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 32,
+      "hidden": 6144,
+      "intermediate": 9216,
+      "top_k": 2,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f21948b3822e9232",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f09eae2777bcca5c"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 64,
+      "hidden": 2048,
+      "intermediate": 1408,
+      "top_k": 6,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_0580286fdc5ae303"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 64,
+      "hidden": 2048,
+      "intermediate": 1408,
+      "top_k": 6,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_20c3df431bdfc016"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 64,
+      "hidden": 2048,
+      "intermediate": 1408,
+      "top_k": 6,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_a781fb31b7de788b",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_6559956b620a5d4b"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 64,
+      "hidden": 2048,
+      "intermediate": 1408,
+      "top_k": 6,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_9a1299fed16cd6d6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_b0de32329538c662"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_cbdf21af3ae9b3ec",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_dc5f61470e458e59"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 64,
+      "hidden": 2048,
+      "intermediate": 1408,
+      "top_k": 6,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 1,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_1032f37d20b71ef9",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_8bd90f5481ba8e93"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_535afc4934d7c6d2"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_1032f37d20b71ef9",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 16,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_70935d0feab1dafe",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_535afc4934d7c6d2"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_468842687bc9d63d",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_55a4fb90f2e5e316",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_657c86bf28f07836"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2721d40e91fc5e33",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_d90de3b4b4bbbf4f",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_cbdf21af3ae9b3ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 4096,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f21948b3822e9232"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 8192,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f09eae2777bcca5c",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 1,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ba9bc483fd613604"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 16,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_55a4fb90f2e5e316",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_468842687bc9d63d",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_95c9602daef8a9bd"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2721d40e91fc5e33"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_b02addaf57f60940"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 4096,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_9a1299fed16cd6d6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_6766536607954153",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 8192,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 3072,
+      "intermediate": 1536,
+      "top_k": 8,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 1,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_468842687bc9d63d"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 16,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_70935d0feab1dafe"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_468842687bc9d63d"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_a781fb31b7de788b",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_580595cc439b40ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_95c9602daef8a9bd",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_580595cc439b40ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2721d40e91fc5e33",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_6abfad82f3df66c6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_b02addaf57f60940",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_cbdf21af3ae9b3ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 4096,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_874a8722975e4308"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_d90de3b4b4bbbf4f"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 8192,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 256,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "top_k": 6,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f21948b3822e9232"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_4feb1973a849e711"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 1,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2721d40e91fc5e33",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_026b1c52077c25f5"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_1032f37d20b71ef9"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_d04e12a0a7c0fa2c"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 16,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_580595cc439b40ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_580595cc439b40ec",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_a781fb31b7de788b"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ece42d432cd4245e",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_a781fb31b7de788b",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_6127447b0d036934"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_9a1299fed16cd6d6"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_cbdf21af3ae9b3ec",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_a781fb31b7de788b"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 4096,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_d90de3b4b4bbbf4f",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 8192,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_e99ef4000f648344",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2204a376425b31c5"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 2048,
+      "top_k": 8,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ad930239eb0ff937",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_f09eae2777bcca5c"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 1,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2721d40e91fc5e33"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_75d269ed4c73c53c",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 4,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_ce8d48dae943d551",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 16,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_580595cc439b40ec"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 64,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2004081500bb616d",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5c6d127e7dad7b10"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_7046cd67186eaf66",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_dd187d9a4a45cdf8"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 256,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_ece42d432cd4245e",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_5d95076863b78012"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_468842687bc9d63d",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_6127447b0d036934"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 1024,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2721d40e91fc5e33",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_2004081500bb616d"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_95c9602daef8a9bd",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_dd187d9a4a45cdf8"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 4096,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_9a1299fed16cd6d6",
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_93a35ddb4fe3e692"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_95c9602daef8a9bd",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_706477d299a3aa17"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 8192,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_706477d299a3aa17"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 384,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "top_k": 6,
+      "tokens": 16384,
+      "complete": true,
+      "fc1": [
+        "sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_12fb161432bc8074"
+      ],
+      "fc2": [
+        "sm107_cudnn_frost_grouped_gemm2_bf16_0a0dac2b9044c179",
+        "sm107_cudnn_frost_grouped_gemm2_bf16_2dc41f0db8a7b78a"
+      ]
     }
   ],
   "version": 1

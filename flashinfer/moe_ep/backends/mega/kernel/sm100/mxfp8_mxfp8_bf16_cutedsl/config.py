@@ -45,6 +45,10 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_mxfp8_mxfp8_bf16_cutedsl"
+    batch_invariant: bool = field(default=False, kw_only=True)
+    combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = field(
+        default="bf16", kw_only=True
+    )
     kind: Literal["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"] = "mxfp8_e4m3"
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
@@ -90,7 +94,44 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
+            raise ValueError("unsupported combine_dtype")
+        if self.combine_dtype != "bf16" and self.kernel_variant == "genphase":
+            raise ValueError(
+                "quantized combine requires the standard inference provider"
+            )
+        if (
+            self.combine_dtype != "bf16"
+            and self.kernel_name == "sm100_mxfp8_mxfp8_bf16_cutedsl"
+            and (not self.batch_invariant or self.combine_dtype != "mxfp8")
+        ):
+            raise ValueError("legacy quantized combine requires BI MXFP8 wire")
         """Reject incompatible dtype, activation and finalization options."""
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool")
+        if self.batch_invariant:
+            from ..common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            if self.kind not in ("mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
+                raise ValueError("unsupported batch_invariant MX quantization kind")
+            if self.kernel_name not in (
+                "sm100_mxfp8_mxfp4_bf16_cutedsl",
+                "sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+                "sm100_mxfp8_mxfp8_bf16_cutedsl",
+            ):
+                raise ValueError(
+                    "batch_invariant only supports the specified block-scaled backends"
+                )
+            if (
+                self.kind in ("mxfp8_e4m3", "mxfp8_e5m2")
+                and self.kernel_name == "sm100_mxfp8_mxfp4_bf16_cutedsl"
+            ):
+                raise ValueError(
+                    "batch_invariant W8A8 requires the MXFP8-weight backend"
+                )
+            validate_block_scaled_batch_invariant(self, arch="sm_100")
         if (
             self.kind == "mxfp4_mxfp8"
             and self.kernel_variant != "genphase"
@@ -125,7 +166,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "situ_linear_beta must be positive and finite when set."
                 )
-            if self.gate_up_clamp is not None or self.activation_clamp is not None:
+            if not self.batch_invariant and (
+                self.gate_up_clamp is not None or self.activation_clamp is not None
+            ):
                 raise ValueError("Activation clamps are not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")

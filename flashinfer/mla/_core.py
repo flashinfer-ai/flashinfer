@@ -49,6 +49,7 @@ from ._utils import (
     MLAHeadDimensions as MLAHeadDimensions,
     deepseek_mla_dimensions as deepseek_mla_dimensions,
     smaller_mla_dimensions as smaller_mla_dimensions,
+    compact_query_mla_dimensions as compact_query_mla_dimensions,
     nope_mla_dimensions as nope_mla_dimensions,
     supported_mla_head_dimensions as supported_mla_head_dimensions,
     _check_mla_query_kv_shape,
@@ -1948,8 +1949,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     in the combined convention or as ``extra_sparse_topk_lens`` counting
     compressed slots only, which implies a length offset of 128). The kernels
     use ``clamp(len + sparse_topk_lens_offset, 0, sparse_topk)`` entries of
-    each row. No copies are made: tables must be int32 with unit column stride
-    (row strides are free), and ``query``/``out``/KV pools must be densely
+    each row. No copies are made: tables must be int32 with unit column stride,
+    start at a 16-byte aligned address and, with more than one row, have a row
+    stride that is a multiple of 4 (the kernels load index rows 16 bytes at a
+    time), and ``query``/``out``/KV pools must be densely
     packed. ``workspace_buffer`` is carved deterministically and exactly per
     route (:func:`flashinfer.mla.cake_dsv4_workspace_requirement`); any
     buffer from the one-row minimum up works: when one launch over all
@@ -1976,7 +1979,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
         ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
-        E4M3; SM120/SM121 accepts BF16.
+        E4M3; SM120/SM121 accepts BF16. With ``backend="cake"`` and
+        ``kv_cache_format="nvfp4"`` on SM100/SM103 the query is either BF16
+        (the NVFP4 decode family) or packed
+        NVFP4, uint8 with last dimension 384 (the cache's row format: codes,
+        then the 28 E4M3 scale factors), which runs the NVFP4 prefill bodies
+        at any row count; the call packs nothing.
+        :func:`flashinfer.mla.cake_dsv4_nvfp4_pack_query`
+        packs a BF16 query. The output is BF16 with last dimension 512.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
         packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
@@ -2071,8 +2081,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``. With ``backend="cake"``, the separate
-        compressed table ``[T, topk_c]`` INT32 (unit column stride; row stride
-        free) that pairs with a ``[T, 128]`` SWA ``sparse_indices``.
+        compressed table ``[T, topk_c]`` INT32 (unit column stride, 16-byte
+        aligned start and, with more than one row, a row stride that is a
+        multiple of 4) that pairs with a ``[T, 128]`` SWA ``sparse_indices``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32. With ``backend="cake"``, compressed-only lengths ``[T]`` that
@@ -2478,7 +2489,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         else:
             raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
         if out is None:
-            out = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+            # A packed NVFP4 query has 384-byte rows; the output rows are 512 BF16.
+            out = torch.empty(
+                (*query.shape[:-1], 512), dtype=torch.bfloat16, device=query.device
+            )
         return run_cake_dsv4_nvfp4(
             query=query_flat,
             swa_kv_cache=swa_kv_cache,
@@ -3037,10 +3051,10 @@ def _validate_mla_dcp_args(
             f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
             f"cp_rank={cp_rank}, cp_world={cp_world}"
         )
-    if backend not in ("auto", "cute-dsl"):
+    if backend not in ("auto", "cute-dsl", "cake"):
         raise ValueError(
-            f"enable_dcp=True is only supported by backend='cute-dsl', got "
-            f"backend={backend!r}"
+            f"enable_dcp=True is only supported by backend='cute-dsl' and the "
+            f"backend='cake' Kimi-K3 FP8 route, got backend={backend!r}"
         )
     if not return_lse:
         raise ValueError(
@@ -3079,8 +3093,9 @@ def _validate_mla_dcp_args(
     if not causal_seqlens_kv_global.is_contiguous():
         raise ValueError("causal_seqlens_kv_global must be contiguous")
 
-    # DCP masking exists only in the monolithic CuTeDSL implementation.
-    return "cute-dsl"
+    # DCP masking exists in the monolithic CuTeDSL implementation and in the Cake Kimi-K3 FP8
+    # route; backend="auto" keeps CuTeDSL.
+    return "cake" if backend == "cake" else "cute-dsl"
 
 
 def _cute_dsl_incompatibility_reason(
@@ -3584,8 +3599,9 @@ def _mla_with_kv_cache_impl(
         Pre-allocated workspace buffer. Must be zero-initialized on first use
         by kernels that use semaphore state.
     qk_nope_head_dim : int
-        Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
-        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
+        Non-RoPE query dimension before absorption. SM100/SM103 TRTLLM-GEN
+        sparse MLA supports ``64`` with ``kv_lora_rank=512`` and
+        ``qk_rope_head_dim=64``. The SM120/SM121 sparse v32/GLM backend
         validates it together with ``query.shape[-1]``. GLM-5.3 uses the
         native ``qk_rope_head_dim=0`` / ``query.shape[-1]=512`` geometry.
     kv_lora_rank : int
@@ -3698,14 +3714,15 @@ def _mla_with_kv_cache_impl(
         Whether to return LSE values. Supported by ``cake``, ``trtllm-gen``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
-        supported only by monolithic CuTeDSL.
+        supported by monolithic CuTeDSL and by the ``cake`` Kimi-K3 FP8 route.
     return_lse_base : Optional[Literal["basee", "base2"]] = None
         Logarithm base of LSE values, including values written to a supplied
-        ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``
-        backends. ``"basee"`` selects natural-log units and ``"base2"`` selects
-        base-2 units. ``None`` preserves each backend's historical default:
-        base-2 for ``trtllm-gen`` and ``sparse``, and natural-log for monolithic
-        ``cute-dsl``. Select an explicit base for stable units under
+        ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, ``sparse`` and
+        the ``cake`` Kimi-K3 FP8 route. ``"basee"`` selects natural-log units and
+        ``"base2"`` selects base-2 units. ``None`` preserves each backend's
+        historical default: base-2 for ``trtllm-gen`` and ``sparse``, and
+        natural-log for monolithic ``cute-dsl`` and the ``cake`` Kimi-K3 route.
+        Select an explicit base for stable units under
         ``backend="auto"``. This option does not enable LSE output; use
         ``return_lse=True`` to request it. Other values raise
         :class:`ValueError`.
@@ -3763,10 +3780,11 @@ def _mla_with_kv_cache_impl(
         contain one valid dummy index and use length 1.
     enable_dcp : bool = False
         Statically enable cyclic decode context parallelism in the monolithic
-        CuTeDSL MLA kernel. DCP returns a rank-local output/LSE state, so
-        ``return_lse=True`` is required and the caller must merge rank states.
-        Both fixed-Q input and compact variable-Q input described by
-        ``cum_seq_lens_q`` are supported.
+        CuTeDSL MLA kernel (``backend="cute-dsl"`` or ``"auto"``) or in the
+        ``backend="cake"`` Kimi-K3 FP8 route (power-of-two ``cp_world``). DCP
+        returns a rank-local output/LSE state, so ``return_lse=True`` is
+        required and the caller must merge rank states. Both fixed-Q input and
+        compact variable-Q input described by ``cum_seq_lens_q`` are supported.
     cp_world : int = 1
         Compile-time context-parallel world size. Rank ``r`` stores global KV
         positions whose token index modulo ``cp_world`` equals ``r``.
@@ -4360,7 +4378,7 @@ def _mla_with_kv_cache_impl(
             enable_pdl,
         )
     elif resolved_backend == "cake":
-        if _cake_trtllm_mla_blackwell_supports(
+        if not enable_dcp and _cake_trtllm_mla_blackwell_supports(
             query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, sparse_mla_top_k
         ):
             # Two Cake MLA families answer to backend="cake": the TRT-LLM-style Blackwell decode
@@ -4397,17 +4415,15 @@ def _mla_with_kv_cache_impl(
 
         # Cake-generated Kimi-K3 MLA over the FP8 paged latent cache (SM100 / SM103): dense
         # decode, packed variable-Q / MTP and incremental prefill; BF16 output, caller-owned
-        # ``out``, current stream, CUDA-Graph replayable.  Unsupported here: sparse top-k,
-        # sinks, LSE output, DCP, skip-softmax, FP16 softmax, PDL, NVFP4 / uint8 caches.
+        # ``out``, current stream, CUDA-Graph replayable; FP32 LSE (natural log unless
+        # ``return_lse_base="base2"``) and cyclic DCP (``causal_seqlens_kv_global``, ``cp_world``,
+        # ``cp_rank``).  Unsupported here: sparse top-k, sinks, skip-softmax, FP16 softmax, PDL,
+        # NVFP4 / uint8 caches.
         unsupported = []
         if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
             unsupported.append("sparse_mla_top_k")
         if sinks is not None:
             unsupported.append("sinks")
-        if return_lse or lse is not None:
-            unsupported.append("return_lse / lse")
-        if enable_dcp:
-            unsupported.append("enable_dcp")
         if skip_softmax_threshold_scale_factor is not None:
             unsupported.append("skip_softmax_threshold_scale_factor")
         if use_fp16_softmax:
@@ -4439,9 +4455,13 @@ def _mla_with_kv_cache_impl(
                 dtype=torch.bfloat16,
                 device=query.device,
             )
+        if return_lse and lse is None:
+            lse = torch.empty(
+                query.shape[:-1], dtype=torch.float32, device=query.device
+            )
         from .cake_kimi_k3_mla import run_cake_kimi_k3_mla_fp8_paged_attention
 
-        return run_cake_kimi_k3_mla_fp8_paged_attention(
+        run_cake_kimi_k3_mla_fp8_paged_attention(
             query,
             kv_cache,
             block_tables,
@@ -4453,7 +4473,15 @@ def _mla_with_kv_cache_impl(
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
             max_seq_len=int(max_seq_len),
+            lse=lse,
+            lse_base="2" if return_lse_base == "base2" else "e",
+            causal_seqs=causal_seqlens_kv_global
+            if enable_dcp and cp_world > 1
+            else None,
+            cp_world=cp_world if enable_dcp else 1,
+            cp_rank=cp_rank if enable_dcp else 0,
         )
+        return (out, lse) if return_lse else out
 
     elif resolved_backend == "sparse":
         # Packed SM120/SM121 sparse MLA only, despite the helper's legacy

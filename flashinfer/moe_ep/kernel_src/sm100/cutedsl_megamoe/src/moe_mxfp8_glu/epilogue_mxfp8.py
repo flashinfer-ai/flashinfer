@@ -39,7 +39,11 @@ from moe_nvfp4_swapab.contract import (
 )
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 
-from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row
+from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row, cvt_f32x4_to_f8x4_pack_i32
+from flashinfer.moe_ep.batch_invariant.mxfp8_device import PackedF32 as Mx8PackedF32, ScalarF32 as Mx8ScalarF32
+from flashinfer.moe_ep.batch_invariant.mxfp8_spec import legacy_fc1_activation, legacy_quantize_block_precast
+from flashinfer.moe_ep.batch_invariant.nvfp4_spec import fc2_output
+from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
 from cutlass.cute.typing import Float32
 from moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
@@ -173,7 +177,10 @@ class GluMxfp8Epilogue:
         use_stg_fc1: bool = False,
         combine_format: Optional[Any] = None,
         act_func: str = "swiglu",
+        batch_invariant: bool = False,
     ) -> None:
+        self.batch_invariant = batch_invariant
+        self._batch_invariant_host_clamp = glu_clamp
         self._act_func = act_func
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout
@@ -655,7 +662,7 @@ class GluMxfp8Epilogue:
             for idx in cutlass.range_constexpr(EpiWarpCount):
                 g_fc1_output_warp_view = cute.local_tile(
                     real_fc1_output,
-                    (EpilogueTileN, Fc1EpilogueOutputTileN, 1),
+                    (*self._epi_tile, 1),
                     (base_token_tile + idx, work_tile_info.tile_n_idx, 0),
                 )
                 GluMxfp8Epilogue.tma_store_fc1_output(
@@ -680,7 +687,29 @@ class GluMxfp8Epilogue:
         multiplication association order is part of each pipeline's numerical
         contract with its host reference).
         """
-        swiglu_act(t_swiglu, t_up, t_gate, prob)
+        if cutlass.const_expr(self.batch_invariant):
+            weight = None
+            if cutlass.const_expr(prob is not None):
+                weight = (prob, prob)
+            for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
+                if cutlass.const_expr(getattr(self, "batch_invariant_activation", None) is not None):
+                    t_swiglu[i], t_swiglu[i + 1] = activation_accumulator(
+                        Mx8PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        variant=self.batch_invariant_activation,
+                        weight=weight,
+                    )
+                else:
+                    t_swiglu[i], t_swiglu[i + 1] = legacy_fc1_activation(
+                        Mx8PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        weight=weight,
+                        clamp=self._batch_invariant_host_clamp,
+                    )
+        else:
+            swiglu_act(t_swiglu, t_up, t_gate, prob)
 
     @cute.jit
     def _run_fc1_subtile(
@@ -740,7 +769,7 @@ class GluMxfp8Epilogue:
                 c_pipeline=c_pipeline,
             )
 
-        if cutlass.const_expr(self.glu_clamp is not None):
+        if cutlass.const_expr(self.glu_clamp is not None and not self.batch_invariant):
             for i in cutlass.range_constexpr(cute.size(r_up)):
                 r_gate[i] = fmin(r_gate[i], self.glu_clamp)
                 r_up[i] = fmin(r_up[i], self.glu_clamp)
@@ -762,7 +791,24 @@ class GluMxfp8Epilogue:
         c = cute.make_rmem_tensor(r_layout.shape, self.fc1_output_dtype)
         if cutlass.const_expr(self.fc1_output_dtype.width == 8):
             # Quantized hand-off: fp8 data + E8M0 block scale.
-            qpvscale = quant_sfd_row(swiglu, c, norm_const, self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype)
+            if cutlass.const_expr(self.batch_invariant):
+                # Each lane owns one complete, ordered logical block32.
+                kind = "mxfp8_e4m3" if self.fc1_output_dtype is cutlass.Float8E4M3FN else "mxfp8_e5m2"
+                scaled, qpvscale = legacy_quantize_block_precast(
+                    Mx8ScalarF32,
+                    (swiglu[0], swiglu[1], swiglu[2], swiglu[3], swiglu[4], swiglu[5], swiglu[6], swiglu[7], swiglu[8], swiglu[9], swiglu[10], swiglu[11], swiglu[12], swiglu[13], swiglu[14], swiglu[15], swiglu[16], swiglu[17], swiglu[18], swiglu[19], swiglu[20], swiglu[21], swiglu[22], swiglu[23], swiglu[24], swiglu[25], swiglu[26], swiglu[27], swiglu[28], swiglu[29], swiglu[30], swiglu[31]),
+                    quant_kind=kind,
+                )
+                for i in cutlass.range_constexpr(self._sf_vec_size):
+                    swiglu[i] = scaled[i]
+                c_i32 = cute.recast_tensor(c, cutlass.Int32)
+                for i in cutlass.range_constexpr(0, self._sf_vec_size, 4):
+                    fp32x4 = cute.make_rmem_tensor(4, Float32)
+                    for j in cutlass.range_constexpr(4):
+                        fp32x4[j] = swiglu[i + j]
+                    c_i32[i // 4] = cutlass.Int32(cvt_f32x4_to_f8x4_pack_i32(fp32x4, self.fc1_output_dtype))
+            else:
+                qpvscale = quant_sfd_row(swiglu, c, norm_const, self._sf_vec_size, self.sf_dtype, self.fc1_output_dtype)
             if subtile_idx == 0:
                 rmem_sf[0] = qpvscale
             elif subtile_idx == 1:
@@ -931,10 +977,7 @@ class GluMxfp8Epilogue:
                 # 3. Write E8M0 scale to local fc2_output_sf for token-back push.
                 fp8_dtype = self._combine_format.act_dtype
                 r_fp8 = cute.make_rmem_tensor(r_acc_layout.shape, fp8_dtype)
-                qpvscale = quant_sfd_row(
-                    r_acc, r_fp8, 1.0, EpilogueTileN,
-                    cutlass.Float8E8M0FNU, fp8_dtype,
-                )
+                qpvscale = self._quantize_fc2_combine(r_acc, r_fp8, fp8_dtype)
                 pool_token_global = (
                     work_tile_info.cumulative_data_physical_row
                     + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
@@ -981,10 +1024,7 @@ class GluMxfp8Epilogue:
                 )
                 fp8_dtype = self._combine_format.act_dtype
                 r_fp8 = cute.make_rmem_tensor(r_acc_layout.shape, fp8_dtype)
-                qpvscale = quant_sfd_row(
-                    r_acc, r_fp8, 1.0, EpilogueTileN,
-                    cutlass.Float8E8M0FNU, fp8_dtype,
-                )
+                qpvscale = self._quantize_fc2_combine(r_acc, r_fp8, fp8_dtype)
                 # Write 32 fp8 elements to local fc2_output_workspace pool.
                 fp8_byte_addr = (
                     token_comm_args.fc2_output_workspace.iterator.toint()
@@ -1012,7 +1052,11 @@ class GluMxfp8Epilogue:
             else:
                 # BF16 path (default): fp32->bf16, two 256-bit STGs.
                 r_bf16 = cute.make_rmem_tensor(r_acc_layout.shape, cutlass.BFloat16)
-                r_bf16.store(r_acc.load().to(cutlass.BFloat16))
+                if cutlass.const_expr(self.batch_invariant):
+                    for i in cutlass.range_constexpr(cute.size(r_acc)):
+                        r_bf16[i] = fc2_output(Mx8ScalarF32, r_acc[i])
+                else:
+                    r_bf16.store(r_acc.load().to(cutlass.BFloat16))
                 stg_atom = cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256,
                 )
@@ -1083,6 +1127,25 @@ class GluMxfp8Epilogue:
 
         iket.range_pop()
 
+
+    @cute.jit
+    def _quantize_fc2_combine(self, r_acc, r_fp8, fp8_dtype):
+        if cutlass.const_expr(self.batch_invariant):
+            values = cute.coalesce(r_acc)
+            scaled, scale = legacy_quantize_block_precast(
+                Mx8ScalarF32,
+                tuple(values[i] for i in range(EpilogueTileN)),
+                quant_kind="mxfp8_e4m3",
+            )
+            scaled_regs = cute.make_rmem_tensor((EpilogueTileN,), cutlass.Float32)
+            for i in cutlass.range_constexpr(EpilogueTileN):
+                scaled_regs[i] = scaled[i]
+            cute.coalesce(r_fp8).store(scaled_regs.load().to(fp8_dtype))
+            return scale
+        return quant_sfd_row(
+            r_acc, r_fp8, 1.0, EpilogueTileN,
+            cutlass.Float8E8M0FNU, fp8_dtype,
+        )
 
     @cute.jit
     def _write_sf_fc2_buffer(self, rmem_sf_fc2, subtile_idx, qpvscale) -> None:
@@ -1293,7 +1356,11 @@ class GluMxfp8Epilogue:
             gmem_sf_f8 = cute.make_tensor(sf_ptr, cute.make_layout(4))
             sf_layout = cute.make_layout(4)
             r_sf_f8 = cute.make_rmem_tensor(sf_layout.shape, self.sf_dtype)
-            r_sf_f8.store(rmem_sf_f32.load().to(self.sf_dtype))
+            if cutlass.const_expr(self.batch_invariant):
+                for i in cutlass.range_constexpr(4):
+                    r_sf_f8[i] = Mx8ScalarF32.cvt_out(rmem_sf_f32[i], "ue8m0")
+            else:
+                r_sf_f8.store(rmem_sf_f32.load().to(self.sf_dtype))
             cute.autovec_copy(r_sf_f8, gmem_sf_f8)
 
 

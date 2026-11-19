@@ -2668,7 +2668,7 @@ def _heuristic_dynamic_route_mode(
         routed_rows=query.routed_rows,
         num_experts=query.num_experts,
         n=dynamic_n,
-        deterministic_output=False,
+        deterministic_output=bool(query.deterministic_output),
         planned_tile_m=planned_tile_m,
     )
     if (
@@ -2835,6 +2835,8 @@ def _heuristic_moe_decode_config(
             and query.routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
         ):
             backend = "dynamic"
+    if backend == "micro" and query.deterministic_output:
+        backend = "dynamic"
     dynamic_tile_m = None
     dynamic_route_mode = None
     if backend == "dynamic":

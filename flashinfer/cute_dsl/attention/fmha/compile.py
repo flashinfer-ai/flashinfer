@@ -234,6 +234,8 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
     device: torch.device,
     has_window_left: bool = False,
     has_window_right=None,
+    *,
+    p_exp_mode: str = "exp2",
 ):
     """Compile (and cache) the trtllm block-scaled FMHA kernel (batched, non-varlen)."""
     from .fmha_blockscaled import BlackwellFusedMultiHeadBlockScaledAttentionForward
@@ -256,6 +258,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
+        p_exp_mode=p_exp_mode,
         # Rescale threshold compresses the dynamic range when quantizing P and interferes
         # skip-softmax criteria. Limit rescale threshold to a small epsilon (0.0 disables
         # skip-correction) when either is enabled.

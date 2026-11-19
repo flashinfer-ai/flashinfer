@@ -3021,6 +3021,7 @@ def run_mtp_decode(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    verify_parents: Optional[torch.Tensor] = None,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -3054,6 +3055,11 @@ def run_mtp_decode(
             that batch slot (matching the read-side padding skip semantics).
         cache_replayssm: Whether to persist only the fold-every-commit
             ReplaySSM inputs instead of full intermediate states.
+        verify_parents: Optional int32 [B, T] parent indices for tree-structured
+            drafts. Requires ``parent[i] < i`` for ``i >= 1``; the root entry
+            may be -1 or 0. Checked on device only when
+            ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. Only the tcgen05
+            ReplaySSM verify honors it; any other path raises.
     """
     if B == 0:
         return
@@ -3073,6 +3079,63 @@ def run_mtp_decode(
     use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
+
+    # SM120 frozen-state ReplaySSM fast path.  SM120 has no tcgen05, so the
+    # state/K, state/Q and Gram products use TF32 warp MMA (mma.sync).  It is
+    # selected where it beats the FMA path: always when B * HV <= 128 (few
+    # CTAs, where splitting V rows across CTAs helps most), and for larger
+    # batches only when T >= 7.  At T <= 6 the FMA path is as fast or faster
+    # (up to ~15% at T=4) once B * HV > 128.
+    use_replayssm_hmma = (
+        (target.major, target.minor) == (12, 0)
+        and cache_replayssm
+        and disable_state_update
+        and not cache_intermediate_states
+        and not per_token_pool_scatter
+        and not use_pool_indexing
+        and output_writeback is None
+        and h0_source.dtype == torch.float32
+        and initial_state_indices.dtype == torch.int32
+        and 4 <= T <= 8
+        and K == 128
+        and V == 128
+        and 1 <= B <= 256
+        and use_qk_l2norm
+        and (use_inline_kernel or T >= 7)
+    )
+    if use_replayssm_hmma:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_hmma import (
+            run_gdn_verify_kernel_mtp_replayssm_hmma,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_hmma(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+            # Split each head's V rows across CTAs so enough state loads are
+            # in flight: four ways when there are few heads, two otherwise.
+            v_split=4 if use_inline_kernel else 2,
+        )
+        return
 
     # SM100 frozen-state ReplaySSM fast path.  One CTA owns two adjacent
     # (V=128, K=128) heads, shares their Q/K and Gram work, streams both FP32
@@ -3125,8 +3188,16 @@ def run_mtp_decode(
             H,
             HV,
             scale,
+            verify_parents,
         )
         return
+    if verify_parents is not None:
+        raise ValueError(
+            "verify_parents is only supported by the tcgen05 ReplaySSM verify "
+            "(SM100/SM103, cache_replayssm with a contiguous fp32 pool, int32 "
+            "indices and BF16 output, 4 <= T <= 8, B <= 256, K = V = 128, even HV "
+            "and HV // H, use_qk_l2norm); this call does not qualify"
+        )
 
     # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:

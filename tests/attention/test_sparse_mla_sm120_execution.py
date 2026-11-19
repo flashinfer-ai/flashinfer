@@ -51,13 +51,21 @@ def test_wrapper_eager_scratch_peak_and_graph_pinning(sm12x):
     lse_bytes = sum(entry.workspace[2][2] for entry in entries)
     assert torch.cuda.memory_allocated() - before <= max_scratch + lse_bytes + (1 << 20)
     torch.testing.assert_close(saved_lse, expected_lse, atol=0, rtol=0)
-    assert all(entry.mid is None and entry.mlse is None for entry in entries)
+    for entry in entries:
+        for buffer, (_, _, size, _) in zip(
+            (entry.mid, entry.mlse), entry.workspace[:2], strict=True
+        ):
+            # Zero-workspace plans keep empty ABI tensors, not scratch storage.
+            if size:
+                assert buffer is None
+            else:
+                assert buffer.numel() == 0
 
     wrapper = SparseMLASm120Wrapper(
         kv_scale_format="ue8m0_g32", compute_precision="fp8"
     )
     states = []
-    for tokens in (4, 8):
+    for tokens in (1, 2):
         lse = run(tokens)
         states.append(
             (tokens, lse, output[:tokens].clone(), lse.clone(), torch.cuda.CUDAGraph())
