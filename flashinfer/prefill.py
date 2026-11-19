@@ -3251,11 +3251,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
             with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
             key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
-            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). Inputs
-            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, ``q_scale``, head dims other than
-            64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
+            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K block scales are
+            linear and the V block scales are linear unless ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token interleaved
+            layout -- the layout is not detectable, so a cache written for ``trtllm-gen`` must be planned with it). Inputs
+            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, non-unit scales of an
+            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
+            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
+            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
+            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache; any other value raises. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -6039,11 +6043,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
             with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
             key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
-            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). Inputs
-            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, ``q_scale``, head dims other than
-            64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
+            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K and V block scales
+            of the ragged pool are linear -- TRT-LLM's 4-token interleaved V layout is a layout of the pages of a paged
+            cache, stated on the paged wrappers with ``plan(v_sf_swizzled=True)``). Inputs
+            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, non-unit scales of an
+            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
+            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
+            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
+            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache; any other value raises. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).

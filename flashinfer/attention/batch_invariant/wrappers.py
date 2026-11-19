@@ -12,9 +12,16 @@ The fp8-KV classes take ``plan(kv_data_type=torch.float8_e4m3fn | torch.float8_e
 host: a synchronisation) in the chain the specification states (``spec.py``): ``c = fp32(sm_scale * k_scale * log2 e)`` and one
 ``mul.rn`` by ``v_scale`` before the output rounding. The NVFP4-KV class ``attention.nvfp4kv`` takes ``plan(kv_data_type=torch.uint8)``
 (FlashInfer's packed NVFP4 cache, ``head_dim // 2`` bytes per row) and at ``run()`` the ``kv_cache_sf`` block scales in the wrappers'
-forms (a ``(k_sf, v_sf)`` tuple, or the single 5-D tensor of the paged wrappers; e4m3 bytes, ``head_dim // 16`` per row, the linear
-layout the NVFP4 append kernel writes) with the same two per-tensor scales. Per-(token, head) fp8 scales (``use_token_head_sf``),
-``q_scale`` and ``o_scale`` are not classes of the mode and raise the typed error.
+forms (a ``(k_sf, v_sf)`` tuple, or the single 5-D tensor of the paged wrappers; e4m3 bytes, ``head_dim // 16`` per row) with the
+same two per-tensor scales. The K block scales are linear; the V block scales are in the layout ``plan(v_sf_swizzled=)``
+states -- ``False`` (the default): linear, what ``nvfp4_quantize_append_paged_kv_cache`` writes; ``True``: the 4-token swizzle
+trtllm-gen reads, which serving engines write for it. The layout cannot be detected from the tensors: a cache read in the
+other layout gives wrong values with no error, so the caller must state it. Per-(token, head) fp8 scales (``use_token_head_sf``)
+are not classes of the mode and raise the typed error.
+
+Unit scales (``neutral.py``): the query and the output are unscaled bf16 in every class, so ``q_scale`` / ``o_scale`` are accepted
+at ``None`` or exactly ``1.0`` (what a serving engine passes on every call) and refused at any other value; ``k_scale`` /
+``v_scale`` follow the same rule for a bf16 KV cache and are operands of the low-bit KV classes.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the

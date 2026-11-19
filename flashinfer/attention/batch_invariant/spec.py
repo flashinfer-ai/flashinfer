@@ -36,7 +36,15 @@ The NVFP4-KV class ``attn.nvfp4kv.d<D>`` takes the cache as e2m1 nibbles with on
 head dim (FlashInfer's NVFP4 paged KV cache and its ``kv_cache_sf``) and the same two per-tensor scales: every K and V leaf is
 ``dq4(values, block_scale)`` -- the e2m1 values times their block scale, a product of at most six significant bits within the
 bf16 range, so the leaf is an exact bf16 value and no rounding step enters the term -- and the chain is the fp8-KV classes'
-(the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding).
+(the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding). The layout the block scales are stored in
+(linear, or the V scales of a paged cache in the 4-token swizzle: ``engine.check_v_sf_layout``) is an address of a leaf, not a
+part of it: one class and one fingerprint for both.
+
+The low-bit-KV classes are stated, like the bf16 class, for finite cache values: the non-finite fp8 codes (the e4m3 NaN, the
+e5m2 infinities and NaNs; an e4m3 NaN block scale) are widened like any code -- a NaN stays a NaN, an infinity an infinity --
+and then give what fp32 softmax arithmetic gives for a non-finite operand; nothing on the device checks for them. The scales
+are checked on the host (``engine.check_sm_scale`` / ``engine.check_v_scale``): ``c`` a normal binary32 number, the key scale
+a positive binary32 number, the value scale finite and nonzero in binary32.
 """
 
 from __future__ import annotations
