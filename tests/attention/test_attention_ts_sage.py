@@ -614,6 +614,7 @@ def _check_case(case: _SageCase, q, k, v, params, summaries) -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "case",
     [
@@ -634,6 +635,7 @@ def test_sage_matches_dequantized_reference(case: _SageCase) -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "case",
     [
