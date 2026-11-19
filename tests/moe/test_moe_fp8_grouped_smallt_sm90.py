@@ -613,6 +613,98 @@ def test_two_moe_layers_concurrent_graph_replay():
         assert torch.equal(out2, ref2)
 
 
+@pytest.mark.parametrize("T", [1, 4, 16, 256])
+@pytest.mark.parametrize("w13_value", [2.0**-14, 2.0**-15, 2.0**-16])
+def test_block_peak_small_products_survive(T, w13_value):
+    # Regression (Codex, round 2): a FIXED 2^-14 weight prescale made the
+    # half FC2 chain overflow-safe but flushed small products to zero
+    # before the fp32 unscale: with W13=2^-15 and W2=64 through the public
+    # preparer, T<=16 returned 0 where the analytic result is ~2.0156 (the
+    # pre-fix kernel returned 2.0, within 0.8%), and W13=2^-14 was off by
+    # 12.3%. The chain now runs the original half arithmetic (bit-for-bit
+    # the pre-existing lower-range behavior) and falls back to fp32
+    # products only for chunks that actually overflow, so BOTH ends of the
+    # admitted range survive.
+    _sm90_or_skip()
+    from flashinfer.fused_moe.prepare import prepare_cutlass_fp8_block_weights
+
+    device = torch.device("cuda:0")
+    w13 = torch.full((E, 2 * I, H), w13_value, dtype=torch.bfloat16, device=device)
+    w2 = torch.full((E, H, I), 64.0, dtype=torch.bfloat16, device=device)
+    view = prepare_cutlass_fp8_block_weights(
+        w13, w2, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    g = torch.Generator(device=device)
+    g.manual_seed(0)
+    ids = torch.stack(
+        [torch.randperm(E, generator=g, device=device)[:K] for _ in range(T)]
+    ).to(torch.int32)
+    b = dict(
+        x=torch.ones((T, H), dtype=torch.bfloat16, device=device),
+        w13=view["fc1_expert_weights"],
+        s13=view["fc1_block_scale"],
+        w2=view["fc2_expert_weights"],
+        s2=view["fc2_block_scale"],
+        ids=ids,
+        tw=torch.full((T, K), 1.0 / K, dtype=torch.float32, device=device),
+    )
+    ref = _reference(b)
+    out = _dispatch(b)
+    assert out is not None
+    rel = float(((out.float() - ref).abs() / ref.abs().clamp_min(1e-30)).max())
+    # 2% envelope: the fp16 intermediate is half-subnormal at these
+    # magnitudes, so ~0.8% is inherent (and was the pre-existing kernel's
+    # behavior); zero outputs or the 12.3% prescale warp must fail.
+    assert rel <= 0.02, (rel, float(out.float().min()), float(ref.min()))
+
+
+def test_fork_join_branches_within_one_capture_get_distinct_scratch():
+    # Regression (Codex, round 2): keying graph scratch by capture id ALONE
+    # aliased parallel fork/join branches recorded on different streams
+    # inside one capture — those branches run concurrently at replay (only
+    # same-stream work within a capture is ordered), so two MoELayer calls
+    # in forked branches corrupted each other 100/100. Scratch is owned per
+    # (capture, capture-time stream) now.
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    layer1, act1, weights1, _b1 = _unified_layer(16, None, seed=11)
+    layer2, act2, weights2, _b2 = _unified_layer(16, None, seed=83)
+    ref1 = layer1(act1, weights1).clone()
+    ref2 = layer2(act2, weights2).clone()
+    # prime one eager workspace per branch stream (the warmup pattern)
+    sa, sb = torch.cuda.Stream(), torch.cuda.Stream()
+    sa.wait_stream(torch.cuda.current_stream())
+    sb.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(sa):
+        layer1(act1, weights1)
+    with torch.cuda.stream(sb):
+        layer2(act2, weights2)
+    torch.cuda.current_stream().wait_stream(sa)
+    torch.cuda.current_stream().wait_stream(sb)
+    torch.cuda.synchronize()
+
+    before = set(smallt._graph_workspaces)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=sa):
+        fork = torch.cuda.Event()
+        fork.record()
+        out1 = layer1(act1, weights1)  # branch 0 on the capture stream
+        with torch.cuda.stream(sb):
+            sb.wait_event(fork)
+            out2 = layer2(act2, weights2)  # branch 1, forked stream
+        torch.cuda.current_stream().wait_stream(sb)  # join
+    new_ws = [v for k, v in smallt._graph_workspaces.items() if k not in before]
+    assert len(new_ws) == 2, "each forked branch must own its scratch"
+    assert new_ws[0].data_ptr() != new_ws[1].data_ptr()
+
+    for _ in range(100):
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out1, ref1)
+        assert torch.equal(out2, ref2)
+
+
 def test_pack_inputs_binds_no_cutlass_workspace():
     # The specialized runner never consumes the CUTLASS workspace, so
     # neither packing path (pack_inputs or the tuning-input hook) may load
