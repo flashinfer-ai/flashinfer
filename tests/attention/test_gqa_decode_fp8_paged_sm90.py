@@ -1010,7 +1010,10 @@ def test_small_probabilities_survive_fp16_p_staging(gap):
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 1, stats
     ref = _reference(batch, q_descale=qd, v_descale=vd)
-    assert not bool((out.float() == 0).all())
+    # every low-probability key carries positive V, so every row, head and
+    # channel must retain a strictly positive contribution: a tolerance check
+    # alone would accept zeros for the ~1e-3 reference values at gap 22
+    assert bool((out.float() > 0).all())
     assert _matched_ratio(out, ref) >= MATCHED
     # the recovered contributions are small; hold them to a tight absolute bound
     assert float((out.float() - ref.float()).abs().max()) <= 2e-3
