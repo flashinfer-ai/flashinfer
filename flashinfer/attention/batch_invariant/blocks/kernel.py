@@ -31,6 +31,7 @@ from ..plan import (
     F_KVLEN,
     F_MODE,
     F_QBASE,
+    F_RANGES,
     F_QLEN,
     F_QTOK0,
     F_REQ,
@@ -103,7 +104,9 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        ranged: bool = False,
     ):
+        self.ranged = ranged  # the ranged class (a compile-time constant of the body)
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
             g,
@@ -151,6 +154,7 @@ class AttentionKernel:
             self.ragged,
             self.hw_rowmax,
             self.cap,
+            self.ranged,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
@@ -552,6 +556,11 @@ class AttentionKernel:
                 stats_prod.advance(2 * k)
                 for u in range(bidx, num_units, grid_size):
                     uk = 2 * u + k
+                    q_base = Int32(0)
+                    range_row0 = Int32(0)
+                    if cutlass.const_expr(st.ranged):
+                        q_base = mDesc[(uk, F_QBASE)]
+                        range_row0 = mDesc[(uk, F_RANGES)]
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
                         k,
@@ -574,9 +583,17 @@ class AttentionKernel:
                         mDesc[(uk, F_QLEN)],
                         mDesc[(uk, F_TILE_LO)],
                         mDesc[(uk, F_TILE_HI)],
+                        mDesc,
+                        q_base,
+                        range_row0,
                     )
             if cutlass.const_expr(not st.q2):
                 for u in range(bidx, num_units, grid_size):
+                    q_base = Int32(0)
+                    range_row0 = Int32(0)
+                    if cutlass.const_expr(st.ranged):
+                        q_base = mDesc[(u, F_QBASE)]
+                        range_row0 = mDesc[(u, F_RANGES)]
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
                         k,
@@ -599,6 +616,9 @@ class AttentionKernel:
                         mDesc[(u, F_QLEN)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        mDesc,
+                        q_base,
+                        range_row0,
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx >= R.correction_warps[0] and warp_idx < R.mma_warp:

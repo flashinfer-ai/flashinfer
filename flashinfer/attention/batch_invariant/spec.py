@@ -1,6 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
+"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal) and ``attn.bf16.d<D>.br`` (causal with
+per-row bidirectional ranges).
+
+The ranged class gives a row one more input, a key range ``[a, b)`` of its request: the row at position ``p`` sees the causal keys
+``[lo, p + 1)`` (``lo`` from the optional sliding window) united with ``[a, b)``. The tiles, the chunks, the online softmax and the
+merge are the same dataflow; only the visible set differs, so a row with an empty range has the causal class's term, node for node.
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -29,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ...batch_invariant import canon
 from ...batch_invariant.fp_interface.term import to_f32
@@ -102,34 +107,61 @@ def scale_log2(sm_scale: float) -> float:
 
 @dataclass(frozen=True)
 class RowSpec:
-    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)`` with
-    ``L = p + 1`` (causal) and ``lo = max(0, p - window_left)``; ``row`` names the row (query token and head) in the leaf terms."""
+    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys: the causal keys
+    ``[lo_causal, p + 1)`` with ``lo_causal = max(0, p - window_left)``, united with the row's bidirectional range ``brange = (a, b)``
+    (the keys ``[a, b)``; ``None`` or ``a >= b``: no range, the causal class's row). ``[lo, L)`` is the hull of the visible keys;
+    ``row`` names the row (query token and head) in the leaf terms."""
 
     p: int
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
+    brange: Optional[Tuple[int, int]] = (
+        None  # the bidirectional range [a, b) of the ranged class
+    )
+
+    @property
+    def range_keys(self) -> Optional[Tuple[int, int]]:
+        """The row's range ``(a, b)`` when it holds a key, else ``None``."""
+        if self.brange is None:
+            return None
+        a, b = self.brange
+        assert a >= 0, self.brange
+        return (a, b) if a < b else None
+
+    @property
+    def lo_causal(self) -> int:
+        return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
 
     @property
     def L(self) -> int:
-        return self.p + 1
+        r = self.range_keys
+        return self.p + 1 if r is None else max(self.p + 1, r[1])
 
     @property
     def lo(self) -> int:
-        return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
+        r = self.range_keys
+        return self.lo_causal if r is None else min(self.lo_causal, r[0])
 
     def visible(self, k: int) -> bool:
-        return self.lo <= k < self.L
+        r = self.range_keys
+        return self.lo_causal <= k <= self.p or (r is not None and r[0] <= k < r[1])
 
 
 def visible_keys(row: RowSpec, t: int, T: int = TILE_KEYS) -> List[int]:
     """The visible absolute keys of tile ``t`` for ``row`` (empty = the tile is absent)."""
     a, b = max(row.lo, t * T), min(row.L, (t + 1) * T)
-    return list(range(a, b)) if a < b else []
+    return [k for k in range(a, b) if row.visible(k)]
 
 
 def present_chunks(row: RowSpec, D: int) -> List[int]:
     C = chunk_len(D, row.L)
-    return list(range(row.lo // C, -(-row.L // C))) if row.lo < row.L else []
+    return [
+        j
+        for j in range(row.lo // C, -(-row.L // C))
+        if any(
+            row.visible(k) for k in range(max(row.lo, j * C), min(row.L, (j + 1) * C))
+        )
+    ]
 
 
 # ----------------------------------------------------------------------------- the engine reductions
@@ -389,18 +421,34 @@ FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
+def ranged_sample_row(T: int, C: int) -> RowSpec:
+    """The ranged class's sample row: a windowed causal part in the third chunk and a range that starts inside the first tile and ends
+    inside the second chunk, so the row has a masked head and tail of a tile on both parts, a chunk of which only the first tile is
+    present, tiles and chunk-interior keys absent between the two parts, and three merged chunks."""
+    return RowSpec(p=2 * C + T // 2, window_left=T // 4, brange=(T // 2, C + T // 4))
+
+
+def spec_fingerprint(D: int = 128, window_left: int = -1, ranges: bool = False) -> str:
     """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
     spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
     masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
     input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row."""
-    key = (D, window_left)
+    is the digest of the no-window sample row; ``window_left`` here only selects another sample row.
+
+    ``ranges``: the ranged class (``attn-bf16-d<D>-br-*``), whose rows take a bidirectional key range next to the causal keys. Its
+    receipt digests ``ranged_sample_row`` and records the mask mode; a row without a range has the causal class's term under it, so
+    the two receipts name the same bits for such rows and differ as identifiers of what a row may see."""
+    if ranges and window_left != -1:
+        raise ValueError("the ranged class's receipt has one sample row")
+    key = (D, window_left, bool(ranges))
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D)
-        row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
+        if ranges:
+            row = ranged_sample_row(spec.T, spec.C)
+        else:
+            row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
         parts = [
             f"D={D}",
             f"T={spec.T}",
@@ -409,8 +457,11 @@ def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
+        if ranges:
+            parts.insert(3, "mask=causal+ranges")
         _FINGERPRINTS[key] = (
             f"attn-bf16-d{D}-"
+            + ("br-" if ranges else "")
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]

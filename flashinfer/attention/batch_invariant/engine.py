@@ -26,8 +26,10 @@ import torch
 
 from .plan import (
     DESC_FIELDS,
+    F_RANGES,
     GRID_SEARCH_ARCHES,
     GROUP_FIELDS,
+    RANGE_ROW_TOKENS,
     build_plan,
     snake_order,
     ws_row,
@@ -380,6 +382,38 @@ class _Planned:
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
         self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
+        self.ranged = False  # the ranged class: the descriptor table carries the per-token range table (set by plan_attention)
+
+
+def _host_ranges(ranges: Optional[torch.Tensor], total_q: int):
+    """The ranged class's per-token ranges as a host int32 array of pairs ``(a, b)`` (the keys ``[a, b)``; ``a == b``: none), one
+    per packed query token; ``None`` for the causal class."""
+    if ranges is None:
+        return None
+    if ranges.dim() != 2 or ranges.shape[1] != 2 or ranges.shape[0] != total_q:
+        raise ValueError(
+            f"ranges of shape {tuple(ranges.shape)}: one (a, b) pair per packed query token is ({total_q}, 2)"
+        )
+    host = ranges.to("cpu").to(torch.int64)
+    if bool(
+        ((host[:, 0] < 0) | (host[:, 0] > host[:, 1]) | (host[:, 1] >= 2**31)).any()
+    ):
+        raise ValueError("ranges must satisfy 0 <= a <= b < 2^31 per token")
+    return host.to(torch.int32).contiguous().numpy()
+
+
+def _desc_table(rows: list, ranges, device=None) -> torch.Tensor:
+    """The kernel's descriptor argument: the unit rows and, for the ranged class, the per-token range table behind them
+    (``plan.F_RANGES`` of every unit row is the table's first row). The table covers a whole Q tile past the last token, so
+    the padding rows of a unit read zeros (no range) inside the table."""
+    units = torch.tensor(rows if rows else [[0] * DESC_FIELDS], dtype=torch.int32)
+    if ranges is None:
+        return units.to(device)
+    units[:, F_RANGES] = units.shape[0]
+    n_tok = ranges.shape[0] + 128  # MAX_GROUP rows of padding tokens at most
+    table = torch.zeros(-(-n_tok // RANGE_ROW_TOKENS) * DESC_FIELDS, dtype=torch.int32)
+    table[: 2 * ranges.shape[0]] = torch.from_numpy(ranges).reshape(-1)
+    return torch.cat((units, table.view(-1, DESC_FIELDS))).to(device)
 
 
 def plan_attention(
@@ -396,8 +430,12 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    ranges: Optional[torch.Tensor] = None,
 ) -> _Planned:
-    """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
+    """``ranges`` selects the ranged class: an integer ``(total_q, 2)`` tensor with one key range ``(a, b)`` per packed query token
+    (the keys ``[a, b)`` of the token's request, ``0 <= a <= b <= kv_len``; ``a == b``: none, the causal row). The plan is built for
+    these ranges (a snapshot: the kernel reads the plan's copy); its batches take the row body.
+    ``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
     holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
     if ragged:
@@ -412,8 +450,13 @@ def plan_attention(
         if sm_count is not None
         else (device_sm_count(device) if device.type == "cuda" else 204)
     )
+    qo_list = qo_indptr.cpu().tolist()
+    host_ranges = _host_ranges(ranges, qo_list[-1] if qo_list else 0)
+    ranged = host_ranges is not None
+    # the ranged class's batches take the row body (the Swaps-AB kernel implements the causal mask alone)
+    small_swap = config.small == "swap" and D in SWAPS_DIMS and not ranged
     plan = build_plan(
-        qo_indptr.cpu().tolist(),
+        qo_list,
         kv_indptr.cpu().tolist(),
         kv_last_page_len.cpu().tolist(),
         Hq,
@@ -424,25 +467,22 @@ def plan_attention(
         config.split_policy,
         sm,
         merge=config.merge,
-        small_swap=config.small == "swap" and D in SWAPS_DIMS,
+        small_swap=small_swap,
         swap_max_rows=SWAPS_MAX_ROWS,
         grid=config.grid,
         grid_search=planner_grid_search(device),
+        ranges=host_ranges,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
-    desc = torch.tensor(
-        plan.desc if plan.desc else [[0] * DESC_FIELDS],
-        dtype=torch.int32,
-        device=device,
-    )
+    rows = plan.desc
     if (
         config.q2
         and len(plan.desc) >= Q2_MIN_UNITS_PER_SM[D] * sm
-        and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))
+        and not (small_swap and swaps_n_pad(plan))
     ):
-        paired = pair_units(plan.desc, sm)
-        plan.num_launch = len(paired) // 2
-        desc = torch.tensor(paired, dtype=torch.int32, device=device)
+        rows = pair_units(plan.desc, sm)
+        plan.num_launch = len(rows) // 2
+    desc = _desc_table(rows, host_ranges, device)
     groups = torch.tensor(
         plan.groups if plan.groups else [[0] * GROUP_FIELDS],
         dtype=torch.int32,
@@ -483,6 +523,7 @@ def plan_attention(
         torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
     )
     planned.ragged = ragged
+    planned.ranged = ranged
     planned.heads = (int(Hq), int(Hkv))
     planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
@@ -503,9 +544,11 @@ def workspace_bytes(
     config: Optional[AttnConfig] = None,
     device=None,
     ragged: bool = False,
+    ranges: Optional[torch.Tensor] = None,
 ) -> int:
     """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
-    group); the planner runs on the host, nothing is allocated."""
+    group); the planner runs on the host, nothing is allocated. ``ranges``: the ranged class's per-token ranges, as
+    ``plan_attention`` takes them."""
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -514,8 +557,10 @@ def workspace_bytes(
     config = config or default_config(D=D)
     device = torch.device(device or qo_indptr.device)
     sm = device_sm_count(device) if device.type == "cuda" else 204
+    qo_list = qo_indptr.cpu().tolist()
+    host_ranges = _host_ranges(ranges, qo_list[-1] if qo_list else 0)
     plan = build_plan(
-        qo_indptr.cpu().tolist(),
+        qo_list,
         kv_indptr.cpu().tolist(),
         kv_last_page_len.cpu().tolist(),
         Hq,
@@ -526,9 +571,10 @@ def workspace_bytes(
         config.split_policy,
         sm,
         merge=config.merge,
-        small_swap=config.small == "swap" and D in SWAPS_DIMS,
+        small_swap=config.small == "swap" and D in SWAPS_DIMS and host_ranges is None,
         swap_max_rows=SWAPS_MAX_ROWS,
         grid_search=planner_grid_search(device),
+        ranges=host_ranges,
     )
     return plan.ws_rows * ws_row(D) * 4
 
@@ -717,7 +763,12 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
-    n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
+    ranged = bool(getattr(planned, "ranged", False))
+    n_pad = (
+        swaps_n_pad(plan)
+        if (config.small == "swap" and D in SWAPS_DIMS and not ranged)
+        else 0
+    )
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
 
@@ -760,7 +811,7 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap
+                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, ranged
             )
         else:
             kernel = get_compiled_attention(
@@ -773,6 +824,7 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
+                ranged,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -808,7 +860,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(
+        get_fixup(D, g, ranged)(
             planned.ws,
             o_view,
             planned.fixup_groups,
@@ -837,8 +889,10 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
+    ranges: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned). ``ranges``: the ranged class
+    (``plan_attention``): one key range ``(a, b)`` per packed query token, seen next to the causal keys."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -855,6 +909,7 @@ def attention_paged(
         config,
         workspace,
         q.device,
+        ranges=ranges,
     )
     return run_attention(
         planned,

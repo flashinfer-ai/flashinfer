@@ -43,6 +43,7 @@ from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
 from .. import spec
+from ..plan import RANGE_ROW_TOKENS
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
@@ -162,11 +163,15 @@ def unit_loop(
     q_len: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    mDesc: cute.Tensor,
+    q_base: Int32,
+    range_row0: Int32,
 ):
     """One unit for softmax warpgroup ``k``, in the full-row placement (its slice = keys ``[k kpt, (k+1) kpt)``) or the
     replicated-row placement (warp ``wq`` of the warpgroup takes slice ``4k + wq`` of ``4 n_wg``; the warpgroup's four
     slices are gathered in its warp 0 through smem before the P store). ``k`` is dynamic: the warpgroups run one copy
-    of this code (the slice index only moves TMEM column offsets and smem indices)."""
+    of this code (the slice index only moves TMEM column offsets and smem indices). ``mDesc``, ``q_base`` (the request's first packed
+    token) and ``range_row0`` (the range table's first row) are read by the ranged class's body only: the row's key range."""
     T, g, TPC = st.T, st.g, st.tpc
     tidx, _, _ = cute.arch.thread_idx()
     thread_idx = tidx % 128  # thread within the warpgroup (= TMEM lane)
@@ -288,6 +293,16 @@ def unit_loop(
         lo_row = pos - window_left
         if lo_row < 0:
             lo_row = Int32(0)
+    # the ranged class: the row also sees the keys [a_row, b_row) of its token's entry of the range table (a == b: none); a
+    # padding row's token may lie past the batch, inside the table's zero tail
+    a_row = Int32(0)
+    b_row = Int32(0)
+    if cutlass.const_expr(st.ranged):
+        tq = q_base + token
+        range_row = range_row0 + tq // RANGE_ROW_TOKENS
+        range_col = 2 * (tq % RANGE_ROW_TOKENS)
+        a_row = mDesc[(range_row, range_col)]
+        b_row = mDesc[(range_row, range_col + 1)]
     neg_inf = Float32(_NEG_INF)
     m = Float32(_NEG_INF)
     N = tile_hi - tile_lo
@@ -330,20 +345,86 @@ def unit_loop(
         # mask only the tiles that need it: a boundary of a live row's visible range inside the tile. Interior tiles
         # are fully visible and padding rows (row >= rows_valid) are never masked: their values are never stored (a
         # warp-uniform decision, no arithmetic involved)
-        need_mask = cute.arch.vote_any_sync(
-            ((k0 < lo_row) | (k0 + T > L_row)) & (row < rows_valid)
-        )
+        if cutlass.const_expr(st.ranged):
+            # a tile is unmasked for a row when it lies inside the row's causal keys or inside its range
+            need_mask = cute.arch.vote_any_sync(
+                ((k0 < lo_row) | (k0 + T > L_row))
+                & ((k0 < a_row) | (k0 + T > b_row))
+                & (row < rows_valid)
+            )
+        else:
+            need_mask = cute.arch.vote_any_sync(
+                ((k0 < lo_row) | (k0 + T > L_row)) & (row < rows_valid)
+            )
         if need_mask:
-            if cutlass.const_expr(not exchange):
-                for i in cutlass.range_constexpr(T):
-                    key = k0 + cols_f[i]
-                    if (key < lo_row) | (key >= L_row):
-                        rF[i] = neg_inf
-            if cutlass.const_expr(not one_slice):
-                for i in cutlass.range_constexpr(kpt):
-                    key = k0 + col_base + cols_s[i]
-                    if (key < lo_row) | (key >= L_row):
-                        rS[i] = neg_inf
+            if cutlass.const_expr(st.ranged):
+                # the keys of this tile the row sees are the hull [u_lo, u_hi) of its causal part and its range part less the
+                # gap [g_lo, g_hi) between the two (empty unless both parts lie in the tile, apart)
+                k1 = k0 + T
+                u_lo = lo_row
+                if u_lo < k0:
+                    u_lo = k0
+                u_hi = L_row
+                if u_hi > k1:
+                    u_hi = k1
+                r_lo = a_row
+                if r_lo < k0:
+                    r_lo = k0
+                r_hi = b_row
+                if r_hi > k1:
+                    r_hi = k1
+                g_lo = Int32(0)
+                g_hi = Int32(0)
+                if r_lo < r_hi:
+                    if u_lo < u_hi:
+                        g_lo = u_hi
+                        if r_hi < g_lo:
+                            g_lo = r_hi
+                        g_hi = u_lo
+                        if r_lo > g_hi:
+                            g_hi = r_lo
+                        if r_lo < u_lo:
+                            u_lo = r_lo
+                        if r_hi > u_hi:
+                            u_hi = r_hi
+                    else:
+                        u_lo = r_lo
+                        u_hi = r_hi
+                # key in [lo, hi) as ONE unsigned compare, (key - lo) < (hi - lo): a key is masked when it is outside the hull
+                # or inside the gap -- two compares per key, as the causal body's mask
+                w_u = u_hi - u_lo
+                if w_u < 0:
+                    w_u = Int32(0)
+                w_g = g_hi - g_lo
+                if w_g < 0:
+                    w_g = Int32(0)
+                wu = cutlass.Uint32(w_u)
+                wg = cutlass.Uint32(w_g)
+                if cutlass.const_expr(not exchange):
+                    du = cutlass.Uint32(k0 - u_lo)
+                    dg = cutlass.Uint32(k0 - g_lo)
+                    for i in cutlass.range_constexpr(T):
+                        col = cutlass.Uint32(int(cols_f[i]))
+                        if ((du + col) >= wu) | ((dg + col) < wg):
+                            rF[i] = neg_inf
+                if cutlass.const_expr(not one_slice):
+                    du_s = cutlass.Uint32(k0 + col_base - u_lo)
+                    dg_s = cutlass.Uint32(k0 + col_base - g_lo)
+                    for i in cutlass.range_constexpr(kpt):
+                        col = cutlass.Uint32(int(cols_s[i]))
+                        if ((du_s + col) >= wu) | ((dg_s + col) < wg):
+                            rS[i] = neg_inf
+            else:
+                if cutlass.const_expr(not exchange):
+                    for i in cutlass.range_constexpr(T):
+                        key = k0 + cols_f[i]
+                        if (key < lo_row) | (key >= L_row):
+                            rF[i] = neg_inf
+                if cutlass.const_expr(not one_slice):
+                    for i in cutlass.range_constexpr(kpt):
+                        key = k0 + col_base + cols_s[i]
+                        if (key < lo_row) | (key >= L_row):
+                            rS[i] = neg_inf
         if cutlass.const_expr(exchange):
             sp = []
             for i in cutlass.range_constexpr(kpt):
@@ -483,6 +564,9 @@ def softmax_loop(
     q_len: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    mDesc: cute.Tensor,
+    q_base: Int32,
+    range_row0: Int32,
 ):
     """One unit for softmax warpgroup ``k``: the replicated-row placement when the unit has at most ``rep_rows = (32 // g) g``
     live rows (``g <= 32``), the full-row placement otherwise. Returns the advanced pipelines."""
@@ -511,6 +595,9 @@ def softmax_loop(
                 q_len,
                 tile_lo,
                 tile_hi,
+                mDesc,
+                q_base,
+                range_row0,
             )
         else:
             s_cons, p_prod, stats_prod = unit_loop(
@@ -536,6 +623,9 @@ def softmax_loop(
                 q_len,
                 tile_lo,
                 tile_hi,
+                mDesc,
+                q_base,
+                range_row0,
             )
     else:
         s_cons, p_prod, stats_prod = unit_loop(
@@ -561,5 +651,8 @@ def softmax_loop(
             q_len,
             tile_lo,
             tile_hi,
+            mDesc,
+            q_base,
+            range_row0,
         )
     return s_cons, p_prod, stats_prod

@@ -12,7 +12,9 @@ does not allow. Which of the two kinds a Q tile gets is the planner's choice (it
 count); every choice computes the same bits (R3).
 
 Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_len``) sits at
-``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``.
+``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. Under the ranged class (``ranges``) token ``i`` also
+sees its own key range ``[a_i, b_i)``: a row block's tiles and chunks are the hull of its tokens' visible keys, which may reach
+past the block's last position, and the unit and group construction is otherwise the same.
 """
 
 from __future__ import annotations
@@ -41,7 +43,12 @@ DESC_FIELDS = 16
     F_TILE_HI,
     F_QBASE,
     F_GROUP,
-) = range(14)
+    F_RANGES,
+) = range(15)
+# F_RANGES (the ranged class; 0 otherwise): the descriptor-table row at which the per-token range table starts. Range row ``r`` holds
+# the ranges of the packed query tokens ``8 r .. 8 r + 7`` as ``RANGE_ROW_TOKENS`` pairs ``(a, b)`` (the keys ``[a, b)``; ``a == b``:
+# none); ``engine.plan_attention`` appends the table to the unit rows, so the kernel's descriptor argument carries both
+RANGE_ROW_TOKENS = DESC_FIELDS // 2
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
@@ -362,6 +369,36 @@ def swaps_unit_kinds(
     return fused, best_grid
 
 
+def range_hulls(ranges, tok0: int, q_len: int, tpt: int, kv_len: int) -> tuple:
+    """Per row block of a request (``tpt`` tokens each, the request's tokens ``tok0 .. tok0 + q_len`` of the packed ``ranges``):
+    the smallest range start and the largest range end over the block's tokens that have a range, as two lists (``kv_len`` and
+    ``0`` for a block without one). ``ranges`` is a sequence of ``(a, b)`` pairs or an integer array of shape ``(total_q, 2)``
+    (reduced with numpy: the planner's cost per token is then a few nanoseconds)."""
+    n_blk = -(-q_len // tpt)
+    if hasattr(ranges, "shape"):
+        import numpy as np
+
+        seg = ranges[tok0 : tok0 + q_len]
+        has = seg[:, 0] < seg[:, 1]
+        assert bool(((seg[:, 0] >= 0) & (seg[:, 1] <= kv_len))[has].all()), (
+            f"a range outside the request's keys [0, {kv_len})"
+        )
+        a = np.full(n_blk * tpt, kv_len, dtype=np.int64)
+        e = np.zeros(n_blk * tpt, dtype=np.int64)
+        a[:q_len] = np.where(has, seg[:, 0], kv_len)
+        e[:q_len] = np.where(has, seg[:, 1], 0)
+        return a.reshape(n_blk, tpt).min(axis=1).tolist(), e.reshape(n_blk, tpt).max(
+            axis=1
+        ).tolist()
+    los, his = [kv_len] * n_blk, [0] * n_blk
+    for i, (a, e) in enumerate(ranges[tok0 : tok0 + q_len]):
+        if a < e:
+            assert a >= 0 and e <= kv_len, (a, e, kv_len)
+            los[i // tpt] = min(los[i // tpt], a)
+            his[i // tpt] = max(his[i // tpt], e)
+    return los, his
+
+
 def build_plan(
     qo_indptr: Sequence[int],
     kv_indptr: Sequence[int],
@@ -379,8 +416,14 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
     grid_search: bool = True,
+    ranges: Optional[Sequence[Sequence[int]]] = None,
 ) -> Plan:
-    """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
+    """``ranges`` (the ranged class): per packed query token its key range ``(a, b)`` -- the keys ``[a, b)`` of its request, within
+    ``[0, kv_len]``, ``a == b`` for none (a sequence of pairs, or an integer array of shape ``(total_q, 2)``). A row block's tile
+    and chunk ranges are the hull of its tokens' visible keys (the causal keys and the range of every token), so they may reach
+    past the block's last position; tiles and chunks inside the hull without a visible key for a row are that row's null steps
+    and absent chunks.
+    ``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
     live rows) takes the kinds and the launch grid of ``swaps_unit_kinds`` (a makespan model over the SM count: every unit fused on
     the grid of integral waves, or every multi-chunk unit split). Otherwise a multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows
     (a decode unit) splits when the fused unit count would leave the machine underfilled (``< 2 x SM``), a wider tile (a prefill
@@ -412,12 +455,17 @@ def build_plan(
         assert kv_len >= q_len, (
             f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
         )
+        if ranges is not None:
+            hull_lo, hull_hi = range_hulls(ranges, qo_indptr[b], q_len, tpt, kv_len)
         for tok0 in range(0, q_len, tpt):
             ntok = min(tpt, q_len - tok0)
             p_first = kv_len - q_len + tok0
             p_last = p_first + ntok - 1
             L_max = p_last + 1
             lo_min = max(0, p_first - window_left) if window_left >= 0 else 0
+            if ranges is not None:
+                lo_min = min(lo_min, hull_lo[tok0 // tpt])
+                L_max = max(L_max, hull_hi[tok0 // tpt])
             chunk_lo, chunk_hi = lo_min // C, -(-L_max // C)
             tile_lo, tile_hi = lo_min // T, -(-L_max // T)
             for h in range(Hkv):

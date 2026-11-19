@@ -799,6 +799,7 @@ def fold_group(
                         chunk_len(st.D),
                         8 if st.n_wg == 1 else 4,
                         st.ws_row,
+                        st.ranged,
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(
