@@ -254,9 +254,10 @@ def _domain_launch(device: int, batch_size: int, scale: float, table, homed):
 
 # --------------------------------------------------------------------------- bits
 
-# The shape list: the listed batch classes' edges (48 / 63 / 64 / 127 / 128 / 255 / 256),
-# a row inside the first and the last class (56 / 512) and B = 1024, at both scales.
-# Below 48 rows no cell is listed (test_states_the_twin_does_not_serve_run_the_whole_body).
+# The shape list: the edges of the listed batch classes (48 / 63 / 64 / 127 / 128 /
+# 255 / 256), a row inside the first and the last class (56 / 512) and B = 1024, at
+# both scales.  Below 48 rows no cell is listed: see
+# test_states_the_twin_does_not_serve_run_the_whole_body.
 _TWIN_BATCHES = [48, 56, 63, 64, 127, 128, 255, 256, 512, 1024]
 
 

@@ -364,6 +364,21 @@ def _wrapper(shape, dtype) -> torch.Tensor:
     )
 
 
+class _Converted:
+    """What the fake ``_cake_gdn_launch_arg`` makes of ``tensor``: equal to another
+    conversion of the same object, and to nothing else, so a twin argument shows
+    whether it went through the conversion, and from what."""
+
+    def __init__(self, tensor) -> None:
+        self.tensor = tensor
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _Converted) and other.tensor is self.tensor
+
+    def __repr__(self) -> str:
+        return f"_Converted({self.tensor!r})"
+
+
 def _decode_inputs(batch_size: int) -> dict[str, torch.Tensor]:
     bf16, fp32 = torch.bfloat16, torch.float32
     return {
@@ -382,7 +397,8 @@ def _decode_inputs(batch_size: int) -> dict[str, torch.Tensor]:
 class _Device:
     """Fakes for one device: its capability and SM count, its SM table (counting the
     queries), the state homing records, the current stream (or a capture), the claim
-    counters and the kernel entries (each records its calls)."""
+    counters, the conversion of launch arguments (``_Converted``), the warnings and
+    the kernel entries (each records its calls; ``launch_error`` fails every one)."""
 
     def __init__(
         self, monkeypatch, *, capability=(10, 7), sm_count=212, counts=(106, 106)
@@ -393,6 +409,8 @@ class _Device:
         self.homings: dict[int, cake_locality.Homing] = {}
         self.failing: set[str] = set()
         self.failing_launch: set[str] = set()
+        self.launch_error: str | None = None
+        self.warnings: list[str] = []
         self.table = self.make_table(counts)
         self.counters = (object(), object())
         self.table_queries = 0
@@ -408,7 +426,14 @@ class _Device:
         monkeypatch.setattr(cake_locality, "tensor_homing", self.tensor_homing)
         monkeypatch.setattr(cake_locality, "launch_counters", self.launch_counters)
         monkeypatch.setattr(gdn_decode, "_cake_gdn_eager_stream", self.eager_stream)
-        monkeypatch.setattr(gdn_decode, "_cake_gdn_launch_arg", lambda tensor: tensor)
+        monkeypatch.setattr(gdn_decode, "_cake_gdn_launch_arg", _Converted)
+        monkeypatch.setattr(
+            gdn_decode,
+            "logger",
+            types.SimpleNamespace(
+                warning=lambda message, *args: self.warnings.append(message % args)
+            ),
+        )
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES", {})
@@ -433,6 +458,8 @@ class _Device:
 
         def entry(*args):
             self.calls.append((name, args))
+            if self.launch_error is not None:
+                raise RuntimeError(f"{self.launch_error}: {name}")
             if name in self.failing_launch:
                 raise RuntimeError(f"failed to load the kernel of {name}")
 
@@ -478,12 +505,17 @@ def _whole_args(inputs, grid_x):
     ) + (grid_x, 1, 1)
 
 
-def _twin_args(inputs, device, rows0):
+def _twin_args(inputs, device, rows0, *, captured=False):
+    # The SM table converted once by the binding; an eager launch's converted counter
+    # pair, a captured launch's pair as launch_counters returned it.
     batch_size = inputs["q"].shape[0]
+    counters = device.counters
+    if not captured:
+        counters = tuple(_Converted(counter) for counter in counters)
     return _whole_args(inputs, 0)[:9] + (
         rows0,
-        *device.counters,
-        device.table.entries,
+        *counters,
+        _Converted(device.table.entries),
         batch_size * 32,
         1,
         1,
@@ -548,7 +580,7 @@ def test_homed_state_launches_the_twin_in_a_listed_cell(
             record,
             whole,
             twin,
-            device.table.entries,
+            _Converted(device.table.entries),
         )
         device.calls.clear()
     assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)]
@@ -637,8 +669,9 @@ def test_twin_build_failure_is_remembered_and_runs_whole(monkeypatch) -> None:
 
 def test_twin_load_failure_at_its_launch_runs_whole(monkeypatch) -> None:
     # A twin whose kernel fails to load at its first launch (the failure comes before
-    # the launch) leaves the call to the row's whole launch, and every later call on
-    # such a state runs the whole launch alone; the whole launch table keeps its value.
+    # the launch) leaves the call to the row's whole launch, which runs; the twin is
+    # dropped with one warning, and every later call on such a state runs the whole
+    # launch alone; the whole launch table keeps its value.
     device = _Device(monkeypatch)
     device.failing_launch.add(_twin_name(_SCALE))
     inputs = _decode_inputs(64)
@@ -664,6 +697,101 @@ def test_twin_load_failure_at_its_launch_runs_whole(monkeypatch) -> None:
     assert record is device.homings[id(inputs["state"])] and domain is None
     assert table is None
     assert whole is gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES[key]
+    (warning,) = device.warnings
+    assert "failed to load or launch" in warning
+    assert f"failed to load the kernel of {_twin_name(_SCALE)}" in warning
+
+
+@pytest.mark.parametrize("launched", [False, True])
+def test_twin_launch_error_propagates_and_keeps_the_twin(monkeypatch, launched) -> None:
+    # A launch error of the call, not of the twin (the whole launch fails too, as on
+    # the legacy default stream while another thread captures on a blocking stream),
+    # raises the whole launch's error, as a call on an unhomed state does, and keeps
+    # the twin: no warning, the same twin launch and binding, and the next call runs
+    # the twin.  That holds at the twin's first launch too.
+    device = _Device(monkeypatch)
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+    if launched:
+        _run(inputs)
+    device.calls.clear()
+    device.launch_error = "operation not permitted when stream is capturing"
+    with pytest.raises(RuntimeError) as raised:
+        _run(inputs)
+    assert str(raised.value) == f"{device.launch_error}: {_whole_name(_SCALE)}"
+    assert str(raised.value.__context__).endswith(_twin_name(_SCALE))
+    assert [name for name, _ in device.calls] == [
+        _twin_name(_SCALE),
+        _whole_name(_SCALE),
+    ]
+    assert device.calls[0][1] == _twin_args(inputs, device, 32)
+    assert device.calls[1][1] == _whole_args(inputs, 64 * 32)
+    assert device.warnings == []
+    key = (0, 64, 16, 16, 32, _SCALE, True)
+    ((domain_key, launch),) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.items()
+    assert domain_key == key + ((106, 106), 32 * _ROW_BYTES)
+    assert launch[0] is not None
+    record = device.homings[id(inputs["state"])]
+    assert gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES[id(record)][2] is launch
+    device.launch_error = None
+    device.calls.clear()
+    for _ in range(2):
+        assert _run(inputs) is inputs["output"]
+    assert device.calls == [(_twin_name(_SCALE), _twin_args(inputs, device, 32))] * 2
+    assert device.loads.count(_twin_name(_SCALE)) == 1
+    assert device.warnings == []
+
+
+def test_twin_load_failure_is_dropped_where_the_whole_launch_runs(monkeypatch) -> None:
+    # A twin that fails to load at a call whose whole launch fails too is kept (the
+    # call raises the whole launch's error); the first call whose whole launch runs
+    # drops it.
+    device = _Device(monkeypatch)
+    device.failing_launch.add(_twin_name(_SCALE))
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+    device.launch_error = "unspecified launch failure"
+    with pytest.raises(RuntimeError, match="unspecified launch failure"):
+        _run(inputs)
+    assert device.warnings == []
+    (launch,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.values()
+    assert launch[0] is not None
+    device.launch_error = None
+    for _ in range(2):
+        assert _run(inputs) is inputs["output"]
+    assert [name for name, _ in device.calls] == [
+        _twin_name(_SCALE),
+        _whole_name(_SCALE),
+        _twin_name(_SCALE),
+        _whole_name(_SCALE),
+        _whole_name(_SCALE),
+    ]
+    assert len(device.warnings) == 1
+    (launch,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.values()
+    assert launch[0] is None
+
+
+def test_twin_takes_the_bound_table_and_converted_eager_counters(monkeypatch) -> None:
+    # The twin takes the SM table its allocation's binding converted once, on every
+    # call, eager or captured; an eager launch takes its stream's converted counter
+    # pair, and a captured launch the pair launch_counters returned, unconverted.
+    device = _Device(monkeypatch)
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+    for _ in range(2):
+        _run(inputs)
+    device.capturing = True
+    _run(inputs)
+    record = device.homings[id(inputs["state"])]
+    table = gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES[id(record)][3]
+    assert table == _Converted(device.table.entries)
+    eager, again, captured = [args for _, args in device.calls]
+    assert eager == again == _twin_args(inputs, device, 32)
+    assert captured == _twin_args(inputs, device, 32, captured=True)
+    assert all(args[12] is table for args in (eager, again, captured))
+    assert eager[10] is again[10] and eager[11] is again[11]
+    assert captured[10] is device.counters[0] and captured[11] is device.counters[1]
+    assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)] * 2
 
 
 def test_twin_launch_follows_the_sm_table_and_the_cut(monkeypatch) -> None:
@@ -682,17 +810,17 @@ def test_twin_launch_follows_the_sm_table_and_the_cut(monkeypatch) -> None:
     device.table = device.make_table((106, 106))
     _run(inputs)
     assert device.loads.count(_twin_name(_SCALE)) == 1
-    assert device.calls[-1][1][12] is first.entries
+    assert device.calls[-1][1][12] == _Converted(first.entries)
     device.home(inputs["state"], rows0=32)
     _run(inputs)
     assert device.loads.count(_twin_name(_SCALE)) == 2
-    assert device.calls[-1][1][12] is device.table.entries
+    assert device.calls[-1][1][12] == _Converted(device.table.entries)
     device.home(inputs["state"], rows0=20)
     _run(inputs)
     device.table = device.make_table((100, 112))
     device.home(inputs["state"], rows0=20)
     _run(inputs)
-    assert device.calls[-1][1][12] is device.table.entries
+    assert device.calls[-1][1][12] == _Converted(device.table.entries)
     assert [args[9] for _, args in device.calls] == [32, 32, 32, 32, 20, 20]
     keys = sorted(key[-2:] for key in gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES)
     assert keys == [
@@ -768,7 +896,7 @@ def test_homed_allocation_is_bound_once(monkeypatch) -> None:
     assert [name for name, _ in device.calls] == [_whole_name(_SCALE)] + [
         _twin_name(_SCALE)
     ] * 2
-    assert device.calls[-1][1][12] is device.table.entries
+    assert device.calls[-1][1][12] == _Converted(device.table.entries)
 
 
 def test_twin_counters_are_reused_per_stream_and_thread(monkeypatch) -> None:
@@ -795,29 +923,32 @@ def test_twin_counters_are_reused_per_stream_and_thread(monkeypatch) -> None:
         assert name == _twin_name(_SCALE)
         return args[10:12]
 
+    def converted(pair):
+        return tuple(_Converted(counter) for counter in pair)
+
     first = used()
-    assert used() == first == pairs[0] and used() == first
+    assert used() == first == converted(pairs[0]) and used() == first
     device.stream = 9
     second = used()
-    assert second == pairs[1] and used() == second
+    assert second == converted(pairs[1]) and used() == second
     device.stream = 7
     assert used() == first and len(pairs) == 2
     theirs: list[tuple] = []
     thread = threading.Thread(target=lambda: theirs.append(used()))
     thread.start()
     thread.join()
-    assert theirs == [pairs[2]]
+    assert theirs == [converted(pairs[2])]
     assert used() == first and len(pairs) == 3
     device.capturing = True
     assert [used(), used()] == pairs[3:5]
     device.capturing = False
     after = used()
-    assert after == pairs[5] and used() == after and len(pairs) == 6
+    assert after == converted(pairs[5]) and used() == after and len(pairs) == 6
     monkeypatch.setattr(cake_locality, "STREAM_PAIR_LIMIT", 2)
     device.stream = 11
-    assert used() == pairs[6] and len(pairs) == 7
+    assert used() == converted(pairs[6]) and len(pairs) == 7
     device.stream = 7
-    assert used() == pairs[7] and len(pairs) == 8
+    assert used() == converted(pairs[7]) and len(pairs) == 8
     assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)] * 8
 
 

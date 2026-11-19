@@ -281,8 +281,11 @@ after the dynamic shared-memory opt-in; 4 CTAs per SM if the query fails).
 `CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES` lists the cells by architecture
 and SM count, die class (even when the dies' SM counts differ by at most 4)
 and batch class: on 212-SM devices both die classes from B = 48 on (timed
-with the L2 flushed by a read before each call, the twin ran slower than the
-whole body at B = 32 to 44, so the `B32-47` class lists no cell). The
+with the L2 flushed by a read before each call, the twin was not faster than
+the whole body at the timed rows below 48: B = 32, 34, 36, 37, 40 and 44 at
+scale `K ** -0.5`, and B = 32 and 37, and 44 on one board, at scale 1.0; at
+B = 47 it ran faster, but the cells start at B = 48, so the `B32-47` class
+lists no cell). The
 public nontranspose decode runs the twin only for a state that is the whole
 homed allocation on a device with an SM table, in a listed cell; it keeps
 those launches in `gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`, keyed

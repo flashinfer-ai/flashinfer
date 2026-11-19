@@ -546,11 +546,11 @@ _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT = 1024
 # ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` key, the dies' SM counts and the die cut of the homed
 # state: ``(entry, grid_x, rows0, table)``, where ``entry`` is the twin's kernel entry or
 # ``None`` when the row runs its whole-GPU launch on that state (no twin listed for the cell
-# or shipped for the row, or a twin that failed to build or load), ``grid_x`` the requested
-# grid (B * HV; the host shim launches at most the resident CTAs), ``rows0`` the batch row
-# nearest the die cut and ``table`` the SM table the launch was resolved with (a hit is
-# reused only for the same table object).  Cleared when it reaches
-# ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
+# or shipped for the row, or a twin that failed to build, load or launch), ``grid_x``
+# the requested grid (B * HV; the host shim launches at most the resident CTAs),
+# ``rows0`` the batch row nearest the die cut and ``table`` the SM table the launch was
+# resolved with (a hit is reused only for the same table object).  Cleared when it
+# reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
 _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES: dict[tuple, tuple] = {}
 # Bytes of one [K=128, V=128] FP32 state head.
 _CAKE_GDN_HEAD_BYTES = 128 * 128 * 4
@@ -567,8 +567,8 @@ _CAKE_GDN_HEAD_BYTES = 128 * 128 * 4
 # SM table it was resolved with: a device's table does not change once probed, and the
 # twin's bits do not depend on the table or the cut (they only order its claims).  A
 # call that finds no SM table is not bound (a later probe may find one).  Cleared when
-# it reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` entries and when a twin fails to
-# load.
+# it reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` entries and when a twin is dropped
+# (``_drop_cake_gdn_nontranspose_domain_twin``).
 _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES: dict[int, tuple] = {}
 # The twin's claim counter pairs of this thread's eager launches, by (device index, raw
 # stream handle): the pair ``cake_locality.launch_counters`` returned for that stream,
@@ -662,11 +662,12 @@ def _drop_cake_gdn_nontranspose_domain_twin(
     key: tuple, homed, launch: tuple, error: Exception
 ) -> None:
     """Record that the twin of ``launch`` (the ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES``
-    value of the row ``key`` on a state whose homing record is ``homed``) failed to load
-    at its launch: the row runs its whole-GPU launch on such states from now on."""
+    value of the row ``key`` on a state whose homing record is ``homed``) failed at its
+    launch where the row's whole-GPU launch runs: the row runs its whole-GPU launch on
+    such states from now on."""
     _, grid_x, rows0, table = launch
     logger.warning(
-        "Cake GDN locality-domain decode of row %s failed to load (%s); "
+        "Cake GDN locality-domain decode of row %s failed to load or launch (%s); "
         "the row runs its whole-GPU kernel",
         key,
         error,
@@ -931,13 +932,18 @@ def _run_cake_gdn_decode_nontranspose(
                     1,
                 )
             except RuntimeError as error:
-                # The twin's kernel loads and opts in to its shared memory at its
-                # first launch, before the launch itself: a failure there leaves the
-                # state, the output and the counters untouched, so the row runs its
-                # whole-GPU launch, now and on later calls.
+                # The twin loads its kernel and opts in to its shared memory on a
+                # device at its first launch there, before the launch itself.  A
+                # failure leaves the state, the output and the counters untouched,
+                # and the call runs the row's whole-GPU launch.  If that raises too,
+                # the error is the call's, not the twin's (for example a launch on
+                # the legacy default stream while another thread captures on a
+                # blocking stream): it propagates as from the whole launch alone, and
+                # the twin is kept.  Otherwise the twin cannot run here, and the row
+                # runs its whole-GPU launch on such states from now on.
+                entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
                 _drop_cake_gdn_nontranspose_domain_twin(key, homed, domain, error)
-            else:
-                return output
+            return output
     entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
     return output
 
