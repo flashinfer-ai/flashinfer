@@ -360,6 +360,9 @@ def _query_pair(qr, FIXED32: tl.constexpr = False):
 
 @triton.jit
 def _qk(qh, ql, kt, USEQL: tl.constexpr = True):
+    if qh.dtype == tl.bfloat16:
+        # Native query; widening the finite E4M3 key is exact.
+        return tl.dot(qh, kt.to(tl.bfloat16), out_dtype=tl.float32)
     s = tl.dot(qh, kt, out_dtype=tl.float32)
     if USEQL:
         s = tl.dot(ql, kt, s, out_dtype=tl.float32)
@@ -1325,8 +1328,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     # div/mod and a masked pointer select on every Q/G/O access.
     qoff = (t0 * NHC + rows)[:, None] * DC + dd[None, :]
     qr = tl.load(Q + qoff, mask=rv[:, None], other=0.0)
-    q8, q8l, sq = _query_pair(qr)
-    cc = SC / sq
+    cc = SC
     rcnt = tl.where(rv, tl.gather(cnt, rm, 0), 0)
 
     ii = tl.arange(0, BN)
@@ -1347,7 +1349,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             w0 = kw * BN
             kt = tl.trans(KD.load([base + w0, 0]))
             vt = VD.load([base + w0, 0])
-            s = _qk(q8, q8l, kt)
+            s = _qk(qr, qr, kt)
             mx = tl.maximum(mx, tl.max(s, 1))
             pp16 = _ex2h(_mul_rz_h2(s, cc))
             li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
@@ -1360,7 +1362,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             w0 = kw * BN
             kt = tl.trans(KD.load([base + w0, 0]))
             vt = VD.load([base + w0, 0])
-            qk = _qk(q8, q8l, kt)
+            qk = _qk(qr, qr, kt)
             s = tl.where(ii[None, :] < (rcnt - w0)[:, None],
                          qk, -3.0e38)
             mx = tl.maximum(mx, tl.max(s, 1))
@@ -1380,7 +1382,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                 w0 = kw * BN
                 kt = tl.trans(KD.load([base + w0, 0]))
                 vt = VD.load([base + w0, 0])
-                s = _qk(q8, q8l, kt)
+                s = _qk(qr, qr, kt)
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
                 li += tl.reduce(pp16, 1, _add_h).to(tl.float32)
                 ph = pp16.to(tl.float8e4nv)
@@ -1392,7 +1394,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                 w0 = kw * BN
                 kt = tl.trans(KD.load([base + w0, 0]))
                 vt = VD.load([base + w0, 0])
-                qk = _qk(q8, q8l, kt)
+                qk = _qk(qr, qr, kt)
                 s = tl.where(ii[None, :] < (rcnt - w0)[:, None],
                              qk, -3.0e38)
                 pp16 = _ex2h((s * cc - mr[:, None]).to(tl.float16))
@@ -1445,7 +1447,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                              mask=si1 < cnt[:, None], other=-1)
             kt = tl.trans(KD.load([base + w0, 0]))
             vt = VD.load([base + w0, 0])
-            qk = _qk(q8, q8l, kt)
+            qk = _qk(qr, qr, kt)
             if BN == 128:
                 wr0 = tl.gather(bw0, rm, 0)
                 wr1 = tl.gather(bw1, rm, 0)
@@ -1512,7 +1514,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                                  mask=si1 < cnt[:, None], other=-1)
                 kt = tl.trans(KD.load([base + w0, 0]))
                 vt = VD.load([base + w0, 0])
-                qk = _qk(q8, q8l, kt)
+                qk = _qk(qr, qr, kt)
                 if BN == 128:
                     wr0 = tl.gather(bw0, rm, 0)
                     wr1 = tl.gather(bw1, rm, 0)
@@ -1728,10 +1730,11 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
         whi = tl.max(lid)
         nw = tl.where(whi >= wlo, (whi - wlo) // BN + 1, 0)
 
-    # per-row fp8 scale: every MMA row uses the full fp8 range, which keeps the
-    # score error well inside the output tolerance, and it costs one row-wise
-    # reduction instead of a CTA-wide one
-    if CAPQ:
+    if SPV:
+        # Use the same native-Q score for anchors, dense windows, sparse
+        # membership windows, and their retries. _qk ignores the second operand.
+        q8, q8l, sq = qr, qr, 1.0
+    elif CAPQ:
         # Fixed x64 query scale: exact in BF16 and avoids the whole-CTA max
         # reduction, but it saturates FP8 for |q| > 3.75, i.e. it is only
         # valid for a query distribution known to stay inside that bound.
@@ -2223,8 +2226,9 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     qo = tl.where(rv, rt, s0) * (NHC * DC) + rh * DC
     qoff = qo[:, None] + dd[None, :]
     qr = tl.load(Q + qoff, mask=rv[:, None], other=0.0)
-    q8, q8l, sq = _query_pair(qr, CAPQ)
-    cc = SC / sq
+    # _tpd_step uses the native BF16 branch of _qk; no query descale.
+    q8, q8l = qr, qr
+    cc = SC
     # The packed proof above establishes cnt == token_position + 1 for every
     # valid token, so avoid broadcasting/reducing the count tile in the hot path.
     rcnt = tl.where(rv, rt - s0 + 1, 0)

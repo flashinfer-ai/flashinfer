@@ -420,7 +420,7 @@ def run_route(inputs, route, monkeypatch):
         ("spv", (8191, 8191)),
     ],
 )
-def test_long_query_cancellation(route, lengths, monkeypatch):
+def test_long_query_cancellation(route, lengths, monkeypatch, record_property):
     x = make_uniform_dense_prefix_inputs(lengths)
     q = x["q"]
     q[..., ::2] = 1.046875
@@ -456,6 +456,9 @@ def test_long_query_cancellation(route, lengths, monkeypatch):
     odd_mass = count // 2
     att = (4 * (even_mass - odd_mass) / (even_mass + odd_mass)).bfloat16()
     ref = (att.float() * 0.5).bfloat16().unsqueeze(-1).expand_as(out)
+    err = (out.float() - ref.float()).abs()
+    record_property("head_max_abs", err.amax(dim=(0, 2)).tolist())
+    record_property("head_mean_abs", err.mean(dim=(0, 2)).tolist())
     assert_close_at_gate(out, ref)
 
 
