@@ -272,6 +272,14 @@ DEVFN void mbar_wait(uint64_t* b, int phase) {
       "r"(phase), "r"(suspend)
       : "memory");
 }
+// Cluster-scope consumer wait.  The wait must ACQUIRE at cluster scope:
+// the peer CTA publishes shared-memory data (its P tile, or its TMA-filled
+// K/V stages) before arriving on this barrier, and the subsequent
+// tcgen05.fence::after_thread_sync only orders the asynchronous MMA after
+// THIS thread's synchronization -- it supplies no visibility of its own, so
+// a relaxed wait would let the MMA read the peer's previous-iteration
+// bytes.  Paired with the release arrive in mbar_arrive_rank0 (and the
+// producer-side release fences on the generic-proxy P stores).
 DEVFN void mbar_wait_cluster(uint64_t* b, int phase) {
   uint32_t a = smaddr(b);
   const uint32_t suspend = 0x989680u;
@@ -279,7 +287,7 @@ DEVFN void mbar_wait_cluster(uint64_t* b, int phase) {
       "{\n"
       ".reg .pred P1;\n"
       "LWC_%=:\n"
-      "mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 "
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
       "P1, [%0], %1, %2;\n"
       "@!P1 bra.uni LWC_%=;\n"
       "}\n" ::"r"(a),
@@ -389,13 +397,17 @@ DEVFN void umma2_ts(uint32_t td, uint32_t ta, uint64_t db, uint32_t idesc, uint3
       "r"(ta), "l"(db), "r"(idesc), "r"(scaleD), "r"(z0), "r"(z1), "r"(z2), "r"(z3), "r"(z4),
       "r"(z5), "r"(z6), "r"(z7));
 }
+// Cluster-scope producer arrive on rank 0's barrier.  RELEASE so the
+// visibility this thread holds (its own generic P stores, or the TMA data
+// it just observed through its CTA-local tbar wait) transfers to the rank-0
+// consumer's acquire wait above.
 DEVFN void mbar_arrive_rank0(uint64_t* b) {
   uint32_t a = smaddr(b);
   asm volatile(
       "{\n"
       ".reg .b32 ra;\n"
       "mapa.shared::cluster.u32 ra, %0, 0;\n"
-      "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [ra];\n"
+      "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [ra];\n"
       "}\n" ::"r"(a)
       : "memory");
 }
