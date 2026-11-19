@@ -273,12 +273,14 @@ _TAIL_SPLIT_P3 = {"sm_100a": (24, None), "sm_103a": (24, 64)}
 #: quantizer.  On SM100 an eager PDL launch behind that quantizer runs this build's
 #: tiles about a fifth slower (most on the CTAs that hold a split tile), which costs
 #: more than the overlap saves; launched after the quantizer ends, or in a CUDA graph,
-#: it runs at full speed.  ``(waves, parts)``: when the persistent grid runs at least
-#: ``waves`` waves and the split tiles fill at most ``1/parts`` of its slots, the call
-#: launches the build without PDL; otherwise it launches ``attention_sd_tsplit`` with
-#: PDL, which is then as fast or faster.  The other builds, and every build after the
-#: other quantizers, keep PDL.
-_TAIL_SPLIT_P3_SERIAL = {"sm_100a": (3, 3)}
+#: it runs at full speed.  Each rule ``(waves, parts, max_selected)``: when the
+#: persistent grid runs at least ``waves`` waves, the split tiles fill at most
+#: ``1/parts`` of its slots (a tail split fills at most half of them) and the call
+#: selects at most ``max_selected`` blocks a row (``None``: no bound), the call
+#: launches the build without PDL.  When no rule holds it launches
+#: ``attention_sd_tsplit`` with PDL, which is then as fast or faster.  The other
+#: builds, and every build after the other quantizers, keep PDL.
+_TAIL_SPLIT_P3_SERIAL = {"sm_100a": ((3, 3, None), (3, 2, 47))}
 #: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
 #: next tile runs) and, per architecture, the band of selected blocks a row
 #: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
@@ -387,17 +389,24 @@ def _tail_split(
     return min(full + 2 * tail, slots), full, full + 2 * tail
 
 
-def _p3_serial(arch: str, plan: Tuple[int, int, int]) -> Optional[bool]:
+def _p3_serial(
+    arch: str, plan: Tuple[int, int, int], block_sparse_num: int
+) -> Optional[bool]:
     """After the one-launch quantizer, does the ``attention_sd_tsplit_p3`` plan
-    ``(grid, split_from, items)`` launch without PDL (``True``) or give way to
-    ``attention_sd_tsplit`` (``False``)?  ``None``: the architecture keeps PDL."""
-    rule = _TAIL_SPLIT_P3_SERIAL.get(arch)
-    if rule is None:
+    ``(grid, split_from, items)`` of a call with ``block_sparse_num`` selected blocks a
+    row launch without PDL (``True``) or give way to ``attention_sd_tsplit``
+    (``False``)?  ``None``: the architecture keeps PDL."""
+    rules = _TAIL_SPLIT_P3_SERIAL.get(arch)
+    if rules is None:
         return None
-    waves, parts = rule
     grid, split_from, items = plan
     tail = (items - split_from) // 2
-    return split_from >= (waves - 1) * grid and parts * tail <= grid
+    return any(
+        split_from >= (waves - 1) * grid
+        and parts * tail <= grid
+        and (max_selected is None or block_sparse_num <= max_selected)
+        for waves, parts, max_selected in rules
+    )
 
 
 #: The launch route of each call key ``(arch, block_sparse_num, total_tiles, device,
@@ -433,7 +442,7 @@ def _route(
             if plan is None:
                 continue
             if p3 and pdl and after_one_launch:
-                launch = _p3_serial(arch, plan)
+                launch = _p3_serial(arch, plan, block_sparse_num)
                 if launch is False:
                     continue
                 serial = launch is True

@@ -680,6 +680,39 @@ def test_tail_split_rows_are_deterministic_and_close_to_the_default_build(
     torch.testing.assert_close(lse[finite], default_lse[finite], atol=1e-2, rtol=0)
 
 
+def test_serial_rule_thresholds():
+    """``_TAIL_SPLIT_P3_SERIAL`` with its thresholds written out: after the one-launch
+    quantizer, an SM100 plan ``(grid, split_from, items)`` of ``attention_sd_tsplit_p3``
+    launches without PDL from three waves of the persistent grid when the split tiles
+    fill at most a third of its slots, or up to half of them (the tail split's bound)
+    when the call selects at most 47 blocks a row; otherwise, and below three waves,
+    it gives way to ``attention_sd_tsplit``.  SM103 keeps PDL."""
+    assert pkg._TAIL_SPLIT_P3_SERIAL == {"sm_100a": ((3, 3, None), (3, 2, 47))}
+    grid = 148
+    for waves, tail, sel, serial in [
+        (2, 1, 24, False),
+        (2, 44, 32, False),
+        (2, 74, 24, False),
+        (3, 1, 58, True),
+        (3, 24, 127, True),
+        (3, 49, 58, True),
+        (3, 50, 24, True),
+        (3, 50, 47, True),
+        (3, 50, 48, False),
+        (3, 56, 32, True),
+        (3, 61, 48, False),
+        (3, 74, 47, True),
+        (3, 74, 58, False),
+        (4, 68, 40, True),
+        (4, 68, 58, False),
+        (7, 8, 96, True),
+    ]:
+        split_from = (waves - 1) * grid
+        plan = (grid, split_from, split_from + 2 * tail)
+        assert pkg._p3_serial("sm_100a", plan, sel) is serial, (waves, tail, sel)
+        assert pkg._p3_serial("sm_103a", plan, sel) is None
+
+
 @requires_sm100
 @pytest.mark.parametrize("heads", [3, 5, 7, 8])
 def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads):
@@ -712,7 +745,7 @@ def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads):
     )
     _, (q8, k8, v8, qs, ks, vs), impl = pkg._quantize_program(q, k, v, "auto", None)
     assert impl == "one_launch", impl
-    rule = pkg._p3_serial(arch, plan)
+    rule = pkg._p3_serial(arch, plan, sel)
     for after in (False, True):
         record, _, args, _, _ = pkg._attention_operands(
             q8,
