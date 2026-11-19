@@ -36,7 +36,6 @@ from ..plan import (
     F_QBASE,
     F_QLEN,
     F_QTOK0,
-    F_REQ,
     F_ROWS,
     F_SLOT,
     F_TILE_HI,
@@ -92,7 +91,6 @@ class SwapsKernel:
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
@@ -126,7 +124,6 @@ class SwapsKernel:
             mGroups,
             mCounters,
             mDesc,
-            mKvIndptr,
             mKvIndices,
             c,
             nc,
@@ -163,7 +160,6 @@ class SwapsKernel:
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
@@ -313,7 +309,6 @@ class SwapsKernel:
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
-            single = num_units <= grid_size  # one unit per CTA (producer.load_loop)
             if cutlass.const_expr(self.pdl):
                 # the preceding grid's stores (Q, the KV cache, the output and workspace it may have produced) are visible from here;
                 # every store of this kernel depends on loads issued after this point. The descriptors are plan constants
@@ -331,10 +326,7 @@ class SwapsKernel:
                     sKV_view,
                     q_prod,
                     kv_prod,
-                    mKvIndptr,
                     mKvIndices,
-                    mDesc[(u, F_REQ)],
-                    single,
                     mDesc[(u, F_KVPTR0)],
                     mDesc[(u, F_NPAGES)],
                     mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],

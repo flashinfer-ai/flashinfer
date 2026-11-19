@@ -27,7 +27,7 @@ DESC_FIELDS = 16
 # F_TILE_LO / F_TILE_HI are the unit's OWN tiles (the row block's visible range clipped to the unit's chunks): every role
 # of the kernel walks exactly that range and derives the chunk boundaries from the absolute tile index;
 # F_KVPTR0 / F_NPAGES = kv_indptr[req] and the request's page count (token offset and count under the ragged layout): the Swaps
-# load warp starts its page lookups from the descriptor when every CTA walks one unit (a placement: the same page ids)
+# load warp takes the request's page range from the descriptor (a plan runs with its own kv_indptr: engine.run_attention)
 (
     F_REQ,
     F_QTOK0,

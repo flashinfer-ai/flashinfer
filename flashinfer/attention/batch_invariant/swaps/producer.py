@@ -37,7 +37,7 @@ def issue_slot(
     """One ring slot: 128 keys from absolute key ``key0``, dims ``[sl slot_dims, (sl + 1) slot_dims)``: acquire it, issue
     ``boxes_per_slot x halves`` TMA boxes (a box is ``box_rows = min(page, 128)`` keys of one page, one 64-wide half).
     Under ``st.ragged`` the pool is one page of ``total_kv`` tokens and the box starts at the request's token offset plus the key
-    (the domain shifted by ``kv_indptr[req]``, a token offset, in ``load_loop``); coordinates past the pool are zero-filled by the TMA and keys past the
+    (the domain shifted by the request's token offset ``kv_ptr0`` in ``load_loop``); coordinates past the pool are zero-filled by the TMA and keys past the
     request's length are masked / zeroed exactly as the junk of a paged pool's pages is."""
     page = st.page
     h = kv_prod.acquire_and_advance()
@@ -114,12 +114,9 @@ def load_loop(
     sKV_view: cute.Tensor,
     q_prod,
     kv_prod,
-    mKvIndptr: cute.Tensor,
     mKvIndices: cute.Tensor,
-    req: Int32,
-    single,
-    kv_ptr0_d: Int32,
-    n_pages_d: Int32,
+    kv_ptr0: Int32,
+    n_pages: Int32,
     tok_abs: Int32,
     kv_head: Int32,
     tile_lo: Int32,
@@ -130,13 +127,9 @@ def load_loop(
     # ``gate`` (the CTA's first unit): once the first ring slots are issued (K_0, K_1, K_2, V_0: the MMA warp's first needs) the warp
     # waits for slot 0's bytes (its full barrier, first phase) before issuing the rest, so the wave's first tiles are not interleaved
     # with every CTA's whole burst
-    # the request's first page-table entry and page count: from the descriptor when every CTA walks one unit (``single``, the
-    # lookup's two round trips are then on the kernel's critical path), else kv_indptr as the multi-unit walk always did
-    kv_ptr0 = kv_ptr0_d
-    n_pages = n_pages_d
-    if not single:
-        kv_ptr0 = mKvIndptr[req]
-        n_pages = mKvIndptr[req + 1] - kv_ptr0
+    # ``kv_ptr0`` / ``n_pages``: the request's first page-table entry and page count, plan constants the descriptor carries
+    # (F_KVPTR0 / F_NPAGES) like the query offsets: a plan runs with its own kv_indptr (engine.run_attention), so no lookup of
+    # kv_indptr[req] stands between the descriptor and the first K / V box
     # Q: the unit's tokens start at the packed row tok_abs (tokens past the request are padding rows, never stored; past total_q the TMA zero-fills)
     tQ_off = cute.domain_offset((0, 0, tok_abs), tQ)
     gQ = cute.zipped_divide(
