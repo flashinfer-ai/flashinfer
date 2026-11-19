@@ -19,19 +19,25 @@ tcgen05 / UMMA / TMEM (SM10x): the PERSISTENT variant of ``kda_replay_mtp_umma``
 launched by its ``launch_umma`` for T <= 4 when the (request, head) items outnumber the
 resident CTA slots (4 per SM). Same math, same results (bitwise).
 
-Persistent layout (see /home/scratch.ameyn_gpu_3/kda_umma_dram_log.md for the study):
-  * grid = 4 CTAs / SM, CTA c runs items c, c + grid, ... (item = request * H + head);
-    every role walks the same list; mbarrier phases count processed items (f_* ones flush
-    items); padded items are skipped by all roles.
+Persistent layout (study log: /home/scratch.ameyn_gpu_3/kda_umma_dram_log.md):
+  * grid = 4 CTAs / SM. Work items = (request, head), item = request * H + head. CTA c
+    starts with item c; warp 0 claims every further item from a global counter
+    (``_work_counters``: [claim, done], the last CTA of a launch resets them) and posts
+    them into a 4-slot SMEM mailbox two entries ahead (mb_full / mb_empty); the issuer
+    warp and the consumers take them. Dynamic claiming removes the static round-robin's
+    tail (8 % idle) and the CTA start stagger. Every role walks the same entries;
+    mbarrier phases count processed items (the f_* ones flush items); padded items are
+    skipped by all roles.
   * 256 threads with the GDN register split (warps 0-3 setmaxnreg 24, consumers on warps
-    4-7 at 104): warp 0 TMA producer, warp 1 UMMA issuer, warps 2-3 idle.
+    4-7 at 104): warp 0 TMA producer + scheduler, warp 1 UMMA issuer, warps 2-3 idle.
   * the next item's state load starts as soon as the current readout has consumed the stage
     (st_free; flush items: after warp 0's stores have read it); warp 0 also bulk-prefetches
     the next item's row inputs, ring window and state into L2; the consumers issue the next
     item's row inputs one item ahead.
   * it removes the per-CTA launch gap (~1 us with TMEM alloc / dealloc) and the cursor round
-    trip of every item; it is then consumer-compute bound (P2 gate math, P3 K~ build), so it
-    is used only where it wins (T <= 4; T = 8 measured 2-4 % slower than one item per CTA).
+    trip of every item; selection in ``kda_replay_mtp_umma._use_persistent``.
+  * concurrency: the counters are per (device, stream); concurrent launches on one stream
+    cannot overlap. Do not launch it concurrently from two streams sharing a stream handle.
 
 The original single-item description follows.
 
@@ -115,7 +121,6 @@ LOG2_E = 1.4426950408889634
 _EPS = 1e-6  # inside the L2-norm rsqrt, as the HMMA kernel
 _TMEM_COLS = 128
 _REGSPLIT = (24, 104)  # setmaxnreg (warps 0-3, consumers) of the 256-thread layout
-_REGSPLIT_HELP = (32, 96)  # the same with the K~ helper warps 2-3
 _MIN_BLOCKS_PER_SM = 4  # 128 of the 512 TMEM columns, ~54 KB SMEM, 80 registers
 # TMEM columns: H = R + Y (readout + history) at 0..15, D (raw u, bf16 pairs) at
 # 32..39 for window slots j 0..15 and 40..47 for j 16..31 (w_ring = 32).
@@ -134,9 +139,6 @@ _FORCE_PERSISTENT: Optional[bool] = None
 _IKET = os.environ.get("KDA_UMMA_IKET", "0") == "1"
 _FORCE_SPLIT: Optional[bool] = None
 _HANG_DEBUG_ADDR = 0  # debug: pinned int32 buffer [CTAs, 8] for watchdog waits
-_KT_CH = False  # K~ in channel layout, live window rows only (uniform skip of j >= P)
-_HELP_P3 = False  # split layout: warps 2-3 build K~ (P3) for the consumers
-_RING_PF = False  # consumers: next item's ring words in registers one item ahead
 _PF_WHERE = "producer"  # debug: L2 prefetch issuer (producer / consumer)
 _HANG_PROGRESS_ADDR = 0  # debug: pinned int32 [CTAs, 8] progress words
 _L2_PREFETCH = True  # persistent: prefetch the next item into L2 (debug switch)
@@ -699,6 +701,111 @@ def _mat_i32(x: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(r)
 
 
+@dsl_user_op
+def _lds_i32(addr: Int32, *, loc=None, ip=None) -> Int32:
+    """ld.shared.u32."""
+    r = llvm.inline_asm(
+        _T.i32(),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.u32 $0, [$1];",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(r)
+
+
+_MBOX = 4  # work-item mailbox slots (warp 0 -> issuer + consumers)
+
+
+@dsl_user_op
+def _claim(lane: Int32, addr: Int64, *, loc=None, ip=None) -> Int32:
+    """Lane 0: atom.relaxed.gpu.add of 1 at ``addr``; the old value, broadcast to the warp
+    by the caller."""
+    r = llvm.inline_asm(
+        _T.i32(),
+        [Int32(lane).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred p;\n\tmov.u32 $0, 0;\n\tsetp.eq.u32 p, $1, 0;\n\t"
+        "@p atom.relaxed.gpu.global.add.u32 $0, [$2], 1;\n\t}",
+        "=r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(r)
+
+
+@dsl_user_op
+def _mbox_post(
+    lane: Int32, slot_addr: Int32, val: Int32, mbar_addr: Int32, *, loc=None, ip=None
+) -> None:
+    """Lane 0: write ``val`` to the mailbox slot and arrive on its full barrier."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(lane).ir_value(loc=loc, ip=ip),
+            Int32(slot_addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+            Int32(mbar_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\t.reg .b64 st;\n\tsetp.eq.u32 p, $0, 0;\n\t"
+        "@p st.shared.u32 [$1], $2;\n\t"
+        "@p mbarrier.arrive.shared::cta.b64 st, [$3];\n\t}",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _claim_done(
+    lane: Int32,
+    done_addr: Int64,
+    last: Int32,
+    claim_addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Lane 0: count this CTA done (acq_rel); the last CTA of the launch resets the claim
+    and done counters to 0 for the next launch (every CTA has made its final claim before
+    it counts itself done)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(lane).ir_value(loc=loc, ip=ip),
+            Int64(done_addr).ir_value(loc=loc, ip=ip),
+            Int32(last).ir_value(loc=loc, ip=ip),
+            Int64(claim_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p, q;\n\t.reg .u32 o;\n\tmov.u32 o, 0xffffffff;\n\t"
+        "setp.eq.u32 p, $0, 0;\n\t"
+        "@p atom.acq_rel.gpu.global.add.u32 o, [$1], 1;\n\t"
+        "setp.eq.u32 q, o, $2;\n\t"
+        "@q st.relaxed.gpu.global.u32 [$3], 0;\n\t"
+        "@q st.relaxed.gpu.global.u32 [$1], 0;\n\t}",
+        "r,l,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def _mbox_take(s_mbox_addr, mb_full, mb_empty, e, cta, warp):
+    """Reader side (issuer warp, consumers): mailbox entry e (wait full, read, release)."""
+    slot = e & (_MBOX - 1)
+    _mbw(mb_full + slot, (e // _MBOX) & 1, 18, cta, warp, e)
+    v = _lds_i32(s_mbox_addr + slot * 4)
+    cute.arch.mbarrier_arrive(mb_empty + slot)
+    return v
+
+
 def _next_cursors(persistent, state_idx_t, hist_len, cache_base, item, nit, nh, cur):
     """The next item's cursors (persistent grid); one item per CTA otherwise (no loads,
     the current cursors stand in and are never used)."""
@@ -866,6 +973,7 @@ class KdaReplayMtpUmma:
         lower_bound: Float32,
         flush_min: Int32,
         ncta: Int32,
+        ws,
         stream,
     ):
         tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
@@ -889,6 +997,7 @@ class KdaReplayMtpUmma:
             scale,
             lower_bound,
             flush_min,
+            ws,
             tma_ld,
             tma_st,
         ).launch(
@@ -919,6 +1028,7 @@ class KdaReplayMtpUmma:
         scale: Float32,
         lower_bound: Float32,
         flush_min: Int32,
+        ws: cute.Tensor,
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
@@ -938,14 +1048,13 @@ class KdaReplayMtpUmma:
         lane = tid % 32
         NH = self.h
         CW0 = 4 if self.split else 2  # first consumer warp
-        HELP = self.split and _HELP_P3  # warps 2-3 build K~
-        KTC = _KT_CH and not HELP
-        RS = _REGSPLIT_HELP if HELP else _REGSPLIT
+        RS = _REGSPLIT
         IK = self.iket
         # work items = (request, head), head fastest; CTA cta runs items cta, cta + ncta, ..
         # (one item per CTA when the grid covers them all)
         NIT = q.shape[0] * NH
-        nk = (NIT - cta + ncta - 1) // ncta
+        claim_addr = ws.iterator.toint()
+        done_addr = claim_addr + Int64(4)
 
         # ------------------------------------------------------------------ SMEM
         smem = cutlass.utils.SmemAllocator()
@@ -1011,7 +1120,11 @@ class KdaReplayMtpUmma:
         # read it
         st_free = smem.allocate_array(cutlass.Int64, 1)
         u_free = smem.allocate_array(cutlass.Int64, 1)
-        kt_ready = smem.allocate_array(cutlass.Int64, 1)  # helper warps: K~ built
+        # work-item mailbox: warp 0 claims items (global counter) and posts them, one
+        # entry per item of this CTA; the issuer warp and the consumers take them
+        s_mbox = smem.allocate_array(Int32, _MBOX)
+        mb_full = smem.allocate_array(cutlass.Int64, _MBOX)
+        mb_empty = smem.allocate_array(cutlass.Int64, _MBOX)
         tmem_addr = smem.allocate(Int32, 4)
 
         if cutlass.const_expr(_HANG_PROGRESS_ADDR != 0):
@@ -1055,7 +1168,9 @@ class KdaReplayMtpUmma:
                 cute.arch.mbarrier_init(f_gdone[1], 128)
                 cute.arch.mbarrier_init(st_free, 1)
                 cute.arch.mbarrier_init(u_free, 128)
-                cute.arch.mbarrier_init(kt_ready, 64)
+                for mi in cutlass.range_constexpr(_MBOX):
+                    cute.arch.mbarrier_init(mb_full + mi, 1)
+                    cute.arch.mbarrier_init(mb_empty + mi, 160)
                 cute.arch.mbarrier_init_fence()
             cute.arch.fence_acq_rel_cta()
             cute.arch.barrier_arrive(barrier_id=3, number_of_threads=64)
@@ -1078,11 +1193,25 @@ class KdaReplayMtpUmma:
                 cpasync.prefetch_descriptor(tma_st.atom)
                 it = Int32(0)
                 fit = Int32(0)
-                for kk in cutlass.range(nk, unroll=1):
-                    item = cta + kk * ncta
+                mb_addr = s_mbox.toint()
+                # entry 0 is item cta (static, posted too so every slot use is taken);
+                # entries 1, 2, .. are claimed: item ncta + c for the c-th claim of the
+                # launch (dynamic balance across CTAs). Entry kk + 2 is posted at the
+                # start of entry kk, two ahead of the readers.
+                _mbox_post(lane, mb_addr, cta, mb_full.toint())
+                nitem = ncta + cute.arch.shuffle_sync(_claim(lane, claim_addr), 0)
+                _mbox_post(lane, mb_addr + 4, nitem, (mb_full + 1).toint())
+                item = Int32(cta)
+                kk = Int32(0)
+                while item < NIT:
                     brow = item // NH
                     hh = item - brow * NH
-                    nitem = item + ncta
+                    e2 = kk + 2
+                    sl2 = e2 & (_MBOX - 1)
+                    if e2 >= _MBOX:
+                        _mbw(mb_empty + sl2, ((e2 // _MBOX) - 1) & 1, 19, cta, warp, kk)
+                    nn = ncta + cute.arch.shuffle_sync(_claim(lane, claim_addr), 0)
+                    _mbox_post(lane, mb_addr + sl2 * 4, nn, (mb_full + sl2).toint())
                     nsidx, nP, nbase = _next_cursors(
                         self.persistent,
                         state_idx_t,
@@ -1179,6 +1308,10 @@ class KdaReplayMtpUmma:
                     sidx = nsidx
                     P = nP
                     base = nbase
+                    item = nitem
+                    nitem = nn
+                    kk = kk + 1
+                _claim_done(lane, done_addr, ncta - 1, claim_addr)
                 if cutlass.const_expr(_HANG_PROGRESS_ADDR != 0):
                     _prog_st(
                         Int64(_HANG_PROGRESS_ADDR)
@@ -1204,16 +1337,19 @@ class KdaReplayMtpUmma:
                 cute.arch.barrier(barrier_id=3, number_of_threads=64)  # warp 0's inits
                 it = Int32(0)
                 fit = Int32(0)
-                for kk in cutlass.range(nk, unroll=1):
-                    item = cta + kk * ncta
+                mb_addr = s_mbox.toint()
+                item = _mbox_take(mb_addr, mb_full, mb_empty, Int32(0), cta, warp)
+                kk = Int32(0)
+                while item < NIT:
                     brow = item // NH
                     hh = item - brow * NH
+                    nitem = _mbox_take(mb_addr, mb_full, mb_empty, kk + 1, cta, warp)
                     nsidx, nP, nbase = _next_cursors(
                         self.persistent,
                         state_idx_t,
                         hist_len,
                         cache_base,
-                        item + ncta,
+                        nitem,
                         NIT,
                         NH,
                         (sidx, P, base),
@@ -1309,6 +1445,8 @@ class KdaReplayMtpUmma:
                     sidx = nsidx
                     P = nP
                     base = nbase
+                    item = nitem
+                    kk = kk + 1
                 if it > 0:
                     _mbw(tmem_done, (it - 1) & 1, 10, cta, warp, -1)
                 U.fence_after_sync()
@@ -1319,111 +1457,6 @@ class KdaReplayMtpUmma:
                         + (Int64(cta) * Int64(8) + Int64(warp)) * Int64(4),
                         Int32(15),
                     )
-                else:
-                    if cutlass.const_expr(HELP):
-                        # ======================================== K~ helpers (warps 2-3)
-                        # K~ = bf16(k̂_j . e^{G_P - G_j}) for window slot hj, channel
-                        # chunks c8 = 2 hq, 2 hq + 1 of both K halves (the consumers'
-                        # P3 arithmetic), off the consumers' critical path. s_kt is free
-                        # once the previous item's history UMMA (its C tiles read K~
-                        # before d_ready) and fold UMMAs (flush) have completed.
-                        hthr = tid - 64
-                        hj = hthr >> 2
-                        hq = hthr & 3
-                        it = Int32(0)
-                        fit = Int32(0)
-                        pfl = Int32(0)
-                        for kk in cutlass.range(nk, unroll=1):
-                            item = cta + kk * ncta
-                            brow = item // NH
-                            hh = item - brow * NH
-                            nsidx, nP, nbase = _next_cursors(
-                                self.persistent,
-                                state_idx_t,
-                                hist_len,
-                                cache_base,
-                                item + ncta,
-                                NIT,
-                                NH,
-                                (sidx, P, base),
-                            )
-                            if sidx >= 0:
-                                is_flush = flush_min <= P
-                                if it > 0:
-                                    _mbw(mma_done, (it - 1) & 1, 15, cta, warp, kk)
-                                    if pfl != 0:
-                                        _mbw(f_mma_b, (fit - 1) & 1, 16, cta, warp, kk)
-                                gp_slot = (base + P - 1) & RING_MASK
-                                g0 = Float32(g_cache[sidx, hh, gp_slot, 2 * hthr])
-                                g1 = Float32(g_cache[sidx, hh, gp_slot, 2 * hthr + 1])
-                                s_gp[2 * hthr] = _sel(P > 0, g0, 0.0, Float32)
-                                s_gp[2 * hthr + 1] = _sel(P > 0, g1, 0.0, Float32)
-                                _bar_sync_ua(5, 64)
-                                kc_row_h = k_cache.iterator.toint() + Int64(
-                                    cute.crd2idx((sidx, hh, 0, 0), k_cache.layout)
-                                ) * Int64(2)
-                                gc_row_h = g_cache.iterator.toint() + Int64(
-                                    cute.crd2idx((sidx, hh, 0, 0), g_cache.layout)
-                                ) * Int64(4)
-                                hpred = Int32(hj < P)
-                                hslot = (base + hj) & RING_MASK
-                                for ci in cutlass.range_constexpr(2):
-                                    c8h = hq * 2 + ci
-                                    ka_ = kc_row_h + Int64(
-                                        (hslot * K_DIM + c8h * 8) * 2
-                                    )
-                                    kraw = [
-                                        U.ldg_v4_if(hpred, ka_),
-                                        U.ldg_v4_if(hpred, ka_ + Int64(128)),
-                                    ]
-                                    ga_ = gc_row_h + Int64(
-                                        (hslot * K_DIM + c8h * 8) * 4
-                                    )
-                                    gj = []
-                                    for gk in cutlass.range_constexpr(2):
-                                        for i4 in cutlass.range_constexpr(2):
-                                            gj += _ldg_f32x4_if(
-                                                hpred, ga_ + Int64(gk * 256 + i4 * 16)
-                                            )
-                                    for gk in cutlass.range_constexpr(2):
-                                        gpv = _lds_f32x4(
-                                            gp_addr + (gk * 64 + c8h * 8) * 4
-                                        ) + _lds_f32x4(
-                                            gp_addr + (gk * 64 + c8h * 8 + 4) * 4
-                                        )
-                                        kw = []
-                                        for i in cutlass.range_constexpr(4):
-                                            w0 = _exp(gpv[2 * i] - gj[gk * 8 + 2 * i])
-                                            w1 = _exp(
-                                                gpv[2 * i + 1] - gj[gk * 8 + 2 * i + 1]
-                                            )
-                                            pk = U.pack_bf16x2(
-                                                U.bf16x2_lo_f32(kraw[gk][i]) * w0,
-                                                U.bf16x2_hi_f32(kraw[gk][i]) * w1,
-                                            )
-                                            kw.append(
-                                                _sel(hpred != 0, pk, Uint32(0), Uint32)
-                                            )
-                                        U.sts_v4(
-                                            kt_addr
-                                            + gk * 2048
-                                            + hj * 128
-                                            + ((c8h ^ (hj % 8)) * 16),
-                                            kw[0],
-                                            kw[1],
-                                            kw[2],
-                                            kw[3],
-                                        )
-                                # the fold UMMA reads K~ through the async proxy
-                                cute.arch.fence_view_async_shared()
-                                cute.arch.mbarrier_arrive(kt_ready)
-                                pfl = Int32(is_flush)
-                                if is_flush:
-                                    fit = fit + 1
-                                it = it + 1
-                            sidx = nsidx
-                            P = nP
-                            base = nbase
         else:
             if cutlass.const_expr(self.split):
                 cute.arch.setmaxregister_increase(RS[1])
@@ -1446,24 +1479,18 @@ class KdaReplayMtpUmma:
             vv = _load_v(v, b0, h0, row, T)
             if ct < NH:
                 s_alog[ct] = Float32(a_log[ct])  # published by the first P1 barrier
-            if cutlass.const_expr(KTC):
-                # K~ rows past the window keep the previous item's (finite) values; zero
-                # them once so the first item never meets uninitialised SMEM
-                zz = Uint32(0)
-                for zi in cutlass.range_constexpr(NJB * 2):
-                    U.sts_v4(kt_addr + (zi * 128 + ct) * 16, zz, zz, zz, zz)
             # G_P and the K~ ring words of the first item (later items': one item ahead)
-            if cutlass.const_expr(_RING_PF):
-                gp, kraw, gj = _load_ring(
-                    g_cache, k_cache, sidx, h0, P, base, ct, jr, c8
-                )
             it = Int32(0)
             fit = Int32(0)
-            for kk in cutlass.range(nk, unroll=1):
-                item = cta + kk * ncta
+            mb_addr = s_mbox.toint()
+            # warp 0's mbarrier inits (the mailbox is read before the first item)
+            cute.arch.barrier(barrier_id=4, number_of_threads=160)
+            item = _mbox_take(mb_addr, mb_full, mb_empty, Int32(0), cta, warp)
+            kk = Int32(0)
+            while item < NIT:
                 brow = item // NH
                 hh = item - brow * NH
-                nitem = item + ncta
+                nitem = _mbox_take(mb_addr, mb_full, mb_empty, kk + 1, cta, warp)
                 nsidx, nP, nbase = _next_cursors(
                     self.persistent,
                     state_idx_t,
@@ -1484,45 +1511,9 @@ class KdaReplayMtpUmma:
                     if it > 0:
                         # every consumer is done with the previous item's tiles / tables
                         _bar_sync_ua(1, 128)
-                    gc_row0 = g_cache.iterator.toint() + Int64(
-                        cute.crd2idx((sidx, hh, 0, 0), g_cache.layout)
-                    ) * Int64(4)
-                    kc_row0 = k_cache.iterator.toint() + Int64(
-                        cute.crd2idx((sidx, hh, 0, 0), k_cache.layout)
-                    ) * Int64(2)
-                    if cutlass.const_expr(KTC):
-                        # channel layout: G_P and the window's raw k̂ / G of channel ct
-                        # (rows j < P; the K~ rows past P keep stale finite values: they
-                        # only meet zero D columns)
-                        gp_c = Float32(
-                            g_cache[sidx, hh, (base + P - 1) & RING_MASK, ct]
-                        )
-                        gp_c = _sel(P > 0, gp_c, 0.0, Float32)
-                        gjc = []
-                        krc = []
-                        for j in cutlass.range_constexpr(16):
-                            jp = Int32(j < P)
-                            js = (base + j) & RING_MASK
-                            gjc.append(
-                                _ldg_f32_if(jp, gc_row0 + Int64((js * K_DIM + ct) * 4))
-                            )
-                            krc.append(
-                                _ldg_u16_if(jp, kc_row0 + Int64((js * K_DIM + ct) * 2))
-                            )
-                    elif cutlass.const_expr(HELP):
-                        # G_P of this channel (bdec / g append); K~ is the helpers'
-                        gp_c = Float32(
-                            g_cache[sidx, hh, (base + P - 1) & RING_MASK, ct]
-                        )
-                        gp_c = _sel(P > 0, gp_c, 0.0, Float32)
-                    elif cutlass.const_expr(not _RING_PF):
-                        gp_c, kraw_c, gj_c = _load_ring(
-                            g_cache, k_cache, sidx, hh, P, base, ct, jr, c8
-                        )
-                    else:
-                        gp_c = gp
-                        kraw_c = kraw
-                        gj_c = gj
+                    gp_c, kraw_c, gj_c = _load_ring(
+                        g_cache, k_cache, sidx, hh, P, base, ct, jr, c8
+                    )
                     kpred = Int32(jr < P)
                     gc_row = g_cache.iterator.toint() + Int64(
                         cute.crd2idx((sidx, hh, 0, 0), g_cache.layout)
@@ -1612,8 +1603,7 @@ class KdaReplayMtpUmma:
                     _ik_push(IK, "c_p2")
                     # -------- P2: gate + operand tiles (channel layout, c = ct)
                     c = ct
-                    if cutlass.const_expr((not HELP and not KTC) or WR == 32):
-                        s_gp[c] = gp_c
+                    s_gp[c] = gp_c
                     bdec = _sel(P > 0, _exp(gp_c), 1.0, Float32)
                     s_bdec[c] = bdec
                     gbase = _sel(is_flush, 0.0, gp_c, Float32)
@@ -1677,8 +1667,6 @@ class KdaReplayMtpUmma:
                         s_coef[_CO_BETA + ct] = Float32(1.0) / (
                             Float32(1.0) + _exp(Float32(0.0) - braw)
                         )
-                    if it == 0:
-                        cute.arch.barrier(barrier_id=4, number_of_threads=160)  # inits
                     cute.arch.fence_view_async_shared()
                     cute.arch.mbarrier_arrive(x_ready)
                     _bar_sync_ua(1, 128)  # s_gp, X_c, Ktil visible to every consumer
@@ -1696,50 +1684,32 @@ class KdaReplayMtpUmma:
                     _ik_pop(IK)
                     _ik_push(IK, "c_p3")
                     # -------- P3: K~ = bf16(k̂_j . e^{G_P - G_j}) (j < P, else 0)
-                    if cutlass.const_expr(KTC):
-                        for j in cutlass.range_constexpr(16):
-                            if j < P:
-                                wj = _exp(gp_c - gjc[j])
-                                kv = U.u16_as_f32(krc[j], True) * wj
-                                U.sts_u16(
-                                    kt_addr + _x_sw128_off(j, ct),
-                                    U.f32_to_u16(kv, True),
-                                )
-                    elif cutlass.const_expr(HELP):
-                        _mbw(kt_ready, ph, 17, cta, warp, kk)
-                    else:
-                        for gk in cutlass.range_constexpr(2):
-                            gpv = _lds_f32x4(
-                                gp_addr + (gk * 64 + c8 * 8) * 4
-                            ) + _lds_f32x4(gp_addr + (gk * 64 + c8 * 8 + 4) * 4)
-                            kw = []
-                            for i in cutlass.range_constexpr(4):
-                                w0 = _exp(gpv[2 * i] - gj_c[gk * 8 + 2 * i])
-                                w1 = _exp(gpv[2 * i + 1] - gj_c[gk * 8 + 2 * i + 1])
-                                pk = U.pack_bf16x2(
-                                    U.bf16x2_lo_f32(kraw_c[gk][i]) * w0,
-                                    U.bf16x2_hi_f32(kraw_c[gk][i]) * w1,
-                                )
-                                kw.append(_sel(kpred != 0, pk, Uint32(0), Uint32))
-                            U.sts_v4(
-                                kt_addr + gk * 2048 + jr * 128 + ((c8 ^ (jr % 8)) * 16),
-                                kw[0],
-                                kw[1],
-                                kw[2],
-                                kw[3],
+                    for gk in cutlass.range_constexpr(2):
+                        gpv = _lds_f32x4(gp_addr + (gk * 64 + c8 * 8) * 4) + _lds_f32x4(
+                            gp_addr + (gk * 64 + c8 * 8 + 4) * 4
+                        )
+                        kw = []
+                        for i in cutlass.range_constexpr(4):
+                            w0 = _exp(gpv[2 * i] - gj_c[gk * 8 + 2 * i])
+                            w1 = _exp(gpv[2 * i + 1] - gj_c[gk * 8 + 2 * i + 1])
+                            pk = U.pack_bf16x2(
+                                U.bf16x2_lo_f32(kraw_c[gk][i]) * w0,
+                                U.bf16x2_hi_f32(kraw_c[gk][i]) * w1,
                             )
+                            kw.append(_sel(kpred != 0, pk, Uint32(0), Uint32))
+                        U.sts_v4(
+                            kt_addr + gk * 2048 + jr * 128 + ((c8 ^ (jr % 8)) * 16),
+                            kw[0],
+                            kw[1],
+                            kw[2],
+                            kw[3],
+                        )
                     if cutlass.const_expr(WR == 32):
                         if P > 16:
                             _kt_block1(
                                 kc_row, gc_row, gp_addr, kt_addr, base, P, jr, c8
                             )
                     _bar_sync_ua(1, 128)
-                    if cutlass.const_expr(_RING_PF):
-                        # the next item's G_P / K~ ring words (this item's are consumed)
-                        gp, kraw, gj = _load_ring(
-                            g_cache, k_cache, nsidx, nh, nP, nbase, ct, jr, c8
-                        )
-
                     _ik_pop(IK)
                     _ik_push(IK, "c_p4")
                     # -------- P4: mma.sync Grams. warp cw 0: Gq = X_c . Ktil^T (fp32,
@@ -1962,14 +1932,12 @@ class KdaReplayMtpUmma:
                     xw, graw, braw, dtb = _load_x(
                         q, k, g, b, dt_bias, a_log, nb, nh, ct, r8, l16, T
                     )
-                    if cutlass.const_expr(_RING_PF):
-                        gp, kraw, gj = _load_ring(
-                            g_cache, k_cache, nsidx, nh, nP, nbase, ct, jr, c8
-                        )
                     vv = _load_v(v, nb, nh, row, T)
                 sidx = nsidx
                 P = nP
                 base = nbase
+                item = nitem
+                kk = kk + 1
             if cutlass.const_expr(_HANG_PROGRESS_ADDR != 0):
                 _prog_st(
                     Int64(_HANG_PROGRESS_ADDR)
@@ -2018,6 +1986,7 @@ class KdaReplayMtpUmma:
             Float32(-5.0),
             Int32(1),
             Int32(1),
+            ft(Int32, (2,), 1),  # claim / done counters
             stream,
         )
 
@@ -2048,9 +2017,6 @@ def _get_kernel(
         _HANG_DEBUG_ADDR,
         _PF_WHERE,
         _HANG_PROGRESS_ADDR,
-        _RING_PF,
-        _HELP_P3,
-        _KT_CH,
     )
     fn = _KERNELS.get(key)
     if fn is None:
@@ -2093,6 +2059,24 @@ def _grid(B: int, H: int, dev: torch.device):
     )
     pz = _FORCE_PERSISTENT if _FORCE_PERSISTENT is not None else True
     return bool(pz), (min(n, slots) if pz else n)
+
+
+_COUNTERS: dict = {}
+
+
+def _work_counters(dev: torch.device) -> torch.Tensor:
+    """The dynamic-claim counters [claim, done] of this device and stream (zeroed once;
+    the last CTA of every launch resets them). Launches on one stream are ordered, so
+    they never share the counters concurrently."""
+    key = (
+        dev.index if dev.index is not None else torch.cuda.current_device(),
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+    t = _COUNTERS.get(key)
+    if t is None:
+        t = torch.zeros(2, dtype=torch.int32, device=dev)
+        _COUNTERS[key] = t
+    return t
 
 
 def launch_umma_persistent(
@@ -2146,6 +2130,7 @@ def launch_umma_persistent(
         float(lower_bound),
         int(flush_min),
         int(ncta),
+        _work_counters(q.device),
     )
     _LAUNCHES += 1
 
