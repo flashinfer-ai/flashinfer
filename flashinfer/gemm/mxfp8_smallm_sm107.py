@@ -255,7 +255,13 @@ def _device_supported(a: torch.Tensor) -> Optional[str]:
     # The capture state that matters is the one of the stream the kernel will
     # launch on — the current stream OF a.device (the FFI binding launches on
     # that device's stream under a device guard) — not the ambient device's.
-    with torch.cuda.device(a.device):
+    # The device context is entered only on an actual mismatch: this guard
+    # runs on a host-latency-bound dispatch path.
+    a_index = a.device.index
+    if a_index is not None and a_index != torch.cuda.current_device():
+        with torch.cuda.device(a_index):
+            capturing = torch.cuda.is_current_stream_capturing()
+    else:
         capturing = torch.cuda.is_current_stream_capturing()
     if capturing and "specialized" not in _backend_modules:
         # Never compile/load inside a capture; the stock path is capture-safe.

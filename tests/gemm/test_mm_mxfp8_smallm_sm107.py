@@ -139,6 +139,61 @@ def test_strided_scale_declines_with_scale_layout():
     )
 
 
+@requires_sm107
+@pytest.mark.parametrize("index,offset", [(0, 16), (1, 16), (2, 1), (3, 1), (4, 1)])
+def test_specialized_misaligned_refusal(index, offset, monkeypatch):
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    m, n, k = 4, 6144, 384
+    a, sa = _const_operand(m, k, 1, 127)
+    b, sb = _const_operand(n, k, 1, 127)
+    args = [a, b, sa, sb, torch.empty((m, n), device="cuda", dtype=torch.bfloat16)]
+    t = args[index]
+    args[index] = torch.empty(t.numel() + offset, device=t.device, dtype=t.dtype)[
+        offset:
+    ].view(t.shape)
+    a, b, sa, sb, out = args
+    assert args[index].is_contiguous()
+    assert (
+        specialized.specialized_mm_mxfp8_eligible(a, b.T, sa, sb, out, out.dtype, False)
+        == "pointer_alignment"
+    )
+    with pytest.raises(NotImplementedError, match="pointer_alignment"):
+        mm_mxfp8(a, b.T, sa, sb, out=out, backend="specialized")
+    module = specialized._get_specialized_module()
+    assert module is not None
+    with pytest.raises(RuntimeError, match="pointer_alignment"):
+        module.mm_mxfp8_smallm_sm107_run(*args)
+
+
+@requires_sm107
+def test_generic_launch_error_crosses_ffi():
+    # M=1 enters gen_m<1>; K=128 gives one valid K group. N=0 makes
+    # grid.x zero at the reachable, non-clustered launch_gen site.
+    module = specialized._get_specialized_module()
+    assert module is not None
+    a, sa = _const_operand(1, 128, 1, 127)
+    b, sb = _const_operand(1, 128, 1, 127)
+    out = torch.empty((1, 0), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="fallback kernel launch failed"):
+        module.mm_mxfp8_smallm_sm107_run(a, b[:0], sa, sb, out)
+
+
+@requires_sm107
+@pytest.mark.parametrize("m,n,k", [(1, 129, 128), (4, 6144, 384), (8, 1152, 5120)])
+def test_direct_epilogue_lanes_and_canaries(m, n, k):
+    module = specialized._get_specialized_module()
+    assert module is not None
+    a, sa = _const_operand(m, k, 1, 127)
+    b, sb = _const_operand(n, k, 1, 127)
+    values = (1 + torch.arange(n, device="cuda") % 4).float()
+    b.copy_(values[:, None].expand(n, k))
+    storage = torch.full((m * n + 16,), -1, dtype=torch.bfloat16, device="cuda")
+    out = storage[8:-8].view(m, n)
+    module.mm_mxfp8_smallm_sm107_run(a, b, sa, sb, out)
+    assert torch.equal(out, (values * k).bfloat16().expand(m, n))
+    assert (storage[:8] == -1).all() and (storage[-8:] == -1).all()
+
+
 def test_backends_declaration():
     assert MM_MXFP8_BACKENDS[0] == "auto"
     assert "specialized" in MM_MXFP8_BACKENDS
@@ -378,31 +433,21 @@ def test_specialized_matches_exact_reference_on_every_allowlisted_shape(
 
 @requires_sm107
 def test_specialized_small_scale_precise_path(monkeypatch):
-    """UE8M0 scale bytes below 3 switch the kernel to its precise-dot
-    (exact-dequant) path: drive one allowlisted shape with tiny magnitudes so
-    the quantizer emits such scales, and hold the same tight tolerance."""
+    """A dequantizes to 2^-136, below half the smallest BF16 subnormal.
+    Ordinary BF16 MMA would return zero. Neither scale triggers rebalancing.
+    """
     monkeypatch.delenv(_DISABLE_ENV, raising=False)
     m, n, k = (4, 5120, 576)
-    torch.manual_seed(7)
-    # Only A is tiny: its UE8M0 scale bytes land below 3 (the precise-dot
-    # trigger) while the products stay far above the fp32 underflow floor.
-    tiny = 2.0**-120
-    a_bf16 = torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * tiny
-    b_bf16 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * 0.25
-    a_q, a_sf = mxfp8_quantize(a_bf16, sf_swizzle_layout=SfLayout.layout_128x4)
-    b_q, b_sf = mxfp8_quantize(b_bf16, sf_swizzle_layout=SfLayout.layout_128x4)
-    # The scenario must actually exercise the small-scale class.
-    a_lin = specialized._unswizzle_sf(a_sf, m, k)
-    assert (a_lin < 3).any(), "test setup must produce UE8M0 scales below 3"
-    reference = _exact_dequant_reference(a_q, b_q, a_sf, b_sf)
+    a_q, a_sf = _const_operand(m, k, 2.0**-9, 0)
+    b_q, b_sf = _const_operand(n, k, 256, 127)
+    reference = torch.full((m, n), k * 2.0**-128, dtype=torch.bfloat16, device="cuda")
     calls = _count_kernel_launches(monkeypatch)
     res = mm_mxfp8(
         a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
     )
     assert len(calls) == 1
-    _assert_matches_exact_reference(reference, res, "small-scale precise path")
-    # The check must stay effective at this magnitude: an all-zero result
-    # (reference max is ~1e-34 here, far below any fixed floor) must fail.
+    assert torch.equal(reference, res)
+    # Keep the separate zero-output negative control for the relative-error helper.
     with pytest.raises(AssertionError):
         _assert_matches_exact_reference(
             reference, torch.zeros_like(res), "small-scale all-zero guard"

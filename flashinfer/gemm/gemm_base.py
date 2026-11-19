@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from collections import Counter, OrderedDict
+from contextvars import ContextVar
 import logging
 import os
 import struct
@@ -8195,6 +8196,33 @@ MM_MXFP8_BACKENDS = (
 )
 
 
+_mxfp8_auto_choice = ContextVar("mxfp8_auto_choice", default=None)
+
+
+def _scope_mxfp8_choice(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        requested = kwargs.get("backend", args[7] if len(args) > 7 else "auto")
+        if requested == "auto" and not kwargs.get("batch_invariant", False):
+            # Automatic dispatch needs candidates for this invocation, even
+            # when skip_check was requested. Explicit backends retain it.
+            kwargs["skip_check"] = False
+        token = _mxfp8_auto_choice.set(None)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _mxfp8_auto_choice.reset(token)
+
+    return wrapped
+
+
+def _resolve_mxfp8_choice(*args, **kwargs):
+    names = _heuristic_func_mm_mxfp8(*args, **kwargs)
+    _mxfp8_auto_choice.set(tuple(names))
+    return names
+
+
+@_scope_mxfp8_choice
 @backend_requirement(
     {
         "specialized": _specialized_mm_mxfp8_requirement,
@@ -8206,7 +8234,7 @@ MM_MXFP8_BACKENDS = (
         "b12x": _b12x_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
-    heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+    heuristic_func=_resolve_mxfp8_choice,
     bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_mxfp8_trace)
@@ -8412,7 +8440,10 @@ def mm_mxfp8(
     )
 
     if backend == "auto":
-        backends = mm_mxfp8.suitable_auto_backends
+        choice = _mxfp8_auto_choice.get()
+        if not choice:
+            raise ValueError("No auto backend resolved for this mm_mxfp8 call")
+        backends = list(choice)
     else:
         backends = [backend]
 
@@ -8471,22 +8502,18 @@ def mm_mxfp8(
     # A cached warp split-K entry is keyed by M bucket, so it can come from an M the
     # kernel does not serve or carry a tactic illegal for this shape. Fall back to
     # the first runner's default, as the autotuner itself does.
-    if hasattr(runner, "is_tactic_compatible") and not (
-        runner.supports_inputs(inputs) and runner.is_tactic_compatible(inputs, tactic)
-    ):
-        # Fall back to the first runner that accepts these inputs rather than
-        # runners[0] unconditionally: the specialized default refuses
-        # off-profile inputs in forward, so skipping it here keeps the
-        # fallback able to serve the call.
-        runner = next(
-            (
-                r
-                for r in runners
-                if not hasattr(r, "supports_inputs") or r.supports_inputs(inputs)
-            ),
-            runners[0],
+    def accepts(r, t):
+        return (not hasattr(r, "supports_inputs") or r.supports_inputs(inputs)) and (
+            not hasattr(r, "is_tactic_compatible") or r.is_tactic_compatible(inputs, t)
         )
-        tactic = -1
+
+    if not any(r is runner for r in runners) or not accepts(runner, tactic):
+        for candidate in runners:
+            if accepts(candidate, -1):
+                runner, tactic = candidate, -1
+                break
+        else:
+            raise ValueError("No mm_mxfp8 runner accepts these inputs")
 
     runner(inputs=inputs, tactic=tactic)
     return out

@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <flashinfer/gemm/mm_mxfp8_smallm_sm107.cuh>
+#include <optional>
 
 #include "tvm_ffi_utils.h"
 
@@ -249,13 +250,29 @@ void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorV
   // that device current. Establish the operands' device for the launches
   // (and restore the caller's current device on scope exit), so a call with
   // all tensors on a non-current GPU is not issued on the wrong device.
-  ffi::CUDADeviceGuard device_guard(aq.device().device_id);
+  // The guard is engaged only on an actual mismatch: this entry sits on a
+  // host-latency-bound path, and the common same-device call should pay one
+  // cudaGetDevice, not a set/restore pair.
+  int current_device = -1;
+  TVM_FFI_ICHECK_EQ(cudaGetDevice(&current_device), cudaSuccess)
+      << "mm_mxfp8_smallm_sm107: current device query failed";
+  std::optional<ffi::CUDADeviceGuard> device_guard;
+  if (current_device != aq.device().device_id) {
+    device_guard.emplace(aq.device().device_id);
+  }
   cudaStream_t st = get_stream(aq.device());
   A.aq = (const uint8_t*)aq.data_ptr();
   A.bq = (const uint8_t*)bq.data_ptr();
   A.asf = (const uint8_t*)a_sf.data_ptr();
   A.bsf = (const uint8_t*)b_sf.data_ptr();
   A.out = (__nv_bfloat16*)result.data_ptr();
+  // Match the specialized Python contract, including for direct FFI calls.
+  const auto aligned = [](const void* p, uintptr_t bytes) {
+    return reinterpret_cast<uintptr_t>(p) % bytes == 0;
+  };
+  TVM_FFI_ICHECK(aligned(A.aq, 32) && aligned(A.bq, 32) && aligned(A.asf, 16) &&
+                 aligned(A.bsf, 16) && aligned(A.out, 16))
+      << "mm_mxfp8_smallm_sm107: pointer_alignment";
   A.m0 = 0;
 
   // ---- measured shape families -------------------------------------------

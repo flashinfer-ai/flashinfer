@@ -432,20 +432,21 @@ DEVI float4 precise_chunk_rb(uint4 b0, uint4 b1, uint4 a, unsigned sb0, unsigned
 // compare and its branch from the store path; the pack itself is one
 // cvt.rn.bf16x2.f32 per output pair instead of two converts plus a shift-or.
 template <bool FULL = false, typename Index = int>
-DEVI void store4(__nv_bfloat16* op, const float* v, Index n, Index N) {
+DEVI void store4(__nv_bfloat16* op, const float4& v, Index n, Index N) {
   // Exact measured routes have N divisible by four and therefore preserve the
   // allocator's 8-byte alignment on every row.  Generic rows may have an odd
   // bf16 stride, so only issue the 64-bit vector store when its address is
   // actually aligned; the scalar tail remains valid for every in-scope N.
-  if (FULL || ((n + 4 <= N) && ((((uintptr_t)op) & 7u) == 0))) {
+  if (FULL || ((N - n >= 4) && ((((uintptr_t)op) & 7u) == 0))) {
     unsigned x, y;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(x) : "f"(v[0]), "f"(v[1]));
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(y) : "f"(v[2]), "f"(v[3]));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(x) : "f"(v.x), "f"(v.y));
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(y) : "f"(v.z), "f"(v.w));
     asm volatile("st.global.v2.u32 [%0], {%1,%2};" ::"l"(op), "r"(x), "r"(y) : "memory");
   } else {
-#pragma unroll
-    for (int c = 0; c < 4; ++c)
-      if (n + c < N) op[c] = __float2bfloat16(v[c]);
+    op[0] = __float2bfloat16(v.x);
+    if (N - n > 1) op[1] = __float2bfloat16(v.y);
+    if (N - n > 2) op[2] = __float2bfloat16(v.z);
+    if (N - n > 3) op[3] = __float2bfloat16(v.w);
   }
 }
 
@@ -1141,10 +1142,14 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
       const int n = (idx - m * NV) * 4;
       float4 t[WK];
 #pragma unroll
-      for (int w = 0; w < WK; ++w) t[w] = *(const float4*)&sred[w][m][n];
-#pragma unroll
+      for (int w = 0; w < WK; ++w) {
+        const float* p = &sred[w][m][n];
+        t[w] = make_float4(p[0], p[1], p[2], p[3]);
+      }
       t[0] = fold4<WK>(t);
-      if (m < mlim) store4<AFFB>(out + (size_t)(mbase + m) * N + nbase + n, &t[0].x, nbase + n, N);
+      if (m < mlim && n < N - nbase) {
+        store4<AFFB>(out + (size_t)(mbase + m) * N + nbase + n, t[0], nbase + n, N);
+      }
     }
     return;
   }
@@ -1180,8 +1185,10 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
       const int n = (idx - m * NV) * 4;
       float4 t[WK];
 #pragma unroll
-      for (int w = 0; w < WK; ++w) t[w] = *(const float4*)&sred[w][m][n];
-#pragma unroll
+      for (int w = 0; w < WK; ++w) {
+        const float* p = &sred[w][m][n];
+        t[w] = make_float4(p[0], p[1], p[2], p[3]);
+      }
       t[0] = fold4<WK>(t);
       int own, local;
       if constexpr (CLSC == 4) {
@@ -1265,7 +1272,9 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
       }
       const int m = idx / NV;
       const int n = (idx - m * NV) * 4;
-      if (m < mlim) store4<AFFB>(out + (size_t)(mbase + m) * N + nbase + n, &sum.x, nbase + n, N);
+      if (m < mlim && n < N - nbase) {
+        store4<AFFB>(out + (size_t)(mbase + m) * N + nbase + n, sum, nbase + n, N);
+      }
     }
   }
 }
