@@ -26,8 +26,11 @@ import torch
 
 from flashinfer.moe_ep._compat import deprecated_aliases
 
+from .activation import fc1_rows_per_intermediate
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
+
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
 SfAtomRows = 128  # to_blocked pads rows to 128 (32x4 atoms x 4-row group)
 SfAtomCols = 4
@@ -569,9 +572,8 @@ def compute_megamoe_reference_sm107_block_scaled(
     raw SF ``(E, hidden, I/vec)``. Nongated FC1 uses I rather than 2I rows,
     with no gate/up interleave.
     """
-    if activation not in ("swiglu", "clamped_relu2"):
-        raise ValueError("reference activation must be swiglu or clamped_relu2")
-    nongated = activation == "clamped_relu2"
+    fc1_rows = fc1_rows_per_intermediate(activation)
+    nongated = fc1_rows == 1
     if nongated and any(
         v is not None
         for v in (gate_up_clamp, situ_beta, situ_linear_beta, swiglu_alpha, swiglu_beta)
@@ -585,7 +587,7 @@ def compute_megamoe_reference_sm107_block_scaled(
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
     hidden = fc2_weight_k_major.shape[1]
-    intermediate = fc1_out if nongated else fc1_out // 2
+    intermediate = fc1_out // fc1_rows
 
     x = _dequant_activation(quant_kind, x_data, x_sf, tokens, hidden)
 

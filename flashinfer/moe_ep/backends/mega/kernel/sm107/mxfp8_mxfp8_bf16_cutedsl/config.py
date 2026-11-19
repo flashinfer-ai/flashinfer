@@ -18,7 +18,7 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
 
     The kernel fuses dispatch, FC1, activation, FC2, and combine with BF16 output.
     It uses E8M0 scales per 32 values and 16-row gate/up stripes. SwiGLU is the default;
-    SiTU requires both positive, finite beta parameters. ``clamped_relu2`` is
+    SiTU requires both positive, finite beta parameters. 'clamped_relu2' is
     nongated: ``(16*tanh(relu(x)/16))**2`` using hardware tanh. It requires
     MXFP8 E4M3 GenPhase and FC1 weights [E, I, H], with no gate/up interleave.
     Inputs must be finite; hardware fmax maps NaN FC1 values to zero.

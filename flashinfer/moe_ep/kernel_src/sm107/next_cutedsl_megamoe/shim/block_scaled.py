@@ -34,6 +34,7 @@ import torch
 from flashinfer.moe_ep._compat import deprecated_aliases
 
 from . import comm
+from .activation import fc1_rows_per_intermediate
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 from .shared_expert import Sm107SharedExpertConfig, validate_feature_config
@@ -287,7 +288,9 @@ class Sm107BlockScaledMoeConfig:
                 f"across world_size ({self.world_size})."
             )
         vec = self.sf_vec_size
-        if self.activation == "clamped_relu2" and self.intermediate % (4 * vec):
+        if fc1_rows_per_intermediate(self.activation) == 1 and self.intermediate % (
+            4 * vec
+        ):
             raise ValueError("clamped_relu2 intermediate must be a multiple of 128.")
         if self.hidden % (4 * vec) != 0:
             raise ValueError(
@@ -814,16 +817,14 @@ class Sm107BlockScaledSymmBuffer:
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
-        from ..src import (
-            RubinInferenceGenphaseMegaMoE,
-            RubinInferenceMegaMoE,
-        )
-        from ..src.sources.api import ImplDesc, ProblemDesc
-        from ..src.sources.quant_def import CombineFormat
 
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
             validate_block_scaled_batch_invariant,
         )
+
+        from ..src import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
+        from ..src.sources.api import ImplDesc, ProblemDesc
+        from ..src.sources.quant_def import CombineFormat
 
         validate_block_scaled_batch_invariant(cfg, arch="sm_107")
         tiler = cfg.resolved_mma_tiler_mnk
@@ -885,9 +886,7 @@ class Sm107BlockScaledSymmBuffer:
                     else {}
                 ),
                 "intermediate_gateup_size": (
-                    cfg.intermediate
-                    if cfg.activation == "clamped_relu2"
-                    else 2 * cfg.intermediate
+                    fc1_rows_per_intermediate(cfg.activation) * cfg.intermediate
                 ),
                 "hidden_size": cfg.hidden,
                 "quant_kind": cfg.quant_kind,
@@ -1412,9 +1411,7 @@ def _expected_weight_shapes(
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
     """(fc1 shape, fc2 shape, fc1 SF numel/expert, fc2 SF numel/expert)."""
     experts = cfg.experts_per_rank
-    fc1_out = (
-        cfg.intermediate if cfg.activation == "clamped_relu2" else 2 * cfg.intermediate
-    )
+    fc1_out = fc1_rows_per_intermediate(cfg.activation) * cfg.intermediate
     vec = cfg.sf_vec_size
     if cfg.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)

@@ -152,7 +152,7 @@ those modules stay in FlashInfer and are not copied into `src/`.
 
 ## Clamped squared ReLU overlay
 
-`activation="clamped_relu2"` selects `(16*tanh(relu(x)/16))**2` with hardware
+`activation='clamped_relu2'` selects `(16*tanh(relu(x)/16))**2` with hardware
 tanh and nongated FC1 weights. It supports MXFP8 E4M3 GenPhase with BF16 combine,
 one epilogue warpgroup, an intermediate width divisible by 128, and
 `die_aware="off"`. Shared experts, dedup, and batch invariance are not supported

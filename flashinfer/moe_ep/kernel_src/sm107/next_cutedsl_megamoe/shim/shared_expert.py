@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from flashinfer.moe_ep.config import Sm107SharedExpertConfig
 
+from .activation import fc1_rows_per_intermediate
+
 
 def validate_feature_config(config):
+    fc1_rows_per_intermediate(config.activation)
     if getattr(config, "activation", None) == "clamped_relu2":
         kind = getattr(config, "quant_kind", getattr(config, "kind", None))
         if (

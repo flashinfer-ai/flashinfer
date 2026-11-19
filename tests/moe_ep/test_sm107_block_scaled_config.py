@@ -17,10 +17,16 @@ import dataclasses
 import pytest
 
 from flashinfer.moe_ep import (
-    Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
-    Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
+from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+    Sm107Mxfp4MegaKernelBackend,
+)
+from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.backend import (
+    Sm107Mxfp8Mxfp4MegaKernelBackend,
 )
 from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
     Sm107Mxfp8BlockScaledMegaKernelBackend,
@@ -31,14 +37,6 @@ from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl impor
 from flashinfer.moe_ep.core.kernel.registry import (
     create_mega_kernel,
     is_mega_kernel_config,
-)
-
-from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.backend import (
-    Sm107Mxfp8Mxfp4MegaKernelBackend,
-)
-
-from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
-    Sm107Mxfp4MegaKernelBackend,
 )
 
 _BACKENDS = (
@@ -223,3 +221,15 @@ def test_clamped_relu2_rejects_unsupported_modes(override):
     kwargs.update(override)
     with pytest.raises(ValueError, match="clamped_relu2"):
         _config(Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, **kwargs)
+
+
+def test_fc1_activation_layout():
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.activation import (
+        fc1_rows_per_intermediate,
+    )
+
+    assert fc1_rows_per_intermediate("swiglu") == 2
+    assert fc1_rows_per_intermediate("situ") == 2
+    assert fc1_rows_per_intermediate("clamped_relu2") == 1
+    with pytest.raises(ValueError, match="unsupported SM107 activation"):
+        fc1_rows_per_intermediate("unknown")
