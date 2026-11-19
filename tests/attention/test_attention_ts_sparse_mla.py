@@ -7,6 +7,8 @@ The test-only preparer adapts vLLM's page-stride mapping and stable compaction
 (0aee727ff6131a1b647941186ceef8f4777bdac2); native Q/KV are never repacked.
 """
 
+import functools
+
 import pytest
 import torch
 
@@ -1126,6 +1128,168 @@ def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
         )
 
 
+# Long enough that a dependent PDL launch is resident and past its prologue
+# before the predecessor below writes anything (about 1 ms at 2 GHz).
+_PDL_SPIN_CYCLES = 2_000_000
+
+_PDL_PREDECESSOR_CPP = r"""
+void restore_late(std::vector<at::Tensor> dst, std::vector<at::Tensor> src,
+                  int64_t spin_cycles);
+void probe_without_wait(at::Tensor src, at::Tensor seen);
+"""
+
+_PDL_PREDECESSOR_CUDA = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+constexpr int kMaxRegions = 4;
+
+struct Regions {
+  uint32_t* dst[kMaxRegions];
+  const uint32_t* src[kMaxRegions];
+  int64_t words[kMaxRegions];
+  int count;
+};
+
+// Releases its PDL dependents at entry, spins, and only then restores each
+// region, so a dependent that reads a region before its grid-dependency wait
+// sees the poisoned bytes.
+__global__ void restore_late_kernel(Regions regions, int64_t spin_cycles) {
+  asm volatile("griddepcontrol.launch_dependents;");
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int r = 0; r < regions.count; ++r) {
+    for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         i < regions.words[r]; i += stride) {
+      regions.dst[r][i] = regions.src[r][i];
+    }
+  }
+}
+
+// A PDL dependent without a grid-dependency wait: it records the first word
+// of src as it finds it.
+__global__ void probe_without_wait_kernel(const uint32_t* src, uint32_t* seen) {
+  seen[0] = *reinterpret_cast<const volatile uint32_t*>(src);
+}
+
+void restore_late(std::vector<at::Tensor> dst, std::vector<at::Tensor> src,
+                  int64_t spin_cycles) {
+  TORCH_CHECK(!dst.empty() && dst.size() == src.size() && dst.size() <= kMaxRegions);
+  Regions regions{};
+  regions.count = static_cast<int>(dst.size());
+  for (int r = 0; r < regions.count; ++r) {
+    for (const at::Tensor& t : {dst[r], src[r]}) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kByte);
+      TORCH_CHECK(t.numel() % 4 == 0 && reinterpret_cast<uintptr_t>(t.data_ptr()) % 4 == 0);
+    }
+    TORCH_CHECK(dst[r].numel() == src[r].numel());
+    regions.dst[r] = static_cast<uint32_t*>(dst[r].data_ptr());
+    regions.src[r] = static_cast<const uint32_t*>(src[r].data_ptr());
+    regions.words[r] = dst[r].numel() / 4;
+  }
+  restore_late_kernel<<<32, 256, 0, at::cuda::getCurrentCUDAStream()>>>(regions, spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void probe_without_wait(at::Tensor src, at::Tensor seen) {
+  TORCH_CHECK(src.is_cuda() && seen.is_cuda() && seen.element_size() == 4);
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(1);
+  config.blockDim = dim3(1);
+  config.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attribute;
+  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute.val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&config, probe_without_wait_kernel,
+                                    static_cast<const uint32_t*>(src.data_ptr()),
+                                    static_cast<uint32_t*>(seen.data_ptr())));
+}
+"""
+
+
+@functools.cache
+def _pdl_predecessor():
+    """Build the test-only PDL predecessor (see _PDL_PREDECESSOR_CUDA)."""
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = torch.cuda.get_device_capability()
+    return load_inline(
+        name="test_attention_ts_sparse_mla_pdl_predecessor",
+        cpp_sources=[_PDL_PREDECESSOR_CPP],
+        cuda_sources=[_PDL_PREDECESSOR_CUDA],
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        ],
+        functions=["restore_late", "probe_without_wait"],
+        verbose=False,
+    )
+
+
+def _byte_span(tensor):
+    """Return a contiguous byte view of the storage a strided tensor view spans."""
+    span = 1 + sum(
+        (n - 1) * s for n, s in zip(tensor.shape, tensor.stride(), strict=True)
+    )
+    return torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+        tensor.untyped_storage(),
+        tensor.storage_offset() * tensor.element_size(),
+        (span * tensor.element_size(),),
+        (1,),
+    )
+
+
+def _check_pdl_window():
+    """A PDL dependent of the predecessor runs before it restores anything.
+
+    Otherwise the attention launches below could not start before their inputs
+    are written, and their bitwise checks would pass however the kernel waits.
+    """
+    predecessor = _pdl_predecessor()
+    poisoned = torch.full((16,), 0xFF, device="cuda", dtype=torch.uint8)
+    seen = torch.zeros(1, device="cuda", dtype=torch.int32)
+    # A process's first launch of each kernel loads it (lazy module loading)
+    # and does not overlap its predecessor; load both before measuring.
+    predecessor.restore_late([poisoned.clone()], [poisoned.clone()], 0)
+    predecessor.probe_without_wait(poisoned, seen)
+    torch.cuda.synchronize()
+    predecessor.restore_late([poisoned], [torch.zeros_like(poisoned)], _PDL_SPIN_CYCLES)
+    predecessor.probe_without_wait(poisoned, seen)
+    torch.cuda.synchronize()
+    assert seen.item() == -1, "the PDL dependent waited for its predecessor"
+    assert torch.count_nonzero(poisoned) == 0
+
+
+def _late_inputs(compiled):
+    """Precede each launch of a compiled sparse MLA callable with a PDL predecessor
+    that poisons Q and the sparse index tables (NaN and -1 bytes) and restores them
+    only after releasing its dependents, so any read issued before the attention
+    grid's dependency wait changes the output."""
+    predecessor = _pdl_predecessor()
+
+    def launch(*args):
+        # Positional ABI of _launch_mla_decode: Q latent first, sparse inputs
+        # (indices, extra indices, lengths, ...) twelfth.
+        tensors = (args[0], *args[11][:2])
+        regions = [
+            _byte_span(t) for t in tensors if isinstance(t, torch.Tensor) and t.numel()
+        ]
+        saved = [region.clone() for region in regions]
+        for region in regions:
+            region.fill_(0xFF)
+        predecessor.restore_late(regions, saved, _PDL_SPIN_CYCLES)
+        return compiled(*args)
+
+    return launch
+
+
 def _first_outputs(run_test, check_config, profile=None, pdl=False):
     """Run ``run_test`` (an existing oracle and replay test) with its compiled configs
     checked, on ``profile`` instead of the policy's schedule when one is given.
@@ -1133,14 +1297,20 @@ def _first_outputs(run_test, check_config, profile=None, pdl=False):
     Returns the output and LSE of the test's first launch, which is eager and whose
     inputs depend only on the test's arguments, for bitwise comparison between
     launches. ``pdl`` compiles the attention kernel with ``use_pdl`` and
-    ``pdl_wait_after_prologue``.
+    ``pdl_wait_after_prologue``, checks that its trace moved the wait after the
+    prologue, and precedes each launch with a predecessor that writes Q and the
+    sparse indices only after the attention grid may start (_late_inputs).
     """
     import copy
     from dataclasses import replace
 
     from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+        ThroughputLatencyMlaDecodeTs,
+    )
 
     compile_kernel = mla_decode._get_compiled_mla_decode
+    waits_after_prologue = ThroughputLatencyMlaDecodeTs.waits_after_prologue
     configs, outputs = [], []
 
     def checked_compile(spec):
@@ -1156,7 +1326,25 @@ def _first_outputs(run_test, check_config, profile=None, pdl=False):
         cfg = spec.kernel._make_config()
         check_config(cfg)
         configs.append(cfg)
-        return compile_kernel(spec)
+        if not pdl:
+            return compile_kernel(spec)
+        traced = []
+
+        def recording(self, *args, **kwargs):
+            traced.append(waits_after_prologue(self, *args, **kwargs))
+            return traced[-1]
+
+        with pytest.MonkeyPatch.context() as trace:
+            # Trace instead of loading a cached binary, so the kernel's own
+            # predicate (scalar scales, no KV producer, persistent, no split
+            # partials) is observed rather than only the config flags.
+            trace.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+            trace.setattr(
+                ThroughputLatencyMlaDecodeTs, "waits_after_prologue", recording
+            )
+            compiled = compile_kernel.__wrapped__(spec)
+        assert traced and all(traced), "the PDL launch kept the entry wait"
+        return _late_inputs(compiled)
 
     run = BatchSparseMLADecodePagedTSWrapper.run
 
@@ -1180,13 +1368,18 @@ def _first_outputs(run_test, check_config, profile=None, pdl=False):
 
 @pytest.mark.parametrize("schedule", ["bf16-static", "fp8-ws-gather", "fp8-nvfp4"])
 def test_pdl_wait_after_prologue_graph(schedule):
-    """A PDL launch of a persistent grid that waits after its prologue reads the
-    inputs and metadata its preceding launches wrote (the graph replays refresh them
-    right before), and matches the entry-wait launch bit for bit."""
+    """A PDL launch of a persistent grid that waits after its prologue reads only
+    what its predecessor wrote, and matches the entry-wait launch bit for bit.
+
+    Every eager and replayed launch follows a predecessor that releases it at
+    entry and writes Q and the sparse indices about a millisecond later, so a
+    read issued before the moved wait sees NaN Q and -1 indices.
+    """
     from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
         SparseMlaProfile,
     )
 
+    _check_pdl_window()
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     profile = None
     if schedule == "fp8-nvfp4":
