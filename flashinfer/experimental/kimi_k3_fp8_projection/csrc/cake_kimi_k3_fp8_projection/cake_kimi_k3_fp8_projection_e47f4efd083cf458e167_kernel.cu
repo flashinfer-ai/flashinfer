@@ -52,25 +52,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-
-
-
-
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-
-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
     unsigned int u;
@@ -115,55 +96,44 @@ kernel_cake_kimi_k3_fp8_projection_e47f4efd083cf458e167(__nv_bfloat16* __restric
     int row_in_tile = row_c - m_tile * sf_rows;
     unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull;
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    float staged[32];
+    unsigned int staged[16];
     #pragma unroll
     for (int u = 0; u < QUANT_UNITS; u++) {
         int k_ld = (k_block0 + u) * 128 + half_lane * 8;
-        float _vec_load_0[8];
         {
-            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (row_base + (unsigned long long)k_ld) + 0);
-            uint4 _vld_0[1];
-            #pragma unroll
-            for (int _blk = 0; _blk < 1; _blk++) {
-                asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
-                    : "=r"(_vld_0[_blk].x), "=r"(_vld_0[_blk].y), "=r"(_vld_0[_blk].z), "=r"(_vld_0[_blk].w) : "l"((const void*)(_vptr_0 + _blk)), "l"(0x12F0000000000000ULL) : "memory");
-                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
-                }
-            }
-        }
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            staged[u * 8 + j] = _vec_load_0[j];
+            uint32_t _uv4_0_0;
+            uint32_t _uv4_0_1;
+            uint32_t _uv4_0_2;
+            uint32_t _uv4_0_3;
+            asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
+                : "=r"(_uv4_0_0), "=r"(_uv4_0_1), "=r"(_uv4_0_2), "=r"(_uv4_0_3) : "l"((const void*)(x + (row_base + (unsigned long long)k_ld) + (0))), "l"(0x12F0000000000000ULL) : "memory");
+            staged[4 * u + 0] = _uv4_0_0;
+            staged[4 * u + 1] = _uv4_0_1;
+            staged[4 * u + 2] = _uv4_0_2;
+            staged[4 * u + 3] = _uv4_0_3;
         }
     }
     #pragma unroll
     for (int u_1 = 0; u_1 < QUANT_UNITS; u_1++) {
         int k_block = k_block0 + u_1;
         int k = k_block * 128 + half_lane * 8;
-        float vals[8];
-        float mags[8];
-        #pragma unroll
-        for (int j_1 = 0; j_1 < 8; j_1++) {
-            vals[j_1] = staged[u_1 * 8 + j_1];
-            mags[j_1] = staged[u_1 * 8 + j_1];
-        }
-        mags[0] = fabsf(mags[0]);
-        mags[1] = fabsf(mags[1]);
-        mags[2] = fabsf(mags[2]);
-        mags[3] = fabsf(mags[3]);
-        mags[4] = fabsf(mags[4]);
-        mags[5] = fabsf(mags[5]);
-        mags[6] = fabsf(mags[6]);
-        mags[7] = fabsf(mags[7]);
-        float absmax = mags[0];
-        #pragma unroll
-        for (int _lr = 1; _lr < 8; _lr++) {
-            absmax = max_noftz(absmax, mags[_lr]);
-        }
+        uint32_t abs0;
+        asm("abs.bf16x2 %0, %1;" : "=r"(abs0) : "r"(staged[4 * u_1]));
+        uint32_t abs1;
+        asm("abs.bf16x2 %0, %1;" : "=r"(abs1) : "r"(staged[4 * u_1 + 1]));
+        uint32_t abs2;
+        asm("abs.bf16x2 %0, %1;" : "=r"(abs2) : "r"(staged[4 * u_1 + 2]));
+        uint32_t abs3;
+        asm("abs.bf16x2 %0, %1;" : "=r"(abs3) : "r"(staged[4 * u_1 + 3]));
+        uint32_t low_max;
+        asm("max.bf16x2 %0, %1, %2;" : "=r"(low_max) : "r"(abs0), "r"(abs1));
+        uint32_t high_max;
+        asm("max.bf16x2 %0, %1, %2;" : "=r"(high_max) : "r"(abs2), "r"(abs3));
+        uint32_t pair_max;
+        asm("max.bf16x2 %0, %1, %2;" : "=r"(pair_max) : "r"(low_max), "r"(high_max));
+        uint32_t unit_max;
+        asm("max.bf16x2 %0, %1, %2;" : "=r"(unit_max) : "r"(pair_max), "r"(pair_max >> 16));
+        float absmax = __uint_as_float(unit_max << 16);
         float other_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
         absmax = fmaxf(absmax, other_0);
         float other_1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
@@ -180,42 +150,68 @@ kernel_cake_kimi_k3_fp8_projection_e47f4efd083cf458e167(__nv_bfloat16* __restric
         unsigned int has_mantissa = ((mantissa != 0) ? 1 : 0);
         unsigned int _max_1 = ((exponent + has_mantissa) > (1) ? (exponent + has_mantissa) : (1));
         unsigned int scale_byte = ((_max_1) < (254) ? (_max_1) : (254));
-        unsigned int inverse_bits = 254 - scale_byte << 23;
-        float inverse = 0.0f;
-        inverse = reinterpret_cast<float*>(&inverse_bits)[0];
-        const float2 _scale2_2 = {inverse, inverse};
-        #pragma unroll
-        for (int _ls = 0; _ls < 4; _ls++)
-            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_2);
+        unsigned int inverse_pair = (254 - scale_byte << 7) * 65537;
+        unsigned int codes[2];
+        uint32_t low_pair_0;
+        asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(low_pair_0) : "r"(staged[4 * u_1]), "r"(inverse_pair));
+        uint32_t high_pair_0;
+        asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(high_pair_0) : "r"(staged[4 * u_1 + 1]), "r"(inverse_pair));
+        uint16_t _cvt_satfinite_e4m3x2_bf16x2_3;
+        #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_3) : "r"(low_pair_0));
+        #else
+        {
+        const uint32_t _bf16x2 = (uint32_t)(low_pair_0);
+        const float _lo = __uint_as_float(_bf16x2 << 16);
+        const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_3) : "f"(_hi), "f"(_lo));
+        }
+        #endif
+        uint16_t _cvt_satfinite_e4m3x2_bf16x2_4;
+        #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_4) : "r"(high_pair_0));
+        #else
+        {
+        const uint32_t _bf16x2 = (uint32_t)(high_pair_0);
+        const float _lo = __uint_as_float(_bf16x2 << 16);
+        const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_4) : "f"(_hi), "f"(_lo));
+        }
+        #endif
+        uint32_t _mov_b32_pack_u16x2_2;
+        asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_2) : "h"(_cvt_satfinite_e4m3x2_bf16x2_3), "h"(_cvt_satfinite_e4m3x2_bf16x2_4));
+        codes[0] = _mov_b32_pack_u16x2_2;
+        uint32_t low_pair_1;
+        asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(low_pair_1) : "r"(staged[4 * u_1 + 2]), "r"(inverse_pair));
+        uint32_t high_pair_1;
+        asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(high_pair_1) : "r"(staged[4 * u_1 + 2 + 1]), "r"(inverse_pair));
+        uint16_t _cvt_satfinite_e4m3x2_bf16x2_6;
+        #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_6) : "r"(low_pair_1));
+        #else
+        {
+        const uint32_t _bf16x2 = (uint32_t)(low_pair_1);
+        const float _lo = __uint_as_float(_bf16x2 << 16);
+        const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_6) : "f"(_hi), "f"(_lo));
+        }
+        #endif
+        uint16_t _cvt_satfinite_e4m3x2_bf16x2_7;
+        #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_7) : "r"(high_pair_1));
+        #else
+        {
+        const uint32_t _bf16x2 = (uint32_t)(high_pair_1);
+        const float _lo = __uint_as_float(_bf16x2 << 16);
+        const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_7) : "f"(_hi), "f"(_lo));
+        }
+        #endif
+        uint32_t _mov_b32_pack_u16x2_5;
+        asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_5) : "h"(_cvt_satfinite_e4m3x2_bf16x2_6), "h"(_cvt_satfinite_e4m3x2_bf16x2_7));
+        codes[1] = _mov_b32_pack_u16x2_5;
         if (row < M) {
-            unsigned int _packed_0[2];
-            {
-                uint32_t _packed;
-                asm volatile("{\n\t"
-                    ".reg .b16 _lo;\n\t"
-                    ".reg .b16 _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}"
-                    : "=r"(_packed) : "f"(vals[0]), "f"(vals[1]),
-                                       "f"(vals[2]), "f"(vals[3]));
-                _packed_0[0] = _packed;
-            }
-            {
-                uint32_t _packed;
-                asm volatile("{\n\t"
-                    ".reg .b16 _lo;\n\t"
-                    ".reg .b16 _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}"
-                    : "=r"(_packed) : "f"(vals[4]), "f"(vals[5]),
-                                       "f"(vals[6]), "f"(vals[7]));
-                _packed_0[1] = _packed;
-            }
-            asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;" :: "l"(a_q + (row_base + (unsigned long long)k)), "r"(_packed_0[(0) + 0]), "r"(_packed_0[(0) + 1]), "l"(0x14F0000000000000ULL) : "memory");
+            asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;" :: "l"(a_q + (row_base + (unsigned long long)k)), "r"(codes[(0) + 0]), "r"(codes[(0) + 1]), "l"(0x14F0000000000000ULL) : "memory");
             if (half_lane == 0) {
                 unsigned long long sf_addr = sf_row_base + (unsigned long long)k_block * (unsigned long long)SF_TILE_BYTES;
                 #pragma unroll

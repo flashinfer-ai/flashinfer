@@ -460,7 +460,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "b4c5c90e28f1a7e4",
         "arg_plan": "quant",
-        "closure_sha256": "a01a19097194b0f650b23c44643a19dd03873a19d449180cd534f7369cbe8558",
+        "closure_sha256": "31b4669454974ba6d7cce20d2e8a30dfb46023f96b0c51c7f92cc1048374baf1",
     },
     "17fedfee50cf604ffcd2": {
         "binding": "021cc0171d570f358807",
@@ -646,7 +646,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "91d545345c79036e",
         "arg_plan": "quant",
-        "closure_sha256": "acb6ab47a17fc9dd8247392d1b9cff6bc0901fc0bd9baa7a48ac0ee6f6640bfb",
+        "closure_sha256": "1df28a77562614506446c257c0103ec7a53071403d09563cf67f8588b0d77afa",
     },
     "2951b0621f2896486fe8": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1939,7 +1939,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "15116dfeea3aaebf",
         "arg_plan": "quant",
-        "closure_sha256": "f6fcc5da1f7ac412f84d8a4118386d810ffb736f0ce6d40636afb17c5bfeb414",
+        "closure_sha256": "87bcfda1ea553c1f2df6b48f8ef1720270a152365df4fa0480ce6d9e24827dbc",
     },
     "5d6e96a98ac4ce9a3a1a": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2522,7 +2522,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "dd05d06fa98d014c",
         "arg_plan": "quant",
-        "closure_sha256": "9f3362e8a7c22b02aff85e96db5318cf60f468c9c27917fb0b283ec0553e19ef",
+        "closure_sha256": "6859ed0c6587c0cd2c197127d00ff6cec3d5124527a856783b1b993cc8354ad1",
     },
     "79282b0772b8f48110f2": {
         "binding": "09ef673497e9adb01b7e",
@@ -3850,7 +3850,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "ff8445a9ce3a4178",
         "arg_plan": "quant",
-        "closure_sha256": "6e7c240fc8f16a243d83ab2fb6fb4ba7d2ab377a6056b805ebeba4b848d32d9a",
+        "closure_sha256": "0059ff0f8562a737198f9a083b05e4ee44c1be8c982cc1c23fcdcbff49d6de08",
     },
     "c4add94f10ad967e96f8": {
         "binding": "021cc0171d570f358807",
@@ -4420,7 +4420,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "ff8c724d5d3fb1e9",
         "arg_plan": "quant",
-        "closure_sha256": "0b9869ec53497df65e63460c4fbae1af7c279e247a64569c02737e54d4102397",
+        "closure_sha256": "223303da8002db157d2ecc88d539a950ad0fdb2d62fc90663b83e410a560e6e6",
     },
     "e911403fba07d72a2590": {
         "binding": "09ef673497e9adb01b7e",
@@ -4576,7 +4576,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "7704a3f586181998",
         "arg_plan": "quant",
-        "closure_sha256": "d8cc8ca3514a16c5a66aadd7bba5550a22f8a43d36b52e1824695e9e07516bb2",
+        "closure_sha256": "1b28f836201184c84002a902b2978b98142801cb1aba8ac96a36b2b9e7e21f0c",
     },
     "f90460931d7c9a77f1a1": {
         "binding": "0cdb8cc10eb1192d3635",
