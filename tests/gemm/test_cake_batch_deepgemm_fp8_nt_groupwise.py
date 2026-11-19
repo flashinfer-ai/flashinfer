@@ -2673,13 +2673,15 @@ def _run_beside_occupier(device, die, domains, table, launch):
             ),
             (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong),
         )
+        # Set before the call: an interrupt can arrive after the driver accepted
+        # the launch. A rejected launch leaves an idle stream to drain.
+        launched = True
         _checked(
             driver.cuLaunchKernel(
                 function, blocks, 1, 1, 1024, 1, 1, smem, occupier_stream, args, 0
             ),
             "cuLaunchKernel(occupier)",
         )
-        launched = True
         reader = torch.cuda.Stream(device=device)
         started = time.monotonic()
         resident = 0

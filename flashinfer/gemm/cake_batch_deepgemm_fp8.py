@@ -1541,6 +1541,14 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     captured before any eager call holds no memset node; a failure there does
     not fail this call.
 
+    Homed weights are meant for ``backend="cake"``.  ``backend="deepgemm"``
+    reads them correctly but more slowly: on 212-SM devices it took 1.39-1.50x
+    the time of plain weights at ``expected_m`` 2-64.  The twin's gain comes
+    from die-local memory reads and was measured with the memory at its full
+    clock.  On a device whose memory ran at a lower clock (driver 620.43, 3186
+    of 4752 MHz) the twin route took 0.99-1.06x the time of plain weights at
+    ``expected_m <= 64``; keep plain weights on such a device.
+
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
     after it is freed faults on replay, so keep it alive as long as such a graph.

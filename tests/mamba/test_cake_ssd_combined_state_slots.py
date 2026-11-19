@@ -29,6 +29,10 @@ limitations under the License.
 # cache, 64-bit pool offsets and CUDA-graph replays with mutated slot vectors,
 # flags and tokens.  The look-back slot twin is expected only where the route
 # serves it (``_LOOKBACK_STATE_SLOTS`` and the architecture's slot table).
+# On sm_107a the claim and wrap programs have slot twins of their own
+# (``_SM107_SLOT_MODULES`` alone): a slot call runs one exactly when the same
+# call without slot vectors runs that program, and the sm_107a GPU cells of
+# those routes check them against the dense call as above.
 
 import hashlib
 import importlib
@@ -77,6 +81,14 @@ _SLOT_KEYS = frozenset(
     + [f"chunkpar_{state}_varlen_slots" for state in _STATES]
     + [f"chunkpar3_{state}_varlen_slots" for state in _STATES]
 )
+# The four sm_107a-only state-slot programs, in ``_SM107_SLOT_MODULES`` alone:
+# the twins of the claim and wrap programs of the bf16 and f32 states.
+_SM107_ONLY_SLOT_KEYS = frozenset(
+    f"exactpre_{state}_varlen_{variant}slots"
+    for variant in ("claim", "wrap")
+    for state in ("bf16", "f32")
+)
+_ALL_SLOT_KEYS = _SLOT_KEYS | _SM107_ONLY_SLOT_KEYS
 _SLOT_FAMILIES = frozenset({"exactfused", "exactpre", "chunkpar", "chunkpar3"})
 # Main dynamic SMEM of the slot programs by (family, dense variant): the dense
 # twin's literal; the sm_107a tail pair render keeps 8 more bytes.
@@ -85,6 +97,8 @@ _SLOT_SMEM_BYTES = {
     ("exactfused", "noring"): 232192,
     ("exactpre", ""): 232320,
     ("exactpre", "tail"): 232320,
+    ("exactpre", "claim"): 232448,
+    ("exactpre", "wrap"): 232448,
     ("chunkpar", ""): 231808,
     ("chunkpar3", ""): 232448,
 }
@@ -180,9 +194,10 @@ def _lookback_slot_family(module, state_dtype, arch):
 
 def _served_slot_keys(module, arch):
     """The slot programs calls on ``arch`` can reach: ``_SLOT_KEYS`` without
-    the look-back twins the route does not serve there."""
+    the look-back twins the route does not serve there, and on sm_107a the
+    claim and wrap twins (``_SM107_ONLY_SLOT_KEYS``)."""
 
-    return frozenset(
+    served = frozenset(
         key
         for key in _SLOT_KEYS
         if not key.startswith("chunkpar_")
@@ -191,6 +206,13 @@ def _served_slot_keys(module, arch):
         )
         == "chunkpar"
     )
+    return served | (_SM107_ONLY_SLOT_KEYS if arch == "sm_107a" else frozenset())
+
+
+def _slot_key_arches(key):
+    """The architectures that build slot program ``key``."""
+
+    return _ARCHES if key in _SLOT_KEYS else ("sm_107a",)
 
 
 def _kernel_parameters(text, kernel):
@@ -297,19 +319,24 @@ def _cpu_pool(rows, nheads, state_dtype, *, pad=64):
 
 
 def test_slot_tables_bind_the_dense_twins_without_gpu():
-    """Both slot tables hold the seventeen keys; each unit is its dense fold
-    stem plus ``_slots`` under its own content hash (one source for sm_100a
-    and sm_103a, one for sm_107a), takes the dense twin's arguments plus the
-    twelve slot arguments and drops ``__restrict__`` from the three state
-    pools; each program launches with its dense twin's SMEM, cluster shape,
-    preprocess and dependent-launch mode on every architecture.  The dense
+    """Both slot tables hold the seventeen keys, and the sm_107a table the
+    four claim and wrap twins beside them; each unit is its dense main stem
+    plus ``_slots`` under its own content hash (one source for sm_100a and
+    sm_103a, one for sm_107a; the claim and wrap twins an sm_107a source
+    alone), takes the dense twin's arguments plus the twelve slot arguments
+    and drops ``__restrict__`` from the three state pools; each program
+    launches with its dense twin's SMEM, cluster shape, preprocess and
+    dependent-launch mode on every architecture that builds it.  The dense
     table is unchanged."""
 
     module = _module()
-    assert len(_SLOT_KEYS) == 17
-    assert set(module._SLOT_MODULES) == set(module._SM107_SLOT_MODULES) == _SLOT_KEYS
-    assert set(module._SLOT_PROGRAMS) == _SLOT_KEYS
-    assert not _SLOT_KEYS & set(module._PROGRAMS)
+    assert len(_SLOT_KEYS) == 17 and len(_SM107_ONLY_SLOT_KEYS) == 4
+    assert set(module._SLOT_MODULES) == _SLOT_KEYS
+    assert set(module._SM107_SLOT_MODULES) == _ALL_SLOT_KEYS
+    assert module._SM107_ONLY_SLOT_PROGRAMS == _SM107_ONLY_SLOT_KEYS
+    assert set(module._SLOT_PROGRAMS) == _ALL_SLOT_KEYS
+    assert not _ALL_SLOT_KEYS & set(module._PROGRAMS)
+    assert set(module._SM107_SLOT_TWIN_VARIANTS) == {"claim", "wrap"}
     assert len(module._PROGRAMS) == 84
     assert len(module._SM107_MODULES) == 68
     assert module._SLOT_ARGS == _SLOT_ARGS
@@ -327,17 +354,23 @@ def test_slot_tables_bind_the_dense_twins_without_gpu():
     assert len(module._MAIN_ARGS_CHUNKPAR3_SLOTS) == _CHUNKPAR3_SLOT_ARGS
     assert len(module._MAIN_ARGS_CHUNKPAR_SLOTS) == _CHUNKPAR_SLOT_ARGS
     source_root = module._source_dir() / module._DEVICE_DIR
-    for key in sorted(_SLOT_KEYS):
+    for key in sorted(_ALL_SLOT_KEYS):
         twin = _dense_twin(key)
         assert _slot_key(twin) == key
         dense = module._PROGRAMS[twin]
+        arches = _slot_key_arches(key)
+        tables = (
+            (module._SLOT_MODULES, module._SM107_SLOT_MODULES)
+            if key in _SLOT_KEYS
+            else (module._SM107_SLOT_MODULES,)
+        )
         family = key.split("_")[0]
         main_args = {
             "chunkpar": module._MAIN_ARGS_CHUNKPAR_SLOTS,
             "chunkpar3": module._MAIN_ARGS_CHUNKPAR3_SLOTS,
         }.get(family, module._MAIN_ARGS_SLOTS)
         dense_stem = dense.main.module.rsplit("_", 1)[0]
-        for table in (module._SLOT_MODULES, module._SM107_SLOT_MODULES):
+        for table in tables:
             identity = table[key]
             stem, digest = identity.rsplit("_", 1)
             assert stem == f"{dense_stem}_slots", (key, identity)
@@ -353,8 +386,15 @@ def test_slot_tables_bind_the_dense_twins_without_gpu():
             assert not re.search(
                 r"__restrict__\s+(?:initial|final|checkpoint)_states\b", text
             ), identity
-        assert module._SLOT_MODULES[key] != module._SM107_SLOT_MODULES[key]
-        for arch in _ARCHES:
+        if key in _SLOT_KEYS:
+            assert module._SLOT_MODULES[key] != module._SM107_SLOT_MODULES[key]
+        else:
+            # An sm_107a-only dense program: its sm_107a unit is its main
+            # module on every architecture, and so is its twin's.
+            assert dense.main.module == module._SM107_MODULES[twin]
+            slot_module = module._SLOT_PROGRAMS[key].main.module
+            assert slot_module == module._SM107_SLOT_MODULES[key]
+        for arch in arches:
             program = module._arch_program(key, arch)
             dense_program = module._arch_program(twin, arch)
             assert program.state_slots and not dense_program.state_slots
@@ -483,8 +523,8 @@ def test_slot_host_templates_bind_the_slot_arguments_without_gpu():
         )
         assert "Generated by cake.runtime.host_shim" not in template
         assert all(placeholder in template for placeholder in _HOST_PLACEHOLDERS)
-    for key in sorted(_SLOT_KEYS):
-        for arch in _ARCHES:
+    for key in sorted(_ALL_SLOT_KEYS):
+        for arch in _slot_key_arches(key):
             program = module._arch_program(key, arch)
             main_pdl = module._main_pdl(key, arch)
             rendered = module._render_host_source(
@@ -546,7 +586,9 @@ _SLOT_FORMS = ("cu_seqlens", "derived", "trusted", "publishing")
 # 64 tokens at 128 heads), the tail pair program's long items (4 x 2048; the
 # sm_107a varlen pair call of 2 x 1024), one 32768-token sequence at 8 heads
 # and a two-sequence call at 4 heads (the chunk-parallel calls), and the
-# sm_107a one-chunk calls of 2048 items (claim / initial-state bulk).
+# sm_107a one-chunk calls of 2048 items (claim / initial-state bulk), and the
+# sm_107a claim and wrap cells of 256 x 128 tokens at 16 heads and 8 x 2048
+# tokens at 32 heads.
 _ANCHOR_CELLS = (
     ((1,) * 1024, 128, 8),
     ((100,) * 8, 128, 8),
@@ -558,16 +600,17 @@ _ANCHOR_CELLS = (
     ((1500, 2600), 4, 4),
     ((100,) * 16, 128, 8),
     ((1,) * 2048, 1, 1),
+    ((128,) * 256, 16, 2),
+    ((2048,) * 8, 32, 4),
 )
-# The base slot program of the sm_107a forms the slot route leaves: claim,
+# The base slot program of the sm_107a forms the slot route leaves:
 # initial-state bulk and one-CTA-cluster calls run the ring program, one-CTA
-# pair calls the 2-CTA pair program, wrap calls the ring or pair program.
+# pair calls the 2-CTA pair program.  The claim and wrap programs run their
+# own twins.
 _BASE_VARIANTS = {
-    "claim": ("",),
     "ibulk": ("",),
     "unit": ("",),
     "tailone": ("tail",),
-    "wrap": ("", "tail"),
 }
 
 
@@ -609,14 +652,17 @@ def test_slot_calls_route_to_the_slot_twins_without_gpu(monkeypatch):
     ``chunkpar3`` program of the ring, ``_noring`` or ``_tail`` schedule),
     else the twin the slot route maps it to -- the retained start program to
     ``exactpre``, the SM100 metadata and SM103 / SM107 one-launch programs to
-    the two-kernel program, the sm_107a claim, initial-state bulk, wrap,
-    one-CTA pair and one-CTA-cluster forms to their base program, the
-    look-back program to its twin where the route serves it
-    (:func:`_lookback_slot_family`), else to the three-phase twin.  The same
-    call with strided slot vectors (columns of a slot table), flags, a
-    checkpoint pool (the state pool itself) and ``null_slot_id=0`` runs the
-    same program.  Each architecture reaches every slot program it serves
-    (all seventeen with the look-back twins shipped)."""
+    the two-kernel program, the sm_107a initial-state bulk, one-CTA pair and
+    one-CTA-cluster forms to their base program, the look-back program to its
+    twin where the route serves it (:func:`_lookback_slot_family`), else to
+    the three-phase twin.  The sm_107a claim and wrap programs (bf16 and f32
+    states) run their own twins: a slot call runs one exactly when the same
+    call without slot vectors runs that program.  The same call with strided
+    slot vectors (columns of a slot table), flags, a checkpoint pool (the
+    state pool itself) and ``null_slot_id=0`` runs the same program.  Each
+    architecture reaches every slot program it serves (all seventeen with the
+    look-back twins shipped, and the four claim and wrap twins on
+    sm_107a)."""
 
     module = _module()
     monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
@@ -690,7 +736,13 @@ def test_slot_calls_route_to_the_slot_twins_without_gpu(monkeypatch):
                     assert program.family in _SLOT_FAMILIES, (name, cell)
                     family, name_state, mode, _variant = name.split("_")
                     assert (name_state, mode) == (state_key, "varlen"), (name, cell)
-                    assert program.variant in ("", "noring", "tail"), (name, cell)
+                    assert program.variant in ("", "noring", "tail") or (
+                        arch == "sm_107a"
+                        and program.variant in module._SM107_SLOT_TWIN_VARIANTS
+                    ), (name, cell)
+                    assert (name in _SM107_ONLY_SLOT_KEYS) == (
+                        dense_name.endswith(("_claim", "_wrap"))
+                    ), (name, dense_name, cell)
                     dense_family, _, dense_mode, *rest = dense_name.split("_")
                     dense_variant = rest[0] if rest else ""
                     lookback = _lookback_slot_family(module, state_dtype, arch)
@@ -700,7 +752,7 @@ def test_slot_calls_route_to_the_slot_twins_without_gpu(monkeypatch):
                     elif (
                         dense_mode == "varlen"
                         and dense_family in _SLOT_FAMILIES
-                        and dense_variant in ("", "noring", "tail")
+                        and dense_variant in ("", "noring", "tail", "claim", "wrap")
                     ):
                         expected = (_slot_key(dense_name),)
                     elif dense_family == "exact":
@@ -815,6 +867,71 @@ def test_lookback_switch_routes_to_the_three_phase_twin_without_gpu(monkeypatch)
             monkeypatch.setattr(module, _LOOKBACK_SWITCH, lookback)
             family = _lookback_slot_family(module, torch.float32, arch)
             assert name == f"{family}_f32_varlen_slots", (arch, lookback, name)
+
+
+def test_gpu_twin_cells_route_as_the_gpu_tests_expect_without_gpu(monkeypatch):
+    """The routes the GPU twin tests rely on, checked on CPU: on sm_107a
+    (208, 212 and 216 SMs) the dense call of every sm_107a cell runs the
+    claim or wrap program and its slot call that program's twin, while the
+    same cells with an f16 state, and every cell on sm_100a and sm_103a, run
+    no claim or wrap twin; the twin calls (with the sm_107a cells on sm_107a)
+    reach every slot program the architecture serves."""
+
+    module = _module()
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
+
+    def route(call, arch, sm_count, slots):
+        _set_override(monkeypatch, call)
+        ngroups = call.ngroups or min(call.nheads, 8)
+        runner = _cpu_forwarding_runner(
+            module,
+            monkeypatch,
+            deque(maxlen=0),
+            arch=arch,
+            nheads=call.nheads,
+            ngroups=ngroups,
+            state_dtype=call.state_dtype,
+            has_varlen=True,
+            has_z=call.has_z,
+            has_initial_states=slots,
+        )
+        monkeypatch.setattr(module, "_sm_count", lambda _, n=sm_count: n)
+        tensors, kwargs = _route_call(
+            call.lengths, call.nheads, ngroups, call.has_z, call.form
+        )
+        if slots:
+            pool = torch.empty((2, call.nheads, 64, 128), dtype=call.state_dtype)
+            vector = torch.full((len(call.lengths),), -1, dtype=torch.int32)
+            runner.run(
+                *tensors,
+                **kwargs,
+                initial_states=pool,
+                initial_state_slots=vector,
+                final_states=pool,
+                final_state_slots=vector,
+            )
+        else:
+            runner.run(*tensors, **kwargs, return_final_states=False)
+        return runner.last_program_name
+
+    for arch in _ARCHES:
+        sm107 = arch == "sm_107a"
+        for sm_count in (208, 212, 216) if sm107 else (_SM_COUNTS[arch],):
+            for call in _SM107_TWIN_CALLS:
+                name = route(call, arch, sm_count, True)
+                if sm107:
+                    _sm107_twin_route(call, name, route(call, arch, sm_count, False))
+                else:
+                    assert name not in _SM107_ONLY_SLOT_KEYS, (arch, str(call), name)
+                f16 = replace(call, state_dtype=torch.float16)
+                name = route(f16, arch, sm_count, True)
+                assert name not in _SM107_ONLY_SLOT_KEYS, (arch, str(f16), name)
+            if sm_count == 208:
+                continue
+            calls = (*_TWIN_CALLS, *(_SM107_TWIN_CALLS if sm107 else ()))
+            reached = {route(call, arch, sm_count, True) for call in calls}
+            served = _served_slot_keys(module, arch)
+            assert reached == served, (arch, sm_count, sorted(served ^ reached))
 
 
 # ---------------------------------------------------------------------------
@@ -1706,6 +1823,20 @@ def _device_arch():
     return dict(zip(_CAKE_CAPABILITIES, _ARCHES, strict=True))[capability]
 
 
+requires_sm107_device = pytest.mark.skipif(
+    not (_cake_device() and _device_arch() == "sm_107a"),
+    reason="the claim and wrap slot programs run on SM107 only",
+)
+
+
+def _sm107_params(*calls):
+    """``calls`` as parameters that run on an SM107 device alone."""
+
+    return tuple(
+        pytest.param(call, marks=requires_sm107_device, id=str(call)) for call in calls
+    )
+
+
 @dataclass(frozen=True)
 class _Call:
     """One packed-varlen call of the GPU tests."""
@@ -2069,7 +2200,7 @@ def test_slot_program_is_bitwise_its_dense_twin(monkeypatch, call):
     )
     torch.cuda.synchronize()
     key = runner._cake_runner.last_program_name
-    assert key in _SLOT_KEYS, key
+    assert key in _ALL_SLOT_KEYS, key
     assert returned is final.pool
 
     (twin_out, twin_final), default = _dense_twin_run(
@@ -2093,13 +2224,15 @@ def test_slot_program_is_bitwise_its_dense_twin(monkeypatch, call):
 @requires_cake_device
 def test_twin_calls_reach_every_slot_program(monkeypatch):
     """On this device the twin calls run every slot program the route serves
-    here (all seventeen with the look-back twins shipped; routes only,
+    here (all seventeen with the look-back twins shipped, and with the
+    sm_107a cells the four claim and wrap twins on SM107; routes only,
     nothing launched)."""
 
     module = _module()
     monkeypatch.setattr(module, "_launch_program", lambda *_, **__: None)
     reached = {}
-    for call in _TWIN_CALLS:
+    sm107 = _SM107_TWIN_CALLS if _device_arch() == "sm_107a" else ()
+    for call in (*_TWIN_CALLS, *sm107):
         _set_override(monkeypatch, call)
         constructor, tensors, arguments, _ = _inputs(call)
         pool = torch.empty(
@@ -2120,6 +2253,141 @@ def test_twin_calls_reach_every_slot_program(monkeypatch):
     assert set(reached) == served, (sorted(served ^ set(reached)), reached)
 
 
+# sm_107a cells whose dense call runs the claim or wrap program (the bf16
+# claim cell of 1024 one-token prefills at 32 heads; the f32 claim cells of
+# 1024 one-token and 256 x 128-token prefills at 8 and 16 heads; the wrap
+# cells of 8 x 2048 tokens at 32 heads without z, both states): their slot
+# calls run the claim and wrap twins.
+_SM107_TWIN_CALLS = (
+    _Call((1,) * 1024, 32, torch.bfloat16, has_z=False),
+    _Call((1,) * 1024, 8, torch.float32, has_z=False, ngroups=1),
+    _Call((128,) * 256, 16, torch.float32, has_z=False, ngroups=2),
+    _Call(
+        (128,) * 256,
+        16,
+        torch.float32,
+        has_z=False,
+        ngroups=2,
+        d_layout="vector",
+        form="trusted",
+    ),
+    _Call((2048,) * 8, 32, torch.bfloat16, has_z=False, ngroups=2, d_layout="none"),
+    _Call((2048,) * 8, 32, torch.float32, has_z=False, ngroups=4),
+    _Call(
+        (2048,) * 8,
+        32,
+        torch.float32,
+        has_z=False,
+        ngroups=4,
+        form="trusted",
+        seq_idx_dtype=torch.int64,
+    ),
+)
+# The cu_seqlens cells among them (the checkpoint and capture layouts), and
+# their wrap cells (the capture calls hold the claim cells already).
+_SM107_CU_SEQLENS_CALLS = tuple(
+    call for call in _SM107_TWIN_CALLS if call.form == "cu_seqlens"
+)
+_SM107_WRAP_CU_SEQLENS_CALLS = tuple(
+    call for call in _SM107_CU_SEQLENS_CALLS if call.lengths[0] > 128
+)
+
+
+def _sm107_twin_route(call, name, dense_name):
+    """Check that the dense call runs the claim or wrap program and the slot
+    call its twin."""
+
+    assert dense_name.endswith(("_claim", "_wrap")), (str(call), dense_name)
+    assert name == _slot_key(dense_name), (str(call), name, dense_name)
+    assert name in _SM107_ONLY_SLOT_KEYS, name
+
+
+@pytest.mark.parametrize("call", _sm107_params(*_SM107_TWIN_CALLS))
+def test_sm107_claim_and_wrap_twins_are_bitwise_the_dense_call(monkeypatch, call):
+    """A call the dense route sends to the claim or wrap program, reading a
+    row-strided initial pool and writing a separate final pool through
+    permuted slot vectors (with -1 and out-of-range slots), runs that
+    program's slot twin and is bitwise the dense call on the gathered initial
+    states: the same output, every valid final slot holding the dense final
+    state and every other byte of both page buffers unchanged.  A bf16 claim
+    call is bitwise the dense claim program, whose update rounds twice."""
+
+    _set_override(monkeypatch, call)
+    constructor, tensors, arguments, _ = _inputs(call)
+    num_sequences = len(call.lengths)
+    rows = num_sequences + 3
+    initial = _Page(rows, call.nheads, call.state_dtype, seed=call.seed + 1)
+    final = _Page(rows, call.nheads, call.state_dtype, seed=call.seed + 2, fill="nan")
+    initial_slots, final_slots = _slot_vectors(num_sequences, rows, seed=call.seed)
+    initial_before, final_before = initial.raw.clone(), final.raw.clone()
+    gathered = _gather(initial.pool, initial_slots)
+
+    name, out, returned = _run(
+        constructor,
+        tensors,
+        arguments,
+        initial_states=initial.pool,
+        initial_state_slots=initial_slots,
+        final_states=final.pool,
+        final_state_slots=final_slots,
+    )
+    assert returned is final.pool
+    dense_name, dense_out, dense_final = _run(
+        constructor, tensors, arguments, initial_states=gathered
+    )
+    _sm107_twin_route(call, name, dense_name)
+    assert torch.equal(out, dense_out), name
+    assert torch.equal(initial.raw, initial_before), "the initial pool was written"
+    expected = final_before.clone()
+    _scatter(final.view(expected), final_slots, dense_final)
+    assert torch.equal(final.raw, expected), name
+
+
+@pytest.mark.parametrize("call", _sm107_params(*_SM107_TWIN_CALLS))
+def test_sm107_in_place_claim_and_wrap_pools_are_bitwise_the_dense_call(
+    monkeypatch, call
+):
+    """One in-place pool (each sequence's final slot its own initial slot,
+    permuted rows, some -1 or out of range): over 32 fresh seeds the claim or
+    wrap twin leaves the page buffer bitwise the dense call's final states
+    on the gathered initial rows scattered back, and the outputs equal."""
+
+    _set_override(monkeypatch, call)
+    num_sequences = len(call.lengths)
+    rows = num_sequences + 3
+    runner = SSDCombined(**_inputs(call)[0], backend="cake")
+    dense = SSDCombined(**_inputs(call)[0], backend="cake")
+    for seed in range(32):
+        _, tensors, arguments, _ = _inputs(replace(call, seed=seed))
+        page = _Page(rows, call.nheads, call.state_dtype, seed=200 + seed)
+        slots, _ = _slot_vectors(num_sequences, rows, seed=300 + seed)
+        before = page.raw.clone()
+        gathered = _gather(page.pool, slots)
+        dense_out, dense_final = dense.run(
+            *tensors, **arguments, initial_states=gathered
+        )
+        dense_out, dense_final = dense_out.clone(), dense_final.clone()
+        out, returned = runner.run(
+            *tensors,
+            **arguments,
+            initial_states=page.pool,
+            initial_state_slots=slots,
+            final_states=page.pool,
+            final_state_slots=slots,
+        )
+        torch.cuda.synchronize()
+        assert returned is page.pool
+        _sm107_twin_route(
+            call,
+            runner._cake_runner.last_program_name,
+            dense._cake_runner.last_program_name,
+        )
+        expected = before.clone()
+        _scatter(page.view(expected), slots, dense_final)
+        assert torch.equal(out, dense_out), seed
+        assert torch.equal(page.raw, expected), seed
+
+
 _SEMANTICS_CALLS = (
     _Call((96, 160), 8, torch.bfloat16),
     _Call((600,) * 8, 32, torch.float32, form="derived"),
@@ -2129,7 +2397,9 @@ _SEMANTICS_CALLS = (
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _SEMANTICS_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call", (*_SEMANTICS_CALLS, *_sm107_params(*_SM107_TWIN_CALLS)), ids=str
+)
 def test_invalid_slots_start_from_zero_and_store_nothing(monkeypatch, call):
     """Initial slots all -1 start every sequence from zero: bitwise the
     dense call without initial states.  Final slots all -1 store nothing:
@@ -2159,7 +2429,7 @@ def test_invalid_slots_start_from_zero_and_store_nothing(monkeypatch, call):
             final_states=final.pool,
             final_state_slots=final_vector,
         )
-        assert name in _SLOT_KEYS and returned is final.pool
+        assert name in _ALL_SLOT_KEYS and returned is final.pool
         return name, out, final.raw.clone()
 
     # All -1 initial: the dense call without initial states.
@@ -2211,7 +2481,7 @@ def test_empty_sequences_carry_their_initial_slot(form, state_dtype):
         final_states=final.pool,
         final_state_slots=final_slots,
     )
-    assert name in _SLOT_KEYS
+    assert name in _ALL_SLOT_KEYS
     assert torch.equal(final.pool[4], initial.pool[1])
     assert not final.pool[6].any()
     gathered = _gather(initial.pool, initial_slots)
@@ -2223,7 +2493,9 @@ def test_empty_sequences_carry_their_initial_slot(form, state_dtype):
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _SEMANTICS_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call", (*_SEMANTICS_CALLS, *_sm107_params(*_SM107_TWIN_CALLS)), ids=str
+)
 def test_mixed_pool_and_dense_sides_are_bitwise_the_dense_call(monkeypatch, call):
     """One side a pool, the other dense: a dense initial side with a final
     pool, and an initial pool with dense (allocated) final states, are
@@ -2247,7 +2519,7 @@ def test_mixed_pool_and_dense_sides_are_bitwise_the_dense_call(monkeypatch, call
         final_states=final.pool,
         final_state_slots=final_slots,
     )
-    assert name in _SLOT_KEYS and returned is final.pool
+    assert name in _ALL_SLOT_KEYS and returned is final.pool
     (twin_out, twin_final), _ = _dense_twin_run(
         _dense_twin(name), constructor, tensors, arguments, initial_states=gathered
     )
@@ -2262,7 +2534,7 @@ def test_mixed_pool_and_dense_sides_are_bitwise_the_dense_call(monkeypatch, call
         initial_states=initial.pool,
         initial_state_slots=initial_slots,
     )
-    assert name in _SLOT_KEYS
+    assert name in _ALL_SLOT_KEYS
     (twin_out, twin_final), _ = _dense_twin_run(
         _dense_twin(name), constructor, tensors, arguments, initial_states=gathered
     )
@@ -2322,7 +2594,7 @@ def test_in_place_pool_is_bitwise_the_two_pool_call(monkeypatch, call):
         torch.cuda.synchronize()
         assert returned is page.pool
         assert runner._cake_runner.last_program_name == two_pool_program
-        assert two_pool_program in _SLOT_KEYS
+        assert two_pool_program in _ALL_SLOT_KEYS
         assert torch.equal(out_one, out_two), seed
         assert torch.equal(page.raw, separate_final.raw), seed
 
@@ -2333,7 +2605,9 @@ def _restore(*pages_and_copies):
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _SEMANTICS_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call", (*_SEMANTICS_CALLS, *_sm107_params(*_SM107_TWIN_CALLS)), ids=str
+)
 def test_strided_flagged_and_null_slots_are_bitwise_their_plain_forms(
     monkeypatch, call
 ):
@@ -2373,7 +2647,7 @@ def test_strided_flagged_and_null_slots_are_bitwise_their_plain_forms(
         )
         torch.cuda.synchronize()
         assert returned is final.pool
-        assert runner._cake_runner.last_program_name in _SLOT_KEYS
+        assert runner._cake_runner.last_program_name in _ALL_SLOT_KEYS
         return out.clone(), initial.raw.clone(), final.raw.clone()
 
     plain = slot_run(initial_state_slots=initial_slots, final_state_slots=final_slots)
@@ -2556,7 +2830,7 @@ def test_vllm_paged_cache_is_bitwise_the_gather_dense_scatter_flow(
     )
     torch.cuda.synchronize()
     key = runner._cake_runner.last_program_name
-    assert key in _SLOT_KEYS and returned is cache.pool
+    assert key in _ALL_SLOT_KEYS and returned is cache.pool
     if override == "always":
         family = _lookback_slot_family(_module(), state_dtype, _device_arch())
         assert key.startswith(f"{family}_"), key
@@ -2669,7 +2943,7 @@ def test_lookback_in_place_pool_with_flags_is_bitwise_the_two_pool_call(
         )
         torch.cuda.synchronize()
         key = runner._cake_runner.last_program_name
-        assert key.startswith(f"{family}_") and key in _SLOT_KEYS, key
+        assert key.startswith(f"{family}_") and key in _ALL_SLOT_KEYS, key
         assert torch.equal(out_one, out_two), seed
         assert torch.equal(page.raw, separate_final.raw), seed
         gathered = _gather(page.view(before), torch.where(flags, slots, -1))
@@ -2712,7 +2986,9 @@ def _checkpoint_token_vector(lengths, *, seed):
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _CHECKPOINT_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call", (*_CHECKPOINT_CALLS, *_sm107_params(*_SM107_CU_SEQLENS_CALLS)), ids=str
+)
 def test_separate_checkpoint_pool_is_bitwise_the_gather_dense_scatter_flow(
     monkeypatch, call
 ):
@@ -2766,7 +3042,7 @@ def test_separate_checkpoint_pool_is_bitwise_the_gather_dense_scatter_flow(
     )
     torch.cuda.synchronize()
     key = runner._cake_runner.last_program_name
-    assert key in _SLOT_KEYS and returned is final.pool, key
+    assert key in _ALL_SLOT_KEYS and returned is final.pool, key
 
     gathered = _gather(initial.view(initial_before), initial_slots)
     dense_checkpoints = torch.zeros(
@@ -2802,7 +3078,9 @@ def test_separate_checkpoint_pool_is_bitwise_the_gather_dense_scatter_flow(
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _CHECKPOINT_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call", (*_CHECKPOINT_CALLS, *_sm107_params(*_SM107_CU_SEQLENS_CALLS)), ids=str
+)
 def test_dense_checkpoint_tensor_in_a_slot_call_is_bitwise_the_dense_twin(
     monkeypatch, call
 ):
@@ -2854,7 +3132,7 @@ def test_dense_checkpoint_tensor_in_a_slot_call_is_bitwise_the_dense_twin(
         )
         torch.cuda.synchronize()
         key = runner._cake_runner.last_program_name
-        assert key in _SLOT_KEYS and returned is final.pool, key
+        assert key in _ALL_SLOT_KEYS and returned is final.pool, key
         return key, out.clone(), final.raw.clone(), checkpoints
 
     key, out, final_raw, checkpoints = slot_run(
@@ -2950,7 +3228,7 @@ def test_pool_rows_beyond_32_bit_offsets(monkeypatch, form, override):
         checkpoint_state_slots=checkpoint_slots,
         checkpoint_states=pool,
     )
-    assert name in _SLOT_KEYS and returned is pool
+    assert name in _ALL_SLOT_KEYS and returned is pool
     dense_checkpoints = torch.zeros(
         (3, nheads, 64, 128), dtype=torch.bfloat16, device="cuda"
     )
@@ -3029,7 +3307,9 @@ _CAPTURE_CALLS = tuple(
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _CAPTURE_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call", (*_CAPTURE_CALLS, *_sm107_params(*_SM107_WRAP_CU_SEQLENS_CALLS)), ids=str
+)
 def test_captured_slot_call_replays_with_mutated_slots_and_pools(monkeypatch, call):
     """A prepared slot call (one in-place pool) captured into a CUDA graph
     replays with the contents of its slot vectors, pool and ``cu_seqlens`` at
@@ -3054,7 +3334,7 @@ def test_captured_slot_call_replays_with_mutated_slots_and_pools(monkeypatch, ca
     runner = SSDCombined(**constructor, backend="cake")
     x, dt, A, B, C = tensors
     prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **arguments, **states, out=out)
-    assert prepared.program_name in _SLOT_KEYS
+    assert prepared.program_name in _ALL_SLOT_KEYS
     assert prepared.workspace_key.state_slots
     runner.run(*tensors, **arguments, **states, out=out)
     torch.cuda.synchronize()
@@ -3098,7 +3378,11 @@ _CAPTURE_CHECKPOINT_CALLS = (
 
 
 @requires_cake_device
-@pytest.mark.parametrize("call", _CAPTURE_CHECKPOINT_CALLS, ids=str)
+@pytest.mark.parametrize(
+    "call",
+    (*_CAPTURE_CHECKPOINT_CALLS, *_sm107_params(*_SM107_CU_SEQLENS_CALLS)),
+    ids=str,
+)
 def test_captured_slot_call_replays_with_mutated_flags_and_checkpoints(
     monkeypatch, call
 ):
@@ -3161,7 +3445,7 @@ def test_captured_slot_call_replays_with_mutated_flags_and_checkpoints(
     runner = SSDCombined(**constructor, backend="cake")
     x, dt, A, B, C = tensors
     prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **arguments, **states, out=out)
-    assert prepared.program_name in _SLOT_KEYS
+    assert prepared.program_name in _ALL_SLOT_KEYS
     runner.run(*tensors, **arguments, **states, out=out)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

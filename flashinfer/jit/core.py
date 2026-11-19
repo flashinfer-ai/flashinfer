@@ -528,7 +528,7 @@ class JitSpecNvcc(JitSpec):
         for source in self.sources:
             is_cuda = source.suffix == ".cu"
             object_suffix = ".cuda.o" if is_cuda else ".o"
-            obj_name = source.with_suffix(object_suffix).name
+            obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
             object_paths.append(jit_dir / obj_name)
         return object_paths
 
