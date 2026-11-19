@@ -3434,6 +3434,8 @@ struct DevCfg {
   int maxcl[11];
 };
 constexpr int kMaxDevices = 64;
+constexpr bool supported_device_ordinal(int id) { return id >= 0 && id < kMaxDevices; }
+static_assert(supported_device_ordinal(0) && !supported_device_ordinal(64));
 static DevCfg g_devcfg[kMaxDevices];
 // TVM FFI releases the GIL, so two host threads can race the per-device
 // init block; call_once makes a cold concurrent call wait for a complete,
@@ -3458,7 +3460,13 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   if (q.shape()[0] == 0) TVM_FFI_THROW(ValueError) << "q must contain at least one token";
   if (seq_lens.shape()[0] + 1 != cum_seq_lens_q.shape()[0])
     TVM_FFI_THROW(ValueError) << "cum_seq_lens_q must have seq_lens.shape[0] + 1 entries";
+  for (const auto& tensor : {q, swa, ckv, out}) {
+    if (reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 != 0)
+      TVM_FFI_THROW(ValueError) << "q, swa, ckv and out must be 16-byte aligned";
+  }
   DLDevice dev = q.device();
+  if (!supported_device_ordinal(dev.device_id))
+    TVM_FFI_THROW(ValueError) << "unsupported specialized device ordinal: " << dev.device_id;
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 #ifdef ENABLE_G4
@@ -3485,8 +3493,8 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   }
 #endif
   ffi::CUDADeviceGuard device_guard(dev.device_id);
-  DevCfg& dc = g_devcfg[dev.device_id & (kMaxDevices - 1)];
-  std::call_once(g_devcfg_once[dev.device_id & (kMaxDevices - 1)], [&] {
+  DevCfg& dc = g_devcfg[dev.device_id];
+  std::call_once(g_devcfg_once[dev.device_id], [&] {
     SET_ATTR(1)
     SET_ATTR(2)
     SET_ATTR(3)

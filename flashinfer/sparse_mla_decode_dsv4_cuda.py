@@ -96,18 +96,14 @@ _MODULE_ERROR = None  # "TypeName: message" string; deliberately traceback-free
 _MODULE_LOCK = _threading.Lock()
 
 
-def get_sparse_mla_decode_dsv4_module():
-    """Build-and-load exactly once per process. functools.cache would not
-    remember a *failed* build, so every later backend="auto" call would
-    repeat the JIT compile attempt (seconds per decode step). The failure is
-    remembered as a traceback-free string (re-raising one cached exception
-    object appends caller frames to its __traceback__ on every raise,
-    pinning those frames' tensors) and a fresh RuntimeError is raised per
-    request; the lock keeps concurrent cold callers from compiling twice."""
+def get_sparse_mla_decode_dsv4_module(*, required=True):
+    """Load once. Optional callers get None on failure, including cache hits."""
     global _MODULE, _MODULE_ERROR
     if _MODULE is not None:
         return _MODULE
     if _MODULE_ERROR is not None:
+        if not required:
+            return None
         raise RuntimeError(
             "specialized module build failed previously: " + _MODULE_ERROR
         )
@@ -115,6 +111,8 @@ def get_sparse_mla_decode_dsv4_module():
         if _MODULE is not None:
             return _MODULE
         if _MODULE_ERROR is not None:
+            if not required:
+                return None
             raise RuntimeError(
                 "specialized module build failed previously: " + _MODULE_ERROR
             )
@@ -122,7 +120,9 @@ def get_sparse_mla_decode_dsv4_module():
             mod = gen_sparse_mla_decode_dsv4_module().build_and_load()
         except Exception as exc:
             _MODULE_ERROR = f"{type(exc).__name__}: {exc}"
-            raise
+            if required:
+                raise
+            return None
         _MODULE = mod
     _BUILT["ready"] = True
     return _MODULE
@@ -176,6 +176,7 @@ def supported_with_reasons(
             extras.get("hca_swa_indices") is None
             and extras.get("hca_compressed_block_tables") is None
             and extras.get("hca_seq_lens") is None
+            and extras.get("hca_is_causal", True) is True
             and extras.get("hca_sparse_indices_format") is None
             and not extras.get("hca_use_persistent"),
         ),
@@ -276,6 +277,9 @@ def supported_with_reasons(
         r.append("out_not_bf16_q_shaped_contiguous")
     if r:
         return r
+    # Run has one setup slot per ordinal in [0, 64).
+    if query.device.index is not None and query.device.index >= 64:
+        return ["unsupported_device_ordinal"]
     # device guards
     if torch.cuda.get_device_capability(query.device) != (10, 3):
         return ["not_sm103"]
@@ -321,18 +325,25 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
-        try:
-            get_sparse_mla_decode_dsv4_module()
-        except Exception as e:  # pragma: no cover - environment-dependent
-            if backend == "specialized":
-                raise
+        from .mla._core import (
+            _check_dsv4_seq_lens,
+            _check_dsv4_topk_range,
+            _validate_dsv4_sync_checks,
+        )
+
+        if _validate_dsv4_sync_checks(query.device):
+            _check_dsv4_topk_range(sparse_topk_lens, sparse_indices.size(-1))
+            _check_dsv4_seq_lens(seq_lens, cum_seq_lens_q[1:] - cum_seq_lens_q[:-1])
+        mod = get_sparse_mla_decode_dsv4_module(required=backend == "specialized")
+        if mod is None:
             LAST_FALLBACK_REASONS[:] = [
-                "specialized_module_unavailable:" + type(e).__name__
+                "specialized_module_unavailable:" + _MODULE_ERROR
             ]
             DISPATCH_STATS["fallback"] += 1
             return None
         DISPATCH_STATS["specialized"] += 1
         return _run_specialized(
+            mod,
             query,
             swa_kv_cache,
             compressed_kv_cache,
@@ -354,6 +365,7 @@ def maybe_dispatch_specialized(
 
 
 def _run_specialized(
+    mod,
     query,
     swa_kv_cache,
     compressed_kv_cache,
@@ -367,7 +379,6 @@ def _run_specialized(
 ):
     if out is None:
         out = torch.empty_like(query)
-    mod = get_sparse_mla_decode_dsv4_module()
     mod.sparse_mla_decode_dsv4_run(
         query,
         swa_kv_cache,

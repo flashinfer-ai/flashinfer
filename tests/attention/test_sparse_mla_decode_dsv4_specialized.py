@@ -184,7 +184,7 @@ def _ws():
     return _WS["b"]
 
 
-def _api(inp, out=None, backend="auto"):
+def _api(inp, out=None, backend="auto", **kwargs):
     return trtllm_batch_decode_sparse_mla_dsv4(
         query=inp["q"],
         swa_kv_cache=inp["swa_kv_cache"],
@@ -201,6 +201,7 @@ def _api(inp, out=None, backend="auto"):
         max_q_len=int(inp["max_q_len"]),
         backend=backend,
         sparse_indices_are_storage_offsets=True,
+        **kwargs,
     )
 
 
@@ -253,11 +254,13 @@ def test_kill_switch_restores_stock(monkeypatch):
 
 
 @requires_sm103
-def test_cuda_graph_replay_matches_eager():
+def test_cuda_graph_replay_matches_eager(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     inp = _make_inputs(1, 6, 32768, seed=29)
     out = torch.empty(6, H, D, dtype=torch.bfloat16, device="cuda")
-    _api(inp, out=out)  # eager warmup builds the module before capture
+    _api(inp, out=out, backend="specialized")
     eager = out.clone()
+    _assert_close(eager, _reference(inp).float())
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     # The eager call and out.clone() were submitted to the current stream;
@@ -265,10 +268,10 @@ def test_cuda_graph_replay_matches_eager():
     # them (the reverse wait below only orders capture after the warmup).
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _api(inp, out=out)
+        _api(inp, out=out, backend="specialized")
     torch.cuda.current_stream().wait_stream(stream)
     with torch.cuda.graph(g):
-        _api(inp, out=out)
+        _api(inp, out=out, backend="specialized")
     for _ in range(3):
         out.zero_()
         g.replay()
@@ -293,19 +296,19 @@ def test_invalid_table_entries_never_reach_a_gather():
     inp["sparse_indices"][7, 60] = -1
     # garbage in the inactive tail: shorten some rows' lens and poison tails
     lens = inp["sparse_topk_lens"]
-    lens[1] = 40
-    lens[9] = 100
+    lens[1] = 128
+    lens[9] = 160
     tbl = inp["sparse_indices"]
-    tbl[1, 40:] = 2**31 - 1024  # far out of range
-    tbl[9, 100:] = -(2**30)
+    tbl[1, 128:] = 2**31 - 1024  # far out of range
+    tbl[9, 160:] = -(2**30)
     # the fp32 reference clamps -1 holes to pool row 0 and gathers it (its
     # 0-probability times a poisoned NaN row is still NaN), so the
     # reference gets CLEAN pools and a sanitized table; the defined output
     # (holes and tails masked) is identical, while the kernel gets the
     # poisoned pools and table
     clean_tbl = tbl.clone()
-    clean_tbl[1, 40:] = -1
-    clean_tbl[9, 100:] = -1
+    clean_tbl[1, 128:] = -1
+    clean_tbl[9, 160:] = -1
     clean_swa = inp["swa_kv_cache"].clone()
     clean_swa.reshape(-1, D)[0] = 0
     clean_ckv = inp["compressed_kv_cache"].clone()
@@ -436,7 +439,7 @@ def test_split_partial_cancellation_preserved(scale_div):
 
 
 @requires_sm103
-@pytest.mark.parametrize("B", [1, 2, 10, 13])
+@pytest.mark.parametrize("B", [1, 2, 3, 4, 5, 6, 10, 13])
 def test_swa_window_sweep_all_routes(B):
     """Mixed open/narrow SWA windows with random data across the batch sizes
     that exercise each kernel route (h8 / fused2 / 4-split main / b13):
@@ -451,6 +454,158 @@ def test_swa_window_sweep_all_routes(B):
         spec_mod.LAST_FALLBACK_REASONS
     )
     _assert_close(out, gold)
+
+
+@requires_sm103
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_nondefault_hca_flag_is_not_served(backend):
+    inp = _direct_inputs(1, [6])
+    count = spec_mod.DISPATCH_STATS["specialized"]
+    message = "does not accept hca_is_causal" if backend == "auto" else "no_hca_args"
+    with pytest.raises(ValueError, match=message):
+        _api(inp, backend=backend, hca_is_causal=False)
+    assert spec_mod.LAST_FALLBACK_REASONS == ["no_hca_args"]
+    assert spec_mod.DISPATCH_STATS["specialized"] == count
+
+
+@requires_sm103
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+@pytest.mark.parametrize(
+    "name,value,message",
+    [
+        ("sparse_topk_lens", 127, "fixed 128 SWA entries"),
+        ("sparse_topk_lens", 641, "cannot exceed sparse_indices capacity"),
+        ("seq_lens", 5, "per-request query lengths"),
+    ],
+)
+def test_eager_length_validation(monkeypatch, backend, name, value, message):
+    inp = _direct_inputs(1, [6])
+    inp[name][0] = value
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    before = dict(spec_mod.DISPATCH_STATS)
+    with pytest.raises(ValueError, match=message):
+        _api(inp, backend=backend)
+    assert before == spec_mod.DISPATCH_STATS
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "operand,reason",
+    [
+        ("q", "q_not_16B_aligned"),
+        ("swa_kv_cache", "swa_pool_not_16B_aligned"),
+        ("compressed_kv_cache", "compressed_pool_not_16B_aligned"),
+        ("out", "out_not_bf16_q_shaped_contiguous"),
+    ],
+)
+def test_offset_view_alignment(monkeypatch, operand, reason):
+    from flashinfer.mla import _core
+
+    inp = _direct_inputs(1, [6])
+    inp["out"] = torch.empty_like(inp["q"])
+    t = inp[operand]
+    inp[operand] = t.new_empty(t.numel() + 1)[1:].view_as(t).copy_(t)
+    assert inp[operand].is_contiguous() and inp[operand].data_ptr() % 16 == 2
+    mod = spec_mod.get_sparse_mla_decode_dsv4_module()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        mod.sparse_mla_decode_dsv4_run(
+            inp["q"],
+            inp["swa_kv_cache"],
+            inp["compressed_kv_cache"],
+            inp["sparse_indices"],
+            inp["sparse_topk_lens"],
+            inp["seq_lens"],
+            inp["cum_seq_lens_q"],
+            6,
+            inp["sinks"],
+            inp["out"],
+        )
+    with pytest.raises(ValueError, match=reason):
+        _api(inp, out=inp["out"], backend="specialized")
+
+    # Verify handoff, without assuming a stock cubin supports offset views.
+    class ReachedStock(Exception):
+        pass
+
+    def stock(device, backend):
+        assert device == t.device and backend == "auto"
+        raise ReachedStock
+
+    monkeypatch.setattr(_core, "_resolve_dsv4_sparse_mla_backend", stock)
+    with pytest.raises(ReachedStock):
+        _api(inp, out=inp["out"])
+    assert [reason] == spec_mod.LAST_FALLBACK_REASONS
+
+
+@requires_sm103
+@pytest.mark.parametrize("error", [FileNotFoundError, RuntimeError])
+def test_unavailable_specialization_continues_on_stock(monkeypatch, error):
+    from types import SimpleNamespace
+
+    inp = _make_inputs(1, 6, 1024, seed=71)
+    gold = _reference(inp).float()
+    attempts = []
+
+    def build():
+        attempts.append(1)
+        raise error(
+            "artifact missing with JIT disabled"
+            if error is FileNotFoundError
+            else "failed build"
+        )
+
+    monkeypatch.setattr(spec_mod, "_MODULE", None)
+    monkeypatch.setattr(spec_mod, "_MODULE_ERROR", None)
+    monkeypatch.setattr(
+        spec_mod,
+        "gen_sparse_mla_decode_dsv4_module",
+        lambda: SimpleNamespace(build_and_load=build),
+    )
+    before = dict(spec_mod.DISPATCH_STATS)
+    for i in (1, 2):
+        _assert_close(_api(inp), gold)
+        assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+        assert spec_mod.DISPATCH_STATS["fallback"] == before["fallback"] + i
+        assert spec_mod.LAST_FALLBACK_REASONS[0].startswith(
+            "specialized_module_unavailable:" + error.__name__
+        )
+    with pytest.raises(RuntimeError, match=error.__name__):
+        _api(inp, backend="specialized")
+    assert attempts == [1]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_concurrent_cold_module_load(monkeypatch, fail):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from types import SimpleNamespace
+
+    start = Barrier(4)
+    attempts = []
+    module = object()
+
+    def build():
+        attempts.append(1)
+        if fail:
+            raise RuntimeError("cold failure")
+        return module
+
+    def load(_):
+        start.wait()
+        return spec_mod.get_sparse_mla_decode_dsv4_module(required=False)
+
+    monkeypatch.setattr(spec_mod, "_MODULE", None)
+    monkeypatch.setattr(spec_mod, "_MODULE_ERROR", None)
+    monkeypatch.setattr(spec_mod, "_BUILT", {"ready": False})
+    monkeypatch.setattr(
+        spec_mod,
+        "gen_sparse_mla_decode_dsv4_module",
+        lambda: SimpleNamespace(build_and_load=build),
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(load, range(4)))
+    assert attempts == [1]
+    assert all(result is (None if fail else module) for result in results)
 
 
 def test_module_build_failure_is_cached(monkeypatch):

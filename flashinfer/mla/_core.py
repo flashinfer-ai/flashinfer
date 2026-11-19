@@ -915,6 +915,28 @@ def _validate_dsv4_sync_checks(device: torch.device) -> bool:
     return True
 
 
+def _check_dsv4_topk_range(lens: torch.Tensor, capacity: int) -> None:
+    if ((lens < 128) | (lens > capacity)).any().item():
+        minimum = int(lens.min().item())
+        if minimum < 128:
+            raise ValueError(
+                "sparse_topk_lens values must include the fixed 128 SWA entries, "
+                f"got minimum {minimum}"
+            )
+        raise ValueError(
+            "sparse_topk_lens values cannot exceed sparse_indices capacity, "
+            f"got max {int(lens.max().item())} and capacity {capacity}"
+        )
+
+
+def _check_dsv4_seq_lens(seq_lens: torch.Tensor, q_lens: torch.Tensor) -> None:
+    if torch.any(seq_lens < q_lens).item():
+        raise ValueError(
+            "seq_lens must be greater than or equal to the per-request query "
+            "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
+        )
+
+
 def _check_dsv4_sparse_mla_inputs(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -1120,23 +1142,7 @@ def _check_dsv4_sparse_mla_inputs(
         and _validate_dsv4_sync_checks(query.device)
         and normalized_sparse_lens.numel() > 0
     ):
-        sparse_topk_capacity = sparse_indices.size(-1)
-        invalid_sparse_lens = torch.logical_or(
-            normalized_sparse_lens < 128,
-            normalized_sparse_lens > sparse_topk_capacity,
-        )
-        if invalid_sparse_lens.any().item():
-            min_sparse_len = int(normalized_sparse_lens.min().item())
-            max_sparse_len = int(normalized_sparse_lens.max().item())
-            if min_sparse_len < 128:
-                raise ValueError(
-                    "sparse_topk_lens values must include the fixed 128 SWA entries, "
-                    f"got minimum {min_sparse_len}"
-                )
-            raise ValueError(
-                "sparse_topk_lens values cannot exceed sparse_indices capacity, "
-                f"got max {max_sparse_len} and capacity {sparse_topk_capacity}"
-            )
+        _check_dsv4_topk_range(normalized_sparse_lens, sparse_indices.size(-1))
 
     if out is not None:
         check_shape_dtype_device(out, out_shape, torch.bfloat16, query.device, "out")
@@ -2292,6 +2298,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 hca_swa_indices=hca_swa_indices,
                 hca_compressed_block_tables=hca_compressed_block_tables,
                 hca_seq_lens=hca_seq_lens,
+                hca_is_causal=hca_is_causal,
                 hca_sparse_indices_format=hca_sparse_indices_format,
                 hca_use_persistent=hca_use_persistent,
                 sparse_topk_lens_offset=sparse_topk_lens_offset,
@@ -2701,11 +2708,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
         else:
             q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-        if torch.any(seq_lens < q_lens).item():
-            raise ValueError(
-                "seq_lens must be greater than or equal to the per-request query "
-                "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
-            )
+        _check_dsv4_seq_lens(seq_lens, q_lens)
     if (
         validate_sync_inputs
         and dsv4_inv_rope_cos_sin_cache is not None
