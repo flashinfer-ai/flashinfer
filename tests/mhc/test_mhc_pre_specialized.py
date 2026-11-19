@@ -132,17 +132,46 @@ def test_big_fuse_projection_unaffected_by_autocast(backend):
 
 
 @requires_sm103
-@pytest.mark.parametrize("T", [1, 256, 512])
+@pytest.mark.parametrize("T", [1, 37, 64, 128, 256, 512])
 def test_back_to_back_determinism(T):
     """Three back-to-back pairs on the same inputs must be bitwise equal.
     T=256/512 exercise the programmatic-dependent-launch (overlapped) arms,
-    where a missing fence would show up as run-to-run divergence."""
+    where a missing fence would show up as run-to-run divergence; T<=64 and
+    T=128 exercise the cluster arms whose owner-push DSMEM partials and
+    staging-slab reuse are published with release arrivals."""
     inputs = _make_inputs(T, seed=7)
     runs = [mhc_pre(*inputs, backend="specialized") for _ in range(6)]
     torch.cuda.synchronize()
     first = runs[0]
     for later in runs[1:]:
         for a, b in zip(first, later, strict=True):
+            assert torch.equal(a, b)
+
+
+@requires_sm103
+@pytest.mark.parametrize("T", [1, 37, 64, 128])
+def test_graph_replay_determinism(T):
+    """Capture one specialized call in a CUDA graph and replay it 20 times,
+    checking every replay bitwise against the eager result on the same
+    inputs. T<=64 and T=128 are the cluster arms whose DSMEM publication
+    uses release arrivals; graph replay keeps launch-to-launch timing tight,
+    the adversarial regime for a publication race."""
+    inputs = _make_inputs(T, seed=11)
+    eager = mhc_pre(*inputs, backend="specialized")  # eager build before capture
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        mhc_pre(*inputs, backend="specialized")  # warm the capture stream
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mhc_pre(*inputs, backend="specialized")
+    for _ in range(20):
+        graph.replay()
+        torch.cuda.synchronize()
+        for a, b in zip(eager, captured, strict=True):
             assert torch.equal(a, b)
 
 
