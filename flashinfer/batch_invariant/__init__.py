@@ -718,13 +718,12 @@ def fingerprint(op: str, **dims) -> str:
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
     class's no-window sample row and covers windowed calls too.
 
-    ``BatchSparseMLADecodePagedTSWrapper``, ``batch_sparse_mla_decode_with_paged_kv_cache``,
     ``trtllm_batch_decode_with_kv_cache_mla`` and ``trtllm_prefill_with_kv_cache_mla`` (sparse MLA on SM100 / SM103 /
-    SM107) take the Q / KV ``dtype``
-    (``torch.float8_e4m3fn`` or ``torch.bfloat16``) and ``head_dim`` (576 for RoPE rows, 512 for NoPE rows): the classes
-    ``mla.sparse.<dtype>.d<head_dim>`` are the ``prims_ts`` sparse MLA kernel on one pinned schedule, and the receipt
-    digests that schedule, the kernel sources and the installed ``nvidia-cutlass-dsl`` version. The head count, the list
-    width, the batch and the call shape (prefill, chunk, decode, multi-token) are not dimensions.
+    SM107) take the Q / KV ``dtype`` (``torch.float8_e4m3fn`` or ``torch.bfloat16``) and ``head_dim`` (576 for RoPE rows,
+    512 for NoPE rows): the classes ``mla.sparse.<dtype>.d<head_dim>`` are a two-CTA sparse MLA kernel on one pinned
+    schedule whose sources the classes own (``flashinfer/batch_invariant/mla/kernel``), and the receipt digests that
+    schedule, those sources and the installed ``nvidia-cutlass-dsl`` version. The head count, the list width, the batch
+    and the call shape (prefill, chunk, decode, multi-token) are not dimensions.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'

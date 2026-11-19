@@ -57,6 +57,16 @@ def _stable(value) -> object:
     raise TypeError(f"no stable encoding for {type(value).__name__}")
 
 
+def _ffi(tensor: torch.Tensor):
+    """A plan-owned tensor converted once for the compiled call (it keeps the storage alive)."""
+    try:
+        import tvm_ffi
+
+        return tvm_ffi.from_dlpack(tensor)
+    except Exception:  # noqa: BLE001
+        return tensor
+
+
 def _fake_scale(is_tensor: bool):
     import cutlass
     import cutlass.cute as cute
@@ -245,12 +255,13 @@ class SparseMLAPlan:
         self._compiled = _compile(
             self.kernel, device, num_qo_heads, q_dtype, rope_dim, self.scale_is_tensor
         )
-        self._sinks = torch.full(
+        sinks = torch.full(
             (num_qo_heads,), -torch.inf, device=device, dtype=torch.float32
         )
-        self._extra = torch.zeros(
+        extra = torch.zeros(
             (1, 1, self.query_dim), device=device, dtype=q_dtype
         ).permute(1, 2, 0)
+        self._sinks, self._extra = _ffi(sinks), _ffi(extra)
         #: Per row count: the unused second list, its zero lengths and the LSE scratch. Never freed (CUDA graphs).
         self._rows: Dict[int, tuple] = {}
 
@@ -263,24 +274,39 @@ class SparseMLAPlan:
                 )
             dev = self.device
             buffers = (
-                torch.zeros((rows, 1), device=dev, dtype=torch.int32),
-                torch.zeros((rows,), device=dev, dtype=torch.int32),
-                torch.empty(
-                    (rows, 1, self.num_qo_heads), device=dev, dtype=torch.float32
-                ).permute(2, 1, 0),
+                _ffi(torch.zeros((rows, 1), device=dev, dtype=torch.int32)),
+                _ffi(torch.zeros((rows,), device=dev, dtype=torch.int32)),
+                _ffi(
+                    torch.empty(
+                        (rows, 1, self.num_qo_heads), device=dev, dtype=torch.float32
+                    ).permute(2, 1, 0)
+                ),
             )
             self._rows[rows] = buffers
         return buffers
 
     def check(self, query, kv_cache, indices, lengths, out, lse, contents: bool):
-        """Shape, dtype, device, stride and alignment checks of one launch; ``contents`` also reads the list on the
-        host (bounds, and the packed-list contract)."""
+        """Layout checks of one launch (element counts, trailing dimensions, dtype, device, contiguity, alignment);
+        ``contents`` also reads the list on the host (bounds, and the packed-list contract)."""
         name, dev, heads = self.class_name, self.device, self.num_qo_heads
         dim = self.query_dim
         if (
-            query.ndim != 3
-            or query.shape[1] != heads
-            or query.shape[2] != dim
+            lengths.ndim != 1
+            or lengths.dtype != torch.int32
+            or lengths.device != dev
+            or not lengths.is_contiguous()
+        ):
+            raise unsupported(
+                name,
+                f"lengths of shape {tuple(lengths.shape)}, dtype {lengths.dtype}",
+                f"contiguous int32 [rows] on {dev}",
+            )
+        rows = lengths.shape[0]
+        if (
+            query.ndim < 2
+            or query.shape[-1] != dim
+            or query.shape[-2] != heads
+            or query.numel() != rows * heads * dim
             or query.dtype != self.q_dtype
             or query.device != dev
             or not query.is_contiguous()
@@ -289,24 +315,21 @@ class SparseMLAPlan:
             raise unsupported(
                 name,
                 f"a query of shape {tuple(query.shape)}, dtype {query.dtype}",
-                f"a contiguous 16-byte-aligned {self.q_dtype} [rows, {heads}, {dim}] on {dev}",
+                f"a contiguous 16-byte-aligned {self.q_dtype} [{rows}, {heads}, {dim}] on {dev}",
             )
-        rows = query.shape[0]
         if (
-            kv_cache.ndim != 2
-            or kv_cache.shape[1] != dim
-            or kv_cache.shape[0] <= 0
-            or kv_cache.shape[0] >= 0x7FFFFFFF
+            kv_cache.ndim < 2
+            or kv_cache.shape[-1] != dim
+            or not 0 < kv_cache.numel() < 0x7FFFFFFF * dim
             or kv_cache.dtype != self.q_dtype
             or kv_cache.device != dev
-            or kv_cache.stride(1) != 1
-            or kv_cache.stride(0) != dim
+            or not kv_cache.is_contiguous()
             or kv_cache.data_ptr() % 16
         ):
             raise unsupported(
                 name,
                 f"a KV cache of shape {tuple(kv_cache.shape)}, dtype {kv_cache.dtype}",
-                f"compact 16-byte-aligned {self.q_dtype} rows [storage_rows, {dim}] on {dev}",
+                f"contiguous 16-byte-aligned {self.q_dtype} rows [storage_rows, {dim}] on {dev}",
             )
         if (
             indices.ndim != 2
@@ -322,18 +345,9 @@ class SparseMLAPlan:
                 f"int32 [{rows}, top_k] on {dev} with a contiguous last dimension",
             )
         if (
-            lengths.shape != (rows,)
-            or lengths.dtype != torch.int32
-            or lengths.device != dev
-            or not lengths.is_contiguous()
-        ):
-            raise unsupported(
-                name,
-                f"lengths of shape {tuple(lengths.shape)}, dtype {lengths.dtype}",
-                f"contiguous int32 [{rows}] on {dev}",
-            )
-        if (
-            out.shape != (rows, heads, spec.LATENT_DIM)
+            out.ndim < 1
+            or out.shape[-1] != spec.LATENT_DIM
+            or out.numel() != rows * heads * spec.LATENT_DIM
             or out.dtype != torch.bfloat16
             or out.device != dev
             or not out.is_contiguous()
@@ -345,7 +359,7 @@ class SparseMLAPlan:
                 f"a contiguous 16-byte-aligned bf16 [{rows}, {heads}, {spec.LATENT_DIM}] on {dev}",
             )
         if lse is not None and (
-            lse.shape != (rows, heads)
+            lse.numel() != rows * heads
             or lse.dtype != torch.float32
             or lse.device != dev
             or not lse.is_contiguous()
@@ -361,7 +375,8 @@ class SparseMLAPlan:
             if ((lengths < 0) | (lengths > width)).any().item():
                 raise ValueError(f"{name}: a list length is outside [0, {width}]")
             live = torch.arange(width, device=dev)[None, :] < lengths[:, None]
-            if (live & ((indices < -1) | (indices >= kv_cache.shape[0]))).any().item():
+            storage_rows = kv_cache.numel() // dim
+            if (live & ((indices < -1) | (indices >= storage_rows))).any().item():
                 raise ValueError(f"{name}: a live index is outside the cache")
             if (live & (indices < 0)).any().item():
                 raise unsupported(
@@ -383,24 +398,45 @@ class SparseMLAPlan:
     ) -> None:
         """Launch on trusted arguments: ``query`` ``[rows, heads, 576|512]``, ``kv_cache`` ``[storage_rows, 576|512]``,
         ``indices`` int32 ``[rows, top_k]``, ``lengths`` int32 ``[rows]``, ``out`` bf16 ``[rows, heads, 512]``, ``lse``
-        fp32 ``[rows, heads]`` or ``None``. Nothing is checked and nothing is read on the host; :meth:`check` holds the
-        layout rules. A scale override keeps the plan's kind (host float or device tensor)."""
-        rows = query.shape[0]
+        fp32 ``[rows, heads]`` or ``None``. ``query``, ``kv_cache``, ``out`` and ``lse`` may carry other leading
+        dimensions as long as they are contiguous with these element counts. Nothing is checked and nothing is read
+        on the host; :meth:`check` holds the layout rules. A scale override keeps the plan's kind (host float or
+        device tensor)."""
+        rows = lengths.shape[0]
         if rows == 0:
             return
         latent = spec.LATENT_DIM
         heads = self.num_qo_heads
+        dim = self.query_dim
         no_list, no_lengths, scratch = self._rows.get(rows) or self._row_buffers(rows)
-        q4 = query.view(rows, 1, heads, self.query_dim)
-        q_latent = q4[..., :latent].permute(2, 3, 1, 0)
+        row = heads * dim
+        start = query.storage_offset()
+        q_latent = query.as_strided((heads, latent, 1, rows), (dim, 1, row, row), start)
+        row = heads * latent
         self._compiled(
             q_latent,
-            q4[..., latent:].permute(2, 3, 1, 0) if self.rope_dim else q_latent,
-            kv_cache.view(-1, 1, self.query_dim)[..., :latent].permute(1, 2, 0),
+            query.as_strided(
+                (heads, self.rope_dim, 1, rows),
+                (dim, 1, heads * dim, heads * dim),
+                start + latent,
+            )
+            if self.rope_dim
+            else q_latent,
+            kv_cache.as_strided(
+                (1, latent, kv_cache.numel() // dim),
+                (dim, 1, dim),
+                kv_cache.storage_offset(),
+            ),
             self._extra,
             indices.transpose(0, 1),
-            out.view(rows, 1, heads, latent).permute(2, 3, 1, 0),
-            scratch if lse is None else lse.view(rows, 1, heads).permute(2, 1, 0),
+            out.as_strided(
+                (heads, latent, 1, rows), (latent, 1, row, row), out.storage_offset()
+            ),
+            scratch
+            if lse is None
+            else lse.as_strided(
+                (heads, 1, rows), (1, heads, heads), lse.storage_offset()
+            ),
             None,
             spec.SPLIT_KV,
             lengths,
@@ -427,16 +463,17 @@ class SparseMLAPlan:
         output_scale: Optional[Scale] = None,
         validate: bool = True,
     ):
-        """Checked launch. ``validate=True`` also reads the list on the host (bounds, no ``-1`` inside the live part),
-        which synchronizes; serving passes ``validate=False`` and keeps the layout checks, or calls :meth:`launch`."""
-        rows = query.shape[0] if query.ndim == 3 else -1
-        if out is None and rows >= 0:
+        """Checked launch; returns ``out`` ``[rows, heads, 512]``, or ``(out, lse)`` with ``return_lse``.
+        ``validate=True`` also reads the list on the host (bounds, no ``-1`` inside the live part), which
+        synchronizes; serving passes ``validate=False`` and keeps the layout checks, or calls :meth:`launch`."""
+        rows = lengths.shape[0] if lengths.ndim == 1 else 0
+        if out is None:
             out = torch.empty(
                 (rows, self.num_qo_heads, spec.LATENT_DIM),
                 device=self.device,
                 dtype=torch.bfloat16,
             )
-        if lse is None and return_lse and rows >= 0:
+        if lse is None and return_lse:
             lse = torch.empty(
                 (rows, self.num_qo_heads), device=self.device, dtype=torch.float32
             )

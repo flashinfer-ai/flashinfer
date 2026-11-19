@@ -63,6 +63,8 @@ KERNEL_STATE: Dict[str, object] = dict(
 
 #: The ``prims_ts`` commit the kernel copy was taken from.
 KERNEL_BASE = "25bc267eb84dd1b28997f62aa4c282a09184c952"
+#: sha256 over the kernel copy (:func:`source_digest`); a device-free test pins it, so an edit is a decision.
+KERNEL_DIGEST = "6fea009cc0482fd3ab05e816f5440c2db61ef9095a11d611ad29141583ee36ff"
 
 
 def dtype_name(dtype) -> str:

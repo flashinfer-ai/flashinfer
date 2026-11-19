@@ -274,6 +274,9 @@ def test_fingerprint_covers_the_kernel_sources():
     )
     root = os.path.dirname(spec.__file__)
     assert all(os.path.isfile(os.path.join(root, "kernel", f)) for f in files)
+    assert spec.source_digest() == spec.KERNEL_DIGEST, (
+        "flashinfer/batch_invariant/mla/kernel changed: reproduce the recorded digests, then update KERNEL_DIGEST"
+    )
 
 
 def test_kernel_copy_is_self_contained():
@@ -401,10 +404,12 @@ def test_lean_model_matches_python_spec():
 
 
 _ISOLATION = """
-import sys, torch
+import sys, warnings, torch
 import flashinfer
 from flashinfer.batch_invariant.mla import cases, spec
 dev = torch.device("cuda")
+seen = warnings.catch_warnings(record=True).__enter__()
+warnings.simplefilter("always")
 for name, dtype, head_dim, heads in cases.DIGEST_CASES[:2] + cases.DIGEST_CASES[-2:]:
     dt = cases.torch_dtype(dtype)
     q = torch.zeros(3, 2, heads, head_dim, dtype=dt, device=dev)
@@ -418,14 +423,15 @@ for name, dtype, head_dim, heads in cases.DIGEST_CASES[:2] + cases.DIGEST_CASES[
     )
 torch.cuda.synchronize()
 loaded = sorted(m for m in sys.modules if m.startswith("flashinfer.attention.prims_ts"))
-print("LOADED", loaded)
+print("LOADED", loaded, [str(w.category.__name__) for w in seen if "xperimental" in w.category.__name__])
 """
 
 
 @needs_device
 def test_flagged_path_does_not_load_the_default_kernel_or_policy():
     """A fresh process that plans, compiles and runs the classes through the stable function never imports
-    ``flashinfer.attention.prims_ts``: neither its kernels nor its schedule policy can reach the classes."""
+    ``flashinfer.attention.prims_ts`` (neither its kernels nor its schedule policy can reach the classes) and emits no
+    experimental-API warning."""
     env = dict(os.environ, FLASHINFER_CUTE_DSL_DISABLE_CACHE="1")
     run = subprocess.run(
         [sys.executable, "-W", "ignore", "-c", _ISOLATION],
@@ -434,7 +440,7 @@ def test_flagged_path_does_not_load_the_default_kernel_or_policy():
         env=env,
     )
     assert run.returncode == 0, run.stderr[-2000:]
-    assert run.stdout.strip().splitlines()[-1] == "LOADED []", run.stdout[-2000:]
+    assert run.stdout.strip().splitlines()[-1] == "LOADED [] []", run.stdout[-2000:]
 
 
 @needs_device
@@ -456,6 +462,33 @@ def test_planned_kernel_state_is_the_recorded_state():
     planned = make_wrapper(cfg).plan
     assert planned.kernel.compile_signature() == state["e4m3", 64, 64]
     assert make_wrapper(cfg).plan is planned
+
+
+@needs_device
+def test_launch_takes_any_contiguous_leading_shape_and_no_rows():
+    cfg = CONFIGS[0]
+    _, head_dim, heads = cfg
+    pool, targets, (ref_out, ref_lse) = shared(cfg)
+    rows = targets.take(range(6))
+    plan = make_wrapper(cfg).plan
+    out = torch.zeros(2, 3, heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros(6, 1, heads, dtype=torch.float32, device="cuda")
+    plan.launch(
+        rows.q.view(2, 3, heads, head_dim),
+        pool.kv,
+        rows.indices,
+        rows.lengths,
+        out,
+        lse,
+    )
+    torch.cuda.synchronize()
+    assert same_bits(out.view(6, heads, 512), ref_out[:6])
+    assert same_bits(lse.view(6, heads), ref_lse[:6])
+    none = torch.empty(0, dtype=torch.int32, device="cuda")
+    empty = plan.run(
+        rows.q[:0], pool.kv, rows.indices[:0], none, return_lse=True, validate=True
+    )
+    assert empty[0].shape == (0, heads, 512) and empty[1].shape == (0, heads)
 
 
 @needs_device
@@ -1095,7 +1128,7 @@ def test_plan_refuses_inputs_outside_the_class():
         dict(query=rows.q.to(torch.float16)),
         dict(kv=flat[:, :-1]),
         dict(kv=flat[::2]),
-        dict(kv=pool.kv),
+        dict(kv=pool.kv.to(torch.float16)),
         dict(indices=rows.indices.long()),
         dict(indices=rows.indices[:1]),
         dict(lengths=rows.lengths[:1]),

@@ -905,6 +905,9 @@ def _normalize_dsv4_topk_lens(
     return topk_lens
 
 
+_sparse_mla_batch_invariant = None
+
+
 def _validate_dsv4_sync_checks(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
         return False
@@ -3800,97 +3803,51 @@ def _mla_with_kv_cache_impl(
         ``sparse_mla_top_k > 0`` and ``backend="auto"``, ``True`` runs the
         batch-invariant sparse MLA classes ``mla.sparse.<dtype>.d<576|512>``
         (``flashinfer.batch_invariant``) in place of TRTLLM-GEN: every query
-        token is one row of the ``prims_ts`` sparse MLA kernel on one fixed
-        schedule, so its output bits depend on its query, its selected-key
-        list, the cache rows and the scales only, and a token gives the same
-        bits from a prefill-sized call, a chunk, a decode step or a
-        multi-token row. ``block_tables`` holds the selected storage rows
+        token is one row of the classes' own kernel on one fixed schedule,
+        so its output bits depend on its query, its selected-key list, the
+        cache rows and the scales only, and a token gives the same bits from
+        a prefill-sized call, a chunk, a decode step or a multi-token row.
+        ``block_tables`` holds the selected storage rows
         (``page * page_size + offset``) of each query token in list order,
         live entries before any ``-1``; ``sparse_mla_top_k_lens`` is accepted
-        for both layouts and defaults to the full width; ``seq_lens`` and
-        ``max_seq_len`` are not read. BF16 or E4M3 query and KV cache of
-        width 576 or 512, any list width, 1 to 128 heads. LSE output is
-        natural-log and needs ``return_lse_base="basee"``. Any other backend,
-        architecture or input (sinks, DCP, packed uint8 caches, skip-softmax,
-        ``use_fp16_softmax``, ``multi_ctas_kv_counter_buffer``) raises
+        for both layouts and defaults to the full width; ``seq_lens``,
+        ``max_seq_len`` and ``workspace_buffer`` are not read. Contiguous
+        16-byte-aligned BF16 or E4M3 query and KV cache of width 576 or 512,
+        any list width, 1 to 128 heads. LSE output is natural-log and needs
+        ``return_lse_base="basee"``. Any other backend, architecture or input
+        (sinks, DCP, packed uint8 caches, skip-softmax, ``use_fp16_softmax``,
+        ``multi_ctas_kv_counter_buffer``) raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`;
-        nothing falls back. The kernel behind the classes is an experimental
-        backend: the first call emits an ``ExperimentalWarning`` and the class
-        fingerprint may change between releases
-        (``flashinfer/batch_invariant/README.md``). CUDA graphs: run one call
-        of the shape before capture and pass ``out``; the graph reads the
-        plan cached for that shape, which is kept until
-        ``flashinfer.batch_invariant.mla.api.clear_plans()``. Set
+        nothing falls back. CUDA graphs: run one call of the shape before
+        capture and pass ``out``; the graph reads the plan cached for that
+        shape, which is kept until
+        ``flashinfer.batch_invariant.mla.clear_plans()``. Set
         ``FLASHINFER_VALIDATE_INPUTS=1`` to check the list contract on the
-        host (synchronizes).
-
-    Note
-    ----
-    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
-    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
-    bmm2_scale = v_scale * o_scale
-    or,
-    bmm1_scale = torch.Tensor([q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5))
-    bmm2_scale = torch.Tensor([v_scale * o_scale])
-
-    The two scale factors should be static constant for cuda graph capture.
-    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
-
-    For static constant scale factors, the scale factors should be provided as float.
-        - (bmm1_scale, bmm2_scale)
-    For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
-        - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
-        - Currently, only fp8 tensor core operation supports this mode.
-    When both are provided, the dynamic scale factor tensors will be used.
-
-    Autotune
-    --------
-    On SM100/SM103/SM107 dense MLA, calling under ``flashinfer.autotune(True)`` with
-    ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` when DCP
-    is disabled. DCP profiles only its required monolithic CuTeDSL runner.
-    Both modes use a bucketed batch sweep up to each runner's kernel/workspace
-    cap and cache the winning tactic per shape signature. Subsequent calls under
-    ``autotune(False)`` use the cached choice; any batch outside the tuned range
-    falls back to the runner's default tactic with a one-time warning.
-    Uniform explicit CuTeDSL requests use the same tuner with one candidate.
-    Explicit TRTLLM-GEN requests enter the tuner only during tuning; inference
-    directly executes its sole tactic. Compact variable-Q requests select an eligible backend directly
-    and do not enter the autotuner. The internal ``autotune`` execution route
-    does not introduce a public functional ``backend="autotune"`` option.
-
-    The autotune bucket range and cache key do **not** depend on
-    ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
-    pool between tuning and inference does not invalidate cached choices. However,
-    the **page-aliasing ratio** during profiling does depend on the pool size:
-    synthetic ``block_tables`` are filled by uniform random sampling into
-    ``[0, kv_cache.shape[0])``, so a small pool produces high aliasing
-    (L2-resident reads) and a large pool produces low aliasing (HBM-bound reads).
-    For best profile fidelity, autotune with a ``kv_cache`` whose size reflects
-    the production page-sharing pattern of your workload (e.g., heavily shared
-    prefix → smaller pool; independent contexts → larger pool).
+        host (synchronizes). Callers that plan once can use
+        ``flashinfer.batch_invariant.mla.plan`` directly.
     """
     if batch_invariant:
-        from ..batch_invariant.mla.api import sparse_mla_batch_invariant
-
         if batch_invariant is not True:
             raise TypeError("batch_invariant must be bool")
+        global _sparse_mla_batch_invariant
+        if _sparse_mla_batch_invariant is None:
+            from ..batch_invariant.mla.api import sparse_mla_batch_invariant
+
+            _sparse_mla_batch_invariant = sparse_mla_batch_invariant
         refused = (
-            ("sinks", sinks),
-            (
-                "skip_softmax_threshold_scale_factor",
-                skip_softmax_threshold_scale_factor,
-            ),
-            ("enable_dcp", enable_dcp),
-            ("cp_world", None if cp_world == 1 else cp_world),
-            ("cp_rank", cp_rank),
-            ("causal_seqlens_kv_global", causal_seqlens_kv_global),
-            ("use_fp16_softmax", use_fp16_softmax),
-            ("multi_ctas_kv_counter_buffer", multi_ctas_kv_counter_buffer),
-            ("uses_shared_paged_kv_idx=False", not uses_shared_paged_kv_idx),
-            ("cute_dsl_impl", None if cute_dsl_impl == "auto" else cute_dsl_impl),
-            ("kv_scale_format", None if kv_scale_format == "auto" else kv_scale_format),
+            sinks,
+            skip_softmax_threshold_scale_factor,
+            enable_dcp,
+            cp_world,
+            cp_rank,
+            causal_seqlens_kv_global,
+            use_fp16_softmax,
+            multi_ctas_kv_counter_buffer,
+            uses_shared_paged_kv_idx,
+            cute_dsl_impl,
+            kv_scale_format,
         )
-        return sparse_mla_batch_invariant(
+        return _sparse_mla_batch_invariant(
             query,
             kv_cache,
             kv_lora_rank,
