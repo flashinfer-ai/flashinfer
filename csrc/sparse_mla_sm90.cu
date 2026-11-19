@@ -129,6 +129,36 @@ __device__ __forceinline__ void ldm_x2t(uint32_t* d, uint32_t addr) {
                : "r"(addr));
 }
 
+// Cold score repair. Read the physical cache row, not the MMA fragments:
+// the latter may already have lost a query component. The NoPE bytes in
+// global memory are in feature order (unlike the swizzled conv tile).
+__device__ __forceinline__ double wide_bf16(unsigned short b) {
+  if ((b & 0x7f80u) == 0) {
+    const int m = b & 127;
+    return double((b & 0x8000u) ? -m : m) * 0x1p-133;
+  }
+  return double(__uint_as_float(uint32_t(b) << 16));
+}
+
+__device__ __noinline__ float repair_score(const __half* packed_q, const uint8_t* kv, int slot,
+                                           float qscale) {
+  const auto* qb = reinterpret_cast<const unsigned short*>(packed_q);
+  const uint8_t* rw = kv + size_t(slot) * BPT;
+  const auto* scales = reinterpret_cast<const float*>(rw + CKV);
+  const auto* rope = reinterpret_cast<const unsigned short*>(rw + 528);
+  double dot = 0.;
+#pragma unroll 1
+  for (int d = 0; d < CKV; d += 2) {
+    const auto pair = fp8x2_to_f16x2(*reinterpret_cast<const unsigned short*>(rw + d));
+    const double scale = scales[d / 128];
+    dot += wide_bf16(qb[d]) * (double(__half2float(__ushort_as_half(pair & 0xffff))) * scale);
+    dot += wide_bf16(qb[d + 1]) * (double(__half2float(__ushort_as_half(pair >> 16))) * scale);
+  }
+#pragma unroll 1
+  for (int d = 0; d < KPE; ++d) dot += wide_bf16(qb[CKV + d]) * wide_bf16(rope[d]);
+  return float(dot * double(qscale));
+}
+
 template <int TILE, int STATIC_TPS>
 __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
     const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kv,
@@ -205,7 +235,24 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
   }
 #pragma unroll
   for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-  if (lane == 0) hsc[warp] = amax >= 65536.f ? exp2f(float(ilogbf(amax) - 15)) : 1.f;
+  const int shift = amax >= 65536.f ? ilogbf(amax) - 15 : 0;
+  bool unsafe = false;
+  if (shift) {
+    // Warp-uniform cold check. A nonzero scaled BF16 becoming subnormal
+    // in FP32 is not guaranteed to survive TF32 conversion and MMA.
+    const unsigned cutoff = unsigned(shift + 1) << 7;
+#pragma unroll 1
+    for (int it = 0; it < 9; ++it) {
+      const uint32_t v = qp[lane + it * 32];
+      const unsigned a = v & 0x7fff, b = (v >> 16) & 0x7fff;
+      unsafe |= (a && a < cutoff) || (b && b < cutoff);
+    }
+    unsafe = __any_sync(0xffffffffu, unsafe);
+  }
+  if (lane == 0) {
+    hsc[warp] = shift ? exp2f(float(shift)) : 1.f;
+    reinterpret_cast<unsigned short*>(qs + warp * QS)[DQ] = unsafe;
+  }
   __syncthreads();
 
   // B fragment rows read Q head l4; C columns belong to heads 2*m4 and 2*m4+1.
@@ -291,6 +338,15 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
       s[3] = (s[3] + s2[3]) * qsb;
       va = (sl[tbase + t0 + l4] >= 0);
       vb = (sl[tbase + t0 + l4 + 8] >= 0);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int h = 2 * m4 + (j & 1);
+        const __half* head = qs + h * QS;
+        if ((j < 2 ? va : vb) &&
+            (reinterpret_cast<const unsigned short*>(head)[DQ] || !isfinite(s[j]))) {
+          s[j] = repair_score(head, kv, sl[tbase + t0 + l4 + (j / 2) * 8], qscale);
+        }
+      }
       float mx0 = fmaxf(va ? s[0] : -INFINITY, vb ? s[2] : -INFINITY);
       float mx1 = fmaxf(va ? s[1] : -INFINITY, vb ? s[3] : -INFINITY);
 #pragma unroll

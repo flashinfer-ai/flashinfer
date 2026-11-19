@@ -233,10 +233,14 @@ def _composable_reference(
             )
             qn = qf[b, j, :, :CKV]
             qp = qf[b, j, :, CKV:]
-            sc = (qn @ ckv.T + qp @ kpe.T) * float(sm_scale)
+            # This backend is the slow oracle: a raw FP32 dot can overflow
+            # even when the scaled logit is finite. Keep softmax wide too.
+            sc = (
+                qn.double() @ ckv.T.double() + qp.double() @ kpe.T.double()
+            ) * sm_scale
             sc = sc.masked_fill(~valid, float("-inf"))
             pr = torch.nan_to_num(torch.softmax(sc, dim=-1))
-            acc[b, j] = pr @ ckv
+            acc[b, j] = pr.float() @ ckv
     out.copy_(acc.to(torch.bfloat16))
     return out
 

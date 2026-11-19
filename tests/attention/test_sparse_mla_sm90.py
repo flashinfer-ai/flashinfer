@@ -419,6 +419,56 @@ def test_small_qk_component(nq, backend, qmag, kmag):
     }
 
 
+@pytest.mark.parametrize("backend", ["specialized", "auto", "reference"])
+@pytest.mark.parametrize("second_pos", [1, 48])
+@pytest.mark.parametrize("mixed_range", [False, True])
+def test_extreme_rope_scores(backend, second_pos, mixed_range):
+    import math
+
+    _sm90_or_skip()
+    q, kv, idx, sl, ws = _make_case(B=1, QL=1, kv_lens=(2,))
+    q.zero_()
+    idx.fill_(-1)
+    idx[..., 0] = 0
+    idx[..., second_pos] = 1
+    k0 = torch.zeros(KPE, device=q.device)
+    k1 = torch.zeros_like(k0)
+    if mixed_range:
+        q[..., CKV] = 2.0**120
+        q[..., CKV + 1] = 2.0**-50
+        k0[1], k1[1] = 2.0**50, -(2.0**50)
+        scale, expected = 1.0, math.tanh(1.0)
+    else:
+        q[..., CKV] = 256.0
+        k0[0] = 2.0**120
+        scale, expected = 1 / 32, 1.0
+    _write_token(kv, 0, 1.0, [1.0] * 4, k0)
+    _write_token(kv, 1, -1.0, [1.0] * 4, k1)
+    y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=scale, backend=backend)
+    torch.testing.assert_close(y, torch.full_like(y, expected), rtol=0, atol=0)
+    chosen = "reference" if backend == "reference" else "specialized"
+    assert _sparse_mla_sm90_stats()["backend_dispatches"][chosen] == 1
+    if backend == "specialized":
+        saved_q = q.clone()
+        q.zero_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = sparse_mla_decode_sm90(
+                q, kv, idx, sl, ws, sm_scale=scale, backend=backend
+            )
+        for exceptional in (True, False, True):
+            if exceptional:
+                q.copy_(saved_q)
+            else:
+                q.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            target = expected if exceptional else 0.0
+            torch.testing.assert_close(
+                captured, torch.full_like(captured, target), rtol=0, atol=0
+            )
+
+
 @pytest.mark.parametrize("value,scale", [(2.0**-9, 2.0**17), (448.0, 1e-8)])
 def test_dequant_scales_before_narrowing(value, scale):
     _sm90_or_skip()
