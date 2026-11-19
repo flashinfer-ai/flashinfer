@@ -514,18 +514,18 @@ def apply_rope_inplace(
     >>> head_dim = 128
     >>> nnz = batch_size * qkv_len
     >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
+    ...    nnz,
+    ...    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    ...    dtype=torch.float16,
+    ...    device="cuda:0",
+    ... )
     >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
     >>> k = qkv_packed[
     ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
     ... ].reshape(nnz, num_kv_heads, head_dim)
     >>> indptr = torch.tensor(
     ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
+    ... )
     >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
     >>> flashinfer.apply_rope_inplace(q, k, indptr, offsets)
 
@@ -669,18 +669,18 @@ def apply_llama31_rope_inplace(
     >>> head_dim = 128
     >>> nnz = batch_size * qkv_len
     >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
+    ...    nnz,
+    ...    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    ...    dtype=torch.float16,
+    ...    device="cuda:0",
+    ... )
     >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
     >>> k = qkv_packed[
     ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
     ... ].reshape(nnz, num_kv_heads, head_dim)
     >>> indptr = torch.tensor(
     ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
+    ... )
     >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
     >>> flashinfer.apply_llama31_rope_inplace(q, k, indptr, offsets)
 
@@ -854,18 +854,18 @@ def apply_rope(
     >>> head_dim = 128
     >>> nnz = batch_size * qkv_len
     >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
+    ...    nnz,
+    ...    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    ...    dtype=torch.float16,
+    ...    device="cuda:0",
+    ... )
     >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
     >>> k = qkv_packed[
     ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
     ... ].reshape(nnz, num_kv_heads, head_dim)
     >>> indptr = torch.tensor(
     ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
+    ... )
     >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
     >>> q_rope, k_rope = flashinfer.apply_rope(q, k, indptr, offsets)
     >>> q_rope.shape
@@ -1042,18 +1042,18 @@ def apply_llama31_rope(
     >>> head_dim = 128
     >>> nnz = batch_size * qkv_len
     >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
+    ...    nnz,
+    ...    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    ...    dtype=torch.float16,
+    ...    device="cuda:0",
+    ... )
     >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
     >>> k = qkv_packed[
     ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
     ... ].reshape(nnz, num_kv_heads, head_dim)
     >>> indptr = torch.tensor(
     ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
+    ... )
     >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
     >>> q_rope, k_rope = flashinfer.apply_llama31_rope(q, k, indptr, offsets)
     >>> q_rope.shape

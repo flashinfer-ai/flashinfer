@@ -156,6 +156,9 @@ from .backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm107_mxfp8_mega_weights,
 )
+from .backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cake import (
+    Sm107_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig,
+)
 from .backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm107_nvfp4_mega_weights,
@@ -272,6 +275,8 @@ from .weights import (
 )
 
 __all__ = [
+    "Sm107SharedExpertConfig",
+    "Sm107SharedExpertWeights",
     "AutoConfig",
     "MoEEpAutoLayer",
     "MoEEpAutoWorkspace",
@@ -356,6 +361,7 @@ __all__ = [
     "Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm107_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig",
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
@@ -548,4 +554,9 @@ from .backends.split.comm.cake.communication import (  # noqa: E402
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
     NVLinkTwoSidedAlltoAll,
+)
+
+from .backends.mega.kernel.sm107.shared_expert import (
+    Sm107SharedExpertConfig,
+    Sm107SharedExpertWeights,
 )

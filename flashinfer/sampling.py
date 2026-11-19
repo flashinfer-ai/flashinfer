@@ -971,11 +971,16 @@ def softmax(
     Parameters
     ----------
     logits : torch.Tensor
-        Two-dimensional CUDA tensor of logits.
+        Two-dimensional CUDA tensor of logits. With ``batch_invariant=True``,
+        leading batch dimensions are also supported, e.g. three-dimensional logits.
     temperature: Optional[Union[torch.Tensor, float]]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
+        Either a scalar or a tensor of shape ``(batch_size,)`` for two-dimensional logits.
+        With ``batch_invariant=True`` and additional leading dimensions, a per-row
+        temperature tensor has shape ``(M,)`` with
+        ``M = logits.numel() // logits.shape[-1]``, or ``logits.shape[:-1]``;
+        a length-one tensor applies to all rows.
         If a scalar, the same temperature is used for all requests.
-        If a tensor, each request has its own temperature. The tensor must be on
+        A per-row tensor gives each row its own temperature. The tensor must be on
         the same CUDA device as ``logits`` and have dtype float16, bfloat16,
         float32, or float64.
     enable_pdl : Optional[bool]
@@ -1103,8 +1108,10 @@ def log_probs(
     out: Optional[torch.Tensor] = None,
     lse_out: Optional[torch.Tensor] = None,
 ):
-    r"""The log-probability of one token per row under ``softmax(logits / temperature)``, with a batch-invariant
-    dataflow: the teacher-forced score of a sampled token (a trainer re-scoring a rollout) and the returned
+    r"""The log-probability of one token per row under ``softmax(logits / temperature)``.
+
+    With ``batch_invariant=True``, the dataflow is batch-invariant: the teacher-forced score of a sampled
+    token (a trainer re-scoring a rollout) and the returned
     log-probability of a decode step (an inference engine) are the same bits whatever the batch, its padding,
     the row's position or the SM count, and run-to-run deterministic.
 
@@ -1385,7 +1392,7 @@ def sampling_from_logits(
 
     Returns
     -------
-    samples: torch.Tensor
+    samples : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         Sampled categories, shape (batch_size,). It's equivalent to sampling from
         :attr:`logits` after applying softmax. Under ``batch_invariant=True`` a row whose weights do
         not sum to a positive finite number (a row of ``-inf`` logits, or with a NaN) draws ``-1``, and with
@@ -1571,7 +1578,10 @@ def sampling_from_probs(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``.
+    The default path expects float32 inputs. With ``batch_invariant=True``, inputs may
+    be bfloat16, float16, or float32 probabilities or unnormalised weights.
+    The output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``
+    when ``out`` is not supplied. With ``batch_invariant=True`` and ``out`` supplied, the output has ``out.dtype``.
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):
