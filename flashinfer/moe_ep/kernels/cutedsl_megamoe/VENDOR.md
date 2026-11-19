@@ -130,10 +130,12 @@ also selects the matching reference and heuristic table.
 
 BF16xMXFP8 B-stage count (`bangyus/cutedsl_megamoe!91`, 2026-11-09):
 `kernel_mxfp8_bf16_glu_fc12.py` raises the default `"b"` pipeline depth from 2
-to 4 and adds an optional `num_activation_stages` constructor argument (at
-least 2) that overrides it. `megamoe_kernel_mxfp8_bf16.py` also forwards the
-argument (not in the MR) so `MegaMoEBf16Mxfp8Config` can expose it as
-`num_activation_stages` (default 4). Drop once the MR merges and the tree
+to 4 (3 for the N256/`smem` implementation, whose 4-stage launch exceeds the
+SM100 shared-memory limit) and adds an optional `num_activation_stages`
+constructor argument (2 up to that per-implementation maximum) that overrides
+it. `megamoe_kernel_mxfp8_bf16.py` also forwards the argument (not in the MR) so
+`MegaMoEBf16Mxfp8Config` can expose it as `num_activation_stages` (default
+`None`: per-implementation depth). Drop once the MR merges and the tree
 re-syncs past it.
 
 ## FlashInfer selectors

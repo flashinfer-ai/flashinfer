@@ -131,6 +131,10 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
     _SmemMiscBudget = 2048
     _TmemColsTotal = 512
 
+    # SMEM-resident transformed A leaves room for 3 B stages at N256; 4 exceeds
+    # the SM100 shared-memory limit at launch.
+    _MaxBStages = {"smem": 3, "tmem": 4}
+
     _SupportedImplementationConfigs = {
         ((256, 128, 128), "tmem", False, 128),
         ((256, 256, 128), "smem", False, 128),
@@ -186,7 +190,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             "a": common_depth,
             "scale": common_depth,
             "transformed_a": common_depth,
-            "b": 4,
+            "b": cls._MaxBStages[transform_buffer],
             "acc": 2,
         }
 
@@ -300,6 +304,15 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             )
         if num_activation_stages is not None and num_activation_stages < 2:
             raise ValueError("num_activation_stages must be at least 2.")
+        if (
+            num_activation_stages is not None
+            and num_activation_stages > self._MaxBStages[transform_buffer]
+        ):
+            raise ValueError(
+                f"num_activation_stages must be at most "
+                f"{self._MaxBStages[transform_buffer]} for "
+                f"transform_buffer={transform_buffer!r}."
+            )
 
         self.mma_tiler_mnk = mma_tiler_mnk
         self.transform_buffer = transform_buffer
