@@ -43,6 +43,7 @@ Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvari
 from __future__ import annotations
 
 import math
+import weakref
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -210,6 +211,28 @@ def _check_output(output: torch.Tensor, v: torch.Tensor) -> None:
         raise unsupported(CLASS, "an output on another device", "the inputs' device")
 
 
+_STARTS_SEEN = [None]
+
+
+def _starts_match(cs, starts):
+    """Whether ``cs`` holds ``starts``; read back once per tensor and version."""
+    tracked = not cs.is_inference()
+    seen = _STARTS_SEEN[0]
+    if (
+        tracked
+        and seen is not None
+        and seen[0]() is cs
+        and seen[1] == cs._version
+        and seen[2] == starts
+    ):
+        return True
+    if cs.tolist() != starts:
+        return False
+    if tracked:
+        _STARTS_SEEN[0] = (weakref.ref(cs), cs._version, starts)
+    return True
+
+
 def _checkpoints(state_checkpoints, checkpoint_cu_starts, lens, v, others):
     """The caller's buffers for the state before every 16-token chunk of every sequence, checked against the lengths."""
     HV, dev = v.shape[2], v.device
@@ -230,7 +253,8 @@ def _checkpoints(state_checkpoints, checkpoint_cu_starts, lens, v, others):
     ):
         raise unsupported(
             CLASS,
-            "state_checkpoints of another shape, dtype, layout or device, or with too few rows",
+            "state_checkpoints of another shape, dtype, layout, alignment or device, with too few rows, "
+            "or requiring grad",
             f"a contiguous bf16 or fp32 [rows, {HV}, 128, 128] buffer with one row per started "
             f"16-token chunk of every sequence ({total} here)",
         )
@@ -257,7 +281,7 @@ def _checkpoints(state_checkpoints, checkpoint_cu_starts, lens, v, others):
         or cs.dtype != torch.int64
         or cs.ndim != 1
         or not cs.is_contiguous()
-        or cs.tolist() != starts
+        or not _starts_match(cs, starts)
     ):
         raise unsupported(
             CLASS,
@@ -315,11 +339,9 @@ def _stateless(
             "a call without initial_state inside a CUDA graph capture",
             "an eager call",
         )
-    cu = None
-    lens = [T] * B
+    cu = offs = None
     if cu_seqlens is not None:
         offs = cu_seqlens.tolist()
-        lens = [b - a for a, b in zip(offs, offs[1:], strict=False)]
         if (
             offs[0] != 0
             or offs[-1] != T
@@ -334,18 +356,21 @@ def _stateless(
     state_checkpoints, checkpoint_cu_starts, every = checkpoints
     ck = cs = None
     if every:
-        if every != CHUNK:
+        if every != CHUNK or not isinstance(every, int):
             raise unsupported(
                 CLASS,
                 f"checkpoint_every_n_tokens={every!r}",
                 f"{CHUNK}, the class's chunk",
             )
+        lens = [T] * B
+        if offs is not None:
+            lens = [b - a for a, b in zip(offs, offs[1:], strict=False)]
         ck, cs = _checkpoints(
             state_checkpoints,
             checkpoint_cu_starts,
             lens,
             v,
-            (q, k, v, g, beta, output),
+            (q, k, v, g, beta, A_log, dt_bias, cu_seqlens, output),
         )
     elif state_checkpoints is not None or checkpoint_cu_starts is not None:
         raise unsupported(
@@ -398,7 +423,7 @@ def _stateless(
         output.copy_(out)
     elif output is not None and not output.is_inference():
         torch.autograd.graph.increment_version(output)
-    if state_checkpoints is not None and every and not ck.is_inference():
+    if state_checkpoints is not None and not ck.is_inference():
         torch.autograd.graph.increment_version(ck)
     return (out if output is None else output), ck
 

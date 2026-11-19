@@ -552,6 +552,24 @@ def test_checkpoint_arguments_are_refused_outside_their_form():
     cases = [
         (dict(checkpoint_every_n_tokens=32), "checkpoint_every_n_tokens=32"),
         (dict(checkpoint_every_n_tokens=64), "checkpoint_every_n_tokens=64"),
+        (dict(checkpoint_every_n_tokens=8), "checkpoint_every_n_tokens=8"),
+        (dict(checkpoint_every_n_tokens=16.0), "checkpoint_every_n_tokens=16.0"),
+        (
+            dict(checkpoint_every_n_tokens=16, state_checkpoints=ck.cpu()),
+            "state_checkpoints of another shape",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, state_checkpoints=ck[:, 0]),
+            "state_checkpoints of another shape",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, checkpoint_cu_starts=starts[:-1]),
+            "checkpoint_cu_starts",
+        ),
+        (
+            dict(checkpoint_every_n_tokens=16, checkpoint_cu_starts=starts.cpu()),
+            "checkpoint_cu_starts",
+        ),
         (dict(state_checkpoints=ck), "without checkpoint_every_n_tokens"),
         (dict(checkpoint_cu_starts=starts), "without checkpoint_every_n_tokens"),
         (
@@ -602,9 +620,32 @@ def test_checkpoint_arguments_are_refused_outside_their_form():
     for kw, message in cases:
         with pytest.raises(BatchInvariantUnsupportedError, match=message):
             recurrent_kda(*x, cu_seqlens=cu, **p, **kw)
+    v = shared[-x[2].numel() :].view(x[2].shape).copy_(x[2])
+    with pytest.raises(BatchInvariantUnsupportedError, match="share memory"):
+        recurrent_kda(
+            x[0],
+            x[1],
+            v,
+            *x[3:],
+            cu_seqlens=cu,
+            checkpoint_every_n_tokens=16,
+            state_checkpoints=shared.view(total, h, D, D),
+            **p,
+        )
+    good = dict(checkpoint_every_n_tokens=16, checkpoint_cu_starts=starts)
+    for _ in range(2):
+        recurrent_kda(*x, cu_seqlens=cu, **p, **good)
+    starts[1] += 1
+    with pytest.raises(BatchInvariantUnsupportedError, match="checkpoint_cu_starts"):
+        recurrent_kda(*x, cu_seqlens=cu, **p, **good)
+    starts[1] -= 1
     pool = torch.zeros(2, h, D, D, device="cuda")
     slots = torch.arange(2, dtype=torch.int32, device="cuda")
-    for kw in (dict(checkpoint_every_n_tokens=16), dict(state_checkpoints=ck)):
+    for kw in (
+        dict(checkpoint_every_n_tokens=16),
+        dict(state_checkpoints=ck),
+        dict(checkpoint_cu_starts=starts),
+    ):
         with pytest.raises(BatchInvariantUnsupportedError, match="with a state pool"):
             recurrent_kda(
                 *x,
@@ -649,8 +690,11 @@ def test_checkpoints_feed_the_cudnn_kda_backward():
         )
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"the cuDNN KDA engine does not run here: {e}")
-    assert theirs.dtype == ours.dtype and theirs.shape[0] >= ours.shape[0]
-    pad = theirs.new_zeros(theirs.shape[0] - ours.shape[0], *ours.shape[1:])
+    m = ours.shape[0]
+    assert theirs.dtype == ours.dtype and theirs.shape[0] >= m
+    assert float((theirs[:m].float() - ours.float()).abs().max()) <= 1e-2
+    assert float((theirs[:m].float() - ours.roll(1, 0).float()).abs().max()) > 1e-1
+    pad = theirs.new_zeros(theirs.shape[0] - m, *ours.shape[1:])
     gen = torch.Generator(device="cuda").manual_seed(5)
     d_out = torch.randn(rows.shape, device="cuda", generator=gen).to(rows.dtype)
 
@@ -669,8 +713,17 @@ def test_checkpoints_feed_the_cudnn_kda_backward():
             **kw,
         )
 
-    for a, b in zip(backward(theirs), backward(torch.cat([ours, pad])), strict=False):
-        if a.numel():
-            a, b = a.float(), b.float()
-            assert bool(torch.isfinite(b).all())
-            assert float((a - b).norm()) <= 1e-2 * float(a.norm())
+    def distances(checkpoints):
+        pairs = zip(backward(theirs), backward(checkpoints), strict=False)
+        return [
+            float((a.float() - b.float()).norm()) / float(a.float().norm())
+            for a, b in pairs
+            if a.numel()
+        ]
+
+    got = distances(torch.cat([ours, pad]))
+    print("KDA_BWD relative distances", got)
+    assert max(got) <= 1e-3
+    wrong = distances(torch.cat([ours.roll(1, 0), pad]))
+    print("KDA_BWD relative distances, rows shifted by one", wrong)
+    assert max(wrong) > 1e-2

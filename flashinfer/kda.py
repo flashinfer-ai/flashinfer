@@ -409,7 +409,8 @@ def recurrent_kda(
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
-            64 or a larger cache-page-aligned multiple.
+            64 or a larger cache-page-aligned multiple. With
+            ``batch_invariant=True`` only 16, and only without ``initial_state``.
         backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn"]):
             Implementation backend. ``"cute-dsl-persistent"`` explicitly selects
             the SM100/SM103 persistent prefill kernel with token-strided BF16
@@ -503,7 +504,8 @@ def recurrent_kda(
             ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
             ``beta_is_logit``, a finite negative ``lower_bound``; speculative
-            decode, checkpoints, ``initial_state_source``, ``seq_order``,
+            decode, checkpoints with a state pool or at another interval,
+            ``checkpoint_state_indices``, ``initial_state_source``, ``seq_order``,
             ``prefill_workspace`` and the frozen-verify arguments are not in
             the class. Unsupported inputs raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
