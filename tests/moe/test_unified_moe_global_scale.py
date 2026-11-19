@@ -21,6 +21,7 @@ from flashinfer.fused_moe.api import (
 )
 from flashinfer.fused_moe.layer import MoELayer
 from flashinfer.fused_moe.runners import _fold_trtllm_nvfp4_activation_scale
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 
 from .utils import check_accuracy
 
@@ -76,8 +77,14 @@ def _run_nvfp4_calibrated_global_scale_case(
         activation=QuantFormat.NVFP4,
         per_token_scale=per_token_scale,
     )
+    row_scale = None
+    x_to_quantize = x
+    if per_token_scale:
+        # Keep the calibrated input scalar in addition to real row scales.
+        row_scale = x.float().abs().amax(dim=-1)
+        x_to_quantize = (x.float() / row_scale[:, None]).to(x.dtype)
     x_q, x_sf = TrtllmFp4Config.prepare_activations(
-        x, quant=quant, hidden_states_scale_global=a1_gs
+        x_to_quantize, quant=quant, hidden_states_scale_global=a1_gs
     )
     activation_kwargs = {}
     if routing_input_mode is not None:
@@ -87,11 +94,7 @@ def _run_nvfp4_calibrated_global_scale_case(
         hidden_states_scale=x_sf,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
-        per_token_scale=(
-            torch.ones(num_tokens, device=device, dtype=torch.float32)
-            if per_token_scale
-            else None
-        ),
+        per_token_scale=row_scale,
         hidden_states_scale_global=a1_gs,
         **activation_kwargs,
     )
@@ -109,7 +112,7 @@ def _run_nvfp4_calibrated_global_scale_case(
             device=device,
             gemm1_scales_global=w1_gs,
             gemm2_scales_global=w2_gs,
-            intermediate_scale_global=a2_gs,
+            intermediate_scale_global=None if per_token_scale else a2_gs,
         ),
     )
     config_kwargs = {}
@@ -229,3 +232,32 @@ def test_activation_global_scale_is_reshaped_before_folding():
     output1, output1_gate = _fold_trtllm_nvfp4_activation_scale(act, view)
     torch.testing.assert_close(output1, torch.full((3,), 0.5))
     torch.testing.assert_close(output1_gate, torch.full((3,), 0.5))
+
+
+@pytest.mark.parametrize(
+    "per_token_scale,recipe",
+    [(True, None), (False, NVFP44Over6Config())],
+)
+def test_cute_dsl_rejects_calibrated_intermediate_scale_for_dynamic_quantization(
+    per_token_scale, recipe
+):
+    quant = QuantConfig(
+        weight=QuantFormat.NVFP4,
+        activation=QuantFormat.NVFP4,
+        per_token_scale=per_token_scale,
+    )
+    w1 = torch.empty((1, 256, 128), dtype=torch.bfloat16)
+    w2 = torch.empty((1, 128, 128), dtype=torch.bfloat16)
+    with pytest.raises(
+        ValueError, match="intermediate_scale_global requires per-tensor"
+    ):
+        CuteDslConfig.prepare_weights(
+            w1,
+            w2,
+            quant=quant,
+            num_local_experts=1,
+            hidden_size=128,
+            intermediate_size=128,
+            nvfp4_4over6=recipe,
+            intermediate_scale_global=2.0,
+        )

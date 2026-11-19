@@ -2666,7 +2666,9 @@ class CuteDslConfig:
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
         ``fc2_input_scale``. The default keeps the historical
-        ``fc2_input_scale = 1.0``.
+        ``fc2_input_scale = 1.0``. Explicit ``intermediate_scale_global`` is
+        for per-tensor NVFP4 GEMM2 input quantization without a pinned 4over6
+        recipe.
         """
         from .prepare import prepare_cute_dsl_weights
 

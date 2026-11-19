@@ -2761,6 +2761,15 @@ def prepare_cute_dsl_weights(
     ):
         raise ValueError("Calibrated global scales are supported only for NVFP4×NVFP4.")
 
+    nvfp4_recipe = resolve_nvfp4_4over6(nvfp4_4over6)
+    if intermediate_scale_global is not None and (
+        quant.per_token_scale or nvfp4_recipe is not None
+    ):
+        raise ValueError(
+            "intermediate_scale_global requires per-tensor NVFP4 GEMM2 input "
+            "quantization without a pinned nvfp4_4over6 recipe."
+        )
+
     if device is None:
         device = w1_bf16.device
     group_size = _cute_dsl_gated_weight_group_size(device, swap_ab)
@@ -2890,14 +2899,13 @@ def prepare_cute_dsl_weights(
         else:
             # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
             # w2_bf16 is passed for its device only.
-            nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
             view["fc2_input_scale"] = (
                 gs
-                if nvfp4_4over6_config is None
+                if nvfp4_recipe is None
                 else make_nvfp4_global_scale(
                     w2_bf16,
                     per_token_activation=True,
-                    nvfp4_4over6_config=nvfp4_4over6_config,
+                    nvfp4_4over6_config=nvfp4_recipe,
                 )
             )
     return view
