@@ -90,9 +90,13 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
-    from ..attention.batch_invariant.spec import spec_fingerprint
+def _attention_fingerprint(head_dim: int, custom_mask: bool = False) -> str:
+    """The attention class at ``head_dim``; ``custom_mask=True`` names the explicit-key-set class a ``plan()`` with a custom mask
+    runs (the mask is data of that class: its values never enter the identifier)."""
+    from ..attention.batch_invariant.spec import mask_fingerprint, spec_fingerprint
 
+    if custom_mask:
+        return mask_fingerprint(head_dim)
     return spec_fingerprint(head_dim)
 
 
@@ -614,11 +618,13 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
+    # a prefill plan with a custom mask runs the explicit-key-set class (`custom_mask=True`): a token's output depends on its own
+    # mask row (ANDed with the window), its head and its request's keys alone; the decode wrapper takes no mask
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("custom_mask",)
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("custom_mask",)
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -721,8 +727,14 @@ def fingerprint(op: str, **dims) -> str:
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    class's no-window sample row and covers windowed calls too. The two prefill wrappers also take ``custom_mask=True``: a
+    ``plan()`` with ``custom_mask`` / ``packed_custom_mask`` runs the explicit-key-set class (``attn-bf16-d<D>-mask-*``), in
+    which a token's visible keys are its own mask row (ANDed with the window) instead of its causal range. The mask is data of
+    that class, like the KV position of the causal one: one receipt covers every mask, and a mask row equal to a causal range
+    gives the causal class's bits.
 
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, custom_mask=True)  # doctest: +SKIP
+    'attn-bf16-d128-mask-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
