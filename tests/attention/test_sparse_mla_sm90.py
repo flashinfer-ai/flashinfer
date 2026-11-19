@@ -338,10 +338,14 @@ def test_tail_probabilities_survive_p_staging(backend):
         _write_token(kv, s, 448.0, [1.0] * 4, rope_tail)
     slots = [(i, i) for i in range(1 + ntail)]
     y = _single_row_call(kv, slots, 16.0, 1.0 / 16.0, backend).float()
+    y_ref = _single_row_call(kv, slots, 16.0, 1.0 / 16.0, "reference").float()
     w = ntail * math.exp(-18.0)
     expect = 448.0 * w / (1.0 + w)
     assert torch.isfinite(y).all()
     assert (y - expect).abs().max().item() <= 1e-3
+    # Tight band vs the exact-math reference: the split whose local max is
+    # the dominant token must not flush its tail probabilities.
+    assert (y - y_ref).abs().max().item() <= 1e-4
 
 
 @pytest.mark.parametrize("qmag", [65536.0, 2.0**24])
@@ -365,6 +369,31 @@ def test_bf16_query_range_is_preserved(backend, qmag):
     expect = math.exp(1.0 / 16.0) / (math.exp(1.0 / 16.0) + 1.0)
     assert torch.isfinite(y).all(), "finite BF16 query produced non-finite output"
     assert (y - expect).abs().max().item() <= 2e-3
+
+
+def test_sparse_mla_sm90_in_aot_collection():
+    # The stable module must ship in the SM90 prebuilt cache: a JIT-disabled
+    # install otherwise silently serves auto calls with the composable
+    # reference path instead of the advertised specialized kernel.
+    from flashinfer.aot import gen_all_modules
+
+    specs = gen_all_modules(
+        [],
+        [],
+        [],
+        [],
+        [False],
+        [False],
+        {"sm90": True},
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+    assert "sparse_mla_sm90" in [s.name for s in specs]
 
 
 def test_specialized_off_envelope_raises():
