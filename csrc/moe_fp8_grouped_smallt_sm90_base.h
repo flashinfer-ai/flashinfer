@@ -32,17 +32,83 @@ __device__ __forceinline__ __half2 bf2_to_h2_prescaled(__nv_bfloat162 v) {
 
 // The small-T fc2 inner products accumulate RAW e4m3 mantissas (the
 // [128,128] quantizer drives every block's peak to ~448) against the fp16
-// fc1 intermediate, whose magnitude is bounded only by half range: one
-// 8-product __hfma2 chain can reach 8 * 448 * 65504 and overflow to inf
-// long before the fp32 block scale is applied. Prescaling the unpacked
-// weights by 2^-14 — exact for EVERY e4m3 value (4 significant bits, the
-// multiply is a pure exponent shift, subnormal halves included) — bounds
-// the chain by 8 * 448 * 2^-14 * 65504 = 14336, safely inside half range;
-// the exact 2^14 is restored in fp32 where the block scale is applied
-// (FC2_W_UNSCALE folded into the scale), so in-range results keep the
-// original rounding behavior.
-#define FC2_W_PRESCALE 6.103515625e-5f /* 2^-14 */
-#define FC2_W_UNSCALE 16384.f
+// fc1 intermediate, whose magnitude spans half's whole range (subnormals
+// included): one 8-product __hfma2 chain can reach 8 * 448 * 65504 and
+// overflow to inf long before the fp32 block scale is applied, while at
+// the other end products as small as 2^-9 * 2^-24 must survive to the
+// fp32 scale. No fixed exponent shift covers both ends (the product range
+// spans ~2^58), so the chunk dot products run the ORIGINAL half chain —
+// bit-for-bit the pre-existing arithmetic for every in-range input — and
+// when (and only when) that chain leaves finite half range, which IEEE
+// makes sticky (inf/nan cannot come back), the chunk is recomputed with
+// fp32 products, which are exact for these operand widths. The check is
+// two instructions per 16-element chunk; the fp32 path is dead code until
+// a chunk actually overflows.
+__device__ __forceinline__ float fc2_dot16_f32(const uint4 w, const __half2* hp) {
+  float s = 0.f;
+  const uint32_t* wp = (const uint32_t*)&w;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    __half2 a, b;
+    unpack4(wp[q], a, b);
+    const float2 fa = __half22float2(a), fb = __half22float2(b);
+    const float2 h0 = __half22float2(hp[2 * q]), h1 = __half22float2(hp[2 * q + 1]);
+    s = fmaf(fa.x, h0.x, s);
+    s = fmaf(fa.y, h0.y, s);
+    s = fmaf(fb.x, h1.x, s);
+    s = fmaf(fb.y, h1.y, s);
+  }
+  return s;
+}
+
+// 16-element raw-mantissa dot product: half fast path, fp32 on overflow.
+__device__ __forceinline__ float fc2_dot16(const uint4 w, const __half2* hp) {
+  __half2 lh = __float2half2_rn(0.f), a, b;
+  unpack4(w.x, a, b);
+  lh = __hfma2(a, hp[0], lh);
+  lh = __hfma2(b, hp[1], lh);
+  unpack4(w.y, a, b);
+  lh = __hfma2(a, hp[2], lh);
+  lh = __hfma2(b, hp[3], lh);
+  unpack4(w.z, a, b);
+  lh = __hfma2(a, hp[4], lh);
+  lh = __hfma2(b, hp[5], lh);
+  unpack4(w.w, a, b);
+  lh = __hfma2(a, hp[6], lh);
+  lh = __hfma2(b, hp[7], lh);
+  const float2 f = __half22float2(lh);
+  const float s = f.x + f.y;
+  if (isfinite(s)) return s;
+  return fc2_dot16_f32(w, hp);
+}
+
+// 8-element variant (uint2 of packed e4m3 against 4 half2).
+__device__ __forceinline__ float fc2_dot8(const uint2 w, const __half2* hp) {
+  __half2 lh = __float2half2_rn(0.f), a, b;
+  unpack4(w.x, a, b);
+  lh = __hfma2(a, hp[0], lh);
+  lh = __hfma2(b, hp[1], lh);
+  unpack4(w.y, a, b);
+  lh = __hfma2(a, hp[2], lh);
+  lh = __hfma2(b, hp[3], lh);
+  const float2 f = __half22float2(lh);
+  const float s = f.x + f.y;
+  if (isfinite(s)) return s;
+  float sf = 0.f;
+  const uint32_t* wp = (const uint32_t*)&w;
+#pragma unroll
+  for (int q = 0; q < 2; ++q) {
+    __half2 a2, b2;
+    unpack4(wp[q], a2, b2);
+    const float2 fa = __half22float2(a2), fb = __half22float2(b2);
+    const float2 h0 = __half22float2(hp[2 * q]), h1 = __half22float2(hp[2 * q + 1]);
+    sf = fmaf(fa.x, h0.x, sf);
+    sf = fmaf(fa.y, h0.y, sf);
+    sf = fmaf(fb.x, h1.x, sf);
+    sf = fmaf(fb.y, h1.y, sf);
+  }
+  return sf;
+}
 
 // ------------------------------------------------------------------
 // fc1 for small T: one warp per intermediate column j, one block row
@@ -413,18 +479,9 @@ __global__ __launch_bounds__(512, 3) void fc2_t1_w32(
 #pragma unroll
   for (int kk = 0; kk < KT; ++kk) {
     const uint4 hv = *(const uint4*)(Hb + kk * I + j0);
-    const float sc = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)] * FC2_W_UNSCALE;
+    const float sc = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)];
     const __half2* hp = (const __half2*)&hv;
-    const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
-    __half2 lh = __float2half2_rn(0.f), a, b;
-    unpack4(w[kk].x, a, b);
-    lh = __hfma2(__hmul2(a, wps), hp[0], lh);
-    lh = __hfma2(__hmul2(b, wps), hp[1], lh);
-    unpack4(w[kk].y, a, b);
-    lh = __hfma2(__hmul2(a, wps), hp[2], lh);
-    lh = __hfma2(__hmul2(b, wps), hp[3], lh);
-    float2 f = __half22float2(lh);
-    acc = fmaf(tws[kk] * sc, f.x + f.y, acc);
+    acc = fmaf(tws[kk] * sc, fc2_dot8(w[kk], hp), acc);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(FULLM, acc, o);
@@ -465,35 +522,18 @@ __global__ __launch_bounds__(256, 3) void fc2_t1_pr(
   // cache misses can overlap the producer instead of extending the wait.
   float wsc[KT];
 #pragma unroll
-  for (int kk = 0; kk < KT; ++kk)
-    wsc[kk] = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)] * FC2_W_UNSCALE;
+  for (int kk = 0; kk < KT; ++kk) wsc[kk] = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)];
 
   cudaGridDependencySynchronize();
   float acc = 0.f;
 #pragma unroll
   for (int kk = 0; kk < KT; ++kk) {
     const __half* hbp = Hb + kk * I + j0;
-    uint4 h0 = *(const uint4*)(hbp);
-    uint4 h1 = *(const uint4*)(hbp + 8);
+    uint4 hv[2];
+    hv[0] = *(const uint4*)(hbp);
+    hv[1] = *(const uint4*)(hbp + 8);
     const float sc = wsc[kk];
-    const __half2* p0 = (const __half2*)&h0;
-    const __half2* p1 = (const __half2*)&h1;
-    const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
-    __half2 lh = __float2half2_rn(0.f), a, b;
-    unpack4(w[kk].x, a, b);
-    lh = __hfma2(__hmul2(a, wps), p0[0], lh);
-    lh = __hfma2(__hmul2(b, wps), p0[1], lh);
-    unpack4(w[kk].y, a, b);
-    lh = __hfma2(__hmul2(a, wps), p0[2], lh);
-    lh = __hfma2(__hmul2(b, wps), p0[3], lh);
-    unpack4(w[kk].z, a, b);
-    lh = __hfma2(__hmul2(a, wps), p1[0], lh);
-    lh = __hfma2(__hmul2(b, wps), p1[1], lh);
-    unpack4(w[kk].w, a, b);
-    lh = __hfma2(__hmul2(a, wps), p1[2], lh);
-    lh = __hfma2(__hmul2(b, wps), p1[3], lh);
-    float2 f = __half22float2(lh);
-    acc = fmaf(tws[kk] * sc, f.x + f.y, acc);
+    acc = fmaf(tws[kk] * sc, fc2_dot16(w[kk], (const __half2*)hv), acc);
   }
 #pragma unroll
   for (int o = 8; o > 0; o >>= 1) acc += __shfl_xor_sync(FULLM, acc, o);
@@ -544,22 +584,7 @@ extern "C" __global__ void fc2_l16(const __half* __restrict__ Hb, const uint8_t*
     const int j0 = sub * 16;
     uint4 w = *(const uint4*)(wp + j0);
     const __half2* hp = (const __half2*)hs + kk * 144 + sub * 9;
-    const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
-    __half2 lh = __float2half2_rn(0.f), a, b;
-    unpack4(w.x, a, b);
-    lh = __hfma2(__hmul2(a, wps), hp[0], lh);
-    lh = __hfma2(__hmul2(b, wps), hp[1], lh);
-    unpack4(w.y, a, b);
-    lh = __hfma2(__hmul2(a, wps), hp[2], lh);
-    lh = __hfma2(__hmul2(b, wps), hp[3], lh);
-    unpack4(w.z, a, b);
-    lh = __hfma2(__hmul2(a, wps), hp[4], lh);
-    lh = __hfma2(__hmul2(b, wps), hp[5], lh);
-    unpack4(w.w, a, b);
-    lh = __hfma2(__hmul2(a, wps), hp[6], lh);
-    lh = __hfma2(__hmul2(b, wps), hp[7], lh);
-    float2 f = __half22float2(lh);
-    part = fmaf(scp[j0 >> 7] * FC2_W_UNSCALE, f.x + f.y, part);
+    part = fmaf(scp[j0 >> 7], fc2_dot16(w, hp), part);
     acc = fmaf(topk_w[t * KTOP + kk], part, acc);
   }
   acc += __shfl_down_sync(FULLM, acc, 8);
@@ -599,22 +624,7 @@ extern "C" __global__ void fc2_l8(const __half* __restrict__ Hb, const uint8_t* 
       const int j0 = sub * 16 + c;
       uint4 w = *(const uint4*)(wp + j0);
       const __half2* hp = (const __half2*)(hs + kk * I + j0);
-      const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
-      __half2 lh = __float2half2_rn(0.f), a, b;
-      unpack4(w.x, a, b);
-      lh = __hfma2(__hmul2(a, wps), hp[0], lh);
-      lh = __hfma2(__hmul2(b, wps), hp[1], lh);
-      unpack4(w.y, a, b);
-      lh = __hfma2(__hmul2(a, wps), hp[2], lh);
-      lh = __hfma2(__hmul2(b, wps), hp[3], lh);
-      unpack4(w.z, a, b);
-      lh = __hfma2(__hmul2(a, wps), hp[4], lh);
-      lh = __hfma2(__hmul2(b, wps), hp[5], lh);
-      unpack4(w.w, a, b);
-      lh = __hfma2(__hmul2(a, wps), hp[6], lh);
-      lh = __hfma2(__hmul2(b, wps), hp[7], lh);
-      float2 f = __half22float2(lh);
-      part = fmaf(scp[j0 >> 7] * FC2_W_UNSCALE, f.x + f.y, part);
+      part = fmaf(scp[j0 >> 7], fc2_dot16(w, hp), part);
     }
     acc = fmaf(topk_w[t * KTOP + kk], part, acc);
   }
