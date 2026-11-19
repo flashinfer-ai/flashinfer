@@ -17,6 +17,8 @@ tensor of per-head sink logits, selects the class's sink member (``spec.sink_mer
 of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
 row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
 are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+The values are not checked: a sink whose base-2 value ``mul(sinks[h], LOG2E)`` overflows binary32 (a magnitude above about
+``2.36e38``) is a sink of that infinity, and a ``+inf`` or NaN sink gives NaN on its head's rows (``spec.sink_merge``).
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -700,6 +702,7 @@ class BatchInvariantAttention:
                     f"{name} of shape {tuple(t.shape)} (strides {tuple(t.stride())}) at run()",
                     f"the planned {self.kv_layout} geometry {want}",
                 )
+        q_source = q
         if not q.is_contiguous():
             q = q.contiguous()
         if q.data_ptr() % 16:
@@ -733,7 +736,9 @@ class BatchInvariantAttention:
             nh_shape = (q.shape[0], Hq)
             if lse is not None:
                 shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
-                bad = engine.check_lse_buffer(lse, q, out, k, v, shape)
+                bad = engine.check_lse_buffer(
+                    lse, q, out, k, v, shape, q_source=q_source
+                )
                 if bad is not None:
                     raise unsupported(
                         CLASS,
@@ -747,7 +752,9 @@ class BatchInvariantAttention:
                 else torch.empty(nh_shape, dtype=torch.float32, device=self.device)
             )
         if sinks is not None:
-            bad = engine.check_sinks(sinks, Hq, self.device, (out, lse_nh))
+            # the HN layout's copy writes the caller's buffer after the launch
+            written = (out, lse_nh, lse if return_lse else None)
+            bad = engine.check_sinks(sinks, Hq, self.device, written)
             if bad is not None:
                 raise unsupported(
                     CLASS,

@@ -1927,6 +1927,25 @@ def test_lse_buffer_refusals(kind):
                 return_lse=True,
                 lse_layout="HN",
             )
+    # a strided q is packed into a copy for the kernels: a buffer over the caller's own q storage is refused all the same
+    # (the store would change the caller's queries), a disjoint one is written
+    wide = torch.zeros(4, 8, 256, dtype=torch.bfloat16, device=dev)
+    q_strided = wide[:, :, ::2]
+    q_strided.copy_(args[0])
+    assert not q_strided.is_contiguous()
+    strided_args = (q_strided,) + tuple(args[1:])
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.run(
+            *strided_args,
+            lse=wide.view(torch.float32).reshape(-1)[:32].view(4, 8),
+            return_lse=True,
+        )
+    assert torch.equal(bits(q_strided), bits(args[0]))
+    lse_buf = torch.empty(4, 8, dtype=torch.float32, device=dev)
+    got = w.run(*strided_args, lse=lse_buf, return_lse=True)
+    assert got[1] is lse_buf
+    assert torch.equal(bits(got[0]), expected[0])
+    assert torch.equal(bits(got[1]), expected[1])
     got = w.run(*args, return_lse=True)
     assert torch.equal(bits(got[0]), expected[0])
     assert torch.equal(bits(got[1]), expected[1])
@@ -1958,8 +1977,9 @@ def sink_reference(pr: Problem, sinks, window_left=-1):
         sink_attention_unified,
     )
 
+    # the helper returns the query's dtype: fp32 queries (the bf16 values, exactly) keep the reference unrounded
     out = sink_attention_unified(
-        pr.q,
+        pr.q.float(),
         pr.k_rag,
         pr.v_rag,
         sinks,
@@ -1987,7 +2007,8 @@ def sink_reference(pr: Problem, sinks, window_left=-1):
         lses.append(torch.logsumexp(s, dim=-1).t())
         tok_q += ql
         tok_kv += kl
-    return out.float(), torch.cat(lses)
+    assert out.dtype == torch.float32
+    return out, torch.cat(lses)
 
 
 def _multi_token_decode(pr, q_len, layout="NHD", **run_kw):
@@ -2452,7 +2473,8 @@ def test_sinks_edge_values(D):
     """The step's corner values. A sink far above every score: ``a`` underflows to ``+0``, the outputs are ``+0`` and the
     base-2 LSE is ``mul(sink, LOG2E)`` (``l' = 1``). A sink far below (or ``-inf``): ``b = +0``, the bits of the row without
     sinks. A sink whose scaled logit equals the row's scaled maximum: ``a = b = 1``. ``+inf`` and NaN sinks give NaN on
-    their heads only."""
+    their heads only. The step sees the sink's base-2 value ``mul(sink, LOG2E)``: a finite sink whose base-2 value
+    overflows binary32 is the sink of that infinity (NaN on its head above, the row without sinks below)."""
     from flashinfer.attention.batch_invariant.spec import LOG2E
     from flashinfer.batch_invariant.sampling.mufu_device import lg2_device
 
@@ -2466,24 +2488,31 @@ def test_sinks_edge_values(D):
     sinks[2] = float("-inf")
     sinks[3] = float("inf")
     sinks[4] = float("nan")
+    sinks[5] = 3.0e38
+    sinks[6] = -3.0e38
+    log2e = torch.tensor(LOG2E, dtype=torch.float32)
+    assert bool(torch.isfinite(sinks[5:7]).all())
+    assert (sinks[5:7].cpu() * log2e).tolist() == [float("inf"), float("-inf")]
     res = run_paged_prefill(pr, run_kw=dict(LSE, sinks=sinks))
     out, lse = _both(res)
-    assert torch.equal(out[:, 5:], ref[:, 5:]) and torch.equal(
-        lse[:, 5:], ref_lse[:, 5:]
+    assert torch.equal(out[:, 7:], ref[:, 7:]) and torch.equal(
+        lse[:, 7:], ref_lse[:, 7:]
     )
     assert bool((out[:, 0] == 0).all())  # +0, bit for bit
     big = torch.tensor(1.0e4, dtype=torch.float32) * torch.tensor(
         LOG2E, dtype=torch.float32
     )
     assert bool((res[1][:, 0].cpu() == big).all())
-    for h in (1, 2):
+    for h in (1, 2, 6):
         assert torch.equal(out[:, h], plain[:, h])
         assert torch.equal(lse[:, h], plain_lse[:, h])
-    for h in (3, 4):
+    for h in (3, 4, 5):
         assert bool(torch.isnan(res[0][:, h].float()).all())
         assert bool(torch.isnan(res[1][:, h]).all())
     (dec, dec_lse), last = run_decode(pr, run_kw=dict(LSE, sinks=sinks))
-    keep = [h for h in range(pr.Hq) if h not in (3, 4)]
+    assert bool(torch.isnan(dec[:, 5].float()).all())
+    assert bool(torch.isnan(dec_lse[:, 5]).all())
+    keep = [h for h in range(pr.Hq) if h not in (3, 4, 5)]
     assert torch.equal(bits(dec)[:, keep], out[last][:, keep])
     assert torch.equal(bits(dec_lse)[:, keep], lse[last][:, keep])
     # a row with one key has l = 1 and its base-2 LSE without sinks is its scaled maximum mul(m, c), bit for bit; where a
@@ -2600,6 +2629,29 @@ def test_sinks_refusals(kind):
             w.run(*args, out=out_buf)
         else:
             w.run(*args, out=out_buf, sinks=out_buf.view(torch.float32).reshape(-1)[:8])
+    # sinks inside the caller's LSE buffer: refused in both layouts (under "HN" the kernels write a (total_q, Hq) buffer
+    # of their own and the transposed copy lands in the caller's), accepted where the buffer is not written (no return_lse)
+    for layout in ("NH", "HN") if kind else ("NH",):
+        lse_buf = torch.zeros(
+            (4, 8) if layout == "NH" else (8, 4), dtype=torch.float32, device=dev
+        )
+        inside = lse_buf.view(-1)[8:16]
+        inside.copy_(good)
+        lse_kw = dict(lse=lse_buf, lse_layout=layout) if kind else dict(lse=lse_buf)
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            if kind == 2:
+                w._sinks = inside
+                w.run(*args, return_lse=True, **lse_kw)
+            else:
+                w.run(*args, return_lse=True, sinks=inside, **lse_kw)
+        assert torch.equal(inside, good)
+        if kind == 2:
+            w._sinks = inside
+            unused = w.run(*args, **lse_kw)
+        else:
+            unused = w.run(*args, sinks=inside, **lse_kw)
+        assert torch.equal(bits(unused), expected)
+        assert torch.equal(inside, good)
     assert torch.equal(bits(run(good)), expected)
     from flashinfer.attention.batch_invariant import engine
 
@@ -2612,6 +2664,15 @@ def test_sinks_refusals(kind):
         with pytest.raises(ValueError):
             engine.run_attention(*eargs, sinks=sinks)
     assert torch.equal(bits(engine.run_attention(*eargs, sinks=good)), expected)
+    # the LSE buffer counts as written only when the LSE is requested
+    lse_buf = torch.zeros(4, 8, dtype=torch.float32, device=dev)
+    inside = lse_buf.view(-1)[8:16]
+    inside.copy_(good)
+    with pytest.raises(ValueError):
+        engine.run_attention(*eargs, sinks=inside, lse=lse_buf, return_lse=True)
+    unused = engine.run_attention(*eargs, sinks=inside, lse=lse_buf)
+    assert torch.equal(bits(unused), expected)
+    assert torch.equal(inside, good)
 
 
 @needs_device

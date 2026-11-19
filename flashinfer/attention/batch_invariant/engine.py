@@ -547,10 +547,12 @@ def check_lse_buffer(
     k: torch.Tensor,
     v: torch.Tensor,
     shape: tuple,
+    q_source: Optional[torch.Tensor] = None,
 ) -> Optional[str]:
     """What is wrong with a caller's LSE buffer (``None`` when it can be written): a contiguous fp32 tensor of ``shape`` on
     the queries' device whose bytes are disjoint from the output, the queries and the K / V caches (CTAs store LSE rows
-    while others still read their operands)."""
+    while others still read their operands). ``q_source``: the caller's query tensor where ``q`` is a packed copy of it;
+    the buffer must not share bytes with it either, since the store would change the caller's queries."""
     if lse.dtype != torch.float32:
         return f"of dtype {lse.dtype}"
     if tuple(lse.shape) != tuple(shape):
@@ -562,6 +564,8 @@ def check_lse_buffer(
     if _output_overlaps_kv(lse, k, v):
         return "that shares bytes with the KV cache"
     if _output_overlaps_kv(lse, q, q if out is None else out):
+        return "that shares bytes with the queries or the output"
+    if q_source is not None and _output_overlaps_kv(lse, q_source, q_source):
         return "that shares bytes with the queries or the output"
     return None
 
@@ -723,6 +727,8 @@ def run_attention(
                 raise ValueError(
                     f"lse must be a contiguous fp32 ({total_q}, {Hq}) tensor on {q.device} that aliases no operand; got one {bad}"
                 )
+    if not return_lse:
+        lse = None  # a buffer passed without return_lse is neither written nor returned
     if sinks is not None:
         bad = check_sinks(sinks, Hq, q.device, (out, lse))
         if bad is not None:
@@ -742,7 +748,7 @@ def run_attention(
         out,
         config,
         ragged,
-        lse=lse if lse_mode else None,
+        lse=lse,
         lse_mode=lse_mode,
         sinks=sinks,
     )

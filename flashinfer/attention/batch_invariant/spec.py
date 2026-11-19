@@ -29,8 +29,11 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
   ``cvt_bf16(add(mul(O, mul(a, div(1, l'))), +0))`` and the LSE member ``add(m', LG2(l'))`` (``m'`` is already scaled).
   The step is taken once per row whatever the tiling, the unit kind and the kernel body; a row without sinks does not
   take it (the terms above, unchanged), so the sink member has its own fingerprints (``sink_fingerprint``).
-  ``sink = -inf`` gives ``b = +0``, ``a = 1`` and the bits of the row without sinks; a sink so large that ``a``
-  underflows gives ``+0`` outputs; a ``+inf`` or NaN sink gives NaN, like any non-finite operand.
+  ``sink = -inf`` gives ``b = +0``, ``a = 1`` and the bits of the row without sinks; a finite sink so large that ``a``
+  underflows gives ``+0`` outputs, as long as its base-2 value ``s2`` is finite; a ``+inf`` or NaN sink gives NaN
+  (``b = EX2(add(+inf, -inf))``), like any non-finite operand. The step works on ``s2``, so a finite sink whose ``s2``
+  overflows binary32 (a magnitude above about ``FLT_MAX / log2 e``, ``2.36e38``) is the sink of that infinity: NaN above,
+  the bits of the row without sinks below.
 
 Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
@@ -324,7 +327,9 @@ class SinkState:
 def sink_merge(fp, st: State, sink, c) -> SinkState:
     """The sink step on the row's final ``(m, l)``: the merge with a virtual key of logit ``sink`` (natural-log units,
     never divided by the scale) and zero value. ``m' = fmax(mul(m, c), mul(sink, LOG2E))``; the two exponentials are of the
-    exact differences to ``m'`` (one of them ``EX2(+0) = 1``); ``l' = fma(l, a, b)``."""
+    exact differences to ``m'`` (one of them ``EX2(+0) = 1``); ``l' = fma(l, a, b)``. Where ``mul(sink, LOG2E)`` is ``+inf``
+    (a ``+inf`` sink, or a finite one whose base-2 value overflows binary32) ``b`` is ``EX2(add(+inf, -inf))``, a NaN,
+    and so are ``l'``, the output and the LSE."""
     ms = fp.mul(st.m, c)
     s2 = fp.mul(sink, fp.const(LOG2E))
     m = fp.fmaxc(ms, s2)
