@@ -796,7 +796,8 @@ def _run_cake_gdn_decode_nontranspose(
     Runs on every eager decode call, so the checks compare the device index, dtype
     identity and shapes directly (no ``torch.device`` built per tensor) and the launch
     comes from ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES``; the checks, their order, the error
-    types and the messages are those of the resolver path.
+    types and the messages are those of the resolver path, followed by one check that
+    path did not have: the row-independent alignment check (``ValueError``).
     """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:

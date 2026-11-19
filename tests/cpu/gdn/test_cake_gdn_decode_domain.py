@@ -560,9 +560,10 @@ def test_unhomed_state_launches_the_whole_route_as_before(monkeypatch) -> None:
 def test_unaligned_inputs_raise_before_any_launch(monkeypatch, backend) -> None:
     # Contiguous views at an unaligned storage offset: the kernels read q and k in
     # 8-byte vectors and the state in 16-byte copies, so the call raises before it
-    # resolves or launches anything, homed or not.  Through the public call
-    # (``backend`` not None) backend="auto" raises too: it does not fall back to the
-    # FlashInfer kernel.
+    # resolves or launches anything, homed or not, with the row's launch cached or
+    # not.  The check is row- and GPU-independent: through the public call
+    # (``backend`` not None) backend="auto" raises too, also on a device the Cake
+    # kernels do not serve; it does not fall back to the FlashInfer kernel.
     device = _Device(monkeypatch)
 
     def flashinfer_kernel(*args, **kwargs):
@@ -578,25 +579,27 @@ def test_unaligned_inputs_raise_before_any_launch(monkeypatch, backend) -> None:
         )
         return output
 
-    for homed in (False, True):
-        for name, address in (
-            ("q", 2),
-            ("q", 4),
-            ("k", 6),
-            ("state", 4),
-            ("state", 8),
-        ):
-            inputs = _decode_inputs(64)
-            tensor = inputs[name]
-            inputs[name] = _fake(tensor.shape, tensor.dtype, address)
-            if homed:
-                device.home(inputs["state"])
-            with pytest.raises(ValueError, match="aligned"):
-                run(inputs)
-    assert device.calls == [] and device.loads == []
+    def run_misaligned(device):
+        for homed in (False, True):
+            for name, address in (
+                ("q", 2),
+                ("q", 4),
+                ("k", 6),
+                ("state", 4),
+                ("state", 8),
+            ):
+                inputs = _decode_inputs(64)
+                tensor = inputs[name]
+                inputs[name] = _fake(tensor.shape, tensor.dtype, address)
+                if homed:
+                    device.home(inputs["state"])
+                with pytest.raises(ValueError, match="aligned"):
+                    run(inputs)
+
     # 8-byte aligned q and k and a 16-byte aligned state launch as before; the other
     # tensors, read and written one element at a time, need only their element
-    # alignment.
+    # alignment.  This runs first: no state is homed yet, and the row's launch is
+    # cached for the misaligned calls that follow.
     inputs = _decode_inputs(64)
     for name, address in (
         ("q", 8),
@@ -613,6 +616,24 @@ def test_unaligned_inputs_raise_before_any_launch(monkeypatch, backend) -> None:
     assert run(inputs) is inputs["output"]
     ((route, args),) = device.calls
     assert _TWIN not in route and args[:9] == _whole_args(inputs, 0)[:9]
+    loads = list(device.loads)
+    run_misaligned(device)
+    assert len(device.calls) == 1 and device.loads == loads
+    # On a device the Cake kernels do not serve (SM90), the misaligned calls raise
+    # all the same, before the architecture is looked up.  An aligned call there
+    # raises CakeGDNUnsupportedError, which backend="auto" turns into a fallback.
+    device = _Device(monkeypatch, capability=(9, 0), sm_count=132)
+    run_misaligned(device)
+    assert device.calls == [] and device.loads == []
+    if backend == "auto":
+        unsupported = pytest.raises(AssertionError, match="fell back")
+    else:
+        unsupported = pytest.raises(
+            cake_gdn.CakeGDNUnsupportedError, match=r"compute capability 9\.0"
+        )
+    with unsupported:
+        run(_decode_inputs(64))
+    assert device.calls == [] and device.loads == []
 
 
 @pytest.mark.parametrize("scale", [_SCALE, 1.0])

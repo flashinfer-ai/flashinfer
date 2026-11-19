@@ -73,9 +73,10 @@ A T=1 call with the contiguous BF16 and FP32 tensors listed above and
 K = V = 128 raises ``ValueError``, under ``backend="auto"`` as under
 ``backend="cake_gdn"`` and for every row and GPU, if q or k does not start at
 an 8-byte aligned address or the state does not start at a 16-byte aligned
-one. ``backend="auto"`` does not fall back to the FlashInfer kernel here: it
-needs aligned inputs too. The other tensors need only the alignment of their
-element type.
+one. ``backend="auto"`` does not fall back to the FlashInfer kernel here: that
+kernel assumes 16-byte aligned q, k, v, output and state, also on the calls
+that ``backend="auto"`` hands to it. On a call the Cake kernels run, the other
+tensors need only the alignment of their element type.
 
 The helper returns ``state`` itself, without a copy, under CUDA graph capture
 and wherever it does not home the state (for example a row the twin does not

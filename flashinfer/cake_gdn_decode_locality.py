@@ -28,7 +28,10 @@ launch over both dies whose CTAs take the (batch row, value head) items of their
 own die's rows first. Its output and updated state are those of the whole-GPU
 body bit for bit. Every other call that the Cake kernels serve runs the whole-GPU
 route; one they do not serve runs the FlashInfer kernel under ``backend="auto"``
-and raises ``CakeGDNUnsupportedError`` under ``backend="cake_gdn"``.
+and raises ``CakeGDNUnsupportedError`` under ``backend="cake_gdn"``. A call with
+the dtypes, shapes and contiguity those kernels take raises ``ValueError`` under
+both, on every row and GPU, if q or k is not 8-byte aligned or the state is not
+16-byte aligned.
 """
 
 from __future__ import annotations
