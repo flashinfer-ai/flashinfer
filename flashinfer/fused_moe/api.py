@@ -3529,14 +3529,18 @@ class SpecializedMoEConfig:
     with their declarations. A layer binds the kernels whose guard admits its
     configuration; for any other configuration the layer skips this backend.
 
-    It is part of the default backend list, so a default ``MoELayer`` needs no
-    extra preparation: any call that no bound kernel admits (token count, tensor
-    layout, the first call of a token count under CUDA-graph capture, a kernel
-    not yet built) runs on the other candidates, and where a kernel admits the
-    call, ``MoELayer`` times it against them like any candidate. A kernel is
-    built for a device by the first eager call it admits, never inside a
-    capture. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on the
-    other candidates.
+    It is the first entry of the default backend list, so a default
+    ``MoELayer`` needs no extra preparation: any call that no bound kernel admits
+    (token count, tensor layout, the first call of a token count under CUDA-graph
+    capture, a kernel not yet built) runs on the other candidates. A kernel
+    admits only the calls where it was measured faster than the other backends,
+    so the backend prefers itself where it admits a call
+    (``prefer_when_accepted``): outside ``flashinfer.autotune(True)``,
+    ``MoELayer`` takes it there without timing it against the other candidates;
+    under ``autotune(True)`` it is timed against them like any candidate. A
+    kernel is built for a device by the first eager call it admits, never inside
+    a capture. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on
+    the other candidates.
     """
 
     @classmethod
@@ -3690,6 +3694,9 @@ class BackendOptions:
 # Default backend search order
 _DEFAULT_BACKEND = BackendOptions(
     candidates=(
+        # Kernels specialized for one served configuration, taken first where
+        # they admit a call (see SpecializedMoEConfig).
+        SpecializedMoEConfig(),
         TrtllmFp4Config(),
         TrtllmFp8BlockConfig(),
         TrtllmFp8PerTensorConfig(),
@@ -3709,7 +3716,6 @@ _DEFAULT_BACKEND = BackendOptions(
         CudnnFrostMxfp8Config(),
         CudnnFrostNvfp4Config(),
         CudnnFrostMxfp8Mxfp4Config(),
-        SpecializedMoEConfig(),
     )
 )
 

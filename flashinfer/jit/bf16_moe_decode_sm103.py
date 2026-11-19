@@ -21,8 +21,10 @@ from .core import JitSpec, gen_jit_spec, sm103a_nvcc_flags
 def gen_bf16_moe_decode_sm103_module() -> JitSpec:
     """JIT spec of the fused SM103 BF16 MoE decode kernels of the specialized
     MoELayer backend (``fused_moe/backends/specialized/kernels/bf16_decode_sm103_glm52``).
-    SM103 only; exact math (no fast-math), since the kernels reproduce the
-    trtllm-gen data path."""
+    The source is the TVM-FFI entry point; the kernels are in the framework-agnostic
+    header ``include/flashinfer/fused_moe/bf16_moe_decode_sm103.cuh`` (on the default
+    include path). SM103 only; exact math (no fast-math), since the kernels
+    reproduce the trtllm-gen data path."""
     return gen_jit_spec(
         "bf16_moe_decode_sm103",
         [jit_env.FLASHINFER_CSRC_DIR / "fused_moe" / "bf16_moe_decode_sm103.cu"],

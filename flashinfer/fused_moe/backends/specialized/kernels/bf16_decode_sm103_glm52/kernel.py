@@ -18,8 +18,9 @@ Not a public API: ``MoELayer`` reaches it through its ``specialized`` backend
 (:class:`flashinfer.fused_moe.SpecializedMoEConfig`).
 
 One expert geometry, the GLM-5.2 MTP layer without expert parallelism, is
-served by fused CUDA kernels (``csrc/fused_moe/bf16_moe_decode_sm103.cu``, JIT
-module ``flashinfer/jit/bf16_moe_decode_sm103.py``): 256 local experts,
+served by fused CUDA kernels (``include/flashinfer/fused_moe/bf16_moe_decode_sm103.cuh``,
+launched by ``csrc/fused_moe/bf16_moe_decode_sm103.cu``, JIT module
+``flashinfer/jit/bf16_moe_decode_sm103.py``): 256 local experts,
 DeepSeekV3 routing with one expert group (sigmoid scores, top-8 by score + bias,
 weights renormalized and scaled by ``routed_scaling_factor``) from fp32 logits
 and an fp32 bias, hidden 6144, intermediate 256, the default SwiGLU, BF16 x
@@ -44,8 +45,10 @@ token count eagerly, i.e. when ``MoELayer`` already timed its candidates for
 that call outside capture; nothing is built inside a capture.
 
 The kernels keep cross-CTA state in device globals of the loaded module (one
-instance per device), so calls on one device must be stream-ordered, as a
-serving step's layers are.
+instance per device). Launches serialize on that state in the kernels
+themselves: a launch starts on it only once every CTA of every earlier launch
+has left (an exit count with release / acquire ordering), so calls may come
+from any stream, thread or CUDA graph on the device.
 
 Numerics: the trtllm-gen BF16 data path -- fp32 accumulation for both GEMMs and
 for the weighted reduction over the top-k experts; routing weights, the SwiGLU

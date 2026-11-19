@@ -18,8 +18,9 @@ fp32 logits and an fp32 bias, hidden 6144, intermediate 256, SwiGLU).
 
 ``kernel.py`` holds the guards, the per-device build, the launch and the
 diagnostics (``stats()``); ``workloads.json`` is the token-count allowlist. The
-CUDA kernels live in ``csrc/fused_moe/bf16_moe_decode_sm103.cu`` (JIT module
-``flashinfer/jit/bf16_moe_decode_sm103.py``) and are loaded on the first call
+CUDA kernels live in ``include/flashinfer/fused_moe/bf16_moe_decode_sm103.cuh``
+and are launched by ``csrc/fused_moe/bf16_moe_decode_sm103.cu`` (JIT module
+``flashinfer/jit/bf16_moe_decode_sm103.py``); they are loaded on the first call
 admitted.
 """
 
