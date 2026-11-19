@@ -325,8 +325,15 @@ def test_cold_graph_capture_auto_falls_back_with_dedicated_reason(monkeypatch):
         graph_q.view(torch.uint8), eager_q.view(torch.uint8), rtol=0, atol=0
     )
 
-    # The capture-time refusal must not trip the process-level failure memo:
-    # an eager auto call afterwards runs the specialized kernel again.
-    _reset_per_token_group_quant_stats()
+    # The capture-time refusal must not trip the process-level failure memo.
+    # Assert the memo BEFORE any reset (a reset would mask a wrongly-set memo),
+    # then make the eager auto call WITHOUT clearing it and check the counter
+    # delta, so a capture handler that sets the memo fails this test.
+    from flashinfer.quantization import fp8_quantization as _ptgq_mod
+
+    assert _ptgq_mod._ptgq_specialized_failed is False
+    before = dict(_ptgq_stats["backend_dispatches"])
     per_token_group_quant_8bit(x, 128, backend="auto")
-    assert _ptgq_stats["backend_dispatches"] == {"specialized": 1, "stock": 0}
+    after = _ptgq_stats["backend_dispatches"]
+    assert after["specialized"] == before.get("specialized", 0) + 1
+    assert after["stock"] == before.get("stock", 0)
