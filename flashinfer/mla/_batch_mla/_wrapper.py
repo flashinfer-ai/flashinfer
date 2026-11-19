@@ -682,6 +682,28 @@ class BatchMLAPagedAttentionWrapper:
         _fp8q_sm90_prospective = False
         _fp8q_sm90_prospective_state = None
         _fp8q_sm90_graph_buf_snapshot = None
+
+        def _fp8q_restore_graph_bufs() -> None:
+            # A rejected replan must leave every buffer a captured graph
+            # reads unchanged, WHATEVER step rejected it: the fp8-Q prepare
+            # itself, plan-argument validation (_MLAPlanArguments), or the
+            # backend plan. The specialized state is only held in locals
+            # until the backend plan succeeds, but prepare rewrites the
+            # reused block-table and sequence-length buffer CONTENTS in
+            # place; restore the snapshot so a graph captured from the
+            # previous plan does not replay with the rejected plan's page
+            # IDs and lengths.
+            if _fp8q_sm90_graph_buf_snapshot:
+                _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
+                for _name, _saved in _fp8q_sm90_graph_buf_snapshot.items():
+                    _live = _fp8q_bufs.get(_name)
+                    if (
+                        isinstance(_live, torch.Tensor)
+                        and _live.shape == _saved.shape
+                        and _live.dtype == _saved.dtype
+                    ):
+                        _live.copy_(_saved)
+
         if (
             q_data_type == torch.float8_e4m3fn
             and kv_data_type == torch.float8_e4m3fn
@@ -693,30 +715,38 @@ class BatchMLAPagedAttentionWrapper:
                 # prepare below rewrites the reused block-table and
                 # sequence-length buffers IN PLACE when the geometry matches.
                 # A graph captured from the previous plan reads those
-                # buffers, so snapshot their contents: if the backend then
-                # rejects this plan, they are restored (see the
-                # plan_from_wrapper call) and the old capture stays valid.
+                # buffers, so snapshot their contents: if ANY later step
+                # rejects this plan — prepare itself, plan-argument
+                # validation (_MLAPlanArguments), or the backend plan — they
+                # are restored (_fp8q_restore_graph_bufs) and the old
+                # capture stays valid.
                 _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
                 _fp8q_sm90_graph_buf_snapshot = {
                     name: _fp8q_bufs[name].clone()
                     for name in ("block_table", "seq_lens")
                     if isinstance(_fp8q_bufs.get(name), torch.Tensor)
                 }
-            _mla_dec_fp8q_sm90_prepare(
-                self,
-                plan_metadata,
-                num_heads,
-                head_dim_ckv,
-                head_dim_kpe,
-                page_size,
-                causal,
-                sm_scale,
-                lse_mode,
-                skip_softmax,
-                use_sinks,
-                _fp8q_sm90_explicit_output_dtype,
-                use_profiler=use_profiler,
-            )
+            try:
+                _mla_dec_fp8q_sm90_prepare(
+                    self,
+                    plan_metadata,
+                    num_heads,
+                    head_dim_ckv,
+                    head_dim_kpe,
+                    page_size,
+                    causal,
+                    sm_scale,
+                    lse_mode,
+                    skip_softmax,
+                    use_sinks,
+                    _fp8q_sm90_explicit_output_dtype,
+                    use_profiler=use_profiler,
+                )
+            except Exception:
+                # e.g. fp8q_backend='specialized' raising after a partial
+                # in-place refresh: the capture must keep its plan intact.
+                _fp8q_restore_graph_bufs()
+                raise
             # Hold the prospective fast-path decision in locals until the
             # backend plan below validates and succeeds: a plan the backend
             # rejects must not leave fresh specialized state (or the
@@ -746,81 +776,75 @@ class BatchMLAPagedAttentionWrapper:
         ):
             graph_plan_int_workspace_buffer = previous_backend._int_workspace_buffer
 
-        input_contract = MLAInputContract(
-            lse_mode=lse_mode,
-            output_dtype=output_dtype,
-            output_scale=output_scale,
-            scale_mode=scale_mode,
-            query_layout=query_layout,
-            kv_cache_layout=kv_cache_layout,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            skip_softmax=skip_softmax,
-            use_sinks=use_sinks,
-        )
-
-        # ---------------------------------------------------------------------------
-        # Lower wrapper inputs to backend plan arguments
-        # ---------------------------------------------------------------------------
-        kv_layout: Literal["combined", "independent-split"] = (
-            "combined" if kv_cache_layout == "packed" else "independent-split"
-        )
-        plan_args = _MLAPlanArguments(
-            metadata=plan_metadata,
-            num_heads=num_heads,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            page_size=page_size,
-            causal=causal,
-            sm_scale=sm_scale,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            query_kind=("packed" if query_layout == "packed" else "independent-split"),
-            kv_kind=("packed" if kv_cache_layout == "packed" else "independent-split"),
-            query_layout=query_layout,
-            kv_cache_layout=kv_cache_layout,
-            lse_mode=lse_mode,
-            kv_layout=kv_layout,
-            output_dtype=output_dtype,
-            output_scale=output_scale,
-            scale_mode=scale_mode,
-            skip_softmax=skip_softmax,
-            enable_pdl=enable_pdl,
-            use_sinks=use_sinks,
-            use_profiler=use_profiler,
-            legacy_flat_csr=legacy_flat_csr,
-            _float_workspace_buffer=self._float_workspace_buffer,
-            _use_cuda_graph=self._use_cuda_graph,
-            _qo_indptr_buf=self._qo_indptr_buf,
-            _kv_indptr_buf=self._kv_indptr_buf,
-            _kv_indices_buf=self._kv_indices_buf,
-            _kv_len_arr_buf=self._kv_len_arr_buf,
-            _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
-            _previous_backend_name=previous_backend_name,
-        )
-
-        # ---------------------------------------------------------------------------
-        # Plan with the selected backend
-        # ---------------------------------------------------------------------------
+        # Everything from here through the backend plan is one rollback
+        # transaction for the fp8-Q graph buffers: the input contract,
+        # plan-argument VALIDATION (_MLAPlanArguments.__post_init__, e.g. an
+        # unsupported scale_mode), and the backend plan itself can all reject
+        # the plan AFTER prepare refreshed the captured buffers in place.
         try:
+            input_contract = MLAInputContract(
+                lse_mode=lse_mode,
+                output_dtype=output_dtype,
+                output_scale=output_scale,
+                scale_mode=scale_mode,
+                query_layout=query_layout,
+                kv_cache_layout=kv_cache_layout,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                skip_softmax=skip_softmax,
+                use_sinks=use_sinks,
+            )
+
+            # -----------------------------------------------------------------------
+            # Lower wrapper inputs to backend plan arguments
+            # -----------------------------------------------------------------------
+            kv_layout: Literal["combined", "independent-split"] = (
+                "combined" if kv_cache_layout == "packed" else "independent-split"
+            )
+            plan_args = _MLAPlanArguments(
+                metadata=plan_metadata,
+                num_heads=num_heads,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                page_size=page_size,
+                causal=causal,
+                sm_scale=sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                query_kind=(
+                    "packed" if query_layout == "packed" else "independent-split"
+                ),
+                kv_kind=(
+                    "packed" if kv_cache_layout == "packed" else "independent-split"
+                ),
+                query_layout=query_layout,
+                kv_cache_layout=kv_cache_layout,
+                lse_mode=lse_mode,
+                kv_layout=kv_layout,
+                output_dtype=output_dtype,
+                output_scale=output_scale,
+                scale_mode=scale_mode,
+                skip_softmax=skip_softmax,
+                enable_pdl=enable_pdl,
+                use_sinks=use_sinks,
+                use_profiler=use_profiler,
+                legacy_flat_csr=legacy_flat_csr,
+                _float_workspace_buffer=self._float_workspace_buffer,
+                _use_cuda_graph=self._use_cuda_graph,
+                _qo_indptr_buf=self._qo_indptr_buf,
+                _kv_indptr_buf=self._kv_indptr_buf,
+                _kv_indices_buf=self._kv_indices_buf,
+                _kv_len_arr_buf=self._kv_len_arr_buf,
+                _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
+                _previous_backend_name=previous_backend_name,
+            )
+
+            # -----------------------------------------------------------------------
+            # Plan with the selected backend
+            # -----------------------------------------------------------------------
             planned_backend = self._backend_type.plan_from_wrapper(plan_args)
         except Exception:
-            # A rejected replan must leave every buffer a captured graph
-            # reads unchanged. The specialized state was only held in locals
-            # (never published), but prepare rewrote the reused block-table
-            # and sequence-length buffer CONTENTS in place; restore them so
-            # a graph captured from the previous plan does not replay with
-            # the rejected plan's page IDs and lengths.
-            if _fp8q_sm90_graph_buf_snapshot:
-                _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
-                for _name, _saved in _fp8q_sm90_graph_buf_snapshot.items():
-                    _live = _fp8q_bufs.get(_name)
-                    if (
-                        isinstance(_live, torch.Tensor)
-                        and _live.shape == _saved.shape
-                        and _live.dtype == _saved.dtype
-                    ):
-                        _live.copy_(_saved)
+            _fp8q_restore_graph_bufs()
             raise
         capabilities = planned_backend._plan_capabilities
         if capabilities.is_experimental:

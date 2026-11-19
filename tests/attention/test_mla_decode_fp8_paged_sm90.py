@@ -895,6 +895,49 @@ def test_unrefreshable_replan_leaves_captured_plan_intact():
     assert torch.equal(out, eager_before)
 
 
+def test_rejected_argument_validation_replan_restores_captured_metadata():
+    """The rollback transaction must start before plan-argument validation:
+    an unsupported scale_mode replan raises in _MLAPlanArguments AFTER the
+    fp8-Q prepare already refreshed the captured buffers in place, so the
+    snapshot must be restored — the old capture's metadata stays bitwise
+    intact and its replay unchanged (the reviewer's original repro)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([250], device)  # four pages, identity page order
+    w, graph, out = _graph_wrapper_and_capture(batch, device)
+    eager_before = _run(w, batch).clone()
+    bufs = w._mla_dec_fp8q_sm90_bufs
+    saved = {
+        name: bufs[name].clone() for name in ("block_table", "seq_lens") if name in bufs
+    }
+    assert saved, bufs.keys()
+
+    with pytest.raises(ValueError):
+        w.plan(
+            qo_indptr=batch["qo_indptr"],
+            kv_indptr=batch["kv_indptr"],
+            kv_indices=torch.tensor([3, 2, 1, 0], dtype=torch.int32, device=device),
+            kv_len_arr=torch.tensor([200], dtype=torch.int32, device=device),
+            num_heads=NH,
+            head_dim_ckv=CKV,
+            head_dim_kpe=KPE,
+            page_size=PAGE,
+            causal=True,
+            sm_scale=SM_SCALE,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            scale_mode="invalid-review-probe",
+        )
+    # the captured metadata buffers are bitwise intact ...
+    for name, before in saved.items():
+        assert torch.equal(bufs[name], before), name
+    # ... and the old capture replays its own plan bitwise
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager_before)
+
+
 def test_dual_device_smoke():
     """Each device arms its own dynamic-smem opt-in (per-device
     std::call_once): the same warp-group launch class must run correctly on
