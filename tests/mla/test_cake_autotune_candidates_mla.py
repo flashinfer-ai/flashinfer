@@ -701,8 +701,8 @@ def test_cake_auto_excluded_where_it_does_not_win(
 ):
     """SM100a (B200) leaves Cake out of backend="auto" for single-token BF16
     VQUARTER rows without sinks, where it does not beat the other candidates,
-    without building its program; sinks, two-token rows, VHALF rows and SM103a
-    (GB300) keep it. No GPU needed."""
+    without building its program or its FP8 decode table; sinks, two-token rows,
+    VHALF rows and SM103a (GB300) keep it. No GPU needed."""
     built, _ = cake_families
     monkeypatch.setattr(cake_module, "_device_facts", lambda index: (arch, num_sms))
     bf16 = torch.bfloat16
@@ -710,6 +710,8 @@ def test_cake_auto_excluded_where_it_does_not_win(
     excluded = arch == "sm_100a"
     vquarter = cake_module.DOMAIN_BF16_VQUARTER
     for page_size in (64, 32):
+        # The runners below that keep Cake create the table; start without it.
+        cake_module._FP8_LUTS.clear()
         plain = _cpu_runner(bf16, page_size)
         inputs = _cpu_inputs(bf16, 8)
         assert plain._domain(inputs, num_sms) == vquarter
@@ -726,6 +728,9 @@ def test_cake_auto_excluded_where_it_does_not_win(
         )
         if excluded:
             assert built == before, "an excluded bucket built a Cake program"
+            assert inputs[0].device not in cake_module._FP8_LUTS, (
+                "an excluded bucket created the FP8 decode table"
+            )
 
         with_sinks = _cpu_runner(bf16, page_size, sinks=sink)
         assert with_sinks._domain(inputs, num_sms) == vquarter
@@ -784,20 +789,29 @@ def test_autotuned_auto_matches_reference(
         core._CakeTrtllmMlaBlackwellRunner, "get_valid_tactics", get_valid_tactics
     )
     calls = _spy_choose_one(monkeypatch)
+    launches = _spy_cake_forward(monkeypatch)
     case = _make_case(
         dtype=dtype, batch_size=batch_size, q_len=q_len, page_size=page_size
     )
     # The tuner can profile Cake for this cell only in the buckets of its own
     # domain (bucket 8 crosses domains, the largest bucket is never offered).
-    _skip_auto_excluded(case)
+    # Where backend="auto" leaves that domain out on this device (SM100a: the
+    # single-token BF16 cell), Cake is listed but never profiled nor selected.
+    excluded = _cake_auto_excluded(case)
 
     with autotune(True, tuning_buckets=TUNING_BUCKETS):
         tuned = _decode(case)
     with autotune(False):
         cached = _decode(case)
 
-    assert [-1] in profiled, "the Cake candidate was never profiled"
     assert _name(calls[0][0][-1]) == "cake"
+    if excluded:
+        assert profiled and [-1] not in profiled, "an excluded Cake bucket profiled"
+        assert not launches, "an excluded Cake candidate ran"
+        for _, (runner, _) in (calls[0], calls[-1]):
+            assert _name(runner) != "cake"
+    else:
+        assert [-1] in profiled, "the Cake candidate was never profiled"
     # The cached call lists Cake only while the tuner holds a Cake winner.
     cached_names = [_name(r) for r in calls[-1][0]]
     assert ("cake" in cached_names) == clean_tuner.may_select_runner_class(
@@ -811,18 +825,27 @@ def test_autotuned_auto_matches_reference(
 
 
 @pytest.mark.parametrize(
-    "dtype,page_size", [(torch.bfloat16, 32), (torch.float8_e4m3fn, 64)]
+    "dtype,batch_size,q_len,page_size",
+    [
+        # Two-token BF16 rows: SM100a leaves single-token VQUARTER rows without
+        # sinks out of backend="auto" (``_cake_mla_auto_excluded``).
+        (torch.bfloat16, 2, 2, 32),
+        (torch.float8_e4m3fn, 4, 1, 64),
+    ],
 )
 def test_forced_cake_selection_matches_reference(
-    monkeypatch, clean_tuner, dtype, page_size
+    monkeypatch, clean_tuner, dtype, batch_size, q_len, page_size
 ):
     _require_cake_arch()
     seen = _force_cake(monkeypatch)
-    case = _make_case(dtype=dtype, page_size=page_size)
+    launches = _spy_cake_forward(monkeypatch)
+    case = _make_case(
+        dtype=dtype, batch_size=batch_size, q_len=q_len, page_size=page_size
+    )
 
     forced = _decode(case)
+    _assert_cake_launched(seen, launches)
     cake, inputs = seen[0]
-    assert _name(cake) == "cake"
     direct = torch.zeros_like(forced)
     cake(inputs=[*inputs[:3], direct], tactic=-1)
     explicit = _decode(dict(case, backend="cake"))
@@ -1004,10 +1027,9 @@ def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
         pytest.skip(f"no one-wave CLC program for {arch} with {num_sms} SMs")
 
 
-def _skip_auto_excluded(case) -> None:
-    """Skip a cell whose Cake domain backend="auto" leaves out on this device
-    (``_cake_mla_auto_excluded``): the dispatcher runs the first candidate
-    there, so the cell would check no Cake launch."""
+def _cake_auto_excluded(case) -> bool:
+    """Whether backend="auto" leaves out the Cake domain of this cell on this
+    device (``_cake_mla_auto_excluded``)."""
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     query, sinks = case["query"], case.get("sinks")
     runner = _cpu_runner(
@@ -1019,12 +1041,21 @@ def _skip_auto_excluded(case) -> None:
     )
     inputs = [query, case["block_tables"], case["seq_lens"], _nan_out(case)]
     domain = runner._domain(inputs, num_sms)
-    if domain is not None and core._cake_mla_auto_excluded(
+    return domain is not None and core._cake_mla_auto_excluded(
         arch, query.dtype, domain, query.shape[1], sinks is not None
-    ):
+    )
+
+
+def _skip_auto_excluded(case) -> None:
+    """Skip a cell whose Cake domain backend="auto" leaves out on this device:
+    the dispatcher runs the first candidate there, so the cell would check no
+    Cake launch."""
+    if _cake_auto_excluded(case):
+        arch, _ = cake_module._device_facts(torch.cuda.current_device())
         pytest.skip(
-            f"backend='auto' does not offer Cake for {domain} with q_len "
-            f"{query.shape[1]} and sinks={sinks is not None} on {arch}"
+            f"backend='auto' does not offer Cake for this cell (q_len "
+            f"{case['query'].shape[1]}, sinks={case.get('sinks') is not None}) "
+            f"on {arch}"
         )
 
 
