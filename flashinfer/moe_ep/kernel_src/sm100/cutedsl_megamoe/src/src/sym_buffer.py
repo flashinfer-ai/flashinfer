@@ -146,6 +146,12 @@ class SymBufferHost:
     offsets: tuple
     rank_idx: Int32
     num_max_ranks: cutlass.Constexpr[int]
+    # POC (multimem barrier): absolute multicast VA of nvlink_barrier_signal, or
+    # 0 when MEGA_MULTIMEM_BARRIER is off / NVLS unavailable. Rides as a plain
+    # trailing i64 scalar kernel arg (NOT on the byval device mapper, which must
+    # stay a single 128B grid_constant); the kernel reads it back as
+    # peer_rank_ptr_mapper_host.mc_base and routes it to nvlink_barrier.
+    mc_base: Int64 = Int64(0)
 
     @staticmethod
     def _as_int64(value) -> Int64:
@@ -217,10 +223,13 @@ class _SymBufferHostAdapter:
                 f"len(offsets)={len(tuple(arg.offsets))} must equal "
                 f"num_max_ranks={int(arg.num_max_ranks)}."
             )
+        # Layout: base, offsets..., rank_idx, mc_base (mc_base trails so the
+        # offsets/rank slicing below stays simple; see __new_from_mlir_values__).
         self._fields = (
             Int64(arg.base_addr),
             *(Int64(x) for x in arg.offsets),
             Int32(arg.rank_idx),
+            Int64(getattr(arg, "mc_base", 0)),
         )
 
     def __c_pointers__(self) -> list[Any]:
@@ -249,14 +258,18 @@ class _SymBufferHostAdapter:
         idx += base_n
 
         offsets = []
-        for field in self._fields[1:-1]:
+        for field in self._fields[1:-2]:
             n = len(get_mlir_types(field))
             offsets.append(new_from_mlir_values(field, values[idx:idx + n]))
             idx += n
 
-        rank_n = len(get_mlir_types(self._fields[-1]))
-        rank_idx = new_from_mlir_values(self._fields[-1], values[idx:idx + rank_n])
+        rank_n = len(get_mlir_types(self._fields[-2]))
+        rank_idx = new_from_mlir_values(self._fields[-2], values[idx:idx + rank_n])
         idx += rank_n
+
+        mc_n = len(get_mlir_types(self._fields[-1]))
+        mc_base = new_from_mlir_values(self._fields[-1], values[idx:idx + mc_n])
+        idx += mc_n
         if idx != len(values):
             raise ValueError(
                 f"SymBufferHost adapter consumed {idx} values, got {len(values)}"
@@ -267,4 +280,5 @@ class _SymBufferHostAdapter:
         object.__setattr__(obj, "offsets", tuple(offsets))
         object.__setattr__(obj, "rank_idx", rank_idx)
         object.__setattr__(obj, "num_max_ranks", self._arg.num_max_ranks)
+        object.__setattr__(obj, "mc_base", mc_base)
         return obj

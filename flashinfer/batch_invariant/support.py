@@ -127,3 +127,109 @@ def _check_device_cached(
             "a CuTe DSL release that can target this device",
         )
     return cc
+
+
+def out_buffer(
+    t,
+    name: str,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    like: torch.Tensor,
+    align: int = 16,
+):
+    """A caller-owned output buffer (an ``out=`` argument): ``None`` passes through; otherwise the tensor is checked and
+    returned as given -- on ``like``'s device, of ``dtype`` and exactly ``shape``, contiguous and ``align``-byte aligned
+    (the kernels store through vector copies). A buffer that fails is refused with ``ValueError``, never copied: an
+    ``out=`` is written in place or not at all (CUDA graphs and framework-owned structures rely on the address)."""
+    if t is None:
+        return None
+    if not isinstance(t, torch.Tensor):
+        raise ValueError(f"{name} must be a tensor, got {type(t).__name__}")
+    if t.device != like.device:
+        raise ValueError(f"{name} must be on {like.device}, got {t.device}")
+    if t.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
+    if tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if t.data_ptr() % align:
+        raise ValueError(
+            f"{name} must be {align}-byte aligned (its storage offset is not)"
+        )
+    return t
+
+
+def byte_range(t: torch.Tensor) -> Tuple[int, int]:
+    """The half-open byte range ``[start, end)`` a tensor's elements occupy, for any strides (the extent is the largest
+    element offset plus one, times the element size); an empty tensor spans nothing."""
+    start = t.data_ptr()
+    numel = t.numel()
+    if numel == 0:
+        return (start, start)
+    if t.is_contiguous():
+        return (start, start + numel * t.element_size())
+    extent = 1 + sum(
+        (n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True) if n > 1
+    )
+    return (start, start + extent * t.element_size())
+
+
+def check_no_overlap(outputs, inputs, in_place=()):
+    """An output buffer may overlap neither another output nor any input -- a partial overlap is a corruption (a row's
+    values read after another row's store) -- except an output that IS the input it is allowed to replace in place:
+    ``in_place`` lists the ``(output name, input name)`` pairs whose byte ranges must then coincide exactly (the kernel
+    writes every element after the thread that owns it read it). ``outputs`` / ``inputs`` are ``(name, tensor | None)``
+    pairs; a violation raises ``ValueError``. Without an output buffer there is nothing to check and no input is
+    touched: the eager entries that allocate their outputs pay nothing for it."""
+    outs = [(n, byte_range(t)) for n, t in outputs if t is not None]
+    if not outs:
+        return
+    ins = [(n, byte_range(t)) for n, t in inputs if t is not None]
+
+    def overlap(a, b):
+        return a[0] < b[1] and b[0] < a[1]
+
+    for i, (n, r) in enumerate(outs):
+        for m, q in outs[i + 1 :]:
+            if overlap(r, q):
+                raise ValueError(
+                    f"{n} and {m} overlap in memory: the outputs need distinct buffers"
+                )
+        for m, q in ins:
+            if overlap(r, q):
+                if (n, m) in in_place and r == q:
+                    continue
+                how = " without aliasing it exactly" if (n, m) in in_place else ""
+                raise ValueError(
+                    f"{n} overlaps {m} in memory{how}: an output buffer may not overlap an input"
+                )
+
+
+_scratch: dict = {}
+#: Every eagerly allocated scratch buffer, kept alive for the process (as ``utils._get_cache_buf`` keeps its replaced
+#: buffers in ``_cache_buf_retired``): a kernel captured into a CUDA graph, or still pending on another stream, writes
+#: into the buffer it was given, so a replaced buffer must never return to the allocator (its address would be reused by
+#: an unrelated tensor). The growth is geometric, so the retained total stays under twice the largest cached buffer.
+_scratch_keep: list = []
+
+
+def scratch(device: torch.device, dtype: torch.dtype, n: int) -> torch.Tensor:
+    """A per-device scratch of at least ``n`` elements for a kernel output nobody reads (the draws' validity word, the
+    truncated draw's kept mass when not requested): grown to the largest size seen, so a call allocates nothing in
+    steady state. Its contents are dead writes. An eager buffer is never freed once handed out (``_scratch_keep``): a
+    CUDA graph that captured it, or a kernel still running on another stream, keeps writing to its address after the
+    cache has moved on. Inside a CUDA-graph capture a buffer the cache cannot serve comes from the graph's private pool
+    and is neither cached nor retained: the pool holds it for the graph's lifetime and returns it when the graph is
+    freed, and a block freed inside the capture is reused only in stream order, as every captured temporary is."""
+    key = (device, dtype)
+    t = _scratch.get(key)
+    if t is not None and t.numel() >= n:
+        return t
+    size = max(n, 2 * (t.numel() if t is not None else 0), 1024)
+    fresh = torch.empty(size, dtype=dtype, device=device)
+    if torch.cuda.is_current_stream_capturing():
+        return fresh
+    _scratch_keep.append(fresh)
+    _scratch[key] = fresh
+    return fresh

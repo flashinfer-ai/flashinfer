@@ -18,16 +18,10 @@ CUDA-graph replay and PDL; ``batch_invariant=False`` is the operator's kernel, b
 the stream kernel's words against the specification.
 """
 
-import glob
 import os
 import random
-import re
 import struct
-import subprocess
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import pytest
 import torch
@@ -49,25 +43,32 @@ from flashinfer.batch_invariant.sampling.draw_api import (
 )
 from flashinfer.batch_invariant.sampling.schedule import device_sm_count
 
+from .batch_invariant_sampling_common import (
+    DS as _DS,
+    PDL as _PDL,
+    SM_COUNTS,
+    bad_ptx_ops,
+    compile_device_free,
+    device_marker,
+    device_supported,
+    device_tests_selected,
+    logits,
+    precompile,
+    weights,
+)
+
 DT = [torch.bfloat16, torch.float16, torch.float32]
-_DS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
+_supported = device_supported(DRAW_ARCHS)
+needs_device = device_marker(DRAW_ARCHS)
+
 #: One block, a partial block (an odd vocabulary), 16 blocks, an odd long one, a long one.
 NS = [64, 1000, 4096, 4097, 32768]
 N_BIG = 152064
-SM_COUNTS = [148, 152, 204, 224]  # B200 / B300 (SM100 / SM103), Rubin (SM107) parts
 #: ``(N, M)`` at which the SM counts above split the dispatcher's pick (the 148 / 152-SM parts have at least M rows
 #: and take the re-read placement, the 204 / 224-SM parts fewer and take the cluster one).
 SM_SPLIT_ROWS = ((4097, 180), (32768, 200))
 #: The dispatcher's row counts the device tests use (the fixture precompiles their picks).
 MS = (1, 2, 4, 5, 6, 8, 11, 16, 37, 64, 512, 20000)
-_supported = torch.cuda.is_available() and bi.is_supported_device(
-    torch.device("cuda"), DRAW_ARCHS
-)
-needs_device = pytest.mark.skipif(
-    not _supported,
-    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
-)
-_PDL = True  # the public entries follow the device (PDL on SM >= 9.0); the generic entry is called the same way
 
 # Random123's known-answer tests for philox4x32 with 10 rounds (kat_vectors): counter, key -> output.
 PHILOX_KATS = [
@@ -86,42 +87,6 @@ PHILOX_KATS = [
 
 
 # ------------------------------------------------------------------------------------------------------ helpers
-def logits(M, N, dtype, seed=0, scale=2.0**-10):
-    """Rows that make reduction-order differences visible (the row class's suite): magnitudes over ~40 binades with
-    random signs, near-cancelling pairs, signed zeros, subnormals, outliers, scaled into a logits-like range; finite."""
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    exp_span = 20.0 if dtype != torch.float16 else 6.0
-    e = (torch.rand(M, N, generator=g) * 2 - 1) * exp_span
-    mant = torch.rand(M, N, generator=g) + 1.0
-    sign = torch.where(torch.rand(M, N, generator=g) < 0.5, -1.0, 1.0)
-    x = sign * mant * torch.exp2(e)
-    pairs = torch.rand(M, N // 2, generator=g) < 0.15
-    idx = torch.arange(0, N - 1, 2)
-    x[:, idx + 1] = torch.where(
-        pairs,
-        -x[:, idx] * (1 + 1e-3 * torch.randn(M, N // 2, generator=g)),
-        x[:, idx + 1],
-    )
-    r = torch.rand(M, N, generator=g)
-    outlier = 2.0**12 if dtype != torch.float16 else 2.0**4
-    x = torch.where(r < 0.01, x * outlier, x)
-    x = torch.where((r >= 0.01) & (r < 0.02), torch.zeros_like(x), x)
-    x = torch.where((r >= 0.02) & (r < 0.03), -torch.zeros_like(x), x)
-    x = torch.where((r >= 0.03) & (r < 0.035), x * 2.0**-130, x)
-    x = (x.to(dtype).float() * scale).to(dtype)
-    assert torch.isfinite(x).all()
-    return x.cuda()
-
-
-def weights(M, N, dtype, seed=0):
-    """Weight rows: random, the first half of row 0 zero, row 2 one-hot at the last element."""
-    g = torch.Generator().manual_seed(seed)
-    p = torch.rand(M, N, generator=g).to(dtype)
-    p[0, : N // 2] = 0
-    if M > 2:
-        p[2] = 0
-        p[2, N - 1] = 1
-    return p.cuda()
 
 
 def keys(M, seed=0):
@@ -189,6 +154,16 @@ def test_fingerprints_are_pinned():
     fl = bi.fingerprint("sampling_from_logits", N=300, dtype="bf16")
     assert fl.startswith("sample-icdf-") and fl != D.spec_fingerprint(300)
     assert fl == D.spec_fingerprint(300, from_logits=True, in_fmt="bf16")
+    # the logits form with a temperature in the scale (the public entry's `temperature`): another receipt per vocabulary
+    flT = bi.fingerprint("sampling_from_logits", N=300, dtype="bf16", temperature=True)
+    assert flT == "sample-icdf-14716b3a5bf29c2c" and flT != fl
+    assert flT == D.spec_fingerprint(
+        300, from_logits=True, in_fmt="bf16", temperature=True
+    )
+    assert (
+        bi.fingerprint("sampling_from_logits", N=300, dtype="bf16", temperature=False)
+        == fl
+    )
     assert D.spec_fingerprint(301) != D.spec_fingerprint(300)
     assert (
         D.SELECT_RULE
@@ -482,16 +457,6 @@ def test_unsupported_inputs_raise_before_any_kernel():
 
 # The admitted PTX forms (the row kernels' suite): the `.rn` arithmetic incl. the mixed-precision forms, the exact
 # conversions and selects, the two declared MUFU instructions, `max.f32`; the stream's integer forms are not fp-like.
-PTX_FP_ALLOWED = re.compile(
-    r"^(fma\.rn\.f32(\.bf16|\.f16)?|add\.rn\.f32(\.bf16|\.f16)?|sub\.rn\.f32(\.bf16|\.f16)?|mul\.rn\.f32|div\.rn\.f32"
-    r"|cvt\.f32\.(bf16|f16)|cvt\.rn\.(bf16|f16)\.f32|cvt\.rn\.f32\.s32|cvt\.rn\.f32\.s64|cvt\.rn\.f32\.u32|cvt\.f32\.f16"
-    r"|cvt\.rn\.f64\.u64|mul\.rn\.f64|cvt\.u32\.u64|cvt\.u64\.u32|cvt\.s64\.s32|cvt\.u64\.s32|cvt\.s32\.s64"
-    r"|max\.(f32|bf16|f16)|min\.f32|abs\.f32|neg\.f32|mov\.(b32|f32)|selp\.f32|setp\.[a-z]+\.(f32|bf16|f16)"
-    r"|ex2\.approx\.ftz\.f32|lg2\.approx\.ftz\.f32)$"
-)
-PTX_FP_LIKE = re.compile(
-    r"^(fma|add|sub|mul|div|sqrt|rsqrt|rcp|ex2|lg2|cvt|max|min|abs|neg|selp|setp|fns|mad|sin|cos|tanh)\."
-)
 IR_CASES = [
     ("f32", 4096, (128, 1, 4), False, False, False, False),  # probabilities, single CTA
     (
@@ -526,53 +491,14 @@ def test_draw_ir_uses_only_declared_forms(
     never divides), the stream's `cvt.rn.f32.u32` and Philox multiplies, the cluster forms only in cluster members, no
     fast-math anywhere."""
     pytest.importorskip("cutlass")
-    env = _ir_compile_env()
     code = (
         "from flashinfer.batch_invariant.sampling.schedule import LSEConfig\n"
         "from flashinfer.batch_invariant.sampling.draw_kernel import get_compiled_kernel\n"
         f"get_compiled_kernel({dtype!r}, {N}, LSEConfig{cfg}, {from_logits}, {trow}, {idx}, {lp}, False)\n"
     )
-    r = subprocess.run(
-        [sys.executable, "-c", _IR_DUMP_PRELUDE + code],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    assert r.returncode == 0, r.stderr[-4000:]
-    mlir = glob.glob(str(tmp_path / "*.mlir"))
-    assert mlir, "no MLIR dumped"
-    ir = Path(mlir[0]).read_text()
-    assert not re.search(r"arith\.(addf|mulf|divf|subf|fmaf)\b", ir), (
-        "arith float op present"
-    )
-    assert not re.search(r"\bmath\.", ir), "math-dialect op present"
-    assert (
-        "fastmath<" not in ir
-        and "rsqrt" not in ir
-        and "div.approx" not in ir
-        and "rcp.approx" not in ir
-    )
-    ptxs = glob.glob(str(tmp_path / "*.ptx"))
-    assert ptxs, "no PTX dumped"
-    ptx = Path(ptxs[0]).read_text()
-    ops = set()
-    for line in ptx.splitlines():
-        tok = line.strip().split()
-        if not tok or tok[0].startswith(("//", ".", "@", "{", "}", "bra", "ret")):
-            continue
-        if PTX_FP_LIKE.match(tok[0].rstrip(";")):
-            ops.add(tok[0].rstrip(";"))
-    bad = sorted(
-        o
-        for o in ops
-        if not PTX_FP_ALLOWED.match(o)
-        and not re.search(r"\.(b|u|s)(8|16|32|64)(\.|$)", o)
-        and not re.match(r"^(cvt\.rzi|mul\.(wide|lo|hi))", o)
-    )
+    _, ptx = compile_device_free(tmp_path, code)
+    bad = bad_ptx_ops(ptx)
     assert not bad, f"PTX contains non-admitted floating-point forms: {bad}"
-    assert not re.search(r"rcp\.|div\.approx|div\.full|sqrt\.", ptx)
     assert "ftz" not in ptx.replace("ex2.approx.ftz.f32", "").replace(
         "lg2.approx.ftz.f32", ""
     )
@@ -590,35 +516,6 @@ def test_draw_ir_uses_only_declared_forms(
 
 
 # ----------------------------------------------------------------------------------------------- on the device
-
-
-# The IR / PTX dumps are requested on the DSL's option object inside this process, not through CUTE_DSL_KEEP* environment
-# variables: a CI that validates the compiler environment of every process against the one recorded at test start
-# counts those as compiler switches (the DSL resolves its options from the environment once, into plain attributes of
-# its singleton; the dumps are written before the cache is consulted, so they never affect what is compiled).
-_IR_DUMP_PRELUDE = (
-    "import os\n"
-    "from cutlass.cutlass_dsl.cutlass import CuTeDSL\n"
-    "_dsl = CuTeDSL()\n"
-    "_dsl.envar.keep_ir = True\n"  # the raw IR before any pass (what CUTE_DSL_KEEP=ir-debug requests)
-    "_dsl.envar.keep_ptx = True\n"  # the PTX (what CUTE_DSL_KEEP=ptx requests)
-    "_dsl.envar.dump_dir = os.getcwd()\n"
-)
-
-
-def _ir_compile_env():
-    """The environment of an IR pin's compile subprocess: this process's, plus FlashInfer's module cache off (so the DSL
-    compiles and the dumps exist; the dumps themselves are requested in-process, ``_IR_DUMP_PRELUDE``). With a device
-    visible the compile targets it as this process would (a CI that validates the compiler environment of every process
-    sees the same ``CUTE_DSL_ARCH`` / ``FLASHINFER_CUDA_ARCH_LIST`` and no ``CUTE_DSL_KEEP*``); without one it is
-    device-free and takes the target from ``BI_TEST_ARCH`` (default ``sm_100a``)."""
-    env = dict(os.environ, FLASHINFER_CUTE_DSL_DISABLE_CACHE="1")
-    if not torch.cuda.is_available():
-        env.update(
-            CUDA_VISIBLE_DEVICES="",
-            CUTE_DSL_ARCH=os.environ.get("BI_TEST_ARCH", "sm_100a"),
-        )
-    return env
 
 
 _WORKER_CODE = r"""
@@ -681,6 +578,11 @@ def _suite_specs(sm):
     t = _cfg_tuple(DS.draw_config(4096, 5, 2, sm))
     specs.append(("bf16", 4096, t, False, False, False, False, False))
     specs.append(("bf16", 4096, t, True, False, False, False, False))
+    # the caller-owned buffers test: the public entries at 4096 x 5 (probabilities; logits with a per-row temperature
+    # and the log-probability; the int64 gather)
+    specs.append(("bf16", 4096, t, False, False, False, False, _PDL))
+    specs.append(("bf16", 4096, t, True, True, False, True, _PDL))
+    specs.append(("bf16", 4096, t, True, False, True, False, _PDL))
     # the review round's tests (2026-11-11): the masked rows through the gather (2^16 draws; the 152064 row 2^14),
     # the chi-square draws (2^20 of a 32-token row), the SM-count test's row counts that split the parts' picks
     for N, _, _ in MASKED_HEAD_CASES:
@@ -700,95 +602,22 @@ def _suite_specs(sm):
     return list(dict.fromkeys(specs))
 
 
-def _device_tests_selected(session) -> bool:
-    """Whether a collected test carries the ``needs_device`` marker (otherwise the precompile has nothing to do: a ``-k``
-    run of the device-free tests on a GPU host compiles no kernel)."""
-    reason = needs_device.kwargs["reason"]
-    return any(
-        m.name == "skipif" and m.kwargs.get("reason") == reason
-        for item in session.items
-        for m in item.iter_markers()
-    )
-
-
 @pytest.fixture(scope="session", autouse=True)
 def _precompile_draw_kernels(request):
-    """Precompile the device tests' kernels on worker processes once per session: a no-op without a supported device,
-    with ``BI_DRAW_PRECOMPILE_WORKERS=0`` (or ``BI_DRAW_NO_PRECOMPILE=1``), and when no device test is selected. The
-    workers inherit this process's environment unchanged -- the same visible device, the same ``CUTE_DSL_ARCH`` and
-    ``FLASHINFER_CUDA_ARCH_LIST`` -- so they compile what this process would, into its module directory, and a CI that
-    validates the compiler environment of every process sees no change. ``BI_DRAW_PRECOMPILE_DEVICE_FREE=1`` (a
-    development host with many cores and no such validation) compiles with no device visible and the device's
-    architecture passed explicitly instead."""
-    workers = int(
-        os.environ.get("BI_DRAW_PRECOMPILE_WORKERS", min(8, os.cpu_count() or 1))
-    )
+    """Precompile the device tests' kernels on device-free workers once per session: a no-op without a supported device,
+    under ``BI_DRAW_NO_PRECOMPILE=1``, and when no device test is selected."""
     if (
         not _supported
-        or workers <= 0
         or os.environ.get("BI_DRAW_NO_PRECOMPILE") == "1"
-        or not _device_tests_selected(request.session)
+        or not device_tests_selected(request.session, needs_device.kwargs["reason"])
     ):
         yield
         return
-    from flashinfer.compilation_context import CompilationContext
-    from flashinfer.jit import env as jit_env
-
-    dev = torch.device("cuda")
-    sm = device_sm_count(dev)
-    archs = sorted(CompilationContext().TARGET_CUDA_ARCHS)
-    major, minor = archs[0]
-    specs = _suite_specs(sm)
-    random.Random(0).shuffle(
-        specs
-    )  # spread the heavy (cluster) kernels over the workers
-    workers = max(1, min(workers, len(specs)))
-    env = dict(os.environ)
-    if os.environ.get("BI_DRAW_PRECOMPILE_DEVICE_FREE") == "1":
-        # no device in the workers: the device's architecture explicitly, so the module directory
-        # (FLASHINFER_CUDA_ARCH_LIST decides the workspace's architecture segment, CUTE_DSL_ARCH the kernel target) is
-        # the one this process loads from
-        env.update(
-            CUDA_VISIBLE_DEVICES="",
-            CUTE_DSL_ARCH=f"sm_{major}{minor}",
-            FLASHINFER_CUDA_ARCH_LIST=" ".join(f"{a}.{b}" for a, b in archs),
-        )
-    chunks = [specs[i::workers] for i in range(workers)]
-
-    def run(chunk):
-        r = subprocess.run(
-            [sys.executable, "-c", _WORKER_CODE, repr(chunk)],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=7200,
-        )
-        if r.returncode != 0:
-            return [(("worker",), r.stderr[-1500:])]
-        tail = [ln for ln in r.stdout.splitlines() if ln.startswith("BAD ")]
-        import ast
-
-        return ast.literal_eval(tail[-1][4:]) if tail else [(("worker",), "no report")]
-
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        bad = [b for res in ex.map(run, chunks) for b in res]
-    print(
-        f"[batch_invariant.sampling.draw] precompiled {len(specs)} kernels on {workers} workers in {time.time() - t0:.0f} s",
-        flush=True,
-    )
-    assert not bad, bad[:3]
-    module_dir = (
-        jit_env.FLASHINFER_JIT_DIR
-        / f"batch_invariant_sampling_draw_sm{major}{minor}_cute_dsl"
-    )
-    n_cached = len(list(module_dir.glob("*.o"))) if module_dir.exists() else 0
-    print(
-        f"[batch_invariant.sampling.draw] {n_cached} kernels in {module_dir}",
-        flush=True,
-    )
-    assert n_cached >= len(specs) // 2, (
-        "the workers did not fill this process's module cache"
+    precompile(
+        _suite_specs(device_sm_count(torch.device("cuda"))),
+        _WORKER_CODE,
+        "batch_invariant_sampling_draw",
+        "[batch_invariant.sampling.draw]",
     )
     yield
 
@@ -883,6 +712,24 @@ def test_logits_match_exact_model_and_logprob(dtype, N):
         x, seed=s, offset=o, batch_invariant=True
     )
     assert tok.dtype == torch.int32 and torch.equal(tok.cpu().long(), ref0["samples"])
+    # the public entry's temperature (per row, and a scalar) and return_logprob: the generic entry's draw at the
+    # dispatcher's pick, the log-probability log_probs' at the token (the trainer's value, full distribution)
+    got = logits_draw(x, s, o, temperature=temps, return_logprob=True)
+    tok_t, lp_t = flashinfer.sampling.sampling_from_logits(
+        x,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        temperature=temps,
+        return_logprob=True,
+    )
+    assert torch.equal(tok_t, got["samples"]) and same(lp_t, got["logp"])
+    assert same(lp_t, flashinfer.sampling.log_probs(x, tok_t.long(), temps))
+    assert torch.equal(tok_t.cpu().long(), ref["samples"])
+    tok_s = flashinfer.sampling.sampling_from_logits(
+        x, seed=s, offset=o, batch_invariant=True, temperature=0.37
+    )
+    assert torch.equal(tok_s, logits_draw(x, s, o, temperature=0.37)["samples"])
 
 
 @needs_device
@@ -1359,6 +1206,241 @@ def test_determinism_graph_replay_and_pdl():
 
 
 @needs_device
+def test_preallocated_outputs(monkeypatch):
+    """Caller-owned output buffers on the public entries (``out=``, ``logprob_out=``): written in place and returned as
+    given, bit for bit the allocating call; an int64 buffer with int64 indices is filled by a cast (the operator's dtype
+    contract), an int32 one is the kernel's own output; the contract refused rather than copied; the default path refuses
+    them; a CUDA graph captured on caller-owned buffers replays into them for new logits and keys."""
+    N, M = 4096, 5
+    x = logits(M, N, torch.bfloat16)
+    s, o = keys(M, 21)
+    temps = torch.rand(M, device="cuda") + 0.5
+    ref_t, ref_lp = flashinfer.sampling.sampling_from_logits(
+        x,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        temperature=temps,
+        return_logprob=True,
+    )
+    ob = torch.empty(M, dtype=torch.int32, device="cuda")
+    lb = torch.empty(M, dtype=torch.float32, device="cuda")
+    t2, l2 = flashinfer.sampling.sampling_from_logits(
+        x,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        temperature=temps,
+        out=ob,
+        logprob_out=lb,
+    )  # logprob_out implies return_logprob
+    assert t2 is ob and l2 is lb and torch.equal(ob, ref_t) and same(lb, ref_lp)
+    w = torch.softmax(x.float(), dim=-1)
+    ref_w = flashinfer.sampling.sampling_from_probs(
+        w, seed=s, offset=o, batch_invariant=True
+    )
+    ob2 = torch.empty(M, dtype=torch.int32, device="cuda")
+    assert (
+        flashinfer.sampling.sampling_from_probs(
+            w, seed=s, offset=o, batch_invariant=True, out=ob2
+        )
+        is ob2
+    )
+    assert torch.equal(ob2, ref_w)
+    sm = device_sm_count(torch.device("cuda"))
+    if (
+        DS.draw_config(N, M, 2, sm).rows_per_cta == 1
+    ):  # the gather needs one row per CTA
+        idx = torch.tensor([0, 2, 2, 4, 1], device="cuda")
+        ref_i = flashinfer.sampling.sampling_from_logits(
+            x, indices=idx, seed=s, offset=o, batch_invariant=True
+        )
+        assert ref_i.dtype == torch.int64
+        o64 = torch.empty(M, dtype=torch.int64, device="cuda")
+        assert (
+            flashinfer.sampling.sampling_from_logits(
+                x, indices=idx, seed=s, offset=o, batch_invariant=True, out=o64
+            )
+            is o64
+        )
+        assert torch.equal(o64, ref_i)
+        o32 = torch.empty(M, dtype=torch.int32, device="cuda")
+        r = flashinfer.sampling.sampling_from_logits(
+            x, indices=idx, seed=s, offset=o, batch_invariant=True, out=o32
+        )
+        assert r is o32 and torch.equal(o32.long(), ref_i)
+    # the contract: refused, never copied; the default path refuses the buffers
+    with pytest.raises(ValueError, match="dtype"):
+        flashinfer.sampling.sampling_from_logits(
+            x, seed=s, offset=o, batch_invariant=True, out=lb
+        )
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.sampling_from_logits(
+            x,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=torch.empty(M + 1, dtype=torch.int32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="log-probability"):
+        draw(
+            w, s, o, logprob_out=lb
+        )  # a log-probability buffer on weights: the value is defined for logits
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.sampling_from_logits(x, seed=s, offset=o, out=ob)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.sampling_from_probs(w, seed=s, offset=o, out=ob2)
+    # overlap: an output may not overlap the input's storage, nor another output (a dtype view included)
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.sampling_from_logits(
+            x,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=x.view(-1)[: 2 * M].view(torch.int32),
+        )
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.sampling_from_logits(
+            x,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=lb.view(torch.int32),
+            logprob_out=lb,
+        )
+    with pytest.raises(ValueError, match="overlap"):  # a key tensor's storage
+        flashinfer.sampling.sampling_from_logits(
+            x, seed=s, offset=o, batch_invariant=True, out=o.view(torch.int32)[:M]
+        )
+    if DS.draw_config(N, M, 2, sm).rows_per_cta == 1:
+        # an int64 samples buffer (the gather's dtype contract) overlapping the log-probability buffer
+        idx = torch.tensor([0, 2, 2, 4, 1], device="cuda")
+        arena = torch.empty(2 * M, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="overlap"):
+            flashinfer.sampling.sampling_from_logits(
+                x,
+                indices=idx,
+                seed=s,
+                offset=o,
+                batch_invariant=True,
+                out=arena.view(torch.int64),
+                logprob_out=arena[:M],
+            )
+    # the scratch behind the kernel's validity word: a buffer a CUDA graph captured must survive the cache's growth (the
+    # replay keeps writing to its address), and so must one a pending kernel on another stream still writes. The block
+    # works on its own cache (restored by monkeypatch): the growth draw below is then 1025 rows whatever the earlier
+    # tests grew the process-wide cache to (after a 2^20-row test it was a 2^20 x 4096 logits tensor), and the
+    # clear() further down touches nothing the later tests see
+    from flashinfer.batch_invariant import support as bi_support
+
+    monkeypatch.setattr(bi_support, "_scratch", {})
+    monkeypatch.setattr(bi_support, "_scratch_keep", [])
+    xs = logits(512, N, torch.bfloat16, seed=3)
+    ss, os_ = keys(512, 31)
+    flashinfer.sampling.sampling_from_logits(
+        xs, seed=ss, offset=os_, batch_invariant=True
+    )
+    captured = bi_support.scratch(xs.device, torch.int32, 512).data_ptr()
+    tb2 = torch.empty(512, dtype=torch.int32, device="cuda")
+    st2 = torch.cuda.Stream()
+    with torch.cuda.stream(st2):
+        flashinfer.sampling.sampling_from_logits(
+            xs, seed=ss, offset=os_, batch_invariant=True, out=tb2
+        )
+        torch.cuda.current_stream().synchronize()
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2, stream=st2):
+            flashinfer.sampling.sampling_from_logits(
+                xs, seed=ss, offset=os_, batch_invariant=True, out=tb2
+            )
+    torch.cuda.synchronize()
+    cur = bi_support.scratch(xs.device, torch.int32, 1)
+    assert cur.data_ptr() == captured  # the cache still serves the captured buffer
+    xl = logits(
+        cur.numel() + 1, N, torch.bfloat16, seed=4
+    )  # one row more than the cache holds: it grows
+    sl, ol = keys(cur.numel() + 1, 32)
+    flashinfer.sampling.sampling_from_logits(
+        xl, seed=sl, offset=ol, batch_invariant=True
+    )
+    grown = bi_support.scratch(xs.device, torch.int32, 1)
+    assert grown.data_ptr() != captured and grown.numel() >= 2 * cur.numel()
+    assert any(t.data_ptr() == captured for t in bi_support._scratch_keep), (
+        "the buffer the graph captured was released"
+    )
+    g2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        tb2,
+        flashinfer.sampling.sampling_from_logits(
+            xs, seed=ss, offset=os_, batch_invariant=True
+        ),
+    )
+    # a capture the cache cannot serve takes its buffer from the graph's private pool: neither cached nor retained (the
+    # pool holds it for the graph's lifetime and returns it when the graph is freed; retaining it kept 2 MiB of pool per
+    # capture reserved in review), and the replay is right
+    bi_support._scratch.clear()  # the next call cannot be served from the cache (the test's own dict)
+    n_keep = len(bi_support._scratch_keep)
+    tb3 = torch.empty(512, dtype=torch.int32, device="cuda")
+    g3 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g3):
+        flashinfer.sampling.sampling_from_logits(
+            xs, seed=ss, offset=os_, batch_invariant=True, out=tb3
+        )
+    assert len(bi_support._scratch_keep) == n_keep, "a capture-time buffer was retained"
+    assert (xs.device, torch.int32) not in bi_support._scratch, (
+        "a capture-time buffer was cached"
+    )
+    g3.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(tb3, tb2)
+    # a CUDA graph on caller-owned buffers: new logits and new keys through the captured addresses
+    xin, sin, oin = x.clone(), s.clone(), o.clone()
+    tb = torch.empty(M, dtype=torch.int32, device="cuda")
+    pb = torch.empty(M, dtype=torch.float32, device="cuda")
+    st = torch.cuda.Stream()
+    with torch.cuda.stream(st):
+        flashinfer.sampling.sampling_from_logits(
+            xin,
+            seed=sin,
+            offset=oin,
+            batch_invariant=True,
+            temperature=temps,
+            out=tb,
+            logprob_out=pb,
+        )
+        torch.cuda.current_stream().synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=st):
+            flashinfer.sampling.sampling_from_logits(
+                xin,
+                seed=sin,
+                offset=oin,
+                batch_invariant=True,
+                temperature=temps,
+                out=tb,
+                logprob_out=pb,
+            )
+    torch.cuda.synchronize()
+    x2 = logits(M, N, torch.bfloat16, seed=9)
+    s2, o2 = keys(M, 22)
+    xin.copy_(x2)
+    sin.copy_(s2)
+    oin.copy_(o2)
+    g.replay()
+    torch.cuda.synchronize()
+    e_t, e_lp = flashinfer.sampling.sampling_from_logits(
+        x2,
+        seed=s2,
+        offset=o2,
+        batch_invariant=True,
+        temperature=temps,
+        return_logprob=True,
+    )
+    assert torch.equal(tb, e_t) and same(pb, e_lp)
+
+
+@needs_device
 def test_default_path_is_the_operator_kernel(monkeypatch):
     """``batch_invariant=False`` (the default) never enters the class and is byte for byte the operator's own kernel
     (the registered custom op the unmodified entries called), for both entries and with ``return_valid``."""
@@ -1385,6 +1467,10 @@ def test_default_path_is_the_operator_kernel(monkeypatch):
         flashinfer.sampling.sampling_from_logits(lg, seed=seed, offset=off),
         mod.sampling_from_logits(lg, None, True, None, seed, off),
     )
+    # the temperature and the log-probability exist under the flag only: the default path refuses them
+    for kw in ({"temperature": 0.7}, {"return_logprob": True}):
+        with pytest.raises(ValueError, match="batch_invariant=True"):
+            flashinfer.sampling.sampling_from_logits(lg, seed=seed, offset=off, **kw)
     with pytest.raises(AssertionError, match="without the flag"):
         flashinfer.sampling.sampling_from_probs(
             probs, seed=seed, offset=off, batch_invariant=True

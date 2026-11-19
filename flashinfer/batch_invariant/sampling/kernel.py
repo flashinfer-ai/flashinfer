@@ -358,7 +358,12 @@ class LSERowKernel:
         # multiple of 32 (the lanes of warp 0 take the ids in turn; `K` at run time predicates the tail)
         assert k_slots == 1 or (k_slots > 0 and k_slots % LANES == 0), k_slots
         self.k_slots = k_slots
-        self.out_dtype = dtype if (mode.probs and not mode.probs_f32) else Float32
+        # the converted row outputs: the softmax in the input dtype, the 16-bit log-softmax member
+        self.out_dtype = (
+            dtype
+            if ((mode.probs and not mode.probs_f32) or mode.logprobs_cvt)
+            else Float32
+        )
         pl = cfg.placement(N)
         self.plan_max = canon.plan(max_reduction(N, None), pl)
         self.plan_sum = canon.plan(sum_reduction(N, None), pl)
@@ -637,11 +642,14 @@ class LSERowKernel:
 
 def _row_outputs(k, loader, kk, fy, nm, c, inv_s, nlg, out_dtype, fp):
     """The output elements of block ``kk`` (plain Python at trace time): ``z`` recomputed identically from the kept /
-    re-read fragment, then the probability (converted to the output dtype) or the log-probability."""
+    re-read fragment, then the probability (converted to the output dtype) or the log-probability (fp32, or converted
+    once to the input dtype for the 16-bit output member)."""
     for e in range(V):
         z = shifted(fp, loader.x(kk, e), nm, c)
         if k.mode.probs:
             fy[e] = prob(fp, fp.ex2(z), inv_s).to(out_dtype)
+        elif k.mode.logprobs_cvt:
+            fy[e] = logp(fp, z, nlg).to(out_dtype)
         else:
             fy[e] = logp(fp, z, nlg)
 

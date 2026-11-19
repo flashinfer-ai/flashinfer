@@ -937,7 +937,7 @@ def test_sf_ring_mc42_rows():
             cb.gemm_plan(2048, 8192, 8192, False, arch, sm_count, tactic=tactic)
 
 
-def test_cake_is_registered_but_never_auto_selected():
+def test_cake_is_registered_as_experimental_backend():
     assert "cake" in mm_fp4.experimental_backends
     assert mm_fp4.is_backend_supported("cake", 100)
     assert mm_fp4.is_backend_supported("cake", 103)
@@ -2045,6 +2045,179 @@ def test_mm_fp4_cake_repeated_call_allocates_only_its_output():
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
     ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
     _assert_matches(out, ref)
+
+
+def test_stream_k_workspace_is_owned_by_the_current_stream():
+    # The stream-K tail's FP32 partials and generation flags belong to the current
+    # CUDA stream: launches on one stream are ordered and share them, launches on
+    # different streams are not ordered and get their own.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    device = torch.device("cuda", torch.cuda.current_device())
+    # A slice count no plan uses, so these flags are first allocated here.
+    floats, flags, slices = 3 * 128 * 192, 96, 1009
+    contexts = [
+        torch.cuda.current_stream(device),
+        torch.cuda.Stream(device),
+        torch.cuda.Stream(device),
+    ]
+    buffers = []
+    for stream in contexts:
+        with torch.cuda.stream(stream):
+            ws, fl = cb._stream_k_workspace(device, floats, flags, slices)
+            # Smaller requests and an index-less device reuse the same storage.
+            again = cb._stream_k_workspace(
+                torch.device("cuda"), floats // 2, flags // 2, slices
+            )
+        assert ws.dtype == torch.float32 and fl.dtype == torch.uint32
+        assert ws.numel() >= floats and fl.numel() >= flags
+        assert again[0].data_ptr() == ws.data_ptr()
+        assert again[1].data_ptr() == fl.data_ptr()
+        buffers.append((ws, fl))
+    torch.cuda.synchronize()
+    for _, fl in buffers:
+        assert not fl.view(torch.int32).any(), "flags not zero on first allocation"
+    ptrs = [t.data_ptr() for pair in buffers for t in pair]
+    assert len(set(ptrs)) == len(ptrs), "streams share stream-K scratch"
+
+    # Grown flags restart from zero in new storage.
+    stream = contexts[1]
+    with torch.cuda.stream(stream):
+        _, fl = cb._stream_k_workspace(device, floats, flags, slices)
+        fl.view(torch.int32).fill_(7)
+        bigger = fl.numel() + 1
+        _, grown = cb._stream_k_workspace(device, floats, bigger, slices)
+    torch.cuda.synchronize()
+    assert grown.numel() >= bigger and grown.data_ptr() != fl.data_ptr()
+    assert not grown.view(torch.int32).any()
+
+
+# (m, n, k) rows whose default plan runs the stream-K tail of the static 2-CTA
+# schedule at some SM count; the test runs the first one this GPU plans with it.
+_STREAM_K_ROWS = (
+    (2048, 7168, 16384),
+    (2048, 7168, 18432),
+    (512, 8192, 28672),
+    (257, 8192, 28672),
+    (8192, 1536, 7168),
+)
+
+
+def _stream_k_row(device):
+    """The first :data:`_STREAM_K_ROWS` row whose mm_fp4 plan (default tactic, then
+    the GEMM-alone tactic, as :func:`cb._gemm_prepared`) keeps the stream-K tail."""
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    for m, n, k in _STREAM_K_ROWS:
+        plan = cb.gemm_plan(m, n, k, False, arch, sm_count)
+        if (alone := cb.gemm_alone_tactic(plan)) is not None:
+            plan = cb.gemm_plan(m, n, k, False, arch, sm_count, tactic=alone)
+        if plan.stream_k:
+            return m, n, k
+    pytest.skip(f"no stream-K row on {arch} with {sm_count} SMs")
+
+
+@pytest.mark.timeout(600)
+def test_stream_k_launches_on_two_streams_match_serial_launches():
+    # Stream-K launches on two streams, not ordered with each other, each use their
+    # own partials and flags: every output equals the output of a launch alone.
+    device = _require_program()
+    m, n, k = _stream_k_row(device)
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=700
+    )
+
+    def run(out):
+        return mm_fp4(
+            a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.bfloat16, out, backend="cake"
+        )
+
+    serial = run(torch.empty((m, n), dtype=torch.bfloat16, device=device))
+    again = run(torch.empty_like(serial))
+    torch.cuda.synchronize(device)
+    plan = cb._gemm_prepared(m, n, k, False, device.index)[0]
+    assert plan.stream_k, plan.kernel_key
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(serial, ref)
+    deterministic = torch.equal(serial, again)
+
+    iterations = 20
+    streams = (torch.cuda.Stream(device), torch.cuda.Stream(device))
+    outs = [torch.full_like(serial, float("nan")) for _ in range(2 * iterations)]
+    scratch = []
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            ws, fl = cb._stream_k_workspace(
+                device, plan.sk_workspace_floats, plan.sk_flag_words, plan.sk_slices
+            )
+        scratch += [ws.data_ptr(), fl.data_ptr()]
+    assert len(set(scratch)) == len(scratch), "streams share stream-K scratch"
+    # Alternate the streams without synchronising them, so their launches overlap.
+    for i in range(iterations):
+        for j, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                run(outs[2 * i + j])
+    torch.cuda.synchronize(device)
+
+    for index, out in enumerate(outs):
+        if deterministic:
+            assert torch.equal(out, serial), f"launch {index} (stream {index % 2})"
+        else:
+            _assert_matches(out, ref)
+
+
+@pytest.mark.timeout(600)
+def test_stream_k_graphs_replay_in_any_order():
+    # Graphs captured on one stream, with no eager launch on that stream before, each
+    # own zeroed stream-K flags: the graph captured second replays first and both
+    # replay concurrently on two streams, and every output equals an eager launch.
+    device = _require_program()
+    m, n, k = _stream_k_row(device)
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=701
+    )
+
+    def run(out):
+        return mm_fp4(
+            a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.bfloat16, out, backend="cake"
+        )
+
+    eager = run(torch.empty((m, n), dtype=torch.bfloat16, device=device))
+    again = run(torch.empty_like(eager))
+    torch.cuda.synchronize(device)
+    assert cb._gemm_prepared(m, n, k, False, device.index)[0].stream_k
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(eager, ref)
+    deterministic = torch.equal(eager, again)
+
+    capture_stream = torch.cuda.Stream(device)
+    outs = [torch.full_like(eager, float("nan")) for _ in range(2)]
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    for graph, out in zip(graphs, outs, strict=True):
+        with torch.cuda.graph(graph, stream=capture_stream):
+            run(out)
+    torch.cuda.synchronize(device)
+
+    def check():
+        for index, out in enumerate(outs):
+            if deterministic:
+                assert torch.equal(out, eager), f"graph {index}"
+            else:
+                _assert_matches(out, ref)
+            out.fill_(float("nan"))
+
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize(device)
+    check()
+    streams = (torch.cuda.Stream(device), torch.cuda.Stream(device))
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams, strict=True):
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize(device)
+        check()
 
 
 def test_scalar_alpha_and_bad_layouts_are_rejected():

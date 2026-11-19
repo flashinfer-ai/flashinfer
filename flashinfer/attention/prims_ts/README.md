@@ -70,8 +70,13 @@ metadata values back to the host. FMHA preserves initialized caller scratch
 by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
-capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch and re-zero it when workspace-layout inputs change; wrappers
+capture. Their default `validate=True` checks geometry and device support;
+FMHA also checks packed-Q offset values. For already-validated inputs,
+`validate=False` skips those repeated checks and offset readbacks while
+preserving alias resolution and the same internal policy cache. The caller
+owns hardware, geometry, dtype and metadata validity; a cold policy lookup
+may still query device properties. Zero caller-owned FMHA scratch before its
+first trusted standalone launch and re-zero it when workspace-layout inputs change; wrappers
 initialize control storage by default. Alternatively, FMHA plans for one
 device may share one buffer of at least the largest size returned for them:
 zero the whole buffer once, bind the same full tensor to every plan (not
@@ -203,6 +208,22 @@ Validation reads metadata values on the host. With `validate=False`, callers own
 shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime conditions.
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
+
+### Per-query KV prefixes for MLA decode
+
+MLA decode supports `plan(use_kv_bounds=True)` with per-run `kv_bounds`:
+contiguous CUDA int32 counts shaped `[B * SQ]` for fixed Q or `[total_q]` for
+packed Q. Counts are shared across a token's heads, replace dense/causal
+visibility, and must be nondecreasing within each request and no larger than
+that request's `seq_lens_kv`. Zero local lengths and prefixes return zero O
+and optional base-2 LSE `-inf`. Bounds are per-run metadata, not retained
+plan values. `plan(zero_empty_rows=False)` skips neutral-row initialization but
+retains prefix masking; empty-row results are then unspecified, not preserved.
+Callers must initialize those rows or exclude them from consumption/merging.
+The default is `True`; the flag is ignored without `use_kv_bounds` and does not
+change workspace sizing. One-shot MLA exposes the same flag.
+See the [MLA contract](kernels/mla_decode/README.md) for validation,
+empty-cache, and workspace details.
 
 ## QToken-KvBlock-Sparse-Attention interface
 
@@ -646,13 +667,17 @@ plan selects the recipe at compile time with `vc_config=VCAttentionConfig(...)`;
 the plan's Q/K dtype selects the Q/K side:
 
 * **VC-Attention-QK16** (`q_dtype`/`k_dtype` bf16): Q and K stay bf16.
-* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.float8_e4m3fn`): the paper's
-  low-bit Q/K. K is centred by its per-head channel mean, Q and K are rotated by
-  the normalised 128-point Hadamard matrix and quantized to E4M3 with one scale
-  per 128-token Q block and per 128-token K tile.
+* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.int8` on SM100/B200,
+  `torch.float8_e4m3fn` elsewhere): the paper's low-bit Q/K. K is centred by its
+  per-head channel mean, Q and K are rotated by the normalised 128-point Hadamard
+  matrix and quantized with one scale per 128-token Q block and per 128-token K
+  tile. `vc_quantize_fp8` / `vc_quantize_repair` write E4M3 codes and
+  `vc_quantize_int8` / `vc_quantize_repair_int8` INT8 codes (SM100 only);
+  `VCAttentionPreprocessor` follows the device, as the paper configures B200
+  (INT8) and B300 (E4M3), which `vc_qk8_dtype(device)` returns.
 
 Every run passes the (permuted) K, the E4M3 V residuals and
-`vc=VCAttentionParams(...)`; QK8 runs pass the E4M3 Q and the Q/K scales too:
+`vc=VCAttentionParams(...)`; QK8 runs pass the coded Q and the Q/K scales too:
 
 ```text
 K'      = (K - mean_tokens(K)) H,  Q' = Q H              (QK8 only; H: 128-point Hadamard)
@@ -688,7 +713,7 @@ package holds the operand contract.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K dtype | `torch.bfloat16` (QK16) or `torch.float8_e4m3fn` (QK8) |
+| Q/K dtype | `torch.bfloat16` (QK16); `torch.int8` on SM100/B200 or `torch.float8_e4m3fn` on SM103 (QK8, `vc_qk8_dtype(device)`); VC plans are rejected on SM107 |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
 | Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed_query=False`, `mask_type="dense"`; QK16 runs the two-CTA UMMA form, QK8 follows the device default |
@@ -716,7 +741,7 @@ off and a positive `repair_tiles`.
 
 ```python
 from flashinfer.attention.prims_ts import (
-    BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor,
+    BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor, vc_qk8_dtype,
 )
 
 wrappers = {}
@@ -732,15 +757,16 @@ prep = VCAttentionPreprocessor()
 ops = prep.prepare(k_bf16, v_bf16, denoise_step=(step, num_steps))
 out = wrappers[ops.demean].run(q_bf16, ops.k, ops.v, vc=ops.params)
 
-# VC-Attention-QK8 plans E4M3 Q/K and passes Q to the preprocessor, again with
-# one plan per demean phase.
+# VC-Attention-QK8 plans the device's Q/K code type and passes Q to the
+# preprocessor, again with one plan per demean phase.
+qk8 = vc_qk8_dtype("cuda")
 wrappers8 = {}
 for demean in (True, False):
     wrappers8[demean] = BatchPrefillTSWrapper()
     wrappers8[demean].plan(
         device="cuda", batch_size=1, max_q_len=S, max_kv_len=S,
         num_qo_heads=H, num_kv_heads=H, head_dim=128,
-        q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
+        q_dtype=qk8, k_dtype=qk8, v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),
     )
 ops8 = prep.prepare(k_bf16, v_bf16, q=q_bf16, denoise_step=(step, num_steps))

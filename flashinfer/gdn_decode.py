@@ -30,10 +30,17 @@ APIs:
 
 import functools
 import os
+import threading
 from typing import Literal, Optional, Tuple
 
 import torch
 
+from . import cake_locality as _cake_locality
+from .cake_gdn_decode_locality import (
+    DOMAIN_COUNTER_WORDS as _CAKE_GDN_DOMAIN_COUNTER_WORDS,
+    localize_gdn_decode_state as localize_gdn_decode_state,
+    nontranspose_domain_variant as _cake_gdn_nontranspose_domain_variant,
+)
 from .jit.core import logger
 from .utils import get_compute_capability
 
@@ -279,6 +286,17 @@ def _cake_gdn_assert_state_slots(
     )
 
 
+def _cake_gdn_strides_keep_alignment(tensor: torch.Tensor, align: int) -> bool:
+    """Whether each stride of a dimension longer than 1 (all but the unit inner one) is
+    a whole number of ``align``-byte vectors."""
+
+    item = tensor.element_size()
+    return all(
+        extent == 1 or stride * item % align == 0
+        for extent, stride in zip(tensor.shape[:-1], tensor.stride()[:-1], strict=True)
+    )
+
+
 def _run_cake_gdn_decode_pretranspose(
     *,
     q: torch.Tensor,
@@ -297,7 +315,13 @@ def _run_cake_gdn_decode_pretranspose(
     intermediate_states_buffer: Optional[torch.Tensor],
     disable_state_update: bool,
 ) -> torch.Tensor:
-    """Launch one exact manifest-backed GDN non-CP decode row or fail closed."""
+    """Launch one exact manifest-backed GDN non-CP decode row or fail closed.
+
+    After the contract checks and before the row resolves, a row-independent
+    alignment check raises ``ValueError`` for a misaligned q, k, v, output, state or
+    checkpoint base, and ``CakeGDNUnsupportedError`` for q, k, v or state strides that
+    break the kernels' vector alignment.
+    """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
         raise RuntimeError("the source-only Cake GDN backend is not installed")
@@ -424,6 +448,46 @@ def _run_cake_gdn_decode_pretranspose(
         cache_steps = int(intermediate_states_buffer.shape[1])
     else:
         cache_steps = 0
+    # Contiguous views may still start at an unaligned storage offset. The kernels this
+    # path launches (each row and architecture) read q and k in up to 16-byte vectors on
+    # the BF16-state rows (8-byte on the FP32-state rows), read v and write the output
+    # in 8-byte vectors on some rows, and move the state and the checkpoint buffer in
+    # up to 16-byte copies (cp.async, uint4 or float4), so such a view would fault
+    # asynchronously; they read a, b, A_log, dt_bias and the slot indices one element at
+    # a time, so their element alignment is enough. The check is deliberately
+    # row-independent: it runs before the row resolves. ValueError, not
+    # CakeGDNUnsupportedError: the FlashInfer kernels that backend="auto" falls back to
+    # assume 16-byte (FP32 state) or 32-byte (BF16 state) aligned q, k, v, output and
+    # state and refuse a misaligned base at launch.
+    qk_align = 16 if state_pool.dtype == torch.bfloat16 else 8
+    if (
+        (q.data_ptr() | k.data_ptr()) % qk_align
+        or (v.data_ptr() | output.data_ptr()) % 8
+        or state_pool.data_ptr() % 16
+        or (
+            intermediate_states_buffer is not None
+            and intermediate_states_buffer.data_ptr() % 16
+        )
+    ):
+        raise ValueError(
+            f"GDN non-CP pretranspose decode requires {qk_align}-byte aligned q and k, "
+            "8-byte aligned v and output, and 16-byte aligned initial_state and "
+            "intermediate_states_buffer"
+        )
+    # Strided q/k/v views and a padded pool add their strides to those vector addresses.
+    # A stride that breaks the alignment is a layout these kernels do not serve; the
+    # FlashInfer kernels accept such strides (as runtime strides or by compiling for
+    # them), so backend="auto" falls back.
+    if not (
+        _cake_gdn_strides_keep_alignment(q, qk_align)
+        and _cake_gdn_strides_keep_alignment(k, qk_align)
+        and _cake_gdn_strides_keep_alignment(v, 8)
+        and _cake_gdn_strides_keep_alignment(state_pool, 16)
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP pretranspose decode requires q, k, v and state strides that "
+            "keep their vector alignment"
+        )
     pool_size = int(state_pool.shape[0])
     _cake_gdn_assert_state_slots(
         initial_state_indices,
@@ -535,6 +599,239 @@ def _run_cake_gdn_decode_pretranspose(
 # reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
 _CAKE_GDN_NONTRANSPOSE_LAUNCHES: dict[tuple, tuple] = {}
 _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT = 1024
+# Launch of the locality-domain twin of a row (``localize_gdn_decode_state``) per the row's
+# ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` key, the dies' SM counts and the die cut of the homed
+# state: ``(entry, grid_x, rows0, table)``, where ``entry`` is the twin's kernel entry or
+# ``None`` when the row runs its whole-GPU launch on that state (no twin listed for the cell
+# or shipped for the row, or a twin that failed to build, load or launch), ``grid_x``
+# the requested grid (B * HV; the host shim launches at most the resident CTAs),
+# ``rows0`` the batch row nearest the die cut and ``table`` the SM table the launch was
+# resolved with (a hit is reused only for the same table object).  Cleared when it
+# reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
+_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES: dict[tuple, tuple] = {}
+# Bytes of one [K=128, V=128] FP32 state head.
+_CAKE_GDN_HEAD_BYTES = 128 * 128 * 4
+# The launch a homed state allocation is bound to, by ``id`` of the allocation's homing
+# record (``cake_locality.tensor_homing`` gives one record object per allocation for its
+# whole life): ``(record, whole, domain, table)``, where ``whole`` is the row's
+# ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` value the binding was made for and ``domain`` the
+# ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`` value the call runs, or ``None`` for the
+# row's whole-GPU launch, and ``table`` the SM table entries of that twin launch as a
+# tvm-ffi tensor (``_cake_gdn_launch_arg``), or ``None``.  A call reuses a binding only
+# for the same record object (held here, so its id is not reused while the entry
+# lives) and the same ``whole`` object (so the same row), and then skips the SM table
+# query, the twin launch lookup and the conversion of the table.  A binding keeps the
+# SM table it was resolved with: a device's table does not change once probed, and the
+# twin's bits do not depend on the table or the cut (they only order its claims).  A
+# call that finds no SM table is not bound (a later probe may find one).  Cleared when
+# it reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` entries and when a twin is dropped
+# (``_drop_cake_gdn_nontranspose_domain_twin``).
+_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES: dict[int, tuple] = {}
+# The twin's claim counter pairs of this thread's eager launches, by (device index, raw
+# stream handle): the pair ``cake_locality.launch_counters`` returned for that stream,
+# as tvm-ffi tensors (``_cake_gdn_launch_arg``), reused by later eager launches on it
+# without that call.  Never used under CUDA graph capture.  At most
+# ``cake_locality.STREAM_PAIR_LIMIT`` pairs per thread; past it they are dropped.
+#
+# The reuse is the one ``launch_counters`` makes itself: launches on one stream are
+# ordered, and each launch leaves its pair zero.  Per thread because the handles 0, 1
+# and 2 can name another stream in each thread (``launch_counters`` keys those per
+# thread too); for any other handle every thread memoizes the one pair
+# ``launch_counters`` keeps for that stream (or one it has since dropped, still used on
+# that stream only).  As for ``launch_counters``, a stream wrapped by
+# ``torch.cuda.ExternalStream`` must not be destroyed while launches on it are in
+# flight.
+_CAKE_GDN_DOMAIN_PAIRS = threading.local()
+# Devices on which a captured twin launch took a pair of the capture reserve since the
+# last eager twin launch through ``cake_locality.launch_counters``: the next eager twin
+# launch on the device goes through it again, which tops the reserve up.
+_CAKE_GDN_DOMAIN_CAPTURED: set[int] = set()
+# Raw stream handles on which CUDA graph capture cannot begin: the legacy default
+# stream, as torch's default stream (0) and as ``cudaStreamLegacy`` (1).
+_CAKE_GDN_UNCAPTURABLE_STREAMS = frozenset({0, 1})
+
+
+def _cake_gdn_nontranspose_domain_launch(
+    key: tuple, state: torch.Tensor, homed
+) -> Optional[tuple]:
+    """``(entry, grid_x, rows0, table)`` of the locality-domain twin for the row ``key`` of
+    ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` on ``state``, whose homing record is ``homed``, or
+    ``None`` when the call runs the row's whole-GPU launch: ``state`` is not the whole
+    allocation of its homing record on the call's device, the device has no SM table, or
+    the row has no twin there (see ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES``)."""
+    device_index = key[0]
+    if (
+        homed.device_index != device_index
+        or state.numel() * state.element_size() != homed.nbytes
+    ):
+        return None
+    table = _cake_locality.sm_table(device_index)
+    if table is None:
+        return None
+    domain_key = key + (table.counts, homed.cut)
+    launch = _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.get(domain_key)
+    if launch is None or launch[3] is not table:
+        launch = _resolve_cake_gdn_nontranspose_domain_launch(key, table, homed.cut)
+        if (
+            len(_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES)
+            >= _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT
+        ):
+            _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.clear()
+        _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES[domain_key] = launch
+    return None if launch[0] is None else launch
+
+
+def _resolve_cake_gdn_nontranspose_domain_launch(key: tuple, table, cut: int) -> tuple:
+    """The ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`` value of the row ``key`` on a state
+    homed with die cut ``cut`` (bytes) on a device with SM table ``table``."""
+    (
+        device_index,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        scale,
+        use_qk_l2norm,
+    ) = key
+    properties = torch.cuda.get_device_properties(device_index)
+    arch = _cake_gdn.arch_for_compute_capability(properties.major, properties.minor)
+    name = _cake_gdn_nontranspose_domain_variant(
+        arch=arch,
+        sm_count=int(properties.multi_processor_count),
+        die_class=_cake_locality.die_class(table.counts),
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    entry = None
+    if name is not None:
+        try:
+            entry = _cake_gdn.load_cake_gdn_kernel(name, arch)
+        except Exception as error:  # noqa: BLE001 - the row keeps its whole-GPU launch
+            logger.warning(
+                "Cake GDN locality-domain decode %s failed to build or load (%s); "
+                "the row runs its whole-GPU kernel",
+                name,
+                error,
+            )
+    row_bytes = num_v_heads * _CAKE_GDN_HEAD_BYTES
+    rows0 = min(batch_size, max(0, (2 * cut + row_bytes) // (2 * row_bytes)))
+    return (entry, batch_size * num_v_heads, rows0, table)
+
+
+def _drop_cake_gdn_nontranspose_domain_twin(
+    key: tuple, homed, launch: tuple, error: Exception
+) -> None:
+    """Record that the twin of ``launch`` (the ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES``
+    value of the row ``key`` on a state whose homing record is ``homed``) failed at its
+    launch where the row's whole-GPU launch runs: the row runs its whole-GPU launch on
+    such states from now on."""
+    _, grid_x, rows0, table = launch
+    logger.warning(
+        "Cake GDN locality-domain decode of row %s failed to load or launch (%s); "
+        "the row runs its whole-GPU kernel",
+        key,
+        error,
+    )
+    _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES[key + (table.counts, homed.cut)] = (
+        None,
+        grid_x,
+        rows0,
+        table,
+    )
+    # Every allocation bound to that twin binds again, to the entry above.
+    _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.clear()
+
+
+def _bind_cake_gdn_nontranspose_domain_launch(
+    key: tuple, whole: tuple, state: torch.Tensor, homed
+) -> tuple:
+    """Bind the homed allocation of ``state`` (homing record ``homed``) to the row
+    ``key`` (``_CAKE_GDN_NONTRANSPOSE_LAUNCHES`` value ``whole``): the
+    ``_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES`` value, stored unless the device has no
+    SM table."""
+    domain = None
+    lasting = True
+    if (
+        homed.device_index == key[0]
+        and state.numel() * state.element_size() == homed.nbytes
+    ):
+        if _cake_locality.sm_table(key[0]) is None:
+            lasting = False  # a later probe may find a table
+        else:
+            domain = _cake_gdn_nontranspose_domain_launch(key, state, homed)
+    bound = (
+        homed,
+        whole,
+        domain,
+        None if domain is None else _cake_gdn_launch_arg(domain[3].entries),
+    )
+    if lasting:
+        if (
+            len(_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES)
+            >= _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT
+        ):
+            _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.clear()
+        _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES[id(homed)] = bound
+    return bound
+
+
+def _cake_gdn_launch_arg(tensor):
+    """``tensor`` as a tvm-ffi tensor over the same memory, which keeps ``tensor``
+    alive: an argument the twin's entry then takes without converting it from torch
+    on every call.  Anything else is returned as is."""
+    if isinstance(tensor, torch.Tensor):
+        import tvm_ffi
+
+        return tvm_ffi.from_dlpack(tensor)
+    return tensor
+
+
+def _cake_gdn_eager_stream(device_index: int) -> Optional[tuple[int, int]]:
+    """``(device_index, raw handle of the current stream of device device_index)``,
+    or ``None`` when that stream is capturing a CUDA graph (the capture test of
+    ``cake_locality.launch_counters``).  The legacy default stream (handle 0, or 1
+    for ``cudaStreamLegacy``) cannot capture, so it needs no test.  Otherwise, when
+    ``device_index`` is the current device, the test asks torch's C bindings
+    directly, the call ``torch.cuda.is_current_stream_capturing`` makes; on another
+    device it is ``cake_locality._stream_capturing``."""
+    handle = torch._C._cuda_getCurrentRawStream(device_index)
+    if handle not in _CAKE_GDN_UNCAPTURABLE_STREAMS:
+        if torch._C._cuda_getDevice() == device_index:
+            if torch._C._cuda_isCurrentStreamCapturing():
+                return None
+        elif _cake_locality._stream_capturing(device_index):
+            return None
+    return (device_index, handle)
+
+
+def _cake_gdn_domain_counters(device_index: int) -> tuple:
+    """The claim counter pair of one twin launch enqueued now on the current stream of
+    device ``device_index`` (``cake_locality.launch_counters``)."""
+    stream = _cake_gdn_eager_stream(device_index)
+    if stream is None:
+        # A pre-zeroed pair of this capture's own.
+        _CAKE_GDN_DOMAIN_CAPTURED.add(device_index)
+        return _cake_locality.launch_counters(
+            _CAKE_GDN_DOMAIN_COUNTER_WORDS, device_index
+        )
+    pairs = getattr(_CAKE_GDN_DOMAIN_PAIRS, "pairs", None)
+    if pairs is None:
+        pairs = _CAKE_GDN_DOMAIN_PAIRS.pairs = {}
+    pair = pairs.get(stream)
+    if pair is None or device_index in _CAKE_GDN_DOMAIN_CAPTURED:
+        _CAKE_GDN_DOMAIN_CAPTURED.discard(device_index)
+        counters0, counters1 = _cake_locality.launch_counters(
+            _CAKE_GDN_DOMAIN_COUNTER_WORDS, device_index
+        )
+        pair = (_cake_gdn_launch_arg(counters0), _cake_gdn_launch_arg(counters1))
+        if len(pairs) >= _cake_locality.STREAM_PAIR_LIMIT:
+            pairs.clear()
+        pairs[stream] = pair
+    return pair
 
 
 def _run_cake_gdn_decode_nontranspose(
@@ -556,7 +853,8 @@ def _run_cake_gdn_decode_nontranspose(
     Runs on every eager decode call, so the checks compare the device index, dtype
     identity and shapes directly (no ``torch.device`` built per tensor) and the launch
     comes from ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES``; the checks, their order, the error
-    types and the messages are those of the resolver path.
+    types and the messages are those of the resolver path, followed by one check that
+    path did not have: the row-independent alignment check (``ValueError``).
     """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
@@ -631,6 +929,19 @@ def _run_cake_gdn_decode_nontranspose(
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
         )
+    # Contiguous views may still start at an unaligned storage offset. Every kernel this
+    # path launches (each row and architecture, and the twin) reads q and k in 8-byte
+    # vectors and the state in 16-byte copies (cp.async, float4 or TMA), so such a view
+    # would fault asynchronously; it reads and writes v, a, b, A_log, dt_bias and the
+    # output one element at a time, so their element alignment is enough.
+    # The check is deliberately row-independent: it runs before the row resolves.
+    # ValueError, not CakeGDNUnsupportedError: the FlashInfer kernel that
+    # backend="auto" falls back to assumes 16-byte aligned q, k, v, output and state.
+    if (q.data_ptr() | k.data_ptr()) % 8 or state.data_ptr() % 16:
+        raise ValueError(
+            "GDN non-CP nontranspose decode requires 8-byte aligned q and k and a "
+            "16-byte aligned state"
+        )
     num_k_heads = k.shape[2]
     key = (
         device_index,
@@ -668,6 +979,49 @@ def _run_cake_gdn_decode_nontranspose(
             _CAKE_GDN_NONTRANSPOSE_LAUNCHES.clear()
         _CAKE_GDN_NONTRANSPOSE_LAUNCHES[key] = launch
     entry, grid_x = launch
+    # A state that ``localize_gdn_decode_state`` homed may run the row's locality-domain
+    # twin; ``tensor_homing`` returns at once in a process that never homed a tensor.
+    homed = _cake_locality.tensor_homing(state)
+    if homed is not None:
+        bound = _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.get(id(homed))
+        if bound is None or bound[0] is not homed or bound[1] is not launch:
+            bound = _bind_cake_gdn_nontranspose_domain_launch(key, launch, state, homed)
+        domain = bound[2]
+        if domain is not None:
+            twin, twin_grid_x, rows0, _ = domain
+            counters0, counters1 = _cake_gdn_domain_counters(device_index)
+            try:
+                twin(
+                    q,
+                    k,
+                    v,
+                    state,
+                    A_log,
+                    a,
+                    dt_bias,
+                    b,
+                    output,
+                    rows0,
+                    counters0,
+                    counters1,
+                    bound[3],
+                    twin_grid_x,
+                    1,
+                    1,
+                )
+            except RuntimeError as error:
+                # The twin loads its kernel and opts in to its shared memory on a
+                # device at its first launch there, before the launch itself.  A
+                # failure leaves the state, the output and the counters untouched,
+                # and the call runs the row's whole-GPU launch.  If that raises too,
+                # the error is the call's, not the twin's (for example a launch on
+                # the legacy default stream while another thread captures on a
+                # blocking stream): it propagates as from the whole launch alone, and
+                # the twin is kept.  Otherwise the twin cannot run here, and the row
+                # runs its whole-GPU launch on such states from now on.
+                entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
+                _drop_cake_gdn_nontranspose_domain_twin(key, homed, domain, error)
+            return output
     entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
     return output
 
@@ -765,8 +1119,9 @@ def gated_delta_rule_decode_pretranspose(
         ``auto`` selects GDN non-CP only for an exact frozen manifest row and
         otherwise uses the existing FlashInfer implementation; on Rubin
         (compute capability 10.7) its T=1 bf16-state calls with
-        ``B * HV >= 512`` use the Rubin-tuned kernel, which gives the same
-        bits as the generic kernel there. ``flashinfer`` always uses the
+        ``B * HV >= 512`` and state slot, head and row strides that are
+        multiples of 8 elements use the Rubin-tuned kernel, which gives the
+        same bits as the generic kernel there. ``flashinfer`` always uses the
         generic FlashInfer kernels. Explicit ``cake_gdn`` requests fail
         closed when the contract is unsupported. ``rubin`` forces the
         Rubin-tuned T=1 kernel and raises ``ValueError`` on other GPUs or
@@ -804,7 +1159,9 @@ def gated_delta_rule_decode_pretranspose(
       MTP for T>1); the pool+indices path routes through the MTP kernel.
       On SM107 (Rubin), T=1 with ``B * HV >= 512`` uses the Rubin-tuned
       kernel (``gdn_kernels/gdn_decode_bf16_state_rubin.py``) under
-      ``backend="auto"``. With a pool from :func:`ugpu_state_pool` every
+      ``backend="auto"`` when the state's slot, head and row strides are
+      multiples of 8 elements (the Rubin kernel cannot be built for other
+      strides). With a pool from :func:`ugpu_state_pool` every
       T=1 call on Rubin runs each half of every state on its own die (two
       per-die launches on green-context streams). This targets CUDA-graph
       captured decode (capturable after one eager call); eager calls with
@@ -817,6 +1174,14 @@ def gated_delta_rule_decode_pretranspose(
     - Legacy path (float32 state, T=1): ``K`` and ``V`` must each be
       ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
       size ``TILE_V``).
+    - GDN non-CP alignment (``initial_state`` pool, ``backend="auto"`` or
+      ``"cake_gdn"``): a call that passes its tensor checks raises
+      ``ValueError`` under both backends, whatever its row, unless q and k
+      start 16-byte aligned (8-byte with a float32 state), v and ``output``
+      8-byte aligned, and ``initial_state`` and ``intermediate_states_buffer``
+      16-byte aligned. q, k, v or ``initial_state`` strides that break that
+      alignment are not served by GDN non-CP: ``auto`` uses the FlashInfer
+      kernel and ``cake_gdn`` raises ``CakeGDNUnsupportedError``.
     """
     # Validate input shapes
     B, T, H, K = q.shape
@@ -964,11 +1329,15 @@ def gated_delta_rule_decode_pretranspose(
         )
         # Rubin (SM107): the Rubin-tuned T=1 kernel. It keeps the whole state tile in
         # flight with fewer instructions and is bitwise equal to the generic T=1
-        # wide_vec kernel, which the generic dispatcher uses from B * HV >= 512.
+        # wide_vec kernel, which the generic dispatcher uses from B * HV >= 512. It
+        # compiles a strided pool with its strides baked into 16-byte state copies
+        # (cp.async), so it cannot be built unless the pool's slot, head and row strides
+        # are multiples of 8 elements; "auto" keeps the generic kernel otherwise.
         use_rubin = backend == "rubin" or (
             backend == "auto"
             and T == 1
             and B * HV >= 512
+            and all(stride % 8 == 0 for stride in bf16_pool.stride()[:-1])
             and _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE
             and get_compute_capability(q.device) == (10, 7)
         )
@@ -1228,7 +1597,9 @@ def gated_delta_rule_decode(
         Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
     state : torch.Tensor
         Current state of shape ``[B, HV, K, V]`` (k-major layout).  Must be
-        float32.  Updated in-place.
+        float32.  Updated in-place.  On a dual-die SM107a GPU, a state from
+        :func:`localize_gdn_decode_state` runs the Cake locality-domain twin
+        where it is listed (bitwise equal to the whole-GPU kernel).
     A_log : torch.Tensor
         Log decay parameter of shape ``[HV]``.  Must be float32.
     a : torch.Tensor
@@ -1917,8 +2288,8 @@ def gated_delta_rule_replayssm_commit(
         Contiguous int32 ``[B, T]`` cache rows to replay, in order. Row ``j``
         of request ``i`` is replayed only when ``j < accept_lens[i]``; later
         entries are padding and may hold any value. Lets tree speculation
-        commit a root-to-node path that is not a contiguous prefix. Rows must
-        lie in [0, T) and must not repeat within a request. Default ``None``
+        commit a root-to-node path that is not a contiguous prefix. Replayed rows
+        must lie in [0, T) and must not repeat within a request. Default ``None``
         replays rows ``0..accept_lens[i]-1`` and compiles a variant with no
         gather.
     track_state_indices : torch.Tensor, optional

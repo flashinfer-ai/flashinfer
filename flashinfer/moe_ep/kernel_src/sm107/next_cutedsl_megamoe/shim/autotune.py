@@ -117,6 +117,8 @@ def sm107_candidates(
     allow_in_kernel_fc2_reduce: bool = False,
     kernel_variant: str = "inference",
     batch_invariant: bool = False,
+    combine_dedup: bool = False,
+    token_back_mode: str = "reuse_dispatch_warps",
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
@@ -142,6 +144,14 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
+    if combine_dedup and (
+        kernel_variant != "inference"
+        or batch_invariant
+        or token_back_mode not in ("reuse_dispatch_warps", "standalone_warps")
+    ):
+        raise ValueError(
+            "dedup candidates require ordinary standard inference and a combine-warp return mode"
+        )
     if batch_invariant:
         if (
             quant_kind
@@ -290,6 +300,12 @@ def sm107_candidates(
             if index < len(groups)
             for candidate in groups[index]
         ]
+    if combine_dedup:
+        out = [
+            dict(candidate, token_back_mode=token_back_mode)
+            for candidate in out
+            if candidate["fc2_use_bulk"] and not candidate["reduce_topk_in_kernel"]
+        ]
     return out
 
 
@@ -372,6 +388,8 @@ def _sweep_sm107_block_scaled_mega_moe(
             cfg.quant_kind,
             kernel_variant=cfg.kernel_variant,
             batch_invariant=getattr(cfg, "batch_invariant", False),
+            combine_dedup=getattr(cfg, "combine_dedup", False),
+            token_back_mode=cfg.token_back_mode,
         )
         if candidates is None
         else candidates
@@ -469,6 +487,12 @@ def _sweep_sm107_block_scaled_mega_moe(
                 for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
                     # Copy the actual bound per-call scales, including defaults.
                     getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
+            if cfg.shared_expert is not None:
+                for name in ("shared_x", "shared_x_sf", "shared_x_sf_linear"):
+                    getattr(trial, name).view(torch.uint8).copy_(
+                        getattr(symm_buffer, name).view(torch.uint8)
+                    )
+                trial.bind_shared_weights(symm_buffer._shared_weights)
             trial.note_staged_tokens(num_tokens)
             trial.prepare(transformed_l1, transformed_l2)
             return trial if make_trial is None else make_trial(trial)
