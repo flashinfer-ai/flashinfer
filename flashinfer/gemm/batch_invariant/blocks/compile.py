@@ -20,7 +20,7 @@ import cutlass
 import cutlass.cute as cute
 
 from ....batch_invariant import jit
-from ..generator import Knobs
+from ..generator import RASTERS, SWIZZLES, Knobs
 from .kernel import BiasBlockGemm, BlockGemm, ScaledBlockGemm
 from .operands import ALIGN, IN_DT, OUT_DT, can_implement  # noqa: F401  (re-exported)
 
@@ -47,12 +47,19 @@ def object_record(cfg: Knobs) -> Knobs:
 
 def launch_args(cfg: Knobs, clusters: int) -> tuple:
     """The trailing Int32 arguments of an object's call: (persistent grid in clusters, swizzle size, raster-along-m
-    flag); ``clusters`` is the launch device's co-resident count, overridden by the knobs' own ``grid_clusters``."""
-    return (
-        int(cfg.grid_clusters or clusters),
-        int(cfg.swizzle_size),
-        1 if cfg.raster_along == "m" else 0,
-    )
+    flag); ``clusters`` is the launch device's co-resident count, overridden by the knobs' own ``grid_clusters``. The
+    values reach the kernel as runtime arguments, so they are checked here (the static objects checked them at compile)."""
+    grid = int(cfg.grid_clusters or clusters)
+    if grid <= 0:
+        raise ValueError(
+            f"batch-invariant GEMM: the persistent grid must be positive, got {grid} clusters"
+        )
+    if cfg.swizzle_size not in SWIZZLES or cfg.raster_along not in RASTERS:
+        raise ValueError(
+            f"batch-invariant GEMM: swizzle {cfg.swizzle_size!r} / raster {cfg.raster_along!r} outside "
+            f"{SWIZZLES} / {RASTERS}"
+        )
+    return (grid, int(cfg.swizzle_size), 1 if cfg.raster_along == "m" else 0)
 
 
 def kernel_name(
