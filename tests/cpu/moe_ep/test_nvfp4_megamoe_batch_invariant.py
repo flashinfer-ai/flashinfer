@@ -25,7 +25,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant i
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("host_only_cuda")]
 
 
 def _public(provider="legacy", **kwargs):

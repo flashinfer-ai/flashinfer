@@ -402,6 +402,7 @@ class BatchInvariantAttention:
                 "equal query and value head dims",
             )
         self._check_heads(num_qo_heads, num_kv_heads)
+        g = num_qo_heads // num_kv_heads
         for name, dt in (
             ("q_data_type", q_data_type),
             ("kv_data_type", kv_data_type),
@@ -497,15 +498,22 @@ class BatchInvariantAttention:
                 max_page = hi  # checked against the cache at run()
         self._check_requests(qo_host, kv_indptr_host, last_host, page_size, causal)
         config = engine.default_config(D=D)
-        if D == 64 and self.kind != "decode":
+        if (
+            D in engine.Q2_DEFAULT_DIMS
+            and self.kind != "decode"
+            and g >= engine.Q2_DEFAULT_MIN_GROUP[D]
+        ):
             from dataclasses import replace
 
             from .swaps.operands import arch_smem_cap
 
-            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill. Its two Q tiles and the
-            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103)
-            slots = 4 if arch_smem_cap(self.device) >= (300 << 10) else 3
-            config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
+            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill (paged and ragged) from GQA
+            # group engine.Q2_DEFAULT_MIN_GROUP up (smaller groups keep the one-warpgroup body). Its two Q tiles and the
+            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103) at
+            # D = 64; at D = 128 the placement fits the 328 KB parts only (engine.Q2_RING)
+            slots = engine.Q2_RING[D][arch_smem_cap(self.device) >= (300 << 10)]
+            if slots:
+                config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         try:
             planned = engine.plan_attention(
                 qo_host,
@@ -798,5 +806,6 @@ class BatchInvariantAttention:
             out,
             self._config,
             ragged=self.kind == "ragged",
+            enable_pdl=enable_pdl,
         )
         return out

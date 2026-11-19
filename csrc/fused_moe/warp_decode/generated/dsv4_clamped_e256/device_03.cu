@@ -44,7 +44,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 1) void
-kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int num_tokens, int route_stride, int M)
+kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int num_tokens, int route_stride, int M, int* __restrict__ route_experts, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -58,6 +58,7 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
     int feature = blockIdx.x * 256 + tid * 2;
     int token = blockIdx.y;
     float preloaded_weights[6];
+    bool route_ok[6];
     float preload_pair[2];
     if (feature + 1 < M && token < num_tokens) {
         {
@@ -99,6 +100,12 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         preloaded_weights[4] = preload_pair[0];
         preloaded_weights[5] = preload_pair[1];
+        route_ok[0] = (unsigned)route_experts[token * 6] < (unsigned)num_experts;
+        route_ok[1] = (unsigned)route_experts[token * 6 + 1] < (unsigned)num_experts;
+        route_ok[2] = (unsigned)route_experts[token * 6 + 2] < (unsigned)num_experts;
+        route_ok[3] = (unsigned)route_experts[token * 6 + 3] < (unsigned)num_experts;
+        route_ok[4] = (unsigned)route_experts[token * 6 + 4] < (unsigned)num_experts;
+        route_ok[5] = (unsigned)route_experts[token * 6 + 5] < (unsigned)num_experts;
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature + 1 < M && token < num_tokens) {
@@ -117,7 +124,7 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         int output_row = slot_pair[0];
         {
             uint32_t _bf16x2_bits_4;
-            _bf16x2_bits_4 = *reinterpret_cast<const uint32_t*>(route_outputs + output_row * route_stride + feature);
+            _bf16x2_bits_4 = route_ok[0] ? *reinterpret_cast<const uint32_t*>(route_outputs + output_row * route_stride + feature) : 0u;
             asm volatile(
                 "{\n\t"
                 "shl.b32 %0, %2, 16;\n\t"
@@ -128,13 +135,13 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         float weight = preloaded_weights[0];
         float _fma_0 = __fmaf_rn(partial[0], weight, value[0]);
-        value[0] = _fma_0;
+        value[0] = route_ok[0] ? _fma_0 : value[0];
         float _fma_1 = __fmaf_rn(partial[1], weight, value[1]);
-        value[1] = _fma_1;
+        value[1] = route_ok[0] ? _fma_1 : value[1];
         int output_row_0 = slot_pair[1];
         {
             uint32_t _bf16x2_bits_5;
-            _bf16x2_bits_5 = *reinterpret_cast<const uint32_t*>(route_outputs + output_row_0 * route_stride + feature);
+            _bf16x2_bits_5 = route_ok[1] ? *reinterpret_cast<const uint32_t*>(route_outputs + output_row_0 * route_stride + feature) : 0u;
             asm volatile(
                 "{\n\t"
                 "shl.b32 %0, %2, 16;\n\t"
@@ -145,9 +152,9 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         float weight_1 = preloaded_weights[1];
         float _fma_2 = __fmaf_rn(partial[0], weight_1, value[0]);
-        value[0] = _fma_2;
+        value[0] = route_ok[1] ? _fma_2 : value[0];
         float _fma_3 = __fmaf_rn(partial[1], weight_1, value[1]);
-        value[1] = _fma_3;
+        value[1] = route_ok[1] ? _fma_3 : value[1];
         int route_index_2 = route_base + 2;
         {
             const int2* _ivptr_6 = reinterpret_cast<const int2*>(route_slots + route_index_2);
@@ -159,7 +166,7 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         int output_row_3 = slot_pair[0];
         {
             uint32_t _bf16x2_bits_7;
-            _bf16x2_bits_7 = *reinterpret_cast<const uint32_t*>(route_outputs + output_row_3 * route_stride + feature);
+            _bf16x2_bits_7 = route_ok[2] ? *reinterpret_cast<const uint32_t*>(route_outputs + output_row_3 * route_stride + feature) : 0u;
             asm volatile(
                 "{\n\t"
                 "shl.b32 %0, %2, 16;\n\t"
@@ -170,13 +177,13 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         float weight_4 = preloaded_weights[2];
         float _fma_4 = __fmaf_rn(partial[0], weight_4, value[0]);
-        value[0] = _fma_4;
+        value[0] = route_ok[2] ? _fma_4 : value[0];
         float _fma_5 = __fmaf_rn(partial[1], weight_4, value[1]);
-        value[1] = _fma_5;
+        value[1] = route_ok[2] ? _fma_5 : value[1];
         int output_row_5 = slot_pair[1];
         {
             uint32_t _bf16x2_bits_8;
-            _bf16x2_bits_8 = *reinterpret_cast<const uint32_t*>(route_outputs + output_row_5 * route_stride + feature);
+            _bf16x2_bits_8 = route_ok[3] ? *reinterpret_cast<const uint32_t*>(route_outputs + output_row_5 * route_stride + feature) : 0u;
             asm volatile(
                 "{\n\t"
                 "shl.b32 %0, %2, 16;\n\t"
@@ -187,9 +194,9 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         float weight_6 = preloaded_weights[3];
         float _fma_6 = __fmaf_rn(partial[0], weight_6, value[0]);
-        value[0] = _fma_6;
+        value[0] = route_ok[3] ? _fma_6 : value[0];
         float _fma_7 = __fmaf_rn(partial[1], weight_6, value[1]);
-        value[1] = _fma_7;
+        value[1] = route_ok[3] ? _fma_7 : value[1];
         int route_index_7 = route_base + 4;
         {
             const int2* _ivptr_9 = reinterpret_cast<const int2*>(route_slots + route_index_7);
@@ -201,7 +208,7 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         int output_row_8 = slot_pair[0];
         {
             uint32_t _bf16x2_bits_10;
-            _bf16x2_bits_10 = *reinterpret_cast<const uint32_t*>(route_outputs + output_row_8 * route_stride + feature);
+            _bf16x2_bits_10 = route_ok[4] ? *reinterpret_cast<const uint32_t*>(route_outputs + output_row_8 * route_stride + feature) : 0u;
             asm volatile(
                 "{\n\t"
                 "shl.b32 %0, %2, 16;\n\t"
@@ -212,13 +219,13 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         float weight_9 = preloaded_weights[4];
         float _fma_8 = __fmaf_rn(partial[0], weight_9, value[0]);
-        value[0] = _fma_8;
+        value[0] = route_ok[4] ? _fma_8 : value[0];
         float _fma_9 = __fmaf_rn(partial[1], weight_9, value[1]);
-        value[1] = _fma_9;
+        value[1] = route_ok[4] ? _fma_9 : value[1];
         int output_row_10 = slot_pair[1];
         {
             uint32_t _bf16x2_bits_11;
-            _bf16x2_bits_11 = *reinterpret_cast<const uint32_t*>(route_outputs + output_row_10 * route_stride + feature);
+            _bf16x2_bits_11 = route_ok[5] ? *reinterpret_cast<const uint32_t*>(route_outputs + output_row_10 * route_stride + feature) : 0u;
             asm volatile(
                 "{\n\t"
                 "shl.b32 %0, %2, 16;\n\t"
@@ -229,9 +236,9 @@ kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100(__nv_bfloat16* __restri
         }
         float weight_11 = preloaded_weights[5];
         float _fma_10 = __fmaf_rn(partial[0], weight_11, value[0]);
-        value[0] = _fma_10;
+        value[0] = route_ok[5] ? _fma_10 : value[0];
         float _fma_11 = __fmaf_rn(partial[1], weight_11, value[1]);
-        value[1] = _fma_11;
+        value[1] = route_ok[5] ? _fma_11 : value[1];
         {
             __nv_bfloat162 _pk = __floats2bfloat162_rn(value[0 + 0], value[0 + 1]);
             *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(output + (token * M + feature)))[0]) = _pk;
