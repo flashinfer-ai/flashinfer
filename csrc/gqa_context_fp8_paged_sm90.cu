@@ -417,9 +417,14 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
      packed scale to +0 and turn the masked -inf scores into NaN (-inf * 0).
      exp2 of a score scaled by <= 2^-24 is ~1 either way (f16 scores are
      bounded by +-65504, so the exponent magnitude stays <= 2^-8), making the
-     clamp the correct uniform-softmax limit of scale -> 0. */
-  const float scale =
-      fmaxf(0.08838834764831845f * 1.4426950408889634f * qds[r] * kds[r], 5.9604644775390625e-8f);
+     clamp the correct uniform-softmax limit of scale -> 0. Clamp from above
+     at 60000 symmetrically: the packed scale must stay f16-finite, and as
+     scale -> inf softmax tends to its one-hot argmax limit, which a clamped
+     scale of 60000 already realises exactly ((s - m) * 60000 <= -60000
+     underflows exp2 to 0 for every non-maximal key). */
+  const float scale = fminf(
+      fmaxf(0.08838834764831845f * 1.4426950408889634f * qds[r] * kds[r], 5.9604644775390625e-8f),
+      60000.f);
   const float vdsc = vds[r];
 
   /* ---- load loop-invariant Q into the wgmma A register fragment ---- */
@@ -453,10 +458,17 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
   for (int i = 0; i < 32; ++i) acc[i] = 0u;
   float mA = -1e30f, mB = -1e30f, lA = 0.f, lB = 0.f;
   const float capd = 8.0f / scale; /* allow p up to 2^8 before refreshing */
-  /* These packed constants only change when the lagging row maximum moves. */
+  /* These packed constants only change when the lagging row maximum moves.
+     rnA/rnB hold the NEGATED lagging row maximum in the raw f16 score
+     domain (p = exp2((s + rn) * scale)): subtracting the reference before
+     the scale folds in keeps the exponent argument exact for any finite
+     descale, where the former s*scale - clamp(m*scale) form broke once
+     |m * scale| crossed its f16-budget clamp. Before the first refresh every
+     score this row has seen is -inf, so rn = 0 keeps (s + rn) = -inf and
+     p = 0 (a +inf rn would make it NaN). */
   const uint32_t rsc = pack_h2(scale);
   uint32_t thrA = 0xfc00fc00u, thrB = 0xfc00fc00u;
-  uint32_t rnA = pack_h2(1e4f * scale), rnB = rnA;
+  uint32_t rnA = 0u, rnB = 0u;
 
   /* ---- prologue: stage the first K/V tile (prefetch distance 1) ---- */
   if (te > tb) {
@@ -486,7 +498,10 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     kbi = kbi + 1;
     if (kbi >= KSTAGE) kbi = 0;
 
-    asm volatile("cp.async.wait_group 0;\n");
+    /* the "memory" clobber keeps the compiler from hoisting the scrub's
+       plain stores above the wait (the wait orders the hardware copies, not
+       the compiler's instruction placement) */
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     /* Scrub the V^T slots of keys at/beyond kvlen in the tail tile: the
        causal mask zeroes their P, but f16 0 * NaN = NaN, so a NaN e4m3 bit
        pattern in an unwritten slot of a partly filled cache page (or in a
@@ -603,16 +618,17 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
       }
       thrA = pack_h2(fminf(mA + capd, 60000.f));
       thrB = pack_h2(fminf(mB + capd, 60000.f));
-      /* The renormaliser -m*scale must stay f16-finite, but clamping the raw
-         max at -1e4 subtracted the clamp instead of the recorded maximum:
-         rows whose scores sit uniformly below -1e4 - ~25/scale (e.g. a
-         constant -16384) had every probability flushed to zero and returned
-         0 instead of the softmax-weighted value. Clamp in scaled (log2)
-         units instead: +-30000 fits f16 with margin and is far beyond exp2's
-         dynamic range, so the clamp can only engage where the probabilities
-         are 0/inf in any arithmetic. */
-      rnA = pack_h2(-fminf(fmaxf(mA * scale, -30000.f), 30000.f));
-      rnB = pack_h2(-fminf(fmaxf(mB * scale, -30000.f), 30000.f));
+      /* The renormaliser is the negated lagging maximum in the raw score
+         domain: the maximum of f16 scores is itself f16-exact, so (s - m)
+         never overflows upward and the subsequent scale multiply is bounded
+         by capd's 2^8 probability budget for any finite descale. (The former
+         -clamp(m*scale, +-30000) form returned 0 instead of the softmax
+         value once |m * scale| crossed the clamp, e.g. per-sequence descale
+         products > ~3.6 over full-range scores.) A row that is still
+         all-masked keeps mA at its -1e30 sentinel; rn = 0 then keeps
+         (s + rn) = -inf and p = 0 instead of packing a non-finite -1e30. */
+      rnA = pack_h2(mA > -1e29f ? -mA : 0.f);
+      rnB = pack_h2(mB > -1e29f ? -mB : 0.f);
     }
     uint32_t sumA = 0u, sumB = 0u;
     /* Pack P straight into the fp8 wgmma A fragment.  Accumulator group j
@@ -624,8 +640,13 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
 #pragma unroll
     for (int j = 0; j < BN / 8; ++j) {
       uint32_t tA, tB;
-      asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(tA) : "r"(sv[2 * j]), "r"(rsc), "r"(rnA));
-      asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(tB) : "r"(sv[2 * j + 1]), "r"(rsc), "r"(rnB));
+      /* subtract the raw-domain reference max first, then fold the scale:
+         (s - m) <= 0 + the capd budget, so the product never overflows f16
+         regardless of the descale magnitude */
+      asm("add.f16x2 %0, %1, %2;\n" : "=r"(tA) : "r"(sv[2 * j]), "r"(rnA));
+      asm("add.f16x2 %0, %1, %2;\n" : "=r"(tB) : "r"(sv[2 * j + 1]), "r"(rnB));
+      asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(tA) : "r"(rsc));
+      asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(tB) : "r"(rsc));
       asm("ex2.approx.f16x2 %0, %0;\n" : "+r"(tA));
       asm("ex2.approx.f16x2 %0, %0;\n" : "+r"(tB));
       asm("add.f16x2 %0, %0, %1;\n" : "+r"(sumA) : "r"(tA));
