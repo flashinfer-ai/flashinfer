@@ -3439,13 +3439,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                 if cutlass.const_expr(self.has_swiglu_beta):
                     acc_vec_up_alpha += cutlass.Float32(self.swiglu_beta)
                 if cutlass.const_expr(self.has_swiglu_alpha):
+                    # Apply the sigmoid before multiplying by up to avoid overflow.
                     tCompute[i] = (
-                        acc_vec_up_alpha
-                        * acc_vec_gate_alpha
+                        acc_vec_gate_alpha
                         * sigmoid_f32(
                             acc_vec_gate_alpha * cutlass.Float32(self.swiglu_alpha),
                             fastmath=True,
                         )
+                        * acc_vec_up_alpha
                     )
                 else:
                     tCompute[i] = acc_vec_up_alpha * silu_f32(
