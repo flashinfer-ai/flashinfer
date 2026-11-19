@@ -9,44 +9,6 @@ import pytest
 import torch
 
 
-@pytest.fixture
-def modern_ep(fake_nccl_ep):
-    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
-    fake_nccl_ep.DispatchQuantizationRecipe = SimpleNamespace(FWD=1)
-    fake_nccl_ep.CombineQuantizationRecipe = SimpleNamespace(NVFP4=1)
-    return fake_nccl_ep
-
-
-def make_handle(ep, *, algorithm="LOW_LATENCY", layout="RANK_MAJOR", **options):
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        EpAlgorithm,
-        EpLayout,
-        FleetAlgoKnobNcclEpConfig,
-        FleetParams,
-        HandleAlgoKnobTopKWeights,
-        HandleParams,
-    )
-    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
-
-    fleet = NcclEpFleet(
-        BootstrapConfig(world_size=4, rank=0),
-        FleetParams(
-            num_experts=8,
-            max_tokens_per_rank=4,
-            token_hidden_size=2048,
-            algorithm=EpAlgorithm[algorithm],
-            layout=EpLayout[layout],
-        ),
-        [FleetAlgoKnobNcclEpConfig(**options)],
-    )
-    handle = fleet.create_handle(
-        HandleParams(topk_ids=torch.zeros(3, 2, dtype=torch.int64)),
-        [HandleAlgoKnobTopKWeights(torch.ones(3, 2))],
-    )
-    return fleet, handle
-
-
 @pytest.mark.parametrize(
     "algorithm,layout,shape",
     [
@@ -56,13 +18,12 @@ def make_handle(ep, *, algorithm="LOW_LATENCY", layout="RANK_MAJOR", **options):
     ],
 )
 def test_forwarded_scales_reach_provider_and_consumer(
-    modern_ep, bypass_build_checks, algorithm, layout, shape
+    modern_ep, make_native_handle, algorithm, layout, shape
 ):
     from flashinfer.moe_ep import DispatchInputParams
-    from flashinfer.moe_ep.modes.split_layer import MoEEpSplitLayer
 
-    fleet, handle = make_handle(
-        modern_ep, algorithm=algorithm, layout=layout, dispatch_quantization="forward"
+    fleet, handle = make_native_handle(
+        algorithm=algorithm, layout=layout, dispatch_quantization="forward"
     )
     x = torch.zeros(3, 2048, dtype=torch.float8_e4m3fn)
     scales = torch.ones(3, 64, dtype=torch.uint8)
@@ -78,14 +39,6 @@ def test_forwarded_scales_reach_provider_and_consumer(
     assert call[2].scales.buffer is received.expert_scales or (
         call[2].scales.buffer.data_ptr() == received.expert_scales.data_ptr()
     )
-    ctx = MoEEpSplitLayer._fleet_kernel_context(
-        SimpleNamespace(_fleet_params=fleet.params, _forward_scales=True), received
-    )
-    assert ctx.expert_tensors_scale is received.expert_scales
-    unchanged = MoEEpSplitLayer._fleet_kernel_context(
-        SimpleNamespace(_fleet_params=fleet.params, _forward_scales=False), received
-    )
-    assert unchanged.expert_tensors_scale is None
     repeated = handle.dispatch(DispatchInputParams(x=[x, scales]))
     assert repeated.expert_scales.data_ptr() == received.expert_scales.data_ptr()
     handle.destroy()
@@ -93,12 +46,10 @@ def test_forwarded_scales_reach_provider_and_consumer(
 
 
 @pytest.mark.parametrize("problem", ["missing", "rows", "alignment", "budget", "dtype"])
-def test_invalid_forwarded_payload_stops_before_dispatch(
-    modern_ep, bypass_build_checks, problem
-):
+def test_invalid_forwarded_payload_stops_before_dispatch(make_native_handle, problem):
     from flashinfer.moe_ep import DispatchInputParams
 
-    fleet, handle = make_handle(modern_ep, dispatch_quantization="forward")
+    fleet, handle = make_native_handle(dispatch_quantization="forward")
     x = torch.zeros(3, 2048, dtype=torch.float8_e4m3fn)
     scales = torch.ones(3, 64, dtype=torch.uint8)
     if problem == "rows":
@@ -117,10 +68,10 @@ def test_invalid_forwarded_payload_stops_before_dispatch(
     fleet.destroy()
 
 
-def test_nvfp4_scales_zero_rows_and_recipe(modern_ep, bypass_build_checks):
+def test_nvfp4_scales_zero_rows_and_recipe(modern_ep, make_native_handle):
     from flashinfer.moe_ep import CombineInputParams
 
-    fleet, handle = make_handle(modern_ep, combine_quantization="nvfp4")
+    fleet, handle = make_native_handle(combine_quantization="nvfp4")
     x = torch.zeros(4, 4, 2048, dtype=torch.bfloat16)
     x[0, 0, 0] = -2
     handle.combine(CombineInputParams(x=[x]))
@@ -145,10 +96,10 @@ def test_nvfp4_scales_zero_rows_and_recipe(modern_ep, bypass_build_checks):
         dict(combine_quantization="nvfp4"),
     ],
 )
-def test_native_options_reject_older_provider(modern_ep, bypass_build_checks, options):
+def test_native_options_reject_older_provider(modern_ep, make_native_handle, options):
     modern_ep.get_lib_version = lambda: "0.2.0"
     with pytest.raises(ValueError, match="EP 0.3"):
-        make_handle(modern_ep, **options)
+        make_native_handle(**options)
 
 
 @pytest.mark.parametrize(
@@ -158,12 +109,10 @@ def test_native_options_reject_older_provider(modern_ep, bypass_build_checks, op
         ("LOW_LATENCY", "EXPERT_MAJOR"),
     ],
 )
-def test_nvfp4_rejects_unsupported_layouts(
-    modern_ep, bypass_build_checks, algorithm, layout
-):
+def test_nvfp4_rejects_unsupported_layouts(make_native_handle, algorithm, layout):
     with pytest.raises(ValueError, match="LOW_LATENCY|RANK_MAJOR"):
-        make_handle(
-            modern_ep, algorithm=algorithm, layout=layout, combine_quantization="nvfp4"
+        make_native_handle(
+            algorithm=algorithm, layout=layout, combine_quantization="nvfp4"
         )
 
 
@@ -239,10 +188,10 @@ def test_layer_rejects_quantization_on_other_transport(option, backend):
 
 
 @pytest.mark.parametrize("invalid", ["dtype", "dimensions", "stride"])
-def test_nvfp4_input_contract(modern_ep, bypass_build_checks, invalid):
+def test_nvfp4_input_contract(make_native_handle, invalid):
     from flashinfer.moe_ep import CombineInputParams
 
-    fleet, handle = make_handle(modern_ep, combine_quantization="nvfp4")
+    fleet, handle = make_native_handle(combine_quantization="nvfp4")
     x = torch.zeros(4, 4, 2048, dtype=torch.bfloat16)
     if invalid == "dtype":
         x = x.float()

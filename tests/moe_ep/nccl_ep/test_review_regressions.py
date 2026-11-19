@@ -23,16 +23,11 @@ from flashinfer.moe_ep import (
 )
 from flashinfer.moe_ep.backends.split.comm.nccl_ep import _runtime, fleet as module
 from tests.moe_ep.nccl_ep.test_handle_mock import _make_fleet, _make_handle
-from tests.moe_ep.nccl_ep.test_native_quantization_mock import make_handle
 
 
 @pytest.mark.parametrize("field", ["tokens", "scales"])
-def test_forwarded_geometry_cannot_release_captured_storage(
-    fake_nccl_ep, bypass_build_checks, field
-):
-    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
-    fake_nccl_ep.DispatchQuantizationRecipe = SimpleNamespace(FWD=1)
-    fleet, handle = make_handle(fake_nccl_ep, dispatch_quantization="forward")
+def test_forwarded_geometry_cannot_release_captured_storage(make_native_handle, field):
+    fleet, handle = make_native_handle(dispatch_quantization="forward")
     values = torch.zeros(3, 2048, dtype=torch.float8_e4m3fn)
     scales = torch.ones(3, 64, dtype=torch.uint8)
     original = handle.dispatch(DispatchInputParams(x=[values, scales]))

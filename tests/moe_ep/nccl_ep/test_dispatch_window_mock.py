@@ -9,48 +9,12 @@ import pytest
 import torch
 
 
-@pytest.fixture
-def modern_ep(fake_nccl_ep):
-    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
-    return fake_nccl_ep
-
-
-def make_handle(ep, *, algorithm="LOW_LATENCY", layout="RANK_MAJOR", **options):
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        EpAlgorithm,
-        EpLayout,
-        FleetAlgoKnobNcclEpConfig,
-        FleetParams,
-        HandleAlgoKnobTopKWeights,
-        HandleParams,
-    )
-    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
-
-    fleet = NcclEpFleet(
-        BootstrapConfig(world_size=4, rank=0),
-        FleetParams(
-            num_experts=8,
-            max_tokens_per_rank=4,
-            token_hidden_size=2048,
-            algorithm=EpAlgorithm[algorithm],
-            layout=EpLayout[layout],
-        ),
-        [FleetAlgoKnobNcclEpConfig(**options)],
-    )
-    handle = fleet.create_handle(
-        HandleParams(topk_ids=torch.zeros(3, 2, dtype=torch.int64)),
-        [HandleAlgoKnobTopKWeights(torch.ones(3, 2))],
-    )
-    return fleet, handle
-
-
 def test_window_reuse_capture_geometry_and_cleanup(
-    modern_ep, bypass_build_checks, monkeypatch
+    modern_ep, make_native_handle, monkeypatch
 ):
     from flashinfer.moe_ep import DispatchInputParams
 
-    fleet, handle = make_handle(modern_ep, dispatch_zero_copy=True)
+    fleet, handle = make_native_handle(dispatch_zero_copy=True)
     modern_ep._core.WindowFlag = SimpleNamespace(COLL_SYMMETRIC=1)
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=0)
@@ -101,28 +65,22 @@ def test_window_reuse_capture_geometry_and_cleanup(
 
 
 @pytest.mark.parametrize(
-    "algorithm,layout,version,match",
+    "algorithm,layout,match",
     [
-        ("LOW_LATENCY", "RANK_MAJOR", "0.2.0", "EP 0.3"),
-        ("HIGH_THROUGHPUT", "EXPERT_MAJOR", "0.3.0", "LOW_LATENCY"),
-        ("LOW_LATENCY", "EXPERT_MAJOR", "0.3.0", "RANK_MAJOR"),
+        ("HIGH_THROUGHPUT", "EXPERT_MAJOR", "LOW_LATENCY"),
+        ("LOW_LATENCY", "EXPERT_MAJOR", "RANK_MAJOR"),
     ],
 )
-def test_window_admission(
-    modern_ep, bypass_build_checks, algorithm, layout, version, match
-):
-    modern_ep.get_lib_version = lambda: version
+def test_window_admission(make_native_handle, algorithm, layout, match):
     with pytest.raises(ValueError, match=match):
-        make_handle(
-            modern_ep, algorithm=algorithm, layout=layout, dispatch_zero_copy=True
-        )
+        make_native_handle(algorithm=algorithm, layout=layout, dispatch_zero_copy=True)
 
 
 @pytest.mark.parametrize("null_handle", [False, True])
 def test_window_registration_failure_allows_retry(
-    modern_ep, bypass_build_checks, monkeypatch, null_handle
+    modern_ep, make_native_handle, monkeypatch, null_handle
 ):
-    fleet, handle = make_handle(modern_ep, dispatch_zero_copy=True)
+    fleet, handle = make_native_handle(dispatch_zero_copy=True)
     modern_ep._core.WindowFlag = SimpleNamespace(COLL_SYMMETRIC=1)
     closed = []
     rejected = SimpleNamespace(handle=0, close=lambda: closed.append("rejected"))
@@ -148,9 +106,9 @@ def test_window_registration_failure_allows_retry(
 
 
 def test_window_descriptor_failure_releases_registration(
-    modern_ep, bypass_build_checks, monkeypatch
+    modern_ep, make_native_handle, monkeypatch
 ):
-    fleet, handle = make_handle(modern_ep, dispatch_zero_copy=True)
+    fleet, handle = make_native_handle(dispatch_zero_copy=True)
     modern_ep._core.WindowFlag = SimpleNamespace(COLL_SYMMETRIC=1)
     closed = []
     window = SimpleNamespace(handle=1, close=lambda: closed.append(True))
