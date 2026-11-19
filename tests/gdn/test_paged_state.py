@@ -2546,6 +2546,209 @@ def test_paged_prefill_cake_cp_cuda_graph_interleaved_plans():
         )
 
 
+def _count_cake_calls(monkeypatch):
+    """Count the calls of the Cake entry of ``chunk_gated_delta_rule_paged``."""
+    import flashinfer.gdn_paged as gdn_paged
+
+    calls = []
+    entry = gdn_paged._chunk_gated_delta_rule_paged_cake_cp
+
+    def counting(*args, **kwargs):
+        calls.append(None)
+        return entry(*args, **kwargs)
+
+    monkeypatch.setattr(gdn_paged, "_chunk_gated_delta_rule_paged_cake_cp", counting)
+    return calls
+
+
+def _auto_inputs(total, heads, dtype):
+    num_q_heads, num_k_heads, num_v_heads = heads
+    num_sab_heads = max(num_q_heads, num_v_heads)
+
+    def uniform(num_heads):
+        return (0.5 * torch.rand(total, num_heads, HEAD_SIZE, device="cuda") - 0.25).to(
+            dtype
+        )
+
+    q, v = uniform(num_q_heads), uniform(num_v_heads)
+    k = F.normalize(uniform(num_k_heads).float(), p=2.0, dim=-1).to(dtype)
+    g = 0.9 + 0.1 * torch.rand(total, num_sab_heads, device="cuda")
+    beta = torch.rand(total, num_sab_heads, device="cuda")
+    return q, k, v, g, beta
+
+
+def _run_auto_against(
+    monkeypatch,
+    backend,
+    new_lens,
+    heads,
+    *,
+    max_seqlen=None,
+    state_dtype=torch.float32,
+    page_size=1024,
+    seed=0,
+):
+    """``backend="auto"`` takes ``backend``'s route and returns its exact
+    output and pool, from one starting pool."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    calls = _count_cake_calls(monkeypatch)
+    num_sab_heads = max(heads[0], heads[2])
+    total = sum(new_lens)
+    # 64-aligned prefixes: none, one page, one chunk.
+    prefix_lens = [(0, page_size, CHUNK)[b % 3] for b in range(len(new_lens))]
+    totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
+    q, k, v, g, beta = _auto_inputs(total, heads, torch.bfloat16)
+    batch = PagedBatch(totals, page_size, num_sab_heads, state_dtype)
+    batch.pool.copy_(0.1 * torch.randn_like(batch.pool))
+    indices, indptr, last = batch.tables()
+    results = {}
+    for name in (backend, "auto"):
+        pool = batch.pool.clone()
+        calls.clear()
+        out = chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            cu_seqlens=_cu(new_lens, "cuda"),
+            state_pool=pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_size=page_size,
+            last_page_len=last,
+            backend=name,
+            max_seqlen=max_seqlen,
+        )
+        torch.cuda.synchronize()
+        results[name] = (out, pool, len(calls))
+    assert results["auto"][2] == (1 if backend == "cake_gdn" else 0), (
+        f'backend="auto" did not take the {backend} route'
+    )
+    assert torch.equal(results["auto"][0], results[backend][0]), "output"
+    assert torch.equal(results["auto"][1], results[backend][1]), "pool"
+
+
+@pytest.mark.parametrize(
+    ("new_lens", "heads", "max_seqlen", "backend"),
+    [
+        # 2 x 4 states and a longest sequence of about 4128 tokens: in the band.
+        ([4096, 4160], (2, 2, 4), None, "cake_gdn"),
+        # The hint lifts a balanced batch of 1024-token sequences into the band.
+        ([1024, 1024], (2, 2, 4), 2048, "cake_gdn"),
+        # Without the hint the mean estimate (1024) keeps it out.
+        ([1024, 1024], (2, 2, 4), None, "flashinfer"),
+        # Long sequences, but 16 x 4 = 64 states run in parallel.
+        ([4096] * 16, (2, 2, 4), None, "flashinfer"),
+    ],
+)
+def test_paged_prefill_auto_backend_choice(
+    monkeypatch, new_lens, heads, max_seqlen, backend
+):
+    _skip_if_unsupported()
+    if backend == "cake_gdn":
+        _skip_unless_cake_cp()
+    _run_auto_against(
+        monkeypatch, backend, new_lens, heads, max_seqlen=max_seqlen, seed=11
+    )
+
+
+@pytest.mark.parametrize("case", ["bf16_pool", "no_cake_programs"])
+def test_paged_prefill_auto_falls_back_when_cake_rejects(monkeypatch, case):
+    """In the band, a call the Cake route rejects runs "flashinfer" instead of
+    raising."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    state_dtype = torch.float32
+    if case == "bf16_pool":
+        state_dtype = torch.bfloat16
+    else:
+        import flashinfer.gdn_kernels.blackwell as blackwell
+
+        monkeypatch.setattr(
+            blackwell, "_chunk_gated_delta_rule_gdn_cp_paged_sm100", None
+        )
+    _run_auto_against(
+        monkeypatch,
+        "flashinfer",
+        [4096, 4160],
+        (2, 2, 4),
+        state_dtype=state_dtype,
+        seed=12,
+    )
+
+
+def test_paged_prefill_auto_cuda_graph(monkeypatch):
+    """A captured backend="auto" call in the band runs the Cake route and
+    reads the live page table at replay, matching an eager call."""
+    _skip_if_unsupported()
+    _skip_unless_cake_cp()
+    calls = _count_cake_calls(monkeypatch)
+    torch.manual_seed(13)
+    random.seed(13)
+    L = 1024
+    new_lens = [4096, 4160]
+    heads = (2, 2, 4)
+    q, k, v, g, beta = _auto_inputs(sum(new_lens), heads, torch.bfloat16)
+    cu = _cu(new_lens, "cuda")
+    pool = 0.1 * torch.randn(24, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    scratch = pool.clone()
+    indices = torch.zeros(10, dtype=torch.int32, device="cuda")
+    indptr = torch.empty(3, dtype=torch.int32, device="cuda")
+    last = torch.empty(2, dtype=torch.int32, device="cuda")
+    guard, out = _guarded_output(sum(new_lens), 4, q.dtype)
+    # (page ids, page counts, last_page_len): prefixes 0 / 0, then 1024 / 64.
+    steps = [
+        ([4, 7, 1, 12, 3, 20, 9, 15, 6, 0], [4, 5], [L, 64]),
+        ([5, 8, 2, 11, 13, 21, 10, 16, 17, 18], [5, 5], [L, 128]),
+    ]
+
+    def call(state_pool, output):
+        return chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            cu_seqlens=cu,
+            state_pool=state_pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_size=L,
+            last_page_len=last,
+            output=output,
+            backend="auto",
+        )
+
+    def set_tables(step):
+        page_ids, counts, last_lens = step
+        indices.copy_(torch.tensor(page_ids, dtype=torch.int32))
+        indptr.copy_(_cu(counts, "cpu"))
+        last.copy_(torch.tensor(last_lens, dtype=torch.int32))
+
+    set_tables(steps[0])
+    graph = _capture(lambda warmup: call(scratch if warmup else pool, out))
+    assert len(calls) == 2, 'backend="auto" did not capture the Cake route'
+    expected_out = torch.empty_like(out)
+    for i, step in enumerate(steps):
+        set_tables(step)
+        expected_pool = pool.clone()
+        call(expected_pool, expected_out)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_output_guard(guard)
+        torch.testing.assert_close(
+            out, expected_out, atol=1e-3, rtol=1e-3, msg=f"step {i}: output"
+        )
+        torch.testing.assert_close(
+            pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"step {i}: pool"
+        )
+
+
 def test_paged_decode_cuda_graph_reads_live_page_tables():
     """A captured paged decode reads the page table at replay: the same graph
     serves a token that opens a new page and one that continues a page."""

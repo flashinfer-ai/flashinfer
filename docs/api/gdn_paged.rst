@@ -93,6 +93,25 @@ scratch page. A padded decode sequence uses a scratch page with
     )
     # Reads page 3, writes page 12; pages 7 and 3 are unchanged.
 
+Backends
+--------
+
+``chunk_gated_delta_rule_paged`` takes ``backend="flashinfer"`` (the default),
+``"cake_gdn"`` or ``"auto"``:
+
+- ``"flashinfer"`` runs the serial chunked kernel on every supported GPU.
+- ``"cake_gdn"`` splits each sequence across SMs on SM100, SM103 and SM107. It
+  needs a float32 pool and every prefix length a multiple of 64; a sequence
+  with a misaligned prefix gets NaN in the page rows it writes. Its results are
+  not bitwise those of ``"flashinfer"``.
+- ``"auto"`` picks ``"cake_gdn"`` when that route accepts the call, few
+  states run in parallel (at most 12 to 48, by device) and the longest sequence
+  is long enough (2048 to 6144 new tokens, more for more states), and
+  ``"flashinfer"`` otherwise. Whenever it may pick ``"cake_gdn"``, it has
+  the same 64-aligned prefix contract. The choice reads only shapes, dtypes and
+  the device, so it is safe in a CUDA graph. The ``backend`` parameter of the
+  function gives the exact rule.
+
 Slot arguments of ``chunk_gated_delta_rule``
 --------------------------------------------
 

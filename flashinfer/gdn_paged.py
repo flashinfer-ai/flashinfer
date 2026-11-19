@@ -34,8 +34,9 @@ import torch
 
 from .api_logging import flashinfer_api
 from .gdn_decode import gated_delta_rule_decode_pretranspose
-from .gdn_prefill import chunk_gated_delta_rule
+from .gdn_prefill import _cake_gdn_cp_band_max_seqlen, chunk_gated_delta_rule
 from .trace.templates.gdn import gdn_decode_paged_trace, gdn_prefill_paged_trace
+from .utils import get_compute_capability
 
 
 def _check_page_table(
@@ -231,6 +232,105 @@ def gdn_paged_decode_slots(
     return slots
 
 
+# The band of ``backend="auto"``, per (compute capability, I/O dtype): tiers
+# ``(max_parallel_states, min_seqlen)``. The Cake route is picked when, for some
+# tier, ``num_seqs * num_sab_heads <= max_parallel_states`` and the bound of the
+# longest sequence's new tokens is at least ``min_seqlen``. A pair that is not
+# listed keeps "flashinfer". The tiers come from measurements against
+# "flashinfer" on B200, GB300 and VR200 (CUDA graph replay, page size 1024,
+# prefixes 0 and 4096, bf16 and fp16): the Cake route was faster in every
+# measured row inside them. On SM107, 49 or more states lose at 4096 tokens.
+_CAKE_GDN_PAGED_AUTO_SM100_TIERS = ((12, 2048), (32, 4096))
+_CAKE_GDN_PAGED_AUTO_SM107_TIERS = ((12, 2048), (32, 4096), (48, 6144))
+_CAKE_GDN_PAGED_AUTO_BANDS: dict[
+    tuple[tuple[int, int], torch.dtype], tuple[tuple[int, int], ...]
+] = {
+    ((10, 0), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
+    ((10, 0), torch.float16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
+    ((10, 3), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
+    ((10, 3), torch.float16): _CAKE_GDN_PAGED_AUTO_SM100_TIERS,
+    ((10, 7), torch.bfloat16): _CAKE_GDN_PAGED_AUTO_SM107_TIERS,
+    ((10, 7), torch.float16): _CAKE_GDN_PAGED_AUTO_SM107_TIERS,
+}
+
+
+def _paged_auto_picks_cake(
+    *,
+    capability: tuple[int, int],
+    num_seqs: int,
+    num_sab_heads: int,
+    seqlen_bound: int,
+    io_dtype: torch.dtype,
+) -> bool:
+    """Whether ``backend="auto"`` takes the Cake route by the measured band.
+
+    Reads host values only. ``seqlen_bound`` bounds the new tokens of the
+    longest sequence (``_cake_gdn_cp_band_max_seqlen``).
+    """
+    tiers = _CAKE_GDN_PAGED_AUTO_BANDS.get((capability, io_dtype), ())
+    if num_seqs <= 0 or num_sab_heads <= 0:
+        return False
+    parallel_states = num_seqs * num_sab_heads
+    return any(
+        parallel_states <= max_parallel_states and seqlen_bound >= min_seqlen
+        for max_parallel_states, min_seqlen in tiers
+    )
+
+
+def _cake_cp_paged_rejection_reason(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    page_size: int,
+) -> Optional[str]:
+    """Why the Cake route cannot serve this call, or ``None``. Reads shapes,
+    dtypes, strides, addresses and the device only."""
+    try:
+        from .gdn_kernels.blackwell import (
+            _chunk_gated_delta_rule_gdn_cp_paged_sm100,
+            _gdn_cp_paged_rejection_reason,
+        )
+    except (ImportError, RuntimeError):
+        return "needs the Cake GDN CP programs"
+    if (
+        _chunk_gated_delta_rule_gdn_cp_paged_sm100 is None
+        or _gdn_cp_paged_rejection_reason is None
+    ):
+        return "needs the Cake GDN CP programs"
+    return _gdn_cp_paged_rejection_reason(q, k, v, state_pool, page_size=page_size)
+
+
+def _paged_auto_uses_cake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    output: Optional[torch.Tensor],
+    *,
+    num_seqs: int,
+    page_size: int,
+    max_seqlen: Optional[int],
+) -> bool:
+    """The route of ``backend="auto"``: the Cake route inside the measured
+    band when it accepts the call. No host synchronization."""
+    if q.device.type != "cuda" or num_seqs <= 0:
+        return False
+    if not _paged_auto_picks_cake(
+        capability=get_compute_capability(q.device),
+        num_seqs=num_seqs,
+        num_sab_heads=max(q.size(1), v.size(1)),
+        seqlen_bound=_cake_gdn_cp_band_max_seqlen(max_seqlen, q.size(0), num_seqs),
+        io_dtype=q.dtype,
+    ):
+        return False
+    # The Cake route also rejects an output buffer that is not contiguous and
+    # 16-byte aligned, which "flashinfer" accepts.
+    if output is not None and (not output.is_contiguous() or output.data_ptr() % 16):
+        return False
+    return _cake_cp_paged_rejection_reason(q, k, v, state_pool, page_size) is None
+
+
 def _chunk_gated_delta_rule_paged_cake_cp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -253,17 +353,12 @@ def _chunk_gated_delta_rule_paged_cake_cp(
     beta_is_logit: bool,
     max_seqlen: Optional[int],
 ) -> torch.Tensor:
-    from .gdn_kernels.blackwell import (
-        _chunk_gated_delta_rule_gdn_cp_paged_sm100,
-        _gdn_cp_paged_rejection_reason,
-    )
-    from .gdn_kernels.gates import materialize_gates, validate_gate_inputs
-
-    if _chunk_gated_delta_rule_gdn_cp_paged_sm100 is None:
-        raise ValueError('backend="cake_gdn" needs the Cake GDN CP programs')
-    reason = _gdn_cp_paged_rejection_reason(q, k, v, state_pool, page_size=page_size)
+    reason = _cake_cp_paged_rejection_reason(q, k, v, state_pool, page_size)
     if reason is not None:
         raise ValueError(f'backend="cake_gdn": {reason}')
+    from .gdn_kernels.blackwell import _chunk_gated_delta_rule_gdn_cp_paged_sm100
+    from .gdn_kernels.gates import materialize_gates, validate_gate_inputs
+
     if (
         gate_domain != "linear"
         or use_gate_in_kernel
@@ -350,7 +445,7 @@ def chunk_gated_delta_rule_paged(
     dt_bias: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
     slots: Optional[GDNPagedPrefillSlots] = None,
-    backend: Literal["flashinfer", "cake_gdn"] = "flashinfer",
+    backend: Literal["flashinfer", "cake_gdn", "auto"] = "flashinfer",
     max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Chunked GDN prefill that reads and writes a paged recurrent-state pool.
@@ -421,13 +516,33 @@ def chunk_gated_delta_rule_paged(
         ``"flashinfer"`` at small ``num_seqs * num_sab_heads`` with long
         sequences, about even at 32 with 2048 new tokens per sequence, and
         slower (0.4-0.8x) at 64 or more.
+        ``"auto"`` (opt-in) picks ``"cake_gdn"`` where it measured faster
+        than ``"flashinfer"``, and ``"flashinfer"`` everywhere else. It picks
+        ``"cake_gdn"`` only when that route accepts the call (the device,
+        dtypes, state pool and page size above, and an ``output``, if given,
+        that is contiguous and 16-byte aligned) and the batch has few states
+        in parallel and a long sequence. With ``S = num_seqs *
+        num_sab_heads`` and ``L`` the new tokens of the longest sequence,
+        that is ``S <= 12`` and ``L >= 2048``, or ``S <= 32`` and ``L >=
+        4096``, on SM100, SM103 and SM107; SM107 also takes ``S <= 48`` and
+        ``L >= 6144``. ``L`` is ``max_seqlen`` when given, else
+        ``ceil(total_seq_len / num_seqs)``. The choice reads only shapes,
+        dtypes and the device, so it does not synchronize and is safe in a
+        CUDA graph. Whenever it may pick ``"cake_gdn"``, ``"auto"`` has the
+        same contract: every prefix must be a multiple of 64, or that
+        sequence's page rows are NaN, and the results are not bitwise those
+        of ``"flashinfer"``. The default stays ``"flashinfer"`` because the
+        choice cannot check the prefix lengths without a host
+        synchronization.
     max_seqlen : int, optional
         With ``backend="cake_gdn"``, an upper bound of the new tokens of any
         sequence; it sizes the split. Without it the bound is the total, and
         a larger value is clamped to the total. A value smaller than the new
         tokens of a sequence is undefined behavior; it is checked only with
         ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``, where it fails a device
-        assert.
+        assert. With ``backend="auto"`` it also sets the length that the
+        choice reads, under the same contract when the choice is
+        ``"cake_gdn"``.
 
     Returns
     -------
@@ -449,8 +564,25 @@ def chunk_gated_delta_rule_paged(
             "state_pool must be [num_pages, num_sab_heads, head_size, head_size], "
             f"got shape {tuple(state_pool.shape)}"
         )
-    if backend not in ("flashinfer", "cake_gdn"):
-        raise ValueError(f'backend must be "flashinfer" or "cake_gdn", got {backend!r}')
+    if backend not in ("flashinfer", "cake_gdn", "auto"):
+        raise ValueError(
+            f'backend must be "flashinfer", "cake_gdn" or "auto", got {backend!r}'
+        )
+    if backend == "auto":
+        backend = (
+            "cake_gdn"
+            if _paged_auto_uses_cake(
+                q,
+                k,
+                v,
+                state_pool,
+                output,
+                num_seqs=num_seqs,
+                page_size=page_size,
+                max_seqlen=max_seqlen,
+            )
+            else "flashinfer"
+        )
     if slots is None:
         slots = gdn_paged_prefill_slots(
             cu_seqlens, page_indices, page_indptr, page_size, last_page_len
