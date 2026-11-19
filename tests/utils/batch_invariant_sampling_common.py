@@ -126,6 +126,9 @@ def precompile(
         return
     workers = max(1, min(workers, len(specs)))
     env = dict(os.environ)
+    env["BI_PRECOMPILE_WORKER"] = (
+        "1"  # the workers compile outside the module lock (batch_invariant.jit.build_and_load)
+    )
     if os.environ.get("BI_SAMPLING_PRECOMPILE_DEVICE_FREE") == "1":
         # no device in the workers: the device's architecture explicitly, so the module directory
         # (FLASHINFER_CUDA_ARCH_LIST decides the workspace's segment, CUTE_DSL_ARCH the kernel target) is the one this

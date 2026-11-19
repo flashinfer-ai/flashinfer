@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple
 
@@ -200,11 +201,27 @@ def relative_sources(module: str) -> list:
     return [str(p.relative_to(_FI_DIR)) for p in module_sources(module)]
 
 
+#: A process that serves as a PRECOMPILE WORKER sets this to ``1``: its builds take the unlocked path below. The default
+#: ``JitSpec.build_and_load`` holds the op family's module lock for the whole compile (one build at a time per family across
+#: processes), which turns a pool of workers into a serial compile: 579 kernels on 8 workers measured 1565 s, the single-process
+#: 2.6 s per kernel times the count (2026-11-18). ``compile_and_persist`` compiles unlocked and takes the lock only for the
+#: stale-module wipe and the artifact export -- the path the GEMM and MoE precompilers use.
+PRECOMPILE_WORKER_ENV = "BI_PRECOMPILE_WORKER"
+
+
 def build_and_load(module: str, kernel: str, compile_fn: Callable[[], Any]) -> Any:
-    """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss."""
+    """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss; in a precompile worker
+    (``BI_PRECOMPILE_WORKER=1``) the compile runs outside the module lock."""
+    key_files = [str(p) for p in module_sources(module)]
+    if os.environ.get(PRECOMPILE_WORKER_ENV) == "1":
+        from ..jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
+
+        spec = JitSpecCuteDsl(
+            module, kernel, compile_fn, _hash_source_files(tuple(key_files))
+        )
+        if not spec.is_compiled:
+            spec.compile_and_persist()
+        return spec.load()
     return build_and_load_cute_dsl_kernel(
-        module,
-        kernel,
-        compile_fn,
-        extra_key_files=[str(p) for p in module_sources(module)],
+        module, kernel, compile_fn, extra_key_files=key_files
     )

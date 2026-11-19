@@ -23,6 +23,7 @@ is the sum identity on the non-negative ``e_j``), which the digits' ``identity_n
 
 from __future__ import annotations
 
+import functools
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -307,6 +308,8 @@ LOG2E_F32 = fp32.to_f32(LOG2E)
 LN2_F32 = fp32.to_f32(LN2)
 
 
+@functools.lru_cache(maxsize=4096)
 def scale_value(T: Optional[float]) -> float:
-    """The host-side ``c`` for a scalar temperature (``fp32.div``, the device's ``div.rn``) or none."""
+    """The host-side ``c`` for a scalar temperature (``fp32.div``, the device's ``div.rn``) or none. Memoised per value:
+    the exact division runs on Python rationals (tens of microseconds), and a serving loop passes the same few temperatures."""
     return LOG2E_F32 if T is None else fp32.div(LOG2E_F32, fp32.to_f32(T))

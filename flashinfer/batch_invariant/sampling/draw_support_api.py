@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union
 
+import functools
+
 import torch
 
 from ..support import check_no_overlap, out_buffer, scratch, unsupported
@@ -56,6 +58,39 @@ def _check_input(x: torch.Tensor, name: str) -> int:
     return check_input(x, name, CLASS, SUPPORT_ARCHS)
 
 
+_CONST_ROWS: Dict[tuple, torch.Tensor] = {}
+_CONST_ROWS_MAX = 256
+
+
+def _const_rows(device, dtype: torch.dtype, v, M: int) -> torch.Tensor:
+    """The per-row tensor of a Python-scalar filter value, cached per (device, dtype, value, rows): the kernel only reads
+    it, so one fill serves every call with that scalar (a fill kernel and an allocation per scalar filter per call before
+    2026-11-18). A tensor made inside a CUDA-graph capture belongs to the graph's pool and is not cached; the cache is
+    bounded (past the bound a call fills a fresh tensor, as before)."""
+    key = (device, dtype, v, M)
+    t = _CONST_ROWS.get(key)
+    if t is None:
+        t = torch.full((M,), v, dtype=dtype, device=device)
+        if (
+            len(_CONST_ROWS) < _CONST_ROWS_MAX
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _CONST_ROWS[key] = t
+    return t
+
+
+@functools.lru_cache(maxsize=None)
+def _filters_for(use_k: bool, use_p: bool, use_m: bool, order: str) -> Filters:
+    """The filter-set descriptor of a call (which filters, the order): the values are the class's placeholders (the kernel reads
+    the per-row tensors), so one object per set -- its construction rounds the placeholders through the exact binary32 model."""
+    return Filters(
+        top_k=1 if use_k else None,
+        top_p=1.0 if use_p else None,
+        min_p=0.0 if use_m else None,
+        order=order,
+    )
+
+
 def _row_param(
     value,
     M: int,
@@ -74,6 +109,14 @@ def _row_param(
     if value is None:
         return None, False
     if isinstance(value, torch.Tensor):
+        if (
+            value.dtype == dtype
+            and value.device == device
+            and value.dim() == 1
+            and value.shape[0] == M
+            and value.is_contiguous()
+        ):
+            return value, True  # already the kernel's form: no copy, no view
         t = value.to(device=device)
         if (
             dtype == torch.int32
@@ -100,7 +143,7 @@ def _row_param(
         v = float(value)
         if not (v >= lo) or v != v or v == float("inf"):
             raise ValueError(f"{name}={value!r} must be a finite number >= {lo}")
-    return torch.full((M,), v, dtype=dtype, device=device), True
+    return _const_rows(device, dtype, v, M), True
 
 
 def _source_row_param(value, indices, idx, Msrc: int, name: str):
@@ -165,7 +208,12 @@ def draw_support(
     ``"all"``, ``""``) and ``count_list`` (``None``: the kernel's rule) are the selection's placements, pinned against each
     other by the suite. ``out`` (int32), ``logprob_out`` and ``kept_logprob_out`` (fp32; each
     implies its ``return_*``) are caller-owned buffers of the output shape, written in place and returned as given."""
-    from .draw_support_kernel import get_compiled_kernel
+    from .draw_support_kernel import (
+        FLAG_INDICES,
+        FLAG_KEPT_LOGPROB,
+        FLAG_TEMP_ROWS,
+        get_compiled_kernel,
+    )
 
     name = "logits" if from_logits else "probs"
     N = _check_input(x, name)
@@ -214,12 +262,7 @@ def draw_support(
     k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k", hi=N)
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
-    filters = Filters(
-        top_k=1 if use_k else None,
-        top_p=1.0 if use_p else None,
-        min_p=0.0 if use_m else None,
-        order=order,
-    )
+    filters = _filters_for(use_k, use_p, use_m, order)
     temp_t, c = _temperature(temperature, M, lead, dev) if from_logits else (None, 0.0)
     elem_bytes = x.element_size()
     if config is None:
@@ -327,6 +370,10 @@ def draw_support(
             M,
             Msrc,
             N,
+            (FLAG_TEMP_ROWS if temp_t is not None else 0)
+            | (FLAG_INDICES if indices is not None else 0)
+            | (FLAG_KEPT_LOGPROB if return_kept_logprob else 0),
+            int(bool(enable_pdl)),
         )
     elif M > 0:
         # a gather from an empty source: every index lies outside the source rows, nothing is read or kept
@@ -375,7 +422,11 @@ def kept_log_probs(
     ``return_logprob``: the full distribution's, ``log_probs`` at the token)``}``. One id per row; ``top_k`` / ``top_p`` /
     ``min_p`` (at least one) and ``order`` as :func:`draw_support` takes them. ``out`` / ``logprob_out`` are caller-owned
     fp32 buffers of the row shape, written in place and returned as given."""
-    from .draw_support_kernel import get_compiled_kernel
+    from .draw_support_kernel import (
+        FLAG_KEPT_LOGPROB,
+        FLAG_TEMP_ROWS,
+        get_compiled_kernel,
+    )
 
     N = _check_input(logits, "logits")
     if order not in ORDERS:
@@ -407,12 +458,7 @@ def kept_log_probs(
     k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k", hi=N)
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
-    filters = Filters(
-        top_k=1 if use_k else None,
-        top_p=1.0 if use_p else None,
-        min_p=0.0 if use_m else None,
-        order=order,
-    )
+    filters = _filters_for(use_k, use_p, use_m, order)
     temp_t, c = _temperature(temperature, M, lead, dev)
     elem_bytes = logits.element_size()
     if config is None:
@@ -508,6 +554,8 @@ def kept_log_probs(
             M,
             M,
             N,
+            (FLAG_TEMP_ROWS if temp_t is not None else 0) | FLAG_KEPT_LOGPROB,
+            int(bool(enable_pdl)),
         )
     res = {"kept_logp": kb if kb is not None else lpk.view(lead)}
     if return_logprob:

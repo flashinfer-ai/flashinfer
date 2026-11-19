@@ -90,6 +90,14 @@ from .support_spec import FIX_SCALE, Filters
 DRAW_SUPPORT_MODULE = "batch_invariant_sampling_draw_support"
 
 
+# The per-call switches of the K5 kernels (a flag word, runtime; never a kernel variant): each one select or one predicated
+# store per ROW, the bits of every row those of the specialised kernels they replace (2026-11-18). `return_logprob` is NOT a
+# flag: the full distribution's log-probability needs the row-sum pass, which the top-k forms do not otherwise run.
+FLAG_TEMP_ROWS = 1  # the temperature per row (mTemp) instead of the constant c_const
+FLAG_INDICES = 2  # the index gather: row r reads source row mIdx[r]
+FLAG_KEPT_LOGPROB = 4  # the drawn token's log-probability over the kept set is written (logits kernels; the score form always)
+
+
 class DrawSupportKernel:
     """The truncated draw for one ``Kp`` bucket (``N`` runtime): the input kind (logits / probabilities), the filter set
     (which of top-k / top-p / min-p are on, their order), the temperature form, with or without an index gather, the drawn
@@ -118,15 +126,18 @@ class DrawSupportKernel:
         assert early_finish in ("", "mass", "all")
         # the score form (``log_probs`` under the sampler's filters): the exact form's selection and kept mass, then the
         # given token's log-probabilities instead of a draw -- logits only, the kept-set value always, no stream, no gather
-        assert not score or (from_logits and return_kept_logprob and not has_indices), (
-            "the score form takes logits, returns the kept-set log-probability and gathers no source rows"
+        assert not score or from_logits, (
+            "the score form takes logits (the kept-set log-probability is its output)"
         )
+        # temp_rows / has_indices / return_kept_logprob are runtime flags of the kernel (FLAG_*): accepted here and ignored
         self.score = score
         self.early_finish, self.study = early_finish, ""
-        self.return_kept_logprob = return_kept_logprob
         self.dtype, self.N, self.Kp, self.cfg = dtype, N, Kp, cfg
-        self.from_logits, self.filters, self.temp_rows = from_logits, filters, temp_rows
-        self.has_indices, self.return_logprob = has_indices, return_logprob
+        self.from_logits, self.filters, self.return_logprob = (
+            from_logits,
+            filters,
+            return_logprob,
+        )
         self.use_k, self.use_p, self.use_m = (
             filters.top_k is not None,
             filters.top_p is not None,
@@ -231,7 +242,8 @@ class DrawSupportKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
+        flags: Int32,
+        enable_pdl: Int32,
         stream,
     ):
         k = self.kernel(
@@ -254,7 +266,7 @@ class DrawSupportKernel:
             M,
             Msrc,
             N,
-            enable_pdl,
+            flags,
             self._tv_layout(self.vec),
             (1, BLOCK),
         )
@@ -298,14 +310,16 @@ class DrawSupportKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
+        flags: Int32,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         fp = CuteF32
         bidx, _, _ = cute.arch.block_idx()
-        if enable_pdl:
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no effect unless the launch carried the PDL attribute (a runtime launch argument)
+        flag_temp = (flags & Int32(FLAG_TEMP_ROWS)) != Int32(0)
+        flag_idx = (flags & Int32(FLAG_INDICES)) != Int32(0)
+        flag_lpk = (flags & Int32(FLAG_KEPT_LOGPROB)) != Int32(0)
         W, C = self.W, self.C
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -322,16 +336,10 @@ class DrawSupportKernel:
         row = rg.to(Int64)
         row_ok = row < M
         row_c = _select(row_ok, row, M - 1)
-        # the source row (an index gather reads row indices[row])
-        src_ok = row_ok
-        if cutlass.const_expr(self.has_indices):
-            src = mIdx[row_c]
-            src_ok = (src >= 0) & (src < Msrc)
-            src_c = _select(src_ok, src, Int64(0))
-            tile_row = src_c.to(Int32)
-        else:
-            src_c = row_c
-            tile_row = rg
+        # the source row: an index gather reads row indices[row] (the flag's dummy index tensor is read at 0 when the flag is off)
+        src = _select(flag_idx, mIdx[_select(flag_idx, row_c, Int64(0))], row_c)
+        src_ok = _select(flag_idx, (src >= 0) & (src < Msrc), row_ok)
+        src_c = _select(src_ok, src, Int64(0))
 
         # ---- shared memory: the staged share, the exchange buffers, the histograms ------------------------------
         smem = cutlass.utils.SmemAllocator()
@@ -392,20 +400,33 @@ class DrawSupportKernel:
                 t
             )
         idX = cute.make_identity_tensor(mX.shape)
-        if cutlass.const_expr(self.temp_rows):
-            c = scale(fp, mTemp[row_c])
-        else:
-            c = c_const
+        # the scale: the row's temperature (the dummy read at 0 when the flag is off) or the constant
+        c = _select(
+            flag_temp, scale(fp, mTemp[_select(flag_temp, row_c, Int64(0))]), c_const
+        )
         pad = NEG_INF if self.from_logits else 0.0
         cta_base = c_rank * self.cfg.blocks_per_cta(self.N)
+        # the source row applied ONCE to the pointer (its element offset through the layout's row stride; the API aligns
+        # every row base and row stride to the vector, so the shifted base keeps the copy atoms' alignment) and the loader's
+        # tiles at row 0: a gathered tile row entering the loader as a loaded value cost 60-90 registers at 256 threads and
+        # spills at the 128-register cap of 512 threads (2026-11-18); with the shifted base every kernel is at its pre-fold count
+        mXr = cute.make_tensor(
+            cute.make_ptr(
+                mX.element_type,
+                (mX.iterator + cute.crd2idx((src_c, 0), mX.layout)).toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=in_bits // 8,
+            ),
+            mX.layout,
+        )
         loader = _DrawLoader(
             self,
             self.plan_sum,
             coords,
-            mX,
+            mXr,
             idX,
             tiler_mn,
-            tile_row,
+            Int32(0),
             Msrc,
             N,
             thr_x,
@@ -649,22 +670,21 @@ class DrawSupportKernel:
         else:
             tok = _select(first_tok >= Int32(0), first_tok, last_tok)
             s_ok = (mass > Float32(0.0)) & (mass < Float32(float("inf")))
-            valid = s_ok & (tok >= Int32(0))
-            if cutlass.const_expr(self.has_indices):
-                valid = valid & src_ok
+            valid = (
+                s_ok & (tok >= Int32(0)) & src_ok
+            )  # an index outside the source rows: an invalid output row
             token = _select(valid, tok, Int32(-1))
             lp = Float32(NAN)
             lpk = Float32(NAN)
-            if cutlass.const_expr(self.return_logprob or self.return_kept_logprob):
+            if cutlass.const_expr(
+                self.from_logits
+            ):  # the token's log-probabilities: the chains per row, the kept one's store on the flag
                 tok_c = _select(valid, token, Int32(0))
                 xt = mX[src_c, tok_c].to(Float32)
                 zt = shifted(fp, xt, nm, c)
                 if cutlass.const_expr(self.return_logprob):
                     lp = _select(valid, logp(fp, zt, fp.neg(lg2(fp, S))), Float32(NAN))
-                if cutlass.const_expr(self.return_kept_logprob):
-                    lpk = _select(
-                        valid, logp(fp, zt, fp.neg(lg2(fp, mass))), Float32(NAN)
-                    )
+                lpk = _select(valid, logp(fp, zt, fp.neg(lg2(fp, mass))), Float32(NAN))
         if t == 0:
             if w == 0:
                 if c_rank == 0:
@@ -677,11 +697,13 @@ class DrawSupportKernel:
                         mMass[row] = mass
                         if cutlass.const_expr(self.return_logprob):
                             mLogp[row] = lp
-                        if cutlass.const_expr(self.return_kept_logprob):
+                        if cutlass.const_expr(self.score):
                             mLogpK[row] = lpk
+                        else:
+                            if flag_lpk:
+                                mLogpK[row] = lpk
         peers.finish()
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 def _topk_threshold(k, rx, tid, lane, kk, peers, red):
@@ -862,11 +884,12 @@ def kernel_name(
 ) -> str:
     """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, gather,
     the two log-probabilities, pdl, the selection's placements, the score form)."""
+    # the temperature form, the index gather, the kept log-probability output and PDL are runtime arguments (FLAG_*,
+    # enable_pdl): not in the name
     return jit.sanitize_symbol_name(
-        f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_"
-        f"{'trow' if temp_rows else 'tconst'}{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
-        f"{'_lpk' if return_kept_logprob else ''}"
-        f"_pdl{int(enable_pdl)}{f'_ef{early_finish}' if early_finish else ''}"
+        f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}"
+        f"{'_lp' if return_logprob else ''}"
+        f"{f'_ef{early_finish}' if early_finish else ''}"
         f"{'' if count_list is None else ('_cl1' if count_list else '_cl0')}"
     )
 
@@ -891,18 +914,19 @@ def get_compiled_kernel(
     strides are runtime arguments."""
     from .schedule import padded_blocks
 
+    # temp_rows / has_indices / enable_pdl / return_kept_logprob are runtime arguments: they leave the bucket's key
     return _compile_bucket(
         dtype_str,
         padded_blocks(N),
         cfg,
         from_logits,
         filters,
-        temp_rows,
-        has_indices,
+        False,
+        False,
         return_logprob,
-        enable_pdl,
+        False,
         early_finish,
-        return_kept_logprob,
+        False,
         score,
         count_list,
     )
@@ -999,7 +1023,8 @@ def _compile_bucket(
             Int64(1),
             Int64(1),
             Int32(1),
-            enable_pdl,
+            Int32(0),
+            Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )
