@@ -466,8 +466,8 @@ def test_forward_return_lse_rejection_preserves_plan(kind):
 # ------------------------------------------------------------------------------------------------------ device-free
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_fingerprint_is_a_function_of_the_head_dim(op):
-    fps = {D: bi.fingerprint(op, head_dim=D) for D in (64, 128, 256)}
-    assert len(set(fps.values())) == 3
+    fps = {D: bi.fingerprint(op, head_dim=D) for D in (64, 128, 256, 512)}
+    assert len(set(fps.values())) == 4
     for D, fp in fps.items():
         assert fp.startswith("attn-bf16-d") and fp == bi.fingerprint(
             WRAPPERS[0], head_dim=D
@@ -475,6 +475,44 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
     assert bi.class_name(op) == "attention.bf16"
     with pytest.raises(TypeError):
         bi.fingerprint(op, head_dim=128, page_size=16)
+
+
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
+def test_recorded_fingerprints(D):
+    """The class digests are the recorded ones: the term of a head dim is not moved by another head dim's body."""
+    from flashinfer.attention.batch_invariant import spec
+
+    assert spec.spec_fingerprint(D) == spec.FINGERPRINTS[D]
+    assert bi.fingerprint(WRAPPERS[0], head_dim=D) == spec.FINGERPRINTS[D]
+    assert (spec.TILE_KEYS, spec.chunk_len(D)) == (128, 512)
+
+
+def test_planner_output_parts_d512():
+    """D = 512: a Q tile over a chunk range is one work unit per 256-column half of the output (``plan.o_parts``); the parts share
+    every descriptor field but ``F_OPART`` -- the workspace slot of a split chunk too: each writes its own columns of the same
+    partial rows -- and the split groups, their rows and the workspace rows are those of the undivided head dims."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    assert [P.o_parts(D) for D in (64, 128, 256, 512)] == [1, 1, 1, 2]
+    assert P.ws_row(512) == 516
+    qo = [0, 300, 301, 1301]
+    kv = [0, 44, 201, 264]
+    last = [12, 4, 8]
+    for policy in ("fused", "split", "auto"):
+        for sm in (8, 148, 100000):
+            p256 = P.build_plan(qo, kv, last, 32, 8, 256, 16, -1, policy, sm)
+            p512 = P.build_plan(qo, kv, last, 32, 8, 512, 16, -1, policy, sm)
+            assert all(d[P.F_OPART] == 0 for d in p256.desc)
+            for part in (0, 1):
+                units = sorted(
+                    tuple(d[: P.F_OPART]) for d in p512.desc if d[P.F_OPART] == part
+                )
+                assert len(units) * 2 == p512.num_units
+                if policy != "auto":  # the same kinds as the undivided plan's
+                    assert units == sorted(tuple(d[: P.F_OPART]) for d in p256.desc)
+            if policy != "auto":
+                assert p512.groups == p256.groups and p512.ws_rows == p256.ws_rows
+            assert p512.ws_row == 516 and not any(p512.group_inkernel)
 
 
 def test_planner_unit_kind_rules():
@@ -677,7 +715,7 @@ def test_unsupported_device_raises_before_any_kernel():
 
 # ------------------------------------------------------------------------------------------------------ on the device
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
 def test_matches_reference(D, Hq, Hkv):
     pr = Problem([300, 1000, 64], [700, 2500, 3000], Hq, Hkv, D, 16, seed=1)
@@ -688,7 +726,7 @@ def test_matches_reference(D, Hq, Hkv):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 def test_prefill_equals_decode(D, layout):
     """R4: the last token of every request gives the same bits as a prefill row and as a decode step."""
@@ -699,7 +737,7 @@ def test_prefill_equals_decode(D, layout):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("page", [1, 16, 128])
 def test_paged_equals_ragged(D, page):
     """R4: the paged and the ragged KV layouts hand the kernel the same keys at the same positions: the same bits."""
@@ -751,7 +789,7 @@ def test_determinism_and_graph_replay(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_dependent_launch_chain_reads_the_predecessor(D):
     """R1 under programmatic dependent launch: four decode steps whose query is the previous step's output, enqueued back to back
     on one stream and captured as one CUDA graph, give the bits of the same steps run one at a time with a device synchronisation
@@ -817,7 +855,7 @@ def test_dependent_launch_chain_reads_the_predecessor(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_batch_permutation_and_subbatch_invariance(D):
     """R2: a request's bits do not depend on its neighbours, its position in the batch or the batch size."""
     q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
@@ -869,7 +907,7 @@ def test_batch_permutation_and_subbatch_invariance(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_decode_batch_invariance_and_page_table_junk(D):
     """R2 for decode: the same request's step gives the same bits in a batch of one and in a batch of eight with other requests,
     whatever pages the pool assigns (the page table and the junk beyond each request's keys never reach the bits)."""
@@ -920,7 +958,7 @@ def _repack(p: Problem) -> Problem:
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_chunked_prefill_equals_full(D):
     """R4 for incremental prefill: a request prefilled in two chunks (the second over the first's cached keys) gives, token for
     token, the bits of the one-shot prefill -- a token's output depends on its position and the keys below it alone, not on how the
@@ -964,7 +1002,7 @@ def test_chunked_prefill_equals_full(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_multi_token_decode_equals_prefill(D):
     """R4 for speculative / multi-token decode: the decode wrapper with ``q_len_per_req = 4`` gives, for the last four tokens of every
     request, the bits of the prefill rows."""
@@ -1002,7 +1040,7 @@ def test_multi_token_decode_equals_prefill(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_head_subset_invariance(D):
     """R2 across heads: running a subset of the KV heads (whole GQA groups, with their query heads) gives, head for head, the bits of
     the run over all heads -- a head's output depends on its own q / K / V alone, never on how many heads share the launch. Prefill
@@ -1107,12 +1145,12 @@ def test_sm_count_and_grid_do_not_change_bits():
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_config_agreement(D):
     """R3: every member of the configuration space (ring depth, unit kind, softmax warpgroups, fold placement, small-unit body)
     gives the same bits as the wrapper's pick; at D = 64 the paired placement too (two Q tiles per CTA), on a batch large enough
     to be paired, and at D = 128 on 328 KB parts (pairing forced with an SM count of one: the problem's units would not fill four
-    per SM; its rings, the split kind with both fold placements). The whole space at D = 128 / 256 (108 / 36 points); every 7th
+    per SM; its rings, the split kind with both fold placements). The whole space at D = 128 / 256 / 512 (108 / 36 / 18 points); every 7th
     point of the 252 at D = 64 (each distinct kernel is a compile)."""
     from dataclasses import replace
 
@@ -1172,6 +1210,76 @@ def test_config_agreement(D):
             cfg,
         )
         assert torch.equal(bits(out), ref), cfg
+
+
+@needs_device
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+def test_d512_output_halves(kind):
+    """D = 512 runs a Q tile as two work units, one per 256-column half of the output and of V, both forming the tile's scores from
+    all 512 dims of Q and K. An output element reads its own column of V alone: replacing the upper half of V leaves the lower
+    half's bits and changes the upper half's, and the other way round; the two halves of one launch agree with a launch whose
+    V halves are exchanged (the same accumulator arithmetic in either unit). Fused and split units, the row body's replicated-row
+    placement for the decode steps."""
+    D, H = 512, 256
+    if kind == "prefill":
+        pr = Problem([300, 1000, 64], [700, 2500, 3000], 32, 8, D, 16, seed=41)
+        run = run_paged_prefill
+    else:
+        pr = Problem([1] * 5, [1024, 4096, 33, 700, 5000], 32, 8, D, 16, seed=42)
+        run = lambda p: run_decode(p)[0]  # noqa: E731
+    base = bits(run(pr)).clone()
+    ref = reference(pr)
+    if kind == "decode":
+        ref = ref[run_decode(pr)[1]]
+    err = (run(pr).float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    v0 = pr.v_nhd.clone()
+    g = torch.Generator(device="cpu").manual_seed(7)
+    noise = (torch.randn(v0.shape[:-1] + (H,), generator=g) * 1.5).to(v0)
+    for lo in (0, H):
+        pr.v_nhd = v0.clone()
+        pr.v_nhd[..., lo : lo + H] = noise
+        out = bits(run(pr))
+        keep = slice(H - lo, 2 * H - lo)
+        assert torch.equal(out[..., keep], base[..., keep])
+        assert not torch.equal(out[..., lo : lo + H], base[..., lo : lo + H])
+    pr.v_nhd = torch.cat([v0[..., H:], v0[..., :H]], dim=-1).contiguous()
+    out = bits(run(pr))
+    assert torch.equal(out[..., :H], base[..., H:])
+    assert torch.equal(out[..., H:], base[..., :H])
+
+
+@needs_device
+def test_d512_decode_takes_the_row_body():
+    """D = 512 has no Swaps-AB body: a decode batch under ``small = "swap"`` (the default) runs the row body's replicated-row
+    placement, the bits of ``small = "rep"`` and of the prefill rows."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    D = 512
+    assert D not in engine.SWAPS_DIMS and engine.default_config(D).small == "swap"
+    kv = [1024, 4096, 33, 700]
+    pr = Problem([1] * 4, kv, 16, 2, D, 16, seed=43)
+    outs = []
+    for small in ("swap", "rep"):
+        cfg = replace(engine.default_config(D), small=small)
+        outs.append(
+            bits(
+                engine.attention_paged(
+                    pr.q,
+                    pr.k_nhd,
+                    pr.v_nhd,
+                    pr.qo_indptr,
+                    pr.kv_indptr,
+                    pr.kv_indices,
+                    pr.kv_last,
+                    config=cfg,
+                )
+            ).clone()
+        )
+    assert torch.equal(outs[0], outs[1])
+    assert torch.equal(outs[0], bits(run_decode(pr)[0]))
 
 
 @needs_device
