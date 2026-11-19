@@ -1,6 +1,15 @@
 ---
 name: benchmark-kernel
-description: Guide for benchmarking FlashInfer kernels with CUPTI timing
+description: Benchmarks FlashInfer kernels with CUPTI timing (CUDA-event fallback) through benchmarks/flashinfer_benchmark.py or flashinfer.testing.bench_gpu_time, compares backends and saves reproducible CSV results. Use when measuring FlashInfer kernel latency, TFLOPS or memory bandwidth, comparing attention, GEMM or MoE backends, or producing before/after performance numbers for a FlashInfer pull request.
+license: Apache-2.0
+metadata:
+  author: "FlashInfer Team"
+  tags:
+    - flashinfer
+    - benchmarking
+    - cupti
+    - performance
+    - gpu
 ---
 
 # Tutorial: Benchmarking FlashInfer Kernels
@@ -112,7 +121,7 @@ python benchmarks/flashinfer_benchmark.py \
 
 **Timing behavior:**
 - ✅ If CUPTI installed: Uses CUPTI (most accurate)
-- ⚠️ If CUPTI not installed: Automatically falls back to CUDA events with warning
+- ⚠ If CUPTI not installed: Automatically falls back to CUDA events with warning
 - 🔧 To force CUDA events: Add `--use_cuda_events` flag
 
 ### Step 3: Understand the Output

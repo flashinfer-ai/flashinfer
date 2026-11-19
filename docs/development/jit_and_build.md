@@ -181,7 +181,7 @@ requests from branches in this repository also write the cache.
 ## Adding a new operation
 
 For stable CUDA operations, use the
-[kernel tutorial](../../.claude/skills/add-cuda-kernel/SKILL.md) and this checklist:
+[kernel tutorial](../../skills/add-cuda-kernel/SKILL.md) and this checklist:
 
 1. Write raw-pointer kernels in `include/flashinfer/`, a launcher in `csrc/`,
    and TVM-FFI exports in a `*_jit_binding.cu` file.

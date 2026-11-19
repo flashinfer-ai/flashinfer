@@ -1,6 +1,14 @@
 ---
 name: self-review
-description: Check your own diff against the repository's review guidance and PR rules before opening a PR
+description: Checks a FlashInfer change's diff against the repository's code review guidance and pull request rules before a PR is opened. Use when a FlashInfer change is complete and about to become a pull request, to catch missing tests, wrong architecture guards, missing benchmark numbers, stale documentation or PR template problems before human review.
+license: Apache-2.0
+metadata:
+  author: "FlashInfer Team"
+  tags:
+    - flashinfer
+    - code-review
+    - pull-request
+    - contributing
 ---
 
 # Self-Review Before Opening a PR
@@ -28,7 +36,7 @@ pointer drift, scratch files) must be left out.
 
 ## Step 2: Apply the review guidance
 
-Read [`docs/code_review_guidance.md`](../../../docs/code_review_guidance.md) and walk its
+Read `docs/code_review_guidance.md` (at the repository root) and walk its
 focus areas and checklist over the diff. In particular:
 
 - **Kernel logic is in scope.** Read indexing/stride math, boundaries and predication,
@@ -51,17 +59,17 @@ focus areas and checklist over the diff. In particular:
 
 ## Step 3: Apply the PR rules
 
-From [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) (Pull Request Guidelines):
+From `CONTRIBUTING.md` at the repository root (Pull Request Guidelines):
 
 - The description uses the default template in
-  [`.github/pull_request_template.md`](../../../.github/pull_request_template.md), filled in
+  `.github/pull_request_template.md`, filled in
   and not replaced by a custom or tool-generated format. Title and description become the
   squash-merge commit and are what `git bisect` surfaces later.
 - A performance change reports observed before/after numbers from a reproducible benchmark
   (`benchmarks/flashinfer_benchmark.py` or a named script), with the GPU and problem sizes.
   A speedup ratio without absolute numbers, or numbers without a GPU, is not enough. Use the
   `benchmark-kernel` skill to produce them.
-- Documentation referenced by the change (`AGENTS.md`, `.claude/skills/`, `docs/`) is
+- Documentation referenced by the change (`AGENTS.md`, `skills/`, `docs/`) is
   updated in the same PR.
 - **Backwards compatibility.** If the change removes or renames a public API, or changes a
   signature, default, or semantics, say so explicitly in the PR description.

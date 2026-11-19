@@ -49,7 +49,7 @@ Generated sources belong in `FLASHINFER_GEN_SRC_DIR`, and compiled outputs in
 source or AOT directories: they may be read-only.
 
 For new CUDA operations, follow the
-[kernel tutorial](.claude/skills/add-cuda-kernel/SKILL.md) and
+[kernel tutorial](skills/add-cuda-kernel/SKILL.md) and
 [operation/trace checklist](docs/development/jit_and_build.md#adding-a-new-operation).
 Public APIs use `@flashinfer_api` with a `TraceTemplate`; update trace examples,
 regenerate their JSON files, and run `tests/trace/`. Register supported stable
@@ -82,7 +82,7 @@ and absolute before/after times. State cache conditions and timing boundaries;
 keep compilation/startup, host time, and GPU kernel time distinct. Use
 `flashinfer.testing.bench_gpu_time(..., enable_cupti=True)` for kernel timing
 (CUPTI with CUDA-event fallback; `pip install -U cupti-python` for CUDA 13+).
-See the [benchmarking guide](.claude/skills/benchmark-kernel/SKILL.md).
+See the [benchmarking guide](skills/benchmark-kernel/SKILL.md).
 
 For resource reuse or longer lifetimes, apply the
 [resource lifetime and performance checklist](docs/code_review_guidance.md#resource-lifetime-and-performance)
@@ -96,7 +96,7 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md) and
 [the review guidance](docs/code_review_guidance.md). Agent reviews include kernel
 implementation details: read indexing, precision, synchronization, and lifetime
 logic; label findings by confidence. Passing tests complement that review.
-A [self-review](.claude/skills/self-review/SKILL.md) is recommended before a PR.
+A [self-review](skills/self-review/SKILL.md) is recommended before a PR.
 
 Keep the [default PR template](.github/pull_request_template.md), explain the
 final behavior, and report relevant validation and performance results.
@@ -126,7 +126,7 @@ prints on each replay; statistics are skipped only when that kernel cannot run. 
 `FLASHINFER_JIT_VERBOSE=1` and `FLASHINFER_JIT_DEBUG=0`: if debug is unset, verbose
 also enables debug builds. Set debug to `1` for symbols, `-O0`, and device
 debugging. See the
-[CUDA debugging guide](.claude/skills/debug-cuda-crash/SKILL.md).
+[CUDA debugging guide](skills/debug-cuda-crash/SKILL.md).
 
 The default cache is `~/.cache/flashinfer/<version>/<arch>/`, with `generated/`
 and `cached_ops/` subdirectories. `FLASHINFER_WORKSPACE_BASE` changes its base.

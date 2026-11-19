@@ -1,6 +1,16 @@
 ---
 name: add-cuda-kernel
-description: Step-by-step tutorial for adding new CUDA kernels to FlashInfer
+description: Step-by-step workflow for adding a new CUDA kernel to FlashInfer, covering the kernel in include/, the launcher and TVM-FFI binding in csrc/, the JIT generator, the Python API with @flashinfer_api and @backend_requirement, a TraceTemplate, tests, AOT registration, the export and a benchmark. Use when adding, creating or implementing a new CUDA kernel or operator in the FlashInfer repository, or when asking which files a new FlashInfer kernel must touch.
+license: Apache-2.0
+metadata:
+  author: "FlashInfer Team"
+  tags:
+    - flashinfer
+    - cuda
+    - kernel
+    - jit
+    - tvm-ffi
+    - gpu
 ---
 
 # Tutorial: Adding a New Kernel to FlashInfer
@@ -955,7 +965,7 @@ if __name__ == "__main__":
 - Using the unified benchmarking framework in `benchmarks/flashinfer_benchmark.py` if applicable
 - Testing across different problem sizes and configurations
 
-→ **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](../benchmark-kernel/SKILL.md)**
+→ **For the complete benchmarking guide, use the `benchmark-kernel` skill.**
 
 ## Summary of Files Created/Modified
 
