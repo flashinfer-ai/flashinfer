@@ -83,7 +83,7 @@ def _write(path, text):
 
 def _closure_names(pkg, rel):
     closure = source_analysis._package_import_closure(pkg / rel)
-    return {str(p.relative_to(pkg)) for p in closure}
+    return {p.relative_to(pkg).as_posix() for p in closure}
 
 
 def _edit_changes_key(pkg, kernel_rel, edited_rel, new_text):
@@ -376,7 +376,7 @@ def real_package(monkeypatch):
 def test_real_kernel_closure_stays_near_its_imports(real_package, kernel, limit):
     closure = source_analysis._package_import_closure(real_package / kernel)
     assert len(closure) <= limit, sorted(
-        str(p.relative_to(real_package)) for p in closure
+        p.relative_to(real_package).as_posix() for p in closure
     )
 
 
@@ -401,7 +401,7 @@ def test_cute_dsl_core_closure_excludes_unrelated_module_generators(real_package
         real_package / "jit" / "cute_dsl_core.py"
     )
     unrelated = sorted(
-        str(p.relative_to(real_package))
+        p.relative_to(real_package).as_posix()
         for p in closure
         if p.is_relative_to(real_package / "jit" / "attention")
         or p.is_relative_to(real_package / "jit" / "gemm")
@@ -418,7 +418,7 @@ def test_gemm_kernel_closure_excludes_attention_stack(real_package):
         real_package / "gemm" / "gemm_svdquant.py"
     )
     attention = sorted(
-        str(p.relative_to(real_package))
+        p.relative_to(real_package).as_posix()
         for p in closure
         if p.name in {"decode.py", "prefill.py"}
         and p.parent == real_package
