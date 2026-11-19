@@ -123,6 +123,7 @@ def unit_loop(
     sP_e: cute.Tensor,
     c: Float32,
     nc: Float32,
+    ca: Float32,
     window_left: Int32,
     rows_valid: Int32,
     q_tok0: Int32,
@@ -193,6 +194,13 @@ def unit_loop(
         )
         cute.arch.fence_view_async_tmem_load()
         sh.release()
+        if cutlass.const_expr(st.soft_cap):
+            # the capped class: this key's score of every row becomes its capped value (spec.capped_score) before the maximum and
+            # the exponentials read it; the mask's -inf is written after, so a masked key stays absent whatever its raw score
+            for i in cutlass.range_constexpr(0, NP, 2):
+                t0, t1 = spec.capped_scores2(CuteF32, rS[i], rS[i + 1], ca)
+                rS[i] = t0
+                rS[i + 1] = t1
         key = t * T + thread_idx
         k0 = t * T
         # mask only the tiles that need it: a boundary of a live row's visible range inside the tile (a warp-uniform decision)

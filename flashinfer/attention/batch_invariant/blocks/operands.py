@@ -186,9 +186,16 @@ class StaticPlan:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        soft_cap: bool = False,
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
-        have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
+        have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``).
+        ``soft_cap``: the capped class (``spec.capped_score`` on every score leaf); its row maximum is over the capped scores, which
+        the load cannot produce, so it always takes the register tree."""
+        assert not (soft_cap and hw_rowmax), (
+            "the capped class takes its row maximum from the register tree"
+        )
+        self.soft_cap = soft_cap
         self.hw_rowmax = hw_rowmax
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
