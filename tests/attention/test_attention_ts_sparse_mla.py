@@ -1126,6 +1126,114 @@ def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
         )
 
 
+def _first_outputs(run_test, check_config, profile=None, pdl=False):
+    """Run ``run_test`` (an existing oracle and replay test) with its compiled configs
+    checked, on ``profile`` instead of the policy's schedule when one is given.
+
+    Returns the output and LSE of the test's first launch, which is eager and whose
+    inputs depend only on the test's arguments, for bitwise comparison between
+    launches. ``pdl`` compiles the attention kernel with ``use_pdl`` and
+    ``pdl_wait_after_prologue``.
+    """
+    import copy
+    from dataclasses import replace
+
+    from flashinfer.attention.prims_ts import mla_decode
+
+    compile_kernel = mla_decode._get_compiled_mla_decode
+    configs, outputs = [], []
+
+    def checked_compile(spec):
+        if pdl:
+            kernel = copy.copy(spec.kernel)
+            kernel.use_pdl = True
+            kernel.pdl_wait_after_prologue = True
+            spec = replace(
+                spec,
+                kernel=kernel,
+                kernel_signature=mla_decode._mla_kernel_compile_signature(kernel),
+            )
+        cfg = spec.kernel._make_config()
+        check_config(cfg)
+        configs.append(cfg)
+        return compile_kernel(spec)
+
+    run = BatchSparseMLADecodePagedTSWrapper.run
+
+    def recording_run(self, *args, **kwargs):
+        result = run(self, *args, **kwargs)
+        if not outputs:
+            outputs.append((kwargs["out"].clone(), kwargs["lse"].clone()))
+        return result
+
+    with pytest.MonkeyPatch.context() as patch:
+        if profile is not None:
+            patch.setattr(
+                mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+            )
+        patch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+        patch.setattr(BatchSparseMLADecodePagedTSWrapper, "run", recording_run)
+        run_test()
+    assert configs and outputs
+    return outputs[0]
+
+
+@pytest.mark.parametrize("schedule", ["bf16-static", "fp8-ws-gather", "fp8-nvfp4"])
+def test_pdl_wait_after_prologue_graph(schedule):
+    """A PDL launch of a persistent grid that waits after its prologue reads the
+    inputs and metadata its preceding launches wrote (the graph replays refresh them
+    right before), and matches the entry-wait launch bit for bit."""
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    profile = None
+    if schedule == "fp8-nvfp4":
+        # The policy's persistent retained NVFP4 schedule over an FP8 primary pool,
+        # whose E4M3 tiles are TMA-gathered.
+        def run_test():
+            test_d512_nvfp4_sources_graph(64, 160, 129, 513, primary_format="fp8")
+
+    else:
+        if schedule == "bf16-static":
+            dtype = torch.bfloat16
+            profile = SparseMlaProfile(
+                family="keep",
+                tile_size_q=64,
+                split_kv=1,
+                scheduler="static",
+                head_dim_ctas=1,
+                gather_issue_warps=4,
+                reuse_kv=True,
+                reuse_kv_stages=8,
+                kv_tile_size=64,
+                page_pipeline_stages=1,
+            )
+        else:
+            dtype = torch.float8_e4m3fn
+            profile = SparseMlaProfile(**_WS_GATHER_PROFILE)
+
+        def run_test():
+            test_native_graph(dtype, sms + 1, 1, 64, 513, True, False, True)
+
+    def launch_config(pdl):
+        def check(cfg):
+            # The prologue wait applies to persistent single-split grids only.
+            assert cfg.use_persistent_scheduler == 1
+            assert cfg.num_ctas_per_seq_kv == 1
+            assert cfg.tma_fp8_primary_tiles == (schedule == "fp8-nvfp4")
+            assert cfg.use_pdl == pdl
+            assert cfg.pdl_wait_after_prologue == pdl
+
+        return check
+
+    reference = _first_outputs(run_test, launch_config(False), profile)
+    out, lse = _first_outputs(run_test, launch_config(True), profile, pdl=True)
+    assert torch.equal(out, reference[0])
+    assert torch.equal(lse, reference[1])
+
+
 def test_caller_workspace_single_source_and_eager_api():
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)
