@@ -44,13 +44,14 @@ def decode_cache_row(raw: Sequence, fmt: str) -> List[float]:
 def mma16_exact(acc: float, a: Sequence[float], b: Sequence[float]) -> float:
     """One ``MMA16`` K-step as the tensor core computes it: with ``E`` the largest of the accumulator's exponent and
     the operand-exponent sums of the non-zero products, the accumulator and every exact product are cut toward zero to
-    a multiple of ``2**(E - 25)``, added exactly, and the sum is cut toward zero to 24 significant bits."""
+    a multiple of ``2**(E - 25)``, added exactly, and the sum is cut toward zero to 24 significant bits (to the
+    ``2**-149`` grid below the normal range; past the largest binary32 value it is an infinity)."""
     vals = [acc, *a, *b]
     if not all(math.isfinite(v) for v in vals):
         out = acc
         for x, y in zip(a, b, strict=True):
             out += x * y
-        return exact.to_f32(out) if math.isfinite(out) else out
+        return out
     pairs = [(x, y) for x, y in zip(a, b, strict=True) if x != 0.0 and y != 0.0]
     exps = [math.frexp(x)[1] + math.frexp(y)[1] - 2 for x, y in pairs]
     if acc != 0.0:
@@ -73,7 +74,13 @@ def mma16_exact(acc: float, a: Sequence[float], b: Sequence[float]) -> float:
     mag = abs(total)
     drop = max(0, mag.bit_length() - 24)
     mag = (mag >> drop) << drop
-    return math.ldexp(float(mag), -shift) * (1.0 if total > 0 else -1.0)
+    sign = 1.0 if total > 0 else -1.0
+    value = Fraction(mag) / Fraction(2) ** shift
+    if value >= Fraction(2) ** 128:
+        return sign * math.inf
+    if value < Fraction(2) ** -126:
+        return sign * math.ldexp(float(int(value * 2**149)), -149)
+    return sign * float(value)
 
 
 def ex2_stand_in(x: float) -> float:

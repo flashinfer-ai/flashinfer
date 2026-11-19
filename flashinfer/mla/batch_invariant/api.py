@@ -31,7 +31,6 @@ __all__ = [
     "check_device",
     "class_of",
     "ex2_device",
-    "fingerprint",
     "run_decode",
     "sparse_mla",
 ]
@@ -62,12 +61,6 @@ def class_of(query: torch.Tensor) -> str:
     fmt = _fmt(query) or "bf16"
     rope = int(query.shape[-1]) - spec.D_LATENT
     return spec.class_name(fmt, rope if rope in spec.ROPE_DIMS else 64)
-
-
-def fingerprint(qk_rope_head_dim: int = 64, dtype=torch.bfloat16) -> str:
-    """The receipt of the class for a layout and a cache dtype."""
-    fmt = "bf16" if dtype == torch.bfloat16 else "e4m3"
-    return spec.spec_fingerprint(int(qk_rope_head_dim), fmt)
 
 
 def check_device(device: torch.device, name: str) -> None:
@@ -140,6 +133,10 @@ def sparse_mla(
             name, f"out {tuple(out.shape)} {out.dtype}", "[rows, heads, 512] bf16"
         )
     tensors.append(("out", out))
+    for label, t in tensors[:-1]:
+        lo, hi = t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()
+        if lo < out.data_ptr() + out.numel() * 2 and out.data_ptr() < hi:
+            raise unsupported(name, f"out overlapping the {label}", "separate storage")
     for label, t in tensors:
         if t.device != query.device:
             raise unsupported(name, f"{label} on {t.device}", "one device")
@@ -149,7 +146,10 @@ def sparse_mla(
             raise unsupported(name, f"a {label} off a 16-byte boundary", "aligned rows")
     c1, c2 = float(bmm1_scale), float(bmm2_scale)
     if not (
-        0.0 < c1 < math.inf and abs(c1) * _LOG2E <= spec.FLT_MAX and math.isfinite(c2)
+        0.0 < c1 < math.inf
+        and abs(c1) * _LOG2E <= spec.FLT_MAX
+        and spec.scale_log2(c1) > 0.0
+        and math.isfinite(c2)
     ):
         raise unsupported(
             name,
@@ -258,13 +258,19 @@ def run_decode(
             f"block_tables of shape {tuple(block_tables.shape)}",
             "one row of sparse_mla_top_k physical token indices per query token",
         )
+    if cum_seq_lens_q is not None and cum_seq_lens_q.device != query.device:
+        raise unsupported(name, "cum_seq_lens_q", "offsets on the query's device")
     lens = sparse_mla_top_k_lens
     if lens is None and seq_lens is not None:
         # the trtllm-gen RoPE convention: a request's live count is min(seq_len, top_k)
-        if seq_lens.dtype != torch.int32 or (
-            query.ndim == 4 and seq_lens.numel() != int(query.shape[0])
+        if (
+            seq_lens.dtype != torch.int32
+            or seq_lens.device != query.device
+            or (query.ndim == 4 and seq_lens.numel() != int(query.shape[0]))
         ):
-            raise unsupported(name, "seq_lens", "one int32 per request")
+            raise unsupported(
+                name, "seq_lens", "one int32 per request on the query's device"
+            )
         per_req = seq_lens.reshape(-1).clamp(max=sparse_mla_top_k)
         if query.ndim == 4:
             lens = per_req.repeat_interleave(int(query.shape[1]))

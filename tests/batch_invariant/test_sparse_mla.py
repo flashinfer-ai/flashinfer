@@ -97,6 +97,8 @@ def test_fingerprints_are_pinned():
     op = "trtllm_batch_decode_with_kv_cache_mla"
     assert bi.class_name(op) == "mla.sparse"
     got = {(r, f): bi.fingerprint(op, qk_rope_head_dim=r, dtype=f) for r, f in MEMBERS}
+    prefill = "trtllm_prefill_with_kv_cache_mla"
+    assert bi.fingerprint(prefill, qk_rope_head_dim=0, dtype="e4m3") == got[(0, "e4m3")]
     assert got == {
         (64, "bf16"): "mla-sparse-bf16-d512r64-da94d889257d348d",
         (0, "bf16"): "mla-sparse-bf16-d512-576b087b91b54520",
@@ -177,6 +179,15 @@ def test_mma_step_model():
     assert reference.mma16_exact(1.0, [0.75] * 16, [2.0**-25] * 16) == 1.0
     assert reference.mma16_exact(-1.0, one, one) == 0.0
     assert str(reference.mma16_exact(0.0, [-0.0] + [0.0] * 15, one)) == "0.0"
+    assert str(reference.mma16_exact(-0.0, [-0.0] * 16, [1.0] * 16)) == "-0.0"
+    # past the largest binary32 value the step is an infinity; below the normal range it stays on the 2^-149 grid
+    big = [2.0**64] + [0.0] * 15
+    assert reference.mma16_exact(0.0, big, big) == float("inf")
+    assert reference.mma16_exact(0.0, [-x for x in big], big) == float("-inf")
+    tiny = reference.mma16_exact(
+        0.0, [2.0**-70 * 1.5] + [0.0] * 15, [2.0**-78 * 1.5] + [0.0] * 15
+    )
+    assert tiny == 2.0**-147 and tiny == exact.to_f32(tiny)
 
 
 def test_cpu_model_is_the_canonical_term():
@@ -273,6 +284,10 @@ def test_partial_rows_match_cpu_model(rope, fmt, split):
     for i, res in enumerate(ref):
         r, h = divmod(i, p.H)
         assert len(res.tiles) == spec.n_tiles(lens[r])
+        counts = got[r, h, :, 514].view(torch.int32).tolist()
+        assert counts[: len(res.tiles)] == [
+            min(128, lens[r] - 128 * t) for t in range(len(res.tiles))
+        ]
         for t, (m, l, o) in enumerate(res.tiles):
             want = torch.tensor([m, l] + [o[c] for c in cols], dtype=torch.float32)
             have = got[r, h, t, [512, 513] + cols]
@@ -372,6 +387,16 @@ def test_adversarial_neighbours_do_not_reach_a_row(rope, fmt):
             600
         )[: 2048 - n]
     assert same(p.run(idx=idx), clean)
+    # the special rows themselves: alone, in the batch and under another configuration
+    for r in bad_rows:
+        assert same(p.run([r], q=q)[0], got[r]), r
+    assert same(p.run(q=q, config=SparseMlaConfig(64, 4, "inkernel", 0, 64, 1)), got)
+    # an entry that is not a row of the cache is an absent position, like a negative one
+    idx = p.idx.clone()
+    idx[0, 7], idx[2, 300] = p.kv.shape[0], 2**31 - 1
+    dead = p.idx.clone()
+    dead[0, 7], dead[2, 300] = -1, -1
+    assert same(p.run(idx=idx), p.run(idx=dead))
 
 
 @needs_device
@@ -407,6 +432,15 @@ def test_sm_count_and_dispatcher_rules_do_not_change_bits(monkeypatch):
         picks.add(default_config(8, 8, 2048, sm))
         assert same(p.run(), ref), sm
     assert {c.tiles_per_unit for c in picks} == {1, 4}
+    # wide heads: the dispatcher's head block follows the SM count, the bits do not
+    wide = Pool(64, "e4m3", 64, [2048, 300], 2048, seed=5)
+    monkeypatch.setattr(api, "_sm_count", lambda index: 148)
+    want, blocks = wide.run(), set()
+    for sm in (1, 64, 148, 10**6):
+        monkeypatch.setattr(api, "_sm_count", lambda index, sm=sm: sm)
+        blocks.add(default_config(2, 64, 2048, sm).head_block)
+        assert same(wide.run(), want), sm
+    assert blocks == {16, 32, 64}
     # a prefill-sized call takes the in-kernel fold
     assert default_config(8192, 8, 2051, 148).fold == "inkernel"
     monkeypatch.setattr(config_module, "FIXUP_WORKSPACE_FLOATS", 1)
@@ -462,8 +496,9 @@ def test_calls_on_two_streams_do_not_share_state(fold):
         assert same(got_a, ref_a) and same(got_b, ref_b)
 
 
-def _decode(p, q, idx, lens=None, seq=None, cum=None, **kw):
-    return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+def _decode(p, q, idx, lens=None, seq=None, cum=None, entry=None, **kw):
+    entry = entry or flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla
+    return entry(
         query=q,
         kv_cache=p.kv.view(-1, 1, 64, p.D),
         workspace_buffer=torch.empty(0, device=q.device),
@@ -511,6 +546,8 @@ def test_prefill_equals_chunked_prefill_equals_decode(rope, fmt):
     cum = torch.tensor([0, T[0], rows], dtype=torch.int32, device="cuda")
     prefill = _decode(p, p.q, p.idx, lens=p.lens_t, cum=cum)
     assert same(prefill, decode)
+    alias = flashinfer.mla.trtllm_prefill_with_kv_cache_mla
+    assert same(_decode(p, p.q, p.idx, lens=p.lens_t, cum=cum, entry=alias), decode)
     for cuts in ([0, 1, 4, 11, 12, 13, 17], [0, 7, 17]):
         pieces = []
         for a, b in zip(cuts[:-1], cuts[1:], strict=True):
@@ -635,6 +672,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         dict(cute_dsl_impl="modular"),
         dict(uses_shared_paged_kv_idx=False),
         dict(bmm1_scale=0.0),
+        dict(bmm1_scale=1e-46),
         dict(bmm1_scale=-SCALE),
         dict(bmm1_scale=float("inf")),
         dict(bmm2_scale=float("nan")),
@@ -677,7 +715,16 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             bmm1_scale=SCALE,
             config=SparseMlaConfig(32, 8, "fixup", 1, 128, 4),
         )
-    # the flag off: the regular backends, untouched
+    with pytest.raises(err):  # the output may not share storage with an input
+        api.sparse_mla(
+            p.q,
+            p.kv,
+            p.idx,
+            bmm1_scale=SCALE,
+            out=p.kv.view(-1)[: 2 * 8 * 512].view(2, 8, 512),
+        )
+    with pytest.raises(err):
+        _decode(p, q4, idx3, seq=p.lens_t.cpu())
     assert (
         "batch_invariant"
         in flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla.__doc__

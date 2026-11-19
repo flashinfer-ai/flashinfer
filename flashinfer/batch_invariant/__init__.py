@@ -642,6 +642,9 @@ CLASSES: Dict[str, ClassInfo] = {
     "trtllm_batch_decode_with_kv_cache_mla": ClassInfo(
         "mla.sparse", ("qk_rope_head_dim", "dtype"), _sparse_mla_fingerprint
     ),
+    "trtllm_prefill_with_kv_cache_mla": ClassInfo(
+        "mla.sparse", ("qk_rope_head_dim", "dtype"), _sparse_mla_fingerprint
+    ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
     "fused_moe_fp8": ClassInfo(

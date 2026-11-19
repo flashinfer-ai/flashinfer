@@ -140,23 +140,24 @@ constexpr int RawOffset() {
   return SmemRowBytes<D>() - D;
 }
 
-// A warp expands its rows (warp, warp + nwarps, ...) in ascending byte order: a write never reaches raw bytes that
-// a later instruction of the warp still reads.
+// A warp expands rows warp, warp + nwarps, ...: a store only reaches raw bytes of lower units,
+// loaded before it.
 template <int D>
 __device__ __forceinline__ void ExpandRows(unsigned char* slots, int nrows, int warp, int nwarps,
                                            int lane) {
   constexpr int SK = SmemRowBytes<D>(), U = D / 16;
   const int units = nrows / nwarps * U;
-  for (int f0 = lane; f0 < units; f0 += 32 * kCvtBatch) {
+  for (int b0 = 0; b0 < units; b0 += 32 * kCvtBatch) {
     uint4 w[kCvtBatch];
     for (int k = 0; k < kCvtBatch; ++k) {
-      const int f = f0 + 32 * k;
+      const int f = b0 + 32 * k + lane;
       if (f < units)
-        w[k] = *reinterpret_cast<const uint4*>(slots + (warp + f / U * nwarps) * SK + RawOffset<D>() +
-                                               16 * (f % U));
+        w[k] = *reinterpret_cast<const uint4*>(slots + (warp + f / U * nwarps) * SK +
+                                               RawOffset<D>() + 16 * (f % U));
     }
+    __syncwarp();
     for (int k = 0; k < kCvtBatch; ++k) {
-      const int f = f0 + 32 * k;
+      const int f = b0 + 32 * k + lane;
       if (f >= units) continue;
       unsigned char* dst = slots + (warp + f / U * nwarps) * SK + 32 * (f % U);
       const uint64_t lo = w[k].x | (static_cast<uint64_t>(w[k].y) << 32);

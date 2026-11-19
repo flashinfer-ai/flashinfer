@@ -13,7 +13,7 @@ the kernel's two key reductions are emitted from the same engine plan (``codegen
 * the score of list position ``j`` is one ``kfold`` of ``D_qk / 16`` opaque ``MMA16`` steps ascending from ``+0``
   (the 512 latent values first, then the 64 RoPE values of the ``d512r64`` layout);
 * tile ``t`` holds list positions ``[128 t, 128 t + 128)``; position ``k = 8 b + 2 c + e`` inside it. A position past
-  the live count, or one whose entry is negative, is absent; a tile without a present position is dropped. Its state is
+  the live count, or one whose entry is negative or not a row of the cache, is absent; a tile without a present position is dropped. Its state is
   ``(m, l, O[d])``: ``m`` the maximum and ``l`` the sum of ``p_k = EX2(fma(s_k, c, mul(m, nc)))`` over the present
   positions, both as the engine's pairwise trees over the digits ``e``, ``b``, ``c`` (innermost first), and ``O[d]``
   eight opaque ``MMA16`` key steps from ``+0`` over ``cvt_bf16(p_k)`` and the latent column ``d`` (an absent position

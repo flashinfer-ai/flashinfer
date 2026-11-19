@@ -96,7 +96,7 @@ def _function(name: str, red: canon.Reduction, split: int) -> str:
 
 def e4m3_table() -> List[int]:
     """bf16 bits of the value every e4m3 byte denotes (exact); the two NaN encodings map to the canonical NaN. The
-    kernel converts with the device's ``cvt`` chain; a device test compares it with this table byte for byte."""
+    kernel converts with the device's ``cvt`` chain; a device test runs every byte through both."""
     out = []
     for v in exact.E4M3_VALUES:
         if v != v:
