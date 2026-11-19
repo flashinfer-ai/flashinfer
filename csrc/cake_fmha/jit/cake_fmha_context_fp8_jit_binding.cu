@@ -316,13 +316,11 @@ void cake_paged_attention_context(
     Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress, bool is_causal,
     Optional<TensorView> lse, int64_t lse_stride_tokens, int64_t lse_stride_heads) {
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK_EQ(key_cache.dtype(),
 #if CAKE_FMHA_CONTEXT_NVFP4
-                    dl_uint8
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_uint8);
 #else
-                    dl_float8_e4m3fn
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float8_e4m3fn);
 #endif
-  );
   TVM_FFI_ICHECK_EQ(value_cache.dtype(), key_cache.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK(!out_scale_factor.has_value());
