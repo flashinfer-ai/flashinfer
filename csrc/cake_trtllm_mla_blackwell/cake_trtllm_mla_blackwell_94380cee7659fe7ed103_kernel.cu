@@ -460,19 +460,23 @@ kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx = 0; work_idx < total_work_items; work_idx++) {
                 unsigned int load_ordered_work_idx = load_work_idx;
+                int load_ordered_len = -1;
                 if ((unsigned long long)work_order != 0ull) {
                     if (total_work_items > 74) {
                         if (total_work_items <= 1024) {
                             load_ordered_work_idx = (unsigned int)work_order[(int)load_work_idx];
+                            load_ordered_len = work_order[1024 + (int)load_work_idx];
                         }
                     }
                 }
                 int batch_idx = load_ordered_work_idx;
                 int value_split = 0;
                 int drp_request = 0;
-                int seqlen_kv_b = 0;
+                int seqlen_kv_b = load_ordered_len;
                 drp_request = (int)((unsigned int)batch_idx / (unsigned int)value_split_count);
-                seqlen_kv_b = seq_lens_kv[drp_request] - value_split_count + (int)((unsigned int)batch_idx % (unsigned int)value_split_count) + 1;
+                if (seqlen_kv_b < 0) {
+                    seqlen_kv_b = seq_lens_kv[drp_request] - value_split_count + (int)((unsigned int)batch_idx % (unsigned int)value_split_count) + 1;
+                }
                 int _max_0 = ((seqlen_kv_b) > (0) ? (seqlen_kv_b) : (0));
                 seqlen_kv_b = _max_0;
                 int start_tile = 0;
@@ -766,18 +770,22 @@ kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx_1 = 0; work_idx_1 < total_work_items; work_idx_1++) {
                 unsigned int softmax_ordered_work_idx = softmax_work_idx;
+                int softmax_ordered_len = -1;
                 if ((unsigned long long)work_order != 0ull) {
                     if (total_work_items > 74) {
                         if (total_work_items <= 1024) {
                             softmax_ordered_work_idx = (unsigned int)work_order[(int)softmax_work_idx];
+                            softmax_ordered_len = work_order[1024 + (int)softmax_work_idx];
                         }
                     }
                 }
                 int batch_idx_1 = softmax_ordered_work_idx;
                 int drp_request_1 = 0;
-                int seqlen_kv_b_1 = 0;
+                int seqlen_kv_b_1 = softmax_ordered_len;
                 drp_request_1 = (int)((unsigned int)batch_idx_1 / (unsigned int)value_split_count);
-                seqlen_kv_b_1 = seq_lens_kv[drp_request_1] - value_split_count + (int)((unsigned int)batch_idx_1 % (unsigned int)value_split_count) + 1;
+                if (seqlen_kv_b_1 < 0) {
+                    seqlen_kv_b_1 = seq_lens_kv[drp_request_1] - value_split_count + (int)((unsigned int)batch_idx_1 % (unsigned int)value_split_count) + 1;
+                }
                 int _max_0_1 = ((seqlen_kv_b_1) > (0) ? (seqlen_kv_b_1) : (0));
                 seqlen_kv_b_1 = _max_0_1;
                 int total_kv_tiles_1 = (int)(((unsigned int)seqlen_kv_b_1 + 128 - 1) / 128);
@@ -1120,19 +1128,23 @@ kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx_2 = 0; work_idx_2 < total_work_items; work_idx_2++) {
                 unsigned int correction_ordered_work_idx = correction_work_idx;
+                int correction_ordered_len = -1;
                 if ((unsigned long long)work_order != 0ull) {
                     if (total_work_items > 74) {
                         if (total_work_items <= 1024) {
                             correction_ordered_work_idx = (unsigned int)work_order[(int)correction_work_idx];
+                            correction_ordered_len = work_order[1024 + (int)correction_work_idx];
                         }
                     }
                 }
                 int batch_idx_2 = correction_ordered_work_idx;
                 int value_split_1 = 0;
                 int drp_request_2 = 0;
-                int seqlen_kv_b_2 = 0;
+                int seqlen_kv_b_2 = correction_ordered_len;
                 drp_request_2 = (int)((unsigned int)batch_idx_2 / (unsigned int)value_split_count);
-                seqlen_kv_b_2 = seq_lens_kv[drp_request_2] - value_split_count + (int)((unsigned int)batch_idx_2 % (unsigned int)value_split_count) + 1;
+                if (seqlen_kv_b_2 < 0) {
+                    seqlen_kv_b_2 = seq_lens_kv[drp_request_2] - value_split_count + (int)((unsigned int)batch_idx_2 % (unsigned int)value_split_count) + 1;
+                }
                 int _max_0_3 = ((seqlen_kv_b_2) > (0) ? (seqlen_kv_b_2) : (0));
                 seqlen_kv_b_2 = _max_0_3;
                 int total_kv_tiles_2 = (seqlen_kv_b_2 + 128 - 1) / 128;
@@ -1368,10 +1380,12 @@ kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx_3 = 0; work_idx_3 < total_work_items; work_idx_3++) {
                 unsigned int mma_ordered_work_idx = mma_work_idx;
+                int mma_ordered_len = -1;
                 if ((unsigned long long)work_order != 0ull) {
                     if (total_work_items > 74) {
                         if (total_work_items <= 1024) {
                             mma_ordered_work_idx = (unsigned int)work_order[(int)mma_work_idx];
+                            mma_ordered_len = work_order[1024 + (int)mma_work_idx];
                         }
                     }
                 }
@@ -1380,9 +1394,11 @@ kernel_cake_trtllm_mla_blackwell_94380cee7659fe7ed103(const __grid_constant__ CU
                 }
                 int batch_idx_3 = mma_ordered_work_idx;
                 int drp_request_3 = 0;
-                int seqlen_kv_b_3 = 0;
+                int seqlen_kv_b_3 = mma_ordered_len;
                 drp_request_3 = (int)((unsigned int)batch_idx_3 / (unsigned int)value_split_count);
-                seqlen_kv_b_3 = seq_lens_kv[drp_request_3] - value_split_count + (int)((unsigned int)batch_idx_3 % (unsigned int)value_split_count) + 1;
+                if (seqlen_kv_b_3 < 0) {
+                    seqlen_kv_b_3 = seq_lens_kv[drp_request_3] - value_split_count + (int)((unsigned int)batch_idx_3 % (unsigned int)value_split_count) + 1;
+                }
                 int _max_0_4 = ((seqlen_kv_b_3) > (0) ? (seqlen_kv_b_3) : (0));
                 seqlen_kv_b_3 = _max_0_4;
                 int total_kv_tiles_3 = (seqlen_kv_b_3 + 128 - 1) / 128;

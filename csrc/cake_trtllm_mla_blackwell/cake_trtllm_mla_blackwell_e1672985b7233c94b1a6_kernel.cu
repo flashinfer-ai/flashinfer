@@ -476,8 +476,9 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx = cluster_id; work_idx < total_work_items; work_idx += num_clusters) {
                 int batch_idx = work_idx / (unsigned int)value_split_count;
+                int softmax_ordered_len = -1;
                 int drp_request = 0;
-                int seqlen_kv_b = 0;
+                int seqlen_kv_b = softmax_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request = row_batches[batch_idx];
                     seqlen_kv_b = row_seq_lens[batch_idx];
@@ -739,8 +740,9 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
             for (unsigned int work_idx_1 = cluster_id; work_idx_1 < total_work_items; work_idx_1 += num_clusters) {
                 int batch_idx_1 = work_idx_1 / (unsigned int)value_split_count;
                 int value_split = work_idx_1 % (unsigned int)value_split_count;
+                int correction_ordered_len = -1;
                 int drp_request_1 = 0;
-                int seqlen_kv_b_1 = 0;
+                int seqlen_kv_b_1 = correction_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request_1 = row_batches[batch_idx_1];
                     seqlen_kv_b_1 = row_seq_lens[batch_idx_1];
@@ -929,8 +931,9 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx_2 = cluster_id; work_idx_2 < total_work_items; work_idx_2 += num_clusters) {
                 int batch_idx_2 = work_idx_2 / (unsigned int)value_split_count;
+                int mma_ordered_len = -1;
                 int drp_request_2 = 0;
-                int seqlen_kv_b_2 = 0;
+                int seqlen_kv_b_2 = mma_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request_2 = row_batches[batch_idx_2];
                     seqlen_kv_b_2 = row_seq_lens[batch_idx_2];
@@ -1189,8 +1192,9 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
             for (unsigned int work_idx_3 = cluster_id; work_idx_3 < total_work_items; work_idx_3 += num_clusters) {
                 int batch_idx_3 = work_idx_3 / (unsigned int)value_split_count;
                 int value_split_1 = work_idx_3 % (unsigned int)value_split_count;
+                int load_ordered_len = -1;
                 int drp_request_3 = 0;
-                int seqlen_kv_b_3 = 0;
+                int seqlen_kv_b_3 = load_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request_3 = row_batches[batch_idx_3];
                     seqlen_kv_b_3 = row_seq_lens[batch_idx_3];
@@ -1275,10 +1279,12 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
                     int k_page_base = pt_base + 4 * abs_tile_k + 2 * cta_rank;
                     int pg_k0 = 0;
                     int pg_k1 = 0;
-                    int _min_3 = ((k_page_base - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (k_page_base - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    pg_k0 = ((k_page_base - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_3] * (1 << page_shift) + (k_page_base - pt_base & (1 << page_shift) - 1) : -1);
-                    int _min_4 = ((k_page_base + 1 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (k_page_base + 1 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    pg_k1 = ((k_page_base + 1 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_4] * (1 << page_shift) + (k_page_base + 1 - pt_base & (1 << page_shift) - 1) : -1);
+                    int _min_3 = ((k_page_base + ((int)lane & 1) - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (k_page_base + ((int)lane & 1) - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                    int drp_k = ((k_page_base + ((int)lane & 1) - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_3] * (1 << page_shift) + (k_page_base + ((int)lane & 1) - pt_base & (1 << page_shift) - 1) : -1);
+                    int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, drp_k, 0);
+                    pg_k0 = _shfl_sync_4;
+                    int _shfl_sync_5 = __shfl_sync(0xFFFFFFFF, drp_k, 1);
+                    pg_k1 = _shfl_sync_5;
                     #pragma unroll
                     for (int n_2 = 0; n_2 < 8; n_2++) {
                         int dst_k = 0;
@@ -1323,10 +1329,11 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
                     load_kv_stage += 1;
                     if (load_kv_stage == 15) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                     int abs_tile_v = start_tile_3 + tile_3 - 1;
+                    int _min_6 = ((pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                    int drp_vh = ((pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_6] * (1 << page_shift) + (pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base & (1 << page_shift) - 1) : -1);
                     #pragma unroll
                     for (int ps_3 = 0; ps_3 < 4; ps_3++) {
-                        int _min_5 = ((pt_base + 4 * abs_tile_v + ps_3 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v + ps_3 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                        int pg_v = ((pt_base + 4 * abs_tile_v + ps_3 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_5] * (1 << page_shift) + (pt_base + 4 * abs_tile_v + ps_3 - pt_base & (1 << page_shift) - 1) : -1);
+                        int pg_v = __shfl_sync(0xFFFFFFFF, drp_vh, ps_3);
                         #pragma unroll
                         for (int acc_stage_2 = 0; acc_stage_2 < ((UNSPLIT) ? 2 : 1); acc_stage_2++) {
                             int v_group_half = 0;
@@ -1361,8 +1368,8 @@ kernel_cake_trtllm_mla_blackwell_e1672985b7233c94b1a6(const __grid_constant__ CU
                 int abs_tile_last = start_tile_3 + num_kv_tiles_3 - 1;
                 #pragma unroll
                 for (int ps_4 = 0; ps_4 < 4; ps_4++) {
-                    int _min_6 = ((pt_base + 4 * abs_tile_last + ps_4 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_last + ps_4 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    int pg_v_last = ((pt_base + 4 * abs_tile_last + ps_4 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_6] * (1 << page_shift) + (pt_base + 4 * abs_tile_last + ps_4 - pt_base & (1 << page_shift) - 1) : -1);
+                    int _min_7 = ((pt_base + 4 * abs_tile_last + ps_4 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_last + ps_4 - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                    int pg_v_last = ((pt_base + 4 * abs_tile_last + ps_4 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_7] * (1 << page_shift) + (pt_base + 4 * abs_tile_last + ps_4 - pt_base & (1 << page_shift) - 1) : -1);
                     #pragma unroll
                     for (int acc_stage_3 = 0; acc_stage_3 < ((UNSPLIT) ? 2 : 1); acc_stage_3++) {
                         int v_group_half_last = 0;

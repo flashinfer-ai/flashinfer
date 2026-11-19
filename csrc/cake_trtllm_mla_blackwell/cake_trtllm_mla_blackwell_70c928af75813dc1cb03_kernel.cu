@@ -51,7 +51,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(64) void
+__global__ __launch_bounds__(512) void
 kernel_cake_trtllm_mla_blackwell_70c928af75813dc1cb03(int* __restrict__ seq_lens, int* __restrict__ work_order, int q_len, int total_rows)
 {
     const int tid = threadIdx.x;
@@ -75,29 +75,40 @@ kernel_cake_trtllm_mla_blackwell_70c928af75813dc1cb03(int* __restrict__ seq_lens
     // Prologue
     unsigned int* keys = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int keys_addr = smem + 0;
+    unsigned int* row_lens = reinterpret_cast<unsigned int*>(smem_raw + 4096);
+    const int row_lens_addr = smem + 4096;
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    asm volatile("griddepcontrol.wait;" ::: "memory");
     int tid_1 = tid;
-    int padded = (total_rows + 3) / 4 * 4;
-    int lens[16];
+    int padded = (total_rows + 128 - 1) / 128 * 128;
+    int reqs[2];
+    int offs[2];
     #pragma unroll
-    for (int s = 0; s < 16; s++) {
-        int load_row = tid_1 + s * 64;
-        lens[s] = 0;
-        if (load_row < total_rows) {
-            int b = (int)((unsigned int)load_row / (unsigned int)q_len);
-            lens[s] = seq_lens[b] - q_len + (load_row - b * q_len) + 1;
+    for (int s = 0; s < 2; s++) {
+        int div_row = tid_1 + s * 512;
+        int b = (int)((unsigned int)div_row / (unsigned int)q_len);
+        offs[s] = div_row - b * q_len;
+        if (div_row >= total_rows) {
+            b = 0;
         }
+        reqs[s] = b;
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    int lens[2];
+    #pragma unroll
+    for (int s_1 = 0; s_1 < 2; s_1++) {
+        lens[s_1] = seq_lens[reqs[s_1]] - q_len + offs[s_1] + 1;
     }
     #pragma unroll
-    for (int s_1 = 0; s_1 < 16; s_1++) {
-        int key_row = tid_1 + s_1 * 64;
+    for (int s_2 = 0; s_2 < 2; s_2++) {
+        int key_row = tid_1 + s_2 * 512;
         if (key_row < padded) {
             unsigned int k = 4294967295u;
+            int kv_len = 0;
             if (key_row < total_rows) {
-                int kv_len = ((lens[s_1]) > (0) ? (lens[s_1]) : (0));
+                int _max_0 = ((lens[s_2]) > (0) ? (lens[s_2]) : (0));
+                kv_len = _max_0;
                 int tiles = kv_len >> 7;
                 if ((kv_len & 127) != 0) {
                     tiles = tiles + 1;
@@ -108,27 +119,49 @@ kernel_cake_trtllm_mla_blackwell_70c928af75813dc1cb03(int* __restrict__ seq_lens
                 k = (unsigned int)(4194303 - tiles) << 10 | (unsigned int)key_row;
             }
             keys[key_row] = k;
+            row_lens[key_row] = (unsigned int)kv_len;
         }
     }
     __syncthreads();
-    int row = blockIdx.x * 64 + tid_1;
-    if (row < total_rows) {
-        unsigned int mine = keys[row];
-        int rank = 0;
+    int row0 = blockIdx.x * 64 + warp * 4;
+    if (row0 < total_rows) {
+        int lane_1 = lane;
+        unsigned int mine[4];
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&mine[0])), "=r"(*reinterpret_cast<uint32_t*>(&mine[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mine[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mine[(0) + 3]))
+            : "r"(keys_addr + (unsigned int)(row0 * 4)) : "memory");
+        unsigned int mine_lens[4];
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&mine_lens[0])), "=r"(*reinterpret_cast<uint32_t*>(&mine_lens[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mine_lens[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mine_lens[(0) + 3]))
+            : "r"(row_lens_addr + (unsigned int)(row0 * 4)) : "memory");
+        unsigned int below[4] = {0};
         unsigned int quad[4];
-        #pragma unroll 4
-        for (int j = 0; j < padded; j += 4) {
+        #pragma unroll 2
+        for (int j = 0; j < padded; j += 128) {
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&quad[0])), "=r"(*reinterpret_cast<uint32_t*>(&quad[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&quad[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&quad[(0) + 3]))
-                : "r"(keys_addr + (unsigned int)(j * 4)) : "memory");
+                : "r"(keys_addr + (unsigned int)((j + lane_1 * 4) * 4)) : "memory");
             #pragma unroll
             for (int q = 0; q < 4; q++) {
-                if (quad[q] < mine) {
-                    rank = rank + 1;
+                #pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    if (quad[q] < mine[m]) {
+                        below[m] = below[m] + 1;
+                    }
                 }
             }
         }
-        work_order[rank] = row;
+        #pragma unroll
+        for (int m_1 = 0; m_1 < 4; m_1++) {
+            unsigned int rank;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(rank) : "r"(below[m_1]));
+            if (lane_1 == m_1) {
+                if (row0 + m_1 < total_rows) {
+                    work_order[(int)rank] = row0 + m_1;
+                    work_order[1024 + (int)rank] = (int)mine_lens[m_1];
+                }
+            }
+        }
     }
 }
 

@@ -450,8 +450,9 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx = cluster_id; work_idx < total_work_items; work_idx += num_clusters) {
                 int batch_idx = work_idx / (unsigned int)value_split_count;
+                int softmax_ordered_len = -1;
                 int drp_request = 0;
-                int seqlen_kv_b = 0;
+                int seqlen_kv_b = softmax_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request = row_batches[batch_idx];
                     seqlen_kv_b = row_seq_lens[batch_idx];
@@ -713,8 +714,9 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
             for (unsigned int work_idx_1 = cluster_id; work_idx_1 < total_work_items; work_idx_1 += num_clusters) {
                 int batch_idx_1 = work_idx_1 / (unsigned int)value_split_count;
                 int value_split = work_idx_1 % (unsigned int)value_split_count;
+                int correction_ordered_len = -1;
                 int drp_request_1 = 0;
-                int seqlen_kv_b_1 = 0;
+                int seqlen_kv_b_1 = correction_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request_1 = row_batches[batch_idx_1];
                     seqlen_kv_b_1 = row_seq_lens[batch_idx_1];
@@ -906,8 +908,9 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
             #pragma unroll 1
             for (unsigned int work_idx_2 = cluster_id; work_idx_2 < total_work_items; work_idx_2 += num_clusters) {
                 int batch_idx_2 = work_idx_2 / (unsigned int)value_split_count;
+                int mma_ordered_len = -1;
                 int drp_request_2 = 0;
-                int seqlen_kv_b_2 = 0;
+                int seqlen_kv_b_2 = mma_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request_2 = row_batches[batch_idx_2];
                     seqlen_kv_b_2 = row_seq_lens[batch_idx_2];
@@ -1298,8 +1301,9 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
             for (unsigned int work_idx_3 = cluster_id; work_idx_3 < total_work_items; work_idx_3 += num_clusters) {
                 int batch_idx_3 = work_idx_3 / (unsigned int)value_split_count;
                 int value_split_1 = work_idx_3 % (unsigned int)value_split_count;
+                int load_ordered_len = -1;
                 int drp_request_3 = 0;
-                int seqlen_kv_b_3 = 0;
+                int seqlen_kv_b_3 = load_ordered_len;
                 if ((unsigned long long)row_batches != 0ull) {
                     drp_request_3 = row_batches[batch_idx_3];
                     seqlen_kv_b_3 = row_seq_lens[batch_idx_3];
@@ -1422,10 +1426,12 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                     int k_page_base = pt_base + 4 * abs_tile_k + 2 * cta_rank;
                     int pg_k0 = 0;
                     int pg_k1 = 0;
-                    int _min_5 = ((k_page_base - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (k_page_base - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    pg_k0 = ((k_page_base - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_5] * (1 << page_shift) + (k_page_base - pt_base & (1 << page_shift) - 1) : -1);
-                    int _min_6 = ((k_page_base + 1 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (k_page_base + 1 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    pg_k1 = ((k_page_base + 1 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_6] * (1 << page_shift) + (k_page_base + 1 - pt_base & (1 << page_shift) - 1) : -1);
+                    int _min_5 = ((k_page_base + ((int)lane & 1) - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (k_page_base + ((int)lane & 1) - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                    int drp_k = ((k_page_base + ((int)lane & 1) - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_5] * (1 << page_shift) + (k_page_base + ((int)lane & 1) - pt_base & (1 << page_shift) - 1) : -1);
+                    int _shfl_sync_6 = __shfl_sync(0xFFFFFFFF, drp_k, 0);
+                    pg_k0 = _shfl_sync_6;
+                    int _shfl_sync_7 = __shfl_sync(0xFFFFFFFF, drp_k, 1);
+                    pg_k1 = _shfl_sync_7;
                     #pragma unroll
                     for (int n_3 = 0; n_3 < 8; n_3++) {
                         int dst_k = 0;
@@ -1470,10 +1476,11 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                     load_kv_stage += 1;
                     if (load_kv_stage == 15) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                     int abs_tile_v = start_tile_3 + tile_3 - 2;
+                    int _min_8 = ((pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                    int drp_v = ((pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_8] * (1 << page_shift) + (pt_base + 4 * abs_tile_v + ((int)lane & 3) - pt_base & (1 << page_shift) - 1) : -1);
                     #pragma unroll
                     for (int pair_3 = 0; pair_3 < 2; pair_3++) {
-                        int _min_7 = ((pt_base + 4 * abs_tile_v + 2 * pair_3 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v + 2 * pair_3 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                        int pg_v_lo = ((pt_base + 4 * abs_tile_v + 2 * pair_3 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_7] * (1 << page_shift) + (pt_base + 4 * abs_tile_v + 2 * pair_3 - pt_base & (1 << page_shift) - 1) : -1);
+                        int pg_v_lo = __shfl_sync(0xFFFFFFFF, drp_v, 2 * pair_3);
                         #pragma unroll
                         for (int acc_stage_6 = 0; acc_stage_6 < ((UNSPLIT) ? 2 : 1); acc_stage_6++) {
                             mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
@@ -1489,8 +1496,7 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                                 tma_4d_gmem2smem_cta2(smem_vquarter_addr + load_kv_stage * 8192, (&tmap_v), 0, 0, v_group_quarter_lo, pg_v_lo, ((kv_full_addr + (load_kv_stage) * 8) & 0xFEFFFFFF));
                             }
                         }
-                        int _min_8 = ((pt_base + 4 * abs_tile_v + 2 * pair_3 + 1 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v + 2 * pair_3 + 1 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                        int pg_v_hi = ((pt_base + 4 * abs_tile_v + 2 * pair_3 + 1 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_8] * (1 << page_shift) + (pt_base + 4 * abs_tile_v + 2 * pair_3 + 1 - pt_base & (1 << page_shift) - 1) : -1);
+                        int pg_v_hi = __shfl_sync(0xFFFFFFFF, drp_v, 2 * pair_3 + 1);
                         #pragma unroll
                         for (int acc_stage_7 = 0; acc_stage_7 < ((UNSPLIT) ? 2 : 1); acc_stage_7++) {
                             int v_group_quarter_hi = value_split_1 * 2 + cta_rank;
@@ -1504,10 +1510,11 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                 }
                 if (num_kv_tiles_3 >= 2) {
                     int abs_tile_v2 = start_tile_3 + num_kv_tiles_3 - 2;
+                    int _min_9 = ((pt_base + 4 * abs_tile_v2 + ((int)lane & 3) - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v2 + ((int)lane & 3) - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                    int drp_v_1 = ((pt_base + 4 * abs_tile_v2 + ((int)lane & 3) - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_9] * (1 << page_shift) + (pt_base + 4 * abs_tile_v2 + ((int)lane & 3) - pt_base & (1 << page_shift) - 1) : -1);
                     #pragma unroll
                     for (int pair_4 = 0; pair_4 < 2; pair_4++) {
-                        int _min_9 = ((pt_base + 4 * abs_tile_v2 + 2 * pair_4 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v2 + 2 * pair_4 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                        int pg_v_lo_1 = ((pt_base + 4 * abs_tile_v2 + 2 * pair_4 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_9] * (1 << page_shift) + (pt_base + 4 * abs_tile_v2 + 2 * pair_4 - pt_base & (1 << page_shift) - 1) : -1);
+                        int pg_v_lo_1 = __shfl_sync(0xFFFFFFFF, drp_v_1, 2 * pair_4);
                         #pragma unroll
                         for (int acc_stage_8 = 0; acc_stage_8 < ((UNSPLIT) ? 2 : 1); acc_stage_8++) {
                             mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
@@ -1523,8 +1530,7 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                                 tma_4d_gmem2smem_cta2(smem_vquarter_addr + load_kv_stage * 8192, (&tmap_v), 0, 0, v_group_quarter_lo_1, pg_v_lo_1, ((kv_full_addr + (load_kv_stage) * 8) & 0xFEFFFFFF));
                             }
                         }
-                        int _min_10 = ((pt_base + 4 * abs_tile_v2 + 2 * pair_4 + 1 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_v2 + 2 * pair_4 + 1 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                        int pg_v_hi_1 = ((pt_base + 4 * abs_tile_v2 + 2 * pair_4 + 1 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_10] * (1 << page_shift) + (pt_base + 4 * abs_tile_v2 + 2 * pair_4 + 1 - pt_base & (1 << page_shift) - 1) : -1);
+                        int pg_v_hi_1 = __shfl_sync(0xFFFFFFFF, drp_v_1, 2 * pair_4 + 1);
                         #pragma unroll
                         for (int acc_stage_9 = 0; acc_stage_9 < ((UNSPLIT) ? 2 : 1); acc_stage_9++) {
                             int v_group_quarter_hi_1 = value_split_1 * 2 + cta_rank;
@@ -1537,10 +1543,11 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                     }
                 }
                 int abs_tile_last = start_tile_3 + num_kv_tiles_3 - 1;
+                int _min_10 = ((pt_base + 4 * abs_tile_last + ((int)lane & 3) - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_last + ((int)lane & 3) - pt_base >> page_shift) : (max_pages_per_seq - 1));
+                int drp_v_2 = ((pt_base + 4 * abs_tile_last + ((int)lane & 3) - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_10] * (1 << page_shift) + (pt_base + 4 * abs_tile_last + ((int)lane & 3) - pt_base & (1 << page_shift) - 1) : -1);
                 #pragma unroll
                 for (int pair_5 = 0; pair_5 < 2; pair_5++) {
-                    int _min_11 = ((pt_base + 4 * abs_tile_last + 2 * pair_5 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_last + 2 * pair_5 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    int pg_v_lo_2 = ((pt_base + 4 * abs_tile_last + 2 * pair_5 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_11] * (1 << page_shift) + (pt_base + 4 * abs_tile_last + 2 * pair_5 - pt_base & (1 << page_shift) - 1) : -1);
+                    int pg_v_lo_2 = __shfl_sync(0xFFFFFFFF, drp_v_2, 2 * pair_5);
                     #pragma unroll
                     for (int acc_stage_10 = 0; acc_stage_10 < ((UNSPLIT) ? 2 : 1); acc_stage_10++) {
                         mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
@@ -1556,8 +1563,7 @@ kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CU
                             tma_4d_gmem2smem_cta2(smem_vquarter_addr + load_kv_stage * 8192, (&tmap_v), 0, 0, v_group_quarter_lo_2, pg_v_lo_2, ((kv_full_addr + (load_kv_stage) * 8) & 0xFEFFFFFF));
                         }
                     }
-                    int _min_12 = ((pt_base + 4 * abs_tile_last + 2 * pair_5 + 1 - pt_base >> page_shift) < (max_pages_per_seq - 1) ? (pt_base + 4 * abs_tile_last + 2 * pair_5 + 1 - pt_base >> page_shift) : (max_pages_per_seq - 1));
-                    int pg_v_hi_2 = ((pt_base + 4 * abs_tile_last + 2 * pair_5 + 1 - pt_base >> page_shift < max_pages_per_seq) ? page_table[pt_base + _min_12] * (1 << page_shift) + (pt_base + 4 * abs_tile_last + 2 * pair_5 + 1 - pt_base & (1 << page_shift) - 1) : -1);
+                    int pg_v_hi_2 = __shfl_sync(0xFFFFFFFF, drp_v_2, 2 * pair_5 + 1);
                     #pragma unroll
                     for (int acc_stage_11 = 0; acc_stage_11 < ((UNSPLIT) ? 2 : 1); acc_stage_11++) {
                         int v_group_quarter_hi_2 = value_split_1 * 2 + cta_rank;
