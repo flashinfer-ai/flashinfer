@@ -381,6 +381,7 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
     grid_search: bool = True,
+    *,
     causal: bool = True,
 ) -> Plan:
     """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``

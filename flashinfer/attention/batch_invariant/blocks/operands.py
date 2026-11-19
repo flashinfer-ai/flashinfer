@@ -186,6 +186,7 @@ class StaticPlan:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        *,
         causal: bool = True,
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that

@@ -397,6 +397,7 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    *,
     causal: bool = True,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
@@ -512,6 +513,7 @@ def workspace_bytes(
     config: Optional[AttnConfig] = None,
     device=None,
     ragged: bool = False,
+    *,
     causal: bool = True,
 ) -> int:
     """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
@@ -746,7 +748,7 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, causal
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, causal=causal
         )
         kernel(
             q_view,
@@ -778,7 +780,7 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, causal
+                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, causal=causal
             )
         else:
             kernel = get_compiled_attention(
@@ -791,7 +793,7 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
-                causal,
+                causal=causal,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -827,7 +829,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g, causal)(
+        get_fixup(D, g, causal=causal)(
             planned.ws,
             o_view,
             planned.fixup_groups,
@@ -856,6 +858,7 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
+    *,
     causal: bool = True,
 ) -> torch.Tensor:
     """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned, or with ``causal=False`` the

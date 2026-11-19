@@ -191,6 +191,7 @@ def fold_row(
     C: cutlass.Constexpr,
     PF: cutlass.Constexpr,
     WS: cutlass.Constexpr,
+    *,
     causal: cutlass.Constexpr = True,
 ):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
@@ -430,7 +431,7 @@ def fold_row_coop(
 
 
 class SplitKVFixup:
-    def __init__(self, D: int, g: int, pdl: bool = PDL, causal: bool = True):
+    def __init__(self, D: int, g: int, pdl: bool = PDL, *, causal: bool = True):
         self.D, self.g, self.pdl = D, g, pdl
         self.causal = causal  # the mask mode (a class dimension; compile-time)
         self.C = chunk_len(D)
@@ -563,7 +564,7 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int, causal: bool = True):
+def get_fixup(D: int, g: int, *, causal: bool = True):
     name = jit.sanitize_symbol_name(
         f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("" if causal else "_nc")
     )

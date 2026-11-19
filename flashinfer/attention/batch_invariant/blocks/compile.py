@@ -36,6 +36,7 @@ def kernel_name(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
+    *,
     causal: bool = True,
 ) -> str:
     return jit.sanitize_symbol_name(
@@ -59,6 +60,7 @@ def get_compiled_attention(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
+    *,
     causal: bool = True,
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
@@ -68,7 +70,9 @@ def get_compiled_attention(
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal)
+    name = kernel_name(
+        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal
+    )
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -135,7 +139,7 @@ def get_compiled_attention(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         k = AttentionKernel(
-            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal
+            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal
         )
         return cute.compile(
             k,

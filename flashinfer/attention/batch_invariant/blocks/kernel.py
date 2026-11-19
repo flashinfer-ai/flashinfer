@@ -103,6 +103,7 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        *,
         causal: bool = True,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
@@ -153,7 +154,7 @@ class AttentionKernel:
             self.ragged,
             self.hw_rowmax,
             self.cap,
-            self.causal,
+            causal=self.causal,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

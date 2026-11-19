@@ -74,6 +74,7 @@ class SwapsKernel:
         ragged: bool = False,
         cap: int = 0,
         pdl: bool = False,
+        *,
         causal: bool = True,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
@@ -102,7 +103,13 @@ class SwapsKernel:
         stream: cuda.CUstream,
     ):
         st = SwapsPlan(
-            self.D, self.g, self.page, self.n_pad, self.ragged, self.cap, self.causal
+            self.D,
+            self.g,
+            self.page,
+            self.n_pad,
+            self.ragged,
+            self.cap,
+            causal=self.causal,
         )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
