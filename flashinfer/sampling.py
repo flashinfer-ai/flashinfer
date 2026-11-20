@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from numbers import Real
 from threading import Lock
 from types import SimpleNamespace
@@ -2154,6 +2155,8 @@ def min_p_sampling_from_probs(
 # Thresholds were empirically determined.
 _TOP_K_FIRST_FAST_PATH_MAX_K = 256
 _TOP_K_FIRST_FAST_PATH_MIN_VOCAB = 65536
+# Widest vector load of the top-k kernels, in bytes.
+_TOP_K_VECTOR_LOAD_BYTES = 16
 
 
 def _top_k_first_fast_path_applicable(
@@ -2172,8 +2175,15 @@ def _top_k_first_fast_path_applicable(
         and indices.device == x.device
         and indices.dtype in (torch.int32, torch.int64)
     )
+    # The radix top-k kernel faults on a base that is unaligned for its vector loads.
+    # Such an input takes the original kernels, which refuse it with a ValueError.
+    load_bytes = (
+        math.gcd(_TOP_K_VECTOR_LOAD_BYTES // x.element_size(), x.size(-1))
+        * x.element_size()
+    )
     return (
         valid_indices
+        and x.data_ptr() % load_bytes == 0
         and (isinstance(top_k, int) or top_k.shape == (x.size(0),))
         and select_k is not None
         and 0 < select_k <= _TOP_K_FIRST_FAST_PATH_MAX_K

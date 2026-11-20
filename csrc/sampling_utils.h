@@ -17,8 +17,34 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
 
+#include <cstdint>
+#include <numeric>
+
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
+
+// Widest vector load of the sampling kernels, in bytes.
+constexpr uint64_t kSamplingVectorLoadBytes = 16;
+
+// The sampling kernels read each row of `tensor` with vector loads of
+// gcd(kSamplingVectorLoadBytes / element size, vocab_size) elements. Rows are vocab_size
+// elements apart, so every load is aligned exactly when the first one is. A contiguous view
+// that starts at an unaligned storage offset passes the other input checks and makes the
+// kernel fault with cudaErrorMisalignedAddress, an asynchronous error that leaves the CUDA
+// context unusable. Refuse such a view before anything is launched.
+inline void check_vector_load_alignment(const TensorView& tensor, const char* name) {
+  const uint64_t element_bytes = tensor.dtype().bits / 8;
+  const uint64_t vocab_size = static_cast<uint64_t>(tensor.size(tensor.ndim() - 1));
+  const uint64_t load_bytes =
+      std::gcd(kSamplingVectorLoadBytes / element_bytes, vocab_size) * element_bytes;
+  const uint64_t address = reinterpret_cast<uint64_t>(tensor.data_ptr());
+  if (address % load_bytes != 0) {
+    TVM_FFI_THROW(ValueError) << name << " must start on a " << load_bytes
+                              << "-byte boundary for a last dimension of " << vocab_size
+                              << ", but its data pointer is " << address % load_bytes
+                              << " bytes past one. Pass a copy (for example with .clone()).";
+  }
+}
 
 // Helper to validate sampling parameters
 inline void check_tensor_param(const Optional<TensorView>& maybe_param, const TensorView& tensor) {
