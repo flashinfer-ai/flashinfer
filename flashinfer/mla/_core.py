@@ -41,6 +41,7 @@ from flashinfer.autotuner import (
     cake_auto_candidate_open,
     make_bucket_mapper,
 )
+from flashinfer.autotuner import autotuner as _autotuner_module
 from flashinfer.jit.core import logger
 
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
@@ -3015,6 +3016,75 @@ _CAKE_MLA_LOADED_FAMILIES: set = set()
 _CAKE_MLA_UNAVAILABLE_FAMILIES: set = set()
 
 
+@functools.cache
+def _cake_mla_module():
+    """``flashinfer.mla.cake_trtllm_mla_blackwell``, imported on first use."""
+    from . import cake_trtllm_mla_blackwell
+
+    return cake_trtllm_mla_blackwell
+
+
+# Host facts of the Cake candidate that depend only on scalars and on the offer
+# table: per (arch, SM count, dtype, page size, q_len, max_seq_len) the offered
+# batch ranges, and per request sizes and batch the launched families. They are
+# derived from the table object ``_CAKE_MLA_TABLE_MEMO_OWNER`` holds and are
+# dropped when ``_CAKE_MLA_AUTO_OFFERS`` names another object. Bounded: cleared
+# when it grows past ``_CAKE_MLA_MEMO_LIMIT`` entries.
+_CAKE_MLA_TABLE_MEMO: Dict[Any, Any] = {}
+_CAKE_MLA_TABLE_MEMO_OWNER: List[Any] = [None]
+_CAKE_MLA_MEMO_LIMIT = 4096
+_MISSING = object()
+
+
+def _cake_mla_table_memo() -> Dict[Any, Any]:
+    table = _CAKE_MLA_AUTO_OFFERS
+    if _CAKE_MLA_TABLE_MEMO_OWNER[0] is not table:
+        _CAKE_MLA_TABLE_MEMO.clear()
+        _CAKE_MLA_TABLE_MEMO_OWNER[0] = table
+    elif len(_CAKE_MLA_TABLE_MEMO) > _CAKE_MLA_MEMO_LIMIT:
+        _CAKE_MLA_TABLE_MEMO.clear()
+    return _CAKE_MLA_TABLE_MEMO
+
+
+def _cake_mla_auto_batch_ranges(
+    device_index: int,
+    dtype: torch.dtype,
+    page_size: int,
+    q_len: int,
+    has_sinks: bool,
+    max_seq_len: int,
+) -> Tuple[Tuple[int, int], ...]:
+    """The ``(first batch, last batch)`` ranges ``_CAKE_MLA_AUTO_OFFERS`` lists
+    for this request configuration on the device of ``device_index`` (any
+    domain), memoized: ``()`` for an unlisted unit or a device that is not
+    SM100a/SM103a."""
+    if has_sinks:
+        return ()
+    try:
+        arch, num_sms = _cake_mla_module()._device_facts(device_index)
+    except RuntimeError:
+        return ()
+    memo = _cake_mla_table_memo()
+    key = ("ranges", arch, num_sms, dtype, page_size, q_len, max_seq_len)
+    ranges = memo.get(key)
+    if ranges is None:
+        ranges = tuple(
+            (first, last)
+            for _, first, last in _cake_mla_auto_offer_ranges(
+                arch, num_sms, dtype, page_size, q_len, False, max_seq_len
+            )
+        )
+        memo[key] = ranges
+    return ranges
+
+
+def _in_batch_ranges(batch_size: int, ranges: Tuple[Tuple[int, int], ...]) -> bool:
+    for first, last in ranges:  # noqa: SIM110 - no generator on the per-call path
+        if first <= batch_size <= last:
+            return True
+    return False
+
+
 def _resolve_cute_dsl_workspace_sizer(
     cute_dsl_impl: str,
     sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
@@ -3205,21 +3275,13 @@ def _cake_mla_auto_candidate_reason(
     TRTLLM-GEN / CuTe DSL candidates. The switch, process-group and tuner gate is
     :func:`~flashinfer.autotuner.cake_auto_candidate_open`; batch-dependent limits
     are checked per profile by :meth:`_CakeTrtllmMlaBlackwellRunner.get_valid_tactics`
-    and per call by :meth:`_CakeTrtllmMlaBlackwellRunner.validate_tactic`.
+    and per call by :meth:`_CakeTrtllmMlaBlackwellRunner.validate_tactic`. The
+    checks on scalars, dtypes and sizes are memoized
+    (``_cake_mla_auto_static_reason``); the sink tensor and the contiguity of
+    every tensor are checked on every call.
     """
-    if get_compute_capability(query.device) not in ((10, 0), (10, 3)):
-        return "requires SM100a or SM103a"
-    if (
-        query.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
-        or kv_cache.dtype != query.dtype
-    ):
-        return "requires BF16 or FP8 E4M3 query and kv_cache of the same dtype"
-    if kv_cache.shape[-2] not in (32, 64):
-        return "requires page size 32 or 64"
     if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
         return "requires host float bmm1_scale / bmm2_scale"
-    if not (math.isfinite(bmm1_scale) and math.isfinite(bmm2_scale)):
-        return "requires finite bmm1_scale / bmm2_scale"
     # The sparse route reads every index (no -1 padding), the route has no
     # skip-softmax and its LSE units do not follow return_lse_base.
     if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
@@ -3234,6 +3296,23 @@ def _cake_mla_auto_candidate_reason(
         return "does not support DCP or multi_ctas_kv_counter_buffer"
     if not uses_shared_paged_kv_idx:
         return "requires uses_shared_paged_kv_idx=True"
+    reason = _cake_mla_auto_static_reason(
+        get_compute_capability(query.device),
+        query.dtype,
+        kv_cache.dtype,
+        kv_cache.shape[-2],
+        bmm1_scale,
+        bmm2_scale,
+        seq_lens.dtype,
+        block_tables.dtype,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        query.size(-2),
+        sinks is not None,
+    )
+    if reason is not None:
+        return reason
     if sinks is not None:
         sink = (
             sinks[0] if isinstance(sinks, (list, tuple)) and len(sinks) == 1 else sinks
@@ -3246,26 +3325,65 @@ def _cake_mla_auto_candidate_reason(
             and tuple(sink.shape) == (query.size(-2),)
         ):
             return "requires one contiguous FP32 sink value per head"
-    if seq_lens.dtype != torch.int32 or block_tables.dtype != torch.int32:
-        return "requires int32 seq_lens and block_tables"
-    if not all(
-        t.is_contiguous() for t in (query, kv_cache, block_tables, seq_lens, out)
+    if not (
+        query.is_contiguous()
+        and kv_cache.is_contiguous()
+        and block_tables.is_contiguous()
+        and seq_lens.is_contiguous()
+        and out.is_contiguous()
     ):
         return "requires contiguous query, kv_cache, block_tables, seq_lens and out"
-    if not _cake_trtllm_mla_blackwell_supports(
-        query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, 0
+    return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _cake_mla_auto_static_reason(
+    capability: Tuple[int, int],
+    dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    seq_lens_dtype: torch.dtype,
+    block_tables_dtype: torch.dtype,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_heads: int,
+    has_sinks: bool,
+) -> Optional[str]:
+    """The checks of ``_cake_mla_auto_candidate_reason`` on the device's
+    compute capability, the dtypes, sizes and host scales; ``None`` when they
+    pass."""
+    if capability not in ((10, 0), (10, 3)):
+        return "requires SM100a or SM103a"
+    if dtype not in (torch.bfloat16, torch.float8_e4m3fn) or kv_dtype != dtype:
+        return "requires BF16 or FP8 E4M3 query and kv_cache of the same dtype"
+    if page_size not in (32, 64):
+        return "requires page size 32 or 64"
+    if not (math.isfinite(bmm1_scale) and math.isfinite(bmm2_scale)):
+        return "requires finite bmm1_scale / bmm2_scale"
+    if seq_lens_dtype != torch.int32 or block_tables_dtype != torch.int32:
+        return "requires int32 seq_lens and block_tables"
+    if not _cake_mla_module().supports_dimension_tuple(
+        qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads, 0
     ):
         return "has no generated program for this dimension tuple"
     # Other head counts, FP8 page 32 and FP8 with sinks take the generic tail
     # program. It rebuilds its row plan with torch ops on every stateless call,
     # serves max_seq_len <= 4096 only, and on FP8 page 32 runs for milliseconds,
     # so it does not join.
-    if query.size(-2) != 128 or (
-        query.dtype == torch.float8_e4m3fn
-        and (kv_cache.shape[-2] != 64 or sinks is not None)
+    if num_heads != 128 or (
+        dtype == torch.float8_e4m3fn and (page_size != 64 or has_sinks)
     ):
         return "takes the generic tail program, which does not join selection"
     return None
+
+
+# Outcomes of ``_CakeTrtllmMlaBlackwellRunner.validate_tactic``.
+_CAKE_VALID_OK = 0
+_CAKE_VALID_STABLE_MISS = 1
+_CAKE_VALID_UNREADY = 2
 
 
 class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
@@ -3337,6 +3455,19 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         self._enable_pdl = enable_pdl
         # The first-stage winner of the same call (set by the dispatcher).
         self._incumbent: Optional["_MlaStageOneWinnerRunner"] = None
+        # The outcome of the last ``validate_tactic``: ``None`` before one,
+        # else one of the ``_CAKE_VALID_*`` values, and the families it
+        # validated (``_mla_cake_stage_two`` memoizes a decision only when no
+        # readiness check decided it).
+        self._validation: Optional[int] = None
+        self._validated_families: Optional[frozenset] = None
+        # validate_tactic calls whose outcome a readiness check decided or that
+        # raised.
+        self._unready = 0
+        # The launch the second stage resolved for this call's inputs
+        # (``_launch_plan``); ``None``: ``forward`` takes the
+        # dispatcher.
+        self._plan: Optional[tuple] = None
 
     def _domain(
         self, inputs, num_sms: int, batch_size: Optional[int] = None
@@ -3345,28 +3476,48 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         ``batch_size`` requests when given) on a device of ``num_sms`` SMs, or
         ``None`` when it does not launch within the row cap or takes the
         generic tail program."""
-        from .cake_trtllm_mla_blackwell import (
-            DOMAIN_BF16_TAIL,
-            DOMAIN_FP8_TAIL,
-            select_domain,
-        )
-
         query, block_tables, seq_lens, out = inputs[:4]
-        if not all(t.is_contiguous() for t in (query, block_tables, seq_lens, out)):
+        if not (
+            query.is_contiguous()
+            and block_tables.is_contiguous()
+            and seq_lens.is_contiguous()
+            and out.is_contiguous()
+        ):
             return None
         _, q_len, num_heads, qk_dim = query.shape
-        if batch_size is None:
-            batch_size = query.size(0)
+        return self._domain_for(
+            query.dtype,
+            q_len,
+            num_heads,
+            qk_dim,
+            int(block_tables.shape[-1]),
+            query.size(0) if batch_size is None else batch_size,
+            num_sms,
+        )
+
+    def _domain_for(
+        self,
+        dtype: torch.dtype,
+        q_len: int,
+        num_heads: int,
+        qk_dim: int,
+        table_width: int,
+        batch_size: int,
+        num_sms: int,
+    ) -> Optional[str]:
+        """``_domain`` from the request sizes (a pure function of them and of
+        the runner's scalars)."""
+        cake = _cake_mla_module()
         max_rows = (
             _CAKE_MLA_FP8_MAX_ROWS
-            if query.dtype == torch.float8_e4m3fn
+            if dtype == torch.float8_e4m3fn
             else _CAKE_MLA_MAX_ROWS
         )
         if batch_size * q_len > max_rows:
             return None
         try:
-            domain = select_domain(
-                dtype=query.dtype,
+            domain = cake.select_domain(
+                dtype=dtype,
                 num_heads=num_heads,
                 qk_dim=qk_dim,
                 value_dim=self._kv_lora_rank,
@@ -3383,49 +3534,158 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
                 max_seq_len=self._max_seq_len,
                 batch_size=batch_size,
                 q_len=q_len,
-                table_width=int(block_tables.shape[-1]),
+                table_width=table_width,
                 kv_lens=None,
                 num_sms=num_sms,
             )
         except ValueError:
             return None
-        return None if domain in (DOMAIN_BF16_TAIL, DOMAIN_FP8_TAIL) else domain
+        return (
+            None if domain in (cake.DOMAIN_BF16_TAIL, cake.DOMAIN_FP8_TAIL) else domain
+        )
 
     def _families(self, inputs, batch_sizes) -> Optional[frozenset]:
         """The families the route launches for each of these batch sizes, or
         ``None`` when one of them does not launch, is not a unit
         ``_CAKE_MLA_AUTO_OFFERS`` lists for the device, or launches other
-        families than the first."""
-        from .cake_trtllm_mla_blackwell import _device_facts, launch_families
+        families than the first.
 
-        query = inputs[0]
-        families = None
+        Per batch size the result is a pure function of the device facts, the
+        request sizes and the runner's scalars, memoized with the offer table
+        (``_cake_mla_table_memo``); the contiguity of the inputs is checked on
+        every call."""
+        cake = _cake_mla_module()
+        query, block_tables, seq_lens, out = inputs[:4]
+        if not (
+            query.is_contiguous()
+            and block_tables.is_contiguous()
+            and seq_lens.is_contiguous()
+            and out.is_contiguous()
+        ):
+            return None
         try:
-            arch, num_sms = _device_facts(query.device.index)
-            for batch_size in batch_sizes:
-                domain = self._domain(inputs, num_sms, batch_size)
-                if domain is None or not _cake_mla_auto_offered(
+            arch, num_sms = cake._device_facts(query.device.index)
+        except RuntimeError:
+            return None
+        _, q_len, num_heads, qk_dim = query.shape
+        table_width = int(block_tables.shape[-1])
+        sizes = (
+            "families",
+            arch,
+            num_sms,
+            query.dtype,
+            q_len,
+            num_heads,
+            qk_dim,
+            table_width,
+            self._page_size,
+            self._kv_lora_rank,
+            self._qk_nope_head_dim,
+            self.sinks is not None,
+            self._bmm2_scale,
+            self._max_seq_len,
+        )
+        memo = _cake_mla_table_memo()
+        families = None
+        for batch_size in batch_sizes:
+            key = (sizes, batch_size)
+            launched = memo.get(key, _MISSING)
+            if launched is _MISSING:
+                launched = self._launched_families(
+                    query.dtype,
+                    q_len,
+                    num_heads,
+                    qk_dim,
+                    table_width,
+                    batch_size,
                     arch,
                     num_sms,
-                    query.dtype,
-                    self._page_size,
-                    domain,
-                    query.size(1),
-                    self.sinks is not None,
-                    self._max_seq_len,
-                    batch_size,
-                ):
-                    return None
-                launched = frozenset(
-                    launch_families(domain, arch, num_sms, batch_size * query.size(1))
                 )
-                if families is None:
-                    families = launched
-                elif launched != families:
-                    return None
+                memo[key] = launched
+            if launched is None:
+                return None
+            if families is None:
+                families = launched
+            elif launched != families:
+                return None
+        return families
+
+    def _launched_families(
+        self,
+        dtype: torch.dtype,
+        q_len: int,
+        num_heads: int,
+        qk_dim: int,
+        table_width: int,
+        batch_size: int,
+        arch: str,
+        num_sms: int,
+    ) -> Optional[frozenset]:
+        """The families a listed batch of ``batch_size`` requests launches, or
+        ``None`` (not launched, not listed, or no route)."""
+        try:
+            domain = self._domain_for(
+                dtype, q_len, num_heads, qk_dim, table_width, batch_size, num_sms
+            )
+            if domain is None or not _cake_mla_auto_offered(
+                arch,
+                num_sms,
+                dtype,
+                self._page_size,
+                domain,
+                q_len,
+                self.sinks is not None,
+                self._max_seq_len,
+                batch_size,
+            ):
+                return None
+            return frozenset(
+                _cake_mla_module().launch_families(
+                    domain, arch, num_sms, batch_size * q_len
+                )
+            )
         except (RuntimeError, ValueError):
             return None
-        return families
+
+    def _launch_plan(self, inputs) -> Optional[tuple]:
+        """``(launch, FP8 decode table, sink placeholder, device)`` for these
+        inputs: the launch ``trtllm_mla_blackwell_decode(..., stateless=True)``
+        makes, resolved once (``DeviceRowLaunch``), or ``None`` when the route
+        takes a program whose rows the host plans, or the device has no FP8
+        decode table yet. Only for a request without sinks."""
+        cake = _cake_mla_module()
+        query, block_tables = inputs[0], inputs[1]
+        if self.sinks is not None:
+            return None
+        device = query.device
+        lut = cake._FP8_LUTS.get(device)
+        if lut is None:
+            return None
+        arch, num_sms = cake._device_facts(device.index)
+        domain = self._domain(inputs, num_sms)
+        if domain is None:
+            return None
+        batch_size, q_len, num_heads, _ = query.shape
+        total_q = batch_size * q_len
+        launch = cake.device_row_launch(
+            domain,
+            cake.launch_family(domain, arch, num_sms, total_q),
+            arch=arch,
+            num_sms=num_sms,
+            num_heads=num_heads,
+            has_sink=False,
+            softmax_scale_log2=self._bmm1_scale * log2e,
+            bmm2=self._bmm2_scale,
+            total_q=total_q,
+            batch_size=batch_size,
+            q_len=q_len,
+            table_width=int(block_tables.shape[-1]),
+            page_size=self._page_size,
+            max_seq_len=self._max_seq_len,
+        )
+        if launch is None:
+            return None
+        return launch, lut, lut[:num_heads], device
 
     @staticmethod
     def _ready(families, device: torch.device) -> bool:
@@ -3501,15 +3761,33 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         beats the first stage's current winner for them.
 
         The tuner calls it on every cache hit; ``False`` makes the hit a miss.
+        It records its outcome (``_validation``): a choice that does not launch
+        for these sizes or no longer names the first stage's winner is
+        ``_CAKE_VALID_STABLE_MISS`` (it holds while the inputs' sizes and the
+        tuner's winners are unchanged), a family not loaded or unavailable is
+        ``_CAKE_VALID_UNREADY`` (it can change in either direction).
         """
+        # Counted as unready until the outcome is known, so a raised error
+        # counts too.
+        self._validation = _CAKE_VALID_UNREADY
+        self._validated_families = None
+        self._unready += 1
         if self._incumbent is None or not isinstance(tactic, tuple):
-            return False
+            return self._stable_miss()
         families = self._families(inputs, (inputs[0].size(0),))
-        return (
-            bool(families)
-            and tactic == self._incumbent.call_winner(inputs)
-            and self._ready(families, inputs[0].device)
-        )
+        if not families or tactic != self._incumbent.call_winner(inputs):
+            return self._stable_miss()
+        if not self._ready(families, inputs[0].device):
+            return False
+        self._unready -= 1
+        self._validation = _CAKE_VALID_OK
+        self._validated_families = families
+        return True
+
+    def _stable_miss(self) -> bool:
+        self._unready -= 1
+        self._validation = _CAKE_VALID_STABLE_MISS
+        return False
 
     def validate_tactic_for_profile(self, inputs, tactic, profile) -> bool:
         """Validate a bucket reused during tuning against the bucket's batches
@@ -3534,14 +3812,32 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         )
 
     def forward(self, inputs, tactic: Any = -1, do_preparation: bool = False, **kwargs):
-        from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
-
         if do_preparation:
             # get_valid_tactics already built the programs (_ready); the tuner's
             # preparation call must not launch the decode.
             return None
         query, block_tables, seq_lens, out = inputs[:4]
-        return trtllm_mla_blackwell_decode(
+        plan = self._plan
+        if plan is not None:
+            # The launch the second stage resolved for exactly these inputs
+            # (their sizes and contiguity were checked for this call): the
+            # kernels and arguments of the dispatcher's stateless mode, without
+            # re-deriving them.
+            launch, _, placeholder, device = plan
+            _cake_mla_module().launch_device_rows(
+                launch,
+                query=query,
+                kv_cache=self.kv_cache,
+                out=out,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
+                sink_arg=placeholder,
+                device=device,
+                stream=torch._C._cuda_getCurrentRawStream(device.index),
+                stateless=True,
+            )
+            return out
+        return _cake_mla_module().trtllm_mla_blackwell_decode(
             query=query,
             kv_cache=self.kv_cache,
             block_tables=block_tables,
@@ -3724,14 +4020,65 @@ def _mla_cake_margin_tuning_config(
     )
 
 
+# Second-stage decisions of lookup-only calls, keyed by
+# ``(memo_key, batch ranges, first-stage selection)``, where ``memo_key`` (built
+# by the dispatcher) holds every argument and tensor size, dtype and device the
+# two stages' lookups and the Cake checks read. A value is ``(tuner, tuner
+# state, offer table, families, launch plan, FP8 decode table)``; ``families``
+# is ``None`` for a decision to run the first stage's selection. See
+# ``_mla_cake_stage_two``. Bounded like ``_CAKE_MLA_TABLE_MEMO``.
+_CAKE_MLA_STAGE_TWO_MEMO: Dict[Any, Any] = {}
+
+
+def _mla_cake_memo_state(tuner: AutoTuner) -> Optional[tuple]:
+    """What, besides the call's arguments, decides a lookup of the two stages
+    now: the generation of the tuner's winner sources (advanced by every change
+    of the in-memory winners and loaded configs of every tuner), the active
+    ``autotune()`` overrides and whether bundled configs are read. ``None``
+    when a lookup reads sources the generation does not cover, or is recorded:
+    while tuning, with a managed ``autotune_v2`` store, inside an
+    ``autotune_v2`` context, under replay diagnostics or with a measurement
+    policy."""
+    if tuner.is_tuning_mode or tuner._managed_cache is not None:
+        return None
+    local = tuner._v2_local
+    if (
+        local.active
+        or local.replay_report is not None
+        or local.strict_replay
+        or local.measure is not None
+    ):
+        return None
+    stack = tuner._get_override_stack()
+    return (
+        _autotuner_module._winner_sources_generation,
+        tuple(stack[-1][:3]) if stack else None,
+        os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"),
+    )
+
+
+def _cake_mla_families_ready(families: frozenset, device: torch.device, lut) -> bool:
+    """Whether every family is loaded and none unavailable, and ``lut`` is the
+    device's FP8 decode table: ``_ready`` without building anything."""
+    unavailable = _CAKE_MLA_UNAVAILABLE_FAMILIES
+    if unavailable and not unavailable.isdisjoint(families):
+        return False
+    return _CAKE_MLA_LOADED_FAMILIES.issuperset(families) and (
+        _cake_mla_module()._FP8_LUTS.get(device) is lut
+    )
+
+
 def _mla_cake_stage_two(
     tuner: AutoTuner,
     runners: List[TunableRunner],
     tuning_config: TuningConfig,
     inputs: List[torch.Tensor],
     selected: Tuple[TunableRunner, Any],
-    cake: _CakeTrtllmMlaBlackwellRunner,
+    cake: Union[
+        _CakeTrtllmMlaBlackwellRunner, Callable[[], _CakeTrtllmMlaBlackwellRunner]
+    ],
     batch_ranges: Tuple[Tuple[int, int], ...],
+    memo_key: Optional[tuple] = None,
 ) -> Tuple[TunableRunner, Any]:
     """The second selection stage: Cake when it beat the first stage's winner
     for this call's bucket and launches now, else ``selected``, the first
@@ -3743,15 +4090,52 @@ def _mla_cake_stage_two(
     first stage's lookup records the call in ``autotune_v2`` replay
     diagnostics; the second stage's lookups are not recorded, and a miss
     under strict replay runs the first stage's winner instead of raising.
+
+    ``cake`` is the Cake runner of the call, or a function building it (only
+    when the call needs it). With a ``memo_key`` (the dispatcher's), a
+    lookup-only decision is memoized per ``(memo_key, batch_ranges, first-stage
+    selection)`` and reused while ``_mla_cake_memo_state`` and the offer table
+    are unchanged: a decision to run Cake while its families stay loaded and
+    available (else the call looks up again), a decision to run the first
+    stage's selection only when no readiness check decided it (a Cake choice
+    that does not launch for these sizes, does not name the first stage's
+    winner, or no Cake choice). The memo is skipped whenever
+    ``_mla_cake_memo_state`` is ``None``.
     """
-    if {_MLA_DECODE_OP, _MLA_CAKE_MARGIN_OP} & tuner._effective_skip_ops:
+    skip_ops = tuner._effective_skip_ops
+    if skip_ops and (_MLA_DECODE_OP in skip_ops or _MLA_CAKE_MARGIN_OP in skip_ops):
         return selected
-    capturing = torch.cuda.is_current_stream_capturing()
-    lookup_only = not tuner.is_tuning_mode or capturing
-    if lookup_only:
-        batch_size = inputs[0].size(0)
-        if not any(first <= batch_size <= last for first, last in batch_ranges):
-            return selected
+    lookup_only = not tuner.is_tuning_mode or torch.cuda.is_current_stream_capturing()
+    if lookup_only and not _in_batch_ranges(inputs[0].size(0), batch_ranges):
+        return selected
+    # A Cake choice runs only in place of the first-stage selection it beat
+    # (also where replay diagnostics made the first stage's lookup miss).
+    beaten = (type(selected[0]).__name__, selected[1])
+    state = memo_entry_key = None
+    if lookup_only and memo_key is not None:
+        state = _mla_cake_memo_state(tuner)
+    if state is not None:
+        memo_entry_key = (memo_key, batch_ranges, beaten)
+        try:
+            entry = _CAKE_MLA_STAGE_TWO_MEMO.get(memo_entry_key)
+        except TypeError:  # an unhashable first-stage tactic
+            entry, state = None, None
+        if (
+            entry is not None
+            and entry[0] is tuner
+            and entry[1] == state
+            and entry[2] is _CAKE_MLA_AUTO_OFFERS
+        ):
+            families = entry[3]
+            if families is None:
+                return selected
+            if _cake_mla_families_ready(families, inputs[0].device, entry[5]):
+                if not isinstance(cake, _CakeTrtllmMlaBlackwellRunner):
+                    cake = cake()
+                cake._plan = entry[4]
+                return cake, beaten
+    if not isinstance(cake, _CakeTrtllmMlaBlackwellRunner):
+        cake = cake()
     # autotune(round_up=True) rebuilds the batch mapping from the profiled
     # buckets, so the second stage then generates the first stage's buckets.
     config = (
@@ -3764,9 +4148,6 @@ def _mla_cake_stage_two(
     incumbent = _MlaStageOneWinnerRunner(runners, tuning_config, inputs, cake)
     cake._incumbent = incumbent
     pair: List[TunableRunner] = [incumbent, cake]
-    # A Cake choice runs only in place of the first-stage selection it beat
-    # (also where replay diagnostics made the first stage's lookup miss).
-    beaten = (type(selected[0]).__name__, selected[1])
     if not lookup_only:
         from ..autotuner.autotuner import _StickyCudaError, _TuningGroupError
 
@@ -3794,6 +4175,8 @@ def _mla_cake_stage_two(
     local = tuner._v2_local
     saved = local.replay_report, local.strict_replay
     local.replay_report, local.strict_replay = None, False
+    cake._validation, cake._unready = None, 0
+    looked_up = False
     try:
         hit, runner_id, tactic, _ = tuner.search_cache(
             _MLA_CAKE_MARGIN_OP,
@@ -3805,11 +4188,36 @@ def _mla_cake_stage_two(
             require_profiling_policy=saved[1],
         )
         cake_ok = hit and pair[runner_id] is cake and tactic == beaten
-        cake_ok = cake_ok and cake.validate_tactic(inputs, tactic)
+        # search_cache returns a hit only after the runner's validate_tactic
+        # accepted it for these inputs (AutoTuner._tactic_still_valid on every
+        # source), so a Cake hit is validated once; a lookup that returned one
+        # without validating it is validated here.
+        if cake_ok and cake._validation is None:
+            cake_ok = cake.validate_tactic(inputs, tactic)
+        looked_up = True
     except Exception:
         cake_ok = False
     finally:
         local.replay_report, local.strict_replay = saved
+    plan = None
+    if cake_ok:
+        try:
+            plan = cake._launch_plan(inputs)
+        except Exception:
+            plan = None
+        cake._plan = plan
+    # Memoize only a decision no readiness check (or failure) took part in.
+    if state is not None and looked_up and cake._unready == 0:
+        if len(_CAKE_MLA_STAGE_TWO_MEMO) > _CAKE_MLA_MEMO_LIMIT:
+            _CAKE_MLA_STAGE_TWO_MEMO.clear()
+        _CAKE_MLA_STAGE_TWO_MEMO[memo_entry_key] = (
+            tuner,
+            state,
+            _CAKE_MLA_AUTO_OFFERS,
+            cake._validated_families if cake_ok else None,
+            plan,
+            _cake_mla_module()._FP8_LUTS.get(inputs[0].device) if cake_ok else None,
+        )
     return (cake, tactic) if cake_ok else selected
 
 
@@ -4688,7 +5096,13 @@ def _mla_with_kv_cache_impl(
     Its FP8 page-64 route allocates its split-K scratch (about 256 KiB per query
     row) on every call. Padded rows (``seq_lens`` 0, or a query row with no
     causal KV token) output zeros. Tuning measures GPU time under CUDA-graph
-    replay; an eager caller also pays the host dispatch.
+    replay; an eager caller also pays the host dispatch. Outside tuning, a
+    batch no listed unit covers skips the second stage, and the second
+    stage's decision is reused for repeated calls with the same arguments and
+    tensor sizes and the same first-stage selection until any tuner's winners
+    or loaded configs change (not while tuning, with an ``autotune_v2`` store
+    or context, or under replay diagnostics); a reused Cake decision launches
+    the programs it resolved for those sizes.
     Uniform explicit CuTeDSL requests use the same tuner with one candidate.
     Explicit TRTLLM-GEN requests enter the tuner only during tuning; inference
     directly executes its sole tactic. Compact variable-Q requests select an eligible backend directly
@@ -4966,49 +5380,48 @@ def _mla_with_kv_cache_impl(
                 # Cake. Cake joins a second stage only for the units the device
                 # lists, only while the tuner may select it, and never while an
                 # autotune process group tunes (rank-local builds and buckets
-                # could differ per rank).
-                if cake_auto_candidate_open(_CAKE_MLA_RUNNER) and (
-                    _cake_mla_auto_candidate_reason(
-                        query=query,
-                        kv_cache=kv_cache,
-                        block_tables=block_tables,
-                        seq_lens=seq_lens,
-                        out=out,
-                        qk_nope_head_dim=qk_nope_head_dim,
-                        kv_lora_rank=kv_lora_rank,
-                        qk_rope_head_dim=qk_rope_head_dim,
-                        sparse_mla_top_k=sparse_mla_top_k,
-                        bmm1_scale=bmm1_scale,
-                        bmm2_scale=bmm2_scale,
-                        sinks=sinks,
-                        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-                        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                        lse_requested=return_lse or lse is not None,
-                        use_fp16_softmax=use_fp16_softmax,
-                        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
-                        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
-                        enable_dcp=enable_dcp,
+                # could differ per rank). Outside tuning only a batch the units
+                # list joins it; tuning joins every batch, so one tuning call
+                # times every offered bucket, as the first stage does.
+                if cake_auto_candidate_open(_CAKE_MLA_RUNNER):
+                    offered = _cake_mla_auto_batch_ranges(
+                        query.get_device(),
+                        query.dtype,
+                        page_size,
+                        query.size(1),
+                        sinks is not None,
+                        max_seq_len,
                     )
-                    is None
-                ):
-                    from .cake_trtllm_mla_blackwell import _device_facts
-
-                    try:
-                        arch, num_sms = _device_facts(query.device.index)
-                    except RuntimeError:
-                        arch, num_sms = "", 0
-                    cake_batch_ranges = tuple(
-                        (first, last)
-                        for _, first, last in _cake_mla_auto_offer_ranges(
-                            arch,
-                            num_sms,
-                            query.dtype,
-                            page_size,
-                            query.size(1),
-                            sinks is not None,
-                            max_seq_len,
+                    if (
+                        offered
+                        and (
+                            AutoTuner.get().is_tuning_mode
+                            or _in_batch_ranges(query.size(0), offered)
                         )
-                    )
+                        and _cake_mla_auto_candidate_reason(
+                            query=query,
+                            kv_cache=kv_cache,
+                            block_tables=block_tables,
+                            seq_lens=seq_lens,
+                            out=out,
+                            qk_nope_head_dim=qk_nope_head_dim,
+                            kv_lora_rank=kv_lora_rank,
+                            qk_rope_head_dim=qk_rope_head_dim,
+                            sparse_mla_top_k=sparse_mla_top_k,
+                            bmm1_scale=bmm1_scale,
+                            bmm2_scale=bmm2_scale,
+                            sinks=sinks,
+                            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                            lse_requested=return_lse or lse is not None,
+                            use_fp16_softmax=use_fp16_softmax,
+                            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+                            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+                            enable_dcp=enable_dcp,
+                        )
+                        is None
+                    ):
+                        cake_batch_ranges = offered
 
             resolved_backend = "autotune"
 
@@ -5141,13 +5554,47 @@ def _mla_with_kv_cache_impl(
                 inputs,
             )
             if cake_batch_ranges:
+                # Every argument the two stages' lookups and the Cake checks
+                # read (the eligibility check above holds the rest fixed:
+                # dense, no sinks, no LSE, host scales, int32 indices,
+                # contiguous tensors); only outside tuning.
+                memo_key = (
+                    None
+                    if tuner.is_tuning_mode
+                    else (
+                        query.get_device(),
+                        query.shape,
+                        query.dtype,
+                        kv_cache.shape,
+                        block_tables.shape,
+                        seq_lens.shape,
+                        out.shape,
+                        out.dtype,
+                        workspace_buffer.shape,
+                        workspace_buffer.dtype,
+                        max_seq_len,
+                        bmm1_scale,
+                        bmm2_scale,
+                        qk_nope_head_dim,
+                        kv_lora_rank,
+                        qk_rope_head_dim,
+                        enable_pdl,
+                        is_var_seq,
+                        tuple(runner_names),
+                        cute_dsl_impl,
+                        use_fp16_softmax,
+                        return_lse_base,
+                        cp_world,
+                        cp_rank,
+                    )
+                )
                 runner, tactic = _mla_cake_stage_two(
                     tuner,
                     runners,
                     tuning_config,
                     inputs,
                     (runner, tactic),
-                    _CakeTrtllmMlaBlackwellRunner(
+                    lambda: _CakeTrtllmMlaBlackwellRunner(
                         kv_cache=kv_cache,
                         qk_nope_head_dim=qk_nope_head_dim,
                         kv_lora_rank=kv_lora_rank,
@@ -5159,6 +5606,7 @@ def _mla_with_kv_cache_impl(
                         enable_pdl=enable_pdl,
                     ),
                     cake_batch_ranges,
+                    memo_key,
                 )
         if isinstance(runner, _BatchMLAPagedAttentionTrtllmGenBackend):
             runner(
