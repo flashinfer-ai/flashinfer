@@ -276,6 +276,8 @@ def _clear_cake_mla_memos():
         core._CAKE_MLA_STAGE_TWO_MEMO.clear()
         core._CAKE_MLA_TABLE_MEMO.clear()
         core._CAKE_MLA_TABLE_MEMO_OWNER[0] = None
+        core._CAKE_MLA_RANGES_MEMO[0] = None
+        core._CAKE_MLA_GATE_MEMO[0] = None
         core._CAKE_MLA_NO_PROGRAM_DEVICES.clear()
         core._cake_mla_auto_static_reason.cache_clear()
 
@@ -464,6 +466,52 @@ def test_mla_cake_gate_follows_tuner_and_process_group(monkeypatch, fresh_tuner)
     assert cake_auto_candidate_open(runner)
     monkeypatch.setenv(DISABLE_ENV, "1")
     assert not cake_auto_candidate_open(runner)
+
+
+def test_cake_gate_memo_follows_the_tuner_state(monkeypatch, fresh_tuner):
+    """The dispatcher's memoized Cake candidate gate is reused only for the
+    same tuner and memo state: a Cake winner added elsewhere, the switch
+    turned off and on again and another tuner evaluate the gate again, and a
+    result whose switch changed after the state was read is not stored. No GPU
+    needed."""
+    gates = []
+    original = core.cake_auto_candidate_open
+
+    def gate(runner_class_name):
+        gates.append(runner_class_name)
+        return original(runner_class_name)
+
+    monkeypatch.setattr(core, "cake_auto_candidate_open", gate)
+
+    def candidate_open(tuner):
+        return core._mla_cake_candidate_open(tuner, core._mla_cake_memo_state(tuner))
+
+    assert [candidate_open(fresh_tuner) for _ in range(2)] == [False] * 2
+    assert len(gates) == 1
+    _hold_cake_entry(fresh_tuner)  # a new winner-source generation
+    assert [candidate_open(fresh_tuner) for _ in range(2)] == [True] * 2
+    assert len(gates) == 2
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    assert [candidate_open(fresh_tuner) for _ in range(2)] == [False] * 2
+    assert len(gates) == 3
+    monkeypatch.delenv(DISABLE_ENV)
+    assert [candidate_open(fresh_tuner) for _ in range(2)] == [True] * 2
+    assert len(gates) == 4
+    # Another tuner with the same state: the gate reads that tuner.
+    other = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", other)
+    assert core._mla_cake_memo_state(other) == core._mla_cake_memo_state(fresh_tuner)
+    assert not candidate_open(other)
+    assert len(gates) == 5
+    monkeypatch.setattr(AutoTuner, "_instance", fresh_tuner)
+    state = core._mla_cake_memo_state(fresh_tuner)
+    # Switched off after the state was read: the result is not stored.
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    assert not core._mla_cake_candidate_open(fresh_tuner, state)
+    monkeypatch.delenv(DISABLE_ENV)
+    assert core._mla_cake_candidate_open(fresh_tuner, state)
+    assert core._mla_cake_candidate_open(fresh_tuner, state)
+    assert len(gates) == 7
 
 
 def test_untuned_auto_builds_no_cake_runner(monkeypatch, fresh_tuner):
@@ -1648,11 +1696,12 @@ def test_auto_memo_follows_the_tuner_state(
     for a first-stage runner of the call, and returns it only for the tuner,
     offer table, split-KV device range values and state it was stored under; a Cake decision only while its
     families are loaded with the same FP8 decode table, and as the first
-    stage's selection for tensors that are not all contiguous. The state is
-    ``None`` (nothing is memoized or reused) while tuning, with a managed
-    store, inside an ``autotune_v2`` context, under replay diagnostics, with a
-    measurement policy, and while ``skip_ops`` names either stage's op. No GPU
-    needed."""
+    stage's selection for tensors that are not all contiguous. The state
+    holds the Cake switch, and a decision is not stored when the switch
+    changed during the call. The state is ``None`` (nothing is memoized or
+    reused) while tuning, with a managed store, inside an ``autotune_v2``
+    context, under replay diagnostics, with a measurement policy, and while
+    ``skip_ops`` names either stage's op. No GPU needed."""
     tuner = fresh_tuner
     query, block_tables, seq_lens, out = _cpu_inputs(torch.bfloat16, 4)
     kv_cache = torch.empty(8, 64, QK_DIM, dtype=torch.bfloat16)
@@ -1670,6 +1719,10 @@ def test_auto_memo_follows_the_tuner_state(
     # The offer table was replaced during the call.
     put(tuner, ("moved",), state, dict(offers), runners, selected, None)
     put(tuner, ("stranger",), state, offers, runners, (_FakeCuteDsl(), -1), None)
+    # The Cake switch was turned off during the call (the gate read it again).
+    with monkeypatch.context() as patch:
+        patch.setenv(DISABLE_ENV, "1")
+        put(tuner, ("toggled",), state, offers, runners, selected, None)
     assert set(core._CAKE_MLA_AUTO_MEMO) == {("first",), ("cake",)}
 
     def get(key, tensor=out, owner=tuner):
@@ -1725,6 +1778,12 @@ def test_auto_memo_follows_the_tuner_state(
         )
         assert get(("first",)) is None
     assert get(("first",)) == first_stage
+    # The state holds the Cake switch, which decides whether Cake joins.
+    with monkeypatch.context() as patch:
+        patch.setenv(DISABLE_ENV, "1")
+        assert get(("first",)) is None
+        assert get(("cake",)) is None
+    assert get(("first",)) == first_stage
     assert get(("first",), owner=AutoTuner()) is None
     with monkeypatch.context() as patch:
         patch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
@@ -1769,6 +1828,9 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
                     )
                     assert expected
                     for _ in range(2):
+                        # Past the per-configuration memo: the second
+                        # lookup reads the table memo.
+                        core._CAKE_MLA_RANGES_MEMO[0] = None
                         assert (
                             core._cake_mla_auto_batch_ranges(
                                 0, dtype, page_size, q_len, False, max_seq_len
@@ -1799,9 +1861,56 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
     monkeypatch.setattr(cake_module, "_device_facts", not_blackwell)
     for _ in range(3):
+        # Past the per-configuration memo, so each call reaches the device.
+        core._CAKE_MLA_RANGES_MEMO[0] = None
         assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
     # A device without Cake programs is queried once, not on every call.
     assert queries == [0]
+
+
+def test_offered_batch_ranges_are_memoized_per_configuration(
+    monkeypatch, cake_families
+):
+    """Each request configuration's offered batch ranges are looked up once,
+    also when configurations alternate, while the offer table and the Cake
+    module's ``_device_facts`` are the same objects; a replaced table and a
+    replaced ``_device_facts`` (as tests patch it) are looked up again. No GPU
+    needed."""
+    lookups = []
+    original = core._cake_mla_lookup_batch_ranges
+
+    def lookup(*args):
+        lookups.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(core, "_cake_mla_lookup_batch_ranges", lookup)
+    bf16 = torch.bfloat16
+
+    def ranges(max_seq_len=1024):
+        return core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, max_seq_len)
+
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
+    assert [ranges() for _ in range(3)] == [((1, 15),)] * 3
+    assert len(lookups) == 1
+    # Alternating configurations each hit after their first lookup.
+    assert [ranges(2048), ranges(), ranges(2048), ranges()] == [
+        (),
+        ((1, 15),),
+        (),
+        ((1, 15),),
+    ]
+    assert len(lookups) == 2
+    key = ("sm_100a", 148, "bfloat16", 64, 1, False)
+    unit = (cake_module.DOMAIN_BF16_VQUARTER, 1024, 2, 3)
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: (unit,)})
+    assert [ranges() for _ in range(2)] == [((2, 3),)] * 2
+    assert len(lookups) == 3
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: ("sm_103a", 152))
+    assert [ranges() for _ in range(2)] == [()] * 2
+    assert len(lookups) == 4
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: ("sm_100a", 148))
+    assert ranges() == ((2, 3),)
+    assert len(lookups) == 5
 
 
 def test_cake_families_memo_follows_the_offer_table(
@@ -3029,11 +3138,17 @@ def _spy_runner_builds(monkeypatch):
 
 
 def _count_eligibility_checks(monkeypatch):
-    """Counts the Cake eligibility checks (``_cake_mla_auto_candidate_reason``)
-    and the memo lookups of the dispatcher."""
-    counts = {"reason": 0, "memo": 0}
+    """Counts the Cake candidate gate (``cake_auto_candidate_open``) and
+    eligibility checks (``_cake_mla_auto_candidate_reason``) and the memo
+    lookups of the dispatcher."""
+    counts = {"gate": 0, "reason": 0, "memo": 0}
+    original_gate = core.cake_auto_candidate_open
     original_reason = core._cake_mla_auto_candidate_reason
     original_get = core._mla_cake_auto_memo_get
+
+    def gate(runner_class_name):
+        counts["gate"] += 1
+        return original_gate(runner_class_name)
 
     def reason(**kwargs):
         counts["reason"] += 1
@@ -3043,6 +3158,7 @@ def _count_eligibility_checks(monkeypatch):
         counts["memo"] += 1
         return original_get(*args, **kwargs)
 
+    monkeypatch.setattr(core, "cake_auto_candidate_open", gate)
     monkeypatch.setattr(core, "_cake_mla_auto_candidate_reason", reason)
     monkeypatch.setattr(core, "_mla_cake_auto_memo_get", get)
     return counts
@@ -3067,10 +3183,11 @@ def test_tuned_auto_selects_once_then_reuses_the_decision(
 ):
     """After tuning, the first call of a request builds the tuning config and
     looks up both stages once; the repeated calls reuse the decision of both
-    stages (no tuning config, no lookup, no eligibility check), build only the
-    runner it selected and run exactly that runner and tactic: Cake where it
-    measured faster, equal to explicit ``backend="cake"`` bit for bit, and the
-    first stage's winner where Cake lost this bucket but won another one."""
+    stages (no tuning config, no lookup, no Cake gate or eligibility check),
+    build only the runner it selected and run exactly that runner and tactic:
+    Cake where it measured faster, equal to explicit ``backend="cake"`` bit for
+    bit, and the first stage's winner where Cake lost this bucket but won
+    another one."""
     _require_cake_arch()
     case = _make_case(batch_size=4, page_size=64)
     _offer_case(monkeypatch, case)
@@ -3104,7 +3221,7 @@ def test_tuned_auto_selects_once_then_reuses_the_decision(
             builds.append(list(built))
     torch.cuda.synchronize()
     assert lookups[0] == 1 and configs[0] == 1
-    assert checks == {"reason": 1, "memo": 3}
+    assert checks == {"gate": 1, "reason": 1, "memo": 3}
     assert [op for op, _, _ in calls] == [core._MLA_DECODE_OP]
     ((runner, tactic),) = results
     assert executed == [(type(runner), tactic)] * 3
@@ -3121,6 +3238,93 @@ def test_tuned_auto_selects_once_then_reuses_the_decision(
         assert _name(runner) != "cake"
     for output in outputs:
         _assert_matches_reference(output, case, f"memoized {_name(runner)}")
+
+
+def test_auto_without_a_cake_result_memoizes_the_first_stage(monkeypatch, fresh_tuner):
+    """Tuned where Cake lost, with no Cake result in any winner source, the
+    Cake candidate gate is closed. The first call of a listed batch evaluates
+    it once and memoizes the first stage's selection; the repeated calls make
+    no selection, build no tuning config, evaluate neither the gate nor the
+    eligibility check, build only the selected runner and run its tactic. A
+    call with a new key under the same state selects without the gate. A
+    Cake result added elsewhere (a new winner-source generation) opens the
+    gate: the next call evaluates the gate and the check and selects through
+    both stages (Cake lost here: the first stage's winner again)."""
+    _require_cake_arch()
+    case = _make_case(batch_size=4, page_size=64)
+    _offer_case(monkeypatch, case)
+    monkeypatch.setattr(
+        core.AutoTuner,
+        "_profile_single_kernel",
+        _profile_times(
+            {
+                "_BatchMLAPagedAttentionTrtllmGenBackend": 3.0,
+                core._CAKE_MLA_RUNNER: 9.0,
+            }
+        ),
+    )
+    with autotune(True, tuning_buckets=TUNING_BUCKETS):
+        _decode(case)
+    assert not fresh_tuner.may_select_runner_class(core._CAKE_MLA_RUNNER)
+    lookups = _count_margin_lookups(monkeypatch)
+    calls = _spy_choose_one(monkeypatch)
+    configs = _count_tuning_configs(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
+    executed = _spy_runner_calls(monkeypatch)
+    checks = _count_eligibility_checks(monkeypatch)
+    built = _spy_runner_builds(monkeypatch)
+    outputs, builds = [], []
+    with autotune(False):
+        for _ in range(3):
+            built.clear()
+            outputs.append(_decode(dict(case, out=_nan_out(case))))
+            builds.append(list(built))
+    torch.cuda.synchronize()
+    assert configs[0] == 1 and lookups[0] == 0 and not results
+    assert checks == {"gate": 1, "reason": 0, "memo": 3}
+    ((op, _, (runner, tactic)),) = calls
+    assert op == core._MLA_DECODE_OP and _name(runner) != "cake"
+    assert executed == [(type(runner), tactic)] * 3
+    assert builds[1] == builds[2] == [type(runner)]
+    ((entry),) = core._CAKE_MLA_AUTO_MEMO.values()
+    assert entry[3][2] is None
+    for output in outputs:
+        _assert_matches_reference(output, case, "memoized first stage")
+
+    # A new key under the same tuner state (here another bmm1_scale) selects,
+    # but reuses the last gate result: no gate.
+    scaled = dict(case, bmm1_scale=case["bmm1_scale"] / 2)
+    checks.update(gate=0, reason=0, memo=0)
+    executed.clear()
+    with autotune(False):
+        output = _decode(dict(scaled, out=_nan_out(case)))
+    torch.cuda.synchronize()
+    assert checks == {"gate": 0, "reason": 0, "memo": 1}
+    assert len(calls) == 2 and configs[0] == 2 and not results
+    assert len(core._CAKE_MLA_AUTO_MEMO) == 2
+    assert executed == [(type(runner), tactic)]
+    _assert_matches_reference(output, scaled, "new key, same state")
+
+    _hold_cake_entry(fresh_tuner)
+    calls.clear()
+    executed.clear()
+    checks.update(gate=0, reason=0, memo=0)
+    with autotune(False):
+        output = _decode(dict(case, out=_nan_out(case)))
+    torch.cuda.synchronize()
+    assert checks == {"gate": 1, "reason": 1, "memo": 1}
+    assert [op for op, _, _ in calls] == [core._MLA_DECODE_OP]
+    assert lookups[0] == 1 and len(results) == 1
+    assert executed == [(type(runner), tactic)]
+    _assert_matches_reference(output, case, "gate opened")
+
+
+def test_dispatcher_keeps_no_closure_cells():
+    """The dispatcher closes over none of its locals (the second stage's Cake
+    factory is a ``functools.partial``), so no call of any backend pays for
+    closure cells. No GPU needed."""
+    code = core._mla_with_kv_cache_impl.__code__
+    assert code.co_cellvars == () and code.co_freevars == ()
 
 
 @pytest.mark.parametrize(
@@ -3143,12 +3347,14 @@ def test_memoized_auto_decision_follows_the_tuner_and_settings(
     ``autotune()`` override, for another offer table or after tuning changed
     the winners: the next call selects through both stages, and the call after
     it reuses the new decision (after tuning again with Cake slower: the first
-    stage's winner). While ``skip_ops`` names the op, Cake is switched off at
-    runtime, under replay diagnostics (which record every call) or inside an
-    ``autotune_v2`` context, every call selects and nothing is reused, with the
-    selection of a call without the memo (no Cake when skipped or switched
-    off); once ``skip_ops`` or the switch is reverted, the memoized decision is
-    reused again."""
+    stage's winner). While ``skip_ops`` names the op, under replay
+    diagnostics (which record every call) or inside an ``autotune_v2``
+    context, every call selects and nothing is reused, with the selection of
+    a call without the memo (no Cake when skipped); once ``skip_ops`` is
+    reverted, the memoized decision is reused again. The Cake switch is part
+    of the memo state: switched off at runtime, the first call selects without
+    Cake and the next reuses that decision; switched on again, the first call
+    selects Cake again and the next reuses it."""
     _require_cake_arch()
     case = _make_case(batch_size=4, page_size=64)
     _offer_case(monkeypatch, case)
@@ -3195,8 +3401,10 @@ def test_memoized_auto_decision_follows_the_tuner_and_settings(
         context = autotune(False, skip_ops=core._MLA_DECODE_OP)
         selections, cake = 2, False
     elif change == "switch_off":
+        # The switch is part of the memo state: the first call selects
+        # without Cake and memoizes that, the second reuses it.
         monkeypatch.setenv(DISABLE_ENV, "1")
-        selections, cake = 2, False
+        selections, cake = 1, False
     elif change == "replay_diagnostics":
         report = ReplayCoverage()
         context = autotune_v2(
@@ -3223,8 +3431,13 @@ def test_memoized_auto_decision_follows_the_tuner_and_settings(
         calls.clear()
         launches.clear()
         with autotune(False):
-            _decode(dict(case, out=_nan_out(case)))
-        assert not calls and len(launches) == 1, change
+            for _ in range(2):
+                _decode(dict(case, out=_nan_out(case)))
+        # Switched off, the memoized first-stage decision replaced the Cake
+        # decision (one entry per key): switched on again, the first call
+        # selects Cake again and the second reuses it.
+        assert len(calls) == (1 if change == "switch_off" else 0), change
+        assert len(launches) == 2, change
 
 
 def _record_runner_calls(monkeypatch):
@@ -3280,7 +3493,7 @@ def test_memoized_cake_decision_runs_the_first_stage_for_strided_out(
     with autotune(False):
         _decode(dict(case, out=_strided_out(case)))
     assert not calls and len(results) == 1
-    assert checks == {"reason": 0, "memo": 1}
+    assert checks == {"gate": 0, "reason": 0, "memo": 1}
     assert built == [type(first_stage[0])]
     assert executed == [(type(first_stage[0]), first_stage[1])]
     ((entry),) = core._CAKE_MLA_AUTO_MEMO.values()
@@ -3294,8 +3507,9 @@ def test_rejected_listed_calls_memoize_only_what_the_key_decides(
     decides (here a static check) memoizes the first stage's selection: the
     repeated calls neither check nor select, and a bmm2_scale of the other
     sign is another key. Rejected for a strided ``out``, nothing is memoized
-    and every call checks and selects. A call the scalar checks reject (LSE)
-    builds no memo key."""
+    and every call checks and selects (the gate result of the state is
+    reused). A call the scalar checks reject (LSE)
+    builds no memo key and does not evaluate the Cake candidate gate."""
     _require_cake_arch()
     case = _make_case(batch_size=4)
     _offer_case(monkeypatch, case)
@@ -3312,30 +3526,33 @@ def test_rejected_listed_calls_memoize_only_what_the_key_decides(
             for _ in range(3):
                 _decode(dict(case, bmm2_scale=0.0))
         assert [op for op, _, _ in calls] == [core._MLA_DECODE_OP]
-        assert checks == {"reason": 1, "memo": 3} and not results
+        assert checks == {"gate": 1, "reason": 1, "memo": 3} and not results
         ((entry),) = core._CAKE_MLA_AUTO_MEMO.values()
         assert entry[3][2] is None
         ((_, _, (runner, tactic)),) = calls
         assert executed == [(type(runner), tactic)] * 3
         with autotune(False):
             _decode(dict(case, bmm2_scale=-0.0))
-        assert len(calls) == 2 and checks["reason"] == 2
+        # Another key under the same state: the last gate result is reused.
+        assert len(calls) == 2 and checks["reason"] == 2 and checks["gate"] == 1
         assert len(core._CAKE_MLA_AUTO_MEMO) == 2
 
     core._CAKE_MLA_AUTO_MEMO.clear()
     calls.clear()
-    checks.update(reason=0, memo=0)
+    checks.update(gate=0, reason=0, memo=0)
     with autotune(False):
         for _ in range(2):
             _decode(dict(case, out=_strided_out(case)))
     assert [op for op, _, _ in calls] == [core._MLA_DECODE_OP] * 2
-    assert checks == {"reason": 2, "memo": 2} and not results
+    # The gate result of the same state is memoized (gate 0, was 2).
+    assert checks == {"gate": 0, "reason": 2, "memo": 2} and not results
     assert not core._CAKE_MLA_AUTO_MEMO
 
-    checks.update(reason=0, memo=0)
+    checks.update(gate=0, reason=0, memo=0)
     with autotune(False):
         _decode(dict(case, return_lse=True))
-    assert checks == {"reason": 0, "memo": 0} and not results
+    # The scalar checks run before the gate: LSE calls pay for neither.
+    assert checks == {"gate": 0, "reason": 0, "memo": 0} and not results
     assert not core._CAKE_MLA_AUTO_MEMO
 
 
