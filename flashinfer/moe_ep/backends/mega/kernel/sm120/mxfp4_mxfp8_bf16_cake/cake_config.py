@@ -28,6 +28,8 @@ CODEC_OVERFLOW_BLOCKS_RANGE = (16, 256)
 CODEC_OVERFLOW_BLOCKS_DEFAULT = 16
 # ``return_codec`` names -> the device build's MOE_RETURN_CODEC value.
 RETURN_CODECS = {"bf16": 0, "int8": 1}
+# ``row_schedule`` values: ``auto`` = per-call choice (see cake_backend._row_schedule), or a fixed one.
+ROW_SCHEDULES = ("auto", "m64", "m128")
 
 TransportTableSpec = Union[str, tuple]
 
@@ -58,6 +60,11 @@ class Sm120CakeMegaMoeConfigBase:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     return_codec: str = "bf16"
+    # Row schedule of every call: ``"auto"`` picks m64 / m128 tiles per call from the rank-uniform row
+    # counts (a tile-count model calibrated per GPU and activation codec); ``"m64"`` / ``"m128"`` pin
+    # one.  Speed only: both schedules return identical bits.  ``FLASHINFER_CAKE_ROW_SCHEDULE``
+    # overrides it (every rank must see the same value).
+    row_schedule: str = "auto"
 
     def activation_parameters(self) -> tuple[int, int, int]:
         """``(MOE_ACTIVATION, MOE_ACT_P0, MOE_ACT_P1)`` of the device build; validates the activation fields."""
@@ -135,6 +142,10 @@ class Sm120CakeMegaMoeConfigBase:
         if self.return_codec not in RETURN_CODECS:
             raise ValueError(
                 f"return_codec must be one of {sorted(RETURN_CODECS)}, got {self.return_codec!r}"
+            )
+        if self.row_schedule not in ROW_SCHEDULES:
+            raise ValueError(
+                f"row_schedule must be one of {list(ROW_SCHEDULES)}, got {self.row_schedule!r}"
             )
         if self.shared_expert not in (None, SHARED_EXPERT_FP8_IN_KERNEL):
             raise ValueError(
@@ -302,6 +313,7 @@ __all__ = [
     "CODEC_OVERFLOW_BLOCKS_DEFAULT",
     "CODEC_OVERFLOW_BLOCKS_RANGE",
     "RETURN_CODECS",
+    "ROW_SCHEDULES",
     "SHARED_EXPERT_FP8_IN_KERNEL",
     "TRANSPORT_TABLE_AUTO",
     "TRANSPORT_TABLE_TUNED",

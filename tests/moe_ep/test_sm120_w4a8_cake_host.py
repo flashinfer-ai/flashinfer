@@ -1402,3 +1402,71 @@ def test_row_schedule_follows_the_mean_rows_with_a_rows_hint() -> None:
     assert rows((2048,) * 4, 1024, bound) == 1024  # never above the bound
     # gather path: exact counts, max rule
     assert rows((1024, 0, 0, 0), None, [1024, 0, 0, 0]) == 1024
+
+
+def test_row_schedule_tile_model() -> None:
+    """``row_schedule="auto"``: the Poisson tile-count model on GPUs with a tile cost ratio (RTX 6000D:
+    always m64; RTX PRO 5000 W4A8: m128 where a 128-row tile replaces two 64-row tiles), the closure
+    threshold elsewhere; a pinned schedule wins; FLASHINFER_CAKE_ROW_SCHEDULE overrides the config."""
+    import os
+    from types import SimpleNamespace
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
+        cake_backend as cb,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_config import (
+        Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    B = cb.Sm120Mxfp4Mxfp8CakeMegaKernelBackend
+
+    def pick(hint, ratio, setting="auto", experts=256, top_k=6):
+        world = len(hint)
+        ws = SimpleNamespace(
+            row_schedule=setting,
+            tile_cost_ratio=ratio,
+            m64_max_rows=512,
+            rows_hint=tuple(hint),
+            staged_bound=max(hint),
+            world_size=world,
+            top_k=top_k,
+            num_experts=experts,
+        )
+        return B._row_schedule(ws, [max(hint)] * world)
+
+    pro5000_w4a8 = cb._ROW_TILE_COST_RATIO[(110, 0)]
+    rtx6000d = cb._ROW_TILE_COST_RATIO[(156, 0)]
+    # RTX 6000D: m64 at every count
+    for hint in ((1024, 0, 0, 0), (1024,) * 4, (2048,) * 4, (4096,) * 8):
+        assert pick(hint, rtx6000d) == "m64"
+    # RTX PRO 5000 W4A8: one source rank (~24 rows per expert) m64; 4 x 1024 (~96) m128;
+    # 4 x 1536 (~144: 2 m128 tiles, the 2nd 12 % used, vs 3 m64 tiles) m64; 4 x 2048 (~192) m128
+    assert pick((1024, 0, 0, 0), pro5000_w4a8) == "m64"
+    assert pick((1024,) * 4, pro5000_w4a8) == "m128"
+    assert pick((1536,) * 4, pro5000_w4a8) == "m64"
+    assert pick((2048,) * 4, pro5000_w4a8) == "m128"
+    # no measured ratio: the closure threshold on the mean rows of the hint
+    assert pick((1024, 0, 0, 0), None) == "m64"
+    assert pick((1024,) * 4, None) == "m128"
+    # pinned
+    assert pick((1024,) * 4, pro5000_w4a8, "m64") == "m64"
+    assert pick((1024, 0, 0, 0), rtx6000d, "m128") == "m128"
+    # expected tiles: below 64 rows per expert one tile either way
+    assert cb._expected_tiles(0, 256, 64) == 0.0
+    assert abs(cb._expected_tiles(256 * 96, 256, 128) - 1.0) < 1e-3
+    # config validation and the environment override
+    with pytest.raises(ValueError, match="row_schedule"):
+        Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(row_schedule="m32")
+    old = os.environ.pop(cb._ROW_SCHEDULE_ENV, None)
+    try:
+        assert cb._row_schedule_setting("auto") == "auto"
+        os.environ[cb._ROW_SCHEDULE_ENV] = "m64"
+        assert cb._row_schedule_setting("auto") == "m64"
+        os.environ[cb._ROW_SCHEDULE_ENV] = "m96"
+        with pytest.raises(MoEEpConfigError):
+            cb._row_schedule_setting("auto")
+    finally:
+        os.environ.pop(cb._ROW_SCHEDULE_ENV, None)
+        if old is not None:
+            os.environ[cb._ROW_SCHEDULE_ENV] = old

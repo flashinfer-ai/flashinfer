@@ -329,6 +329,9 @@ def ep_layer(request):
     )
     layer.warmup(make_inputs(256, seed=1, shape=shape))
     torch.cuda.synchronize()
+    # The schedule tests pin both instances through the closure threshold on every GPU; the per-GPU
+    # tile model of ``row_schedule="auto"`` is covered by test_auto_row_schedule_follows_the_tile_model.
+    layer._workspace.tile_cost_ratio = None
     yield rank, world_size, layer, oracle, shape
     layer.destroy()
     dist.barrier()

@@ -786,6 +786,9 @@ def ep_layer(request):
     )
     layer.warmup(make_inputs(256, seed=1, shape=shape))
     torch.cuda.synchronize()
+    # The schedule tests pin both instances through the closure threshold on every GPU; the per-GPU
+    # tile model of ``row_schedule="auto"`` is covered by test_auto_row_schedule_follows_the_tile_model.
+    layer._workspace.tile_cost_ratio = None
     yield rank, world_size, layer, oracle, shape
     # The layer owns collective transport resources: release them on every rank
     # before another variant (or test module) opens its own session.
@@ -1047,6 +1050,55 @@ def test_first_call_on_a_non_default_stream(ep_layer) -> None:
     assert fresh._kernel.protocol_error(fresh._workspace) == 0
     fresh.destroy()
     dist.barrier()
+
+
+@pytest.mark.arch_sm120
+@pytest.mark.gpu_4
+def test_auto_row_schedule_follows_the_tile_model(ep_layer) -> None:
+    """``row_schedule="auto"`` on this GPU (the tile model where the GPU and codec have a measured tile
+    cost ratio, else the closure threshold): hinted single-source and uniform calls launch the
+    schedule of ``_row_schedule`` and return the bits of the other schedule."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
+        _ROW_TILE_COST_RATIO,
+    )
+
+    rank, world_size, layer, oracle, shape = ep_layer
+    ws = layer._workspace
+    kernel = layer._kernel
+    sm_count = torch.cuda.get_device_properties(ws.device).multi_processor_count
+    ws.tile_cost_ratio = _ROW_TILE_COST_RATIO.get((sm_count, kernel.ACT_CODEC))
+    try:
+        for i, pattern in enumerate(
+            ([1024] + [0] * (world_size - 1), [512] * world_size, [2048] * world_size)
+        ):
+            rows_by_rank = [min(r, ws.max_rows) for r in pattern]
+            bound = max(rows_by_rank)
+            tensors = make_inputs(
+                rows_by_rank[rank], seed=1900 + 10 * i + rank, shape=shape
+            )
+            layer.stage_inputs(
+                tensors, compile_tokens_per_rank=bound, rows_by_rank=rows_by_rank
+            )
+            auto = layer.compute_staged(output=None).clone()
+            launch = _launch(layer)
+            want = type(kernel)._row_schedule(ws, launch["rows_by_rank"])
+            assert launch["instance"].startswith(want), (pattern, launch["instance"])
+            other = "m128" if want == "m64" else "m64"
+            ws.row_schedule = other
+            try:
+                layer.stage_inputs(
+                    tensors, compile_tokens_per_rank=bound, rows_by_rank=rows_by_rank
+                )
+                pinned = layer.compute_staged(output=None).clone()
+            finally:
+                ws.row_schedule = "auto"
+            assert _launch(layer)["instance"].startswith(other)
+            torch.cuda.synchronize()
+            assert torch.equal(auto, pinned), pattern
+            check_close(auto, oracle(tensors))
+    finally:
+        ws.tile_cost_ratio = None
+    _protocol_clean(layer)
 
 
 def _bucketed(layer, tensors, bound: int) -> torch.Tensor:
