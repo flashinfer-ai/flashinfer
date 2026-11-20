@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // TVM-FFI binding/launch TU for the specialized sm120 fp8 block-scale MoE kernels.
 // The framework-independent device code lives in
 // include/flashinfer/fused_moe/specialized_fused_moe_fp8_blockscale_sm120/prefill_flat.cuh;

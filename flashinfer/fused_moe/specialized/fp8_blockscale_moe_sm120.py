@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Specialized fused MoE for fp8 e4m3 weights with DeepSeek-style [128, 128]
 fp32 block scales on SM120 (RTX PRO 6000), bf16 activations in/out,
 silu-gated.
@@ -349,8 +351,6 @@ def maybe_run_specialized(
     )
     if reason is not None:
         return None, _bump_fallback(reason)
-    dispatch_run = _kernel_entry()
-
     T = input.shape[0]
     if output is None:
         output = torch.empty((T, _H), dtype=torch.bfloat16, device=input.device)
@@ -366,6 +366,7 @@ def maybe_run_specialized(
         # through an undersized or misplaced pointer).
         return None, _bump_fallback("output_form")
     with torch.cuda.device(input.device):
+        dispatch_run = _kernel_entry()
         dev_index = (
             input.device.index
             if input.device.index is not None
@@ -464,10 +465,9 @@ def warmup(
         # capture legal later; it must itself run eagerly.
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("warmup must not run under CUDA-graph capture.")
-    dispatch_run = _kernel_entry()
-
     pending = set()
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        dispatch_run = _kernel_entry()
         for T in ts:
             x = torch.zeros((T, _H), dtype=torch.bfloat16, device=warm_device)
             ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=warm_device)

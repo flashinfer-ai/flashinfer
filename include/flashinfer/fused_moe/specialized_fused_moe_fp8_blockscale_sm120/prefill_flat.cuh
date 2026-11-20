@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //
 // Framework-independent device code: the kernels, device helpers and their
 // launch-geometry constants/macros, relocated verbatim from the former csrc

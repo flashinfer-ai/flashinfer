@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Fused silu-gated block-fp8 MoE for sm_120 (RTX PRO 6000 Blackwell).
 // Hand written CUDA C++ ; no external compute libraries.
 //
@@ -560,8 +562,8 @@ __global__ __launch_bounds__(256, 12 / NR) void t1_v3_kernel(
   unpack_bf16x16(xa, xb, xv);
 
   const int h0 = blockIdx.x * NR;
-  int e2 = ids[warp];
-  asm("and.b32 %0, %0, 255;" : "+r"(e2));
+  const int rid2 = ids[warp];
+  const int e2 = rid2 & 255;
   const uint8_t* wb2 = w2 + ((size_t)e2 * HID + h0) * INT_ + lane * 16;
   uint4 w2r[NR];
   if (PF == 1) {
@@ -586,7 +588,6 @@ __global__ __launch_bounds__(256, 12 / NR) void t1_v3_kernel(
   }
   __syncthreads();
   const int k = warp;
-  const float sc = w2s[(size_t)e2 * 64 + (h0 >> 7) * 4 + lsub] * tws[k];
   if (tid < 2 * NR) {
     float g = 0.f, u = 0.f;
 #pragma unroll
@@ -617,15 +618,23 @@ __global__ __launch_bounds__(256, 12 / NR) void t1_v3_kernel(
 #pragma unroll
     for (int r = 0; r < NR; ++r) w2r[r] = *reinterpret_cast<const uint4*>(wb2 + (size_t)r * INT_);
   }
+  // Each warp owns one FC2 slot. An omitted slot contributes literal zeros,
+  // but its warp still participates in the block reduction below.
+  if (static_cast<unsigned>(rid2) < NEXP) {
+    const float sc = w2s[(size_t)e2 * 64 + (h0 >> 7) * 4 + lsub] * tws[k];
 #pragma unroll
-  for (int r = 0; r < NR; r += 2) {
-    const float2 ab = t1_dot16_native_pair(w2r[r], w2r[r + 1], iv);
-    const float a0 = warp_sum(ab.x * sc);
-    const float a1 = warp_sum(ab.y * sc);
-    if (lane == 0) {
-      red[k][r] = a0;
-      red[k][r + 1] = a1;
+    for (int r = 0; r < NR; r += 2) {
+      const float2 ab = t1_dot16_native_pair(w2r[r], w2r[r + 1], iv);
+      const float a0 = warp_sum(ab.x * sc);
+      const float a1 = warp_sum(ab.y * sc);
+      if (lane == 0) {
+        red[k][r] = a0;
+        red[k][r + 1] = a1;
+      }
     }
+  } else if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < NR; ++r) red[k][r] = 0.f;
   }
   __syncthreads();
   if (tid < NR) {

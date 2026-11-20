@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Fused block-FP8 silu-gated MoE for sm120 (RTX PRO 6000 Blackwell).
 // E=256, top_k=8, H=2048, I=512.
 //
@@ -589,7 +591,8 @@ __global__ __launch_bounds__(NWARP * 32, NWARP == 13 ? 2 : 1) void k_persistent_
       float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
-        const int e = idp[k] & 255;
+        const int e = idp[k];
+        if (static_cast<unsigned>(e) >= E_NUM) continue;
         const __nv_bfloat16* ip = p_inter + (size_t)(t * TOPK + k) * I_DIM + lane * 16;
         float ir[16];
         const uint4 ia = p_ld_inter_l1_evict_last(ip);
@@ -632,7 +635,8 @@ __global__ __launch_bounds__(NWARP * 32, NWARP == 13 ? 2 : 1) void k_persistent_
     float acc0 = 0.f, acc1 = 0.f;
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) {
-      const int e = idp[k] & 255;
+      const int e = idp[k];
+      if (static_cast<unsigned>(e) >= E_NUM) continue;
       const __nv_bfloat16* ip = p_inter + (size_t)(t * TOPK + k) * I_DIM + lane * 16;
       float ir[16];
       const uint4 ia = reinterpret_cast<const uint4*>(ip)[0];
