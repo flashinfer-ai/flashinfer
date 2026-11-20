@@ -319,7 +319,17 @@ def _fp8bs_decodem_try_dispatch(
                     "never falls back — use backend='auto' or 'deepgemm'"
                 ) from e
             return None
-    module.run(input, weight, weight_scale, _QUANT_EPS, out)
+    # Outside the build handler: native errors are never build failures or
+    # fallback signals. False specifically means no kernel was submitted.
+    if not module.try_run(input, weight, weight_scale, _QUANT_EPS, out):
+        reason = "stream_cluster_capacity"
+        _fallback(f"{requested}: {reason}")
+        if requested == "specialized":
+            raise NotImplementedError(
+                "fp8_blockscale_gemm_sm90 backend='specialized' cannot serve "
+                f"this call ({reason}); use backend='auto' or 'deepgemm'"
+            )
+        return None
     _stats["backend_dispatches"]["specialized"] += 1
     return out
 

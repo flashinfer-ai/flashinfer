@@ -564,6 +564,32 @@ def native_rejection_module(tmp_path_factory):
                     f"? cudaErrorNotSupported : {op}(__VA_ARGS__))\n"
                 )
                 text = text.replace(anchor, anchor + wrapper)
+            if src.name == "fp8bs_gemm_decodem_sm90.cu":
+                text += r"""
+// Test-only H100/cu129 probe. Pack status and output separately; on error
+// the output parameter is undefined and is not read.
+int64_t ProbeCPA(ffi::TensorView x, bool potential) {
+  const auto dev = x.device();
+  ffi::CUDADeviceGuard guard(dev.device_id);
+  auto kernel = fp8_blockscale_wgmma_cpa_kernel<16, 16, false, false, true, true,
+                                                false, true, true, true, true>;
+  decodem::check(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+                 "probe opt-in");
+  cudaLaunchConfig_t cfg{};
+  cfg.gridDim = dim3(41 * 16, 1, 1);
+  cfg.blockDim = dim3(128, 1, 1);
+  cfg.stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
+  int count = -1;
+  const auto err = potential ? cudaOccupancyMaxPotentialClusterSize(&count, kernel, &cfg)
+                             : cudaOccupancyMaxActiveClusters(&count, kernel, &cfg);
+  if (err != cudaSuccess) {
+    (void)cudaGetLastError();
+    return -(int64_t)err;
+  }
+  return count;
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(probe_cpa, ProbeCPA);
+"""
             copy = directory / src.name
             copy.write_text(text)
             copies.append(copy)
@@ -574,6 +600,127 @@ def native_rejection_module(tmp_path_factory):
         patch.setattr(recipe, "gen_jit_spec", private_spec)
         spec = recipe.gen_fp8bs_gemm_decodem_sm90_module()
     return spec.build_and_load()
+
+
+@pytest.fixture
+def green8():
+    green_contexts = pytest.importorskip("torch.cuda.green_contexts")
+
+    # Keep the context and this exact stream alive throughout the test.
+    ctx = green_contexts.GreenContext(num_sms=8)
+    yield ctx.Stream()
+
+
+@requires_sm90
+def test_native_green_occupancy(green8, native_rejection_module, record_property):
+    x = torch.empty((12, 6144), device="cuda", dtype=torch.bfloat16)
+    full = torch.cuda.current_stream()
+    for label, stream in (("full1", full), ("green8", green8), ("full2", full)):
+        with torch.cuda.stream(stream):
+            potential = native_rejection_module.probe_cpa(x, True)
+            active = native_rejection_module.probe_cpa(x, False)
+        record_property(label, f"potential={potential}, active={active}")
+        if label == "green8":
+            # Negative numbers here are the negated cudaError_t, not counts.
+            assert active in (0, -912), (label, potential, active)
+        else:
+            assert active > 0, (label, potential, active)
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    "shape,green_ok",
+    [
+        ((12, 2624, 6144), False),  # exact CPA 16
+        ((10, 2624, 6144), False),  # other CPA 16
+        ((24, 2624, 6144), False),  # KU 12
+        ((2, 2048, 7168), False),  # KU 14
+        ((3, 2048, 2048), False),  # direct split-K 16
+        ((13, 2048, 2048), True),  # direct split-K 4
+        ((1, 8192, 1536), True),  # MWG
+        ((13, 7168, 2048), True),  # HMMA
+    ],
+)
+def test_switch_stream_capacity(green8, shape, green_ok):
+    m, n, k = shape
+    x = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    w = torch.ones((n, k), device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.ones(((n + 127) // 128, k // 128), device="cuda")
+    buf = torch.full((m * n + 16,), -32, device=x.device, dtype=x.dtype)
+    out = buf[8:-8].view(m, n)
+    full = torch.cuda.current_stream()
+    full.synchronize()
+    for stream, ok in ((full, True), (green8, green_ok), (full, True)):
+        with torch.cuda.stream(stream):
+            for backend in ("specialized", "auto"):
+                _reset_fp8bs_decodem_stats()
+                out.fill_(-32)
+                if not ok and backend == "specialized":
+                    with pytest.raises(
+                        NotImplementedError, match="stream_cluster_capacity"
+                    ):
+                        fp8_blockscale_gemm_sm90(
+                            x, w, None, ws, out=out, backend=backend
+                        )
+                    assert (buf == -32).all().item()
+                else:
+                    result = fp8_blockscale_gemm_sm90(
+                        x, w, None, ws, out=out, backend=backend
+                    )
+                    assert result.data_ptr() == out.data_ptr()
+                    assert (out == k).all().item()
+                    assert (buf[:8] == -32).all().item()
+                    assert (buf[-8:] == -32).all().item()
+                stats = _fp8bs_decodem_stats()
+                assert stats["backend_dispatches"] == {
+                    "specialized": int(ok),
+                    "deepgemm": int(not ok and backend == "auto"),
+                }
+                assert stats["fallback_reasons"] == (
+                    {} if ok else {f"{backend}: stream_cluster_capacity": 1}
+                )
+        stream.synchronize()
+
+
+@requires_sm90
+def test_green_capture(green8):
+    m, n, k = 13, 2048, 2048
+    x = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    w = torch.ones((n, k), device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.ones((n // 128, k // 128), device="cuda")
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    torch.cuda.current_stream().synchronize()
+    with torch.cuda.stream(green8):
+
+        def call():
+            fp8_blockscale_gemm_sm90(x, w, None, ws, out=out, backend="specialized")
+
+        call()
+        green8.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=green8):
+            call()
+        for scale in (2, 1):
+            ws.fill_(scale)
+            out.zero_()
+            graph.replay()
+            assert (out == scale * k).all().item()
+
+
+@requires_sm90
+def test_native_green_wrong_current_device(green8, native_rejection_module):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs another current device")
+    m, n, k = 12, 2624, 6144
+    x, w, ws = _make(m, n, k)
+    out = torch.full((m, n), -32, device=x.device, dtype=x.dtype)
+    other = (x.device.index + 1) % torch.cuda.device_count()
+    torch.cuda.current_stream().synchronize()
+    with torch.cuda.stream(green8), torch.cuda.device(other):
+        assert not native_rejection_module.try_run(x, w, ws, 0.0, out)
+        assert torch.cuda.current_device() == other
+    green8.synchronize()
+    assert (out == -32).all().item()
 
 
 @requires_sm90

@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 import json
+from contextlib import nullcontext
 from copy import deepcopy
 from importlib import resources
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -78,3 +81,42 @@ def test_valid_narrower_policy_is_read(manifest):
     assert mod._auto_refusal(6, 2048, 2048) is None
     assert mod._auto_refusal(6, 2624, 6144) == "shape_alignment"
     assert mod._auto_refusal(6, 8192, 1536) == "unmeasured_nk"
+
+
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_native_stream_decision(monkeypatch, backend):
+    x = SimpleNamespace(shape=(12, 6144), device=0)
+    w = SimpleNamespace(shape=(2624, 6144))
+    ws, out = object(), object()
+    native = Mock(spec_set=["try_run"])
+    native.try_run.side_effect = [True, False, RuntimeError("occupancy failed"), True]
+    monkeypatch.setattr(mod, "_get_module", lambda: native)
+    monkeypatch.setattr(mod, "_eligibility", lambda *args: (True, "ok"))
+    monkeypatch.setattr(mod.torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        mod,
+        "_stats",
+        {
+            "jit_build": "built",
+            "fallback_reasons": {},
+            "backend_dispatches": {"specialized": 0, "deepgemm": 0},
+        },
+    )
+
+    def call():
+        return mod._fp8bs_decodem_try_dispatch(x, w, None, ws, out, backend)
+
+    assert call() is out
+    if backend == "auto":
+        assert call() is None
+    else:
+        with pytest.raises(NotImplementedError, match="stream_cluster_capacity"):
+            call()
+    with pytest.raises(RuntimeError, match="occupancy failed"):
+        call()
+    assert call() is out
+    assert native.try_run.call_count == 4
+    native.try_run.assert_called_with(x, w, ws, mod._QUANT_EPS, out)
+    assert mod._stats["backend_dispatches"] == {"specialized": 2, "deepgemm": 0}
+    assert mod._stats["fallback_reasons"] == {f"{backend}: stream_cluster_capacity": 1}
+    assert mod._stats["jit_build"] == "built"

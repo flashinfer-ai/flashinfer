@@ -12,6 +12,7 @@
 #include <cstring>
 #include <flashinfer/gemm/fp8bs_gemm_decodem_sm90/hmma.cuh>
 
+#include "fp8bs_decodem_cluster.h"
 #include "fp8bs_gemm_decodem_sm90.h"
 
 // ---------------------------------------------------------------------------
@@ -45,7 +46,7 @@ static cudaError_t launch_mt(const void* x, const void* w, const void* ws, void*
   cfg.blockDim = dim3(NTHREAD, 1, 1);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = stream;
-  cudaLaunchAttribute attr[2];
+  cudaLaunchAttribute attr[2]{};
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = ksplit;
   attr[0].val.clusterDim.y = 1;
@@ -59,6 +60,7 @@ static cudaError_t launch_mt(const void* x, const void* w, const void* ws, void*
     cfg.attrs = attr;
     cfg.numAttrs = 1;
   }
+  decodem::admit(cfg, fp8bs_kernel<MT, NWARP, KSHIFT>);
   return cudaLaunchKernelEx(&cfg, fp8bs_kernel<MT, NWARP, KSHIFT>, (const __nv_bfloat16*)x,
                             (const uint8_t*)w, (const float*)ws, (__nv_bfloat16*)out, M, N, K, Sk,
                             eps, nbuf);

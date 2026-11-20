@@ -13,6 +13,7 @@
 #include <cstring>
 #include <flashinfer/gemm/fp8bs_gemm_decodem_sm90/mwg.cuh>
 
+#include "fp8bs_decodem_cluster.h"
 #include "fp8bs_gemm_decodem_sm90.h"
 
 namespace mwg {
@@ -33,8 +34,10 @@ static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x, const
       mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>,
       cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "mwg shared-memory opt-in: " << cudaGetErrorString(err);
-  mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>
-      <<<grid, 128 * NWG, SMEM, stream>>>(x, w, ws, eps, out, M, N, K);
+  decodem::submit(
+      grid, 128 * NWG, SMEM, stream,
+      mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>,
+      x, w, ws, eps, out, M, N, K);
 }
 
 template <int MT>

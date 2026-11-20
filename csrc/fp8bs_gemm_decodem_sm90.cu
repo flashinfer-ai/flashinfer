@@ -15,6 +15,7 @@
 #include <cstring>
 #include <flashinfer/gemm/fp8bs_gemm_decodem_sm90/decodem.cuh>
 
+#include "fp8bs_decodem_cluster.h"
 #include "fp8bs_gemm_decodem_sm90.h"
 
 namespace ffi = tvm::ffi;
@@ -65,11 +66,13 @@ static void launch_ku(dim3 grid, bool lb, cudaStream_t stream, const __nv_bfloat
     attribute.val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = &attribute;
     config.numAttrs = 1;
+    decodem::admit(config, kern);
     const cudaError_t err =
         cudaLaunchKernelEx(&config, kern, x, weight, weight_scale, eps, out, M, N, K);
     TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "launch_ku: " << cudaGetErrorString(err);
   } else {
-    kern<<<grid, 128, PUSH_BYTES, stream>>>(x, weight, weight_scale, eps, out, M, N, K);
+    decodem::submit(grid, 128, PUSH_BYTES, stream, kern, x, weight, weight_scale, eps, out, M, N,
+                    K);
   }
 }
 
@@ -140,11 +143,12 @@ static void launch_splitk_load_balanced(dim3 grid, cudaStream_t stream, const __
   attribute.val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = &attribute;
   config.numAttrs = 1;
-  const cudaError_t err = cudaLaunchKernelEx(
-      &config,
+  auto kern =
       fp8_blockscale_wgmma_splitk_kernel<MT, SPLIT, KeepX, PackMT8, PushDSM, false, false, false,
-                                         CompactM2, ScaleOpt, false, AsyncM2, DenseN>,
-      x, weight, weight_scale, eps, out, M, N, K);
+                                         CompactM2, ScaleOpt, false, AsyncM2, DenseN>;
+  decodem::admit(config, kern);
+  const cudaError_t err =
+      cudaLaunchKernelEx(&config, kern, x, weight, weight_scale, eps, out, M, N, K);
   TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "launch_splitk_load_balanced: " << cudaGetErrorString(err);
 }
 
@@ -210,8 +214,10 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
                              cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
         cudaSuccess);
     const dim3 grid((N + 63) / 64 * 16, (M + 15) / 16);
-    fp8_blockscale_wgmma_cpa_kernel<16, 16, false, false, true, true, false, true, true, true, true>
-        <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(grid, 128, 0, stream,
+                    fp8_blockscale_wgmma_cpa_kernel<16, 16, false, false, true, true, false, true,
+                                                    true, true, true>,
+                    xp, wp, wsp, eps, op, M, N, K);
     return;
   }
   if (M == 4 && N == 2048 && K == 2048) {
@@ -253,8 +259,8 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
                                            cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
                       cudaSuccess);
     const dim3 grid((N + 63) / 64 * 16, (M + 15) / 16);
-    fp8_blockscale_wgmma_cpa_kernel<16, 16, true, true>
-        <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(grid, 128, 0, stream, fp8_blockscale_wgmma_cpa_kernel<16, 16, true, true>, xp,
+                    wp, wsp, eps, op, M, N, K);
     return;
   }
   const bool use_split8 = N <= 2304 && K >= 4096;
@@ -270,8 +276,8 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
   } else if (use_wide_large_k && M > 8 && M <= 16) {
     if (K >= 2048) {
       const dim3 grid((N + 63) / 64 * 4, (M + 15) / 16);
-      fp8_blockscale_wgmma_splitk_kernel<16, 4, true>
-          <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+      decodem::submit(grid, 128, 0, stream, fp8_blockscale_wgmma_splitk_kernel<16, 4, true>, xp, wp,
+                      wsp, eps, op, M, N, K);
     } else {
       const dim3 grid((N + 63) / 64 * 6, (M + 15) / 16);
       if (M == 16 && N == 8192 && K == 1536)
@@ -284,14 +290,14 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
     }
   } else if (use_wide_mid_n && M > 8 && M <= 16) {
     const dim3 grid((N + 63) / 64 * 8, (M + 15) / 16);
-    fp8_blockscale_wgmma_splitk_kernel<16, 8>
-        <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(grid, 128, 0, stream, fp8_blockscale_wgmma_splitk_kernel<16, 8>, xp, wp, wsp,
+                    eps, op, M, N, K);
   } else if (use_split4 && M <= 8) {
     TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(fp8_blockscale_wgmma_splitk_kernel<8, 16>,
                                            cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
                       cudaSuccess);
-    fp8_blockscale_wgmma_splitk_kernel<8, 16>
-        <<<dim3(row8_grid.x * 16, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(dim3(row8_grid.x * 16, row8_grid.y), 128, 0, stream,
+                    fp8_blockscale_wgmma_splitk_kernel<8, 16>, xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split4 && M > 16 && M <= 24) {
     // Narrow N leaves few column tiles, so the grid is small; batching two
     // k-groups per shared round doubles the weight vectors in flight per
@@ -322,8 +328,8 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
                                         eps, op, M, N, K);
     }
   } else if (use_split2) {
-    fp8_blockscale_wgmma_splitk_kernel<8, 2>
-        <<<dim3(row8_grid.x * 2, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(dim3(row8_grid.x * 2, row8_grid.y), 128, 0, stream,
+                    fp8_blockscale_wgmma_splitk_kernel<8, 2>, xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split8 && M <= 8) {
     if ((K >> 7) == 14 * 4) {
       if (M == 2) {
@@ -345,40 +351,52 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
                                               wp, wsp, eps, op, M, N, K);
     }
   } else if (use_split8 && M <= 24) {
-    fp8_blockscale_wgmma_splitk_kernel<8, 8>
-        <<<dim3(row8_grid.x * 8, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(dim3(row8_grid.x * 8, row8_grid.y), 128, 0, stream,
+                    fp8_blockscale_wgmma_splitk_kernel<8, 8>, xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split4 && M <= 24) {
-    fp8_blockscale_wgmma_splitk_kernel<8, 4>
-        <<<dim3(row8_grid.x * 4, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(dim3(row8_grid.x * 4, row8_grid.y), 128, 0, stream,
+                    fp8_blockscale_wgmma_splitk_kernel<8, 4>, xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split6 && M > 16 && M <= 24) {
-    fp8_blockscale_wgmma_splitk_kernel<8, 8>
-        <<<dim3(row8_grid.x * 8, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(dim3(row8_grid.x * 8, row8_grid.y), 128, 0, stream,
+                    fp8_blockscale_wgmma_splitk_kernel<8, 8>, xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split6 && M <= 24) {
-    fp8_blockscale_wgmma_splitk_kernel<8, 6>
-        <<<dim3(row8_grid.x * 6, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(dim3(row8_grid.x * 6, row8_grid.y), 128, 0, stream,
+                    fp8_blockscale_wgmma_splitk_kernel<8, 6>, xp, wp, wsp, eps, op, M, N, K);
   } else if (M <= 24) {
-    fp8_blockscale_wgmma_kernel<8><<<row8_grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(row8_grid, 128, 0, stream, fp8_blockscale_wgmma_kernel<8>, xp, wp, wsp, eps, op,
+                    M, N, K);
   } else {
     const dim3 block(64);
     const dim3 grid((N + 63) / 64, (M + 15) / 16);
-    fp8_blockscale_kernel<<<grid, block, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
+    decodem::submit(grid, block, 0, stream, fp8_blockscale_kernel, xp, wp, wsp, eps, op, M, N, K);
   }
 }
 
-void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale, float eps,
-         ffi::TensorView out) {
+bool TryRun(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale, float eps,
+            ffi::TensorView out) {
   // Scope the post-launch check to THIS call: an earlier, already-handled
   // runtime error left in the host thread's error slot must not be reported
   // as this GEMM's launch failure (sticky device-fault errors re-report on
   // every call either way and are unaffected by this clear).
   (void)cudaGetLastError();
-  RunImpl(x, weight, weight_scale, eps, out);
+  try {
+    RunImpl(x, weight, weight_scale, eps, out);
+  } catch (const decodem::StreamClusterRefusal&) {
+    return false;
+  }
   // Every route launches asynchronously; a refused launch (bad cluster or
   // shared-memory configuration) must surface instead of returning an
   // unwritten `out`.
   const cudaError_t err = cudaGetLastError();
   TVM_FFI_ICHECK_EQ(err, cudaSuccess)
       << "fp8bs_gemm_decodem_sm90: kernel launch failed: " << cudaGetErrorString(err);
+  return true;
+}
+
+void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale, float eps,
+         ffi::TensorView out) {
+  TVM_FFI_ICHECK(TryRun(x, weight, weight_scale, eps, out)) << "stream_cluster_capacity";
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(try_run, TryRun);
