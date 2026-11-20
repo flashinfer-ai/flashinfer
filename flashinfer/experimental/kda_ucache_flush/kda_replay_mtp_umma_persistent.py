@@ -588,10 +588,11 @@ def _c_ntile_block1(nt, lane, a_ln, kt_addr, c_addr):
     cute.arch.fence_view_async_shared()  # read by the j-block 1 history UMMA
 
 
-def _d_block1(use_smem, u_ptr, base, P, ct, tbase):
+def _d_block1(use_smem, u_ptr, base, P, tbase):
     """w_ring = 32: D columns 40..47 = raw u of window slots j = 16..31 (zero past
     P), from the SMEM window (u_ptr = this row's s_uwin byte address) or the ring
-    (u_ptr = this row's u_cache[sidx, h, 0, row] address). Call only when P > 16."""
+    (u_ptr = this row's u_cache[sidx, h, 0, row] address); tbase carries this warp's
+    TMEM lane quadrant. Call only when P > 16."""
     uv = []
     for j in range(16, 32):
         if use_smem:
@@ -608,12 +609,13 @@ def _d_block1(use_smem, u_ptr, base, P, ct, tbase):
         lo = _sel(16 + 2 * i < P, uv[2 * i], Uint32(0), Uint32)
         hi = _sel(16 + 2 * i + 1 < P, uv[2 * i + 1], Uint32(0), Uint32)
         words.append(lo | (hi << Uint32(16)))
-    U.tmem_st_u32(ct, tbase + _COL_D + 8, words)
+    U.tmem_st_u32(0, tbase + _COL_D + 8, words)
 
 
-def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone, sr=None):
+def _rmw(g, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone, sr=None):
     """Flush rows: S_half <- round(bdec . S0_half + F) in place on state K half g (TMEM
-    F at cols 64..127, this thread's V row = TMEM lane), then publish the half to warp
+    F at cols 64..127, this thread's V row = TMEM lane; tbase = the warp-uniform tcgen05.ld address with
+    this warp's TMEM lane quadrant in its lane field), then publish the half to warp
     0's TMA store (f_gdone). bdec is per channel (s_bdec, a warp-uniform broadcast
     read). Half 0 releases the F columns (f_epi_a) after its last TMEM load so the fold
     UMMA of half 1 can overwrite them.
@@ -658,7 +660,7 @@ def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone, sr=None):
         for _ in range(3):
             lx.append(lx[-1] * Uint32(U.LCG_A) + Uint32(U.LCG_C))
     for grp in range(64 // ldn):
-        fv = U.tmem_ld(ct, tbase + _COL_F + grp * ldn, ldn)
+        fv = U.tmem_ld(0, tbase + _COL_F + grp * ldn, ldn)
         if rounds > 0:
             # one draw per 8-element chunk, the load's chunks in one call (counters
             # off + 8 s); off_row is a multiple of 64, so no carry into the high word
@@ -1305,10 +1307,11 @@ class KdaReplayMtpUmma:
         # Cursors of the first item (every thread), then the mbarrier inits while they
         # are in flight. Every role walks the same item list with the same cursors.
         sidx, P, base = _cursors(state_idx_t, hist_len, cache_base, cta, NIT, NH)
-        ct = (
-            tid - 32 * CW0
-        ) & 127  # consumer index: channel c / (row r, lane l) / TMEM lane
-        row = ((warp & 3) << 5) | lane  # V row of this consumer thread (= TMEM lane)
+        ct = (tid - 32 * CW0) & 127  # consumer index: channel c / (row r, lane l)
+        # TMEM lane quadrant of this warp: 32 * (warp % 4), the lanes tq .. tq + 31 its
+        # tcgen05.ld / st reach; their address is warp-uniform with tq in the lane field
+        tq = (warp & 3) << 5
+        row = tq | lane  # V row of this consumer thread (= TMEM lane)
         r8 = ct >> 4  # row layout: X row r8 + 8 p, 8 k values at l16 * 8
         l16 = ct & 15
         if warp == 0:
@@ -2027,11 +2030,13 @@ class KdaReplayMtpUmma:
                             barrier_id=2, number_of_threads=160
                         )  # TMEM addr
                         U.fence_after_sync()
-                    tbase = tmem_addr[0]
-                    U.tmem_st_u32(ct, tbase + _COL_D, words)
+                    tbase = tmem_addr[0] | (
+                        tq << 16
+                    )  # lane field: this warp's quadrant
+                    U.tmem_st_u32(0, tbase + _COL_D, words)
                     if cutlass.const_expr(WR == 32):
                         if P > 16:
-                            _d_block1(USE_SMEM_U, u_ptr, base, P, ct, tbase)
+                            _d_block1(USE_SMEM_U, u_ptr, base, P, tbase)
                     if cutlass.const_expr(USE_SMEM_U):
                         # the window has been read (the LDS values are consumed above):
                         # order those generic-proxy reads before warp 0's next bulk copy
@@ -2052,7 +2057,6 @@ class KdaReplayMtpUmma:
                         U.fence_after_sync()
                         _rmw(
                             0,
-                            ct,
                             row,
                             tbase,
                             st_addr_c,
@@ -2072,8 +2076,8 @@ class KdaReplayMtpUmma:
                     nld = (
                         1 << (T - 1).bit_length()
                     )  # tcgen05.ld widths are powers of two
-                    hk = U.tmem_ld(ct, tbase + _COL_H, nld)
-                    hq = U.tmem_ld(ct, tbase + _COL_H + T, nld)
+                    hk = U.tmem_ld(0, tbase + _COL_H, nld)
+                    hq = U.tmem_ld(0, tbase + _COL_H + T, nld)
                     U.tmem_wait_ld()
                     U.fence_before_sync()
                     if not is_flush:
@@ -2103,7 +2107,6 @@ class KdaReplayMtpUmma:
                         U.fence_after_sync()
                         _rmw(
                             1,
-                            ct,
                             row,
                             tbase,
                             st_addr_c,
