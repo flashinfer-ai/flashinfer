@@ -40,6 +40,7 @@ from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
 from .flashinfer_benchmark_utils import (
+    BACKEND_REJECTION_ERRORS,
     dtype_str_to_torch_dtype,
     filter_backends_by_compute_capability,
     get_device,
@@ -1152,18 +1153,30 @@ def testBlockSparseAttentionWrapper(args):
         if sage and b != "vsa_sm100_blk64":
             print(f"[WARNING] {b} has no Sage-FP8 path; skipping.")
             continue
+        if b == "vsa_sm100_blk64" and (Hq != Hkv or (sage and Hq not in (4, 8))):
+            # sparse.py / bsa_attn_sm100_blk64.py: MHA only, Sage FP8 at 4 or 8 heads.
+            print(
+                "[WARNING] vsa_sm100_blk64 requires num_qo_heads == num_kv_heads "
+                "(4 or 8 heads for Sage FP8); skipping."
+            )
+            continue
         wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(workspace, backend=b)
-        wrapper.plan(indptr, indices, M, N, R, C, Hq, Hkv, D, **plan_kw)
-        if b == "cutile":
-            # cutile compiles at the first run and needs cuda-tile + tileiras.
+        if b == "cutile" or b.startswith("vsa_"):
+            # These compile at plan or first run (cutile needs cuda-tile + tileiras,
+            # the vsa_* kernels a CuTe DSL build); a failed compile drops the backend.
             try:
+                wrapper.plan(indptr, indices, M, N, R, C, Hq, Hkv, D, **plan_kw)
                 wrapper.run(q, k, v)
-            except Exception as e:
+            except torch.OutOfMemoryError:
+                raise
+            except BACKEND_REJECTION_ERRORS as e:
                 print(
-                    f"[INFO] cutile backend does not support this configuration: "
-                    f"{type(e).__name__}: {e}. Skipping."
+                    f"[WARNING] {b} backend rejected this configuration and "
+                    f"is dropped from the line: {type(e).__name__}: {e}"
                 )
                 continue
+        else:
+            wrapper.plan(indptr, indices, M, N, R, C, Hq, Hkv, D, **plan_kw)
         if args.refcheck:
             outputs[b] = wrapper.run(q, k, v).detach().clone()
         times = _time(args, lambda _b, w=wrapper: w.run(q, k, v), b)

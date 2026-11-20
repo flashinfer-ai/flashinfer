@@ -281,8 +281,19 @@ def testTopKVarlen(args):
         )
 
     # pre_idx: argmax in col-0, sequential fill elsewhere (GVR convention); one
-    # hint row per request, taken from its first draft row.
-    argmax_idx = logits[::next_n].argmax(dim=-1).int()
+    # hint row per request, taken from the valid columns of its first draft row
+    # (the kernels ignore a hint outside the row's length).
+    first_row_len = ((seq_lens - next_n + 1) // compress_ratio).clamp(1, width)
+    first_rows = (
+        logits[::next_n]
+        .float()
+        .masked_fill(
+            torch.arange(width, device=device).unsqueeze(0)
+            >= first_row_len.unsqueeze(1),
+            float("-inf"),
+        )
+    )
+    argmax_idx = first_rows.argmax(dim=-1).int()
     pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device=device)
     pre_idx[:, 0] = argmax_idx
     for j in range(1, top_k):
@@ -479,9 +490,16 @@ def _test_topk_varlen_prefill(args, backends, device):
     for backend in list(backends):
         try:
             outputs[backend] = run_backend(backend, logits)[0].detach().clone()
-        except (BackendSupportedError, ValueError) as e:
-            backends.remove(backend)
-            print(f"[WARNING] {backend} skipped: {e}")
+        except BackendSupportedError as e:
+            reason = str(e)
+        except ValueError as e:
+            if "Problem size is not supported" not in str(e):
+                raise
+            reason = str(e)
+        else:
+            continue
+        backends.remove(backend)
+        print(f"[WARNING] {backend} skipped: {reason}")
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res

@@ -2,7 +2,36 @@ import argparse
 import torch
 
 from flashinfer.testing.utils import set_seed
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    BackendSupportedError,
+    GPUArchitectureError,
+    LibraryError,
+    get_compute_capability,
+)
+
+# What the library raises when a backend rejects a configuration: Python guards
+# (ValueError / NotImplementedError / AssertionError), C++ and cubin lookups
+# (RuntimeError), a missing optional toolchain (ImportError, or OSError for the
+# tileiras compiler) and the library's own types. TypeError, AttributeError,
+# KeyError and the like mean harness/library skew and are left to propagate.
+BACKEND_REJECTION_ERRORS = (
+    ValueError,
+    NotImplementedError,
+    AssertionError,
+    RuntimeError,
+    ImportError,
+    OSError,
+    BackendSupportedError,
+    GPUArchitectureError,
+    LibraryError,
+)
+try:
+    # A CuTe DSL kernel that fails to compile for a configuration.
+    from cutlass.base_dsl.common import DSLBaseError
+
+    BACKEND_REJECTION_ERRORS += (DSLBaseError,)
+except ImportError:
+    pass
 
 # Output columns for the test results.
 output_column_dict = {
@@ -723,7 +752,8 @@ routine_cc_to_supported_backends = {
     "trtllm_batch_decode_sparse_mla_dsv4": {
         # NOTE: cute-dsl is the CuTe DSL HCA kernel (--dsv4_layer hca only).
         # _resolve_dsv4_sparse_mla_backend (mla/_core.py): trtllm-gen admits
-        # 10.0/10.3/10.7, cute-dsl 10.0/10.3 only.
+        # 10.0/10.3/10.7; it admits cute-dsl there too, listed here on 10.0/10.3
+        # (the archs it has been timed on).
         "7.5": [],
         "8.0": [],
         "8.6": [],

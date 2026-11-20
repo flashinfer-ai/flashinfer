@@ -45,6 +45,7 @@ from .flashinfer_benchmark_utils import (
     is_close_stats,
     filter_backends_by_compute_capability,
     to_float8,
+    BACKEND_REJECTION_ERRORS,
 )
 
 TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
@@ -113,6 +114,29 @@ def _drop_backends_without_mode(backends, args, window_ok, soft_cap_ok, sinks_ok
             _drop_backend(backends, backend, "does not support --logits_soft_cap")
         elif args.sinks and backend not in sinks_ok:
             _drop_backend(backends, backend, "does not support --sinks here")
+
+
+def _has_ignored_mode_flags(args, consumed=()):
+    """True (after an [ERROR]) if a mode flag this routine never forwards is set.
+
+    The CSV writer back-fills every mode column from args, so a flag the
+    routine ignores would be recorded on a row that ran without it.
+    """
+    requested = {
+        "window_left": args.window_left >= 0,
+        "logits_soft_cap": args.logits_soft_cap > 0,
+        "sinks": args.sinks,
+        "use_token_head_sf": args.use_token_head_sf,
+        "use_fp16_softmax": args.use_fp16_softmax,
+        "uses_spcompress": args.uses_spcompress,
+        "skip_softmax_threshold_scale_factor": (
+            args.skip_softmax_threshold_scale_factor is not None
+        ),
+    }
+    ignored = [f"--{k}" for k, on in requested.items() if on and k not in consumed]
+    if ignored:
+        print(f"[ERROR] {args.routine} does not take {', '.join(ignored)}.")
+    return bool(ignored)
 
 
 def _drop_backends_without_trtllm_knobs(backends, args, device, knob_ok):
@@ -202,7 +226,7 @@ def _make_sinks(args, num_qo_heads, device):
 
 
 def _probe_backend(backend, fn):
-    """Run one call; on failure report and return False (probe-and-drop).
+    """Run one call; on a library rejection warn and return False (probe-and-drop).
 
     Used for backends whose support is decided by a runtime route or cubin
     lookup (xqa, cutile, cute-dsl) rather than a Python guard the
@@ -212,11 +236,13 @@ def _probe_backend(backend, fn):
         fn()
         torch.cuda.synchronize()
         return True
-    except Exception as e:
+    except torch.OutOfMemoryError:
+        raise
+    except BACKEND_REJECTION_ERRORS as e:
         msg = str(e).splitlines()[0][:200] if str(e) else ""
         print(
-            f"[INFO] {backend} backend does not support this configuration: "
-            f"{type(e).__name__}: {msg}. Skipping."
+            f"[WARNING] {backend} backend rejected this configuration and is "
+            f"dropped from the line: {type(e).__name__}: {msg}"
         )
         return False
 
@@ -324,6 +350,7 @@ def _validate_prims_ts_context_samples(
     causal,
     paged_kv_indices=None,
     kv_lens=None,
+    window_left=-1,
 ):
     """Validate PrimTS context output with exact sampled FP32 attention.
 
@@ -381,8 +408,10 @@ def _validate_prims_ts_context_samples(
             # Bottom-right causal alignment: row i sees the prefix ending at
             # Skv - Sq + i, inclusive.
             visible_kv = k_matrix.shape[0] - q_len + query_idx + 1
-            k_matrix = k_matrix[:visible_kv]
-            v_matrix = v_matrix[:visible_kv]
+            # A sliding window keeps the row's own key and window_left before it.
+            first_kv = max(0, visible_kv - 1 - window_left) if window_left >= 0 else 0
+            k_matrix = k_matrix[first_kv:visible_kv]
+            v_matrix = v_matrix[first_kv:visible_kv]
 
         q_vector = q[q_begin + query_idx, query_head].float()
         probabilities = torch.softmax(
@@ -1172,6 +1201,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "trtllm-gen",
                 "uses implicit causal masking and does not support full-mask speculative decode",
             )
+        # The wrapper plans cute-dsl with its default causal mask (window_right=0).
+        _drop_backend(
+            backends,
+            "cute-dsl",
+            "is planned with a causal mask and does not support full-mask speculative decode",
+        )
         if "trtllm-native" in backends and get_compute_capability(device)[0] == 10:
             while "trtllm-native" in backends:
                 _drop_backend(
@@ -1973,6 +2008,18 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     rtol = 2e-1
     atol = 1e-2
     res = []
+    if _has_ignored_mode_flags(
+        args,
+        (
+            "window_left",
+            "logits_soft_cap",
+            "sinks",
+            "use_fp16_softmax",
+            "uses_spcompress",
+            "skip_softmax_threshold_scale_factor",
+        ),
+    ):
+        return res
 
     q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
     if q_dtype not in [torch.float16, torch.bfloat16, torch.float8_e4m3fn]:
@@ -2948,6 +2995,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             causal=causal,
             paged_kv_indices=kv_indices,
             kv_lens=actual_seq_lens_kv_device,
+            window_left=args.window_left,
         )
         if args.verbose >= 1:
             print(
@@ -2985,6 +3033,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     causal=causal,
                     paged_kv_indices=kv_indices,
                     kv_lens=actual_seq_lens_kv_device,
+                    window_left=args.window_left,
                 )
             )
             if args.verbose >= 1:
@@ -3148,6 +3197,18 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     rtol = 2e-1
     atol = 1e-2
     res = []
+    if _has_ignored_mode_flags(
+        args,
+        (
+            "window_left",
+            "logits_soft_cap",
+            "sinks",
+            "use_fp16_softmax",
+            "uses_spcompress",
+            "skip_softmax_threshold_scale_factor",
+        ),
+    ):
+        return res
 
     q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
     if q_dtype not in [
@@ -3334,7 +3395,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     _drop_backends_without_mode(
         backends,
         args,
-        window_ok=("fa2", "fa3", "auto", "trtllm-native", "cute-dsl", "prims-ts"),
+        # Ragged trtllm-native has no windowed cubin (causal) and raises
+        # NotImplementedError for a non-causal window.
+        window_ok=("fa2", "fa3", "auto", "cute-dsl", "prims-ts"),
         soft_cap_ok=("fa2", "fa3", "auto"),
         sinks_ok=("trtllm-native", "cute-dsl"),
     )
@@ -3958,6 +4021,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             causal=causal,
+            window_left=args.window_left,
         )
         if args.verbose >= 1:
             print(
@@ -3992,6 +4056,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     softmax_scale=prims_ts_softmax_scale,
                     output_scale=prims_ts_output_scale,
                     causal=causal,
+                    window_left=args.window_left,
                 )
             )
             if args.verbose >= 1:
@@ -4147,6 +4212,8 @@ def testAppendPagedKVCache(args):
             f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
         )
     res = []
+    if _has_ignored_mode_flags(args):
+        return res
 
     backends = filter_backends_by_compute_capability(
         args.backends, args.routine, device
@@ -4485,6 +4552,8 @@ def testSingleRequestAttention(args):
         k, k_scale_t = to_float8(k, kv_dtype)
         v, v_scale_t = to_float8(v, kv_dtype)
         k_scale, v_scale = k_scale_t.item(), v_scale_t.item()
+    if _has_ignored_mode_flags(args, ("window_left", "logits_soft_cap")):
+        return res
     mode_kwargs = {}
     if args.window_left >= 0:
         mode_kwargs["window_left"] = args.window_left
@@ -4625,6 +4694,8 @@ def testMergeStates(args):
             f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
         )
     res = []
+    if _has_ignored_mode_flags(args):
+        return res
     backends = filter_backends_by_compute_capability(
         args.backends, args.routine, device
     )
@@ -4735,6 +4806,8 @@ def testBatchMLAPagedAttentionWrapper(args):
     rtol = 2e-1
     atol = 1e-2
     res = []
+    if _has_ignored_mode_flags(args, ("use_fp16_softmax",)):
+        return res
 
     # Handle different query data types.
     q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
@@ -5791,6 +5864,8 @@ def testConcatMlaK(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if _has_ignored_mode_flags(args):
+        return []
     if args.generate_repro_command:
         print(
             "[INFO] To reproduce this test case, run the following command: "
@@ -5927,6 +6002,8 @@ def testConcatMlaKvQuantFp8(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if _has_ignored_mode_flags(args):
+        return []
     if args.generate_repro_command:
         print(
             "[INFO] To reproduce this test case, run the following command: "
@@ -6325,6 +6402,8 @@ def testTrtllmBatchDecodeSparseMlaDsv4(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if _has_ignored_mode_flags(args):
+        return []
     if args.generate_repro_command:
         print(
             "[INFO] To reproduce this test case, run the following command: "
