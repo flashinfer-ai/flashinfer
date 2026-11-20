@@ -2776,6 +2776,7 @@ def kda_recoverssm_verify(
             HV=HV,
             H=H,
             kg_v4=all(s_ % 8 == 0 for s_ in kg_cache.stride()[:3]),
+            g_v4=raw_g.stride(1) % 8 == 0,
         )
         return out
     if cache_key not in _CACHE:

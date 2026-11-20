@@ -54,6 +54,7 @@ def run_kda_oo_umma(
     HV: int,
     H: int,
     kg_v4: bool = True,
+    g_v4: bool = True,
 ) -> None:
     """Compile (once per specialisation) and launch on ``args`` -- the
     ``KdaDecodeWyOutputOnlyKernel`` argument list."""
@@ -86,6 +87,7 @@ def run_kda_oo_umma(
         HV,
         H,
         bool(kg_v4),
+        bool(g_v4),
     )
     fn = _KERNELS.get(key)
     if fn is None:
@@ -99,6 +101,7 @@ def run_kda_oo_umma(
             null_min=null_min,
             kg_v4=kg_v4,
             min_blocks=min_blocks,
+            g_v4=g_v4,
         )
         fn = cute.compile[gdn_compile_options(device)](kernel, *args)
         _KERNELS[key] = fn

@@ -282,6 +282,154 @@ def _lds_f32x4(addr: Int32, *, loc=None, ip=None):
     ]
 
 
+@dsl_user_op
+def _sts_bf16(addr: Int32, x: Float32, *, loc=None, ip=None) -> None:
+    """st.shared.b16 of ``x`` rounded to bf16 (RN)."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Float32(x).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b16 h;\n\tcvt.rn.bf16.f32 h, $1;\n\tst.shared.b16 [$0], h;\n\t}",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _stg_bf16(addr: Int64, x: Float32, *, loc=None, ip=None) -> None:
+    """st.global.b16 of ``x`` rounded to bf16 (RN)."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Float32(x).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b16 h;\n\tcvt.rn.bf16.f32 h, $1;\n\tst.global.b16 [$0], h;\n\t}",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _pack2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Int64:
+    """Two fp32 as one .b64 f32x2 operand (``lo`` in the low word)."""
+    r = llvm.inline_asm(
+        _T.i64(),
+        [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+        "mov.b64 $0, {$1, $2};",
+        "=l,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(r)
+
+
+@dsl_user_op
+def _unpack2(x: Int64, *, loc=None, ip=None):
+    """The two fp32 words of a .b64 f32x2 value (low, high)."""
+    st = llvm.StructType.get_literal([_T.f32()] * 2)
+    r = llvm.inline_asm(
+        st,
+        [Int64(x).ir_value(loc=loc, ip=ip)],
+        "mov.b64 {$0, $1}, $2;",
+        "=f,=f,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return [
+        Float32(llvm.extractvalue(_T.f32(), r, [i], loc=loc, ip=ip)) for i in range(2)
+    ]
+
+
+@dsl_user_op
+def _ffma2(a: Int64, b: Int64, c: Int64, *, loc=None, ip=None) -> Int64:
+    """fma.rn.f32x2: two independent fp32 fmas (each rounded once, as fma.rn.f32)."""
+    r = llvm.inline_asm(
+        _T.i64(),
+        [Int64(v).ir_value(loc=loc, ip=ip) for v in (a, b, c)],
+        "fma.rn.f32x2 $0, $1, $2, $3;",
+        "=l,l,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(r)
+
+
+@dsl_user_op
+def _fmul2(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    """mul.rn.f32x2."""
+    r = llvm.inline_asm(
+        _T.i64(),
+        [Int64(v).ir_value(loc=loc, ip=ip) for v in (a, b)],
+        "mul.rn.f32x2 $0, $1, $2;",
+        "=l,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(r)
+
+
+@dsl_user_op
+def _ffma(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
+    """fma.rn.f32."""
+    r = llvm.inline_asm(
+        _T.f32(),
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c)],
+        "fma.rn.f32 $0, $1, $2, $3;",
+        "=f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(r)
+
+
+@dsl_user_op
+def _lds_b64x2(addr: Int32, *, loc=None, ip=None):
+    """ld.shared.v2.b64 (16 B aligned): two f32x2 operands."""
+    st = llvm.StructType.get_literal([_T.i64()] * 2)
+    r = llvm.inline_asm(
+        st,
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.b64 {$0,$1}, [$2];",
+        "=l,=l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return [
+        Int64(llvm.extractvalue(_T.i64(), r, [i], loc=loc, ip=ip)) for i in range(2)
+    ]
+
+
+@dsl_user_op
+def _lds_b64(addr: Int32, *, loc=None, ip=None) -> Int64:
+    """ld.shared.b64 (8 B aligned): one f32x2 operand."""
+    r = llvm.inline_asm(
+        _T.i64(),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.b64 $0, [$1];",
+        "=l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(r)
+
+
 def _x_sw128_off(row, c, half_bytes):
     """Byte offset of element (row, k = c) in a K-major SW128 operand tile: two
     64-element K halves ``half_bytes`` apart, 128 B rows, 16 B chunks XOR-swizzled
@@ -315,6 +463,7 @@ class KdaOutputOnlyUmma:
         null_min: int = 1,
         kg_v4: bool = True,
         min_blocks: Optional[int] = None,
+        g_v4: bool = True,
     ):
         assert 1 <= T <= 16, T
         self.T = T
@@ -327,6 +476,9 @@ class KdaOutputOnlyUmma:
         # drop-in kg cache rows 16-B aligned (every kg stride a multiple of 8
         # elements): 16-B stores of the key half, else 2-B stores (separate build)
         self.kg_v4 = bool(kg_v4)
+        # gate rows read as 16-B row chunks (token stride a multiple of 8 elements)
+        # and transposed through SMEM, else per-thread scalar loads (separate build)
+        self.g_v4 = bool(g_v4)
         self.NX = 16 if T <= 8 else 32  # X_r / X_c rows (2T live)
         self.KT = 8 if T <= 8 else 16  # Ktil rows (T live)
         self.num_threads = 192
@@ -473,7 +625,20 @@ class KdaOutputOnlyUmma:
                 Int64(tok0 + t_q) * Int64(ctx["sq"]) + Int64(i_h * K_DIM + l16 * 8)
             ) * Int64(2)
             vals += _ldg_v4_or0(live, _sel(is_q, aq, ak, Int64))
-        for t in cutlass.range_constexpr(T):
+        if cutlass.const_expr(self.g_v4):
+            # gate rows t = r8 + 8 i, 8 channels at l16 * 8 (row layout)
+            for i in cutlass.range_constexpr((T + 7) // 8):
+                tg = r8 + 8 * i
+                vals += _ldg_v4_or0(
+                    Int32((tg < T) & (tg < seq_len)),
+                    ctx["g"]
+                    + (
+                        Int64(tok0 + tg) * Int64(ctx["sg"])
+                        + Int64(hv * K_DIM + l16 * 8)
+                    )
+                    * Int64(2),
+                )
+        for t in cutlass.range_constexpr(0 if self.g_v4 else T):
             vals.append(
                 _ldg_u16_if(
                     Int32(t < seq_len),
@@ -565,11 +730,13 @@ class KdaOutputOnlyUmma:
         s_ktil = smem.allocate_tensor(
             cutlass.Uint16, cute.make_layout(KT * XC_PITCH // 2), byte_alignment=128
         )
-        s_gram = smem.allocate_tensor(
-            Float32, cute.make_layout(NX * KT), byte_alignment=16
-        )
+        # coefficient tables (written from the Gram fragments in P4) + beta; the raw
+        # gate rows [t][K] bf16 (staged in P1) alias the tables until the end of P2
+        # (beta lies past them)
+        GST = ((T + 7) // 8) * 8 * K_DIM // 2  # fp32 words of the gate staging
+        CO_N = max(2 * TT * TT, GST)
         s_coef = smem.allocate_tensor(
-            Float32, cute.make_layout(2 * TT * TT + TT), byte_alignment=16
+            Float32, cute.make_layout(CO_N + TT), byte_alignment=128
         )
         st_full = [smem.allocate_array(cutlass.Int64, 1) for _ in range(2)]
         x_ready = smem.allocate_array(cutlass.Int64, 1)
@@ -579,7 +746,7 @@ class KdaOutputOnlyUmma:
         tmem_addr = smem.allocate(Int32, 4)
         _CO_A = 0
         _CO_BQ = TT * TT
-        _CO_BETA = 2 * TT * TT
+        _CO_BETA = CO_N
 
         if warp == 1:
             U.tmem_alloc(tmem_addr, _TMEM_COLS)
@@ -618,6 +785,7 @@ class KdaOutputOnlyUmma:
         v_addr = s_v.iterator.toint()
         ktil_addr = s_ktil.iterator.toint()
         coef_addr = s_coef.iterator.toint()
+        gst_addr = coef_addr
         q_base = gQ.iterator.toint()
         k_base = gK.iterator.toint()
         v_base = gV.iterator.toint()
@@ -748,8 +916,19 @@ class KdaOutputOnlyUmma:
                 U.fence_after_sync()
                 tbase = tmem_addr[0]
                 xw = [pf[4 * p_ : 4 * p_ + 4] for p_ in range(NP)]
-                graw = pf[4 * NP : 4 * NP + T]
-                braw = pf[4 * NP + T]
+                NGW = 4 * ((T + 7) // 8) if self.g_v4 else T
+                graw = pf[4 * NP : 4 * NP + NGW]
+                braw = pf[4 * NP + NGW]
+                if cutlass.const_expr(self.g_v4):
+                    # stage the gate rows [t][K] for the channel-layout P2
+                    for i in cutlass.range_constexpr((T + 7) // 8):
+                        U.sts_v4(
+                            gst_addr + (r8 + 8 * i) * VB + l16 * 16,
+                            graw[4 * i],
+                            graw[4 * i + 1],
+                            graw[4 * i + 2],
+                            graw[4 * i + 3],
+                        )
                 eA = Float32(0.0)
                 dtb = Float32(0.0)
                 if cutlass.const_expr(GM != GATE_PRECOMPUTED):
@@ -840,6 +1019,8 @@ class KdaOutputOnlyUmma:
                 # -------- P2: gate + operand tiles (channel layout, c = ct)
                 c = ct
                 cum = Float32(0.0)
+                if cutlass.const_expr(self.g_v4):
+                    graw = [U.lds_u16(gst_addr + t * VB + c * 2) for t in range(T)]
                 for t in cutlass.range_constexpr(T):
                     gx = U.u16_as_f32(graw[t], True)
                     if cutlass.const_expr(EMIT):
@@ -887,16 +1068,14 @@ class KdaOutputOnlyUmma:
                         glog = _sel(Int32(t) < seq_len, glog, 0.0, Float32)
                     cum = cum + glog
                     ep = _ex2(cum * Float32(LOG2_E))
-                    en = _ex2((Float32(0.0) - cum) * Float32(LOG2_E))
+                    en = _ex2(cum * Float32(-LOG2_E))  # == (0 - cum) * log2(e)
                     ka_ = x_addr + _x_sw128_off(t, c, XH)
                     qa_ = x_addr + _x_sw128_off(T + t, c, XH)
                     kh = U.u16_as_f32(U.lds_u16(ka_), True)
                     qh = U.u16_as_f32(U.lds_u16(qa_), True)
-                    U.sts_u16(ka_, U.f32_to_u16(kh * ep, True))
-                    U.sts_u16(qa_, U.f32_to_u16(qh * ep, True))
-                    U.sts_u16(
-                        ktil_addr + t * XC_PITCH + c * 2, U.f32_to_u16(kh * en, True)
-                    )
+                    _sts_bf16(ka_, kh * ep)
+                    _sts_bf16(qa_, qh * ep)
+                    _sts_bf16(ktil_addr + t * XC_PITCH + c * 2, kh * en)
                 if ct < T:
                     bv = U.u16_as_f32(braw, True)
                     if cutlass.const_expr(self.beta_is_logit):
@@ -911,7 +1090,7 @@ class KdaOutputOnlyUmma:
                 cute.arch.mbarrier_arrive(x_ready)
                 _bar_sync_ua(1, 128)
 
-                # -------- P4: mma.sync Gram X_r . Ktil^T (fp32, s_gram [NX][KT]); A
+                # -------- P4: mma.sync Gram X_r . Ktil^T (fp32) -> coefficient tables; A
                 # fragments straight from the SW128 X_r tile
                 NTILE = (NX // 16) * (KT // 8)
                 if cw < NTILE:
@@ -936,31 +1115,30 @@ class KdaOutputOnlyUmma:
                         acc = U.mma_bf16_16816(
                             fa[0], fa[1], fa[2], fa[3], fb[0], fb[1], acc
                         )
+                    # coefficient tables straight from the fragments: Gram row r < T
+                    # is k̂_r (A[r][s] = beta_r G, s < r), T <= r < 2T is q̂_{r-T}
+                    # (Bq[r-T][s] = G, s <= r-T); rows >= 2T are dead
                     r0 = mt * 16 + grp
                     c0 = nt * 8 + 2 * c4
-                    s_gram[r0 * KT + c0] = acc[0]
-                    s_gram[r0 * KT + c0 + 1] = acc[1]
-                    s_gram[(r0 + 8) * KT + c0] = acc[2]
-                    s_gram[(r0 + 8) * KT + c0 + 1] = acc[3]
+                    for h_ in cutlass.range_constexpr(2):
+                        rr = r0 + 8 * h_
+                        is_k = rr < T
+                        tr = _sel(is_k, rr, rr - T, Int32)
+                        bt = s_coef[_CO_BETA + _sel(is_k, rr, 0, Int32)]
+                        for e_ in cutlass.range_constexpr(2):
+                            cc = c0 + e_
+                            gv = acc[2 * h_ + e_]
+                            av = _sel(cc < tr, -(bt * gv), 0.0, Float32)
+                            bq = _sel(cc <= tr, gv, 0.0, Float32)
+                            if rr < T2:
+                                # token pairs interleaved: (t, s) at
+                                # ((t >> 1) TT + s) 2 + (t & 1)
+                                s_coef[
+                                    _sel(is_k, _CO_A, _CO_BQ, Int32)
+                                    + ((tr >> 1) * TT + cc) * 2
+                                    + (tr & 1)
+                                ] = _sel(is_k, av, bq, Float32)
                 _bar_sync_ua(1, 128)
-
-                # -------- P5: intra-step coefficient tables (fp32, masked by select)
-                NT_ = T * T
-                for i in cutlass.range_constexpr((2 * NT_ + 127) // 128):
-                    e = ct + 128 * i
-                    if e < 2 * NT_:
-                        tab = e // NT_
-                        tt = (e // T) % T
-                        ss_ = e % T
-                        gv = s_gram[(tab * T + tt) * KT + ss_]
-                        bt = s_coef[_CO_BETA + tt]
-                        av = _sel(ss_ < tt, bt * gv, 0.0, Float32)
-                        bq = _sel(ss_ <= tt, gv, 0.0, Float32)
-                        if tab == 0:
-                            s_coef[_CO_A + tt * TT + ss_] = av
-                        else:
-                            s_coef[_CO_BQ + tt * TT + ss_] = bq
-                _bar_sync_ua(1, 128)  # coefficient tables
 
                 # -------- epilogue: per V row forward substitution
                 cute.arch.mbarrier_wait(mma_done, ph)
@@ -969,35 +1147,99 @@ class KdaOutputOnlyUmma:
                 hk = U.tmem_ld(tq, tbase, nld)
                 U.tmem_wait_ld()
                 cute.arch.mbarrier_wait(v_full, ph)
+                # forward substitution two tokens at a time with f32x2 fmas: each
+                # lane runs one token's chain in the original order, so every value
+                # is rounded exactly as the scalar recurrence (A is stored negated:
+                # fma(-A, u, acc) == acc - A u)
+
+                def _co(tab, t_, s_):
+                    return coef_addr + (tab + ((t_ >> 1) * TT + s_) * 2 + (t_ & 1)) * 4
+
+                def _ld_v(t_):
+                    return U.u16_as_f32(U.lds_u16(v_addr + t_ * VB + row * 2), True)
+
+                # u_t = beta_t (v_t - hk_t) - sum_s A_ts u_s; the first term is
+                # fused as fma(beta_t, v_t - hk_t, -A_t0 u_0) (the scalar code's
+                # contraction), the rest as fma(-A_ts, u_s, acc)
                 uu: list = []
-                for t in cutlass.range_constexpr(T):
-                    bt = s_coef[_CO_BETA + t]
-                    vt = U.u16_as_f32(U.lds_u16(v_addr + t * VB + row * 2), True)
-                    acc_u = bt * (vt - hk[t])
-                    for s4 in cutlass.range_constexpr(0, t, 4):
-                        cf = _lds_f32x4(coef_addr + (_CO_A + t * TT + s4) * 4)
-                        for jj in cutlass.range_constexpr(min(4, t - s4)):
-                            acc_u = acc_u - cf[jj] * uu[s4 + jj]
-                    uu.append(acc_u)
+                ud: list = []  # (u_s, u_s) pairs
+                for t0 in cutlass.range_constexpr(0, T, 2):
+                    if cutlass.const_expr(t0 + 1 < T):
+                        bt2 = _pack2(s_coef[_CO_BETA + t0], s_coef[_CO_BETA + t0 + 1])
+                        d2 = _pack2(_ld_v(t0) - hk[t0], _ld_v(t0 + 1) - hk[t0 + 1])
+                        if cutlass.const_expr(t0 == 0):
+                            b0, b1 = _unpack2(bt2)
+                            e0, e1 = _unpack2(d2)
+                            u0 = b0 * e0
+                            u1 = _ffma(b1, e1, s_coef[_CO_A + 1] * u0)
+                        else:
+                            cf = _lds_b64x2(_co(_CO_A, t0, 0))
+                            acc = _ffma2(bt2, d2, _fmul2(cf[0], ud[0]))
+                            acc = _ffma2(cf[1], ud[1], acc)
+                            for s2 in cutlass.range_constexpr(2, t0, 2):
+                                cf = _lds_b64x2(_co(_CO_A, t0, s2))
+                                acc = _ffma2(cf[0], ud[s2], acc)
+                                acc = _ffma2(cf[1], ud[s2 + 1], acc)
+                            u0, a1 = _unpack2(acc)
+                            u1 = _ffma(
+                                s_coef[_CO_A + ((t0 >> 1) * TT + t0) * 2 + 1], u0, a1
+                            )
+                        uu += [u0, u1]
+                        ud += [_pack2(u0, u0), _pack2(u1, u1)]
+                    else:
+                        bt = s_coef[_CO_BETA + t0]
+                        d0 = _ld_v(t0) - hk[t0]
+                        if cutlass.const_expr(t0 == 0):
+                            a0 = bt * d0
+                        else:
+                            a0 = _ffma(
+                                bt, d0, s_coef[_CO_A + ((t0 >> 1) * TT) * 2] * uu[0]
+                            )
+                            for s_ in cutlass.range_constexpr(1, t0):
+                                a0 = _ffma(
+                                    s_coef[_CO_A + ((t0 >> 1) * TT + s_) * 2],
+                                    uu[s_],
+                                    a0,
+                                )
+                        uu.append(a0)
                 hq = U.tmem_ld(tq, tbase + T, nld)
                 U.tmem_wait_ld()
+                yy: list = []
+                for t0 in cutlass.range_constexpr(0, T, 2):
+                    if cutlass.const_expr(t0 + 1 < T):
+                        acc = _pack2(hq[t0], hq[t0 + 1])
+                        for s2 in cutlass.range_constexpr(0, t0, 2):
+                            cf = _lds_b64x2(_co(_CO_BQ, t0, s2))
+                            acc = _ffma2(cf[0], ud[s2], acc)
+                            acc = _ffma2(cf[1], ud[s2 + 1], acc)
+                        acc = _ffma2(_lds_b64(_co(_CO_BQ, t0, t0)), ud[t0], acc)
+                        y0, y1 = _unpack2(acc)
+                        y1 = _ffma(
+                            s_coef[_CO_BQ + ((t0 >> 1) * TT + t0 + 1) * 2 + 1],
+                            uu[t0 + 1],
+                            y1,
+                        )
+                        yy += [y0, y1]
+                    else:
+                        y0 = hq[t0]
+                        for s_ in cutlass.range_constexpr(t0 + 1):
+                            y0 = _ffma(
+                                s_coef[_CO_BQ + ((t0 >> 1) * TT + s_) * 2], uu[s_], y0
+                            )
+                        yy.append(y0)
                 for t in cutlass.range_constexpr(T):
-                    y = hq[t]
-                    for s4 in cutlass.range_constexpr(0, t + 1, 4):
-                        cf = _lds_f32x4(coef_addr + (_CO_BQ + t * TT + s4) * 4)
-                        for jj in cutlass.range_constexpr(min(4, t + 1 - s4)):
-                            y = y + cf[jj] * uu[s4 + jj]
+                    y = yy[t]
                     if cutlass.const_expr(DROPIN):
                         y = _sel(is_null, 0.0, y, Float32)
                         if Int32(t) < seq_len:
-                            _stg_u16(
+                            _stg_bf16(
                                 o_base
                                 + (
                                     Int64(tok0 + t) * Int64(so_t)
                                     + Int64(hv * V_DIM + row)
                                 )
                                 * Int64(2),
-                                U.f32_to_u16(y, True),
+                                y,
                             )
                             if kg_live != 0:
                                 _stg_f32(
@@ -1013,8 +1255,8 @@ class KdaOutputOnlyUmma:
                         oa = (
                             Int64(tok0 + t) * Int64(so_t) + Int64(hv * V_DIM + row)
                         ) * Int64(2)
-                        _stg_u16(o_base + oa, U.f32_to_u16(y, True))
+                        _stg_bf16(o_base + oa, y)
                         if cutlass.const_expr(EMIT):
-                            _stg_u16(c_base + oa, U.f32_to_u16(uu[t], True))
+                            _stg_bf16(c_base + oa, uu[t])
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(tmem_done)

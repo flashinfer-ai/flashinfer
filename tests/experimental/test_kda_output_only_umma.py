@@ -277,6 +277,58 @@ def test_umma_cuda_graph_replay(T):
             assert torch.equal(a, b)
 
 
+def _dropin_case(B, spec_len, H, seed, g_pad=0):
+    """Ragged drop-in inputs (empty sequences, null / zero slots); ``g_pad`` pads the
+    gate's token stride by that many elements."""
+    gen = torch.Generator().manual_seed(seed)
+    dev = "cuda"
+    K = V = 128
+    lens = torch.randint(0, spec_len + 1, (B,), generator=gen)
+    lens[1] = spec_len
+    qsl = torch.zeros(B + 1, dtype=torch.int32)
+    qsl[1:] = lens.cumsum(0)
+    tot = int(qsl[-1])
+    rn = lambda *s_: torch.randn(*s_, generator=gen).to(dev)  # noqa: E731
+    q = rn(1, tot, H, K).bfloat16()
+    k = rn(1, tot, H, K).bfloat16()
+    v = rn(1, tot, H, V).bfloat16()
+    g_buf = rn(1, tot, H * K + g_pad).bfloat16()
+    g = g_buf[..., : H * K].view(1, tot, H, K)
+    beta = rn(1, tot, H).bfloat16()
+    nblk = B + 2
+    state = (rn(nblk, H, V, K) * 0.1).bfloat16()
+    sidx = torch.randperm(nblk - 1, generator=gen)[:B].to(torch.int32) + 1
+    sidx[0] = 0
+    sidx[3] = -1
+    rest = (rn(H) * 0.3, rn(H * K) * 0.1, -5.0)
+    return (q, k, v, g, beta), rest, state, qsl.to(dev), sidx.to(dev), nblk
+
+
+def _run_dropin(case, spec_len, H):
+    (q, k, v, g, beta), (A_log, dt, lb), state, qsl, sidx, nblk = case
+    corr = torch.full((nblk, H, spec_len, 128), 7.0, device="cuda")
+    kg = torch.full((nblk, H, spec_len, 256), 7.0, dtype=torch.bfloat16, device="cuda")
+    out = _WY_DROPIN(
+        q, k, v, g, beta, A_log, dt, lb, state, corr, kg, qsl, sidx, spec_len,
+        backend="umma",
+    )  # fmt: skip
+    return out, corr, kg
+
+
+@pytest.mark.parametrize("T", [1, 5, 16])
+def test_umma_dropin_unaligned_gate_stride(T):
+    """A gate token stride that is not a multiple of 8 elements takes the 2-byte gate
+    load build; bitwise equal to the 16-byte build on the same values."""
+    padded = _dropin_case(40, T, 4, seed=3 + T, g_pad=4)
+    aligned = list(padded)
+    aligned[0] = (*padded[0][:3], padded[0][3].contiguous(), padded[0][4])
+    a = _run_dropin(padded, T, 4)
+    b = _run_dropin(tuple(aligned), T, 4)
+    torch.cuda.synchronize()
+    for x, y in zip(a, b, strict=True):
+        assert torch.equal(x, y)
+
+
 def test_umma_dense_negative_slot_reads_zero_state():
     """Dense mode: a negative ``initial_state_indices`` entry reads a zero state on
     the UMMA backend, as on the WY kernel (so automatic selection cannot change the
