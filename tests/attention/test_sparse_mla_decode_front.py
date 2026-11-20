@@ -248,7 +248,11 @@ def test_wrapper_backends_refuse_seq_lens_workspace_and_require_sm_scale(name):
 # --------------------------------------------------------------------------
 
 
-def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
+@pytest.mark.parametrize("backend,inner", [("cuda", "sparse"), ("cake", "cake")])
+@pytest.mark.parametrize("impl", ["auto", "decode", "decode-splitkv"])
+def test_wrapper_passthrough_caches_runner_and_allocates_out(
+    monkeypatch, backend, inner, impl
+):
     q = torch.zeros(3, 8, 576, dtype=torch.bfloat16)
     kv = torch.zeros(4, 584, dtype=torch.uint8)
     idx = torch.full((3, 2048), -1, dtype=torch.int32)
@@ -280,7 +284,7 @@ def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
         kv,
         idx,
         sm_scale=0.0625,
-        backend="cuda",
+        backend=backend,
         backend_args={"topk_length": topk, "kv_cache_format": "fp8"},
     )
     out2 = sparse_mla_decode(
@@ -288,17 +292,19 @@ def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
         kv,
         idx,
         sm_scale=0.0625,
-        backend="cuda",
-        backend_args={"topk_length": topk, "kv_cache_format": "fp8"},
+        backend=backend,
+        backend_args={"topk_length": topk, "kv_cache_format": "fp8", "impl": impl},
     )
     # One construction, two runs: the front caches per (device, ctor knobs).
     assert len(made) == 1
     assert made[0]["kv_cache_format"] == "fp8"
     # The front's backend name pins the wrapper implementation.
-    assert made[0]["backend"] == "sparse"
+    assert made[0]["backend"] == inner
     runner = next(iter(front._sm120_runners.values()))
     assert len(runner.runs) == 2
     assert runner.runs[0][5]["topk_length"] is topk
+    assert "impl" not in runner.runs[0][5]
+    assert runner.runs[1][5]["impl"] == impl
     # Allocated latent-space output: bf16, d_v=512 by default.
     assert out1.shape == (3, 8, 512) and out1.dtype == torch.bfloat16
     assert out2.shape == (3, 8, 512)
@@ -308,7 +314,7 @@ def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
         kv,
         idx,
         sm_scale=0.0625,
-        backend="cuda",
+        backend=backend,
         backend_args={"topk_length": topk, "kv_cache_format": "fp8"},
     )
     assert len(made) == 2

@@ -217,6 +217,7 @@ _SM120_RUN_KEYS = (
     "out_lse",
     "mid_out",
     "mid_lse",
+    "impl",
     "prefill_impl",
     "return_lse",
     "lse_scale",
@@ -438,6 +439,10 @@ def sparse_mla_decode(
     torch.Tensor or tuple
         The selected backend's documented return value (``(out, lse)`` for
         the wrapper backends with ``backend_args['return_lse']=True``).
+        Without a caller-provided ``backend_args['out_lse']``, the cached
+        wrapper owns the returned LSE. A same-shaped call on the same stream
+        can overwrite it. To retain results across calls, supply a distinct
+        ``out_lse`` for each result or clone the LSE before the next call.
 
     Notes
     -----
