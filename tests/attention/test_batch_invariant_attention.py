@@ -499,7 +499,7 @@ def test_class_constants_and_fingerprints_are_pinned():
     pinned = {
         64: (128, 512, "attn-bf16-d64-9a05233ec9351b0d"),
         128: (128, 512, "attn-bf16-d128-027b0379515b82e2"),
-        256: (128, 2048, "attn-bf16-d256-87a2d175c554372b"),
+        256: (128, 2048, "attn-bf16-d256-66130d3648d80cbb"),
     }
     assert set(pinned) == set(spec.HEAD_DIMS)
     for D, (T, C, fp) in pinned.items():
@@ -533,6 +533,76 @@ def test_class_constants_and_fingerprints_are_pinned():
             assert max(d[P.F_CHUNK_HI] for d in plan.desc) == -(-kv_len // C)
             assert max(d[P.F_TILE_HI] for d in plan.desc) == -(-kv_len // T)
             assert all(d[P.F_TILE_HI] - d[P.F_TILE_LO] <= C // T for d in plan.desc)
+
+
+def test_fingerprint_sample_rule():
+    """The rows the digest hashes (``spec.fingerprint_samples``): a class whose chunk is at most ``FINGERPRINT_SAMPLE_KEYS`` hashes
+    its own full row (one chunk and half a tile); a class with longer chunks hashes its bounded row and a row of the reduced
+    instance with the same tiles per chunk, whose term holds a merge of two chunks."""
+    import re
+
+    from flashinfer.attention.batch_invariant import spec
+    from flashinfer.batch_invariant.fp_interface.term import sexpr
+
+    def shape(D):
+        return [
+            (s.T, s.C, r.p)
+            for s, r in spec.fingerprint_samples(
+                D, spec.tile_keys(D), spec.chunk_len(D)
+            )
+        ]
+
+    assert shape(64) == shape(128) == [(128, 512, 576)]
+    assert shape(256) == [(128, 2048, 576), (32, 512, 528)]
+    for D in spec.HEAD_DIMS:
+        T, C = spec.tile_keys(D), spec.chunk_len(D)
+        for s, _ in spec.fingerprint_samples(D, T, C):
+            assert s.D == D and s.C // s.T == C // T and s.T % spec.MMA_K == 0
+    # more tiles per chunk than the reduced instance can hold: refused, never hashed without a merge
+    with pytest.raises(ValueError):
+        spec.fingerprint_samples(256, 128, 8192)
+
+    def merged_max(s, r):
+        """The row maximum of the final state: every chunk's tile fold starts from ``-inf`` and the chunks are merged, in
+        order, into a state that starts from ``-inf``, so the constant appears once per chunk and once more."""
+        m = sexpr(s.state(r, 0).m)
+        keys = {int(k) for k in re.findall(r"\(b \d+ (\d+)\)", m)}
+        return m, keys
+
+    bounded, reduced = spec.fingerprint_samples(256, 128, 2048)
+    m, keys = merged_max(*bounded)
+    assert m.count("(const -inf)") == 2 and keys == set(range(577))  # one chunk
+    m, keys = merged_max(*reduced)
+    # merge(merge(init, chunk 0), chunk 1): the second chunk's maximum against the merged state's
+    assert (
+        m.startswith("(fmax (fmax (const -inf) (fmax ") and m.count("(const -inf)") == 3
+    )
+    assert keys == set(range(529)) and reduced[0].C == 512
+    m, keys = merged_max(*spec.fingerprint_samples(128, 128, 512)[0])
+    assert m.count("(const -inf)") == 3 and keys == set(range(577))
+
+
+def test_fingerprint_evaluation_stays_small():
+    """The receipt of the head dim with the longest chunks is evaluated in a fresh process well under a minute and a few GB."""
+    import subprocess
+    import sys
+
+    code = (
+        "import resource, time; t = time.time();"
+        "from flashinfer.attention.batch_invariant import spec;"
+        "fp = spec.spec_fingerprint(256);"
+        "print(fp, time.time() - t, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=True,
+    ).stdout.split()
+    fp, seconds, gib = out[-3], float(out[-2]), float(out[-1])
+    assert fp == "attn-bf16-d256-66130d3648d80cbb"
+    assert seconds < 60 and gib < 12, (seconds, gib)
 
 
 def test_planner_unit_kind_rules():

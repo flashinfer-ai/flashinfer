@@ -416,33 +416,65 @@ _FINGERPRINTS: Dict[tuple, str] = {}
 # test_batch_invariant_attention.py`` pins them against ``spec_fingerprint``.
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
-FINGERPRINT_D256 = "attn-bf16-d256-87a2d175c554372b"
+FINGERPRINT_D256 = "attn-bf16-d256-66130d3648d80cbb"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
-FINGERPRINT_SAMPLE_KEYS = 512  # the longest chunk prefix of the fingerprint's sample row (``class_fingerprint``)
+FINGERPRINT_SAMPLE_KEYS = 512  # the longest chunk the fingerprint's sample rows span (``fingerprint_samples``)
+
+
+def fingerprint_samples(D: int, T: int, C: int, window_left: int = -1) -> List[tuple]:
+    """The sample rows whose terms ``class_fingerprint`` hashes for the class ``(D, T, C)``, as ``(spec, row)`` pairs.
+
+    The digest is taken over the fully expanded canonical S-expression of a row's term, whose length grows with the square of
+    the keys in a chunk, so the rule is a function of the chunk length:
+
+    * ``C <= FINGERPRINT_SAMPLE_KEYS``: ONE row of the class itself at ``p = C + T / 2`` -- one full chunk and half a tile, so
+      the tile fold over every tile of a chunk, the chunk merge of two chunks, the masking of the last tile and the epilogue
+      are all inside.
+    * a longer chunk, whose full row is not materialised: TWO rows.
+      (a) The bounded row of the class itself at ``p = FINGERPRINT_SAMPLE_KEYS + T / 2``: the first tiles of one chunk at the
+      class's own ``T`` and ``D`` -- the score fold, the ``T``-key tile step (row maximum, rescale, row sum, the PV steps), the
+      merge with the init state, the masking and the epilogue -- but no merge of two chunks.
+      (b) A row of the REDUCED instance ``(D, T', C')`` with ``C' = FINGERPRINT_SAMPLE_KEYS`` and ``T' = T C' / C`` at
+      ``p = C' + T' / 2``: the same dataflow with the same number of tiles per chunk (``C' / T' = C / T``), so the tile fold
+      runs over every tile of a chunk and the finished chunk is merged with the next one. It witnesses the shape of the chunk
+      fold and of the chunk-to-chunk merge; its tiles are ``T'`` keys, not the class's ``T`` (those are in (a)).
+
+    ``T'`` must be a tile the term builder expresses (a whole number of ``MMA_K``-key PV steps): a class with more than
+    ``FINGERPRINT_SAMPLE_KEYS / MMA_K`` tiles per chunk has no reduced instance and is refused. A window scales with the
+    reduced instance's keys."""
+    K = FINGERPRINT_SAMPLE_KEYS
+    if C <= K:
+        return [
+            (AttentionSpec(D, T=T, C=C), RowSpec(p=C + T // 2, window_left=window_left))
+        ]
+    Tr = T * K // C
+    if T * K % C or Tr % MMA_K:
+        raise ValueError(
+            f"no reduced fingerprint instance for (T, C) = ({T}, {C}): T * {K} / C must be a multiple of {MMA_K}"
+        )
+    win_r = window_left if window_left < 0 else window_left * Tr // T
+    return [
+        (AttentionSpec(D, T=T, C=C), RowSpec(p=K + T // 2, window_left=window_left)),
+        (AttentionSpec(D, T=Tr, C=K), RowSpec(p=K + Tr // 2, window_left=win_r)),
+    ]
 
 
 def class_fingerprint(D: int, T: int, C: int, window_left: int = -1) -> str:
-    """The identifier of the dataflow at head dim ``D`` with tile ``T`` and chunk ``C``: hashes ``D``, ``T``, ``C`` together with the
-    terms of output elements 0 and 1 of a sample row -- a function of ``(D, T, C)``, injective in the three by construction.
-    The sample row's prefix spans ``min(C, FINGERPRINT_SAMPLE_KEYS)`` keys plus half a tile: with ``C <= 512`` one full chunk and
-    half a tile (the tile fold, the chunk merge, the masking of the last tile and the epilogue are all inside); with a longer
-    chunk the first tiles of one chunk (the tile fold, the merge with the init state, the masking and the epilogue). The digest
-    is taken over the fully expanded canonical S-expression, whose length grows with the square of the tiles in a chunk, so
-    a sample row past a longer chunk cannot be materialised; ``C`` itself is hashed either way."""
+    """The identifier of the dataflow at head dim ``D`` with tile ``T`` and chunk ``C``: hashes ``D``, ``T``, ``C`` literally
+    together with the terms of output elements 0 and 1 of every sample row of ``fingerprint_samples`` -- a function of
+    ``(D, T, C)``, injective in the three by construction. A class whose full row is materialised hashes that one row; a
+    class with longer chunks hashes its bounded row and then the reduced instance's row, each second row preceded by the
+    reduced instance's ``(T', C')``."""
     from ...batch_invariant.fp_interface.term import fingerprint
 
-    spec = AttentionSpec(D, T=T, C=C)
-    row = RowSpec(p=min(C, FINGERPRINT_SAMPLE_KEYS) + T // 2, window_left=window_left)
-    parts = [
-        f"D={D}",
-        f"T={T}",
-        f"C={C}",
-        f"win={window_left}",
-        fingerprint(spec.output(row, 0)),
-        fingerprint(spec.output(row, 1)),
-    ]
+    samples = fingerprint_samples(D, T, C, window_left)
+    parts = [f"D={D}", f"T={T}", f"C={C}", f"win={window_left}"]
+    for i, (spec, row) in enumerate(samples):
+        if i:
+            parts += [f"T'={spec.T}", f"C'={spec.C}"]
+        parts += [fingerprint(spec.output(row, 0)), fingerprint(spec.output(row, 1))]
     return (
         f"attn-bf16-d{D}-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
     )
