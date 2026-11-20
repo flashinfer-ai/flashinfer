@@ -127,6 +127,20 @@ class Problem:
         ).contiguous()
 
 
+def klen(D, n):
+    """A key count stated for 512-key chunks, mapped to the head dim's chunk length: the same number of whole chunks (at most
+    three, which keeps the problems small) and the same remainder, so a test's requests cross the chunk boundaries of the class
+    at every head dim. The identity where the class's chunks are 512 keys."""
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    C = chunk_len(D)
+    return n if C == 512 else min(n // 512, 3) * C + n % 512
+
+
+def klens(D, ns):
+    return [klen(D, n) for n in ns]
+
+
 def workspace(device, mb=128):
     return torch.empty(mb << 20, dtype=torch.uint8, device=device)
 
@@ -485,7 +499,7 @@ def test_class_constants_and_fingerprints_are_pinned():
     pinned = {
         64: (128, 512, "attn-bf16-d64-9a05233ec9351b0d"),
         128: (128, 512, "attn-bf16-d128-027b0379515b82e2"),
-        256: (128, 512, "attn-bf16-d256-b8cb59dab4eb6c0f"),
+        256: (128, 2048, "attn-bf16-d256-87a2d175c554372b"),
     }
     assert set(pinned) == set(spec.HEAD_DIMS)
     for D, (T, C, fp) in pinned.items():
@@ -724,7 +738,7 @@ def test_unsupported_device_raises_before_any_kernel():
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
 def test_matches_reference(D, Hq, Hkv):
-    pr = Problem([300, 1000, 64], [700, 2500, 3000], Hq, Hkv, D, 16, seed=1)
+    pr = Problem([300, 1000, 64], klens(D, [700, 2500, 3000]), Hq, Hkv, D, 16, seed=1)
     out = run_paged_prefill(pr)
     ref = reference(pr)
     err = (out.float() - ref).abs().max().item()
@@ -736,7 +750,9 @@ def test_matches_reference(D, Hq, Hkv):
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 def test_prefill_equals_decode(D, layout):
     """R4: the last token of every request gives the same bits as a prefill row and as a decode step."""
-    pr = Problem([256, 1, 1024, 33], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=2)
+    pr = Problem(
+        [256, 1, 1024, 33], klens(D, [1500, 2500, 1024, 4096]), 32, 8, D, 16, seed=2
+    )
     pre = run_paged_prefill(pr, layout)
     dec, last = run_decode(pr, layout)
     assert torch.equal(bits(pre[last]), bits(dec))
@@ -747,7 +763,15 @@ def test_prefill_equals_decode(D, layout):
 @pytest.mark.parametrize("page", [1, 16, 128])
 def test_paged_equals_ragged(D, page):
     """R4: the paged and the ragged KV layouts hand the kernel the same keys at the same positions: the same bits."""
-    pr = Problem([300, 1000, 64, 2048], [700, 2500, 3000, 2048], 32, 8, D, page, seed=3)
+    pr = Problem(
+        [300, 1000, 64, 2048],
+        klens(D, [700, 2500, 3000, 2048]),
+        32,
+        8,
+        D,
+        page,
+        seed=3,
+    )
     assert torch.equal(bits(run_paged_prefill(pr)), bits(run_ragged_prefill(pr)))
     assert torch.equal(
         bits(run_paged_prefill(pr, "HND")), bits(run_ragged_prefill(pr, "HND"))
@@ -803,7 +827,9 @@ def test_dependent_launch_chain_reads_the_predecessor(D):
     scheduled early never reads a predecessor's unfinished output."""
     from flashinfer.utils import device_support_pdl
 
-    pr = Problem([1, 1, 1, 1], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=21)
+    pr = Problem(
+        [1, 1, 1, 1], klens(D, [1500, 2500, 1024, 4096]), 32, 8, D, 16, seed=21
+    )
     if not device_support_pdl(pr.device):
         pytest.skip("this part has no programmatic dependent launch")
     w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -864,7 +890,10 @@ def test_dependent_launch_chain_reads_the_predecessor(D):
 @pytest.mark.parametrize("D", [64, 128, 256])
 def test_batch_permutation_and_subbatch_invariance(D):
     """R2: a request's bits do not depend on its neighbours, its position in the batch or the batch size."""
-    q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
+    q_lens, kv_lens = (
+        [300, 1000, 64, 2048, 1],
+        klens(D, [700, 2500, 3000, 2048, 5000]),
+    )
     pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=5)
     full = bits(run_paged_prefill(pr))
     rows = [
@@ -917,7 +946,7 @@ def test_batch_permutation_and_subbatch_invariance(D):
 def test_decode_batch_invariance_and_page_table_junk(D):
     """R2 for decode: the same request's step gives the same bits in a batch of one and in a batch of eight with other requests,
     whatever pages the pool assigns (the page table and the junk beyond each request's keys never reach the bits)."""
-    kv = [1024, 4096, 33, 700, 2500, 8192, 1, 1500]
+    kv = klens(D, [1024, 4096, 33, 700, 2500, 8192, 1, 1500])
     pr = Problem([1] * 8, kv, 32, 8, D, 16, seed=6)
     out8, _ = run_decode(pr)
     for i in (0, 1, 5, 6):
@@ -968,9 +997,13 @@ def _repack(p: Problem) -> Problem:
 def test_chunked_prefill_equals_full(D):
     """R4 for incremental prefill: a request prefilled in two chunks (the second over the first's cached keys) gives, token for
     token, the bits of the one-shot prefill -- a token's output depends on its position and the keys below it alone, not on how the
-    prefill was cut. Two requests cut at different points (one cut inside a 512-key chunk, one at a tile boundary), paged and ragged."""
-    kv = [1700, 1000]
-    cut = [700, 512]
+    prefill was cut. Two requests cut at different points (one cut inside a chunk of the class, one at a chunk boundary), paged and
+    ragged; the lengths follow the head dim's chunk length (1700 / 1000 keys cut at 700 / 512 with 512-key chunks)."""
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    C = chunk_len(D)
+    kv = [3 * C + 164, 2 * C - 24]
+    cut = [C + 188, C]
     full = Problem(kv, kv, 32, 8, D, 16, seed=12)
     out_full = bits(run_paged_prefill(full))
     assert torch.equal(out_full, bits(run_ragged_prefill(full)))
@@ -1013,7 +1046,9 @@ def test_multi_token_decode_equals_prefill(D):
     """R4 for speculative / multi-token decode: the decode wrapper with ``q_len_per_req = 4`` gives, for the last four tokens of every
     request, the bits of the prefill rows."""
     q_len = 4
-    pr = Problem([256, 33, 1024, 7], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=15)
+    pr = Problem(
+        [256, 33, 1024, 7], klens(D, [1500, 2500, 1024, 4096]), 32, 8, D, 16, seed=15
+    )
     pre = bits(run_paged_prefill(pr))
     last4 = torch.cat(
         [
@@ -1053,7 +1088,9 @@ def test_head_subset_invariance(D):
     (paged and ragged) and decode; a four-group subset and a single group."""
     Hq, Hkv = 32, 8
     g = Hq // Hkv
-    pr = Problem([300, 1, 1000, 64], [700, 2500, 2500, 3000], Hq, Hkv, D, 16, seed=16)
+    pr = Problem(
+        [300, 1, 1000, 64], klens(D, [700, 2500, 2500, 3000]), Hq, Hkv, D, 16, seed=16
+    )
     full_pre = bits(run_paged_prefill(pr))
     full_dec, last = run_decode(pr)
     full_dec = bits(full_dec)
@@ -1234,7 +1271,9 @@ def test_config_agreement(D):
     if D == 64:
         pr = Problem([2048, 2048, 1], [4096, 3000, 1000], 32, 8, D, 16, seed=8)
     else:
-        pr = Problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=8)
+        pr = Problem(
+            [256, 1, 1000, 1], klens(D, [3000, 2500, 1000, 5000]), 32, 8, D, 16, seed=8
+        )
     ref = bits(run_paged_prefill(pr))
     space = engine.all_valid_configs(D)
     cfgs = list(space[::7] if D == 64 else space)
@@ -1287,12 +1326,19 @@ def test_config_agreement(D):
 
 
 @needs_device
-def test_sliding_window_prefill_equals_decode():
-    pr = Problem([256, 1, 2000], [1500, 2500, 5000], 32, 8, 128, 16, seed=9)
-    pre = run_paged_prefill(pr, window_left=600)
-    dec, last = run_decode(pr, window_left=600)
+@pytest.mark.parametrize("D", [128, 256])
+def test_sliding_window_prefill_equals_decode(D):
+    """A window of more than one chunk of the class (600 keys with 512-key chunks), so that the visible range of a row starts
+    inside one chunk and ends in a later one, and rows of one tile drop different leading chunks."""
+    win = klen(D, 600)
+    pr = Problem([256, 1, 2000], klens(D, [1500, 2500, 5000]), 32, 8, D, 16, seed=9)
+    pre = run_paged_prefill(pr, window_left=win)
+    dec, last = run_decode(pr, window_left=win)
     assert torch.equal(bits(pre[last]), bits(dec))
-    assert torch.equal(bits(pre), bits(run_ragged_prefill(pr, window_left=600)))
+    assert torch.equal(bits(pre), bits(run_ragged_prefill(pr, window_left=win)))
+    ref = reference(pr, window_left=win)
+    err = (pre.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
 
 
 def _paired_d128(engine):

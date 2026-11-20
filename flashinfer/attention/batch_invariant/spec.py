@@ -59,11 +59,16 @@ TILE_KEYS_OF = {
     128: 128,
     256: 128,
 }
-# C(D): keys per chunk (``C / T`` tiles) -- a class parameter per head dim (another C is a different class)
+# C(D): keys per chunk (``C / T`` tiles) -- a class parameter per head dim (another C is a different class). D = 256 takes
+# 2048: its body cannot hold the merged chunk state next to the 256-column accumulator in TMEM (``plan.om_in_tmem``), so a
+# fused unit's chunk merge is a round trip of a 128 x 256 fp32 state through a global scratch during which the tensor core
+# waits; with four times the keys per chunk a prefill row pays a quarter of them. The price is decode parallelism: a decode
+# step has ``Hkv x ceil(L / C)`` work units per request, so a batch with fewer (request, KV head) pairs than SMs runs a context
+# of up to a few chunks on part of the machine (``chunk_len``)
 CHUNK_LEN_OF = {
     64: 512,
     128: 512,
-    256: 512,
+    256: 2048,
 }
 assert all(
     D in TILE_KEYS_OF
@@ -411,18 +416,25 @@ _FINGERPRINTS: Dict[tuple, str] = {}
 # test_batch_invariant_attention.py`` pins them against ``spec_fingerprint``.
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
-FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
+FINGERPRINT_D256 = "attn-bf16-d256-87a2d175c554372b"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
+FINGERPRINT_SAMPLE_KEYS = 512  # the longest chunk prefix of the fingerprint's sample row (``class_fingerprint``)
+
+
 def class_fingerprint(D: int, T: int, C: int, window_left: int = -1) -> str:
-    """The identifier of the dataflow at head dim ``D`` with tile ``T`` and chunk ``C``: hashes the terms of output elements 0
-    and 1 of a row whose prefix spans one full chunk plus half a tile (so the tile fold, the chunk merge with the init state, the
-    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``: a function of ``(D, T, C)``."""
+    """The identifier of the dataflow at head dim ``D`` with tile ``T`` and chunk ``C``: hashes ``D``, ``T``, ``C`` together with the
+    terms of output elements 0 and 1 of a sample row -- a function of ``(D, T, C)``, injective in the three by construction.
+    The sample row's prefix spans ``min(C, FINGERPRINT_SAMPLE_KEYS)`` keys plus half a tile: with ``C <= 512`` one full chunk and
+    half a tile (the tile fold, the chunk merge, the masking of the last tile and the epilogue are all inside); with a longer
+    chunk the first tiles of one chunk (the tile fold, the merge with the init state, the masking and the epilogue). The digest
+    is taken over the fully expanded canonical S-expression, whose length grows with the square of the tiles in a chunk, so
+    a sample row past a longer chunk cannot be materialised; ``C`` itself is hashed either way."""
     from ...batch_invariant.fp_interface.term import fingerprint
 
     spec = AttentionSpec(D, T=T, C=C)
-    row = RowSpec(p=C + T // 2, window_left=window_left)
+    row = RowSpec(p=min(C, FINGERPRINT_SAMPLE_KEYS) + T // 2, window_left=window_left)
     parts = [
         f"D={D}",
         f"T={T}",

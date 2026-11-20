@@ -234,7 +234,7 @@ def tileBits : Nat → Nat
 def chunkLen : Nat → Nat
   | 64 => 512
   | 128 => 512
-  | 256 => 512
+  | 256 => 2048
   | _ => 0
 
 /-- The class term of a row at head dim `D`: `D / 16` MMA K-steps per score, the head dim's tile and chunk. -/
