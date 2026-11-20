@@ -20,8 +20,10 @@ are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The te
 A run with sinks and a run without are two members with different bits, so ``plan(..., has_sinks=True | False)`` declares
 which one the plan's runs are: a ``run()`` that departs from the declaration raises (``None``, the default, leaves the
 choice to each run). The check is made in Python at ``run()``, so capturing ``run()`` into a CUDA graph is unaffected.
-The values are not checked: a sink whose base-2 value ``mul(sinks[h], LOG2E)`` overflows binary32 (a magnitude above about
-``2.36e38``) is a sink of that infinity, and a ``+inf`` or NaN sink gives NaN on its head's rows (``spec.sink_merge``).
+The values are not checked. A ``+inf`` or NaN sink gives NaN on its head's rows and a ``-inf`` sink the bits of the run
+without sinks (``spec.sink_merge``); the step works on the base-2 value ``mul(sinks[h], LOG2E)``, so a finite sink above
+about ``2.36e38`` (the value overflows to ``+inf``) gives NaN as well, and one below about ``-2.36e38`` (``-inf``) the
+bits of the run without sinks.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -654,6 +656,8 @@ class BatchInvariantAttention:
                 "the planned window",
             )
         Hq, Hkv, D = self._heads
+        # the caller's tensor: the kernels may run on a reshaped or packed copy of it
+        q_source = q
         if q.dim() == 4:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
         if q.dim() != 3 or q.shape[1] != Hq or q.shape[2] != D:
@@ -715,7 +719,6 @@ class BatchInvariantAttention:
                     f"{name} of shape {tuple(t.shape)} (strides {tuple(t.stride())}) at run()",
                     f"the planned {self.kv_layout} geometry {want}",
                 )
-        q_source = q
         if not q.is_contiguous():
             q = q.contiguous()
         if q.data_ptr() % 16:
@@ -724,6 +727,7 @@ class BatchInvariantAttention:
                 "a q whose base address is not 16-byte aligned",
                 "a 16-byte-aligned q (the TMA descriptor's requirement)",
             )
+        storage = engine.plan_storage(self._planned)
         if out is None:
             out = torch.empty_like(q)
         elif (
@@ -744,19 +748,35 @@ class BatchInvariantAttention:
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        elif engine._overlaps_any(out, storage):
+            raise unsupported(
+                CLASS,
+                "an output that aliases the float workspace buffer",
+                "an output byte span disjoint from the workspace (the launch stores its split-KV partials there)",
+            )
         lse_nh = None
         if return_lse:
             nh_shape = (q.shape[0], Hq)
             if lse is not None:
                 shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
+                # the page table a run reads is the plan's own copy (plan() snapshots kv_indptr and kv_indices)
+                tables = (self._kv_indices, *engine.plan_tables(self._planned))
                 bad = engine.check_lse_buffer(
-                    lse, q, out, k, v, shape, q_source=q_source
+                    lse,
+                    q,
+                    out,
+                    k,
+                    v,
+                    shape,
+                    q_source=q_source,
+                    storage=storage,
+                    tables=tables,
                 )
                 if bad is not None:
                     raise unsupported(
                         CLASS,
                         f"an lse buffer {bad}",
-                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out nor the KV cache",
+                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out, the KV cache nor the float workspace buffer",
                     )
             # the kernels write the (total_q, Hq) rows; the HN layout is a copy of them
             lse_nh = (
@@ -766,13 +786,13 @@ class BatchInvariantAttention:
             )
         if sinks is not None:
             # the HN layout's copy writes the caller's buffer after the launch
-            written = (out, lse_nh, lse if return_lse else None)
+            written = (out, lse_nh, lse if return_lse else None, *storage)
             bad = engine.check_sinks(sinks, Hq, self.device, written)
             if bad is not None:
                 raise unsupported(
                     CLASS,
                     f"sinks {bad}",
-                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out nor lse",
+                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out, lse nor the float workspace buffer",
                 )
         engine._run_attention_validated(
             self._planned,

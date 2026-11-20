@@ -83,11 +83,12 @@ def check_lse_layout(lse_layout: str) -> None:
 
 
 def check_has_sinks_undeclared(has_sinks: Optional[bool]) -> None:
-    """``plan(has_sinks=)`` is a declaration of the batch-invariant attention; the other backends take sinks per ``run()``."""
+    """``plan(has_sinks=)`` is a declaration of the batch-invariant attention; the other backends that support sinks take
+    them per ``run()``."""
     if has_sinks is not None:
         raise ValueError(
             f"has_sinks={has_sinks} is only supported with batch_invariant=True; "
-            "without it, leave has_sinks unset and pass sinks at run()."
+            "without it, leave has_sinks unset; sinks are passed at run(), on the backends that support them."
         )
 
 

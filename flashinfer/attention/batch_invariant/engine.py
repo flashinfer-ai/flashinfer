@@ -391,6 +391,8 @@ class _Planned:
     ):
         self.plan, self.desc, self.groups, self.ws = plan, desc, groups, ws
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
+        # the caller's workspace tensor the partials live in (set by plan_attention)
+        self.workspace: Optional[torch.Tensor] = None
         self.ragged = False  # the packed-token KV layout (set by plan_attention)
         # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
         # and per Q tile, the configuration decides pairing and the unit body)
@@ -516,6 +518,7 @@ def plan_attention(
         torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
     )
     planned.ragged = ragged
+    planned.workspace = workspace
     planned.heads = (int(Hq), int(Hkv))
     planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
@@ -570,6 +573,36 @@ def workspace_bytes(
     return plan.ws_rows * ws_row(D) * 4
 
 
+def plan_storage(planned: _Planned) -> tuple:
+    """The tensors a launch of the plan writes besides the output and the LSE buffer: the split-KV partials, the per-CTA
+    scratch and the caller's workspace tensor the partials live in. The caller's tensor counts whole, whatever prefix
+    this plan uses, so whether a buffer inside it is refused does not depend on the batch."""
+    return tuple(
+        t for t in (planned.workspace, planned.ws, planned.scratch) if t is not None
+    )
+
+
+def plan_tables(planned: _Planned) -> tuple:
+    """The plan's own tensors a launch reads: the descriptor and group tables, the ``kv_indptr`` snapshot and the arrival
+    counters."""
+    return tuple(
+        t
+        for t in (
+            planned.desc,
+            planned.groups,
+            planned.fixup_groups,
+            planned.fold_counters,
+            planned.kv_indptr,
+        )
+        if t is not None
+    )
+
+
+def _overlaps_any(t: torch.Tensor, others) -> bool:
+    """Whether the contiguous ``t`` shares bytes with one of ``others`` (addresses compare on one device only)."""
+    return any(o.device == t.device and _output_overlaps_kv(t, o, o) for o in others)
+
+
 def check_lse_buffer(
     lse: torch.Tensor,
     q: torch.Tensor,
@@ -578,11 +611,16 @@ def check_lse_buffer(
     v: torch.Tensor,
     shape: tuple,
     q_source: Optional[torch.Tensor] = None,
+    storage=(),
+    tables=(),
 ) -> Optional[str]:
     """What is wrong with a caller's LSE buffer (``None`` when it can be written): a contiguous fp32 tensor of ``shape`` on
     the queries' device whose bytes are disjoint from the output, the queries and the K / V caches (CTAs store LSE rows
-    while others still read their operands). ``q_source``: the caller's query tensor where ``q`` is a packed copy of it;
-    the buffer must not share bytes with it either, since the store would change the caller's queries."""
+    while others still read their operands). ``q_source``: the caller's query tensor where ``q`` is a packed or reshaped
+    copy of it; the buffer must not share bytes with it either, since the store would change the caller's queries.
+    ``storage``: the plan's ``plan_storage``; an LSE row stored there would be read back as a split-KV partial.
+    ``tables``: the page-table tensors and the plan's ``plan_tables``; an LSE row stored there would be read as page
+    ids or descriptors."""
     if lse.dtype != torch.float32:
         return f"of dtype {lse.dtype}"
     if tuple(lse.shape) != tuple(shape):
@@ -597,6 +635,10 @@ def check_lse_buffer(
         return "that shares bytes with the queries or the output"
     if q_source is not None and _output_overlaps_kv(lse, q_source, q_source):
         return "that shares bytes with the queries or the output"
+    if _overlaps_any(lse, storage):
+        return "that shares bytes with the plan's workspace"
+    if _overlaps_any(lse, tables):
+        return "that shares bytes with the page table or the plan's tables"
     return None
 
 
@@ -612,7 +654,7 @@ def sinks_declaration_mismatch(has_sinks: Optional[bool], sinks) -> Optional[str
 def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[str]:
     """What is wrong with a caller's ``sinks`` (``None`` when the kernels can read it): a contiguous fp32 ``(Hq,)`` tensor
     on the queries' device, read in place at every launch (so a captured graph replays with the tensor's current values),
-    whose bytes none of the ``written`` tensors (the output, the LSE buffer) share."""
+    whose bytes none of the ``written`` tensors (the output, the LSE buffer, the plan's ``plan_storage``) share."""
     if not isinstance(sinks, torch.Tensor):
         return f"of type {type(sinks).__name__}"
     if sinks.dtype != torch.float32:
@@ -623,8 +665,10 @@ def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[st
         return f"on {sinks.device}"
     if not sinks.is_contiguous():
         return "that is not contiguous"
-    if any(w is not None and _output_overlaps_kv(w, sinks, sinks) for w in written):
-        return "that shares bytes with the output or the LSE buffer"
+    if _overlaps_any(sinks, [w for w in written if w is not None]):
+        return (
+            "that shares bytes with the output, the LSE buffer or the plan's workspace"
+        )
     return None
 
 
@@ -792,6 +836,11 @@ def run_attention(
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
+    storage = plan_storage(planned)
+    if supplied_out and _overlaps_any(out, storage):
+        raise ValueError(
+            "out must not alias the plan's workspace: output rows and split-KV partials are stored by the same launch"
+        )
     c = check_sm_scale(sm_scale)
     lse_mode = 0
     if return_lse:
@@ -801,7 +850,16 @@ def run_attention(
         if lse is None:
             lse = torch.empty(total_q, Hq, dtype=torch.float32, device=q.device)
         else:
-            bad = check_lse_buffer(lse, q, out, k_cache, v_cache, (total_q, Hq))
+            bad = check_lse_buffer(
+                lse,
+                q,
+                out,
+                k_cache,
+                v_cache,
+                (total_q, Hq),
+                storage=storage,
+                tables=(kv_indptr, kv_indices, *plan_tables(planned)),
+            )
             if bad is not None:
                 raise ValueError(
                     f"lse must be a contiguous fp32 ({total_q}, {Hq}) tensor on {q.device} that aliases no operand; got one {bad}"
@@ -809,10 +867,10 @@ def run_attention(
     if not return_lse:
         lse = None  # a buffer passed without return_lse is neither written nor returned
     if sinks is not None:
-        bad = check_sinks(sinks, Hq, q.device, (out, lse))
+        bad = check_sinks(sinks, Hq, q.device, (out, lse, *storage))
         if bad is not None:
             raise ValueError(
-                f"sinks must be a contiguous fp32 ({Hq},) tensor on {q.device} that aliases no output; got one {bad}"
+                f"sinks must be a contiguous fp32 ({Hq},) tensor on {q.device} that aliases no output and no workspace; got one {bad}"
             )
     _run_attention_validated(
         planned,

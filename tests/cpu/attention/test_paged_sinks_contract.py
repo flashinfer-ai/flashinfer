@@ -90,7 +90,9 @@ def test_has_sinks_is_refused_outside_the_batch_invariant_plan():
 
     check_has_sinks_undeclared(None)
     for declared in (True, False):
-        with pytest.raises(ValueError, match=f"has_sinks={declared}"):
+        with pytest.raises(
+            ValueError, match=f"has_sinks={declared}.*backends that support them"
+        ):
             check_has_sinks_undeclared(declared)
 
 
