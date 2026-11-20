@@ -122,6 +122,7 @@ def _write_csv(path, results, args):
                     "routing_source": result["input_identity"]["routing_source"],
                     "variant": variant,
                     "graph_calls": args.repeats,
+                    "warmup_graphs": args.warmup_graphs,
                     "rounds": args.rounds,
                     "median_max_rank_us": median,
                     "max_rank_median_us": result["max_rank_median_us"][variant],
@@ -367,7 +368,7 @@ def _worker(rank, args):
                     name: _capture(stages, args.repeats)
                     for name, stages in runs.items()
                 }
-                for _ in range(3):
+                for _ in range(args.warmup_graphs):
                     for graph, events, _ in captures.values():
                         graph.replay()
                         events[-1].synchronize()
@@ -491,6 +492,7 @@ def _worker(rank, args):
                                 "gpu": torch.cuda.get_device_name(),
                                 "torch": torch.__version__,
                                 "repeats": args.repeats,
+                                "warmup_graphs": args.warmup_graphs,
                                 "rounds": args.rounds,
                                 "ep": args.ep,
                                 "nodes": args.nodes,
@@ -570,6 +572,7 @@ def _parse_args(argv=None):
     parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--capacity", type=int, default=384)
     parser.add_argument("--repeats", type=int, default=40)
+    parser.add_argument("--warmup-graphs", type=int, default=3)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--reference-runner", type=str)
     parser.add_argument(
@@ -642,8 +645,8 @@ def _parse_args(argv=None):
         parser.error(
             "source-baseline and replica-slot arms require one node and canonical weights"
         )
-    if args.repeats < 1 or args.rounds < 1:
-        parser.error("repeats and rounds must be positive")
+    if args.repeats < 1 or args.warmup_graphs < 1 or args.rounds < 1:
+        parser.error("repeats, warmup graphs and rounds must be positive")
     if args.trace_layers < 1:
         parser.error("trace layers must be positive")
     if args.cold_l2 and args.repeats != 1:

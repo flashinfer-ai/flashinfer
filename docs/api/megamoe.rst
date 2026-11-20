@@ -198,7 +198,7 @@ one host with eight H20 GPUs::
       m=${mc%:*}; capacity=${mc#*:}
       torchrun --standalone --nproc-per-node=8 benchmarks/bench_megamoe_fp4_sm90.py \
         --shapes flash --tokens "$m" --capacity "$capacity" \
-        --routing balanced --seed 7919 --repeats 200 --rounds 5 \
+        --routing balanced --seed 7919 --repeats 2000 --warmup-graphs 10 --rounds 5 \
         --output "ep8-m${m}.json" --csv "ep8-m${m}.csv"
     done
 
@@ -211,7 +211,7 @@ different ``NODE_RANK`` (0 or 1). Execute the same loop in the same order::
         --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
         benchmarks/bench_megamoe_fp4_sm90.py --shapes flash \
         --tokens "$m" --capacity "$capacity" --routing balanced --seed 7919 \
-        --repeats 200 --rounds 5 \
+        --repeats 2000 --warmup-graphs 10 --rounds 5 \
         --output "ep16-m${m}.json" --csv "ep16-m${m}.csv"
     done
 
@@ -223,7 +223,8 @@ set. Specify customer layer dimensions with
 prepared formats retain the fixed geometry requirements above.
 
 Each CUDA-event sample spans ``--repeats`` complete routed-core calls in a graph
-and is divided by that count. ``median_us`` in JSON (``median_max_rank_us`` in
+and is divided by that count. ``--warmup-graphs`` sets the number of graph replays
+before sampling. ``median_us`` in JSON (``median_max_rank_us`` in
 CSV) is the median of the per-sample maximum rank latency.
 ``max_rank_median_us`` is the maximum of the rank-wise medians; these statistics
 are not interchangeable. Input staging and the graph's initial collective gate
