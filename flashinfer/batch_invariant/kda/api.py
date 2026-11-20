@@ -18,7 +18,15 @@ pool (:mod:`.pool`). Call shapes:
   arguments yet; :func:`recurrent_kda_batch_invariant_extend` is its entry (one launch of the step kernel for fewer
   than 32 tokens per sequence). The call shape decides for every sequence
   of a call: in a prefill call a sequence with a single token also starts from its slot's state as a boundary;
-* speculative decode (``num_spec_tokens``) is not in the class yet and raises.
+* speculative decode (multi-token verify): ``num_spec_tokens=S`` with ``1 + S`` tokens per sequence (``[N, 1 + S]``, or
+  ``cu_seqlens`` with ``N * (1 + S)`` tokens) and one slot per sequence. The tokens are appended to the slot's open
+  chunk in one launch of the step kernel, so row ``t`` of a sequence at position ``p`` is row ``p + t`` of its prefill
+  and the row ``t + 1`` single decode steps give. The class keeps the drafts next to the pool: there are no per-token
+  checkpoint slots (``ssm_state_indices`` of shape ``[N, 1 + S]`` is refused). ``num_accepted_tokens`` (int32 ``[N]``)
+  settles each slot's previous verify first: a slot that kept ``a`` of its rows continues from position ``p + a``, in
+  the state ``a`` single decode steps leave (at most 16 tokens per verify). :func:`recurrent_kda_batch_invariant_accept` is the same settlement as
+  its own call. ``num_accepted_tokens=None`` and a verify that is never settled count as kept in full (today's
+  operator reads ``None`` as "start from checkpoint slot 0"; the class has no checkpoint slots).
 
 A prefill into a slot discards whatever open rows the slot had (its state is taken as a chunk boundary), which is why
 a chunked prefill cuts at multiples of 16. A slot whose state the caller replaced since the class last wrote it (a new
@@ -213,6 +221,8 @@ def recurrent_kda_batch_invariant(
     beta_is_logit: bool,
     backend: str,
     refused: Dict[str, object],
+    num_spec_tokens: Optional[int] = None,
+    num_accepted_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if backend != "auto":
         raise unsupported(
@@ -223,11 +233,15 @@ def recurrent_kda_batch_invariant(
     for name, value in refused.items():
         if value is None or value is False or (isinstance(value, int) and value == 0):
             continue
-        limit = {
-            "num_spec_tokens": "single-token decode (speculative decode is not in the class yet)",
-            "num_accepted_tokens": "single-token decode (speculative decode is not in the class yet)",
-        }.get(name, "the class's own inputs")
-        raise unsupported(CLASS, f"{name}={value!r}", limit)
+        raise unsupported(CLASS, f"{name}={value!r}", "the class's own inputs")
+    if num_spec_tokens == 0 and not isinstance(num_spec_tokens, bool):
+        num_spec_tokens = None
+    if num_spec_tokens is None and num_accepted_tokens is not None:
+        raise unsupported(
+            CLASS,
+            "num_accepted_tokens without num_spec_tokens",
+            "num_spec_tokens with it, or recurrent_kda_batch_invariant_accept",
+        )
     if not (use_qk_l2norm_in_kernel and use_gate_in_kernel and beta_is_logit):
         raise unsupported(
             CLASS,
@@ -267,6 +281,44 @@ def recurrent_kda_batch_invariant(
     else:
         N = B
         decode = T == 1
+    if num_spec_tokens is not None:
+        if (
+            isinstance(num_spec_tokens, bool)
+            or not isinstance(num_spec_tokens, int)
+            or num_spec_tokens < 1
+        ):
+            raise unsupported(
+                CLASS,
+                f"num_spec_tokens={num_spec_tokens!r}",
+                "an integer of at least 1",
+            )
+        per_seq = 1 + num_spec_tokens
+        if N * per_seq != B * T:
+            raise unsupported(
+                CLASS,
+                f"{B * T} tokens for {N} sequences with num_spec_tokens={num_spec_tokens}",
+                f"{per_seq} tokens per sequence (the cu_seqlens of a verify are taken as that stride, unread)",
+            )
+        if initial_state is None:
+            raise unsupported(
+                CLASS,
+                "a verify without initial_state",
+                "an fp32 state pool the caller keeps",
+            )
+        rows = _verify(
+            *(t.reshape(N, per_seq, *t.shape[2:]) for t in (q, k, v, g, beta)),
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            lower_bound=lower_bound,
+            scale=scale,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            checked=(H, HV),
+        )
+        out = output if output is not None else rows.view(v.shape)
+        return out, (initial_state if output_final_state else None)
 
     if initial_state is None:
         raise unsupported(
@@ -632,3 +684,199 @@ def recurrent_kda_batch_invariant_extend(
         scale,
     )
     return rows.view(v.shape)
+
+
+def _accepted(num_accepted_tokens, N: int, device: torch.device) -> torch.Tensor:
+    t = num_accepted_tokens
+    if (
+        not isinstance(t, torch.Tensor)
+        or t.dtype != torch.int32
+        or t.ndim != 1
+        or t.numel() != N
+        or t.device != device
+    ):
+        shape = tuple(t.shape) if isinstance(t, torch.Tensor) else type(t).__name__
+        raise unsupported(
+            CLASS,
+            f"num_accepted_tokens {shape}",
+            f"an int32 [{N}] tensor on the inputs' device (one count per sequence)",
+        )
+    return t.contiguous()
+
+
+def _verify(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    A_log,
+    dt_bias,
+    initial_state,
+    lower_bound,
+    scale,
+    ssm_state_indices,
+    num_accepted_tokens,
+    output,
+    checked: Optional[Tuple[int, int]] = None,
+) -> torch.Tensor:
+    """The verify of ``[N, T]`` tokens; returns the packed bf16 ``[N * T, HV, 128]`` rows (``output``'s memory when
+    given). Nothing is read back to the host."""
+    if checked is None:
+        H, HV = _check_inputs(q, k, v, g, beta)
+        _check_params(A_log, dt_bias, lower_bound, HV)
+        check_device(q.device, CLASS, KDA_ARCHS)
+        for t in (k, v, g, beta, A_log, dt_bias):
+            if t.device != q.device:
+                raise unsupported(CLASS, "inputs on several devices", "one device")
+    else:
+        H, HV = checked
+    dev = q.device
+    _check_pool(initial_state, HV, dev)
+    N, T = q.shape[:2]
+    if N == 0 or T == 0:
+        raise unsupported(CLASS, "an empty call", "at least one token per sequence")
+    if T > CHUNK:
+        raise unsupported(
+            CLASS,
+            f"a verify of {T} tokens per sequence",
+            f"at most {CHUNK} (a verify crosses one chunk boundary at most); longer appends are recurrent_kda_batch_invariant_extend",
+        )
+    S = int(initial_state.shape[0])
+    if ssm_state_indices is not None and ssm_state_indices.ndim == 2:
+        raise unsupported(
+            CLASS,
+            f"ssm_state_indices of shape {tuple(ssm_state_indices.shape)}",
+            f"int32 [{N}]: one slot per sequence (the class keeps the drafts next to the pool, not in checkpoint slots)",
+        )
+    slot_ids = _slot_ids(ssm_state_indices, N, dev, S)
+    accepted = None
+    if num_accepted_tokens is not None:
+        accepted = _accepted(num_accepted_tokens, N, dev)
+    if output is not None:
+        if (
+            output.numel() != v.numel()
+            or output.shape[-2:] != v.shape[-2:]
+            or output.dtype != _IO
+            or not output.is_contiguous()
+            or output.device != dev
+        ):
+            raise unsupported(
+                CLASS,
+                "an output of another size, dtype, layout or device than v",
+                "a contiguous bf16 output of v's size on the inputs' device",
+            )
+        lo, hi = output.data_ptr(), initial_state.data_ptr()
+        if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
+            raise unsupported(
+                CLASS,
+                "an output that shares memory with the state pool",
+                "an output buffer of its own",
+            )
+    ep = get_pool(initial_state)
+    scale_f = HEAD_DIM**-0.5 if scale is None else float(scale)
+    packed = _pack(q, k, v, g, beta, H, HV)
+    rows = (
+        torch.empty_like(packed[2])
+        if output is None
+        else output.view(N * T, HV, HEAD_DIM)
+    )
+    ep.verify(
+        initial_state,
+        slot_ids,
+        accepted,
+        packed,
+        rows,
+        A_log,
+        dt_bias,
+        lower_bound,
+        scale_f,
+        T,
+    )
+    return rows
+
+
+def recurrent_kda_batch_invariant_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    lower_bound: float,
+    scale: Optional[float] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
+    num_accepted_tokens: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The multi-token verify of the class (speculative decode, MTP): ``[N, T, HV, 128]`` (``beta`` ``[N, T, HV]``),
+    at most 16 tokens per sequence, appended to each slot's open chunk in one launch of the step kernel. Returns
+    the bf16 ``[N, T, HV, 128]`` rows: row ``t`` of a sequence at position ``p`` is row ``p + t`` of its prefill and
+    the row of the ``t + 1``-th of ``T`` single decode steps. The same call as
+    ``recurrent_kda(..., num_spec_tokens=T - 1, batch_invariant=True)``.
+
+    The slot is left ``T`` tokens ahead with a record of what the launch overwrote and of the decay prefix after
+    each row. Settling the verify with ``a`` of its rows kept (:func:`recurrent_kda_batch_invariant_accept`, or
+    ``num_accepted_tokens`` on the slot's next verify, which settles before it runs) leaves the slot at position
+    ``p + a`` in the state ``a`` single decode steps leave: its count and prefix become those of the kept position,
+    and the boundary state and cached rows come back from the record when the kept rows stop before a boundary the
+    launch crossed. No row is run again. A verify that is not settled counts as kept in full. On a slot whose state
+    the caller had replaced (or that was never begun) keeping no row leaves the slot begun at that state: the same
+    rows follow, the count is 0 where an untouched slot's is unset. The settlement refers to the slot's latest verify
+    and has to come before any other call on the slot: it is dropped when the slot's open-row count, state or decay
+    prefix is no longer what the verify left (decode steps and multi-token steps in between move them; a prefill and
+    a reset drop it explicitly).
+
+    Nothing is read back to the host, so the call is one node sequence of a captured CUDA graph (its slots are
+    unchecked, as in a decode step); the first verify on a pool must be eager (it allocates the record:
+    ``HV * (64 KB + 21 KB + 8 KB)`` per slot)."""
+    rows = _verify(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        lower_bound=lower_bound,
+        scale=scale,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        output=output,
+    )
+    return output if output is not None else rows.view(v.shape)
+
+
+def recurrent_kda_batch_invariant_accept(
+    initial_state: torch.Tensor,
+    num_accepted_tokens: Optional[torch.Tensor],
+    *,
+    ssm_state_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Settle the latest verify of each listed slot with ``num_accepted_tokens[i]`` of its rows kept (int32 ``[N]``;
+    ``None`` or a count of at least the verify's tokens keeps all, a count below 0 keeps none): the slot is left in
+    the state that many single decode steps from the verify's start leave. A slot without a verify to settle is
+    left as it is. One launch, nothing read back; inside a graph capture the pool must have run a verify before."""
+    check_device(initial_state.device, CLASS, KDA_ARCHS)
+    HV = int(initial_state.shape[1]) if initial_state.ndim == 4 else 0
+    _check_pool(initial_state, HV, initial_state.device)
+    dev = initial_state.device
+    S = int(initial_state.shape[0])
+    if ssm_state_indices is not None:
+        N = ssm_state_indices.numel()
+    elif num_accepted_tokens is not None:
+        N = num_accepted_tokens.numel()
+    else:
+        N = S
+    if N == 0:
+        raise unsupported(CLASS, "an empty call", "at least one slot")
+    slot_ids = _slot_ids(ssm_state_indices, N, dev, S)
+    accepted = None
+    if num_accepted_tokens is not None:
+        accepted = _accepted(num_accepted_tokens, N, dev)
+    get_pool(initial_state).settle(initial_state, slot_ids, accepted)

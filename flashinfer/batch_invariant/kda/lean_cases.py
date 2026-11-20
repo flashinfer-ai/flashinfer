@@ -1,8 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Generate ``lean/BIKernels/KdaCases.lean`` from the Python side: the replay arithmetic of the class ``kda.bf16.c16``
-(:mod:`.spec`) on a set of positions (chunk boundaries, their neighbours, a long position and the chunk before it) and the
-pool's count transitions, pinned in Lean by kernel ``decide`` against the model of ``Kda.lean``. No ``native_decide``:
+(:mod:`.spec`) on a set of positions (chunk boundaries, their neighbours, a long position and the chunk before it), the
+pool's count transitions and the record rule of the multi-token verify, pinned in Lean by kernel ``decide`` against the model of ``Kda.lean``. No ``native_decide``:
 the file adds nothing to the axiom policy.
 
     python -m flashinfer.batch_invariant.kda.lean_cases     # rewrite lean/BIKernels/KdaCases.lean
@@ -24,6 +24,21 @@ CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "KdaCases.lean")
 #: 4096-token sequence.
 POSITIONS = [0, 1, 15, 16, 17, 31, 32, 33, 1000, 4079, 4080, 4095, 4096]
 COUNTS = list(range(spec.CHUNK))
+#: The verifies ``(open rows, tokens)``: inside a chunk, up to and across its boundary, a whole chunk.
+VERIFIES = [
+    (0, 1),
+    (0, 6),
+    (0, 16),
+    (3, 6),
+    (9, 6),
+    (10, 6),
+    (11, 6),
+    (15, 1),
+    (15, 2),
+    (15, 9),
+    (5, 16),
+    (15, 16),
+]
 
 
 def cases() -> List[Tuple[int, int, int, bool]]:
@@ -34,6 +49,10 @@ def count_cases() -> List[Tuple[int, int]]:
     return [(c, spec.next_count(c)) for c in COUNTS]
 
 
+def verify_cases() -> List[Tuple[int, int, int, int]]:
+    return spec.verify_cases(VERIFIES)
+
+
 def conformance_lines() -> List[str]:
     """What ``lake exe kdaconformance`` prints, from the Python specification."""
     lines = [
@@ -41,6 +60,9 @@ def conformance_lines() -> List[str]:
         for p, b, n, c in cases()
     ]
     lines += [f"kdacount {c} next {n}" for c, n in count_cases()]
+    lines += [
+        f"kdaverify {c} rows {n} after {a} saved {s}" for c, n, a, s in verify_cases()
+    ]
     return lines
 
 
@@ -69,6 +91,17 @@ def render() -> str:
     L += [
         f"  ({c}, {n}){',' if i + 1 < len(cc) else ''}" for i, (c, n) in enumerate(cc)
     ]
+    vc = verify_cases()
+    L += [
+        "]",
+        "",
+        "/-- `(open rows, verify rows, open rows after, saved rows + 1)` of the verify's record rule. -/",
+        "def kdaVerifyCases : List (Nat × Nat × Nat × Nat) := [",
+    ]
+    L += [
+        f"  ({c}, {n}, {a}, {s}){',' if i + 1 < len(vc) else ''}"
+        for i, (c, n, a, s) in enumerate(vc)
+    ]
     L += [
         "]",
         "",
@@ -77,6 +110,10 @@ def render() -> str:
         "  decide",
         "",
         "theorem kda_count_cases_ok : kdaCountCases.all (fun c => Kda.nextCount c.1 == c.2) = true := by",
+        "  decide",
+        "",
+        "theorem kda_verify_cases_ok : kdaVerifyCases.all (fun c =>",
+        "    Kda.countAfter c.1 c.2.1 == c.2.2.1 && Kda.verifySaved c.1 c.2.1 == c.2.2.2) = true := by",
         "  decide",
         "",
         "end BIK",

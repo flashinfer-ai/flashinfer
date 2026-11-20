@@ -110,11 +110,11 @@ void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, T
                                      TensorView beta, TensorView slots, TensorView starts,
                                      TensorView lens, int64_t stride, TensorView out,
                                      TensorView state, TensorView state_bf16, TensorView cnt,
-                                     TensorView prefix, TensorView k_inv_rows,
-                                     TensorView k_inv_f32_rows, TensorView rhs_rows,
-                                     TensorView update_rows, TensorView l_rows, TensorView stamp,
-                                     TensorView a_log, TensorView dt_bias, double scale,
-                                     double half_gate_scale_log2) {
+                                     TensorView prefix, TensorView prefix_rows, int64_t prefix_cap,
+                                     TensorView k_inv_rows, TensorView k_inv_f32_rows,
+                                     TensorView rhs_rows, TensorView update_rows, TensorView l_rows,
+                                     TensorView stamp, TensorView a_log, TensorView dt_bias,
+                                     double scale, double half_gate_scale_log2) {
   namespace bi = kda::bi_decode;
   CHECK_DIM(3, q);
   CHECK_DIM(4, state);
@@ -138,15 +138,19 @@ void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, T
                  rhs_rows.numel() == cached && update_rows.numel() == cached);
   TVM_FFI_ICHECK(l_rows.numel() == sh * bi::CH * bi::CH);
   TVM_FFI_ICHECK(a_log.numel() == num_heads && dt_bias.numel() == num_heads * bi::D);
+  TVM_FFI_ICHECK(prefix_cap >= 0 &&
+                 (prefix_cap == 0 || prefix_rows.numel() == sh * prefix_cap * bi::D))
+      << "prefix_rows is not [slots, heads, prefix_cap, 128]";
   for (TensorView t :
        {q, k, v, g, beta, out, state_bf16, k_inv_rows, rhs_rows, update_rows, l_rows}) {
     check_dtype(t, kDLBfloat, 16, "a bf16 tensor");
     CHECK_CONTIGUOUS(t);
   }
-  for (TensorView t : {state, prefix, k_inv_f32_rows, stamp, a_log, dt_bias}) {
+  for (TensorView t : {state, prefix, prefix_rows, k_inv_f32_rows, stamp, a_log, dt_bias}) {
     check_dtype(t, kDLFloat, 32, "an fp32 tensor");
     CHECK_CONTIGUOUS(t);
   }
+  CHECK_DEVICE(prefix_rows, state);
   for (TensorView t : {slots, starts, lens, cnt}) {
     check_dtype(t, kDLInt, 32, "an int32 tensor");
     CHECK_CONTIGUOUS(t);
@@ -165,7 +169,8 @@ void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, T
       ptr<const uint16_t>(g), ptr<const uint16_t>(beta), ptr<const int>(slots),
       stride > 0 ? nullptr : ptr<const int>(starts), stride > 0 ? nullptr : ptr<const int>(lens),
       static_cast<int>(stride), ptr<uint16_t>(out), ptr<float>(state), ptr<uint16_t>(state_bf16),
-      ptr<int>(cnt), ptr<float>(prefix), ptr<uint16_t>(k_inv_rows), ptr<float>(k_inv_f32_rows),
+      ptr<int>(cnt), ptr<float>(prefix), prefix_cap > 0 ? ptr<float>(prefix_rows) : nullptr,
+      static_cast<int>(prefix_cap), ptr<uint16_t>(k_inv_rows), ptr<float>(k_inv_f32_rows),
       ptr<uint16_t>(rhs_rows), ptr<uint16_t>(update_rows), ptr<uint16_t>(l_rows), ptr<float>(stamp),
       ptr<const float>(a_log), ptr<const float>(dt_bias), static_cast<float>(scale),
       static_cast<float>(half_gate_scale_log2), static_cast<int>(batch),

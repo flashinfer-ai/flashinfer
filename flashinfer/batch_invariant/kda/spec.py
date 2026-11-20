@@ -89,6 +89,26 @@ def append_split(count: int, n: int) -> Tuple[int, int, int]:
     return head, whole, n - head - whole
 
 
+def verify_split(count: int, n: int) -> Tuple[int, int]:
+    """A verify of ``n`` rows (at most a chunk) on a slot holding ``count`` open rows leaves ``(count after, saved)``:
+    ``saved`` is ``-1`` while the rows stay inside the open chunk (the boundary state and the cached rows below
+    ``count`` are untouched, the record is the count and the decay prefix), else the number of cached rows of the open
+    chunk that the rows after the boundary replace, recorded with the boundary state (``count + n - 16``, which is at
+    most ``count`` for ``n <= 16``)."""
+    over = count + n - CHUNK
+    return (count + n) % CHUNK, (-1 if over < 0 else min(over, count))
+
+
+def accepted_count(count: int, kept: int) -> int:
+    """The open rows of a slot that held ``count`` before a verify and keeps ``kept`` of its rows."""
+    return (count + kept) % CHUNK
+
+
+def accepted_commits(count: int, kept: int) -> int:
+    """The boundaries the kept rows cross: how often the settled slot's boundary state has advanced."""
+    return (count + kept) // CHUNK
+
+
 def _package_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -143,6 +163,11 @@ def spec_fingerprint() -> str:
     ]
     digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
     return f"kda-bf16-c16-engine-{digest}"
+
+
+def verify_cases(pairs: List[Tuple[int, int]]) -> List[Tuple[int, int, int, int]]:
+    """``(count, n, count after, saved + 1)`` per verify: the rows the Lean cases pin (``0``: nothing saved)."""
+    return [(c, n, verify_split(c, n)[0], verify_split(c, n)[1] + 1) for c, n in pairs]
 
 
 def replay_cases(positions: List[int]) -> List[Tuple[int, int, int, bool]]:

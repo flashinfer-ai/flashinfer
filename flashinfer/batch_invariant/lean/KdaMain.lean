@@ -10,3 +10,5 @@ def main : IO Unit := do
     IO.println s!"kda {p} boundary {Kda.boundary p} hist {Kda.historyLen p} commit {Kda.commits (Kda.historyLen p)}"
   for c in kdaCountCases do
     IO.println s!"kdacount {c.1} next {Kda.nextCount c.1}"
+  for c in kdaVerifyCases do
+    IO.println s!"kdaverify {c.1} rows {c.2.1} after {Kda.countAfter c.1 c.2.1} saved {Kda.verifySaved c.1 c.2.1}"

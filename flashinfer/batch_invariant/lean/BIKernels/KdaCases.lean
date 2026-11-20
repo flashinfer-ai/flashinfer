@@ -41,11 +41,31 @@ def kdaCountCases : List (Nat × Nat) := [
   (15, 0)
 ]
 
+/-- `(open rows, verify rows, open rows after, saved rows + 1)` of the verify's record rule. -/
+def kdaVerifyCases : List (Nat × Nat × Nat × Nat) := [
+  (0, 1, 1, 0),
+  (0, 6, 6, 0),
+  (0, 16, 0, 1),
+  (3, 6, 9, 0),
+  (9, 6, 15, 0),
+  (10, 6, 0, 1),
+  (11, 6, 1, 2),
+  (15, 1, 0, 1),
+  (15, 2, 1, 2),
+  (15, 9, 8, 9),
+  (5, 16, 5, 6),
+  (15, 16, 15, 16)
+]
+
 theorem kda_cases_ok : kdaCases.all (fun c =>
     Kda.boundary c.1 == c.2.1 && Kda.historyLen c.1 == c.2.2.1 && Kda.commits c.2.2.1 == c.2.2.2) = true := by
   decide
 
 theorem kda_count_cases_ok : kdaCountCases.all (fun c => Kda.nextCount c.1 == c.2) = true := by
+  decide
+
+theorem kda_verify_cases_ok : kdaVerifyCases.all (fun c =>
+    Kda.countAfter c.1 c.2.1 == c.2.2.1 && Kda.verifySaved c.1 c.2.1 == c.2.2.2) = true := by
   decide
 
 end BIK

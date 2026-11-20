@@ -17,6 +17,15 @@ from one the class wrote. Two placements compute the class's term:
 ``api._append`` appends several tokens per sequence with both: the step kernel up to the next boundary, the prefill
 kernel over the whole chunks, the step kernel for the tail. :meth:`ExactPool.span` is the step kernel looping over
 several rows per slot in one launch.
+
+A multi-token verify (:meth:`ExactPool.verify`) is that span behind a record of what it overwrites (the count and the
+decay prefix; the boundary state and the cached rows a completed chunk replaces, only when the span crosses a boundary),
+with the span writing the decay prefix after each of its rows into the record. Settling a verify with fewer rows kept
+than were run (:meth:`ExactPool.accept`, or the next verify) sets the slot's count and prefix to the kept position
+and, when the kept rows stop before a boundary the span crossed, puts the recorded boundary state and rows back: the
+slot is then what that many single steps leave, without running a row again. The kernel of
+``include/flashinfer/kda/batch_invariant_verify.cuh`` moves bytes and counts only; every row and prefix value is the
+step kernel's.
 """
 
 from __future__ import annotations
@@ -43,6 +52,13 @@ def _module():
     from ...jit.kda_batch_invariant import gen_kda_batch_invariant_module
 
     return gen_kda_batch_invariant_module().build_and_load()
+
+
+@functools.cache
+def _verify_module():
+    from ...jit.kda_batch_invariant_verify import gen_kda_batch_invariant_verify_module
+
+    return gen_kda_batch_invariant_verify_module().build_and_load()
 
 
 def _release(storage: int) -> None:
@@ -97,6 +113,8 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
         ep = ExactPool(pool)
     else:
         ep.cnt.fill_(-1)
+        if ep.record is not None:
+            ep.record.meta.zero_()
     storage = pool.untyped_storage()
     if not any(k[0] == key[0] for k in (*_POOLS, *_RETIRED)):
         weakref.finalize(storage, _release, key[0])
@@ -123,6 +141,8 @@ class ExactPool:
         self.rhs_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.update_rows = zeros(S, HV, CHUNK, HEAD_DIM)
         self.l_rows = zeros(S, HV, CHUNK, CHUNK)
+        #: The verify record, allocated by the first verify on the pool.
+        self.record: Optional[VerifyRecord] = None
 
     def mutable(self) -> Tuple[torch.Tensor, ...]:
         """The tensors a step may change besides the pool and the cached rows of the row it writes."""
@@ -177,6 +197,9 @@ class ExactPool:
             _module().kda_batch_invariant_begin(
                 slots, pool, self.state_bf16, self.cnt, self.stamp
             )
+            if self.record is not None:
+                # a slot taken as a boundary has no verify left to settle
+                self.record.meta.index_fill_(0, slots.long(), 0)
 
     def counts(self, pool: torch.Tensor, slot_list: Sequence[int]) -> List[int]:
         """The open rows of each slot (one device read). A slot whose state the caller replaced is begun first, as
@@ -217,11 +240,12 @@ class ExactPool:
         starts: Optional[torch.Tensor] = None,
         lens: Optional[torch.Tensor] = None,
         stride: int = 0,
+        prefix_rows: Optional[torch.Tensor] = None,
     ) -> None:
         """Sequence ``i`` appends packed rows ``[starts[i], starts[i] + lens[i])`` (int32, on the device; ``stride``
         rows from row ``i * stride`` when ``stride`` is given instead) to slot ``slot_ids[i]`` and writes their rows
         into ``out`` at the same positions. One launch: each block loops over its rows and commits every chunk it
-        completes."""
+        completes. ``prefix_rows`` (fp32 ``[slots, HV, cap, 128]``) receives the decay prefix after each row."""
         q, k, v, g, beta = packed
         if not stride and (starts is None or lens is None):
             raise ValueError("span needs starts and lens, or a stride")
@@ -241,6 +265,8 @@ class ExactPool:
             self.state_bf16,
             self.cnt,
             self.prefix,
+            self.prefix if prefix_rows is None else prefix_rows,
+            0 if prefix_rows is None else int(prefix_rows.shape[2]),
             self.k_inv_rows,
             self.k_inv_f32_rows,
             self.rhs_rows,
@@ -251,4 +277,114 @@ class ExactPool:
             dt_bias.reshape(self.H, HEAD_DIM),
             float(scale),
             float(lower_bound) * GATE_LOG2_E * 0.5,
+        )
+
+    def verify_record(self) -> "VerifyRecord":
+        """The pool's verify record: allocated once, outside a graph capture, with room for a whole chunk of rows."""
+        if self.record is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise unsupported(
+                    CLASS,
+                    "a verify or a settlement first run on a pool inside a CUDA graph capture",
+                    "one eager verify on the pool before the capture",
+                )
+            self.record = VerifyRecord(self.slots, self.H, CHUNK, self.device)
+        return self.record
+
+    def settle(
+        self,
+        pool: torch.Tensor,
+        slot_ids: torch.Tensor,
+        accepted: Optional[torch.Tensor],
+        tokens: int = 0,
+    ) -> None:
+        """Settle each slot's pending verify with ``accepted[i]`` of its rows kept (``None``: all of them) and, for
+        ``tokens > 0``, record what a span of that many rows will overwrite. One launch, nothing read back; a no-op
+        on a pool that never ran a verify (refused inside a capture, where the graph would stay empty)."""
+        rec = self.record
+        if rec is None:
+            if torch.cuda.is_current_stream_capturing():
+                self.verify_record()
+            return
+        _verify_module().kda_batch_invariant_verify_settle(
+            slot_ids,
+            slot_ids if accepted is None else accepted,
+            int(accepted is not None),
+            int(tokens),
+            pool,
+            self.state_bf16,
+            self.cnt,
+            self.prefix,
+            self.k_inv_rows,
+            self.k_inv_f32_rows,
+            self.rhs_rows,
+            self.update_rows,
+            self.l_rows,
+            self.stamp,
+            *rec.buffers(),
+        )
+
+    def verify(
+        self,
+        pool: torch.Tensor,
+        slot_ids: torch.Tensor,
+        accepted: Optional[torch.Tensor],
+        packed: Tuple[torch.Tensor, ...],
+        out: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        tokens: int,
+    ) -> None:
+        """The slots' pending verifies settled with ``accepted``, then ``tokens`` packed rows per sequence appended
+        behind a record; their rows go to ``out``. Two launches, nothing read back."""
+        rec = self.verify_record()
+        self.settle(pool, slot_ids, accepted, tokens)
+        self.span(
+            pool,
+            slot_ids,
+            packed,
+            out,
+            A_log,
+            dt_bias,
+            lower_bound,
+            scale,
+            stride=tokens,
+            prefix_rows=rec.prefix_rows,
+        )
+
+
+class VerifyRecord:
+    """Per slot: what the last verify's span overwrote, and the decay prefix after each of its rows (``cap`` rows of
+    room: a chunk)."""
+
+    def __init__(self, S: int, HV: int, cap: int, dev: torch.device) -> None:
+        self.cap = cap
+
+        def zeros(*shape, dtype=_IO):
+            return torch.zeros(shape, dtype=dtype, device=dev)
+
+        # per (slot, head): rows pending, the count after them, the count before them, the cached rows recorded
+        self.meta = zeros(S, HV, 4, dtype=torch.int32)
+        self.prefix = zeros(S, HV, HEAD_DIM, dtype=torch.float32)
+        self.prefix_rows = zeros(S, HV, cap, HEAD_DIM, dtype=torch.float32)
+        self.state = zeros(S, HV, HEAD_DIM, HEAD_DIM, dtype=torch.float32)
+        self.k_inv_rows = zeros(S, HV, CHUNK, HEAD_DIM)
+        self.k_inv_f32_rows = zeros(S, HV, CHUNK, HEAD_DIM, dtype=torch.float32)
+        self.rhs_rows = zeros(S, HV, CHUNK, HEAD_DIM)
+        self.update_rows = zeros(S, HV, CHUNK, HEAD_DIM)
+        self.l_rows = zeros(S, HV, CHUNK, CHUNK)
+
+    def buffers(self) -> Tuple[torch.Tensor, ...]:
+        return (
+            self.meta,
+            self.prefix,
+            self.prefix_rows,
+            self.state,
+            self.k_inv_rows,
+            self.k_inv_f32_rows,
+            self.rhs_rows,
+            self.update_rows,
+            self.l_rows,
         )
