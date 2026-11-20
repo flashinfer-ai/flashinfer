@@ -35,6 +35,7 @@ from .api import (  # noqa: F401
     # Unified configs and packs
     B12xNvfp4Config,
     B12xW4A16Config,
+    SpecializedW4A16Config,
     BackendOptions,
     CakeStepFunConfig,
     CudnnFrostBf16Config,
@@ -100,6 +101,7 @@ from .da_runtime import (  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    SpecializedW4A16Runner,
     CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
@@ -355,6 +357,8 @@ __all__ = [
     "B12xNvfp4Runner",
     "B12xW4A16Config",
     "B12xW4A16Runner",
+    "SpecializedW4A16Config",
+    "SpecializedW4A16Runner",
     "BackendOptions",
     "CakeStepFunConfig",
     "CudnnFrostBf16Config",

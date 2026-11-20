@@ -2973,6 +2973,91 @@ class B12xW4A16Config:
 
 
 @dataclass(frozen=True)
+class SpecializedW4A16Config:
+    """SM120 agent-generated shape-specialized W4A16 MoE backend (its own
+    module, :mod:`flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120`
+    — not a b12x kernel, and not reachable through ``b12x_fused_moe`` or
+    ``B12xMoEWrapper``).
+
+    Weights: its own ``specialized_w4a16`` view only, in the kernels'
+    documented ROW-MAJOR group-16 scale layout at the exact unpadded
+    geometry (``[E, I, H/16]`` / ``[E, H, I/16]``). This is NOT the stock
+    b12x view, whose scales are stored 128-row-padded and swizzled
+    (``[E, 1920, 168]`` for w1 at this geometry): the two views are not
+    interchangeable, neither runner aliases the other's, and a pack that
+    carries only the b12x view leaves this candidate ineligible instead of
+    raising mid-shootout.
+
+    CUDA graphs: before capture, eagerly launch each required kernel family
+    on the input CUDA device, or call ``specialized_moe_nvfp4_w4a16_sm120.warmup``.
+    Loading the module alone is insufficient. The runner allocates output and
+    scratch per call on the launch stream; capture uses the active graph pool.
+    Independent graphs with private pools and independent writable operands
+    can replay concurrently. Callers sharing a graph pool must follow PyTorch's
+    pool replay ordering and lifetime rules.
+
+    Determinism: expert partials combine with BF16 atomics, so repeated
+    identical calls can differ by a few BF16 ulp in accumulation order.
+    Consumers that require bitwise reproducibility should route to a
+    deterministic backend (e.g. the stock :class:`B12xW4A16Config`).
+
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM120) and
+    the runner gates the kernels' fixed contract (E=128, top_k=6,
+    hidden=2688, intermediate=1856, ReLU^2, CUDA >= 13.2 toolkit) and
+    per-call token-count allowlist, so under ``backend=auto`` the
+    ``MoELayer`` per-token-bucket shootout times the specialized kernels
+    directly on matching layers — including under autotune tuning mode —
+    and routes to them where they win. The runner serves ONLY the kernels'
+    own domain: out-of-allowlist calls are declined at eligibility time and
+    served by whichever other configured backend wins them.
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects the candidate at
+    support-check time and makes the runner decline every call.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 120
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        *,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+    ):
+        """Build the ``specialized_w4a16`` weight view from row-major
+        group-16 checkpoint tensors (the kernels' documented layout; NOT
+        the stock b12x swizzled storage — the two views carry different
+        memory layouts and are not interchangeable).
+
+        Register the result with
+        ``MoEWeightPack.prepare_for("specialized_w4a16", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_specialized_w4a16_weights`.
+        """
+        from .prepare import prepare_specialized_w4a16_weights
+        from .utils import resolve_b12x_activation_name
+
+        return prepare_specialized_w4a16_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=resolve_b12x_activation_name(activation),
+            source_format=source_format,
+        )
+
+    def __repr__(self) -> str:
+        return "SpecializedW4A16Config()"
+
+
+@dataclass(frozen=True)
 class CudnnFrostBf16Config:
     """Frost BF16 MoE on SM107 and SM120, with packed precomputed routing.
 
@@ -3632,6 +3717,7 @@ BackendConfigType = Union[
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    SpecializedW4A16Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3679,6 +3765,7 @@ ALL_BACKEND_CONFIGS = (
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    SpecializedW4A16Config,
 )
 
 
@@ -3732,6 +3819,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runner gate arch + contract; out-of-domain calls are declined
+        # and served by the other candidates).
+        SpecializedW4A16Config(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),

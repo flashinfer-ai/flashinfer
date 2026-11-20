@@ -2830,6 +2830,96 @@ def prepare_b12x_nvfp4_weights(
     }
 
 
+def prepare_specialized_w4a16_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str,
+    source_format: str = "modelopt",
+) -> Dict[str, Union[torch.Tensor, str]]:
+    """Build the SM120 ``specialized_w4a16`` weight view.
+
+    The specialized module's documented contract: ROW-MAJOR group-16 block
+    scales at the exact unpadded geometry (``w1_weight_sf`` is
+    ``[E, I, H/16]``, ``w2_weight_sf`` is ``[E, H, I/16]``), fixed to
+    E=128, top_k=6, H=2688, I=1856, non-gated ReLU^2. This is NOT the stock
+    b12x layout — the stock path stores scales in 128-row-padded swizzled
+    form (``[E, 1920, 168]`` for w1 at this geometry) — so the two views are
+    not interchangeable and neither runner aliases the other's.
+
+    No conversion is performed: checkpoint tensors already in the row-major
+    group-16 layout are validated and returned (the per-expert global scales
+    are normalized to FP32 alphas, with the ``compressed_tensors``
+    reciprocal convention applied). A layout mismatch raises here, at
+    preparation time, instead of at the first forward. Deliberately
+    independent of the stock CuTe-DSL machinery: the specialized backend
+    needs neither that package nor the swizzled scale cache.
+
+    Register the result with
+    ``MoEWeightPack.prepare_for("specialized_w4a16", ...)``.
+    """
+    from .specialized_moe_nvfp4_w4a16_sm120 import _C
+
+    E = int(_C["num_experts"])
+    H = int(_C["hidden_size"])
+    I = int(_C["intermediate_size"])
+    if activation != _C["activation"]:
+        raise ValueError(
+            f"the specialized W4A16 kernels serve only "
+            f"activation={_C['activation']!r}; got {activation!r}"
+        )
+    source_format = source_format.lower()
+    if source_format not in ("modelopt", "compressed_tensors"):
+        raise ValueError(
+            "the specialized W4A16 view takes source_format 'modelopt' or "
+            f"'compressed_tensors', got {source_format!r}"
+        )
+
+    def _source_global_scale(global_scale, *, source_format):
+        # Same convention as the stock path: compressed_tensors stores the
+        # reciprocal of the modelopt per-expert alpha.
+        if source_format == "compressed_tensors":
+            return (1.0 / global_scale).to(torch.float32).contiguous()
+        return global_scale.contiguous()
+
+    def _checked(name, t, shape, dtype):
+        if not isinstance(t, torch.Tensor) or t.dtype != dtype:
+            raise TypeError(f"{name} must be a {dtype} tensor")
+        if tuple(t.shape) != shape:
+            raise ValueError(
+                f"{name} must have the specialized row-major shape "
+                f"{shape} (unpadded group-16 layout; the swizzled "
+                f"128-row-padded b12x storage is a different view), got "
+                f"{tuple(t.shape)}"
+            )
+        return t.contiguous()
+
+    w1_alpha = _source_global_scale(w1_global_scale, source_format=source_format)
+    w2_alpha = _source_global_scale(w2_global_scale, source_format=source_format)
+    if tuple(w1_alpha.shape) != (E,) or tuple(w2_alpha.shape) != (E,):
+        raise ValueError(
+            f"global scales must be per-expert [{E}] tensors, got "
+            f"{tuple(w1_alpha.shape)} / {tuple(w2_alpha.shape)}"
+        )
+    return {
+        "w1_weight": _checked("w1_fp4", w1_fp4, (E, I, H // 2), torch.uint8),
+        "w1_weight_sf": _checked(
+            "w1_blockscale", w1_blockscale, (E, I, H // 16), torch.float8_e4m3fn
+        ),
+        "w1_alpha": w1_alpha.to(torch.float32).contiguous(),
+        "w2_weight": _checked("w2_fp4", w2_fp4, (E, H, I // 2), torch.uint8),
+        "w2_weight_sf": _checked(
+            "w2_blockscale", w2_blockscale, (E, H, I // 16), torch.float8_e4m3fn
+        ),
+        "w2_alpha": w2_alpha.to(torch.float32).contiguous(),
+        "scale_layout": "rowmajor_group16",
+    }
+
+
 def prepare_b12x_w4a16_weights(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,

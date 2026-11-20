@@ -136,6 +136,9 @@ exclude = [
   "mla_kv_pack_fp8_workloads.json",
   "top_p_renorm_probs_specialized_workloads.json",
 ]
+# Token-count/contract allowlist of the specialized SM120 NVFP4-W4A16 MoE
+# backend, read at import time next to its module.
+"flashinfer.fused_moe" = ["specialized_moe_nvfp4_w4a16_sm120_allowlist.json"]
 # Provider export records and retained patch files accompany their sources.
 "flashinfer.moe_ep.kernels.cutedsl_megamoe" = ["*.md", "*.json", "patches/*.patch"]
 "flashinfer.moe_ep.shims.sm90.cutedsl_megamoe" = ["*.md"]

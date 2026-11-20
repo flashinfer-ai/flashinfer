@@ -121,7 +121,12 @@ def is_cuda_tile_available(device=None) -> bool:
     has no ``pip`` module to call). On cu12x CI images that don't pre-install
     tileiras, this skip-guard prevents cuTile tests from crashing mid-JIT.
     """
-    if importlib.util.find_spec("cuda.tile.tune") is None:
+    # find_spec imports parent packages for a dotted name. The optional
+    # cuda.tile package can itself be absent in an otherwise valid install.
+    try:
+        if importlib.util.find_spec("cuda.tile.tune") is None:
+            return False
+    except ModuleNotFoundError:
         return False
 
     tileiras_path = _find_tileiras_binary()
