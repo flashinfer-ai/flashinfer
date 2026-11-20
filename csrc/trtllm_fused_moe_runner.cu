@@ -246,7 +246,8 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace,
                  bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-                 bool enable_pdl, int32_t validHiddenSize, int32_t validIntermediateSize) {
+                 bool enable_pdl, int32_t validHiddenSize, int32_t validIntermediateSize,
+                 tensorrt_llm::kernels::TrtllmGenBatchedGemmPartition const& partition) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
@@ -270,7 +271,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
               ptrClampLimit, output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
               ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas,
               permutedIdxToBiasRowIdx, bmm1Workspace, stream, device, configIndex, enable_pdl,
-              /* validM */ -1, validN, validK);
+              /* validM */ -1, validN, validK, partition);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -359,7 +360,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-                 int32_t validIntermediateSize, int32_t validHiddenSize) {
+                 int32_t validIntermediateSize, int32_t validHiddenSize,
+                 tensorrt_llm::kernels::TrtllmGenBatchedGemmPartition const& partition) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
@@ -378,7 +380,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
       /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
       /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, /* permutedIdxToBiasRowIdx */ nullptr,
-      bmm2Workspace, stream, device, configIndex, enable_pdl, /* validM */ -1, validN, validK);
+      bmm2Workspace, stream, device, configIndex, enable_pdl, /* validM */ -1, validN, validK,
+      partition);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -520,6 +523,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
   activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
   activationData.tileTokensDim = workspace.ProjUpTileN;
+  // The persistent activation walks the permuted rows (local pairs plus tile padding) or the
+  // (token, slot) pairs, whichever list is shorter; it needs the row -> token map and the row
+  // count of the permuted buffers.
+  activationData.permutedIdxToTokenIdx = workspace.permuted_idx_to_token_idx;
+  activationData.totalMaxPaddedTokens = workspace.total_max_padded_tokens;
 
   // Setup finalize data
   if (args.do_finalize) {
@@ -770,6 +778,15 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
         reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream, enable_pdl);
+    if (args.fc2_input_out != nullptr) {
+      invokeNvfp4PermutedRowsToExpanded(
+          args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t const*>(workspace.activation_output),
+          reinterpret_cast<uint8_t const*>(workspace.activation_output_scale),
+          reinterpret_cast<float const*>(workspace.token_scales_fc2), sfLayout, args.fc2_input_out,
+          args.fc2_input_scale_out, args.fc2_input_token_scale_out, stream);
+    }
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
@@ -792,6 +809,228 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   // Run finalize
   if (args.do_finalize) {
     // Run finalize
+    moe::dev::finalize::run(finalizeData, stream);
+    sync_check_cuda_error(stream);
+  }
+}
+
+namespace {
+void checkCudaCall(cudaError_t err, char const* what) {
+  FLASHINFER_CHECK(err == cudaSuccess, what, " failed: ", cudaGetErrorString(err));
+}
+
+// Forks work from the caller's stream onto the locality-domain streams and joins it back. The
+// events are created per call and destroyed when this object goes out of scope: CUDA frees a
+// recorded event once it completes, and under graph capture each record/wait pair becomes a graph
+// edge, so the domain streams join the capture and are merged back before it ends.
+class DomainForkJoin {
+ public:
+  DomainForkJoin(cudaStream_t main, std::array<cudaStream_t, LocalizedMoE::kNumDomains> streams)
+      : mMain(main), mStreams(streams) {
+    checkCudaCall(cudaEventCreateWithFlags(&mReady, cudaEventDisableTiming), "cudaEventCreate");
+    for (auto& done : mDone) {
+      checkCudaCall(cudaEventCreateWithFlags(&done, cudaEventDisableTiming), "cudaEventCreate");
+    }
+  }
+  ~DomainForkJoin() {
+    cudaEventDestroy(mReady);
+    for (auto done : mDone) {
+      cudaEventDestroy(done);
+    }
+  }
+  DomainForkJoin(DomainForkJoin const&) = delete;
+  DomainForkJoin& operator=(DomainForkJoin const&) = delete;
+
+  // Every domain stream waits for the work already enqueued on the caller's stream.
+  void fork() {
+    checkCudaCall(cudaEventRecord(mReady, mMain), "cudaEventRecord");
+    for (auto stream : mStreams) {
+      checkCudaCall(cudaStreamWaitEvent(stream, mReady, 0), "cudaStreamWaitEvent");
+    }
+  }
+
+  // The caller's stream waits for everything enqueued on the domain streams.
+  void join() {
+    for (size_t d = 0; d < mStreams.size(); ++d) {
+      checkCudaCall(cudaEventRecord(mDone[d], mStreams[d]), "cudaEventRecord");
+      checkCudaCall(cudaStreamWaitEvent(mMain, mDone[d], 0), "cudaStreamWaitEvent");
+    }
+  }
+
+  // join() for error paths: never throws, so the original error propagates.
+  void joinNoThrow() noexcept {
+    for (size_t d = 0; d < mStreams.size(); ++d) {
+      if (cudaEventRecord(mDone[d], mStreams[d]) == cudaSuccess) {
+        cudaStreamWaitEvent(mMain, mDone[d], 0);
+      }
+    }
+  }
+
+ private:
+  cudaStream_t mMain;
+  std::array<cudaStream_t, LocalizedMoE::kNumDomains> mStreams;
+  cudaEvent_t mReady{};
+  std::array<cudaEvent_t, LocalizedMoE::kNumDomains> mDone{};
+};
+}  // namespace
+
+bool Runner::isValidLocalizedConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                         int32_t intermediateSize, int32_t numLocalExperts,
+                                         int32_t numTokens, int32_t smCount) const {
+  if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size())) {
+    return false;
+  }
+  auto const& config = mPassingConfigs[configIndex];
+  auto const gemm1Config = static_cast<int32_t>(config.gemm1Config);
+  auto const gemm2Config = static_cast<int32_t>(config.gemm2Config);
+  // Each domain computes half of FC1's intermediate columns over the full hidden size, and half
+  // of FC2's hidden columns over the full intermediate size.
+  return mPermuteGemm1.supportsPartition(gemm1Config, smCount) &&
+         mGemm2.supportsPartition(gemm2Config, smCount) &&
+         mPermuteGemm1.isValidConfigIndex(gemm1Config, topK, hiddenSize, intermediateSize / 2,
+                                          numLocalExperts, numTokens) &&
+         mGemm2.isValidConfigIndex(gemm2Config, topK, hiddenSize / 2, intermediateSize,
+                                   numLocalExperts, numTokens);
+}
+
+std::vector<int64_t> Runner::getValidLocalizedConfigIndices(int32_t topK, int32_t hiddenSize,
+                                                            int32_t intermediateSize,
+                                                            int32_t numLocalExperts,
+                                                            int32_t numTokens,
+                                                            int32_t smCount) const {
+  std::vector<int64_t> validIndices;
+  for (int64_t i = 0; i < static_cast<int64_t>(mPassingConfigs.size()); ++i) {
+    if (isValidLocalizedConfigIndex(i, topK, hiddenSize, intermediateSize, numLocalExperts,
+                                    numTokens, smCount)) {
+      validIndices.push_back(i);
+    }
+  }
+  // Put the untuned default first: the pair each GEMM's heuristic picks for its half shape.
+  try {
+    int64_t const gemm1Default = mPermuteGemm1.getDefaultValidConfigIndex(
+        topK, hiddenSize, intermediateSize / 2, numLocalExperts, numTokens);
+    int64_t const gemm2Default = mGemm2.getDefaultValidConfigIndex(
+        topK, hiddenSize / 2, intermediateSize, numLocalExperts, numTokens);
+    auto it = std::find_if(validIndices.begin(), validIndices.end(), [&](int64_t i) {
+      return mPassingConfigs[i].gemm1Config == gemm1Default &&
+             mPassingConfigs[i].gemm2Config == gemm2Default;
+    });
+    if (it != validIndices.end()) {
+      std::rotate(validIndices.begin(), it, it + 1);
+    }
+  } catch (std::exception const&) {
+    // No heuristic default for a half shape: keep the catalog order.
+  }
+  return validIndices;
+}
+
+void Runner::runLocalized(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+                          LocalizedMoE const& localized, int device, cudaStream_t stream,
+                          int64_t configIndex, bool enable_pdl) {
+  constexpr int kDomains = LocalizedMoE::kNumDomains;
+  int32_t const hiddenSize = args.hidden_size;
+  int32_t const intermediateSize = args.intermediate_size;
+  int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+  int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+
+  // The split covers the plain NVFP4 x NVFP4 gated path only; every other variant would need its
+  // own per-domain handling of the extra operands.
+  FLASHINFER_CHECK(mPermuteGemm1.mDtypeAct == btg::Dtype::E2m1 &&
+                       mPermuteGemm1.mDtypeWeights == btg::Dtype::E2m1,
+                   "Localized MoE supports NVFP4 activations and weights only.");
+  FLASHINFER_CHECK(isGatedActivation(mPermuteGemm1.mActType),
+                   "Localized MoE requires a gated activation.");
+  FLASHINFER_CHECK(!mUsePerTokenScalingGemm1 && !mUsePerTokenScalingGemm2 &&
+                       !mUsePerChannelScalingGemm1 && !mUsePerChannelScalingGemm2,
+                   "Localized MoE does not support per-token or per-channel scales.");
+  FLASHINFER_CHECK(args.gemm1_bias == nullptr && args.gemm2_bias == nullptr,
+                   "Localized MoE does not support GEMM biases.");
+  FLASHINFER_CHECK(args.num_fused_shared_experts == 0,
+                   "Localized MoE does not support fused shared experts.");
+  FLASHINFER_CHECK(!args.valid_hidden_size.has_value() &&
+                       !args.valid_intermediate_size.has_value() &&
+                       getGemm2OutputHiddenSize(args) == hiddenSize,
+                   "Localized MoE does not support padded (valid) dimensions.");
+  // Each half must stay a whole number of 128-row weight-shuffle blocks, and the FC1 output-scale
+  // slice must start on a four-scale-block boundary.
+  FLASHINFER_CHECK(intermediateSize % 256 == 0 && hiddenSize % 256 == 0,
+                   "Localized MoE needs hidden and intermediate sizes that are multiples of 256, "
+                   "got hidden=",
+                   hiddenSize, ", intermediate=", intermediateSize);
+  FLASHINFER_CHECK(localized.smCount > 0, "Localized MoE needs the per-domain SM count.");
+  FLASHINFER_CHECK(localized.streams[0] != localized.streams[1] && localized.streams[0] != stream &&
+                       localized.streams[1] != stream,
+                   "Localized MoE needs two distinct domain streams, both different from the "
+                   "caller's stream.");
+  for (int d = 0; d < kDomains; ++d) {
+    // The BMM scratch may be null: a config without split-K needs none.
+    FLASHINFER_CHECK(localized.gemm1Weights[d] && localized.gemm1WeightsScale[d] &&
+                         localized.gemm2Weights[d] && localized.gemm2WeightsScale[d],
+                     "Localized MoE is missing a weight shard for domain ", d);
+  }
+  FLASHINFER_CHECK(
+      isValidLocalizedConfigIndex(configIndex, totalExpertsPerToken, hiddenSize, intermediateSize,
+                                  totalLocalExperts, args.num_tokens, localized.smCount),
+      "MoE tactic ", configIndex,
+      " cannot run localized: it must be valid for the per-domain shapes and write "
+      "output slices.");
+
+  moe::dev::activation::Data activationData;
+  moe::dev::finalize::Data finalizeData;
+  moe::dev::convertsf::Data convertSfData;
+  sync_check_cuda_error(stream);
+  setOpsData(args, workspace, enable_pdl, convertSfData, activationData, finalizeData);
+
+  auto const& config = mPassingConfigs[configIndex];
+  int32_t const localIntermediate = intermediateSize / kDomains;
+  int32_t const localHidden = hiddenSize / kDomains;
+
+  // The domain GEMMs launch without PDL: each one follows an event wait, not a kernel on its own
+  // stream, so there is no preceding kernel to overlap with.
+  DomainForkJoin forkJoin(stream, localized.streams);
+  try {
+    forkJoin.fork();
+    for (int d = 0; d < kDomains; ++d) {
+      mPermuteGemm1.run(
+          args.hidden_states, args.hidden_states_scale, localized.gemm1Weights[d],
+          localized.gemm1WeightsScale[d], workspace.token_scales,
+          /* perChannelScales */ nullptr, args.output1_scales_scalar,
+          args.output1_scales_gate_scalar, /* ptrBias */ nullptr, args.gemm1_alpha, args.gemm1_beta,
+          args.gemm1_clamp_limit, /* permutedIdxToBiasRowIdx */ nullptr, workspace.gemm1_output,
+          workspace.gemm1_output_scale, totalExpertsPerToken, hiddenSize, localIntermediate,
+          totalLocalExperts, args.num_tokens, workspace.permuted_idx_to_token_idx,
+          workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+          workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
+          localized.bmm1Workspaces[d], args.mUseRoutingScalesOnInput, device, localized.streams[d],
+          static_cast<int32_t>(config.gemm1Config), /* enable_pdl */ false,
+          /* validHiddenSize */ -1, /* validIntermediateSize */ -1,
+          {intermediateSize, d * localIntermediate, localized.smCount});
+    }
+    // FC2 reduces over the full intermediate size, so both FC1 halves must be complete.
+    forkJoin.join();
+    forkJoin.fork();
+    for (int d = 0; d < kDomains; ++d) {
+      mGemm2.run(workspace.gemm1_output, workspace.gemm1_output_scale, localized.gemm2Weights[d],
+                 localized.gemm2WeightsScale[d], workspace.token_scales_fc2,
+                 /* perChannelScales */ nullptr, args.output2_scales_scalar, /* ptrBias */ nullptr,
+                 workspace.gemm2_output, workspace.gemm2_output_scale, totalExpertsPerToken,
+                 localHidden, intermediateSize, totalLocalExperts, args.num_tokens,
+                 workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+                 workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
+                 localized.bmm2Workspaces[d], device, localized.streams[d],
+                 static_cast<int32_t>(config.gemm2Config), /* enable_pdl */ false,
+                 /* validIntermediateSize */ -1, /* validHiddenSize */ -1,
+                 {hiddenSize, d * localHidden, localized.smCount});
+    }
+    forkJoin.join();
+  } catch (...) {
+    // Re-join before unwinding: a domain stream left forked would break an enclosing graph
+    // capture and let the caller free buffers the domains still use.
+    forkJoin.joinNoThrow();
+    throw;
+  }
+
+  if (args.do_finalize) {
     moe::dev::finalize::run(finalizeData, stream);
     sync_check_cuda_error(stream);
   }

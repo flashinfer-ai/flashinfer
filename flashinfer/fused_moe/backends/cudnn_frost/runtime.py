@@ -99,18 +99,39 @@ def _tactic_digest(source_sha256: str) -> str:
     return _cached_tactic_digest(source_sha256, identity_key())
 
 
-def bind_kernel(kernel, device):
+def cluster_capacities(device):
+    """Capture the preparation device's cached cluster launch capacities."""
+    from .device import device_facts
+
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return ()
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return device_facts(index).clusters
+
+
+def bind_kernel(kernel, device, *, top_k=None):
     """Resolve a dimension-catalog recipe for the preparation device."""
     from dataclasses import replace
     from .device import device_facts, specialize_parameters
     from .source_template import materialize_source
 
     if hasattr(kernel, "original"):
-        return kernel._replace(original=bind_kernel(kernel.original, device))
+        return kernel._replace(
+            original=bind_kernel(kernel.original, device, top_k=top_k)
+        )
 
     parameters = getattr(kernel, "source_parameters", None)
     if parameters is None:
         return kernel
+    if top_k is not None and getattr(kernel, "combines_output", False):
+        from copy import deepcopy
+
+        parameters = deepcopy(parameters)
+        parameters["constants"] = [
+            [name, str(top_k) if name == "moe_top_k" else expression]
+            for name, expression in parameters["constants"]
+        ]
     device = torch.device(device)
     if device.type != "cuda":
         return kernel
@@ -121,7 +142,11 @@ def bind_kernel(kernel, device):
     resolved, workspace = specialize_parameters(parameters, facts)
     path, digest = materialize_source(kernel.template_path, resolved)
     return replace(
-        kernel, source_path=path, source_sha256=digest, workspace_bytes=workspace
+        kernel,
+        source_path=path,
+        source_sha256=digest,
+        workspace_bytes=workspace,
+        source_parameters=parameters,
     )
 
 

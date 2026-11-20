@@ -24,6 +24,9 @@ from flashinfer.fused_moe.backends.cudnn_frost import (
 from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
     moe as bf16_moe,
 )
+from flashinfer.fused_moe.backends.cudnn_frost.cache import (
+    require_graph_resource_retention,
+)
 from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
     activation_name,
@@ -73,6 +76,21 @@ frost_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 7), (12, 0)),
     reason="packaged cuDNN Frost sources target SM107a and SM120a",
+)
+
+
+def _graph_retention_reason():
+    try:
+        require_graph_resource_retention()
+    except NotImplementedError as exc:
+        return str(exc)
+    return None
+
+
+# MoE runners decline admission on PyTorch without CUDAGraph.retain_object (< 2.14).
+_GRAPH_RETENTION_REASON = _graph_retention_reason()
+graph_retention = pytest.mark.skipif(
+    _GRAPH_RETENTION_REASON is not None, reason=str(_GRAPH_RETENTION_REASON)
 )
 BF16_SHORTLIST_GEOMETRIES = {
     (12, 7168, 3072, 1),
@@ -149,6 +167,7 @@ def _bf16_moe_reference(act, weights, activation=None):
     return expanded.sum(dim=1).bfloat16()
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
@@ -232,6 +251,7 @@ def test_bf16_activation_artifact_pools_are_disjoint(
         shared_fc2 = fc2_ids
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("topk", [1, 2, 4])
 def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
@@ -287,6 +307,7 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     torch.cuda.current_stream().wait_stream(stream)
 
 
+@graph_retention
 @frost_gpu
 def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics():
     runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cuda")
@@ -316,6 +337,7 @@ def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics
         runner.pack_inputs(a, wa)
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
@@ -507,6 +529,7 @@ def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkey
     assert not layer._winners
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
@@ -693,7 +716,11 @@ def test_bf16_explicit_final_boundary_and_graph(stage, swap, store):
     kernels = [
         kernel
         for kernel in (first if stage == "fc1" else second)
-        if kernel.swap_ab == swap and kernel.tactic_metadata["store_mode"] == store
+        if (
+            kernel.swap_ab == swap
+            and kernel.tactic_metadata["store_mode"] == store
+            and not getattr(kernel, "gathers_input", False)
+        )
     ]
     if not kernels:
         pytest.skip("this orientation/store is not in the packaged shortlist")
@@ -1303,7 +1330,7 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
         if key[0] == arch
     }
     assert {key[1] for key in table} == set(ACTIVATIONS)
-    assert {key[2:] for key in table} == BF16_SHORTLIST_GEOMETRIES
+    assert {key[2:] for key in table} >= BF16_SHORTLIST_GEOMETRIES
     monkeypatch.setattr(runtime, "_arch_for", lambda device: arch)
     monkeypatch.setattr(
         torch.cuda,
@@ -1313,7 +1340,11 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
     runtime.clear_artifact_cache()
     try:
         for (_, name, experts, hidden, intermediate, topk), profiles in table.items():
-            assert sorted(profiles) == [1, 16, 128, 512, 2048, 4096, 8192, 12288]
+            if (experts, hidden, intermediate, topk) in BF16_SHORTLIST_GEOMETRIES:
+                assert set(profiles) >= {1, 16, 128, 512, 2048, 4096, 8192, 12288}
+            else:
+                assert arch == "sm_107a" and name == "swiglu"
+                assert sorted(profiles) == [1, 4, 16, 64, 256, 1024, 4096, 8192, 16384]
             previous = 0
             for tokens, (fc1, fc2) in sorted(profiles.items()):
                 # Measured counts and the next-bucket rule, without compiling.
@@ -1327,7 +1358,15 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
                         "cpu",
                         ACTIVATIONS[name](),
                     )
-                    assert tuple(k.artifact_id for k in first) == fc1
+                    if isinstance(profiles[tokens], shortlist.CompleteChoices):
+                        assert tuple(k.artifact_id for k in first) == fc1
+                        assert 1 <= len(first) <= 2 and 1 <= len(second) <= 2
+                    else:
+                        grouped = tuple(k for k in first if not k.gathers_input)
+                        assert tuple(k.artifact_id for k in grouped) == fc1
+                        assert len(first) - len(grouped) <= 2
+                        if arch == "sm_107a":
+                            assert any(k.gathers_input for k in first)
                     assert tuple(k.artifact_id for k in second) == fc2
                     assert all(k.arch == arch and k.activation == name for k in first)
                     assert all(k.arch == arch for k in second)
@@ -1361,6 +1400,7 @@ def test_fma_shared_source_identity(family):
         assert requirements[path] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("tokens", [1, 4])
 @pytest.mark.parametrize("name", ["swiglu", "situ", "relu2"])
@@ -1643,13 +1683,14 @@ def _assert_block_scale_geometry_roundtrip(
             record["contract"]["output_dtype"] in ("float4_e2m1fn_x2", "float8_e4m3fn")
             and record["tactic"]["store_mode"] == "tma"
         ):
-            assert constants["epi_chunk_elems"] == "32"
+            assert constants["epi_chunk_elems"] in ("32", "64")
         family = (
             record["arch"],
             record["op"],
             record["contract"]["output_dtype"],
             record["tactic"]["swap_ab"],
             record["tactic"]["store_mode"],
+            record["contract"].get("moe_mode", "none"),
         )
         families.setdefault(family, set()).add(entry["path"])
         source_families.setdefault(entry["path"], set()).add(family)
@@ -1674,24 +1715,30 @@ def _assert_block_scale_geometry_roundtrip(
         "block_scale_grouped_gemm2",
     }
     # Offline selection may retain different numbers of geometries and ABI
-    # families. Every retained geometry of one family must share one source;
+    # families. Every geometry of one family shares one source;
     # source paths must not accidentally mix activations or launch ABIs.
     assert all(len(paths) == 1 for paths in families.values())
     # Activations share a topology template; layout/store/output remain fixed.
     assert all(
-        len({(v[0], v[2], v[3], v[4]) for v in variants}) == 1
+        len({(v[0], v[2], v[3], v[4], v[5]) for v in variants}) == 1
         for variants in source_families.values()
     )
     # Per gated/non-gated topology: SM107 normal/swap-AB x STG/TMA plus fused
-    # STG/TMA FC1, SM120 STG normal/swap-AB plus fused normal FC1; then FC2.
-    for arch, per_topology, fc2 in (("sm_107a", 6, 4), ("sm_120a", 3, 2)):
+    # STG/TMA FC1, SM120 STG normal/swap-AB plus fused normal FC1; then FC2
+    # store/layout variants for each output reduction mode.
+    for arch, per_topology, fc2 in (("sm_107a", 12, 4), ("sm_120a", 3, 2)):
         sources = {
             path
             for family, paths in families.items()
             if family[0] == arch
             for path in paths
         }
-        assert len(sources) <= 2 * per_topology + fc2
+        fc2_modes = {
+            family[5]
+            for family in families
+            if family[0] == arch and family[1].endswith("gemm2")
+        }
+        assert len(sources) <= 2 * per_topology + fc2 * len(fc2_modes)
     assert sum(len(digests) for digests in by_source.values()) == len(records)
 
 
@@ -2371,6 +2418,7 @@ def _pick_stage_pair(pool):
     return first, second
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
@@ -2381,10 +2429,12 @@ def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, fc1_outp
     )
 
 
+@graph_retention
 @frost_gpu
+@pytest.mark.parametrize("zero_scale_routes", [False, True])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("tokens", [1, 4])
-def test_legacy_mx_fma_shared_pipeline(mixed, tokens, monkeypatch):
+def test_legacy_mx_fma_shared_pipeline(mixed, tokens, zero_scale_routes, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("legacy FMA admission is SM107 only")
     _assert_mxfp8_moe_full_pipeline_and_graph(
@@ -2394,6 +2444,7 @@ def test_legacy_mx_fma_shared_pipeline(mixed, tokens, monkeypatch):
         mixed=mixed,
         geometry=(tokens, 2048, 1408, 64, 6),
         require_fma=True,
+        zero_scale_routes=zero_scale_routes,
     )
 
 
@@ -2405,6 +2456,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     fc1_output="bf16",
     geometry=(17, 256, 256, 4, 2),
     require_fma=False,
+    zero_scale_routes=False,
 ):
     from flashinfer.fused_moe import (
         CutlassMxfp8Config,
@@ -2466,9 +2518,12 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
         torch.tensor([1.5, -0.75, 0.0, 0.5], device="cuda").repeat(e // 4)
     )
     ids = torch.randint(0, e // 2, (t, k), device="cuda", dtype=torch.int32)
-    if require_fma and t == 1:
-        # Even experts have a zero FC1 or FC2 input scale. Cover both zero- and
-        # nonzero-scale routes instead of relying on a one-token random draw.
+    # Even experts have a zero FC1 or FC2 input scale. Preserve zero-scale
+    # routes while keeping a nonzero reference, including for a single token.
+    if zero_scale_routes:
+        ids.zero_()
+        ids[0, 0] = 1
+    else:
         ids[0] = torch.arange(k, device=ids.device, dtype=ids.dtype)
     scores = torch.rand(t, k, device="cuda")
     scores /= scores.sum(-1, keepdim=True)
@@ -2597,6 +2652,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     assert (out.float() - reference.float()).norm() / reference.float().norm() < 0.02
 
 
+@graph_retention
 @frost_gpu
 def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
@@ -2708,6 +2764,7 @@ def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
             tactic=("fc1", j),
             workspace_bytes=128,
             gated=True,
+            gathers_input=False,
             launch_tail=("output", "scale", "gate_alpha", "up_alpha"),
             swap_ab=bool(j),
         )
@@ -3080,6 +3137,7 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
     return expanded.sum(dim=1).bfloat16()
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
@@ -3247,6 +3305,7 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         runner.forward(list(inputs))
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("tokens", [1, 4])
 def test_legacy_nvfp4_fma_shared_pipeline(tokens, monkeypatch):
@@ -3262,6 +3321,7 @@ def test_legacy_nvfp4_fma_shared_pipeline(tokens, monkeypatch):
     )
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("store", ["stg", "tma"])
 def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
@@ -3274,6 +3334,7 @@ def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
         )
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("mixed", [False, True])
@@ -3423,6 +3484,7 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
             ).norm() / reference.float().norm() < 0.02
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("store", ["stg", "tma"])
@@ -3556,6 +3618,20 @@ def test_nvfp4_packaged_shortlists_resolve_all_profiles(
 
     _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch)
 
+    monkeypatch.setattr(moe.common, "_arch_for", lambda _: "sm_107a")
+    snapshot = moe._capture_selection(moe._artifact_roots(), "sm_107a", 128, SwiGLU())
+    for topk in (8, 9, 1024):
+        shape = (1, 128, 128, 1024, topk)
+        live = moe._selected_kernels(*shape, "cpu", SwiGLU())
+        captured = snapshot.select_kernels(shape)
+        assert tuple(tuple(k.artifact_id for k in pool) for pool in live) == tuple(
+            tuple(k.artifact_id for k in pool) for pool in captured
+        )
+        for first, second in (live, captured):
+            assert first and second
+            combined = {k.swap_ab for k in second if k.combines_output}
+            assert combined == ({False, True} if topk == 8 else set())
+
 
 def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
     from flashinfer.fused_moe.backends.cudnn_frost import (
@@ -3591,9 +3667,32 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                     "cpu",
                     ACTIVATIONS[name](),
                 )
-                assert 2 <= len(first) <= 6 and len(second) == 2
+                if isinstance(identities, shortlist.CompleteChoices):
+                    assert tuple(k.artifact_id for k in first) == identities[0]
+                    assert tuple(k.artifact_id for k in second) == identities[1]
+                    assert 1 <= len(first) <= 2 and 1 <= len(second) <= 2
+                    assert all(
+                        k.fc1 and k.activation == name and k.arch == arch for k in first
+                    )
+                    assert all(not k.fc1 and k.arch == arch for k in second)
+                    assert len(
+                        {(a.tactic, b.tactic) for a in first for b in second}
+                    ) == (len(first) * len(second))
+                    continue
+                regular = tuple(
+                    k for k in second if not getattr(k, "combines_output", False)
+                )
+                combined = tuple(
+                    k for k in second if getattr(k, "combines_output", False)
+                )
+                gathered = tuple(k for k in first if k.gathers_input)
+                first = tuple(k for k in first if not k.gathers_input)
+                assert len(gathered) <= 6
+                assert 2 <= len(first) <= 6 and len(regular) == 2 and len(combined) <= 2
+                if arch == "sm_107a" and moe.runtime is nvfp4:
+                    assert combined
                 assert tuple(k.artifact_id for k in first[:2]) == identities[0]
-                assert tuple(k.artifact_id for k in second) == identities[1]
+                assert tuple(k.artifact_id for k in regular) == identities[1]
                 for kernel in first[2:]:
                     assert kernel.quantizes_output and not kernel.swap_ab
                     assert kernel.tactic_metadata["tile"] in {
@@ -3620,12 +3719,11 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                     assert variants <= {
                         (tile, store) for tile in normal_tiles for store in stores
                     }
-                assert all(k.fc1 and k.activation == name for k in first)
+                assert all(k.fc1 and k.activation == name for k in first + gathered)
                 assert all(not k.fc1 for k in second)
-                assert (
-                    len({(a.tactic, b.tactic) for a in first for b in second})
-                    == len(first) * 2
-                )
+                assert len(
+                    {(a.tactic, b.tactic) for a in first + gathered for b in second}
+                ) == len(first + gathered) * len(second)
             previous = tokens
 
 
@@ -3725,6 +3823,7 @@ def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
     )
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
@@ -3737,6 +3836,7 @@ def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
     )
 
 
+@graph_retention
 @frost_gpu
 def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
@@ -4097,9 +4197,9 @@ def test_frost_layer_bounds_token_bucket_winners_and_refreshes_lru(monkeypatch):
 @pytest.mark.parametrize(
     "dtype",
     [
-        pytest.param("bf16", marks=frost_gpu),
+        pytest.param("bf16", marks=[frost_gpu, graph_retention]),
         *(
-            pytest.param(dtype, marks=frost_gpu)
+            pytest.param(dtype, marks=[frost_gpu, graph_retention])
             for dtype in ("mxfp8", "nvfp4", "mxfp8_mxfp4")
         ),
     ],

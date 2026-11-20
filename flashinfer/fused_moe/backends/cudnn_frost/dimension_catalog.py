@@ -84,13 +84,15 @@ def expand_catalog(payload: dict[str, Any]) -> dict[str, Any]:
                 )
                 contract = deepcopy(variant["contract"])
                 contract["activation"] = activation
+                combine = contract.get("moe_mode") == "combine"
+                gather = contract.get("moe_mode") == "gather"
                 op = ("" if dtype == "bf16" else "block_scale_") + (
                     "grouped_gemm2"
                     if family["stage"] == "fc2"
                     else f"grouped_gemm1_{activation}"
                 )
                 quantized = contract["output_dtype"] != "bfloat16"
-                abi = f"cudnn_frost_{op}{'_quantized' if quantized else ''}{'_swap_ab' if tile['swap_ab'] else ''}"
+                abi = f"cudnn_frost_{op}{'_combine' if combine else ''}{'_gather' if gather else ''}{'_quantized' if quantized else ''}{'_swap_ab' if tile['swap_ab'] else ''}"
                 aux = [] if family["stage"] == "fc2" else ["scale"]
                 if dtype != "bf16":
                     aux = (
@@ -108,6 +110,8 @@ def expand_catalog(payload: dict[str, Any]) -> dict[str, Any]:
                     aux = aux[:-1] + ["gate_scale", "linear_scale"] + aux[-1:]
                 if quantized and dtype == "nvfp4":
                     aux.append("quant_scale")
+                if combine:
+                    aux = []
                 tail = (
                     (["output_scale"] if quantized else []) + aux + ["output"]
                     if policy["data"] == "tma"
@@ -126,6 +130,14 @@ def expand_catalog(payload: dict[str, Any]) -> dict[str, Any]:
                     launch={"tail": tail},
                     tactic=tile,
                 )
+                if combine:
+                    raw["launch"]["prefix"] = [
+                        "top_k_scores",
+                        "token_ks",
+                        "token_index",
+                    ]
+                if gather:
+                    raw["launch"]["prefix"] = ["token_index"]
                 # BF16 FC2 has no auxiliary scale, even though activation is identity.
                 if dtype == "bf16" and family["stage"] == "fc2":
                     raw["launch"] = {"tail": ["output"]}
@@ -142,16 +154,20 @@ def expand_catalog(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _factor_sources(sources):
-    """Split frozen sources into a shared body and exact activation fragments."""
+    """Share a frozen body across activation and geometry specializations."""
     from difflib import SequenceMatcher
 
     first = sources[min(sources)].splitlines(keepends=True)
     changes = {}
+    distinct = {}
     intervals = []
-    for activation, source in sources.items():
+    for specialization, source in sources.items():
+        if source in distinct:
+            changes[specialization] = distinct[source]
+            continue
         lines = source.splitlines(keepends=True)
         operations = SequenceMatcher(None, first, lines, autojunk=False).get_opcodes()
-        changes[activation] = (lines, operations)
+        changes[specialization] = distinct[source] = (lines, operations)
         intervals.extend((a, b) for tag, a, b, _, _ in operations if tag != "equal")
     merged = []
     for start, end in sorted(intervals):
@@ -166,7 +182,7 @@ def _factor_sources(sources):
     parts += first[offset:]
     shared = "".join(parts)
     fragments = {}
-    for activation, (lines, operations) in changes.items():
+    for specialization, (lines, operations) in changes.items():
         output = []
         for start, end in merged:
             part = []
@@ -186,9 +202,9 @@ def _factor_sources(sources):
             reconstructed = reconstructed.replace(
                 f"# @@FROST_ACTIVATION_{index}@@\n", fragment
             )
-        if reconstructed != sources[activation]:
-            raise RuntimeError("Frost activation factoring changed the frozen source")
-        fragments[activation] = output
+        if reconstructed != sources[specialization]:
+            raise RuntimeError("Frost source factoring changed the frozen source")
+        fragments[specialization] = output
     return shared, fragments
 
 
@@ -280,13 +296,25 @@ def write_catalog(
             tactic["swap_ab"],
             record["contract"]["output_dtype"],
             tactic["store_mode"],
+            record["contract"].get("moe_mode", "none"),
+            int(
+                dict(record["source"]["parameters"]["constants"]).get(
+                    "epi_chunk_elems", "0"
+                )
+            ),
         )
         groups[key].append(record)
 
+    # Keep each producer's geometry-dependent body until its frozen fragments
+    # have been factored into the shared template below.
     prepared = []
     schemas: dict[tuple[str, ...], list[dict[str, str]]] = defaultdict(list)
-    for key, members in sorted(groups.items()):
-        arch, stage, topology, swapped, output, store = key
+    # Preserve the established record order for existing grouped-input readers.
+    # GATHER is an opt-in input ABI and follows the original variants.
+    for key, members in sorted(
+        groups.items(), key=lambda item: (item[0][-2] == "gather", item[0])
+    ):
+        arch, stage, topology, swapped, output, store, mode, chunk = key
         sources: dict[str, str] = {}
         prefixes: set[str] = set()
         parameters: dict[str, dict[str, str]] = {}
@@ -374,6 +402,16 @@ def write_catalog(
             )
         )
 
+    shared_sources: dict[
+        tuple[str, str, str, bool, str, str, str], dict[tuple[int, str], str]
+    ] = defaultdict(dict)
+    for key, sources, *_ in prepared:
+        for activation, source in sources.items():
+            shared_sources[key[:-1]][key[-1], activation] = source
+    shared_templates = {
+        key: _factor_sources(sources) for key, sources in shared_sources.items()
+    }
+
     payload: dict[str, Any] = dict(
         schema_version=4,
         producer={
@@ -411,7 +449,7 @@ def write_catalog(
         payload["parameter_bases"][name] = dict(order=list(schema), defaults=defaults)
         bases[schema] = (name, defaults)
     families = {}
-    pending_sources = []
+    pending_sources: dict[Path, str] = {}
     for (
         key,
         sources,
@@ -421,7 +459,7 @@ def write_catalog(
         schema,
         producer_template,
     ) in prepared:
-        arch, stage, topology, swapped, output, store = key
+        arch, stage, topology, swapped, output, store, mode, chunk = key
         family_key = (arch, stage, topology)
         if family_key not in families:
             families[family_key] = dict(
@@ -430,18 +468,26 @@ def write_catalog(
         quantized = output != "bfloat16"
         policy = "tmastg" if store == "tma" and quantized else store
         tag = f"{arch.replace('_', '').removesuffix('a')}_{stage}_{topology}_{'swap' if swapped else 'normal'}_{'quantized' if quantized else 'bf16'}_{policy}"
-        template, fragments = _factor_sources(sources)
+        if mode == "combine":
+            tag += "_combine"
+        if mode == "gather":
+            tag += "_gather"
+        template, fragments = shared_templates[key[:-1]]
         relative = f"sources/{tag}.py"
         destination = root / relative
-        pending_sources.append((destination, template))
+        if pending_sources.setdefault(destination, template) != template:
+            raise RuntimeError("inconsistent Frost shared source template")
         refs: dict[str, list[str]] = {}
-        for activation, chunks in fragments.items():
+        for activation in sources:
             refs[activation] = []
-            for chunk in chunks:
-                ref = hashlib.sha256(chunk.encode()).hexdigest()[:16]
-                if ref in payload["fragments"] and payload["fragments"][ref] != chunk:
+            for fragment in fragments[chunk, activation]:
+                ref = hashlib.sha256(fragment.encode()).hexdigest()[:16]
+                if (
+                    ref in payload["fragments"]
+                    and payload["fragments"][ref] != fragment
+                ):
                     raise RuntimeError("Frost fragment reference collision")
-                payload["fragments"][ref] = chunk
+                payload["fragments"][ref] = fragment
                 refs[activation].append(ref)
         base, defaults = bases[schema]
         families[family_key]["variants"].append(
@@ -468,7 +514,7 @@ def write_catalog(
     expanded = expand_catalog(payload)
     new_ids = {logical_id(r, dtype): r["id"] for r in expanded["kernels"]}
     mapping = {r["id"]: new_ids[logical_id(r, dtype)] for r in records}
-    for destination, template in pending_sources:
+    for destination, template in pending_sources.items():
         destination.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(
             dir=destination.parent, prefix=destination.name, suffix=".tmp"

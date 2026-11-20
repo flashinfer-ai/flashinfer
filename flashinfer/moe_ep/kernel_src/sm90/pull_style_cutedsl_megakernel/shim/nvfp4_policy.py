@@ -19,10 +19,15 @@ NVFP4_FC1_SCHEDULE_VERSION = "nvfp4_fc1_k256_auto_overlap_v1"
 NVFP4_KPERM_CHOICES = (0, 32, 64)
 # Identical replicas of the 1 KiB conversion table; they only spread lanes
 # over shared-memory banks. 32 replicas use 256-byte rows whose addresses are
-# built with one PRMT per scale byte.
-NVFP4_LUT_REPLICA_CHOICES = (8, 16, 32)
+# built with one PRMT per scale byte. Fewer than 8 replicas trade bank
+# conflicts for shared memory (an N64 K256 tile needs it for a fourth stage).
+NVFP4_LUT_REPLICA_CHOICES = (1, 2, 4, 8, 16, 32)
 # Lane -> replica map: lane quad (default), lane pair, or lane.
 NVFP4_LUT_MAPS = ("quad", "pair", "lane")
+# Weight-scale ring depth. 0 keeps the 4 KiB K256 scale slot in lockstep with
+# every AB stage; 1 or 2 give the scales their own smaller ring (K256 hybrid
+# tiles only), which frees 4 KiB per AB stage beyond it.
+NVFP4_SF_STAGE_CHOICES = (0, 1, 2)
 # NVFP4-only tactic fields and the values a legacy (MXFP4-schema) tactic
 # implies. They depend on the tile: a 32-replica table costs 24 KiB more
 # shared memory, which N32/N64 tiles recover with the compact pull buffer.
@@ -30,6 +35,7 @@ NVFP4_CONVERSION_TACTIC_DEFAULTS: Dict[str, Any] = {
     "compact_pull_buffer": False,
     "nvfp4_lut_replicas": 8,
     "nvfp4_lut_map": "quad",
+    "nvfp4_sf_stages": 0,
 }
 
 
@@ -44,12 +50,14 @@ class Nvfp4ConversionLayout:
     """Compile-time layout of the in-register NVFP4 promotion.
 
     ``kperm`` must match the weight preprocessing and activation staging.
-    The LUT fields change only shared-memory banking and size, never values.
+    The LUT and scale-ring fields change only shared-memory banking, size and
+    pipelining, never values.
     """
 
     kperm: int = 64
     lut_replicas: int = 8
     lut_map: str = "quad"
+    sf_stages: int = 0
 
     def __post_init__(self) -> None:
         validate_nvfp4_kperm(self.kperm)
@@ -58,11 +66,19 @@ class Nvfp4ConversionLayout:
             or self.lut_replicas not in NVFP4_LUT_REPLICA_CHOICES
         ):
             raise ValueError(
-                f"nvfp4_lut_replicas must be 8, 16 or 32; got {self.lut_replicas!r}"
+                "nvfp4_lut_replicas must be 1, 2, 4, 8, 16 or 32; "
+                f"got {self.lut_replicas!r}"
             )
         if self.lut_map not in NVFP4_LUT_MAPS:
             raise ValueError(
                 f"nvfp4_lut_map must be 'quad', 'pair' or 'lane'; got {self.lut_map!r}"
+            )
+        if (
+            type(self.sf_stages) is not int
+            or self.sf_stages not in NVFP4_SF_STAGE_CHOICES
+        ):
+            raise ValueError(
+                f"nvfp4_sf_stages must be 0, 1 or 2; got {self.sf_stages!r}"
             )
 
     @property
@@ -85,7 +101,9 @@ def split_nvfp4_conversion_tactic(
     if type(nvfp4["compact_pull_buffer"]) is not bool:
         raise ValueError("compact_pull_buffer must be a bool")
     layout = Nvfp4ConversionLayout(
-        lut_replicas=nvfp4["nvfp4_lut_replicas"], lut_map=nvfp4["nvfp4_lut_map"]
+        lut_replicas=nvfp4["nvfp4_lut_replicas"],
+        lut_map=nvfp4["nvfp4_lut_map"],
+        sf_stages=nvfp4["nvfp4_sf_stages"],
     )
     core = {
         name: value
@@ -96,6 +114,7 @@ def split_nvfp4_conversion_tactic(
         "compact_pull_buffer": nvfp4["compact_pull_buffer"],
         "nvfp4_lut_replicas": layout.lut_replicas,
         "nvfp4_lut_map": layout.lut_map,
+        "nvfp4_sf_stages": layout.sf_stages,
     }
 
 
@@ -164,3 +183,73 @@ def resolve_nvfp4_fc1_overlap(
         and device_name == "NVIDIA H200"
         and sm_count == 132
     )
+
+
+def nvfp4_shared_memory_budget(
+    *,
+    smem_capacity: int,
+    occupancy: int,
+    ab_data_bytes: int,
+    activation_sf_bytes: int,
+    weight_sf_bytes: int,
+    misc_bytes: int,
+    c_bytes_total: int,
+    conversion: Nvfp4ConversionLayout,
+) -> Dict[str, int]:
+    """One host reservation formula for kernel construction and candidate pruning.
+
+    Byte counts come from the actual CuTe layouts in the kernel. The bounded
+    N64 candidate oracle supplies the equivalent dense-layout counts. This is
+    a conservative reservation, not a query of CUDA's dynamic/shared charge.
+    """
+    for name, value in locals().copy().items():
+        if name == "conversion":
+            continue
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if occupancy < 1:
+        raise ValueError("occupancy must be positive")
+    sf_stages = conversion.sf_stages
+    bytes_per_stage = (
+        ab_data_bytes + activation_sf_bytes + (0 if sf_stages else weight_sf_bytes)
+    )
+    if bytes_per_stage <= 0:
+        raise ValueError("AB stage must reserve positive bytes")
+    capacity = smem_capacity // occupancy
+    fixed = (
+        misc_bytes + c_bytes_total + conversion.lut_bytes + sf_stages * weight_sf_bytes
+    )
+    stages = (capacity - fixed) // bytes_per_stage
+    if sf_stages:
+        stages -= stages % (2 * sf_stages)
+        if stages < 2 * sf_stages:
+            raise ValueError(
+                f"nvfp4_sf_stages={sf_stages} needs at least {2 * sf_stages} "
+                "AB stages; shared memory leaves fewer."
+            )
+        # Phase alignment must not discard stages that the lockstep layout fits.
+        lockstep_stages = (
+            capacity - misc_bytes - c_bytes_total - conversion.lut_bytes
+        ) // (ab_data_bytes + activation_sf_bytes + weight_sf_bytes)
+        if stages < lockstep_stages:
+            raise ValueError(
+                f"nvfp4_sf_stages={sf_stages} rounds AB stages to {stages}, "
+                f"below the same-layout lockstep depth {lockstep_stages}."
+            )
+    if stages < 2:
+        raise ValueError(
+            "Hopper NVFP4xFP8 requires at least two AB/offset stages; "
+            f"computed {stages}."
+        )
+    return {
+        "capacity": capacity,
+        "ab_bytes_per_stage": bytes_per_stage,
+        "num_ab_stage": stages,
+        "weight_sf_stages": sf_stages or stages,
+        "weight_sf_bytes_per_stage": weight_sf_bytes,
+        "misc": misc_bytes,
+        "c_bytes_total": c_bytes_total,
+        "lut_bytes": conversion.lut_bytes,
+        "fixed_overhead": fixed,
+        "spare": capacity - fixed - stages * bytes_per_stage,
+    }

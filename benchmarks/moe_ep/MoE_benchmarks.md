@@ -6,7 +6,7 @@ optionally + the expert grouped-GEMM). Two drivers:
 | Driver | Measures | Comparable to |
 |---|---|---|
 | `benchmarks/moe_ep/core/comm/bench_ep_matrix.py` | **comm only** — dispatch + combine, no FFN | the upstream `contrib/nccl_ep/ep_bench` C++ reference |
-| `benchmarks/moe_ep/bench_moe_ep.py` | **full** MoE — dispatch → grouped GEMM → combine | (no external ref; LL has the NCCL-EP README config) |
+| `benchmarks/moe_ep/bench_moe_ep_fleet.py` | **full** MoE — dispatch → grouped GEMM → combine | (no external ref; LL has the NCCL-EP README config) |
 
 The headline study is `bench_ep_matrix.py` vs `ep_bench`: it confirms FlashInfer and
 ep_bench launch the **same** kernels with the **same** GPU time, and quantifies (and then
@@ -83,16 +83,16 @@ ssh "$LOGIN_HOST" "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
   see §3.1. **Off by default** (opt-in; read once at `flashinfer.moe_ep` import).
 - `EP_PROFILE_HOST=1` (`EP_PROFILE_SKIP=N`) — print a per-step host-wall burn-down on rank 0.
 
-### 2b. Full MoE compute (`bench_moe_ep.py`)
+### 2b. Full MoE compute (`bench_moe_ep_fleet.py`)
 ```bash
 torchrun --nnodes=$N --nproc_per_node=8 --node_rank=$SLURM_NODEID \
   --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \
-  benchmarks/moe_ep/bench_moe_ep.py --reference --algorithm ll --backend nccl_ep --quant bf16 \
+  benchmarks/moe_ep/bench_moe_ep_fleet.py --reference --algorithm ll --backend nccl_ep --quant bf16 \
   --warmup 5 --repeat 20            # --layout rank_major  | --algorithm ht --ep-test-geometry
 ```
 `--reference` selects the ep_bench geometry (hidden 7168, experts 256, top_k 8, 128 tok/rank).
-Rank 0 prints one CSV line: `BENCH_CSV,algo,layout,tokens,gpus,backend,quant,dispatch_us,
-compute_us,combine_us,e2e_us,tok_s`. Allow ≥45 min walltime — the first run JIT-compiles +
+Rank 0 prints one CSV line: `BENCH_CSV,algo,layout,tokens,gpus,backend,quant,mode,dispatch_us,
+compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps`. Allow ≥45 min walltime — the first run JIT-compiles +
 autotunes the trtllm bf16 kernel (~12–15 min).
 
 ---
@@ -159,7 +159,7 @@ host-sync readback is now removed unconditionally — `DispatchOutput` no longer
 
 ---
 
-## 4. Results — full MoE compute (`bench_moe_ep.py`)
+## 4. Results — full MoE compute (`bench_moe_ep_fleet.py`)
 
 Per-stage median µs (compute = grouped bf16 GEMM via `flashinfer.fused_moe` `TrtllmBf16Config`,
 EP-local `top_k=1`). Compute-bound throughout; tok/s ~linear in GPU count.
@@ -185,7 +185,7 @@ B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/
 ---
 
 ## 5. Artifacts / reproduce
-- Drivers: `benchmarks/moe_ep/core/comm/bench_ep_matrix.py`, `benchmarks/moe_ep/bench_moe_ep.py`; SLURM harness
+- Drivers: `benchmarks/moe_ep/core/comm/bench_ep_matrix.py`, `benchmarks/moe_ep/bench_moe_ep_fleet.py`; SLURM harness
   `benchmarks/moe_ep/core/comm/run_ep_matrix.sh` + per-rank `run_ep_matrix_one_pt.sh` (PyTorch image) /
   `run_ep_matrix_one.sh` (legacy CUDA-13.0 image).
 - nsys kernel times: `nsys profile -t cuda … bench_ep_matrix.py` then

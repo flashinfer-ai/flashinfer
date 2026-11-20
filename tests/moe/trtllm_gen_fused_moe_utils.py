@@ -509,9 +509,11 @@ class FP4Moe(Moe):
             hidden_states_quant, hidden_states_scale = mxfp8_quantize(
                 hidden_states, is_swizzling
             )
-            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
-                *hidden_states.shape[:-1], -1
-            )
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+            if not is_swizzling:
+                hidden_states_scale = hidden_states_scale.reshape(
+                    *hidden_states.shape[:-1], -1
+                )
             return {
                 "hidden_states": hidden_states_quant,
                 "hidden_states_scale": hidden_states_scale,
@@ -1207,13 +1209,21 @@ class MxInt4BlockScaleMoe(Moe):
 
 
 class FP8BlockScaleMoe(Moe):
-    """FP8 MoE implementation with block scaling (DeepSeek style or MxFp8 x MxFp8)."""
+    """FP8 MoE implementation with block scaling (DeepSeek style or MxFp8 x MxFp8).
+
+    ``block_size`` is the side of the square DeepSeek FP32 scale block: 128
+    (the checkpoint layout) or 32 (vLLM's re-blocked TP shards, Prims-TS
+    only). MXFP8 ignores it.
+    """
 
     def __init__(
-        self, fp8_quantization_type: QuantMode = QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+        self,
+        fp8_quantization_type: QuantMode = QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+        block_size: int = 128,
     ):
         super().__init__()
         self.fp8_quantization_type = fp8_quantization_type
+        self.block_size = block_size
 
     @property
     def quant_mode(self) -> QuantMode:
@@ -1231,20 +1241,21 @@ class FP8BlockScaleMoe(Moe):
         ]  # [num_experts, 2*intermediate_size, hidden_size]
 
         if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
+            block = self.block_size
             # Quantize weights to FP8
             gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
             gemm1_scales = 2 * torch.rand(
                 (
                     num_experts,
-                    intermediate_size_factor * intermediate_size // 128,
-                    hidden_size // 128,
+                    intermediate_size_factor * intermediate_size // block,
+                    hidden_size // block,
                 ),
                 device="cuda",
             ).to(torch.float)
 
             gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
             gemm2_scales = 2 * torch.rand(
-                (num_experts, hidden_size // 128, intermediate_size // 128),
+                (num_experts, hidden_size // block, intermediate_size // block),
                 device="cuda",
             ).to(torch.float)
         elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
@@ -1335,7 +1346,7 @@ class FP8BlockScaleMoe(Moe):
         # todo(Yingyi):quantize bf16 to fp8
         if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
             hidden_states_quant, hidden_states_scale = to_float8_blockwise(
-                hidden_states
+                hidden_states, block_size_n=self.block_size
             )
         elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
             hidden_states_quant, hidden_states_scale = mxfp8_quantize(
@@ -1703,11 +1714,12 @@ class FP8BlockScaleMoe(Moe):
         n_rows, intermediate_size = ref_routed.shape
 
         if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
-            # Per-(1, 128) linear block scale derived from the reference.
+            # Per-(1, block) linear block scale derived from the reference.
+            block = self.block_size
             finfo = torch.finfo(torch.float8_e4m3fn)
-            n_blocks = intermediate_size // 128
+            n_blocks = intermediate_size // block
             scale = (
-                ref_routed.view(n_rows, n_blocks, 128)
+                ref_routed.view(n_rows, n_blocks, block)
                 .abs()
                 .amax(dim=-1, keepdim=True)
                 .clamp(min=1e-12)
@@ -1716,7 +1728,7 @@ class FP8BlockScaleMoe(Moe):
             kernel_dequant = (
                 kernel_routed.view(torch.float8_e4m3fn)
                 .to(torch.float32)
-                .view(n_rows, n_blocks, 128)
+                .view(n_rows, n_blocks, block)
                 * scale
             ).view(n_rows, intermediate_size)
         else:  # FP8_BLOCK_SCALE_MXFP8
@@ -3400,15 +3412,18 @@ def run_moe_reference_dsfp8(args):
     # Generate block scales at runtime for FP8 block scaling
 
     def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
-        """Reference FP8 block-scale dequantization."""
+        """Reference FP8 block-scale dequantization.
+
+        The block size (128 or 32) is implied by the scale shape.
+        """
         input = input.to(torch.float)
         scale = scale.to(torch.float)
         if transpose_scale:
             scale = scale.t()
 
         m, n = input.shape
-        m_tile = 128 if block_m else 1
-        n_tile = 128 if block_n else 1
+        m_tile = m // scale.shape[0] if block_m else 1
+        n_tile = n // scale.shape[1] if block_n else 1
 
         assert m % m_tile == 0
         assert n % n_tile == 0

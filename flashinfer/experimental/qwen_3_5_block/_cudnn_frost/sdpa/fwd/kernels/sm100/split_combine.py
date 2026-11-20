@@ -20,9 +20,12 @@ the dense padded-Q trim (a row at or past its batch's Q length) keeps the unspli
 partials are the same as a valid keyless row's, so the dense sink entry takes the per-batch Q lengths (``compile_ptr(has_q_lens=True)``) and drops the
 sink for those rows.
 
-One block of four warps per four (q_row, head, batch) rows, a lane owning four
-columns of d_v and walking the split axis; rows shorter than a block (decode,
-S_q < 4) take the decode form, whose four warps share one row's split axis.
+One warp per (q_row, head, batch) row, up to four rows per block; a lane
+owns four columns of d_v and walks the split axis. At S_q <= 2 the lean
+form groups the independent rows across heads, with at most four head
+warps per block. There is no CTA barrier or cross-warp exchange. Past G_S
+splits, those short rows take the decode form, whose four warps share one
+row's split axis.
 
 The DECODE-GRID kernel (``_combine_decode_grid_kernel``), a fourth form of the
 lean fp32-partial path: one block per (q_row, head, batch,
@@ -125,6 +128,46 @@ fused kernels need so one G declaration serves both paths).  Every form carries
 the gate -- the decode and decode-grid forms apply the same arithmetic at their
 store -- so a gated and an ungated launch of one shape run one kernel; the gated
 entry takes no sink (a gated split with a sink is declined ahead of this pass).
+
+Gate AND a static-scale e4m3 store in ONE entry (``compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")`` ->
+``_host_ptr_gated_e4m3``; the serving decode chain's fused "split combine + sigmoid gate + static quant" launch): the gated entry's frame
+with a REQUIRED 1-element fp32 pointer appended after the gate strides -- the per-tensor DEQUANT scale ``s`` of the consumer (the o_proj
+input scale: the stored byte decodes as ``byte * s``).  Per element, on every form: the fp32 merged value, the gate arithmetic above (the
+dead-row SELECT after the fma), then ``* inv`` with ``inv = div.rn.f32(1, s)`` computed on device once per thread (the serving stacks'
+``inv = div.rn(1, scale)`` convention; the kernels' ``scale_o`` operand read as a DIVISOR under the trailing ``quant_divisor`` constexpr),
+then ``cvt.rn.satfinite.e4m3x2.f32`` per pair (round-to-nearest-even, saturating at +-448: a finite value never becomes NaN) stored as
+ONE 32-bit word per lane where the output row is 4-byte addressable (``_store_e4m3_quad``: base, D stride 1 and the (B, S, H) strides
+multiples of 4 elements -- one byte per element), the module's element path otherwise.  So the fp32 gated value is rounded ONCE, to e4m3
+(no half rounding in between): the unfused twin -- the gated half entry then ``e4m3(bf16(O) * inv)`` -- and the serving stacks' gate-and-quantize launch
+(``e4m3(bf16(bf16(O) * sigmoid(G)) * inv)``) differ from it by at most one e4m3 ulp at the larger magnitude, never bitwise, wherever the
+half twin does not underflow before the scale; below the half dtype's smallest normal the twin loses digits and then flushes to zero (f16
+from 2^-25 down) while the fused path keeps the fp32 magnitude -- the single rounding is the contract, the twin is not a general bound
+(the boundary cell of ``test_split_combine_gate_e4m3.py``: four partials of 1e-8 under a zero partial LSE, a zero gate, the scale 1e-10 ->
+48 on every form, the f16 twin 0, the bf16 twin 52).  A dead row
+stores exactly 0 (the SELECT precedes the scale; ``0 * inv`` with a finite ``inv``) -- so ``s`` is a POSITIVE NORMAL fp32 by contract: its
+value is never validated (a device word), and a zero / subnormal ``s`` makes ``inv`` +inf, a dead row's ``0 * inf`` the e4m3 NaN byte and
+every live element +-448 (or NaN where it is exactly 0) --, the LSE never sees the gate or the scale, and ``_launch_combine`` admits the
+scale on the decode-grid kernel for THIS entry only (``scale_o is None or quant_divisor``: the quantized entries' MULTIPLIER scale keeps the
+module's own forms as before).  ``quant_divisor`` is a trace-time constant on the four kernels behind ``_launch_combine``'s five forms
+(``_combine_packed_kernel`` is reached by the packed host entry only and never takes the fused store) and the two launchers, so every other
+entry's traced code is what it was.
+
+TWO ROUNDING CONVENTIONS of the fused store (``compile_ptr(out_rounding=)``; the trailing ``quant_rounding`` constexpr on the same four kernels
+and two launchers; on the adapter an OP ATTRIBUTE of the declaration, never a knob -- it changes the bytes).  ``"single"`` (the default) is the
+convention above: ONE rounding, of the fp32 gated value, FROST's own -- every existing entry traces the code it did.  ``"staged"`` reproduces a
+serving stack's gate-and-quantize launch byte for byte, ``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, s))``: the merged
+value rounded to bf16 as that stack's attention kernel stores it, the exact sigmoid as a DIVISION (``cute.math.exp`` at its default -- the
+precise lowering, never ``tanh.approx`` / a bare ``ex2`` -- and ``arith.divf`` = ``div.rn.f32``), the gated value rounded to bf16 once more, the
+fp32 multiply by the same ``div.rn(1, s)`` inverse, the saturating cvt -- spelled with the SAME DSL ops the stack's kernel spells
+(``_staged_gate_quad``), so the two agree bitwise on the arithmetic given the same (bf16 O, G, s); in a served chain the attention's own fp32
+accumulation order still flips a bf16 rounding of O on a small fraction of the elements.  Its purpose: a provider whose speculative verify is
+tuned on the stack's bytes can take the fused launch without moving the acceptance length -- the ~2-3 % of the elements one e4m3 code apart
+between the two conventions are enough to flip a near-tie greedy token.  The staged arm reads the same gate loads, keeps the dead-row SELECT
+per element AFTER the gate, then takes the single arm's ``* inv`` and store: the LSE, the dead rows (exactly 0), the PDL pair and every form
+(AUTO / ON / OFF / the lean group walk) are the single mode's.  bf16 gate dtype only (the convention is a bf16 chain's; the f16 analogue is
+refused by name, not defined); ``"staged"`` without ``gate_e4m3`` is refused by name.  The suite's boundary cell reads the mode: at a merged
+value of 1e-8, a zero gate and the scale 1e-10 the single mode stores 48 (fp32 50 ties to even), the staged mode 52 (bf16 1.0012e-8 halved to
+bf16 5.0059e-9, times 1e10 = 50.06).
 """
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -136,6 +179,7 @@ from pathlib import Path
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._quantized import _unscale_amax_kernel
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import DECODE_COMBINE_MAX_LEAN_BLOCKS as _DECODE_COMBINE_MAX_LEAN_BLOCKS
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDING_STAGED, COMBINE_OUT_ROUNDINGS
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._cutlass_compat import SmemAllocator
 
 import cutlass
@@ -145,7 +189,7 @@ from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import ffma2, fmul2, opaque_f32_zero
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global_v4, st_global_v2
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v2
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 # This helper is imported normally, outside the parameterized template loader.
@@ -228,10 +272,20 @@ DECODE_GRID_LEAN_WALK = 3
 # kernel's per-chain slot count and the wide lean group's width (DECODE_SPLITS_PER_CHAIN == G_S == 16): the bitwise window of the forms.
 LEAN_WALK_G_S = 4
 LEAN_WALK_G_T = 16
+# The fused gated e4m3 store's ROUNDING CONVENTION (the trailing ``quant_rounding`` constexpr of the four kernels behind ``_launch_combine`` and
+# of the two launchers; ``compile_ptr(out_rounding=)`` maps heuristics.COMBINE_OUT_ROUNDINGS onto it; the module docstring).  SINGLE = one
+# rounding of the fp32 gated value (the default: every existing entry's traced code); STAGED = a serving stack's gate-and-quantize order
+# (``_staged_gate_quad``: bf16 of the merged value, the exact sigmoid as a division, bf16 of the gated value, then the shared ``* inv`` and
+# saturating cvt).  A third convention appends 2 (the DECODE_GRID_* pattern), never a new signature.
+QUANT_ROUNDING_SINGLE = 0
+QUANT_ROUNDING_STAGED = 1
 
 
 def lean_grid_blocks(b: int, h: int, s_q: int) -> int:
-    """The lean forms' grid in blocks: ``ceil(S_q / ROWS_PER_BLOCK) x H_q x B`` (the quantity the decode-grid and lean-walk selection rules read)."""
+    """Logical row-grid size used by the decode-grid and lean-walk selection rules.
+
+    Short-query head packing changes the physical block grid, not this selector domain.
+    """
     return -(-int(s_q) // ROWS_PER_BLOCK) * int(h) * int(b)
 
 
@@ -240,7 +294,8 @@ def decode_grid_selected(b: int, h: int, s_q: int, d_v: int, has_sink: bool = Fa
     partials (16-byte aligned, the lean path's own precondition) of this geometry takes the decode-grid kernel --
     ``d_v % 4 == 0``, the lean grid at most ``heuristics.DECODE_COMBINE_MAX_LEAN_BLOCKS`` blocks, and no sink (``has_sink``,
     appended: the sink entries fold the sink in the module's own forms).  Quantized entries (an amax or an output scale) and
-    half partials always take the module's own forms."""
+    half partials always take the module's own forms; the FUSED gated e4m3 entry (``gate_e4m3``: its static scale is a divisor) follows
+    this twin like the half entries."""
     return not has_sink and int(d_v) % 4 == 0 and lean_grid_blocks(b, h, s_q) <= _DECODE_COMBINE_MAX_LEAN_BLOCKS
 
 
@@ -282,6 +337,9 @@ def _accumulate_splits(
         live = lse_s > neg_inf
         e = cute.math.exp(lse_s - m_safe, fastmath=True)
         w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        # Finite LSE can still underflow against a dominant split or sink.
+        # Its payload is dead too: never multiply zero by a NaN/Inf partial.
+        live = w > zero
         e0 = zero
         e1 = zero
         e2 = zero
@@ -365,13 +423,102 @@ def _ld_global_f32(addr):
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
+def _rcp_div_rn(s):
+    """``div.rn.f32(1, s)``: the IEEE round-to-nearest reciprocal of the fused e4m3 entry's static per-tensor DEQUANT scale (the serving
+    stacks' ``inv = div.rn(1, scale)`` convention), spelled as the instruction so the contract is the PTX and not a fast-math choice; the
+    1.0 is a PTX immediate, never a constant float asm OPERAND (a constant float operand ICEs libNVVM)."""
+    r = nvvm.inline_ptx(
+        "div.rn.f32 $0, 0f3F800000, $1;",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[s],
+    )
+    return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
+
+
+def _staged_gate_elem(o32, g, all_dead, zero, one):
+    """One element of :func:`_staged_gate_quad`: ``bf16(bf16(o32) / (1 + exp(-g)))`` widened back to fp32, exactly 0 on a dead row -- a SELECT
+    after the gate (a NaN gate on a dead row never reaches the byte; ``0 * inv`` with a finite ``inv`` is the dead row's 0 as in the single mode).
+    The ops are the ones a serving stack's gate-and-quantize kernel spells in this DSL, in its order, at its default flags: ``arith.truncf`` to bf16
+    (round-to-nearest-even) and ``arith.extf`` back, ``cute.math.exp`` without ``fastmath`` (the precise lowering, never the approximate one),
+    ``arith.addf``, ``arith.divf`` (``div.rn.f32``) -- so the two agree bitwise given the same (bf16 O, G)."""
+    a = o32.to(cutlass.BFloat16).to(cutlass.Float32)
+    den = one + cute.math.exp(-g)
+    v = (a / den).to(cutlass.BFloat16).to(cutlass.Float32)
+    return cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), v.ir_value()))
+
+
+def _staged_gate_quad(o0, o1, o2, o3, g0, g1, g2, g3, all_dead):
+    """The STAGED rounding convention of the fused gated e4m3 store (``quant_rounding == QUANT_ROUNDING_STAGED``; the module docstring) on one
+    lane's four columns: the fp32 merged values ``o0 .. o3`` (``acc * inv_den``, the value the ungated half entry rounds to bf16 at its store) and
+    the fp32 gate values ``g0 .. g3`` -> the four fp32 values the caller multiplies by ``div.rn(1, s)`` and converts with ``cvt.rn.satfinite`` --
+    per element ``SELECT(all_dead, 0, bf16(bf16(o) / (1 + exp(-g))))`` (:func:`_staged_gate_elem`).  Per-lane register arithmetic under a
+    trace-time constant: no barrier, no SMEM, no new global read; the single arm's text is untouched."""
+    zero = cutlass.Float32(0.0)
+    one = cutlass.Float32(1.0)
+    return (
+        _staged_gate_elem(o0, g0, all_dead, zero, one),
+        _staged_gate_elem(o1, g1, all_dead, zero, one),
+        _staged_gate_elem(o2, g2, all_dead, zero, one),
+        _staged_gate_elem(o3, g3, all_dead, zero, one),
+    )
+
+
+def _st_e4m3x4(addr, v0, v1, v2, v3):
+    """Four fp32 -> four e4m3 bytes in ONE 32-bit word (element ``i`` in byte ``i``) by two ``cvt.rn.satfinite.e4m3x2.f32`` -- each operand
+    rounded ONCE on its own: round-to-nearest-even, saturating at +-448, a finite value never becomes NaN; the first source operand lands in
+    the UPPER byte (the ``fp32_to_fp8_pack`` convention) -- stored by one ``st.global.b32`` at ``addr`` (4-byte aligned by the caller's test)."""
+    word = nvvm.inline_ptx(
+        "{ .reg .b16 lo, hi;\ncvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\ncvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\nmov.b32 $0, {lo, hi}; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[v0, v1, v2, v3],
+    )
+    st_global(addr, cutlass.Int32(word[0] if isinstance(word, (tuple, list)) else word), cutlass.Int32)
+
+
+@cute.jit
+def _store_e4m3_quad(o_out: cute.Tensor, o_batch, o_tok, head, d0, d_v, v0, v1, v2, v3, row_ok):
+    """The fused gated e4m3 entry's store of one lane's four scaled columns ``d0 .. d0 + 3`` of the final row ``(o_batch, o_tok, head)``
+    (``row_ok`` = the row is live and this thread stores): PACKED -- one ``st.global.b32`` of the four ``cvt.rn.satfinite`` bytes -- where the
+    e4m3 output is 4-byte addressable (base ``& 3 == 0``, D stride 1, the (B, S, H) strides multiples of 4 elements: one byte per element)
+    and all four columns are inside the row; the module's element path otherwise (a strided output keeps its layout; the packed path is
+    taken only where it is exact).  Both paths round with the same saturating RN conversion."""
+    oo = cutlass.make_array_view(o_out)
+    out_base = o_out.iterator.toint()
+    _st_strides = cutlass.Int64(o_out.stride[0]) | cutlass.Int64(o_out.stride[1]) | cutlass.Int64(o_out.stride[2])
+    packed_ok = (
+        ((out_base & cutlass.Int64(3)) == cutlass.Int64(0))
+        & (cutlass.Int64(o_out.stride[3]) == cutlass.Int64(1))
+        & ((_st_strides & cutlass.Int64(3)) == cutlass.Int64(0))
+    )
+    if packed_ok & row_ok & (d0 + cutlass.Int32(3) < d_v):
+        o_idx = cute.crd2idx((o_batch, o_tok, head, d0), o_out.layout)
+        _st_e4m3x4(out_base + cutlass.Int64(o_idx), v0, v1, v2, v3)
+    else:
+        vals = (v0, v1, v2, v3)
+        for i in cutlass.range_constexpr(4):
+            # Index all modes: ArrayView's row slice is a pointer and drops the final mode's stride.
+            if row_ok & (d0 + cutlass.Int32(i) < d_v):
+                oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+
+
+@cute.jit
+def _query_length(q_lens, batch):
+    """Lengths and adjacent prefix pairs are two plan-time views of device data."""
+    a = cutlass.make_array_view(q_lens)
+    if cutlass.const_expr(cute.rank(q_lens) == 2):
+        length = cutlass.Int64(a[batch, 1]) - cutlass.Int64(a[batch, 0])
+    else:
+        length = cutlass.Int64(a[batch])
+    return length
+
+
 def _row_sink_logit(sinks, q_lens, head, batch, q_row):
     """The sink logit one row folds: its head's, or -inf (no sink at all) on a PADDED row -- a query row at or past its batch's Q length
     ``q_lens[batch]`` (the dense padded-Q trim), whose O / Stats stay 0 / -inf whatever the sink.  The partials of such a row and of a valid row whose
     every key is masked are the same (every split dead), so the reduction cannot tell them apart without the length."""
     sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
     if cutlass.const_expr(q_lens is not None):
-        padded = cutlass.Int32(q_row) >= cutlass.Int32(cutlass.make_array_view(q_lens)[batch])
+        padded = cutlass.Int32(q_row) >= cutlass.Int32(_query_length(q_lens, batch))
         sink_logit = cutlass.Float32(arith.select(padded.ir_value(), cutlass.Float32(NEG_INF).ir_value(), sink_logit.ir_value()))
     return sink_logit
 
@@ -503,20 +650,39 @@ def _combine_kernel(
     # the split tile's output, so nothing is read above the wait; the pass has no prologue to overlap, so the dependent grid (the
     # out projection in the gated block) is released right after it and stages its own while this pass runs.
     use_pdl: cutlass.Constexpr[bool] = False,
+    pack_heads: cutlass.Constexpr[bool] = False,
+    # The FUSED gated e4m3 entry (compile_ptr(gate_e4m3=True); the module docstring): scale_o is the static per-tensor DEQUANT scale --
+    # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
+    # trace-time constant: the OFF arm's traced code is unchanged.
+    quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
         launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
-    q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
-    head = cute.arch.block_idx()[1]
-    batch = cute.arch.block_idx()[2]
+    if cutlass.const_expr(pack_heads):
+        # Group the independent query rows across heads to keep each block busy.
+        head64 = cutlass.Int64(cute.arch.block_idx()[0]) * ROWS_PER_BLOCK + cutlass.Int64(tidx // 32)
+        head = cutlass.Int32(head64)
+        q_row = cute.arch.block_idx()[1]
+        batch = cute.arch.block_idx()[2]
+        in_bounds = head64 < cutlass.Int64(o_partial.shape[2])
+    else:
+        q_row = cute.arch.block_idx()[0] * cutlass.Int32(ROWS_PER_BLOCK) + tidx // cutlass.Int32(32)
+        head = cute.arch.block_idx()[1]
+        batch = cute.arch.block_idx()[2]
+        in_bounds = q_row < s_q
 
-    # A warp past S_q (last block only) has no row; there is no block-level
+    # A warp past the query/head bound has no row; there is no block-level
     # barrier below, so it simply falls through. Everything inside is
     # warp-uniform except the per-lane column guard.
-    if q_row < s_q:
+    if in_bounds:
         op = cutlass.make_array_view(o_partial)
         lp = cutlass.make_array_view(lse_partial)
         oo = cutlass.make_array_view(o_out)
@@ -537,6 +703,8 @@ def _combine_kernel(
             rq = cutlass.make_array_view(ragged_q)
             q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
             q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+            if cutlass.const_expr(q_lens is not None):
+                q_len64 = _query_length(q_lens, batch)
             in_seq = cutlass.Int64(q_row) < q_len64
             o_batch = cutlass.Int32(0)
             o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
@@ -587,6 +755,8 @@ def _combine_kernel(
             q_scale = cutlass.Float32(1.0)
             if cutlass.const_expr(scale_o is not None):
                 q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+                if cutlass.const_expr(quant_divisor):
+                    q_scale = _rcp_div_rn(q_scale)  # the fused e4m3 entry: inv = div.rn(1, scale), the serving stacks' convention
             # Gate in the combine: the 0.5 handed to the packed multiply must be opaque (a constant
             # float into inline_ptx ICEs libNVVM).  Hoisted once per row, like the fused kernels do
             # per tile; traced only on the gated entry, so the plain entries' code is unchanged.
@@ -640,24 +810,29 @@ def _combine_kernel(
                             g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                         if d0 + cutlass.Int32(3) < d_v:
                             g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                        h0 = acc0 * inv_den_half
-                        h1 = acc1 * inv_den_half
-                        h2 = acc2 * inv_den_half
-                        h3 = acc3 * inv_den_half
-                        s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                        s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                        t0 = cute.math.tanh(s0, approx=True)
-                        t1 = cute.math.tanh(s1, approx=True)
-                        t2 = cute.math.tanh(s2, approx=True)
-                        t3 = cute.math.tanh(s3, approx=True)
-                        y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                        y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                        outs = (
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                        )
+                        if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                            # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value
+                            # rounded to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                            outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                        else:
+                            h0 = acc0 * inv_den_half
+                            h1 = acc1 * inv_den_half
+                            h2 = acc2 * inv_den_half
+                            h3 = acc3 * inv_den_half
+                            s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                            s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                            t0 = cute.math.tanh(s0, approx=True)
+                            t1 = cute.math.tanh(s1, approx=True)
+                            t2 = cute.math.tanh(s2, approx=True)
+                            t3 = cute.math.tanh(s3, approx=True)
+                            y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                            y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                            outs = (
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                            )
                     vals = []
                     for i in cutlass.range_constexpr(4):
                         o_val = outs[i]
@@ -683,12 +858,15 @@ def _combine_kernel(
                                 if row_live & (d0 + cutlass.Int32(i) < d_v):
                                     oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
                     else:
-                        for i in cutlass.range_constexpr(4):
-                            # Index all modes: ArrayView's row slice is a pointer and drops
-                            # the final mode's stride, so a subsequent [d0] would assume
-                            # contiguous D.
-                            if row_live & (d0 + cutlass.Int32(i) < d_v):
-                                oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+                        if cutlass.const_expr(quant_divisor):
+                            _store_e4m3_quad(o_out, o_batch, o_tok, head, d0, d_v, vals[0], vals[1], vals[2], vals[3], row_live)
+                        else:
+                            for i in cutlass.range_constexpr(4):
+                                # Index all modes: ArrayView's row slice is a pointer and drops
+                                # the final mode's stride, so a subsequent [d0] would assume
+                                # contiguous D.
+                                if row_live & (d0 + cutlass.Int32(i) < d_v):
+                                    oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
         else:
             # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
             # Every lane redundantly walks the (very short) split axis; the values
@@ -754,6 +932,8 @@ def _combine_kernel(
             q_scale = cutlass.Float32(1.0)
             if cutlass.const_expr(scale_o is not None):
                 q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+                if cutlass.const_expr(quant_divisor):
+                    q_scale = _rcp_div_rn(q_scale)  # the fused e4m3 entry: inv = div.rn(1, scale), the serving stacks' convention
             # Gate in the combine: sigmoid's two constants fold into the scale
             # (``h = acc * (inv_den / 2)``: exact, a power-of-two scaling of the
             # plain output) and into the ``h * t + h`` fma; the 0.5 handed to the
@@ -833,37 +1013,48 @@ def _combine_kernel(
                             g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                         if d0 + cutlass.Int32(3) < d_v:
                             g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                        h0 = acc0 * inv_den_half
-                        h1 = acc1 * inv_den_half
-                        h2 = acc2 * inv_den_half
-                        h3 = acc3 * inv_den_half
-                        s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                        s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                        t0 = cute.math.tanh(s0, approx=True)
-                        t1 = cute.math.tanh(s1, approx=True)
-                        t2 = cute.math.tanh(s2, approx=True)
-                        t3 = cute.math.tanh(s3, approx=True)
-                        y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                        y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                        outs = (
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                        if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                            # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value
+                            # rounded to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                            outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                        else:
+                            h0 = acc0 * inv_den_half
+                            h1 = acc1 * inv_den_half
+                            h2 = acc2 * inv_den_half
+                            h3 = acc3 * inv_den_half
+                            s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                            s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                            t0 = cute.math.tanh(s0, approx=True)
+                            t1 = cute.math.tanh(s1, approx=True)
+                            t2 = cute.math.tanh(s2, approx=True)
+                            t3 = cute.math.tanh(s3, approx=True)
+                            y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                            y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                            outs = (
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                            )
+                    if cutlass.const_expr(quant_divisor):
+                        # the fused gated e4m3 entry: the four scaled columns, then the packed / element store (no amax arm on this entry)
+                        _store_e4m3_quad(
+                            o_out, o_batch, o_tok, head, d0, d_v, outs[0] * q_scale, outs[1] * q_scale, outs[2] * q_scale, outs[3] * q_scale, row_live
                         )
-                    for i in cutlass.range_constexpr(4):
-                        o_val = outs[i]
-                        if cutlass.const_expr(amax_o is not None):
-                            # Measured before scale_o, so this is already the pre-quant
-                            # amax and needs no post-hoc divide.
-                            amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
-                        if cutlass.const_expr(scale_o is not None):
-                            o_val = o_val * q_scale
-                        # Index all modes: ArrayView's row slice is a pointer and drops
-                        # the final mode's stride, so a subsequent [d0] would assume
-                        # contiguous D.
-                        if row_live & (d0 + cutlass.Int32(i) < d_v):
-                            oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
+                    else:
+                        for i in cutlass.range_constexpr(4):
+                            o_val = outs[i]
+                            if cutlass.const_expr(amax_o is not None):
+                                # Measured before scale_o, so this is already the pre-quant
+                                # amax and needs no post-hoc divide.
+                                amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+                            if cutlass.const_expr(scale_o is not None):
+                                o_val = o_val * q_scale
+                            # Index all modes: ArrayView's row slice is a pointer and drops
+                            # the final mode's stride, so a subsequent [d0] would assume
+                            # contiguous D.
+                            if row_live & (d0 + cutlass.Int32(i) < d_v):
+                                oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
 
         # amax: reduce across the warp, then ONE atomic per warp.  The value is
         # non-negative, so its fp32 bit pattern orders the same as the float and
@@ -944,6 +1135,15 @@ def _combine_decode_kernel(
     # Programmatic dependent launch: _combine_kernel's pair, traced under the same flag the launch attribute is set by -- the
     # wait before the first global read (the ragged offsets and the partial slabs alike), the release right after it.
     use_pdl: cutlass.Constexpr[bool] = False,
+    # The FUSED gated e4m3 entry (compile_ptr(gate_e4m3=True); the module docstring): scale_o is the static per-tensor DEQUANT scale --
+    # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
+    # trace-time constant: the OFF arm's traced code is unchanged.
+    quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The decode form (S_q < 4): one block of four warps per row set.
 
@@ -1003,6 +1203,8 @@ def _combine_decode_kernel(
         rq = cutlass.make_array_view(ragged_q)
         q_base = cutlass.Int64(rq[batch]) // cutlass.Int64(ragged_q_div)
         q_len64 = cutlass.Int64(rq[batch + cutlass.Int32(1)]) // cutlass.Int64(ragged_q_div) - q_base
+        if cutlass.const_expr(q_lens is not None):
+            q_len64 = _query_length(q_lens, batch)
         in_seq = cutlass.Int64(q_row) < q_len64
         o_batch = cutlass.Int32(0)
         o_tok64 = cutlass.Int64(cutlass.make_array_view(ragged_o)[batch]) // cutlass.Int64(ragged_o_div) + cutlass.Int64(q_row)
@@ -1098,6 +1300,8 @@ def _combine_decode_kernel(
     q_scale = cutlass.Float32(1.0)
     if cutlass.const_expr(scale_o is not None):
         q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+        if cutlass.const_expr(quant_divisor):
+            q_scale = _rcp_div_rn(q_scale)  # the fused e4m3 entry: inv = div.rn(1, scale), the serving stacks' convention
     for cbase in cutlass.range(0, d_v, 128, unroll=1):
         d0 = cbase + lane * cutlass.Int32(4)
         col_ok = active & (d0 < d_v)
@@ -1208,38 +1412,47 @@ def _combine_decode_kernel(
                         g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                     if d0 + cutlass.Int32(3) < d_v:
                         g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                h0 = acc0 * inv_den_half
-                h1 = acc1 * inv_den_half
-                h2 = acc2 * inv_den_half
-                h3 = acc3 * inv_den_half
-                s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                t0 = cute.math.tanh(s0, approx=True)
-                t1 = cute.math.tanh(s1, approx=True)
-                t2 = cute.math.tanh(s2, approx=True)
-                t3 = cute.math.tanh(s3, approx=True)
-                y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                outs = (
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                )
-            for i in cutlass.range_constexpr(4):
-                o_val = outs[i]
-                if cutlass.const_expr(amax_o is not None):
-                    # Measured before scale_o, so this is already the pre-quant
-                    # amax and needs no post-hoc divide.
-                    if col_ok & (d0 + cutlass.Int32(i) < d_v):
-                        amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
-                if cutlass.const_expr(scale_o is not None):
-                    o_val = o_val * q_scale
-                # Index all modes: ArrayView's row slice is a pointer and drops
-                # the final mode's stride, so a subsequent [d0] would assume
-                # contiguous D.
-                if row_live & (d0 + cutlass.Int32(i) < d_v):
-                    oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
+                if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                    # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value rounded
+                    # to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                    outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                else:
+                    h0 = acc0 * inv_den_half
+                    h1 = acc1 * inv_den_half
+                    h2 = acc2 * inv_den_half
+                    h3 = acc3 * inv_den_half
+                    s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                    s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                    t0 = cute.math.tanh(s0, approx=True)
+                    t1 = cute.math.tanh(s1, approx=True)
+                    t2 = cute.math.tanh(s2, approx=True)
+                    t3 = cute.math.tanh(s3, approx=True)
+                    y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                    y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                    outs = (
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                    )
+            if cutlass.const_expr(quant_divisor):
+                # the fused gated e4m3 entry: the four scaled columns, then the packed / element store (no amax arm on this entry)
+                _store_e4m3_quad(o_out, o_batch, o_tok, head, d0, d_v, outs[0] * q_scale, outs[1] * q_scale, outs[2] * q_scale, outs[3] * q_scale, row_live)
+            else:
+                for i in cutlass.range_constexpr(4):
+                    o_val = outs[i]
+                    if cutlass.const_expr(amax_o is not None):
+                        # Measured before scale_o, so this is already the pre-quant
+                        # amax and needs no post-hoc divide.
+                        if col_ok & (d0 + cutlass.Int32(i) < d_v):
+                            amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+                    if cutlass.const_expr(scale_o is not None):
+                        o_val = o_val * q_scale
+                    # Index all modes: ArrayView's row slice is a pointer and drops
+                    # the final mode's stride, so a subsequent [d0] would assume
+                    # contiguous D.
+                    if row_live & (d0 + cutlass.Int32(i) < d_v):
+                        oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
 
     # amax: reduce across the warp, then ONE atomic per warp.  The value is
     # non-negative, so its fp32 bit pattern orders the same as the float and
@@ -1295,6 +1508,15 @@ def _combine_decode_grid_kernel(
     # out projection in the gated block) is released right after it -- the lean kernel's pair, on the kernel the served decode
     # plans run (a chain whose combine lacked the sites would silently serialize here).
     use_pdl: cutlass.Constexpr[bool] = False,
+    # The FUSED gated e4m3 entry (compile_ptr(gate_e4m3=True); the module docstring): scale_o is the static per-tensor DEQUANT scale --
+    # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
+    # trace-time constant: the OFF arm's traced code is unchanged.
+    quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The DECODE-GRID form of the lean fp32-partial combine (module constants ``DECODE_*``; the layout
     + barrier / SMEM notes are in the module docstring; the cc 10.7 adapter's form on a small split
@@ -1495,27 +1717,34 @@ def _combine_decode_grid_kernel(
                     g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                 if d0 + cutlass.Int32(3) < d_v:
                     g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-            hg0 = acc0 * inv_den_half
-            hg1 = acc1 * inv_den_half
-            hg2 = acc2 * inv_den_half
-            hg3 = acc3 * inv_den_half
-            s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-            s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-            t0 = cute.math.tanh(s0, approx=True)
-            t1 = cute.math.tanh(s1, approx=True)
-            t2 = cute.math.tanh(s2, approx=True)
-            t3 = cute.math.tanh(s3, approx=True)
-            y0, y1 = ffma2(t0, t1, hg0, hg1, hg0, hg1)
-            y2, y3 = ffma2(t2, t3, hg2, hg3, hg2, hg3)
-            outs = (
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-            )
+            if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value rounded to
+                # bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+            else:
+                hg0 = acc0 * inv_den_half
+                hg1 = acc1 * inv_den_half
+                hg2 = acc2 * inv_den_half
+                hg3 = acc3 * inv_den_half
+                s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                t0 = cute.math.tanh(s0, approx=True)
+                t1 = cute.math.tanh(s1, approx=True)
+                t2 = cute.math.tanh(s2, approx=True)
+                t3 = cute.math.tanh(s3, approx=True)
+                y0, y1 = ffma2(t0, t1, hg0, hg1, hg0, hg1)
+                y2, y3 = ffma2(t2, t3, hg2, hg3, hg2, hg3)
+                outs = (
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                )
         q_scale = cutlass.Float32(1.0)
         if cutlass.const_expr(scale_o is not None):
             q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+            if cutlass.const_expr(quant_divisor):
+                q_scale = _rcp_div_rn(q_scale)  # the fused e4m3 entry: inv = div.rn(1, scale), the serving stacks' convention
         amax_local = zero
         vals = []
         for i in cutlass.range_constexpr(4):
@@ -1553,10 +1782,13 @@ def _combine_decode_grid_kernel(
                     if store_row & (d0 + cutlass.Int32(i) < d_v):
                         oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
         else:
-            for i in cutlass.range_constexpr(4):
-                # Index all modes: ArrayView's row slice is a pointer and drops the final mode's stride.
-                if store_row & (d0 + cutlass.Int32(i) < d_v):
-                    oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+            if cutlass.const_expr(quant_divisor):
+                _store_e4m3_quad(o_out, o_batch, o_tok, head, d0, d_v, vals[0], vals[1], vals[2], vals[3], store_row)
+            else:
+                for i in cutlass.range_constexpr(4):
+                    # Index all modes: ArrayView's row slice is a pointer and drops the final mode's stride.
+                    if store_row & (d0 + cutlass.Int32(i) < d_v):
+                        oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
         if cutlass.const_expr(amax_o is not None):
             # ONE atomic per block over the chunk's columns (an integer max on the non-negative fp32
             # bit pattern is exact and order-independent); all 32 lanes run the shuffles.
@@ -1590,6 +1822,9 @@ def _combine_packed_kernel(
     stats_log2: cutlass.Constexpr[bool],
     sinks: Optional[cute.Tensor] = None,
     prefetch_group: cutlass.Constexpr[int] = 0,
+    cu_q: Optional[cute.Tensor] = None,
+    origin_offsets=None,
+    origin_specs: cutlass.Constexpr = None,
 ) -> None:
     """Four packed rows per CTA; each warp reuses split weights across D.
 
@@ -1604,6 +1839,26 @@ def _combine_packed_kernel(
     if (row >= o_partial.shape[1]) | (row >= cutlass.make_array_view(total_q)[0]):
         # Warp-uniform, with no CTA barriers in this kernel.
         nvvm.exit()
+    o_row, stats_row = cutlass.Int64(row), cutlass.Int64(row)
+    if cutlass.const_expr(cu_q is not None):
+        prefix = cutlass.make_array_view(cu_q)
+        lo, hi = cutlass.Int32(0), cutlass.Int32(cu_q.shape[0] - 1)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if prefix[mid + 1] <= row:
+                lo = mid + 1
+            else:
+                hi = mid
+        local_row = cutlass.Int64(row) - cutlass.Int64(prefix[lo])
+        if cutlass.const_expr(origin_specs[3] is not None):
+            o_row = (
+                cutlass.Int64(cutlass.make_array_view(origin_offsets[3])[lo]) * cutlass.Int64(origin_specs[3][1]) // cutlass.Int64(o_out.stride[1]) + local_row
+            )
+        if cutlass.const_expr(origin_specs[4] is not None):
+            stats_row = (
+                cutlass.Int64(cutlass.make_array_view(origin_offsets[4])[lo]) * cutlass.Int64(origin_specs[4][1]) // cutlass.Int64(origin_specs[4][2])
+                + local_row
+            )
     op = cutlass.make_array_view(o_partial)
     lp = cutlass.make_array_view(lse_partial)
     oo = cutlass.make_array_view(o_out)
@@ -1640,14 +1895,14 @@ def _combine_packed_kernel(
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
                     values = (a0, a1, a2, a3)
                     for slot in cutlass.range_constexpr(4):
-                        oo[0, row, head, d0 + slot] = (values[slot] * inv_den).to(o_out.element_type)
+                        oo[0, o_row, head, d0 + slot] = (values[slot] * inv_den).to(o_out.element_type)
                     if cutlass.const_expr(lse_out is not None):
                         if (lane == 0) & (d_base == 0):
                             value = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
                             value = cutlass.Float32(arith.select(all_dead.ir_value(), neg_inf.ir_value(), value.ir_value()))
                             if cutlass.const_expr(stats_log2):
                                 value = value * cutlass.Float32(1.4426950408889634)
-                            cutlass.make_array_view(lse_out)[0, head, row] = value
+                            cutlass.make_array_view(lse_out)[0, head, stats_row] = value
             # Warp-uniform branch, no CTA synchronization in either reducer.
             nvvm.exit()
     parallel = n_splits <= 32
@@ -1708,14 +1963,14 @@ def _combine_packed_kernel(
         for slot in cutlass.range_constexpr(4):
             d = d_base + lane + slot * 32
             if d < o_partial.shape[3]:
-                oo[0, row, head, d] = (acc[slot] * inv_den).to(o_out.element_type)
+                oo[0, o_row, head, d] = (acc[slot] * inv_den).to(o_out.element_type)
     if cutlass.const_expr(lse_out is not None):
         if lane == 0:
             value = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             value = cutlass.Float32(arith.select(all_dead.ir_value(), neg_inf.ir_value(), value.ir_value()))
             if cutlass.const_expr(stats_log2):
                 value = value * cutlass.Float32(1.4426950408889634)
-            cutlass.make_array_view(lse_out)[0, head, row] = value
+            cutlass.make_array_view(lse_out)[0, head, stats_row] = value
 
 
 _combine_packed_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1770,6 +2025,15 @@ def _combine_lean_walk_kernel(
     # the split tile's output, so nothing is read above the wait; the pass has no prologue to overlap, so the dependent grid (the
     # out projection in the gated block) is released right after it and stages its own while this pass runs.
     use_pdl: cutlass.Constexpr[bool] = False,
+    # The FUSED gated e4m3 entry (compile_ptr(gate_e4m3=True); the module docstring): scale_o is the static per-tensor DEQUANT scale --
+    # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
+    # trace-time constant: the OFF arm's traced code is unchanged.
+    quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The LEAN GROUP WALK: the module's former lean kernel, restored as the fifth form for the lean-grid-overflow launches of the cc 10.7
     line (the module docstring).  One warp per (q_row, head, batch), ROWS_PER_BLOCK rows per block, a lane owning four columns of every
@@ -1849,6 +2113,8 @@ def _combine_lean_walk_kernel(
         q_scale = cutlass.Float32(1.0)
         if cutlass.const_expr(scale_o is not None):
             q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+            if cutlass.const_expr(quant_divisor):
+                q_scale = _rcp_div_rn(q_scale)  # the fused e4m3 entry: inv = div.rn(1, scale), the serving stacks' convention
         # Gate in the combine: the 0.5 handed to the packed multiply must be opaque (a constant
         # float into inline_ptx ICEs libNVVM).  Hoisted once per row, like the fused kernels do
         # per tile; traced only on the gated entry, so the plain entries' code is unchanged.
@@ -1957,24 +2223,29 @@ def _combine_lean_walk_kernel(
                         g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                     if d0 + cutlass.Int32(3) < d_v:
                         g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                    h0 = acc0 * inv_den_half
-                    h1 = acc1 * inv_den_half
-                    h2 = acc2 * inv_den_half
-                    h3 = acc3 * inv_den_half
-                    s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                    s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                    t0 = cute.math.tanh(s0, approx=True)
-                    t1 = cute.math.tanh(s1, approx=True)
-                    t2 = cute.math.tanh(s2, approx=True)
-                    t3 = cute.math.tanh(s3, approx=True)
-                    y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                    y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                    outs = (
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                    )
+                    if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                        # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value
+                        # rounded to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                        outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                    else:
+                        h0 = acc0 * inv_den_half
+                        h1 = acc1 * inv_den_half
+                        h2 = acc2 * inv_den_half
+                        h3 = acc3 * inv_den_half
+                        s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                        s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                        t0 = cute.math.tanh(s0, approx=True)
+                        t1 = cute.math.tanh(s1, approx=True)
+                        t2 = cute.math.tanh(s2, approx=True)
+                        t3 = cute.math.tanh(s3, approx=True)
+                        y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                        y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                        outs = (
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                        )
                 vals = []
                 for i in cutlass.range_constexpr(4):
                     o_val = outs[i]
@@ -2000,12 +2271,15 @@ def _combine_lean_walk_kernel(
                             if row_live & (d0 + cutlass.Int32(i) < d_v):
                                 oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
                 else:
-                    for i in cutlass.range_constexpr(4):
-                        # Index all modes: ArrayView's row slice is a pointer and drops
-                        # the final mode's stride, so a subsequent [d0] would assume
-                        # contiguous D.
-                        if row_live & (d0 + cutlass.Int32(i) < d_v):
-                            oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+                    if cutlass.const_expr(quant_divisor):
+                        _store_e4m3_quad(o_out, o_batch, o_tok, head, d0, d_v, vals[0], vals[1], vals[2], vals[3], row_live)
+                    else:
+                        for i in cutlass.range_constexpr(4):
+                            # Index all modes: ArrayView's row slice is a pointer and drops
+                            # the final mode's stride, so a subsequent [d0] would assume
+                            # contiguous D.
+                            if row_live & (d0 + cutlass.Int32(i) < d_v):
+                                oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
         # amax: reduce across the warp, then ONE atomic per warp.  The value is
         # non-negative, so its fp32 bit pattern orders the same as the float and
         # an integer atomicMax is exact -- the same trick the kernels' own
@@ -2054,6 +2328,15 @@ def _launch_own_forms(
     sinks: Optional[cute.Tensor] = None,
     q_lens: Optional[cute.Tensor] = None,
     use_pdl: cutlass.Constexpr[bool] = False,
+    # The FUSED gated e4m3 entry (compile_ptr(gate_e4m3=True); the module docstring): scale_o is the static per-tensor DEQUANT scale --
+    # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
+    # trace-time constant: the OFF arm's traced code is unchanged.
+    quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The module's own THREE-WAY rule -- what ``DECODE_GRID_OFF`` means, and what every launch that takes neither the
     decode-grid kernel nor the lean group walk runs: one of three kernels, chosen per launch from the runtime geometry
@@ -2097,7 +2380,7 @@ def _launch_own_forms(
     # S_q = 1, 2-8 splits: 3.4-4.4 us -> 2.1-2.9 us).
     if cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2):
         if n_splits > cutlass.Int32(G_S):
-            _combine_decode_kernel(*args, use_pdl=use_pdl).launch(
+            _combine_decode_kernel(*args, use_pdl=use_pdl, quant_divisor=quant_divisor, quant_rounding=quant_rounding).launch(
                 grid=(1, H, B),
                 block=[THREADS, 1, 1],
                 smem=SMEM_BYTES,
@@ -2105,14 +2388,18 @@ def _launch_own_forms(
                 use_pdl=use_pdl,
             )
         else:
-            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl).launch(
-                grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
-                block=[THREADS, 1, 1],
+            # Each warp owns one row without a CTA barrier or cross-warp
+            # exchange. Group heads so short-query batches use fewer blocks;
+            # a head tail is guarded independently in the kernel.
+            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl, pack_heads=True, quant_divisor=quant_divisor, quant_rounding=quant_rounding).launch(
+                grid=((H + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, SQ, B),
+                block=[cute.math.min(cutlass.Int32(H), cutlass.Int32(ROWS_PER_BLOCK)) * 32, 1, 1],
+                max_number_threads=[THREADS, 1, 1],
                 stream=stream,
                 use_pdl=use_pdl,
             )
     else:
-        _combine_kernel(*args, use_pdl=use_pdl).launch(
+        _combine_kernel(*args, use_pdl=use_pdl, quant_divisor=quant_divisor, quant_rounding=quant_rounding).launch(
             grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
             block=[THREADS, 1, 1],
             stream=stream,
@@ -2142,6 +2429,15 @@ def _launch_combine(
     sinks: Optional[cute.Tensor] = None,
     q_lens: Optional[cute.Tensor] = None,
     use_pdl: cutlass.Constexpr[bool] = False,
+    # The FUSED gated e4m3 entry (compile_ptr(gate_e4m3=True); the module docstring): scale_o is the static per-tensor DEQUANT scale --
+    # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
+    # trace-time constant: the OFF arm's traced code is unchanged.
+    quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """One launch for every ABI: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
@@ -2166,7 +2462,10 @@ def _launch_combine(
     other launch takes the module's own three-way rule (``_launch_own_forms``):
     under AUTO / ON / OFF a sink, an amax or an output scale, half partials, an
     unaligned slab, a grid past the bound (AUTO) or OFF itself; under LEAN_WALK
-    a sink, half partials or an unaligned slab."""
+    a sink, half partials or an unaligned slab.  ``quant_divisor`` (appended; the fused gated e4m3 entry) reads ``scale_o`` as the
+    static per-tensor DEQUANT scale (``inv = div.rn(1, s)`` on device) and stores the e4m3 row packed; it is the ONE caller whose scale the
+    decode-grid kernel admits (``scale_o is None or quant_divisor``) -- the quantized entries' multiplier scale keeps the module's own
+    forms as before."""
     B, H, SQ, D = problem_size
     if cutlass.const_expr(decode_grid == DECODE_GRID_LEAN_WALK and o_partial.element_type == cutlass.Float32 and sinks is None and q_lens is None):
         # The LEAN GROUP WALK entry (the cc 10.7 adapter's on a lean-grid-overflow plan): the walk where the lean geometry holds -- the
@@ -2200,6 +2499,8 @@ def _launch_combine(
                 cutlass.Int32(ragged_caps[1]),
                 gate,
                 use_pdl,
+                quant_divisor,
+                quant_rounding,
             ).launch(
                 grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
                 block=[THREADS, 1, 1],
@@ -2227,6 +2528,8 @@ def _launch_combine(
                 sinks,
                 q_lens,
                 use_pdl,
+                quant_divisor,
+                quant_rounding,
             )
     else:
         # The decode-grid kernel's geometry test is the lean path's own: lane l reads columns 4l..4l+3 of the compact fp32 partial
@@ -2237,7 +2540,7 @@ def _launch_combine(
             decode_grid != DECODE_GRID_OFF
             and o_partial.element_type == cutlass.Float32
             and amax_o is None
-            and scale_o is None
+            and (scale_o is None or quant_divisor)
             and sinks is None
             and q_lens is None
         ):
@@ -2273,6 +2576,8 @@ def _launch_combine(
                 cutlass.Int32(ragged_caps[1]),
                 gate,
                 use_pdl,
+                quant_divisor,
+                quant_rounding,
             ).launch(
                 grid=(cutlass.Int32(SQ) * n_chunks, H, B),
                 block=[DECODE_THREADS, 1, 1],
@@ -2300,6 +2605,8 @@ def _launch_combine(
                 sinks,
                 q_lens,
                 use_pdl,
+                quant_divisor,
+                quant_rounding,
             )
 
 
@@ -2404,6 +2711,64 @@ def _host_ptr_gated(
 
 
 @cute.jit
+def _host_ptr_gated_e4m3(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    gate_ptr: cute.Pointer,
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    scale_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
+    use_pdl: cutlass.Constexpr[bool] = False,
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
+) -> None:
+    """:func:`_host_ptr_gated` plus the 1-element fp32 static per-tensor DEQUANT scale ``scale_ptr`` (REQUIRED, right after the gate
+    strides: no defaulted slot ahead of ``stream``) -- the FUSED gated e4m3 entry of the module docstring: the fp32 merged value gated, times
+    ``div.rn(1, scale[0])`` on device, rounded ONCE to the e4m3 output (``cvt.rn.satfinite``), the dead rows 0, the LSE untouched.  Every form
+    (the decode-grid kernel under AUTO / ON where its geometry holds, the module's own forms otherwise) runs the same arithmetic.
+    ``quant_rounding`` (appended after ``use_pdl``; a Constexpr, never a runtime slot, so the positional frame is unchanged) names the store's
+    rounding convention: ``QUANT_ROUNDING_SINGLE`` (the default, the one rounding above) or ``QUANT_ROUNDING_STAGED`` (``compile_ptr(out_rounding=
+    "staged")``: a serving stack's gate-and-quantize order, ``_staged_gate_quad``)."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    B, H, SQ, D = problem_size
+    gate = cute.make_tensor(gate_ptr, cute.make_layout((B, SQ, H, D), stride=gate_strides))
+    scale = cute.make_tensor(scale_ptr, cute.make_layout((1,), stride=(1,)))
+    _launch_combine(
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        scale,
+        problem_size,
+        n_splits,
+        stats_log2,
+        None,
+        None,
+        None,
+        (1, 1, 1),
+        (0, 0),
+        gate,
+        decode_grid,
+        stream,
+        None,
+        None,
+        use_pdl,
+        True,
+        quant_rounding,
+    )
+
+
+@cute.jit
 def _host_ptr_packed(
     o_partial_ptr: cute.Pointer,
     lse_partial_ptr: cute.Pointer,
@@ -2418,6 +2783,10 @@ def _host_ptr_packed(
     stream: _cuda_driver.CUstream = None,
     sinks_ptr: Optional[cute.Pointer] = None,
     prefetch_group: cutlass.Constexpr[int] = 0,
+    cu_q_ptr: Optional[cute.Pointer] = None,
+    origin_ptrs=None,
+    origin_specs: cutlass.Constexpr = None,
+    n_batch: cutlass.Int32 = 0,
 ) -> None:
     """Combine compact [split, packed token, head, D] partials (B must be 1)."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
@@ -2429,7 +2798,15 @@ def _host_ptr_packed(
     grid = ((problem_size[2] + 3) // 4, problem_size[1], 1)
     # The prepared attention host already specializes on split count. Compile
     # just that reducer; standalone runtime-split callers keep the generic one.
-    _combine_packed_kernel(*args, prefetch_group=prefetch_group).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
+    cu_q = cute.make_tensor(cu_q_ptr, cute.make_layout((n_batch + 1,), stride=(1,))) if cutlass.const_expr(cu_q_ptr is not None) else None
+    offsets = (
+        tuple(cute.make_tensor(ptr, cute.make_layout((n_batch + 1,), stride=(1,))) if ptr is not None else None for ptr in origin_ptrs)
+        if cutlass.const_expr(origin_ptrs is not None)
+        else None
+    )
+    _combine_packed_kernel(*args, prefetch_group=prefetch_group, cu_q=cu_q, origin_offsets=offsets, origin_specs=origin_specs).launch(
+        grid=grid, block=[THREADS, 1, 1], stream=stream
+    )
 
 
 @cute.jit
@@ -2448,6 +2825,42 @@ def _host_ptr_quantized(
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Preserve the sink-free quantized entry's original positional ABI."""
+    _host_ptr_quantized_sink(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        amax_o_ptr,
+        scale_o_ptr,
+        has_scale_o,
+        stats_log2,
+        stream,
+    )
+
+
+@cute.jit
+def _host_ptr_quantized_sink(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    amax_o_ptr: Optional[cute.Pointer],
+    scale_o_ptr: Optional[cute.Pointer],
+    has_scale_o: cutlass.Constexpr[bool],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+    sinks_ptr: Optional[cute.Pointer] = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+) -> None:
     """Reduce FP8-input partials, then scale/cast and report the recombined Amax.
 
     Quantized outputs keep unscaled partials and apply scale_o here. Half outputs
@@ -2455,6 +2868,8 @@ def _host_ptr_quantized(
     reduction. The preceding split-attention kernel initializes Amax, ordered
     before this reduction on the same stream. MXFP8 has no scalar output
     scale: its None-specialized pointer also removes Amax unscaling.
+    Optional sink/Q-length pointers trail the original stream slot. The sink
+    participates in the final normalizer once; padded Q rows remain dead.
     """
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
@@ -2465,6 +2880,12 @@ def _host_ptr_quantized(
     scale_o = None
     if cutlass.const_expr(has_scale_o):
         scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
+    sinks = None
+    if cutlass.const_expr(sinks_ptr is not None):
+        sinks = _sink_operand(sinks_ptr, problem_size)
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((problem_size[0],), stride=(1,)))
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2483,6 +2904,8 @@ def _host_ptr_quantized(
         None,
         DECODE_GRID_OFF,
         stream,
+        sinks,
+        q_lens,
     )
     if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o and scale_o_ptr is not None):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
@@ -2507,6 +2930,50 @@ def _host_ptr_ragged(
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Preserve the offset-only entry's positional ABI; None is not a runtime slot."""
+    _host_ptr_ragged_q_lens(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        ragged_q_ptr,
+        ragged_o_ptr,
+        ragged_lse_ptr,
+        ragged_divs,
+        ragged_caps,
+        stats_log2,
+        decode_grid,
+        stream,
+        q_lens_ptr=None,
+        q_lens_prefix=False,
+    )
+
+
+@cute.jit
+def _host_ptr_ragged_q_lens(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+    q_lens_prefix: cutlass.Constexpr[bool] = False,
+) -> None:
     """The ragged-Q decode leg's pointer ABI: :func:`_host_ptr` plus the (B+1,)
     ragged offsets of Q / O / Stats (int32 or int64 elements), their
     elements-per-token divisors and the (O, Stats) packed token capacities; the
@@ -2523,6 +2990,10 @@ def _host_ptr_ragged(
     ragged_lse = None
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        layout = cute.make_layout((B, 2), stride=(1, 1)) if cutlass.const_expr(q_lens_prefix) else cute.make_layout((B,), stride=(1,))
+        q_lens = cute.make_tensor(q_lens_ptr, layout)
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2541,6 +3012,7 @@ def _host_ptr_ragged(
         None,
         decode_grid,
         stream,
+        q_lens=q_lens,
     )
 
 
@@ -2661,6 +3133,52 @@ def _host_ptr_ragged_sink(
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
+    """Preserve the offset-only entry's positional ABI; None is not a runtime slot."""
+    _host_ptr_ragged_sink_q_lens(
+        o_partial_ptr,
+        lse_partial_ptr,
+        o_out_ptr,
+        lse_out_ptr,
+        problem_size,
+        n_splits,
+        o_strides,
+        lse_strides,
+        ragged_q_ptr,
+        ragged_o_ptr,
+        ragged_lse_ptr,
+        ragged_divs,
+        ragged_caps,
+        sinks_ptr,
+        stats_log2,
+        decode_grid,
+        stream,
+        q_lens_ptr=None,
+        q_lens_prefix=False,
+    )
+
+
+@cute.jit
+def _host_ptr_ragged_sink_q_lens(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_q_ptr: cute.Pointer,
+    ragged_o_ptr: cute.Pointer,
+    ragged_lse_ptr: Optional[cute.Pointer],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    sinks_ptr: cute.Pointer,
+    stats_log2: cutlass.Constexpr[bool],
+    decode_grid: cutlass.Constexpr[int],
+    stream: _cuda_driver.CUstream = None,
+    q_lens_ptr: Optional[cute.Pointer] = None,
+    q_lens_prefix: cutlass.Constexpr[bool] = False,
+) -> None:
     """:func:`_host_ptr_ragged` plus the fp32 [H] attention-sink logits."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
@@ -2673,6 +3191,10 @@ def _host_ptr_ragged_sink(
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
     sinks = _sink_operand(sinks_ptr, problem_size)
+    q_lens = None
+    if cutlass.const_expr(q_lens_ptr is not None):
+        layout = cute.make_layout((B, 2), stride=(1, 1)) if cutlass.const_expr(q_lens_prefix) else cute.make_layout((B,), stride=(1,))
+        q_lens = cute.make_tensor(q_lens_ptr, layout)
     _launch_combine(
         o_partial,
         lse_partial,
@@ -2692,6 +3214,7 @@ def _host_ptr_ragged_sink(
         decode_grid,
         stream,
         sinks,
+        q_lens,
     )
 
 
@@ -2729,6 +3252,9 @@ def compile_ptr(
     has_q_lens: bool = False,
     decode_grid: int = DECODE_GRID_OFF,
     use_pdl: bool = False,
+    ragged_q_lens: int = 0,
+    gate_e4m3: bool = False,
+    out_rounding: str = COMBINE_OUT_ROUNDING_SINGLE,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -2741,16 +3267,21 @@ def compile_ptr(
     and append the device-total-Q pointer; other entries share the existing
     reduction and launch. The quantized dense entry appends Amax/scale
     pointers; half and ragged entries keep their existing positional ABI.
+    The quantized sink entry preserves that prefix and appends sink/Q-length
+    pointers after the stream, with an explicit None Q-length slot when absent.
     ``has_scale_o_input=False`` removes the scalar input and Amax unscale
     launch for MXFP8. Per-tensor FP8 retains both by default.
     ``gate=True`` (dense half launches only; ``dtype_gate`` "f16" / "bf16" names
     G's dtype) is the gate-in-combine entry: the dense ABI plus G's pointer and
     its four BSHD strides appended -- see the module docstring for the
     numerics it fixes.
-    ``has_sink`` selects the sink entries (half outputs only): the reduction
+    ``has_sink`` selects the sink entries (half or quantized outputs): the reduction
     folds the attention sink once (the partials are sink-free).  The dense and
     ragged entries append the fp32 [H] sink-logit pointer right before
     ``stats_log2``; the packed entry takes it as its trailing ``sinks_ptr``.
+    ``ragged_q_lens`` appends the device Q-length pointer after the stream on the
+    ragged entry: 1 reads B lengths, 2 reads B+1 cumulative lengths. These decide
+    live rows independently of the physical offsets used to address Q/O/Stats.
     ``has_q_lens`` (the dense sink entry only) appends the int32 (B,) per-batch Q-length pointer after the sink pointer: the rows of the padded-Q trim
     past their batch's length keep ``O := 0 / LSE := -inf`` instead of folding the sink.
     ``decode_grid`` (appended; ``DECODE_GRID_OFF`` by default: an entry that names no
@@ -2776,10 +3307,52 @@ def compile_ptr(
     ``griddepcontrol`` wait before its first read and release right after -- the
     same math, bitwise.  A sink entry declines it (a typed error) until that
     combination is run on a device.
+    ``gate_e4m3=True`` (appended; with ``gate=True`` and ``dtype_o="e4m3"``, fp32 partials) is the FUSED gated static-scale e4m3 entry
+    (``_host_ptr_gated_e4m3``, the module docstring): the gated entry's frame plus a REQUIRED 1-element fp32 DEQUANT-scale pointer right
+    after the gate strides; it never composes with the quantized entries' ``quantized`` / ``has_amax`` / ``has_scale_o`` arms (its scale is
+    a divisor, appended by the entry itself), takes the ``decode_grid`` selector and ``use_pdl`` like the gated half entry, and is the one
+    FP8 output that does not require ``quantized=True``.
+    ``out_rounding`` (appended; ``"single"`` by default; in the key) names the fused e4m3 entry's ROUNDING CONVENTION (the module docstring):
+    ``"single"`` = ONE rounding of the fp32 gated value (every existing entry's code), ``"staged"`` = a serving stack's gate-and-quantize order
+    -- ``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, s))``, the exact sigmoid as a division and two bf16 roundings, spelled
+    with the DSL ops that stack's kernel spells -- so a provider can serve bytes identical to that chain; it is the trailing ``quant_rounding``
+    constexpr of the four kernels and the two launchers, read at the gate site only.  Declined by name: a value outside
+    ``heuristics.COMBINE_OUT_ROUNDINGS``, ``"staged"`` without ``gate_e4m3`` (the half and quantized entries round once at their store and take
+    no convention), ``"staged"`` with an f16 gate (the convention is a bf16 chain's; the f16 analogue is not wired).
     """
     if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
-    if (has_amax or has_scale_o or dtype_o in ("e4m3", "e5m2")) and not quantized:
+    if gate_e4m3 and not gate:
+        raise ValueError("gate_e4m3 is a gate=True specialization (the fused entry gates the fp32 merged value before its one e4m3 rounding)")
+    if gate_e4m3 and dtype_o != "e4m3":
+        raise ValueError("gate_e4m3 stores e4m3 (the static per-tensor scale convention it serves); got dtype_o " + repr(dtype_o))
+    if gate_e4m3 and dtype_partial != "f32":
+        raise ValueError("gate_e4m3 serves the decode chain's fp32 partials (one rounding of the fp32 gated value); got dtype_partial " + repr(dtype_partial))
+    if gate_e4m3 and (quantized or has_amax or has_scale_o):
+        raise ValueError(
+            "gate_e4m3 appends its own scale (a DEQUANT divisor after the gate strides): the quantized entries' quantized / has_amax / has_scale_o arms do not compose with it"
+        )
+    if out_rounding not in COMBINE_OUT_ROUNDINGS:
+        raise ValueError(
+            f"out_rounding must be one of {COMBINE_OUT_ROUNDINGS} ('single' = one rounding of the fp32 gated value, 'staged' = a serving stack's "
+            f"gate-and-quantize order); got {out_rounding!r}"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and not gate_e4m3:
+        raise ValueError(
+            "out_rounding='staged' belongs to the fused gated e4m3 entry (gate_e4m3=True): the half and quantized entries round once at their store "
+            "and take no rounding convention"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and dtype_gate is None:
+        raise ValueError(
+            "out_rounding='staged' needs the gate dtype declared: pass dtype_gate='bf16' (the convention rounds the merged O and the gated value to "
+            "bf16, the serving chain's dtype)"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and dtype_gate != "bf16":
+        raise ValueError(
+            "out_rounding='staged' is defined for the bf16 half dtype (the convention rounds the merged O and the gated value to bf16, the serving "
+            "chain's dtype); the f16 analogue is not wired -- got dtype_gate " + repr(dtype_gate)
+        )
+    if (has_amax or has_scale_o or dtype_o in ("e4m3", "e5m2")) and not (quantized or gate_e4m3):
         raise ValueError("FP8 outputs and scalar operands require the quantized pointer entry")
     if has_scale_o and not has_scale_o_input:
         raise ValueError("scaled combine requires a scale_o input")
@@ -2795,10 +3368,10 @@ def compile_ptr(
         raise ValueError("the gate-in-combine entry needs dtype_gate 'f16' or 'bf16' (the gate G is a half tensor of O's shape)")
     if dtype_gate is not None and not gate:
         raise ValueError("dtype_gate is a gate=True specialization")
-    if has_sink and quantized:
-        raise ValueError("the sink fold is wired for the half combine entries only (FP8 split + sink stays declined)")
     if has_sink and gate:
         raise ValueError("the gate-in-combine entry carries no sink fold (a gated split with a sink is declined)")
+    if ragged_q_lens not in (0, 1, 2) or (ragged_q_lens and not ragged):
+        raise ValueError("ragged_q_lens requires the ragged entry: 1 for lengths, 2 for prefixes")
     if has_q_lens and not has_sink:
         raise ValueError("has_q_lens is a sink specialization: the Q lengths only decide which rows fold the sink")
     if has_q_lens and (ragged or packed):
@@ -2832,7 +3405,7 @@ def compile_ptr(
         entry, extra, form = _host_ptr_packed, (P(cutlass.Int32),), ()
     elif quantized:
         entry, extra, form = (
-            _host_ptr_quantized,
+            _host_ptr_quantized_sink if has_sink else _host_ptr_quantized,
             (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32) if has_scale_o_input else None, bool(has_scale_o)),
             (),
         )
@@ -2840,7 +3413,11 @@ def compile_ptr(
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
         # dense entry's positional ABI stays exactly what its callers pass.
         off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
-        entry, extra = (_host_ptr_ragged_sink if has_sink else _host_ptr_ragged), (
+        if ragged_q_lens:
+            entry = _host_ptr_ragged_sink_q_lens if has_sink else _host_ptr_ragged_q_lens
+        else:
+            entry = _host_ptr_ragged_sink if has_sink else _host_ptr_ragged
+        extra = (
             P(off_t),
             P(off_t),
             P(off_t) if has_lse else None,
@@ -2851,9 +3428,12 @@ def compile_ptr(
         # The gate-in-combine entry appends G's pointer and BSHD strides; the
         # dense entry's positional ABI stays exactly what its callers pass.
         entry, extra = _host_ptr_gated, (P(_ELEM[dtype_gate]), (cutlass.Int64(0),) * 4)
+        if gate_e4m3:
+            # The FUSED entry appends the 1-element fp32 static scale after the gate strides (its own frame; the gated entry's is unchanged).
+            entry, extra = _host_ptr_gated_e4m3, (*extra, P(cutlass.Float32))
     else:
         entry, extra = (_host_ptr_sink_q_lens if has_q_lens else _host_ptr_sink if has_sink else _host_ptr), ()
-    if has_sink and not packed:
+    if has_sink and not packed and not quantized:
         extra = (*extra, P(cutlass.Float32))  # the fp32 [H] sink logits, right before stats_log2 (the packed entry's ride as its trailing sinks_ptr)
         if has_q_lens:
             extra = (*extra, P(cutlass.Int32))  # the int32 (B,) per-batch Q lengths of the padded-Q trim, right after the sinks
@@ -2867,6 +3447,11 @@ def compile_ptr(
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd_combine_ptr",
-        **({"sinks_ptr": P(cutlass.Float32)} if (has_sink and packed) else {}),
+        **({"sinks_ptr": P(cutlass.Float32)} if (has_sink and (packed or quantized)) else {}),
+        **({"q_lens_ptr": P(cutlass.Int32)} if (has_q_lens and quantized) else {}),
+        **({"q_lens_ptr": P(cutlass.Int32), "q_lens_prefix": ragged_q_lens == 2} if ragged_q_lens else {}),
         **({"use_pdl": True} if use_pdl else {}),
+        # the fused entry's rounding convention: a Constexpr kwarg after use_pdl (the positional frame is unchanged); absent = SINGLE, the
+        # default arm, so every existing entry's call is what it was
+        **({"quant_rounding": QUANT_ROUNDING_STAGED} if out_rounding == COMBINE_OUT_ROUNDING_STAGED else {}),
     )

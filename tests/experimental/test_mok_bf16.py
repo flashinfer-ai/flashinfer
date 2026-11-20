@@ -4,12 +4,12 @@
 
 Covers the fused forward/backward (ring replay, empty experts, variable
 widths, CUDA Graph replay), clamped SwiGLU, FP32 weight-gradient
-accumulation, GLM-5.3-Flash local expert counts, context-only recompute,
-every exported scheduler layout and the epilogues, plus the host-only
+accumulation, GLM-5.3-Flash local expert counts, context-only recompute, the
+context-free forward, every exported scheduler layout and the epilogues, plus the host-only
 communication-split tables, resolvers and configuration switches.
 
 Backend suite: the package is imported only through
-:func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+:func:`tests.cake.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
 wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from tests.experimental._mok_reference import require_gpu, single_rank_schedule
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kernels = cake_package("cake_mok_bf16", "_kernels")
 api = cake_package("cake_mok_bf16", "api")
@@ -262,11 +262,8 @@ def _check_fused_training(
 
 
 @pytest.fixture(autouse=True)
-def _exact_matmul(monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    monkeypatch.setattr(
-        torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False
-    )
+def _exact_matmul(cuda_matmul_flags):
+    cuda_matmul_flags(allow_tf32=False, allow_bf16_reduced_precision_reduction=False)
 
 
 def test_fused_training():
@@ -369,6 +366,128 @@ def test_recompute_context(swiglu_limit, macro):
 
     for a, b in zip(gradients(saved), gradients(rebuilt), strict=True):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("swiglu_limit", [None, 0.125], ids=["plain", "clamped"])
+@pytest.mark.parametrize("macro", [768, 4096], ids=["replay", "resident"])
+def test_context_free_forward(swiglu_limit, macro):
+    """The context-free forward writes the context forward's y, combine rows,
+    hidden and routed x bitwise, in every launch, without gate/up storage; the
+    context recomputed after it gives backward the saved context's bits."""
+    require_gpu()
+    clamped = swiglu_limit is not None
+    forward, context_free = MoKForward(clamped), MoKForward(clamped, context=False)
+    recompute, backward = MoKRecompute(clamped), MoKBackward(clamped)
+    tokens, hidden, intermediate, experts, topk, mini, comm = (
+        512,
+        512,
+        256,
+        4,
+        2,
+        256,
+        4,
+    )
+    torch.manual_seed(4127)
+    options = dict(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, **options) * 0.125
+    dy = torch.randn_like(x) * 0.125
+    shared = [
+        torch.randn(intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(hidden, intermediate, **options) / intermediate**0.5,
+    ]
+    routed = [
+        torch.randn(experts, intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(experts, intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(experts, hidden, intermediate, **options) / intermediate**0.5,
+    ]
+    scores = torch.rand(tokens, topk, device="cuda") + 0.1
+    row = torch.arange(tokens, device="cuda")
+    routes = torch.stack([(row * 3 + slot) % experts for slot in range(topk)], -1)
+    s = single_rank_schedule(routes, experts)
+    schedule = (s["peers"], s["schedule"], s["num_tokens"], s["counts"])
+    weights = (shared[0], routed[0], shared[1], routed[1], shared[2], routed[2])
+    rows = min(s["actual"], macro)
+
+    def run(kernel):
+        combine = torch.zeros(tokens * topk, hidden, **options)
+        values = kernel(
+            x, [x.data_ptr()], combine, [combine.data_ptr()], *weights,
+            *schedule, topk, swiglu_limit, comm, macro, mini,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return values, combine
+
+    saved, combine = run(forward)
+    assert torch.count_nonzero(combine).item() > 0
+    assert torch.count_nonzero(saved[7]).item() > 0
+    for _ in range(3):
+        values, free_combine = run(context_free)
+        assert values[1:5] == (None,) * 4
+        assert torch.equal(free_combine, combine)
+        assert torch.equal(values[7], saved[7])  # y_shared
+        assert torch.equal(values[5], saved[5])  # hidden_shared
+        for index in (0, 6):  # routed x, hidden of the resident macrobatch
+            assert torch.equal(values[index][:rows], saved[index][:rows]), index
+    rebuilt = recompute(
+        x, [x.data_ptr()], shared[0], routed[0], shared[1], routed[1],
+        *schedule, topk, swiglu_limit, comm, macro, mini,
+    )  # fmt: skip
+
+    def gradients(context):
+        dx_peer = torch.zeros(tokens * topk, hidden, **options)
+        ds_peer = torch.zeros_like(scores)
+        values = backward(
+            dy, [dy.data_ptr()], dx_peer, [dx_peer.data_ptr()],
+            scores, [scores.data_ptr()], ds_peer, [ds_peer.data_ptr()],
+            *weights, *context[:7], x, [x.data_ptr()], *schedule,
+            topk, swiglu_limit, comm, macro, mini,
+        )  # fmt: skip
+        return (dx_peer, ds_peer, values[0], *values[9:])
+
+    expected = gradients(saved)
+    assert all(torch.count_nonzero(value).item() > 0 for value in expected)
+    for a, b in zip(expected, gradients(rebuilt), strict=True):
+        assert torch.equal(a, b)
+
+
+def test_context_free_forward_arguments_are_checked_before_device_work(monkeypatch):
+    """``save_context`` and ``context`` must be booleans; MXFP8 routed experts
+    have no context-free forward. Each refusal comes before any copy, barrier
+    or launch (host only)."""
+    with pytest.raises(TypeError, match="context must be a boolean"):
+        MoKForward(False, context=1)
+    functional = object.__new__(backend.MoKFunctional)
+    functional.local_experts = 4
+    functional._validated = {}  # the weight-validation memo __init__ creates
+    events = []
+    monkeypatch.setattr(
+        backend.MoKFunctional, "_inputs", staticmethod(lambda *args: (None, 256))
+    )
+    monkeypatch.setattr(functional, "_check_device", lambda workspace: None)
+    monkeypatch.setattr(functional, "_barrier", lambda w: events.append("barrier"))
+    monkeypatch.setattr(functional, "_kernels", lambda *a: events.append("kernels"))
+    monkeypatch.setattr(
+        backend.MoKFunctional,
+        "_copy_source",
+        staticmethod(lambda *args: events.append("copy")),
+    )
+    options = dict(dtype=torch.bfloat16)
+    x = torch.zeros(256, 256, **options)
+    shared = [torch.zeros(256, 256, **options) for _ in range(3)]
+    data = torch.zeros(4, 256, 256, dtype=torch.uint8)
+    mxfp8 = [(data, torch.zeros(64, dtype=torch.uint8)) for _ in range(3)]
+    with pytest.raises(TypeError, match="save_context must be a boolean"):
+        functional.forward(None, None, None, x, None, *shared, *mxfp8, save_context=0)
+    with pytest.raises(ValueError, match="save_context=False requires BF16"):
+        functional.forward(
+            None, None, None, x, None, *shared, *mxfp8, save_context=False
+        )
+    with pytest.raises(TypeError, match="save_context must be a boolean"):
+        functional.prepare(None, save_context="no")
+    with pytest.raises(ValueError, match="save_context=False requires BF16"):
+        functional.prepare(None, True, save_context=False)
+    assert events == ["kernels"]  # prepare compiles the MXFP8 pair, then refuses
 
 
 @pytest.mark.parametrize("ep,experts", SCHEDULER_LAYOUTS)
@@ -648,6 +767,38 @@ def test_observe_load_issues_one_copy_and_no_histogram_ops():
     assert host.dtype == torch.int32 and host.is_pinned() and host.numel() == ep_size
     torch.cuda.synchronize()
     assert host.tolist() == backend.count_routed_load(routes, ep_size, experts).tolist()
+
+
+def test_observe_load_keeps_a_completed_observation():
+    """A host running ahead of the device schedules the next step before any
+    launch of the previous one saw its observation complete; the next
+    observation adopts the completed one before replacing it, so the split
+    still follows the routed load."""
+    require_gpu()
+    from types import SimpleNamespace
+
+    ep_size, experts = 4, 4
+    functional = backend.MoKFunctional(ep_size, experts, 2)
+    config = MoKConfig(
+        fwd_num_comm_sms=4,
+        bwd_num_comm_sms=4,
+        imbalance_comm_sms=(6, 6),
+        imbalance_threshold=1.5,
+    )
+    skewed = (
+        torch.arange(ep_size * 256 * 2, device="cuda", dtype=torch.int32) % experts
+    ).view(ep_size, 256, 2)
+    capacity = ep_size * 256 * 2 + experts * 256
+    workspace = SimpleNamespace(ep_rank=0, ep_size=ep_size)
+    functional.scheduler(skewed, capacity, 0)
+    functional._observe_load(workspace, config)
+    torch.cuda.synchronize()
+    functional.scheduler(skewed, capacity, 0)
+    functional._observe_load(workspace, config)  # no launch in between
+    entry = functional._load_entry(workspace, create=False)
+    expected = backend.count_routed_load(skewed, ep_size, experts).tolist()
+    assert list(entry["loads"]) == expected
+    assert functional._comm_split(config, workspace) == (6, 6)
 
 
 def _layout_reference(counts, peers):
@@ -1174,7 +1325,8 @@ def test_launcher_geometry_memo_is_pure(tile, local_tokens, capacity, macro, exp
     """The memoised launch geometry of the MXFP8 launchers equals a fresh
     evaluation of the per-call arithmetic at training geometries and both tile
     widths, including the expert-dependent backward cluster and task counts; a
-    bounded memo clears and still serves correct values."""
+    full memo drops its least recently used entry and still serves correct
+    values."""
     hidden, intermediate, mini = 6144, 2048, 4096
     forward = kernels._forward_mxfp8_geometry(
         local_tokens, hidden, intermediate, capacity, macro, mini, tile
@@ -1196,9 +1348,14 @@ def test_launcher_geometry_memo_is_pure(tile, local_tokens, capacity, macro, exp
             assert (tuple(actual) if name.endswith("_div") else actual) == value, name
     cache = {}
     keys = [(i, tile) for i in range(kernels._GEOMETRY_LIMIT + 1)]
-    for key in keys:
+    for key in keys[:-1]:
         kernels._remember(cache, key, key[0])
-    assert len(cache) == 1 and cache[keys[-1]] == keys[-1][0]
+    # A hit refreshes keys[0]; keys[1] becomes the least recently used entry.
+    assert kernels._recall(cache, keys[0]) == 0
+    kernels._remember(cache, keys[-1], keys[-1][0])
+    assert len(cache) == kernels._GEOMETRY_LIMIT and keys[1] not in cache
+    assert all(cache[key] == key[0] for key in (keys[0], *keys[2:]))
+    assert kernels._recall(cache, keys[1]) is None
 
 
 def test_ffi_stream_context_follows_torch_current_stream():
@@ -1294,6 +1451,9 @@ def test_select_comm_split_decision_table():
         ((10, 3), 152, "bf16", None),  # GB300
         ((10, 3), 152, "mxfp8", None),
         ((10, 7), 160, "bf16", None),
+        ((10, 7), 212, "mxfp8", (72, 60)),  # Rubin
+        ((10, 7), 212, "bf16", None),
+        ((10, 7), 216, "mxfp8", None),  # other Rubin SM count
         ((12, 0), 170, "bf16", None),
     ],
 )
@@ -1317,6 +1477,39 @@ def test_imbalance_comm_sms_auto_follows_the_device(
     assert api.resolve_imbalance_comm_sms(precision) == expected
 
 
+@pytest.mark.parametrize(
+    "capability,sm_count,precision,expected",
+    [
+        ((10, 7), 212, "mxfp8", 1.5),  # Rubin: measured device threshold
+        ((10, 7), 212, "bf16", 4.0),
+        ((10, 7), 216, "mxfp8", 2.7),  # other Rubin SM count: precision default
+        ((10, 0), 148, "mxfp8", 2.7),  # B200
+        ((10, 0), 148, "bf16", 4.0),
+    ],
+)
+def test_imbalance_threshold_follows_the_device(
+    monkeypatch, capability, sm_count, precision, expected
+):
+    """Host-only: with a device, the threshold is the device's measured row of
+    ``IMBALANCE_DEVICE_THRESHOLDS`` where one exists, else the precision's
+    ``IMBALANCE_THRESHOLDS`` value; without a device it is always the latter."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=sm_count),
+    )
+    assert api.resolve_imbalance_threshold(precision, 0) == expected
+    assert (
+        api.resolve_imbalance_threshold(precision)
+        == api.IMBALANCE_THRESHOLDS[precision]
+    )
+
+
 def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     """Host-only: the config default disables the imbalance split, the facade
     default ``"auto"`` resolves the measured row of the device generation, and
@@ -1332,9 +1525,11 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     # The measured rows and thresholds (backend README); a change here is a
     # shipping change. The backend default is the BF16 threshold.
     assert api.IMBALANCE_COMM_SMS == {
-        (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}}
+        (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}},
+        (10, 7): {212: {"mxfp8": (72, 60)}},
     }
     assert api.IMBALANCE_THRESHOLDS == {"bf16": 4.0, "mxfp8": 2.7}
+    assert api.IMBALANCE_DEVICE_THRESHOLDS == {(10, 7): {212: {"mxfp8": 1.5}}}
     assert api.IMBALANCE_THRESHOLDS["bf16"] == api.IMBALANCE_THRESHOLD
     assert api.resolve_imbalance_threshold("bf16") == config.imbalance_threshold
     assert api.resolve_imbalance_threshold("mxfp8") == 2.7
@@ -1359,12 +1554,24 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     "capability,sm_count,precision,ep_size,expected",
     [
         ((10, 3), 152, "mxfp8", 8, (44, 36)),  # GB300, EP8 across two nodes
-        ((10, 3), 152, "mxfp8", 4, None),  # GB300 EP4: no unconditional gain
-        ((10, 3), 152, "bf16", 8, None),
+        ((10, 3), 152, "mxfp8", 32, (44, 36)),
+        ((10, 3), 152, "mxfp8", 64, (44, 36)),
+        ((10, 3), 152, "mxfp8", 4, None),  # GB300 EP4 / EP16: no gain
+        ((10, 3), 152, "mxfp8", 16, None),
+        ((10, 3), 152, "bf16", 4, (20, 24)),
+        ((10, 3), 152, "bf16", 8, (20, 24)),
+        ((10, 3), 152, "bf16", 16, (20, 24)),
+        ((10, 3), 152, "bf16", 32, (20, 24)),
+        ((10, 3), 152, "bf16", 64, (20, 24)),
+        ((10, 3), 152, "bf16", 1, None),  # unmeasured group size: factory split
         ((10, 3), 160, "mxfp8", 8, None),  # other GB300 SM count: factory split
         ((10, 0), 148, "mxfp8", 8, None),  # B200: the imbalance switch instead
         ((10, 0), 152, "mxfp8", 8, None),  # GB200
         ((10, 7), 160, "mxfp8", 8, None),
+        ((10, 7), 212, "mxfp8", 8, (60, 60)),  # Rubin, EP8 across two nodes
+        ((10, 7), 212, "mxfp8", 16, None),
+        ((10, 7), 212, "bf16", 8, None),
+        ((10, 7), 216, "mxfp8", 8, None),  # other Rubin SM count: factory split
     ],
 )
 def test_comm_sms_auto_follows_the_device_and_group(
@@ -1387,16 +1594,32 @@ def test_comm_sms_auto_follows_the_device_and_group(
     assert api.resolve_comm_sms(precision, ep_size) == expected
 
 
-def test_comm_sms_factory_defaults_are_unchanged():
-    """Host-only: the factory split stays 40 / 40, the measured rows are the
-    shipped table (a change here is a shipping change) and malformed arguments
-    are rejected before any collective."""
+def test_comm_sms_defaults_resolve_the_measured_rows():
+    """Host-only: the facade defaults are ``"auto"`` (the measured row, else the
+    factory split 40 / 40), the measured rows are the shipped table (a change
+    here is a shipping change) and malformed arguments are rejected before any
+    collective."""
     import inspect
 
     facade = inspect.signature(api.create_mok_bf16_workspace).parameters
-    assert facade["fwd_num_comm_sms"].default == 40
-    assert facade["bwd_num_comm_sms"].default == 40
-    assert api.COMM_SMS == {(10, 3): {152: {"mxfp8": {8: (44, 36)}}}}
+    assert facade["fwd_num_comm_sms"].default == "auto"
+    assert facade["bwd_num_comm_sms"].default == "auto"
+    assert api._FACTORY_COMM_SMS == (40, 40)
+    assert api.COMM_SMS == {
+        (10, 3): {
+            152: {
+                "bf16": {
+                    4: (20, 24),
+                    8: (20, 24),
+                    16: (20, 24),
+                    32: (20, 24),
+                    64: (20, 24),
+                },
+                "mxfp8": {8: (44, 36), 32: (44, 36), 64: (44, 36)},
+            }
+        },
+        (10, 7): {212: {"mxfp8": {8: (60, 60)}}},
+    }
     with pytest.raises(ValueError, match="precision must be one of"):
         api.resolve_comm_sms("fp8", 8)
     with pytest.raises(ValueError, match="ep_size must be a positive"):

@@ -1,26 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Tiny IR describing a matmul + pointwise-epilogue fusion — the contract
-between `graph_analyzer.py` (builds it from a cuDNN graph) and
-`epilogue_codegen.py` (lowers it to a cute DSL epilogue snippet).
-
-A binary op is either ``aux`` + ``parent_idx`` (one in-chain operand + a
-graph-input aux) or ``parent_idx_b`` + ``parent_idx`` (two in-chain operands,
-fan-in); ``aux`` and ``parent_idx_b`` are mutually exclusive. Any producer can
-be materialized as a GMEM output via ``.set_output(True).set_data_type(...)``.
-``FusionChain.outputs`` lists slots in canonical order (dense outputs first —
-dense outputs in recorder order, then reductions, then quant scales),
-the same order callers pass."""
+"""Fusion IR for GEMM operands, pointwise operations, and outputs."""
 
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Literal
 
-# SUPPORTED_DTYPES = aux/output storage dtypes; COMPUTE_DTYPES = pointwise
-# compute dtypes accepted from cuDNN graph attrs.
 Dtype = Literal[
     "bf16",
     "fp16",
@@ -53,9 +42,19 @@ AMajor = Literal["k", "m"]
 BMajor = Literal["k", "n"]
 OutMajor = Literal["n", "m"]
 
-# Aux broadcast onto the (M, N) tile: scalar / per_row (len M) / per_col
-# (len N) / per_elem (full M×N).
-BroadcastMode = Literal["scalar", "per_row", "per_col", "per_elem"]
+BroadcastMode = Literal["scalar", "per_row", "per_col", "per_elem", "per_k"]
+
+
+class Axis(Enum):
+    """Logical GEMM extents, independent of codegen's symbol names."""
+
+    M = auto()
+    N = auto()
+    K = auto()
+    BATCH = auto()
+    GROUP = auto()
+
+
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
 REDUCTION_DTYPES: tuple[Dtype, ...] = ("fp32", "int32")
 
@@ -88,8 +87,6 @@ UNARY_OPS: tuple[str, ...] = (
     "gen_index",
 )
 
-# Binary pointwise ops (running accumulator + one aux). `aux_on_rhs=True` means
-# op(acc, aux); False means op(aux, acc) — matters for sub/div.
 BINARY_OPS: tuple[str, ...] = (
     "add",
     "mul",
@@ -123,13 +120,6 @@ TERNARY_OPS: tuple[str, ...] = ("binary_select",)
 
 ALL_OPS: tuple[str, ...] = UNARY_OPS + BINARY_OPS + TERNARY_OPS + ("aux_load",)
 
-# Ops with `f(0, *) == 0` unconditionally. Single source of truth for the
-# mainloop K-OOB fix: a fully zero-preserving fused chain keeps the TMA K-tail
-# zero-fill at 0, so no OOB masking is needed. Qualifies only if unconditional:
-# unary f(0)=0 ops + binary `mul`. sigmoid/exp/cos (f(0)!=0), add/sub, div
-# (aux/0=inf) do NOT. A new op defaults to NON-zero-preserving unless listed
-# here — the safe default (forgetting only costs an unneeded mask; wrongly
-# assuming it would silently miscompute).
 ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
     {
         "identity",
@@ -153,12 +143,7 @@ ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
 
 
 def out_major_of(stride: "tuple[int, ...] | None") -> "OutMajor":
-    """A dense output's layout, read off its STRIDE alone.
-
-    Not off `dim`: cuDNN fills a derived tensor's extents only at
-    `build_operation_graph()` time, while its stride is there from the start, so
-    the extents are not available to disambiguate a degenerate N == 1. An unset
-    stride is the default layout."""
+    """A dense output's layout, read off its STRIDE alone."""
     if not stride:
         return "n"
     if stride[-1] == 1:
@@ -170,10 +155,7 @@ def out_major_of(stride: "tuple[int, ...] | None") -> "OutMajor":
 
 @dataclass(frozen=True)
 class ChainOutput:
-    """One materialized GMEM output. ``source`` = where the value is taken from:
-    "matmul" (fp32 accumulator) / "gemm_<g>" / "op_<i>" / "quant_<i>" /
-    "reduction_<i>" / "quant_scale_<i>". ``dtype`` is the on-disk dtype (each
-    output casts from the running fp32 value)."""
+    """One materialized GMEM output."""
 
     source: str
     dtype: Dtype
@@ -191,13 +173,7 @@ class ChainOutput:
 
 @dataclass(frozen=True)
 class OutputSpec:
-    """One dense (per-element) GMEM output: a producer's value cast to
-    ``dtype``. All dense outputs are equivalent — ``output_specs[0]`` merely
-    occupies the kernel template's primary-output ABI slot. ``source_ref`` is a
-    producing-op reference (< 0 = GEMM via ``gemm_source``, >= 0 = ``ops[i]``).
-    ``quant_idx`` names a ``FusionChain.quants`` entry when this output's value
-    is the block-quantization of the producer (rather than a plain cast); its
-    scale side-output rides ``outputs`` as ``quant_scale_<quant_idx>``."""
+    """One dense (per-element) GMEM output: a producer's value cast to ``dtype``."""
 
     source_ref: int
     dtype: Dtype
@@ -221,9 +197,7 @@ class OutputSpec:
 
 @dataclass(frozen=True)
 class ReductionSpec:
-    """A materialized reduction side-output. ``source_ref`` names the reduced
-    producer (FusionOp parent scheme: GEMM output negative, op output >=0).
-    ``dim`` is public `(B, M, N)`; extent-1 dims are the reduced ones."""
+    """A materialized reduction side-output."""
 
     mode: ReductionMode
     source_ref: int
@@ -247,24 +221,13 @@ class ReductionSpec:
             raise ValueError(f"reduction output dtype {self.dtype!r} must match compute_dtype " f"{self.compute_dtype!r} for direct atomic reduction")
 
 
-# What a block_scale_quantize may emit as DATA. The SCALE half has its own set on
-# `BlockQuantizeSpec.scale_dtype` -- ue5m3 lives there, not here: it is a scale
-# format, carried end to end as an opaque byte.
 QUANT_DATA_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
 
-# A sub-byte dtype packs two adjacent M rows into one byte, and those rows are
-# held by different lanes -- a read-modify-write race, not an implementation gap.
 M_MAJOR_OUT_DTYPES = ("bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2", "fp8_e8m0", "fp8_e5m3", "int8", "uint8", "int32")
 
 
 def segmented_row_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
-    """Static rows needed by independently 128-row-padded group segments.
-
-    Runtime group sizes are device data. For ``total_rows=M`` split across at
-    most ``num_groups=G`` non-empty groups, the exact maximum number of 128-row
-    atoms is ``A + (M - A) // 128``, where ``A=min(M,G)``. This graph-time
-    envelope admits every valid partition without synchronizing the offsets.
-    """
+    """Static rows needed by independently 128-row-padded group segments."""
     if total_rows < 0:
         raise ValueError(f"segmented row scale total_rows must be non-negative; got {total_rows}")
     if num_groups < 1:
@@ -276,26 +239,7 @@ def segmented_row_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
 
 @dataclass(frozen=True)
 class BlockQuantizeSpec:
-    """One block-scale quantize node (cuDNN ``block_scale_quantize``): each
-    contiguous block of the producer yields one scale + one block of quantized
-    output. ``axis`` picks the blocked axis: -1/2 = N (row quant, per-thread
-    blocks), 1 = M (col quant, one warp's 32 lanes = one 32-row block).
-    The quantized data is a dense output (the OutputSpec carrying this entry's
-    ``quant_idx``); ``scale_dim`` is the scale side-output. Row quant: compact
-    `(B, M, N/block_size)`, F8_128x4 pads to `(B, rup(M,128), rup(N/bs,4))`.
-    Col quant: compact `(B, M/block_size, N)`, F8_128x4 = the transposed atom
-    `(B, rup(N,128), rup(M/bs,4))`.
-
-    ``grouped_by_moe`` (F8_128x4 only; declared via ``group_offset=fto`` on the
-    quant node) makes each routed group its own scale segment. For col quant the
-    segment is the group's compact transposed table at its atom-quad base; the
-    runtime CONTRACT remains that every fto value is a multiple of
-    ``4 * block_size``. For row quant the segment starts at the prefix sum of
-    the preceding groups' 128-row atom counts. For fixed ``M`` and declared
-    group count ``G``, ``scale_dim[1]`` must cover the graph-time worst case
-    ``128 * (A + (M-A)//128)``, ``A=min(M,G)``. This admits every valid runtime
-    partition without reading device offsets on the host. Padding scale bytes
-    are not written by the quantizer and must be initialized to a valid value."""
+    """Describe one block quantizer and its scale output."""
 
     source_ref: int
     block_size: int
@@ -326,23 +270,28 @@ class BlockQuantizeSpec:
 
 @dataclass(frozen=True)
 class TensorRef:
-    """An auxiliary tensor input to the epilogue (e.g., bias, alpha, scale)."""
+    """An auxiliary fusion input (epilogue broadcasts or mainloop per-K scale)."""
 
     name: str
     dim: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: Dtype
     bcast_mode: BroadcastMode
-    # Per-group MoE aux: dim[0] == num_groups; the epilogue indexes the leading
-    # axis by the tile's routed-group index. ``bcast_mode`` describes the
-    # remaining (M, N) axes (scalar = (G,1,1), per_col = (G,1,N)).
     grouped_by_moe: bool = False
+    reduction_axis: int | None = None
 
     def __post_init__(self) -> None:
         if self.dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported aux dtype {self.dtype!r}; expected one of {SUPPORTED_DTYPES}")
         if len(self.dim) != len(self.stride):
             raise ValueError(f"dim {self.dim} and stride {self.stride} length mismatch")
+        if self.bcast_mode == "per_k" and (len(self.dim) != 3 or self.dim[0] != 1 or (self.dim[1] != 1 and self.dim[2] != 1)):
+            raise ValueError(f"per-K aux {self.name!r} must have shape [1,1,K] or [1,K,1]; got {self.dim}")
+        if self.bcast_mode == "per_k":
+            if self.reduction_axis not in (1, 2) or self.dim[3 - self.reduction_axis] != 1:
+                raise ValueError(f"per-K aux {self.name!r} needs an explicit reduction axis consistent with dim {self.dim}")
+        elif self.reduction_axis is not None:
+            raise ValueError(f"aux {self.name!r}: reduction_axis is only valid for per-K broadcasts")
         if self.grouped_by_moe:
             if len(self.dim) != 3:
                 raise ValueError(f"per-group aux {self.name!r} must be rank-3; got dim {self.dim}")
@@ -351,18 +300,35 @@ class TensorRef:
             if self.bcast_mode not in ("scalar", "per_col", "per_row"):
                 raise ValueError(f"per-group aux {self.name!r} supports scalar, per_col or per_row broadcast; " f"got {self.bcast_mode!r}")
 
+    @property
+    def k_axis(self) -> int:
+        """Logical reduction axis of a rank-3 per-K broadcast (A: 2, B: 1)."""
+        if self.bcast_mode != "per_k":
+            raise ValueError(f"aux {self.name!r} is not a per-K broadcast")
+        assert self.reduction_axis is not None  # Validated at construction.
+        return self.reduction_axis
 
-# Producing-operation references — "where does this op's input come from?".
-# A reference (``FusionOp.parent_idx`` / ``parent_idx_b``) is one int:
-#   * ``>= 0`` → a pointwise op result, ``ops[ref]``.
-#   * ``< 0``  → a GEMM output; ``gemm_index(ref) = -1 - ref`` (-1 = GEMM 0,
-#                -2 = GEMM 1, ...). Single-GEMM's only ref is -1 (the legacy
-#                "matmul output" sentinel).
-#   * ``None`` → parent_idx: auto (prev op, or GEMM 0 for op 0); parent_idx_b:
-#                no second in-chain operand.
-# No separate "which GEMM" field: a ref names one producing op (GEMM or
-# pointwise), mirroring cuDNN. Once two GEMMs merge in an op, downstream refs
-# point at that op (>=0).
+    @property
+    def symbolic_shape(self) -> tuple[int | Axis, ...]:
+        """Logical dynamic extents, with the same rank as declared ``dim``.
+
+        Kernel ABI rank promotion belongs to lowering, not this record.
+        Per-K orientation comes from the operand, even when K equals one.
+        """
+        if self.bcast_mode == "per_k":
+            shape = [1, 1, 1]
+            shape[self.k_axis] = Axis.K
+            return tuple(shape)
+        axes = {
+            "scalar": (1, 1),
+            "per_row": (Axis.M, 1),
+            "per_col": (1, Axis.N),
+            "per_elem": (Axis.M, Axis.N),
+        }[self.bcast_mode]
+        if len(self.dim) == 3:
+            batch = Axis.GROUP if self.grouped_by_moe else (1 if self.dim[0] == 1 else Axis.BATCH)
+            return (batch, *axes)
+        return axes[2 - len(self.dim) :]
 
 
 def gemm_source(g: int) -> int:
@@ -382,13 +348,7 @@ def gemm_index(ref: int) -> int:
 
 @dataclass(frozen=True)
 class FusionOp:
-    """A single pointwise op in the epilogue chain. Unary → ``aux`` None; binary
-    → ``aux`` names an enclosing-chain aux tensor. Materialization is expressed
-    by :class:`OutputSpec` entries referencing this op, not on the op itself.
-    ``parent_idx`` / ``parent_idx_b`` are producing-operation references (see the
-    module note). Fan-out = ops sharing one parent ref; fan-in = a binary op
-    with both parent refs in-chain (``aux`` must be None — mutually exclusive).
-    ``aux_on_rhs`` picks the second operand's side."""
+    """A single pointwise op in the epilogue chain."""
 
     op: str
     aux: str | None = None  # TensorRef.name, or None for unary / fan-in
@@ -397,13 +357,7 @@ class FusionOp:
     parent_idx_b: int | None = None  # fan-in: second producing-op ref (None = absent)
     parent_idx_c: int | None = None  # ternary (binary_select): third producing-op ref
     attrs: tuple[tuple[str, float], ...] = ()  # scalar attrs (negative_slope/clips/swish_beta/axis)
-    # Op math precision (cuDNN per-op ``compute_data_type``); fp32 or int32.
-    # Transcendentals (exp/log/sqrt/rsqrt/sigmoid/gelu/swish) should use fp32.
     compute_dtype: Dtype = "fp32"
-    # Declared output dtype of this op's (virtual or materialized) tensor. The
-    # running value is rounded to it before the next op — a narrow dtype loses
-    # precision on purpose (matching cuDNN even for virtual tensors). fp32
-    # (default) = no rounding.
     out_dtype: Dtype = "fp32"
 
     def __post_init__(self) -> None:
@@ -444,12 +398,7 @@ class FusionOp:
 
 @dataclass(frozen=True)
 class MatmulSpec:
-    """Shape + dtype of the anchor matmul. Rank-3: A=(batch_A, M, K),
-    B=(batch_B, K, N), out=(batch, M, N), batch=max(batch_A, batch_B); each
-    operand batch is the output batch or 1 (broadcast). Materializing the
-    matmul result is expressed by an :class:`OutputSpec` with a GEMM
-    ``source_ref``; the accumulator is rounded to ``out_dtype`` before any
-    fusion op reads it."""
+    """Shape + dtype of the anchor matmul."""
 
     M: int
     N: int
@@ -479,43 +428,16 @@ class MatmulSpec:
             )
         if max(self.a_batch, self.b_batch) != self.batch:
             raise ValueError(f"output batch must be max(a_batch, b_batch); got " f"batch={self.batch}, a_batch={self.a_batch}, " f"b_batch={self.b_batch}")
-        # MMA (a, b, accum) runnability is NOT validated here (depends on arch +
-        # pipeline, which the IR doesn't know) — the compiler checks it against
-        # the arch-aware table. IR only validates structural + output-storage dtype.
         if self.out_dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported matmul out_dtype {self.out_dtype!r}; " f"expected one of {SUPPORTED_DTYPES}")
 
 
 @dataclass(frozen=True)
 class BlockScaleSpec:
-    """A block-scaled matmul: ``C = (descale_a ⊙ A) @ (descale_b ⊙ B)`` — narrow
-    (FP4/FP8) A/B each dequantized by a per-block K scale inside the MMA
-    (``tcgen05.mma.kind::mx*.block_scale``).
-
-    Detected by a purely STRUCTURAL match in the analyzer.  Two real dequants
-    fold directly.  If exactly one side is dequantized and its peer is raw FP8,
-    the peer is normalized to a logical dequant whose scale is one; only the
-    real side has a runtime SF tensor.  No dtype/block/arch rules live here —
-    runnability is decided at compile time from the same normalized MMA key in
-    both cases.  Currently runs: fp4 with any of e4m3 / e8m0 / e5m3 scales at
-    either K-block (16 or 32) — the two axes are orthogonal, so nvfp4 and mxfp4
-    are just the two best-known corners — plus fp8 (e4m3/e5m2) with e8m0 scales
-    at block 32. Mixed mxfp8/mxfp4 is supported in either operand order (shared
-    e8m0 scale format, block 32): SM100 uses the K32 padded-E2M1 layout,
-    while Rubin additionally provides a native-packed K64 form. E5M3 scales
-    require SM 10.7+.
-
-    SF tensors are runtime-positional (not ``TensorRef``s). F8_128x4 inputs are
-    packed byte blobs; MoE GATHER instead requires linear token SF with explicit
-    source-token dimensions and strides. Weight SF retains F8_128x4. GATHER's
-    producer packs the linear rows into the same 128-row × 4-K MMA atoms."""
+    """Describe the data and scale inputs of a block-scaled GEMM."""
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
-    # Per-side scale info, kept SEPARATE for asymmetric block-scale.  An
-    # unnormalized non-dequantized side has all None fields; a fake side has
-    # logical scale metadata plus its fake_dequant mark. `block_size_*` is 2D
-    # (A=[non_K, K], B=[K, non_K]); only 1D K-scaling is used today.
     block_size_a: "tuple[int, ...] | None" = None
     block_size_b: "tuple[int, ...] | None" = None
     sf_dtype_a: "Dtype | None" = None  # A's scale-factor dtype (None if A not scaled)
@@ -527,41 +449,23 @@ class BlockScaleSpec:
     sfa_stride: tuple[int, ...] | None = None
     sfb_dim: tuple[int, ...] | None = None
     sfb_stride: tuple[int, ...] | None = None
-    # Each dequant op's compute + output dtype (dequant OUTPUT = the MMA's input
-    # type for that operand). None for a non-dequantized side. Recorded for the
-    # compile-stage check (cuDNN requires dequant math precision = FLOAT).
     dequant_compute_a: "Dtype | None" = None
     dequant_compute_b: "Dtype | None" = None
     dequant_out_a: "Dtype | None" = None  # = MMA input type for A
     dequant_out_b: "Dtype | None" = None  # = MMA input type for B
-    # A raw FP8 operand opposite one real block-scale dequant is represented as
-    # a logical dequant by a scale of one.  These marks are deliberately NOT
-    # part of the registry's MMA-type key: capability is decided from the
-    # normalized fields above, exactly like a graph with two real dequants.
-    # Codegen uses them only to elide the runtime SF tensor / TMA / SMEM path
-    # and seed that side's still-reserved TMEM scale region with packed 1.0.
     fake_dequant_a: bool = False
     fake_dequant_b: bool = False
-    # matmul-level dtypes (accum/output/tap) are NOT duplicated here — read
-    # chain.matmul / chain.output_dtype. Only input-side info lives here.
+    padded_e2m1: bool = False
 
     def __post_init__(self) -> None:
-        # Structural sanity ONLY — no dtype/block/family/arch rules (analyzer is
-        # structural; the compile stage decides which combos run).
         if self.sf_dtype_a is None and self.sf_dtype_b is None:
             raise ValueError("block_scale spec has neither operand dequantized " "(at least one of A / B must be block-scaled)")
 
     @property
     def both_sided(self) -> bool:
-        """True iff both operands have logical scale metadata.
-
-        Either side may be a fake dequant backed by a constant-one TMEM scale
-        region instead of a runtime scale-factor tensor.
-        """
+        """True iff both operands have logical scale metadata."""
         return self.sf_dtype_a is not None and self.sf_dtype_b is not None
 
-    # Convenience scalars for the symmetric both-sided path (only valid when the
-    # two sides agree, which the compile-stage check enforces).
     @property
     def block_size(self) -> int:
         """K-block size as a single int. A is [non_K, K] (K = last dim); B is
@@ -578,9 +482,6 @@ class BlockScaleSpec:
 
     @property
     def is_fp4(self) -> bool:
-        # Kept as the homogeneous-combo predicate it represented before mixed
-        # input widths were admitted.  Callers that need one side must inspect
-        # that side's dtype explicitly.
         return self.both_fp4
 
     @property
@@ -594,9 +495,6 @@ class BlockScaleSpec:
     @property
     def mma_block_scale_kind(self) -> str:
         """GEMM ``nvvm.MMABlockScaleKind`` member name."""
-        # Rubin's mixed FP8/FP4 instruction is MXF8F6F4, whose
-        # per-side format fields independently encode FP8 or E2M1.  MXF4NVF4
-        # is the UTCOMMA path and requires FP4 on both sides.
         return "MXF4NVF4" if self.both_fp4 else "MXF8F6F4"
 
     @property
@@ -607,12 +505,7 @@ class BlockScaleSpec:
 
     @property
     def sf_scale_format(self) -> int:
-        """``Tcgen05MxInstrDesc`` ``scale_format`` field (idesc bits 24-23);
-        E5M3 (2) needs SM 10.7+ silicon. Unlike :attr:`combo` this one is BAKED
-        INTO THE KERNEL, so an unregistered SF dtype must not fall back to some
-        other format's bits — that would miscompute silently. Declines instead
-        (``NotImplementedError`` is what the engine router treats as "does not
-        serve this graph"; a ``KeyError`` would escape as an engine bug)."""
+        """``Tcgen05MxInstrDesc`` ``scale_format`` field (idesc bits 24-23); E5M3 (2) needs SM 10.7+ silicon."""
         fmt = {"fp8_e4m3": 0, "fp8_e8m0": 1, "fp8_e5m3": 2}.get(self.sf_dtype)
         if fmt is None:
             raise NotImplementedError(f"no MMA scale_format encoding for block-scale SF dtype {self.sf_dtype!r}")
@@ -621,23 +514,10 @@ class BlockScaleSpec:
 
 @dataclass(frozen=True)
 class MoeSpec:
-    """A MoE grouped matmul forward pass: per routed group g,
-    ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % num_experts].T``. A
-    batched matmul where each expert owns a runtime M-range of the flat token
-    tensor (boundaries in a runtime ``first_token_offset``, not baked). Anchor
-    MatmulSpec dims: M=total tokens, K=hidden, N=weight; a_batch=1,
-    b_batch=num_experts. Compiler routes to ``sm100_moe_grouped_matmul_fwd_*``
-    (grouped persistent scheduler + per-group A TMA descriptor replacement).
-    In ``gather`` mode, M counts routed rows and ``token_index`` maps each
-    routed row to a source token. In ``scatter`` mode, the input stays grouped
-    and output row is ``token_index[row] * top_k + token_ks[row]``.
-    COMBINE weights those contributions by top-k scores and sums into token rows.
-    Template capabilities gate execution."""
+    """A MoE grouped matmul forward pass: per routed group g, ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % num_experts].T``."""
 
     num_experts: int  # E — the weight batch; routed group g uses expert g % E
     mode: str = "none"
-    # first_token_offset dtype (INT32 or INT64; cuDNN accepts both). Baked at JIT
-    # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
     offset_multiple: int = 1
@@ -688,48 +568,20 @@ class FusionChain:
     matmul: MatmulSpec
     aux_tensors: list[TensorRef] = field(default_factory=list)
     ops: list[FusionOp] = field(default_factory=list)
-    # Dense GMEM outputs, all equivalent (each = one producer's value cast to
-    # its dtype). output_specs[0] occupies the kernel's primary-output ABI slot;
-    # the order is the runtime slot order. Reductions / the quant scale are
-    # side outputs appended after these in `outputs`.
     output_specs: list[OutputSpec] = field(default_factory=list)
-    # Multi-GEMM: num_gemms parallel GEMMs share the SAME shape/layout/dtype
-    # (``matmul``) but may use different A/B operands, all feeding one epilogue
-    # DAG (e.g. silu(A@B0)*(A@B1)). Operands are deduped: num_a/b_operands count
-    # DISTINCT tensors; ``gemm_operands[g] = (a_idx, b_idx)`` picks from them. An
-    # op names which GEMM output it reads via a negative parent_idx (gemm_source).
-    # Single-GEMM default (1 A, 1 B, one (0,0) GEMM) is the legacy path (ref -1).
     num_a_operands: int = 1
     num_b_operands: int = 1
     gemm_operands: list[tuple[int, int]] = field(default_factory=lambda: [(0, 0)])
-    # Mainloop fusion: unary ops on A applied BEFORE the MMA (``C = op(A) @ B``),
-    # run on the dedicated mainloop warps (8..11 in the 12-warp template) that
-    # transform the TMA'd A SMEM tile in place. POC scope: linear unary chain on
-    # A only. Empty ⇒ no fusion ⇒ ordinary 8-warp template.
     mainloop_a_ops: list[FusionOp] = field(default_factory=list)
     # Same for B (``C = A @ op(B)``); each CTA transforms its own B tile in place.
     mainloop_b_ops: list[FusionOp] = field(default_factory=list)
-    # Mixed-input mainloop: narrow LOAD dtype when the fused operand is loaded
-    # narrower than the MMA reads (e.g. int8 A -> bf16 MMA); ``matmul.a/b_dtype``
-    # hold the wider MMA dtype. None ⇒ no cast (load == MMA). The mainloop warps
-    # stage the cast (TMA loads narrow, warps widen into the MMA SMEM tile).
     mainloop_a_load_dtype: Dtype | None = None
     mainloop_b_load_dtype: Dtype | None = None
-    # Block-scaled matmul: set when A/B are produced by block_scale_dequantize
-    # nodes. Routes to ``sm100_block_scale_matmul_*`` (TMA-loads SF, SMEM→TMEM
-    # utccp, block-scaled MMA); the epilogue DAG still runs on the fp32
-    # accumulator. None ⇒ ordinary matmul.
     block_scale: "BlockScaleSpec | None" = None
-    # MoE grouped matmul: set when the graph's single op is moe_grouped_matmul.
-    # Routes to ``sm100_moe_grouped_matmul_fwd_*``. None ⇒ ordinary matmul.
     moe: "MoeSpec | None" = None
-    # Materialized reduction side-outputs (extra slots after the dense outputs),
-    # initialized by the runtime wrapper and updated atomically in the epilogue.
     reductions: list[ReductionSpec] = field(default_factory=list)
-    # Block-scale quantize nodes. Each entry's quantized data is a dense output
-    # (the OutputSpec carrying its index in ``quant_idx``); each scale is a side
-    # output appended after the reductions.
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
+    gemm_out_dtypes: tuple[Dtype, ...] = ()
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):
@@ -744,6 +596,10 @@ class FusionChain:
             raise ValueError("num_a_operands / num_b_operands must be positive")
         if not self.gemm_operands:
             raise ValueError("gemm_operands must list at least one GEMM")
+        if self.gemm_out_dtypes and len(self.gemm_out_dtypes) != self.num_gemms:
+            raise ValueError("gemm_out_dtypes must describe every GEMM")
+        if any(dtype not in SUPPORTED_DTYPES for dtype in self.gemm_out_dtypes):
+            raise ValueError(f"unsupported GEMM output dtypes: {self.gemm_out_dtypes}")
         for g, (ai, bi) in enumerate(self.gemm_operands):
             if not (0 <= ai < self.num_a_operands) or not (0 <= bi < self.num_b_operands):
                 raise ValueError(f"gemm_operands[{g}]=({ai},{bi}) out of range for " f"{self.num_a_operands} A / {self.num_b_operands} B operands")
@@ -757,6 +613,8 @@ class FusionChain:
         for op in self.ops:
             if op.aux is not None and op.aux not in names:
                 raise ValueError(f"op {op.op!r} references unknown aux {op.aux!r}")
+            if op.aux is not None and self.aux_by_name(op.aux).bcast_mode == "per_k":
+                raise ValueError("per-K scale is a mainloop-only aux, not an epilogue broadcast")
         for red in self.reductions:
             if is_gemm_source(red.source_ref):
                 g = gemm_index(red.source_ref)
@@ -795,10 +653,6 @@ class FusionChain:
             quant_refs.append(spec.quant_idx)
         if sorted(quant_refs) != list(range(len(self.quants))):
             raise ValueError(f"each quant needs exactly one dense data output; quants={len(self.quants)}, " f"referenced={sorted(quant_refs)}")
-        # Mainloop fusion (POC): a straight op chain. Unary, or binary with a
-        # single SCALAR aux (e.g. A*alpha) — scalar keeps it swizzle-agnostic.
-        # No fan-in; per-row/col/elem aux is out of scope (needs swizzle-aware
-        # SMEM indexing).
         for label, oplist in (
             ("mainloop_a_ops", self.mainloop_a_ops),
             ("mainloop_b_ops", self.mainloop_b_ops),
@@ -807,12 +661,19 @@ class FusionChain:
                 if op.parent_idx_b is not None:
                     raise ValueError(f"{label} op {op.op!r} cannot have parent_idx_b (no fan-in)")
                 if op.op in BINARY_OPS and op.aux is None:
-                    raise ValueError(f"{label} binary op {op.op!r} needs a scalar aux tensor")
+                    raise ValueError(f"{label} binary op {op.op!r} needs an aux tensor")
                 if op.aux is not None:
                     if op.aux not in names:
                         raise ValueError(f"{label} op {op.op!r} references unknown aux {op.aux!r}")
                     ref = self.aux_by_name(op.aux)
-                    if ref.bcast_mode != "scalar":
+                    if ref.bcast_mode == "per_k":
+                        expected = (1, 1, self.matmul.K) if label == "mainloop_a_ops" else (1, self.matmul.K, 1)
+                        axis = 2 if label == "mainloop_a_ops" else 1
+                        if ref.dim != expected or ref.k_axis != axis:
+                            raise ValueError(
+                                f"{label} per-K aux {ref.name!r}: expected {expected} with K axis {axis}, " f"got {ref.dim} with K axis {ref.k_axis}"
+                            )
+                    elif ref.bcast_mode != "scalar":
                         raise ValueError(
                             f"{label} op {op.op!r} aux {op.aux!r} must broadcast as a "
                             f"scalar (got {ref.bcast_mode!r}); per-row/col/elem mainloop "
@@ -870,9 +731,24 @@ class FusionChain:
         return self.output_specs[0].dtype if self.output_specs else "bf16"
 
     @property
+    def widen_integer_accumulators(self) -> bool:
+        """Select the register format entering the epilogue."""
+        return self.matmul.accum_dtype == "int32" and self.gemm_out_dtype(0) != "int32" and not self.is_multi_gemm
+
+    @property
     def out_major(self) -> "OutMajor":
         """Layout of the primary-ABI-slot output."""
         return self.output_specs[0].major if self.output_specs else "n"
+
+    def gemm_out_dtype(self, index: int) -> Dtype:
+        """Return one GEMM's declared output dtype."""
+        if self.gemm_out_dtypes:
+            return self.gemm_out_dtypes[index]
+        if self.is_multi_gemm and not self.ops:
+            for spec in self.output_specs:
+                if spec.source_ref == gemm_source(index) and spec.quant_idx is None:
+                    return spec.dtype
+        return self.matmul.out_dtype
 
     def aux_by_name(self, name: str) -> TensorRef:
         for t in self.aux_tensors:
@@ -890,10 +766,7 @@ class FusionChain:
 
     @property
     def outputs(self) -> list["ChainOutput"]:
-        """GMEM outputs in slot order: the dense ``output_specs`` (all
-        equivalent; index 0 = the kernel's primary ABI slot), then reductions,
-        then one quant scale per ``quants`` entry. Callers must pass runtime
-        output tensors in this order."""
+        """Return materialized outputs in kernel argument order."""
         outs: list[ChainOutput] = [
             ChainOutput(source=self._output_label(spec), dtype=spec.dtype, dim=spec.dim, stride=spec.stride) for spec in self.output_specs
         ]
@@ -925,9 +798,7 @@ class FusionChain:
         return self.outputs[1:] if self.output_specs else list(self.outputs)
 
     def dtypes_used(self) -> frozenset[Dtype]:
-        """Every dtype this chain names, anywhere. Found by walking the IR's
-        ``Dtype``-annotated fields rather than listing the dtype-bearing specs,
-        so a gate built on this cannot be bypassed by a field added later."""
+        """Every dtype this chain names, anywhere."""
         found: set[Dtype] = set()
         _walk_dtype_fields(self, found)
         return frozenset(found)
@@ -965,17 +836,7 @@ class FusionChain:
 
 
 def swap_ab(chain: FusionChain) -> FusionChain:
-    """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``.
-
-    No runtime storage moves.  Every dense non-virtual tensor swaps its last
-    two logical dimensions and strides, A/B-side metadata trades places, and
-    pointwise operation topology stays unchanged.  The binding performs the
-    corresponding tensor-role swap separately.
-
-    Quantization axes and scale metadata follow the transpose; the ordinary
-    quantization support checks decide whether the resulting layout can run.
-    MoE lowers to a distinct internal operation whose groups partition N.
-    """
+    """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``."""
 
     def _mn(values):
         if values is None or len(values) < 2:
@@ -986,8 +847,6 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         return {"per_row": "per_col", "per_col": "per_row"}.get(mode, mode)
 
     def _op(op):
-        # gen_index is the only pointwise op whose value depends on an output
-        # axis. Scalar attributes on every other op are transpose-invariant.
         attrs = tuple((key, 3 - value if key == "axis" and value in (1, 2) else value) for key, value in op.attrs)
         return dataclasses.replace(op, attrs=attrs) if attrs != op.attrs else op
 
@@ -1007,13 +866,16 @@ def swap_ab(chain: FusionChain) -> FusionChain:
     for t in chain.aux_tensors:
         dim, stride = t.dim, t.stride
         if len(dim) == 1:
-            # Rank-1 aux broadcasts as (1, N). Make that axis explicit before
-            # transposing; runtime _reshape_aux_to_fake supplies the same view.
             dim, stride = (1, dim[0]), (stride[0], stride[0])
-        swapped_aux.append(dataclasses.replace(t, dim=_mn(dim), stride=_mn(stride), bcast_mode=_bcast(t.bcast_mode)))
-    # An unset output stride means compact N-major. Materialize it before the
-    # transpose; leaving it unset would incorrectly remain N-major instead of
-    # becoming the equivalent M-major view.
+        swapped_aux.append(
+            dataclasses.replace(
+                t,
+                dim=_mn(dim),
+                stride=_mn(stride),
+                bcast_mode=_bcast(t.bcast_mode),
+                reduction_axis=None if t.reduction_axis is None else 3 - t.reduction_axis,
+            )
+        )
     swapped_outputs = [
         dataclasses.replace(
             o,
@@ -1027,11 +889,7 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         dataclasses.replace(
             q,
             axis=2 if q.axis == 1 else 1,
-            # transpose=True is an API spelling of axis=1, already resolved
-            # by the analyzer. Use the explicit axis in the transformed IR.
             transpose=False,
-            # F8_128x4 describes physical atoms, with the blocked axis last
-            # for both row and column quantization. Their storage is unchanged.
             scale_dim=q.scale_dim if q.scale_reorder == "F8_128x4" else _mn(q.scale_dim),
         )
         for q in chain.quants

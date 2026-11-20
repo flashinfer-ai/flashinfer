@@ -33,6 +33,15 @@
 #ifndef CAKE_FMHA_NVFP4
 #error "CAKE_FMHA_NVFP4 must be supplied by the route-specific JIT"
 #endif
+#ifndef CAKE_FMHA_FIXED_NUM_SPLITS
+#define CAKE_FMHA_FIXED_NUM_SPLITS 0
+#endif
+#ifndef CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT
+#define CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT 0
+#endif
+#ifndef CAKE_FMHA_REDUCE_USE_PDL
+#define CAKE_FMHA_REDUCE_USE_PDL 0
+#endif
 
 using tvm::ffi::Optional;
 using tvm::ffi::Variant;
@@ -221,6 +230,36 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   TVM_FFI_ICHECK_EQ(tensor.stride(2) % 16, 0);
   TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16, 0);
 
+#if !CAKE_FMHA_NVFP4
+  // The E4M3 program's sm_100a path loads K/V with cp.async.bulk.tensor.4d at
+  // (dim, token, head, page); only its sm_103a path issues the 5d load over the
+  // unit k-group axis below.  A 5-D map under a 4d load is an illegal
+  // instruction, so encode the rank the running device's program reads.
+  int cc_minor = 0;
+  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor,
+                                           tensor.device().device_id),
+                    cudaSuccess);
+  if (cc_minor == 0) {
+    uint64_t global_dim4[4] = {kHeadDim, CAKE_FMHA_PAGE_SIZE,
+                               static_cast<uint64_t>(tensor.size(1)),
+                               static_cast<uint64_t>(tensor.size(0))};
+    uint64_t global_strides4[3] = {static_cast<uint64_t>(tensor.stride(2)),
+                                   static_cast<uint64_t>(tensor.stride(1)),
+                                   static_cast<uint64_t>(tensor.stride(0))};
+    uint32_t box_dim4[4] = {kHeadDim, 16u, 1u, 1u};
+    uint32_t elem_strides4[4] = {1u, 1u, 1u, 1u};
+    CUtensorMap tm4;
+    CUresult result4 = cuTensorMapEncodeTiled(
+        &tm4, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, tensor.data_ptr(), global_dim4,
+        global_strides4, box_dim4, elem_strides4, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TVM_FFI_ICHECK_EQ(result4, CUDA_SUCCESS)
+        << "failed to encode Cake FMHA " << name << " tensor map";
+    return tm4;
+  }
+#endif
+
   uint64_t global_dim[5] = {
       kHeadDim, CAKE_FMHA_PAGE_SIZE, 1u,
       static_cast<uint64_t>(tensor.size(1)),
@@ -333,55 +372,18 @@ struct SplitPlan {
   int blocks_per_split;
 };
 
-SplitPlan ResolveSplitPlan(TensorView seq_lens, int64_t max_kv_len,
-                           int sm_count, cudaStream_t stream) {
-  CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
-  CUresult capture_result =
-      cuStreamIsCapturing(reinterpret_cast<CUstream>(stream), &capture_status);
-  TVM_FFI_ICHECK_EQ(capture_result, CUDA_SUCCESS);
-  TVM_FFI_ICHECK_EQ(capture_status, CU_STREAM_CAPTURE_STATUS_NONE)
-      << "FP8 optimized routing must resolve seq_lens before CUDA Graph capture";
-
-  std::vector<int> host_lengths(BATCH_SIZE);
-  cudaError_t status = cudaMemcpyAsync(
-      host_lengths.data(), seq_lens.data_ptr(), BATCH_SIZE * sizeof(int),
-      cudaMemcpyDeviceToHost, stream);
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess);
-  status = cudaStreamSynchronize(stream);
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess);
-
-  int max_seen = 0;
-  int even_bucket = -1;
-  bool split_safe = true;
-  for (int length : host_lengths) {
-    TVM_FFI_ICHECK_GT(length, 0)
-        << "optimized quantized decode requires positive KV lengths";
-#if !CAKE_FMHA_NVFP4
-    TVM_FFI_ICHECK_GE(length, 512)
-        << "optimized FP8 decode requires at least four KV blocks";
-#endif
-#if CAKE_FMHA_FULL_BLOCKS
-    TVM_FFI_ICHECK_EQ(length % 128, 0)
-        << "optimized FP8 decode requires full 128-token blocks";
-#endif
-    int blocks = (length + 127) / 128;
-    blocks += blocks % 2;
-    if (even_bucket < 0) even_bucket = blocks;
-#if CAKE_FMHA_NVFP4
-    even_bucket = std::max(even_bucket, blocks);
-#else
-    TVM_FFI_ICHECK_EQ(blocks, even_bucket)
-        << "optimized FP8 decode requires one evened-block bucket";
-#endif
-    max_seen = std::max(max_seen, length);
-    split_safe = split_safe && length % 256 == 0;
-  }
-  TVM_FFI_ICHECK_EQ(max_seen, max_kv_len);
-
+// The plan reads host scalars only: max_kv_len bounds every length (0 <= seq_lens[b] <= max_kv_len) and sizes
+// the page padding, the split count and the workspace. The kernels read seq_lens on the device: a batch's tiles
+// mask the tokens past its length, and a tile with no token (length 0, or a split past a shorter sequence) is empty.
+SplitPlan ResolveSplitPlanHost(int64_t max_kv_len, int sm_count) {
+  TVM_FFI_ICHECK_GE(max_kv_len, 0);
+  int even_bucket = static_cast<int>((max_kv_len + 127) / 128);
+  even_bucket += even_bucket % 2;
+  even_bucket = std::max(even_bucket, 2);  // the kernel walks at least one block pair per tile
   int total_tiles = BATCH_SIZE * NUM_KV_HEADS;
   int num_splits = 1;
   int blocks_per_split = even_bucket;
-  if (split_safe && total_tiles < sm_count && even_bucket >= 8) {
+  if (total_tiles < sm_count && even_bucket >= 8) {
     int target = std::max(1, sm_count / total_tiles);
     blocks_per_split = (even_bucket + target - 1) / target;
     blocks_per_split = std::max(4, blocks_per_split + blocks_per_split % 2);
@@ -528,8 +530,15 @@ void cake_paged_attention_decode(
 
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
   cudaStream_t stream = get_stream(query.device());
-  SplitPlan plan = ResolveSplitPlan(seq_lens, max_kv_len,
-                                    static_cast<int>(sm_count), stream);
+  SplitPlan plan = ResolveSplitPlanHost(max_kv_len, static_cast<int>(sm_count));
+#if CAKE_FMHA_FIXED_NUM_SPLITS != 0
+  // The fixed-plan module serves only its plan (the route selects it from the same host scalars).
+  TVM_FFI_ICHECK(plan.num_splits == CAKE_FMHA_FIXED_NUM_SPLITS &&
+                 plan.blocks_per_split == CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT)
+      << "Cake FMHA FP8 decode: fixed split plan " << CAKE_FMHA_FIXED_NUM_SPLITS << " x "
+      << CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT << " does not match the host plan " << plan.num_splits << " x "
+      << plan.blocks_per_split;
+#endif
   int64_t source_pages = block_tables.size(block_tables.ndim() - 1);
   int64_t page_table_rows = shared_page_table ? 1 : 2;
   int64_t required_pages =
@@ -617,21 +626,26 @@ void cake_paged_attention_decode(
   int64_t query_items = needs_query_padding
                             ? BATCH_SIZE * NUM_KV_HEADS * kTileQ * kHeadDim
                             : 0;
-  int64_t prep_items = std::max<int64_t>({page_items, query_items, 1});
-  int const prep_threads = 256;
-  int const prep_blocks =
-      static_cast<int>((prep_items + prep_threads - 1) / prep_threads);
-  PrepareQuantDecode<<<prep_blocks, prep_threads, 0, stream>>>(
-      static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
-      static_cast<int>(page_items), static_cast<int>(source_pages),
-      static_cast<int>(padded_pages), static_cast<int>(page_table_rows),
-      static_cast<const uint8_t*>(query.data_ptr()), padded_query,
-      static_cast<int>(query_items), kGroupSize, query.stride(0),
-      query.stride(1), query.stride(2),
-      bmm1_tensor.has_value() ? nullptr : bmm1_ptr, bmm1_scalar,
-      bmm2_tensor.has_value() ? nullptr : bmm2_ptr, bmm2_scalar);
-  TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)
-      << "failed to prepare Cake FMHA FP8 decode inputs";
+  // Host scalars reach the kernels as arguments (a null scale pointer selects them), so the
+  // preparation kernel runs only when the page table or the query needs padding.
+  if (needs_page_padding || needs_query_padding) {
+    int64_t prep_items = std::max<int64_t>({page_items, query_items, 1});
+    int const prep_threads = 256;
+    int const prep_blocks =
+        static_cast<int>((prep_items + prep_threads - 1) / prep_threads);
+    PrepareQuantDecode<<<prep_blocks, prep_threads, 0, stream>>>(
+        static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
+        static_cast<int>(page_items), static_cast<int>(source_pages),
+        static_cast<int>(padded_pages), static_cast<int>(page_table_rows),
+        static_cast<const uint8_t*>(query.data_ptr()), padded_query,
+        static_cast<int>(query_items), kGroupSize, query.stride(0),
+        query.stride(1), query.stride(2), nullptr, bmm1_scalar, nullptr,
+        bmm2_scalar);
+    TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)
+        << "failed to prepare Cake FMHA FP8 decode inputs";
+  }
+  float* bmm1_arg_ptr = bmm1_tensor.has_value() ? bmm1_ptr : nullptr;
+  float* bmm2_arg_ptr = bmm2_tensor.has_value() ? bmm2_ptr : nullptr;
 
   int* page_table_ptr =
       needs_page_padding ? padded_page_table
@@ -651,17 +665,17 @@ void cake_paged_attention_decode(
   grid_x = std::min(grid_x, 128u);
   cudaError_t status = cake_fmha_launch_decode_quant_nvfp4(
       p_q, p_k, p_v, p_ksf, p_vsf, static_cast<uint8_t*>(out.data_ptr()),
-      page_table_ptr, static_cast<int*>(seq_lens.data_ptr()), bmm1_ptr,
-      bmm2_ptr, partial_o, partial_max, partial_sum, page_batch_stride,
+      page_table_ptr, static_cast<int*>(seq_lens.data_ptr()), bmm1_arg_ptr,
+      bmm2_arg_ptr, partial_o, partial_max, partial_sum, page_batch_stride,
       page_v_offset, bmm1_is_log2, plan.num_splits, plan.blocks_per_split,
-      grid_x, 1, 1, stream);
+      bmm1_scalar, bmm2_scalar, grid_x, 1, 1, stream);
 #else
   cudaError_t status = cake_fmha_launch_decode_quant_fp8(
       p_q, p_k, p_v, static_cast<uint8_t*>(out.data_ptr()), page_table_ptr,
-      static_cast<int*>(seq_lens.data_ptr()), bmm1_ptr, bmm2_ptr, partial_o,
-      partial_max, partial_sum, page_batch_stride, page_v_offset,
-      bmm1_is_log2, plan.num_splits, plan.blocks_per_split, grid_x, 1, 1,
-      stream);
+      static_cast<int*>(seq_lens.data_ptr()), bmm1_arg_ptr, bmm2_arg_ptr,
+      partial_o, partial_max, partial_sum, page_batch_stride, page_v_offset,
+      bmm1_is_log2, plan.num_splits, plan.blocks_per_split, bmm1_scalar,
+      bmm2_scalar, grid_x, 1, 1, stream);
 #endif
 #if CAKE_FMHA_NVFP4
   RecordTmaDeviceSlotUses(
@@ -676,15 +690,15 @@ void cake_paged_attention_decode(
   if (plan.num_splits > 1) {
     status = cake_fmha_launch_decode_quant_fp8_reduce(
         partial_o, partial_max, partial_sum,
-        static_cast<uint8_t*>(out.data_ptr()), bmm2_ptr, plan.num_splits,
-        BATCH_SIZE * NUM_Q_HEADS, 1, 1, stream);
+        static_cast<uint8_t*>(out.data_ptr()), bmm2_arg_ptr, plan.num_splits,
+        bmm2_scalar, BATCH_SIZE * NUM_Q_HEADS, 1, 1, stream,
+        CAKE_FMHA_REDUCE_USE_PDL != 0 && enable_pdl);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "Cake FMHA FP8 reduce launch failed: "
         << cudaGetErrorString(status);
   }
 
   (void)multi_ctas_kv_counter_buffer;
-  (void)enable_pdl;
 }
 
 }  // namespace cake_fmha

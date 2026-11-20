@@ -44,6 +44,10 @@ class MoEEpTensors:
     # uses ``FleetParams.max_tokens_per_rank``. Fleet/Handle transports and
     # ``MoEEpMegaLayer`` ignore it.
     runtime_max_tokens_per_rank: Optional[int] = None
+    # Shared-expert input when routed activations are already quantized in a
+    # different format. BF16 is quantized by the backend; MXFP8 also needs scales.
+    shared_hidden_states: Optional["torch.Tensor"] = None
+    shared_scales: Optional["torch.Tensor"] = None
 
     @property
     def num_tokens(self) -> int:

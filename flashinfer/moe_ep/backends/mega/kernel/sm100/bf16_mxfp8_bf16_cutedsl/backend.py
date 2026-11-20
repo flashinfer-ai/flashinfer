@@ -16,6 +16,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from ..common.bf16_staging import (
     stage_mega_moe_inputs,
     validate_bf16_forward_inputs,
@@ -40,7 +41,7 @@ def _clamp(config: Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
 
 
 @register_mega_kernel("sm100_bf16_mxfp8_bf16_cutedsl")
-class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16Mxfp8CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     supports_output_view = True
 
     @classmethod
@@ -61,6 +62,14 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         validate_bf16_mxfp8_cutedsl_cuda()
         validate_mega_arch()
+        if self._kernel_config.batch_invariant:
+            from ..common.batch_invariant import (
+                bf16_batch_invariant_arch,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            self._arithmetic_arch = bf16_batch_invariant_arch()
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -117,8 +126,30 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            # Ordinary entries retain their historical key convention.
+            apply_routing_weights_before_fc2=k.batch_invariant,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=(1 if k.batch_invariant else None),
+            gate_up_clamp=_clamp(k),
+            activation=k.activation,
+            swiglu_alpha=k.swiglu_alpha,
+            swiglu_beta=k.swiglu_beta,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.a16_batch_invariant import a16_batch_invariant_fingerprint
+
+        return a16_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -143,6 +174,12 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             num_valid_tokens_tensor=config.num_valid_tokens_tensor,
             knobs=self._workspace_knobs(fleet_params),
+            batch_invariant=config.batch_invariant,
+            activation=config.activation,
+            swiglu_alpha=config.swiglu_alpha,
+            swiglu_beta=config.swiglu_beta,
+            situ_beta=config.situ_beta,
+            situ_linear_beta=config.situ_linear_beta,
         )
         if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
@@ -270,6 +307,10 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens=None,
         )
         partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        if self._kernel_config.batch_invariant:
+            ids = workspace.topk_idx[:num_tokens]
+            valid = (ids >= 0) & (ids < workspace.num_total_experts)
+            workspace._unfinalized_weights[:num_tokens].copy_(valid.to(torch.float32))
         return (
             partials[:num_tokens].view(
                 num_tokens * self._kernel_config.top_k, workspace.hidden
@@ -300,6 +341,8 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
             config.resolved_finalize_mode,
+            config.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             epilogue_pool_key(config.num_valid_tokens_tensor),
             knobs_pool_key(self._workspace_knobs(fleet_params)),
         )

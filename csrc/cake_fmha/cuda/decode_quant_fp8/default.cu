@@ -107,10 +107,21 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #ifndef NUM_KV_HEADS
 #define NUM_KV_HEADS 2
 #endif
-#define NUM_SPLITS 0
-#define BLOCKS_PER_SPLIT 0
-#define FULL_BLOCKS 1
-#define ENABLE_PDL 0
+// The fixed split plan (8 splits x 16 blocks) and the PDL trigger of the route's fixed-plan module; 0 = the
+// runtime plan, no trigger.
+#ifndef CAKE_FMHA_FIXED_NUM_SPLITS
+#define CAKE_FMHA_FIXED_NUM_SPLITS 0
+#endif
+#ifndef CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT
+#define CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT 0
+#endif
+#ifndef CAKE_FMHA_ENABLE_PDL
+#define CAKE_FMHA_ENABLE_PDL 0
+#endif
+#define NUM_SPLITS CAKE_FMHA_FIXED_NUM_SPLITS
+#define BLOCKS_PER_SPLIT CAKE_FMHA_FIXED_BLOCKS_PER_SPLIT
+#define FULL_BLOCKS 0
+#define ENABLE_PDL CAKE_FMHA_ENABLE_PDL
 
 #include <math_constants.h>
 
@@ -971,7 +982,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, uint8_t* __restrict__ O, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, float* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split)
+kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, uint8_t* __restrict__ O, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, float* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split, float bmm1_scalar, float bmm2_scalar)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1310,7 +1321,7 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
         asm volatile("setmaxnreg.inc.sync.aligned.u32 184;");
         { // softmax_main
             float log2e_mult_s = ((bmm1_is_log2 != 0) ? 1.0f : 1.4426950408889634f);
-            float softmax_scale_log2 = bmm1_scale_ptr[0] * log2e_mult_s;
+            float softmax_scale_log2 = ((bmm1_scale_ptr != nullptr) ? bmm1_scale_ptr[0] : bmm1_scalar) * log2e_mult_s;
             int is_wg1 = ((warp >= 4) ? 1 : 0);
             const int tmem_row_base_v = warp % 4 * 32;
             int my_tmem_s_base = taddr + (unsigned int)(((is_wg1 != 0) ? 8 : 0));
@@ -1327,6 +1338,7 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
             float sv_hi[4];
             int op01_phase = ((is_wg1 != 0) ? 0 : 1);
             int op01_stage = 0;
+            unsigned int p_store_count = 0;
 #if __CUDA_ARCH__ == 1030
             unsigned int work_stage_s = 0;
             unsigned int tile_idx_s = blockIdx.x;
@@ -1373,7 +1385,9 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                 uint32_t _amf_u_0 = __float_as_uint(-3.4028235e+38f);
                 uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
                 unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-                if (wg_tid < 8) {
+                // Two max-exchange buffers, alternating per pair: a warp that runs ahead into pair k + 1 must not
+                // raise the slot another warp of its warpgroup still has to read for pair k (one barrier per pair).
+                if (wg_tid < 16) {
                     my_exch_u32_ptr[wg_tid] = _amf_enc_0;
                 }
                 if (is_wg1 != 0) {
@@ -1430,6 +1444,28 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     int kv_row1 = ldtm_row_base + 8;
                     int kv_row2 = ldtm_row_base + 16;
                     int kv_row3 = ldtm_row_base + 24;
+                    // Runtime lengths: a score past seq_lens[b] (a tail token or the padding block of an odd block
+                    // count) takes -FLT_MAX before the row max, so its probability is exactly 0.
+                    // Only the top block pair (pair 0: the tile's last two blocks) of a non-empty tile can hold
+                    // tokens past seq_lens[b]; an empty tile's output is replaced, so lower pairs need no mask.
+                    if (pair == 0) {
+                        if (block_base + kv_row0 >= seqlen_kv) {
+                            sv[0] = -3.4028235e+38f;
+                            sv[1] = -3.4028235e+38f;
+                        }
+                        if (block_base + kv_row1 >= seqlen_kv) {
+                            sv[2] = -3.4028235e+38f;
+                            sv[3] = -3.4028235e+38f;
+                        }
+                        if (block_base + kv_row2 >= seqlen_kv) {
+                            sv[4] = -3.4028235e+38f;
+                            sv[5] = -3.4028235e+38f;
+                        }
+                        if (block_base + kv_row3 >= seqlen_kv) {
+                            sv[6] = -3.4028235e+38f;
+                            sv[7] = -3.4028235e+38f;
+                        }
+                    }
                     float pair_max[2];
                     float _max_0 = max_noftz(sv[0], sv[2]);
                     float _max_1 = max_noftz(sv[4], sv[6]);
@@ -1448,6 +1484,7 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         float _max_7 = max_noftz(pair_max[c_1], _shfl_xor_1);
                         pair_max[c_1] = _max_7;
                     }
+                    unsigned int* pair_exch_u32_ptr = my_exch_u32_ptr + (pair % 2) * 8;
                     float old_max_pair[2];
                     float new_max_pair[2];
                     #pragma unroll
@@ -1463,19 +1500,19 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         uint32_t _amf_u_2 = __float_as_uint(new_max_pair[1]);
                         uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
                         unsigned int _amf_enc_2 = _amf_u_2 ^ _amf_mask_2;
-                        atomicMax(&my_exch_u32_ptr[col_pair_base], _amf_enc_1);
-                        atomicMax(&my_exch_u32_ptr[col_pair_base + 1], _amf_enc_2);
+                        atomicMax(&pair_exch_u32_ptr[col_pair_base], _amf_enc_1);
+                        atomicMax(&pair_exch_u32_ptr[col_pair_base + 1], _amf_enc_2);
                     }
                     if (is_wg1 != 0) {
                         asm volatile("barrier.sync 9, 128;" ::: "memory");
                     } else {
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                     }
-                    uint32_t _amf_u_3 = my_exch_u32_ptr[col_pair_base];
+                    uint32_t _amf_u_3 = pair_exch_u32_ptr[col_pair_base];
                     uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
                     float _amf_dec_0 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
                     new_max_pair[0] = _amf_dec_0;
-                    uint32_t _amf_u_4 = my_exch_u32_ptr[col_pair_base + 1];
+                    uint32_t _amf_u_4 = pair_exch_u32_ptr[col_pair_base + 1];
                     uint32_t _amf_mask_4 = ((_amf_u_4 >> 31) - 1u) | 0x80000000u;
                     float _amf_dec_1 = __uint_as_float(_amf_u_4 ^ _amf_mask_4);
                     new_max_pair[1] = _amf_dec_1;
@@ -1514,15 +1551,6 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     tmem_st_x4_f32(my_tmem_stats, stats_pair);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-#if __CUDA_ARCH__ == 1030
-                    mbarrier_arrive(corr_scale_addr + (is_wg1) * 8);
-#else
-                    if (is_wg1 != 0) {
-                        mbarrier_arrive(corr_scale_1_addr);
-                    } else {
-                        mbarrier_arrive(corr_scale_0_addr);
-                    }
-#endif  // __CUDA_ARCH__
                     float exp_vals[8];
                     row_max_pair[0] = new_max_pair[0];
                     row_max_pair[1] = new_max_pair[1];
@@ -1606,9 +1634,19 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                                                "f"(exp_vals[6]), "f"(exp_vals[7]));
                         regs_p[1] = _packed;
                     }
+                    // P is single-buffered per warpgroup: the P.V MMA that read this buffer last must be complete
+                    // before it is overwritten (its commit arrives on o_done).
+                    if (p_store_count != 0) {
+                        mbarrier_wait((is_wg1 != 0) ? o_done_1_addr : o_done_0_addr, (p_store_count - 1) & 1);
+                    }
+                    p_store_count += 1;
                     int mtx_idx = lane / 8;
                     int thr_row_idx = lane % 8;
-                    int seg_col_idx = warp_in_wg * 2 + mtx_idx ^ thr_row_idx;
+                    // The PV MMA reads P through a 128B-swizzle descriptor: the hardware XORs each 16-byte chunk with the
+                    // absolute shared-address row phase ((address >> 7) % 8). The P buffers start 640 bytes into a
+                    // 1024-byte swizzle atom, so the store applies that phase rather than the tile-relative row.
+                    int p_row_phase = ((((is_wg1 != 0) ? smem_p1_addr : smem_p0_addr) >> 7) + thr_row_idx) % 8;
+                    int seg_col_idx = warp_in_wg * 2 + mtx_idx ^ p_row_phase;
                     int stsm_offset = thr_row_idx * 128 + seg_col_idx * 16;
                     const void* _stmatrix_b8_ptr_5 = reinterpret_cast<const void*>(reinterpret_cast<uint8_t*>(my_p_base) + stsm_offset);
                     uint64_t _stmatrix_b8_addr64_5;
@@ -1619,6 +1657,17 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         :: "r"(_stmatrix_b8_addr_5), "r"(regs_p[0]), "r"(regs_p[1])
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    // corr_scale releases this pair's statistics and P together: the correction warps answer it with
+                    // o_free, after which the MMA warp issues the P.V MMA that reads P.
+#if __CUDA_ARCH__ == 1030
+                    mbarrier_arrive(corr_scale_addr + (is_wg1) * 8);
+#else
+                    if (is_wg1 != 0) {
+                        mbarrier_arrive(corr_scale_1_addr);
+                    } else {
+                        mbarrier_arrive(corr_scale_0_addr);
+                    }
+#endif  // __CUDA_ARCH__
 #if __CUDA_ARCH__ == 1030
                     if (is_wg1 != 0) {
                         mbarrier_wait(corr_empty_1_addr, _phase_corr_empty_1_0);
@@ -1741,8 +1790,8 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // correction_main
             float log2e_mult_c = ((bmm1_is_log2 != 0) ? 1.0f : 1.4426950408889634f);
-            float softmax_scale_log2_1 = bmm1_scale_ptr[0] * log2e_mult_c;
-            float output_scale = bmm2_scale_ptr[0];
+            float softmax_scale_log2_1 = ((bmm1_scale_ptr != nullptr) ? bmm1_scale_ptr[0] : bmm1_scalar) * log2e_mult_c;
+            float output_scale = ((bmm2_scale_ptr != nullptr) ? bmm2_scale_ptr[0] : bmm2_scalar);
             const int tmem_row_base_v_1 = warp % 4 * 32;
             const int corr_row = tmem_row_base_v_1 << 16;
             const int corr_tid = warp % 4 * 32 + lane;
@@ -2126,7 +2175,15 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     part_vals[5] = o0_hi_epi[1] * pscale0_o + o1_hi_epi[1] * pscale1_o;
                     part_vals[6] = o0_hi_epi[2] * pscale0_e + o1_hi_epi[2] * pscale1_e;
                     part_vals[7] = o0_hi_epi[3] * pscale0_o + o1_hi_epi[3] * pscale1_o;
-                    int corr_x_odd = ((lane % 2 == 0) ? 112 : 48);
+                    // A tile with no KV token of its batch in this split's block range (seq_lens[b] == 0, or a split
+                    // past the end of a shorter sequence) is empty: partial O 0, max -inf, sum 0, so the reduce skips it.
+                    const bool tile_empty_c = seqlen_kv_1 <= split_start_block_1 * BLOCK_N;
+                    if (tile_empty_c) {
+                        #pragma unroll
+                        for (int e_c = 0; e_c < 8; e_c++) {
+                            part_vals[e_c] = 0.0f;
+                        }
+                    }
                     int corr_row_e = (unsigned int)tmem_row_base_v_1 + lane / 4;
                     int q_even = col_pair_base_c;
                     int q_odd = col_pair_base_c + 1;
@@ -2134,27 +2191,27 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     int po_even = ((head_base + q_even) * ((NUM_SPLITS != 0) ? NUM_SPLITS : num_splits) + split_c) * HEAD_DIM;
                     int po_odd = ((head_base + q_odd) * ((NUM_SPLITS != 0) ? NUM_SPLITS : num_splits) + split_c) * HEAD_DIM;
                     if (q_even < group_ratio_rt) {
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e ^ 80))) + (0)) = part_vals[0];
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 8 ^ 80))) + (0)) = part_vals[2];
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 16 ^ 80))) + (0)) = part_vals[4];
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 24 ^ 80))) + (0)) = part_vals[6];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e))) + (0)) = part_vals[0];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 8))) + (0)) = part_vals[2];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 16))) + (0)) = part_vals[4];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 24))) + (0)) = part_vals[6];
                     }
                     if (q_odd < group_ratio_rt) {
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e ^ corr_x_odd))) + (0)) = part_vals[1];
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 8 ^ corr_x_odd))) + (0)) = part_vals[3];
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 16 ^ corr_x_odd))) + (0)) = part_vals[5];
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 24 ^ corr_x_odd))) + (0)) = part_vals[7];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e))) + (0)) = part_vals[1];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 8))) + (0)) = part_vals[3];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 16))) + (0)) = part_vals[5];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 24))) + (0)) = part_vals[7];
                     }
                     if (corr_tid < 4) {
                         int st_even = (head_base + q_even) * ((NUM_SPLITS != 0) ? NUM_SPLITS : num_splits) + split_c;
                         int st_odd = (head_base + q_odd) * ((NUM_SPLITS != 0) ? NUM_SPLITS : num_splits) + split_c;
                         if (q_even < group_ratio_rt) {
-                            *(reinterpret_cast<float*>(partial_max + st_even) + (0)) = fm0 * softmax_scale_log2_1;
-                            *(reinterpret_cast<float*>(partial_sum + st_even) + (0)) = local_sum_pair[0];
+                            *(reinterpret_cast<float*>(partial_max + st_even) + (0)) = tile_empty_c ? -CAKE_FMHA_INF : fm0 * softmax_scale_log2_1;
+                            *(reinterpret_cast<float*>(partial_sum + st_even) + (0)) = tile_empty_c ? 0.0f : local_sum_pair[0];
                         }
                         if (q_odd < group_ratio_rt) {
-                            *(reinterpret_cast<float*>(partial_max + st_odd) + (0)) = fm1 * softmax_scale_log2_1;
-                            *(reinterpret_cast<float*>(partial_sum + st_odd) + (0)) = local_sum_pair[1];
+                            *(reinterpret_cast<float*>(partial_max + st_odd) + (0)) = tile_empty_c ? -CAKE_FMHA_INF : fm1 * softmax_scale_log2_1;
+                            *(reinterpret_cast<float*>(partial_sum + st_odd) + (0)) = tile_empty_c ? 0.0f : local_sum_pair[1];
                         }
                     }
                     asm volatile("barrier.sync 11, 128;" ::: "memory");
@@ -2206,6 +2263,13 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     float2 out_hi23_f2 = fma_f32x2_rn_ftz(_f2_56, final_scale0_pair_f2, o1_hi23_scaled_f2_1);
                     out_vals[6] = out_hi23_f2.x;
                     out_vals[7] = out_hi23_f2.y;
+                    // seq_lens[b] == 0: the tile holds no KV token, so the output is zero.
+                    if (seqlen_kv_1 <= split_start_block_1 * BLOCK_N) {
+                        #pragma unroll
+                        for (int e_c = 0; e_c < 8; e_c++) {
+                            out_vals[e_c] = 0.0f;
+                        }
+                    }
                     unsigned int regs_o[2];
                     {
                         uint32_t _packed;
@@ -2296,6 +2360,11 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                 tile_idx_c = _clc_ctaid_5;
 #endif  // __CUDA_ARCH__
             }
+#if ENABLE_PDL
+            {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+#endif  // ENABLE_PDL
             mbarrier_arrive(tmem_dealloc_addr);
         }
     }
@@ -2814,14 +2883,14 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         "setp.ne.b32 p, %0, 0;\n\t"
                         "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                         "}"
-                        :: "r"((active_pg_p) ? 1 : 0), "r"((unsigned int)pg_stage_addr_p + lane * 4), "l"(page_table + (pt_base_k_p + page_base_p + page_i_p)));
+                        :: "r"((active_pg_p) ? 1 : 0), "r"((unsigned int)pg_stage_addr_p + (group_block_p * 8 + page_i_p) * 4), "l"(page_table + (pt_base_k_p + page_base_p + page_i_p)));
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p;\n\t"
                         "setp.ne.b32 p, %0, 0;\n\t"
                         "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
                         "}"
-                        :: "r"((active_pg_p) ? 1 : 0), "r"((unsigned int)pg_stage_addr_p + (32 + lane) * 4), "l"(page_table + (pt_base_v_p + page_base_p + page_i_p)));
+                        :: "r"((active_pg_p) ? 1 : 0), "r"((unsigned int)pg_stage_addr_p + (32 + group_block_p * 8 + page_i_p) * 4), "l"(page_table + (pt_base_v_p + page_base_p + page_i_p)));
                     asm volatile(
                         "{\n\t"
                         "cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n\t"

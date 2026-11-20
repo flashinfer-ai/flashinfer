@@ -143,6 +143,19 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
     cd "${DEEPGEMM_SRC}"
     git checkout "${DEEPGEMM_COMMIT}"
     git submodule update --init --recursive
+    # DeepGEMM's install.sh runs `python setup.py bdist_wheel` in its own checkout.
+    # DeepGEMM's pinned setup.py uses setuptools'
+    # build_ext and an explicit C++17 flag, which overrides environment flags.
+    # Patching setup.py to use torch's BuildExtension without that flag lets the
+    # installed torch select its standard. Preserve other commands and skip Ninja.
+    sed -i \
+        -e 's/^from torch\.utils\.cpp_extension import CUDAExtension, CUDA_HOME$/from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME/' \
+        -e "s/'-std=c++17', //g" \
+        -e "/cmdclass={/{
+            N
+            s/'build_py':/'build_ext': BuildExtension.with_options(use_ninja=False),\n            'build_py':/
+        }" \
+        setup.py
     ./install.sh
 )
 

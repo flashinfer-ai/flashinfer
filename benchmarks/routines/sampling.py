@@ -27,10 +27,12 @@ from flashinfer.testing.utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
     blank_unused_mode_columns,
+    check_batch_invariance,
     dtype_str_to_torch_dtype,
     get_device,
     is_close_stats,
     print_perf_metrics,
+    probe_backends,
     filter_backends_by_compute_capability,
     warn_if_pdl_unsupported,
 )
@@ -61,6 +63,8 @@ def _sampling_param(args, value, batch_size, device, dtype):
     The tensor form is what serving frameworks pass; it takes different library
     dispatch paths than the scalar form (e.g. it disables the top_k_first fast path).
     """
+    if isinstance(value, torch.Tensor):
+        return value  # already per-request (--per_row_top_k)
     if args.param_mode == "tensor":
         return torch.full((batch_size,), value, dtype=dtype, device=device)
     return value
@@ -170,6 +174,10 @@ def _dispatch_sampling_test(args):
     """
     if args.routine == "softmax":
         return testSoftmax(args)
+    elif args.routine == "log_softmax":
+        return testLogSoftmax(args)
+    elif args.routine == "log_probs":
+        return testLogProbs(args)
     elif args.routine == "sampling_from_probs":
         return testSamplingFromProbs(args)
     elif args.routine == "sampling_from_logits":
@@ -252,6 +260,19 @@ def parse_sampling_args(line, parser):
         help="Top-K value for top-k sampling.",
     )
     parser.add_argument(
+        "--per_row_top_k",
+        action="store_true",
+        default=False,
+        help="Pass top_k as a per-row tensor (filled with --top_k) instead of a scalar.",
+    )
+    parser.add_argument(
+        "--top_k_max",
+        type=int,
+        required=False,
+        default=None,
+        help="top_k_max bound passed to top_k_top_p_sampling_from_probs/logits.",
+    )
+    parser.add_argument(
         "--top_p",
         type=float,
         required=False,
@@ -300,6 +321,12 @@ def parse_sampling_args(line, parser):
         required=False,
         default=None,
         help="Number of rows for top_k_page_table_transform and top_k_ragged_transform. Defaults to batch_size.",
+    )
+    batch_invariant_only_routines = ["log_softmax", "log_probs"]
+    default_backends = (
+        ["batch_invariant"]
+        if pre_args.routine in batch_invariant_only_routines
+        else ["cuda"]
     )
     parser.add_argument(
         "--page_size",
@@ -357,15 +384,27 @@ def parse_sampling_args(line, parser):
         type=str,
         required=False,
         nargs="+",
-        default=["cuda"],
-        choices=["cuda", "radix", "clusters", "cub"],
+        default=default_backends,
+        choices=["cuda", "batch_invariant", "radix", "clusters", "cub"],
         help=(
-            "Kernel backends to test. Default: cuda. 'radix'/'clusters'/'cub' (top-k routines) "
-            "force a top-k backend via FLASHINFER_TOPK_ALGO, 'cuda' is the library's auto-dispatch."
+            "Kernel backends to test. Default: cuda (batch_invariant for log_softmax and log_probs, their only "
+            "backend). `batch_invariant` runs softmax with batch_invariant=True, the batch-invariant class lse.row "
+            "and is the kernel of log_softmax and log_probs. With --refcheck its output is also checked bit for bit "
+            "against the same rows computed alone, in a sub-batch and under a permutation. "
+            "'radix'/'clusters'/'cub' (top-k routines) force a top-k backend via FLASHINFER_TOPK_ALGO; "
+            "there 'cuda' is the library's auto-dispatch."
         ),
     )
 
     args = parser.parse_args(line)
+
+    if args.routine in batch_invariant_only_routines and any(
+        backend != "batch_invariant" for backend in args.backends
+    ):
+        parser.error(
+            f"--backends for {args.routine}: batch_invariant is the only backend "
+            "(the batch-invariant class is the routine's only kernel)"
+        )
 
     # Default num_rows to batch_size if not specified
     if args.num_rows is None:
@@ -441,15 +480,30 @@ def testSoftmax(args):
             return flashinfer.sampling.softmax(
                 logits, temperature=temperature_arg, enable_pdl=args.enable_pdl
             )
+        elif backend == "batch_invariant":
+            return flashinfer.sampling.softmax(
+                logits,
+                temperature=temperature,
+                enable_pdl=args.enable_pdl,
+                batch_invariant=True,
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
+
+    backends = probe_backends(backends, run_backend, logits, only=("batch_invariant",))
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
     outputs = {}
+    output_dtypes = {}
     for cur_backend in backends:
+        output = run_backend(cur_backend, logits).detach()
+        output_dtypes[cur_backend] = output.dtype
         if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend, logits).detach()
+            outputs[cur_backend] = output
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -464,8 +518,12 @@ def testSoftmax(args):
         ref_temperature = 1.0 if temperature is None else temperature
         reference_output = torch.softmax(logits.float() / ref_temperature, dim=-1)
         for backend, output in outputs.items():
+            # A 16-bit output carries its own rounding: a few ulps of that dtype on top of the fp32 tolerance.
+            rtol = 1e-3
+            if output.dtype != torch.float32:
+                rtol = max(rtol, 4 * torch.finfo(output.dtype).eps)
             num_diff, num_total, pct_diff = is_close_stats(
-                reference_output, output.float(), rtol=1e-3, atol=1e-5
+                reference_output, output.float(), rtol=rtol, atol=1e-5
             )
             if num_diff > 0:
                 print(
@@ -477,6 +535,19 @@ def testSoftmax(args):
                         f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
                     )
 
+        if "batch_invariant" in outputs:
+            # Bitwise: the same rows alone / in a sub-batch / permuted give the same bits.
+            def run_rows(rows):
+                return run_backend("batch_invariant", logits.index_select(0, rows))
+
+            check_batch_invariance(
+                "softmax/batch_invariant",
+                run_rows,
+                batch_size,
+                outputs["batch_invariant"],
+                verbose=args.verbose,
+            )
+
     for backend in backends:
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
@@ -484,10 +555,10 @@ def testSoftmax(args):
 
             # Memory bandwidth calculation for softmax
             # Read: logits (input)
-            # Write: probs (float32 output)
+            # Write: probs (in the output dtype the backend returned)
             problem_bytes = (
                 batch_size * vocab_size * input_dtype.itemsize  # input read
-                + batch_size * vocab_size * 4  # output write (float32)
+                + batch_size * vocab_size * output_dtypes[backend].itemsize  # output
             )
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
@@ -507,6 +578,201 @@ def testSoftmax(args):
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
+
+
+def _row_logp_routine(args, routine_name, with_token_ids):
+    """The shared body of testLogSoftmax / testLogProbs.
+
+    Both entries have one kernel, the batch-invariant class lse.row (flashinfer/batch_invariant/README.md), so
+    `batch_invariant` is their only backend: the operator runs with batch_invariant=True. Outputs are fp32.
+    """
+    if args.verbose >= 1:
+        print(f"[INFO] Running {routine_name}")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    temperature = args.temperature
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    token_ids = None
+    if with_token_ids:
+        token_ids = torch.randint(
+            0, vocab_size, (batch_size,), dtype=torch.int64, device=device
+        )
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }")
+        print(f"[VVERBOSE] {logits.dtype = }")
+        if token_ids is not None:
+            print(f"[VVERBOSE] {token_ids.shape = }")
+
+    def run_backend(backend, logits, token_ids):
+        if backend != "batch_invariant":
+            raise ValueError(f"Unsupported backend: {backend}")
+        if with_token_ids:
+            return flashinfer.sampling.log_probs(
+                logits,
+                token_ids,
+                temperature=temperature,
+                enable_pdl=args.enable_pdl,
+                batch_invariant=True,
+            )
+        return flashinfer.sampling.log_softmax(
+            logits,
+            temperature=temperature,
+            enable_pdl=args.enable_pdl,
+            batch_invariant=True,
+        )
+
+    # The class raises (never falls back) outside its contract: probe the backend once before timing it.
+    backends = probe_backends(backends, run_backend, logits, token_ids)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    # Storage for timing results and outputs for refcheck
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, logits, token_ids).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits, token_ids),
+        )
+
+    # Reference check: compare against PyTorch log_softmax in fp32 (gathered at the ids for log_probs)
+    if run_refcheck and outputs:
+        reference_output = torch.log_softmax(logits.float() / temperature, dim=-1)
+        if with_token_ids:
+            reference_output = reference_output.gather(1, token_ids[:, None]).squeeze(1)
+        for backend, output in outputs.items():
+            num_diff, num_total, pct_diff = is_close_stats(
+                reference_output, output.float(), rtol=1e-3, atol=1e-4
+            )
+            if num_diff > 0:
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.2f}%) elements differ from PyTorch reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
+                    )
+
+        if "batch_invariant" in outputs:
+            # Bitwise: the same rows alone / in a sub-batch / permuted give the same bits.
+            def run_rows(rows):
+                return run_backend(
+                    "batch_invariant",
+                    logits.index_select(0, rows),
+                    None if token_ids is None else token_ids.index_select(0, rows),
+                )
+
+            check_batch_invariance(
+                f"{args.routine}/batch_invariant",
+                run_rows,
+                batch_size,
+                outputs["batch_invariant"],
+                verbose=args.verbose,
+            )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth: the logits read, the fp32 output written (one value per row for log_probs,
+            # plus the ids read), a row of log-probabilities otherwise.
+            problem_bytes = batch_size * vocab_size * input_dtype.itemsize
+            if with_token_ids:
+                problem_bytes += batch_size * (token_ids.element_size() + 4)
+            else:
+                problem_bytes += batch_size * vocab_size * 4
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["temperature"] = temperature
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testLogSoftmax(args):
+    """
+    Test log_softmax API.
+
+    This test:
+    1. Generates random input logits
+    2. Runs flashinfer.sampling.log_softmax with batch_invariant=True (the batch-invariant class lse.row,
+       the entry's only kernel; `batch_invariant` is the routine's only backend)
+    3. Runs reference check (torch.log_softmax in fp32, and bit for bit against the same rows computed
+       alone, in a sub-batch and under a permutation)
+    4. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    return _row_logp_routine(args, "testLogSoftmax", with_token_ids=False)
+
+
+def testLogProbs(args):
+    """
+    Test log_probs API.
+
+    This test:
+    1. Generates random input logits and one token id per row
+    2. Runs flashinfer.sampling.log_probs with batch_invariant=True (the batch-invariant class lse.row,
+       the entry's only kernel; `batch_invariant` is the routine's only backend)
+    3. Runs reference check (torch.log_softmax in fp32 gathered at the ids, and bit for bit against the
+       same rows computed alone, in a sub-batch and under a permutation)
+    4. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    return _row_logp_routine(args, "testLogProbs", with_token_ids=True)
 
 
 def testSamplingFromProbs(args):
@@ -955,6 +1221,7 @@ def testTopKTopPSamplingFromProbs(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     top_p = args.top_p
+    top_k_max = args.top_k_max
     filter_apply_order = args.filter_apply_order
     # Use explicit seed/offset to enable CUDA graph compatibility
     seed = args.random_seed
@@ -966,6 +1233,9 @@ def testTopKTopPSamplingFromProbs(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+
+    if args.per_row_top_k:
+        top_k = torch.full((batch_size,), top_k, dtype=torch.int32, device=device)
 
     ## Prepare input tensors
     probs = _make_probs(args, batch_size, vocab_size, device)
@@ -989,6 +1259,7 @@ def testTopKTopPSamplingFromProbs(args):
                 seed=seed,
                 offset=offset,
                 **_deterministic_kwargs(args),
+                top_k_max=top_k_max,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1030,9 +1301,11 @@ def testTopKTopPSamplingFromProbs(args):
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["vocab_size"] = vocab_size
-                cur_res["top_k"] = top_k
+                cur_res["top_k"] = args.top_k
                 cur_res["top_p"] = top_p
                 cur_res["filter_apply_order"] = filter_apply_order
+                cur_res["per_row_top_k"] = args.per_row_top_k
+                cur_res["top_k_max"] = top_k_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -1071,6 +1344,7 @@ def testTopKTopPSamplingFromLogits(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     top_p = args.top_p
+    top_k_max = args.top_k_max
     filter_apply_order = args.filter_apply_order
     # Use explicit seed/offset to enable CUDA graph compatibility
     seed = args.random_seed
@@ -1082,6 +1356,9 @@ def testTopKTopPSamplingFromLogits(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+
+    if args.per_row_top_k:
+        top_k = torch.full((batch_size,), top_k, dtype=torch.int32, device=device)
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
@@ -1107,6 +1384,7 @@ def testTopKTopPSamplingFromLogits(args):
                 seed=seed,
                 offset=offset,
                 **_deterministic_kwargs(args),
+                top_k_max=top_k_max,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1148,9 +1426,11 @@ def testTopKTopPSamplingFromLogits(args):
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["vocab_size"] = vocab_size
-                cur_res["top_k"] = top_k
+                cur_res["top_k"] = args.top_k
                 cur_res["top_p"] = top_p
                 cur_res["filter_apply_order"] = filter_apply_order
+                cur_res["per_row_top_k"] = args.per_row_top_k
+                cur_res["top_k_max"] = top_k_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)

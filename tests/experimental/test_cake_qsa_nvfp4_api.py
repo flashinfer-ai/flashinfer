@@ -20,8 +20,9 @@ The backend suite ``test_cake_qsa_nvfp4.py`` exercises the package.  This file c
 what needs flashinfer itself: the ``backend`` keyword of
 ``flashinfer.sparse.qsa_sparse_paged_attention`` -- ``backend="cake"`` reaches the
 package with every operand, the default ``"auto"`` is the package on every compute
-capability it exports a library for (8.x, 9.0, 10.0, 10.3, 10.7, 12.0: capability-exact) and the
-existing implementation elsewhere, ``"default"`` keeps the existing
+capability above 9.0 it exports a library for (10.0, 10.3, 10.7, 12.0: capability-exact)
+when ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set (and refuses the call without
+it) and the existing implementation elsewhere, ``"default"`` keeps the existing
 implementation, an unknown value is refused -- device runs of the route and of the auto
 default against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
@@ -44,11 +45,10 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.experimental.qsa_nvfp4.backend as existing_backend
 import flashinfer.sparse as public_api
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake_qsa_nvfp4 import cake_backend, cake_jit
-from tests.test_helpers.cake_qsa_nvfp4_reference import write_slots
+from tests.experimental.test_helpers.cake_qsa_nvfp4_reference import write_slots
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 HEAD_DIM = 256
@@ -90,13 +90,48 @@ def _patch_both_backends(monkeypatch):
         cake_backend, "qsa_sparse_paged_attention", _recorder(calls, "cake")
     )
     monkeypatch.setattr(
-        existing_backend, "qsa_sparse_paged_attention", _recorder(calls, "existing")
+        public_api, "_qsa_sparse_paged_attention_default", _recorder(calls, "existing")
     )
     return calls
 
 
-def test_entry_point_is_marked_experimental():
-    assert public_api.qsa_sparse_paged_attention.is_experimental
+def test_entry_point_is_stable():
+    assert not getattr(public_api.qsa_sparse_paged_attention, "is_experimental", False)
+
+
+def test_auto_cake_route_requires_the_experimental_opt_in(monkeypatch):
+    """``auto`` reaches the experimental package only with the opt-in set; without it the
+    call is refused before any implementation runs, and ``backend="cake"`` needs no opt-in.
+    Both routes to the package emit the experimental-backend warning."""
+    from flashinfer import api_logging
+
+    calls = _patch_both_backends(monkeypatch)
+    monkeypatch.setattr(public_api, "_qsa_auto_backend", lambda device: "cake")
+    t = torch.empty(0)
+    monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
+    with pytest.raises(
+        RuntimeError, match="FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS"
+    ):
+        public_api.qsa_sparse_paged_attention(
+            t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
+        )
+    assert calls == []
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
+    with pytest.warns(ExperimentalWarning, match="'cake' selected for"):
+        result = public_api.qsa_sparse_paged_attention(
+            t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t, backend="cake"
+        )
+    assert result == "cake"
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
+    with pytest.warns(
+        ExperimentalWarning, match="'cake' may be selected automatically for"
+    ):
+        result = public_api.qsa_sparse_paged_attention(
+            t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
+        )
+    assert result == "cake"
+    assert [tag for tag, _, _ in calls] == ["cake", "cake"]
 
 
 def test_backend_is_a_keyword_with_a_default():
@@ -174,9 +209,9 @@ def test_explicit_default_backend_keeps_the_existing_implementation(monkeypatch)
 
 
 def test_auto_backend_resolves_by_capability(monkeypatch):
-    """``auto`` is the Cake route for every capability the package exports (8.0, 8.6, 8.7,
-    8.9, 9.0, 10.0, 10.3, 10.7, 12.0) and the reference implementation for any other capability
-    or a non-CUDA device: the rule is capability-exact, so 12.1 (no delivered library) stays on
+    """``auto`` is the Cake route for every capability above 9.0 the package exports (10.0,
+    10.3, 10.7, 12.0) and the reference implementation for 8.x, 9.0, any other capability or a
+    non-CUDA device: the rule is capability-exact, so 12.1 (no delivered library) stays on
     the reference until the package ships for it; the table below needs no GPU, the capability
     lookup is replaced."""
     assert public_api._qsa_auto_backend(torch.device("cpu")) == "default"
@@ -196,17 +231,18 @@ def test_auto_backend_resolves_by_capability(monkeypatch):
     ]
     for capability in sorted(cake_jit.ARCH_BY_CAPABILITY):
         table[device] = capability
-        assert public_api._qsa_auto_backend(device) == "cake", capability
+        want = "default" if capability[0] in (8, 9) else "cake"
+        assert public_api._qsa_auto_backend(device) == want, capability
     for capability in ((7, 5), (12, 1)):
         table[device] = capability
         assert public_api._qsa_auto_backend(device) == "default", capability
 
 
 def test_auto_rule_covers_every_exported_capability(monkeypatch):
-    """The entry's rule is the package's capability table and nothing else: over every
-    capability of majors 7 through 12, exactly the exported ones resolve to the Cake route,
-    so ``auto`` never selects a route that refuses the device and never leaves an exported
-    device on the reference."""
+    """The entry's rule is the package's capability table above 9.0 and nothing else: over
+    every capability of majors 7 through 12, exactly the exported ones above 9.0 resolve to the
+    Cake route, so ``auto`` never selects a route that refuses the device and never leaves an
+    exported device above 9.0 on the reference."""
     device = torch.device("cuda", 0)
     table = {}
     monkeypatch.setattr(public_api, "get_compute_capability", lambda d: table[d])
@@ -216,16 +252,18 @@ def test_auto_rule_covers_every_exported_capability(monkeypatch):
             table[device] = (major, minor)
             if public_api._qsa_auto_backend(device) == "cake":
                 routed.add((major, minor))
-    assert routed == set(cake_jit.ARCH_BY_CAPABILITY)
+    assert routed == {c for c in cake_jit.ARCH_BY_CAPABILITY if c[0] > 9}
 
 
 def test_omitted_backend_takes_the_auto_route(monkeypatch):
-    """On the device at hand an omitted ``backend`` reaches the package when the device's
-    capability is an exported one and the existing implementation otherwise (recorders
-    stand in for both, so this needs a CUDA device but no exported target)."""
+    """On the device at hand, with the experimental opt-in set, an omitted ``backend`` reaches
+    the package when the device's capability is an exported one above 9.0 and the existing
+    implementation otherwise (recorders stand in for both, so this needs a CUDA device but no
+    exported target)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     calls = _patch_both_backends(monkeypatch)
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     device = torch.device("cuda", torch.cuda.current_device())
     capability = tuple(torch.cuda.get_device_capability(device))
     t = torch.empty(0, device=device)
@@ -233,11 +271,27 @@ def test_omitted_backend_takes_the_auto_route(monkeypatch):
         result = public_api.qsa_sparse_paged_attention(
             t, t, t, t, t, t, False, output_gate=t, k_sf=t, v_sf=t
         )
-    want = (
-        "cake" if cake_jit.arch_for_capability(capability) is not None else "existing"
-    )
+    exported = cake_jit.arch_for_capability(capability) is not None
+    want = "cake" if exported and capability[0] > 9 else "existing"
     assert result == want
     assert [tag for tag, _, _ in calls] == [want]
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_omitted_backend_sends_fp8_and_bf16_to_the_existing_implementation(
+    monkeypatch, kv_dtype
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    calls = _patch_both_backends(monkeypatch)
+    t = torch.empty(0, device="cuda")
+    kv = t.to(kv_dtype)
+    with _quiet():
+        result = public_api.qsa_sparse_paged_attention(
+            t, kv, kv, t, t, t, False, output_gate=t
+        )
+    assert result == "existing"
+    assert [tag for tag, _, _ in calls] == ["existing"]
 
 
 def test_omitted_backend_on_a_cpu_tensor_takes_the_existing_implementation(monkeypatch):
@@ -526,7 +580,7 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     128 single-split grid of 256 CTAs is wide too, which selects nothing there (the tcgen05
     decode has one split-form record).  On sm_120a the bound is the stream alone
     (``long_stream``): at 188 SMs (376 resident CTAs) rows 32 (3 splits, 11 tiles per CTA),
-    64 (2 splits, 17) and 128 (1 split, 33) are wide within one wave, rows 1-16 (at most 7
+    64 and 128 (1 split, 33 tiles) are wide within one wave, rows 1-16 (at most 7
     tiles per CTA) are not; the stream bound is inclusive at 11 tiles."""
     sm_count, arch = 108, "sm_80"
     tiles = cake_backend.num_tiles(2051)
@@ -590,7 +644,7 @@ def test_wide_grid_is_multi_wave_with_long_streams():
         rows: cake_backend.num_splits(rows, 2, 2051, 188, "sm_120a")
         for rows in (1, 2, 4, 8, 16, 32, 64, 128)
     }
-    assert [splits_188[rows] for rows in (16, 32, 64, 128)] == [5, 3, 2, 1]
+    assert [splits_188[rows] for rows in (16, 32, 64, 128)] == [5, 3, 1, 1]
     for rows in (1, 2, 4, 8, 16):
         splits = splits_188[rows]
         assert -(-tiles // splits) < 11, rows
@@ -703,10 +757,14 @@ def test_cake_route_runs_the_package():
     assert torch.equal(out, want)
 
 
-def test_auto_route_is_the_cake_route():
-    """Without ``backend`` the public entry runs the package on an exported capability: the result
-    is bitwise the explicit ``backend="cake"`` result."""
+def test_auto_route_is_the_cake_route(monkeypatch):
+    """Without ``backend``, with the experimental opt-in set, the public entry runs the
+    package on an exported capability above 9.0: the result is bitwise the explicit
+    ``backend="cake"`` result."""
     device = _device_or_skip()
+    if torch.cuda.get_device_capability(device)[0] <= 9:
+        pytest.skip("auto runs the existing implementation on 8.x and 9.0")
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     operands = _operands(device)
     with _quiet():
         want = public_api.qsa_sparse_paged_attention(**operands, backend="cake")
