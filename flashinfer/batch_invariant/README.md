@@ -410,6 +410,9 @@ the whole remainder, so give the pool a storage of its own.
 
 What the caller owes the class:
 
+* A call that carries a sequence's state passes the pool. Without `initial_state` (and without the other state
+  arguments) the call does not raise: it is the stateless call below and returns rows from the zero state, so a decode
+  step that drops its pool returns every token as a first token.
 * A new sequence loaded into a slot starts with a prefill call (more tokens than sequences) or carries `prefix_lens`.
   A one-token call without `prefix_lens` continues what the slot holds: on a reused slot it continues the previous
   sequence, with finite rows that are not the new sequence's (nothing detects a slot whose state the caller replaced).
@@ -433,6 +436,94 @@ What the caller owes the class:
 `output_final_state` returns the pool. The decode entries (`gated_delta_rule_decode_pretranspose`,
 `gated_delta_rule_mtp`) do not take the flag: they compute the gates from the raw parameters and keep another state
 layout; a decode step of the class is a one-token call of `chunk_gated_delta_rule`.
+
+### Stateless call: a trainer's forward pass
+
+Without `initial_state` the same entry is a stateless call, the form a training forward takes: packed whole sequences,
+every one from the zero state, rows only.
+
+```python
+out = torch.empty_like(v)          # once, reused every step
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+```
+
+* The rows of a sequence are bit for bit the rows the pool calls return for it (prefill, chunked prefill and decode),
+  whatever the other sequences of the call, their order and their number. It is one launch of the class's prefill
+  kernel with every sequence reading the zero state and storing none.
+* No pool, no state next to a pool, no state returned: `state_indices`, `prefix_lens`, `output_state` and
+  `output_final_state=True` raise the typed error without `initial_state`. A sequence that has to continue later is a
+  pool call.
+* With `output=` and a contiguous int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and
+  adds no allocation of its own, and reads the offsets back to check them. With `cu_seqlens_cpu` it runs from those
+  host offsets instead (no read of a device tensor), so device and host offsets cannot disagree in it; only their lengths are compared.
+  The host offsets are copied to the device once and the last 16 copies are kept (across streams, devices and the
+  two forms of the call; a few int32 per sequence, and per stored state with `train_states`), so a call that repeats
+  the offsets of an earlier one on the same stream copies nothing. Offsets that are not 1-D integers raise the typed error. The
+  prefill underneath allocates, as in every prefill of the class, the normalized `q` and `k` (`2 * T * HQ * 256`
+  bytes), the linear gates (`4 * T * HV` bytes) and a small kernel workspace, all freed at return. Per device and
+  v-head count the class keeps one state tensor the kernel is pointed at and never reads or writes (3.1 MB at 48 v
+  heads) and, for the call without `train_states`, an int32 index tensor, allocated at the first stateless call and
+  regrown to twice the sequence count when a call brings more sequences than it holds (the replaced ones are kept,
+  a few bytes per sequence).
+* `output` may share no memory with an input, the offsets, `train_states` or one of the class's state pools (a pool
+  owns its storage from its first slot to the storage's end), and an `output` allocated under `inference_mode` is
+  refused in a call outside it (typed errors, before anything is written). The call bumps its autograd version (an
+  inference tensor has none).
+* It cannot be captured in a CUDA graph (it raises).
+* **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
+  `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
+  differentiable op on the same inputs wrapped in an `autograd.Function` whose forward returns these rows. The
+  shortcut `ref + (out - ref).detach()` rounds in bf16 and does not return these bits. What that gradient is, and
+  whether it is batch-invariant, is the trainer's.
+
+**Intermediates for a backward pass: `train_states`.** The same call stores the state every 64-token chunk of every
+sequence starts from in a caller-owned buffer:
+
+```python
+from flashinfer.batch_invariant.gdn import training_state_rows, training_state_slots
+
+states = torch.empty(training_state_slots(seq_lens), HV, 128, 128, device=v.device)   # fp32, once per layer
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out, train_states=states,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequence i starts from (zero for j = 0)
+```
+
+* A backward over the class's recurrence works from the inputs, the output gradient and, per 64-token chunk, the
+  state the chunk starts from. That state is the one term it cannot recompute from the chunk's own inputs; without
+  it a backward first re-runs the state scan over the sequence (FLA's backward and cuDNN's default path do). Every
+  other term of a chunk (the normalized `q` / `k`, the cumulative gates, the triangular solve, the corrected values)
+  is a function of the chunk's own 64 input rows and that state, so a backward evaluates the chunks independently of
+  each other and only the state adjoint runs from chunk to chunk. Those per-chunk terms are internal to the kernel
+  and are not exported, and no backward surveyed takes them from a forward.
+* **The layout is the one cuDNN's GDN backward takes** (`cudnn::gated_delta_net_bwd`, argument `state_checkpoints`
+  with `checkpoint_every_n_tokens=64`): `(n - 1) // 64 + 1` rows per sequence of `n` tokens, sequences in call order,
+  a sequence's first row the zero state its first chunk starts from (the call writes the zeros) and row `j` the state
+  after its first `64 * j` tokens; a state is `[HV, 128 (value), 128 (key)]`, one per v head (`state @ k` is the
+  predicted value). The state after a sequence's last token is not stored. With the same `q`, `k`, `v`, `g`, `beta`,
+  `cu_seqlens` and `scale`, `use_qk_l2norm_in_kernel=True` and `gate_domain="log"`, cuDNN frontend 1.32.3 takes the
+  buffer as it is; a frontend that requires the series in the input dtype takes `states.to(torch.bfloat16)`. The
+  gradients it returns from this series agree with the ones from its own recomputed series, and with an fp64 autograd
+  of the token recurrence, to bf16 rounding (`tests/gdn/test_batch_invariant_gdn_stateless.py`, skipped without the
+  frontend). cuDNN's own series is a bf16 rounding of its forward's states and is not these bits; the gradient is
+  the backward's, and this class makes no bitwise statement about it. FLA's `h` is the transpose,
+  `[..., key, value]`.
+* Each stored state is bit for bit the state an inference prefill of the same prefix leaves in its pool, whatever the
+  other sequences of the call. The output rows are the rows of the call without `train_states`.
+* 64 KiB per v head and chunk, which approaches 1 KiB per token and v head for long sequences (48 KiB per token at
+  48 v heads, four times the output) and is one state per sequence for sequences of at most 64 tokens. Rows past
+  `training_state_slots` are left as they are. The layout's index tensors are kept with the offsets' copies.
+* The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
+  that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is not 16-byte aligned
+  or shares memory with one of the class's state pools, the output, an input or the offsets, raises the typed error.
+  A pool owns its storage from its first slot to the storage's end, so a buffer carved from the same allocation
+  after a pool is refused too: give `train_states` an allocation of its own.
+
+Tests: `tests/gdn/test_batch_invariant_gdn_stateless.py`.
 
 `lean/BIKernels/Gdn.lean` models the two kernels as an opaque chunk step and an opaque row step and defines the
 prefill as the fold of the chunk step over 64-row chunks. Four device facts carry the model, all checked bit for bit
