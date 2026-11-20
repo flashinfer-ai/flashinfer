@@ -73,6 +73,12 @@ __device__ __forceinline__ uint32_t dequant_pair(uint32_t bytes, float scale) {
   return __half_as_ushort(__low2half(v)) | (uint32_t(__half_as_ushort(__high2half(v))) << 16);
 }
 
+// Test the BF16 encodings, independent of FP32 flush-to-zero behavior.
+__device__ __forceinline__ bool has_bf16_subnormal(uint32_t pair) {
+  const unsigned a = pair & 0x7fffu, b = (pair >> 16) & 0x7fffu;
+  return (a - 1u < 127u) || (b - 1u < 127u);
+}
+
 __device__ __forceinline__ uint32_t tf32(float x) {
   uint32_t r;
   asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
@@ -272,18 +278,19 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
   // Keep packed BF16 in shared memory; scale only after unpacking to FP32.
   const uint32_t* qp = (const uint32_t*)(q + (size_t)row * (8 * DQ)) + warp * (DQ / 2);
   float amax = 0.f;
+  bool unsafe = false;
 #pragma unroll
   for (int it = 0; it < 9; ++it) {
     const int d2 = lane + it * 32;
     const uint32_t v = qp[d2];
     ((uint32_t*)(qs + warp * QS))[d2] = v;
+    unsafe |= has_bf16_subnormal(v);
     amax = fmaxf(amax, fabsf(__uint_as_float(v << 16)));
     amax = fmaxf(amax, fabsf(__uint_as_float(v & 0xffff0000u)));
   }
 #pragma unroll
   for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
   const int shift = amax >= 65536.f ? ilogbf(amax) - 15 : 0;
-  bool unsafe = false;
   if (shift) {
     // Warp-uniform cold check. A nonzero scaled BF16 becoming subnormal
     // in FP32 is not guaranteed to survive TF32 conversion and MMA.
@@ -294,8 +301,8 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
       const unsigned a = v & 0x7fff, b = (v >> 16) & 0x7fff;
       unsafe |= (a && a < cutoff) || (b && b < cutoff);
     }
-    unsafe = __any_sync(0xffffffffu, unsafe);
   }
+  unsafe = __any_sync(0xffffffffu, unsafe);
   if (lane == 0) {
     hsc[warp] = shift ? exp2f(float(shift)) : 1.f;
     reinterpret_cast<unsigned short*>(qs + warp * QS)[DQ] = unsafe;
@@ -340,7 +347,9 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         o2.z = dequant_pair(n.w & 0xffffu, sc0[i]) & vm;
         o2.w = dequant_pair(n.w >> 16, sc0[i]) & vm;
         *(uint4*)(crow + 256 + lane * 8) = o2;
-        *(uint32_t*)(crow + CKV + lane * 2) = rp[i] & vm;
+        const uint32_t rope = rp[i] & vm;
+        *(uint32_t*)(crow + CKV + lane * 2) = rope;
+        needs_wide |= has_bf16_subnormal(rope);
       }
     }
     __syncthreads();
@@ -409,6 +418,14 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, o));
       }
       if (l4 == 0) {
+        // Keep the absolute split LSE on the fast path only while its FP32
+        // spacing is at most 2^-11 log2 units: log2(l) adds at most
+        // 14 + log2(TOPK) = 25 to a nonempty split maximum. Checking each
+        // warp maximum here reuses the existing block vote; ignore padding.
+        if (nsplits > 1) {
+          needs_wide |= (mx0 != -INFINITY && fabsf(mx0) >= 4096.f) ||
+                        (mx1 != -INFINITY && fabsf(mx1) >= 4096.f);
+        }
         red0[warp * 8 + 2 * m4] = mx0;
         red0[warp * 8 + 2 * m4 + 1] = mx1;
       }

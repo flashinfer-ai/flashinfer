@@ -492,15 +492,43 @@ def test_scaled_score_beyond_fp32(backend, second_pos):
 
 
 @pytest.mark.parametrize("backend", ["specialized", "auto"])
-def test_tied_wide_maxima_keep_split_mass(backend):
+@pytest.mark.parametrize("subnormal_key", [False, True])
+def test_subnormal_rope_operand(backend, subnormal_key):
+    _sm90_or_skip()
+    q, kv, idx, sl, ws = _make_case(B=1, QL=1, kv_lens=(2,))
+    q.zero_()
+    rope = torch.zeros(KPE, device=q.device, dtype=torch.bfloat16)
+    # BF16 subnormal 0x0008 is 8 * 2^-133. Set bits directly so the
+    # fixture does not depend on a floating conversion preserving denormals.
+    tiny, large = (rope, q[..., CKV]) if subnormal_key else (q[..., CKV], rope)
+    if subnormal_key:
+        tiny = tiny[:1]
+    else:
+        large = large[:1]
+    tiny.view(torch.int16).fill_(8)
+    large.fill_(2.0**120)
+    _write_token(kv, 0, 448.0, [1.0] * 4, rope)
+    rope.view(torch.int16)[0] ^= -32768
+    _write_token(kv, 1, -448.0, [1.0] * 4, rope)
+    y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=1.0, backend=backend)
+    # Logits +/-2^-10 give BF16(448 * tanh(2^-10)) = 0.4375.
+    torch.testing.assert_close(y, torch.full_like(y, 0.4375), rtol=0, atol=0)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"]["specialized"] == 1
+
+
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+@pytest.mark.parametrize(
+    "qmag,kmag", [(4096.0, 4096.0), (-4096.0, 4096.0), (2.0**100, 2.0**100)]
+)
+def test_tied_wide_maxima_keep_split_mass(backend, qmag, kmag):
     _sm90_or_skip()
     kv = torch.zeros((1, PAGE, BPT), device="cuda", dtype=torch.uint8)
     rope = torch.zeros(KPE, device="cuda")
-    rope[0] = 2.0**100
+    rope[0] = kmag
     _write_token(kv, 0, 3.0, [1.0] * 4, rope)
     _write_token(kv, 1, 0.0, [1.0] * 4, rope)
     # Identical logits, but two copies in the second split: (3+0+0)/3.
-    y = _single_row_call(kv, [(0, 0), (48, 1), (49, 1)], 2.0**100, 1.0, backend)
+    y = _single_row_call(kv, [(0, 0), (48, 1), (49, 1)], qmag, 1.0, backend)
     torch.testing.assert_close(y, torch.ones_like(y), rtol=0, atol=0)
     assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
         "specialized": 1,
@@ -657,3 +685,34 @@ def test_graph_replay_enters_and_leaves_wide_repair(nq):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(out, torch.full_like(out, scale), rtol=0, atol=0)
+
+
+def test_graph_replay_enters_and_leaves_subnormal_repair():
+    _sm90_or_skip()
+    q, kv, idx, sl, ws = _make_case(B=1, QL=1, kv_lens=(2,))
+    q.zero_()
+    rope = torch.zeros(KPE, device=q.device, dtype=torch.bfloat16)
+    rope[0] = 2.0**120
+    _write_token(kv, 0, 448.0, [1.0] * 4, rope)
+    rope[0] = -(2.0**120)
+    _write_token(kv, 1, -448.0, [1.0] * 4, rope)
+
+    def run():
+        return sparse_mla_decode_sm90(
+            q, kv, idx, sl, ws, sm_scale=1.0, backend="specialized"
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    for bits, expected in ((0, 0.0), (8, 0.4375), (0, 0.0)):
+        q[..., CKV].view(torch.int16).fill_(bits)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.full_like(out, expected), rtol=0, atol=0)
