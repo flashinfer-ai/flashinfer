@@ -60,6 +60,7 @@ from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ....batch_invariant.fp_interface.cute import CuteF32
+from ....cute_dsl.utils import mbarrier_wait_acquire_cluster
 from ..generator import BREUSE_FMTS, Knobs, MainloopBlock
 from ..spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, EpilogueChain, sf_bytes  # noqa: F401  (sf_bytes re-exported)
 from .epilogue import apply_chain_pre_cvt, epilogue_loop
@@ -1202,7 +1203,8 @@ def blockscaled_cluster_epilogue_loop(
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             mbar, (C - 1) * slot_elems * 4
                         )
-                cute.arch.mbarrier_wait(mbar, 0)
+                # the peers' st.async complete at cluster scope: a CTA-scope wait does not acquire their fragments
+                mbarrier_wait_acquire_cluster(mbar, Int32(0))
                 # the chunk fold, in chunk order from +0 (the fixup's fold): P_c from the mailbox slot of rank c, own
                 # registers at c = rank
                 for i in cutlass.range_constexpr(vpt):
