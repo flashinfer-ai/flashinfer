@@ -1267,6 +1267,36 @@ def test_domain_serving_plan_of_listed_cells():
 
 
 @_host_only
+def test_serving_grid_reserve():
+    """The whole serving program's grid: the SM count less the measured CTA
+    reserve. 212-SM devices run the full grid from expected_m 36 up; every other
+    SM count, and smaller expected_m, keep the reserve they had."""
+
+    def grid(arch, sm_count, k, expected_m):
+        plan = serving_plan(
+            arch, sm_count, 64, 512, 7168 if k == 2048 else 4096, k, expected_m
+        )
+        assert plan.route == _SERVING_ROUTE
+        return plan.stages[0].grid[0]
+
+    for k in (7168, 2048):
+        assert grid("sm_107a", 212, k, 1) == 212
+        assert grid("sm_107a", 212, k, 2) == 212 - (16 if k == 7168 else 20)
+        for expected_m in (4, 8, 16, 32, 35):
+            assert grid("sm_107a", 212, k, expected_m) == 188
+        for expected_m in (36, 64, 512, 4096):
+            assert grid("sm_107a", 212, k, expected_m) == 212
+            assert serving_config(512, k, expected_m, 212, "sm_107a")[3] == 0
+        for arch, sm_count, reserve in (
+            ("sm_100a", 148, 20 if k == 7168 else 24),
+            ("sm_103a", 148, 8 if k == 7168 else 24),
+            ("sm_107a", 216, 24),
+        ):
+            for expected_m in (36, 64, 4096):
+                assert serving_config(512, k, expected_m, sm_count, arch)[3] == reserve
+
+
+@_host_only
 def test_domain_serving_routed_needs_every_expected_m_routed(monkeypatch):
     """Weights are localizable only where every expected_m runs a twin."""
     import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
