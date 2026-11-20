@@ -11,8 +11,9 @@ checks are host-side and device-free unless a caller hands in a device tensor.
 ==========================================  =====================================================================================
 argument                                    accepted (no effect on the bits); everything else raises
 ==========================================  =====================================================================================
-``q_scale`` / ``k_scale`` / ``v_scale`` /   ``None`` or exactly ``1.0``, as a host number or a one-element CPU tensor (a device
-``o_scale``                                 tensor would cost a readback per ``run()``: refused)
+``q_scale`` / ``k_scale`` / ``v_scale`` /   ``None`` or exactly ``1.0``, as a number or a one-element floating-point tensor; a
+``o_scale``                                 device tensor is read back once per tensor version (``resolve_scale``), and before
+                                            any CUDA-graph capture
 ``fixed_split_size``                        ``None`` / ``-1`` (no request) and any positive size: the request is a KV split that
                                             does not follow the batch, which the class's 512-key chunks on the absolute KV axis
                                             already are; the size itself is not used
@@ -26,35 +27,79 @@ argument                                    accepted (no effect on the bits); ev
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+import weakref
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
 from ...batch_invariant.support import unsupported
 
 SCALE_NAMES = ("q_scale", "k_scale", "v_scale", "o_scale")
-_UNIT_SCALES = "unscaled bf16 operands (q_scale / k_scale / v_scale / o_scale of None or exactly 1.0, as host numbers)"
+_UNIT_SCALES = "unscaled bf16 operands (q_scale / k_scale / v_scale / o_scale of None or exactly 1.0, as a number or a one-element floating-point tensor)"
 
 
-def host_scale(class_name: str, name: str, value):
-    """The host number of one scale argument, or the typed refusal for a form that cannot be read without a device
-    readback: a Python or numpy number, or a one-element CPU tensor. This is the one place that decides which forms are
-    readable (a device tensor is not: reading it would stall every ``run()``), for every wrapper and for eager and CUDA
-    graph mode alike."""
+_SCALE_FORMS = (
+    "a Python number or a one-element floating-point tensor (a device tensor is read once per tensor version; inside a "
+    "CUDA-graph capture its value must already be known: pass a Python number or a CPU tensor, or call once before the capture)"
+)
+# device scale tensors already read: id(tensor) -> (weak reference to the tensor, its version when read, the value)
+_DEVICE_SCALES: Dict[int, Tuple[weakref.ref, int, float]] = {}
+
+
+def _read_device_scale(value: torch.Tensor) -> float:
+    """The one device readback of a scale tensor (a synchronisation point)."""
+    return float(value.item())
+
+
+def resolve_scale(class_name: str, name: str, value):
+    """The host number of one scale argument, for every wrapper and for eager and CUDA graph mode alike:
+
+    * a Python or numpy number (not a bool) is itself;
+    * a one-element floating-point CPU tensor is read on the host at every call;
+    * a one-element floating-point device tensor is read back at most once per tensor version: the value is remembered
+      for the tensor object (held through a weak reference, so a recycled ``id`` cannot alias it) and its ``_version``,
+      and later calls with the same unmodified tensor issue no readback and no synchronisation. An in-place write bumps
+      the version and the next call reads again. Storage changed without a version bump (``set_``, writes through a raw
+      pointer or another framework's view) is the caller's responsibility. A CUDA-graph capture cannot read the device:
+      a tensor whose value is not known when ``run()`` executes inside a capture raises, so it is resolved by a call
+      before the capture (the warm-up ``run()``).
+
+    Any other form (several elements, an integer or bool tensor, a bool, a non-number) raises the typed error."""
     if isinstance(value, torch.Tensor):
-        if value.device.type != "cpu":
-            raise unsupported(
-                class_name,
-                f"{name} as a tensor on {value.device} (reading it would stall every run())",
-                _UNIT_SCALES,
-            )
         if value.numel() != 1:
             raise unsupported(
                 class_name,
                 f"{name} as a tensor of {value.numel()} elements",
                 _UNIT_SCALES,
             )
-        return value.item()
+        if not value.dtype.is_floating_point:
+            raise unsupported(
+                class_name, f"{name} as a tensor of dtype {value.dtype}", _UNIT_SCALES
+            )
+        if value.device.type == "cpu":
+            return value.item()
+        key = id(value)
+        known = _DEVICE_SCALES.get(key)
+        if known is not None and known[0]() is value and known[1] == value._version:
+            return known[2]
+        if value.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise unsupported(
+                class_name,
+                f"{name} as a tensor on {value.device} first seen inside a CUDA-graph capture (its value cannot be read "
+                "there)",
+                _SCALE_FORMS,
+            )
+        number = _read_device_scale(value)
+
+        def forget(ref, key=key):
+            entry = _DEVICE_SCALES.get(key)
+            if entry is not None and entry[0] is ref:
+                del _DEVICE_SCALES[key]
+
+        _DEVICE_SCALES[key] = (weakref.ref(value, forget), value._version, number)
+        return number
+    if isinstance(value, bool):
+        raise unsupported(class_name, f"{name}={value!r}", _UNIT_SCALES)
     return value
 
 
@@ -62,14 +107,14 @@ def check_unit_scales(
     class_name: str, scales: Sequence, free: Sequence[str] = ()
 ) -> None:
     """``scales`` in the order of :data:`SCALE_NAMES`: each must be ``None`` or exactly one (compared with ``1.0`` exactly,
-    no tolerance: engines pass the exact value; ``host_scale`` says which forms of the argument are read). A unit scale
+    no tolerance: engines pass the exact value; ``resolve_scale`` says which forms of the argument are read). A unit scale
     multiplies nothing, so it is the unscaled class; any other value is a term the class does not have. ``free`` names
     the scales a class takes as operands (the per-tensor ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not
     checked here. The query and the output scale are unit-only for every class."""
     for name, value in zip(SCALE_NAMES, scales, strict=False):
         if value is None or name in free:
             continue
-        shown = host_scale(class_name, name, value)
+        shown = resolve_scale(class_name, name, value)
         try:
             unit = float(shown) == 1.0
         except (TypeError, ValueError):

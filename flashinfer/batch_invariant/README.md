@@ -79,7 +79,7 @@ replays both engines' eager call sequences against the minimal call):
 
 | argument | accepted | why it is neutral |
 |---|---|---|
-| `q_scale` / `k_scale` / `v_scale` / `o_scale` (`run`, `forward`) | `None`, or exactly `1.0` as a host number or a one-element CPU tensor | a unit scale multiplies nothing; any other value is a term the bf16 class does not have, and a device tensor would need a readback per `run()` |
+| `q_scale` / `k_scale` / `v_scale` / `o_scale` (`run`, `forward`) | `None`, or exactly `1.0` as a number or a one-element floating-point tensor (CPU or device) | a unit scale multiplies nothing; any other value is a term the bf16 class does not have. A device tensor is read back once per tensor version and remembered, so repeated calls with the same unmodified tensor do not synchronise; an in-place write is read again (storage changed without a version bump is the caller's responsibility). Inside a CUDA-graph capture nothing is read: a device tensor not seen before the capture raises, so the warm-up `run()` resolves it |
 | `sinks`, `kv_cache_sf`, `skip_softmax_threshold_scale_factor` (`run`) | `None` | the feature is off |
 | `logits_soft_cap` | `None` or `0` | the feature is off; the wrapper's `_logits_soft_cap` reads `0.0` afterwards, as after a regular plan |
 | `o_data_type` | bf16 (the q dtype), or `None` | it restates the class's output dtype |
