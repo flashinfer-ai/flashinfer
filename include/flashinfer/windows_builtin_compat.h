@@ -15,11 +15,11 @@
  */
 #pragma once
 
-// Pre-included by the JIT on native Windows builds (nvcc -include). The generated Cake host bindings use the
-// GNU checked-arithmetic builtins, which a Visual Studio host compiler does not provide. Define them here, for
-// that host only, with the same semantics: store the wrapped result in *r and return true on overflow.
-// Operands and result must share one integer type; any other combination fails to compile instead of
-// silently changing the result.
+// Pre-included by the JIT on native Windows builds (nvcc -include). The generated Cake host
+// bindings use the GNU checked-arithmetic builtins, which a Visual Studio host compiler does not
+// provide. Define them here, for that host only, with the same semantics: store the wrapped result
+// in *r and return true on overflow. Operands and result must share one integer type; any other
+// combination fails to compile instead of silently changing the result.
 #if defined(_MSC_VER) && !defined(__clang__) && !defined(__GNUC__) && defined(__cplusplus)
 
 #include <type_traits>

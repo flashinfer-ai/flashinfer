@@ -50,6 +50,7 @@ See ``README.md`` in this package (section "Concurrency").
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
 import os
@@ -2256,10 +2257,10 @@ def _clear_cuda_last_error() -> None:
     copy), so this calls ``cudaGetLastError`` in every ``libcudart`` the process has loaded."""
     if sys.platform == "win32":
         # No /proc and no RTLD_NOLOAD: loading the DLL by name returns the copy the process already holds.
-        try:
-            ctypes.CDLL(f"cudart64_{(torch.version.cuda or '').split('.')[0]}.dll").cudaGetLastError()
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            ctypes.CDLL(
+                f"cudart64_{(torch.version.cuda or '').split('.')[0]}.dll"
+            ).cudaGetLastError()
         return
     paths = set()
     try:

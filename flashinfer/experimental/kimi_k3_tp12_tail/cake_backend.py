@@ -625,7 +625,9 @@ def _clear_cuda_last_error() -> None:
             # Windows has no RTLD_* flags; loading a DLL by name returns the copy the process already holds.
             cudart = ctypes.CDLL(f"cudart64_{major}.dll")
         else:
-            cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+            cudart = ctypes.CDLL(
+                f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW
+            )
     except OSError:
         return
     cudart.cudaGetLastError.restype = ctypes.c_int
