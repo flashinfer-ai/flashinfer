@@ -444,7 +444,8 @@ def _validate_checkpoint_cu_starts(
 
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("", "0"):
         return
-    if cu_seqlens is None:
+    # Malformed shapes are left to the backends' own checks and errors.
+    if cu_seqlens is None or cu_seqlens.ndim != 1 or checkpoint_cu_starts.ndim != 1:
         return
     if cu_seqlens.is_cuda:
         with torch.cuda.device(cu_seqlens.device):

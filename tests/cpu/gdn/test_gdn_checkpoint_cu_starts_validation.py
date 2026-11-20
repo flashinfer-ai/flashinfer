@@ -159,6 +159,18 @@ def test_checkpoint_state_indices_bounds(validate):
         _check([0, 256, 384], [0], rows=10, indices=[0, 1, 2, 3, 4, 5])
 
 
+def test_malformed_shapes_are_left_to_the_backends(validate):
+    # Not 1-D: the backends raise their own shape errors.
+    gdn_prefill._validate_checkpoint_cu_starts(
+        cu_seqlens=_i64([0, 256, 384]),
+        checkpoint_cu_starts=_i64([[0, 256, 384]]),
+        checkpoint_every_n_tokens=EVERY,
+        state_checkpoints=torch.zeros(6, HV, 1, 1),
+        checkpoint_state_indices=None,
+        prefix_lens=None,
+    )
+
+
 @pytest.mark.parametrize("value", [None, "", "0"])
 def test_off_by_default(monkeypatch, value):
     if value is None:
@@ -179,10 +191,11 @@ def test_skipped_during_graph_capture(validate, monkeypatch):
     monkeypatch.setattr(
         gdn_prefill.torch.cuda, "is_current_stream_capturing", lambda: True
     )
-    cu = types.SimpleNamespace(is_cuda=True, device="cuda:1")
+    # Reading this fake's values would fail, so the check must return first.
+    cu = types.SimpleNamespace(is_cuda=True, device="cuda:1", ndim=1)
     gdn_prefill._validate_checkpoint_cu_starts(
         cu_seqlens=cu,
-        checkpoint_cu_starts=None,
+        checkpoint_cu_starts=_i64([0, 256, 384]),
         checkpoint_every_n_tokens=EVERY,
         state_checkpoints=None,
         checkpoint_state_indices=None,
