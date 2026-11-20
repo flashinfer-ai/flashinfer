@@ -315,6 +315,29 @@ def _run_dropin(case, spec_len, H):
     return out, corr, kg
 
 
+@pytest.mark.parametrize(
+    "mode,T",
+    [("dense", 2), ("dense", 12), ("dense", 16), ("dropin", 3), ("dropin", 16)],
+)
+def test_umma_persistent_matches_one_item_per_cta(monkeypatch, mode, T):
+    """The persistent grid (several work items per CTA: phase flips, buffer reuse,
+    the next item's state TMA behind the readout) is bitwise equal to one item per
+    CTA, with more items than resident CTAs."""
+    res = {}
+    for persistent in (True, False):
+        monkeypatch.setattr(_launch, "_PERSISTENT", persistent)
+        if mode == "dense":
+            args, kw = _inputs(250, T, 4, 8, "sp", seed=T)
+            res[persistent] = _WY_DENSE(
+                *args, **kw, emit_corrections=True, backend="umma"
+            )
+        else:
+            res[persistent] = _run_dropin(_dropin_case(420, T, 4, seed=T), T, 4)
+    torch.cuda.synchronize()
+    for a, b in zip(res[True], res[False], strict=True):
+        assert torch.equal(a, b)
+
+
 @pytest.mark.parametrize("T", [1, 5, 16])
 def test_umma_dropin_unaligned_gate_stride(T):
     """A gate token stride that is not a multiple of 8 elements takes the 2-byte gate

@@ -29,12 +29,18 @@ key / (scaled) query of the query head i_h = hv / (HV / H):
 
 u_t is also the RecoverSSM correction (emit mode).
 
-CTA = (value head, sequence), grid (HV, B), 192 threads:
-  warp 0   : mbarrier inits, TMA of the bf16 state (two 16 KB SW128 K halves).
-  warp 1   : TMEM allocation at entry (32 columns), the UMMA issuer.
-  warps 2-5: consumers: row-layout L2 norm, channel-layout gate (X_r / X_c / Ktil
-             tiles), the mma.sync Gram [X_c] . Ktil^T, the per-V-row forward
-             substitution epilogue (TMEM lane = V row).
+Work item = (sequence b, value head hv), item = b * HV + hv; 1-D grid of 160-thread
+CTAs, one item per CTA or (``persistent``) min(items, SMs * CTAs/SM) CTAs striding
+over the items (removes the ~1 us per-CTA launch gap; picked per T / mode on the
+host). Per item:
+  warp 0   : mbarrier inits + TMEM allocation (32 columns) at entry; TMA of the bf16
+             state (two 16 KB SW128 K halves), v-row bulk copies, the UMMA issue.
+  warps 1-4: consumers: row-layout L2 norm (q / k and the gate rows as 16-B chunks,
+             gate rows transposed through SMEM), channel-layout gate (X_r / Ktil
+             tiles), the mma.sync Gram X_r . Ktil^T written straight into the
+             coefficient tables, the per-V-row forward substitution epilogue (TMEM
+             lane = V row) in f32x2 fmas (each lane one token's chain, bitwise equal
+             to the scalar recurrence).
 UMMA: readout R = S0 . X_r^T, M128 N{16, 32} K128 (kind::f16, BF16 A / B, fp32 TMEM);
 X_r = [khat; qhat] (2T rows, zero rows after), so R holds S0 khat_t in column t and
 S0 qhat_t in column T + t.
@@ -264,25 +270,6 @@ def _bulk_g2s_if(
 
 
 @dsl_user_op
-def _lds_f32x4(addr: Int32, *, loc=None, ip=None):
-    """ld.shared.v4.f32 -> four fp32 values (16 B aligned)."""
-    st = llvm.StructType.get_literal([_T.f32()] * 4)
-    r = llvm.inline_asm(
-        st,
-        [Int32(addr).ir_value(loc=loc, ip=ip)],
-        "ld.shared.v4.f32 {$0,$1,$2,$3}, [$4];",
-        "=f,=f,=f,=f,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
-    )
-    return [
-        Float32(llvm.extractvalue(_T.f32(), r, [i], loc=loc, ip=ip)) for i in range(4)
-    ]
-
-
-@dsl_user_op
 def _sts_bf16(addr: Int32, x: Float32, *, loc=None, ip=None) -> None:
     """st.shared.b16 of ``x`` rounded to bf16 (RN)."""
     llvm.inline_asm(
@@ -464,6 +451,10 @@ class KdaOutputOnlyUmma:
         kg_v4: bool = True,
         min_blocks: Optional[int] = None,
         g_v4: bool = True,
+        hv_heads: Optional[int] = None,
+        q_heads: Optional[int] = None,
+        num_sms: Optional[int] = None,
+        persistent: bool = False,
     ):
         assert 1 <= T <= 16, T
         self.T = T
@@ -479,9 +470,17 @@ class KdaOutputOnlyUmma:
         # gate rows read as 16-B row chunks (token stride a multiple of 8 elements)
         # and transposed through SMEM, else per-thread scalar loads (separate build)
         self.g_v4 = bool(g_v4)
+        # head counts baked in (the launch caches per (HV, H)): constant index math
+        self.hv_heads = hv_heads
+        self.q_heads = q_heads
+        # persistent: min(items, num_sms * min_blocks) CTAs striding over the items,
+        # else one item per CTA (same kernel body, every CTA runs one iteration)
+        self.persistent = bool(persistent)
+        self.num_sms = num_sms
+        assert not self.persistent or num_sms is not None
         self.NX = 16 if T <= 8 else 32  # X_r / X_c rows (2T live)
         self.KT = 8 if T <= 8 else 16  # Ktil rows (T live)
-        self.num_threads = 192
+        self.num_threads = 160  # warp 0: TMA / UMMA / TMEM; warps 1-4: consumers
         self.min_blocks = ctas_per_sm(T) if min_blocks is None else int(min_blocks)
 
     @cute.jit
@@ -546,6 +545,11 @@ class KdaOutputOnlyUmma:
             smem_layout,
             cta_tiler=(1, 1, V_DIM, elems),
         )
+        n_items = HV * B_val
+        grid_x = n_items
+        if cutlass.const_expr(self.persistent):
+            cap = Int32(self.num_sms * self.min_blocks)
+            grid_x = _sel(n_items < cap, n_items, cap, Int32)
         self.kernel(
             gQ,
             gK,
@@ -577,7 +581,7 @@ class KdaOutputOnlyUmma:
             H,
             tma_ld,
         ).launch(
-            grid=(HV, B_val, 1),
+            grid=(grid_x, 1, 1),
             block=(self.num_threads, 1, 1),
             min_blocks_per_mp=self.min_blocks,
             stream=stream,
@@ -596,7 +600,7 @@ class KdaOutputOnlyUmma:
         HV = ctx["HV"]
         hv = item % HV
         brow = item // HV
-        i_h = hv // (HV // ctx["H"])
+        i_h = hv // ctx["GRP"]
         r8 = ctx["r8"]
         l16 = ctx["l16"]
         ct = ctx["ct"]
@@ -703,11 +707,17 @@ class KdaOutputOnlyUmma:
         VB = V_DIM * 2  # bytes per v row
 
         tid, _, _ = cute.arch.thread_idx()
-        hv_cta, brow_cta, _ = cute.arch.block_idx()
+        bid, _, _ = cute.arch.block_idx()
+        G_, _, _ = cute.arch.grid_dim()
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
-        # one work item (sequence b, value head hv) per CTA: item = b * HV + hv
-        item = brow_cta * HV + hv_cta
+        if cutlass.const_expr(self.hv_heads is not None):
+            HV = self.hv_heads
+            H = self.q_heads
+        GRP = HV // H  # value heads per query head (GQA)
+        # persistent: CTA bid takes items bid, bid + G, ... (item = b * HV + hv)
+        n_items = Int32(gH0idx.layout.shape[0]) * HV
+        n_it = (n_items - Int32(bid) + Int32(G_) - 1) // Int32(G_)
 
         # ------------------------------------------------------------------ SMEM
         smem = cutlass.utils.SmemAllocator()
@@ -743,17 +753,15 @@ class KdaOutputOnlyUmma:
         v_full = smem.allocate_array(cutlass.Int64, 1)
         mma_done = smem.allocate_array(cutlass.Int64, 1)
         tmem_done = smem.allocate_array(cutlass.Int64, 1)
+        v_free = smem.allocate_array(cutlass.Int64, 1)
         tmem_addr = smem.allocate(Int32, 4)
         _CO_A = 0
         _CO_BQ = TT * TT
         _CO_BETA = CO_N
 
-        if warp == 1:
+        if warp == 0:
             U.tmem_alloc(tmem_addr, _TMEM_COLS)
             cute.arch.relinquish_tmem_alloc_permit()
-            U.fence_before_sync()
-            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=160)
-        if warp == 0:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_init(st_full[0], 1)
                 cute.arch.mbarrier_init(st_full[1], 1)
@@ -761,10 +769,11 @@ class KdaOutputOnlyUmma:
                 cute.arch.mbarrier_init(v_full, 1)
                 cute.arch.mbarrier_init(mma_done, 1)
                 cute.arch.mbarrier_init(tmem_done, 128)
+                cute.arch.mbarrier_init(v_free, 128)
                 cute.arch.mbarrier_init_fence()
             cute.arch.fence_acq_rel_cta()
-            cute.arch.barrier_arrive(barrier_id=3, number_of_threads=64)
-            cute.arch.barrier_arrive(barrier_id=4, number_of_threads=160)
+            U.fence_before_sync()
+            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=160)
 
         if cutlass.const_expr(DROPIN):
             sq_t = s_q_tok
@@ -798,7 +807,20 @@ class KdaOutputOnlyUmma:
         if warp == 0:
             # ============================================================ producer
             cpasync.prefetch_descriptor(tma_ld.atom)
-            if True:  # one work item per CTA
+            U.fence_before_sync()
+            cute.arch.sync_warp()
+            U.fence_after_sync()
+            tbase = tmem_addr[0]
+            sd = U.sdesc_sw128(V_DIM * 128)
+            x_desc = sd + Uint64(x_addr >> 4)
+            stage_desc = [
+                sd + Uint64(st_addr >> 4),
+                sd + Uint64((st_addr + 16384) >> 4),
+            ]
+            idesc = _bf16_idesc(128, NX)
+            for it in cutlass.range(n_it, unroll=1):
+                item = Int32(bid) + it * Int32(G_)
+                ph = it & 1
                 hv = item % HV
                 brow = item // HV
                 raw_idx = Int32(gH0idx[brow])
@@ -813,6 +835,21 @@ class KdaOutputOnlyUmma:
                     bos = Int32(gQsl[brow])
                     seq_len = Int32(gQsl[brow + 1]) - bos
                 tok0 = bos if DROPIN else brow * T
+                # state buffer free once the previous item's readout completed
+                if it > 0:
+                    cute.arch.mbarrier_wait(mma_done, ph ^ 1)
+                for gk in cutlass.range_constexpr(2):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(st_full[gk], 16384)
+                    U.simple_tma_copy(
+                        tma_ld.atom,
+                        tma_ld.tma_tensor[sidx, hv, None, (None, gk)],
+                        s_state[None, (None, gk)],
+                        st_full[gk],
+                    )
+                # v rows free once the consumers read the previous item's
+                if it > 0:
+                    cute.arch.mbarrier_wait(v_free, ph ^ 1)
                 with cute.arch.elect_one():
                     nv = _sel(seq_len < T, seq_len, T, Int32)
                     nv = _sel(nv < 0, 0, nv, Int32)
@@ -827,28 +864,9 @@ class KdaOutputOnlyUmma:
                             Int32(VB),
                             v_full.toint(),
                         )
-                for gk in cutlass.range_constexpr(2):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(st_full[gk], 16384)
-                    U.simple_tma_copy(
-                        tma_ld.atom,
-                        tma_ld.tma_tensor[sidx, hv, None, (None, gk)],
-                        s_state[None, (None, gk)],
-                        st_full[gk],
-                    )
-        elif warp == 1:
-            # ============================================================ UMMA issuer
-            tbase = tmem_addr[0]
-            sd = U.sdesc_sw128(V_DIM * 128)
-            x_desc = sd + Uint64(x_addr >> 4)
-            stage_desc = [
-                sd + Uint64(st_addr >> 4),
-                sd + Uint64((st_addr + 16384) >> 4),
-            ]
-            idesc = _bf16_idesc(128, NX)
-            cute.arch.barrier(barrier_id=3, number_of_threads=64)
-            if True:  # one work item per CTA
-                ph = 0
+                # TMEM free once the consumers loaded the previous readout
+                if it > 0:
+                    cute.arch.mbarrier_wait(tmem_done, ph ^ 1)
                 cute.arch.mbarrier_wait(x_ready, ph)
                 U.fence_after_sync()
                 for gk in cutlass.range_constexpr(2):
@@ -863,13 +881,13 @@ class KdaOutputOnlyUmma:
                             (gk > 0) or (ka > 0),
                         )
                 U.umma_commit(mma_done)
-            cute.arch.mbarrier_wait(tmem_done, 0)
+            cute.arch.mbarrier_wait(tmem_done, (n_it - 1) & 1)
             U.fence_after_sync()
             U.tmem_dealloc(tbase, _TMEM_COLS)
         else:
             # ============================================================ consumers
-            cw = warp - 2
-            ct = (tid - 64) & 127  # consumer index: channel / (row, lane) / TMEM lane
+            cw = warp - 1
+            ct = tid - 32  # consumer index: channel / (row, lane)
             tq = (warp & 3) << 5  # TMEM lane quadrant of this warp (tcgen05.ld base)
             row = tq | lane  # V row of this consumer (= TMEM lane)
             r8 = ct >> 4
@@ -880,7 +898,7 @@ class KdaOutputOnlyUmma:
                 idx=gH0idx,
                 qsl=gQsl,
                 HV=HV,
-                H=H,
+                GRP=GRP,
                 k=k_base,
                 q=q_base,
                 g=g_base,
@@ -893,12 +911,13 @@ class KdaOutputOnlyUmma:
                 l16=l16,
                 ct=ct,
             )
-            pf = self._load_inputs(item, ctx)
-            if True:  # one work item per CTA
-                ph = 0
+            for it in cutlass.range(n_it, unroll=1):
+                item = Int32(bid) + it * Int32(G_)
+                pf = self._load_inputs(item, ctx)
+                ph = it & 1
                 hv = item % HV
                 brow = item // HV
-                i_h = hv // (HV // H)  # query head (GQA)
+                i_h = hv // GRP  # query head (GQA)
                 raw_idx = Int32(gH0idx[brow])
                 bos = Int32(0)
                 seq_len = Int32(T)
@@ -911,9 +930,14 @@ class KdaOutputOnlyUmma:
                 if cutlass.const_expr(DROPIN):
                     kg_live = Int32(raw_idx >= Int32(self.null_min))
                 # ---- inputs (loads issued before the barriers)
-                cute.arch.barrier(barrier_id=4, number_of_threads=160)  # inits
-                cute.arch.barrier(barrier_id=2, number_of_threads=160)  # TMEM
-                U.fence_after_sync()
+                if it == 0:
+                    cute.arch.barrier(
+                        barrier_id=2, number_of_threads=160
+                    )  # inits + TMEM
+                    U.fence_after_sync()
+                else:
+                    # previous item's epilogue done with the coefficient / beta block
+                    _bar_sync_ua(1, 128)
                 tbase = tmem_addr[0]
                 xw = [pf[4 * p_ : 4 * p_ + 4] for p_ in range(NP)]
                 NGW = 4 * ((T + 7) // 8) if self.g_v4 else T
@@ -1202,8 +1226,14 @@ class KdaOutputOnlyUmma:
                                     a0,
                                 )
                         uu.append(a0)
+                # v reads (generic proxy) ordered before warp 0's next bulk copy into
+                # the rows (async proxy): proxy fence, then the release arrive
+                cute.arch.fence_view_async_shared()
+                cute.arch.mbarrier_arrive(v_free)  # v rows read
                 hq = U.tmem_ld(tq, tbase + T, nld)
                 U.tmem_wait_ld()
+                U.fence_before_sync()
+                cute.arch.mbarrier_arrive(tmem_done)  # readout read out of TMEM
                 yy: list = []
                 for t0 in cutlass.range_constexpr(0, T, 2):
                     if cutlass.const_expr(t0 + 1 < T):
@@ -1258,5 +1288,3 @@ class KdaOutputOnlyUmma:
                         _stg_bf16(o_base + oa, y)
                         if cutlass.const_expr(EMIT):
                             _stg_bf16(c_base + oa, uu[t])
-            U.fence_before_sync()
-            cute.arch.mbarrier_arrive(tmem_done)

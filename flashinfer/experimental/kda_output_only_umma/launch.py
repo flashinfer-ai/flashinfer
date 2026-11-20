@@ -40,6 +40,18 @@ def kda_oo_umma_auto_ok(device: torch.device, T: int) -> bool:
     return T <= _AUTO_T_MAX and kda_oo_umma_unavailable_reason(device, T) is None
 
 
+# Persistent grid (CTAs stride over the work items) where it measured faster on B200
+# (H=12, B 512-2048): T > 8 (both entries, 1.04-1.12x) and the drop-in at T <= 4
+# (1.03-1.05x); elsewhere one item per CTA. Tests set _PERSISTENT to force either.
+_PERSISTENT: Optional[bool] = None
+
+
+def _use_persistent(T: int, vllm_dropin: bool) -> bool:
+    if _PERSISTENT is not None:
+        return _PERSISTENT
+    return T > 8 or (vllm_dropin and T <= 4)
+
+
 def run_kda_oo_umma(
     args: list,
     *,
@@ -57,7 +69,9 @@ def run_kda_oo_umma(
     g_v4: bool = True,
 ) -> None:
     """Compile (once per specialisation) and launch on ``args`` -- the
-    ``KdaDecodeWyOutputOnlyKernel`` argument list."""
+    ``KdaDecodeWyOutputOnlyKernel`` argument list. ``kg_v4`` / ``g_v4``: the kg
+    cache strides / the gate token stride are multiples of 8 elements (16-B
+    accesses; else the 2-byte builds)."""
     global _LAUNCHES
     import cutlass.cute as cute
 
@@ -74,8 +88,13 @@ def run_kda_oo_umma(
     min_blocks = (
         1 if tuple(torch.cuda.get_device_capability(device)) == (10, 7) else None
     )
+    persistent = _use_persistent(T, vllm_dropin)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     key = (
         gdn_device_target(device).compile_key,
+        persistent,
+        num_sms,
+        bool(g_v4),
         min_blocks,
         T,
         int(gate_mode),
@@ -87,7 +106,6 @@ def run_kda_oo_umma(
         HV,
         H,
         bool(kg_v4),
-        bool(g_v4),
     )
     fn = _KERNELS.get(key)
     if fn is None:
@@ -102,6 +120,10 @@ def run_kda_oo_umma(
             kg_v4=kg_v4,
             min_blocks=min_blocks,
             g_v4=g_v4,
+            hv_heads=HV,
+            q_heads=H,
+            num_sms=num_sms,
+            persistent=persistent,
         )
         fn = cute.compile[gdn_compile_options(device)](kernel, *args)
         _KERNELS[key] = fn
