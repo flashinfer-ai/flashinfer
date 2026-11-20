@@ -466,7 +466,7 @@ def _plan_with_deferred_compilation(wrapper, *args, **kwargs):
     assert wrapper._state["compiled"] is None
     assert mla_decode_module._get_compiled_mla_decode.cache_info() == cache_info
     with pytest.raises(RuntimeError, match=r"plan\(compile=True\)"):
-        wrapper.run(None, None, None, None)
+        wrapper.run(None, None, None, None, validate=False)
     wrapper.plan(*args, **kwargs)
     compiled = wrapper._state["compiled"]
     assert compiled is not None and wrapper._state["compile_spec"] == spec
