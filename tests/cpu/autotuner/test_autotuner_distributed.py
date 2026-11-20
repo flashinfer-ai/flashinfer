@@ -518,7 +518,6 @@ class RunnerB(RunnerA):
 config = TuningConfig()
 inputs = [torch.zeros(8, 8)]
 runners = [RunnerA(), RunnerB()]
-candidates = _ProfilingCandidates.from_runners(runners, inputs)
 op = "test::distributed_cache_hit"
 tuner = AutoTuner.get()
 tuner.clear_cache()
@@ -545,6 +544,9 @@ try:
         key = tuner._get_cache_key(op, runners[0], (inputs[0].shape,), config,
                                    runners[0].get_cache_key_extras(inputs))
         policy = tuner._profiling_policy(config)
+        candidates = _ProfilingCandidates.from_runners(
+            runners, inputs, race_default=tuner._in_v2_context
+        )
         store = tuner._active_managed_store
         all_hit = case in ("all_hit", "all_hit_different_tactics", "all_hit_different_runners", "all_hit_stale_memory")
         if all_hit or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
