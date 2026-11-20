@@ -14,6 +14,7 @@
 
 """CPU compatibility contracts; GPU numerics live in the adjacent KDA suite."""
 
+import contextlib
 import importlib.util
 import sys
 from types import SimpleNamespace
@@ -242,3 +243,71 @@ def test_kda_pool_declining_plan_does_not_retry_with_compact_scratch(
     assert calls[0]["state_indices"] is inputs["state_indices"]
     assert calls[0]["overwrite_initial_state"]
     torch.testing.assert_close(inputs["initial_state"], before)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("family", ["gdn", "gdn2", "gdp", "kda"])
+@pytest.mark.parametrize("num_outputs", [3, 4])
+def test_graph_builder_accepts_appended_frontend_outputs(
+    monkeypatch, adapter, family, num_outputs
+):
+    # FE 1.33 appends composed_initial_state (None unless requested) to the
+    # three outputs of 1.32; the builder must bind O and final_state either way.
+    class FakeTensor:
+        def __init__(self, name):
+            self.name, self.uid = name, None
+
+        def set_uid(self, uid):
+            self.uid = uid
+            return self
+
+        def get_uid(self):
+            return self.uid
+
+        def __getattr__(self, attr):
+            if attr.startswith("set_"):
+                return lambda *args: self
+            raise AttributeError(attr)
+
+    class FakeGraph:
+        def tensor(self, name, **kwargs):
+            return FakeTensor(name)
+
+    def build(**kwargs):
+        out = FakeTensor("O")
+        final = FakeTensor("final_state") if kwargs["output_final_state"] else None
+        return [out, final, None, None][:num_outputs]
+
+    graph = FakeGraph()
+    setattr(graph, family, build)
+
+    @contextlib.contextmanager
+    def fake_graph(handle):
+        yield graph, []
+
+    monkeypatch.setattr(adapter.cudnn, "graph", fake_graph)
+    q = torch.ones(7, 2, 8)
+    state = torch.zeros(1, 2, 8, 8)
+    built, tensors = adapter._create_la_graph.__wrapped__(
+        family,
+        q,
+        q,
+        q,
+        q,
+        torch.ones(7, 2),
+        torch.tensor([0, 7], dtype=torch.int32),
+        torch.empty_like(q),
+        w=q if family == "gdn2" else None,
+        initial_state=state,
+        final_state=state,
+        num_householder=1 if family == "gdp" else None,
+        scale=1.0,
+        use_qk_l2norm=False,
+        use_beta_sigmoid=False,
+        safe_gate=False,
+        gate_lower_bound=None,
+        batch_invariant=False,
+    )
+    assert built is graph
+    assert [t.name for t in tensors] == ["q", "k", "v", "O", "final_state"]
+    assert tensors[-1].uid == adapter.UIDs.FINAL_STATE_UID.value

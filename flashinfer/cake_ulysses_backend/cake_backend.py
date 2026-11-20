@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
-import sys
+import os
 from typing import Any, Optional, Sequence
 
 import torch
@@ -193,8 +193,9 @@ class _ViewBlock(ctypes.Structure):
     ]
 
 
-# ctypes.CDLL(None) is POSIX-only; on Windows the C runtime that owns malloc/free is ucrtbase.
-_LIBC = ctypes.CDLL("ucrtbase" if sys.platform == "win32" else None)
+# ctypes.CDLL(None) names the C library only on POSIX; on Windows malloc and
+# free come from the universal C runtime.
+_LIBC = ctypes.CDLL("ucrtbase" if os.name == "nt" else None)
 _LIBC.malloc.restype = ctypes.c_void_p
 _LIBC.malloc.argtypes = [ctypes.c_size_t]
 _LIBC.free.restype = None
