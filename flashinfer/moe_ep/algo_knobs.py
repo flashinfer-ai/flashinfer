@@ -55,6 +55,54 @@ class FleetAlgoKnobTopologyCapacity(AlgoKnob):
 
 
 @dataclass(frozen=True)
+class FleetAlgoKnobFaultTolerance(AlgoKnob):
+    """Enable rank masking so a dead/slow peer degrades instead of trapping.
+
+    Without this knob a peer that stops responding during dispatch or combine
+    trips a GPU ``trap()`` and takes the job down. With it, both transports
+    mask the offending rank, skip it, and let the collective complete — its
+    experts simply contribute nothing (see the note on dropped tokens below).
+
+    LOW_LATENCY only, on both transports: nccl_ep leaves its mask buffer NULL
+    under HIGH_THROUGHPUT (later mask calls then abort the process) and
+    nixl_ep has no HT mask support at all. ``validate_fleet_params`` rejects
+    the combination up front.
+
+    The runtime API lives on the Fleet: :meth:`~flashinfer.moe_ep.core.comm.
+    fleet.Fleet.query_fault`, ``query_active_mask``, ``set_active_mask``,
+    ``reconcile_active_mask`` and ``clear_faults``. See
+    ``docs/design_docs/moe_ep_runbook.md`` for the recovery state machine.
+
+    Note: a masked rank's experts are dropped from combine with **no** topk
+    re-normalization, so affected tokens come out scaled by the surviving
+    weight sum. That is a deliberate choice — see the runbook.
+    """
+
+    enabled: bool = True
+    # GPU wait-loop timeout. 0 = transport default (nccl_ep ~100 s, nixl_ep 30 s).
+    # Too low marks merely-slow ranks dead; prefer the default unless testing.
+    timeout_ms: int = 0
+    # Wall-clock budget for reconcile_active_mask()'s store rendezvous.
+    reconcile_timeout_s: float = 30.0
+    # Extra budget for coordinator takeover when the elected coordinator
+    # also turns out to be dead.
+    coordinator_takeover_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.timeout_ms < 0:
+            raise ValueError(
+                f"FleetAlgoKnobFaultTolerance.timeout_ms must be >= 0 "
+                f"(0 = transport default), got {self.timeout_ms}"
+            )
+        if self.reconcile_timeout_s <= 0 or self.coordinator_takeover_s <= 0:
+            raise ValueError(
+                "FleetAlgoKnobFaultTolerance: reconcile_timeout_s and "
+                "coordinator_takeover_s must be positive, got "
+                f"{self.reconcile_timeout_s} / {self.coordinator_takeover_s}"
+            )
+
+
+@dataclass(frozen=True)
 class FleetAlgoKnobAllocator(AlgoKnob):
     """Route NCCL-EP device buffers through a custom allocator.
 

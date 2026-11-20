@@ -224,8 +224,8 @@ def run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, cuda_version) {
           def dockerTags = readYaml file: 'ci/docker-tags.yml'
           def docker_run = getDockerRun(cuda_version, dockerTags)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-          sh(script: "${docker_run} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
+          sh(script: "./scripts/infra/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} --no-gpu ./scripts/infra/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
         }
       }
     } catch (Exception e) {
@@ -242,8 +242,8 @@ def run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, cuda_version) {
         def dockerTags = readYaml file: 'ci/docker-tags.yml'
         def docker_run = getDockerRun(cuda_version, dockerTags)
         sh(script: "ls -alh", label: 'Show work directory')
-        sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-        sh(script: "${docker_run} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
+        sh(script: "./scripts/infra/task_show_node_info.sh", label: 'Show node info')
+        sh(script: "${docker_run} --no-gpu ./scripts/infra/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
       }
     }
   }
@@ -273,8 +273,8 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
           def dockerTags = readYaml file: 'ci/docker-tags.yml'
           def docker_run = getDockerRun(cuda_version, dockerTags)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-          sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
+          sh(script: "./scripts/infra/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} ./scripts/infra/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
         }
       }
     } catch (Exception e) {
@@ -291,8 +291,8 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
         def dockerTags = readYaml file: 'ci/docker-tags.yml'
         def docker_run = getDockerRun(cuda_version, dockerTags)
         sh(script: "ls -alh", label: 'Show work directory')
-        sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-        sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
+        sh(script: "./scripts/infra/task_show_node_info.sh", label: 'Show node info')
+        sh(script: "${docker_run} ./scripts/infra/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
       }
     }
   }
@@ -314,24 +314,6 @@ stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
-    // CUDA 12.6 AOT Tests
-    'AOT-Build-Import-x86-64-cu126': {
-      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu126',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
-    },
-    'AOT-Build-Import-aarch64-cu126': {
-      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
-    },
-    // CUDA 12.8 AOT Tests
-    'AOT-Build-Import-x86-64-cu128': {
-      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
-    },
-    'AOT-Build-Import-aarch64-cu128': {
-      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
-    },
     // CUDA 12.9 AOT Tests
     'AOT-Build-Import-x86-64-cu129': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',

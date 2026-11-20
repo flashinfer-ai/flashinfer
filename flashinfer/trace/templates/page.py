@@ -15,6 +15,7 @@
 """TraceTemplates for paged-KV cache append operations."""
 
 import math
+from copy import deepcopy
 from typing import Any, cast
 
 import torch
@@ -515,6 +516,306 @@ nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
 )
 
 
+def _fp8_pth_paged_cache_shapes(
+    num_pages, page_size, num_kv_heads, head_dim, kv_layout
+):
+    slot_last = head_dim + 16
+    if kv_layout == "HND":
+        slot_shape = (num_pages, num_kv_heads, page_size, slot_last)
+        sf_shape = (num_pages, num_kv_heads, page_size)
+    else:
+        slot_shape = (num_pages, page_size, num_kv_heads, slot_last)
+        sf_shape = (num_pages, page_size, num_kv_heads)
+    return slot_shape, sf_shape
+
+
+def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
+    *,
+    nnz_kv: int,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 4,
+    kv_layout: str = "NHD",
+    kv_data_type: str = "e4m3",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping``."""
+    if head_dim % 16 != 0:
+        raise ValueError("head_dim must be divisible by 16 for the FP8 inline slot")
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, math.ceil(max(nnz_kv, 1) / page_size))
+    append_key = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, dtype=torch.float16, device=device
+    )
+    append_value = torch.randn_like(append_key)
+    slot_shape, sf_shape = _fp8_pth_paged_cache_shapes(
+        num_pages, page_size, num_kv_heads, head_dim, kv_layout
+    )
+    k_slot = torch.zeros(slot_shape, dtype=torch.uint8, device=device)
+    v_slot = torch.zeros_like(k_slot)
+    # Scale views are the inline 4-byte float32 region of the same uint8 slot.
+    k_sf = k_slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+    v_sf = v_slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+    slot_mapping = torch.arange(nnz_kv, dtype=torch.int32, device=device)
+    return {
+        "append_key": append_key,
+        "append_value": append_value,
+        "slot_mapping": slot_mapping,
+        "paged_kv_cache": (k_slot, v_slot),
+        "kv_cache_sf": (k_sf, v_sf),
+        "kv_layout": kv_layout,
+        "kv_data_type": kv_data_type,
+    }
+
+
+cast(
+    Any,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)._trace_init_dependencies = (_fp8_pth_paged_cache_shapes,)
+
+
+def _fp8_pth_hnd_init(
+    *,
+    nnz_kv: int,
+    num_pages: int = 4,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+    kv_layout: str = "HND",
+    kv_data_type: str = "e4m3",
+):
+    return _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
+        nnz_kv=nnz_kv,
+        num_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        seed=seed,
+        kv_layout=kv_layout,
+        kv_data_type=kv_data_type,
+    )
+
+
+cast(Any, _fp8_pth_hnd_init)._trace_init_dependencies = (
+    _fp8_pth_paged_cache_shapes,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+
+def _fp8_pth_e5m2_init(
+    *,
+    nnz_kv: int,
+    num_pages: int = 4,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+    kv_layout: str = "NHD",
+    kv_data_type: str = "e5m2",
+):
+    return _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
+        nnz_kv=nnz_kv,
+        num_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        seed=seed,
+        kv_layout=kv_layout,
+        kv_data_type=kv_data_type,
+    )
+
+
+cast(Any, _fp8_pth_e5m2_init)._trace_init_dependencies = (
+    _fp8_pth_paged_cache_shapes,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+
+def _fp8_pth_hnd_e5m2_init(
+    *,
+    nnz_kv: int,
+    num_pages: int = 4,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+    kv_layout: str = "HND",
+    kv_data_type: str = "e5m2",
+):
+    return _fp8_pth_e5m2_init(
+        nnz_kv=nnz_kv,
+        num_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        seed=seed,
+        kv_layout=kv_layout,
+        kv_data_type=kv_data_type,
+    )
+
+
+cast(Any, _fp8_pth_hnd_e5m2_init)._trace_init_dependencies = (
+    _fp8_pth_paged_cache_shapes,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+    _fp8_pth_e5m2_init,
+)
+
+for _fp8_pth_init in (
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+    _fp8_pth_hnd_init,
+    _fp8_pth_e5m2_init,
+    _fp8_pth_hnd_e5m2_init,
+):
+    cast(Any, _fp8_pth_init)._trace_init_const_axes = (
+        "num_kv_heads",
+        "head_dim",
+        "page_size",
+    )
+
+
+_fp8_pth_nhd_trace = TraceTemplate(
+    op_type="page_append",
+    name_prefix="fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping",
+    description=(
+        "Quantize fp16/bf16 K/V rows into an FP8 per-(token, head) paged KV cache "
+        "using a flat slot_mapping array, writing the e4m3/e5m2 data and the "
+        "float32 scale into one inline slot. Negative slots are ignored."
+    ),
+    axes={
+        "nnz_kv": Var(description="Total K/V tokens to append."),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "slot_last": Const(abbrev="sl"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+    },
+    inputs={
+        "append_key": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "append_value": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "kv_layout": Scalar("string", optional=True),
+        "kv_data_type": Scalar("string", optional=True),
+        "slot_mapping": Tensor(["nnz_kv"], dtype="int32"),
+        "paged_k_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=0,
+        ),
+        "paged_v_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=1,
+        ),
+        "k_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=0,
+        ),
+        "v_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=1,
+        ),
+    },
+    outputs={
+        "paged_k_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=0,
+            description="Updated inline-slot K cache (in-place).",
+        ),
+        "paged_v_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=1,
+            description="Updated inline-slot V cache (in-place).",
+        ),
+        "k_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=0,
+            description="Updated K scale view (in-place).",
+        ),
+        "v_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=1,
+            description="Updated V scale view (in-place).",
+        ),
+    },
+    constraints=[
+        "slot_last == head_dim + 16",
+    ],
+    tags=["status:verified"],
+    init=_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+# Keep the existing NHD definition and name; HND swaps only the cache axes.
+_fp8_pth_hnd_trace = deepcopy(_fp8_pth_nhd_trace)
+_fp8_pth_hnd_trace.name_prefix = f"{_fp8_pth_nhd_trace.name_prefix}_hnd"
+_fp8_pth_hnd_trace.init = _fp8_pth_hnd_init
+_fp8_pth_nhd_trace.constraints.append("kv_layout == 'NHD'")
+_fp8_pth_hnd_trace.constraints.append("kv_layout == 'HND'")
+for _descriptors in (_fp8_pth_hnd_trace.inputs, _fp8_pth_hnd_trace.outputs):
+    for _descriptor in _descriptors.values():
+        if isinstance(_descriptor, Tensor) and _descriptor.param in (
+            "paged_kv_cache",
+            "kv_cache_sf",
+        ):
+            _descriptor.dim_names[1:3] = ["num_kv_heads", "page_size"]
+
+# Distinct names prevent auto-dump from deduplicating the two FP8 formats.
+# Keep the existing e4m3 names for compatibility with recorded definitions.
+_fp8_pth_nhd_e5m2_trace = deepcopy(_fp8_pth_nhd_trace)
+_fp8_pth_nhd_e5m2_trace.name_prefix = f"{_fp8_pth_nhd_trace.name_prefix}_e5m2"
+_fp8_pth_nhd_e5m2_trace.init = _fp8_pth_e5m2_init
+_fp8_pth_hnd_e5m2_trace = deepcopy(_fp8_pth_hnd_trace)
+_fp8_pth_hnd_e5m2_trace.name_prefix = f"{_fp8_pth_hnd_trace.name_prefix}_e5m2"
+_fp8_pth_hnd_e5m2_trace.init = _fp8_pth_hnd_e5m2_init
+for _fp8_pth_template, _fp8_pth_format in (
+    (_fp8_pth_nhd_trace, "e4m3"),
+    (_fp8_pth_hnd_trace, "e4m3"),
+    (_fp8_pth_nhd_e5m2_trace, "e5m2"),
+    (_fp8_pth_hnd_e5m2_trace, "e5m2"),
+):
+    _fp8_pth_template.constraints.append(f"kv_data_type == {_fp8_pth_format!r}")
+
+
+def fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace(**kwargs):
+    from ...page import _normalize_fp8_dtype
+
+    fp8_code = _normalize_fp8_dtype(kwargs.get("kv_data_type", "e4m3"))
+    if kwargs.get("kv_layout", "NHD") == "HND":
+        return _fp8_pth_hnd_e5m2_trace if fp8_code else _fp8_pth_hnd_trace
+    return _fp8_pth_nhd_e5m2_trace if fp8_code else _fp8_pth_nhd_trace
+
+
+cast(
+    Any, fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace
+).templates = (
+    _fp8_pth_nhd_trace,
+    _fp8_pth_hnd_trace,
+    _fp8_pth_nhd_e5m2_trace,
+    _fp8_pth_hnd_e5m2_trace,
+)
+
+
 @torch.no_grad()
 def _append_paged_mla_kv_cache_reference(
     append_ckv,
@@ -683,6 +984,126 @@ append_paged_mla_kv_cache_trace = TraceTemplate(
     tags=["status:verified"],
     reference=_append_paged_mla_kv_cache_reference,
     init=_append_paged_mla_kv_cache_init,
+)
+
+
+def _nvfp4_quantize_append_paged_mla_kv_cache_init(
+    *,
+    nnz_kv: int,
+    batch_size: int = 2,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 4,
+    batch_size_plus_1: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_quantize_append_paged_mla_kv_cache``."""
+    base = _append_paged_mla_kv_cache_init(
+        nnz_kv=nnz_kv,
+        batch_size=batch_size,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        num_pages=num_pages,
+        batch_size_plus_1=batch_size_plus_1,
+        num_kv_indices=num_kv_indices,
+        device=device,
+        seed=seed,
+    )
+    num_pages = base["ckv_cache"].shape[0]
+    base["ckv_cache"] = torch.zeros(
+        num_pages, page_size, head_dim_ckv // 2, dtype=torch.uint8, device=device
+    )
+    base["ckv_sf_cache"] = torch.zeros(
+        num_pages,
+        page_size,
+        head_dim_ckv // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    base["kpe_cache"] = torch.zeros(
+        num_pages, page_size, head_dim_kpe, dtype=torch.float8_e4m3fn, device=device
+    )
+    base["ckv_scale"] = 1.0
+    base["kpe_scale"] = 1.0
+    return base
+
+
+cast(Any, _nvfp4_quantize_append_paged_mla_kv_cache_init)._trace_init_dependencies = (
+    _append_paged_mla_kv_cache_init,
+)
+
+
+nvfp4_quantize_append_paged_mla_kv_cache_trace = TraceTemplate(
+    op_type="page_append",
+    name_prefix="nvfp4_quantize_append_paged_mla_kv_cache",
+    description=(
+        "Quantize fp16/bf16 MLA (ckv, kpe) rows into an NVFP4 MLA paged KV "
+        "cache: ckv goes to a packed uint8 E2M1 cache plus an FP8 E4M3 "
+        "per-16-channel scale cache, kpe goes to an FP8 E4M3 cache."
+    ),
+    axes={
+        "nnz_kv": Var(description="Total K/V tokens to append."),
+        "head_dim_ckv": Const(abbrev="ckv"),
+        "head_dim_kpe": Const(abbrev="kpe"),
+        "packed_head_dim_ckv": Const(abbrev="pd"),
+        "scale_dim_ckv": Const(abbrev="sd"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(description="batch_size + 1."),
+        "num_kv_indices": Var(),
+    },
+    inputs={
+        "append_ckv": Tensor(["nnz_kv", "head_dim_ckv"]),
+        "append_kpe": Tensor(["nnz_kv", "head_dim_kpe"]),
+        "batch_indices": Tensor(["nnz_kv"], dtype="int32"),
+        "positions": Tensor(["nnz_kv"], dtype="int32"),
+        "ckv_cache": Tensor(
+            ["num_pages", "page_size", "packed_head_dim_ckv"],
+            dtype="uint8",
+        ),
+        "ckv_sf_cache": Tensor(
+            ["num_pages", "page_size", "scale_dim_ckv"],
+            dtype="float8_e4m3fn",
+        ),
+        "kpe_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_kpe"],
+            dtype="float8_e4m3fn",
+        ),
+        "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+        "ckv_scale": Scalar("float64"),
+        "kpe_scale": Scalar("float64"),
+    },
+    outputs={
+        "ckv_cache": Tensor(
+            ["num_pages", "page_size", "packed_head_dim_ckv"],
+            dtype="uint8",
+            description="Updated packed compressed KV cache (in-place).",
+        ),
+        "ckv_sf_cache": Tensor(
+            ["num_pages", "page_size", "scale_dim_ckv"],
+            dtype="float8_e4m3fn",
+            description="Updated compressed KV scale cache (in-place).",
+        ),
+        "kpe_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_kpe"],
+            dtype="float8_e4m3fn",
+            description="Updated FP8 KPE cache (in-place).",
+        ),
+    },
+    constraints=[
+        "batch_size_plus_1 == batch_size + 1",
+        "packed_head_dim_ckv * 2 == head_dim_ckv",
+        "scale_dim_ckv * 16 == head_dim_ckv",
+    ],
+    tags=["status:verified"],
+    init=_nvfp4_quantize_append_paged_mla_kv_cache_init,
 )
 
 

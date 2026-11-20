@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 
 #include "DevKernel.h"
@@ -58,8 +59,10 @@ enum class RoutingMethodType : int64_t {
   MiniMax2 = 7,
   // Sigmoid: Sigmoid -> TopK (no renormalization)
   Sigmoid = 8,
+  // TopKSigmoid: TopK -> Sigmoid (no renormalization)
+  TopKSigmoid = 9,
   // Unspecified
-  Unspecified = 9,
+  Unspecified = 10,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -89,6 +92,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "MiniMax2";
     case RoutingMethodType::Sigmoid:
       return "Sigmoid";
+    case RoutingMethodType::TopKSigmoid:
+      return "TopKSigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -168,7 +173,13 @@ enum class ActivationType : int64_t {
   SwigluStep = 7,
   GegluTanh = 8,
   Identity = 9,
-  InvalidType = 10,  // Must be last
+  Situ = 10,
+  InvalidType = 11,  // Must be last among the normally-sequential members
+  // Keep these after InvalidType to preserve existing backend enum values.
+  // ClampedRelu2 also supports TRTLLM BF16 and MXFP8.
+  // PowLU is CUTLASS-only.
+  ClampedRelu2 = 12,
+  PowLU = 13,
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -193,6 +204,12 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "SwigluStep";
     case ActivationType::GegluTanh:
       return "GegluTanh";
+    case ActivationType::Situ:
+      return "Situ";
+    case ActivationType::ClampedRelu2:
+      return "ClampedRelu2";
+    case ActivationType::PowLU:
+      return "PowLU";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -202,7 +219,8 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ ||
+         activationType == ActivationType::PowLU;
 }
 
 }  // namespace MoE
@@ -231,6 +249,10 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
+  // 2*intermediateSize] validHiddenSize: valid K dimension (unpadded). If negative, uses
+  // hiddenSize. validIntermediateSize: valid N/2 dimension (unpadded). If negative, uses
+  // intermediateSize.
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
            float* outputScalesGateScalar, void* ptrBias, float* ptrGatedActAlpha,
@@ -240,7 +262,13 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1,
+           tensorrt_llm::kernels::TrtllmGenBatchedGemmPartition const& partition = {});
+
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const {
+    return mRunner.supportsPartition(configIndex, smCount);
+  }
 
  private:
   friend class MoE::Runner;
@@ -277,13 +305,22 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
+  // hiddenSize] validIntermediateSize: valid K dimension (unpadded). If negative, uses
+  // intermediateSize. validHiddenSize: valid N dimension (unpadded). If negative, uses hiddenSize.
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, void* perTokenScales, void* perChannelScales,
            float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK,
            int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1,
+           tensorrt_llm::kernels::TrtllmGenBatchedGemmPartition const& partition = {});
+
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const {
+    return mRunner.supportsPartition(configIndex, smCount);
+  }
 
  private:
   friend class MoE::Runner;
@@ -303,8 +340,9 @@ struct MoERunnerArgs {
                                    // gemm(hidden_state, routing_weights)
   void* routing_bias = nullptr;    // [num_experts] in bfloat16 for now = mDtypeExpW
   void* hidden_states = nullptr;   // [num_tokens, hidden_size] in fp8 = mDtypeElt
-  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
-  // and [num_tokens, hidden_size/16] in float for e2m1
+  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe,
+  // [num_tokens, hidden_size/16] in float for e2m1, and [num_tokens, 1]
+  // in float for FP8 per-token/per-channel.
   void* hidden_states_scale = nullptr;
 
   // Gemm input:
@@ -327,8 +365,20 @@ struct MoERunnerArgs {
   int32_t num_fused_shared_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
-  // Hidden dimension output of MoE block. It is not padded.
-  // If not provided it is the same as hidden_size.
+  // Hidden dimension output of MoE block, i.e. GEMM2's N dimension and the row stride of the
+  // gemm2_output workspace. If not provided, it is the same as hidden_size.
+  //
+  // Once valid dims are in play there are three distinct hidden widths (GPT-OSS values in
+  // brackets), so do not conflate them:
+  //   - hidden_size [3072]: the padded *input* row width, i.e. GEMM1's K.
+  //   - hidden_size_output [2944]: GEMM2's N. With valid dims the caller must set it to
+  //     roundUp(valid_hidden_size, 128) -- the width the FC2 weights and biases are laid out for
+  //     (TRT-LLM's args.output_hidden_size). Without valid dims GEMM2 keeps the full hidden_size N
+  //     and hidden_size_output is instead the width finalize truncates its output rows to.
+  //     See getGemm2OutputHiddenSize() in csrc/trtllm_fused_moe_runner.cu.
+  //   - the `output` row width [2880]: valid_hidden_size when supplied, else hidden_size_output.
+  //     Only finalize sees it; it writes exactly that many of GEMM2's columns, so the caller never
+  //     receives uninitialized columns.
   std::optional<int32_t> hidden_size_output;
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};
@@ -337,6 +387,15 @@ struct MoERunnerArgs {
   int32_t topk_group{0};
   float routed_scaling_factor{0.0f};
   int32_t intermediate_size{0};
+
+  // Valid (unpadded) dimensions for GEMM computation.
+  // These allow tensor dimensions to be padded for alignment while computing only the valid region.
+  // If not provided, they default to the corresponding padded dimensions.
+  // - valid_hidden_size: Valid K dimension for GEMM1, valid N dimension for GEMM2
+  // - valid_intermediate_size: Valid N/2 dimension for GEMM1, valid K dimension for GEMM2
+  std::optional<int32_t> valid_hidden_size;
+  std::optional<int32_t> valid_intermediate_size;
+
   int32_t local_expert_offset{0};
   int32_t local_num_experts{0};
   // TODO: support other types
@@ -351,12 +410,29 @@ struct MoERunnerArgs {
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
 
+  // Gated GEMM1 scales follow the shuffled, interleaved weight rows.
+  float* gemm1_per_channel_weight_scale = nullptr;  // [local_num_experts, M]
+  float* gemm2_per_channel_weight_scale = nullptr;  // [local_num_experts, hidden_size]
+
   // Output:
   void* output = nullptr;
   float* output_scale = nullptr;
 
   // finalize
   bool do_finalize{true};
+
+  // 4over6 recipe for the per-token GEMM2-input requantization, as the code
+  // decoded by resolveNVFP4Recipe() (nvfp4Recipe.h). The default
+  // (kNVFP44Over6FromEnv) reads FLASHINFER_NVFP4_4OVER6* on every launch.
+  int64_t nvfp4_4over6_code{-1};
+
+  // Optional copy of the per-token NvFP4 GEMM2 input in (token, slot) order:
+  // packed E2M1 [num_tokens, top_k, intermediate_size / 2], linear E4M3 block scales
+  // [num_tokens, top_k, intermediate_size / 16] and per-row decode scales [num_tokens, top_k].
+  // Set all three or none.
+  uint8_t* fc2_input_out = nullptr;
+  uint8_t* fc2_input_scale_out = nullptr;
+  float* fc2_input_token_scale_out = nullptr;
 };
 
 struct MoEWorkspace {
@@ -411,11 +487,36 @@ struct MoEWorkspace {
   void* bmm2_workspace = nullptr;
 };
 
+// Two-way uGPU localization of the MoE GEMMs (Rubin locality domains). Each domain runs FC1 and
+// FC2 on its own stream over its own weight shard and writes its output columns into slices of
+// the shared GEMM outputs: FC1 produces intermediate columns [d * I/2, (d + 1) * I/2) and FC2
+// hidden columns [d * H/2, (d + 1) * H/2). Routing and finalize stay on the caller's stream.
+struct LocalizedMoE {
+  static constexpr int kNumDomains = 2;
+  // Per-domain shuffled weight shards: FC1 [E, I, H/2] (the domain's halves of the up and gate
+  // rows) and FC2 [E, H/2, I/2] (the domain's hidden rows over the full intermediate size).
+  std::array<void*, kNumDomains> gemm1Weights{};
+  std::array<void*, kNumDomains> gemm1WeightsScale{};
+  std::array<void*, kNumDomains> gemm2Weights{};
+  std::array<void*, kNumDomains> gemm2WeightsScale{};
+  // One stream per domain, each limited to that domain's SMs (for example a green context).
+  std::array<cudaStream_t, kNumDomains> streams{};
+  // SMs available to each domain stream.
+  int32_t smCount{0};
+  // Per-domain BMM scratch, sized like MoEWorkspace::bmm1_workspace / bmm2_workspace.
+  std::array<void*, kNumDomains> bmm1Workspaces{};
+  std::array<void*, kNumDomains> bmm2Workspaces{};
+};
+
 // Config indices to be used with Batched GEMM runners
 struct MoEConfig {
   int64_t gemm1Config;
   int64_t gemm2Config;
 };
+
+// GEMM1 / GEMM2 stages of the fused-MoE runner (trtllm-gen batched GEMM).
+using Gemm1Runner = PermuteGemm1::Runner;
+using Gemm2Runner = Gemm2::Runner;
 
 class Runner {
  public:
@@ -441,16 +542,36 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize,
                                                            int32_t intermediateSize,
                                                            int32_t numLocalExperts,
-                                                           int32_t numTokens) const;
+                                                           int32_t numTokens,
+                                                           int32_t hiddenSizeOutput = -1) const;
+
+  [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
 
   [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
                                         int32_t intermediateSize, int32_t numLocalExperts,
-                                        int32_t numTokens) const;
+                                        int32_t numTokens, int32_t hiddenSizeOutput = -1) const;
 
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
-                                                   int32_t numLocalExperts,
-                                                   int32_t numTokens) const;
+                                                   int32_t numLocalExperts, int32_t numTokens,
+                                                   int32_t hiddenSizeOutput = -1) const;
+
+  // Run with the GEMMs split across locality domains (see LocalizedMoE). The config must be one
+  // of getValidLocalizedConfigIndices().
+  void runLocalized(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+                    LocalizedMoE const& localized, int device, cudaStream_t stream,
+                    int64_t configIndex, bool enable_pdl);
+
+  // Configs whose GEMMs are valid on one domain's share (FC1 at intermediate I/2, FC2 at hidden
+  // H/2) and can write slices on a stream with smCount SMs.
+  [[nodiscard]] std::vector<int64_t> getValidLocalizedConfigIndices(
+      int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts,
+      int32_t numTokens, int32_t smCount) const;
+
+  [[nodiscard]] bool isValidLocalizedConfigIndex(int64_t configIndex, int32_t topK,
+                                                 int32_t hiddenSize, int32_t intermediateSize,
+                                                 int32_t numLocalExperts, int32_t numTokens,
+                                                 int32_t smCount) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,
@@ -463,8 +584,8 @@ class Runner {
   bool mUsePerTokenScalingGemm2;
   bool mUsePerChannelScalingGemm1;
   bool mUsePerChannelScalingGemm2;
-  PermuteGemm1::Runner mPermuteGemm1;
-  Gemm2::Runner mGemm2;
+  Gemm1Runner mPermuteGemm1;
+  Gemm2Runner mGemm2;
 
   // This will be the cartesian product of the passing configs for gemm1 and gemm2
   // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2

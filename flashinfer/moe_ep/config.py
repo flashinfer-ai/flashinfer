@@ -16,17 +16,105 @@ backend's Fleet __init__.
 from __future__ import annotations
 
 import enum
+import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     import torch
     import torch.distributed
 
 
+@dataclass(frozen=True)
+class Sm107SharedExpertConfig:
+    """A replicated MXFP8 shared FFN added to the routed output on each rank."""
+
+    intermediate_size: int
+    kind: Literal["mxfp8_e4m3", "mxfp8_e5m2"] = "mxfp8_e4m3"
+    l2_position: Literal["early", "tail"] | None = None
+    work_id_mode: Literal["grid_stride", "atomic_counter"] | None = None
+    fc1_swizzle: int | None = None
+
+    def __post_init__(self):
+        if (
+            type(self.intermediate_size) is not int
+            or self.intermediate_size <= 0
+            or self.intermediate_size % 128
+        ):
+            raise ValueError(
+                "shared intermediate_size must be a positive multiple of 128"
+            )
+        if self.kind not in ("mxfp8_e4m3", "mxfp8_e5m2"):
+            raise ValueError("shared experts require MXFP8 E4M3 or E5M2")
+        if self.l2_position not in (None, "early", "tail"):
+            raise ValueError("shared l2_position must be early, tail, or None")
+        if self.work_id_mode not in (None, "grid_stride", "atomic_counter"):
+            raise ValueError("unsupported shared work_id_mode")
+        if self.fc1_swizzle is not None and (
+            type(self.fc1_swizzle) is not int or self.fc1_swizzle < 0
+        ):
+            raise ValueError("shared fc1_swizzle must be a nonnegative integer or None")
+
+
 class EpAlgorithm(enum.Enum):
     LOW_LATENCY = 0
     HIGH_THROUGHPUT = 1
+
+
+class FinalizeMode(enum.Enum):
+    """How a MegaMoE kernel reduces the per-route GEMM2 rows over top-k.
+
+    * ``AUTO`` — ``CAKE`` if the backend's Cake reducer supports the
+      problem, else ``PERSISTENT`` if ``num_valid_tokens_tensor`` is set, else
+      ``DEFAULT``.
+    * ``DEFAULT`` — non-persistent finalize kernel.
+    * ``PERSISTENT`` — persistent finalize kernel that reads
+      ``num_valid_tokens_tensor``.
+    * ``CAKE`` — frozen Cake top-k reducer.
+    * ``NONE`` — no finalize: ``MoEEpMegaLayer.forward_unfinalized`` returns
+      ``(rows, weights, route_map)`` for caller finalization.
+
+    Each backend accepts the subset it implements.
+
+    The former ``do_finalize`` option remains an alias on configs that exposed
+    it: ``True`` maps to ``AUTO`` and ``False`` to ``NONE``. Reading the alias
+    returns whether finalization is enabled. Use ``finalize_mode`` in new code.
+    """
+
+    AUTO = 0
+    DEFAULT = 1
+    PERSISTENT = 2
+    CAKE = 3
+    NONE = 4
+
+
+def validate_finalize_mode(
+    mode: FinalizeMode,
+    supported: Sequence[FinalizeMode],
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None,
+) -> None:
+    if not isinstance(mode, FinalizeMode):
+        raise TypeError(f"finalize_mode must be a FinalizeMode, got {mode!r}.")
+    if mode not in supported:
+        names = ", ".join(m.name for m in supported)
+        raise ValueError(
+            f"finalize_mode={mode.name} is unsupported; use one of {names}."
+        )
+    if mode is FinalizeMode.PERSISTENT and num_valid_tokens_tensor is None:
+        raise ValueError(
+            "finalize_mode=PERSISTENT requires num_valid_tokens_tensor: a "
+            "caller-owned CUDA int32 tensor of shape (1,) holding the live "
+            "token count."
+        )
+
+
+def warn_deprecated_config_field(old: str, new: str) -> None:
+    # stacklevel targets the caller of the dataclass __init__.
+    warnings.warn(
+        f"{old} is deprecated and will be removed in a future release; use {new}.",
+        DeprecationWarning,
+        stacklevel=4,
+    )
 
 
 class EpLayout(enum.Enum):
@@ -88,6 +176,14 @@ class BootstrapConfig:
     rank: int
     stream: int = 0  # int representation of a cudaStream_t; 0 = default stream
     auto_bootstrap: bool = True
+    # CUDA device ordinal to bind for this rank. None = derive from the
+    # LOCAL_RANK env var, falling back to ``rank`` (torchrun convention).
+    # Host frameworks that already bound their worker's device (possibly
+    # under a remapped CUDA_VISIBLE_DEVICES, where the derived ordinal would
+    # point at the wrong or a nonexistent GPU) should pass
+    # ``torch.cuda.current_device()``. Keyword-only so it does not shift the
+    # positional binding of the pre-existing fields below.
+    device: Optional[int] = field(default=None, kw_only=True)
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )
@@ -105,6 +201,8 @@ class BootstrapConfig:
             raise ValueError(f"world_size must be positive, got {self.world_size}")
         if not (0 <= self.rank < self.world_size):
             raise ValueError(f"rank {self.rank} not in [0, {self.world_size})")
+        if self.device is not None and self.device < 0:
+            raise ValueError(f"device must be non-negative, got {self.device}")
 
 
 @dataclass(frozen=True)
@@ -119,6 +217,9 @@ class FleetParams:
     :mod:`flashinfer.moe_ep.algo_knobs` Fleet-level knobs rather than top-level
     fields. Split-only fields ``dtype_bytes``, ``algorithm``, and ``layout`` are
     ignored by the mega path.
+
+    ``tuning_live_tokens`` selects an offline workload bucket for backends
+    supporting live-token tuning; it never changes the workspace capacity.
     """
 
     num_experts: int
@@ -127,8 +228,17 @@ class FleetParams:
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
     layout: EpLayout = EpLayout.EXPERT_MAJOR
+    # Optional offline-tuning workload bucket; capacity remains unchanged.
+    tuning_live_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        if self.tuning_live_tokens is not None and (
+            type(self.tuning_live_tokens) is not int
+            or not 0 <= self.tuning_live_tokens <= self.max_tokens_per_rank
+        ):
+            raise ValueError(
+                "tuning_live_tokens must be an int between zero and capacity"
+            )
         for name in (
             "num_experts",
             "max_tokens_per_rank",
@@ -225,6 +335,13 @@ class CombineInputParams:
 
     x: Sequence["torch.Tensor"]
     out: Optional["torch.Tensor"] = None
+    # Whether ``out`` keeps its address across calls. Only the caller knows: a
+    # graph state reuses one buffer, while the default forward allocates a
+    # fresh one per call. Backends that cache per-address FFI state must not
+    # cache a churning buffer -- doing so pins it, prevents the allocator
+    # reusing that address, and leaks one output per call. Defaults to False so
+    # a caller that says nothing is never cached.
+    out_is_stable: bool = False
 
 
 @dataclass(frozen=True)

@@ -16,21 +16,31 @@
 #ifndef FLASHINFER_MATH_CUH_
 #define FLASHINFER_MATH_CUH_
 
+#ifdef _WIN32
+typedef unsigned short ushort;
+#endif
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <cstdint>
+#include <cuda/std/limits>
 
 namespace flashinfer {
 namespace math {
 
 // log2(e)
-constexpr float log2e = 1.44269504088896340736f;
+constexpr float log2e_f = 1.44269504088896340736f;
+constexpr double log2e_d = 1.44269504088896340736;
+constexpr float log2e = log2e_f;
 
 constexpr float loge2 = 0.693147180559945309417f;
 
-constexpr float inf = 5e4;
+// Masked-logit infinity. IEEE -inf (not a finite sentinel like the historical
+// -5e4, which misclassified valid logits below it); softmax consumers clamp
+// their exponent subtrahends to keep (-inf) - (-inf) from producing NaN.
+constexpr float inf = cuda::std::numeric_limits<float>::infinity();
 
 __forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&x; }
 

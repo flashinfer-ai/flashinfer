@@ -37,7 +37,7 @@ FlashInfer supports two timing methods:
 > `cudaEventElapsedTime` is unreliable (can go negative), which would corrupt
 > tactic ranking — the globaltimer path avoids that. CC auto-detection can be
 > overridden with `FLASHINFER_CONFIDENTIAL_COMPUTE=0/1`. (Full env-var reference
-> in `CLAUDE.md`.)
+> in `AGENTS.md`.)
 
 ## Installation
 
@@ -63,7 +63,7 @@ If you don't install CUPTI, the framework will:
 ### Step 1: Choose Your Test Routine
 
 Available routines:
-- **Attention**: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`
+- **Attention**: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `trtllm_batch_decode_sparse_mla_dsv4`
 - **GEMM**: `bmm_fp8`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `mm_fp4`
 - **MOE**: `trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe`, `cutlass_fused_moe`
 
@@ -429,4 +429,4 @@ python benchmarks/flashinfer_benchmark.py \
 
 - See `benchmarks/README.md` for full flag documentation
 - See `benchmarks/samples/sample_testlist.txt` for more examples
-- See CLAUDE.md "Benchmarking" section for technical details
+- See AGENTS.md "Benchmarking" section for technical details

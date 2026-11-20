@@ -35,7 +35,7 @@ Without this hook, fi's autotune profile uses random expert assignments
 Reference: ports trt-llm's GroupedGemmInputsHelper.generate_num_tokens_per_expert
 and generate_token_selected_experts from
 tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py (lines 31-167) and the
-``inputs_pre_hook`` mechanism from CuteDslFusedMoENvfp4InputsHelper in
+``inputs_pre_hook`` mechanism from the CuteDSL fused-MoE runner in
 tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py.
 """
 
@@ -61,6 +61,8 @@ class CuteDslMoEInputsHelper:
         local_expert_offset: Starting expert index for this rank
             (= 0 when expert parallelism is disabled).
         seed: Seed for reproducibility (default 515, matches trt-llm).
+        tse_idx: Position of ``token_selected_experts`` in the runner's
+            input list (default 2, the ``CuteDslMoEWrapper.run`` layout).
     """
 
     def __init__(
@@ -70,12 +72,14 @@ class CuteDslMoEInputsHelper:
         num_local_experts: int,
         local_expert_offset: int = 0,
         seed: int = 515,
+        tse_idx: int = 2,
     ):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
         self.seed = seed
+        self.tse_idx = tse_idx
 
     def generate_num_tokens_per_expert(
         self, num_tokens: int, approx_max_load: bool = False
@@ -175,7 +179,9 @@ class CuteDslMoEInputsHelper:
         balanced approx-max-load assignment. All other inputs pass through
         unchanged.
 
-        Input layout matches ``CuteDslMoEWrapper.run`` argument order:
+        ``self.tse_idx`` locates ``token_selected_experts`` in the runner's
+        input list. The default (2) matches the ``CuteDslMoEWrapper.run``
+        argument order:
 
             inputs[0]: x                       (passed through)
             inputs[1]: x_sf                    (passed through)
@@ -183,7 +189,7 @@ class CuteDslMoEInputsHelper:
             inputs[3..]: token_final_scales, weights, scales, alphas, output
                                                (all passed through)
         """
-        x, x_sf, token_selected_experts, *rest = inputs
+        token_selected_experts = inputs[self.tse_idx]
         num_tokens = token_selected_experts.size(0)
 
         per_expert = self.generate_num_tokens_per_expert(
@@ -195,4 +201,6 @@ class CuteDslMoEInputsHelper:
             device=token_selected_experts.device,
             dtype=token_selected_experts.dtype,
         )
-        return [x, x_sf, new_tse, *rest]
+        out = list(inputs)
+        out[self.tse_idx] = new_tse
+        return out

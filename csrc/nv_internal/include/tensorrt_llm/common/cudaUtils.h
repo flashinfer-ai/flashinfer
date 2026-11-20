@@ -138,12 +138,11 @@ void checkEx(T ptr, std::initializer_list<T> const& validReturns, char const* co
 inline std::optional<bool> isCudaLaunchBlocking() {
   thread_local bool firstCall = true;
   thread_local std::optional<bool> result = std::nullopt;
-  if (!firstCall) {
+  if (firstCall) {
+    // Unset leaves result disengaged so doCheckError keeps its debug-build default.
     char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-    if (env != nullptr && std::string(env) == "1") {
-      result = true;
-    } else {
-      result = false;
+    if (env != nullptr) {
+      result = std::string(env) == "1";
     }
     firstCall = false;
   }
@@ -388,12 +387,16 @@ inline size_t divUp(T1 const& a, T2 const& b) {
   return (tmp_a + tmp_b - 1) / tmp_b;
 }
 
-inline int roundUp(int a, int b) { return divUp(a, b) * b; }
-
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
           typename = std::enable_if_t<std::is_integral<U>::value>>
 auto constexpr ceilDiv(T numerator, U denominator) {
   return (numerator + denominator - 1) / denominator;
+}
+
+template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
+          typename = std::enable_if_t<std::is_integral<U>::value>>
+auto constexpr roundUp(T numerator, U denominator) {
+  return ceilDiv(numerator, denominator) * denominator;
 }
 
 template <typename T>

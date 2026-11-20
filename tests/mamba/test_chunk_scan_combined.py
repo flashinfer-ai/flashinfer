@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import flashinfer.mamba as mamba
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 # Import Triton reference for comparison
 from .triton_reference.ssd_combined import (
@@ -143,12 +143,20 @@ def _compute_varlen_metadata(cu_seqlens, chunk_size):
     return seq_idx, chunk_indices, chunk_offsets
 
 
-# Skip all tests if not on Blackwell
+# Skip all tests if not on Blackwell (SM100/SM103).
+# SM107 (Rubin) is not yet supported by the Mamba SSD kernel.
+def _is_blackwell_ssd_supported():
+    if not torch.cuda.is_available():
+        return False
+    if not is_sm100a_supported(torch.device("cuda")):
+        return False
+    _, minor = get_compute_capability(torch.device("cuda"))
+    return minor in (0, 3, 7)  # SM100, SM103 and SM107 (Rubin)
+
+
 pytestmark = pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda"))
-    if torch.cuda.is_available()
-    else True,
-    reason="Blackwell GPU (SM100+) required for CuTe DSL Mamba2 SSD kernel",
+    not _is_blackwell_ssd_supported(),
+    reason="SM100/SM103/SM107 GPU required for CuTe DSL Mamba2 SSD kernel",
 )
 
 
@@ -172,9 +180,7 @@ class TestChunkScanCombined:
     def headdim(self, request):
         return request.param
 
-    @pytest.fixture(
-        params=[128]
-    )  # Must match kernel's N (CUTLASS kernel is hardcoded for N=128)
+    @pytest.fixture(params=[128, 64])
     def dstate(self, request):
         return request.param
 
@@ -865,7 +871,7 @@ class TestChunkScanCombinedVarlen:
     def headdim(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[128, 64])
     def dstate(self, request):
         return request.param
 
@@ -1358,7 +1364,7 @@ class TestChunkScanCombinedWithZ:
     def headdim(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[128, 64])
     def dstate(self, request):
         return request.param
 

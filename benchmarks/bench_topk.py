@@ -64,23 +64,25 @@ def torch_deterministic_algorithms(enabled: bool):
             torch.use_deterministic_algorithms(previous)
 
 
-def bench_median_ms(fn) -> float:
+def bench_median_ms(fn, use_cuda_graph: bool) -> float:
     measurements = bench_gpu_time(
         fn,
         enable_cupti=True,
         dry_run_iters=10,
         repeat_iters=100,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
     )
     return float(np.median(measurements))
 
 
 def bench_flashinfer_modes(
-    run_flashinfer, deterministic: bool
+    run_flashinfer, deterministic: bool, use_cuda_graph: bool
 ) -> tuple[float, float | None]:
-    selected_ms = bench_median_ms(lambda: run_flashinfer(deterministic))
+    selected_ms = bench_median_ms(lambda: run_flashinfer(deterministic), use_cuda_graph)
     nondeterministic_ms = (
-        bench_median_ms(lambda: run_flashinfer(False)) if deterministic else None
+        bench_median_ms(lambda: run_flashinfer(False), use_cuda_graph)
+        if deterministic
+        else None
     )
     return selected_ms, nondeterministic_ms
 
@@ -92,12 +94,22 @@ TIE_BREAK_VARIANTS: tuple[tuple[str, TopKTieBreak], ...] = (
 
 
 def bench_tie_break_variants(
-    run_flashinfer_with_tie_break, baseline_ms: float
+    run_flashinfer_with_tie_break, baseline_ms: float, use_cuda_graph: bool = False
 ) -> dict[str, float]:
+    """Time the native tie-break path (FlashInfer(tie-*) columns).
+
+    Callers must set_topk_algo("default") immediately before calling: under "auto" the
+    dispatcher routes non-deterministic tie-break calls to the CUB backend, which would
+    silently turn these columns into a second CUB measurement (the CUB tie timings have
+    their own columns via cub_topk_metrics).
+    """
     metrics: dict[str, float] = {}
     for suffix, tie_break in TIE_BREAK_VARIANTS:
         try:
-            tie_ms = bench_median_ms(lambda: run_flashinfer_with_tie_break(tie_break))
+            tie_ms = bench_median_ms(
+                lambda tb=tie_break: run_flashinfer_with_tie_break(tb),
+                use_cuda_graph,
+            )
             metrics[f"flashinfer_tie_{suffix}_us"] = tie_ms * 1e3
             metrics[f"tie_{suffix}_slowdown_vs_baseline"] = tie_ms / baseline_ms
         except RuntimeError as exc:
@@ -134,6 +146,117 @@ def append_tie_break_columns(line: str, result: dict, enabled: bool) -> str:
     return line + format_variant("small") + format_variant("large")
 
 
+CUB_TOPK_MAX_LEN = (
+    1 << 21
+)  # DeviceBatchedTopK's per-segment cap (cluster backend, SM90+)
+CUB_TOPK_PRE_SM90_MAX_LEN = 8192  # ceiling below SM90 (CUB's single-block backend)
+
+
+def cub_backend_supported(
+    scores: torch.Tensor, tie_break: TopKTieBreak = TopKTieBreak.NONE
+) -> bool:
+    """Whether the dispatcher's CUB backend would serve this page-table transform call.
+
+    Mirrors flashinfer.topk.can_use_cub_topk. A forced-cub measurement where the backend
+    declines would silently time the radix path relabeled, so gate host-side.
+    """
+    if scores.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    d = scores.size(1)
+    if d > CUB_TOPK_MAX_LEN:
+        return False
+    if (d > CUB_TOPK_PRE_SM90_MAX_LEN or tie_break != TopKTieBreak.NONE) and (
+        get_compute_capability(torch.device("cuda"))[0] < 9
+    ):
+        return False
+    return True
+
+
+def cub_topk_metrics(
+    run,
+    scores: torch.Tensor,
+    deterministic: bool,
+    compare_tie_break: bool,
+    fi_ms: float,
+    use_cuda_graph: bool = False,
+) -> dict:
+    """Time the same top-k call forced to the CUB backend.
+
+    ``run(tie_break)`` must invoke one of the CUB-backed public APIs (``top_k``,
+    ``top_k_page_table_transform``, or ``top_k_ragged_transform``). Skipped for
+    deterministic mode (the CUB backend declines it) and unsupported configurations.
+    """
+    metrics: dict[str, float] = {}
+    if deterministic or not cub_backend_supported(scores):
+        return metrics
+    set_topk_algo("cub")
+    try:
+        cub_ms = bench_median_ms(lambda: run(TopKTieBreak.NONE), use_cuda_graph)
+        metrics["cub_us"] = cub_ms * 1e3
+        metrics["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
+        if compare_tie_break:
+            for suffix, tie_break in TIE_BREAK_VARIANTS:
+                if cub_backend_supported(scores, tie_break):
+                    tie_ms = bench_median_ms(
+                        lambda tb=tie_break: run(tb), use_cuda_graph
+                    )
+                    metrics[f"cub_tie_{suffix}_us"] = tie_ms * 1e3
+    finally:
+        # The per-case RuntimeError handlers continue to the next case, so the
+        # forced-cub setting must not leak past an OOM/UNSUPPORTED measurement.
+        set_topk_algo("auto")
+    return metrics
+
+
+def append_cub_header(
+    header: str, tie_break_enabled: bool, show_clusters: bool = False
+) -> str:
+    header += f" {'CUB':>12} {'CUBvsFI':>10}"
+    if tie_break_enabled:
+        header += (
+            f" {'CUB(tie-small)':>15} {'CUBvsFI(tie-s)':>15}"
+            f" {'CUB(tie-large)':>15} {'CUBvsFI(tie-l)':>15}"
+        )
+    if show_clusters:
+        header += f" {'CUBvsClusters':>14}"
+    return header
+
+
+def append_cub_columns(
+    line: str, result: dict, tie_break_enabled: bool, show_clusters: bool = False
+) -> str:
+    if "cub_us" in result:
+        line += (
+            f" {result['cub_us']:>10.2f}us {result['speedup_cub_vs_flashinfer']:>9.2f}x"
+        )
+    else:
+        line += f" {'n/a':>12} {'n/a':>10}"
+    if tie_break_enabled:
+        for suffix in ("small", "large"):
+            cub_tie = result.get(f"cub_tie_{suffix}_us")
+            line += f" {cub_tie:>13.2f}us" if cub_tie is not None else f" {'n/a':>15}"
+            # Native tie time / CUB tie time (>= 1.0x means CUB wins); n/a when either
+            # side is missing (CUB declined, or the native tie path errored, e.g.
+            # UNSUPPORTED at k=4096).
+            fi_tie = result.get(f"flashinfer_tie_{suffix}_us")
+            if cub_tie is not None and fi_tie is not None:
+                line += f" {fi_tie / cub_tie:>14.2f}x"
+            else:
+                line += f" {'n/a':>15}"
+    if show_clusters:
+        # Clusters time / CUB time (>= 1.0x means CUB wins); n/a when either backend
+        # was not measured (pre-SM100, CUDA graphs, clusters-incompatible arguments).
+        # The grid sections store the clusters timing under the legacy "fast_topk_us"
+        # key; the varlen runner uses "clusters_us".
+        clusters_us = result.get("clusters_us", result.get("fast_topk_us"))
+        cub_us = result.get("cub_us")
+        if clusters_us is not None and cub_us is not None:
+            line += f" {clusters_us / cub_us:>13.2f}x"
+        else:
+            line += f" {'n/a':>14}"
+    return line
+
+
 def bench_top_k_from_scores(
     scores: torch.Tensor,
     k: int,
@@ -141,6 +264,7 @@ def bench_top_k_from_scores(
     compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark top-k on a pre-generated score tensor."""
     batch_size, seq_len = scores.shape
@@ -152,8 +276,10 @@ def bench_top_k_from_scores(
             k,
             deterministic=deterministic_mode,
             tie_break=TopKTieBreak.NONE,
+            dsa_graph_safe=use_cuda_graph,
         ),
         deterministic,
+        use_cuda_graph,
     )
 
     result = {
@@ -170,37 +296,48 @@ def bench_top_k_from_scores(
         )
 
     with torch_deterministic_algorithms(deterministic):
-        torch_ms = bench_median_ms(lambda: torch.topk(scores, k, dim=-1))
+        torch_ms = bench_median_ms(
+            lambda: torch.topk(scores, k, dim=-1), use_cuda_graph
+        )
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k(
                     scores,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
+                    dsa_graph_safe=use_cuda_graph,
                 ),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
 
     if compare_torch_deterministic and not deterministic:
         with torch_deterministic_algorithms(True):
-            torch_det_ms = bench_median_ms(lambda: torch.topk(scores, k, dim=-1))
+            torch_det_ms = bench_median_ms(
+                lambda: torch.topk(scores, k, dim=-1), use_cuda_graph
+            )
         result["torch_deterministic_us"] = torch_det_ms * 1e3
         result["speedup_vs_torch_deterministic"] = torch_det_ms / fi_ms
 
-    set_topk_algo("clusters")
-    fast_topk_ms = bench_median_ms(lambda: flashinfer.top_k(scores, k))
-    result["fast_topk_us"] = fast_topk_ms * 1e3
-    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
-    set_topk_algo("auto")
+    if not use_cuda_graph:
+        set_topk_algo("clusters")
+        fast_topk_ms = bench_median_ms(
+            lambda: flashinfer.top_k(scores, k), use_cuda_graph
+        )
+        result["fast_topk_us"] = fast_topk_ms * 1e3
+        result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+        set_topk_algo("auto")
 
     # SGLang comparison (only supports k=2048 and float32)
     if (
@@ -211,10 +348,25 @@ def bench_top_k_from_scores(
     ):
         lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
         sg_ms = bench_median_ms(
-            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None)
+            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None),
+            use_cuda_graph,
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
+
+    # The same call forced to the CUB backend
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k(
+                scores, k, tie_break=tie_break, dsa_graph_safe=use_cuda_graph
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -366,6 +518,7 @@ def bench_dsa_top_k(
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
     causal_chunk: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     scores = generate_dsa_scores(
         batch_size=batch_size,
@@ -382,6 +535,7 @@ def bench_dsa_top_k(
         compare_tie_break=compare_tie_break,
         compare_torch_deterministic=compare_torch_deterministic,
         compare_sglang=compare_sglang,
+        use_cuda_graph=use_cuda_graph,
     )
     result["rows"] = batch_size * q_len
     result["q_len"] = q_len
@@ -399,6 +553,7 @@ def bench_top_k(
     compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark basic top_k operation."""
     scores = generate_scores(batch_size, seq_len, k, dtype, input_pattern)
@@ -409,6 +564,7 @@ def bench_top_k(
         compare_tie_break=compare_tie_break,
         compare_torch_deterministic=compare_torch_deterministic,
         compare_sglang=compare_sglang,
+        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -421,6 +577,7 @@ def bench_page_table_transform(
     deterministic: bool = False,
     compare_tie_break: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark fused top_k + page table transform."""
     scores = generate_scores(batch_size, seq_len, k, dtype, input_pattern)
@@ -431,9 +588,6 @@ def bench_page_table_transform(
         .expand(batch_size, -1)
         .contiguous()
     )
-    use_cuda_graph = True
-    enable_cupti = True
-
     set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_page_table_transform(
@@ -443,8 +597,10 @@ def bench_page_table_transform(
             k,
             deterministic=deterministic_mode,
             tie_break=TopKTieBreak.NONE,
+            dsa_graph_safe=use_cuda_graph,
         ),
         deterministic,
+        use_cuda_graph,
     )
 
     result = {
@@ -461,20 +617,17 @@ def bench_page_table_transform(
         )
 
     # FlashInfer clusters
-    set_topk_algo("clusters")
-    measurements = bench_gpu_time(
-        lambda: flashinfer.top_k_page_table_transform(
-            scores, src_page_table, lengths, k
-        ),
-        enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=100,
-        use_cuda_graph=use_cuda_graph,
-    )
-    fast_topk_ms = np.median(measurements)
-    result["fast_topk_us"] = fast_topk_ms * 1e3
-    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
-    set_topk_algo("auto")
+    if not use_cuda_graph:
+        set_topk_algo("clusters")
+        fast_topk_ms = bench_median_ms(
+            lambda: flashinfer.top_k_page_table_transform(
+                scores, src_page_table, lengths, k
+            ),
+            use_cuda_graph,
+        )
+        result["fast_topk_us"] = fast_topk_ms * 1e3
+        result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+        set_topk_algo("auto")
 
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
@@ -482,16 +635,18 @@ def bench_page_table_transform(
         sg_ms = bench_median_ms(
             lambda: sgl_kernel.fast_topk_transform_fused(
                 scores, lengths, src_page_table, cu_seqlens_q, k
-            )
+            ),
+            use_cuda_graph,
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
 
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k_page_table_transform(
@@ -499,12 +654,34 @@ def bench_page_table_transform(
                     src_page_table,
                     lengths,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
+                    dsa_graph_safe=use_cuda_graph,
                 ),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
+
+    # The same fused call forced to the CUB backend (uniform lengths == seq_len).
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k_page_table_transform(
+                scores,
+                src_page_table,
+                lengths,
+                k,
+                tie_break=tie_break,
+                dsa_graph_safe=use_cuda_graph,
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -518,6 +695,7 @@ def bench_ragged_transform(
     deterministic: bool = False,
     compare_tie_break: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark fused top_k + ragged index transform."""
     scores = generate_scores(batch_size, seq_len, k, dtype, input_pattern)
@@ -525,9 +703,6 @@ def bench_ragged_transform(
     offsets = torch.arange(
         0, batch_size * seq_len, seq_len, device="cuda", dtype=torch.int32
     )
-    use_cuda_graph = True
-    enable_cupti = True
-
     set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_ragged_transform(
@@ -537,8 +712,10 @@ def bench_ragged_transform(
             k,
             deterministic=deterministic_mode,
             tie_break=TopKTieBreak.NONE,
+            dsa_graph_safe=use_cuda_graph,
         ),
         deterministic,
+        use_cuda_graph,
     )
 
     result = {
@@ -555,25 +732,23 @@ def bench_ragged_transform(
         )
 
     # FlashInfer clusters
-    set_topk_algo("clusters")
-    measurements = bench_gpu_time(
-        lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
-        enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=100,
-        use_cuda_graph=use_cuda_graph,
-    )
-    fast_topk_ms = np.median(measurements)
-    result["fast_topk_us"] = fast_topk_ms * 1e3
-    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
-    set_topk_algo("auto")
+    if not use_cuda_graph:
+        set_topk_algo("clusters")
+        fast_topk_ms = bench_median_ms(
+            lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
+            use_cuda_graph,
+        )
+        result["fast_topk_us"] = fast_topk_ms * 1e3
+        result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+        set_topk_algo("auto")
 
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
         sg_ms = bench_median_ms(
             lambda: sgl_kernel.fast_topk_transform_ragged_fused(
                 scores, lengths, offsets, k
-            )
+            ),
+            use_cuda_graph,
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
@@ -581,6 +756,7 @@ def bench_ragged_transform(
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k_ragged_transform(
@@ -588,12 +764,34 @@ def bench_ragged_transform(
                     offsets,
                     lengths,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
+                    dsa_graph_safe=use_cuda_graph,
                 ),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
+
+    # The same fused call forced to the CUB backend (uniform lengths == seq_len).
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k_ragged_transform(
+                scores,
+                offsets,
+                lengths,
+                k,
+                tie_break=tie_break,
+                dsa_graph_safe=use_cuda_graph,
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -842,6 +1040,7 @@ def bench_varlen_transform(
     has_clusters: bool,
     deterministic: bool = False,
     compare_tie_break: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark a transform API on realistic variable-length segments."""
     device = torch.device("cuda")
@@ -864,6 +1063,7 @@ def bench_varlen_transform(
                 row_to_batch=row_to_batch,
                 deterministic=deterministic_mode,
                 tie_break=tie_break,
+                dsa_graph_safe=use_cuda_graph,
             )
         return flashinfer.top_k_ragged_transform(
             scores,
@@ -872,10 +1072,13 @@ def bench_varlen_transform(
             k,
             deterministic=deterministic_mode,
             tie_break=tie_break,
+            dsa_graph_safe=use_cuda_graph,
         )
 
     set_topk_algo("default")
-    fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(run, deterministic)
+    fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
+        run, deterministic, use_cuda_graph
+    )
 
     len_min, len_mean, len_max, trivial_frac = summarize_lengths(lengths, k)
     result = {
@@ -904,35 +1107,55 @@ def bench_varlen_transform(
     # run, otherwise the "clusters" timing would just be the default path relabeled.
     can_run_clusters = (
         has_clusters
+        and not use_cuda_graph
         and not (deterministic or compare_tie_break)
         and not (transform == "page_table" and row_to_batch is not None)
     )
     if can_run_clusters:
         set_topk_algo("clusters")
-        clusters_ms = bench_median_ms(lambda: run(False))
+        clusters_ms = bench_median_ms(lambda: run(False), use_cuda_graph)
         result["clusters_us"] = clusters_ms * 1e3
         result["speedup_clusters_vs_default"] = fi_ms / clusters_ms
     set_topk_algo("auto")
 
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
-                lambda tie_break: run(True, tie_break),
+                lambda tie_break: run(deterministic, tie_break),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
 
     # torch reference operates on a pre-masked tensor (mask built outside timing) so
     # we compare selection cost against the length-aware kernel.
     masked_scores = build_masked_scores(scores, lengths)
     with torch_deterministic_algorithms(deterministic):
-        torch_ms = bench_median_ms(lambda: torch.topk(masked_scores, k, dim=-1))
+        torch_ms = bench_median_ms(
+            lambda: torch.topk(masked_scores, k, dim=-1), use_cuda_graph
+        )
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
+
+    # The same fused call forced to the CUB backend. Both transforms are CUB-backed
+    # (page_table including row_to_batch rows, and ragged), so every varlen row gets
+    # a CUB column; cub_topk_metrics itself skips unsupported configurations.
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: run(False, tie_break),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -985,8 +1208,20 @@ def main():
         "--tie-break",
         action="store_true",
         help=(
-            "Also benchmark deterministic tie-break variants and report "
-            "FlashInfer(tie-small/tie-large) columns with slowdown aligned to DetSlowdown baseline"
+            "Also benchmark tie-break variants and report "
+            "FlashInfer(tie-small/tie-large) columns with slowdown against "
+            "the non-deterministic baseline"
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Capture each timed call in a CUDA graph and time the replays "
+            "(CUPTI hardware timestamps when available), matching production "
+            "CUDA-graph usage. FlashInfer calls pass dsa_graph_safe=True (as "
+            "SGLang's graphed calls do) and the Clusters column is skipped "
+            "(the clusters backend declines dsa_graph_safe)."
         ),
     )
     parser.add_argument(
@@ -1057,19 +1292,26 @@ def main():
 
     dtype = parse_dtype(args.dtype)
 
-    if args.tie_break and not args.deterministic:
-        print(
-            "NOTE: --tie-break requires deterministic kernels; enabling --deterministic."
-        )
-        args.deterministic = True
-
     if args.compare_sglang and not HAS_SGL_KERNEL:
         print("WARNING: sgl_kernel not found, skipping SGLang comparison")
         args.compare_sglang = False
 
     # Test configurations
-    batch_sizes = [1, 16, 64, 256]
-    seq_lens = [256, 512, 1024, 2048, 4096, 16384, 65536, 131072, 262144, 524288]
+    batch_sizes = [1, 16, 32, 64, 128, 256]
+    seq_lens = [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+    ]
     k_values = [256, 512, 1024, 2048, 4096]
     top_k_cases = build_top_k_cases(
         batch_sizes=batch_sizes,
@@ -1167,8 +1409,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print(
             "NOTE: default top-k sweep includes two extra large-batch/long-vocab "
@@ -1194,6 +1436,7 @@ def main():
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1209,6 +1452,7 @@ def main():
                     compare_tie_break=args.tie_break,
                     compare_torch_deterministic=args.compare_torch_deterministic,
                     compare_sglang=args.compare_sglang,
+                    use_cuda_graph=args.cuda_graph,
                 )
                 if show_det_or_tie:
                     nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1257,6 +1501,9 @@ def main():
                     )
                 elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
+                line = append_cub_columns(
+                    line, result, args.tie_break, not show_det_or_tie
+                )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1293,8 +1540,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1314,6 +1561,7 @@ def main():
             )
         if args.compare_torch_deterministic and not show_det_or_tie:
             header += f" {'torch.det':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1348,6 +1596,7 @@ def main():
                     compare_torch_deterministic=args.compare_torch_deterministic,
                     compare_sglang=False,
                     causal_chunk=case.causal_chunk,
+                    use_cuda_graph=args.cuda_graph,
                 )
                 if show_det_or_tie:
                     nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1389,6 +1638,9 @@ def main():
                         f" {result['torch_deterministic_us']:>10.2f}us "
                         f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
                     )
+                line = append_cub_columns(
+                    line, result, args.tie_break, not show_det_or_tie
+                )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1418,8 +1670,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1433,6 +1685,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1451,6 +1704,7 @@ def main():
                             deterministic=args.deterministic,
                             compare_tie_break=args.tie_break,
                             compare_sglang=args.compare_sglang,
+                            use_cuda_graph=args.cuda_graph,
                         )
                         if show_det_or_tie:
                             nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1495,6 +1749,9 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
+                        line = append_cub_columns(
+                            line, result, args.tie_break, not show_det_or_tie
+                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1523,8 +1780,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1538,6 +1795,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1556,6 +1814,7 @@ def main():
                             deterministic=args.deterministic,
                             compare_tie_break=args.tie_break,
                             compare_sglang=args.compare_sglang,
+                            use_cuda_graph=args.cuda_graph,
                         )
                         if show_det_or_tie:
                             nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1600,6 +1859,9 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
+                        line = append_cub_columns(
+                            line, result, args.tie_break, not show_det_or_tie
+                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1663,8 +1925,8 @@ def main():
                 )
             if args.tie_break:
                 print(
-                    "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                    "slowdowns align with the same baseline as DetSlowdown"
+                    f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                    "slowdowns use the non-deterministic baseline"
                 )
             print(
                 "NOTE: Clusters column omitted under deterministic/tie-break "
@@ -1694,6 +1956,7 @@ def main():
             if show_clusters:
                 header += f" {'Clusters':>12} {'vsClusters':>10}"
             header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        header = append_cub_header(header, args.tie_break, show_clusters)
         print(header)
         print("-" * len(header))
 
@@ -1712,6 +1975,7 @@ def main():
                         has_clusters,
                         deterministic=args.deterministic,
                         compare_tie_break=args.tie_break,
+                        use_cuda_graph=args.cuda_graph,
                     )
                     base_line = (
                         f"{result['regime']:>8} {result['length_dist']:>10} "
@@ -1764,6 +2028,9 @@ def main():
                             f" {result['torch_us']:>11.2f}us "
                             f"{result['speedup_vs_torch']:>8.2f}x"
                         )
+                    line = append_cub_columns(
+                        line, result, args.tie_break, show_clusters
+                    )
                     print(line)
                 except RuntimeError as e:
                     error_label = classify_benchmark_runtime_error(e)

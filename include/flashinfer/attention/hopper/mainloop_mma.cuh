@@ -178,7 +178,7 @@ CUTLASS_DEVICE void mma_f16(
   constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
                                                    : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
   // masking loops
-  // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
+  // For multi item scoring, we use this loop only to mask along the diagonal
 #pragma unroll
   for (int masking_step = 0; masking_step < n_masking_steps && kv_tile_idx > swa_begin_kv_tile_idx;
        ++masking_step, kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {

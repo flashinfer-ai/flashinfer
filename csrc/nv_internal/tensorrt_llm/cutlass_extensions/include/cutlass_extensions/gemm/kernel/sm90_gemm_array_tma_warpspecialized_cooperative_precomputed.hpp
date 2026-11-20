@@ -148,6 +148,12 @@ class GemmUniversalPrecomputedScheduler<
   static_assert(IsGroupedGemmKernel,
                 "Precomputed grouped scheduler kernel is only for grouped ptr-array GEMM.");
 
+  // Set by the epilogue's producer-acquire policy: immutable grouped D descriptors then share the
+  // mainloop producer's visibility handoff. Otherwise D keeps the consumer-late acquire.
+  static constexpr bool ProducerAcquiresPrebuiltD = IsGroupedGemmKernel &&
+                                                    CollectiveEpilogue::UsesPrebuiltDDescriptor &&
+                                                    CollectiveEpilogue::ProducerAcquiresPrebuiltD;
+
   using SchedulerTag = GroupScheduler;
   using TileScheduler = detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8>;
   using TileSchedulerArguments = typename TileScheduler::Arguments;
@@ -659,6 +665,13 @@ class GemmUniversalPrecomputedScheduler<
               collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
               needs_tensormap_acquire = false;
             }
+            if constexpr (ProducerAcquiresPrebuiltD) {
+              // All producer lanes, including the barrier-arriving leader, acquire D before
+              // load() calls producer_acquire/release-arrive. This also precedes the
+              // release-arrives of later same-group tiles.
+              collective_epilogue.template tensormaps_fence_acquire<false>(
+                  params.epilogue.ptr_D_prebuilt_tma_descs + curr_batch);
+            }
           }
 
           collective_mainloop.load(params.mainloop, mainloop_pipeline, mainloop_pipe_producer_state,
@@ -808,24 +821,28 @@ class GemmUniversalPrecomputedScheduler<
       int32_t const sm_count = params.hw_info.sm_count;
       // Do we potentially issue tail arrives for TMA stores, if epilogue load is waiting for it
       bool do_store_tail = false;
+      bool const issue_tma_store = (mma_thread_idx / NumThreadsPerWarp) == 0;
       // Get a copy of tensormaps
-      auto epi_store_tensormap =
-          get<0>(collective_epilogue.store_init(params.epilogue, shared_storage.tensormaps.epilogue,
-                                                sm_count, sm_idx, consumer_warp_group_idx));
+      auto epi_store_tensormap = get<0>(collective_epilogue.store_init(
+          params.epilogue, shared_storage.tensormaps.epilogue, sm_count, sm_idx,
+          consumer_warp_group_idx, work_tile_info.is_valid() ? work_tile_info.L_idx : 0,
+          issue_tma_store));
 
       bool did_batch_change = true;
       constexpr bool IsEpiLoad = false;
 
-      if (work_tile_info.is_valid()) {
-        if (warp_idx_in_warp_group == 0) {
-          collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
-              shared_storage.tensormaps.epilogue, params.epilogue, epi_store_tensormap,
-              problem_shape_MNKL, work_tile_info.L_idx, consumer_warp_group_idx);
+      if constexpr (!CollectiveEpilogue::UsesPrebuiltDDescriptor) {
+        if (work_tile_info.is_valid()) {
+          if (warp_idx_in_warp_group == 0) {
+            collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
+                shared_storage.tensormaps.epilogue, params.epilogue, epi_store_tensormap,
+                problem_shape_MNKL, work_tile_info.L_idx, consumer_warp_group_idx);
 
-          // Converge before issuing tensormap fence release since fence is aligned
-          __syncwarp();
-          collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(
-              shared_storage.tensormaps.epilogue, epi_store_tensormap, consumer_warp_group_idx);
+            // Converge before issuing tensormap fence release since fence is aligned
+            __syncwarp();
+            collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(
+                shared_storage.tensormaps.epilogue, epi_store_tensormap, consumer_warp_group_idx);
+          }
         }
       }
 
@@ -871,8 +888,12 @@ class GemmUniversalPrecomputedScheduler<
         TileScheduler::fixup(params.scheduler, work_tile_info, accumulators, NumMmaWarpGroups,
                              consumer_warp_group_idx);
 
-        if (did_batch_change) {
-          collective_epilogue.template tensormaps_fence_acquire<IsEpiLoad>(epi_store_tensormap);
+        // A producer-acquired prebuilt D reaches this WG through the tile's mainloop full-barrier
+        // release/acquire pair; mutable D and consumer-late prebuilt D are acquired here.
+        if constexpr (!ProducerAcquiresPrebuiltD) {
+          if (did_batch_change && issue_tma_store) {
+            collective_epilogue.template tensormaps_fence_acquire<IsEpiLoad>(epi_store_tensormap);
+          }
         }
 
         if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {
@@ -899,7 +920,11 @@ class GemmUniversalPrecomputedScheduler<
             problem_shape_MNKL =
                 append<4>(params.problem_shape.get_problem_shape(work_tile_info.L_idx), 1);
           }
-          if (warp_idx_in_warp_group == 0) {
+          if constexpr (CollectiveEpilogue::UsesPrebuiltDDescriptor) {
+            epi_store_tensormap = get<0>(collective_epilogue.store_init(
+                params.epilogue, shared_storage.tensormaps.epilogue, sm_count, sm_idx,
+                consumer_warp_group_idx, work_tile_info.L_idx, issue_tma_store));
+          } else if (warp_idx_in_warp_group == 0) {
             collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
                 shared_storage.tensormaps.epilogue, params.epilogue, epi_store_tensormap,
                 problem_shape_MNKL, work_tile_info.L_idx, consumer_warp_group_idx);

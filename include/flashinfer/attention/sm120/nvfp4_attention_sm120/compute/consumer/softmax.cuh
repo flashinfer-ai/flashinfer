@@ -25,6 +25,11 @@
 
 namespace nvfp4_attention {
 
+using cute::_;
+using cute::_0;
+using cute::_1;
+using cute::_2;
+using cute::_3;
 using cute::clear;
 using cute::copy;
 using cute::fill;
@@ -309,6 +314,105 @@ struct SoftmaxFused {
 #endif
   }
 
+  // Establish the row maximum and online rescale from the complete N128 score tile
+  // before either N64 slot is retired and reused by the next QK tile.
+  template <bool FirstTile, bool InfCheck = false, typename TensorAcc, typename TensorMax>
+  CUTLASS_DEVICE void prepare_online_softmax_n128(TensorAcc& acc, TensorMax& AbsMaxP,
+                                                  const float softmax_scale_log2) {
+    Tensor acc_reduction_view =
+        make_tensor(acc.data(), nvfp4_attention::convert_to_reduction_layout(acc.layout()));
+
+    static_assert(decltype(size<1, 1>(acc_reduction_view))::value == 4,
+                  "An N128 score tile must contain four N32 MMA repeats");
+
+    if constexpr (FirstTile) {
+      fill(row_max, -INFINITY);
+      clear(row_sum);
+      fill(scores_scale, 1.f);
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(acc_reduction_view); ++mi) {
+      float const scores_max_prev = row_max(mi);
+      auto find_chunk_max = [&](auto ni) {
+        float local_max = -INFINITY;
+        CUTLASS_PRAGMA_UNROLL
+        for (int ei = 0; ei < size<1, 0>(acc_reduction_view); ++ei) {
+          local_max = fmaxf(local_max, acc_reduction_view(mi, make_coord(ei, ni)));
+        }
+        float const max_recv = __shfl_xor_sync(int32_t(-1), local_max, 1);
+        AbsMaxP(mi, ni) = fmaxf(local_max, max_recv);
+        row_max(mi) = fmaxf(row_max(mi), AbsMaxP(mi, ni));
+      };
+      find_chunk_max(_0{});
+      find_chunk_max(_1{});
+      find_chunk_max(_2{});
+      find_chunk_max(_3{});
+      row_max(mi) = reduce_row_max_from_pairs(row_max(mi));
+
+      if constexpr (!FirstTile) {
+        float const scores_max_cur =
+            !InfCheck ? row_max(mi) : (row_max(mi) == -INFINITY ? 0.f : row_max(mi));
+        scores_scale(mi) =
+            softmax_exp2<InfCheck>((scores_max_prev - scores_max_cur) * softmax_scale_log2);
+        row_sum(mi) *= scores_scale(mi);
+      }
+    }
+  }
+
+  template <int ScoreSlot, bool InfCheck = false, typename TensorAcc, typename TensorMax>
+  CUTLASS_DEVICE void softmax_quantize_n64(TensorAcc& acc, TensorMax& AbsMaxP,
+                                           const float softmax_scale_log2) {
+    Tensor acc_reduction_view =
+        make_tensor(acc.data(), nvfp4_attention::convert_to_reduction_layout(acc.layout()));
+    Tensor acc_conversion_view =
+        make_tensor(acc.data(), nvfp4_attention::convert_to_conversion_layout(acc.layout()));
+    Tensor acc_conversion_slot = acc_conversion_view(_, _, Int<ScoreSlot>{});
+    auto acc_conversion_flatten =
+        group_modes<1, 4>(group_modes<0, 2>(flatten(acc_conversion_slot)));
+    Tensor AbsMaxP_slot = AbsMaxP(_, make_coord(_, _, Int<ScoreSlot>{}));
+
+    static_assert(ScoreSlot == 0 || ScoreSlot == 1, "N64 score slot must be 0 or 1");
+    static_assert(decltype(size<1, 1>(acc_reduction_view))::value == 4,
+                  "An N128 score tile must contain four N32 MMA repeats");
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(acc_reduction_view); ++mi) {
+      float const max_scaled =
+          InfCheck ? (row_max(mi) == -INFINITY
+                          ? 0.f
+                          : (row_max(mi) * softmax_scale_log2 + fp8_scalexfp4_scale_log2))
+                   : (row_max(mi) * softmax_scale_log2 + fp8_scalexfp4_scale_log2);
+
+      auto exp2_sum = [&](auto ni) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ei = 0; ei < size<1, 0>(acc_reduction_view); ++ei) {
+          float const p = softmax_exp2<InfCheck>(
+              acc_reduction_view(mi, make_coord(ei, ni)) * softmax_scale_log2 - max_scaled);
+          acc_reduction_view(mi, make_coord(ei, ni)) = p;
+          row_sum(mi) += p;
+        }
+        AbsMaxP(mi, ni) = softmax_exp2<InfCheck>(AbsMaxP(mi, ni) * softmax_scale_log2 - max_scaled +
+                                                 fp4_scale_log2);
+      };
+      if constexpr (ScoreSlot == 0) {
+        exp2_sum(_0{});
+        exp2_sum(_1{});
+      } else {
+        exp2_sum(_2{});
+        exp2_sum(_3{});
+      }
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(AbsMaxP_slot); ++i) {
+      float const inv_absmax = safe_inv_absmax(AbsMaxP_slot(i));
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < size<0>(acc_conversion_flatten); ++j) {
+        acc_conversion_flatten(j, i) *= inv_absmax;
+      }
+    }
+  }
+
 #if defined(FP16_SOFTMAX)
 
   template <bool FirstTile, bool InfCheck = false, typename TensorAcc, typename TensorMax>
@@ -479,6 +583,20 @@ struct SoftmaxFused {
       for (int ni = 0; ni < size<1>(o_store_reduction_view); ++ni) {
         o_store_reduction_view(mi, ni) =
             o_store_reduction_view(mi, ni) * scores_scale(mi) + o_tmp_reduction_view(mi, ni);
+      }
+    }
+  }
+
+  template <typename TensorAcc>
+  CUTLASS_DEVICE void rescale_o_inplace(TensorAcc& o_store) {
+    Tensor o_store_reduction_view =
+        make_tensor(o_store.data(), nvfp4_attention::convert_to_reduction_layout(o_store.layout()));
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size(row_max); ++mi) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < size<1>(o_store_reduction_view); ++ni) {
+        o_store_reduction_view(mi, ni) *= scores_scale(mi);
       }
     }
   }
@@ -762,8 +880,10 @@ struct SoftmaxFused {
 
   template <bool InfCheck>
   __device__ __forceinline__ static float softmax_exp2(float x) {
-    if (x <= -126.0f) {
-      return 0.0f;
+    if constexpr (InfCheck) {
+      if (x <= -126.0f) {
+        return 0.0f;
+      }
     }
 #if defined(SOFTMAX_FMA_EXP2)
     if constexpr (!InfCheck) {

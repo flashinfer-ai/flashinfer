@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
+
 from . import env as jit_env
 import torch
 from .utils import filename_safe_dtype_map
@@ -22,6 +24,7 @@ from .core import (
     JitSpec,
     gen_jit_spec,
 )
+from .cpp_ext import is_windows
 
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
@@ -29,6 +32,23 @@ xqa_nvcc_flags = [
     "-DUSE_INPUT_KV=0",
     "-DUSE_CUSTOM_BARRIER=1",
 ]
+
+
+def swap_ab_eligible(q_seq_len: int, head_group_ratio: int) -> bool:
+    """True when the shape fits the SM90 kernel's SPEC_Q_SEQ_LEN (SWAP_AB)
+    specialization."""
+    return q_seq_len * head_group_ratio <= 32
+
+
+@functools.cache
+def _has_sm90_target() -> bool:
+    return any(major == 9 for major, _ in CompilationContext().TARGET_CUDA_ARCHS)
+
+
+def ragged_q_changes_build(q_seq_len: int, head_group_ratio: int) -> bool:
+    """True when ragged Q changes the build: it suppresses SPEC_Q_SEQ_LEN
+    (SWAP_AB), which only the SM90 kernel uses."""
+    return swap_ab_eligible(q_seq_len, head_group_ratio) and _has_sm90_target()
 
 
 def gen_xqa_module(
@@ -66,10 +86,22 @@ def gen_xqa_module(
         )
     flag_tokens_per_page = [f"-DTOKENS_PER_PAGE={page_size}"]
 
-    if head_dim % 16 != 0 or head_dim > 256 or head_dim < 16:
+    if head_dim % 16 != 0 or head_dim > 512 or head_dim < 16:
         raise ValueError(
-            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 256]"
+            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 512]"
         )
+    if head_dim > 256:
+        # headElems > 256 uses per-warp head-dim splits in mha.cu (see nbHeadSplits);
+        # the specialized SPEC_DEC/SM90-GMMA paths do not support it, and the
+        # persistent-Q smem budget requires head_group_ratio <= 16.
+        if q_seq_len > 1:
+            raise ValueError(
+                f"head_dim {head_dim} > 256 does not support speculative decoding (q_seq_len > 1)"
+            )
+        if head_group_ratio > 16:
+            raise ValueError(
+                f"head_dim {head_dim} > 256 requires head_group_ratio <= 16, got {head_group_ratio}"
+            )
     flag_head_dim = [f"-DHEAD_ELEMS={head_dim}"]
 
     flag_head_group_ratio = [f"-DHEAD_GRP_SIZE={head_group_ratio}"]
@@ -88,7 +120,10 @@ def gen_xqa_module(
         use_spec_dec = True
         # The SPEC_Q_SEQ_LEN (SWAP_AB) specialization requires a uniform q
         # length across the batch, so it must be skipped for ragged Q.
-        if q_seq_len * head_group_ratio <= 32 and not use_ragged_q:
+        ragged_changes_flags = use_ragged_q and ragged_q_changes_build(
+            q_seq_len, head_group_ratio
+        )
+        if swap_ab_eligible(q_seq_len, head_group_ratio) and not ragged_changes_flags:
             flag_spec_dec = ["-DSPEC_DEC=1", f"-DSPEC_Q_SEQ_LEN={q_seq_len}"]
         else:
             flag_spec_dec = ["-DSPEC_DEC=1"]
@@ -100,10 +135,11 @@ def gen_xqa_module(
             raise ValueError("use_ragged_q requires q_seq_len > 1 (speculative decode)")
         flag_spec_dec = ["-DSPEC_DEC=0"]
         use_spec_dec = False
+        ragged_changes_flags = False
 
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 12]
+        supported_major_versions=[9, 10, 12], map_sm107_to_100f=True
     )
     sm_nvcc_flags = nvcc_flags
 
@@ -115,10 +151,8 @@ def gen_xqa_module(
         jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
     ]
 
-    target_archs = compilation_context.TARGET_CUDA_ARCHS
-
-    has_sm90 = any(major == 9 for major, minor in target_archs)
-    if has_sm90:
+    if _has_sm90_target() and head_dim <= 256:
+        # The SM90 GMMA kernel does not support head_dim > 256.
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
         flag_sm90_mha = ["-DUSE_SM90_MHA=1"]
@@ -127,7 +161,6 @@ def gen_xqa_module(
 
     # Suffix the URI only when ragged Q actually changes the compile flags
     # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
-    ragged_changes_flags = use_ragged_q and q_seq_len * head_group_ratio <= 32
     ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
     return gen_jit_spec(
         f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
@@ -146,6 +179,22 @@ def gen_xqa_module(
         + flag_sm90_mha,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
+
+
+def get_xqa_mla_uri(
+    input_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    head_group_ratio: int,
+    use_sliding_window: bool,
+) -> str:
+    # Windows limits a path to 260 characters and the JIT cache repeats the module
+    # name inside its directory, so the module name is shortened there.
+    # Linux keeps the original name, so existing caches and AOT modules are unchanged.
+    if not is_windows:
+        return f"xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
+    return f"xm{filename_safe_dtype_map[input_dtype]}k{filename_safe_dtype_map[kv_cache_dtype]}p{page_size}h{head_dim}g{head_group_ratio}w{use_sliding_window}"
 
 
 def gen_xqa_module_mla(
@@ -192,8 +241,17 @@ def gen_xqa_module_mla(
 
     flag_mla_wrapper = ["-DMLA_WRAPPER=1"]
 
+    uri = get_xqa_mla_uri(
+        input_dtype,
+        kv_cache_dtype,
+        page_size,
+        head_dim,
+        head_group_ratio,
+        use_sliding_window,
+    )
+
     return gen_jit_spec(
-        f"xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
+        uri,
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mla_sm120.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",

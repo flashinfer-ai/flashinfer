@@ -19,7 +19,8 @@ import os
 import struct
 
 import pytest
-from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
+from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
 import torch
 from torch.nn import functional as F
 
@@ -40,17 +41,45 @@ from flashinfer import (
     mxfp8_quantize,
     mxfp4_dequantize_host,
 )
-from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
+from tests.quantization.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
 from . import utils as moe_utils
 
-pytestmark = pytest.mark.solo
+_CUTLASS_MOE_SUPPORTED_ARCHES = {
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (10, 7),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+}
+_CUTLASS_MOE_ARCH_SKIP = pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda")) not in _CUTLASS_MOE_SUPPORTED_ARCHES,
+    reason="CUTLASS fused MoE is not supported on this architecture",
+)
+
+# Peak host RSS 139-210 GiB on B200/GB200/GB300, 286 GiB on VR200 and up to
+# 119 GiB on H100 (flashinfer-ci nightlies, 2026-10).
+pytestmark = pytest.mark.node_exclusive
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 
 set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
+
+
+def make_situ_scales(num_experts):
+    """Per-expert SiTU-GLU tanh scales, deliberately different from DEFAULT_SITU_BETA /
+    DEFAULT_SITU_LINEAR_BETA so a kernel silently falling back to those would fail."""
+    return {
+        "situ_beta": torch.full((num_experts,), 5.0, dtype=torch.float32).cuda(),
+        "situ_linear_beta": torch.full(
+            (num_experts,), 18.0, dtype=torch.float32
+        ).cuda(),
+    }
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -323,6 +352,8 @@ def compute_with_experts(
     beta=None,
     limit=None,
     activation_type=ActivationType.Swiglu,
+    situ_beta=DEFAULT_SITU_BETA,
+    situ_linear_beta=DEFAULT_SITU_LINEAR_BETA,
 ):
     results = torch.zeros_like(x)
     for expert_id in range(num_experts):
@@ -359,6 +390,22 @@ def compute_with_experts(
             x2 = x2.clamp_(min=-limit, max=limit) + beta
 
             inter = x1_scaled * x2
+        elif activation_type == ActivationType.Situ:
+            # SiTU-GLU, computed in fp32; see SituAdaptor in cutlass_fused_moe_kernels.cuh.
+            # situ_beta / situ_linear_beta are per-expert when given as a tensor/list.
+            sb = float(
+                situ_beta[expert_id] if hasattr(situ_beta, "__getitem__") else situ_beta
+            )
+            slb = float(
+                situ_linear_beta[expert_id]
+                if hasattr(situ_linear_beta, "__getitem__")
+                else situ_linear_beta
+            )
+            gate = (expert_inputs @ w1_expert.t()).float()
+            up = (expert_inputs @ w3_expert.t()).float()
+            out_glu = sb * torch.tanh(gate / sb) * torch.sigmoid(gate)
+            out_linear = slb * torch.tanh(up / slb)
+            inter = (out_glu * out_linear).to(x.dtype)
         else:
             inter = F.silu(expert_inputs @ w1_expert.t()) * (
                 expert_inputs @ w3_expert.t()
@@ -390,12 +437,24 @@ EP_TOP_K = [2]
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
-    "activation_type",
-    [ActivationType.Swiglu, ActivationType.SwigluStep],
-    ids=["swiglu", "swiglustep"],
+    "activation_type, situ_per_expert",
+    [
+        (ActivationType.Swiglu, False),
+        (ActivationType.SwigluStep, False),
+        (ActivationType.Situ, False),
+        (ActivationType.Situ, True),
+    ],
+    ids=["swiglu", "swiglustep", "situ_default", "situ_per_expert"],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size, activation_type
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    activation_type,
+    situ_per_expert,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -425,6 +484,13 @@ def test_moe(
     )
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # When situ_per_expert is off the kernel must fall back to its compile-time defaults, which is
+    # what compute_with_experts() uses by default. The per-expert scales below are deliberately
+    # non-default so the test fails if the kernel ignores the tensors and falls back anyway.
+    situ_kwargs = make_situ_scales(num_experts) if situ_per_expert else {}
+    ref_situ_kwargs = {k: v.tolist() for k, v in situ_kwargs.items()}
+
     ref_output = compute_with_experts(
         num_experts,
         x,
@@ -433,6 +499,7 @@ def test_moe(
         selected_experts,
         routing_weights,
         activation_type=activation_type,
+        **ref_situ_kwargs,
     )
     flash_output = torch.empty_like(ref_output)
     flash_output = fused_moe.cutlass_fused_moe(
@@ -445,9 +512,282 @@ def test_moe(
         output=flash_output,
         quant_scales=None,
         activation_type=activation_type,
+        **situ_kwargs,
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="BF16 ClampedRelu2 activation epilogue fusion is only supported on SM10x",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_bf16_clamped_relu2_epilogue_repeated():
+    """BF16 GEMM1 applies bounded ReLU2 in its epilogue on every invocation."""
+    m, k, top_k = 32, 512, 1
+    dtype = torch.bfloat16
+    clamp_scale = 16.0
+
+    probe_values = torch.tensor(
+        [-64.0, -16.0, -1.0, 0.0, 1.0, 8.0, 16.0, 64.0],
+        dtype=dtype,
+        device="cuda",
+    )
+    x = probe_values.repeat(ceil_div(m * k, probe_values.numel()))[: m * k].view(m, k)
+    identity = torch.eye(k, dtype=dtype, device="cuda").unsqueeze(0).contiguous()
+    selected_experts = torch.zeros((m, top_k), dtype=torch.int32, device="cuda")
+    routing_weights = torch.ones((m, top_k), dtype=torch.float32, device="cuda")
+    limit = torch.tensor([clamp_scale], dtype=torch.float32, device="cuda")
+    expected = (
+        (clamp_scale * torch.tanh(torch.relu(x.float()) / clamp_scale))
+        .square()
+        .to(dtype)
+    )
+
+    outputs = []
+    with autotune(True):
+        for _ in range(2):
+            output = torch.empty_like(x)
+            fused_moe.cutlass_fused_moe(
+                x,
+                selected_experts,
+                routing_weights,
+                identity,
+                identity,
+                dtype,
+                clamped_relu2_limit=limit,
+                quant_scales=None,
+                activation_type=ActivationType.ClampedRelu2,
+                use_fused_finalize=False,
+                output=output,
+            )
+            outputs.append(output.clone())
+
+    torch.testing.assert_close(outputs[0], expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="BF16 ClampedRelu2 activation epilogue fusion is only supported on SM10x",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_bf16_clamped_relu2_epilogue_multi_expert():
+    """Exercise the model-wide fused activation across multiple experts."""
+    e, m, k, top_k = 4, 32, 512, 1
+    dtype = torch.bfloat16
+    clamp_scale = 16.0
+
+    probe_values = torch.tensor(
+        [-64.0, -16.0, -1.0, 0.0, 1.0, 8.0, 16.0, 64.0],
+        dtype=dtype,
+        device="cuda",
+    )
+    x = probe_values.repeat(ceil_div(m * k, probe_values.numel()))[: m * k].view(m, k)
+    expert_scales = torch.tensor([0.5, 1.0, 1.5, 2.0], dtype=dtype, device="cuda")
+    identity = torch.eye(k, dtype=dtype, device="cuda")
+    w1 = (expert_scales[:, None, None] * identity[None, :, :]).contiguous()
+    w2 = identity[None, :, :].expand(e, -1, -1).contiguous()
+    selected_experts = (torch.arange(m, dtype=torch.int32, device="cuda") % e).view(
+        m, top_k
+    )
+    routing_weights = torch.ones((m, top_k), dtype=torch.float32, device="cuda")
+    limit = torch.tensor([clamp_scale], dtype=torch.float32, device="cuda")
+
+    row_scales = expert_scales[selected_experts[:, 0].long()].float().unsqueeze(1)
+    pre_activation = x.float() * row_scales
+    expected = (
+        (clamp_scale * torch.tanh(torch.relu(pre_activation) / clamp_scale))
+        .square()
+        .to(dtype)
+    )
+
+    actual = torch.empty_like(x)
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w1,
+        w2,
+        dtype,
+        clamped_relu2_limit=limit,
+        quant_scales=None,
+        activation_type=ActivationType.ClampedRelu2,
+        use_fused_finalize=False,
+        output=actual,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_clamped_relu2_requires_scalar_limit():
+    m, hidden, inter, e, top_k = 1, 128, 128, 2, 1
+    x = torch.randn(m, hidden, dtype=torch.bfloat16, device="cuda")
+    w1 = torch.randn(e, inter, hidden, dtype=x.dtype, device=x.device)
+    w2 = torch.randn(e, hidden, inter, dtype=x.dtype, device=x.device)
+    selected_experts = torch.zeros((m, top_k), dtype=torch.int32, device=x.device)
+    routing_weights = torch.ones((m, top_k), dtype=torch.float32, device=x.device)
+
+    kwargs = dict(
+        input=x,
+        token_selected_experts=selected_experts,
+        token_final_scales=routing_weights,
+        fc1_expert_weights=w1,
+        fc2_expert_weights=w2,
+        output_dtype=x.dtype,
+        quant_scales=None,
+        activation_type=ActivationType.ClampedRelu2,
+    )
+    with pytest.raises(ValueError, match="requires a one-element"):
+        fused_moe.cutlass_fused_moe(**kwargs)
+    with pytest.raises(ValueError, match=r"shape \(1,\)"):
+        fused_moe.cutlass_fused_moe(
+            **kwargs,
+            clamped_relu2_limit=torch.full(
+                (e,), 16.0, dtype=torch.float32, device=x.device
+            ),
+        )
+    with pytest.raises(ValueError, match="does not accept SwiGLU"):
+        fused_moe.cutlass_fused_moe(
+            **kwargs,
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device=x.device
+            ),
+            swiglu_alpha=torch.ones(e, dtype=torch.float32, device=x.device),
+        )
+    with pytest.raises(ValueError, match="does not accept SwiGLU"):
+        fused_moe.cutlass_fused_moe(
+            **kwargs,
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device=x.device
+            ),
+            swiglu_limit=torch.ones(e, dtype=torch.float32, device=x.device),
+        )
+    with pytest.raises(ValueError, match="supported only with"):
+        fused_moe.cutlass_fused_moe(
+            **{**kwargs, "activation_type": ActivationType.Relu2},
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device=x.device
+            ),
+        )
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 9,
+    reason="DeepSeek FP8 block scaling is supported only on SM90",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_raw_op_rejects_clamped_relu2_on_deepseek_blockscale():
+    """The registered op must reject unsupported activations before kernel dispatch."""
+    m, hidden, inter, e, top_k = 1, 128, 128, 1, 1
+    x = torch.zeros((m, hidden), dtype=torch.bfloat16, device="cuda")
+    selected_experts = torch.zeros((m, top_k), dtype=torch.int32, device="cuda")
+    routing_weights = torch.ones((m, top_k), dtype=torch.float32, device="cuda")
+    w1 = torch.empty((e, inter, hidden), dtype=torch.float8_e4m3fn, device="cuda")
+    w2 = torch.empty((e, hidden, inter), dtype=torch.float8_e4m3fn, device="cuda")
+    w1_scales = torch.ones((e, 1, 1), dtype=torch.float32, device="cuda")
+    w2_scales = torch.ones((e, 1, 1), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="supported only for SM10x"):
+        get_cutlass_fused_moe_module("90").cutlass_fused_moe(
+            output=torch.empty_like(x),
+            input=x,
+            token_selected_experts=selected_experts,
+            token_final_scales=routing_weights,
+            fc1_expert_weights=w1,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2,
+            fc2_expert_biases=None,
+            output_dtype=torch.bfloat16,
+            quant_scales=[w1_scales, w2_scales],
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device="cuda"
+            ),
+            use_deepseek_fp8_block_scale=True,
+            activation_type=ActivationType.ClampedRelu2,
+            profile_ids=[-1, -1],
+        )
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "input",
+        "token_selected_experts",
+        "token_final_scales",
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_biases",
+        "fc2_expert_biases",
+        "output",
+    ],
+)
+@pytest.mark.parametrize("layout", ["padded_rows", "strided_columns"])
+@pytest.mark.parametrize("entrypoint", ["public", "registered"])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_rejects_noncontiguous_operands(argument, layout, entrypoint):
+    torch.manual_seed(0)
+    tokens, hidden, inter, experts, top_k = 16, 128, 128, 4, 2
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 5
+    w1 = torch.randn(experts, 2 * inter, hidden, device="cuda", dtype=x.dtype) / 5
+    w2 = torch.randn(experts, hidden, inter, device="cuda", dtype=x.dtype) / 5
+    weights, ids = compute_routing(torch.randn(tokens, experts, device="cuda"), top_k)
+    ids = ids.to(torch.int32)
+    expected = compute_with_experts(experts, x, w1, w2, ids, weights)
+    args = dict(
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        fc1_expert_weights=w1,
+        fc2_expert_weights=w2,
+        fc1_expert_biases=None,
+        fc2_expert_biases=None,
+        output=torch.empty_like(x),
+        output_dtype=x.dtype,
+        quant_scales=[],
+        enable_pdl=False,
+        profile_ids=[-1, -1],
+    )
+    major, minor = get_compute_capability(x.device)
+    call = (
+        fused_moe.cutlass_fused_moe
+        if entrypoint == "public"
+        else get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe
+    )
+    if argument in ("fc1_expert_biases", "fc2_expert_biases"):
+        args["fc1_expert_biases"] = torch.zeros(
+            experts, 2 * inter, device=x.device, dtype=x.dtype
+        )
+        args["fc2_expert_biases"] = torch.zeros(
+            experts, hidden, device=x.device, dtype=x.dtype
+        )
+    call(**args)
+    torch.testing.assert_close(args["output"], expected, rtol=1e-2, atol=1e-2)
+
+    original = args[argument]
+    storage = torch.empty(
+        (*original.shape[:-1], original.shape[-1] * 2),
+        device=original.device,
+        dtype=original.dtype,
+    )
+    view = (
+        storage[..., : original.shape[-1]]
+        if layout == "padded_rows"
+        else storage[..., ::2]
+    )
+    view.copy_(original)
+    assert not view.is_contiguous()
+    args[argument] = view
+    with pytest.raises(
+        (ValueError, RuntimeError), match=f"{argument}.*must be contiguous"
+    ):
+        call(**args)
+
+    args[argument] = view.contiguous()
+    call(**args)
+    torch.testing.assert_close(args["output"], expected, rtol=1e-2, atol=1e-2)
 
 
 def compute_with_experts_gelu_tanh(
@@ -488,11 +828,184 @@ def compute_with_experts_gelu_tanh(
     return results.view_as(x)
 
 
+def compute_with_experts_powlu(
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+    m=2.5,
+    limit=None,
+):
+    """Reference for the PowLU-GLU MoE.
+
+    Same shapes and gated weight-split convention as ``compute_with_experts``:
+    ``w31`` splits along dim 0 into ``(w3, w1)`` with ``w3`` the first half
+    (linear/up branch) and ``w1`` the second half (gate branch). The activation
+    is ``min(PowLU(gate), limit) * clamp(linear, -limit, limit)`` -- the clamp
+    runs *after* the nonlinearity, which is SGLang's ``gemm1_clamp_limit``
+    semantics and what ``powlu_and_mul`` computes.
+
+    Returns ``(results, gate_clip_fraction)``; the caller asserts on the second
+    value so a limit that silently fails to reach the kernel cannot pass.
+    """
+    results = torch.zeros_like(x)
+    clipped = 0
+    total = 0
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
+
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        gate = expert_inputs @ w1_expert.t()
+        linear = (expert_inputs @ w3_expert.t()).float()
+        act = moe_utils.powlu_ref(gate, m)
+        if limit is not None:
+            clipped += int((act > limit).sum())
+            total += act.numel()
+            act = act.clamp(max=limit)
+            linear = linear.clamp(min=-limit, max=limit)
+        # The kernel writes the activation output in the GEMM dtype before GEMM2.
+        inter = (act * linear).to(x.dtype)
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x), (clipped / total if total else 0.0)
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_powlu(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+    """Default PowLU (m=2.5, unclamped) on the bf16 CUTLASS MoE path.
+
+    Same shapes and weight-split convention as the SwiGLU ``test_moe``; only the
+    activation differs. With no per-expert tensors the kernel must fall back to
+    PowLUAdaptor's compile-time m and an infinite limit.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output, _ = compute_with_experts_powlu(
+        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+    )
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.PowLU,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_powlu_per_expert_m_and_limit(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    """PowLU with per-expert m and clamp.
+
+    ``m`` rides swiglu_alpha and the clamp rides swiglu_limit (PowLUAdaptor
+    reuses those generic slots). ``m=3.5`` exercises a non-default exponent.
+    The limit is deliberately far below PowLU's peak -- 7.02 at m=3.5 --
+    so the clamp demonstrably engages; the assertion on the clip fraction keeps
+    this test from passing if the limit never reaches the kernel.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    m = 3.5
+    limit = 0.5
+    # Gate-up weights are left unscaled (no /5) so the gate reaches well past
+    # the clamp; the clip-fraction assert below depends on it.
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, dtype=dtype
+    ).cuda()
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output, clip_fraction = compute_with_experts_powlu(
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+        m=m,
+        limit=limit,
+    )
+    assert clip_fraction > 0.05, (
+        f"the clamp barely engaged ({clip_fraction:.3%} of gate values); this "
+        "configuration would not detect a dropped swiglu_limit"
+    )
+
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.PowLU,
+        swiglu_alpha=torch.full((num_experts,), m, dtype=torch.float32).cuda(),
+        swiglu_limit=torch.full((num_experts,), limit, dtype=torch.float32).cuda(),
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate_size):
     """Gated tanh-GELU activation (ActivationType.GegluTanh) on the bf16 CUTLASS
     MoE path. Same shapes / weight-split convention as the SwiGLU ``test_moe``,
@@ -542,6 +1055,7 @@ def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_unfused_finalize(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -605,6 +1119,102 @@ def test_moe_unfused_finalize(
     )
 
 
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_deterministic_mode_selects_unfused_finalize():
+    """Under ``torch.use_deterministic_algorithms(True)`` the default finalize is unfused.
+
+    Two autotuned runs of the same routed BF16 batch, with ``use_fused_finalize``
+    left at its default, must be bit-identical, and no fused-finalize runner may be
+    built for the call.
+    """
+    batch_size, hidden_size, intermediate_size, num_experts, top_k = (
+        256,
+        1024,
+        1024,
+        8,
+        4,
+    )
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 10
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda()
+        / 10
+    )
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    selected_experts = selected_experts.to(torch.int)
+    ref_output = compute_with_experts(
+        num_experts,
+        x.float(),
+        w31_weight.float(),
+        w2_weight.float(),
+        selected_experts,
+        routing_weights,
+    )
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner_dict = get_cutlass_fused_moe_module(
+        f"{major * 10 + minor}"
+    ).MoERunner.runner_dict
+    runners_before = set(runner_dict)
+
+    def run_default():
+        out = torch.empty(batch_size, hidden_size, dtype=dtype, device="cuda")
+        return fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            dtype,
+            output=out,
+            quant_scales=None,
+        )[0]
+
+    was_deterministic = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        with autotune(True):
+            out1 = run_default()
+            out2 = run_default()
+        ws_default = fused_moe.cutlass_fused_moe_workspace_size(
+            batch_size,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+            x_dtype=dtype,
+            weight_dtype=dtype,
+            output_dtype=dtype,
+        )
+    finally:
+        torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+
+    ws_unfused = fused_moe.cutlass_fused_moe_workspace_size(
+        batch_size,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        x_dtype=dtype,
+        weight_dtype=dtype,
+        output_dtype=dtype,
+        use_fused_finalize=False,
+    )
+
+    torch.testing.assert_close(ref_output, out1.float(), rtol=2e-2, atol=2e-2)
+    assert torch.equal(out1, out2), "deterministic mode must give bit-identical outputs"
+    assert ws_default == ws_unfused
+    new_runners = set(runner_dict) - runners_before
+    assert all(key[7] is False for key in new_runners), new_runners
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -613,9 +1223,10 @@ def test_moe_unfused_finalize(
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu, ActivationType.SwigluStep],
-    ids=["swiglu", "swiglustep"],
+    [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
+    ids=["swiglu", "swiglustep", "situ"],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8(
     batch_size,
     hidden_size,
@@ -661,6 +1272,11 @@ def test_moe_fp8(
         w31_dequantized.data[expert_id].copy_(torch.mul(w31_quant.to(dtype=otype), s31))
         w2_dequantized.data[expert_id].copy_(torch.mul(w2_quant.to(dtype=otype), s2))
 
+    situ_kwargs = (
+        make_situ_scales(num_experts) if activation_type == ActivationType.Situ else {}
+    )
+    ref_situ_kwargs = {k: v.tolist() for k, v in situ_kwargs.items()}
+
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     ref_output = compute_with_experts(
         num_experts,
@@ -670,6 +1286,7 @@ def test_moe_fp8(
         selected_experts,
         routing_weights,
         activation_type=activation_type,
+        **ref_situ_kwargs,
     )
     flash_output = torch.empty_like(ref_output)
     # For fp8, the hidden_state expects quantized.
@@ -693,6 +1310,7 @@ def test_moe_fp8(
         quant_scales=quant_scales,
         output=flash_output,
         activation_type=activation_type,
+        **situ_kwargs,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
@@ -713,10 +1331,13 @@ def test_moe_fp8(
     ids=["swiglu", "swiglustep", "relu2"],
 )
 @pytest.mark.parametrize("use_4over6", [False, True])
+# use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4(
     batch_size,
     hidden_size,
@@ -728,6 +1349,7 @@ def test_moe_nvfp4(
     quantized_input,
     activation_type,
     use_4over6,
+    use_autotune,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -818,19 +1440,20 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    _ = fused_moe.cutlass_fused_moe(
-        hidden_states,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w1_q.contiguous().view(torch.long),
-        w2_q.contiguous().view(torch.long),
-        otype,
-        quant_scales=quant_scales,
-        input_sf=input_sf,
-        output=flash_output,
-        activation_type=activation_type,
-        swiglu_limit=swiglu_limit,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1_q.contiguous().view(torch.long),
+            w2_q.contiguous().view(torch.long),
+            otype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            output=flash_output,
+            activation_type=activation_type,
+            swiglu_limit=swiglu_limit,
+        )
 
     # Ref check
     a_fp4, a_scale_interleaved = fp4_quantize(x, a1_gs)
@@ -878,11 +1501,120 @@ def test_moe_nvfp4(
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
 
+def test_moe_nvfp4_pinned_4over6_requires_nvfp4():
+    """A pinned recipe on a non-NVFP4 call is refused before any device work."""
+    num_experts, hidden, inter = 4, 64, 32
+    with pytest.raises(ValueError, match="NVFP4"):
+        fused_moe.cutlass_fused_moe(
+            torch.empty((2, hidden), dtype=torch.bfloat16),
+            torch.zeros((2, 1), dtype=torch.int32),
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.empty((num_experts, 2 * inter, hidden), dtype=torch.bfloat16),
+            torch.empty((num_experts, hidden, inter), dtype=torch.bfloat16),
+            torch.bfloat16,
+            quant_scales=[],
+            nvfp4_4over6=NVFP44Over6Config(),
+        )
+
+
+def _nvfp4_recipe_case(device):
+    """Small NVFP4×NVFP4 call with unquantized BF16 input, so both CUTLASS
+    activation quantizations (GEMM1 input and GEMM2 input) run in-kernel."""
+    torch.manual_seed(42)
+    e, m, n, k = 8, 64, 512, 1024
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=torch.bfloat16) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=torch.bfloat16) / 10
+    w1_q = torch.empty((e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w2_q = torch.empty((e, k, n // 2), device=device, dtype=torch.uint8)
+    w1_sf = torch.empty((e, 2 * n, k // 16), device=device, dtype=torch.float8_e4m3fn)
+    w2_sf = torch.empty((e, k, n // 16), device=device, dtype=torch.float8_e4m3fn)
+    w1_gs = torch.empty((e,), device=device, dtype=torch.float32)
+    w2_gs = torch.empty((e,), device=device, dtype=torch.float32)
+    # Weights are caller-quantized, so their recipe is independent of the
+    # in-kernel one; quantize them with 4over6 off.
+    with moe_utils.nvfp4_4over6_env(False):
+        for expert in range(e):
+            w1_gs[expert] = nvfp4_global_encode_scale_te(
+                w1[expert].abs().max().float(), None
+            )
+            w2_gs[expert] = nvfp4_global_encode_scale_te(
+                w2[expert].abs().max().float(), None
+            )
+            w1_q[expert], w1_sf[expert] = fp4_quantize(w1[expert], w1_gs[expert])
+            w2_q[expert], w2_sf[expert] = fp4_quantize(w2[expert], w2_gs[expert])
+    x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    a1_gs = torch.tensor(1.0, device=device, dtype=torch.float32)
+    a2_gs = torch.tensor(1.0, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = compute_routing(
+        torch.randn((m, e), device=device, dtype=torch.bfloat16), 2
+    )
+    return dict(
+        input=x,
+        token_selected_experts=selected_experts.to(torch.int),
+        token_final_scales=routing_weights,
+        fc1_expert_weights=w1_q.view(torch.long),
+        fc2_expert_weights=w2_q.view(torch.long),
+        output_dtype=torch.bfloat16,
+        quant_scales=[
+            a1_gs,
+            w1_sf.view(torch.int32),
+            1.0 / (a1_gs * w1_gs),
+            a2_gs,
+            w2_sf.view(torch.int32),
+            1.0 / (a2_gs * w2_gs),
+        ],
+    )
+
+
+# The autouse fixture keys on ``use_4over6`` and pins every
+# FLASHINFER_NVFP4_4OVER6* variable, so the environment legs differ only in
+# the on/off switch (and E4M3_USE_256 for the second recipe).
+@pytest.mark.parametrize("use_4over6", [True])
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_nvfp4_pinned_recipe_matches_env(recipe, use_4over6):
+    """``nvfp4_4over6=`` selects, bit for bit, the quantizer the environment
+    selects, and ``None`` ignores an environment that turns 4over6 on."""
+    device = torch.device("cuda:0")
+    kwargs = _nvfp4_recipe_case(device)
+
+    def run(**extra):
+        # The flat call returns [output, ...]; read the caller-owned buffer.
+        out = torch.empty_like(kwargs["input"])
+        fused_moe.cutlass_fused_moe(**kwargs, output=out, **extra)
+        torch.cuda.synchronize()
+        return out
+
+    e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
+    with moe_utils.env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
+        env_on = run()
+        none_under_env_on = run(nvfp4_4over6=None)
+    with moe_utils.nvfp4_4over6_env(False):
+        env_off = run()
+        pinned_under_env_off = run(nvfp4_4over6=recipe)
+
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", EP_NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", EP_TOP_K)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_expert_parallel(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -979,6 +1711,7 @@ TP_SIZES = [2, 4]
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_tensor_parallel(
     batch_size, hidden_size, num_experts, tp_size, intermediate_size
 ):
@@ -1086,6 +1819,7 @@ def test_moe_tensor_parallel(
 @pytest.mark.parametrize("top_k", EP_TOP_K)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_tensor_expert_parallel(
     batch_size, hidden_size, num_experts, top_k, tp_size, intermediate_size
 ):
@@ -1304,6 +2038,7 @@ def dequantize_block(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -1498,10 +2233,12 @@ def dequant_mxfp8_batches(
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4(
     batch_size,
     hidden_size,
@@ -1512,6 +2249,7 @@ def test_moe_mxfp8_mxfp4(
     alpha,
     beta,
     limit,
+    use_autotune,
 ):
     """
     Test MoE with MXFP8 activations and MXFP4 weights.
@@ -1562,21 +2300,22 @@ def test_moe_mxfp8_mxfp4(
         beta_t = None
 
     # Call cutlass_fused_moe with MXFP8 activations and MXFP4 weights
-    _ = fused_moe.cutlass_fused_moe(
-        mxfp8_x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        mxfp4_w1.contiguous().view(torch.long),
-        mxfp4_w2.contiguous().view(torch.long),
-        otype,
-        swiglu_alpha=alpha_t,
-        swiglu_limit=limit_t,
-        swiglu_beta=beta_t,
-        quant_scales=quant_scales,
-        input_sf=mxfp8_x_sf,
-        use_mxfp8_act_scaling=True,
-        output=flash_output,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp4_w1.contiguous().view(torch.long),
+            mxfp4_w2.contiguous().view(torch.long),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
 
     dq_mxfp8_x = (
         mxfp8_dequantize_host(
@@ -1639,6 +2378,7 @@ def test_moe_mxfp8_mxfp4(
     torch.cuda.get_device_capability()[0] not in [10],
     reason="MXFP8xMXFP8 is only supported on SM100 for now",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp8(
     batch_size,
     hidden_size,
@@ -1739,6 +2479,129 @@ def test_moe_mxfp8_mxfp8(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="MXFP8xMXFP8 activation epilogue fusion is only supported on SM10x",
+)
+@pytest.mark.parametrize("otype", [torch.float16, torch.bfloat16])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_mxfp8_mxfp8_clamped_relu2_epilogue_identity(otype):
+    """Isolate the fused activation and MXFP8 quantization from MoE routing.
+
+    Identity FC1/FC2 weights make both GEMMs one-product copies.  A single
+    expert with unit routing weight removes routing/finalize arithmetic.  The
+    remaining comparison exercises bounded ReLU2 followed by MXFP8 block-scale
+    generation in the GEMM1 epilogue.
+    """
+    e, m, n, k, top_k = 1, 32, 512, 512, 1
+    clamp_scale = 16.0
+
+    probe_values = torch.tensor(
+        [
+            -64.0,
+            -32.0,
+            -16.0,
+            -8.0,
+            -2.0,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            2.0,
+            8.0,
+            16.0,
+            32.0,
+            64.0,
+        ],
+        dtype=otype,
+        device="cuda",
+    )
+    x = probe_values.repeat(ceil_div(m * k, probe_values.numel()))[: m * k].view(m, k)
+    for row in range(m):
+        x[row] = torch.roll(x[row], shifts=row)
+
+    identity = torch.eye(k, dtype=otype, device="cuda")
+    w1 = identity.unsqueeze(0).contiguous()
+    w2 = identity.unsqueeze(0).contiguous()
+
+    mxfp8_x, mxfp8_x_sf = mxfp8_quantize(x, True, 32)
+    mxfp8_w1, mxfp8_w1_scale = quant_mxfp8_batches(w1, e)
+    mxfp8_w2, mxfp8_w2_scale = quant_mxfp8_batches(w2, e)
+    mxfp8_w1_scale_i32 = pack_mxfp8_scales_u8_to_int32_batches(mxfp8_w1_scale, n, k)
+    mxfp8_w2_scale_i32 = pack_mxfp8_scales_u8_to_int32_batches(mxfp8_w2_scale, k, n)
+
+    selected_experts = torch.zeros((m, top_k), dtype=torch.int32, device="cuda")
+    routing_weights = torch.ones((m, top_k), dtype=torch.float32, device="cuda")
+    fake_input_scale = torch.ones(e, dtype=torch.float32, device="cuda")
+    limits = torch.tensor([clamp_scale], dtype=torch.float32, device="cuda")
+    flash_output = torch.zeros_like(x)
+
+    def run_fused_moe():
+        fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts,
+            routing_weights,
+            mxfp8_w1,
+            mxfp8_w2,
+            otype,
+            clamped_relu2_limit=limits,
+            quant_scales=[
+                mxfp8_w1_scale_i32,
+                fake_input_scale,
+                mxfp8_w2_scale_i32,
+                fake_input_scale,
+            ],
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            activation_type=ActivationType.ClampedRelu2,
+            use_fused_finalize=False,
+            output=flash_output,
+        )
+
+    with autotune(True):
+        run_fused_moe()
+        first_output = flash_output.clone()
+        flash_output.fill_(float("nan"))
+        run_fused_moe()
+    torch.testing.assert_close(first_output, flash_output, rtol=0.0, atol=0.0)
+
+    dq_x = (
+        mxfp8_dequantize_host(
+            mxfp8_x.cpu().view(torch.uint8),
+            mxfp8_x_sf.cpu().view(torch.uint8).reshape(-1),
+            True,
+        )
+        .cuda()
+        .float()
+    )
+    dq_w1 = dequant_mxfp8_batches(mxfp8_w1, mxfp8_w1_scale).cuda().float()
+    dq_w2 = dequant_mxfp8_batches(mxfp8_w2, mxfp8_w2_scale).cuda().float()
+
+    pre_activation = dq_x @ dq_w1[0].t()
+    activated = (
+        clamp_scale * torch.tanh(torch.relu(pre_activation) / clamp_scale)
+    ).square()
+    activated_q, activated_sf = mxfp8_quantize(
+        activated.contiguous(),
+        is_sf_swizzled_layout=True,
+        alignment=32,
+        backend="cute-dsl",
+    )
+    activated_dq = (
+        mxfp8_dequantize_host(
+            activated_q.cpu().view(torch.uint8),
+            activated_sf.cpu().view(torch.uint8).reshape(-1),
+            True,
+        )
+        .cuda()
+        .float()
+    )
+    ref_output = (activated_dq @ dq_w2[0].t()).to(otype)
+
+    torch.testing.assert_close(ref_output, flash_output, rtol=0.0, atol=0.0)
+
+
 def dequant_mxfp4_batches_host(
     mat_fp4: torch.Tensor,
     scale_tensor: torch.Tensor,
@@ -1763,6 +2626,7 @@ def dequant_mxfp4_batches_host(
     torch.cuda.get_device_capability()[0] != 9,
     reason="BF16xMXFP4 is only supported on SM90",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4(
     batch_size,
     hidden_size,
@@ -1877,6 +2741,7 @@ def test_moe_bf16_mxfp4(
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_autotune", [False, True])
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_w4a8(
     batch_size: int,
     hidden_size: int,
@@ -2045,6 +2910,7 @@ def test_moe_w4a8(
     not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 is only supported on SM100+",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unswizzled_input_sf():
     """Test cutlass_fused_moe with swizzled_input_sf=False (linear layout input_sf).
 
@@ -2202,6 +3068,7 @@ def test_moe_nvfp4_unswizzled_input_sf():
     and not is_sm12x_supported(torch.device("cuda")),
     reason="NVFP4 is only supported on SM100+",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unaligned_hidden_size(
     batch_size,
     hidden_size,
@@ -2381,6 +3248,7 @@ NDIM_PADDING_INTERMEDIATE_SIZES = [768, 1024]
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_ndim_padding_safety(
     batch_size,
     hidden_size,
@@ -2512,14 +3380,18 @@ def test_moe_nvfp4_ndim_padding_safety(
         ActivationType.Swiglu,
     )
     # Two-tier tolerance for FP4 at larger K dimensions (2048 vs 128 in existing tests):
-    # 1. Tight: >=95% of elements within atol=0.5 (baseline on SM120 is ~98%+).
-    #    If N-dim padding corruption occurs, this drops dramatically.
+    # 1. Tight: most elements within atol=0.5. SM100/SM120 use a 95% bar; SM107
+    #    uses 90% because hardware-dependent reduction order shifts the
+    #    batch_size=1 match rate. If N-dim padding corruption occurs, this drops
+    #    dramatically either way.
     # 2. Relaxed: 100% within atol=2.0. Catches catastrophic NaN/corruption.
     abs_diff = (ref_output - flash_output).abs()
     tight_match_rate = (abs_diff <= 0.5).float().mean().item()
-    assert tight_match_rate >= 0.95, (
+    is_sm107 = get_compute_capability(torch.device("cuda")) == (10, 7)
+    tight_bar = 0.90 if is_sm107 else 0.95
+    assert tight_match_rate >= tight_bar, (
         f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (0.5). "
-        f"Expected >=95%."
+        f"Expected >={tight_bar * 100:.0f}%."
     )
     assert abs_diff.max().item() <= 2.0, (
         f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance (2.0)."
@@ -2535,6 +3407,7 @@ def test_moe_nvfp4_ndim_padding_safety(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     batch_size,
     hidden_size,
@@ -2637,13 +3510,15 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     # two levels of block scaling. Baseline on SM120 is ~76-85% at atol=0.5.
     # 1. Tight: >=95% within atol=1.0. 2. Relaxed: 100% within atol=3.0.
     abs_diff = (ref_output - flash_output).abs()
-    tight_match_rate = (abs_diff <= 1.0).float().mean().item()
+    ref_mag = ref_output.abs()
+    tight_match_rate = (abs_diff <= 1.0 + 0.05 * ref_mag).float().mean().item()
     assert tight_match_rate >= 0.95, (
-        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (1.0). "
-        f"Expected >=95%."
+        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance "
+        f"(1.0 + 5%*|ref|). Expected >=95%."
     )
-    assert abs_diff.max().item() <= 3.0, (
-        f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance (3.0)."
+    assert (abs_diff <= 3.0 + 0.10 * ref_mag).all().item(), (
+        f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance "
+        f"(3.0 + 10%*|ref|)."
     )
 
 
@@ -2713,13 +3588,32 @@ def _make_humming_e8m0_weight_scale(
     device: torch.device,
     low: int = 114,
     high: int = 128,
+    per_expert_exponent_offsets: bool = False,
 ) -> torch.Tensor:
-    """Generate deterministic raw E8M0 scale bytes for Humming preprocessing."""
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    values = torch.arange(numel, device=device, dtype=torch.int32)
-    return (low + values.remainder(high - low)).to(torch.uint8).reshape(shape)
+    """Generate deterministic raw E8M0 scale bytes for Humming preprocessing.
+
+    The default global sequence preserves the numerical envelope used by the
+    broad tactic tests.  Focused expert-map tests add ``expert_id % 3`` to a
+    shared within-expert pattern, producing residual-scale ratios of 1:2:4.
+    """
+    if not per_expert_exponent_offsets:
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        values = torch.arange(numel, device=device, dtype=torch.int32)
+        return (low + values.remainder(high - low)).to(torch.uint8).reshape(shape)
+
+    elements_per_expert = 1
+    for dim in shape[1:]:
+        elements_per_expert *= dim
+    values = torch.arange(
+        elements_per_expert, device=device, dtype=torch.int32
+    ).reshape((1, *shape[1:]))
+    expert_offsets = torch.arange(shape[0], device=device, dtype=torch.int32).remainder(
+        3
+    )
+    expert_offsets = expert_offsets.reshape((shape[0], *((1,) * (len(shape) - 1))))
+    return (low + values.remainder(high - low) + expert_offsets).to(torch.uint8)
 
 
 def _reference_humming_e8m0_weight_scale(
@@ -2821,7 +3715,24 @@ PHASE3_HUMMING_E2E_CASES = {
         "raw_scale": (118, 122),
         "torch_ref_tolerance": (5e-2, 1e-3),
         "torch_ref_max_bad": 0,
+        "check_expert_residual_mapping": True,
         "description": "default small smoke, offset range 1..4",
+    },
+    "ep_rank1": {
+        "seed": 29,
+        "e": 2,
+        "m": 4,
+        "n": 512,
+        "k": 512,
+        "top_k": 2,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 0,
+        "ep_size": 2,
+        "ep_rank": 1,
+        "skip_autotune": True,
+        "check_expert_residual_mapping": True,
+        "description": "EP rank 1 maps global route IDs to local residual arrays",
     },
     "wide_offset": {
         "seed": 7,
@@ -3081,12 +3992,27 @@ def _run_w4a16_moe_hopper(
     W4A16_CORRECTNESS_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A16_CORRECTNESS_CONFIGS],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4_hopper_correctness(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
     _run_w4a16_moe_hopper(
         batch_size, hidden_size, num_experts, top_k, intermediate_size
     )
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="Mixed-input MoE epilogue policies require SM90",
+)
+@pytest.mark.parametrize("intermediate_size", [3072, 3200])
+def test_moe_bf16_mxfp4_hopper_epilogue_k_boundary(intermediate_size):
+    # FC1 stays above the H20 threshold while FC2 exercises the threshold and
+    # an aligned K above it. Both share the maximum-workspace allocation.
+    # Use the same numerical coverage criterion as the other large W4A16
+    # cases: BF16 cancellation near zero can exceed the strict per-element
+    # reference tolerance even in the unmodified generic implementation.
+    _run_w4a16_moe_hopper(16, 4096, 4, 2, intermediate_size, strict_correctness=False)
 
 
 @pytest.mark.skipif(
@@ -3098,6 +4024,7 @@ def test_moe_bf16_mxfp4_hopper_correctness(
     W4A16_COVERAGE_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in W4A16_COVERAGE_CONFIGS],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4_hopper_coverage(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -3122,6 +4049,7 @@ def test_moe_bf16_mxfp4_hopper_coverage(
     W4A16_ACTIVATION_CONFIGS,
     ids=["swiglu_default", "alpha_0.5", "alpha_1.702"],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4_hopper_activations(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
 ):
@@ -3147,9 +4075,15 @@ def test_moe_bf16_mxfp4_hopper_activations(
     ids=list(PHASE3_HUMMING_E2E_CASES.keys()),
 )
 @pytest.mark.parametrize("use_autotune", [False, True])
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     case_name, case, use_autotune
 ):
+    if use_autotune and case.get("skip_autotune", False):
+        pytest.skip(
+            "autotune is covered by other Humming cases; "
+            "this case only checks EP expert mapping"
+        )
     torch.manual_seed(case["seed"])
     device = torch.device("cuda")
     e, m, n, k, top_k = (
@@ -3159,6 +4093,11 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         case["k"],
         case["top_k"],
     )
+    ep_size = case.get("ep_size", 1)
+    ep_rank = case.get("ep_rank", 0)
+    check_expert_residual_mapping = case.get("check_expert_residual_mapping", False)
+    start_expert = e * ep_rank
+    end_expert = start_expert + e
     output_dtype = torch.bfloat16
 
     x_fp32 = torch.randn(m, k, dtype=torch.float32, device=device) * 0.05
@@ -3168,14 +4107,27 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
 
     # Humming-style preprocessing constrains the original E8M0 scale range and
     # stores only a small exponent offset for the pre-MMA FP4->E4M3 conversion.
-    # The residual is supplied through the GEMM epilogue routed-token scale.
+    # The per-expert residual is combined with each routed row's activation
+    # dequantization scale before that combined scale reaches the GEMM epilogue.
     raw_scale_low, raw_scale_high = case["raw_scale"]
     w1_raw_scale = _make_humming_e8m0_weight_scale(
-        (e, 2 * n, k // 32), device, low=raw_scale_low, high=raw_scale_high
+        (e, 2 * n, k // 32),
+        device,
+        low=raw_scale_low,
+        high=raw_scale_high,
+        per_expert_exponent_offsets=check_expert_residual_mapping,
     )
     w2_raw_scale = _make_humming_e8m0_weight_scale(
-        (e, k, n // 32), device, low=raw_scale_low, high=raw_scale_high
+        (e, k, n // 32),
+        device,
+        low=raw_scale_low,
+        high=raw_scale_high,
+        per_expert_exponent_offsets=check_expert_residual_mapping,
     )
+    if check_expert_residual_mapping:
+        # Shift FC2 by one E8M0 exponent so its residual differs from FC1. This
+        # makes the focused check fail if quant-scale slots 1 and 4 are swapped.
+        w2_raw_scale = (w2_raw_scale.to(torch.int16) + 1).to(torch.uint8)
     w1_processed, w1_exp_offset, w1_residual = (
         fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
             w1, w1_raw_scale, interleave=False
@@ -3207,6 +4159,10 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     torch.testing.assert_close(w2_exp_offset, w2_ref_offset)
     torch.testing.assert_close(w1_residual, w1_ref_residual)
     torch.testing.assert_close(w2_residual, w2_ref_residual)
+    if check_expert_residual_mapping:
+        # E8M0 stores only an exponent, so the uniform +1 applied to W2 above
+        # doubles its residual while leaving its folded offsets unchanged.
+        torch.testing.assert_close(w2_residual, w1_residual * 2.0)
     expected_max_offset = min(raw_scale_high - raw_scale_low, 12)
     assert 1 <= int(w1_exp_offset.min().item()) <= expected_max_offset
     assert 1 <= int(w2_exp_offset.min().item()) <= expected_max_offset
@@ -3246,35 +4202,34 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         torch.testing.assert_close(w2_residual, w2_api_residual)
 
     router_logits = torch.randn(m, e, dtype=output_dtype, device=device)
-    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    routing_weights, selected_local_experts = compute_routing(router_logits, top_k)
+    selected_experts = selected_local_experts + start_expert
+    assert int(selected_experts.min().item()) >= start_expert
+    assert int(selected_experts.max().item()) < end_expert
+    if ep_rank > 0:
+        assert int(selected_experts.min().item()) >= e
     # Humming keeps the FP4->FP8 exponent-bias compensation in the epilogue for
-    # this FP8 x MXFP4 path. Fold the derived residual and the known 2^6 factor
-    # into the routed-token scale inputs for both GEMMs.
+    # this FP8 x MXFP4 path. Slots 1 and 4 are per-local-expert residuals; the
+    # runtime maps each expert-permuted routed row to its expert before folding
+    # the residual into that row's dynamic activation dequantization scale.
     humming_epilogue_compensation = 64.0
-    fc1_residual_route_scale = (
-        w1_residual[selected_experts.to(torch.long)] * humming_epilogue_compensation
-    )
-    fc2_residual_route_scale = (
-        w2_residual[selected_experts.to(torch.long)] * humming_epilogue_compensation
-    )
-
-    def make_expert_contiguous_token_scale(route_scale):
-        return torch.cat(
-            [route_scale[selected_experts == expert_id] for expert_id in range(e)]
-        ).contiguous()
-
-    fc1_residual_token_scale = make_expert_contiguous_token_scale(
-        fc1_residual_route_scale
-    )
-    fc2_residual_token_scale = make_expert_contiguous_token_scale(
-        fc2_residual_route_scale
-    )
+    fc1_residual_expert_scale = (
+        w1_residual * humming_epilogue_compensation
+    ).contiguous()
+    fc2_residual_expert_scale = (
+        w2_residual * humming_epilogue_compensation
+    ).contiguous()
+    assert fc1_residual_expert_scale.shape == (e,)
+    assert fc2_residual_expert_scale.shape == (e,)
+    if check_expert_residual_mapping and e > 1:
+        assert torch.unique(fc1_residual_expert_scale).numel() > 1
+        assert torch.unique(fc2_residual_expert_scale).numel() > 1
     quant_scales = [
         w1_scale_il.view(torch.int32),
-        fc1_residual_token_scale,
+        fc1_residual_expert_scale,
         fc2_act_global,
         w2_scale_il.view(torch.int32),
-        fc2_residual_token_scale,
+        fc2_residual_expert_scale,
     ]
 
     def run_flash(profile_ids=None):
@@ -3289,6 +4244,8 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             quant_scales=quant_scales,
             use_w4_group_scaling=True,
             use_wfp4afp8_humming=True,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
             output=flash_output,
             profile_ids=profile_ids,
         )
@@ -3299,12 +4256,13 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     x_ref = x.to(torch.float32)
     ref_output = torch.zeros(m, k, dtype=torch.float32, device=device)
     print_ref_stats = os.environ.get("FLASHINFER_PRINT_PHASE3_REF_STATS", "0") == "1"
-    for expert_id in range(e):
-        mask = selected_experts == expert_id
+    for local_expert_id in range(e):
+        global_expert_id = start_expert + local_expert_id
+        mask = selected_experts == global_expert_id
         if not mask.any():
             continue
         batch_idx, nth_expert = torch.where(mask)
-        w3_expert, w1_expert = torch.chunk(w1_ref[expert_id], 2, dim=0)
+        w3_expert, w1_expert = torch.chunk(w1_ref[local_expert_id], 2, dim=0)
         x_rows = x_ref[batch_idx]
         fc1_amax = x_rows.abs().amax(dim=1)
         fc1_quant = torch.where(
@@ -3314,9 +4272,7 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
         x_fp8 = x_fp8_tensor.to(torch.float32)
-        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_route_scale[
-            batch_idx, nth_expert
-        ]
+        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_expert_scale[local_expert_id]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
         fc1_w1 = (x_fp8 @ w1_expert.t()) * route_fc1_scale[:, None]
@@ -3331,10 +4287,8 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
         fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
-        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_route_scale[
-            batch_idx, nth_expert
-        ]
-        fc2 = (fc1_fp8 @ w2_ref[expert_id].t()) * route_fc2_scale[:, None]
+        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_expert_scale[local_expert_id]
+        fc2 = (fc1_fp8 @ w2_ref[local_expert_id].t()) * route_fc2_scale[:, None]
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 
     torch_ref_rtol, torch_ref_atol = case["torch_ref_tolerance"]
@@ -3354,6 +4308,75 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     profile_label = "autotune" if use_autotune else "default"
     with autotune(True) if use_autotune else nullcontext():
         assert_flash_output(profile_label, run_flash())
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 Humming tiny-amax regression requires SM90",
+)
+@pytest.mark.parametrize("tiny_stage", ["input", "post_activation"])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_fp8_mxfp4_humming_tiny_amax_stays_finite(tiny_stage):
+    """A tiny nonzero row must not overflow its dynamic FP8 scale."""
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    e, m, n, k = 1, 1, 512, 512
+
+    if tiny_stage == "input":
+        x = torch.full((m, k), 3e-37, device=device, dtype=torch.bfloat16)
+        fc1_expert_residual_scale = torch.ones(e, device=device)
+    else:
+        x = (torch.randn(m, k, device=device) * 0.05).to(torch.bfloat16)
+        fc1_expert_residual_scale = torch.full((e,), 3e-18, device=device)
+    w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
+    w1_raw_scale = torch.full(
+        (e, 2 * n, k // 32), 122, device=device, dtype=torch.uint8
+    )
+    w2_raw_scale = torch.full((e, k, n // 32), 122, device=device, dtype=torch.uint8)
+
+    w1_processed, w1_exp_offset, _ = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w1, w1_raw_scale, interleave=False
+        )
+    )
+    w2_processed, w2_exp_offset, w2_residual = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w2, w2_raw_scale, interleave=False
+        )
+    )
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w1_processed, "fp4_fp8"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w2_processed, "fp4_fp8"
+    )
+    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_exp_offset)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_exp_offset)
+
+    selected_experts = torch.zeros((m, 1), device=device, dtype=torch.int32)
+    routing_weights = torch.ones((m, 1), device=device, dtype=torch.float32)
+    output = torch.zeros((m, k), device=device, dtype=torch.bfloat16)
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_il,
+        w2_il,
+        torch.bfloat16,
+        quant_scales=[
+            w1_scale_il.view(torch.int32),
+            fc1_expert_residual_scale,
+            torch.ones((), device=device, dtype=torch.float32),
+            w2_scale_il.view(torch.int32),
+            w2_residual * 64.0,
+        ],
+        use_w4_group_scaling=True,
+        use_wfp4afp8_humming=True,
+        output=output,
+    )
+
+    assert torch.isfinite(output).all()
 
 
 # W4A8 Hopper interleaved path.
@@ -3528,6 +4551,7 @@ def _run_w4a8_moe_hopper(
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A8_CORRECTNESS_CONFIGS],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_w4a8_hopper_correctness(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype
 ):
@@ -3540,6 +4564,7 @@ def test_moe_w4a8_hopper_correctness(
     not is_sm90a_supported(torch.device("cuda")),
     reason="W4A8 MoE (Hopper mixed-input) requires SM90",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_w4a8_hopper_autotune():
     _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
 
@@ -3548,6 +4573,7 @@ def test_moe_w4a8_hopper_autotune():
     not is_sm90a_supported(torch.device("cuda")),
     reason="W4A8 MoE (Hopper mixed-input) requires SM90",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_exact_size_accepted_with_packed_weights():
     _run_w4a8_moe_hopper(
         1,
@@ -3563,21 +4589,6 @@ def test_workspace_exact_size_accepted_with_packed_weights():
 # ---------------------------------------------------------------------------
 # Workspace buffer tests (issue #3364, Option A)
 # ---------------------------------------------------------------------------
-_WS_CUTLASS_MOE_SUPPORTED_ARCHES = {
-    (8, 9),
-    (9, 0),
-    (10, 0),
-    (10, 3),
-    (11, 0),
-    (12, 0),
-    (12, 1),
-}
-_WS_CUTLASS_MOE_SKIP = pytest.mark.skipif(
-    get_compute_capability(torch.device("cuda"))
-    not in _WS_CUTLASS_MOE_SUPPORTED_ARCHES,
-    reason="CUTLASS fused MoE is not supported on this architecture",
-)
-
 _WS_CFG = dict(
     hidden_size=256,
     intermediate_size=512,
@@ -3637,14 +4648,14 @@ def _ws_size(num_tokens, cfg=_WS_CFG, *, ep_size=1, ep_rank=0, device=None):
     )
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_size_positive_and_monotonic():
     sizes = [_ws_size(n) for n in [256, 1024, 4096, 8192]]
     assert all(s > 0 for s in sizes)
     assert all(sizes[i] <= sizes[i + 1] for i in range(len(sizes) - 1))
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_buffered_matches_unbuffered():
     inputs = _make_ws_inputs(256)
     out_unbuf = _call_ws(*inputs)[0]
@@ -3653,14 +4664,14 @@ def test_workspace_buffered_matches_unbuffered():
     torch.testing.assert_close(out_unbuf, out_buf, rtol=0, atol=0)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_exact_size_accepted():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cuda")
     _call_ws(*inputs, workspace_buffer=ws)  # must not raise
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_exact_size_accepted_with_ep():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(
@@ -3671,7 +4682,7 @@ def test_workspace_exact_size_accepted_with_ep():
     _call_ws(*inputs, workspace_buffer=ws, ep_size=2, ep_rank=0)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_undersized_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(1, dtype=torch.uint8, device="cuda")
@@ -3679,7 +4690,7 @@ def test_workspace_undersized_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_wrong_dtype_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.float32, device="cuda")
@@ -3687,7 +4698,7 @@ def test_workspace_wrong_dtype_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_cpu_tensor_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cpu")
@@ -3695,11 +4706,11 @@ def test_workspace_cpu_tensor_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="workspace device-guard test requires two CUDA devices",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_device_tracks_input_not_current_device():
     with torch.cuda.device(1):
         inputs = _make_ws_inputs(64)
@@ -3716,7 +4727,7 @@ def test_workspace_device_tracks_input_not_current_device():
             _call_ws(*inputs, workspace_buffer=wrong_device_ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_wrong_ndim_rejected():
     inputs = _make_ws_inputs(256)
     n = _ws_size(256)
@@ -3725,7 +4736,7 @@ def test_workspace_wrong_ndim_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_noncontiguous_rejected():
     inputs = _make_ws_inputs(64)
     n = _ws_size(64)
@@ -3736,7 +4747,7 @@ def test_workspace_noncontiguous_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_size_rejects_nonpositive_dims():
     from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
 
@@ -3766,7 +4777,7 @@ def test_workspace_size_rejects_nonpositive_dims():
         )
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_no_alloc_during_buffered_call():
     inputs = _make_ws_inputs(512)
     ws = torch.empty(_ws_size(512), dtype=torch.uint8, device="cuda")
@@ -3787,7 +4798,7 @@ def test_workspace_no_alloc_during_buffered_call():
     )
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_cuda_graph_capture_replay():
     num_tokens = 128
     inputs = _make_ws_inputs(num_tokens)
@@ -3807,6 +4818,41 @@ def test_workspace_cuda_graph_capture_replay():
     out_t = out[0] if isinstance(out, (list, tuple)) else out
     out_e = out_eager[0] if isinstance(out_eager, (list, tuple)) else out_eager
     torch.testing.assert_close(out_t, out_e, rtol=0, atol=0)
+
+
+def _small_moe_inputs(m, hidden, inter, e, top_k, dtype=torch.bfloat16):
+    w31 = torch.randn(e, 2 * inter, hidden, dtype=dtype, device="cuda") / 10
+    w2 = torch.randn(e, hidden, inter, dtype=dtype, device="cuda") / 10
+    logits = torch.randn(m, e, dtype=torch.float32, device="cuda")
+    weights, ids = torch.topk(torch.softmax(logits, -1), top_k)
+    return w31, w2, weights.float().contiguous(), ids.to(torch.int)
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_vectorized_kernel_rejects_misaligned_input():
+    """The vectorized expand/activation kernels need 16B-aligned rows; a
+    misaligned input base must fail fast on the host with a clear diagnostic
+    instead of an IMA (device asserts are compiled out in release builds)."""
+    torch.manual_seed(42)
+    m, hidden, inter, e, top_k = 4, 128, 128, 8, 2
+    w31, w2, weights, ids = _small_moe_inputs(m, hidden, inter, e, top_k)
+
+    # Contiguous view whose base is 2B- but not 16B-aligned.
+    buf = torch.randn(m * hidden + 8, dtype=torch.bfloat16, device="cuda")
+    x = buf[1 : 1 + m * hidden].view(m, hidden)
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+
+    with pytest.raises(Exception, match="16B-aligned"):
+        fused_moe.cutlass_fused_moe(
+            x,
+            ids,
+            weights,
+            w31,
+            w2,
+            torch.bfloat16,
+            quant_scales=None,
+            output=torch.empty_like(x),
+        )
 
 
 if __name__ == "__main__":

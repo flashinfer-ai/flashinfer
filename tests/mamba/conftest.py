@@ -12,6 +12,7 @@ parallel across cores, and is a near-free no-op when the modules are already
 present in the JIT disk cache.
 """
 
+import pytest
 import torch
 
 # Every _CHECKPOINTING_SSU_VARIANT_FIELDS combination requested by
@@ -1013,7 +1014,67 @@ _CHECKPOINTING_SSU_VARIANTS = [
 _PREWARM_MIN_TESTS = 8
 
 
+def _triton_supports_current_arch() -> bool:
+    """Whether the installed Triton's PTX toolchain can target this GPU.
+
+    The mamba references are Triton kernels; when Triton's bundled
+    nvptxcompiler predates the device (e.g. torch-pinned Triton on sm_107),
+    ``make_ptx`` calls ``abort()`` and takes the whole pytest process down —
+    unskippable at test time, so probe the matching ``ptxas`` binary in a
+    subprocess instead. Defaults to True on any probe uncertainty.
+    """
+    import contextlib
+    import os
+    import subprocess
+
+    try:
+        if not torch.cuda.is_available():
+            return True
+        major, minor = torch.cuda.get_device_capability()
+
+        # Imported for the side effect: flashinfer.triton's
+        # _patch_triton_ptxas_blackwell() exports TRITON_PTXAS_BLACKWELL_PATH
+        with contextlib.suppress(Exception):
+            import flashinfer.triton  # noqa: F401
+
+        from triton.backends.nvidia.compiler import get_ptxas
+
+        ptxas = get_ptxas(major * 10 + minor).path
+        for gpu_name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+            r = subprocess.run(
+                [ptxas, "--gpu-name", gpu_name, os.devnull, "-o", os.devnull],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            err = (r.stderr or "") + (r.stdout or "")
+            if "not defined for option 'gpu-name'" not in err:
+                return True
+        return False
+    except Exception:
+        return True
+
+
+# trylast: count only the nodes that will run, after -k/-m and the sharding
+# plugin's --flashinfer-node-file have deselected the rest. A sharding batch of
+# a few checkpointing tests then skips the 57-module prewarm.
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
+    if items and not _triton_supports_current_arch():
+        skip_triton = pytest.mark.skip(
+            reason="installed Triton cannot target this GPU architecture "
+            "(the mamba reference implementations are Triton kernels and "
+            "abort the process at compile time)"
+        )
+        for item in items:
+            item.add_marker(skip_triton)
+        return
+
+    # --collect-only (including the sharding runner's planning pass) runs no
+    # tests, so compiling kernels for them is wasted work.
+    if config.getoption("--collect-only"):
+        return
+
     n_checkpointing = sum(
         1 for item in items if "test_checkpointing_ssu" in item.nodeid
     )
@@ -1072,7 +1133,12 @@ def pytest_collection_modifyitems(config, items):
     os.environ["MAX_JOBS"] = str(max(1, total_jobs // max_workers))
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(spec.build, verbose=False): spec for spec in specs}
+            # Take the per-module lock build_and_load() uses: parallel sharding
+            # workers can prewarm the same modules on a cold cache.
+            futures = {
+                pool.submit(spec.build, verbose=False, need_lock=True): spec
+                for spec in specs
+            }
             for fut in concurrent.futures.as_completed(futures):
                 try:
                     fut.result()

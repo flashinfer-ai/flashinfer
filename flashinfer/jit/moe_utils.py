@@ -20,6 +20,8 @@ from .core import (
     gen_jit_spec,
     current_compilation_context,
 )
+from .cpp_ext import is_windows
+from .windows_header_overlay import get_windows_header_overlay
 
 
 def gen_moe_utils_module() -> JitSpec:
@@ -58,15 +60,29 @@ def gen_moe_utils_module() -> JitSpec:
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
-    symlink_path = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
-    )
-    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
-    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+    canonical_export_path = jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path
+    if is_windows:
+        # On Windows the export headers come from a patched overlay instead of
+        # a symlink (see windows_header_overlay.py); it must come first on the
+        # include path.
+        verify_symlinked_headers(canonical_export_path, BMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = get_windows_header_overlay(
+            canonical_export_path,
+            "moe_utils",
+            BMM_EXPORT_HEADERS,
+            ("flashinfer", "trtllm", "batched_gemm", "trtllmGen_bmm_export"),
+        )
+    else:
+        symlink_path = (
+            jit_env.FLASHINFER_GEN_SRC_DIR
+            / "flashinfer"
+            / "trtllm"
+            / "batched_gemm"
+            / "trtllmGen_bmm_export"
+        )
+        ensure_symlink(symlink_path, canonical_export_path)
+        verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = None
     nvcc_flags = [
         "-DTLLM_GEN_EXPORT_INTERFACE",  # Use relative includes in downloaded headers
         "-DENABLE_BF16",
@@ -74,8 +90,18 @@ def gen_moe_utils_module() -> JitSpec:
         "-DENABLE_FP4",
     ]
 
+    # SM107 (Rubin) must be built for the sm100f family target: no public CUDA
+    # toolkit (13.0 or 13.2) accepts ``compute_107a``, so without this mapping
+    # nvcc aborts with "Unsupported gpu architecture 'compute_107a'". These flags
+    # are passed as ``extra_cuda_cflags`` and override the global flags, so the
+    # mapping must be requested here.
+    # Built for every grouped_mm architecture (SM80 to SM121), where the cuDNN
+    # grouped-GEMM MoE runners sort, permute, activate and finalize with these kernels.
+    # Their SM90+ instructions (PDL) sit behind __CUDA_ARCH__ >= 900, and
+    # moe_sort launches its cluster and cooperative routing kernels only on SM90+
+    # devices, using the block and multi-kernel routing paths below that.
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[8, 9, 10, 11, 12], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -93,12 +119,19 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[
+            *([windows_header_overlay] if windows_header_overlay is not None else []),
             jit_env.FLASHINFER_CSRC_DIR,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",

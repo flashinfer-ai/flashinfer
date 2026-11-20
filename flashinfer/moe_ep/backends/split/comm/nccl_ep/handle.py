@@ -91,10 +91,9 @@ class NcclEpHandle(Handle):
         # long-lived Fleet makes the recv buffers, counter tensors and FFI
         # descriptor objects reusable across forwards. Tensor wrappers are
         # memoized by (data_ptr, dtype, shape), so an entry can only ever
-        # describe the same memory layout it was built for; the dict is cleared
-        # when it grows past a bound (entries are then rebuilt, which is always
-        # safe — each handle only needs address stability within its own
-        # lifetime).
+        # describe the same memory layout it was built for. Only those wrappers
+        # are evicted at the size bound: workspace buffers must stay alive at
+        # their existing addresses for graphs captured against this fleet.
         self._hot = fleet._hot_cache
         self._handle_knobs = _index_knobs(algo_knobs)
         self._stream = self._knob_stream()
@@ -115,6 +114,9 @@ class NcclEpHandle(Handle):
             topk_idx = topk_idx.to(torch.int64)
         self._topk_idx = topk_idx
         self._num_tokens_in = topk_idx.shape[0]
+        # Buffers are sized for the creating shape; update() may only
+        # rebind a token count at or below it.
+        self._max_num_tokens_in = topk_idx.shape[0]
         self._top_k = topk_idx.shape[1]
         self._topk_idx_t = self._wrap(topk_idx)
 
@@ -175,13 +177,41 @@ class NcclEpHandle(Handle):
             self._topk_idx_t,
             layout_info=create_layout_info,  # HT recv-count opt-in; None otherwise
             config=None,
+            # Creation is host-side allocation and must happen OUTSIDE any
+            # capture (nccl_ep.h:422), so it stays on the handle's own stream.
             stream=self._stream,
         )
         _t = _hp("hinit.create_handle_c", _t)
 
+        # InitHandle ran on self._stream. Every later op issued on that same
+        # stream is therefore ordered after it for free. A captured op is not:
+        # the capture stream is a different stream (see _op_stream), and the
+        # dependency cannot be created from inside the capture -- see the
+        # guard in update() for why, and for what the caller must do instead.
+        self._ran_outside_capture = False
+
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
+
+    def _op_stream(self) -> int:
+        """Stream to issue transport work on.
+
+        Normally the handle's own stream: the ``HandleAlgoKnobUserStream``
+        value, else the fleet's. Under CUDA-graph capture that is the wrong
+        one. A handle that outlives a capture is created *before* it begins
+        (see ``update``), so its creation-time stream is not the stream being
+        captured, and work issued there lands outside the graph entirely --
+        the capture records nothing and the replay is a no-op.
+
+        Outside capture this returns exactly what it always did, so non-graph
+        behaviour (including an explicit UserStream) is unchanged.
+        """
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            return torch.cuda.current_stream().cuda_stream
+        return self._stream
 
     # Only memoize wrappers of SMALL tensors: the wrapper keeps the torch tensor
     # alive, so caching wraps of large activations (e.g. 8k-token prefill inputs,
@@ -202,6 +232,15 @@ class NcclEpHandle(Handle):
         never alias the wrong layout — a reused address with a different
         shape/dtype misses and builds a fresh wrapper. Large tensors are
         wrapped per call (see _WRAP_MEMO_MAX_BYTES).
+
+        ONLY call this for a tensor whose address the caller keeps stable. The
+        wrapper holds its torch tensor alive, so memoizing a per-call buffer
+        pins it and stops the allocator handing that address back until the
+        bounded cache is cleared. The memo then misses every time, defeating
+        its own premise. Combine's output is exactly that case and is gated on
+        ``CombineInputParams.out_is_stable``; do not route a churning tensor
+        here on the assumption that a repeated address proves stability, since
+        a freed-then-reallocated buffer repeats on the very next call.
         """
         if t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
             return self._ep.Tensor(t)
@@ -210,13 +249,128 @@ class NcclEpHandle(Handle):
         w = hot.get(key)
         if w is None:
             if len(hot) > self._WRAP_MEMO_MAX_ENTRIES:
-                hot.clear()
+                # Named entries own recv buffers, counters and configs. A
+                # captured graph may still reference their allocations after
+                # later eager calls fill the wrapper memo, so preserve them.
+                for cached_key in list(hot):
+                    if (
+                        isinstance(cached_key, tuple)
+                        and len(cached_key) == 3
+                        and isinstance(cached_key[0], int)
+                    ):
+                        del hot[cached_key]
             w = self._ep.Tensor(t)
             hot[key] = w
         return w
 
+    def update(self, params) -> None:
+        """Rebind to a new step's routing via ``ncclEpUpdateHandle``.
+
+        This is the per-step half of the split that makes CUDA-graph capture
+        possible: ``ncclEpInitHandle`` (done in ``__init__``, via
+        ``create_handle``) allocates and must stay outside the capture, while
+        this call only recomputes routing metadata and is safe to record
+        inside it. Without it a handle is created and destroyed per forward,
+        so a captured graph replays against freed device memory.
+
+        The routing SHAPE is fixed at creation: ``top_k`` because LL passes
+        ``num_topk`` to InitHandle, and the token count because the per-token
+        weights supplied via ``HandleAlgoKnobTopKWeights`` are bound then and
+        are not re-bindable here -- a shorter ``topk_ids`` would leave combine
+        reading weights for rows that no longer exist. Only the routing VALUES
+        may change. That is also all a CUDA graph can express, since it bakes
+        shapes at capture.
+
+        Capture contract: ``InitHandle`` must have completed before
+        ``cudaStreamBeginCapture``, because nothing inside the capture can
+        order the recorded work after it. ``torch.cuda.graph()`` satisfies
+        this -- it synchronizes the device in ``__enter__``. A caller driving
+        the raw capture API must synchronize itself. This method rejects the
+        one case it can see, a first update that is already captured.
+        """
+        import torch
+
+        topk_idx = params.topk_ids
+        if topk_idx.dtype != torch.int64:
+            topk_idx = topk_idx.to(torch.int64)
+        if topk_idx.shape[1] != self._top_k:
+            raise ValueError(
+                f"Handle.update cannot change top_k: handle was created with "
+                f"top_k={self._top_k}, got {topk_idx.shape[1]}. Create a new "
+                "handle instead."
+            )
+        if topk_idx.shape[0] != self._num_tokens_in:
+            raise ValueError(
+                f"Handle.update cannot change the token count: handle was "
+                f"created with {self._num_tokens_in} tokens, got "
+                f"{topk_idx.shape[0]}. The topk_weights bound at creation "
+                "(HandleAlgoKnobTopKWeights) still describe the original "
+                "rows, so a different count would desynchronize combine. "
+                "Create a new handle instead."
+            )
+        if not topk_idx.is_cuda:
+            raise ValueError(
+                f"Handle.update: topk_ids must be on the GPU, got {topk_idx.device}."
+            )
+        if self._topk_idx.is_cuda and topk_idx.device != self._topk_idx.device:
+            raise ValueError(
+                f"Handle.update: topk_ids moved device, {self._topk_idx.device}"
+                f" -> {topk_idx.device}."
+            )
+        if not topk_idx.is_contiguous():
+            raise ValueError("Handle.update: topk_ids must be contiguous.")
+
+        # Ordering against InitHandle. Ops issued on self._stream are ordered
+        # after it by the stream itself, which covers every non-captured call
+        # (_op_stream returns self._stream whenever we are not capturing).
+        #
+        # A captured call is not covered, and cannot be fixed from here: the
+        # capture stream may not wait on an event recorded before the capture
+        # began, and cudaEventSynchronize during capture invalidates it
+        # outright (cudaErrorStreamCaptureInvalidated). The dependency has to
+        # exist before cudaStreamBeginCapture, which is the caller's job --
+        # torch.cuda.graph() does it, synchronizing the device in __enter__.
+        #
+        # So this cannot verify the ordering, only that the documented recipe
+        # was followed: one update outside the capture before the captured
+        # one. That is a cheap, loud stand-in for a race that is otherwise
+        # silent until replay.
+        op_stream = self._op_stream()
+        if op_stream == self._stream:
+            self._ran_outside_capture = True
+        elif not self._ran_outside_capture:
+            raise RuntimeError(
+                "Handle.update: the first update on this handle cannot be "
+                "the captured one -- nothing inside a capture can order it "
+                "after InitHandle. Run one update outside the capture first "
+                "(the standard warmup does this), having synchronized before "
+                "capture began (torch.cuda.graph does this for you)."
+            )
+
+        self._topk_idx = topk_idx
+        self._num_tokens_in = topk_idx.shape[0]
+        self._topk_idx_t = self._wrap(topk_idx)
+        # layout_info is the HT recv-count opt-in and None for LL, which is
+        # exactly what ncclEpUpdateHandle requires of each mode. See
+        # _op_stream() for why this is not simply self._stream.
+        self._handle.update(
+            self._topk_idx_t,
+            layout_info=self._create_layout_info,
+            stream=op_stream,
+        )
+
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         x = params.x[0]
+        # The activation count must match the routing the handle currently
+        # holds. A mismatch passes the per-path capacity guards and reaches
+        # NCCL-EP, which indexes routing by row.
+        if x.shape[0] != self._num_tokens_in:
+            raise MoEEpConfigError(
+                f"dispatch received {x.shape[0]} activation rows but the "
+                f"handle's routing has {self._num_tokens_in}. Pass the same "
+                "token count as the topk_ids this handle was created with or "
+                "last updated to."
+            )
         if self._is_ht:
             return self._dispatch_ht(x)
         if self._is_rank_major:
@@ -229,7 +383,25 @@ class NcclEpHandle(Handle):
         _t = _pc() if _HP else None
         world_size = self._fleet.bootstrap.world_size
         max_per_rank = self._fleet.params.max_tokens_per_rank
-        hidden = self._fleet.params.token_hidden_size
+        # The recv row mirrors the sent row (shape AND dtype). This is
+        # FleetParams.token_hidden_size for plain BF16 dispatch, but a kernel
+        # backend's pack_dispatch_payload may send a narrower packed row (e.g.
+        # MXFP8 payload + scale bytes as uint8) within the transport's
+        # token_hidden_size * dtype_bytes byte budget.
+        hidden = x.shape[1]
+
+        # LL sizes its staging to max_tokens_per_rank; dispatching more than
+        # that overruns the buffer and the kernel dies with a SIGSEGV carrying
+        # no Python traceback. HT already refuses this (see _dispatch_ht);
+        # LL did not, so the same mistake was silent memory corruption.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep LL dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank}). Size the "
+                "Fleet for the largest per-rank token count you will dispatch "
+                "(FleetParams.max_tokens_per_rank), or dispatch in chunks."
+            )
 
         # Fleet-cached recv buffer (a fresh Handle is created every forward, so
         # per-handle caching never hits; the fleet persists).
@@ -280,10 +452,10 @@ class NcclEpHandle(Handle):
             outputs,
             layout_info=layout_info,
             config=config,
-            stream=self._stream,
+            stream=self._op_stream(),
         )
         _t = _hp("ll_disp.ffi_dispatch", _t)
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
         _t = _hp("ll_disp.ffi_complete", _t)
 
         self._dispatch_inputs = inputs
@@ -307,7 +479,21 @@ class NcclEpHandle(Handle):
 
         world_size = self._world_size
         max_per_rank = self._fleet.params.max_tokens_per_rank
-        hidden = self._fleet.params.token_hidden_size
+        # Recv row mirrors the sent row; see _dispatch_ll.
+        hidden = x.shape[1]
+        # LL sizes its staging to max_tokens_per_rank; dispatching more than
+        # that overruns the buffer and the kernel dies with a SIGSEGV carrying
+        # no Python traceback. HT already refuses this (see _dispatch_ht);
+        # LL did not, so the same mistake was silent memory corruption.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep LL dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank}). Size the "
+                "Fleet for the largest per-rank token count you will dispatch "
+                "(FleetParams.max_tokens_per_rank), or dispatch in chunks."
+            )
+
         m = max_per_rank * world_size
 
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
@@ -348,9 +534,9 @@ class NcclEpHandle(Handle):
             outputs,
             layout_info=layout_info,
             config=config,
-            stream=self._stream,
+            stream=self._op_stream(),
         )
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
 
         self._dispatch_inputs = inputs
         self._dispatch_outputs = outputs
@@ -371,7 +557,8 @@ class NcclEpHandle(Handle):
         import torch
 
         max_per_rank = self._fleet.params.max_tokens_per_rank
-        hidden = self._fleet.params.token_hidden_size
+        # Recv row mirrors the sent row; see _dispatch_ll.
+        hidden = x.shape[1]
         world = self._fleet.params.num_experts // self._num_local_experts
         num_recv = max_per_rank * world
 
@@ -404,7 +591,7 @@ class NcclEpHandle(Handle):
         cached = self._hot.get("ht_recv_bufs")
         if (
             cached is None
-            or cached[0].shape[0] != num_recv
+            or cached[0].shape != (num_recv, hidden)
             or cached[1].shape[1] != self._top_k
             or cached[0].dtype != x.dtype
             or cached[0].device != x.device
@@ -442,10 +629,14 @@ class NcclEpHandle(Handle):
         _t = _hp("ht_disp.build_ffi_objs", _t)
 
         self._handle.dispatch(
-            inputs, outputs, layout_info=None, config=config, stream=self._stream
+            inputs,
+            outputs,
+            layout_info=None,
+            config=config,
+            stream=self._op_stream(),
         )
         _t = _hp("ht_disp.ffi_dispatch", _t)
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
         _t = _hp("ht_disp.ffi_complete", _t)
 
         self._dispatch_inputs = inputs
@@ -478,20 +669,25 @@ class NcclEpHandle(Handle):
                 self._num_tokens_in, hidden, dtype=x.dtype, device=x.device
             )
         )
+        # The stability promise applies only to a caller-supplied buffer.
+        # An output allocated above is fresh even if the flag was set.
+        out_is_stable = params.out is not None and params.out_is_stable
 
         if self._is_ht:
             x2d = x.reshape(-1, hidden)
-            # Cache the static config; the token wraps go through the _wrap
-            # memo (x2d is a fresh view each call, out_t may alias new tensors).
+            # Cache the static config and explicitly stable output only.
             ck = ("ht_comb_cfg", self._staged)
             config = self._hot.get(ck)
             if config is None:
                 config = self._ep.CombineConfig(send_only=int(self._staged))
                 self._hot[ck] = config
-            outputs = self._ep.CombineOutputs(tokens=self._wrap(out_t))
+            out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
+            outputs = self._ep.CombineOutputs(tokens=out_w)
             inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
-            self._handle.combine(inputs, outputs, config=config, stream=self._stream)
-            self._handle.complete(stream=self._stream)
+            self._handle.combine(
+                inputs, outputs, config=config, stream=self._op_stream()
+            )
+            self._handle.complete(stream=self._op_stream())
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             self._combine_x2d = x2d
@@ -501,9 +697,11 @@ class NcclEpHandle(Handle):
             inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x))
             outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
             config = self._ep.CombineConfig(send_only=int(self._staged))
-            self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+            self._handle.combine(
+                inputs, outputs, config=config, stream=self._op_stream()
+            )
             if self._staged:
-                self._handle.complete(stream=self._stream)
+                self._handle.complete(stream=self._op_stream())
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             return CombineOutput(x=out_t)
@@ -529,14 +727,19 @@ class NcclEpHandle(Handle):
             config = self._ep.CombineConfig(send_only=int(self._staged))
             self._hot[ck] = config
         inputs = self._ep.CombineInputs(tokens=self._wrap(x))
+        # Memoize the output descriptor only when the caller owns a stable
+        # buffer (a graph state does; the default forward's empty_like does
+        # not). Caching a per-call buffer retains one output per forward until
+        # the bounded cache is cleared -- see _wrap.
+        out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
         outputs = self._ep.CombineOutputs(
-            tokens=self._wrap(out_t),
+            tokens=out_w,
             topk_weights=weights_t,
         )
 
-        self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+        self._handle.combine(inputs, outputs, config=config, stream=self._op_stream())
         if self._staged:
-            self._handle.complete(stream=self._stream)
+            self._handle.complete(stream=self._op_stream())
 
         self._combine_inputs = inputs
         self._combine_outputs = outputs

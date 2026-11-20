@@ -10,16 +10,16 @@ It spans **two repositories**:
 - **FlashInfer** — branch `feat/vllm-moe-ep-api` off `upstream/main`
   (`github.com/Anerudhan/flashinfer`, remote `origin`).
 - **vLLM** — branch `feat/flashinfer-ep-all2all` off `Anerudhan/vllm` `main`
-  (upstream `vllm-project/vllm` fork), cloned at `/home/scratch.agopal_sw/play/NCCL/vllm`.
+  (upstream `vllm-project/vllm` fork), cloned locally.
 
-> Status: code complete + **GPU-validated on Pre-Nyx (8×GPU, single node, CUDA 13.2)** — see
+> Status: code complete + **GPU-validated (8×B200 single node, CUDA 13.2)** — see
 > §0. Both `flashinfer_ep_low_latency` and `flashinfer_ep_high_throughput` pass end-to-end
 > (smoke, GSM8K, throughput). Deferred: DeepEP comparison column (DeepEP's own CUDA-13.2 build
 > fails), raw NCCL-EP backend (not in upstream vLLM), 2-node, and `bench serve` TTFT/TPOT.
 
 ---
 
-## 0. Validated results (Pre-Nyx, 8×GPU single node, CUDA 13.2)
+## 0. Validated results (8×B200 single node, CUDA 13.2)
 
 Base image `nvcr.io/nvidia/pytorch:26.05-py3`; vLLM built from source (torch gate passed);
 FlashInfer run from the branch. All checks below **pass**:
@@ -163,7 +163,7 @@ Base image is **forced** to `nvcr.io/nvidia/pytorch:26.05-py3` (CUDA 13.2): cros
 aborts (`nccl_ep.cc:2884 illegal memory access`) on any non-13.2 stack, and the plan requires
 2-node HT. vLLM is therefore built **from source** against the image's torch.
 
-> **Pre-Nyx (and most SLURM clusters) have no Docker daemon** — images are built with
+> **The validation cluster (like most SLURM clusters) has no Docker daemon** — images are built with
 > **pyxis/enroot** via `srun --container-save`, not `docker build`. This is how the `.sqsh`
 > images used for all results were produced. The `docker/Dockerfile.*` files remain the
 > canonical build spec and are usable on a machine that *does* have Docker (see the optional
@@ -197,7 +197,7 @@ so the build uses NGC-26.05's torch. If they are incompatible the vLLM build fai
 before anything else. Runtime env baked in: `NCCL_NET_PLUGIN=none` (HPC-X v8 segfaults NCCL
 ≥2.30), the 2.30.7 `libnccl` symlink, and the HT-JIT toolchain env.
 
-**Optional — on a Docker host / CI** (not Pre-Nyx): the same images build directly from the
+**Optional — on a Docker host / CI** (not the SLURM cluster): the same images build directly from the
 Dockerfiles.
 ```bash
 docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .
@@ -232,7 +232,7 @@ Validate dispatch+combine correctness at world=8 via the **comm-matrix `--valida
 `--gres`** on this cluster). The exact runner:
 ```bash
 srun --ntasks-per-node=8 --container-image=$RW/flashinfer-ep-pt2605.sqsh --container-mounts=$RW:/host \
-  bash -lc 'EP_SYNC=/host/sync_ht NCCL_GIN_TYPE=3 bash /host/<checkout>/benchmarks/run_ep_matrix_one_pt.sh \
+  bash -lc 'EP_SYNC=/host/sync_ht NCCL_GIN_TYPE=3 bash /host/<checkout>/benchmarks/moe_ep/core/comm/run_ep_matrix_one_pt.sh \
     --algorithm ht --layout fl --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate'
 # LL: --algorithm ll --layout em --tokens 128 --validate
 ```
@@ -303,10 +303,10 @@ Validate the **LL** path first (§5) — it maps cleanly and has no such open po
 ```bash
 # per-rank wrapper; file:// rendezvous on a shared mount
 EP_SYNC=/shared/ep_sync srun --ntasks-per-node=8 \
-    benchmarks/run_ep_matrix_one.sh <bench_ep_matrix.py args>
-# or the single-process driver:
-torchrun --nproc_per_node=8 benchmarks/bench_moe_ep.py \
-    --tokens 8192 --world-size 8 --backend nccl_ep --quant bf16
+    benchmarks/moe_ep/core/comm/run_ep_matrix_one.sh <bench_ep_matrix.py args>
+# or the nccl_ep / nixl_ep layer benchmark (one process per GPU):
+torchrun --nproc_per_node=8 benchmarks/moe_ep/bench_moe_ep_fleet.py \
+    --tokens 8192 --backend nccl_ep --quant bf16
 ```
 
 ### 7.2 End-to-end serving perf (the comparison matrix)
@@ -343,3 +343,98 @@ the competitive datapoint. For a per-stage breakdown, add an nsys capture
 `--all2all-backend` values: `flashinfer_ep_low_latency`, `flashinfer_ep_high_throughput`
 (this work); `nccl_low_latency`, `nccl_high_throughput` (raw nccl.ep, if present);
 `deepep_low_latency`, `deepep_high_throughput` (DeepEP).
+
+## 8. Fault tolerance — future vLLM wiring (design note)
+
+**No vLLM code ships with this change.** FlashInfer now exposes the FT rank-mask
+API (see `moe_ep_runbook.md`); this section records the target shape so a later
+vLLM commit is mechanical.
+
+vLLM already owns the contract — `All2AllManagerBase.support_fault_tolerance`,
+`query_active_mask()`, `query_fault()`, and a per-step hook in
+`gpu_model_runner.py` that calls `query_fault()` on the async-output stream.
+The native `nixl_ep` manager is the reference implementation. The FlashInfer-EP
+managers added by PR #47948 simply hardcode `support_fault_tolerance = False`.
+
+### Target shape
+
+```python
+class FlashInferEPAll2AllManagerBase(All2AllManagerBase):
+    _transport = "nccl_ep"          # subclass overrides to "nixl_ep"
+
+    def __init__(self, cpu_group, ...):
+        from flashinfer.moe_ep import supports_fault_tolerance
+        self.support_fault_tolerance = (
+            envs.VLLM_FLASHINFER_EP_FAULT_TOLERANCE
+            and supports_fault_tolerance(self._transport)
+        )
+
+    def _make_fleet(self, args):
+        knobs = [FleetAlgoKnobAllocator(torch_caching=True)]
+        if self.support_fault_tolerance:
+            knobs.append(FleetAlgoKnobFaultTolerance(
+                timeout_ms=envs.VLLM_FLASHINFER_EP_TIMEOUT_MS))
+            if self._transport == "nixl_ep":
+                knobs.append(FleetAlgoKnobTopologyCapacity(
+                    n=envs.VLLM_NIXL_EP_MAX_NUM_RANKS))
+        ...
+
+    def query_active_mask(self) -> torch.Tensor:
+        return self._primary_fleet().query_active_mask()   # already int32[world], 1 = active
+
+    def query_fault(self) -> torch.Tensor:
+        cur = self.query_active_mask()
+        return (cur != self._last_mask).any()
+```
+
+Because the manager is transport-parameterized (`_transport`), **both**
+`flashinfer_ep_low_latency` (NCCL-EP) and `flashinfer_ep_nixl` inherit FT from
+the one base class.
+
+### Four things the vLLM commit must get right
+
+1. **The HT manager keeps `support_fault_tolerance = False`.** FlashInfer's
+   `validate_fleet_params` rejects FT + HIGH_THROUGHPUT outright (nccl leaves
+   the mask buffer NULL and later mask calls abort the process; nixl has no HT
+   mask), so the HT subclass must override rather than inherit.
+
+2. **`self._fleets` is a dict keyed by MoE config, and every entry shares one
+   EP group.** FT state must therefore be reconciled across *all* of them, not
+   just one — hoist the FT operations onto a designated primary fleet (and fan
+   `update_topology` out). This is the one genuinely non-trivial piece; the
+   native `NixlEPAll2AllManager` sidesteps it with a class-level singleton
+   buffer. Reconciling each fleet independently would burn one store round per
+   fleet and, worse, let them drift.
+
+3. **Polarity is not comparable across managers today.** vLLM's existing
+   `NixlEPAll2AllManager.query_active_mask()` returns the *raw* NIXL buffer —
+   i.e. nonzero means *masked*, despite the method name — and the DeepEP-LL
+   manager likewise returns its raw buffer. Neither is a bug today because the
+   only consumers are a `(cur != last).any()` diff and a debug print. The
+   FlashInfer manager returns **1 = active**. Propose normalizing the base
+   contract to 1 = active as a follow-up; until then, do not compare masks
+   across manager types.
+
+4. **Degraded serving needs a home.** vLLM currently turns a detected fault
+   into a `RuntimeError` and the engine dies — there is no continue-serving
+   path. The alternative this API enables: on fault, the worker calls
+   `fleet.reconcile_active_mask()` + `fleet.clear_faults(readmit=False)`
+   between steps and reports the new mask to the engine core as a control-plane
+   event instead of raising. That is *why* FlashInfer exposes reconcile/clear at
+   all; vLLM has nowhere to put them yet. Note the quality caveat: a masked
+   rank's tokens are dropped with no topk renormalization (formula in the
+   runbook), so a serving deployment should surface the surviving-weight
+   fraction or fail requests below a threshold rather than silently degrade.
+
+**Placement:** `query_fault()` from the existing `check_ep_fault` hook;
+`reconcile_active_mask()` / `clear_faults()` from the fault branch of
+`get_output()` or a new engine-level handler — **never** inside a captured CUDA
+graph (FlashInfer raises on capture).
+
+**Proposed env vars:** `VLLM_FLASHINFER_EP_FAULT_TOLERANCE` (default 0),
+`VLLM_FLASHINFER_EP_TIMEOUT_MS` (default 0 = transport default).
+
+**A rank can be told it is dead.** `reconcile_active_mask()` raises
+`MoEEpRankEvictedError` on a worker the survivors masked out. vLLM should treat
+that as "shut this worker down / hand it back to the elastic-EP scale flow",
+not as a transient error to retry.

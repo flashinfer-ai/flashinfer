@@ -141,6 +141,16 @@ class SoftmaxRole:
         4. Transforming scores using exp2(x*scale - max*scale)
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
+
+        CONTRACT: step() advances the applicable pipeline participants
+        internally — mma_si_consumer always; s0_s1_sequence_producer
+        (stage 0) or s0_s1_sequence_consumer (stage 1) and si_corr_producer
+        only on non-logits-transform builds — and returns all four.  Every
+        call site MUST tuple-unpack them back into the same variables
+        (rebinding an unmutated participant is harmless).  That rebinding
+        assignment is what marks the participants as loop-carried in
+        run()'s dynamic loops — dropping it silently freezes their state
+        across iterations (see the helper-method rules in loader_tma.py).
         """
         assert self.q_dtype is not None
         assert self.o_dtype is not None

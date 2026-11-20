@@ -185,6 +185,7 @@ def make_prefill_topology(
     softmax_corr_stages: int = 1,
     mma_corr_stages: int = 2,
     epi_stages: int = 2,
+    load_pt_stages: int | None = None,
 ) -> PipelineTopology:
     """Build the pipeline topology for FMHA prefill.
 
@@ -195,8 +196,15 @@ def make_prefill_topology(
                                 --[mma_corr]------------------------------>
                                               Softmax0 --[s0_s1_seq]--> Softmax1
 
+    With ``load_pt_stages`` set (paged KV at high pages-per-tile), a tenth
+    pipeline feeds the loader pre-clamped page ids from the otherwise-idle
+    empty warp::
+
+        PT_Load --[load_pt]--> Load
+
     :param schedule: Warp schedule defining warp role assignments.
     :param kv_stages: Stage count for KV pipeline (3 for fp16/bf16, 4 for fp8).
+    :param load_pt_stages: Page-table ring depth, or None for no pt pipeline.
     """
     s = schedule
     load = (s.load_warp_id,)
@@ -206,8 +214,10 @@ def make_prefill_topology(
     corr = s.correction_warp_ids
     epi = (s.epilogue_warp_id,)
 
+    pt_edges = _load_pt_edges(schedule, load_pt_stages)
     return PipelineTopology(
-        edges=[
+        edges=pt_edges
+        + [
             PipelineEdge(
                 "load_q",
                 PipelineType.TMA_UMMA,
@@ -280,12 +290,30 @@ def make_prefill_topology(
     )
 
 
+def _load_pt_edges(
+    schedule: WarpSchedule, load_pt_stages: int | None
+) -> List[PipelineEdge]:
+    """The empty-warp -> loader page-table edge ([] when disabled)."""
+    if load_pt_stages is None:
+        return []
+    return [
+        PipelineEdge(
+            "load_pt",
+            PipelineType.CP_ASYNC,
+            stages=load_pt_stages,
+            producer_warp_ids=(schedule.empty_warp_id,),
+            consumer_warp_ids=(schedule.load_warp_id,),
+        )
+    ]
+
+
 def make_prefill_topology_transform(
     schedule: WarpSchedule,
     q_stages: int = 2,
     kv_stages: int = 3,
     mma_softmax_stages: int = 1,
     epi_stages: int = 2,
+    load_pt_stages: int | None = None,
 ) -> PipelineTopology:
     """Build the pipeline topology for FMHA prefill with logits_transform variants.
 
@@ -298,8 +326,12 @@ def make_prefill_topology_transform(
               --[load_kv]->     --[mma_s1]--> Softmax1 --[s1_epi]-->
                                 Softmax0 --[s0_s1_seq]--> Softmax1
 
+    With ``load_pt_stages`` set, the same PT_Load --[load_pt]--> Load edge
+    as :func:`make_prefill_topology`.
+
     :param schedule: Warp schedule defining warp role assignments.
     :param kv_stages: Stage count for KV pipeline (3 for fp16/bf16, 4 for fp8).
+    :param load_pt_stages: Page-table ring depth, or None for no pt pipeline.
     """
     s = schedule
     load = (s.load_warp_id,)
@@ -308,8 +340,10 @@ def make_prefill_topology_transform(
     s1 = s.softmax1_warp_ids
     epi = (s.epilogue_warp_id,)
 
+    pt_edges = _load_pt_edges(schedule, load_pt_stages)
     return PipelineTopology(
-        edges=[
+        edges=pt_edges
+        + [
             PipelineEdge(
                 "load_q",
                 PipelineType.TMA_UMMA,

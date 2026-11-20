@@ -83,8 +83,8 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // this is a full table of which token is routed to which expert.
   // the assumption here is that there are no more than 128 experts.
   // we use a stride of 33 instead of 32 to avoid shared memory bank conflicts.
-  __shared__ int32_t __attribute((
-      aligned(128))) smemExpertTokenCountFull[WarpKernelMaxNumTokens][WarpKernelSmemStride];
+  __shared__ int32_t __align__(128)
+      smemExpertTokenCountFull[WarpKernelMaxNumTokens][WarpKernelSmemStride];
   static_assert(WarpKernelSmemStride == WarpSize + 1);
   static_assert(KernelParams::MaxNumExperts / sizeof(int32_t) <= WarpSize);
 
@@ -132,6 +132,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         if (params.mPtrTopKWeights != nullptr) {
           params.mPtrTopKWeights[tokenIdx] = finalScore;
         }
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+        }
       }
     }
   } else {
@@ -162,6 +165,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     setBits</* IsZero= */ true>(expertTokenCount, 1, scoreIdx.idx % ExpertsPerThread);
     if (threadIdx.x < params.mNumTokens) {
       smemExpertTokenCountFull[threadIdx.x][scoreIdx.idx / ExpertsPerThread] = expertTokenCount;
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[threadIdx.x] = scoreIdx.idx;
+      }
     }
   }
 
@@ -183,13 +189,30 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     expertCount += expertTokenCount;
   }
 
+  // Keep routing decisions for all experts so remote tokens receive a -1 permutation index.
+  // Only local experts contribute CTAs and padded rows.
+  int32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+  int32_t localExpertCount[ExpertsPerThread];
+  int32_t mappedLocalExpertIdx[ExpertsPerThread];
+  bool isLocalExpertPerExpert[ExpertsPerThread];
+#pragma unroll
+  for (int ii = 0; ii < ExpertsPerThread; ++ii) {
+    auto const expertIdx = static_cast<int32_t>(threadIdx.x) * ExpertsPerThread + ii;
+    auto const localExpertIdx = expertIdx - params.mLocalExpertsStartIdx;
+    auto const isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                               (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+    isLocalExpertPerExpert[ii] = isLocalExpert;
+    mappedLocalExpertIdx[ii] = localExpertIdx >> params.mLocalExpertsStrideLog2;
+    localExpertCount[ii] = isLocalExpert ? getBits(expertCount, ii) : 0;
+  }
+
   // at this point, we are ready for the scan across all experts to get the
   // thread-wise offsets across experts
   // first, we need to reduce across our 4 experts into `numCta`
   int32_t numCta = 0;
 #pragma unroll
   for (int ii = 0; ii < ExpertsPerThread; ++ii) {
-    auto count = getBits(expertCount, ii);
+    auto count = localExpertCount[ii];
     int32_t num;
     if (params.mIsPow2) {
       num = divUpLog2<int32_t>(count, params.mPaddingLog2);
@@ -209,7 +232,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   auto ctaOffsetExp = ctaOffset;
 #pragma unroll
   for (int ii = 0; ii < ExpertsPerThread; ++ii) {
-    auto count = getBits(expertCount, ii);
+    auto count = localExpertCount[ii];
     int32_t finalNumCta;
     if (params.mIsPow2) {
       finalNumCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
@@ -217,11 +240,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
     }
 
-    auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
     // during the scan for expert offsets, we can already write out
     // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
+    // Only local experts have CTAs, and batch indices address this rank's weight tensors.
     for (int cta = 0; cta < finalNumCta; ++cta) {
-      params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = expertIdx;
+      params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = mappedLocalExpertIdx[ii];
       // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
       int32_t mnLimit1;
       int32_t mnLimit2;
@@ -233,6 +256,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         mnLimit2 = mulTileN<int32_t>(ctaOffsetExp, params.mTileTokensDim) + count;
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
+      initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
     }
     ctaOffsetExp += finalNumCta;
   }
@@ -255,7 +279,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // for this, we perform a scan similar to the one directly after the warp-scan:
   // here, we keep the local offset for each of the thread's experts in a field
   // of registers
-  auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
   // Convert CTA-level ctaOffset back to token-space (CGA granularity)
   int32_t finalExpertOffset[ExpertsPerThread];
   if (params.mIsPow2) {
@@ -267,9 +290,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   for (int ii = 1; ii < ExpertsPerThread; ++ii) {
     int32_t tmp;
     if (params.mIsPow2) {
-      tmp = divUpMulLog2<int32_t>(getBits(expertCount, ii - 1), params.mPaddingLog2);
+      tmp = divUpMulLog2<int32_t>(localExpertCount[ii - 1], params.mPaddingLog2);
     } else {
-      tmp = divUpMulTileN<int32_t>(getBits(expertCount, ii - 1), params.mTileTokensDim);
+      tmp = divUpMulTileN<int32_t>(localExpertCount[ii - 1], params.mTileTokensDim);
     }
     finalExpertOffset[ii] = finalExpertOffset[ii - 1] + tmp;
   }
@@ -289,11 +312,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       // determine whether the offset for this expert and token changes
       auto localOffsetToken = getBits(expertOffset[tokenIdx], ii);
       auto isTokenRouted = getBits(expertOffset[tokenIdx + 1], ii) > localOffsetToken;
-      // the expert index of this expert
-      auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
-      auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
-      auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+      auto isLocalExpert = isLocalExpertPerExpert[ii];
       // the permuted index: we add the local offset relative to this expert and token
       // to the global offset from the scan for this expert
       auto permutedIdx = isLocalExpert ? finalExpertOffset[ii] + localOffsetToken : int32_t{-1};
@@ -328,7 +347,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
   using TypePacked = PackedScoreIdx<OutputT>;
-  __shared__ TypePacked __attribute((aligned(128))) smemPackedScoreIdx[NumWarps];
+  __shared__ TypePacked __align__(128) smemPackedScoreIdx[NumWarps];
 
   uint32_t const clusterBlockRank = blockIdx.x;
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
@@ -380,6 +399,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   // make packed scores available to all threads in cluster
   __cluster_barrier_arrive();
   __cluster_barrier_wait();
+
+  // Publish the same top-1 expert selected by the permutation path for FromLogits replay.
+  if (laneIdx == 0 && validToken && params.mPtrRoutingReplayOut != nullptr) {
+    params.mPtrRoutingReplayOut[warpTokenIdx] = smemPackedScoreIdx[warpIdx].idx;
+  }
 
   if (params.mPtrTopKIds != nullptr || params.mPtrScores != nullptr) {
     routingPermutation<KernelParams, OutputT, NumThreads, NumWarps, MaxNumTopExperts,
@@ -459,6 +483,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       auto finalScore = OutputT{sigmoid_accurate(float{warpMaxScore[0]})};
       TypePacked packedScore{finalScore, static_cast<int16_t>(warpMaxExpertIdx[0])};
       params.mPtrTopKPacked[tokenIdx] = packedScore;
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+      }
     }
   }
 

@@ -1,0 +1,4 @@
+# Receipt-bound generated sources (Cake export of cake_rmsnorm_train): the source registry attests these bytes;
+# formatting them would break the receipts that bind them to the exporter.
+DisableFormat: true
+SortIncludes: Never

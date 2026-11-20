@@ -6,8 +6,8 @@
 
 This module intentionally has *no* ``cuda.tile`` imports so it stays
 importable on environments where the cuTile compile chain isn't present
-(e.g. ``flashinfer-ci-cu126/cu128/cu129`` docker images, which target CUDA
-12.x ecosystems and don't ship the ``nvidia-cuda-tileiras`` cu13 toolchain).
+(e.g. CUDA 12 CI images, which intentionally don't ship the
+``nvidia-cuda-tileiras`` compile toolchain).
 Callers — including pytest skip-guards — can use
 :func:`is_cuda_tile_available` to gate ``backend="cutile"`` paths without
 triggering a hard ``ImportError`` at module import time.
@@ -18,6 +18,41 @@ import importlib.util
 import os
 import shutil
 import subprocess
+from collections import OrderedDict
+
+# ---------------------------------------------------------------------------
+# Hinted-kernel cache (ported from tilegym.ops.cutile.utils.cached_replace_hints)
+# ---------------------------------------------------------------------------
+# cuTile's per-shape JIT compile cache lives *on the hinted-kernel object*
+# returned by ``kernel.replace_hints(...)``. Calling ``replace_hints`` afresh on
+# every launch (as a naive migration does) builds a new object each time and
+# discards that compile cache -> a full recompile per launch on the non-autotune
+# / single-config paths. Memoizing the hinted kernel keeps the compile cache
+# alive across launches, matching the TileGym source behavior.
+#
+# Deliberately no ``cuda.tile`` import here so this module stays importable on
+# environments without the cuTile compile chain (see module docstring).
+_HINTED_KERNEL_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_HINTED_KERNEL_CACHE_MAX = 256
+
+
+def cached_replace_hints(kernel, **hints):
+    """Return a memoized ``kernel.replace_hints(**hints)``.
+
+    Keyed on ``(id(kernel), sorted(hints))``. The source kernel is stored
+    alongside the hinted kernel so its ``id()`` cannot be recycled while the
+    entry is live. Bounded LRU (cap ``_HINTED_KERNEL_CACHE_MAX``).
+    """
+    key = (id(kernel), tuple(sorted(hints.items())))
+    entry = _HINTED_KERNEL_CACHE.get(key)
+    if entry is not None:
+        _HINTED_KERNEL_CACHE.move_to_end(key)
+        return entry[0]
+    hinted = kernel.replace_hints(**hints)
+    _HINTED_KERNEL_CACHE[key] = (hinted, kernel)  # keep owner alive
+    if len(_HINTED_KERNEL_CACHE) > _HINTED_KERNEL_CACHE_MAX:
+        _HINTED_KERNEL_CACHE.popitem(last=False)
+    return hinted
 
 
 def _find_tileiras_binary() -> str | None:
@@ -52,7 +87,7 @@ def _tileiras_supports_arch(tileiras_path: str, sm_arch: str) -> bool:
         return True  # assume supported if we can't check
 
 
-def is_cuda_tile_available() -> bool:
+def is_cuda_tile_available(device=None) -> bool:
     """Return True iff cuTile kernels can actually JIT-compile in this env.
 
     A working cuTile setup requires *both*:
@@ -67,8 +102,8 @@ def is_cuda_tile_available() -> bool:
        b. As ``tileiras`` on ``PATH``.
        c. As ``${CUDA_HOME:-/usr/local/cuda}/bin/tileiras`` (system CTK 13.1+).
 
-    Also verifies that the installed tileiras binary supports the current GPU's
-    SM architecture (e.g. ``sm_90`` for Hopper).  Some cuda-tile wheel builds
+    Also verifies that the installed tileiras binary supports the requested GPU's
+    SM architecture (the current GPU when ``device`` is omitted). Some cuda-tile wheel builds
     (e.g. the cu13 toolchain shipped with ``9.9.99.dev*``) do not include SM90
     support even though the Python API lists it as a valid target; calling
     ``compile_cubin`` with ``--gpu-name sm_90`` would crash mid-autotune with a
@@ -93,16 +128,29 @@ def is_cuda_tile_available() -> bool:
     if tileiras_path is None:
         return False
 
-    # Check that the installed tileiras supports the current GPU's SM arch.
+    # Check that the installed tileiras supports the requested GPU's SM arch.
     # Some toolchain builds omit certain architectures (e.g. cu13 drops sm_90).
     try:
         import torch
 
         if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
+            major, minor = torch.cuda.get_device_capability(device)
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
                 return False
+            # cuda.tile also compiles through NVRTC; an NVRTC older than the
+            # device arch fails at launch with "invalid value for
+            # --gpu-architecture" even when tileiras itself is fine.
+            try:
+                from cuda.bindings import nvrtc as _nvrtc
+
+                err, num_archs = _nvrtc.nvrtcGetNumSupportedArchs()
+                if int(err) == 0 and num_archs > 0:
+                    err, archs = _nvrtc.nvrtcGetSupportedArchs()
+                    if int(err) == 0 and (major * 10 + minor) not in list(archs):
+                        return False
+            except Exception:
+                pass  # bindings missing/too old — fall through to tileiras verdict
     except Exception:
         pass  # no torch or no GPU — skip arch check, let the caller decide
 

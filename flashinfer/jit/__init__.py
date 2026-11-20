@@ -17,6 +17,8 @@ limitations under the License.
 import ctypes
 import functools
 import os
+import platform
+import torch
 
 # Re-export
 from . import cubin_loader
@@ -25,7 +27,6 @@ from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import gen_cudnn_fmha_module as gen_cudnn_fmha_module
 from .attention import gen_batch_attention_module as gen_batch_attention_module
-from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
@@ -47,7 +48,6 @@ from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
 from .attention import get_batch_attention_uri as get_batch_attention_uri
-from .attention import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .attention import get_batch_decode_uri as get_batch_decode_uri
 from .attention import get_batch_mla_uri as get_batch_mla_uri
 from .attention import get_batch_prefill_uri as get_batch_prefill_uri
@@ -73,17 +73,24 @@ from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
 from .core import sm103a_nvcc_flags as sm103a_nvcc_flags
+from .core import sm107a_nvcc_flags as sm107a_nvcc_flags
 from .core import sm110a_nvcc_flags as sm110a_nvcc_flags
 from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
 from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
-from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
-from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
+from .comm import gen_cake_alltoall_module as gen_cake_alltoall_module
+from .comm import (
+    gen_nvlink_one_sided_alltoall_module as gen_nvlink_one_sided_alltoall_module,
+)
+from .comm import (
+    gen_nvlink_two_sided_alltoall_module as gen_nvlink_two_sided_alltoall_module,
+)
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (
     gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
@@ -92,25 +99,147 @@ from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
+from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
+from .cake_megamoe_topk_reduce import (
+    gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
+)
+from .cake_sampling import gen_cake_sampling_module as gen_cake_sampling_module
+from .cake_sampling import get_cake_sampling_uri as get_cake_sampling_uri
+from .cake_sampling import load_cake_sampling_module as load_cake_sampling_module
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_uri as get_cake_megamoe_topk_reduce_uri,
+)
+from .cake_megamoe_topk_reduce import (
+    load_cake_megamoe_topk_reduce_module as load_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    is_cake_megamoe_topk_reduce_module_loaded as is_cake_megamoe_topk_reduce_module_loaded,
+)
+from .cake_megamoe_topk_reduce import (
+    run_cake_megamoe_topk_reduce as run_cake_megamoe_topk_reduce,
+)
+from .fused_moe import gen_alphamoe_sm100_module as gen_alphamoe_sm100_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
+from .q_token_kv_block_sparse_metadata import (
+    gen_prims_ts_q_token_kv_block_sparse_metadata_module as gen_prims_ts_q_token_kv_block_sparse_metadata_module,
+)
 from .fp4_kv_dequantization import (
     gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
 )
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .cake_kda import (
+    cake_kda_affine_is_available as cake_kda_affine_is_available,
+)
+from .cake_kda import (
+    gen_cake_kda_affine_module as gen_cake_kda_affine_module,
+)
+from .cake_kda import (
+    gen_cake_kda_m128_unbounded_softplus_module as gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_kda import (
+    get_cake_kda_affine_module as get_cake_kda_affine_module,
+)
+from .cake_kda import (
+    get_cake_kda_prefill_module as get_cake_kda_prefill_module,
+)
+from .cake_kda import (
+    load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_fused_moe_warp_decode import (
+    gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m64_module as gen_flash_kda_m64_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m128_module as gen_flash_kda_m128_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m128_n16_module as gen_flash_kda_m128_n16_module,
+)
+from .flash_kda import (
+    get_flash_kda_prefill_module as get_flash_kda_prefill_module,
+)
+from .flash_kda import (
+    load_flash_kda_m64_module as load_flash_kda_m64_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_module as load_flash_kda_m128_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_n16_module as load_flash_kda_m128_n16_module,
+)
+from .blackwell_msa import BLACKWELL_MSA_VARIANTS as BLACKWELL_MSA_VARIANTS
+from .blackwell_msa import (
+    BLACKWELL_MSA_VARIANTS_BY_TARGET as BLACKWELL_MSA_VARIANTS_BY_TARGET,
+)
+from .blackwell_msa import gen_blackwell_msa_module as gen_blackwell_msa_module
+from .blackwell_msa import get_blackwell_msa_module as get_blackwell_msa_module
+from .blackwell_msa import get_blackwell_msa_uri as get_blackwell_msa_uri
+from .blackwell_msa import load_blackwell_msa_module as load_blackwell_msa_module
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
+from .cake_bgmv_moe import (
+    gen_cake_bgmv_moe_module as gen_cake_bgmv_moe_module,
+)
+from .cake_bgmv_moe import (
+    load_cake_bgmv_moe_module as load_cake_bgmv_moe_module,
+)
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
-
-
-cuda_lib_path = os.environ.get(
-    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
+from .fused_moe import (
+    gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
 )
-if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
-    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
+from .fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
+)
+
+if platform.system() == "Windows":
+    cuda_path = None
+    if os.environ.get("CUDA_HOME"):
+        cuda_path = os.environ.get("CUDA_HOME")
+    elif os.environ.get("CUDA_ROOT"):
+        cuda_path = os.environ.get("CUDA_ROOT")
+    elif os.environ.get("CUDA_PATH"):
+        cuda_path = os.environ.get("CUDA_PATH")
+    elif os.environ.get("CUDA_LIB_PATH"):
+        cuda_path = os.path.abspath(
+            os.path.join(os.environ.get("CUDA_LIB_PATH"), "..", "..")
+        )
+    else:
+        cuda_path = f"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v{torch.version.cuda}"
+
+    if cuda_path and os.path.exists(cuda_path) and torch.version.cuda:
+        cudart_version = torch.version.cuda.split(".")[0]
+        if cudart_version < "12":
+            cudart_version += "0"
+        cuda_arch = (
+            "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+        )
+        arch_bin_path = os.path.join(cuda_path, "bin", cuda_arch)
+        dll_bin_path = (
+            arch_bin_path
+            if os.path.exists(arch_bin_path)
+            else os.path.join(cuda_path, "bin")
+        )
+        cudart_dll = os.path.join(dll_bin_path, f"cudart64_{cudart_version}.dll")
+        if os.path.exists(cudart_dll):
+            ctypes.CDLL(cudart_dll, mode=ctypes.RTLD_GLOBAL)
+else:
+    cuda_lib_path = os.environ.get(
+        "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
+    )
+    if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
+        ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)

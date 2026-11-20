@@ -21,12 +21,31 @@
 #include <cstdint>
 #include <vector>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm {
 namespace kernels {
+
+// Thrown by TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex when configs exist for the
+// problem shape but none of their cubins loads on this driver (GitHub #5322). A caller that can
+// serve the problem another way, such as the MoE launcher's tile fallback, catches this type;
+// every other failure of the runner is a plain flashinfer::Error.
+class NoLoadableKernelError : public flashinfer::Error {
+ public:
+  using flashinfer::Error::Error;
+};
+
+// Thrown by TrtllmGenBatchedGemmRunner::getValidConfigIndices when no config of the tile is valid
+// for the problem shape. The MoE launcher's tile fallback skips such a tile the same way it skips
+// a tile whose cubins do not load; code that catches flashinfer::Error still receives it.
+class NoValidConfigError : public flashinfer::Error {
+ public:
+  using flashinfer::Error::Error;
+};
 
 // Keep this in sync with the ActType in
 // cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
@@ -40,13 +59,35 @@ enum class ActType {
   // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
   //
   // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
-  SwiGlu,
+  SwiGlu = 0,
   // For ActType == GeGlu, we use the simplified version
   //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
   // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
   // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
-  GeGlu,
+  GeGlu = 1,
+  SiTuGlu = 2,
+  None = 3,
+  // StepFun applies the gate cap after SiLU: clamp(up, -L, L) * min(silu(gate), L).
+  SwiGluStep = 4,
 };
+
+static_assert(static_cast<int>(ActType::SwiGlu) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::SwiGlu));
+static_assert(static_cast<int>(ActType::GeGlu) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
+// SwiGluStep is value 4 in trtllm-gen export 7.0.5.0.4.0. The public 7.0.4
+// headers omit it; retain source compatibility until the new cubins are pinned.
+#ifndef TLLM_RUBIN_FEATURES
+// Historically the separate Rubin BMM pin predated SiTuGlu: its
+// gemmGatedAct::ActType was {SwiGlu, GeGlu, None} with None == 2, so these two
+// symbols/values existed only in the Blackwell package. The BMM pin is now a
+// single multi-arch package that carries SiTuGlu for both, so this guard is
+// vestigial and can be dropped once the Rubin build is re-verified.
+static_assert(static_cast<int>(ActType::SiTuGlu) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::SiTuGlu));
+static_assert(static_cast<int>(ActType::None) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::None));
+#endif
 
 // Type of the element-wise activation to apply after the Gemm
 enum class EltwiseActType {
@@ -61,6 +102,7 @@ enum class EltwiseActType {
   // act = relu(x0) ^ 2
   // where x0 is the output of the Gemm.
   Relu2,
+  ClampedRelu2 = static_cast<int>(batchedGemm::gemm::EltwiseActType::ClampedRelu2),
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {
@@ -84,13 +126,29 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   batchedGemm::trtllm::gen::Dtype biasDtype{batchedGemm::trtllm::gen::Dtype::Fp32};
   // whether to apply row-wise scaling factors to the activations
   bool usePerTokenScaling{false};
+  // dtype of the row-wise scaling factors when usePerTokenScaling is enabled
+  batchedGemm::trtllm::gen::Dtype perTokenSfDtype{batchedGemm::trtllm::gen::Dtype::Void};
   // whether to apply row-wise scaling factors to the weights
   bool usePerChannelScaling{false};
+};
+
+// One launch's share of a GEMM that is split across a GPU's locality domains (uGPU
+// localization). The launch writes its output columns into a slice of a wider shared buffer and
+// sizes its grid for the SMs of one domain. The default value is an ordinary launch.
+struct TrtllmGenBatchedGemmPartition {
+  // Full width of each output row, in post-activation elements; 0 keeps the contiguous layout.
+  int32_t outputRowWidth{0};
+  // First output column this launch writes, in post-activation elements.
+  int32_t outputColumnOffset{0};
+  // SMs available to the launch's stream; 0 uses the whole device.
+  int32_t smCount{0};
 };
 
 class TrtllmGenBatchedGemmRunner {
  public:
   explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
+
+  [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutB(int32_t configIndex) const;
 
   [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
                                                std::vector<int32_t> const& batchedTokens,
@@ -99,6 +157,9 @@ class TrtllmGenBatchedGemmRunner {
                                                int32_t configIndex) const;
 
   // Generic GEMM interface
+  // When validM/validN/validK are non-negative, they specify the valid (unpadded) region
+  // of the M/N/K dimensions for computation while the full m/n/k dimensions describe the
+  // padded tensor memory layout. If negative (default), they are set equal to m/n/k.
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a,
            void const* sfA, void const* b, void const* sfB, void const* perTokensSfA,
@@ -108,7 +169,8 @@ class TrtllmGenBatchedGemmRunner {
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
            int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-           int32_t configIndex, bool enable_pdl);
+           int32_t configIndex, bool enable_pdl, int32_t validM = -1, int32_t validN = -1,
+           int32_t validK = -1, TrtllmGenBatchedGemmPartition const& partition = {});
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
@@ -147,6 +209,10 @@ class TrtllmGenBatchedGemmRunner {
                                         std::vector<int32_t> const& batchedTokens,
                                         int32_t numTokens, int32_t numBatches,
                                         int32_t maxNumCtasInBatchDim) const;
+
+  // Whether the config can write a slice of a shared output (TMA stores, no output multicast or
+  // DeepSeek FP8) and fits a stream limited to smCount SMs.
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const;
 
  private:
   void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

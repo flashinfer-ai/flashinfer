@@ -206,3 +206,127 @@ def test_split_device_green_ctx_by_sm_count_alignment(
                 f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}"
             )
         raise
+
+
+def _need_locality_domains(dev):
+    if green_ctx.get_locality_domain_count(dev) < 2:
+        pytest.skip("needs a GPU with at least two locality domains (uGPUs)")
+
+
+def test_split_device_green_ctx_by_locality_domain():
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    n = green_ctx.get_locality_domain_count(dev)
+    total = green_ctx.get_device_resource(green_ctx.get_cudevice(dev)).sm.smCount
+    streams, resources = green_ctx.split_device_green_ctx_by_locality_domain(dev)
+    assert len(streams) == len(resources) == n
+    assert all(r.sm.smCount == total // n for r in resources)
+    x = torch.randn(1 << 20, device=dev)
+    for s in streams:
+        with torch.cuda.stream(s):
+            y = x * 2
+        s.synchronize()
+        torch.testing.assert_close(y, x * 2)
+
+
+@pytest.mark.parametrize("part_shape", [(1,), (37, 32, 128, 128)])
+def test_empty_per_locality_domain(part_shape):
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    n = green_ctx.get_locality_domain_count(dev)
+    t = green_ctx.empty_per_locality_domain(part_shape, torch.bfloat16, dev)
+    assert t.shape == (n, *part_shape)
+    for i in range(n):
+        assert t[i].is_contiguous()
+    ref = torch.randn(n, *part_shape, device=dev).to(torch.bfloat16)
+    t.copy_(ref)
+    assert torch.equal(t, ref)
+    del t
+
+
+def test_locality_domain_helpers_accept_unindexed_device():
+    _need_locality_domains(torch.device("cuda:0"))
+    torch.cuda.set_device(0)
+    assert green_ctx.get_locality_domain_count(torch.device("cuda")) >= 2
+    t = green_ctx.empty_per_locality_domain(
+        (4, 1024), torch.float32, torch.device("cuda")
+    )
+    t.fill_(1.0)
+    assert t.sum().item() == t.numel()
+
+
+def test_split_by_locality_domain_on_non_current_device():
+    """Streams of a device other than the current one belong to that device."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two GPUs")
+    dev = torch.device("cuda:1")
+    _need_locality_domains(dev)
+    with torch.cuda.device(0):
+        streams, _ = green_ctx.split_device_green_ctx_by_locality_domain(dev)
+        assert all(s.device == dev for s in streams)
+        x = torch.randn(1 << 20, device=dev)
+        with torch.cuda.stream(streams[0]):
+            y = x * 2
+        streams[0].synchronize()
+    torch.testing.assert_close(y, x * 2)
+
+
+def test_empty_per_locality_domain_freed_during_capture():
+    """A localized tensor that dies during CUDA graph capture does not synchronize the
+    device there (which would invalidate the capture); its release waits until after."""
+    import gc
+
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    torch.cuda.set_device(0)
+    t = green_ctx.empty_per_locality_domain((1 << 20,), torch.float32, dev)
+    x = torch.zeros(1, device=dev)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        x.add_(1)
+        del t
+        gc.collect()
+        assert len(green_ctx._deferred_releases) == 1
+    graph.replay()
+    torch.cuda.synchronize()
+    assert x.item() == 1
+    t2 = green_ctx.empty_per_locality_domain((16,), torch.float32, dev)
+    assert not green_ctx._deferred_releases  # released by the next allocation
+    del t2
+
+
+def test_empty_per_locality_domain_unwinds_on_failure(monkeypatch):
+    """A failing driver call after the mappings are made releases them before re-raising."""
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    real = green_ctx.driver
+    calls = {"unmap": 0, "release": 0, "free": 0}
+
+    class _Driver:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @staticmethod
+        def cuMemSetAccess(*args):
+            raise RuntimeError("injected cuMemSetAccess failure")
+
+        @staticmethod
+        def cuMemUnmap(*args):
+            calls["unmap"] += 1
+            return real.cuMemUnmap(*args)
+
+        @staticmethod
+        def cuMemRelease(*args):
+            calls["release"] += 1
+            return real.cuMemRelease(*args)
+
+        @staticmethod
+        def cuMemAddressFree(*args):
+            calls["free"] += 1
+            return real.cuMemAddressFree(*args)
+
+    monkeypatch.setattr(green_ctx, "driver", _Driver())
+    n = green_ctx.get_locality_domain_count(dev)
+    with pytest.raises(RuntimeError, match="injected"):
+        green_ctx.empty_per_locality_domain((1024,), torch.float32, dev)
+    assert calls == {"unmap": n, "release": n, "free": 1}

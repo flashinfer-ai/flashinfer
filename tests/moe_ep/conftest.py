@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 
 import pytest
 
@@ -14,6 +16,12 @@ _MOE_EP_TEST_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [
     p for p in sys.path if os.path.abspath(p or os.getcwd()) != _MOE_EP_TEST_ROOT
 ]
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    from tests.moe.utils import parametrize_id
+
+    return parametrize_id(val)
 
 
 @pytest.fixture
@@ -30,6 +38,24 @@ def dist_not_initialized():
         yield
 
 
+@pytest.fixture(scope="session")
+def isolated_deep_gemm_cache():
+    """Provide one session cache when the caller did not configure DeepGEMM."""
+    configured_cache = os.environ.get("TRTLLM_DG_CACHE_DIR")
+    if configured_cache is not None:
+        yield configured_cache
+        return
+
+    cache_dir = tempfile.mkdtemp(prefix="flashinfer-deep-gemm-test-")
+    os.environ["TRTLLM_DG_CACHE_DIR"] = cache_dir
+    try:
+        yield cache_dir
+    finally:
+        if os.environ.get("TRTLLM_DG_CACHE_DIR") == cache_dir:
+            os.environ.pop("TRTLLM_DG_CACHE_DIR")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 # NOTE: ``pytest_addoption`` (--backend), ``pytest_configure`` (nvep/gpu_*/
 # arch_blackwell markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
 # auto-skips) are intentionally defined ONLY in the root ``tests/conftest.py``.
@@ -39,11 +65,29 @@ def dist_not_initialized():
 
 
 @pytest.fixture
+def require_split_backend(request):
+    """Gate split regressions before their first collective.
+
+    The graph tests parametrize ``backend``; unparametrized guard and memo
+    regressions exercise nccl_ep only.
+    """
+    from flashinfer.moe_ep import available_backends
+
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "nccl_ep") if callspec else "nccl_ep"
+    selected = request.config.getoption("--backend")
+    if selected not in (None, "both", backend):
+        pytest.skip(f"requires {backend}; --backend={selected}")
+    if backend not in available_backends():
+        pytest.skip(f"{backend} backend is not available")
+
+
+@pytest.fixture
 def stubbed_fleet_registry():
     """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
     from unittest import mock
 
-    from flashinfer.moe_ep.core.comm.fleet import _BACKEND_REGISTRY
+    from flashinfer.moe_ep.core.comm.fleet import _FLEET_REGISTRY
 
     log: list[str] = []
 
@@ -83,20 +127,20 @@ def stubbed_fleet_registry():
         def destroy(self):
             log.append("destroy")
 
-    saved_nccl = _BACKEND_REGISTRY.get("nccl_ep")
-    saved_nixl = _BACKEND_REGISTRY.get("nixl_ep")
-    _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
-    _BACKEND_REGISTRY["nixl_ep"] = _StubFleet
+    saved_nccl = _FLEET_REGISTRY.get("nccl_ep")
+    saved_nixl = _FLEET_REGISTRY.get("nixl_ep")
+    _FLEET_REGISTRY["nccl_ep"] = _StubFleet
+    _FLEET_REGISTRY["nixl_ep"] = _StubFleet
     with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
         yield log
     if saved_nccl is not None:
-        _BACKEND_REGISTRY["nccl_ep"] = saved_nccl
+        _FLEET_REGISTRY["nccl_ep"] = saved_nccl
     else:
-        _BACKEND_REGISTRY.pop("nccl_ep", None)
+        _FLEET_REGISTRY.pop("nccl_ep", None)
     if saved_nixl is not None:
-        _BACKEND_REGISTRY["nixl_ep"] = saved_nixl
+        _FLEET_REGISTRY["nixl_ep"] = saved_nixl
     else:
-        _BACKEND_REGISTRY.pop("nixl_ep", None)
+        _FLEET_REGISTRY.pop("nixl_ep", None)
 
 
 def pytest_sessionfinish(session, exitstatus):

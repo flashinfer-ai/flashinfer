@@ -9,8 +9,8 @@ Grouped matrix multiplication APIs for Mixture-of-Experts (MoE) layers,
 where each expert holds its own weight matrix and tokens are routed to
 experts via an ``m_indptr`` cumulative-count tensor.
 
-The functions in this module mirror the dense ``flashinfer.gemm.mm_*``
-APIs and currently dispatch to the cuDNN MoE backend.
+The dense-style ``grouped_mm_*`` functions in this module mirror the ``flashinfer.gemm.mm_*``
+APIs and currently dispatch to the cuDNN MoE backend by default.
 
 BF16 / FP16
 -----------

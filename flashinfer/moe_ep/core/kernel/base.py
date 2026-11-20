@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     import torch
+
+    from ....fused_moe.api import QuantFormat
 
     from ...config import BootstrapConfig, FleetParams
     from ...tensors import MoEEpTensors
@@ -23,6 +27,27 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    # Id space of ``recv_topk_idx``. True: GLOBAL expert ids, as the
+    # MoEEpCommunication transports deliver them; picks outside this rank's
+    # local expert range (another rank's experts, ``invalid_expert_id``) are
+    # for the kernel to skip. False: ids local to this rank, with -1 for picks
+    # it does not own, as the Fleet/Handle transports deliver them.
+    recv_topk_idx_global: bool = False
+    recv_count: Optional["torch.Tensor"] = None
+    # Per-token scale factors of ``expert_tensors`` when the tokens were
+    # quantized before dispatch (see SplitKernelBackend.dispatch_format), one
+    # row per received token; None when ``expert_tensors`` is unquantized.
+    expert_tensors_scale: Optional["torch.Tensor"] = None
+    # [num_tokens, hidden] bfloat16 buffer the kernel may write its output
+    # into, such as the communication's combine input region
+    # (MoEEpCommunication.get_combine_input_buffer), which the combine then
+    # reads in place; None lets the kernel allocate. The kernel returns the
+    # tensor it wrote, which need not be this one.
+    output: Optional["torch.Tensor"] = None
+    # Whether the kernel must write zeros into the ``output`` rows of received
+    # tokens without an expert on this rank; False when the combine never
+    # reads them (MoEEpCommunication.combine_reads_only_local_expert_rows).
+    zero_rows_without_local_expert: bool = True
 
 
 class SplitKernelBackend(ABC):
@@ -56,12 +81,66 @@ class SplitKernelBackend(ABC):
         self._transformed_weights = weights
         return weights
 
+    def pack_dispatch_payload(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Optionally transform the token payload before EP dispatch.
+
+        Default: identity (BF16 tokens on the wire). A backend that quantizes
+        activations may override this to send a packed quantized payload and
+        unpack it in :meth:`compute`. ``FleetParams`` keeps describing the
+        LOGICAL bf16 token; the packed row's byte width must not exceed
+        ``token_hidden_size * dtype_bytes`` (the transport's per-token byte
+        budget)."""
+        return x
+
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        """Whether :meth:`pack_dispatch_payload` sends other bytes than the BF16
+        tokens, which the transport must then carry byte for byte."""
+        return False
+
+    def dispatch_format(self) -> "Optional[QuantFormat]":
+        """Activation format to quantize tokens to before a rank-major dispatch.
+
+        Applies only to the MoEEpCommunication path, whose transports carry
+        quantized rows plus a row-aligned scale payload. ``None`` (the default)
+        dispatches the unquantized tokens. A backend that returns a format
+        implements :meth:`quantize_for_dispatch` and accepts the received
+        values with ``SplitKernelContext.expert_tensors_scale`` in
+        :meth:`compute`.
+        """
+        return None
+
+    def quantize_for_dispatch(
+        self, x: "torch.Tensor"
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Quantize ``[num_tokens, hidden]`` tokens to :meth:`dispatch_format`.
+
+        Returns ``(values, scales)``, each a 2D tensor with one row per token.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not quantize tokens before dispatch"
+        )
+
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
+
+    def destroy(self) -> None:  # noqa: B027 - intentional no-op default
+        """Drop per-forward state, which may reference the transport's
+        receive buffers. The layer calls this before it destroys the
+        transport, whose buffers must not outlive it."""
 
 
 class MegaKernelBackend(ABC):
     """Fused kernel backend that owns comm + local MoE on the mega EP path."""
+
+    # Backends opt in to returning a workspace-backed output view by setting
+    # this capability during backend registration.  Keep the default false so
+    # existing backends retain the materializing output path.
+    supports_output_view: bool = False
+    supports_unfinalized_output: bool = False
+    supports_live_token_tuning: bool = False
+    supports_auto_workspaces: bool = False
+    _knob_cache_module: str
 
     def __init__(self, config: object) -> None:
         self._config = config
@@ -70,6 +149,100 @@ class MegaKernelBackend(ABC):
         self._ep_comm_group: Any = None
         self._ep_rank: int = 0
         self._ep_world_size: int = 0
+        self._profile_knobs: dict[tuple[int, int | None], dict] = {}
+        self._autotune_winner: dict[str, Any] | None = None
+
+    @classmethod
+    def create(cls, config: Any) -> MegaKernelBackend:
+        """Construct a backend, including an opt-in variant selector."""
+        return cls(config)
+
+    def ep_weight_pack(self, weights):
+        """Convert the selector's [up, gate] FC1 rows to the backend's input order."""
+        return weights
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Arithmetic receipt when the backend implements a specified BI class."""
+        return None
+
+    def ep_selected_config(self, workspace):
+        return self.get_tuned_config(workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        """Compile a fixed EP plan locally, before any rank launches it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support fixed EP preparation"
+        )
+
+    def ep_validate_selection(self, fleet_params, selection):
+        """Validate a cached fixed configuration before collective allocation."""
+        import dataclasses
+
+        from flashinfer.autotuner.autotuner import _json_to_tactic
+        from .registry import create_mega_kernel
+
+        expected = (
+            {"kernel_variant", "knobs"}
+            if hasattr(self._config, "kernel_variant")
+            else {"knobs"}
+        )
+        if set(selection) != expected:
+            raise ValueError(
+                "cached MegaMoE selection fields do not match its configuration"
+            )
+        fields = {
+            "knobs": {k: _json_to_tactic(v) for k, v in selection["knobs"].items()}
+        }
+        if "kernel_variant" in selection:
+            if not hasattr(self._config, "kernel_variant"):
+                raise ValueError("this MegaMoE configuration has no kernel_variant")
+            fields["kernel_variant"] = selection["kernel_variant"]
+        config = dataclasses.replace(self._config, **fields)
+        kernel = create_mega_kernel(config)
+        kernel.bind_ep_bootstrap(self._ep_bootstrap)
+        kernel.validate_init(self._ep_bootstrap, fleet_params)
+        if getattr(self._config, "batch_invariant", False):
+            self.validate_init(self._ep_bootstrap, fleet_params)
+            if kernel.batch_invariant_fingerprint(
+                fleet_params
+            ) != self.batch_invariant_fingerprint(fleet_params):
+                raise ValueError(
+                    "cached MegaMoE selection changes the arithmetic fingerprint"
+                )
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        """Run a fresh inner search for an explicitly forced outer search."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support forced EP tuning"
+        )
+
+    def ep_tuning_fallback(self):
+        import dataclasses
+
+        return dataclasses.replace(self._config, knobs=None)
+
+    def ep_tuning_contract(self, fleet_params):
+        """Describe complete-forward tuning support for an outer EP selector."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support complete-EP selection"
+        )
+
+    def get_tuned_config(self, workspace: Any = None) -> Any:
+        """Return a fixed kernel config for the selected automatic result."""
+        import dataclasses
+
+        if not dataclasses.is_dataclass(self._config) or isinstance(self._config, type):
+            raise TypeError("this MegaMoE backend does not expose a dataclass config")
+        return dataclasses.replace(self._config, knobs=self.get_tuned_knobs(workspace))
+
+    def get_tuned_knobs(self, workspace: Any = None) -> dict[str, Any]:
+        """Return a copy of the last completed automatic tuning result."""
+        if self._autotune_winner is None:
+            raise RuntimeError(
+                "MegaMoE has no completed automatic tuning result; "
+                "call warmup() on a layer configured with knobs='auto' first"
+            )
+        return deepcopy(self._autotune_winner)
 
     @classmethod
     @abstractmethod
@@ -163,12 +336,50 @@ class MegaKernelBackend(ABC):
         heap use and compiled sessions by the layer count.
         """
         self._ensure_ep_bootstrap(bootstrap)
-        key = self._workspace_pool_key(fleet_params)
-        if key is None:
+        request = self._workspace_pool_request(fleet_params)
+        if request is None:
             return self._allocate_workspace(fleet_params)
+        key, factory = request
         from .workspace_pool import acquire_workspace
 
-        return acquire_workspace(key, lambda: self._allocate_workspace(fleet_params))
+        return acquire_workspace(key, factory)
+
+    def _tuning_key(self, fleet_params: "FleetParams") -> dict[str, Any]:
+        raise NotImplementedError
+
+    def coordinate_workspace_replacement(self, workspace: Any) -> bool:
+        """Agree whether later selection needs new storage for captured graphs.
+
+        Called on every EP rank before input staging. Backends may perform a
+        collective here; no rank may allocate replacement storage until it returns.
+        """
+        return False
+
+    def _tuning_cache(self) -> Any:
+        return importlib.import_module(self._knob_cache_module)
+
+    def live_token_buckets(self, fleet_params: "FleetParams") -> list[int]:
+        """Offline workload profiles available at this exact capacity."""
+        if not self.supports_live_token_tuning:
+            return []
+        knobs = getattr(self._config, "knobs", None)
+        if isinstance(knobs, dict) or knobs == "auto":
+            return []
+        return self._tuning_cache().live_token_buckets(**self._tuning_key(fleet_params))
+
+    def _workspace_knobs(self, fleet_params: "FleetParams") -> dict | None:
+        knobs = getattr(self._config, "knobs", None)
+        if isinstance(knobs, dict):
+            return knobs
+        if knobs == "auto":
+            return None
+        key = (fleet_params.max_tokens_per_rank, fleet_params.tuning_live_tokens)
+        if key not in self._profile_knobs:
+            self._profile_knobs[key] = self._tuning_cache().resolve_knobs(
+                **self._tuning_key(fleet_params),
+                live_tokens=fleet_params.tuning_live_tokens,
+            )[0]
+        return self._profile_knobs[key]
 
     @abstractmethod
     def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
@@ -183,6 +394,22 @@ class MegaKernelBackend(ABC):
         """
         return None
 
+    def _workspace_pool_request(
+        self,
+        fleet_params: "FleetParams",
+    ) -> Optional[tuple[Any, Callable[[], Any]]]:
+        """Return one pool key and its matching allocation factory.
+
+        The default preserves the legacy backend contract. Backends whose
+        pool key depends on mutable external state can override this hook to
+        resolve that state once and capture the same frozen value in both the
+        key and factory.
+        """
+        key = self._workspace_pool_key(fleet_params)
+        if key is None:
+            return None
+        return key, lambda: self._allocate_workspace(fleet_params)
+
     def validate_forward(  # noqa: B027 - intentional no-op default
         self,
         t: "MoEEpTensors",
@@ -192,6 +419,13 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
 
+    def validate_capture_ready(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> None:
+        """Fail before staging if a selected workspace has lazy capture work."""
+
     def validate_transformed_weights(  # noqa: B027 - intentional no-op default
         self,
         transformed_weights: Any,
@@ -199,6 +433,23 @@ class MegaKernelBackend(ABC):
         fleet_params: "FleetParams",
     ) -> None:
         """Optional init-time validation for user-supplied kernel-ready weights."""
+
+    def set_compile_tokens_per_rank(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        """Select an optional per-invocation graph/compile token bucket.
+
+        The workspace capacity remains fixed by ``FleetParams``. Backends that
+        specialize kernels for smaller graph buckets override this hook. A
+        caller may only provide a non-``None`` value when every EP rank uses
+        the same value for the invocation.
+        """
+        if compile_tokens_per_rank is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support compile token buckets"
+            )
 
     def stage_inputs(  # noqa: B027 - intentional no-op default
         self,
@@ -208,6 +459,17 @@ class MegaKernelBackend(ABC):
         quantize_input: bool,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
+
+    def workspace_output(self, workspace: Any) -> "torch.Tensor":
+        """Return the stable output tensor owned by ``workspace``.
+
+        Backends that support zero-copy framework integration override this
+        method. Keeping the accessor on the backend avoids exposing private,
+        backend-specific workspace layouts to callers.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a workspace output"
+        )
 
     @abstractmethod
     def compute(
@@ -221,23 +483,56 @@ class MegaKernelBackend(ABC):
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
 
+    def _compute_prepared(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+        *,
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Execute immediately after the layer validates and stages a forward.
+
+        Backends may omit checks already covered by that path. Public staged
+        execution continues through ``compute``.
+        """
+        return self.compute(workspace, transformed_weights, output=output)
+
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Return borrowed GEMM2 rows, remaining weights, and route-to-row indices."""
+        raise NotImplementedError("this MegaMoE backend cannot defer top-k reduction")
+
     def destroy(self, workspace: Any) -> None:
         """Release durable workspace resources (pool-aware, refcounted)."""
         if workspace is None:
             return
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mega workspace release cannot run during CUDA graph capture"
+            )
         from .workspace_pool import release_workspace
 
+        # Backend-local launch state belongs to this owner even when the
+        # physical workspace is pooled with other backend instances.
+        self._forget_local_workspace_state(workspace)
         if release_workspace(workspace):
-            # The fused-stage memos key on topk_idx.data_ptr(); the symmetric
-            # heap reuses freed addresses, so evict before the buffer dies.
-            # sys.modules lookup (not an import): if the shim was never
-            # loaded, no memo exists and the heavy import must not happen.
-            import sys
-
-            quant_stage = sys.modules.get(
-                "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
-            )
-            topk_idx = getattr(workspace, "topk_idx", None)
-            if quant_stage is not None and topk_idx is not None:
-                quant_stage.forget_staged_tokens(topk_idx)
+            self._forget_workspace_state(workspace)
             workspace.destroy()
+
+    def _forget_local_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Drop this backend instance's memoized state for ``workspace``.
+
+        Called for every owner release, including non-final pooled releases.
+        """
+
+    def _forget_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Drop process-global state keyed on this workspace's buffers.
+
+        Called on the last release, just before ``workspace.destroy()`` frees
+        the buffers (whose addresses the symmetric heap may reuse). Default is
+        a no-op; backends with cross-owner memos override this."""

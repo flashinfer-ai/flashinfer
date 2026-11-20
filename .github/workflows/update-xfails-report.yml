@@ -24,14 +24,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version-file: '.python-version'
 
       - name: Create reports directory
         run: mkdir -p reports
 
       - name: Run XFails tracker
         run: |
-          python scripts/xfails_tracker.py > reports/xfails_report.txt 2>&1 || {
+          python scripts/infra/xfails_tracker.py > reports/xfails_report.txt 2>&1 || {
             echo "Error: XFails tracker script failed"
             cat reports/xfails_report.txt
             exit 1

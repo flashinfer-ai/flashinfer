@@ -102,11 +102,53 @@ void glm_dsa_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
   generic_router_gemm_op<float, float32_code, 256, 6144, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
 }
 
+// bfloat16-output DeepSeek-V3: same shape as dsv3_router_gemm_op, used by
+// callers that keep the router logits in bfloat16.
+void dsv3_bf16_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
+                              bool launch_with_pdl) {
+  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 256, 7168, 1, 16>(mat_a, mat_b, out,
+                                                                         launch_with_pdl);
+}
+
+// Kimi-K2 family (K2/K2.5/K2.6): 384 routed experts, hidden dim 7168.
+void kimi_k2_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
+                            bool launch_with_pdl) {
+  generic_router_gemm_op<float, float32_code, 384, 7168, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
+}
+
+void kimi_k2_bf16_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
+                                 bool launch_with_pdl) {
+  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 384, 7168, 1, 16>(mat_a, mat_b, out,
+                                                                         launch_with_pdl);
+}
+
+// Kimi-K3: 896 routed experts (16 active), hidden dim 7168.
+void kimi_k3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
+                            bool launch_with_pdl) {
+  generic_router_gemm_op<float, float32_code, 896, 7168, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
+}
+
+void kimi_k3_bf16_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
+                                 bool launch_with_pdl) {
+  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 896, 7168, 1, 16>(mat_a, mat_b, out,
+                                                                         launch_with_pdl);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_router_gemm_op,
                               flashinfer::trtllm_dsv3_router_gemm::dsv3_router_gemm_op);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ml3_router_gemm_op,
                               flashinfer::trtllm_dsv3_router_gemm::ml3_router_gemm_op);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(glm_dsa_router_gemm_op,
                               flashinfer::trtllm_dsv3_router_gemm::glm_dsa_router_gemm_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_bf16_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::dsv3_bf16_router_gemm_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k2_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::kimi_k2_router_gemm_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k2_bf16_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::kimi_k2_bf16_router_gemm_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k3_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::kimi_k3_router_gemm_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k3_bf16_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::kimi_k3_bf16_router_gemm_op);
 
 }  // namespace flashinfer::trtllm_dsv3_router_gemm

@@ -24,6 +24,8 @@ def _bmm_export_symlink_path(gen_src_dir):
     """Location where the BMM export headers are symlinked for C++ includes."""
     return (
         Path(gen_src_dir)
+        / "trtllm_export"
+        / "fused_moe_trtllm_sm100"
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"

@@ -66,7 +66,7 @@ namespace fusion = cutlass::epilogue::fusion;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int StagesC_, int StagesD_, int FragmentSize_, bool ReuseSmemC_, bool DelayTmaStore_,
-          int NumEpilogueWarpGroups_,
+          int NumEpilogueWarpGroups_, bool UsesPrebuiltDDescriptor_,
           class CtaTileMNK_,    //     (CTA_M,CTA_N,CTA_K)
           class EpilogueTile_,  // (EPI_TILE_M,EPI_TILE_N)
           class ElementC_, class StrideC_, class ElementD_, class StrideD_, class FusionCallbacks_,
@@ -193,12 +193,26 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   constexpr static bool RequiresTransactionBytes = true;
 
   constexpr static int NumEpilogueWarpGroups = NumEpilogueWarpGroups_;
+  static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideC, StrideC>;
+  static constexpr bool UsesPrebuiltDDescriptor = UsesPrebuiltDDescriptor_ && IsGroupedGemmKernel;
+  // Kernel trait for the D descriptor acquire placement: false keeps the consumer-late acquire.
+  // Only Sm90MixedInputProducerAcquiredDEpilogue sets it.
+  static constexpr bool ProducerAcquiresPrebuiltD = false;
 
   // TMA pipeline for storing D
   using StorePipeline =
       cute::conditional_t<ReuseSmemC, cutlass::PipelineTmaStore<StagesC, StagesD - 1>,
                           cutlass::PipelineTmaStore<StagesD>>;
   using StorePipelineState = cutlass::PipelineState<ReuseSmemC ? StagesC : StagesD>;
+
+  struct TensorMapStorageWithMutableD : cute::aligned_struct<128, _0> {
+    cute::TmaDescriptor smem_tensormap_C;
+    cute::array<cute::TmaDescriptor, NumEpilogueWarpGroups> smem_tensormap_D;
+  };
+
+  struct TensorMapStorageWithPrebuiltD : cute::aligned_struct<128, _0> {
+    cute::TmaDescriptor smem_tensormap_C;
+  };
 
   struct SharedStorage {
     struct TensorStorage {
@@ -211,10 +225,10 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
       FusionStorage thread;
     } tensors;
 
-    struct TensorMapStorage : cute::aligned_struct<128, _0> {
-      cute::TmaDescriptor smem_tensormap_C;
-      cute::array<cute::TmaDescriptor, NumEpilogueWarpGroups> smem_tensormap_D;
-    } tensormaps;
+    using TensorMapStorage =
+        cute::conditional_t<UsesPrebuiltDDescriptor, TensorMapStorageWithPrebuiltD,
+                            TensorMapStorageWithMutableD>;
+    TensorMapStorage tensormaps;
 
     using PipelineStorage = typename LoadPipeline::SharedStorage;
     PipelineStorage pipeline;
@@ -223,8 +237,6 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   using TensorMapStorage = typename SharedStorage::TensorMapStorage;
   using PipelineStorage = typename SharedStorage::PipelineStorage;
 
-  static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideC, StrideC>;
-
   // Host side epilogue arguments
   struct Arguments {
     typename FusionCallbacks::Arguments thread{};
@@ -232,6 +244,7 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
     StrideC dC;
     ElementD** ptr_D = nullptr;
     StrideD dD;
+    cute::TmaDescriptor const* ptr_D_prebuilt_tma_descs = nullptr;
   };
 
   // Device side epilogue params
@@ -256,6 +269,7 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
     StrideC dC;
     ElementD** ptr_D;
     StrideD dD;
+    cute::TmaDescriptor const* ptr_D_prebuilt_tma_descs;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
   };
 
@@ -329,6 +343,7 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
         args.dC,
         args.ptr_D,
         args.dD,
+        args.ptr_D_prebuilt_tma_descs,
         transaction_bytes,
     };
   }
@@ -336,8 +351,10 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   template <class ProblemShape>
   static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args,
                                    int sm_count) {
+    constexpr uint32_t NumMutableOutputTensors =
+        UsesPrebuiltDDescriptor ? 0 : NumEpilogueWarpGroups;
     constexpr uint32_t NumInputTensors =
-        NumEpilogueWarpGroups + (cute::is_void_v<ElementC> ? 0 : 1);
+        NumMutableOutputTensors + (cute::is_void_v<ElementC> ? 0 : 1);
     auto descriptors_shape = cute::make_shape(sm_count, Int<NumInputTensors>{});
     constexpr size_t SizeOfCuTensorMap = sizeof(cute::TmaDescriptor);
 
@@ -357,9 +374,13 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   }
 
   template <class ProblemShape>
-  static bool can_implement(ProblemShape problem_shape, [[maybe_unused]] Arguments const& args) {
+  static bool can_implement(ProblemShape problem_shape, Arguments const& args) {
     bool implementable = true;
     bool fusion_implementable = true;
+
+    if constexpr (UsesPrebuiltDDescriptor && is_destination_supported) {
+      implementable = implementable && (args.ptr_D_prebuilt_tma_descs != nullptr);
+    }
 
     if (problem_shape.is_host_problem_shape_available()) {
       for (int i = 0; i < problem_shape.groups(); ++i) {
@@ -938,18 +959,27 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   }
 
   CUTLASS_DEVICE auto store_init(Params const& params, TensorMapStorage& shared_tensormaps,
-                                 int32_t sm_count, int32_t sm_idx, int32_t warp_group_idx) {
-    int warp_idx_in_warp_group = canonical_warp_idx_sync() % NumWarpsPerWarpGroup;
-    // Since only one warp issues TMA store, we only need that one warp to initialize tensormaps
-    if (warp_idx_in_warp_group == 0) {
-      // Initialize tma
-      constexpr bool IsLoad = false;
-      auto store_tensormaps =
-          tensormaps_init<IsLoad>(params, shared_tensormaps, sm_count, sm_idx, warp_group_idx);
-      return store_tensormaps;
+                                 int32_t sm_count, int32_t sm_idx, int32_t warp_group_idx,
+                                 int32_t group_idx = 0, bool issue_tma_store = true) {
+    if constexpr (UsesPrebuiltDDescriptor) {
+      if (issue_tma_store) {
+        return cute::make_tuple(params.ptr_D_prebuilt_tma_descs + group_idx);
+      }
+      TmaDescriptor const* null_tma_desc = nullptr;
+      return cute::make_tuple(null_tma_desc);
+    } else {
+      int warp_idx_in_warp_group = canonical_warp_idx_sync() % NumWarpsPerWarpGroup;
+      // Since only one warp issues TMA store, we only need that one warp to initialize tensormaps
+      if (warp_idx_in_warp_group == 0) {
+        // Initialize tma
+        constexpr bool IsLoad = false;
+        auto store_tensormaps =
+            tensormaps_init<IsLoad>(params, shared_tensormaps, sm_count, sm_idx, warp_group_idx);
+        return store_tensormaps;
+      }
+      TmaDescriptor* null_tma_desc = nullptr;
+      return cute::make_tuple(null_tma_desc);
     }
-    TmaDescriptor* null_tma_desc = nullptr;
-    return cute::make_tuple(null_tma_desc);
   }
 
   //
@@ -959,15 +989,17 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
   template <bool IsLoad>
   CUTLASS_DEVICE auto tensormaps_init(Params const& params, TensorMapStorage& shared_tensormaps,
                                       int32_t sm_count, int32_t sm_idx, int32_t warp_group_idx) {
+    constexpr uint32_t NumMutableOutputTensors =
+        UsesPrebuiltDDescriptor ? 0 : NumEpilogueWarpGroups;
     constexpr uint32_t NumInputTensors =
-        NumEpilogueWarpGroups + (cute::is_void_v<ElementC> ? 0 : 1);
+        NumMutableOutputTensors + (cute::is_void_v<ElementC> ? 0 : 1);
     Layout desc_layout = make_layout(make_shape(sm_count, Int<NumInputTensors>{}));
 
     Tensor gmem_tensormap = make_tensor(params.tensormaps, desc_layout);  // (SMs, NumInputTensors)
 
     if constexpr (IsLoad) {
       if (is_source_supported) {
-        constexpr int C_tensormap_index = NumEpilogueWarpGroups;
+        constexpr int C_tensormap_index = NumMutableOutputTensors;
         Tensor pC_tensormap =
             make_tensor(params.tma_load_c.get_tma_descriptor(), Int<1>{}, Int<1>{});
         Tensor sC_tensormap =
@@ -983,17 +1015,21 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
       TmaDescriptor* null_tma_desc = nullptr;
       return cute::make_tuple(null_tma_desc);
     } else {
-      Tensor pD_tensormap =
-          make_tensor(params.tma_store_d.get_tma_descriptor(), Int<1>{}, Int<1>{});
-      Tensor sD_tensormap = make_tensor(
-          make_smem_ptr(&shared_tensormaps.smem_tensormap_D[warp_group_idx]), Int<1>{}, Int<1>{});
+      if constexpr (UsesPrebuiltDDescriptor) {
+        return cute::make_tuple(params.ptr_D_prebuilt_tma_descs);
+      } else {
+        Tensor pD_tensormap =
+            make_tensor(params.tma_store_d.get_tma_descriptor(), Int<1>{}, Int<1>{});
+        Tensor sD_tensormap = make_tensor(
+            make_smem_ptr(&shared_tensormaps.smem_tensormap_D[warp_group_idx]), Int<1>{}, Int<1>{});
 
-      if (cute::elect_one_sync()) {
-        // Bringing tensormaps from params to smem for modification later
-        copy(recast<uint128_t>(pD_tensormap), recast<uint128_t>(sD_tensormap));
+        if (cute::elect_one_sync()) {
+          // Bringing tensormaps from params to smem for modification later
+          copy(recast<uint128_t>(pD_tensormap), recast<uint128_t>(sD_tensormap));
+        }
+        __syncwarp();
+        return cute::make_tuple(&gmem_tensormap(sm_idx, warp_group_idx));
       }
-      __syncwarp();
-      return cute::make_tuple(&gmem_tensormap(sm_idx, warp_group_idx));
     }
   }
 
@@ -1010,7 +1046,7 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
                                                           params.ptr_C[next_batch]);
         }
       }
-    } else if constexpr (is_destination_supported) {
+    } else if constexpr (is_destination_supported && !UsesPrebuiltDDescriptor) {
       cute::tma_descriptor_replace_addr_in_shared_mem(
           shared_tensormaps.smem_tensormap_D[warp_group_idx], params.ptr_D[next_batch]);
     }
@@ -1046,7 +1082,7 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
               shared_tensormaps.smem_tensormap_C, prob_shape, prob_stride);
         }
       }
-    } else if constexpr (is_destination_supported) {
+    } else if constexpr (is_destination_supported && !UsesPrebuiltDDescriptor) {
       ElementD const* ptr_D = nullptr;
       Tensor tensor_d =
           make_tensor(ptr_D, make_layout(make_shape(M, N, Int<1>{}), params.dD[next_group]));
@@ -1091,7 +1127,7 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
       if constexpr (is_source_supported) {
         tma_descriptor_cp_fence_release(tensormap, shared_tensormaps.smem_tensormap_C);
       }
-    } else if constexpr (is_destination_supported) {
+    } else if constexpr (is_destination_supported && !UsesPrebuiltDDescriptor) {
       tma_descriptor_cp_fence_release(tensormap,
                                       shared_tensormaps.smem_tensormap_D[warp_group_idx]);
     }
@@ -1116,17 +1152,102 @@ class Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// EnableSource=false adapter around a source-capable (non-void C) epilogue. It statically removes
+// the device-side C descriptor maintenance only:
+//  - Public ElementC is void, so callers pass a null C pointer. Arguments, Params, fusion and
+//    SharedStorage stay the base types on purpose, keeping the base D store pipeline and epilogue
+//    shared memory (and therefore the mainloop carveout). A supplied C pointer is ignored.
+//  - can_implement requires beta == 0 with no beta pointer/array; alpha pointers stay legal. For
+//    these calls the unchanged base beta predicate skips every C load; the beta * C multiply-add
+//    is still compiled and runs on a cleared C fragment. The empty load-pipeline handshakes and
+//    the host placeholder C descriptor/workspace are retained.
+//  - load_init returns no C descriptor and the IsLoad (C) tensormap update/release/acquire calls
+//    compile to nothing; the D (!IsLoad) calls forward to the base.
+// Fusions without beta fields (per-token scale) only get the base checks.
+template <class EpilogueBase>
+struct Sm90MixedInputSourceDisabledEpilogue : EpilogueBase {
+  using Base = EpilogueBase;
+  using Base::Base;
+  using ElementC = void;
+
+  template <class ProblemShape>
+  static bool can_implement(ProblemShape problem_shape, typename Base::Arguments const& args) {
+    using Arguments = typename Base::Arguments;
+    bool beta_implementable = true;
+    if constexpr (detail::has_beta<Arguments>::value) {
+      beta_implementable = beta_implementable && args.thread.beta == 0.0;
+    }
+    if constexpr (detail::has_beta_ptr<Arguments>::value) {
+      beta_implementable = beta_implementable && args.thread.beta_ptr == nullptr;
+    }
+    if constexpr (detail::has_beta_ptr_array<Arguments>::value) {
+      beta_implementable = beta_implementable && args.thread.beta_ptr_array == nullptr;
+    }
+    if (!beta_implementable) {
+      CUTLASS_TRACE_HOST(
+          "  CAN IMPLEMENT: Beta/beta pointer was set, but the epilogue source is disabled.\n");
+      return false;
+    }
+    return Base::can_implement(problem_shape, args);
+  }
+
+  CUTLASS_DEVICE auto load_init(typename Base::Params const&, typename Base::TensorMapStorage&,
+                                int32_t, int32_t) {
+    return cute::make_tuple(static_cast<cute::TmaDescriptor*>(nullptr));
+  }
+
+  template <bool IsLoad, class... Args>
+  CUTLASS_DEVICE void tensormaps_perform_update(Args&&... args) {
+    if constexpr (!IsLoad) {
+      Base::template tensormaps_perform_update<false>(cute::forward<Args>(args)...);
+    }
+  }
+
+  template <bool IsLoad, class... Args>
+  CUTLASS_DEVICE void tensormaps_cp_fence_release(Args&&... args) {
+    if constexpr (!IsLoad) {
+      Base::template tensormaps_cp_fence_release<false>(cute::forward<Args>(args)...);
+    }
+  }
+
+  template <bool IsLoad, class... Args>
+  CUTLASS_DEVICE void tensormaps_fence_acquire(Args&&... args) {
+    if constexpr (!IsLoad) {
+      Base::template tensormaps_fence_acquire<false>(cute::forward<Args>(args)...);
+    }
+  }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Producer-acquire adapter: only sets the kernel trait, so the mainloop producer acquires an
+// immutable prebuilt D descriptor before its full-barrier arrive instead of each consumer WG
+// acquiring it after the mainloop. All types and methods stay the wrapped epilogue's. A mutable D
+// descriptor is rewritten by the consumer, so it keeps the consumer-late acquire.
+template <class EpilogueBase>
+struct Sm90MixedInputProducerAcquiredDEpilogue : EpilogueBase {
+  using Base = EpilogueBase;
+  using Base::Base;
+  static constexpr bool ProducerAcquiresPrebuiltD = Base::UsesPrebuiltDDescriptor;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <class ArchTag, class OpClass, class TileShape_MNK, class ClusterShape_MNK,
           class EpilogueTileType, class ElementAccumulator, class ElementCompute, class ElementC_,
           class GmemLayoutTagC_, int AlignmentC, class ElementD_, class GmemLayoutTagD,
           int AlignmentD, class Schedule,
           class FusionOpOrCallbacks = cutlass::epilogue::fusion::LinearCombination<
-              ElementD_, ElementCompute, ElementC_, ElementCompute>>
+              ElementD_, ElementCompute, ElementC_, ElementCompute>,
+          bool UsesPrebuiltDDescriptor = false, bool EnableSource = true,
+          bool ProducerAcquiresPrebuiltD = false>
 struct MixedInputSm90TmaEpilogueBuilder {
   static_assert(cute::is_same_v<ArchTag, cutlass::arch::Sm90>,
                 "Mixed-input TMA epilogue builder is SM90-only.");
   static_assert(cutlass::epilogue::collective::detail::sm90_is_ptr_array_tma_v<Schedule>,
                 "Mixed-input TMA epilogue builder expects a ptr-array TMA schedule.");
+  static_assert(EnableSource || not cute::is_void_v<ElementC_>,
+                "EnableSource=false wraps a source-capable epilogue; pass the real C type.");
 
  private:
   static_assert(detail::is_aligned<ElementC_, AlignmentC, ElementD_, AlignmentD>(),
@@ -1166,12 +1287,14 @@ struct MixedInputSm90TmaEpilogueBuilder {
       DispatchPolicy, FusionOpOrCallbacks, TileShape_MNK, EpilogueTile_MN,
       ElementAccumulator>::Callbacks;
 
- public:
-  using CollectiveOp = Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue<
+  // Every EnableSource / ProducerAcquiresPrebuiltD combination shares this source-capable
+  // epilogue, so C/D stages, shared storage and fusion types do not depend on them.
+  using SourceCapableOp = Sm90MixedInputPtrArrayTmaWarpSpecializedEpilogue<
       DispatchPolicy::StagesC, DispatchPolicy::StagesD, DispatchPolicy::FragmentSize,
       DispatchPolicy::ReuseSmemC, DispatchPolicy::DelayTmaStore,
-      DispatchPolicy::NumEpilogueWarpGroups, TileShape_MNK, EpilogueTile_MN, ElementC_,
-      GmemStrideTypeC, ElementD_, GmemStrideTypeD, FusionCallbacks, CopyOpG2S,
+      DispatchPolicy::NumEpilogueWarpGroups, UsesPrebuiltDDescriptor, TileShape_MNK,
+      EpilogueTile_MN, ElementC_, GmemStrideTypeC, ElementD_, GmemStrideTypeD, FusionCallbacks,
+      CopyOpG2S,
       decltype(detail::sm90_get_epilogue_smem_swizzle_layout_atom<UnderlyingGmemStrideTypeC,
                                                                   ElementC, EpilogueTile_MN>()),
       decltype(detail::sm90_get_smem_load_op_for_source<UnderlyingGmemStrideTypeC, ElementC,
@@ -1182,6 +1305,21 @@ struct MixedInputSm90TmaEpilogueBuilder {
       decltype(detail::sm90_get_smem_store_op_for_accumulator<UnderlyingGmemStrideTypeD, ElementD,
                                                               EpilogueTile_MN>()),
       CopyAtomC, void>;
+
+  using SourcePolicyOp = cute::conditional_t<EnableSource, SourceCapableOp,
+                                             Sm90MixedInputSourceDisabledEpilogue<SourceCapableOp>>;
+
+ public:
+  // Wrappers are applied only when requested: with both controls off this is SourceCapableOp.
+  using CollectiveOp =
+      cute::conditional_t<ProducerAcquiresPrebuiltD,
+                          Sm90MixedInputProducerAcquiredDEpilogue<SourcePolicyOp>, SourcePolicyOp>;
+  static_assert(
+      cute::is_same_v<typename CollectiveOp::SharedStorage,
+                      typename SourceCapableOp::SharedStorage> &&
+          cute::is_same_v<typename CollectiveOp::Params, typename SourceCapableOp::Params> &&
+          cute::is_same_v<typename CollectiveOp::Arguments, typename SourceCapableOp::Arguments>,
+      "Epilogue policies must keep the source-capable storage, params and arguments.");
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

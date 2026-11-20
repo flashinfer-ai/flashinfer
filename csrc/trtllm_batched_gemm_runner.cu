@@ -14,7 +14,13 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -35,6 +41,169 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+// Serialises the loads below, their inserts into the cache above, and the dispatch that reads it.
+// The cache is shared rather than per thread so that a short-lived host thread does not load a
+// module it can never unload: the handles live for the process, as before this change.
+static std::mutex globalTrtllmGenBatchedGemmModuleMutex;
+
+namespace {
+
+/**
+ * Key prefix of the current CUDA context: the raw context id bytes, exactly as
+ * BatchedGemmInterface::run() builds its module-cache key. Modules are per context, so a load
+ * in one context never stands in for another.
+ *
+ * @param key Receives the context id bytes on success.
+ * @param failedCall Receives the name of the driver call that failed.
+ * @return CUDA_SUCCESS, or the CUresult of the failed driver call.
+ */
+CUresult currentContextKey(std::string* key, std::string* failedCall) {
+  CUcontext ctx = nullptr;
+  CUresult res = cuCtxGetCurrent(&ctx);
+  if (res == CUDA_SUCCESS && ctx == nullptr) {
+    cudaFree(nullptr);
+    res = cuCtxGetCurrent(&ctx);
+  }
+  if (res != CUDA_SUCCESS || ctx == nullptr) {
+    *failedCall = "cuCtxGetCurrent";
+    return res == CUDA_SUCCESS ? CUDA_ERROR_INVALID_CONTEXT : res;
+  }
+  unsigned long long ctxId = 0;
+  res = cuCtxGetId(ctx, &ctxId);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuCtxGetId";
+    return res;
+  }
+  *key = std::string(reinterpret_cast<char*>(&ctxId), sizeof(ctxId));
+  return CUDA_SUCCESS;
+}
+
+/**
+ * Loads the cubin of `config` into `cache` with checked CUresults, so that
+ * BatchedGemmInterface::run() finds the module in the cache and never reaches its own
+ * unchecked cuModuleLoadData / cuModuleGetFunction (GitHub #5322). An empty cubin, which the
+ * Python loader hands back after a failed download or checksum, fails here with the driver's
+ * CUresult like a cubin the driver rejects.
+ *
+ * @param config The batched-GEMM config whose cubin and kernel are loaded.
+ * @param cache The module cache shared with BatchedGemmInterface::run().
+ * @param failedCall Receives the name of the driver call that failed.
+ * @return CUDA_SUCCESS when the module is in the cache, else the failing CUresult.
+ */
+CUresult preloadModule(BatchedGemmConfig const& config, BatchedGemmInterface::ModuleCache& cache,
+                       std::string* failedCall) {
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, failedCall);
+  if (res != CUDA_SUCCESS) {
+    return res;
+  }
+  std::string const key = ctxKey + std::string(config.mFunctionName);
+  if (cache.find(key) != cache.end()) {
+    return CUDA_SUCCESS;
+  }
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+  res = loadCubinData(&module, config);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuModuleLoadData";
+    return res;
+  }
+  res = cuModuleGetFunction(&function, module, config.mFunctionName);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuModuleGetFunction";
+    cuModuleUnload(module);
+    return res;
+  }
+  cache.emplace(key, std::make_tuple(module, function));
+  return CUDA_SUCCESS;
+}
+
+/**
+ * Whether the cubin of `config` loads on this driver, remembered per CUDA context so a cubin that
+ * does not load is tried once rather than on every call. A load is tried twice before a cubin
+ * counts as unloadable: on the Windows arm64 drivers of GitHub #5322 some two-CTA kernels fail
+ * once and load on the second attempt. An out-of-memory result is not remembered, since it can
+ * clear. A cubin that does not load is reported once on stderr. A successful load stays in the
+ * module cache for run().
+ *
+ * @param config The batched-GEMM config to load.
+ * @return true when the cubin loads, false when it does not.
+ */
+bool cubinLoads(BatchedGemmConfig const& config) {
+  static std::unordered_map<std::string, bool> probed;
+  static std::unordered_set<std::string> reported;
+  std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+  std::string failedCall;
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, &failedCall);
+  FLASHINFER_CHECK(res == CUDA_SUCCESS, failedCall, " returned CUresult ", static_cast<int>(res),
+                   " while loading trtllm-gen cubin ", config.mFunctionName);
+  std::string const name = ctxKey + std::string(config.mFunctionName);
+  auto const it = probed.find(name);
+  if (it != probed.end()) {
+    return it->second;
+  }
+  res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  if (res != CUDA_SUCCESS) {
+    res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  }
+  bool const ok = res == CUDA_SUCCESS;
+  if (!ok && reported.insert(name).second) {
+    std::fprintf(stderr,
+                 "[FlashInfer] trtllm-gen cubin %s does not load on this driver (%s returned "
+                 "CUresult %d); skipping it (GitHub #5322)\n",
+                 config.mFunctionName, failedCall.c_str(), static_cast<int>(res));
+  }
+  if (ok || res != CUDA_ERROR_OUT_OF_MEMORY) {
+    probed.emplace(name, ok);
+  }
+  return ok;
+}
+
+}  // namespace
+
+namespace {
+
+// The trtllm-gen cubin manifest is a downloaded artifact, so which architectures
+// it actually covers is not knowable at compile time. Encode only the
+// cubin-arch -> SM-version compatibility rules here and let `config.mSm` decide
+// what is available. Unknown cubin families are rejected so that a newly shipped
+// one fails loudly instead of being mis-dispatched onto hardware that cannot run
+// it (see #4107).
+bool isArchCompatible(int smVersion, tg::CudaArch cubinArch) {
+  switch (cubinArch) {
+    case tg::CudaArch::Sm100a:
+      return smVersion == 100;
+    case tg::CudaArch::Sm100f:
+      return smVersion == 100 || smVersion == 103;
+    case tg::CudaArch::Sm103a:
+      return smVersion == 103;
+#ifdef TLLM_RUBIN_FEATURES
+    // CudaArch::Sm107a only exists in the Rubin cubin pin's generated headers,
+    // which is also the only build that defines TLLM_RUBIN_FEATURES. sm107 is
+    // unreachable in the non-Rubin module: get_trtllm_moe_sm100_module() picks
+    // the Rubin variant by device compute capability before this runs.
+    case tg::CudaArch::Sm107a:
+      return smVersion == 107;
+#endif
+    default:
+      return false;
+  }
+}
+
+void checkPassingConfigIndex(std::vector<int64_t> const& passingConfigIndices,
+                             int32_t configIndex) {
+  auto const it = std::find(passingConfigIndices.begin(), passingConfigIndices.end(), configIndex);
+  if (it == passingConfigIndices.end()) {
+    std::ostringstream msg;
+    msg << "Config index " << configIndex
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+    FLASHINFER_ERROR(msg.str());
+  }
+}
+
+}  // namespace
 
 std::vector<int64_t> prioritizePredefinedConfigs(
     int m, int n, int k, std::vector<int64_t> const& sortedIndices,
@@ -117,14 +286,29 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
         if (options.mBiasDtype != mOptions.biasDtype) continue;
       }
+      bool const usesPerTokenScaling =
+          options.mTransposeMmaOutput ? options.mUsePerTokenSfB : options.mUsePerTokenSfA;
       if (mOptions.usePerTokenScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+        if (!usesPerTokenScaling) continue;
+        if (options.mPerTokenSfDtype != mOptions.perTokenSfDtype) continue;
       }
-      if (mOptions.usePerChannelScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+      // The MoE pipeline allocates and consumes output scaling factors in the
+      // block format's default dtype. Reject cubins that override that
+      // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
+      // scaling factors into a buffer sized for E4M3 factors.
+      //
+      // The published cubin packages predate BatchedGemmOptions::mDtypeSfC, so
+      // filter by kernel name instead: the offending kernels encode the linear
+      // FP32 output scale-factor dtype as the "E2m1xFp32" name token (present
+      // only in the sm_107a package). TODO: restore the typed mDtypeSfC check
+      // once packages carrying the field are published and pinned.
+      if (config.mFunctionName != nullptr &&
+          std::strstr(config.mFunctionName, "E2m1xFp32") != nullptr) {
+        continue;
       }
+      bool const usesPerChannelScaling =
+          options.mTransposeMmaOutput ? options.mUsePerTokenSfA : options.mUsePerTokenSfB;
+      if (usesPerChannelScaling != mOptions.usePerChannelScaling) continue;
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
@@ -133,19 +317,45 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
         continue;
       }
-      // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
-      if (options.mPatchF2fp && sm_version == 103) {
-        if (config.mSm != tg::CudaArch::Sm103a) continue;
-      }
-      if (options.mPatchF2fp && sm_version == 100) {
-        if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
-      }
+      if (!isArchCompatible(sm_version, config.mSm)) continue;
+      // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
+      if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
-        // Skip cubins with clusterZ > 1 due to correctness issues described in
-        // https://github.com/flashinfer-ai/flashinfer/issues/3197
-        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
+    }
+  }
+
+  if (mPassingConfigIndices.empty()) {
+    // Distinguish "this GPU has no cubins at all" from "no cubin matches these GEMM
+    // options". The former is the common failure on unsupported hardware, and the
+    // option dump below would send users looking in entirely the wrong place.
+    bool anyArchCompatible = false;
+    for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+      if (isArchCompatible(sm_version, configs[i].mSm)) {
+        anyArchCompatible = true;
+        break;
+      }
+    }
+    std::ostringstream arch_msg;
+    arch_msg << "The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm"
+             << sm_version << "; this backend currently ships cubins for sm100, sm103 and sm107.";
+    FLASHINFER_CHECK(anyArchCompatible, arch_msg.str());
+    if (mOptions.fusedAct && mOptions.actType == ActType::SwiGluStep) {
+      bool anyStepCompatible = false;
+      for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+        auto const& config = configs[i];
+        if (config.mOptions.mFusedAct &&
+            static_cast<int>(config.mOptions.mActType) == static_cast<int>(ActType::SwiGluStep) &&
+            isArchCompatible(sm_version, config.mSm)) {
+          anyStepCompatible = true;
+          break;
+        }
+      }
+      FLASHINFER_CHECK(
+          anyStepCompatible,
+          "SwiGLUStep requires trtllm-gen batched-GEMM cubins with the StepFun epilogue "
+          "(export 7.0.5.0.4.0 or later); the current artifact contains no StepFun kernels.");
     }
   }
 
@@ -164,13 +374,22 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mFusedBiasShuffleMode: " << (int64_t)mOptions.fusedBiasShuffleMode
             << ", mBiasDtype: " << tg::dtypeToString(mOptions.biasDtype)
             << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mPerTokenSfDtype: " << tg::dtypeToString(mOptions.perTokenSfDtype)
             << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
+}
+
+batchedGemm::trtllm::gen::SfLayout TrtllmGenBatchedGemmRunner::getSfLayoutB(
+    int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
+  auto const configs = BatchedGemmInterface().getBatchedGemmConfigs();
+  return configs[configIndex].mOptions.mSfLayoutB;
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -208,15 +427,49 @@ void TrtllmGenBatchedGemmRunner::run(
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-    int32_t configIndex, bool enable_pdl) {
+    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK,
+    TrtllmGenBatchedGemmPartition const& partition) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
+  auto const numConfigs = bmm.getNumBatchedGemmConfigs();
 
+  FLASHINFER_CHECK(
+      configIndex >= 0 && static_cast<size_t>(configIndex) < static_cast<size_t>(numConfigs),
+      "Config index", configIndex, "is out of range; the manifest has", numConfigs, "configs");
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   auto const& config = configs[configIndex];
   // printf("running config %d: %s\n", configIndex, config.mFunctionName);
+
+  if (enable_pdl) {
+    // The fused MoE's glue kernels (the DeepSeek FP8 activation after GEMM1, the finalize after
+    // GEMM2) read routing outputs before their own griddepcontrol.wait. That is sound only if
+    // every CTA of the GEMM they depend on waits on its primary before it triggers the dependent
+    // launch or exits, so that routing is complete by the time a glue kernel can start. trtllm-gen
+    // builds its kernels that way; this rules out, for the kernel actually selected, the option
+    // combinations that would allow a trigger or an exit before the wait. A kernel with no wait
+    // at all is launched without the PDL attribute by BatchedGemmInterface (plain stream order),
+    // which keeps the chain intact as well.
+    auto const& opts = config.mOptions;
+    bool const waitsOnPrimary = opts.mGridWaitForPrimaryRouting ||
+                                opts.mGridWaitForPrimaryEarlyExit || opts.mGridWaitForPrimaryA ||
+                                opts.mGridWaitForPrimaryB;
+    // The same condition under which BatchedGemmInterface launches the kernel with the PDL
+    // attribute: a kernel with none of these is launched in plain stream order and needs no check.
+    bool const launchedWithPdl =
+        waitsOnPrimary || opts.mFineGrainedConsumerA || opts.mFineGrainedConsumerB;
+    bool const exitingCtasWait = !(opts.mEnablesEarlyExit || opts.mEnablesDelayedEarlyExit) ||
+                                 opts.mGridWaitForPrimaryEarlyExit;
+    FLASHINFER_CHECK(
+        !launchedWithPdl || (waitsOnPrimary && exitingCtasWait &&
+                             (!opts.mGridTriggerSecondaryA || opts.mGridWaitForPrimaryA) &&
+                             (!opts.mGridTriggerSecondaryB || opts.mGridWaitForPrimaryB)),
+        "Batched GEMM kernel ", config.mFunctionName,
+        " may trigger its dependent launch or exit before waiting on its primary; "
+        "the MoE glue kernels rely on the wait coming first.");
+  }
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -238,6 +491,10 @@ void TrtllmGenBatchedGemmRunner::run(
   if (mOptions.routeAct) {
     FLASHINFER_CHECK(routeMap, "Batched GEMM with routeAct requires routeMap");
     FLASHINFER_CHECK(numTokens > 0, "Batched GEMM with routeAct requires numTokens > 0");
+  }
+
+  if (mOptions.eltwiseActType == EltwiseActType::ClampedRelu2) {
+    FLASHINFER_CHECK(ptrClampLimit, "ClampedRelu2 requires a device clamp-limit buffer");
   }
 
   // Dims
@@ -291,12 +548,52 @@ void TrtllmGenBatchedGemmRunner::run(
   // Outputs
   gemmData.mOutputBuffers.mPtrC = c;
   gemmData.mOutputBuffers.mPtrSfC = outSfC;
+  // A non-zero row width makes the kernel store its columns at mColumnOffsetC of a wider buffer;
+  // the interface rejects slices the config cannot store (see supportsPartition).
+  gemmData.mOutputBuffers.mRowWidthC = partition.outputRowWidth;
+  gemmData.mOutputBuffers.mColumnOffsetC = partition.outputColumnOffset;
 
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+  if (partition.smCount > 0) {
+    FLASHINFER_CHECK(partition.smCount <= multiProcessorCount, "Partition SM count ",
+                     partition.smCount, " exceeds the device's ", multiProcessorCount, " SMs");
+    // Persistent kernels size their grid from this count; a domain stream only has its own SMs.
+    multiProcessorCount = partition.smCount;
+  }
+
+  // Resolve valid dimensions in the caller's logical m/n/k space, then remap M/N into the
+  // internal coordinate space used above when transposeMmaOutput swaps m and n.
+  int32_t const logicalValidM = (validM >= 0) ? validM : m;
+  int32_t const logicalValidN = (validN >= 0) ? validN : n;
+  int32_t const logicalValidK = (validK >= 0) ? validK : k;
+
+  FLASHINFER_CHECK(logicalValidM >= 0 && logicalValidM <= m, "validM (", logicalValidM,
+                   ") must be in [0, m=", m, "]");
+  FLASHINFER_CHECK(logicalValidN >= 0 && logicalValidN <= n, "validN (", logicalValidN,
+                   ") must be in [0, n=", n, "]");
+  FLASHINFER_CHECK(logicalValidK >= 0 && logicalValidK <= k, "validK (", logicalValidK,
+                   ") must be in [0, k=", k, "]");
+
+  gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? logicalValidN : logicalValidM;
+  gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? logicalValidM : logicalValidN;
+  gemmData.mProblemDimensions.mValidK = logicalValidK;
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
+
+  // Load the kernel with checked CUresults before the launch: the export header's run() ignores
+  // the results of its own cuModuleLoadData / cuModuleGetFunction and would launch an
+  // uninitialised handle (GitHub #5322). The lock stays held across bmm.run(): the header reads
+  // the module cache during dispatch, and a load on another thread could rehash the map
+  // underneath it. The launch itself is asynchronous, so the critical section is short.
+  std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+  std::string failedCall;
+  CUresult const loadRes =
+      preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  FLASHINFER_CHECK(loadRes == CUDA_SUCCESS, failedCall, " returned CUresult ",
+                   static_cast<int>(loadRes), " for trtllm-gen cubin ", config.mFunctionName,
+                   " (numBatches: ", numBatches, ", GemmMNK: ", m, " ", n, " ", k, ")");
 
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
@@ -372,6 +669,13 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
   BatchedGemmData gemmData{};
+  // The pinned TRTLLM-Gen validator checks pointer presence even for shape-only queries.
+  // This host placeholder is never dereferenced or passed to a kernel; run() checks the
+  // real clamp pointer. Remove when upstream supports shape-only ClampedRelu2 validation.
+  float const clampLimitPlaceholder = 1.0f;
+  if (mOptions.eltwiseActType == EltwiseActType::ClampedRelu2) {
+    gemmData.mInputBuffers.mPtrClampLimit = &clampLimitPlaceholder;
+  }
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -425,19 +729,48 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
       return optionsA.mTileN > optionsB.mTileN;
     }
 
-    // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on
-    // the larger side, prefer persistent tile scheduler.
-    if (optionsA.mTileScheduler != optionsB.mTileScheduler) {
-      auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
-      auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
-      if (numCtas > multiProcessorCount) {
-        return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
-      } else {
-        return optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
-      }
+    // Tier 2+: When previous comparators are the same, prefer fewer split-K slices. Split-K adds a
+    // cross-CTA reduction and is left to the autotuner; on B200/B300 the splitK2/splitK3 tie-mates
+    // of an unsplit kernel measured 1.3-1.9x slower for the routed MoE GEMMs (#6838).
+    if (optionsA.mNumSlicesForSplitK != optionsB.mNumSlicesForSplitK) {
+      return optionsA.mNumSlicesForSplitK < optionsB.mNumSlicesForSplitK;
     }
 
-    return false;
+    // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on
+    // the larger side, prefer persistent tile scheduler. The estimate drops split-K and clusters so
+    // it only depends on the tile shape, which both configs share here; otherwise cmp(a, b) and
+    // cmp(b, a) could disagree and the sort would not be a strict weak ordering.
+    bool const persistentA =
+        optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+    bool const persistentB =
+        optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+    if (persistentA != persistentB) {
+      auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
+      options.mNumSlicesForSplitK = 1;
+      options.mClusterDimX = 1;
+      options.mClusterDimY = 1;
+      options.mClusterDimZ = 1;
+      auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+      return numCtas > multiProcessorCount ? persistentA : persistentB;
+    }
+
+    // The tiers below only order configs the tiers above leave tied. The untuned default is the
+    // first sorted entry, so every tie must be broken by the kernel itself, never by its position
+    // in the cubin manifest: a reorder of the manifest must not change the default (#6838).
+
+    // Tier 3: prefer deeper A/B pipelines. Without it the name tie-break below would pick the
+    // shallowest (_s3_) tie-mate, measured up to 1.2x slower on the DeepSeek-V4 FC1 GEMM.
+    if (optionsA.mNumStagesA != optionsB.mNumStagesA) {
+      return optionsA.mNumStagesA > optionsB.mNumStagesA;
+    }
+    if (optionsA.mNumStagesB != optionsB.mNumStagesB) {
+      return optionsA.mNumStagesB > optionsB.mNumStagesB;
+    }
+
+    // Final tier: the kernel name is unique, so the order is total.
+    char const* nameA = configs[idx0].mFunctionName;
+    char const* nameB = configs[idx1].mFunctionName;
+    return std::strcmp(nameA != nullptr ? nameA : "", nameB != nullptr ? nameB : "") < 0;
   };
 
   // Sort configs by options.
@@ -457,8 +790,10 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     }
   }
 
-  FLASHINFER_CHECK(!validConfigIndices.empty(),
-                   "No valid config found for the given problem shape");
+  if (validConfigIndices.empty()) {
+    throw NoValidConfigError(__FUNCTION__, __FILE__, __LINE__,
+                             "No valid config found for the given problem shape");
+  }
 
   return validConfigIndices;
 }
@@ -469,7 +804,23 @@ int64_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(
   auto const validConfigIndices =
       getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
 
-  return validConfigIndices[0];
+  // The default is the first config in priority order whose cubin loads on this driver. Where
+  // every cubin loads that is the first entry, and the load is the one run() needs anyway. The
+  // autotuner needs no such filter: run() raises for a tactic whose cubin does not load and the
+  // tuner skips that tactic.
+  auto const bmm = BatchedGemmInterface();
+  auto const configs = bmm.getBatchedGemmConfigs();
+  for (auto const& configIndex : validConfigIndices) {
+    if (cubinLoads(configs[configIndex])) {
+      return configIndex;
+    }
+  }
+  throw NoLoadableKernelError(
+      __FUNCTION__, __FILE__, __LINE__,
+      "All " + std::to_string(validConfigIndices.size()) +
+          " configs valid for this problem shape have cubins that do not load on this driver, "
+          "the first in priority order being " +
+          std::string(configs[validConfigIndices.front()].mFunctionName) + " (GitHub #5322)");
 }
 
 bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t m, int32_t n,
@@ -481,6 +832,11 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const configs = bmm.getBatchedGemmConfigs();
 
   BatchedGemmData gemmData{};
+  // Match getValidConfigIndices: this shape-only placeholder is never dereferenced or launched.
+  float const clampLimitPlaceholder = 1.0f;
+  if (mOptions.eltwiseActType == EltwiseActType::ClampedRelu2) {
+    gemmData.mInputBuffers.mPtrClampLimit = &clampLimitPlaceholder;
+  }
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -505,6 +861,20 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const& config = configs[configIndex];
 
   return bmm.isValidConfig(config, gemmData);
+}
+
+bool TrtllmGenBatchedGemmRunner::supportsPartition(int32_t configIndex, int32_t smCount) const {
+  auto const bmm = BatchedGemmInterface();
+  if (configIndex < 0 || configIndex >= static_cast<int32_t>(bmm.getNumBatchedGemmConfigs()) ||
+      smCount <= 0) {
+    return false;
+  }
+  auto const& options = bmm.getBatchedGemmConfigs()[configIndex].mOptions;
+  int32_t const clusterSize = options.mClusterDimX * options.mClusterDimY * options.mClusterDimZ;
+  // The same conditions setKernelParams enforces for an output slice, plus enough SMs in one
+  // domain for a cluster and for every split-K slice of it.
+  return options.mUseTmaStore && !options.mUseCMultiCast && !options.mUseDeepSeekFp8 &&
+         clusterSize <= smCount && options.mNumSlicesForSplitK <= smCount / clusterSize;
 }
 
 }  // namespace kernels

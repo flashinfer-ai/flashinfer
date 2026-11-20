@@ -72,6 +72,20 @@ namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
 #endif
 
+// MSVC workaround: Helper to force dependent type resolution.
+// MSVC has a known bug where it fails to resolve nested dependent types
+// from template aliases (C3083/C2039). By wrapping the access in a
+// dedicated struct template, MSVC is forced to fully instantiate the
+// base type before accessing its members.
+template <typename DefaultGemmGroupedType>
+struct MoeGemmKernelTraits {
+  using GemmKernel = typename DefaultGemmGroupedType::GemmKernel;
+  using Mma = typename GemmKernel::Mma;
+  using Epilogue = typename GemmKernel::Epilogue;
+  using ThreadblockSwizzle = typename GemmKernel::ThreadblockSwizzle;
+  static constexpr auto kGroupScheduleMode = GemmKernel::kGroupScheduleMode;
+};
+
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
           cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
@@ -150,7 +164,9 @@ struct genericMoeGemmKernelLauncher {
 #endif
 
       // Finally, set up the kernel.
-      using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+      // MSVC workaround: use MoeGemmKernelTraits helper to force MSVC to fully
+      // resolve the dependent type chain before accessing nested members.
+      using DefaultGemmGroupedType_ = cutlass::gemm::kernel::DefaultGemmGrouped<
           ElementType, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone,
           MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
           typename MixedGemmArchTraits::LayoutB, cutlass::ComplexTransform::kNone,
@@ -158,14 +174,15 @@ struct genericMoeGemmKernelLauncher {
           ElementAccumulator, typename MixedGemmArchTraits::OperatorClass, arch, ThreadblockShape,
           WarpShape, typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
           cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, Stages,
-          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, TaggedOperator>::GemmKernel;
+          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, TaggedOperator>;
+
+      using Traits_ = MoeGemmKernelTraits<DefaultGemmGroupedType_>;
 
       using GemmKernel =
-          cutlass::gemm::kernel::MoeFCGemm<typename GemmKernel_::Mma,
-                                           typename GemmKernel_::Epilogue,
-                                           typename GemmKernel_::ThreadblockSwizzle,
+          cutlass::gemm::kernel::MoeFCGemm<typename Traits_::Mma, typename Traits_::Epilogue,
+                                           typename Traits_::ThreadblockSwizzle,
                                            arch,  // Ensure top level arch is used for dispatch
-                                           GemmKernel_::kGroupScheduleMode>;
+                                           Traits_::kGroupScheduleMode>;
 
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
@@ -684,8 +701,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
     if (sm == 90) {
       using Tile = cutlass_extensions::CutlassTileConfigSM90;
       using Schedule = cutlass_extensions::MainloopScheduleType;
-      for (Tile tile : {Tile::CtaShape128x8x128B, Tile::CtaShape128x16x128B,
-                        Tile::CtaShape128x32x128B, Tile::CtaShape128x40x128B}) {
+      for (Tile tile :
+           {Tile::CtaShape128x8x128B, Tile::CtaShape128x16x128B, Tile::CtaShape128x32x128B,
+            Tile::CtaShape128x40x128B, Tile::CtaShape128x64x128B}) {
         for (Schedule schedule :
              {Schedule::SINGLE_WARPGROUP_PREFILL, Schedule::SINGLE_WARPGROUP_ROLLING}) {
           CutlassGemmConfig config(tile, schedule, cutlass_extensions::EpilogueScheduleType::AUTO,
@@ -880,6 +898,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Af
                   T, WeightType, OutputType, EpilogueTag,
                   TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>;
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION:
+              return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<
+                  T, WeightType, OutputType, EpilogueTag,
+                  TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION>;
             case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION:
             default:
               TLLM_THROW("Unimplemented fusion %d requested", (int)hopper_inputs.fusion);
@@ -1018,7 +1039,11 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
   } while (0)
 
       CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
-      if (sm_ == 90) {
+      if constexpr (use_mxfp8 || (std::is_same_v<T, __nv_bfloat16> &&
+                                  std::is_same_v<WeightType, __nv_bfloat16>)) {
+        CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION);
+      }
+      if (sm_ >= 90) {
         CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
       }
 
@@ -1091,8 +1116,37 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::
     queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) {
   // TMA warp-specialized configs (Hopper/Blackwell native) do not use the Ampere GroupedGEMM
-  // occupancy path, so we conservatively report them as supported (occupancy > 0).
+  // occupancy path. They can still be rejected at dispatch time, though: e.g. on SM120 NVFP4
+  // several candidate tile shapes throw "Unsupported tile shape config" from the tile-shape
+  // switch and can never launch. Blindly reporting occupancy 1 makes get_valid_tactics present
+  // those tactics to the autotuner, where they only ever fail during profiling (14 of 60
+  // tactics for the bf16-activation x nvfp4-weight grouped GEMM on SM120). Probe the TMA WS
+  // dispatch in workspace-query mode instead, the same graceful-skip idiom
+  // calcMaxWorkspaceSize uses, so dispatch-rejected configs report occupancy 0.
   if (config.is_tma_warp_specialized) {
+    if constexpr (tensorrt_llm::kernels::cutlass_kernels::
+                      isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() &&
+                  !use_w4afp8 && !use_wfp4a16 && !use_sm90_mixed_input_gemm) {
+      auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+      if constexpr (use_wfp4afp8) {
+        fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+      } else if constexpr (use_mxfp8) {
+        fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+      } else if (use_fp4) {
+        fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+      }
+      try {
+        // num_experts only scales the reported workspace size, not the validity of the
+        // (arch, type, tile) combination.
+        int const probe_num_experts = num_experts_ > 0 ? num_experts_ : 1;
+        cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecialized<
+            T, WeightType, OutputType, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>(
+            probe_num_experts, config, multi_processor_count_, fpX_block_scaling_type);
+      } catch (tensorrt_llm::common::TllmException const& e) {
+        TLLM_LOG_TRACE("Config rejected by TMA WS dispatch, reporting occupancy 0: %s", e.what());
+        return 0;
+      }
+    }
     return 1;
   }
 

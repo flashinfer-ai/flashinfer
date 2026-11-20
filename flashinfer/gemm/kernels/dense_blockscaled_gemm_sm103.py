@@ -37,13 +37,17 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm103_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
+from flashinfer.gemm.kernels.epilogue_utils import (
+    epilogue_tma_store_with_alpha,
+    epilogue_with_alpha,
+)
 
 
 class Sm103BlockScaledPersistentDenseGemmKernel:
@@ -603,11 +607,6 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
-        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
-        # before multiplication could cause overflow when acc values are large.
-        alpha_value = alpha[0].to(cutlass.Float32)
-
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -904,6 +903,11 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
 
         # PDL bookend: always emitted, actual behavior controlled by use_pdl= in .launch()
         griddepcontrol_wait()
+
+        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
+        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
+        # before multiplication could cause overflow when acc values are large.
+        alpha_value = alpha[0].to(cutlass.Float32)
 
         #
         # Construct the scheduler
@@ -1572,8 +1576,6 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 c_pipeline = pipeline.PipelineTmaStore.create(
                     num_stages=self.num_c_stage, producer_group=c_producer_group
                 )
-            # Wrap epilogue_op with alpha scaling
-            alpha_epilogue_op = lambda x: epilogue_op(alpha_value * x)
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -1589,7 +1591,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 work_tile = tile_sched.get_current_work()
                 num_tiles_executed = tile_sched.num_tiles_executed
                 if cutlass.const_expr(self.use_tma_store):
-                    acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
+                    acc_consumer_state = epilogue_tma_store_with_alpha(
                         self,
                         tidx,
                         warp_idx,
@@ -1599,20 +1601,22 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         tCgC,
                         epi_tile,
                         num_tiles_executed,
-                        alpha_epilogue_op,
+                        epilogue_op,
+                        alpha_value,
                         mma_tile_coord_mnl,
                         acc_consumer_state,
                         acc_pipeline,
                         c_pipeline,
                     )
                 else:
-                    acc_consumer_state = utils.gemm.sm100.epilogue(
+                    acc_consumer_state = epilogue_with_alpha(
                         self,
                         tidx,
                         tCtAcc_base,
                         tCgC,
                         epi_tile,
-                        alpha_epilogue_op,
+                        epilogue_op,
+                        alpha_value,
                         mma_tile_coord_mnl,
                         acc_consumer_state,
                         acc_pipeline,
@@ -1765,7 +1769,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :return: SMEM layout for operand A
         :rtype: cute.Layout
         """
-        is_k_major = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+        is_k_major = tiled_mma.op.a_major_mode == OperandMajorMode.K
         a_smem_layout_staged = tcgen05.tile_to_mma_shape(
             tcgen05.make_smem_layout_atom(
                 tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Uint8
@@ -1808,7 +1812,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :return: SMEM layout for operand B
         :rtype: cute.Layout
         """
-        is_k_major = tiled_mma.op.b_major_mode == cute.nvgpu.OperandMajorMode.K
+        is_k_major = tiled_mma.op.b_major_mode == OperandMajorMode.K
         b_smem_layout_staged = tcgen05.tile_to_mma_shape(
             tcgen05.make_smem_layout_atom(
                 tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Uint8
@@ -1832,11 +1836,11 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         """
 
         sf_vec_size: int
-        major_mode: cute.nvgpu.OperandMajorMode = cute.nvgpu.OperandMajorMode.K
+        major_mode: OperandMajorMode = OperandMajorMode.K
         _layout: cute.Layout = field(init=False, repr=False)
 
         def __post_init__(self) -> None:
-            if self.major_mode == cute.nvgpu.OperandMajorMode.K:
+            if self.major_mode == OperandMajorMode.K:
                 atom_shape = ((8, 4, 4), (self.sf_vec_size, 4))
                 atom_stride = ((16, 128, 4), (0, 1))
             else:

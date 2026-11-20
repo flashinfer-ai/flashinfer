@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #ifdef ENABLE_FP4
 #include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
@@ -118,6 +119,11 @@ struct ActivationParams {
   float const* swiglu_alpha = nullptr;
   float const* swiglu_beta = nullptr;
   float const* swiglu_limit = nullptr;
+  // SiTU-GLU per-expert tanh scales; nullptr uses the SituAdaptor compile-time defaults.
+  float const* situ_beta = nullptr;
+  float const* situ_linear_beta = nullptr;
+  // Model-wide scalar used only by the fused ClampedRelu2 epilogue.
+  float const* clamped_relu2_limit = nullptr;
 
   explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
     TLLM_CHECK_WITH_INFO(
@@ -126,11 +132,20 @@ struct ActivationParams {
   }
 
   ActivationParams(ActivationType activation_type, float const* swiglu_alpha,
-                   float const* swiglu_beta, float const* swiglu_limit)
+                   float const* swiglu_beta, float const* swiglu_limit,
+                   float const* situ_beta = nullptr, float const* situ_linear_beta = nullptr)
       : activation_type(activation_type),
         swiglu_alpha(swiglu_alpha),
         swiglu_beta(swiglu_beta),
-        swiglu_limit(swiglu_limit) {}
+        swiglu_limit(swiglu_limit),
+        situ_beta(situ_beta),
+        situ_linear_beta(situ_linear_beta) {}
+
+  static ActivationParams ClampedRelu2(float const* limit) {
+    ActivationParams params(ActivationType::ClampedRelu2);
+    params.clamped_relu2_limit = limit;
+    return params;
+  }
 
   // TODO Port everything properly and get rid of these implicit conversions
   operator ActivationType() const { return activation_type; }
@@ -298,6 +313,10 @@ struct QuantParams {
 
     GemmInputs fc1;
     GemmInputs fc2;
+    // 4over6 recipe for both NVFP4 activation quantizations (GEMM1 input when
+    // the activations arrive unquantized, GEMM2 input), as the code decoded by
+    // resolveNVFP4Recipe(). The default reads FLASHINFER_NVFP4_4OVER6*.
+    int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv;
   } fp4;
 
   // GPTQ/AWQ quantization params
@@ -389,14 +408,14 @@ struct QuantParams {
       float const* fc2_act_global_scale,
       TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc2_weight_block_scale,
       float const* fc2_global_scale,  //
-      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
-
-  {
+      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false,
+      int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv) {
     QuantParams qp;
     qp.fp4.fc1 = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale,
                   fc1_global_scale};
     qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale,
                   fc2_global_scale};
+    qp.fp4.nvfp4_4over6_code = nvfp4_4over6_code;
     return qp;
   }
 
@@ -712,6 +731,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
                     T* const output, void* const intermediate_result,
                     int64_t const* const expert_first_token_offset,
+                    int const* const permuted_token_selected_experts,
                     TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
                     WeightType const* const fc1_expert_weights,
                     ScaleBiasType const* const fc1_expert_biases,
@@ -771,7 +791,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
         use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
     return Self::gemm1(moe_gemm_runner_, block_scale_gemm_runner, static_cast<T const*>(input),
                        static_cast<T*>(output), intermediate_result, expert_first_token_offset,
-                       tma_ws_input_template, static_cast<WeightType const*>(fc1_expert_weights),
+                       /*permuted_token_selected_experts=*/nullptr, tma_ws_input_template,
+                       static_cast<WeightType const*>(fc1_expert_weights),
                        static_cast<ScaleBiasType const*>(fc1_expert_biases), num_valid_tokens_ptr,
                        static_cast<ScaleBiasType const*>(fc1_int_scales), fc1_fp8_dequant,
                        fc2_fp8_quant, act_fp8_token_scale, fc1_fp4_act_flat, fc2_fp4_act_flat,
@@ -1014,6 +1035,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   float* permuted_token_final_scales_{};
 
   int64_t* expert_first_token_offset_{};
+  int64_t* gemm_expert_first_token_offset_{};
 
   void* glu_inter_result_{};
   void* fc2_result_{};
@@ -1078,6 +1100,7 @@ struct GemmProfilerBackend {
     mNeedWeights = need_weights;
     mParallelismConfig = parallelism_config;
     mEnableAlltoall = enable_alltoall;
+    mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mSm90Wfp4Afp8Mode = sm90_wfp4afp8_mode;
     mSM = common::getSMVersion();
 
@@ -1144,13 +1167,30 @@ struct GemmProfilerBackend {
   bool mUseLora{};
   bool mMinLatencyMode{};
   bool mNeedWeights{};
+  bool mUseMxfp8ActScaling{};
   Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled;
 
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
  private:
+  bool profilesClampedRelu2Epilogue() const {
+    bool const is_mxfp8 = mUseMxfp8ActScaling && mDType == nvinfer1::DataType::kFP8 &&
+                          mWType == nvinfer1::DataType::kFP8;
+    bool const is_bf16 = mDType == nvinfer1::DataType::kBF16 && mWType == nvinfer1::DataType::kBF16;
+    return mSM >= 100 && mSM < 110 && mGemmToProfile == GemmToProfile::GEMM_1 &&
+           mActivationType == ActivationType::ClampedRelu2 && !mBias && !mUseLora &&
+           !mMinLatencyMode && (is_mxfp8 || is_bf16);
+  }
+
   bool isNativeWfp4Afp8Family() const {
     return mSM >= 100 && mDType == nvinfer1::DataType::kFP8 &&
+           (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
+  }
+
+  // Native NVFP4: FP4 activations x FP4 weights. Shared by workspace
+  // allocation and consumption so the two never disagree (issue #4003).
+  bool isNativeWfp4Afp4Family() const {
+    return (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   }
 

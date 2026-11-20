@@ -95,8 +95,10 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   bool const dt_softplus = params.dt_softplus;
 
   // State scale pointer (only used when scaleState == true)
-  [[maybe_unused]] auto* __restrict__ state_scale =
-      reinterpret_cast<state_scale_t*>(params.state_scale);
+  [[maybe_unused]] state_scale_t* __restrict__ state_scale = nullptr;
+  if constexpr (scaleState) {
+    state_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+  }
 
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
@@ -130,10 +132,11 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
-  [[maybe_unused]] auto* __restrict__ dst_state_scale =
-      scaleState ? reinterpret_cast<state_scale_t*>(params.state_scale) +
-                       dst_state_batch * params.state_scale_stride_batch + head * DIM
-                 : nullptr;
+  [[maybe_unused]] state_scale_t* __restrict__ dst_state_scale = nullptr;
+  if constexpr (scaleState) {
+    dst_state_scale = reinterpret_cast<state_scale_t*>(params.state_scale) +
+                      dst_state_batch * params.state_scale_stride_batch + head * DIM;
+  }
 
   __shared__ SharedStorageSimple<input_t, state_scale_t, ROWS_PER_BLOCK, DSTATE> sram;
 
@@ -316,7 +319,8 @@ struct SharedStorageVertical {
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
   float out[dim];
-  alignas(128) std::conditional_t<scaleState, state_scale_t, char> state_scale[dim * scaleState];
+  alignas(
+      128) std::conditional_t<scaleState, state_scale_t, char> state_scale[scaleState ? dim : 1];
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
   barrier_t bar_empty[numStages];
@@ -650,8 +654,10 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  [[maybe_unused]] auto* __restrict__ state_scale =
-      reinterpret_cast<state_scale_t*>(params.state_scale);
+  [[maybe_unused]] state_scale_t* __restrict__ state_scale = nullptr;
+  if constexpr (scaleState) {
+    state_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+  }
 
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
@@ -773,8 +779,8 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
     // Write output — wait for all consumer warps to finish writing sram.out
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
-    auto d = warp * warpSize + lane;
-    if (d < DIM) {
+    // The consumer warps cover consumerWarps * warpSize rows per iteration, so loop for DIM > 128.
+    for (int d = warp * warpSize + lane; d < DIM; d += consumerWarps * warpSize) {
       auto out_value = sram.out[d];
       if (z) {
         float z_value = toFloat(sram.z[d]);
@@ -783,10 +789,8 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
         out_value *= silu_z;
       }
       convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
-    }
-    if constexpr (scaleState) {
-      if (params.update_state && state_batch != params.pad_slot_id) {
-        if (d < DIM) {
+      if constexpr (scaleState) {
+        if (params.update_state && state_batch != params.pad_slot_id) {
           state_scale[dst_state_batch * params.state_scale_stride_batch + head * DIM + d] =
               sram.state_scale[d];
         }
@@ -931,7 +935,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
         auto const i = iBegin + ii;
 
-        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        auto* sState_ptr =
+            reinterpret_cast<unsigned int*>(&sram.state[stage][d * colsPerStage + ii]);
         uint32_t rState = *sState_ptr;
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
@@ -982,7 +987,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
             conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
         auto const i = iBegin + ii;
 
-        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        auto* sState_ptr =
+            reinterpret_cast<unsigned int*>(&sram.state[stage][d * colsPerStage + ii]);
         uint32_t rState = *sState_ptr;
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
@@ -1196,6 +1202,16 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
                   "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
   }
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
+  // The horizontal kernel gives each row 2 lanes of its (DIM / 64) * 4 consumer warps, so it
+  // covers exactly DIM rows only when DIM is a multiple of 64. Its state descriptor also loads
+  // all DIM rows as one TMA box, which holds at most 256 elements per dimension.
+  constexpr bool kHorizontalSupportsDim = DIM % 64 == 0 && DIM <= 256;
+  // The vertical kernel processes 16 rows per stage (4 rows for each of its 4 consumer warps),
+  // and its producer fills all 3 pipeline stages before the first write-back, so it needs at
+  // least 48 rows. With fewer, the producer waits for write-backs that never come.
+  constexpr bool kVerticalSupportsDim = DIM % 16 == 0 && DIM >= 3 * 16;
+#endif
 
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
@@ -1213,12 +1229,14 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       // for the non-tiled producer-consumer kernels to hide latency).
       int const total_blocks = params.batch * params.nheads;
       int const num_sms = GetCudaMultiProcessorCount();
-      if (total_blocks < num_sms * 2)
+      if (total_blocks < num_sms * 2 || !kVerticalSupportsDim)
+        // Simple is also the only kernel for DIM not divisible by 16 or below 48
         algo = SSUAlgorithm::kSimple;
       else if (sm_major < 10)
         algo = SSUAlgorithm::kVertical;
-      else if (scaleState)
-        // Horizontal kernel cannot do 2-pass quantization, so always use vertical
+      else if (scaleState || !kHorizontalSupportsDim)
+        // Horizontal kernel cannot do 2-pass quantization and needs DIM divisible by 64,
+        // so use vertical
         algo = SSUAlgorithm::kVertical;
       else
         // On Blackwell+: vertical is slightly faster for fp32 state,
@@ -1268,6 +1286,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto rowsPerStage = 4 * numConsumers;
     FLASHINFER_CHECK(params.dim % rowsPerStage == 0, "dim must be divisible by ", rowsPerStage,
                      " for vertical kernel");
+    FLASHINFER_CHECK(params.dim >= rowsPerStage * numStages, "dim must be at least ",
+                     rowsPerStage * numStages, " for vertical kernel");
 
     // TMA alignment checks for all pointers loaded via memcpy_async_tx
     FLASHINFER_CHECK_TMA_ALIGNED(params.x);
@@ -1283,11 +1303,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     dim3 block(warpSize, numWarps);
     dim3 grid(params.batch, params.nheads);
 
-    auto state_tensor =
-        tma::buildNdDescriptor(typeid(state_t),
-                               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-                               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                               /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
+    auto state_tensor = tma::buildNdDescriptor(
+        typeid(state_t),
+        /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+        /*strides*/ {1, DSTATE, DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)},
+        /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
 
     using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
                                          rowsPerStage, DIM, DSTATE, numStages>;
@@ -1301,6 +1321,9 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
         !scaleState,
         "Horizontal kernel does not support scaled state (int16). "
         "Cannot do 2-pass quantization because dstate tiles are discarded after processing.");
+    FLASHINFER_CHECK(
+        kHorizontalSupportsDim,
+        "Horizontal kernel requires dim divisible by 64 and at most 256, got dim=", DIM);
     constexpr auto numConsumers = (DIM / 64) * 4;
     constexpr auto numProducers = 1;
     constexpr auto numWarps = numProducers + numConsumers;
@@ -1319,11 +1342,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
 
-      auto state_tensor =
-          tma::buildNdDescriptor(typeid(state_t),
-                                 /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-                                 /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                                 /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
+      auto state_tensor = tma::buildNdDescriptor(
+          typeid(state_t),
+          /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+          /*strides*/ {1, DSTATE, DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)},
+          /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
       static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
 
       using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
@@ -1335,7 +1358,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
     };
 
-    dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, ratio_launcher);
+    // Instantiate the kernel only for supported dims: below 64 it would have no consumer warps,
+    // and above 256 its TMA box would be too large.
+    if constexpr (kHorizontalSupportsDim) {
+      dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, ratio_launcher);
+    }
   }
 #endif
   else {

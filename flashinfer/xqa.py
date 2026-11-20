@@ -21,8 +21,12 @@ import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.page import xqa_mla_trace, xqa_trace
-from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
-from .jit.utils import filename_safe_dtype_map
+from .jit.xqa import (
+    gen_xqa_module,
+    gen_xqa_module_mla,
+    ragged_q_changes_build,
+    swap_ab_eligible,
+)
 from .utils import (
     get_device_sm_count,
     register_custom_op,
@@ -32,7 +36,6 @@ from .utils import (
 )
 
 
-@functools.cache
 def get_xqa_module(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -43,6 +46,34 @@ def get_xqa_module(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool = False,
+):
+    # Ragged Q must reuse the uniform module unless it changes the compile
+    # flags; a second cache entry would re-register the same torch op.
+    use_ragged_q = use_ragged_q and ragged_q_changes_build(q_seq_len, head_group_ratio)
+    return _get_xqa_module_cached(
+        input_dtype,
+        kv_cache_dtype,
+        page_size,
+        head_dim,
+        head_group_ratio,
+        use_sliding_window,
+        output_dtype,
+        q_seq_len,
+        use_ragged_q,
+    )
+
+
+@functools.cache
+def _get_xqa_module_cached(
+    input_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    head_group_ratio: int,
+    use_sliding_window: bool,
+    output_dtype: torch.dtype,
+    q_seq_len: int,
+    use_ragged_q: bool,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -180,6 +211,7 @@ def xqa(
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -237,8 +269,6 @@ def xqa(
         per draft row, assuming draft tokens occupy consecutive positions at
         the end of the sequence (linear chains, causal or full masks);
         tree-structured drafts are not supported with sliding window.
-        On SM90 with fp8 KV cache, speculative decode with a sliding window
-        runs on the generic kernel rather than the Hopper fp8 kernel.
     kv_layout : str, default="NHD"
         The layout of the KV cache. Can be either ``NHD`` or ``HND``.
     sm_count : Optional[int], default=None
@@ -267,17 +297,21 @@ def xqa(
         tokens this step. When set, ``q`` and ``output`` are packed as
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
-        cumulative offsets. On SM90 with fp8 KV cache, ragged Q runs on the
-        generic kernel rather than the Hopper fp8 kernel.
+        cumulative offsets.
 
     Note
     ----
+    On SM90 with fp8 KV cache, speculative decode runs on the generic kernel
+    instead of the Hopper fp8 kernel when any of these holds: ragged Q,
+    attention sinks, a positive ``sliding_win_size`` (even one larger than
+    every sequence), or ``q_seq_len * (num_q_heads // num_kv_heads) <= 32``.
+
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0] (or seq_lens.shape[0] with ragged Q)
     - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
-    - kv_cache_dtype from k.dtype
+    - kv_cache_dtype from k_cache.dtype
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """
@@ -352,6 +386,7 @@ def xqa(
     if (
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
+        and head_dim <= 256  # SM90 kernel does not support head_dim > 256
     ):
         run_sm90_fp8_mha = True
     else:
@@ -359,7 +394,7 @@ def xqa(
 
     if k_cache.dtype == torch.uint8:
         assert get_compute_capability(torch.device(device="cuda"))[0] in [12], (
-            "XQA NVFP4 KV is only supported on SM120 GPUs"
+            "XQA NVFP4 KV is only supported on SM12x GPUs"
         )
         assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
         assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"
@@ -367,10 +402,6 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
-    # Ragged Q only changes the build when it suppresses the SPEC_Q_SEQ_LEN
-    # specialization; otherwise reuse the uniform module (a separate cache
-    # entry would re-register the same torch op name and fail).
-    ragged_build = use_ragged_q and q_seq_len * head_group_ratio <= 32
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -380,16 +411,21 @@ def xqa(
         use_sliding_window,
         output.dtype,
         q_seq_len,
-        ragged_build,
+        use_ragged_q,
     )
 
     if q_seq_len > 1:
         assert mask is not None, "Mask is required for speculative decoding"
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
-        if use_ragged_q or use_sliding_window:
-            # mha_sm90.cu rejects ragged Q, and its spec-dec sliding-window
-            # path mis-masks full draft masks; use the generic kernel.
+        if (
+            use_ragged_q
+            or use_sliding_window
+            or swap_ab_eligible(q_seq_len, head_group_ratio)
+        ):
+            # mha_sm90.cu rejects ragged Q and gets full draft masks wrong,
+            # both under sliding windows and in SWAP_AB. Causal masks can't
+            # be exempted without inspecting the device-side mask.
             run_sm90_fp8_mha = False
 
     xqa_module.xqa(
@@ -429,17 +465,20 @@ def get_xqa_module_mla(
     head_group_ratio: int,
     use_sliding_window: bool = False,
 ):
-    module = gen_xqa_module_mla(
+    spec = gen_xqa_module_mla(
         input_dtype,
         kv_cache_dtype,
         page_size,
         head_dim,
         head_group_ratio,
         use_sliding_window,
-    ).build_and_load()
+    )
+    # Reuse the JIT module URI so the two names can never drift apart.
+    op_name = f"flashinfer::{spec.name}"
+    module = spec.build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
+        op_name,
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa_mla(
@@ -477,9 +516,7 @@ def get_xqa_module_mla(
             enable_pdl,
         )
 
-    @register_fake_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
-    )
+    @register_fake_op(op_name)
     def _fake_xqa_mla(
         sm_count: int,
         q_scale: Union[float, torch.Tensor],
@@ -520,6 +557,7 @@ def xqa_mla(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
+
     Parameters
     ----------
     q : torch.Tensor
