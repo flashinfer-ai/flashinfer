@@ -17,6 +17,33 @@ def _data_dtype(kind: str) -> torch.dtype:
     raise ValueError(f"unsupported MX activation kind {kind!r}")
 
 
+def try_stage_mxfp4_with_shared(tensors, workspace) -> bool:
+    """Use the fused staging layout when both experts consume the same BF16 input."""
+    x = tensors.hidden_states
+    if (
+        workspace.config.shared_expert is None
+        or tensors.shared_hidden_states is not None
+        or tensors.shared_scales is not None
+        or os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") == "0"
+        or os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") != "0"
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or not x.is_contiguous()
+        or x.shape[1] % 128 != 0
+        or workspace.x_sf.shape[1] != x.shape[1] // 32
+        or not 1 <= tensors.topk_ids.shape[1] <= 128
+        or not tensors.topk_ids.is_contiguous()
+        or not tensors.topk_weights.is_contiguous()
+    ):
+        return False
+    try:
+        from .shared_staging_triton import stage_routed_and_shared
+    except ImportError:
+        return False
+    stage_routed_and_shared(tensors, workspace)
+    return True
+
+
 def stage_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
