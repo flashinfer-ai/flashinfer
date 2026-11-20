@@ -36,6 +36,7 @@ from ..blocks.operands import (
     HALF,
     IN_DTYPE,
     SMEM_CAP,
+    SPLIT_LOOP_PAGE_MAX,
     SPLIT_WARPS,
     split_pages,
 )
@@ -240,7 +241,9 @@ class SwapsPlan:
         # the K / V boxes of small pages are issued under the split placement, by kv_warps warps (the load warp alone otherwise)
         self.split = split_pages(page, ragged)
         self.kv_warps = SPLIT_WARPS if self.split else 1
-        self.split_loop = False  # the boxes unrolled at every page size: measured faster than the row body's loop in this body
+        self.split_loop = (
+            self.split and page <= SPLIT_LOOP_PAGE_MAX
+        )  # the boxes of 1- and 2-key pages in a run-time loop
         self.roles = Roles
         self.n_wg = 1  # one softmax warpgroup (fold_group's prefetch depth reads it)
         self.T = TILE_KEYS

@@ -69,7 +69,7 @@ def issue_slot_split(
     if cutlass.const_expr(st.split_loop):
         # a run-time loop (the block's z index is 0: it keeps the trip count out of the compiler's sight, so the loop is not
         # unrolled). Unrolled, the boxes of a slot of 1- or 2-key pages are tens of kilobytes of straight-line code per call
-        # site and issuing warp, and in the row body every warp of the CTA, the softmax's included, waits on instruction fetch
+        # site and issuing warp, and every warp of the CTA, the softmax warps included, waits on instruction fetch
         _, _, bz = cute.arch.block_idx()
         for i in range(part, st.boxes_per_slot + bz, st.kv_warps):
             kb = (
