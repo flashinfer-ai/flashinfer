@@ -337,6 +337,8 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     _config_type: type[MegaMoEHopperMxfp4Config] = MegaMoEHopperMxfp4Config
     _inputs_type: type[MegaMoEHopperMxfp4Inputs] = MegaMoEHopperMxfp4Inputs
     _folded_scale_rows = 16
+    _folded_scale_cols = 16
+    _folded_scale_dtype = torch.uint8
     _validate_tactic = staticmethod(_validate_complete_mxfp4_tactic)
 
     def _conversion_tactic(self, kernel) -> Dict[str, Any]:
@@ -757,7 +759,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             require_cuda(name, tensor)
             if tensor.dtype != torch.uint8 or tuple(tensor.shape) != weight_shape:
                 raise ValueError(
-                    f"{name} must be packed E2M1 uint8 with shape "
+                    f"{name} must be packed {self._weight_format} uint8 with shape "
                     f"{weight_shape}; "
                     f"got {tensor.dtype} {tuple(tensor.shape)}."
                 )
@@ -773,19 +775,35 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             (
                 "fc1_weight_sf",
                 inputs.fc1_weight_sf,
-                (e, c.fc1_out // 64, c.hidden // 128, self._folded_scale_rows, 16),
+                (
+                    e,
+                    c.fc1_out // 64,
+                    c.hidden // 128,
+                    self._folded_scale_rows,
+                    self._folded_scale_cols,
+                ),
             ),
             (
                 "fc2_weight_sf",
                 inputs.fc2_weight_sf,
-                (e, c.hidden // 64, c.intermediate // 128, self._folded_scale_rows, 16),
+                (
+                    e,
+                    c.hidden // 64,
+                    c.intermediate // 128,
+                    self._folded_scale_rows,
+                    self._folded_scale_cols,
+                ),
             ),
         )
         for name, tensor, offset_shape in offset_contracts:
             require_cuda(name, tensor)
-            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != offset_shape:
+            if (
+                tensor.dtype != self._folded_scale_dtype
+                or tuple(tensor.shape) != offset_shape
+            ):
                 raise ValueError(
-                    f"{name} must be folded Humming uint8 offsets with shape "
+                    f"{name} must be folded {self._weight_format} scales "
+                    f"with dtype {self._folded_scale_dtype} and shape "
                     f"{offset_shape}; got {tensor.dtype} {tuple(tensor.shape)}."
                 )
             if not tensor.is_contiguous():

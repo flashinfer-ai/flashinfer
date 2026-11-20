@@ -1081,7 +1081,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 fp8_fragment_a,
                 tidx % cutlass.Int32(128),
             )
-            expanded_offsets = make_expanded_offset_view_k256(
+            expanded_offsets = self._make_expanded_scale_view_k256(
                 smem_weight_sf,
                 self.mma_tiler[0],
             )
@@ -1114,7 +1114,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             for k_block in cutlass.range_constexpr(4):
                 if local_warp_idx == cutlass.Int32(0):
                     iket.range_push("mx_f1_cvt0")
-                convert_packed_a_kblock(
+                self._convert_packed_a_kblock(
                     packed_registers,
                     fp8_fragment_a,
                     partitioned_offsets,
@@ -1148,7 +1148,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             for k_block in cutlass.range_constexpr(4, 8):
                 if local_warp_idx == cutlass.Int32(0):
                     iket.range_push("mx_f1_cvt1")
-                convert_packed_a_kblock(
+                self._convert_packed_a_kblock(
                     packed_registers,
                     fp8_fragment_a,
                     partitioned_offsets,
@@ -1188,7 +1188,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     copy_view,
                 )
                 for k_block in cutlass.range_constexpr(4):
-                    convert_packed_a_kblock(
+                    self._convert_packed_a_kblock(
                         packed_registers,
                         fp8_fragment_a,
                         partitioned_offsets,
@@ -1206,7 +1206,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 warpgroup.commit_group()
                 warpgroup.wait_group(0)
                 for k_block in cutlass.range_constexpr(4, 8):
-                    convert_packed_a_kblock(
+                    self._convert_packed_a_kblock(
                         packed_registers,
                         fp8_fragment_a,
                         partitioned_offsets,
