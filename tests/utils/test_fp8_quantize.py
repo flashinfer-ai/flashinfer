@@ -94,10 +94,13 @@ def test_mxfp8_dequantize_round_trip(layout, device):
         not torch.cuda.is_available() or not _is_mxfp8_supported(torch.device(device))
     ):
         pytest.skip("MXFP8 quantization requires SM100 or newer")
-    # Small integers scaled by powers of two are exactly representable here.
+    # Exercise the E4M3FN subnormal/normal boundary and the two largest finite values.
+    magnitudes = torch.tensor([0, 2**-9, 7 * 2**-9, 2**-6, 9 * 2**-9, 1, 416, 448])
+    block = torch.cat((magnitudes, -magnitudes)).repeat(2)
     # Cross both swizzle tile boundaries and keep the flattened batch row order.
-    exponents = torch.arange(2 * 67 * 5).reshape(2, 67, 5, 1) % 16 - 8
-    x = (2.0**exponents * torch.arange(-16, 16)).reshape(2, 67, 160)
+    # Exponents -117 through 119 keep every nonzero input finite and normal in BF16.
+    exponents = torch.arange(2 * 67 * 5).reshape(2, 67, 5, 1) % 237 - 117
+    x = (2.0**exponents * block).reshape(2, 67, 160)
     if device == "cuda":
         q, sf = mxfp8_quantize(x.to(device, torch.bfloat16), sf_swizzle_layout=layout)
     else:

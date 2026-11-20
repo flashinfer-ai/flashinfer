@@ -7,6 +7,8 @@ import torch
 import tvm_ffi
 
 from ..api_logging import flashinfer_api
+from ..batch_invariant.quantization.layout import sf_numel, unswizzle_sf
+from ..batch_invariant.quantization.mx_api import layout_of
 from ..cutile import is_cuda_tile_available
 from ..trace.templates.quantize import (
     mxfp8_dequantize_trace,
@@ -1180,9 +1182,6 @@ def mxfp8_dequantize(
     Pass the same scale layout used for quantization (128x4 by default).
     Returns a CPU float32 tensor with the shape of the quantized input.
     """
-    from ..batch_invariant.quantization.layout import sf_numel, unswizzle_sf
-    from ..batch_invariant.quantization.mx_api import layout_of
-
     if input.ndim < 1 or input.shape[-1] % 32:
         raise ValueError("input must have a last dimension divisible by 32")
     if input.dtype not in (torch.float8_e4m3fn, torch.uint8):
