@@ -46,6 +46,15 @@ MASKED_ROUTE = -1
 K_BLOCK = 32
 FP8_MAX = 448.0
 
+# The fused Triton quantizer when it imports, else the eager torch reference quantizer below
+# (bit-identical codes and scales, ~10 elementwise / reduction launches per call)
+try:
+    from .cake_mxfp8_quant import mxfp8_fused_supported, mxfp8_quantize_fused
+
+    _FUSED_QUANT = True
+except ImportError:  # host-only unit tests load this file outside the package
+    _FUSED_QUANT = False
+
 
 def quantize_activations_k32(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """BF16/FP32 ``[rows, H]`` -> (e4m3 codes ``uint8 [rows, H]``, UE8M0 ``uint8 [rows, H // 32]``).
@@ -159,6 +168,19 @@ def stage_inputs(
     """
 
     rows = int(hidden_states.shape[0])
+    if quantize_input and _FUSED_QUANT:
+        if mxfp8_fused_supported(hidden_states):
+            # one launch: quantize straight into the workspace rows + copy the routing rows
+            mxfp8_quantize_fused(
+                hidden_states,
+                codes=x_fp8,
+                sf=x_sf,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                topk_ids_out=topk_idx_out,
+                topk_weights_out=topk_weights_out,
+            )
+            return rows
     if quantize_input:
         codes, exponents = quantize_activations_k32(hidden_states)
     else:
