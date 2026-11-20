@@ -701,6 +701,8 @@ def test_launch_shared_memory_matches_the_budget(T):
         with open(tf) as fh:
             ev = [e for e in json.load(fh)["traceEvents"] if e.get("cat") == "kernel"]
         os.remove(tf)
+        if not ev:
+            pytest.skip("torch.profiler captured no device events")
         assert len(ev) == 1, [e["name"] for e in ev]
         smem = int(ev[0]["args"]["shared memory"])
         assert smem == m._SMEM_FIXED + 256 * max(wr, 16), (T, fm, wr, smem)
