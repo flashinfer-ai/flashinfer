@@ -36,7 +36,9 @@ The NVFP4-KV class ``attn.nvfp4kv.d<D>`` takes the cache as e2m1 nibbles with on
 head dim (FlashInfer's NVFP4 paged KV cache and its ``kv_cache_sf``) and the same two per-tensor scales: every K and V leaf is
 ``dq4(values, block_scale)`` -- the e2m1 values times their block scale, a product of at most six significant bits within the
 bf16 range, so the leaf is an exact bf16 value and no rounding step enters the term -- and the chain is the fp8-KV classes'
-(the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding).
+(the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding). The layout the block scales are stored in
+(linear, or the V scales of a paged cache in the 4-token swizzle: ``engine.check_v_sf_layout``) is an address of a leaf, not a
+part of it: one class and one fingerprint for both.
 
 The token-head-scale classes ``attn.e4m3kv_th.d<D>`` / ``attn.e5m2kv_th.d<D>`` (``TH_KV_FMTS``) take an fp8 cache with one
 binary32 scale per (token, KV head) for K and one for V (FlashInfer's ``use_token_head_sf`` layout). K and V stay exact: every
@@ -70,6 +72,12 @@ below ``2^-126``, so a key whose scaled score is more than ``126 / c`` below the
 adds nothing however large its value scale; and an operand below the bf16 normal range (``|p_k vs_k| < 2^-126``) keeps
 at most its subnormal bits. A row whose value scales span more than the weights' ``2^126`` is therefore not the exact sum
 of its keys' scaled values; within those floors every key's contribution carries the bf16 rounding of its operand.
+
+The low-bit-KV classes are stated, like the bf16 class, for finite cache values: the non-finite fp8 codes (the e4m3 NaN, the
+e5m2 infinities and NaNs; an e4m3 NaN block scale) are widened like any code -- a NaN stays a NaN, an infinity an infinity --
+and then give what fp32 softmax arithmetic gives for a non-finite operand; nothing on the device checks for them. The scales
+are checked on the host (``engine.check_sm_scale`` / ``engine.check_v_scale``): ``c`` a normal binary32 number, the key scale
+a positive binary32 number, the value scale finite and nonzero in binary32.
 """
 
 from __future__ import annotations
@@ -91,6 +99,7 @@ from ...batch_invariant.fp_interface.term import Term, TermAlgebra
 TILE_KEYS = 128  # T: keys per KV tile (the N extent of one QK^T MMA tile)
 MMA_K = 16  # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
 FLT_MAX = 3.4028234663852886e38  # the largest binary32 number
+FLT_MIN = 1.1754943508222875e-38  # the smallest normal binary32 number
 MMA_OP = _GEMM_MMA_OP  # "mma_bf16_k16": the same opaque instruction family as the GEMM
 HEAD_DIMS = (
     64,

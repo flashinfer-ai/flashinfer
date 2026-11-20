@@ -1,13 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
-kv_slots, n_wg, q2, ragged, cap, kv_fmt)`` with dynamic shapes, strides, page table, work units and scales; cache module
+kv_slots, n_wg, q2, ragged, cap, kv_fmt, v_sf_swizzled)`` with dynamic shapes, strides, page table, work units and scales; cache module
 ``batch_invariant_attention``.
 ``cap`` is the shared-memory capacity the smem plan is sized for (the execution device's): part of the kernel's identity, in-process
 and on disk, so a kernel compiled for one part is never loaded for another. ``kv_fmt`` ``"bf16"`` is the bf16 class's kernel;
 ``"e4m3"`` / ``"e5m2"`` the fp8-KV kernels, whose K / V operands are the fp8 caches viewed as bytes (``(D, page, Hkv, num_pages)``
 uint8, 16-byte-aligned strides) and which take the value scale ``vs``; ``"nvfp4"`` the NVFP4-KV kernel (packed ``(D / 2, ...)``
-bytes with the ``(D / 16, ...)`` block scales); ``"e4m3th"`` / ``"e5m2th"`` the token-head-scale kernels, which take the fp8
+bytes with the ``(D / 16, ...)`` block scales; ``v_sf_swizzled`` selects the address the V block scales are read at, the linear
+layout or the 4-token swizzle of a paged cache); ``"e4m3th"`` / ``"e5m2th"`` the token-head-scale kernels, which take the fp8
 byte caches and two binary32 scale tensors ``(page, Hkv, num_pages)`` of any strides.
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
@@ -43,6 +44,7 @@ def kernel_name(
     hw_rowmax: bool = False,
     cap: int = 0,
     kv_fmt: str = "bf16",
+    v_sf_swizzled: bool = False,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
@@ -51,6 +53,7 @@ def kernel_name(
         + ("_hwm" if hw_rowmax else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("" if kv_fmt == "bf16" else f"_kv{kv_fmt}")
+        + ("_vsfswz" if v_sf_swizzled else "")
     )
 
 
@@ -66,13 +69,18 @@ def get_compiled_attention(
     hw_rowmax: bool = False,
     cap: int = 0,
     kv_fmt: str = "bf16",
+    v_sf_swizzled: bool = False,
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
-    ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0)."""
+    ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0).
+    ``v_sf_swizzled``: the NVFP4 kernel reads the V block scales in the 4-token swizzle (``convert.sf_swizzle_coord``); part of
+    the kernel's name."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, kv_fmt)
+    name = kernel_name(
+        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, kv_fmt, v_sf_swizzled
+    )
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -185,7 +193,17 @@ def get_compiled_attention(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         k = AttentionKernel(
-            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, kv_fmt
+            D,
+            g,
+            page,
+            kv_slots,
+            n_wg,
+            q2,
+            ragged,
+            hw_rowmax,
+            cap,
+            kv_fmt,
+            v_sf_swizzled,
         )
         return cute.compile(
             k,

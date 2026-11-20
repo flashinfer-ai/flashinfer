@@ -1487,6 +1487,24 @@ def test_plan_refusals():
                 kv_data_type=E4,
                 o_data_type=torch.float16,
             )
+        if kind != "ragged":  # the swizzled V block-scale layout is NVFP4's
+            with _unsupported("v_sf_swizzled"):
+                w.plan(
+                    *args,
+                    **kw,
+                    use_token_head_sf=True,
+                    v_sf_swizzled=True,
+                    q_data_type=BF16,
+                    kv_data_type=E4,
+                )
+        with _unsupported():  # an unknown dtype argument is a typed refusal too
+            w.plan(
+                *args,
+                **kw,
+                use_token_head_sf=True,
+                q_data_type=BF16,
+                kv_data_type="float8",
+            )
         # the supported plan names the class
         w.plan(*args, **kw, use_token_head_sf=True, q_data_type=BF16, kv_data_type=E4)
         assert w._batch_invariant.CLASS == "attention.e4m3kv_th", kind
@@ -1551,14 +1569,23 @@ def test_run_refusals(kind):
             run(kv_cache_sf=(ksf, bad))
     with _unsupported():  # device
         run(kv_cache_sf=(ksf.cpu(), vsf))
-    with _unsupported("k_scale"):  # the per-tensor scales are not part of the class
-        run(kv_cache_sf=sf, k_scale=1.0)
+    # the per-tensor scales are not operands of the class: unit values (what serving engines pass) are accepted and change
+    # nothing, any other value raises
+    unit = run(
+        kv_cache_sf=sf,
+        q_scale=1.0,
+        k_scale=1.0,
+        v_scale=torch.ones(1, device=dev),
+    )
+    assert torch.equal(bits(unit), ref)
     with _unsupported("k_scale"):
+        run(kv_cache_sf=sf, k_scale=2.0)
+    with _unsupported("v_scale"):
         run(kv_cache_sf=sf, v_scale=2.0)
     with _unsupported("k_scale"):
-        run(kv_cache_sf=sf, k_scale=torch.ones(1, device=dev), v_scale=1.0)
+        run(kv_cache_sf=sf, k_scale=torch.full((1,), 0.5, device=dev), v_scale=1.0)
     with _unsupported("q_scale"):
-        run(kv_cache_sf=sf, q_scale=1.0)
+        run(kv_cache_sf=sf, q_scale=0.5)
     with _unsupported():  # the other fp8 format, a bf16 cache, an NVFP4 cache
         run_kv(k.view(E5), v.view(E5), kv_cache_sf=sf)
     with _unsupported():
@@ -1622,11 +1649,13 @@ def test_other_classes_refuse_token_head_scales():
     sf = tp.sf("NHD")
     ref = bits(run_paged_prefill(tp))
     assert torch.equal(bits(run(tp.k_nhd, tp.v_nhd, kv_cache_sf=sf)), ref)
+    unit = run(tp.k_nhd, tp.v_nhd, kv_cache_sf=sf, k_scale=1.0, v_scale=1.0)
+    assert torch.equal(bits(unit), ref)
     for kw in (
         {},
         dict(kv_cache_sf=sf[0]),
-        dict(kv_cache_sf=sf, k_scale=1.0),
-        dict(kv_cache_sf=sf, v_scale=1.0),
+        dict(kv_cache_sf=sf, k_scale=2.0),
+        dict(kv_cache_sf=sf, v_scale=0.5),
         dict(kv_cache_sf=(sf[0].double(), sf[1])),
         dict(kv_cache_sf=(sf[0], sf[1][:-1])),
         dict(kv_cache_sf=(sf[0].cpu(), sf[1])),

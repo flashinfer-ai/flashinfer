@@ -9,7 +9,9 @@ placement of the class's exact ``widen`` leaves (``spec.kv_widen``), never an ar
 The NVFP4 variant (``st.fp4``) reads 8 packed bytes (16 e2m1 nibbles of one key) and the block's e4m3 scale byte per group and
 forms ``value * scale`` in binary32 (``cvt.rn.f16x2.e2m1x2`` / ``cvt.rn.f16x2.e4m3x2``, ``cvt.f32.f16``, ``mul.rn.f32``): a
 product of at most six significant bits within the bf16 range, exact at every step, then ``cvt.rn.bf16x2.f32`` moves bits. The
-ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``).
+ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``). The V block scales of a paged cache are read in the linear layout
+or in the 4-token swizzle (``sf_swizzle_coord``, ``st.v_sf_swizzled``): the two layouts store the same scale bytes at different
+addresses, so the leaves -- and with them the class and its fingerprint -- do not depend on the layout.
 
 Exactness: every e4m3 and e5m2 value is a binary16 value, every binary16 value is a binary32 value, and every fp8 value has at most
 four significant bits, so the hardware chain ``cvt.rn.f16x2.<fmt>x2`` -> ``cvt.f32.f16`` -> ``cvt.rn.bf16x2.f32`` moves bits and
@@ -226,6 +228,19 @@ def dequant_group(r_in: cute.Tensor, sf: Float32, r_out: cute.Tensor):
         r_out[4 * j + 3] = w3
 
 
+def sf_swizzle_coord(n_blk: int, blk, tok):
+    """Where the 4-token swizzle of a paged NVFP4 cache stores the block scale of ``(blk, tok)`` -- block ``blk`` (of ``n_blk`` =
+    ``D / 16`` per key) of the token at offset ``tok`` in its page: within each group of four consecutive tokens of a page and
+    head, the ``4 x n_blk`` scale bytes are stored at token ``(tok // 4) * 4 + blk // (n_blk / 4)``, block
+    ``(blk % (n_blk / 4)) * 4 + tok % 4`` (the layout trtllm-gen reads the V block scales in, which serving engines write for
+    it). A permutation of the scale bytes inside the four-token group, so the page size must be a multiple of four tokens; the
+    scales of a page tail (a last page filled to fewer than a multiple of four tokens) lie in the rows of its group like any
+    other. Plain Python on Python or DSL integers: the addressing has one statement for the kernel and the tests."""
+    assert n_blk % 4 == 0, n_blk
+    per = n_blk // 4
+    return (blk % per) * 4 + tok % 4, (tok // 4) * 4 + blk // per
+
+
 @cute.jit
 def fetch_tile_scales(
     st,
@@ -285,6 +300,7 @@ def convert_slot(
     n_pages: Int32,
     kv_head: Int32,
     ctid: Int32,
+    sf_swizzled: cutlass.Constexpr,
     mVsf: cute.Tensor,
     s_ks: cute.Tensor,
     s_vs: cute.Tensor,
@@ -294,9 +310,10 @@ def convert_slot(
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) of the low-bit cache ``mKV`` (``(D, page, Hkv,
     num_pages)`` bytes for fp8, ``(D / 2, ...)`` packed nibbles for NVFP4 with the block scales ``mSF`` ``(D / 16, ...)``; under
     ``st.ragged`` one page of ``total_kv`` tokens): acquire it, convert the slot's ``slot_keys x D`` elements in 16-element groups
-    dealt round-robin over the stage's threads, fence and commit. ``fetch_sf`` (the first slot of a K tile of the
-    token-head-scale kernels): between the acquire and the conversion, fetch the tile's scales (``mSF`` the key scales, ``mVsf``
-    the value scales) into entry ``sf_entry`` of the side ring."""
+    dealt round-robin over the stage's threads, fence and commit. ``sf_swizzled``: the block scales of ``mSF`` are stored in the
+    4-token swizzle (``sf_swizzle_coord``) instead of the linear layout -- another address of the same scale byte. ``fetch_sf``
+    (the first slot of a K tile of the token-head-scale kernels): between the acquire and the conversion, fetch the tile's
+    scales (``mSF`` the key scales, ``mVsf`` the value scales) into entry ``sf_entry`` of the side ring."""
     CT = st.roles.convert_threads
     GPK = st.D // GROUP  # groups per key
     n_groups = st.slot_keys * GPK
@@ -348,9 +365,17 @@ def convert_slot(
                 page_id = mKvIndices[kv_ptr0 + pslot]
                 off = cute.crd2idx((e0, ka % st.page, kv_head, page_id), mKV.layout)
                 if cutlass.const_expr(st.fp4):
-                    sfoff = cute.crd2idx(
-                        (d0 // GROUP, ka % st.page, kv_head, page_id), mSF.layout
-                    )
+                    if cutlass.const_expr(sf_swizzled):
+                        sfoff = cute.crd2idx(
+                            sf_swizzle_coord(st.D // GROUP, d0 // GROUP, ka % st.page)
+                            + (kv_head, page_id),
+                            mSF.layout,
+                        )
+                    else:
+                        sfoff = cute.crd2idx(
+                            (d0 // GROUP, ka % st.page, kv_head, page_id),
+                            mSF.layout,
+                        )
             cute.autovec_copy(
                 cute.make_tensor(
                     mKV.iterator + cute.assume(off, divby=EB),
@@ -406,6 +431,7 @@ def convert_tile(
     n_pages: Int32,
     kv_head: Int32,
     ctid: Int32,
+    sf_swizzled: cutlass.Constexpr,
     mVsf: cute.Tensor,
     s_ks: cute.Tensor,
     s_vs: cute.Tensor,
@@ -427,6 +453,7 @@ def convert_tile(
             n_pages,
             kv_head,
             ctid,
+            sf_swizzled,
             mVsf,
             s_ks,
             s_vs,
@@ -456,9 +483,10 @@ def convert_unit(
     s_vs: cute.Tensor,
     seq0: Int32,
 ):
-    """The K and V tiles of one unit into the ring, in the TMA producer's slot order (``producer.load_loop``). ``seq0`` is the
-    CTA's running tile count at the unit's first tile: tile ``tile_lo + n`` owns entry ``(seq0 + n) % sf_stages`` of the scale
-    side ring (``s_ks`` / ``s_vs``; the token-head-scale kernels)."""
+    """The K and V tiles of one unit into the ring, in the TMA producer's slot order (``producer.load_loop``). The K block scales
+    of an NVFP4 cache are linear; the V block scales are linear or swizzled as the plan states (``st.v_sf_swizzled``). ``seq0``
+    is the CTA's running tile count at the unit's first tile: tile ``tile_lo + n`` owns entry ``(seq0 + n) % sf_stages`` of the
+    scale side ring (``s_ks`` / ``s_vs``; the token-head-scale kernels)."""
     LA = st.qk_ahead
     SF = st.sf_stages
     kv_ptr0 = mKvIndptr[req]
@@ -476,6 +504,7 @@ def convert_unit(
         n_pages,
         kv_head,
         ctid,
+        False,
         mVsf,
         s_ks,
         s_vs,
@@ -496,6 +525,7 @@ def convert_unit(
                 n_pages,
                 kv_head,
                 ctid,
+                False,
                 mVsf,
                 s_ks,
                 s_vs,
@@ -515,6 +545,7 @@ def convert_unit(
                 n_pages,
                 kv_head,
                 ctid,
+                st.v_sf_swizzled,
                 mVsf,
                 s_ks,
                 s_vs,
@@ -534,6 +565,7 @@ def convert_unit(
                     n_pages,
                     kv_head,
                     ctid,
+                    False,
                     mVsf,
                     s_ks,
                     s_vs,
@@ -555,6 +587,7 @@ def convert_unit(
                     n_pages,
                     kv_head,
                     ctid,
+                    False,
                     mVsf,
                     s_ks,
                     s_vs,
@@ -573,6 +606,7 @@ def convert_unit(
                 n_pages,
                 kv_head,
                 ctid,
+                st.v_sf_swizzled,
                 mVsf,
                 s_ks,
                 s_vs,

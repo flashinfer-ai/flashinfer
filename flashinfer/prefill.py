@@ -3251,16 +3251,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
             with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
             key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
-            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). An fp8
-            cache planned with ``use_token_head_sf=True`` runs the classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``:
-            ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per (token, KV head) (the cache's shape minus the
-            head dim; any strides); the fp8 values are widened exactly and each scale enters once per key: key ``j``'s score is
-            multiplied by ``k_sf_j`` before the softmax and its softmax weight by ``v_sf_j`` before the bf16 rounding that
-            forms the P operand of the PV product (the normaliser sums the unscaled weights); ``k_scale`` / ``v_scale``
-            are not taken with it. Inputs outside the classes (q / o dtypes other than bf16, ``q_scale``, head dims other than
-            64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
+            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K block scales are
+            linear and the V block scales are linear unless ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token interleaved
+            layout -- the layout is not detectable, so a cache written for ``trtllm-gen`` must be planned with it). An fp8 cache planned with ``use_token_head_sf=True`` runs the classes
+            ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per
+            (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and each
+            scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
+            by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the normaliser sums the unscaled
+            weights). Inputs
+            outside the classes (q / o dtypes other than bf16, non-unit scales of an
+            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
+            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
+            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
+            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
+            other value raises. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -3913,6 +3918,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        v_sf_swizzled: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -4048,6 +4055,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        v_sf_swizzled : bool
+            Keyword-only, read under ``batch_invariant=True`` with a packed NVFP4 KV cache (``kv_data_type=torch.uint8``): the
+            layout of the V block scales that :meth:`run` receives in ``kv_cache_sf``. ``False`` (default): linear, what
+            :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache` writes. ``True``: TRT-LLM's 4-token interleaved
+            layout (what the ``trtllm-gen`` backend reads, and what serving engines write for it); ``page_size`` must then be
+            a multiple of four. The K block scales are linear in both. The layout cannot be detected from the tensors, so
+            the caller must state it: scales read in the other layout give wrong outputs with no error. Without
+            ``batch_invariant=True`` the layout is fixed by the backend and ``True`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4060,12 +4075,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if v_sf_swizzled and self._batch_invariant is None:
+            raise ValueError(
+                "v_sf_swizzled is an option of batch_invariant=True; the regular backends fix the layout of the NVFP4 V "
+                "block scales (fa2: linear, trtllm-gen: the 4-token interleaved layout)"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(
             self._int_workspace_buffer, "int_workspace_buffer"
         )
+        if self._batch_invariant is not None:
+            # a dtype argument that names no torch dtype raises the mode's typed error
+            self._batch_invariant.check_dtype_args(
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+            )
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -4110,6 +4137,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                v_sf_swizzled=v_sf_swizzled,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -6021,16 +6049,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
             with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
             key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
-            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). An fp8
-            cache planned with ``use_token_head_sf=True`` runs the classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``:
-            ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per (token, KV head) (the cache's shape minus the
-            head dim; any strides); the fp8 values are widened exactly and each scale enters once per key: key ``j``'s score is
-            multiplied by ``k_sf_j`` before the softmax and its softmax weight by ``v_sf_j`` before the bf16 rounding that
-            forms the P operand of the PV product (the normaliser sums the unscaled weights); ``k_scale`` / ``v_scale``
-            are not taken with it. Inputs outside the classes (q / o dtypes other than bf16, ``q_scale``, head dims other than
-            64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
+            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K and V block scales
+            of the ragged pool are linear -- TRT-LLM's 4-token interleaved V layout is a layout of the pages of a paged
+            cache, stated on the paged wrappers with ``plan(v_sf_swizzled=True)``). An fp8 cache planned with ``use_token_head_sf=True`` runs the classes
+            ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per
+            (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and each
+            scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
+            by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the normaliser sums the unscaled
+            weights). Inputs
+            outside the classes (q / o dtypes other than bf16, non-unit scales of an
+            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
+            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
+            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
+            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
+            other value raises. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -6455,6 +6488,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if self._batch_invariant is not None:
+            # a dtype argument that names no torch dtype raises the mode's typed error
+            self._batch_invariant.check_dtype_args(
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+            )
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
