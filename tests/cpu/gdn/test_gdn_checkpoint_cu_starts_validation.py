@@ -153,8 +153,16 @@ def test_checkpoint_state_indices_bounds(validate):
         ValueError, match=r"rows \[4, 6\) of checkpoint_state_indices, which has 5"
     ):
         _check([0, 256, 384], [0, 4], rows=10, indices=[0, 1, 2, 3, 4])
-    with pytest.raises(ValueError, match=r"-1 or rows in \[0, 10\)"):
+    with pytest.raises(
+        ValueError,
+        match=r"sequence 1 writes checkpoint 1 to checkpoint_state_indices\[5\] "
+        r"= 10, which must be -1 or a row in \[0, 10\)",
+    ):
         _check([0, 256, 384], [0, 4], rows=10, indices=[0, 1, 2, 3, 4, 10])
+    with pytest.raises(ValueError, match=r"checkpoint_state_indices\[0\] = -2"):
+        _check([0, 256, 384], [0, 4], rows=10, indices=[-2, 1, 2, 3, 4, 5])
+    # Entries no sequence addresses are not read, so any value is accepted.
+    _check([0, 256, 384], [1, 5], rows=10, indices=[99, 1, 2, 3, 4, 5, 6, -7])
     with pytest.raises(ValueError, match="num_seqs = 2 or num_seqs \\+ 1"):
         _check([0, 256, 384], [0], rows=10, indices=[0, 1, 2, 3, 4, 5])
 

@@ -495,14 +495,6 @@ def _validate_checkpoint_cu_starts(
             )
         rows = int(checkpoint_state_indices.numel())
         rows_name = "checkpoint_state_indices"
-        pool = int(state_checkpoints.shape[0])
-        if rows:
-            ids = checkpoint_state_indices.cpu()
-            if bool(((ids < -1) | (ids >= pool)).any()):
-                raise ValueError(
-                    "checkpoint_state_indices must contain -1 or rows in "
-                    f"[0, {pool}) of state_checkpoints"
-                )
 
     for i, (start, count) in enumerate(zip(starts[:num_seqs], counts, strict=True)):
         if count and (start < 0 or start + count > rows):
@@ -511,6 +503,19 @@ def _validate_checkpoint_cu_starts(
                 f"[{start}, {start + count}) of {rows_name}, which has {rows} "
                 "rows; checkpoint_cu_starts counts checkpoints, not tokens"
             )
+
+    if checkpoint_state_indices is not None:
+        # Only the entries a sequence addresses are read; the rest are free.
+        pool = int(state_checkpoints.shape[0])
+        ids = checkpoint_state_indices.cpu().reshape(-1).tolist()
+        for i, (start, count) in enumerate(zip(starts[:num_seqs], counts, strict=True)):
+            for j in range(start, start + count):
+                if not -1 <= ids[j] < pool:
+                    raise ValueError(
+                        f"sequence {i} writes checkpoint {j - start} to "
+                        f"checkpoint_state_indices[{j}] = {ids[j]}, which must "
+                        f"be -1 or a row in [0, {pool}) of state_checkpoints"
+                    )
 
 
 def _cake_gdn_prefill_dtype_name(dtype: torch.dtype) -> str:
