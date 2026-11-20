@@ -1752,7 +1752,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
         runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
-        if cur_backend in ("xqa", "cute-dsl") and not _probe_backend(
+        # Support is decided by which cubins / JIT kernels exist for the dtype
+        # and page-size mix (trtllm-native also runs xqa off SM10x): probe.
+        probe = cur_backend in ("xqa", "cute-dsl", "trtllm-gen", "trtllm-native")
+        if probe and not _probe_backend(
             cur_backend,
             lambda: run_backend_wrapper(
                 cur_backend,
@@ -5315,6 +5318,25 @@ def testBatchMLAPagedAttentionWrapper(args):
             if direct_backend
             else None
         )
+        # The direct-API backends accept or refuse a shape only when called
+        # (no cubin / no kernel for this head count or page size): probe.
+        if direct_backend and not _probe_backend(
+            cur_backend,
+            lambda: run_backend_wrapper(
+                cur_backend,
+                runtime_q_nope,
+                runtime_q_pe,
+                runtime_ckv_cache,
+                runtime_kpe_cache,
+                runtime_q,
+                runtime_kv_cache,
+                runtime_workspace,
+                block_tables,
+                actual_seq_lens_kv,
+                runtime_out,
+            ),
+        ):
+            continue
         if run_refcheck:
             if runtime_out is not None:
                 # direct_out is shared by the direct-API / wrapper-native
