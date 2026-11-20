@@ -4259,6 +4259,13 @@ def validate_config(
         )
     if cfg.gated_weight_group_size not in (1, 64):
         raise ValueError("gated_weight_group_size must be 1 or 64")
+    if cfg.gated_weight_group_size > 1 and problem_mnk is not None:
+        _, problem_n, _ = problem_mnk
+        if isinstance(problem_n, int) and problem_n % (2 * cfg.gated_weight_group_size):
+            raise ValueError(
+                "gated_weight_group_size requires problem N to contain complete "
+                f"gate/up groups of {2 * cfg.gated_weight_group_size}, got {problem_n}"
+            )
     if cfg.gated_weight_group_size == 64 and not (
         not cfg.is_swap_ab
         and cfg.dtype_c == int(DType.E2M1)
@@ -4554,6 +4561,12 @@ def validate_config(
         raise ValueError("dense_dkg_store_order requires the rolled dense epilogue")
     if cfg.dense_dkg_store_order and cfg.has_gated_epilogue:
         raise ValueError("dense_dkg_store_order requires non-gated output")
+    if (
+        cfg.dense_dkg_store_order
+        and cfg.dense_epilogue_warps == 8
+        and not cfg.dense_preload_epilogue
+    ):
+        raise ValueError("dense_dkg_store_order with eight warps requires preload")
     _validate_binary_config_option("dense_rolled_epilogue", cfg.dense_rolled_epilogue)
     if cfg.dense_rolled_epilogue and not (
         (

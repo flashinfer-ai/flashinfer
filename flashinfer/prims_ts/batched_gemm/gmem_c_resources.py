@@ -1560,7 +1560,14 @@ class GmemCResource(MemoryResource):
                 & (output_col < self.problem_n // Int32(2))
             ):
                 prims.cp_async_bulk_tensor_global_shared_cta(
-                    self.tma_c_desc, self.sC.subview(offset), (output_col, output_row)
+                    self.tma_c_desc,
+                    self.sC.subview(offset),
+                    (output_col, output_row),
+                    l2_cache_hint=(
+                        _streaming_c_cache_policy()
+                        if cutlass.const_expr(self.cfg.dense_streaming_c)
+                        else None
+                    ),
                 )
         elif cutlass.const_expr(action.op == EpilogueOp.COMMIT):
             if (warp % Int32(4) == Int32(0)) & (cute.arch.lane_idx() == Int32(0)):

@@ -1217,3 +1217,20 @@ class TestPrimsTsUnifiedGpu:
                 dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
             )(act, major_k_weights)
             assert torch.equal(major_k_out, prims_out)
+
+
+def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout():
+    keys, hashes = set(), set()
+    for fused in (False, True):
+        for layout in ("MajorK", "BlockMajorK"):
+            cfg = _config(
+                backend=PrimsTsConfig(nvfp4_weight_layout=layout),
+                finalize=MoEFinalizeConfig(use_fused_finalize=fused),
+                execution=ExecutionConfig(enable_pdl=False),
+            )
+            runner = PrimsTsRunner(cfg, torch.device("cpu"))
+            key = runner.get_cache_key_extras([])
+            assert key == runner._cache_key_extras()
+            keys.add(key)
+            hashes.add(hash(runner))
+    assert len(keys) == len(hashes) == 4

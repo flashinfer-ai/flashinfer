@@ -40,7 +40,6 @@ import torch
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import PrimsTsConfig, prims_ts_fp4_block_scale_moe
 from flashinfer.fused_moe.api import QuantConfig, QuantFormat
-from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
 from flashinfer.prims_ts.moe import runner as moe_runner
 from flashinfer.testing import bench_gpu_time
 from flashinfer.tllm_enums import RoutingMethodType, WeightLayout
@@ -172,6 +171,17 @@ def main():
         parser.error(
             "Require 0 < top-k <= experts, rounds >= 1 and positive token counts."
         )
+    tactics_by_tokens = {
+        tokens: [
+            [-1, -1] if name == "default" else list(map(int, name.split("_")))
+            for name in args.tactics
+            if name == "default" or tokens * args.top_k / args.experts >= 512
+        ]
+        for tokens in args.tokens
+    }
+    for tokens, tactics in tactics_by_tokens.items():
+        if not tactics:
+            parser.error(f"All requested tactics are excluded for tokens={tokens}.")
     torch.manual_seed(17)
     e, h, i, k = args.experts, args.hidden, args.intermediate, args.top_k
     quant = QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4)
@@ -238,34 +248,27 @@ def main():
 
         graphs, outputs, samples, errors, configs, output_stats = {}, [], {}, {}, {}, {}
         breakdown_graphs, breakdown_samples = {}, {}
-        tactics = [
-            [-1, -1] if name == "default" else list(map(int, name.split("_")))
-            for name in args.tactics
-            if name == "default" or tokens * k / e >= 512
-        ]
+        tactics = tactics_by_tokens[tokens]
         with patch.object(AutoTuner.get(), "choose_one", choose):
             baseline = run().clone().float()
             for selected in tactics:
                 label = str(selected)
-                pair = map_trtllm_nvfp4_moe_tactic(
-                    selected,
-                    sm_arch=107,
-                    num_tokens=tokens,
-                    top_k=k,
-                    num_local_experts=e,
-                    weight_layout=int(getattr(WeightLayout, args.layout)),
-                    enable_pdl=True,
-                )
                 configs[label] = {}
-                for fc in ("fc1", "fc2"):
-                    cfg = getattr(pair, fc).cfg.build()
+                compile_gemm = moe_runner.get_compiled_gemm
+
+                def record_config(key, stage, io, stream):
+                    cfg = io["cfg"]
+                    fc = stage.removeprefix("nvfp4_")
                     configs[label][fc] = dict(
                         swap_ab=cfg.is_swap_ab,
                         token_tile=cfg.tile_token,
                         cga=list(cfg.preferred_cluster_shape),
                         workid_stages=cfg.num_stages_workid,
                     )
-                output = run()
+                    return compile_gemm(key, stage, io, stream)
+
+                with patch.object(moe_runner, "get_compiled_gemm", record_config):
+                    output = run()
                 error = float((output.float() - baseline).norm() / baseline.norm())
                 assert torch.isfinite(output).all() and error < 0.12, (label, error)
                 errors[label] = error

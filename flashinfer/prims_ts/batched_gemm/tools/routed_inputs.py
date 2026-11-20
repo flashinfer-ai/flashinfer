@@ -42,6 +42,7 @@ class Fixture:
     def __init__(self, path, shape):
         self.path = Path(path)
         self.manifest = json.loads((self.path / "manifest.json").read_text())
+        self.source_tensors = self.manifest["tensors"].copy()
         assert self.manifest["shape"][:3] == list(shape)[:3]
         assert self.manifest["shape"][3] >= shape[3]
         self.experts = shape[3]
@@ -60,6 +61,10 @@ class Fixture:
 
     def _array(self, name):
         array = np.load(self.path / (name + ".npy"), mmap_mode="c", allow_pickle=False)
+        assert (
+            hashlib.sha256(memoryview(array).cast("B")).hexdigest()
+            == self.source_tensors[name]["sha256"]
+        ), f"source checksum mismatch: {name}"
         if self.prefix and name in ("B", "SFB", "route"):
             array = array[: array.size // self.source_experts * self.experts]
         return array
@@ -74,6 +79,8 @@ class Fixture:
         return torch.from_numpy(array).to(device=device)
 
     def audit(self, name, tensor):
+        # A matching prefix must not hide corruption elsewhere in its source.
+        self._array(name)
         digest = sha256(physical_bytes(tensor))
         assert digest == self.manifest["tensors"][name]["sha256"], (name, digest)
         return digest

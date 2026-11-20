@@ -14,6 +14,12 @@
 
 """
 Map Prims-TS MoE autotuner tactics to local Prims-TS GEMM configs.
+
+JSON ``epilogue_steps`` holds one plan as ``[step, ...]`` or a sweep as
+``[[step, ...], [step, ...]]``. Each step is an object such as
+``{"load_fragments": 1, "stage_fragments": 1}``, with fields from EpilogueStep.
+Both forms resolve to one immutable step tuple per expanded configuration;
+empty arrays are errors, and each plan must satisfy its GEMM's schedule limits.
 """
 
 from __future__ import annotations
@@ -637,6 +643,20 @@ def _expanded_prims_ts_json_configs_for_arch(
                             f"expects {len(keys)} values, got {row!r}"
                         )
                     choices.append(dict(zip(keys, row, strict=True)))
+            elif key == "epilogue_steps":
+                # A plan is [step, ...]; a sweep is [[step, ...], ...].
+                # Unlike scalar option sweeps, [] cannot mean zero configs.
+                from ..batched_gemm.epilogue_schedule import normalize_epilogue_steps
+
+                if not isinstance(value, list) or not value:
+                    raise ValueError(
+                        "epilogue_steps must contain a nonempty plan or sweep"
+                    )
+                plans = value if isinstance(value[0], list) else [value]
+                choices = []
+                for plan in plans:
+                    normalize_epilogue_steps(plan)
+                    choices.append({key: plan})
             elif isinstance(value, list):
                 choices = [{key: item} for item in value]
             else:

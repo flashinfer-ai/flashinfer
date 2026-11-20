@@ -532,3 +532,61 @@ def test_fc1_rolling_does_not_fold_grouped_emission_or_early_release():
         cfg = replace(base, dense_preload_epilogue=1, epilogue_steps=steps)
         assert not cfg.preload_epilogue_plan.fc1_rolled_actions
         _verify_repeated_tile_lifetimes(cfg.preload_epilogue_plan)
+
+
+def test_legacy_preset_clears_explicit_steps():
+    cfg = _step_config(schedules.epilogue_steps_for_prefix(2, finalize=False), warps=8)
+    legacy = replace(cfg, **schedules.PLAIN_PRELOAD_8W.overrides())
+    assert not legacy.epilogue_steps
+    assert (
+        legacy.preload_epilogue_plan
+        == _config(schedules.PLAIN_PRELOAD_8W).preload_epilogue_plan
+    )
+
+
+@pytest.mark.parametrize("streaming", [0, 1])
+@pytest.mark.parametrize("group", [0, 1])
+def test_fc1_emit_uses_streaming_cache_policy(monkeypatch, streaming, group):
+    from types import SimpleNamespace
+    from flashinfer.prims_ts.batched_gemm import gmem_c_resources as module
+    from tests.prims_ts.python_body import python_body
+
+    policy, calls = object(), []
+    monkeypatch.setattr(module, "Int32", int)
+    monkeypatch.setattr(module, "_streaming_c_cache_policy", lambda: policy)
+    monkeypatch.setattr(module.cute.arch, "warp_idx", lambda: group * 4)
+    monkeypatch.setattr(module.cute.arch, "lane_idx", lambda: 0)
+    monkeypatch.setattr(
+        module.prims,
+        "cp_async_bulk_tensor_global_shared_cta",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    cfg = SimpleNamespace(
+        dense_streaming_c=streaming,
+        tile_m=256,
+        tile_n=256,
+        num_bytes_c_tma_store_per_group=4096,
+        warp_layout=SimpleNamespace(epilogue_warp_idx=0),
+        preload_epilogue_plan=SimpleNamespace(
+            output_unit=2,
+            scratch_stages=1,
+            fc1_fragment_index=lambda fragment, group: fragment + group * 4,
+        ),
+    )
+    resource = SimpleNamespace(
+        cfg=cfg,
+        problem_n=1024,
+        tma_c_desc="descriptor",
+        sC=SimpleNamespace(subview=lambda offset: offset),
+    )
+    stage = SimpleNamespace(work_tile=SimpleNamespace(tile_idx=(1, 2, 0)))
+    action = SimpleNamespace(op=schedules.EpilogueOp.EMIT, fragment=0)
+    python_body(module.GmemCResource._fc1_step_output_action)(
+        resource, stage, action, None
+    )
+    assert calls == [
+        (
+            ("descriptor", group * 4096, (256, 256 + group * 128)),
+            dict(l2_cache_hint=policy if streaming else None),
+        )
+    ]

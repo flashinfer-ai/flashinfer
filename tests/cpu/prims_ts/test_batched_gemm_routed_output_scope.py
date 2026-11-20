@@ -57,3 +57,21 @@ def test_routed_repeat_scope_rejects_missing_token_storage(is_swap_ab):
         _active_route_output(
             output, torch.tensor([True, False, True, False]), is_swap_ab=is_swap_ab
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("is_swap_ab", [False, True])
+def test_routed_repeat_scope_compares_signed_zero_bits(dtype, is_swap_ab):
+    first = torch.zeros((2, 2), dtype=dtype)
+    second = first.clone()
+    active = torch.tensor([True, False])
+    if is_swap_ab:
+        first, second = first.T, second.T
+
+    def observable(output):
+        return _active_route_output(output, active, is_swap_ab=is_swap_ab)
+
+    second[1, 1] = -0.0
+    assert _same_launch_output(observable(first), observable(second))
+    second[0, 0] = -0.0
+    assert not _same_launch_output(observable(first), observable(second))

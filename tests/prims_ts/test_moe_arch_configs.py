@@ -137,3 +137,61 @@ def test_silu_reuses_relu2_row_with_non_gated_activation():
     assert fc1_cfg.act_kind == int(ActKind.SILU)
     assert fc1_cfg.has_eltwise_act
     assert not fc1_cfg.has_gated_epilogue
+
+
+@pytest.mark.parametrize("form", ["plan", "sweep", "empty", "empty_plan"])
+def test_json_epilogue_plan_and_sweep(monkeypatch, tmp_path, form):
+    from dataclasses import asdict
+    import json
+    from flashinfer.prims_ts.moe import config_mapper as mapper
+    from flashinfer.prims_ts.batched_gemm.epilogue_schedule import (
+        epilogue_steps_for_prefix,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import DType
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+
+    plans = [epilogue_steps_for_prefix(n, finalize=False) for n in (0, 2)]
+    encoded = [[asdict(step) for step in plan] for plan in plans]
+    value = {"plan": encoded[0], "sweep": encoded, "empty": [], "empty_plan": [[]]}[
+        form
+    ]
+    pair = mapper.map_trtllm_nvfp4_moe_tactic([512, 0], sm_arch=107)
+    options = dict(
+        mapper._expanded_prims_ts_json_configs(107)[
+            pair.fc2.prims_ts_gemm_config_index
+        ].options
+    )
+    options.update(
+        dense_preload_store_prefix_fragments=0,
+        epilogue_regs=168,
+        num_stages_c_smem=2,
+        num_stages_a=2,
+        num_stages_b=2,
+        num_stages_smem_sfa=2,
+        num_stages_smem_sfb=2,
+    )
+    options["epilogue_steps"] = value
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(dict(sm_archs=[107], templates={}, configs=[options])))
+    monkeypatch.setattr(mapper, "_prims_ts_config_resource", lambda arch: path)
+    expand = mapper._expanded_prims_ts_json_configs_for_arch.__wrapped__
+    if form.startswith("empty"):
+        with pytest.raises(ValueError, match="epilogue_steps.*nonempty"):
+            expand(107)
+        return
+    configs = expand(107)
+    actual = []
+    for cfg in configs[: len(plans) if form == "sweep" else 1]:
+        kwargs = mapper._json_config_kwargs(
+            cfg,
+            sm_arch=107,
+            fc="fc2",
+            activation_type=0,
+            has_bias=False,
+            default_dtype_a=int(DType.E2M1),
+            default_dtype_b=int(DType.E2M1),
+            default_dtype_c=int(DType.BF16),
+        )
+        actual.append(kwargs["epilogue_steps"])
+        validate_config(make_config(**kwargs), problem_mnk=(8192, 1024, 512))
+    assert actual == (plans if form == "sweep" else plans[:1])
