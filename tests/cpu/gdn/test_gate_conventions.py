@@ -99,6 +99,7 @@ def test_transformed_trace_preserves_default_definition_and_runs_standalone():
     assert transformed.name_prefix == "gdn_prefill_gates"
     assert gdn_prefill_trace(gate_domain="log") is transformed
     assert gdn_prefill_trace(beta_is_logit=True) is transformed
+    assert gdn_prefill_trace(gate_domain="log", batch_invariant=True) is None
     args = transformed.init(
         total_seq_len=4,
         num_seqs=2,
@@ -177,7 +178,7 @@ def test_gate_trace_requires_beta_for_logit_transform(definition_source):
 @pytest.mark.parametrize("heads", [(4, 2, 2), (2, 2, 4)])
 @pytest.mark.parametrize("empty_sequence", [False, True])
 def test_gate_trace_reference_grouping_and_state_pool(heads, empty_sequence):
-    from tests.test_helpers.cudnn_linear_attention import serial_delta_rule
+    from tests.gdn.test_helpers.cudnn_linear_attention import serial_delta_rule
 
     hq, hk, hv = heads
     template = gdn_prefill_trace(use_gate_in_kernel=True)
@@ -240,7 +241,7 @@ def test_gate_trace_reference_grouping_and_state_pool(heads, empty_sequence):
 
 @pytest.mark.cpu_only
 def test_pool_only_trace_selects_slot_aware_schema_and_reference():
-    from tests.test_helpers.cudnn_linear_attention import serial_delta_rule
+    from tests.gdn.test_helpers.cudnn_linear_attention import serial_delta_rule
 
     indices = torch.tensor([5, 1], dtype=torch.int32)
     template = gdn_prefill_trace(state_indices=indices)

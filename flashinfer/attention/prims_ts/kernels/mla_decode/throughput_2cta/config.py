@@ -25,7 +25,11 @@ from ..helpers.constants import (
     SUPPORTED_MLA_PAGE_SIZES,
     WARP_LANES,
 )
-from ..helpers.nvfp4_kv import Nvfp4KVConfig, validate_nvfp4_kv_formats
+from ..helpers.nvfp4_kv import (
+    Nvfp4KVConfig,
+    is_sm107_target,
+    validate_nvfp4_kv_formats,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -166,6 +170,9 @@ class MlaDecodeConfig(Nvfp4KVConfig):
 
     # Final quantized output can use a staged TMA store on padding warp 10.
     use_tma_output: bool = False
+    # Final BF16 sparse output: each correction warp stages its 32-row boxes
+    # in swizzled SMEM and issues its own TMA stores.
+    stage_bf16_output: bool = False
 
     # Pipeline stage counts for the captured schedule resources.  The combined
     # K/V stage count keeps enough delayed-V stages live for K-before-V overlap.
@@ -280,6 +287,7 @@ class MlaDecodeConfig(Nvfp4KVConfig):
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
+    use_kv_bounds: bool = False
     # Threshold skip correction in log2 units (binades); 0 disables it.  A positive value
     # freezes the running row max while a K tile raises it by at most this
     # amount.  It is a compile-time constant: a runtime scalar stays live in
@@ -362,6 +370,7 @@ def make_mla_decode_config(
     is_var_seq: bool = False,
     is_var_split_kv: bool = False,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    use_kv_bounds: bool = False,
     sparse_gather_warps: int = 1,
     sparse_kv_stages: int = 0,
     cache_uniform_sparse_pages: bool = False,
@@ -405,6 +414,7 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    cfg.use_kv_bounds = use_kv_bounds
     # Range-checked by MlaDecodeTs and plan().
     cfg.softmax_rescale_threshold_log2 = softmax_rescale_threshold_log2
     cfg.lse_base_on_e = lse_base_on_e
@@ -496,6 +506,13 @@ def make_mla_decode_config(
             2,
             2 if rope_dim or fuse_output_quant else 3,
         )
+        if rope_dim and is_sm107_target():
+            # SM107's 327 KiB SMEM retains a third converted D576 K/V pair
+            # (279 KiB; 311 KiB with the fused output stage), so converters
+            # run two tiles ahead of the MMA (VR200 H96 top-k 2048, 64 rows:
+            # 27.8 -> 25.8 us; 256 rows: 71.9 -> 65.5 us). A fourth K stage
+            # adds nothing.
+            cfg.load_k_stage, cfg.load_v_stage = 3, 3
         cfg.load_num_warps = 8
         cfg.mma_s_stage = 1
         cfg.load_v_warp_id = cfg.load_k_warp_id
@@ -511,7 +528,21 @@ def make_mla_decode_config(
         cfg.correction_reg_num = 160 if sparse_gather_warps == 8 else 192
         cfg.other_reg_num = 64
 
-    if sparse_kv_stages:
+    split_fp8_kv_stages = (
+        qkv_dtype == "e4m3"
+        and page_size == 1
+        and sparse_gather_warps == 1
+        and not has_nvfp4_kv
+        and not fuse_output_quant
+    )
+    if sparse_kv_stages and split_fp8_kv_stages:
+        # Native FP8 counts both split streams: two K stages, the rest V. A
+        # third V stage spends the remaining 32 KiB per CTA on gather depth
+        # (D512; D576 on SM107, where the policy requests it).
+        if sparse_kv_stages not in (4, 5):
+            raise ValueError("FP8 split K/V pipeline supports four or five stages")
+        cfg.load_k_stage, cfg.load_v_stage = 2, sparse_kv_stages - 2
+    elif sparse_kv_stages:
         if qkv_dtype != "bf16" or page_size != 1 or sparse_gather_warps not in (4, 8):
             raise ValueError("pipeline tuning requires multi-warp BF16 sparse 2CTA")
         if sparse_kv_stages < 4:

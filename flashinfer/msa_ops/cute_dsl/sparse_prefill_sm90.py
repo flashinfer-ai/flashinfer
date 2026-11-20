@@ -53,6 +53,8 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup, OperandMajorMode
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 D = 128  # head_dim
 PG = 128  # page / KV block size
 TOPK = 16  # max selected blocks per (kv head, query token)
@@ -70,6 +72,7 @@ F8_LO = -448.0  # e4m3 finite range; clamping maps NaN into it
 F8_HI = 448.0
 OSTR = 136  # padded bf16 row stride of the smem epilogue buffer
 SPAD = 144  # padded fp8 smem row stride in the transpose pre-pass
+TCTAS = 1024  # transpose CTAs at most (~8 resident per SM on H100)
 # V^T row 16c + i holds key 16c + _SLOT_KEY[i] (header comment, SLOT).
 _SLOT_KEY = tuple(8 * ((i >> 1) & 1) + 2 * (i >> 2) + (i & 1) for i in range(16))
 
@@ -315,8 +318,12 @@ class MsaSparseAttnFp8:
             sOut: cute.struct.Align[cute.struct.MemRange[f8, 128 * SPAD], 1024]
 
         self.tshared = TShared
-        self.tkernel(mKV, mVT).launch(
-            grid=[npg, self.hkv, 1],
+        # One CTA per referenced (sequence, column) slot, not per cache page:
+        # the KV pool is sized by free memory, tens of thousands of pages,
+        # while a batch reads the pages of its own extents.  A bounded grid
+        # walks the slots and skips the ones past each sequence's end.
+        self.tkernel(mKV, mVT, mPT, mSeq, nb, mpg).launch(
+            grid=[cutlass.min(nb * mpg, TCTAS), self.hkv, 1],
             block=[VTHR, 1, 1],
             smem=TShared.size_in_bytes(),
             stream=stream,
@@ -352,17 +359,30 @@ class MsaSparseAttnFp8:
         )
 
     @cute.kernel
-    def tkernel(self, mKV, mVT):
-        """kv[p, h, key, D:2D] -> vt[p, h, d, key]  (fp8, keys innermost)."""
-        f8 = self.f8
+    def tkernel(self, mKV, mVT, mPT, mSeq, nb, mpg):
+        """kv[p, h, key, D:2D] -> vt[p, h, d, key]  (fp8, keys innermost) for
+        every page a sequence's extent references."""
         tidx, _, _ = cute.arch.thread_idx()
-        pg, h, _ = cute.arch.block_idx()
+        bx, h, _ = cute.arch.block_idx()
+        nbx, _, _ = cute.arch.grid_dim()
 
         smem = utils.SmemAllocator()
         st = smem.allocate(self.tshared)
         sIn = st.sIn.get_tensor(cute.make_layout(128 * SPAD)).iterator
         sOut = st.sOut.get_tensor(cute.make_layout(128 * SPAD)).iterator
 
+        # A page two sequences share is written twice with the same bytes.
+        # The barriers inside separate one slot's smem reuse from the next.
+        for e in cutlass.range(bx, nb * mpg, nbx, unroll=1):
+            b = e // mpg
+            col = e - b * mpg
+            if col * PG < mSeq[b]:
+                self._tpage(mKV, mVT, sIn, sOut, tidx, mPT[b, col], h)
+
+    @cute.jit
+    def _tpage(self, mKV, mVT, sIn, sOut, tidx, pg, h):
+        """Transpose one page's V through shared memory."""
+        f8 = self.f8
         gIn = cute.zipped_divide(mKV[None, None, h, pg], (1, 16))
         gOut = cute.zipped_divide(mVT[None, None, h, pg], (1, 16))
         buf = cute.make_rmem_tensor(cute.make_layout((1, 16)), f8)
@@ -848,8 +868,7 @@ def run(
     softmax_scale=None,
 ):
     # Everything that depends only on the shape signature (tile choice, launch
-    # geometry, the boxed scalars the compiled entry expects) is resolved once
-    # per shape; the per-call path is seven pointer boxes and one DSL call.
+    # geometry) is resolved once per shape; the per-call path is one call.
     """Run MSA sparse prefill over the union schedule. Writes ``p``."""
     ptshape = page_table.shape
     sig = (
@@ -862,15 +881,6 @@ def run(
         softmax_scale,
     )
     plan = _PLAN.get(sig)
-    stream = _stream()
-    pq = _I64(q.data_ptr())
-    pkv = _I64(kv.data_ptr())
-    pidx = _I64(q2k_indices.data_ptr())
-    ppt = _I64(page_table.data_ptr())
-    ppfx = _I64(prefix_lens.data_ptr())
-    psk = _I64(seqused_k.data_ptr())
-    pcu = _I64(cu_seqlens_q.data_ptr())
-    po = _I64(out.data_ptr())
     if plan is None:
         hq, hkv, npg, tq, nb, mpg = (int(v) for v in sig[:6])
         # nt is a compile-time tile height, so one launch gets one value; the
@@ -884,50 +894,33 @@ def run(
         # each sequence rounds up by at most one group. Surplus CTAs clamp onto
         # the last group and recompute it.
         ngrp = (tq + nt - 1) // nt + nb
-        Tq, Npg, Mpg = _I32(tq), _I32(npg), _I32(mpg)
-        Nb, Ngrp = _I32(nb), _I32(ngrp)
-        vt = torch.empty((npg, hkv, D, PG), dtype=kv.dtype, device=kv.device)
-        pvt = _I64(vt.data_ptr())
-        key = (hq, hkv, nt, softmax_scale)
+        key = (hq, hkv, nt, softmax_scale, q.dtype, kv.dtype)
         fn = _CACHE.get(key)
         if fn is None:
-            fn = cute.compile(
-                MsaSparseAttnFp8(hq, hkv, nt, softmax_scale=softmax_scale),
-                pq,
-                pkv,
-                pvt,
-                pidx,
-                ppt,
-                ppfx,
-                psk,
-                pcu,
-                po,
-                Tq,
-                Npg,
-                Nb,
-                Mpg,
-                Ngrp,
-                stream,
+            # The compile only reads the argument kinds: pointers and sizes are
+            # runtime values, so placeholders stand in for them.
+            args = (MsaSparseAttnFp8(hq, hkv, nt, softmax_scale=softmax_scale),)
+            args += (_I64(0),) * 9 + (_I32(0),) * 5 + (_stream(),)
+            fn = _CACHE[key] = build_and_load_cute_dsl_kernel(
+                "msa_sparse_prefill_sm90",
+                f"hq{hq}_hkv{hkv}_nt{nt}_scale{softmax_scale}_{q.dtype}_{kv.dtype}",
+                lambda: cute.compile(*args, options="--enable-tvm-ffi"),
+                (__file__,),
             )
-            _CACHE[key] = fn
-        plan = (fn, Tq, Npg, Nb, Mpg, Ngrp, (npg, hkv, D, PG))
+        plan = (fn, (tq, npg, nb, mpg, ngrp), (npg, hkv, D, PG))
         _PLAN[sig] = plan
-    fn, Tq, Npg, Nb, Mpg, Ngrp, vshape = plan
+    fn, sizes, vshape = plan
     vt = torch.empty(vshape, dtype=kv.dtype, device=kv.device)
     fn(
-        pq,
-        pkv,
-        _I64(vt.data_ptr()),
-        pidx,
-        ppt,
-        ppfx,
-        psk,
-        pcu,
-        po,
-        Tq,
-        Npg,
-        Nb,
-        Mpg,
-        Ngrp,
-        stream,
+        q.data_ptr(),
+        kv.data_ptr(),
+        vt.data_ptr(),
+        q2k_indices.data_ptr(),
+        page_table.data_ptr(),
+        prefix_lens.data_ptr(),
+        seqused_k.data_ptr(),
+        cu_seqlens_q.data_ptr(),
+        out.data_ptr(),
+        *sizes,
+        _stream(),
     )

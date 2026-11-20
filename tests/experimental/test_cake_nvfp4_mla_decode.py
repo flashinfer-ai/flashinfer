@@ -29,6 +29,7 @@ covered by ``test_cake_nvfp4_mla_decode_api.py``.
 
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import re
@@ -111,7 +112,7 @@ FURTHER_RECORDS = {
         {"short_rows": True, "epi_warp": True, "spec_uh": True},
     ),
     REDUCE_GENERAL_RECORD: ("reduce", cake_jit.ARCHES, {"general_splits": True}),
-    REDUCE_TWO_SPLITS_RECORD: ("reduce", ("sm_100a",), {"two_splits": True}),
+    REDUCE_TWO_SPLITS_RECORD: ("reduce", cake_jit.ARCHES, {"two_splits": True}),
 }
 
 ATOL = RTOL = 0.1
@@ -732,7 +733,8 @@ def general_reduce_record(monkeypatch):
 
 @pytest.fixture
 def two_splits_reduce_record(monkeypatch, general_reduce_record):
-    """Registers the SM100 two-split combine record beside the general one."""
+    """Registers the two-split combine record for both architectures beside the
+    general one."""
     return _register_further(monkeypatch, REDUCE_TWO_SPLITS_RECORD)
 
 
@@ -1318,24 +1320,38 @@ def _reduce_inputs(kv_lens, num_sms, *, q_len=6, num_heads=64, tiles_per_split=2
 )
 def test_split_row_range(row_splits, want):
     assert split_row_range(row_splits) == want
+    assert split_row_range(tuple(row_splits)) == want
 
 
-@pytest.mark.parametrize("num_sms", [148, 152])
+def test_two_split_rows_match_split_row_range():
+    """The selector's list scans over the counts of a plan of at most two
+    splits per row find the range split_row_range finds, for every count
+    sequence of up to seven rows."""
+    for n in range(8):
+        for row_splits in itertools.product((0, 1, 2), repeat=n):
+            want = split_row_range(row_splits)
+            assert cake_backend._two_split_rows(list(row_splits)) == want
+            assert cake_backend._two_split_rows(row_splits) == want
+
+
+@pytest.mark.parametrize(
+    "arch,num_sms", [("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152)]
+)
 def test_select_reduce_record_picks_two_splits_for_short_contiguous_plans(
-    spec_records, two_splits_reduce_record, num_sms
+    spec_records, two_splits_reduce_record, arch, num_sms
 ):
-    assert ("sm_100a", num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
+    assert (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
     plan, rows = _reduce_inputs([256, 300], num_sms)
     assert plan.max_splits == 2 and rows == [1] * 6 + [2] * 6
-    assert select_decode_record(plan, "sm_100a") == SHORT_SPEC_RECORD
+    assert select_decode_record(plan, arch) == SHORT_SPEC_RECORD
     kwargs = dict(num_sms=num_sms, row_splits=rows)
-    assert select_reduce_record(plan, "sm_100a", **kwargs) == REDUCE_TWO_SPLITS_RECORD
-    # Without the device facts, on another architecture or cluster count, the
-    # plan keeps the default combine.
-    assert select_reduce_record(plan, "sm_100a") == "reduce"
-    assert select_reduce_record(plan, "sm_103a", **kwargs) == "reduce"
+    assert select_reduce_record(plan, arch, **kwargs) == REDUCE_TWO_SPLITS_RECORD
+    # Without the device facts, or on another cluster count (the 148-SM SM103
+    # part included), the plan keeps the default combine.
+    assert select_reduce_record(plan, arch) == "reduce"
+    assert select_reduce_record(plan, arch, num_sms=132, row_splits=rows) == "reduce"
     assert (
-        select_reduce_record(plan, "sm_100a", num_sms=132, row_splits=rows) == "reduce"
+        select_reduce_record(plan, "sm_103a", num_sms=148, row_splits=rows) == "reduce"
     )
 
 
@@ -1363,6 +1379,85 @@ def test_select_reduce_record_two_splits_needs_the_record(
     kwargs = dict(num_sms=148, row_splits=rows)
     assert select_reduce_record(plan, "sm_100a", **kwargs) == REDUCE_TWO_SPLITS_RECORD
     monkeypatch.delitem(cake_jit.MODULES, REDUCE_TWO_SPLITS_RECORD)
+    assert select_reduce_record(plan, "sm_100a", **kwargs) == "reduce"
+
+
+def test_two_split_targets_bound_the_sm103_units_by_the_sm100_short_limit():
+    """On the 152-SM SM103 part the two-split combine runs only plans whose
+    units the SM100 short-row rule bounds (32 pipeline tiles); the SM100 targets
+    keep their selection unchanged (no unit limit)."""
+    want = {
+        ("sm_100a", 74): None,
+        ("sm_100a", 76): None,
+        ("sm_103a", 76): cake_backend.SHORT_MAX_UNIT_TILES["sm_100a"],
+    }
+    assert want == REDUCE_TWO_SPLITS_TARGETS
+    assert cake_backend.SHORT_MAX_UNIT_TILES["sm_100a"] == 32
+
+
+@pytest.mark.parametrize(
+    "units,limit,want",
+    [
+        ([[16, 16]], 32, True),
+        ([[16, 17]], 32, False),
+        ([[32], [32], [2]], 32, True),
+        ([[32], [33]], 32, False),
+        ([[33]], 33, True),
+        ([[33], [64]], None, True),
+    ],
+)
+def test_two_split_unit_ok_sums_every_unit(units, limit, want):
+    plan = _hand_plan(*units)
+    assert cake_backend._two_split_unit_ok(plan, limit) is want
+
+
+@pytest.mark.parametrize(
+    "split_tiles,request_tiles,want",
+    [
+        (32, 64, REDUCE_TWO_SPLITS_RECORD),  # two units of 32 tiles
+        (33, 66, "reduce"),  # two units of 33 tiles
+        (33, 64, "reduce"),  # units of 33 and 31 tiles
+        (31, 62, REDUCE_TWO_SPLITS_RECORD),  # two units of 31 tiles
+    ],
+)
+def test_select_reduce_record_two_splits_unit_limit_on_sm103(
+    spec_records, two_splits_reduce_record, split_tiles, request_tiles, want
+):
+    """A 32 / 33 pipeline-tile unit boundary on the 152-SM SM103 part: every
+    plan runs a short-row decode program there (its limit is 64 tiles), and the
+    two-split combine runs only while no unit exceeds 32 tiles."""
+    plan, rows = _reduce_inputs(
+        [request_tiles * cake_backend.TILE_KV], 152, tiles_per_split=split_tiles
+    )
+    assert plan.max_splits == 2 and rows == [2] * 6
+    assert max(unit_tiles(plan)) == split_tiles
+    assert select_decode_record(plan, "sm_103a", 152) == SHORT_SPEC_RECORD
+    kwargs = dict(num_sms=152, row_splits=rows)
+    assert select_reduce_record(plan, "sm_103a", **kwargs) == want
+    # The 148-SM SM103 part never runs it.
+    assert (
+        select_reduce_record(plan, "sm_103a", num_sms=148, row_splits=rows) == "reduce"
+    )
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+def test_select_reduce_record_two_splits_sm100_has_no_unit_limit(
+    spec_records, two_splits_reduce_record, num_sms
+):
+    """On SM100 the combine's selection is the short-row rule's: a plan of 32-tile
+    units runs it, and a 33-tile unit leaves the short-row decode programs."""
+    plan, rows = _reduce_inputs(
+        [64 * cake_backend.TILE_KV], num_sms, tiles_per_split=32
+    )
+    assert cake_backend._two_split_unit_ok(plan, None)
+    kwargs = dict(num_sms=num_sms, row_splits=rows)
+    assert select_reduce_record(plan, "sm_100a", **kwargs) == REDUCE_TWO_SPLITS_RECORD
+    plan, rows = _reduce_inputs(
+        [66 * cake_backend.TILE_KV], num_sms, tiles_per_split=33
+    )
+    decode = select_decode_record(plan, "sm_100a", num_sms)
+    assert decode not in cake_backend.SHORT_DECODE_RECORDS
+    kwargs = dict(num_sms=num_sms, row_splits=rows)
     assert select_reduce_record(plan, "sm_100a", **kwargs) == "reduce"
 
 
@@ -2304,3 +2399,98 @@ def test_two_splits_reduce_matches_the_reduce_bitwise(
     assert_programs_match_bitwise(
         monkeypatch, REDUCE_TWO_SPLITS_RECORD, kv_lens, **options
     )
+
+
+def test_two_splits_reduce_binds_once_per_buffer_set():
+    """prepare binds the two-split combine once per caller buffer set: another
+    prepare into the same buffers reuses the bound arguments, other buffers
+    bind their own, and every runner writes the same bits."""
+    reason = _gpu_skip_reason()
+    if reason:
+        pytest.skip(reason)
+    arch = cake_jit.arch_for_capability(torch.cuda.get_device_capability())
+    record = cake_jit.MODULES.get(REDUCE_TWO_SPLITS_RECORD)
+    if record is None or arch not in record["arches"]:
+        pytest.skip(f"no {REDUCE_TWO_SPLITS_RECORD} program registered for {arch}")
+    num_sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    kv_lens, q_len, num_heads = [256, 300], 6, 64
+    total_q = len(kv_lens) * q_len
+    plan = build_work_plan(
+        kv_lens, num_heads=num_heads, num_sms=num_sms, q_len=q_len, tiles_per_split=2
+    )
+    splits = token_splits(
+        plan,
+        _q_indptr(len(kv_lens), q_len),
+        q_len=q_len,
+        num_heads=num_heads,
+        total_q=total_q,
+    )
+    facts = dict(num_sms=num_sms, row_splits=splits)
+    if select_reduce_record(plan, arch, **facts) != REDUCE_TWO_SPLITS_RECORD:
+        pytest.skip(f"the selector keeps the reduce program at {num_sms} SMs")
+    inputs = make_inputs(
+        kv_lens, num_heads, q_len=q_len, enable_sink=True, device="cuda"
+    )
+    nbytes = max_nvfp4_mla_decode_workspace_size(len(kv_lens), num_heads, q_len=q_len)
+
+    def buffers():
+        return (
+            torch.empty((nbytes,), dtype=torch.uint8, device="cuda"),
+            torch.empty(
+                (total_q, num_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+            ),
+            torch.empty((total_q, num_heads), dtype=torch.float32, device="cuda"),
+        )
+
+    def prepare(workspace, out, lse):
+        return cake_backend.prepare_nvfp4_batch_decode_with_kv_cache_mla(
+            inputs["query"],
+            inputs["query_scale"],
+            inputs["kv_cache"],
+            inputs["kv_scale"],
+            inputs["block_tables"],
+            inputs["seq_lens"],
+            workspace,
+            sm_scale=inputs["sm_scale"],
+            sinks=inputs["sinks"],
+            out=out,
+            lse=lse,
+            return_lse=True,
+            tiles_per_split=2,
+        )
+
+    def pointers(runner):
+        return [
+            a.data_ptr() if isinstance(a, torch.Tensor) else a
+            for a in runner.reduce_arguments
+        ]
+
+    def run(runner):
+        result = runner()
+        torch.cuda.synchronize()
+        return result[0].clone(), result[1].clone()
+
+    one, two = buffers(), buffers()
+    first = prepare(*one)
+    assert first.reduce_program == record["library"]
+    want = run(first)
+    again = prepare(*one)
+    assert again.reduce_arguments is first.reduce_arguments
+    assert again.launches[1][1] is first.launches[1][1]
+    assert again.reduce_kwargs is not first.reduce_kwargs
+    assert again.reduce_kwargs["grid"] == first.reduce_kwargs["grid"]
+    other = prepare(*two)
+    assert other.launches[1][1] is not first.launches[1][1]
+    assert pointers(other) != pointers(first)
+    assert_bound_to_the_record(other.reduce_arguments, record, other.reduce_kwargs)
+    # Buffers prepare allocates itself are bound per call.
+    fresh = prepare(one[0], None, None)
+    assert fresh.launches[1][1] is not first.launches[1][1]
+    for runner in (again, other, fresh, first):
+        out, lse = run(runner)
+        assert torch.equal(out, want[0]) and torch.equal(lse, want[1])
+    for _ in range(cake_backend._TWO_SPLIT_BINDINGS_MAX + 1):
+        prepare(*buffers())
+    assert len(cake_backend._TWO_SPLIT_BINDINGS) <= cake_backend._TWO_SPLIT_BINDINGS_MAX

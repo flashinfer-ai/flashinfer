@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_ITEM_SUMS_OFF 0
-#define SMEM_ITEM_SUMS_STAGE_BYTES 128
-#define SMEM_ITEM_SUMS_STRIDE 128
-#define SMEM_COL_SUMS_OFF 128
-#define SMEM_COL_SUMS_STAGE_BYTES 128
-#define SMEM_COL_SUMS_STRIDE 128
-#define SMEM_TOTAL 256
-#define THREADS 1024
-
 #include <math_constants.h>
 
 extern "C" {
@@ -82,7 +72,7 @@ kernel_cake_msa_icp_indexer_eb804215a3d74733ee47(int* __restrict__ qo_lens, int*
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* item_sums = reinterpret_cast<int*>(smem_raw + 0);
     const int item_sums_addr = smem + 0;
     int* col_sums = reinterpret_cast<int*>(smem_raw + 128);

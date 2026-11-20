@@ -19,10 +19,12 @@
 // Original generated payload before FlashInfer type adaptation: 8720 bytes,
 // sha256:e47f82923112e143173f32dbb145986f8c9a1503fd2bb71f22f5c065769162e3.
 // The raw sm_100a and sm_103a payloads were byte-identical. This integration
-// uses standard integer types and adds sm_103a-only PDL wait/trigger control.
+// uses standard integer types and adds sm_103a and sm_107a PDL wait/trigger control (an ordered
+// per-row temperature load after the wait).
 
 // clang-format off
 #include <stdint.h>
+#include <flashinfer/cake_blackwell_softmax_pdl.cuh>
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
@@ -116,7 +118,7 @@ kernel_flashinfer_blackwell_softmax_followup_rowwise(float* __restrict__ x, floa
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     const bool enable_pdl = (parameter_kind & 4) != 0;
     parameter_kind &= 3;
     if (enable_pdl) {
@@ -137,7 +139,7 @@ kernel_flashinfer_blackwell_softmax_followup_rowwise(float* __restrict__ x, floa
 
     // === Task calls (dependency order) ===
     int row = bid;
-    float temperature = ((parameter_kind == 2) ? parameter[row] : scalar_temperature);
+    float temperature = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (row)) : scalar_temperature);
     float inv_temperature = 1.0f / temperature;
     int row_base = row * vocab_size;
     int row_misalignment = row_base % 4;
@@ -292,7 +294,7 @@ kernel_flashinfer_blackwell_softmax_followup_rowwise(float* __restrict__ x, floa
         float _exp2_9 = exp2_term(tail_scaled_1, cta_max);
         output[tail_index_1] = _exp2_9 * inv_sum;
     }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     if (enable_pdl) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }

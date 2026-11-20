@@ -448,6 +448,26 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
     for p, parts in tuple_parts.items():
         kwargs[p] = tuple(parts)
 
+    if template.name_prefix and template.name_prefix.startswith("ulysses_scatter_qkv_"):
+        # The real workspace is collectively prepared. Schema-only tests read
+        # its metadata without allocating GPU storage or initializing a group.
+        head_dim = template.axes["head_dim"].value
+        if head_dim is None:  # Inferred Const axes need a valid sample input.
+            head_dim = 64
+        q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+        kwargs.update(
+            q=q,
+            k=q,
+            v=q,
+            workspace=SimpleNamespace(world_size=8, used_sequence=513),
+        )
+
+    if template.name_prefix == "ulysses_exchange_chunks":
+        kwargs.update(
+            self=SimpleNamespace(world_size=1),
+            x=torch.empty(1, 1, 1, axis_size, dtype=torch.uint8),
+        )
+
     return kwargs
 
 
@@ -677,30 +697,38 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         for template in prims_ts_block_sparse_trace_dispatch.templates
     }
     assert set(one_shot_traces) == {
-        "prims_ts_block_sparse",
-        "prims_ts_block_sparse_bitmask",
-        "prims_ts_block_sparse_bsr_proxy",
-        "prims_ts_block_sparse_bitmask_proxy",
-        "prims_ts_block_sparse_shared",
-        "prims_ts_block_sparse_bitmask_shared",
-        "prims_ts_block_sparse_bsr_proxy_shared",
-        "prims_ts_block_sparse_bitmask_proxy_shared",
-        "prims_ts_block_sparse_dense",
+        name + suffix
+        for name in {
+            "prims_ts_block_sparse",
+            "prims_ts_block_sparse_bitmask",
+            "prims_ts_block_sparse_bsr_proxy",
+            "prims_ts_block_sparse_bitmask_proxy",
+            "prims_ts_block_sparse_shared",
+            "prims_ts_block_sparse_bitmask_shared",
+            "prims_ts_block_sparse_bsr_proxy_shared",
+            "prims_ts_block_sparse_bitmask_proxy_shared",
+            "prims_ts_block_sparse_dense",
+        }
+        for suffix in ("", "_scales_ft", "_scales_tf", "_scales_tt")
     }
     contiguous_wrapper_traces = {
         template.name_prefix: template
         for template in prims_ts_block_sparse_wrapper_trace_dispatch.templates
     }
     assert set(contiguous_wrapper_traces) == {
-        "prims_ts_block_sparse_wrapper",
-        "prims_ts_block_sparse_wrapper_bitmask",
-        "prims_ts_block_sparse_wrapper_bsr_proxy",
-        "prims_ts_block_sparse_wrapper_bitmask_proxy",
-        "prims_ts_block_sparse_wrapper_shared",
-        "prims_ts_block_sparse_wrapper_bitmask_shared",
-        "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
-        "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
-        "prims_ts_block_sparse_wrapper_dense",
+        name + suffix
+        for name in {
+            "prims_ts_block_sparse_wrapper",
+            "prims_ts_block_sparse_wrapper_bitmask",
+            "prims_ts_block_sparse_wrapper_bsr_proxy",
+            "prims_ts_block_sparse_wrapper_bitmask_proxy",
+            "prims_ts_block_sparse_wrapper_shared",
+            "prims_ts_block_sparse_wrapper_bitmask_shared",
+            "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
+            "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
+            "prims_ts_block_sparse_wrapper_dense",
+        }
+        for suffix in ("", "_scales_ft", "_scales_tf", "_scales_tt")
     }
     route_modes = {
         ("bsr", False): ("", {"block_indptr", "block_indices"}),
@@ -872,10 +900,14 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         for template in prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates
     }
     assert set(wrapper_paged_templates) == {
-        "prims_ts_paged_block_sparse_wrapper_tuple",
-        "prims_ts_paged_block_sparse_wrapper_combined",
-        "prims_ts_paged_block_sparse_wrapper_tuple_shared",
-        "prims_ts_paged_block_sparse_wrapper_combined_shared",
+        name + suffix
+        for name in {
+            "prims_ts_paged_block_sparse_wrapper_tuple",
+            "prims_ts_paged_block_sparse_wrapper_combined",
+            "prims_ts_paged_block_sparse_wrapper_tuple_shared",
+            "prims_ts_paged_block_sparse_wrapper_combined_shared",
+        }
+        for suffix in ("", "_scales_ft", "_scales_tf", "_scales_tt")
     }
     for template in (
         contiguous_wrapper_trace,
@@ -1220,6 +1252,13 @@ def test_attention_ts_trace_semantic_and_storage_pages(
         attention_ts_decode_trace_dispatch(**standalone_kwargs),
     )
     for template in direct_templates:
+        # The registry samples native pages and encoded page size 4; other
+        # encoded sizes are generated dynamically by the same factory.
+        if not encoded or semantic_page_size == 4:
+            assert any(
+                template is registered
+                for registered in attention_ts_decode_trace_dispatch.templates
+            )
         assert ("_encoded_page" in template.name_prefix) == encoded
         if encoded:
             assert f"_encoded_page{semantic_page_size}" in template.name_prefix
@@ -1605,6 +1644,108 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     assert "mask:dense" in mla_definitions[1]["tags"]
 
 
+def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
+    """Bounded traces describe local prefixes, including empty rank-local KV."""
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+        batch_mla_decode_with_paged_kv_cache,
+    )
+    from flashinfer.fi_trace import fi_trace
+    from flashinfer.trace.templates.attention import (
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+    )
+
+    query = torch.empty((2, 8, 96, 576), dtype=torch.float8_e4m3fn)
+    kwargs = {
+        "query": query,
+        "kv_cache": torch.empty((2, 1, 128, 576), dtype=torch.float8_e4m3fn),
+        "block_tables": torch.tensor(((-1, -1), (0, 1)), dtype=torch.int32),
+        "seq_lens_kv": torch.tensor((0, 65), dtype=torch.int32),
+    }
+    default_template = prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs)
+    assert any(
+        default_template is registered
+        for registered in prims_ts_decode_mla_one_shot_trace_dispatch.templates
+    )
+    bounds = torch.tensor(
+        [0] * 8 + [0, 1, 63, 64, 65, 65, 65, 65],
+        dtype=torch.int32,
+    )
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        packed_query=False,
+        mask_type="causal",
+        max_q_len=8,
+        max_kv_len=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        use_kv_bounds=False,
+    )
+    ordinary = fi_trace(wrapper.run, **kwargs)
+    wrapper._plan_state.use_kv_bounds = True
+    for missing_bounds in ({}, {"kv_bounds": None}):
+        with pytest.raises(ValueError, match="kv_bounds"):
+            fi_trace(wrapper.run, **kwargs, **missing_bounds)
+    bounded = fi_trace(wrapper.run, **kwargs, kv_bounds=bounds)
+    assert ordinary["name"] != bounded["name"]
+    assert bounded["axes"]["causal"]["value"] == 0
+    assert ordinary["axes"]["causal"]["value"] == 1
+    assert "min(seq_lens_kv) >= 0" in bounded["constraints"]
+    assert "min(seq_lens_kv) >= 1" not in bounded["constraints"]
+    assert "min(seq_lens_kv) >= 1" in ordinary["constraints"]
+    assert "mask:kv_prefix" in bounded["tags"]
+    assert "mask:causal" not in bounded["tags"]
+    assert "kv_bounds" not in ordinary["inputs"]
+
+    one_shot_kwargs = dict(kwargs)
+    ordinary_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs)
+    bounded_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
+        **one_shot_kwargs, kv_bounds=bounds
+    )
+    assert ordinary_one_shot["name"] != bounded_one_shot["name"]
+    assert "kv_bounds" not in ordinary_one_shot["inputs"]
+    for definition in (bounded, bounded_one_shot):
+        assert "_kv_bounds" in definition["name"]
+        assert definition["axes"]["use_kv_bounds"]["value"] == 1
+        assert definition["axes"]["zero_empty_rows"]["value"] == 1
+        assert definition["inputs"]["kv_bounds"]["shape"] == ["num_kv_bounds"]
+        assert definition["inputs"]["kv_bounds"]["dtype"] == "int32"
+        assert not definition["inputs"]["kv_bounds"].get("optional", False)
+        assert "num_kv_bounds == batch_size * seq_len_q" in definition["constraints"]
+        assert "unknown" not in str(definition["inputs"])
+    for template in (
+        prims_ts_decode_mla_wrapper_trace_dispatch(
+            self=wrapper, **kwargs, kv_bounds=bounds
+        ),
+        prims_ts_decode_mla_one_shot_trace_dispatch(
+            **one_shot_kwargs, kv_bounds=bounds
+        ),
+    ):
+        assert_template_constraints_valid(template, label=template.name_prefix)
+
+    wrapper._plan_state.zero_empty_rows = False
+    opt_out = fi_trace(wrapper.run, **kwargs, kv_bounds=bounds)
+    opt_out_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
+        **one_shot_kwargs, kv_bounds=bounds, zero_empty_rows=False
+    )
+    for definition in (opt_out, opt_out_one_shot):
+        assert "_no_zero_empty_rows" in definition["name"]
+        assert definition["axes"]["zero_empty_rows"]["value"] == 0
+        assert "unspecified" in definition["description"]
+    assert opt_out["name"] != bounded["name"]
+    assert opt_out_one_shot["name"] != bounded_one_shot["name"]
+    assert "zero_empty_rows" in opt_out_one_shot["inputs"]
+    # Ignored flags must not break canonical template identity without bounds.
+    assert (
+        prims_ts_decode_mla_one_shot_trace_dispatch(
+            **kwargs,
+            zero_empty_rows=False,
+        )
+        is default_template
+    )
+
+
 # ---------------------------------------------------------------------------
 # End-to-end checks: fi_trace with auto-generated CPU tensors
 #
@@ -1655,6 +1796,31 @@ _E2E_IDS = [label for _, _, label in _E2E_PAIRS]
 def test_fi_trace_complete(func, template, label):
     """fi_trace with auto-generated CPU tensors must return a complete definition."""
     assert_fi_trace_complete(func, template, label=label)
+
+
+@pytest.mark.parametrize("layout", ["sage2_sm90", "sage2_sm89_sm120"])
+@pytest.mark.parametrize(
+    "declared_head_dim,expected_head_dim", [(None, 64), (64, 64), (128, 128)]
+)
+def test_ulysses_qkv_sample_head_dim(layout, declared_head_dim, expected_head_dim):
+    from copy import copy
+
+    from flashinfer.trace.templates.comm import ulysses_scatter_qkv_trace_dispatch
+
+    template = copy(
+        ulysses_scatter_qkv_trace_dispatch(workspace=SimpleNamespace(layout=layout))
+    )
+    template.axes = {
+        **template.axes,
+        "head_dim": Const(value=declared_head_dim, abbrev="d"),
+    }
+    kwargs = _make_sample_kwargs(template)
+    for name in ("q", "k", "v"):
+        assert kwargs[name].shape == (1, 65, 8, expected_head_dim)
+    definition = template.build_fi_trace_fn(
+        "flashinfer.comm.ulysses.UlyssesCommunicator.scatter_qkv"
+    )(**kwargs)
+    assert definition["axes"]["head_dim"]["value"] == expected_head_dim
 
 
 # ---------------------------------------------------------------------------

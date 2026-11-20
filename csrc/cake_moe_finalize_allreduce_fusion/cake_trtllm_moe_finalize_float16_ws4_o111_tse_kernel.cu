@@ -40,18 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_REDUCE_SMEM_OFF 0
-#define SMEM_REDUCE_SMEM_STAGE_BYTES 132
-#define SMEM_REDUCE_SMEM_STRIDE 132
-#define SMEM_RMS_SCALAR_OFF 132
-#define SMEM_RMS_SCALAR_STAGE_BYTES 4
-#define SMEM_RMS_SCALAR_STRIDE 4
-#define SMEM_RMS_SLOTS_OFF 136
-#define SMEM_RMS_SLOTS_STAGE_BYTES 32
-#define SMEM_RMS_SLOTS_STRIDE 32
-#define SMEM_TOTAL 256
-#define THREADS 224
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -94,23 +82,15 @@ __device__ __forceinline__ float approx_rcp(float x) {
 }
 
 
-namespace flashinfer_cake_moe_finalize_allreduce_fusion {
-__device__ inline unsigned int laneId()
-{
-    uint32_t id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(id));
-    return id;
-}
-} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
-
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
 kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __half* __restrict__ expert_scales, __half* __restrict__ shared_expert_output, __half* __restrict__ residual, __half* __restrict__ norm_weight, __half* __restrict__ residual_out, __half* __restrict__ norm_out, __half* __restrict__ quant_out, __half* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane = flashinfer_cake_moe_finalize_allreduce_fusion::laneId();
+    const uint32_t warp = __shfl_sync(0xFFFFFFFF, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -128,7 +108,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
     const int reduce_smem_addr = smem + 0;
     float* rms_scalar = reinterpret_cast<float*>(smem_raw + 132);
@@ -180,7 +160,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
     int control_current_word = control_0[2];
     int control_clear_word = control_0[4];
     int control_current = control_current_word % 3;
-    long long data_base = 0;
+    long long data_base = 0ll;
     __syncthreads();
     if (tid == 0) {
         asm volatile("fence.acq_rel.gpu;" ::: "memory");
@@ -204,9 +184,9 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+        clear_words[word] = 2147516416ll;
     }
-    long long clear_base = 0;
+    long long clear_base = 0ll;
     int access = first_access;
     int rms_parity = 0;
     int clear_limit = 0;
@@ -309,7 +289,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
                 int top_k_opaque = top_k;
                 asm("" : "+r"(top_k_opaque));
                 {
-                    long long expert_elem = (long long)(((route_index_qa < 0) ? 0 : route_index_qa)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem = (long long)((route_index_qa < 0) ? 0 : route_index_qa) * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_8[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_8[0 + 0]), "+r"(_vec_load_8[0 + 1]), "+r"(_vec_load_8[0 + 2]), "+r"(_vec_load_8[0 + 3]) : "l"(allreduce_in + expert_elem + 0), "r"((int)(top_k_opaque > route_base)));
                     #pragma unroll
@@ -326,7 +306,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
                     route_scales[0] = _vec_load_9[0];
                 }
                 {
-                    long long expert_elem_1 = (long long)(((route_index_qb < 0) ? 0 : route_index_qb)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_1 = (long long)((route_index_qb < 0) ? 0 : route_index_qb) * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_10[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_10[0 + 0]), "+r"(_vec_load_10[0 + 1]), "+r"(_vec_load_10[0 + 2]), "+r"(_vec_load_10[0 + 3]) : "l"(allreduce_in + expert_elem_1 + 0), "r"((int)(top_k > route_base + 1)));
                     #pragma unroll
@@ -343,7 +323,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
                     route_scales[1] = _vec_load_11[0];
                 }
                 {
-                    long long expert_elem_2 = (long long)(((route_index_qc < 0) ? 0 : route_index_qc)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_2 = (long long)((route_index_qc < 0) ? 0 : route_index_qc) * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_12[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_12[0 + 0]), "+r"(_vec_load_12[0 + 1]), "+r"(_vec_load_12[0 + 2]), "+r"(_vec_load_12[0 + 3]) : "l"(allreduce_in + expert_elem_2 + 0), "r"((int)(top_k > route_base + 2)));
                     #pragma unroll
@@ -360,7 +340,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
                     route_scales[2] = _vec_load_13[0];
                 }
                 {
-                    long long expert_elem_3 = (long long)(((route_index_qd < 0) ? 0 : route_index_qd)) * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_3 = (long long)((route_index_qd < 0) ? 0 : route_index_qd) * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_14[4] = {0};
                     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.s32 p, %5, 0;\n\t@p ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n\t}" : "+r"(_vec_load_14[0 + 0]), "+r"(_vec_load_14[0 + 1]), "+r"(_vec_load_14[0 + 2]), "+r"(_vec_load_14[0 + 3]) : "l"(allreduce_in + expert_elem_3 + 0), "r"((int)(top_k > route_base + 3)));
                     #pragma unroll
@@ -738,12 +718,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
             }
             int chunk = cluster_thread / 224;
             int owner = published_token + chunk & 3;
-            long long scatter_offset = ((long long)rank * (long long)tokens + (long long)published_token) * 1792 + (long long)(cluster_thread - chunk * 224) * 8;
+            long long scatter_offset = ((long long)rank * (long long)tokens + (long long)published_token) * 1792ll + (long long)(cluster_thread - chunk * 224) * 8ll;
             int scatter_current_word = control_current_word;
             asm("" : "+r"(scatter_current_word));
             int scatter_bytes_word = control_bytes_per_buffer_word;
             asm("" : "+r"(scatter_bytes_word));
-            long long scatter_base = (long long)(scatter_current_word % 3) * ((long long)scatter_bytes_word / 2);
+            long long scatter_base = (long long)(scatter_current_word % 3) * ((long long)scatter_bytes_word / 2ll);
             __half* scatter_dst = reinterpret_cast<__half*>(workspace_tensor[8 + owner]) + scatter_base + scatter_offset;
             asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(scatter_dst), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
         }
@@ -754,7 +734,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
             asm("" : "+r"(early_bytes_word));
             int early_clear_word = control_clear_word;
             asm("" : "+r"(early_clear_word));
-            long long early_stride = (long long)early_bytes_word / 2;
+            long long early_stride = (long long)early_bytes_word / 2ll;
             data_base = (long long)(early_current_word % 3) * early_stride;
             clear_base = (long long)((early_current_word + 2) % 3) * early_stride;
             clear_limit = early_clear_word / 8;
@@ -766,7 +746,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
         #pragma unroll 1
         for (int clear_access = clear_next; clear_access < clear_end; clear_access += access_stride) {
             {
-                auto _gst_5 = workspace_local + (clear_base + (long long)clear_access * 8);
+                auto _gst_5 = workspace_local + (clear_base + (long long)clear_access * 8ll);
                 __builtin_assume(__isGlobal(_gst_5));
                 reinterpret_cast<int4*>(_gst_5)[0] = reinterpret_cast<int4*>(clear_words)[0];
             }
@@ -779,15 +759,15 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
             int owned_token = token_begin + (step - 1) * token_stride;
             int owned_chunk = cluster_thread / 224;
             if ((owned_token + owned_chunk & 3) == rank) {
-                long long owned_offset = (long long)owned_token * 1792 + (long long)(cluster_thread - owned_chunk * 224) * 8;
-                long long sender_stride = (long long)tokens * 1792;
+                long long owned_offset = (long long)owned_token * 1792ll + (long long)(cluster_thread - owned_chunk * 224) * 8ll;
+                long long sender_stride = (long long)tokens * 1792ll;
                 int owned_access = owned_token * 896 + cluster_thread;
                 uint32_t _sysv_poll_group_0[16];
                 do {
                     asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + owned_offset)) : "memory");
                     asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(workspace_local + (data_base + 2 * sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(workspace_local + (data_base + 3 * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(workspace_local + (data_base + 2ll * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(workspace_local + (data_base + 3ll * sender_stride + owned_offset)) : "memory");
                 } while (
                     (((_sysv_poll_group_0[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll_group_0[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 16) & 0xffffu) == 0x8000u) ||
@@ -935,7 +915,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
                         : "=l"(*reinterpret_cast<unsigned long long*>(&sum_value[_pair * 2]))
                         : "r"(scaled_f16_5_1[_pair]));
                 }
-                long long gather_offset = (long long)tokens * 7168 + (long long)owned_access * 8;
+                long long gather_offset = (long long)tokens * 7168ll + (long long)owned_access * 8ll;
                 long long peer_base_0[1];
                 {
                     uint64_t _scalar_bits_6;
@@ -1002,7 +982,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
                 }
             }
             float sum_value_1[8];
-            long long gather_in = data_base + (long long)tokens * 7168 + (long long)access * 8;
+            long long gather_in = data_base + (long long)tokens * 7168ll + (long long)access * 8ll;
             uint32_t gathered[4];
             do {
                 asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(gathered[0]), "=r"(gathered[1]), "=r"(gathered[2]), "=r"(gathered[3]) : "l"(workspace_local + gather_in) : "memory");
@@ -1028,7 +1008,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
             int elem = access * 8;
             float vec_load_1[8];
             {
-                const uint4* _vptr_11 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
+                const uint4* _vptr_11 = reinterpret_cast<const uint4*>(norm_weight + access_in_token * 8 + 0);
                 uint4 _vld_11[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1283,7 +1263,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse(__half* __restrict__ allred
     #pragma unroll 1
     for (int clear_access_1 = clear_next; clear_access_1 < clear_limit; clear_access_1 += access_stride) {
         {
-            auto _gst_29 = workspace_local + (clear_base + (long long)clear_access_1 * 8);
+            auto _gst_29 = workspace_local + (clear_base + (long long)clear_access_1 * 8ll);
             __builtin_assume(__isGlobal(_gst_29));
             reinterpret_cast<int4*>(_gst_29)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }

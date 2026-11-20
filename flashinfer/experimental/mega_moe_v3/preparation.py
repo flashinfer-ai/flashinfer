@@ -7,7 +7,16 @@ the host pads the routed weights and their scales to the next multiple of 128
 with zero weights when the logical width is not one already. The padded
 columns add exact zeros, so the result is bit-identical to the unpadded
 arithmetic, and a width that already is a multiple of 128 is packed exactly as
-before (no copy).
+before (no copy). A route whose metadata states ``w2_dense_k`` and
+``w2_logical_k`` runs a program that also reads the down-projection weights
+unpadded: a call at the logical width ``w2_logical_k`` binds ``W2`` as a
+dense ``[E * H + 1, w2_dense_k / 2]`` copy of the caller's bytes (zero codes
+past ``w2_logical_k`` and one zero row at the end, which the last row's final
+K step reads into) with ``K2 = w2_dense_k``, and every other call on that route
+binds the padded ``W2`` as before. The scales are padded alike either way.
+The dense image's tensor map is a rank-3 16U4 map with 32-byte chunk strides;
+a driver that refuses it fails the bind with an error, never with a wrong
+result.
 
 Expert-parallel calls describe the rank's window of the global expert space:
 ``num_experts`` is the number of experts this rank holds (the leading dimension
@@ -47,6 +56,10 @@ PIPELINE_KEY_FIELDS = (
     "routed_weight_dtype",
     "activation_clamp",
 )
+# The down-projection image widths a route may state (``w2_dense_k``,
+# ``w2_logical_k``), by (experts, physical intermediate): the logical width
+# and the dense image widths of it the programs read (``_w2_dense_widths``).
+W2_DENSE_WIDTHS = {(384, 384): (288, (288, 320)), (384, 640): (576, (576,))}
 # The plan's control arena (``_carve_control_arena``): a 2 MiB GPU page
 # window, 64 KiB guards, one 4 KiB page per buffer, 128-byte steps within
 # a shared page, and the knob that selects what is carved into it.
@@ -273,6 +286,39 @@ def _pad_intermediate(w1, w1_sf, w2, w2_sf, logical: int, physical: int, pack: i
         cols(w2, physical // pack, 0),
         cols(w2_sf, physical // SF_GRAN, PAD_SCALE),
     )
+
+
+def _w2_dense_widths(metadata, num_experts: int, intermediate: int):
+    """``(w2_dense_k, w2_logical_k)`` a route's metadata states, or ``None``.
+
+    The route's program reads ``B2`` as the dense ``[E * H + 1, w2_dense_k /
+    pack]`` image of a ``w2_logical_k``-wide down-projection when ``K2`` is
+    ``w2_dense_k``. Both keys come together, as positive multiples of the scale
+    group, at a width ``W2_DENSE_WIDTHS`` lists for the route's experts and
+    physical ``intermediate``; anything else is refused.
+    """
+    stated = [k for k in ("w2_dense_k", "w2_logical_k") if k in metadata]
+    if not stated:
+        return None
+    if len(stated) != 2:
+        raise ValueError(
+            f"route metadata states {stated[0]!r} without its pair; 'w2_dense_k' "
+            "and 'w2_logical_k' come together"
+        )
+    dense, logical = metadata["w2_dense_k"], metadata["w2_logical_k"]
+    if not all(type(v) is int and v > 0 and v % SF_GRAN == 0 for v in (dense, logical)):
+        raise ValueError(
+            "route metadata 'w2_dense_k' / 'w2_logical_k' must be positive "
+            f"multiples of {SF_GRAN}; got {dense!r} / {logical!r}"
+        )
+    widths = W2_DENSE_WIDTHS.get((num_experts, intermediate))
+    if widths is None or logical != widths[0] or dense not in widths[1]:
+        raise ValueError(
+            f"route metadata states w2_dense_k {dense} and w2_logical_k {logical}; "
+            f"the {num_experts}-expert intermediate-{intermediate} route takes "
+            f"{widths if widths else 'no dense W2 image'}"
+        )
+    return dense, logical
 
 
 def _sf_float_to_u32_words(sf_float):
@@ -535,8 +581,18 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     Such a program ranks tokens within an expert, not slots, so a token that
     routes to one local expert through two slots is refused, and it stages the
     scale words with 16-byte loads, so an ``x_sf_packed`` view that does not
-    start on a 16-byte boundary is copied to one that does. Without metadata
-    (the original routes) the host uses the original heuristics.
+    start on a 16-byte boundary is copied to one that does. ``w2_dense_k`` and
+    ``w2_logical_k`` (stated together, ``_w2_dense_widths``) name a program
+    that also reads the down-projection weights unpadded: a call at the logical
+    width ``w2_logical_k`` binds ``B2`` as a fresh dense ``[E * H + 1,
+    w2_dense_k / pack]`` copy of ``w2``'s bytes (zero codes past
+    ``w2_logical_k``, then one zero row) and ``K2`` as ``w2_dense_k``; any
+    other call binds the padded ``B2`` with ``K2`` the physical width.
+    ``SFB2`` is the padded one on both. ``num_ctas`` (stated by a route whose
+    persistent grid is smaller than the device, ``runtime.route_num_ctas``) is
+    the grid the bindings launch, ``(num_ctas, 1, 1)``; without it the grid is
+    one CTA per SM, ``(num_sms, 1, 1)``. Without metadata (the original routes)
+    the host uses the original heuristics.
     """
     import torch
 
@@ -559,6 +615,10 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     if weight_fmt not in ("fp4", "fp8"):
         raise ValueError("routed_weight_dtype must be 'fp4' or 'fp8'")
     pack = 2 if weight_fmt == "fp4" else 1
+    w2_widths = _w2_dense_widths(metadata, E, I)
+    dense_w2 = (
+        w2_widths is not None and logical_I == w2_widths[1] and weight_fmt == "fp4"
+    )
     if not 1 <= E <= DISP_NUM_EXPERTS_MAX or not 1 <= TK <= min(E, 32):
         raise ValueError(
             "MegaMoE requires 1..384 experts and 1..min(experts,32) routes"
@@ -649,11 +709,26 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         .contiguous()
     )
     x_sf = inputs["x_sf_packed"].contiguous().view(torch.int32).view(torch.uint32)
+    w2_caller = w2
     w1, w1_sf, w2, w2_sf = _pad_intermediate(w1, w1_sf, w2, w2_sf, logical_I, I, pack)
     B1 = _interleave_gate_up(w1).contiguous().view(torch.uint8)
     SFB1 = _sf_float_to_u32_words(_interleave_gate_up(w1_sf)).view(torch.uint32)
     B2 = w2.contiguous().view(torch.uint8)
     SFB2 = _sf_float_to_u32_words(w2_sf).view(torch.uint32)
+    if dense_w2:
+        # The dense down-projection image: the caller's bytes, each row's
+        # w2_logical_k codes then zero codes up to w2_dense_k, in a fresh
+        # allocation (no alias of the caller's tensor), plus one zero row.
+        # The last K step's box reads past the end of its row into the next
+        # one; the extra row keeps that read inside the image for the last
+        # expert's last row (the program refuses an image without it).
+        w2_dense_k = w2_widths[0]
+        B2 = torch.zeros(
+            (E * H + 1, w2_dense_k // pack), dtype=torch.uint8, device=device
+        )
+        B2[: E * H, : logical_I // pack].copy_(
+            w2_caller.contiguous().view(torch.uint8).reshape(E * H, logical_I // pack)
+        )
     pool_fp8 = torch.zeros(M_total, H // 4, dtype=torch.int32, device="cuda")
     # The FC1 ``A`` map: the pool rows the dispatch fills, or the activation
     # bytes themselves for a program that reads the routed rows in place
@@ -740,9 +815,16 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     meta_token = control("meta_token")
     meta_slot = control("meta_slot")
     num_sms = int(num_sms)
-    # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
-    # the routes fill, e.g. when -1 slots leave fewer routed tokens.
-    persistent_grid = num_sms
+    # The source schedule runs its persistent grid (NUM_CTAS) however few tiles
+    # the routes fill, e.g. when -1 slots leave fewer routed tokens: one CTA per
+    # SM, or the smaller count the route states. Workspace sizing and the SFB1
+    # view stay keyed on the device's SM count.
+    persistent_grid = int(metadata.get("num_ctas", num_sms))
+    if not 0 < persistent_grid <= num_sms:
+        raise ValueError(
+            f"route metadata 'num_ctas' must be a persistent grid of 1 to "
+            f"{num_sms} CTAs on this device; got {metadata.get('num_ctas')!r}"
+        )
     grid = (persistent_grid, 1, 1)
     reset_storage = control("reset_storage")
     expert_counts = reset_storage[:E].view(torch.int32)
@@ -808,7 +890,7 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         grid_n1=grid_n1,
         K1_tiles=K1_tiles,
         N2=N2,
-        K2=K2,
+        K2=w2_widths[0] if dense_w2 else K2,
         grid_n2=grid_n2,
         K2_tiles=K2_tiles,
         total_m_tiles=total_m_tiles,

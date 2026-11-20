@@ -70,7 +70,22 @@ def expert(x, gate, up, down, swiglu_limit=None):
     return hidden @ down.T
 
 
-def reference(
+def reference(global_data, weights, **options):
+    """Autograd reference of one training step, computed with cuBLASLt.
+
+    The cuBLAS 13.1 default path on SM103 returns some BF16/FP16 ``A^T B``
+    weight-gradient products without their last 1-3 rows of the reduction
+    (for example K = 9475); cuBLASLt includes them.
+    """
+    previous = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    try:
+        return _reference(global_data, weights, **options)
+    finally:
+        torch.backends.cuda.preferred_blas_library(previous)
+
+
+def _reference(
     global_data, weights, *, fp32=False, source_counts=None, swiglu_limit=None
 ):
     rank, ep = dist.get_rank(), dist.get_world_size()
@@ -222,8 +237,9 @@ class TrainingIteration:
     pair returned by ``quantize_mok_mxfp8_weights``) runs the routed experts in
     native MXFP8. ``recompute`` discards the forward context and rebuilds it
     with ``recompute_forward_context`` before backward (activation
-    checkpointing). ``accumulators`` are six FP32 tensors zeroed and filled by
-    an ``fp32_wgrad`` adapter.
+    checkpointing); with ``save_context=False`` (BF16 routed experts, needs
+    ``recompute``) the forward stores no context at all. ``accumulators`` are
+    six FP32 tensors zeroed and filled by an ``fp32_wgrad`` adapter.
     """
 
     def __init__(
@@ -241,7 +257,12 @@ class TrainingIteration:
         mxfp8_weights=None,
         recompute=False,
         accumulators=None,
+        save_context=True,
     ):
+        if not save_context and not recompute:
+            raise ValueError(
+                "save_context=False needs recompute=True: backward reads the recomputed context"
+            )
         if (
             x.dtype != torch.bfloat16
             or dy.dtype != torch.bfloat16
@@ -270,6 +291,7 @@ class TrainingIteration:
         self.weights = weights
         self.swiglu_limit = swiglu_limit
         self.recompute = recompute
+        self.save_context = save_context
         self.accumulators = accumulators
         if mxfp8_weights is None:
             self.forward_weights = self.backward_weights = weights
@@ -295,6 +317,7 @@ class TrainingIteration:
             self.scores,
             *self.forward_weights,
             swiglu_limit=limit,
+            save_context=self.save_context,
         )
         if self.recompute:
             self.context = None

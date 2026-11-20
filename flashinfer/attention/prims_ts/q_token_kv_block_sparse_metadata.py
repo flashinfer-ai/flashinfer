@@ -27,9 +27,9 @@ Construction uses one CUDA C++ CTA per route. Q1 maps selected and tail blocks
 directly. Q2--Q8 union at most ``G * (topk + 1)`` selected/tail IDs using a
 shared byte/bit map when its model-context footprint fits without adding CTA
 waves, or a bounded radix-sort fallback. No global-cache-sized scratch is
-required. On SM90 and newer, the metadata grid releases the attention prologue
-at entry through programmatic dependent launch (PDL); the consumer wait still
-covers metadata completion.
+required. On SM90 and newer, each metadata CTA releases the attention grid
+through programmatic dependent launch (PDL) after its last output store; the
+consumer wait covers metadata completion.
 """
 
 from __future__ import annotations
@@ -38,13 +38,18 @@ import functools
 import math
 import threading
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
 from ._block_sparse.common import _num_sparse_pattern_heads
+from ._q_token_kv_block_sparse_policy import membership_planes
+from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
+
+if TYPE_CHECKING:
+    from .decode import PagedKVScaleFactors
 
 _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
 _Q_TOKEN_KV_BLOCK_SPARSE_BLOCK_SIZES = (4, 8, 16, 32, 64, 128)
@@ -66,6 +71,49 @@ def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
     from ...jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
 
     return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
+
+
+@functools.cache
+def _wide_metadata_smem_bytes(
+    group_size: int, max_seq_len_kv: int, sparse_block_size: int
+) -> int:
+    module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
+    return int(
+        module.wide_metadata_smem_bytes(group_size, max_seq_len_kv, sparse_block_size)
+    )
+
+
+def _validate_wide_metadata_fits(
+    group_size: int,
+    max_seq_len_kv: int,
+    sparse_block_size: int,
+    device_index: int,
+) -> None:
+    """Reject G16/G32 when their metadata map cannot fit the device's SMEM.
+
+    G9-G32 metadata keeps a map over the model's whole block prefix
+    (``max_seq_len_kv / sparse_block_size`` blocks) in shared memory; there is
+    no bounded fallback, so the check runs before any launch.
+    """
+    if group_size <= 8:
+        return
+    needed = _wide_metadata_smem_bytes(group_size, max_seq_len_kv, sparse_block_size)
+    available = torch.cuda.get_device_properties(
+        device_index
+    ).shared_memory_per_block_optin
+    if needed < 0 or needed > available:
+        raise ValueError(
+            f"QToken-KvBlock-Sparse-Attention group_size={group_size} keeps a "
+            f"metadata map of max_seq_len_kv={max_seq_len_kv} / "
+            f"kv_block_size={sparse_block_size} blocks in shared memory, which "
+            + (
+                "exceeds the map's size limit"
+                if needed < 0
+                else f"needs {needed} bytes"
+            )
+            + f" (device limit {available}); use group_size <= 8, a larger "
+            "kv_block_size or a smaller max_seq_len_kv"
+        )
 
 
 @dataclass(frozen=True)
@@ -318,8 +366,8 @@ class _PrimsTSQTokenKvBlockSparsePlan:
     """
 
     _metadata_plan: _PrimsTSQTokenKvBlockSparseMetadataPlan
-    _bmm1_scale: float
-    _bmm2_scale: float
+    _bmm1_scale: GlobalScale
+    _bmm2_scale: GlobalScale
     _attention_plan: Any
     _query: _QTokenKvBlockSparseTensorDescriptor
     _block_indices: _QTokenKvBlockSparseTensorDescriptor
@@ -338,8 +386,8 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         query_positions: torch.Tensor,
         *,
         out: torch.Tensor,
-        sm_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        sm_scale: Optional[GlobalScale] = None,
+        v_scale: Optional[GlobalScale] = None,
     ) -> torch.Tensor:
         """Launch prepared QToken-KvBlock-Sparse-Attention metadata and attention on the current stream."""
 
@@ -373,6 +421,32 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         _validate_16byte_alignment(query, "query")
         _validate_16byte_alignment(out, "out")
 
+        scale_qk = resolve_scale(sm_scale, self._bmm1_scale, "sm_scale", query.device)
+        scale_v = resolve_scale(v_scale, self._bmm2_scale, "v_scale", query.device)
+        return self.run_unchecked(
+            query,
+            block_indices,
+            block_table,
+            token_to_request,
+            query_positions,
+            out=out,
+            sm_scale=scale_qk,
+            v_scale=scale_v,
+        )
+
+    def run_unchecked(
+        self,
+        query: torch.Tensor,
+        block_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_request: Optional[torch.Tensor],
+        query_positions: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        sm_scale: GlobalScale,
+        v_scale: GlobalScale,
+    ) -> torch.Tensor:
+        """Launch tensors and scales that satisfy the prepared plan's ABI."""
         direct_q1_inputs = None
         if self._attention_plan._direct_q1_inputs:
             direct_q1_inputs = (
@@ -394,21 +468,11 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         attention_out = _flatten_fixed_q_token_kv_block_sparse_groups(
             out, self._fixed_query_group_size
         )
-        from .decode import _validate_scale
-
-        scale_qk = (
-            self._bmm1_scale
-            if sm_scale is None
-            else _validate_scale(sm_scale, "sm_scale")
-        )
-        scale_v = (
-            self._bmm2_scale if v_scale is None else _validate_scale(v_scale, "v_scale")
-        )
         self._attention_plan._run_unchecked(
             attention_query,
             attention_out,
-            scale_qk,
-            scale_v,
+            sm_scale,
+            v_scale,
             direct_q1_inputs,
         )
         return out
@@ -436,6 +500,8 @@ class _QTokenKvBlockSparsePlanConfig:
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
     out_dtype: torch.dtype
+    sm_scale: GlobalScale
+    v_scale: GlobalScale
 
 
 def _q_token_tensor_abi_key(
@@ -504,6 +570,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
         q_dtype: torch.dtype = torch.float16,
         kv_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
+        sm_scale: Optional[GlobalScale] = None,
+        v_scale: GlobalScale = 1.0,
     ) -> None:
         """Publish a capacity-only QToken-KvBlock-Sparse-Attention plan.
 
@@ -535,6 +603,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
         one KV partition and omits split scratch. Pass False for prefill and
         True for decode, independently of ``packed_query``. Workspace sizing
         must use the same value. Change it only by replanning outside capture.
+
+        ``sm_scale`` and ``v_scale`` independently accept host floats or CUDA
+        FP32 tensors of shape () or (1,). They establish the compiled argument kinds
+        and default run values. Softmax scales are in natural units. Device
+        values must remain finite and positive and may change during replay.
         """
 
         from .decode import (
@@ -574,6 +647,12 @@ class QTokenKvBlockSparsePagedTSWrapper:
             out_dtype = q_dtype
         planned_device, device_index = _resolve_cuda_device(device)
         _validate_runtime_device(planned_device)
+        sm_scale = normalize_scale(
+            head_dim**-0.5 if sm_scale is None else sm_scale,
+            "sm_scale",
+            planned_device,
+        )
+        v_scale = normalize_scale(v_scale, "v_scale", planned_device)
         if not isinstance(workspace_buffer, torch.Tensor):
             raise TypeError("workspace_buffer must be a torch.Tensor")
         if workspace_buffer.device != planned_device:
@@ -629,6 +708,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
             out_dtype=out_dtype,
+            sm_scale=sm_scale,
+            v_scale=v_scale,
         )
         with self._plan_lock:
             self._config = candidate
@@ -654,11 +735,58 @@ class QTokenKvBlockSparsePagedTSWrapper:
         *,
         seq_lens: Optional[torch.Tensor] = None,
         qo_indptr: Optional[torch.Tensor] = None,
-        sm_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        sm_scale: Optional[GlobalScale] = None,
+        v_scale: Optional[GlobalScale] = None,
         out: Optional[torch.Tensor] = None,
+        validate: bool = True,
+        kv_scale_factors: Optional[PagedKVScaleFactors] = None,
     ) -> torch.Tensor:
         """Build live routes and launch the current QToken attention plan.
+
+        Packed NVFP4 K/V (``torch.uint8``, E2M1 with the even element in the
+        low nibble) takes one of two layouts:
+
+        - ``[pages, Hkv, page_size, D/2]`` with
+          ``kv_scale_factors=(K_SF, V_SF)``, the decode
+          ``PagedKVScaleFactors``: E4M3 tensors shaped
+          ``[pages, Hkv, page_size, D/16]``, K token-major and V in TRT-LLM's
+          four-token interleaved order. Like the caches, they may be strided
+          HND views.
+        - ``[pages, Hkv, page_size, D/2 + D/16]`` without
+          ``kv_scale_factors``: each token row holds its payload followed by
+          its own D/16 E4M3 block scales.
+
+        Q's dtype selects the MMA: BF16 Q runs exact BF16 operands (E2M1 x E4M3
+        products are exact in BF16), FP8 Q runs FP8 MMA on K/V rounded to E4M3.
+        The output is BF16 either way.
+
+        The kernel transforms NVFP4 K/V once per KV tile of every route that
+        loads it. Grouped routes overlap, so long packed query batches
+        transform each selected token many times (about 90 times at 4K queries
+        over a 64K context). With BF16 Q, a framework can instead convert each
+        request's visible NVFP4 pages to a BF16 paged cache once per call and
+        run this wrapper with BF16 K/V (``kv_dtype=torch.bfloat16`` and that
+        cache's block table). Results are unchanged, since E2M1 x E4M3 products
+        are exact in BF16. This does not apply to FP8 Q, which rounds K/V to
+        E4M3 and requires FP8 K/V otherwise. It needs no Prims-TS support; the
+        trade-off is:
+
+        - It pays only with TileQ128 groups (``group_size * Hq / Hkv > 64``,
+          e.g. G32 for 4 Q heads per KV head, G16 for 8), whose transform is
+          on the critical path, and with many queries. On GB300 (D256, top-k
+          512 blocks of 4 tokens, 0-64K prefixes) it measured 1.02-1.37x faster
+          than the best NVFP4 launch for 1K-4K packed queries (more with more
+          queries and longer prefixes), 0.84-1.11x at 512, and 0.63-1.0x
+          (never faster) at 128-256.
+        - Its cost grows with visible tokens x KV heads, not with the queries
+          (about 26 us for 64K tokens x 2 KV heads, near HBM bandwidth), and
+          the BF16 copy takes about 3.6x the NVFP4 cache's memory. Overlap it
+          with independent work (e.g. the indexer's top-k) and skip it for long
+          contexts, where it can cost more than it saves (not measured past
+          64K).
+        - Converting only the blocks the indexer selected did not pay: marking
+          them costs more than it saves, and long query batches select half or
+          more of the visible blocks anyway.
 
         Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``. Fixed Q is
         ``[B, Nq, G, Hq, D]`` without ``qo_indptr``. ``indexer_block_ids`` is
@@ -692,7 +820,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
         stable tensor storage. A changed packed extent or retained K/V/offset
         storage triggers a new preparation outside capture. ``sm_scale`` and
         ``v_scale`` are live launch scalars, so frameworks may update Q/K and V
-        dequantization scales without rebuilding the capacity plan.
+        dequantization scales without rebuilding the capacity plan. Each scale
+        independently accepts a host float or a contiguous CUDA FP32 tensor
+        of shape () or (1,) on the planned device. Run overrides must preserve the
+        respective plan-time type; omitted operands inherit the plan defaults.
+        Tensor values must remain finite and positive, without host readback.
 
         Parameters
         ----------
@@ -726,16 +858,27 @@ class QTokenKvBlockSparsePagedTSWrapper:
             CUDA Int32 packed-route offsets. Required for packed Q and omitted
             for fixed Q; each route must stay within one request and contain
             at most the planned ``group_size`` tokens.
-        sm_scale : float, optional
-            Softmax scale, defaulting to ``head_dim**-0.5``. Include Q/K
-            dequantization scales here when using FP8 inputs.
-        v_scale : float, optional
+        sm_scale : float or torch.Tensor, optional
+            Softmax scale. Omitted values inherit ``plan()``'s scale, which
+            defaults to ``head_dim**-0.5``. Include Q/K dequantization scales
+            here when using FP8 inputs.
+        v_scale : float or torch.Tensor, optional
             Value-cache dequantization scale applied to the output,
-            defaulting to one.
+            inheriting ``plan()``'s scale when omitted. The plan defaults to one.
         out : torch.Tensor, optional
             Caller-owned output with Q's logical shape and the planned output
             dtype. When omitted, the wrapper retains and reuses its output.
             Must not overlap any input or workspace storage; this is not checked.
+
+        validate : bool, optional
+            Validate tensor metadata and prepare changed bindings (default True).
+            Set False only after a successful validated run with the same plan.
+            All tensors must preserve their validated shapes, strides, devices,
+            dtypes and alignment; K/V, kv_scale_factors and qo_indptr must also
+            retain their storage (unchecked runs reuse the validated bindings).
+            Contents may change, and Q, indexer, table, per-token metadata and out
+            may use replacement storage with the same ABI. Scale overrides are
+            still checked. Revalidate after changing bindings or calling plan().
 
         Returns
         -------
@@ -744,6 +887,32 @@ class QTokenKvBlockSparsePagedTSWrapper:
         """
 
         config = self._require_config()
+        sm_scale = resolve_scale(sm_scale, config.sm_scale, "sm_scale", config.device)
+        v_scale = resolve_scale(v_scale, config.v_scale, "v_scale", config.device)
+        if not validate:
+            if self._prepared_plan is None:
+                raise RuntimeError(
+                    "run with validate=True after plan() before validate=False"
+                )
+            if out is None:
+                out = self._default_out
+                if out is None:
+                    raise RuntimeError(
+                        "supply out or first run with validate=True and out=None"
+                    )
+                _validate_q_token_kv_block_sparse_plan_tensor(
+                    out, "out", self._prepared_plan._out
+                )
+            return self._prepared_plan.run_unchecked(
+                q,
+                indexer_block_ids,
+                block_table,
+                token_to_request,
+                seq_lens if seq_lens is not None else query_positions,
+                out=out,
+                sm_scale=sm_scale,
+                v_scale=v_scale,
+            )
         if not isinstance(q, torch.Tensor):
             raise TypeError("q must be a torch.Tensor")
         if q.device != config.device or q.dtype != config.q_dtype:
@@ -821,11 +990,18 @@ class QTokenKvBlockSparsePagedTSWrapper:
         k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(
             paged_kv_cache
         )
+        # Packed NVFP4 stores two E2M1 values per byte. Without separate scale
+        # tensors, each row also carries the token's D/16 E4M3 block scales.
+        cache_head_dim = config.head_dim
+        if config.kv_dtype == torch.uint8:
+            cache_head_dim = config.head_dim // 2 + (
+                config.head_dim // 16 if kv_scale_factors is None else 0
+            )
         if (
             k_cache.device != config.device
             or k_cache.dtype != config.kv_dtype
             or tuple(k_cache.shape[1:])
-            != (config.num_kv_heads, config.page_size, config.head_dim)
+            != (config.num_kv_heads, config.page_size, cache_head_dim)
         ):
             raise ValueError("paged_kv_cache does not match the planned HND cache ABI")
         required_columns = (
@@ -859,6 +1035,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
         prepared_key = (
             fixed_query_len,
+            scale_types(sm_scale, v_scale),
             _q_token_tensor_abi_key(q),
             _q_token_tensor_abi_key(indexer_block_ids),
             _q_token_tensor_abi_key(block_table),
@@ -868,6 +1045,10 @@ class QTokenKvBlockSparsePagedTSWrapper:
             _q_token_tensor_abi_key(k_cache, include_storage=True),
             _q_token_tensor_abi_key(v_cache, include_storage=True),
             _q_token_tensor_abi_key(qo_indptr, include_storage=True),
+            *(
+                _q_token_tensor_abi_key(scale, include_storage=True)
+                for scale in (kv_scale_factors or ())
+            ),
         )
         if self._prepared_plan is None or prepared_key != self._prepared_key:
             if torch.cuda.is_current_stream_capturing():
@@ -886,7 +1067,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         config.workspace_buffer,
                         out=out,
                         max_seq_len_kv=config.max_seq_len_kv,
-                        bmm1_scale=sm_scale,
+                        bmm1_scale=config.sm_scale,
+                        bmm2_scale=config.v_scale,
                         qo_indptr=qo_indptr,
                         group_size=config.group_size,
                         sparse_block_size=config.kv_block_size,
@@ -894,6 +1076,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         share_pattern_across_kv_heads=config.share_pattern_across_kv_heads,
                         count_current_block_in_topk=config.count_current_block_in_topk,
                         fixed_query_len=fixed_query_len,
+                        kv_scale_factors=kv_scale_factors,
                     )
                     self._prepared_key = prepared_key
         assert self._prepared_plan is not None
@@ -984,8 +1167,12 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     return (groups, page_capacity), (groups, membership_words), (groups,)
 
@@ -1091,6 +1278,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     if out_dtype is None:
         out_dtype = q_dtype
     _, device_index = _resolve_cuda_device(device)
+    _validate_wide_metadata_fits(
+        group_size, max_seq_len_kv, sparse_block_size, device_index
+    )
     spec = _resolve_decode_launch_spec(
         device_index,
         groups,
@@ -1114,20 +1304,23 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
+    # Eligible Keeps G2..G8/page-4 profiles consume one bit-plane per query.
     # Other profiles and the standalone metadata API retain page-byte masks.
     query_major_memberships = (
         sparse_block_size == 4
-        and spec.config.use_fp8_qkv
-        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
+        and replace(spec.config, fixed_seqlen=True).selects_query_major_memberships
     )
     if query_major_memberships:
         page_capacity = (page_capacity + 31) // 32 * 32
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     q_token_kv_block_sparse_page_indices_shape = (metadata_rows, page_capacity)
     q_token_kv_block_sparse_page_indices_bytes = metadata_rows * page_capacity * 4
@@ -1151,8 +1344,10 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
     attention_scratch_bytes = attention_layout.total_bytes
+    uses_split_kv = attention_layout.uses_split_kv
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
         seq_lens_byte_offset + seq_lens_bytes
     )
@@ -1166,7 +1361,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         seq_lens_bytes=seq_lens_bytes,
         attention_workspace_byte_offset=attention_workspace_byte_offset,
         attention_scratch_bytes=attention_scratch_bytes,
-        uses_split_kv=attention_layout.uses_split_kv,
+        uses_split_kv=uses_split_kv,
         query_major_memberships=query_major_memberships,
         max_seq_len=max_seq_len,
         total_bytes=attention_workspace_byte_offset + attention_scratch_bytes,
@@ -1328,7 +1523,14 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         )
     if k_cache.ndim != 4:
         raise ValueError("k_cache must have shape [pages, Hkv, storage_page_size, D]")
-    if k_cache.device != query.device or k_cache.shape[3] != head_dim:
+    # Packed NVFP4 caches store two E2M1 values per byte, optionally followed
+    # by the token's interleaved E4M3 block scales.
+    cache_head_dims = (
+        (head_dim // 2, head_dim // 2 + head_dim // 16)
+        if k_cache.dtype == torch.uint8
+        else (head_dim,)
+    )
+    if k_cache.device != query.device or k_cache.shape[3] not in cache_head_dims:
         raise ValueError("query and k_cache must share device and head dimension")
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("block_table must be a rank-two int32 tensor")
@@ -1472,6 +1674,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     if groups == 0:
         return outputs
 
+    _validate_wide_metadata_fits(
+        group_size, max_seq_len_kv, sparse_block_size, block_indices.device.index
+    )
     enable_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     release_attention_pdl = enable_pdl and release_attention_pdl
@@ -1696,8 +1901,8 @@ def _prepare_q_token_kv_block_sparse_attention(
     *,
     out: torch.Tensor,
     max_seq_len_kv: int,
-    bmm1_scale: Optional[float] = None,
-    bmm2_scale: float = 1.0,
+    bmm1_scale: Optional[GlobalScale] = None,
+    bmm2_scale: GlobalScale = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
     group_size: int = 1,
     sparse_block_size: int = 4,
@@ -1705,6 +1910,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
     fixed_query_len: int = 0,
+    kv_scale_factors: Optional[PagedKVScaleFactors] = None,
 ) -> _PrimsTSQTokenKvBlockSparsePlan:
     """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
@@ -1764,9 +1970,9 @@ def _prepare_q_token_kv_block_sparse_attention(
         Static maximum visible logical K/V length in tokens, including current
         query or MTP tokens. It must fit within each dense block-table row and
         remain unchanged across CUDA graph replay.
-    bmm1_scale : float, optional
+    bmm1_scale : float or torch.Tensor, optional
         Scale applied to QK scores. It defaults to ``head_dim**-0.5``.
-    bmm2_scale : float
+    bmm2_scale : float or torch.Tensor
         Scale applied to the attention output.
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative route offsets selecting packed-query
@@ -1866,13 +2072,14 @@ def _prepare_q_token_kv_block_sparse_attention(
         count_current_block_in_topk=count_current_block_in_topk,
     )
     views = layout.bind(workspace_buffer)
-    from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
+    from .decode import _prepare_prims_ts_batch_decode_plan
 
-    scale_qk = _validate_scale(
+    scale_qk = normalize_scale(
         query.shape[-1] ** -0.5 if bmm1_scale is None else bmm1_scale,
         "bmm1_scale",
+        query.device,
     )
-    scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
+    scale_v = normalize_scale(bmm2_scale, "bmm2_scale", query.device)
     # Generic FMHA sees one query group as a route, so its route-local
     # sequence-length parameters receive G, not the full request length.
     attention_plan, _ = _prepare_prims_ts_batch_decode_plan(
@@ -1891,6 +2098,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         window_left=-1,
         kv_layout="HND",
         page_size=math.gcd(sparse_block_size, int(k_cache.shape[2])),
+        kv_scale_factors=kv_scale_factors,
         direct_q1_sparse_block_size=sparse_block_size,
         query_major_memberships=layout.query_major_memberships,
         use_q_token_kv_block_sparse_route=True,
@@ -1909,6 +2117,8 @@ def _prepare_q_token_kv_block_sparse_attention(
         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
         direct_q1_fixed_query_len=fixed_query_len,
         allow_head_aware_locators=group_size > 1,
+        softmax_scale=scale_qk,
+        output_scale=scale_v,
     )
     # Preparation only binds shapes and storage; attention does not read these
     # outputs until metadata runs. Use its resolved format for the producer.
@@ -1963,8 +2173,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     group_size: int = 1,
     kv_block_size: int = 4,
     mask_type: Literal["causal"] = "causal",
-    sm_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
+    sm_scale: Optional[GlobalScale] = None,
+    v_scale: Optional[GlobalScale] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
@@ -1972,6 +2182,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
     seq_lens: Optional[torch.Tensor] = None,
+    kv_scale_factors: Optional[PagedKVScaleFactors] = None,
 ) -> torch.Tensor:
     """Plan and run one QToken-KvBlock-Sparse-Attention launch.
 
@@ -1996,7 +2207,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Packed ``[total_q, Hq, D]`` or fixed ``[B, Nq, G, Hq, D]`` query.
     paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
         Separate HND K/V cache tensors shaped
-        ``[num_pages, Hkv, page_size, D]``. The cache writer must zero-fill
+        ``[num_pages, Hkv, page_size, D]`` (packed NVFP4: last dimension
+        ``D/2`` or ``D/2 + D/16``, see ``kv_scale_factors``). The cache writer must zero-fill
         unused token slots in allocated pages, as required by
         :meth:`QTokenKvBlockSparsePagedTSWrapper.run`.
     block_table : torch.Tensor
@@ -2028,9 +2240,9 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Semantic sparse K/V block size: 4/8/16/32/64/128, default four.
     mask_type : {"causal"}
         QToken-KvBlock-Sparse-Attention currently supports causal masking only.
-    sm_scale : float, optional
+    sm_scale : float or torch.Tensor, optional
         Softmax scale, defaulting to ``head_dim**-0.5``.
-    v_scale : float, optional
+    v_scale : float or torch.Tensor, optional
         Value-cache dequantization scale applied to the attention output,
         defaulting to one. Frameworks using an FP8 K/V cache should pass the
         cache's live V scale.
@@ -2055,6 +2267,11 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         True (default) counts a completed current block in the selection budget.
         False excludes it from selected IDs and always appends its visible tokens.
         Match this setting in workspace sizing and planning.
+    kv_scale_factors : PagedKVScaleFactors, optional
+        ``(K_SF, V_SF)`` block scales of a packed NVFP4 cache without
+        interleaved scales, as in paged decode; see
+        :meth:`QTokenKvBlockSparsePagedTSWrapper.run` for both packed NVFP4
+        layouts and the MMA precision each Q dtype selects.
 
     Returns
     -------
@@ -2113,6 +2330,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
         out_dtype=out_dtype,
+        sm_scale=sm_scale,
+        v_scale=1.0 if v_scale is None else v_scale,
     )
     return wrapper.run(
         q,
@@ -2126,6 +2345,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         sm_scale=sm_scale,
         v_scale=v_scale,
         out=out,
+        kv_scale_factors=kv_scale_factors,
     )
 
 

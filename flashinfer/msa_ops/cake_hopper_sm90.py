@@ -96,7 +96,8 @@ _HSTAGE_BYTES = (
 # grid for one-split classes with more items than resident CTAs, and the 64-key (HALF) ring for the two q-len-1
 # classes the same-session ABBA proved (GQA 16x4 q1 b128: HALF STAGES 2 + VSEQ; b16 q1: HALF STAGES 4).  Both
 # forms are physical variants of their own: ``plan_sparse_decode`` serves them only when the delivered program set
-# has their route, otherwise the 128-key variant the latency model picked (``_route_available``).
+# has their route, otherwise the 128-key variant the latency model picked, or that variant's two-stage ring when the
+# export has no program for it either (``_route_available``).
 _NC16_LEAN = (
     "qk",
     "v",
@@ -477,7 +478,10 @@ def plan_sparse_decode(
     pages inside the launch (``seqlen_q * topk / max_pages`` at or above 1.5), and for the multi-token (MTP) grids
     beyond one wave (re-selection at or above 0.5) or filling a full two-CTAs-per-SM wave (at or above 1.0), whose
     co-scheduled tokens re-select pages that ``evict_first`` has already dropped.  When the delivered program set has
-    no route for a HALF / persistent form, the plan falls back to the 128-key variant the model picked.
+    no route for a HALF / persistent form, the plan falls back to the 128-key variant the model picked; when that
+    variant's own route was not delivered either (the three-stage nc16 coordinates the model picks on 132-SM parts),
+    to its two-stage ring form, which the export delivers for every split count of both head folds.  A coordinate
+    with neither route raises ``ValueError`` naming both.
     """
 
     group = num_q_heads // num_kv_heads
@@ -561,6 +565,19 @@ def plan_sparse_decode(
         plan = replace(model, persist=True, ctas=min(base, slots))
     if plan is not model and not _route_available(plan.route):
         plan = model
+    if not _route_available(plan.route):
+        # The model's own coordinate was never delivered: on 132 SMs the cost model picks three ring stages for the
+        # nc16 bands where st3's wave cost beats st2's, but the export has st3 only as nc16:s2:st3:none and the
+        # persistent nc16:s1:st3:none (#7222).  Every nc{8,16} s{1,2,4,8}:st2:{evict_first,none}:main route is
+        # delivered, so the same grid, split count and scratch run with the two-stage ring: st2 admits every split
+        # st3 does (``_max_splits(nc, 2)`` is 16 for both folds) and needs less shared memory.
+        fallback = replace(model, stages=2)
+        if not _route_available(fallback.route):
+            raise ValueError(
+                f"no Hopper MSA decode program for route {model.route!r} "
+                f"(nor for its two-stage ring form {fallback.route!r})"
+            )
+        plan = fallback
     return plan
 
 

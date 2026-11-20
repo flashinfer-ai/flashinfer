@@ -165,6 +165,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # Dispatch pull batch depth / per-pass rotation (see TokenInPullTokenBackPush).
+        dispatch_pull_batch: int = 1,
+        dispatch_pull_rotate: bool = False,
     ) -> None:
         if token_back_mode not in (
             "epi_warps", "standalone_warps", "reuse_dispatch_warps",
@@ -424,6 +427,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             # Only the active dispatch warps get a pull-buffer slot; the idle
             # slots would otherwise cost 3 * hidden_bytes of AB-stage SMEM.
             compact_pull_buffer=compact_pull_buffer,
+            pull_batch=dispatch_pull_batch,
+            pull_rotate=dispatch_pull_rotate,
         )
         self.dedup_dispatch = dedup_dispatch
 

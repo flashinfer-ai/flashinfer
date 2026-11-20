@@ -2,7 +2,9 @@
 
 The backend is experimental and may change without backward compatibility.
 Naming it (`backend="cake"`) is the explicit opt-in and emits FlashInfer's
-experimental backend warning once; `backend="auto"` never selects it.
+experimental backend warning once. With
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`, `backend="auto"` adds the GEMM as the last
+autotuning candidate of the per-token-alpha `mm_fp4` path (used only when it measures fastest).
 
 It serves FlashInfer's per-token NVFP4 quantize + GEMM path on SM100 (B200) and SM103
 (B300 / GB300):
@@ -62,7 +64,7 @@ cb.prepare_nvfp4_per_token_quantize(x, gs_inv, ws)()      # quantizer alone
 cb.prepare_mm_fp4_per_token(ws.fp4, ws.sf, w_fp4, w_sf, ws.scale, out)()   # GEMM alone
 ```
 
-Validated matrix (`validated_problems` in `tests/test_helpers/cake_nvfp4_per_token.py`):
+Validated matrix (`validated_problems` in `tests/quantization/test_helpers/cake_nvfp4_per_token.py`):
 `(K, N)` in {(7168, 2112),
 (7168, 1536), (16384, 7168), (7168, 18432), (18432, 7168), (8192, 8192),
 (8192, 28672), (28672, 8192)} x `M` in {1, 8, 17, 32, 128, 130, 257, 512, 2048, 8192}

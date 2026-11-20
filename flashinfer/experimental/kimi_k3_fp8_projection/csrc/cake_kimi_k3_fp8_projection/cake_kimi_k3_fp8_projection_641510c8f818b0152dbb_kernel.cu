@@ -47,47 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 504
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SK_PRE_OFFSET 256
-#define TMEM_TMEM_SFA_OFFSET 480
-#define TMEM_TMEM_SFB_OFFSET 488
-#define NUM_TMA_PIPE_STAGES 3
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_SMEM_OUT_OFF 207872
-#define SMEM_SMEM_OUT_STAGE_BYTES 8192
-#define SMEM_SMEM_OUT_STRIDE 8192
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 32768
-#define SMEM_SMEM_A_STRIDE 68608
-#define SMEM_SMEM_B_OFF 33792
-#define SMEM_SMEM_B_STAGE_BYTES 32768
-#define SMEM_SMEM_B_STRIDE 68608
-#define SMEM_SMEM_SFA_ALL_OFF 66560
-#define SMEM_SMEM_SFA_ALL_STAGE_BYTES 1024
-#define SMEM_SMEM_SFA_ALL_STRIDE 68608
-#define SMEM_SMEM_SFB_ALL_OFF 67584
-#define SMEM_SMEM_SFB_ALL_STAGE_BYTES 2048
-#define SMEM_SMEM_SFB_ALL_STRIDE 68608
-#define SMEM_SMEM_SFA0_OFF 66560
-#define SMEM_SMEM_SFA0_STAGE_BYTES 512
-#define SMEM_SMEM_SFA0_STRIDE 68608
-#define SMEM_SMEM_SFA1_OFF 67072
-#define SMEM_SMEM_SFA1_STAGE_BYTES 512
-#define SMEM_SMEM_SFA1_STRIDE 68608
-#define SMEM_SMEM_SFB0_OFF 67584
-#define SMEM_SMEM_SFB0_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB0_STRIDE 68608
-#define SMEM_SMEM_SFB1_OFF 68608
-#define SMEM_SMEM_SFB1_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB1_STRIDE 68608
-#define SMEM_WORK_RESPONSE_OFF 206848
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 224256
-#define THREADS 320
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define B_HALF_N 128
@@ -297,7 +256,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 207872);
     const int smem_out_addr = smem + 207872;
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -319,8 +278,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 206848);
     const int work_response_addr = smem + 206848;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -370,13 +328,11 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_sk_pre = taddr + 256;
-    const int tmem_tmem_sfa = taddr + 480;
-    const int tmem_tmem_sfb = taddr + 488;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_sk_pre = taddr + 256;
+    const unsigned int tmem_tmem_sfa = taddr + 480;
+    const unsigned int tmem_tmem_sfb = taddr + 488;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -714,9 +670,9 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         int init_flag = ((iter_k_3 == skp_ek0_1) ? 1 : 0);
                         if (elect_sync()) {
                             init_flag = init_flag;
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 0, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 0, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)));
+                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 0 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
                             tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_sfa1_addr) >> 4) + (mma_tma_stage) * 4288)));
                             tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288)));
                             tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
@@ -727,13 +683,13 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                    0x10c00000U, tmem_tmem_sfa, tmem_tmem_sfb, ((init_flag) ? 0 : 1));
+                                    0x10c00000U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 2, b_desc + 2,
-                                    0x30c00010U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                    0x30c00010U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 4, b_desc + 4,
-                                    0x50c00020U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                    0x50c00020U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 6, b_desc + 6,
-                                    0x70c00030U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                    0x70c00030U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                             }
                             int _smem_desc_lo_3 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
                             int _smem_desc_lo_4 = (((smem_b_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
@@ -769,9 +725,9 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                             int init_flag_1 = ((iter_k_4 == 0) ? 1 : 0);
                             if (elect_sync()) {
                                 init_flag_1 = init_flag_1;
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
+                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 0, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)));
+                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 0, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)));
+                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 0 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
                                 tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_sfa1_addr) >> 4) + (mma_tma_stage) * 4288)));
                                 tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288)));
                                 tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
@@ -782,13 +738,13 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                                     uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_6) | ((uint64_t)0x40004040 << 32);
 
                                     tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0x10c00000U, tmem_tmem_sfa, tmem_tmem_sfb, ((init_flag_1) ? 0 : 1));
+                                        0x10c00000U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag_1) ? 0 : 1));
                                     tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 2, b_desc + 2,
-                                        0x30c00010U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                        0x30c00010U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                     tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 4, b_desc + 4,
-                                        0x50c00020U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                        0x50c00020U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                     tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 6, b_desc + 6,
-                                        0x70c00030U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                        0x70c00030U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                 }
                                 int _smem_desc_lo_7 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
                                 int _smem_desc_lo_8 = (((smem_b_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
@@ -857,9 +813,9 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         int init_flag_2 = ((iter_k_5 == skp_lk0_1) ? 1 : 0);
                         if (elect_sync()) {
                             init_flag_2 = init_flag_2;
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)));
-                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)));
-                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 0, make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (mma_tma_stage) * 4288)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 0, make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288)));
+                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 0 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb0_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
                             tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_sfa1_addr) >> 4) + (mma_tma_stage) * 4288)));
                             tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288)));
                             tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfb1_addr) >> 4) + (mma_tma_stage) * 4288 + 32)));
@@ -870,13 +826,13 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_10) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                    0x10c00000U, tmem_tmem_sfa, tmem_tmem_sfb, ((init_flag_2) ? 0 : 1));
+                                    0x10c00000U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag_2) ? 0 : 1));
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 2, b_desc + 2,
-                                    0x30c00010U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                    0x30c00010U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 4, b_desc + 4,
-                                    0x50c00020U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                    0x50c00020U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                                 tcgen05_mma_mxf8_bs_cta2(tmem_accum, a_desc + 6, b_desc + 6,
-                                    0x70c00030U, tmem_tmem_sfa, tmem_tmem_sfb, 1);
+                                    0x70c00030U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, 1);
                             }
                             int _smem_desc_lo_11 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
                             int _smem_desc_lo_12 = (((smem_b_addr + 16384) >> 4) & 0x3FFF) + (mma_tma_stage) * 4288;
@@ -1024,7 +980,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                     int skp_cvi = skp_cvi0 + v * 32;
                     {
                         float4 _v4 = make_float4(quad_p[0 + 0], quad_p[0 + 1], quad_p[0 + 2], quad_p[0 + 3]);
-                        *reinterpret_cast<float4*>((sk_partials + ((unsigned long long)skp_cvi * 4)) + 0) = _v4;
+                        *reinterpret_cast<float4*>((sk_partials + (unsigned long long)skp_cvi * 4ull) + 0) = _v4;
                     }
                 }
                 asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1205,7 +1161,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v = 0; skp_v < 8; skp_v++) {
                             int skp_vi = skp_vi0 + skp_v * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi * 4ull + 0);
                                 parts_q[4 * skp_v + 0] = _v4.x;
                                 parts_q[4 * skp_v + 1] = _v4.y;
                                 parts_q[4 * skp_v + 2] = _v4.z;
@@ -1224,7 +1180,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_1 = 0; skp_v_1 < 8; skp_v_1++) {
                             int skp_vi_1 = skp_vi0_0 + skp_v_1 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_1 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_1 * 4ull + 0);
                                 parts_q_0[4 * skp_v_1 + 0] = _v4.x;
                                 parts_q_0[4 * skp_v_1 + 1] = _v4.y;
                                 parts_q_0[4 * skp_v_1 + 2] = _v4.z;
@@ -1243,7 +1199,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_2 = 0; skp_v_2 < 8; skp_v_2++) {
                             int skp_vi_2 = skp_vi0_1 + skp_v_2 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_2 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_2 * 4ull + 0);
                                 parts_q_1[4 * skp_v_2 + 0] = _v4.x;
                                 parts_q_1[4 * skp_v_2 + 1] = _v4.y;
                                 parts_q_1[4 * skp_v_2 + 2] = _v4.z;
@@ -1262,7 +1218,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_3 = 0; skp_v_3 < 8; skp_v_3++) {
                             int skp_vi_3 = skp_vi0_2 + skp_v_3 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_3 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_3 * 4ull + 0);
                                 parts_q_2[4 * skp_v_3 + 0] = _v4.x;
                                 parts_q_2[4 * skp_v_3 + 1] = _v4.y;
                                 parts_q_2[4 * skp_v_3 + 2] = _v4.z;
@@ -1284,7 +1240,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_4 = 0; skp_v_4 < 8; skp_v_4++) {
                             int skp_vi_4 = skp_vi0_3 + (8 + skp_v_4) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_4 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_4 * 4ull + 0);
                                 parts_q_3[4 * skp_v_4 + 0] = _v4.x;
                                 parts_q_3[4 * skp_v_4 + 1] = _v4.y;
                                 parts_q_3[4 * skp_v_4 + 2] = _v4.z;
@@ -1303,7 +1259,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_5 = 0; skp_v_5 < 8; skp_v_5++) {
                             int skp_vi_5 = skp_vi0_4 + (8 + skp_v_5) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_5 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_5 * 4ull + 0);
                                 parts_q_4[4 * skp_v_5 + 0] = _v4.x;
                                 parts_q_4[4 * skp_v_5 + 1] = _v4.y;
                                 parts_q_4[4 * skp_v_5 + 2] = _v4.z;
@@ -1322,7 +1278,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_6 = 0; skp_v_6 < 8; skp_v_6++) {
                             int skp_vi_6 = skp_vi0_5 + (8 + skp_v_6) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_6 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_6 * 4ull + 0);
                                 parts_q_5[4 * skp_v_6 + 0] = _v4.x;
                                 parts_q_5[4 * skp_v_6 + 1] = _v4.y;
                                 parts_q_5[4 * skp_v_6 + 2] = _v4.z;
@@ -1341,7 +1297,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_7 = 0; skp_v_7 < 8; skp_v_7++) {
                             int skp_vi_7 = skp_vi0_6 + (8 + skp_v_7) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_7 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_7 * 4ull + 0);
                                 parts_q_6[4 * skp_v_7 + 0] = _v4.x;
                                 parts_q_6[4 * skp_v_7 + 1] = _v4.y;
                                 parts_q_6[4 * skp_v_7 + 2] = _v4.z;
@@ -1363,7 +1319,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_8 = 0; skp_v_8 < 8; skp_v_8++) {
                             int skp_vi_8 = skp_vi0_7 + (16 + skp_v_8) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_8 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_8 * 4ull + 0);
                                 parts_q_7[4 * skp_v_8 + 0] = _v4.x;
                                 parts_q_7[4 * skp_v_8 + 1] = _v4.y;
                                 parts_q_7[4 * skp_v_8 + 2] = _v4.z;
@@ -1382,7 +1338,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_9 = 0; skp_v_9 < 8; skp_v_9++) {
                             int skp_vi_9 = skp_vi0_3_1 + (16 + skp_v_9) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_9 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_9 * 4ull + 0);
                                 parts_q_3_1[4 * skp_v_9 + 0] = _v4.x;
                                 parts_q_3_1[4 * skp_v_9 + 1] = _v4.y;
                                 parts_q_3_1[4 * skp_v_9 + 2] = _v4.z;
@@ -1401,7 +1357,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_10 = 0; skp_v_10 < 8; skp_v_10++) {
                             int skp_vi_10 = skp_vi0_4_1 + (16 + skp_v_10) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_10 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_10 * 4ull + 0);
                                 parts_q_4_1[4 * skp_v_10 + 0] = _v4.x;
                                 parts_q_4_1[4 * skp_v_10 + 1] = _v4.y;
                                 parts_q_4_1[4 * skp_v_10 + 2] = _v4.z;
@@ -1420,7 +1376,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_11 = 0; skp_v_11 < 8; skp_v_11++) {
                             int skp_vi_11 = skp_vi0_5_1 + (16 + skp_v_11) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_11 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_11 * 4ull + 0);
                                 parts_q_5_1[4 * skp_v_11 + 0] = _v4.x;
                                 parts_q_5_1[4 * skp_v_11 + 1] = _v4.y;
                                 parts_q_5_1[4 * skp_v_11 + 2] = _v4.z;
@@ -1442,7 +1398,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_12 = 0; skp_v_12 < 4; skp_v_12++) {
                             int skp_vi_12 = skp_vi0_8 + (24 + skp_v_12) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_12 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_12 * 4ull + 0);
                                 parts_q_8[4 * skp_v_12 + 0] = _v4.x;
                                 parts_q_8[4 * skp_v_12 + 1] = _v4.y;
                                 parts_q_8[4 * skp_v_12 + 2] = _v4.z;
@@ -1461,7 +1417,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_13 = 0; skp_v_13 < 4; skp_v_13++) {
                             int skp_vi_13 = skp_vi0_6_1 + (24 + skp_v_13) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_13 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_13 * 4ull + 0);
                                 parts_q_6_1[4 * skp_v_13 + 0] = _v4.x;
                                 parts_q_6_1[4 * skp_v_13 + 1] = _v4.y;
                                 parts_q_6_1[4 * skp_v_13 + 2] = _v4.z;
@@ -1480,7 +1436,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_14 = 0; skp_v_14 < 4; skp_v_14++) {
                             int skp_vi_14 = skp_vi0_7_1 + (24 + skp_v_14) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_14 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_14 * 4ull + 0);
                                 parts_q_7_1[4 * skp_v_14 + 0] = _v4.x;
                                 parts_q_7_1[4 * skp_v_14 + 1] = _v4.y;
                                 parts_q_7_1[4 * skp_v_14 + 2] = _v4.z;
@@ -1499,7 +1455,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_15 = 0; skp_v_15 < 4; skp_v_15++) {
                             int skp_vi_15 = skp_vi0_8_1 + (24 + skp_v_15) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_15 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_15 * 4ull + 0);
                                 parts_q_8_1[4 * skp_v_15 + 0] = _v4.x;
                                 parts_q_8_1[4 * skp_v_15 + 1] = _v4.y;
                                 parts_q_8_1[4 * skp_v_15 + 2] = _v4.z;
@@ -1564,34 +1520,34 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                     for (int i_9 = 0; i_9 < 32; i_9++) {
                         _tmem_load_2[i_9] = _tmem_load_3[i_9] + _tmem_load_2[i_9];
                     }
-                    float _tmem_load_4[32];
+                    float _tmem_load_4_0[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1]), "=f"(_tmem_load_4[2]), "=f"(_tmem_load_4[3]), "=f"(_tmem_load_4[4]), "=f"(_tmem_load_4[5]), "=f"(_tmem_load_4[6]), "=f"(_tmem_load_4[7]), "=f"(_tmem_load_4[8]), "=f"(_tmem_load_4[9]), "=f"(_tmem_load_4[10]), "=f"(_tmem_load_4[11]), "=f"(_tmem_load_4[12]), "=f"(_tmem_load_4[13]), "=f"(_tmem_load_4[14]), "=f"(_tmem_load_4[15]), "=f"(_tmem_load_4[16]), "=f"(_tmem_load_4[17]), "=f"(_tmem_load_4[18]), "=f"(_tmem_load_4[19]), "=f"(_tmem_load_4[20]), "=f"(_tmem_load_4[21]), "=f"(_tmem_load_4[22]), "=f"(_tmem_load_4[23]), "=f"(_tmem_load_4[24]), "=f"(_tmem_load_4[25]), "=f"(_tmem_load_4[26]), "=f"(_tmem_load_4[27]), "=f"(_tmem_load_4[28]), "=f"(_tmem_load_4[29]), "=f"(_tmem_load_4[30]), "=f"(_tmem_load_4[31])
+                        : "=f"(_tmem_load_4_0[0]), "=f"(_tmem_load_4_0[1]), "=f"(_tmem_load_4_0[2]), "=f"(_tmem_load_4_0[3]), "=f"(_tmem_load_4_0[4]), "=f"(_tmem_load_4_0[5]), "=f"(_tmem_load_4_0[6]), "=f"(_tmem_load_4_0[7]), "=f"(_tmem_load_4_0[8]), "=f"(_tmem_load_4_0[9]), "=f"(_tmem_load_4_0[10]), "=f"(_tmem_load_4_0[11]), "=f"(_tmem_load_4_0[12]), "=f"(_tmem_load_4_0[13]), "=f"(_tmem_load_4_0[14]), "=f"(_tmem_load_4_0[15]), "=f"(_tmem_load_4_0[16]), "=f"(_tmem_load_4_0[17]), "=f"(_tmem_load_4_0[18]), "=f"(_tmem_load_4_0[19]), "=f"(_tmem_load_4_0[20]), "=f"(_tmem_load_4_0[21]), "=f"(_tmem_load_4_0[22]), "=f"(_tmem_load_4_0[23]), "=f"(_tmem_load_4_0[24]), "=f"(_tmem_load_4_0[25]), "=f"(_tmem_load_4_0[26]), "=f"(_tmem_load_4_0[27]), "=f"(_tmem_load_4_0[28]), "=f"(_tmem_load_4_0[29]), "=f"(_tmem_load_4_0[30]), "=f"(_tmem_load_4_0[31])
                         : "r"(skp_pre_addr + 32));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_10 = 0; i_10 < 32; i_10++) {
-                        _tmem_load_2[32 + i_10] = _tmem_load_4[i_10] + _tmem_load_2[32 + i_10];
+                    for (int i_9_1 = 0; i_9_1 < 32; i_9_1++) {
+                        _tmem_load_2[32 + i_9_1] = _tmem_load_4_0[i_9_1] + _tmem_load_2[32 + i_9_1];
                     }
-                    float _tmem_load_5[32];
+                    float _tmem_load_4_1[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(_tmem_load_5[0]), "=f"(_tmem_load_5[1]), "=f"(_tmem_load_5[2]), "=f"(_tmem_load_5[3]), "=f"(_tmem_load_5[4]), "=f"(_tmem_load_5[5]), "=f"(_tmem_load_5[6]), "=f"(_tmem_load_5[7]), "=f"(_tmem_load_5[8]), "=f"(_tmem_load_5[9]), "=f"(_tmem_load_5[10]), "=f"(_tmem_load_5[11]), "=f"(_tmem_load_5[12]), "=f"(_tmem_load_5[13]), "=f"(_tmem_load_5[14]), "=f"(_tmem_load_5[15]), "=f"(_tmem_load_5[16]), "=f"(_tmem_load_5[17]), "=f"(_tmem_load_5[18]), "=f"(_tmem_load_5[19]), "=f"(_tmem_load_5[20]), "=f"(_tmem_load_5[21]), "=f"(_tmem_load_5[22]), "=f"(_tmem_load_5[23]), "=f"(_tmem_load_5[24]), "=f"(_tmem_load_5[25]), "=f"(_tmem_load_5[26]), "=f"(_tmem_load_5[27]), "=f"(_tmem_load_5[28]), "=f"(_tmem_load_5[29]), "=f"(_tmem_load_5[30]), "=f"(_tmem_load_5[31])
+                        : "=f"(_tmem_load_4_1[0]), "=f"(_tmem_load_4_1[1]), "=f"(_tmem_load_4_1[2]), "=f"(_tmem_load_4_1[3]), "=f"(_tmem_load_4_1[4]), "=f"(_tmem_load_4_1[5]), "=f"(_tmem_load_4_1[6]), "=f"(_tmem_load_4_1[7]), "=f"(_tmem_load_4_1[8]), "=f"(_tmem_load_4_1[9]), "=f"(_tmem_load_4_1[10]), "=f"(_tmem_load_4_1[11]), "=f"(_tmem_load_4_1[12]), "=f"(_tmem_load_4_1[13]), "=f"(_tmem_load_4_1[14]), "=f"(_tmem_load_4_1[15]), "=f"(_tmem_load_4_1[16]), "=f"(_tmem_load_4_1[17]), "=f"(_tmem_load_4_1[18]), "=f"(_tmem_load_4_1[19]), "=f"(_tmem_load_4_1[20]), "=f"(_tmem_load_4_1[21]), "=f"(_tmem_load_4_1[22]), "=f"(_tmem_load_4_1[23]), "=f"(_tmem_load_4_1[24]), "=f"(_tmem_load_4_1[25]), "=f"(_tmem_load_4_1[26]), "=f"(_tmem_load_4_1[27]), "=f"(_tmem_load_4_1[28]), "=f"(_tmem_load_4_1[29]), "=f"(_tmem_load_4_1[30]), "=f"(_tmem_load_4_1[31])
                         : "r"(skp_pre_addr + 64));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_11 = 0; i_11 < 32; i_11++) {
-                        _tmem_load_2[64 + i_11] = _tmem_load_5[i_11] + _tmem_load_2[64 + i_11];
+                    for (int i_10 = 0; i_10 < 32; i_10++) {
+                        _tmem_load_2[64 + i_10] = _tmem_load_4_1[i_10] + _tmem_load_2[64 + i_10];
                     }
                     float _tmem_load_6[16];
                     tmem_ld_x16(&_tmem_load_6[0], skp_pre_addr + 96);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_12 = 0; i_12 < 16; i_12++) {
-                        _tmem_load_2[96 + i_12] = _tmem_load_6[i_12] + _tmem_load_2[96 + i_12];
+                    for (int i_11 = 0; i_11 < 16; i_11++) {
+                        _tmem_load_2[96 + i_11] = _tmem_load_6[i_11] + _tmem_load_2[96 + i_11];
                     }
                     float post[16];
                     if (skp_lnc_2 > 0) {
@@ -1601,7 +1557,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_16 = 0; skp_v_16 < 4; skp_v_16++) {
                             int skp_vi_16 = skp_pvi0 + (28 + skp_v_16) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_16 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_16 * 4ull + 0);
                                 parts_p[4 * skp_v_16 + 0] = _v4.x;
                                 parts_p[4 * skp_v_16 + 1] = _v4.y;
                                 parts_p[4 * skp_v_16 + 2] = _v4.z;
@@ -1609,8 +1565,8 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                             }
                         }
                         #pragma unroll
-                        for (int i_13 = 0; i_13 < 16; i_13++) {
-                            post[i_13] = parts_p[i_13];
+                        for (int i_12 = 0; i_12 < 16; i_12++) {
+                            post[i_12] = parts_p[i_12];
                         }
                     }
                     if (skp_lnc_2 > 1) {
@@ -1620,7 +1576,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_17 = 0; skp_v_17 < 4; skp_v_17++) {
                             int skp_vi_17 = skp_pvi0_0 + (28 + skp_v_17) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_17 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_17 * 4ull + 0);
                                 parts_p_0[4 * skp_v_17 + 0] = _v4.x;
                                 parts_p_0[4 * skp_v_17 + 1] = _v4.y;
                                 parts_p_0[4 * skp_v_17 + 2] = _v4.z;
@@ -1628,8 +1584,8 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                             }
                         }
                         #pragma unroll
-                        for (int i_9_1 = 0; i_9_1 < 16; i_9_1++) {
-                            post[i_9_1] = post[i_9_1] + parts_p_0[i_9_1];
+                        for (int i_11_1 = 0; i_11_1 < 16; i_11_1++) {
+                            post[i_11_1] = post[i_11_1] + parts_p_0[i_11_1];
                         }
                     }
                     if (skp_lnc_2 > 2) {
@@ -1639,7 +1595,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_18 = 0; skp_v_18 < 4; skp_v_18++) {
                             int skp_vi_18 = skp_pvi0_1 + (28 + skp_v_18) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_18 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_18 * 4ull + 0);
                                 parts_p_1[4 * skp_v_18 + 0] = _v4.x;
                                 parts_p_1[4 * skp_v_18 + 1] = _v4.y;
                                 parts_p_1[4 * skp_v_18 + 2] = _v4.z;
@@ -1647,8 +1603,8 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                             }
                         }
                         #pragma unroll
-                        for (int i_10_1 = 0; i_10_1 < 16; i_10_1++) {
-                            post[i_10_1] = post[i_10_1] + parts_p_1[i_10_1];
+                        for (int i_12_1 = 0; i_12_1 < 16; i_12_1++) {
+                            post[i_12_1] = post[i_12_1] + parts_p_1[i_12_1];
                         }
                     }
                     if (skp_lnc_2 > 3) {
@@ -1658,7 +1614,7 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                         for (int skp_v_19 = 0; skp_v_19 < 4; skp_v_19++) {
                             int skp_vi_19 = skp_pvi0_2 + (28 + skp_v_19) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_19 * 4) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + (unsigned long long)skp_vi_19 * 4ull + 0);
                                 parts_p_2[4 * skp_v_19 + 0] = _v4.x;
                                 parts_p_2[4 * skp_v_19 + 1] = _v4.y;
                                 parts_p_2[4 * skp_v_19 + 2] = _v4.z;
@@ -1666,8 +1622,8 @@ kernel_cake_kimi_k3_fp8_projection_641510c8f818b0152dbb(const __grid_constant__ 
                             }
                         }
                         #pragma unroll
-                        for (int i_11_1 = 0; i_11_1 < 16; i_11_1++) {
-                            post[i_11_1] = post[i_11_1] + parts_p_2[i_11_1];
+                        for (int i_13 = 0; i_13 < 16; i_13++) {
+                            post[i_13] = post[i_13] + parts_p_2[i_13];
                         }
                     }
                     #pragma unroll

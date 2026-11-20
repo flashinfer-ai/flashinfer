@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_STAGE_OFF 4224
-#define SMEM_STAGE_STAGE_BYTES 16384
-#define SMEM_STAGE_STRIDE 16384
-#define SMEM_LOCAL_OFFSETS_OFF 0
-#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
-#define SMEM_LOCAL_OFFSETS_STRIDE 4100
-#define SMEM_SCAN_VALUES_OFF 4100
-#define SMEM_SCAN_VALUES_STAGE_BYTES 32
-#define SMEM_SCAN_VALUES_STRIDE 32
-#define SMEM_TOTAL 20608
 #define THREADS 1024
 #define NUM_WARPS 32
 #define MAX_EXPERTS 512
@@ -306,10 +295,24 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
         unsigned int merge_b = __shfl_sync(0xFFFFFFFF, sort_key, 15 + routed_top_k - lane & 31);
         if (lane == 0) {
             merge_a = 4294967295;
+        }
+        if (lane == routed_top_k) {
+            merge_b = 4294967295;
+        }
+        unsigned int merge_min = 0;
+        if (routed_top_k >= lane) {
+            unsigned int _min_40 = ((merge_a) < (merge_b) ? (merge_a) : (merge_b));
+            merge_min = _min_40;
 #else
-        stage[stage_base + 96 + lane] = lane_key;
+        stage[stage_base + 96 + lane] = lane_bits;
         __syncwarp();
-        int lanes_above = 0;
+        float lane_value = 0.0f;
+        lane_value = reinterpret_cast<float*>(&lane_bits)[0];
+        float above_counts[4];
+        above_counts[0] = 0.0f;
+        above_counts[1] = 0.0f;
+        above_counts[2] = 0.0f;
+        above_counts[3] = 0.0f;
         unsigned int keys[16];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(0) + 3]))
@@ -323,66 +326,70 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&keys[12])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(12) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 12) * 4)));
-        if (keys[0] > lane_key) {
-            lanes_above = lanes_above + 1;
-#endif
-        }
-#if __CUDA_ARCH__ == 1030
-        if (lane == routed_top_k) {
-            merge_b = 4294967295;
-#else
-        if (keys[1] > lane_key) {
-            lanes_above = lanes_above + 1;
-#endif
-        }
-#if __CUDA_ARCH__ == 1030
-        unsigned int merge_min = 0;
-        if (routed_top_k >= lane) {
-            unsigned int _min_40 = ((merge_a) < (merge_b) ? (merge_a) : (merge_b));
-            merge_min = _min_40;
-#else
-        if (keys[2] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[3] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[4] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[5] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[6] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[7] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[8] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[9] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[10] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[11] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[12] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[13] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[14] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys[15] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
+        float staged_value_0 = 0.0f;
+        unsigned int _bit_cast_src_20 = keys[0];
+        staged_value_0 = reinterpret_cast<float*>(&_bit_cast_src_20)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_0 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_1 = 0.0f;
+        unsigned int _bit_cast_src_21 = keys[1];
+        staged_value_1 = reinterpret_cast<float*>(&_bit_cast_src_21)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_1 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_2 = 0.0f;
+        unsigned int _bit_cast_src_22 = keys[2];
+        staged_value_2 = reinterpret_cast<float*>(&_bit_cast_src_22)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_2 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_3 = 0.0f;
+        unsigned int _bit_cast_src_23 = keys[3];
+        staged_value_3 = reinterpret_cast<float*>(&_bit_cast_src_23)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_3 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_4 = 0.0f;
+        unsigned int _bit_cast_src_24 = keys[4];
+        staged_value_4 = reinterpret_cast<float*>(&_bit_cast_src_24)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_4 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_5 = 0.0f;
+        unsigned int _bit_cast_src_25 = keys[5];
+        staged_value_5 = reinterpret_cast<float*>(&_bit_cast_src_25)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_5 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_6 = 0.0f;
+        unsigned int _bit_cast_src_26 = keys[6];
+        staged_value_6 = reinterpret_cast<float*>(&_bit_cast_src_26)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_6 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_7 = 0.0f;
+        unsigned int _bit_cast_src_27 = keys[7];
+        staged_value_7 = reinterpret_cast<float*>(&_bit_cast_src_27)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_7 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_8 = 0.0f;
+        unsigned int _bit_cast_src_28 = keys[8];
+        staged_value_8 = reinterpret_cast<float*>(&_bit_cast_src_28)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_8 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_9 = 0.0f;
+        unsigned int _bit_cast_src_29 = keys[9];
+        staged_value_9 = reinterpret_cast<float*>(&_bit_cast_src_29)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_9 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_10 = 0.0f;
+        unsigned int _bit_cast_src_30 = keys[10];
+        staged_value_10 = reinterpret_cast<float*>(&_bit_cast_src_30)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_10 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_11 = 0.0f;
+        unsigned int _bit_cast_src_31 = keys[11];
+        staged_value_11 = reinterpret_cast<float*>(&_bit_cast_src_31)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_11 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_12 = 0.0f;
+        unsigned int _bit_cast_src_32 = keys[12];
+        staged_value_12 = reinterpret_cast<float*>(&_bit_cast_src_32)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_12 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_13 = 0.0f;
+        unsigned int _bit_cast_src_33 = keys[13];
+        staged_value_13 = reinterpret_cast<float*>(&_bit_cast_src_33)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_13 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_14 = 0.0f;
+        unsigned int _bit_cast_src_34 = keys[14];
+        staged_value_14 = reinterpret_cast<float*>(&_bit_cast_src_34)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_14 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_15 = 0.0f;
+        unsigned int _bit_cast_src_35 = keys[15];
+        staged_value_15 = reinterpret_cast<float*>(&_bit_cast_src_35)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_15 > lane_value) ? 1.0f : 0.0f);
         unsigned int keys_0[16];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&keys_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(0) + 3]))
@@ -396,54 +403,73 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&keys_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(12) + 3]))
             : "r"(stage_addr + (unsigned int)((stage_base + 96 + 28) * 4)));
-        if (keys_0[0] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[1] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[2] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[3] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[4] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[5] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[6] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[7] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[8] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[9] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[10] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[11] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[12] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[13] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[14] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
-        if (keys_0[15] > lane_key) {
-            lanes_above = lanes_above + 1;
-        }
+        float staged_value_16 = 0.0f;
+        unsigned int _bit_cast_src_36 = keys_0[0];
+        staged_value_16 = reinterpret_cast<float*>(&_bit_cast_src_36)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_16 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_17 = 0.0f;
+        unsigned int _bit_cast_src_37 = keys_0[1];
+        staged_value_17 = reinterpret_cast<float*>(&_bit_cast_src_37)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_17 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_18 = 0.0f;
+        unsigned int _bit_cast_src_38 = keys_0[2];
+        staged_value_18 = reinterpret_cast<float*>(&_bit_cast_src_38)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_18 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_19 = 0.0f;
+        unsigned int _bit_cast_src_39 = keys_0[3];
+        staged_value_19 = reinterpret_cast<float*>(&_bit_cast_src_39)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_19 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_20 = 0.0f;
+        unsigned int _bit_cast_src_40 = keys_0[4];
+        staged_value_20 = reinterpret_cast<float*>(&_bit_cast_src_40)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_20 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_21 = 0.0f;
+        unsigned int _bit_cast_src_41 = keys_0[5];
+        staged_value_21 = reinterpret_cast<float*>(&_bit_cast_src_41)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_21 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_22 = 0.0f;
+        unsigned int _bit_cast_src_42 = keys_0[6];
+        staged_value_22 = reinterpret_cast<float*>(&_bit_cast_src_42)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_22 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_23 = 0.0f;
+        unsigned int _bit_cast_src_43 = keys_0[7];
+        staged_value_23 = reinterpret_cast<float*>(&_bit_cast_src_43)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_23 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_24 = 0.0f;
+        unsigned int _bit_cast_src_44 = keys_0[8];
+        staged_value_24 = reinterpret_cast<float*>(&_bit_cast_src_44)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_24 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_25 = 0.0f;
+        unsigned int _bit_cast_src_45 = keys_0[9];
+        staged_value_25 = reinterpret_cast<float*>(&_bit_cast_src_45)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_25 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_26 = 0.0f;
+        unsigned int _bit_cast_src_46 = keys_0[10];
+        staged_value_26 = reinterpret_cast<float*>(&_bit_cast_src_46)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_26 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_27 = 0.0f;
+        unsigned int _bit_cast_src_47 = keys_0[11];
+        staged_value_27 = reinterpret_cast<float*>(&_bit_cast_src_47)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_27 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_28 = 0.0f;
+        unsigned int _bit_cast_src_48 = keys_0[12];
+        staged_value_28 = reinterpret_cast<float*>(&_bit_cast_src_48)[0];
+        above_counts[0] = above_counts[0] + ((staged_value_28 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_29 = 0.0f;
+        unsigned int _bit_cast_src_49 = keys_0[13];
+        staged_value_29 = reinterpret_cast<float*>(&_bit_cast_src_49)[0];
+        above_counts[1] = above_counts[1] + ((staged_value_29 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_30 = 0.0f;
+        unsigned int _bit_cast_src_50 = keys_0[14];
+        staged_value_30 = reinterpret_cast<float*>(&_bit_cast_src_50)[0];
+        above_counts[2] = above_counts[2] + ((staged_value_30 > lane_value) ? 1.0f : 0.0f);
+        float staged_value_31 = 0.0f;
+        unsigned int _bit_cast_src_51 = keys_0[15];
+        staged_value_31 = reinterpret_cast<float*>(&_bit_cast_src_51)[0];
+        above_counts[3] = above_counts[3] + ((staged_value_31 > lane_value) ? 1.0f : 0.0f);
+        float lanes_above_sum = above_counts[0] + above_counts[1] + (above_counts[2] + above_counts[3]);
+        int _min_52 = (((int)lanes_above_sum) < (31) ? ((int)lanes_above_sum) : (31));
+        int lanes_above = ((_min_52) > (0) ? (_min_52) : (0));
         unsigned int bound_vote = 4294967295;
         if (lanes_above < routed_top_k) {
             bound_vote = lane_key;
@@ -518,196 +544,61 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
 #else
         unsigned int slot_lanes[16];
         int candidates = 0;
-        unsigned int _warp_vote_20 = __ballot_sync(0xFFFFFFFF, row_values[0] >= bound_value);
-        slot_lanes[0] = _warp_vote_20;
+        unsigned int _warp_vote_53 = __ballot_sync(0xFFFFFFFF, row_values[0] >= bound_value);
+        slot_lanes[0] = _warp_vote_53;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[0]);
-        unsigned int _warp_vote_21 = __ballot_sync(0xFFFFFFFF, row_values[1] >= bound_value);
-        slot_lanes[1] = _warp_vote_21;
+        unsigned int _warp_vote_54 = __ballot_sync(0xFFFFFFFF, row_values[1] >= bound_value);
+        slot_lanes[1] = _warp_vote_54;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[1]);
-        unsigned int _warp_vote_22 = __ballot_sync(0xFFFFFFFF, row_values[2] >= bound_value);
-        slot_lanes[2] = _warp_vote_22;
+        unsigned int _warp_vote_55 = __ballot_sync(0xFFFFFFFF, row_values[2] >= bound_value);
+        slot_lanes[2] = _warp_vote_55;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[2]);
-        unsigned int _warp_vote_23 = __ballot_sync(0xFFFFFFFF, row_values[3] >= bound_value);
-        slot_lanes[3] = _warp_vote_23;
+        unsigned int _warp_vote_56 = __ballot_sync(0xFFFFFFFF, row_values[3] >= bound_value);
+        slot_lanes[3] = _warp_vote_56;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[3]);
-        unsigned int _warp_vote_24 = __ballot_sync(0xFFFFFFFF, row_values[4] >= bound_value);
-        slot_lanes[4] = _warp_vote_24;
+        unsigned int _warp_vote_57 = __ballot_sync(0xFFFFFFFF, row_values[4] >= bound_value);
+        slot_lanes[4] = _warp_vote_57;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[4]);
-        unsigned int _warp_vote_25 = __ballot_sync(0xFFFFFFFF, row_values[5] >= bound_value);
-        slot_lanes[5] = _warp_vote_25;
+        unsigned int _warp_vote_58 = __ballot_sync(0xFFFFFFFF, row_values[5] >= bound_value);
+        slot_lanes[5] = _warp_vote_58;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[5]);
-        unsigned int _warp_vote_26 = __ballot_sync(0xFFFFFFFF, row_values[6] >= bound_value);
-        slot_lanes[6] = _warp_vote_26;
+        unsigned int _warp_vote_59 = __ballot_sync(0xFFFFFFFF, row_values[6] >= bound_value);
+        slot_lanes[6] = _warp_vote_59;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[6]);
-        unsigned int _warp_vote_27 = __ballot_sync(0xFFFFFFFF, row_values[7] >= bound_value);
-        slot_lanes[7] = _warp_vote_27;
+        unsigned int _warp_vote_60 = __ballot_sync(0xFFFFFFFF, row_values[7] >= bound_value);
+        slot_lanes[7] = _warp_vote_60;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[7]);
-        unsigned int _warp_vote_28 = __ballot_sync(0xFFFFFFFF, row_values[8] >= bound_value);
-        slot_lanes[8] = _warp_vote_28;
+        unsigned int _warp_vote_61 = __ballot_sync(0xFFFFFFFF, row_values[8] >= bound_value);
+        slot_lanes[8] = _warp_vote_61;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[8]);
-        unsigned int _warp_vote_29 = __ballot_sync(0xFFFFFFFF, row_values[9] >= bound_value);
-        slot_lanes[9] = _warp_vote_29;
+        unsigned int _warp_vote_62 = __ballot_sync(0xFFFFFFFF, row_values[9] >= bound_value);
+        slot_lanes[9] = _warp_vote_62;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[9]);
-        unsigned int _warp_vote_30 = __ballot_sync(0xFFFFFFFF, row_values[10] >= bound_value);
-        slot_lanes[10] = _warp_vote_30;
+        unsigned int _warp_vote_63 = __ballot_sync(0xFFFFFFFF, row_values[10] >= bound_value);
+        slot_lanes[10] = _warp_vote_63;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[10]);
-        unsigned int _warp_vote_31 = __ballot_sync(0xFFFFFFFF, row_values[11] >= bound_value);
-        slot_lanes[11] = _warp_vote_31;
+        unsigned int _warp_vote_64 = __ballot_sync(0xFFFFFFFF, row_values[11] >= bound_value);
+        slot_lanes[11] = _warp_vote_64;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[11]);
-        unsigned int _warp_vote_32 = __ballot_sync(0xFFFFFFFF, row_values[12] >= bound_value);
-        slot_lanes[12] = _warp_vote_32;
+        unsigned int _warp_vote_65 = __ballot_sync(0xFFFFFFFF, row_values[12] >= bound_value);
+        slot_lanes[12] = _warp_vote_65;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[12]);
-        unsigned int _warp_vote_33 = __ballot_sync(0xFFFFFFFF, row_values[13] >= bound_value);
-        slot_lanes[13] = _warp_vote_33;
+        unsigned int _warp_vote_66 = __ballot_sync(0xFFFFFFFF, row_values[13] >= bound_value);
+        slot_lanes[13] = _warp_vote_66;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[13]);
-        unsigned int _warp_vote_34 = __ballot_sync(0xFFFFFFFF, row_values[14] >= bound_value);
-        slot_lanes[14] = _warp_vote_34;
+        unsigned int _warp_vote_67 = __ballot_sync(0xFFFFFFFF, row_values[14] >= bound_value);
+        slot_lanes[14] = _warp_vote_67;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[14]);
-        unsigned int _warp_vote_35 = __ballot_sync(0xFFFFFFFF, row_values[15] >= bound_value);
-        slot_lanes[15] = _warp_vote_35;
+        unsigned int _warp_vote_68 = __ballot_sync(0xFFFFFFFF, row_values[15] >= bound_value);
+        slot_lanes[15] = _warp_vote_68;
         candidates = candidates + (int)(unsigned int)__popc(slot_lanes[15]);
 #endif
         if (candidates <= 32 && bound_key != 2147483648u && bound_key > 8388607) {
             route_by_route = 0;
 #if __CUDA_ARCH__ == 1030
-#else
-            int candidate_position = 0;
-            int stage_rows[16];
-            unsigned int stage_word = 0;
-            stage_rows[0] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[0] & lanes_below);
-            if ((slot_lanes[0] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_36 = row_values[0];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_36)[0];
-                stage[stage_rows[0]] = stage_word;
-                stage[stage_rows[0] + 32] = (unsigned int)lane;
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[0]);
-            stage_rows[1] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[1] & lanes_below);
-            if ((slot_lanes[1] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_37 = row_values[1];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_37)[0];
-                stage[stage_rows[1]] = stage_word;
-                stage[stage_rows[1] + 32] = (unsigned int)(lane + 32);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[1]);
-            stage_rows[2] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[2] & lanes_below);
-            if ((slot_lanes[2] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_38 = row_values[2];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_38)[0];
-                stage[stage_rows[2]] = stage_word;
-                stage[stage_rows[2] + 32] = (unsigned int)(lane + 64);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[2]);
-            stage_rows[3] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[3] & lanes_below);
-            if ((slot_lanes[3] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_39 = row_values[3];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_39)[0];
-                stage[stage_rows[3]] = stage_word;
-                stage[stage_rows[3] + 32] = (unsigned int)(lane + 96);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[3]);
-            stage_rows[4] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[4] & lanes_below);
-            if ((slot_lanes[4] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_40 = row_values[4];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_40)[0];
-                stage[stage_rows[4]] = stage_word;
-                stage[stage_rows[4] + 32] = (unsigned int)(lane + 128);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[4]);
-            stage_rows[5] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[5] & lanes_below);
-            if ((slot_lanes[5] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_41 = row_values[5];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_41)[0];
-                stage[stage_rows[5]] = stage_word;
-                stage[stage_rows[5] + 32] = (unsigned int)(lane + 160);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[5]);
-            stage_rows[6] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[6] & lanes_below);
-            if ((slot_lanes[6] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_42 = row_values[6];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_42)[0];
-                stage[stage_rows[6]] = stage_word;
-                stage[stage_rows[6] + 32] = (unsigned int)(lane + 192);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[6]);
-            stage_rows[7] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[7] & lanes_below);
-            if ((slot_lanes[7] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_43 = row_values[7];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_43)[0];
-                stage[stage_rows[7]] = stage_word;
-                stage[stage_rows[7] + 32] = (unsigned int)(lane + 224);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[7]);
-            stage_rows[8] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[8] & lanes_below);
-            if ((slot_lanes[8] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_44 = row_values[8];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_44)[0];
-                stage[stage_rows[8]] = stage_word;
-                stage[stage_rows[8] + 32] = (unsigned int)(lane + 256);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[8]);
-            stage_rows[9] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[9] & lanes_below);
-            if ((slot_lanes[9] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_45 = row_values[9];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_45)[0];
-                stage[stage_rows[9]] = stage_word;
-                stage[stage_rows[9] + 32] = (unsigned int)(lane + 288);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[9]);
-            stage_rows[10] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[10] & lanes_below);
-            if ((slot_lanes[10] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_46 = row_values[10];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_46)[0];
-                stage[stage_rows[10]] = stage_word;
-                stage[stage_rows[10] + 32] = (unsigned int)(lane + 320);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[10]);
-            stage_rows[11] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[11] & lanes_below);
-            if ((slot_lanes[11] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_47 = row_values[11];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_47)[0];
-                stage[stage_rows[11]] = stage_word;
-                stage[stage_rows[11] + 32] = (unsigned int)(lane + 352);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[11]);
-            stage_rows[12] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[12] & lanes_below);
-            if ((slot_lanes[12] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_48 = row_values[12];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_48)[0];
-                stage[stage_rows[12]] = stage_word;
-                stage[stage_rows[12] + 32] = (unsigned int)(lane + 384);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[12]);
-            stage_rows[13] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[13] & lanes_below);
-            if ((slot_lanes[13] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_49 = row_values[13];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_49)[0];
-                stage[stage_rows[13]] = stage_word;
-                stage[stage_rows[13] + 32] = (unsigned int)(lane + 416);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[13]);
-            stage_rows[14] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[14] & lanes_below);
-            if ((slot_lanes[14] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_50 = row_values[14];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_50)[0];
-                stage[stage_rows[14]] = stage_word;
-                stage[stage_rows[14] + 32] = (unsigned int)(lane + 448);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[14]);
-            stage_rows[15] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[15] & lanes_below);
-            if ((slot_lanes[15] >> (unsigned int)lane & 1) != 0) {
-                float _bit_cast_src_51 = row_values[15];
-                stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_51)[0];
-                stage[stage_rows[15]] = stage_word;
-                stage[stage_rows[15] + 32] = (unsigned int)(lane + 480);
-            }
-            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[15]);
-            __syncwarp();
-#endif
             unsigned int candidate_bits = 0;
             unsigned int candidate_id = 0;
             unsigned int candidate_key = 0;
-#if __CUDA_ARCH__ == 1030
             unsigned int _warp_redux_42;
             asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_42) : "r"(own_count));
             int own_trips = (int)_warp_redux_42;
@@ -721,8 +612,21 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
                     unsigned int own_plane_3 = __ballot_sync(0xFFFFFFFF, (own_count >> 3 & 1) != 0);
                     unsigned int own_plane_4 = __ballot_sync(0xFFFFFFFF, (own_count >> 4 & 1) != 0);
                     own_position = own_position + ((unsigned int)__popc(own_plane_2 & lanes_below) << 2) + ((unsigned int)__popc(own_plane_3 & lanes_below) << 3) + ((unsigned int)__popc(own_plane_4 & lanes_below) << 4);
+#else
+            int candidate_position = 0;
+            int stage_rows[16];
+            unsigned int stage_word = 0;
+            if (slot_lanes[0] != 0) {
+                stage_rows[0] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[0] & lanes_below);
+                if ((slot_lanes[0] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_69 = row_values[0];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_69)[0];
+                    stage[stage_rows[0]] = stage_word;
+                    stage[stage_rows[0] + 32] = (unsigned int)lane;
+#endif
                 }
             }
+#if __CUDA_ARCH__ == 1030
             #pragma unroll 1
             for (int own_trip = 0; own_trip < own_trips; own_trip++) {
                 unsigned int own_next = own_slots;
@@ -730,38 +634,205 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
                 if (own_next != 0) {
                     int _find_first_set_43 = __ffs(own_next);
                     stage[stage_base + 32 + (int)own_position + own_trip] = (unsigned int)(lane + (_find_first_set_43 - 1) * 32);
+#else
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[0]);
+            if (slot_lanes[1] != 0) {
+                stage_rows[1] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[1] & lanes_below);
+                if ((slot_lanes[1] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_70 = row_values[1];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_70)[0];
+                    stage[stage_rows[1]] = stage_word;
+                    stage[stage_rows[1] + 32] = (unsigned int)(lane + 32);
+#endif
                 }
             }
+#if __CUDA_ARCH__ == 1030
             __syncwarp();
-#endif
             if (candidates > lane) {
-#if __CUDA_ARCH__ == 1030
-#else
-                candidate_bits = stage[stage_base + lane];
-#endif
                 candidate_id = stage[stage_base + 32 + lane];
-#if __CUDA_ARCH__ == 1030
                 float candidate_value = logits[row_base + (unsigned long long)candidate_id];
                 if (row_nan != 0) {
                     candidate_value = fminf(candidate_value, CUDART_INF_F);
+#else
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[1]);
+            if (slot_lanes[2] != 0) {
+                stage_rows[2] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[2] & lanes_below);
+                if ((slot_lanes[2] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_71 = row_values[2];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_71)[0];
+                    stage[stage_rows[2]] = stage_word;
+                    stage[stage_rows[2] + 32] = (unsigned int)(lane + 64);
+#endif
                 }
+#if __CUDA_ARCH__ == 1030
                 candidate_bits = reinterpret_cast<unsigned int*>(&candidate_value)[0];
+#else
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[2]);
+            if (slot_lanes[3] != 0) {
+                stage_rows[3] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[3] & lanes_below);
+                if ((slot_lanes[3] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_72 = row_values[3];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_72)[0];
+                    stage[stage_rows[3]] = stage_word;
+                    stage[stage_rows[3] + 32] = (unsigned int)(lane + 96);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[3]);
+            if (slot_lanes[4] != 0) {
+                stage_rows[4] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[4] & lanes_below);
+                if ((slot_lanes[4] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_73 = row_values[4];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_73)[0];
+                    stage[stage_rows[4]] = stage_word;
+                    stage[stage_rows[4] + 32] = (unsigned int)(lane + 128);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[4]);
+            if (slot_lanes[5] != 0) {
+                stage_rows[5] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[5] & lanes_below);
+                if ((slot_lanes[5] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_74 = row_values[5];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_74)[0];
+                    stage[stage_rows[5]] = stage_word;
+                    stage[stage_rows[5] + 32] = (unsigned int)(lane + 160);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[5]);
+            if (slot_lanes[6] != 0) {
+                stage_rows[6] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[6] & lanes_below);
+                if ((slot_lanes[6] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_75 = row_values[6];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_75)[0];
+                    stage[stage_rows[6]] = stage_word;
+                    stage[stage_rows[6] + 32] = (unsigned int)(lane + 192);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[6]);
+            if (slot_lanes[7] != 0) {
+                stage_rows[7] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[7] & lanes_below);
+                if ((slot_lanes[7] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_76 = row_values[7];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_76)[0];
+                    stage[stage_rows[7]] = stage_word;
+                    stage[stage_rows[7] + 32] = (unsigned int)(lane + 224);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[7]);
+            if (slot_lanes[8] != 0) {
+                stage_rows[8] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[8] & lanes_below);
+                if ((slot_lanes[8] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_77 = row_values[8];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_77)[0];
+                    stage[stage_rows[8]] = stage_word;
+                    stage[stage_rows[8] + 32] = (unsigned int)(lane + 256);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[8]);
+            if (slot_lanes[9] != 0) {
+                stage_rows[9] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[9] & lanes_below);
+                if ((slot_lanes[9] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_78 = row_values[9];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_78)[0];
+                    stage[stage_rows[9]] = stage_word;
+                    stage[stage_rows[9] + 32] = (unsigned int)(lane + 288);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[9]);
+            if (slot_lanes[10] != 0) {
+                stage_rows[10] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[10] & lanes_below);
+                if ((slot_lanes[10] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_79 = row_values[10];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_79)[0];
+                    stage[stage_rows[10]] = stage_word;
+                    stage[stage_rows[10] + 32] = (unsigned int)(lane + 320);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[10]);
+            if (slot_lanes[11] != 0) {
+                stage_rows[11] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[11] & lanes_below);
+                if ((slot_lanes[11] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_80 = row_values[11];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_80)[0];
+                    stage[stage_rows[11]] = stage_word;
+                    stage[stage_rows[11] + 32] = (unsigned int)(lane + 352);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[11]);
+            if (slot_lanes[12] != 0) {
+                stage_rows[12] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[12] & lanes_below);
+                if ((slot_lanes[12] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_81 = row_values[12];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_81)[0];
+                    stage[stage_rows[12]] = stage_word;
+                    stage[stage_rows[12] + 32] = (unsigned int)(lane + 384);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[12]);
+            if (slot_lanes[13] != 0) {
+                stage_rows[13] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[13] & lanes_below);
+                if ((slot_lanes[13] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_82 = row_values[13];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_82)[0];
+                    stage[stage_rows[13]] = stage_word;
+                    stage[stage_rows[13] + 32] = (unsigned int)(lane + 416);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[13]);
+            if (slot_lanes[14] != 0) {
+                stage_rows[14] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[14] & lanes_below);
+                if ((slot_lanes[14] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_83 = row_values[14];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_83)[0];
+                    stage[stage_rows[14]] = stage_word;
+                    stage[stage_rows[14] + 32] = (unsigned int)(lane + 448);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[14]);
+            if (slot_lanes[15] != 0) {
+                stage_rows[15] = stage_base + candidate_position + (int)(unsigned int)__popc(slot_lanes[15] & lanes_below);
+                if ((slot_lanes[15] >> (unsigned int)lane & 1) != 0) {
+                    float _bit_cast_src_84 = row_values[15];
+                    stage_word = reinterpret_cast<unsigned int*>(&_bit_cast_src_84)[0];
+                    stage[stage_rows[15]] = stage_word;
+                    stage[stage_rows[15] + 32] = (unsigned int)(lane + 480);
+                }
+            }
+            candidate_position = candidate_position + (int)(unsigned int)__popc(slot_lanes[15]);
+            __syncwarp();
+            unsigned int candidate_bits = 0;
+            unsigned int candidate_id = 0;
+            unsigned int candidate_key = 4286578688;
+            if (candidates > lane) {
+                candidate_bits = stage[stage_base + lane];
+                candidate_id = stage[stage_base + 32 + lane];
 #endif
                 unsigned int candidate_flat = candidate_bits;
                 if ((candidate_bits & 2139095040) == 0) {
                     candidate_flat = 0;
                 }
+#if __CUDA_ARCH__ == 1030
                 candidate_key = candidate_flat ^ 2147483648u;
                 if ((candidate_flat & 2147483648u) != 0) {
                     candidate_key = candidate_flat ^ 4294967295u;
                 }
+#else
+                candidate_key = candidate_flat;
+#endif
             }
             stage[stage_base + 96 + lane] = candidate_key;
             __syncwarp();
-            int candidate_rank = 0;
 #if __CUDA_ARCH__ == 1030
+            int candidate_rank = 0;
             unsigned int keys[16];
 #else
+            float candidate_value_rank = 0.0f;
+            candidate_value_rank = reinterpret_cast<float*>(&candidate_key)[0];
+            float rank_counts[4];
+            rank_counts[0] = 0.0f;
+            rank_counts[1] = 0.0f;
+            rank_counts[2] = 0.0f;
+            rank_counts[3] = 0.0f;
             unsigned int keys_1[16];
 #endif
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -794,116 +865,119 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
                 : "r"(stage_addr + (unsigned int)((stage_base + 96 + 12) * 4)));
 #if __CUDA_ARCH__ == 1030
             if (keys[0] > candidate_key) {
-#else
-            if (keys_1[0] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[1] > candidate_key) {
-#else
-            if (keys_1[1] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[2] > candidate_key) {
-#else
-            if (keys_1[2] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[3] > candidate_key) {
-#else
-            if (keys_1[3] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[4] > candidate_key) {
-#else
-            if (keys_1[4] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[5] > candidate_key) {
-#else
-            if (keys_1[5] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[6] > candidate_key) {
-#else
-            if (keys_1[6] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[7] > candidate_key) {
-#else
-            if (keys_1[7] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[8] > candidate_key) {
-#else
-            if (keys_1[8] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[9] > candidate_key) {
-#else
-            if (keys_1[9] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[10] > candidate_key) {
-#else
-            if (keys_1[10] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[11] > candidate_key) {
-#else
-            if (keys_1[11] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[12] > candidate_key) {
-#else
-            if (keys_1[12] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[13] > candidate_key) {
-#else
-            if (keys_1[13] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[14] > candidate_key) {
-#else
-            if (keys_1[14] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
-#if __CUDA_ARCH__ == 1030
             if (keys[15] > candidate_key) {
-#else
-            if (keys_1[15] > candidate_key) {
-#endif
                 candidate_rank = candidate_rank + 1;
             }
+#else
+            float staged_value_32 = 0.0f;
+            unsigned int _bit_cast_src_85 = keys_1[0];
+            staged_value_32 = reinterpret_cast<float*>(&_bit_cast_src_85)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_32 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_33 = 0.0f;
+            unsigned int _bit_cast_src_86 = keys_1[1];
+            staged_value_33 = reinterpret_cast<float*>(&_bit_cast_src_86)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_33 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_34 = 0.0f;
+            unsigned int _bit_cast_src_87 = keys_1[2];
+            staged_value_34 = reinterpret_cast<float*>(&_bit_cast_src_87)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_34 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_35 = 0.0f;
+            unsigned int _bit_cast_src_88 = keys_1[3];
+            staged_value_35 = reinterpret_cast<float*>(&_bit_cast_src_88)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_35 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_36 = 0.0f;
+            unsigned int _bit_cast_src_89 = keys_1[4];
+            staged_value_36 = reinterpret_cast<float*>(&_bit_cast_src_89)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_36 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_37 = 0.0f;
+            unsigned int _bit_cast_src_90 = keys_1[5];
+            staged_value_37 = reinterpret_cast<float*>(&_bit_cast_src_90)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_37 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_38 = 0.0f;
+            unsigned int _bit_cast_src_91 = keys_1[6];
+            staged_value_38 = reinterpret_cast<float*>(&_bit_cast_src_91)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_38 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_39 = 0.0f;
+            unsigned int _bit_cast_src_92 = keys_1[7];
+            staged_value_39 = reinterpret_cast<float*>(&_bit_cast_src_92)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_39 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_40 = 0.0f;
+            unsigned int _bit_cast_src_93 = keys_1[8];
+            staged_value_40 = reinterpret_cast<float*>(&_bit_cast_src_93)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_40 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_41 = 0.0f;
+            unsigned int _bit_cast_src_94 = keys_1[9];
+            staged_value_41 = reinterpret_cast<float*>(&_bit_cast_src_94)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_41 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_42 = 0.0f;
+            unsigned int _bit_cast_src_95 = keys_1[10];
+            staged_value_42 = reinterpret_cast<float*>(&_bit_cast_src_95)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_42 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_43 = 0.0f;
+            unsigned int _bit_cast_src_96 = keys_1[11];
+            staged_value_43 = reinterpret_cast<float*>(&_bit_cast_src_96)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_43 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_44 = 0.0f;
+            unsigned int _bit_cast_src_97 = keys_1[12];
+            staged_value_44 = reinterpret_cast<float*>(&_bit_cast_src_97)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_44 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_45 = 0.0f;
+            unsigned int _bit_cast_src_98 = keys_1[13];
+            staged_value_45 = reinterpret_cast<float*>(&_bit_cast_src_98)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_45 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_46 = 0.0f;
+            unsigned int _bit_cast_src_99 = keys_1[14];
+            staged_value_46 = reinterpret_cast<float*>(&_bit_cast_src_99)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_46 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_47 = 0.0f;
+            unsigned int _bit_cast_src_100 = keys_1[15];
+            staged_value_47 = reinterpret_cast<float*>(&_bit_cast_src_100)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_47 > candidate_value_rank) ? 1.0f : 0.0f);
+#endif
             if (candidates > 16) {
 #if __CUDA_ARCH__ == 1030
                 unsigned int keys_0[16];
@@ -940,117 +1014,126 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
                     : "r"(stage_addr + (unsigned int)((stage_base + 96 + 28) * 4)));
 #if __CUDA_ARCH__ == 1030
                 if (keys_0[0] > candidate_key) {
-#else
-                if (keys_2[0] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[1] > candidate_key) {
-#else
-                if (keys_2[1] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[2] > candidate_key) {
-#else
-                if (keys_2[2] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[3] > candidate_key) {
-#else
-                if (keys_2[3] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[4] > candidate_key) {
-#else
-                if (keys_2[4] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[5] > candidate_key) {
-#else
-                if (keys_2[5] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[6] > candidate_key) {
-#else
-                if (keys_2[6] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[7] > candidate_key) {
-#else
-                if (keys_2[7] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[8] > candidate_key) {
-#else
-                if (keys_2[8] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[9] > candidate_key) {
-#else
-                if (keys_2[9] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[10] > candidate_key) {
-#else
-                if (keys_2[10] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[11] > candidate_key) {
-#else
-                if (keys_2[11] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[12] > candidate_key) {
-#else
-                if (keys_2[12] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[13] > candidate_key) {
-#else
-                if (keys_2[13] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[14] > candidate_key) {
-#else
-                if (keys_2[14] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
-#if __CUDA_ARCH__ == 1030
                 if (keys_0[15] > candidate_key) {
-#else
-                if (keys_2[15] > candidate_key) {
-#endif
                     candidate_rank = candidate_rank + 1;
                 }
+#else
+                float staged_value_48 = 0.0f;
+                unsigned int _bit_cast_src_101 = keys_2[0];
+                staged_value_48 = reinterpret_cast<float*>(&_bit_cast_src_101)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_48 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_49 = 0.0f;
+                unsigned int _bit_cast_src_102 = keys_2[1];
+                staged_value_49 = reinterpret_cast<float*>(&_bit_cast_src_102)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_49 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_50 = 0.0f;
+                unsigned int _bit_cast_src_103 = keys_2[2];
+                staged_value_50 = reinterpret_cast<float*>(&_bit_cast_src_103)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_50 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_51 = 0.0f;
+                unsigned int _bit_cast_src_104 = keys_2[3];
+                staged_value_51 = reinterpret_cast<float*>(&_bit_cast_src_104)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_51 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_52 = 0.0f;
+                unsigned int _bit_cast_src_105 = keys_2[4];
+                staged_value_52 = reinterpret_cast<float*>(&_bit_cast_src_105)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_52 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_53 = 0.0f;
+                unsigned int _bit_cast_src_106 = keys_2[5];
+                staged_value_53 = reinterpret_cast<float*>(&_bit_cast_src_106)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_53 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_54 = 0.0f;
+                unsigned int _bit_cast_src_107 = keys_2[6];
+                staged_value_54 = reinterpret_cast<float*>(&_bit_cast_src_107)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_54 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_55 = 0.0f;
+                unsigned int _bit_cast_src_108 = keys_2[7];
+                staged_value_55 = reinterpret_cast<float*>(&_bit_cast_src_108)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_55 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_56 = 0.0f;
+                unsigned int _bit_cast_src_109 = keys_2[8];
+                staged_value_56 = reinterpret_cast<float*>(&_bit_cast_src_109)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_56 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_57 = 0.0f;
+                unsigned int _bit_cast_src_110 = keys_2[9];
+                staged_value_57 = reinterpret_cast<float*>(&_bit_cast_src_110)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_57 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_58 = 0.0f;
+                unsigned int _bit_cast_src_111 = keys_2[10];
+                staged_value_58 = reinterpret_cast<float*>(&_bit_cast_src_111)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_58 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_59 = 0.0f;
+                unsigned int _bit_cast_src_112 = keys_2[11];
+                staged_value_59 = reinterpret_cast<float*>(&_bit_cast_src_112)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_59 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_60 = 0.0f;
+                unsigned int _bit_cast_src_113 = keys_2[12];
+                staged_value_60 = reinterpret_cast<float*>(&_bit_cast_src_113)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_60 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_61 = 0.0f;
+                unsigned int _bit_cast_src_114 = keys_2[13];
+                staged_value_61 = reinterpret_cast<float*>(&_bit_cast_src_114)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_61 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_62 = 0.0f;
+                unsigned int _bit_cast_src_115 = keys_2[14];
+                staged_value_62 = reinterpret_cast<float*>(&_bit_cast_src_115)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_62 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_63 = 0.0f;
+                unsigned int _bit_cast_src_116 = keys_2[15];
+                staged_value_63 = reinterpret_cast<float*>(&_bit_cast_src_116)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_63 > candidate_value_rank) ? 1.0f : 0.0f);
+#endif
             }
+#if __CUDA_ARCH__ == 1030
+#else
+            float candidate_rank_sum = rank_counts[0] + rank_counts[1] + (rank_counts[2] + rank_counts[3]);
+            int _min_117 = (((int)candidate_rank_sum) < (31) ? ((int)candidate_rank_sum) : (31));
+            int candidate_rank = ((_min_117) > (0) ? (_min_117) : (0));
+#endif
             unsigned int tied_lanes = __ballot_sync(0xFFFFFFFF, candidates > lane);
             int rank_bit_set_r_0 = candidate_rank & 1;
             unsigned int rank_bit_lanes_r_0 = __ballot_sync(0xFFFFFFFF, rank_bit_set_r_0 != 0);
@@ -1170,8 +1253,8 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
                 unsigned int _bit_cast_src_44 = stage[stage_base + 64 + lane];
                 selected_logit = reinterpret_cast<float*>(&_bit_cast_src_44)[0];
 #else
-                unsigned int _bit_cast_src_52 = stage[stage_base + 64 + lane];
-                selected_logit = reinterpret_cast<float*>(&_bit_cast_src_52)[0];
+                unsigned int _bit_cast_src_118 = stage[stage_base + 64 + lane];
+                selected_logit = reinterpret_cast<float*>(&_bit_cast_src_118)[0];
 #endif
                 selected_expert = (int)stage[stage_base + 80 + lane];
             }
@@ -1294,8 +1377,8 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
                 int _atomic_fetch_add_45 = atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
                 count_ordinal = _atomic_fetch_add_45;
 #else
-                int _atomic_fetch_add_53 = atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
-                count_ordinal = _atomic_fetch_add_53;
+                int _atomic_fetch_add_119 = atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
+                count_ordinal = _atomic_fetch_add_119;
 #endif
             } else {
                 atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
@@ -1314,8 +1397,8 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm(float* __re
             float _exp2_46 = approx_exp2((selected_logit - selected_max) * 1.442695f);
             selected_exp = _exp2_46;
 #else
-            float _exp2_54 = approx_exp2((selected_logit - selected_max) * 1.442695f);
-            selected_exp = _exp2_54;
+            float _exp2_120 = approx_exp2((selected_logit - selected_max) * 1.442695f);
+            selected_exp = _exp2_120;
 #endif
         }
         float selected_sum = selected_exp;

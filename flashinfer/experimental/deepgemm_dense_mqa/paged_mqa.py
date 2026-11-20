@@ -89,7 +89,11 @@ leaves it dirty: re-create the plan). Output: FP32 ``[B * next_n,
 paged_logits_stride(max_context_len)]`` with DeepGEMM's ``clean_logits=False``
 semantics (inside every KV split a row touches, positions at or past the row's
 length are ``-inf``; cells beyond the row's last split are untouched);
-consume ``plan.logical_output`` (``[:, :max_context_len]``).
+consume ``plan.logical_output`` (``[:, :max_context_len]``). The programs
+address the logits with signed 32-bit element offsets, so one launch covers at
+most ``MAX_LAUNCH_LOGITS`` (2^31) of them: ``PagedMqaPlan`` refuses a larger
+``B * next_n x paged_logits_stride(max_context_len)``, and
+``fp8_paged_mqa_logits`` launches such a call once per range of requests.
 """
 
 from __future__ import annotations
@@ -103,6 +107,9 @@ from .dense_mqa import (
 )
 
 FUSED_ROW_BYTES = HEAD_DIM + 4  # one FP8 row + its FP32 scale
+# The most FP32 logits one launch of a paged program writes: its stores form signed 32-bit element offsets, so
+# fp8_paged_mqa_logits launches a larger batch per range of requests.
+MAX_LAUNCH_LOGITS = 1 << 31
 
 
 def paged_policy():
@@ -1190,6 +1197,12 @@ class PagedMqaPlan:
             )
         )
         stride = paged_logits_stride(max_context_len)
+        if batch * next_n * stride > MAX_LAUNCH_LOGITS:
+            raise ValueError(
+                f"the paged programs address at most {MAX_LAUNCH_LOGITS} logits per launch (B * next_n = "
+                f"{batch * next_n}, logits stride = {stride}); split the batch into request ranges "
+                "(fp8_paged_mqa_logits does)"
+            )
         if output is None:
             output = torch.empty(
                 (batch * next_n, stride), dtype=torch.float32, device=q.device
@@ -1339,7 +1352,10 @@ def fp8_paged_mqa_logits(
     (see :class:`PagedMqaPlan`). ``clean_logits=True`` is rejected for
     two-dimensional context lengths exactly as DeepGEMM does; ``indices`` must
     be ``None``. Returns the FP32 ``[B * next_n, max_context_len]`` view of a
-    freshly allocated row-padded buffer.
+    freshly allocated row-padded buffer. A batch whose ``[B * next_n,
+    paged_logits_stride(max_context_len)]`` logits pass ``MAX_LAUNCH_LOGITS``
+    elements runs one launch per range of requests, each on the default path
+    (a schedule table covers the whole batch, so no range reads it).
     """
     if clean_logits:
         raise ValueError(
@@ -1367,6 +1383,28 @@ def fp8_paged_mqa_logits(
                 "PagedScheduleMetaPlan or None"
             )
         num_sms = int(schedule_meta.shape[0]) - 1
+    batch, next_n = _check_context_lens(context_lens)
+    stride = paged_logits_stride(int(max_context_len))
+    if batch * next_n * stride > MAX_LAUNCH_LOGITS:
+        import torch
+
+        requests = max(1, MAX_LAUNCH_LOGITS // (next_n * stride))
+        output = torch.empty(
+            (batch * next_n, stride), dtype=torch.float32, device=q.device
+        )
+        for start in range(0, batch, requests):
+            stop = min(batch, start + requests)
+            PagedMqaPlan(
+                q[start:stop],
+                kv_cache,
+                weights[start * next_n : stop * next_n],
+                context_lens[start:stop],
+                block_table[start:stop],
+                max_context_len,
+                output=output[start * next_n : stop * next_n],
+                sm_count=num_sms,
+            ).run()
+        return output[:, : int(max_context_len)]
     plan = PagedMqaPlan(
         q,
         kv_cache,

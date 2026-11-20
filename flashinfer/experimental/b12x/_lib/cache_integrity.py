@@ -67,6 +67,9 @@ def valid_object(object_path: Path, manifest_path: Path, cache_key: str) -> bool
 
 
 def _fsync_directory(path: Path) -> None:
+    # Windows has no O_DIRECTORY: directories cannot be opened or fsynced there.
+    if not hasattr(os, "O_DIRECTORY"):
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
