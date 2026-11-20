@@ -28,12 +28,23 @@
 #define TRTLLM_ABI_NAMESPACE _v1
 #endif
 
+// MSVC does not let a plain `namespace tensorrt_llm { namespace kernels {` block
+// reopen `kernels` of the inline ABI namespace, so the two spellings would name
+// two namespaces there. MSVC builds leave the ABI namespace out.
 #ifndef TRTLLM_ABI_NAMESPACE_BEGIN
+#ifdef _MSC_VER
+#define TRTLLM_ABI_NAMESPACE_BEGIN
+#else
 #define TRTLLM_ABI_NAMESPACE_BEGIN inline namespace TRTLLM_ABI_NAMESPACE {
+#endif
 #endif
 
 #ifndef TRTLLM_ABI_NAMESPACE_END
+#ifdef _MSC_VER
+#define TRTLLM_ABI_NAMESPACE_END
+#else
 #define TRTLLM_ABI_NAMESPACE_END }
+#endif
 #endif
 
 /**
