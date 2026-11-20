@@ -621,8 +621,11 @@ MODULE_DECIDED_THEOREMS = (
     "AttnR.output_depends_on_range",
     "AttnR.range_around_position_is_causal_at_end",
 )
-#: `native_decide` theorems of the generated ``AttentionRangesCases.lean`` (the ranged attention class's spec cases)
-RANGES_DECIDED_THEOREMS = tuple(f"attnr_{n}_spec" for n, *_ in ATTN_RANGE_CASES)
+#: `native_decide` theorems of the generated ``AttentionRangesCases.lean``: the ranged attention class's spec cases and, per
+#: case, the equality of the ranged row's term with the explicit-key-set term of its visible set over a longer request
+RANGES_DECIDED_THEOREMS = tuple(
+    f"attnr_{n}_spec" for n, *_ in ATTN_RANGE_CASES
+) + tuple(f"attnr_{n}_keyset" for n, *_ in ATTN_RANGE_CASES)
 #: The `native_decide` theorems of the generated `AttentionMaskCases.lean`: the explicit-key-set spec cases and, per causal toy
 #: case, the equality of the causal row's term with the explicit-key-set term of its causal range.
 ATTN_MASK_DECIDED_THEOREMS = tuple(
@@ -1398,8 +1401,12 @@ def render_ranges() -> str:
         "",
         "/-! The ranged attention class on toy sizes (T = 16, C = 32; a row sees its causal keys and its range): the Python spec's "
         "output element (`attention/batch_invariant/spec.py`, `RowSpec.brange`) reproduced by `AttentionRanges.lean` node for node, "
-        "the split kernel's equality to it instantiated on every case, and the causal class's term on the cases without a range. -/",
+        "the split kernel's equality to it instantiated on every case, the causal class's term on the cases without a range, and "
+        "the explicit-key-set row with the same visible set: the general theorem instantiated on the row's own key range, and the "
+        f"equality decided for a request with {ATTN_MASK_EXTRA_KEYS} more keys (the Python spec builds the same term object). -/",
     ]
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+
     for name, D, T, C, p, win, ra, rb, rid, d, sx in attn_range_cases():
         tb = T.bit_length() - 1
         L.append(
@@ -1417,6 +1424,18 @@ def render_ranges() -> str:
                 f"theorem attnr_{name}_causal : AttnR.output attnRP_{name} = Attn.output attnRP_{name}.causal := "
                 f"AttnR.no_range_is_causal _ (by decide)"
             )
+        ranged = RowSpec(p=p, window_left=win, row=rid, brange=(ra, rb))
+        kv_len = ranged.L + ATTN_MASK_EXTRA_KEYS
+        S = AttentionSpec(D, T=T, C=C)
+        assert S.output(ranged.as_key_set(kv_len), d) is S.output(ranged, d), name
+        L.append(
+            f"theorem attnr_{name}_keyset_row : Attn.maskOutput (Attn.MParams.ofV attnRP_{name}.toV) = AttnR.output attnRP_{name} := "
+            f"AttnR.key_set_row_of_range_row _ (by decide)"
+        )
+        L.append(
+            f"theorem attnr_{name}_keyset : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, "
+            f"{_lean_bools([ranged.visible(k) for k in range(kv_len)])}, {rid}, {d}⟩ = AttnR.output attnRP_{name} := by native_decide"
+        )
     L.append(
         "def attnRangesCases : List (String × AttnR.Params) := ["
         + ", ".join(f'("{n}", attnRP_{n})' for n, *_ in ATTN_RANGE_CASES)
