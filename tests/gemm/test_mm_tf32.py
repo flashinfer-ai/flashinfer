@@ -54,13 +54,14 @@ def _check(out: torch.Tensor, a: torch.Tensor, b: torch.Tensor):
 
 
 # Curated smoke set: one plain case per backend, PDL and autotune on each that has
-# them, an N tail and a short K.
+# them, N tails and a short K.
 _SMOKE_CASES = [
     # m, n, k, pdl, backend, auto_tuning
     (1, 1024, 256, False, "cute-dsl", False),
     (8, 256, 8192, True, "cute-dsl", False),
     (24, 200, 4096, False, "cute-dsl", True),
     (130, 384, 2048, True, "cute-dsl", False),
+    (8, 250, 4096, True, "cute-dsl", False),  # N % 4 != 0: 8-byte-aligned output rows
     (64, 256, 8192, False, "cublas", False),
     (16, 256, 4096, True, "auto", True),
     (1024, 2048, 1024, False, "auto", False),
@@ -118,11 +119,32 @@ def test_mm_tf32_cute_dsl_tactics(m, n, k, overrides):
     assert torch.equal(out, again), f"{tactic}: two runs differ"
 
 
+def test_mm_tf32_explicit_tactic():
+    _require_cute_dsl()
+    m, n, k = 256, 256, 8192
+    a, b = _inputs(m, n, k)
+    tactic = (64, 64, 2, 4, 64)
+    out = mm_tf32(a, b, pdl=True, tactic=tactic)
+    torch.cuda.synchronize()
+    _check(out, a, b)
+    assert torch.equal(out, mm_tf32(a, b, pdl=True, backend="auto", tactic=tactic))
+    with pytest.raises(ValueError, match="cute-dsl backend only"):
+        mm_tf32(a, b, backend="cublas", tactic=tactic)
+    # Under autotune() the tactic still runs as given; nothing is profiled.
+    with autotune(True):
+        assert torch.equal(out, mm_tf32(a, b, pdl=True, tactic=tactic))
+    for backend in ("auto", "cute-dsl"):
+        with pytest.raises(ValueError, match="split_k"):
+            mm_tf32(a, b, backend=backend, tactic=(64, 64, 3, 4, 64))
+    with pytest.raises(TypeError):
+        mm_tf32(a, b, True, None, "cute-dsl", tactic)  # keyword-only
+
+
 def test_mm_tf32_cute_dsl_pdl_waits_for_a():
     _require_cute_dsl()
     m, n, k = 8, 256, 8192
     a, b = _inputs(m, n, k)
-    expected = mm_tf32(a, b, pdl=True)
+    expected = mm_tf32(a, b, pdl=True, backend="cute-dsl")
 
     # The first element of a is what the previous kernel is still producing.
     # No other kernel may run between that producer and the GEMM.
@@ -130,7 +152,7 @@ def test_mm_tf32_cute_dsl_pdl_waits_for_a():
     value = word.item()
     word.fill_(0.0)
     late_store(word, value)
-    out = mm_tf32(a, b, pdl=True)
+    out = mm_tf32(a, b, pdl=True, backend="cute-dsl")
 
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 

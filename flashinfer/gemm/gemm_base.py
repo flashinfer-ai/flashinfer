@@ -1074,7 +1074,8 @@ def _cute_dsl_mm_tf32_requirement(
     b: torch.Tensor,
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cute-dsl", "cublas", "auto"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
 ):
     if not is_sm100a_supported(a.device):
         raise ValueError("The CuTeDSL TF32 backend requires SM10x with CUDA 12.8+.")
@@ -1086,8 +1087,10 @@ def _cute_dsl_mm_tf32_requirement(
         raise error("The CuTeDSL TF32 backend requires nvidia-cutlass-dsl.")
     from .kernels.dense_tf32_gemm_sm100_splitk import default_tactic
 
-    with torch.cuda.device(a.device):
-        default_tactic(a.shape[0], b.shape[1], a.shape[1])
+    # An explicit tactic is validated in the common check.
+    if tactic is None:
+        with torch.cuda.device(a.device):
+            default_tactic(a.shape[0], b.shape[1], a.shape[1])
     return True
 
 
@@ -1097,10 +1100,13 @@ def _cublas_mm_tf32_requirement(
     b: torch.Tensor,
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cute-dsl", "cublas", "auto"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
 ):
     if pdl and backend == "cublas":
         raise ValueError("The cuBLAS TF32 backend has no PDL launch; pass pdl=False.")
+    if tactic is not None:
+        raise ValueError("tactic applies to the cute-dsl backend only.")
     if not torch.backends.cuda.matmul.allow_tf32:
         raise ValueError(
             "The cuBLAS TF32 backend runs torch.matmul, which uses TF32 only when "
@@ -1114,11 +1120,27 @@ def _check_mm_tf32_problem_size(
     b: torch.Tensor,
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cute-dsl", "cublas", "auto"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
 ):
     from .kernels.utils import validate_tf32_gemm_inputs
 
     validate_tf32_gemm_inputs(a, b, out)
+    if tactic is not None:
+        # Here rather than in the CuTeDSL check, so a bad tactic raises under
+        # "auto" too instead of leaving no backend.
+        from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+        if is_cute_dsl_available():
+            from .kernels.dense_tf32_gemm_sm100_splitk import (
+                Tf32SplitKTactic,
+                validate_tactic,
+            )
+
+            with torch.cuda.device(a.device):
+                validate_tactic(
+                    Tf32SplitKTactic(*tactic), a.shape[0], b.shape[1], a.shape[1]
+                )
     return True
 
 
@@ -1128,7 +1150,8 @@ def _heuristic_func_mm_tf32(
     b: torch.Tensor,
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cute-dsl", "cublas", "auto"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
 ):
     # The cluster split-K kernel wins while its 64 x 64 output tiles fit in half
     # the SMs (its splits fill the rest); beyond that cuBLAS's large tiles win.
@@ -1253,7 +1276,9 @@ def mm_tf32(
     b: torch.Tensor,
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cute-dsl", "cublas", "auto"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    *,
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
 ) -> torch.Tensor:
     r"""MM TF32: ``out = a @ b`` with FP32 inputs, TF32 MMAs and FP32 output.
 
@@ -1281,7 +1306,7 @@ def mm_tf32(
         Out tensor, shape (m, n), fp32 in row-major layout. Allocated if None.
 
     backend: Literal["cute-dsl", "cublas", "auto"]
-        The backend to use for the operation. Defaults to ``"cute-dsl"``.
+        The backend to use for the operation. Defaults to ``"auto"``.
         ``"cute-dsl"``: a low-M SM100/SM103/SM107 kernel that splits K over a
         thread-block cluster and reduces the partial sums in distributed
         shared memory in the same launch, in a fixed order (deterministic);
@@ -1292,6 +1317,13 @@ def mm_tf32(
         ``"auto"``: CuTeDSL first while its output tiles fit in half the
         SMs (low M), cuBLAS first above; with autotuning, the faster of the
         two per M bucket.
+
+    tactic: Optional[Tuple[int, int, int, int, int]]
+        CuTeDSL only: run this ``(mma_m, mma_n, split_k, ab_stages, cta_k)``
+        (``Tf32SplitKTactic`` field order) and skip the default and the
+        autotuner, also inside ``autotune()``. For callers that tune the kernel where it runs, e.g.
+        beside a concurrent kernel on another stream, where a smaller grid
+        that co-resides with it can finish first. Defaults to ``None``.
 
     Returns
     -------
@@ -1315,6 +1347,13 @@ def mm_tf32(
         out = torch.empty(
             (a.shape[0], b.shape[1]), device=a.device, dtype=torch.float32
         )
+    if tactic is not None:
+        from .kernels.dense_tf32_gemm_sm100_splitk import (
+            Tf32SplitKTactic,
+            run_tf32_splitk_dense,
+        )
+
+        return run_tf32_splitk_dense(a, b, out, pdl, Tf32SplitKTactic(*tactic))
     backends = mm_tf32.suitable_auto_backends if backend == "auto" else [backend]
     major, minor = torch.cuda.get_device_capability(a.device)
     runners = [
