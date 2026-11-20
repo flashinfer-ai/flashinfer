@@ -1414,12 +1414,14 @@ def test_xqa_large_negative_scores(dtype, random_scores, q_len, window_left):
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("seq_len,q_len", [(0, 1), (1, 1), (3, 3), (257, 1)])
-@pytest.mark.parametrize("num_splits", [1, 8])
-def test_xqa_empty_softmax_tiles(dtype, seq_len, q_len, num_splits, monkeypatch):
-    # Exercise both online merging and split-KV reduction, including empty chunks.
-    monkeypatch.setenv("XQA_NB_SUB_SEQ", str(num_splits))
+@pytest.mark.parametrize("num_pages", [None, 64])
+def test_xqa_empty_softmax_tiles(dtype, seq_len, q_len, num_pages):
+    # The launch uses one split-KV block per 256 tokens of block-table capacity
+    # (bounded by the SM count), so a 64-page table gives four blocks and leaves
+    # the ones past seq_len empty. The exact-size table covers the short launch.
     workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=GPU_DEVICE)
-    num_pages = max(1, (seq_len + 15) // 16)
+    if num_pages is None:
+        num_pages = max(1, (seq_len + 15) // 16)
     query = torch.zeros(q_len, 8, 128, dtype=dtype, device=GPU_DEVICE)
     query[..., 0] = 1024
     key = torch.zeros(num_pages, 16, 1, 128, dtype=dtype, device=GPU_DEVICE)
@@ -1439,7 +1441,7 @@ def test_xqa_empty_softmax_tiles(dtype, seq_len, q_len, num_splits, monkeypatch)
             None
         ],
         seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=GPU_DEVICE),
-        max_seq_len=max(1, seq_len),
+        max_seq_len=num_pages * 16,
         bmm1_scale=1.0,
         bmm2_scale=1.0,
         q_len_per_req=q_len,
