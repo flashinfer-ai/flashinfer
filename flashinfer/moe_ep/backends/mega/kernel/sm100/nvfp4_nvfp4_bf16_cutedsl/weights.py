@@ -270,7 +270,6 @@ def preprocess_standard_mega_weights(
     _resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
-    kwargs = dict(quant_kind="nvfp4", intermediate_size=intermediate_size)
     if isinstance(weights, PrequantizedMoEWeights):
 
         def typed_scale(scale):
@@ -284,11 +283,17 @@ def preprocess_standard_mega_weights(
             typed_scale(weights.w13_scale),
             typed_scale(weights.w2_scale),
             hidden_size=hidden_size,
-            **kwargs,
+            quant_kind="nvfp4",
+            intermediate_size=intermediate_size,
         )
     if weights.w13.shape[1:] != (2 * intermediate_size, hidden_size):
         raise ValueError("w13 must have canonical shape [E, 2I, H].")
-    return preprocess_block_scaled_weights(weights.w13, weights.w2, **kwargs)
+    return preprocess_block_scaled_weights(
+        weights.w13,
+        weights.w2,
+        quant_kind="nvfp4",
+        intermediate_size=intermediate_size,
+    )
 
 
 def _nvfp4_swizzled_flat_sf_size(rows: int, cols: int) -> int:
