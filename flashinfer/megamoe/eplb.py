@@ -76,6 +76,22 @@ def _check_geometry(
         )
 
 
+def _plan_tensor(value: Any, shape: Tuple[int, ...], name: str) -> torch.Tensor:
+    """Validate integer plan data before converting it to CPU INT32."""
+    try:
+        tensor = torch.as_tensor(value, device="cpu")
+        torch.iinfo(tensor.dtype)
+    except (TypeError, ValueError, RuntimeError, OverflowError) as error:
+        raise ValueError(f"{name} must contain INT32 integers") from error
+    if tensor.numel() != math.prod(shape):
+        raise ValueError(f"{name} must have shape {shape}")
+    if any(
+        not -0x80000000 <= item <= _RESIDENT_BOUND for item in tensor.flatten().tolist()
+    ):
+        raise ValueError(f"{name} entries must fit in INT32")
+    return tensor.to(torch.int32).reshape(shape)
+
+
 class MegaMoEExpertSlots:
     """Redundant expert slots, their weights and the replica plan of one layer.
 
@@ -123,6 +139,12 @@ class MegaMoEExpertSlots:
     plan_generation : torch.Tensor
         INT32 ``[1]`` number of plans :meth:`plan_and_remap` has written,
         advanced on the device by every launch.
+
+    Notes
+    -----
+    Remapping assigns token ordinals in CTA arrival order, so prefill results
+    can vary bitwise between runs. Current tests check bitwise repeats through
+    128 tokens per rank; this is a tested range, not a determinism guarantee.
     """
 
     l1_weights: torch.Tensor
@@ -320,6 +342,10 @@ class MegaMoEExpertSlots:
         copies : array-like, optional
             ``[num_experts, ranks, 2]`` copy table (see :attr:`copies`). Every
             non-resident copy rank must hold the expert in ``slot_expert``.
+            The resident rank comes first; cumulative bounds are nonnegative
+            and nondecreasing. Zero-sized shares and finite final bounds are
+            allowed. A rank of -1 ends the row; its bound and later entries
+            are ignored. A row may use all ranks without a terminator.
             Omitted: every expert stays on its resident rank.
         expert_base : array-like, optional
             ``[num_experts]`` ordinal base of this rank (see :attr:`expert_base`).
@@ -337,15 +363,44 @@ class MegaMoEExpertSlots:
             self.num_experts,
             self.num_resident_experts,
         )
-        table = torch.as_tensor(slot_expert, dtype=torch.int32).reshape(R, S).cpu()
+        table = _plan_tensor(slot_expert, (R, S), "slot_expert")
         if int(table.min()) < -1 or int(table.max()) >= E:
             raise ValueError("slot_expert entries must be -1 or a logical expert")
+        held_by_rank = []
         for r in range(R):
             held = [int(e) for e in table[r] if int(e) >= 0]
             if len(held) != len(set(held)) or any(e // H == r for e in held):
                 raise ValueError(
                     "a rank's redundant slots must hold distinct non-resident experts"
                 )
+            held_by_rank.append(set(held))
+        copy_table = None
+        if copies is not None:
+            copy_table = _plan_tensor(copies, (E, R, 2), "copies")
+            for expert, row in enumerate(copy_table.tolist()):
+                resident = expert // H
+                if row[0][0] != resident:
+                    raise ValueError(
+                        "copies must list each expert's resident rank first"
+                    )
+                previous_bound = 0
+                for dest, bound in row:
+                    if dest == -1:
+                        break
+                    if not 0 <= dest < R:
+                        raise ValueError("copies ranks must be -1 or in [0, ranks)")
+                    if bound < previous_bound:
+                        raise ValueError(
+                            "copies bounds must be nonnegative and nondecreasing"
+                        )
+                    if dest != resident and expert not in held_by_rank[dest]:
+                        raise ValueError(
+                            "each non-resident copy must own a slot of its expert"
+                        )
+                    previous_bound = bound
+        base = None
+        if expert_base is not None:
+            base = _plan_tensor(expert_base, (E,), "expert_base")
         prev = self.slot_expert.cpu()
         pending = int(self.copy_count.item())
         waiting = set(self.copy_list.cpu()[:pending, 0].tolist())
@@ -356,18 +411,14 @@ class MegaMoEExpertSlots:
             and (int(table[self.rank, s]) != int(prev[self.rank, s]) or s in waiting)
         ]
         self.slot_expert.copy_(table)
-        if copies is None:
+        if copy_table is None:
             self._fill_resident_copies()
         else:
-            self.copies.copy_(
-                torch.as_tensor(copies, dtype=torch.int32).reshape(E, R, 2)
-            )
-        if expert_base is None:
+            self.copies.copy_(copy_table)
+        if base is None:
             self.expert_base.zero_()
         else:
-            self.expert_base.copy_(
-                torch.as_tensor(expert_base, dtype=torch.int32).reshape(E)
-            )
+            self.expert_base.copy_(base)
         self.local_counter.zero_()
         self.copy_list.zero_()
         if changed:

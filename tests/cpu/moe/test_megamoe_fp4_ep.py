@@ -446,3 +446,145 @@ def test_expert_slots_reject_cross_node_buffer_before_workspace_creation(monkeyp
     )
     with pytest.raises(ValueError, match="requires a single node"):
         megamoe.MegaMoEExpertSlots(SimpleNamespace(num_nodes=2), 256, 4)
+
+
+def _cpu_replica_plan():
+    """Create CPU-backed tables for the actual plan-installation method."""
+    slots = megamoe.MegaMoEExpertSlots.__new__(megamoe.MegaMoEExpertSlots)
+    slots.num_ranks, slots.num_experts = 4, 8
+    slots.num_resident_experts, slots.num_redundant_slots, slots.rank = 2, 2, 1
+    slots.slot_expert = torch.full((4, 2), -1, dtype=torch.int32)
+    slots.copies = torch.empty(8, 4, 2, dtype=torch.int32)
+    slots._fill_resident_copies()
+    slots.expert_base = torch.full((8,), 11, dtype=torch.int32)
+    slots.local_counter = torch.full((8,), 7, dtype=torch.int32)
+    slots.copy_list = torch.full((2, 2), -1, dtype=torch.int32)
+    slots.copy_count = torch.zeros(1, dtype=torch.int32)
+    slots.copy_done = torch.full((2, 2), 9, dtype=torch.int32)
+    table = torch.tensor([[2, 4], [0, 4], [0, 2], [0, 2]], dtype=torch.int64)
+    copies = slots.copies.to(torch.int64)
+    copies[0] = torch.tensor([[0, 0], [1, 0], [2, 2], [3, 2]])
+    # The device planner writes only the first sentinel, leaving later data stale.
+    copies[2] = torch.tensor([[1, 2], [0, 3], [-1, -1], [77, -42]])
+    copies[4] = torch.tensor([[2, 0], [1, 0], [-1, 0], [99, -99]])
+    base = torch.arange(8, dtype=torch.int64)
+    return slots, table, copies, base
+
+
+@pytest.mark.cpu_only
+def test_replica_plan_accepts_zero_shares_full_rows_and_stale_sentinel_tail():
+    slots, table, copies, base = _cpu_replica_plan()
+    assert slots.set_replica_plan(table, copies, base) == 2
+    assert torch.equal(slots.slot_expert, table.to(torch.int32))
+    assert torch.equal(slots.copies, copies.to(torch.int32))
+    assert torch.equal(slots.expert_base, base.to(torch.int32))
+    assert not slots.local_counter.any()
+    assert slots.copy_list.tolist() == [[0, 0], [1, 4]]
+    assert slots.copy_count.item() == 2
+    assert not slots.copy_done.any()
+    assert slots.set_replica_plan(table, copies, base) == 2
+    slots.copy_count.zero_()
+    assert slots.set_replica_plan(table, copies, base) == 0
+
+
+@pytest.mark.cpu_only
+def test_replica_plan_default_tables_restore_resident_only_routing():
+    slots, table, copies, base = _cpu_replica_plan()
+    slots.set_replica_plan(table, copies, base)
+    assert slots.set_replica_plan(torch.full((4, 2), -1)) == 0
+    assert slots.slot_expert.eq(-1).all()
+    assert slots.copies[:, 0, 0].tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert slots.copies[:, 0, 1].eq(torch.iinfo(torch.int32).max).all()
+    assert slots.copies[:, 1:].eq(-1).all()
+    assert not slots.expert_base.any() and not slots.copy_count.any()
+
+
+@pytest.mark.cpu_only
+def test_replica_plan_preserves_int32_boundary_values_and_flat_inputs():
+    slots, table, copies, base = _cpu_replica_plan()
+    base[0], base[1] = torch.iinfo(torch.int32).min, torch.iinfo(torch.int32).max
+    copies[2, 1, 1] = torch.iinfo(torch.int32).max
+    slots.set_replica_plan(table.flatten().tolist(), copies.flatten(), base)
+    assert torch.equal(slots.expert_base, base.to(torch.int32))
+    assert slots.copies[2, 1, 1].item() == torch.iinfo(torch.int32).max
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "slot_shape",
+        "slot_range",
+        "slot_resident",
+        "slot_duplicate",
+        "slot_float",
+        "slot_overflow",
+        "copies_shape",
+        "copies_float",
+        "copies_rank_range",
+        "copies_negative_rank",
+        "copies_wrong_resident",
+        "copies_missing_slot",
+        "copies_negative_bound",
+        "copies_decreasing_bounds",
+        "copies_rank_overflow",
+        "copies_bound_overflow",
+        "base_shape",
+        "base_float",
+        "base_overflow",
+    ],
+)
+def test_replica_plan_rejects_all_bad_inputs_before_mutating_tables(invalid):
+    slots, table, copies, base = _cpu_replica_plan()
+    if invalid == "slot_shape":
+        table = table[:-1]
+    elif invalid == "slot_range":
+        table[1, 0] = 8
+    elif invalid == "slot_resident":
+        table[1, 0] = 2
+    elif invalid == "slot_duplicate":
+        table[1, 1] = table[1, 0]
+    elif invalid == "slot_float":
+        table = table.to(torch.float32)
+    elif invalid == "slot_overflow":
+        table[1, 0] = 2**32
+    elif invalid == "copies_shape":
+        copies = copies[:-1]
+    elif invalid == "copies_float":
+        copies = copies.to(torch.float32)
+    elif invalid == "copies_rank_range":
+        copies[0, 1, 0] = 4
+    elif invalid == "copies_negative_rank":
+        copies[0, 1, 0] = -2
+    elif invalid == "copies_wrong_resident":
+        copies[0, 0, 0] = 1
+    elif invalid == "copies_missing_slot":
+        table[2, 0] = 1
+    elif invalid == "copies_negative_bound":
+        copies[0, 0, 1] = -1
+    elif invalid == "copies_decreasing_bounds":
+        copies[0, 0, 1], copies[0, 1, 1] = 3, 2
+    elif invalid == "copies_rank_overflow":
+        copies[0, 1, 0] = 2**32 + 1
+    elif invalid == "copies_bound_overflow":
+        copies[0, 0, 1] = 2**31
+    elif invalid == "base_shape":
+        base = base[:-1]
+    elif invalid == "base_float":
+        base = base.to(torch.float32)
+    elif invalid == "base_overflow":
+        base[0] = 2**31
+    names = (
+        "slot_expert",
+        "copies",
+        "expert_base",
+        "local_counter",
+        "copy_list",
+        "copy_count",
+        "copy_done",
+    )
+    before = {name: getattr(slots, name).clone() for name in names}
+    with pytest.raises(ValueError):
+        slots.set_replica_plan(table, copies, base)
+    for name in names:
+        assert torch.equal(getattr(slots, name), before[name]), name
