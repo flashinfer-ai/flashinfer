@@ -29,6 +29,7 @@ committed table is derived from measurements on B200 and GB300 only.
 
 import contextlib
 import itertools
+import math
 import os
 import threading
 from dataclasses import replace
@@ -548,9 +549,7 @@ def _memo_state_through_accessors(tuner):
     )
 
 
-def test_memo_state_reads_the_switch_and_stacks_as_the_tuner(
-    monkeypatch, fresh_tuner
-):
+def test_memo_state_reads_the_switch_and_stacks_as_the_tuner(monkeypatch, fresh_tuner):
     """The memo state reads the Cake switch on every call, compared as
     ``cake_auto_candidates_enabled`` compares it (also flipped between two
     calls), and the thread's skip_ops and override stacks as the tuner's
@@ -599,14 +598,20 @@ def test_memo_state_reads_the_switch_and_stacks_as_the_tuner(
     results = []
 
     def fresh_thread():
-        # No stack was created in this thread before the first read.
+        # No stack was created in this thread before the first read, and the
+        # read creates none (the accessors of the reference do).
         first = core._mla_cake_memo_state(tuner)
-        results.append((first, _memo_state_through_accessors(tuner)))
+        created = (
+            hasattr(tuner._skip_ops_local, "stack"),
+            hasattr(tuner._override_local, "stack"),
+        )
+        results.append((first, _memo_state_through_accessors(tuner), created))
 
     thread = threading.Thread(target=fresh_thread)
     thread.start()
     thread.join()
     assert results and results[0][0] == results[0][1] is not None
+    assert results[0][2] == (False, False)
 
 
 class _Workspace:
@@ -690,12 +695,8 @@ def test_decode_buckets_match_the_unmemoized_computation(monkeypatch):
     from flashinfer.cute_dsl import utils as cute_dsl_utils
 
     num_sms = {"value": 148}
-    monkeypatch.setattr(
-        cute_dsl_utils, "get_num_sm", lambda device: num_sms["value"]
-    )
-    trtllm_gen_buckets = get_hybrid_num_tokens_buckets(
-        core._TRTLLM_GEN_MLA_MAX_BATCH
-    )
+    monkeypatch.setattr(cute_dsl_utils, "get_num_sm", lambda device: num_sms["value"])
+    trtllm_gen_buckets = get_hybrid_num_tokens_buckets(core._TRTLLM_GEN_MLA_MAX_BATCH)
     sinks_tensor = torch.zeros(NUM_HEADS, dtype=torch.float32)
     checked = 0
     for case in itertools.product(
@@ -737,6 +738,54 @@ def test_decode_buckets_match_the_unmemoized_computation(monkeypatch):
             assert core._compute_mla_decode_buckets(*args) == expected, case
         checked += 1
     assert checked > 0
+
+
+def test_cute_dsl_batch_search_shares_entries_across_unread_max_seq_len(
+    monkeypatch,
+):
+    """The memoized CuTe DSL workspace search keys ``max_seq_len`` only for
+    the policy that reads it (monolithic): with the modular policy a call
+    with another ``max_seq_len`` hits the entry; with the monolithic policy
+    it searches again. No GPU needed."""
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+    sizer_calls = []
+    sizer = core._call_cute_dsl_workspace_sizer
+
+    def counting_sizer(*args, **kwargs):
+        sizer_calls.append(args)
+        return sizer(*args, **kwargs)
+
+    monkeypatch.setattr(core, "_call_cute_dsl_workspace_sizer", counting_sizer)
+    core._cute_dsl_max_batch_search.cache_clear()
+
+    def cap(impl, max_seq_len):
+        return core._cute_dsl_max_supported_batch(
+            workspace_bytes=16 << 20,
+            q_len=1,
+            num_heads=NUM_HEADS,
+            kv_lora_rank=LATENT,
+            max_active_blocks=148,
+            max_seq_len=max_seq_len,
+            candidate_max=core._TRTLLM_GEN_MLA_MAX_BATCH,
+            cute_dsl_impl=impl,
+            sinks=None,
+        )
+
+    try:
+        first = cap("modular", 1024)
+        assert sizer_calls
+        sizer_calls.clear()
+        assert [cap("modular", msl) for msl in (1025, 4096, 16384)] == [first] * 3
+        assert not sizer_calls
+        cap("monolithic", 1024)
+        sizer_calls.clear()
+        cap("monolithic", 1025)
+        assert sizer_calls
+    finally:
+        core._cute_dsl_max_batch_search.cache_clear()
 
 
 def test_untuned_auto_builds_no_cake_runner(monkeypatch, fresh_tuner):
@@ -1628,6 +1677,50 @@ def test_second_stage_times_a_cold_chain(monkeypatch, stages):
     assert stages.select(4) == (stages.runners[1], -1)
 
 
+def _margin_policies(tuner):
+    """The stored L2 policies of the second stage's winners."""
+    return {
+        policy[policy.index("l2_cache_policy") + 1]
+        for (_, key), policy in tuner._profiling_cache_policies.items()
+        if key.custom_op == core._MLA_CAKE_MARGIN_OP
+    }
+
+
+def test_second_stage_retunes_single_replay_entries(monkeypatch, stages):
+    """Second-stage winners stored under the single cold replay (as before the
+    chain) are not reused when tuning again: the tuning lookup rejects their
+    policy, so the incumbent and Cake are timed anew with the chain and the
+    stored policy becomes the chained one. No GPU needed."""
+    single = replace(
+        core._mla_cake_margin_tuning_config(stages.config, stages.ranges),
+        cold_chain_launches=1,
+        profile_arena_input_indices=(),
+    )
+    assert single.l2_cache_policy == "cold"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            core, "_mla_cake_margin_tuning_config", lambda config, ranges: single
+        )
+        stages.select(4, tune=True)
+    assert stages.cake_profiled() == [1, 2, 4, 8]
+    assert _margin_policies(stages.tuner) == {"cold"}
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == _CAKE_WINS
+
+    stages.profiled.clear()
+    recorded = _record_policies(monkeypatch)
+    runner, tactic = stages.select(4, tune=True)
+    assert _name(runner) == "cake" and tactic == WINNER
+    assert stages.cake_profiled() == [1, 2, 4, 8]
+    assert stages.incumbent_profiled() == [1, 2, 4, 8]
+    assert {
+        policy
+        for name, policy in recorded
+        if name in ("_MlaStageOneWinnerRunner", core._CAKE_MLA_RUNNER)
+    } == {_CHAIN_POLICY}
+    assert _margin_policies(stages.tuner) == {_CHAIN_POLICY}
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == _CAKE_WINS
+
+
 def test_round_up_second_stage_keeps_the_single_cold_replay(monkeypatch, stages):
     """Under ``autotune(round_up=True)`` the second stage uses the first
     stage's config, with its single cold replay. No GPU needed."""
@@ -2363,6 +2456,82 @@ def test_autotuned_auto_matches_reference(
     )
     for label, output in (("tuned", tuned), ("cached", cached)):
         _assert_matches_reference(output, case, label)
+
+
+@pytest.mark.parametrize(
+    "dtype,batch_size,q_len,page_size",
+    [
+        (torch.bfloat16, 4, 1, 32),
+        (torch.float8_e4m3fn, 2, 2, 64),
+    ],
+)
+def test_second_stage_chain_times_both_candidates(
+    monkeypatch, clean_tuner, dtype, batch_size, q_len, page_size
+):
+    """Real tuning of an offered unit: every second-stage measurement of the
+    incumbent and of Cake times the cold chain and returns a finite time
+    without an error; the chain's inputs have laned query and output, and
+    one block_tables and seq_lens; the second stage records no failed profile
+    and stores the chained policy. (A measurement error is otherwise only
+    logged and timed as infinite, and the call stays correct.)"""
+    _require_cake_arch()
+    margin_runners = {"_MlaStageOneWinnerRunner", core._CAKE_MLA_RUNNER}
+    measured = []
+    profile = AutoTuner._profile_single_kernel
+
+    def record(tuner, runner, inputs, tactic, tuning_config, *args, **kwargs):
+        name = type(runner).__name__
+        try:
+            result = profile(
+                tuner, runner, inputs, tactic, tuning_config, *args, **kwargs
+            )
+        except Exception as exc:
+            measured.append((name, tuning_config.l2_cache_policy, exc))
+            raise
+        measured.append((name, tuning_config.l2_cache_policy, result))
+        return result
+
+    chains = []
+    prepare = AutoTuner._prepare_input_tensors_with_batches
+
+    def record_batches(tuner, inputs, tuning_config):
+        batches = prepare(tuner, inputs, tuning_config)
+        if tuning_config.uses_cold_chain:
+            chains.append((inputs, batches))
+        return batches
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record)
+    monkeypatch.setattr(
+        AutoTuner, "_prepare_input_tensors_with_batches", record_batches
+    )
+    case = _make_case(
+        dtype=dtype, batch_size=batch_size, q_len=q_len, page_size=page_size
+    )
+    _offer_case(monkeypatch, case)
+    failed = clean_tuner.stats.failed_profiling_count
+    failed_before = set(failed.get(core._MLA_CAKE_MARGIN_OP, ()))
+
+    with autotune(True, tuning_buckets=TUNING_BUCKETS):
+        tuned = _decode(case)
+
+    margin = [entry for entry in measured if entry[0] in margin_runners]
+    assert {name for name, _, _ in margin} == margin_runners
+    for name, policy, result in margin:
+        assert policy == _CHAIN_POLICY, (name, policy)
+        assert not isinstance(result, BaseException), (name, result)
+        assert math.isfinite(result) and result > 0, (name, result)
+    assert set(failed.get(core._MLA_CAKE_MARGIN_OP, ())) == failed_before
+    assert _margin_policies(clean_tuner) == {_CHAIN_POLICY}
+    assert chains
+    for inputs, batches in chains:
+        assert len(batches) == core._MLA_CAKE_MARGIN_CHAIN_LAUNCHES
+        for index in core._MLA_CAKE_MARGIN_ARENA_INPUTS:
+            assert len({batch[index].data_ptr() for batch in batches}) > 1, index
+        for index in (1, 2):
+            assert {batch[index].data_ptr() for batch in batches} == {
+                inputs[index].data_ptr()
+            }, index
+    _assert_matches_reference(tuned, case, "tuned")
 
 
 @pytest.mark.parametrize(
