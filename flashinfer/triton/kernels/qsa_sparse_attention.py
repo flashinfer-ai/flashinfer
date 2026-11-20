@@ -2350,16 +2350,17 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         return
     if T == 16382 and B == 2 and "w7" not in _NO_WSPEC:
         w7_bt, w7_rw, w7_mk, w7_bn, stages = (
-            (2, 16, 16, 64, 1) if _SMALL_NATIVE_Q_TILE else (21, 128, 32, 128, 2)
+            (5, 32, 16, 64, 1) if _SMALL_NATIVE_Q_TILE else (21, 128, 32, 128, 2)
         )
         w7_nprog = (T + w7_bt - 1) // w7_bt + 1
-        kd, vd = _desc(k_cache, v_cache, w7_bn, nslot)
+        host_desc = bool(_HTMA) and not _SMALL_NATIVE_Q_TILE
+        kd, vd = _desc(k_cache, v_cache, w7_bn, nslot) if host_desc else (k_cache, v_cache)
         try:
             _qsa_w7_tma[(w7_nprog,)](
                 q, gate, k_cache, v_cache, kd, vd,
                 packed, cu_seqlens, page_base, out,
                 T, nslot, BT=w7_bt, RW=w7_rw, MK=w7_mk, BN=w7_bn,
-                HOST_DESC=bool(_HTMA),
+                HOST_DESC=host_desc,
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
                 num_warps=8, num_stages=stages)
             return
@@ -2405,17 +2406,18 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         "w6" not in _NO_WSPEC
     ):
         w6_bt, w6_rw, w6_mk, wbn, stages = (
-            (2, 16, 16, 64, 1) if _SMALL_NATIVE_Q_TILE
+            (5, 32, 16, 64, 1) if _SMALL_NATIVE_Q_TILE
             else (21, 128, 32, 128 if T == 4057 else bn, 2)
         )
         w6_nprog = (T + w6_bt - 1) // w6_bt + B - 1
-        kd, vd = _desc(k_cache, v_cache, wbn, nslot)
+        host_desc = bool(_HTMA) and not _SMALL_NATIVE_Q_TILE
+        kd, vd = _desc(k_cache, v_cache, wbn, nslot) if host_desc else (k_cache, v_cache)
         try:
             _qsa_w6[(w6_nprog,)](
                 q, gate, k_cache, v_cache, kd, vd, packed, cu_seqlens,
                 page_base,
                 out, T, nslot, BT=w6_bt, RW=w6_rw, MK=w6_mk, BN=wbn, NR=B,
-                HTMA=bool(_HTMA),
+                HTMA=host_desc,
                 CAPQ=False, FASTEX2=(T < 6000), GATEPTX=(T >= 6000),
                 PEEL=(T < 6000), DEN16=(T == 4057),
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
