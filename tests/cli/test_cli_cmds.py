@@ -14,6 +14,7 @@ the other logging/replay functionality tests, since it's tightly coupled with th
 """
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -167,10 +168,16 @@ def test_download_cubin_flag_mocked(monkeypatch):
     assert "All cubin download tasks completed successfully" in out
 
 
-def test_download_cubin_cmd_mocked(monkeypatch):
+def test_download_cubin_cmd_mocked(monkeypatch, tmp_path):
     """
     Test that download-cubin downloads raw cubin artifacts using a mocked cubin path.
     """
+    # download_artifacts() prunes every cached file missing from the (mocked)
+    # manifest, so keep it off the shared cubin cache that concurrent JIT
+    # builds read from.
+    monkeypatch.setattr(
+        "flashinfer.artifacts.FLASHINFER_CUBIN_DIR", tmp_path / "cubins"
+    )
     fmha_cubin = "fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP32VarSeqQ128Kv128PersistentContext.cubin"
 
     def mock_get_subdir_file_list():
@@ -268,6 +275,52 @@ def test_install_jit_cache_wheel_cmd_minimal_does_not_add_sm80(monkeypatch):
         "flashinfer-jit-cache==0.4.1+cu130",
         "flashinfer-jit-cache-sm120f==0.4.1+cu130",
     ]
+
+
+def test_install_jit_cache_wheel_cmd_sm_implies_minimal(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "12.9")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm90a")
+
+    out = _test_cmd_helper(["install-jit-cache-wheel", "--sm", "sm90a", "--dry-run"])
+
+    _assert_output_contains_all(
+        out,
+        "Install mode: minimal",
+        "Providers: sm90a",
+        "--no-deps",
+        "flashinfer-jit-cache==0.4.1+cu129 flashinfer-jit-cache-sm90a==0.4.1+cu129",
+    )
+    assert "flashinfer-jit-cache-sm80" not in out
+
+
+def test_install_jit_cache_wheel_cmd_rejects_sm_with_mode_all(monkeypatch):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    def fail_run(*_args, **_kwargs):
+        pytest.fail("Conflicting options must not execute subprocesses")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "install-jit-cache-wheel",
+            "--cuda-version",
+            "12.9",
+            "--mode",
+            "all",
+            "--sm",
+            "sm90a",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--sm cannot be combined with --mode all." in result.output
 
 
 def test_install_jit_cache_wheel_cmd_minimal_detects_visible_sm(monkeypatch):
@@ -828,6 +881,203 @@ def test_download_kernels_cmd_mocked(monkeypatch):
     ]
 
 
+def test_download_kernels_cmd_sm_installs_only_compatible_provider(monkeypatch):
+    recorded = []
+
+    def mock_run(cmd, check=False):
+        recorded.append((cmd, check))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm89")
+
+    out = _test_cmd_helper(
+        [
+            "download-kernels",
+            "--cuda-version",
+            "12.9",
+            "--flashinfer-version",
+            "0.4.1",
+            "--sm",
+            "sm86",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "=== Cubin Wheel Install ===",
+        "=== JIT Cache Wheel Install ===",
+        "Install mode: minimal",
+        "Providers: sm80",
+        "flashinfer-jit-cache-sm80==0.4.1+cu129",
+    )
+    assert recorded == [
+        (
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--no-deps",
+                "--index-url",
+                "https://flashinfer.ai/whl",
+                "flashinfer-cubin==0.4.1",
+            ],
+            False,
+        ),
+        (
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--no-deps",
+                "--index-url",
+                "https://flashinfer.ai/whl/cu129",
+                "flashinfer-jit-cache==0.4.1+cu129",
+                "flashinfer-jit-cache-sm80==0.4.1+cu129",
+            ],
+            False,
+        ),
+    ]
+
+
+def test_download_kernels_cmd_minimal_detects_visible_sm(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "12.9")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(
+        flashinfer_main.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(9, "0a")},
+    )
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm90a")
+
+    out = _test_cmd_helper(["download-kernels", "--mode", "minimal", "--dry-run"])
+
+    _assert_output_contains_all(
+        out,
+        "flashinfer-cubin==0.4.1",
+        "Install mode: minimal",
+        "Providers: sm90a",
+        "flashinfer-jit-cache-sm90a==0.4.1+cu129",
+    )
+    assert "flashinfer-jit-cache-sm80" not in out
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            ["--mode", "all", "--sm", "sm90a"],
+            "--sm cannot be combined with --mode all.",
+        ),
+        (["--sm", "hopper"], "Invalid SM architecture 'hopper'."),
+        (
+            ["--cuda-version", "12.7"],
+            "No compatible flashinfer-jit-cache wheel found for CUDA 12.7",
+        ),
+    ],
+)
+def test_download_kernels_cmd_rejects_invalid_selection_before_install(
+    monkeypatch, args, message
+):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    def fail_run(*_args, **_kwargs):
+        pytest.fail("Invalid options must not install any wheel")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    result = CliRunner().invoke(
+        cli, ["download-kernels", "--flashinfer-version", "0.4.1", *args]
+    )
+
+    assert result.exit_code != 0
+    assert message in result.output
+    assert "=== Cubin Wheel Install ===" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("command", "flag", "expected_url"),
+    [
+        ("install-cubin-wheel", "--index-url", "https://mirror.example/cubin"),
+        ("install-cubin-wheel", "--cubin-index-url", "https://mirror.example/cubin"),
+        ("install-jit-cache-wheel", "--index-url", "https://mirror.example/jit"),
+        (
+            "install-jit-cache-wheel",
+            "--jit-cache-index-url",
+            "https://mirror.example/jit",
+        ),
+    ],
+)
+def test_install_wheel_cmds_accept_download_kernels_index_url_spelling(
+    monkeypatch, command, flag, expected_url
+):
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(
+        [
+            command,
+            "--flashinfer-version",
+            "0.4.1",
+            *(
+                ["--cuda-version", "12.9"]
+                if command == "install-jit-cache-wheel"
+                else []
+            ),
+            flag,
+            expected_url,
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(out, f"--index-url {expected_url}")
+
+
+def test_kernel_wheel_install_cmds_share_option_help():
+    """Options the install commands share must not drift apart."""
+    import click
+
+    from flashinfer.__main__ import cli
+
+    def option_help(command_name):
+        command = cli.commands[command_name]
+        return {
+            option: param.help
+            for param in command.params
+            for option in param.opts
+            if isinstance(param, click.Option)
+        }
+
+    cubin = option_help("install-cubin-wheel")
+    jit_cache = option_help("install-jit-cache-wheel")
+    kernels = option_help("download-kernels")
+
+    for option in ("--cuda-version", "--mode", "--sm"):
+        assert jit_cache[option] == kernels[option], option
+    for option in ("--flashinfer-version", "--nightly", "--dry-run"):
+        assert cubin[option] == jit_cache[option] == kernels[option], option
+    assert cubin["--cubin-index-url"] == kernels["--cubin-index-url"]
+    assert jit_cache["--jit-cache-index-url"] == kernels["--jit-cache-index-url"]
+
+
 def test_download_kernels_cmd_allows_local_flashinfer_version(monkeypatch):
     def fail_run(*_args, **_kwargs):
         raise AssertionError("subprocess.run should not be called for dry-run")
@@ -889,6 +1139,116 @@ def test_download_kernels_cmd_attempts_jit_cache_after_cubin_failure(monkeypatch
     assert len(recorded) == 2
     assert recorded[0][0][-1] == "flashinfer-cubin==0.4.1"
     assert recorded[1][0][-1] == "flashinfer-jit-cache==0.4.1+cu129"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_download_kernels_cmds_as_invoked_by_vllm(monkeypatch, dry_run):
+    """Keep the commands vLLM's ``vllm download-kernels`` wrapper runs working.
+
+    vLLM (vllm/entrypoints/cli/download_kernels.py) runs ``python -m flashinfer
+    download-kernels`` when PyTorch's CUDA is 12.9 or newer and
+    ``install-cubin-wheel`` otherwise, appending only ``--dry-run``. Both must
+    keep working with no other flags and with the CUDA version detected from
+    PyTorch.
+    """
+    import flashinfer.__main__ as flashinfer_main
+
+    recorded = []
+
+    def mock_run(cmd, check=False):
+        recorded.append(cmd)
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "13.0")
+    dry_run_args = ["--dry-run"] if dry_run else []
+
+    out = _test_cmd_helper(["download-kernels", *dry_run_args])
+    _assert_output_contains_all(
+        out,
+        "flashinfer-cubin==0.4.1",
+        "Install mode: all",
+        "https://flashinfer.ai/whl/cu130",
+        "flashinfer-jit-cache==0.4.1+cu130",
+    )
+
+    out = _test_cmd_helper(["install-cubin-wheel", *dry_run_args])
+    _assert_output_contains_all(out, "flashinfer-cubin==0.4.1")
+
+    if dry_run:
+        assert recorded == []
+    else:
+        assert [cmd[-1] for cmd in recorded] == [
+            "flashinfer-cubin==0.4.1",
+            "flashinfer-jit-cache==0.4.1+cu130",
+            "flashinfer-cubin==0.4.1",
+        ]
+        # mode "all" lets pip resolve every provider from the shim.
+        assert "--no-deps" not in recorded[1]
+
+
+def test_download_kernels_cmd_with_stale_kernel_wheels_real(tmp_path):
+    """Kernel wheels left behind by an upgrade must not block their replacement.
+
+    Regression test for #5886. The mismatch is detected while ``flashinfer`` is
+    imported, before the CLI runs, so this has to start a fresh interpreter.
+    """
+    import flashinfer
+
+    if flashinfer.__version__ == "0.0.0+unknown":
+        pytest.skip("Source checkouts without build metadata skip the version check.")
+
+    for package, version, entry_point in (
+        ("flashinfer_cubin", "0.0.1", "get_cubin_dir"),
+        ("flashinfer_jit_cache", "0.0.1+cu130", "get_jit_cache_providers"),
+    ):
+        (tmp_path / package).mkdir()
+        (tmp_path / package / "__init__.py").write_text(
+            f"__version__ = {version!r}\n"
+            f"def {entry_point}():\n"
+            f"    raise AssertionError('stale {package} must not be used')\n"
+        )
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in ("FLASHINFER_CUBIN_DIR", "FLASHINFER_DISABLE_VERSION_CHECK")
+    }
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(tmp_path), env.get("PYTHONPATH")))
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "flashinfer",
+            "download-kernels",
+            "--cuda-version",
+            "13.0",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    public_version = Version(flashinfer.__version__).public
+    _assert_output_contains_all(
+        output,
+        "Ignoring incompatible flashinfer-cubin package",
+        "Ignoring incompatible flashinfer-jit-cache package",
+        "flashinfer download-kernels",
+        f"flashinfer-cubin=={public_version}",
+        f"flashinfer-jit-cache=={public_version}+cu130",
+    )
 
 
 class MockJitSpec:

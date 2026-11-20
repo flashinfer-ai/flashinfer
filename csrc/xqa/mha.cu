@@ -30,6 +30,9 @@
 #ifndef GENERATE_CUBIN
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+#include <string>
+
 #include "hostUtils.h"
 #ifndef NDEBUG
 #include <cstdio>

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from flashinfer import SfLayout
 from flashinfer.fp4_quantization import nvfp4_quantize
 from flashinfer.grouped_mm import grouped_mm_fp4
+from flashinfer.grouped_mm.cudnn import _cudnn_moe_block_scale_min_version
 
 from .conftest import (
     ref_grouped_mm,
@@ -333,6 +334,28 @@ class TestGroupedMmFp4:
 @requires_cudnn_moe_block_scale
 @requires_grouped_mm_fp4_cc
 class TestGroupedMmFp4Validation:
+    def test_sm12x_requires_block_scale_cudnn(self, monkeypatch):
+        """SM120 / SM121 reject a cuDNN without their block-scaled engine before
+        any graph is built."""
+        import cudnn
+
+        import flashinfer.grouped_mm.core as grouped_mm_core
+
+        a = torch.zeros(128, 64, dtype=torch.uint8, device="cuda")
+        b = torch.zeros(1, 128, 64, dtype=torch.uint8, device="cuda")
+        a_descale = torch.zeros(128, 8, dtype=torch.float8_e4m3fn, device="cuda")
+        b_descale = torch.zeros(1, 128, 8, dtype=torch.float8_e4m3fn, device="cuda")
+        m_indptr = torch.tensor([0, 128], dtype=torch.int32, device="cuda")
+        required = _cudnn_moe_block_scale_min_version(120)
+        monkeypatch.setattr(
+            grouped_mm_core, "get_compute_capability", lambda _: (12, 0)
+        )
+        monkeypatch.setattr(cudnn, "backend_version", lambda: required - 100)
+        with pytest.raises(
+            RuntimeError, match=f"requires backend version >= {required}"
+        ):
+            grouped_mm_fp4(a, b, a_descale, b_descale, m_indptr, block_size=16)
+
     def test_wrong_input_dtype(self):
         a = torch.randn(64, 64, dtype=torch.bfloat16, device="cuda")
         b = torch.randn(2, 64, 64, dtype=torch.bfloat16, device="cuda")

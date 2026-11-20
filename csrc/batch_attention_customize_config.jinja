@@ -13,6 +13,11 @@ using namespace flashinfer;
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
+#define BATCH_ATTENTION_KV_STRIDE_MODE_RUNTIME 0
+#define BATCH_ATTENTION_KV_STRIDE_MODE_EQUAL 1
+#define BATCH_ATTENTION_KV_STRIDE_MODE_INDEPENDENT 2
+#define BATCH_ATTENTION_KV_STRIDE_MODE BATCH_ATTENTION_KV_STRIDE_MODE_{{ paged_kv_stride_mode | upper }}
+
 #ifdef FLASHINFER_ENABLE_PROFILER
 #define PROFILER_PARAMS_SETTER \
   params[i].profiler_buffer = static_cast<uint64_t*>(profiler_buffer.data_ptr());

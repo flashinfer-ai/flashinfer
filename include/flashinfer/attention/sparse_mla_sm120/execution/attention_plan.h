@@ -14,7 +14,7 @@ namespace flashinfer::sparse_mla_sm120::execution {
 constexpr int DecodeMaxHeads = 128;
 constexpr int FixedPageSize = 64;
 constexpr bool runtime_page(ModelType model) {
-  return model == ModelType::DSV4 || model == ModelType::DSV4_1 || model == ModelType::DSV3_2 ||
+  return model == ModelType::DSV4 || is_dsv41(model) || model == ModelType::DSV3_2 ||
          model == ModelType::GLM_NSA || model == ModelType::GLM53_NOPE ||
          model == ModelType::DOTS3_SWA;
 }
@@ -32,11 +32,11 @@ PrefillLaunchResult visit_prefill_heads(int heads, F&& call) {
   constexpr bool swap = Variant == 4;
 #define HEAD(H) \
   if (heads == H) return call(std::integral_constant<int, H>{});
-  if constexpr ((sg && (inline_scale || MT == ModelType::DSV4_1 || MT == ModelType::DOTS3_SWA)) ||
+  if constexpr ((sg && (inline_scale || is_dsv41(MT) || MT == ModelType::DOTS3_SWA)) ||
                 (mg && MT == ModelType::DSV4)) {
     HEAD(8) HEAD(16)
   }
-  if constexpr ((sg && (MT == ModelType::DSV4_1 || MT == ModelType::DOTS3_SWA)) ||
+  if constexpr ((sg && (is_dsv41(MT) || MT == ModelType::DOTS3_SWA)) ||
                 (mg && (inline_scale || MT == ModelType::DSV4))) {
     HEAD(32) HEAD(64)
   }
@@ -64,12 +64,13 @@ inline bool has_prefill_heads(ModelType model, int variant, int heads) {
     MODEL(GLM53_NOPE);
     MODEL(DOTS3_SWA);
     MODEL(DSV4_1);
+    MODEL(DSV4_1_INLINE);
   }
 #undef MODEL
   return false;
 }
 
-#define SPARSE_MLA_EXTRA_PAGES(F) F(64) F(2)
+#define SPARSE_MLA_EXTRA_PAGES(F) F(64) F(32) F(2)
 
 template <typename F>
 PrefillLaunchResult visit_extra_page(int page, F&& call) {
@@ -98,6 +99,13 @@ auto visit_decode_heads(int heads, F&& call) {
 constexpr int decode_scratch_heads(int heads) { return heads == 8 ? 8 : (heads + 15) / 16 * 16; }
 
 enum class NumericRoute : int64_t { FP8, QkBF16PvFP8, FullBF16, NVFP4 };
+// Kernel families, independent of whether the call enables the mega prologue
+// and epilogue. NVFP4 entries consume the DSV4 packed FP4 cache: Decode uses
+// the base head tile, GroupedDecode shares KV across a larger head group, and
+// Prefill uses its streaming prefill kernel. The FP8 entries consume homogeneous
+// DSV4_1 / DSV4_1_INLINE caches: SplitKVDecode is the cooperative decode kernel,
+// while Decode reuses the prefill pipeline without KV splitting. Mixed-cache
+// and full-BF16 arithmetic retain separate routes.
 enum class Implementation : int64_t {
   Ordinary,
   MixedCache,
@@ -108,7 +116,9 @@ enum class Implementation : int64_t {
   MG,
   FullTile,
   SwapAB,
-  Dsv4Nvfp4Prefill
+  Dsv4Nvfp4Prefill,
+  Dsv4Fp8SplitKVDecode,
+  Dsv4Fp8Decode
 };
 enum class Merge : int64_t { Direct, Merge2, General, Stage1 };
 
@@ -131,6 +141,9 @@ struct AttentionMetadata {
   bool has_sink;
   bool extra_fp4;
   int variant;
+  // Extra-cache row advance: the record width for footer caches, the
+  // validated row pitch for inline-scale records; zero without an extra cache.
+  size_t extra_row_stride_bytes = 0;
 };
 
 struct DeviceCaps {
@@ -161,6 +174,8 @@ struct ExecutionPlan {
 };
 
 // QkBF16PvFP8 as a request permits that route; the resolver may still select FP8.
+void set_fp8_decode_resources(ExecutionPlan& plan);
+
 ExecutionPlan resolve_attention(const AttentionMetadata& metadata, NumericRoute requested,
                                 int requested_cpb, DeviceCaps caps);
 

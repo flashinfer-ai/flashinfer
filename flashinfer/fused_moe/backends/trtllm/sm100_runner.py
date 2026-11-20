@@ -36,6 +36,9 @@ from flashinfer.fused_moe.shared.validation import (
     resolve_moe_act_sf_layout,
 )
 from flashinfer.jit.core import logger
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP4_4OVER6_CODE_FROM_ENV,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -76,8 +79,13 @@ class MoERunner(TunableRunner):
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
         num_fused_shared_experts: int = 0,
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        localized_sm_count: int = 0,
     ):
         self.moe_op = moe_op
+        # SMs per locality domain when the GEMMs run localized (uGPU); 0 otherwise. A
+        # localized launch runs each GEMM at half its shape, so it has its own tactics.
+        self.localized_sm_count = int(localized_sm_count)
         self.num_local_experts = num_local_experts
         self.top_k = top_k
         self.num_fused_shared_experts = num_fused_shared_experts or 0
@@ -94,6 +102,9 @@ class MoERunner(TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_packed_weights = use_packed_weights
         self.use_per_token_scaling = use_per_token_scaling
+        # 4over6 recipe (nvfp4_4over6_code()) for the per-token GEMM2-input
+        # requantization; the default reads FLASHINFER_NVFP4_4OVER6* per call.
+        self.nvfp4_4over6_code = int(nvfp4_4over6_code)
         self.num_experts = num_experts if num_experts is not None else num_local_experts
         # Runtime routing tensors and their initializer closures carry object
         # identity, so keep them in an attribute excluded by
@@ -128,6 +139,7 @@ class MoERunner(TunableRunner):
             int(self.weight_layout),
             bool(self.use_packed_weights),
             bool(self.use_per_token_scaling),
+            int(self.localized_sm_count),
         )
 
     def _make_tuning_config(
@@ -220,6 +232,9 @@ class MoERunner(TunableRunner):
             self.hidden_size_output,
             self.intermediate_size,
             self.num_local_experts + nfse,
+            # Global expert count: lets the launcher also offer the tiles that fit
+            # expert-parallel inputs whose rows carry global expert ids.
+            self.num_experts + nfse,
             self.activation_type,
             self.use_shuffled_weight,
             self.weight_layout,
@@ -227,10 +242,25 @@ class MoERunner(TunableRunner):
             num_tokens,
             has_gemm1_lora_delta,
         )
-        instance_key = (id(self.moe_op), query_key)
+        query_args: tuple = query_key
+        if self.localized_sm_count > 0:
+            query_args = (
+                self.top_k + nfse,
+                self.hidden_size,
+                self.intermediate_size,
+                self.num_local_experts + nfse,
+                self.num_experts + nfse,
+                num_tokens,
+                self.activation_type,
+                self.localized_sm_count,
+            )
+            query = self.moe_op.trtllm_get_valid_localized_moe_configs
+        else:
+            query = self.moe_op.trtllm_get_valid_moe_configs
+        instance_key = (id(self.moe_op), query_args)
         if instance_key not in MoERunner.valid_tactics_dict:
             try:
-                valid_tactics = self.moe_op.trtllm_get_valid_moe_configs(*query_key)
+                valid_tactics = query(*query_args)
             except Exception as e:
                 logger.debug(
                     f"[Autotuner]: Failed to get valid tactics for {query_key}. "
@@ -251,22 +281,27 @@ class MoERunner(TunableRunner):
         )
 
         moe_inputs = MoeRunnerInputs.from_list(inputs)
-        rows = self.moe_op.trtllm_get_valid_moe_factorizations(
-            self.dtype_act,
-            self.dtype_weights,
-            self.fp8_quantization_type,
-            self.top_k + self.num_fused_shared_experts,
-            self.hidden_size,
-            self.hidden_size_output,
-            self.intermediate_size,
-            self.num_local_experts + self.num_fused_shared_experts,
-            self.activation_type,
-            self.use_shuffled_weight,
-            self.weight_layout,
-            self.use_per_token_scaling,
-            moe_inputs.hidden_states.shape[0],
-            moe_inputs.gemm1_lora_delta is not None,
-        )
+        # The anchor probe loads each tile's default cubin in the current CUDA
+        # context, so run it on the inputs' device: a tile loadable only there
+        # would otherwise be dropped.
+        with torch.cuda.device(moe_inputs.hidden_states.device):
+            rows = self.moe_op.trtllm_get_valid_moe_factorizations(
+                self.dtype_act,
+                self.dtype_weights,
+                self.fp8_quantization_type,
+                self.top_k + self.num_fused_shared_experts,
+                self.hidden_size,
+                self.hidden_size_output,
+                self.intermediate_size,
+                self.num_local_experts + self.num_fused_shared_experts,
+                self.num_experts + self.num_fused_shared_experts,
+                self.activation_type,
+                self.use_shuffled_weight,
+                self.weight_layout,
+                self.use_per_token_scaling,
+                moe_inputs.hidden_states.shape[0],
+                moe_inputs.gemm1_lora_delta is not None,
+            )
         tactics = []
         anchors = {}
         for tile_n, config, fc1, fc2, is_anchor in rows:
@@ -314,6 +349,14 @@ class MoERunner(TunableRunner):
         da_routing_metadata = kwargs.get("da_routing_metadata", ())
         da_body_workspace = kwargs.get("da_body_workspace", ())
         prepare_da_body = do_preparation and bool(da_routing_metadata)
+        # Profiling launches share the caller's workspace so autotuning needs no scratch
+        # beyond it; a bucket larger than the buffer allocates what does not fit. DA bodies
+        # own their typed workspaces.
+        workspace_buffer = (
+            None
+            if da_routing_metadata or da_body_workspace
+            else kwargs.get("workspace_buffer")
+        )
 
         num_tokens = hidden_states.shape[0]
         assert output.shape[0] == num_tokens, (
@@ -401,6 +444,8 @@ class MoERunner(TunableRunner):
                 list(da_routing_metadata),
                 list(da_body_workspace),
                 prepare_da_body,
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -458,6 +503,8 @@ class MoERunner(TunableRunner):
                     prepare_da_body,
                     kwargs.get("valid_hidden_size"),
                     kwargs.get("valid_intermediate_size"),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
@@ -490,6 +537,8 @@ class MoERunner(TunableRunner):
                     [-1, -1] if tactic == -1 else tactic,
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
             else:
                 common_args = (
@@ -520,6 +569,9 @@ class MoERunner(TunableRunner):
                     list(da_routing_metadata),
                     list(da_body_workspace),
                     prepare_da_body,
+                    kwargs.get("gemm1_clamp_limit"),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
                 if routing_logits is None:
                     # FP8 per tensor scale, pre-computed routing.
@@ -579,6 +631,8 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -628,6 +682,16 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                workspace_buffer,
+                False,  # query_workspace_size
+                self.nvfp4_4over6_code,
+                list(kwargs.get("localized_weights") or []),
+                list(kwargs.get("localized_streams") or []),
+                self.localized_sm_count,
+                # Honored by every launch through this runner. Autotuning never
+                # captures because the public op leaves it out of the kwargs it
+                # passes to the tuner.
+                list(kwargs.get("fc2_input_out") or ()),
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

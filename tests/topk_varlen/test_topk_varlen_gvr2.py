@@ -529,6 +529,7 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
         next_n,
         cr,
         hint_free,
+        None,  # page_shift: unpaged output
         _host._arch_token(),
         _host._sm_count(),
     )
@@ -542,6 +543,25 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
     "rows,msl_c,top_k,next_n,cr,family",
     [
         (8, 131072, 1024, 4, 4, "reg_clus"),  # clustered register-resident
+        (8, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC admitted (local), CS=4
+        (64, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC, CS=2, one wave
+        (
+            4,
+            65536,
+            2048,
+            2,
+            1,
+            "reg_clus",
+        ),  # K > BLKC above 32K, CS=8, next_n rows (one wave on every part)
+        (
+            100,
+            65536,
+            512,
+            1,
+            1,
+            "main",
+        ),  # unsplit 75-148 row slab: two-CTA (512, 8, 2) regime (local)
+        (148, 32768, 2048, 1, 1, "main"),  # same regime, K > 1024 (KPT 4)
         (8, 6144, 512, 1, 4, "reg"),  # register-resident (local VPT=2 rung)
         (8, 8192, 512, 1, 1, "reg"),  # local VPT=2 rung, top of its band
         (256, 8192, 512, 1, 1, "reg"),  # local b > 148 BLK=512 rung (upstream: main)
@@ -1064,6 +1084,78 @@ def test_gvr2_sequential_warmup_populates_exact_launchers():
 
 
 @requires_gvr2
+@pytest.mark.parametrize("page_size", [None, 64], ids=["unpaged", "paged64"])
+def test_gvr2_warmup_launches_both_staged_output_variants(page_size):
+    """The register family's staged-output emit is a compile dimension picked
+    by the row count (one wave, rows <= SMs, stages; deeper grids emit
+    directly), so one register band holds two kernel objects. warmup_varlen's
+    band key did not include it: for a band spanning the SM count (N = 2048,
+    K = 512 covers every row count) only the one-wave variant got an eager
+    launch, and the many-wave variant was compiled by the final launcher
+    population without ever being called, leaving its first-call gate cold
+    for the capture that follows. next_n = 3 gives this test compile keys no
+    other test warms, so the objects are cold beforehand."""
+    top_k, msl, nn = 512, 2048, 3
+    sms = _host._sm_count()
+    rows = nn * sms  # past the SM count: the many-wave (direct-emit) variant
+    npad = _round64(msl)
+    page_shift = None if page_size is None else page_size.bit_length() - 1
+    modes = [(False, None), (True, None)]  # (hint_free, page_shift)
+    if page_shift is not None:
+        modes.append((True, page_shift))
+
+    def launcher(r, hf, ps):
+        hits = [
+            lc
+            for key, lc in _host._VARLEN_CACHE.items()
+            if key[:5] == (r, npad, top_k, msl, nn) and key[6:8] == (hf, ps)
+        ]
+        assert len(hits) == 1, (
+            f"{len(hits)} launchers: rows={r} hint_free={hf} page_shift={ps}"
+        )
+        return hits[0]
+
+    _host.warmup_varlen(
+        top_k, msl, next_n=nn, num_rows_list=(rows,), page_size=page_size
+    )
+    torch.cuda.synchronize()
+    for hf, ps in modes:
+        many = launcher(rows, hf, ps)  # the requested geometry (many waves)
+        one = launcher(nn, hf, ps)  # the band's first-row representative (one wave)
+        assert many[0] == one[0] == "reg", (many[0], one[0])
+        assert many[1] is not one[1], "the two row counts must compile distinct objects"
+        assert _host._first_call_done(one[1]), (
+            f"one-wave variant cold: hint_free={hf} page_shift={ps}"
+        )
+        assert _host._first_call_done(many[1]), (
+            f"many-wave variant cold: hint_free={hf} page_shift={ps}"
+        )
+    # the capture the warmup is for, at the requested geometry (hint-free, and
+    # paged through an identity table so slots are columns)
+    gen = torch.Generator(device=_DEV).manual_seed(31)
+    logits = torch.randn(rows, npad, generator=gen, device=_DEV) - 2.0
+    batch = rows // nn
+    seq_lens = torch.full((batch,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=_DEV)
+    kw = {}
+    if page_size is not None:
+        pt = torch.arange(npad // page_size, dtype=torch.int32, device=_DEV)
+        kw = dict(page_table=pt.repeat(batch, 1).contiguous(), page_size=page_size)
+    s = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out, next_n=nn, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(
+        logits, out, _row_valid_lens([msl] * batch, rows, nn, 1, msl), top_k
+    )
+
+
+@requires_gvr2
 def test_gvr2_rejects_overlapping_rows():
     """stride(0) < shape[1] (an expand view) is not a row-major layout the
     kernel can address; the checker used to derive npad = 0 from it and
@@ -1200,6 +1292,12 @@ def test_gvr2_route_pure_and_total():
         ([8192, 5000, 300, 1], 1, 1, 512),  # reg VPT=2 rung + short rows
         ([8192 * 4, 6000 * 4, 2048 * 4], 2, 4, 512),  # MTP rows, cr=4
         ([65536, 40000, 1000], 1, 1, 1024),  # reg_clus band
+        (
+            [32768, 20000, 2049, 2048, 1500, 1],
+            1,
+            1,
+            2048,
+        ),  # reg_clus, K > BLKC: short rows stride the identity write
         ([262144, 100000, 2047], 1, 1, 2048),  # main/clus band, K=2048
         ([8192] * 200 + [100] * 56, 1, 1, 512),  # b > sms BLK=512/VPT=4 rung
     ],
@@ -1520,6 +1618,92 @@ def test_gvr2_hint_free_concurrent_first_calls_on_many_streams_are_exact():
     assert not errors, errors
     for b, out in zip(batches, outs, strict=True):
         _check_varlen_rows(logits[:b], out, [n] * b, top_k)
+
+
+def test_gvr2_route_reg_clus_k2048():
+    """K = 2048 is admitted to the clustered register family (FlashInfer-local;
+    upstream gates it at k <= BLKC): every admitted row count up to 32K, and
+    above 32K only while the cluster grid fits one GPC wave (b * cs <= 7/8 of
+    the SM count: 129 on B200, 182 on Rubin)."""
+    r = _host.route
+    for n in (20480, 32768):
+        assert r(1, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        assert (
+            r(37, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        )  # 148 CTAs, still beats the slab here
+        assert r(64, n, _round64(n), 2048)["tpl"] == (1024, 4, 2)
+        assert (
+            r(75, n, _round64(n), 2048)["kernel"] == "main"
+        )  # no cluster fits (av == 1)
+    for n in (49152, 65536):
+        assert r(1, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        assert r(32, n, _round64(n), 2048)["tpl"] == (
+            1024,
+            4,
+            4,
+        )  # 128 CTAs: one wave on B200
+        assert (
+            r(37, n, _round64(n), 2048)["kernel"] == "main"
+        )  # 148 CTAs of 4-clusters: two waves on B200
+        assert r(44, n, _round64(n), 2048, sms=208)["tpl"] == (
+            1024,
+            4,
+            4,
+        )  # Rubin: 176 CTAs fit
+        assert (
+            r(52, n, _round64(n), 2048, sms=208)["kernel"] == "main"
+        )  # Rubin: 208 CTAs do not
+    # K <= BLKC admission unchanged by the wave gate
+    assert r(37, 65536, 65536, 1024)["kernel"] == "reg_clus"
+    assert (
+        r(1, 16384, 16384, 2048)["kernel"] == "reg"
+    )  # below the band: register rung as before
+
+
+def test_gvr2_route_unsplit_slab_regime():
+    """Unsplit slab rows (R == 1) in the 75-148 row band with rows of <= 64K
+    columns take the b > 148 configuration ((512, 8, 2): 512 threads, two CTAs
+    per SM) instead of upstream's one-wave 1024-thread slab; the split slab
+    (R > 1), 33-74 rows and rows above 64K keep the big regime (FlashInfer-
+    local, see _big_regime)."""
+    r = _host.route
+    for k in (512, 1024, 2048):
+        for b in (75, 104, 148):
+            for n in (32768, 49152, 65536):
+                p = r(b, n, _round64(n), k)
+                # tpl = (BLK, U, MINB, ...)
+                assert p["kernel"] == "main" and p["tpl"][:3] == (512, 8, 2), (
+                    k,
+                    b,
+                    n,
+                    p["tpl"],
+                )
+                assert p["rt"]["R"] == 1 and p["rt"]["SCAP_"] == (
+                    8192 if k > 1024 else 4096
+                )
+            # above 64K the band keeps the 1024-thread configuration
+            p = r(b, 65540, _round64(65540), k)
+            assert p["kernel"] == "main" and (p["tpl"][0], p["tpl"][2]) == (1024, 1)
+            assert p["rt"]["SCAP_"] == 16384
+    # 33-74 unsplit rows (K = 2048 above 32K) keep the big configuration
+    p = r(37, 65536, 65536, 2048)
+    assert p["kernel"] == "main" and p["tpl"][0] == 1024 and p["rt"]["R"] == 1
+    # split slab at <= 74 rows keeps the 1024-thread big configuration
+    p = r(16, 262144, 262144, 2048)
+    assert p["kernel"] == "main" and (p["tpl"][0], p["tpl"][2]) == (1024, 1)
+    assert p["rt"]["R"] > 1 and p["rt"]["SCAP_"] == 8192
+    p = r(1, 1 << 20, 1 << 20, 1024)
+    assert p["kernel"] == "main" and p["tpl"][0] == 1024 and p["rt"]["R"] == 148
+    # b > 148 unchanged
+    assert r(200, 65536, 65536, 512)["tpl"][:3] == (512, 8, 2)
+    assert r(304, 65536, 65536, 1024)["tpl"][:3] == (256, 8, 4)
+    assert _host._big_regime(148, 1, 16384) is False
+    assert _host._big_regime(148, 1, 16385) is True
+    assert (
+        _host._big_regime(74, 1, 16384) is True
+        and _host._big_regime(74, 2, 8192) is True
+    )
+    assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
 
 
 def test_gvr2_route_reg_clus_sm_count_aware():

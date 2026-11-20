@@ -266,6 +266,7 @@ def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
     layer = _mega_layer()
     with (
         mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}),
+        mock.patch("torch.cuda.current_device", return_value=0),
         pytest.raises(RuntimeError, match="torch.distributed"),
     ):
         layer._ensure_workspace()
@@ -521,6 +522,31 @@ def test_mega_layer_init_accepts_valid_transformed_weights():
     assert layer._transformed is not None
 
 
+def test_mega_layer_transformed_weight_aliases_include_scales():
+    transformed = _fake_deep_gemm_transformed()
+    layer = _mega_layer(transformed_weights=transformed)
+    try:
+        prepared = layer.get_transformed_weights()
+        assert prepared is transformed
+        for stage in prepared:
+            for tensor in stage:
+                tensor.fill_(3)
+        for stage in transformed:
+            for tensor in stage:
+                assert (tensor == 3).all()
+    finally:
+        layer.destroy()
+
+
+def test_mega_layer_transformed_weights_reject_destroyed_layer():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer = _mega_layer()
+    layer.destroy()
+    with pytest.raises(MoEEpConfigError, match="destroyed"):
+        layer.get_transformed_weights()
+
+
 def test_mega_layer_init_rejects_invalid_transformed_weight_dtype():
     import torch
 
@@ -731,3 +757,187 @@ def test_mega_layer_warmup_requires_tensors_when_prestaged():
 
     resolve_workspace.assert_not_called()
     assert layer._workspace is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("layout", ["fp32", "bf16", "broadcast", "strided", "mixed"])
+@pytest.mark.parametrize("mask", range(8))
+def test_nvfp4_stage_epilogues_preserve_copy_semantics(
+    monkeypatch, device, layout, mask
+):
+    import torch
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        backend as nvfp4_backend,
+    )
+
+    backend = nvfp4_backend.Nvfp4CutedslMegaKernelBackend(
+        nvfp4_backend.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2
+        )
+    )
+    monkeypatch.setattr(nvfp4_backend, "stage_mega_moe_inputs", lambda *a, **kw: None)
+    names = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        _epilogue_default_ones=torch.ones(16, device=device),
+        **{name: torch.full((16,), -1.0, device=device) for name in names},
+    )
+    expected = {name: torch.ones_like(getattr(workspace, name)) for name in names}
+    sources = []
+    for i in range(3):
+        source = torch.arange(32, dtype=torch.float32, device=device) + i
+        if layout == "bf16" or (layout == "mixed" and i == 1):
+            source = source.to(torch.bfloat16)
+        if layout == "broadcast":
+            source = source[:1]
+        elif layout == "strided":
+            source = source[::2]
+        else:
+            source = source[:16]
+        sources.append(source)
+    t = MoEEpTensors(
+        hidden_states=torch.empty(0, 128, device=device),
+        topk_ids=None,
+        topk_weights=None,
+        **{
+            name: sources[i] if mask & (1 << i) else None
+            for i, name in enumerate(names)
+        },
+    )
+    for name in names:
+        source = getattr(t, name)
+        if source is not None:
+            expected[name].copy_(source)
+    backend.stage_inputs(t, workspace, quantize_input=True)
+    for source in sources:
+        source.add_(100)
+    for name in names:
+        torch.testing.assert_close(
+            getattr(workspace, name), expected[name], rtol=0, atol=0
+        )
+        setattr(t, name, None)
+    # Omitted overrides restore the configuration defaults (ones here).
+    backend.stage_inputs(t, workspace, quantize_input=True)
+    for name in names:
+        torch.testing.assert_close(
+            getattr(workspace, name), torch.ones_like(expected[name]), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("layout", ["fp32", "bf16", "broadcast", "strided", "mixed"])
+def test_nvfp4_stage_epilogues_graph_shared_workspace(monkeypatch, layout):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        backend as nvfp4_backend,
+    )
+
+    monkeypatch.setattr(nvfp4_backend, "stage_mega_moe_inputs", lambda *a, **kw: None)
+    names = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        _epilogue_default_ones=torch.ones(16, device="cuda"),
+        **{name: torch.zeros(16, device="cuda") for name in names},
+    )
+    layers = []
+    for layer in range(2):
+        backend = nvfp4_backend.Nvfp4CutedslMegaKernelBackend(
+            nvfp4_backend.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=128, top_k=2
+            )
+        )
+        sources = {}
+        for i, name in enumerate(names):
+            source = (
+                torch.arange(32, device="cuda", dtype=torch.float32) + 10 * layer + i
+            )
+            if layout == "bf16" or (layout == "mixed" and i == 1):
+                source = source.to(torch.bfloat16)
+            sources[name] = (
+                source[:1]
+                if layout == "broadcast"
+                else source[::2]
+                if layout == "strided"
+                else source[:16]
+            )
+        if layer == 1:
+            sources["fc2_alpha"] = None
+        t = MoEEpTensors(
+            hidden_states=torch.empty(0, 128, device="cuda"),
+            topk_ids=None,
+            topk_weights=None,
+            **sources,
+        )
+        backend.stage_inputs(t, workspace, quantize_input=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            backend.stage_inputs(t, workspace, quantize_input=True)
+        layers.append((graph, sources))
+    expected = {name: getattr(workspace, name).clone() for name in names}
+    for layer in (0, 1, 0, 1):
+        graph, sources = layers[layer]
+        for source in sources.values():
+            if source is not None:
+                source.add_(10)
+        graph.replay()
+        for name, source in sources.items():
+            if source is not None:
+                expected[name].copy_(source)
+            else:
+                expected[name].fill_(1)
+            torch.testing.assert_close(
+                getattr(workspace, name), expected[name], rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_nvfp4_stage_epilogues_preserve_workspace_alias_order(monkeypatch, device):
+    import torch
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        backend as nvfp4_backend,
+    )
+
+    backend = nvfp4_backend.Nvfp4CutedslMegaKernelBackend(
+        nvfp4_backend.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2
+        )
+    )
+    monkeypatch.setattr(nvfp4_backend, "stage_mega_moe_inputs", lambda *a, **kw: None)
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        fc1_alpha=torch.ones(16, device=device),
+        fc2_alpha=torch.full((16,), 2.0, device=device),
+        fc1_norm_const=torch.ones(16, device=device),
+        _epilogue_default_ones=torch.ones(16, device=device),
+    )
+    t = MoEEpTensors(
+        hidden_states=torch.empty(0, 128, device=device),
+        topk_ids=None,
+        topk_weights=None,
+        fc1_alpha=workspace.fc2_alpha,
+        fc2_alpha=workspace.fc1_alpha,
+    )
+    backend.stage_inputs(t, workspace, quantize_input=True)
+    expected = torch.full((16,), 2.0, device=device)
+    torch.testing.assert_close(workspace.fc1_alpha, expected, rtol=0, atol=0)
+    torch.testing.assert_close(workspace.fc2_alpha, expected, rtol=0, atol=0)

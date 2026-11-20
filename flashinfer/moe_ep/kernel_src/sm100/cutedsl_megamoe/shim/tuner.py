@@ -156,7 +156,18 @@ _MXFP8_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "atomic_counter",
 }
 
-# TODO: WIP BF16 supports one validated fixed MMA/cluster geometry.
+# BF16×NVFP4 uses the measured flag4/epi-warp atomic profile at every buffer size.
+_BF16_NVFP4_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 128, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "atomic_counter",
+}
+
+# Preserve the baseline geometry for untuned sessions and ordinary autotuning.
 _BF16_TOKEN_KNOBS: Dict[str, Any] = {
     "mma_tiler_mnk": (256, 256, 64),
     "cluster_shape_mnk": (2, 1, 1),
@@ -237,7 +248,7 @@ def _mxfp8_default_knobs(
 
 
 def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
-    """One validated fixed MMA/cluster geometry."""
+    """Baseline MMA/cluster geometry; BI autotuning can select another plan."""
     knobs = dict(_BF16_TOKEN_KNOBS)
     # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
@@ -256,6 +267,15 @@ def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str,
     return knobs
 
 
+def _bf16_nvfp4_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
+    """Default mixed BF16/NVFP4 profile across buffer sizes."""
+    knobs = dict(_BF16_NVFP4_TOKEN_KNOBS)
+    knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
+    if enable_in_kernel_fc2_reduce:
+        knobs["token_back_mode"] = "reuse_dispatch_warps"
+    return knobs
+
+
 def default_knobs(
     num_tokens: int,
     *,
@@ -269,12 +289,16 @@ def default_knobs(
     provenance.  ``combine_dtype`` and ``enable_in_kernel_fc2_reduce`` are
     session axes the profile is made valid against, so the result is always
     directly applicable to that session.  Permitting ikr also selects it by
-    default on every dtype (an autotune sweep may still turn it back off);
-    BF16 additionally constrains the token-back carrier to match.  Only NVFP4
-    has quantized combine.
+    default on supported dtypes (an autotune sweep may still turn it back off);
+    BF16 and BF16×NVFP4 additionally constrain the token-back carrier to match.
+    Only NVFP4 has quantized combine.
 
     Returns a fresh dict each call.
     """
+    if dtype == "bf16_nvfp4":
+        return _bf16_nvfp4_default_knobs(
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+        )
     if dtype == "bf16":
         return _bf16_default_knobs(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
@@ -295,7 +319,7 @@ def default_knobs(
         )
     raise ValueError(
         f"no knob profile for dtype {dtype!r}; expected 'nvfp4', 'mxfp8', "
-        "'bf16', or 'bf16_mxfp8'."
+        "'bf16', 'bf16_mxfp8', or 'bf16_nvfp4'."
     )
 
 
@@ -334,12 +358,18 @@ def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
 
 
 def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
-    """Validate the fixed geometry accepted by the BF16 kernel."""
+    """Validate supported correlated geometry, independent of problem shape."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        bf16_plan_config,
+    )
+
+    try:
+        geometry = bf16_plan_config(knobs=knobs)
+    except ValueError:
+        return False
+    effective = {**knobs, **dataclasses.asdict(geometry)}
     return (
-        knobs.get("mma_tiler_mnk", (256, 256, 64)) == (256, 256, 64)
-        and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
-        and knobs.get("use_2cta_instrs", True)
-        and knobs.get("force_static_sched", True)
+        knobs.get("force_static_sched", True)
         and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")
         and knobs.get("token_back_mode", "epi_warps")
         in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
@@ -347,13 +377,7 @@ def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
             knobs.get("in_kernel_fc2_reduce", False)
             and knobs.get("token_back_mode", "epi_warps") == "epi_warps"
         )
-        and is_valid(
-            {
-                **knobs,
-                "mma_tiler_mnk": (256, 256, 64),
-                "cluster_shape_mnk": (2, 1, 1),
-            }
-        )
+        and is_valid(effective)
     )
 
 
@@ -380,6 +404,33 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         in ("epi_warps", "reuse_dispatch_warps")
         and knobs.get("clc_bundle_size") is None
         and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
+    )
+
+
+def is_valid_bf16_nvfp4(knobs: Dict[str, Any]) -> bool:
+    """Validate the mixed BF16/NVFP4 geometry and token-back carrier."""
+    tile = tuple(knobs.get("mma_tiler_mnk", (256, 128, 256)))
+    cluster = tuple(knobs.get("cluster_shape_mnk", (2, 1, 1)))
+    token_back = knobs.get("token_back_mode", "epi_warps")
+    return (
+        tile
+        in (
+            (128, 32, 256),
+            (128, 64, 256),
+            (128, 128, 256),
+            (256, 32, 256),
+            (256, 64, 256),
+            (256, 128, 256),
+        )
+        and (cluster == (2, 1, 1) or (cluster == (1, 1, 1) and tile == (128, 64, 256)))
+        and knobs.get("use_2cta_instrs", tile[0] == 256) == (tile[0] == 256)
+        and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")
+        and knobs.get("force_static_sched", True)
+        and token_back in ("epi_warps", "reuse_dispatch_warps")
+        and (
+            not knobs.get("in_kernel_fc2_reduce", False)
+            or token_back == "reuse_dispatch_warps"
+        )
     )
 
 
@@ -427,16 +478,83 @@ def describe_invalid_knobs(
 
 def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate BF16 knobs against the requested configuration."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        bf16_plan_config,
+        validate_bf16_batch_invariant,
+    )
+
+    try:
+        validate_bf16_batch_invariant(config, knobs)
+        geometry = bf16_plan_config(config, knobs)
+    except ValueError:
+        return False
     return _ikr_knob_permitted(config, knobs) and is_valid_bf16(
-        _effective_knobs(config, knobs)
+        {**_effective_knobs(config, knobs), **dataclasses.asdict(geometry)}
     )
 
 
 def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate mixed BF16/MXFP8 knobs against a session's IKR permission."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+        validate_a16_batch_invariant,
+    )
+
+    try:
+        validate_a16_batch_invariant(config, knobs)
+    except (TypeError, ValueError):
+        return False
     return _ikr_knob_permitted(config, knobs) and is_valid_bf16_mxfp8(
         _effective_knobs(config, knobs)
     )
+
+
+def is_valid_nvfp4_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Apply NVFP4 BI admission as well as the ordinary geometry rules."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        validate_nvfp4_batch_invariant,
+    )
+
+    try:
+        validate_nvfp4_batch_invariant(config, knobs, implementation="legacy")
+    except (TypeError, ValueError):
+        return False
+    wire = {"bf16": "bf16", "mxfp8": "32e4m3xe8m0", "nvfp4": "16e2m1xbf16"}[
+        config.combine_dtype
+    ]
+    return _ikr_knob_permitted(config, knobs) and is_valid(
+        _effective_knobs(config, knobs), combine_format=wire
+    )
+
+
+def is_valid_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Apply W8A8 BI admission before the ordinary scheduling predicates."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+        validate_mxfp8_batch_invariant,
+    )
+
+    try:
+        validate_mxfp8_batch_invariant(config, knobs, implementation="legacy")
+    except (TypeError, ValueError):
+        return False
+    return _ikr_knob_permitted(config, knobs) and is_valid(
+        _effective_knobs(config, knobs)
+    )
+
+
+def is_valid_bf16_nvfp4_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Validate BF16/NVFP4 knobs against the session's reduction permission."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+        validate_a16_batch_invariant,
+    )
+
+    try:
+        validate_a16_batch_invariant(config, knobs)
+    except (TypeError, ValueError):
+        return False
+    effective = _effective_knobs(config, knobs)
+    if "mma_tiler_mnk" in knobs and "use_2cta_instrs" not in knobs:
+        effective["use_2cta_instrs"] = knobs["mma_tiler_mnk"][0] == 256
+    return _ikr_knob_permitted(config, knobs) and is_valid_bf16_nvfp4(effective)
 
 
 def iter_candidates(
@@ -467,10 +585,35 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
 
     Only knobs the config declares are set; ``token_back_mode`` is translated to
     the MXFP8 config's ``token_back_by_dispatch`` bool.  ``config`` is any of the
-    frontend config dataclasses (NVFP4 / MXFP8 / BF16 — knobs a dtype's config
-    does not expose are silently dropped).  Passing ``knobs=None`` returns
-    the config unchanged.
+    frontend config dataclasses, including mixed BF16 activation modes; knobs
+    a dtype's config does not expose are silently dropped. Passing ``knobs=None``
+    returns the config unchanged.
     """
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        bf16_plan_config,
+        validate_bf16_batch_invariant,
+    )
+
+    is_bf16 = type(config).__name__ == "MegaMoEBf16Config"
+    if is_bf16:
+        validate_bf16_batch_invariant(config, knobs)
+    elif getattr(config, "batch_invariant", False) and type(config).__name__ in (
+        "MegaMoEBf16Nvfp4Config",
+        "MegaMoEBf16Mxfp8Config",
+    ):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            validate_a16_batch_invariant,
+        )
+
+        validate_a16_batch_invariant(config, knobs)
+    elif getattr(config, "batch_invariant", False):
+        if type(config).__name__ not in ("MegaMoENvfp4Config", "MegaMoEMxfp8Config"):
+            raise ValueError("unsupported batch-invariant tuning configuration")
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            validate_block_scaled_batch_invariant,
+        )
+
+        validate_block_scaled_batch_invariant(config, knobs, implementation="legacy")
     if not knobs:
         return config
     fields = {f.name for f in dataclasses.fields(config)}
@@ -481,10 +624,62 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
         elif key in fields:
             overrides[key] = value
         # silently drop knobs this dtype's config does not expose
-    # a 256-M tile implies 2-CTA instrs; keep the derived flag consistent.
-    if "mma_tiler_mnk" in overrides and "use_2cta_instrs" in fields:
+    if is_bf16 and "mma_tiler_mnk" in fields:
+        overrides.update(dataclasses.asdict(bf16_plan_config(config, knobs)))
+    # Other dtypes retain their existing 2-CTA derivation.
+    elif "mma_tiler_mnk" in overrides and "use_2cta_instrs" in fields:
         overrides.setdefault("use_2cta_instrs", overrides["mma_tiler_mnk"][0] == 256)
     return dataclasses.replace(config, **overrides)
+
+
+# Config fields set from the API arguments; a knobs dict must not override them.
+_EXPLICIT_CONFIG_FIELDS = frozenset(
+    {
+        "rank",
+        "world_size",
+        "num_tokens_per_rank",
+        "num_topk",
+        "num_total_experts",
+        "hidden",
+        "intermediate",
+        "kind",
+        "gate_up_clamp",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "activation",
+        "situ_beta",
+        "situ_linear_beta",
+        "apply_routing_weights_before_fc2",
+        "apply_topk_in_fc1",  # Deprecated name
+        "enable_in_kernel_fc2_reduce",
+        "use_custom_finalize",
+        "defer_topk_reduce",  # Deprecated name
+        "use_persistent_finalize_kernel",
+        "combine_dtype",
+        "enable_fc1_activation_per_token_scale",
+        "batch_invariant",
+        "input_norm_const",
+        "has_fc1_alpha",
+        "has_fc2_alpha",
+        "has_fc1_norm_const",
+    }
+)
+
+
+def reject_explicit_knobs(knobs: Optional[Dict[str, Any]]) -> None:
+    """Raise if ``knobs`` names a config field set through the API arguments."""
+    explicit = sorted(_EXPLICIT_CONFIG_FIELDS.intersection(knobs or ()))
+    if explicit:
+        raise ValueError(
+            f"{explicit} are explicit config fields, not tunable knobs; set them "
+            f"through the API arguments instead of the knobs dict."
+        )
+
+
+def with_checked_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
+    """:func:`with_knobs`, but raise on knobs naming an explicit config field."""
+    reject_explicit_knobs(knobs)
+    return with_knobs(config, knobs)
 
 
 __all__ = [
@@ -497,6 +692,11 @@ __all__ = [
     "is_valid_bf16_for_config",
     "is_valid_bf16_mxfp8",
     "is_valid_bf16_mxfp8_for_config",
+    "is_valid_mxfp8_for_config",
+    "is_valid_bf16_nvfp4",
+    "is_valid_bf16_nvfp4_for_config",
     "iter_candidates",
+    "reject_explicit_knobs",
+    "with_checked_knobs",
     "with_knobs",
 ]

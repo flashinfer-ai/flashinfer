@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 # pyright: reportMissingImports=false
-"""Single-file two-GPU raw UBLKCP P2P bandwidth benchmark.
+"""Single-file two-GPU raw UBLKCP P2P bandwidth benchmark for Blackwell and Rubin.
+
+The kernel issues descriptor-free ``cp.async.bulk`` (UBLKCP) transfers between a
+local SMEM staging buffer and a peer-mapped buffer owned by device 1, so all
+measured traffic crosses NVLink with no collective library in the path.
+
+A measurement point is described by five knobs; each one accepts a
+comma-separated list and the benchmark sweeps their cartesian product:
+
+* ``--mode``             ``pull`` reads from the remote GPU, ``push`` writes to it
+* ``--x_ctas``           CTAs, i.e. SMs used; capped by the device SM count
+* ``--warps_per_sm``     UBLKCP-issuing warps per SM; capped at 4
+* ``--z_bytes_per_inst`` bytes per UBLKCP; multiple of 128, up to 32 KiB
+* ``--w_comm_mbytes``    total NVLink traffic per point, in MiB
+
+``--y_copy_per_iter`` additionally sets how many UBLKCP instructions a warp keeps
+in flight per iteration, trading SMEM footprint for issue depth.
 
 This script intentionally does not import any local project modules.  It uses
 PyTorch for allocation/timing, cuda-python for peer access, and CuTeDSL for the
@@ -11,12 +27,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import math
+import os
 import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Callable, Iterable, Literal
 
 import torch
 
@@ -29,19 +47,23 @@ from cutlass.cutlass_dsl import Int32, Int64, T, Uint8, dsl_user_op
 
 Mode = Literal["pull", "push"]
 
-DEFAULT_BUFFER_MIB = 300
-DEFAULT_WARMUPS = 2
-DEFAULT_REPEATS = 5
-NUM_WARPS = 4
-THREADS_PER_CTA = NUM_WARPS * 32
-TMA_CACHE_HINT_EVICT_NORMAL = 0x1000000000000000
-TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
+default_buffer_mib = 300
+default_warmups = 2
+default_repeats = 5
+max_warps_per_sm = 4
+max_bytes_per_inst = 32 * 1024
+bytes_per_inst_granularity = 128
+tma_cache_hint_evict_normal = 0x1000000000000000
+tma_cache_hint_evict_first = 0x12F0000000000000
+
+# Compute capability -> CuTeDSL arch string.  Blackwell (B200/B300) and Rubin
+# reach NVLink through the same descriptor-free cp.async.bulk path below, so the
+# table only decides how the run is reported and which SMEM limit applies.
+supported_architectures = {(10, 0): "sm_100", (10, 3): "sm_103", (10, 7): "sm_107"}
 
 
 @dsl_user_op
-def ublkcp_pull_raw(
-    dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes: Int32, *, loc=None, ip=None
-) -> None:
+def ublkcp_pull_raw(dst_smem, src_gmem_addr: Int64, mbar_smem, num_bytes: Int32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
         [
@@ -49,10 +71,9 @@ def ublkcp_pull_raw(
             src_gmem_addr.ir_value(),
             num_bytes.ir_value(),
             mbar_smem.toint(loc=loc, ip=ip).ir_value(),
-            Int64(TMA_CACHE_HINT_EVICT_FIRST).ir_value(),
+            Int64(tma_cache_hint_evict_first).ir_value(),
         ],
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint "
-        "[$0], [$1], $2, [$3], $4;",
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [$0], [$1], $2, [$3], $4;",
         "r,l,r,r,l",
         has_side_effects=True,
         asm_dialect=0,
@@ -62,19 +83,16 @@ def ublkcp_pull_raw(
 
 
 @dsl_user_op
-def ublkcp_push_raw(
-    dst_gmem_addr: Int64, src_smem, num_bytes: Int32, *, loc=None, ip=None
-) -> None:
+def ublkcp_push_raw(dst_gmem_addr: Int64, src_smem, num_bytes: Int32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
         [
             dst_gmem_addr.ir_value(),
             src_smem.toint(loc=loc, ip=ip).ir_value(),
             num_bytes.ir_value(),
-            Int64(TMA_CACHE_HINT_EVICT_NORMAL).ir_value(),
+            Int64(tma_cache_hint_evict_normal).ir_value(),
         ],
-        "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint "
-        "[$0], [$1], $2, $3;",
+        "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [$0], [$1], $2, $3;",
         "l,r,r,l",
         has_side_effects=True,
         asm_dialect=0,
@@ -103,14 +121,7 @@ def ld_shared_u32(smem_ptr, *, loc=None, ip=None) -> Int32:
 def read_clock64(*, loc=None, ip=None) -> Int64:
     return Int64(
         llvm.inline_asm(
-            T.i64(),
-            [],
-            "mov.u64 $0, %clock64;",
-            "=l",
-            has_side_effects=True,
-            asm_dialect=0,
-            loc=loc,
-            ip=ip,
+            T.i64(), [], "mov.u64 $0, %clock64;", "=l", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip
         )
     )
 
@@ -128,15 +139,19 @@ def ublkcp_bench_kernel(
     x_ctas: cutlass.Constexpr[int],
     y_copy_per_iter: cutlass.Constexpr[int],
     z_bytes_per_inst: cutlass.Constexpr[int],
+    warps_per_sm: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     warp_idx = cute.arch.make_warp_uniform(tidx // Int32(32))
     lane_idx = cute.arch.lane_idx()
 
+    # cp.async.bulk needs a 16B-aligned SMEM address.  Allocating the payload
+    # first parks it at the window base, so that holds for any warp count instead
+    # of depending on how a preceding mbarrier array happens to be padded.
     smem = cutlass.utils.SmemAllocator()
-    pull_mbar = smem.allocate_array(Int64, NUM_WARPS)
-    payload = smem.allocate_array(Uint8, NUM_WARPS * y_copy_per_iter * z_bytes_per_inst)
+    payload = smem.allocate_array(Uint8, warps_per_sm * y_copy_per_iter * z_bytes_per_inst)
+    pull_mbar = smem.allocate_array(Int64, warps_per_sm)
 
     if cutlass.const_expr(mode == "pull"):
         if lane_idx == Int32(0):
@@ -150,55 +165,33 @@ def ublkcp_bench_kernel(
     iter_idx = Int32(0)
     while iter_idx < iters:
         iter_t0 = Int64(0)
-        if cutlass.const_expr(
-            (mode == "push" and push_clock_stats)
-            or (mode == "pull" and pull_clock_stats)
-        ):
+        if cutlass.const_expr((mode == "push" and push_clock_stats) or (mode == "pull" and pull_clock_stats)):
             if lane_idx == Int32(0):
                 iter_t0 = read_clock64()
 
         for u in cutlass.range_constexpr(0, y_copy_per_iter, 1):
             copy_linear = (
-                (Int64(iter_idx) * Int64(x_ctas) + Int64(bidx)) * Int64(NUM_WARPS)
-                + Int64(warp_idx)
+                (Int64(iter_idx) * Int64(x_ctas) + Int64(bidx)) * Int64(warps_per_sm) + Int64(warp_idx)
             ) * Int64(y_copy_per_iter) + Int64(u)
-            remote_addr = (
-                remote_base_addr
-                + Int64(base_offset)
-                + copy_linear * Int64(z_bytes_per_inst)
-            )
-            smem_off = (warp_idx * Int32(y_copy_per_iter) + Int32(u)) * Int32(
-                z_bytes_per_inst
-            )
+            remote_addr = remote_base_addr + Int64(base_offset) + copy_linear * Int64(z_bytes_per_inst)
+            smem_off = (warp_idx * Int32(y_copy_per_iter) + Int32(u)) * Int32(z_bytes_per_inst)
             smem_ptr = payload + smem_off
             with cute.arch.elect_one():
                 if cutlass.const_expr(mode == "pull"):
-                    ublkcp_pull_raw(
-                        smem_ptr,
-                        remote_addr,
-                        pull_mbar + warp_idx,
-                        Int32(z_bytes_per_inst),
-                    )
+                    ublkcp_pull_raw(smem_ptr, remote_addr, pull_mbar + warp_idx, Int32(z_bytes_per_inst))
                 else:
                     ublkcp_push_raw(remote_addr, smem_ptr, Int32(z_bytes_per_inst))
 
         if cutlass.const_expr(mode == "pull"):
             if lane_idx == Int32(0):
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    pull_mbar + warp_idx,
-                    Int32(y_copy_per_iter * z_bytes_per_inst),
-                )
+                cute.arch.mbarrier_arrive_and_expect_tx(pull_mbar + warp_idx, Int32(y_copy_per_iter * z_bytes_per_inst))
                 cute.arch.mbarrier_wait(pull_mbar + warp_idx, phase)
                 if cutlass.const_expr(pull_clock_stats):
                     pull_delta = read_clock64() - iter_t0
                     clock_min_cycles = cutlass.min(clock_min_cycles, pull_delta)
                     clock_max_cycles = cutlass.max(clock_max_cycles, pull_delta)
-                sample = ld_shared_u32(
-                    payload + warp_idx * Int32(y_copy_per_iter * z_bytes_per_inst)
-                )
-                sink_idx = (iter_idx * Int32(x_ctas) + Int32(bidx)) * Int32(
-                    NUM_WARPS
-                ) + warp_idx
+                sample = ld_shared_u32(payload + warp_idx * Int32(y_copy_per_iter * z_bytes_per_inst))
+                sink_idx = (iter_idx * Int32(x_ctas) + Int32(bidx)) * Int32(warps_per_sm) + warp_idx
                 local_sink[sink_idx] = sample
         else:
             if lane_idx == Int32(0):
@@ -214,11 +207,9 @@ def ublkcp_bench_kernel(
             phase = phase ^ Int32(1)
         iter_idx = iter_idx + Int32(1)
 
-    if cutlass.const_expr(
-        (mode == "push" and push_clock_stats) or (mode == "pull" and pull_clock_stats)
-    ):
+    if cutlass.const_expr((mode == "push" and push_clock_stats) or (mode == "pull" and pull_clock_stats)):
         if lane_idx == Int32(0):
-            stats_base = (Int32(bidx) * Int32(NUM_WARPS) + warp_idx) * Int32(2)
+            stats_base = (Int32(bidx) * Int32(warps_per_sm) + warp_idx) * Int32(2)
             clock_stats[stats_base] = clock_min_cycles
             clock_stats[stats_base + Int32(1)] = clock_max_cycles
 
@@ -240,6 +231,7 @@ def launch_ublkcp_bench(
     x_ctas: cutlass.Constexpr[int],
     y_copy_per_iter: cutlass.Constexpr[int],
     z_bytes_per_inst: cutlass.Constexpr[int],
+    warps_per_sm: cutlass.Constexpr[int],
 ):
     ublkcp_bench_kernel(
         local_sink,
@@ -253,13 +245,22 @@ def launch_ublkcp_bench(
         x_ctas,
         y_copy_per_iter,
         z_bytes_per_inst,
-    ).launch(grid=[x_ctas, 1, 1], block=[THREADS_PER_CTA, 1, 1])
+        warps_per_sm,
+    ).launch(grid=[x_ctas, 1, 1], block=[warps_per_sm * 32, 1, 1])
+
+
+@dataclass(frozen=True)
+class DeviceEnvironment:
+    architecture: str
+    sm_count: int
+    smem_capacity: int
 
 
 @dataclass(frozen=True)
 class BenchConfig:
     mode: Mode
     x_ctas: int
+    warps_per_sm: int
     y_copy_per_iter: int
     z_bytes_per_inst: int
     w_comm_mbytes: int
@@ -271,6 +272,7 @@ class BenchConfig:
 class BenchResult:
     mode: Mode
     x_ctas: int
+    warps_per_sm: int
     y_copy_per_iter: int
     z_bytes_per_inst: int
     w_comm_mbytes: int
@@ -290,16 +292,37 @@ class BenchResult:
     skipped: str = ""
 
 
-def parse_int_list(text: str) -> list[int]:
-    values = []
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        values.append(int(part))
-    if not values:
-        raise ValueError(f"empty integer list: {text!r}")
-    return values
+def int_list_arg(
+    name: str, *, minimum: int = 1, maximum: int | None = None, multiple_of: int | None = None
+) -> Callable[[str], list[int]]:
+    """Build an argparse ``type`` that parses a comma-separated list and enforces its bounds.
+
+    Rejecting out-of-range input here (rather than skipping it later) keeps the
+    hardware limits in one place and makes a typo fail before any compilation.
+    """
+
+    def parse(text: str) -> list[int]:
+        values: list[int] = []
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(part)
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"{name}: {part!r} is not an integer") from None
+            if value < minimum or (maximum is not None and value > maximum):
+                upper = "inf" if maximum is None else str(maximum)
+                raise argparse.ArgumentTypeError(f"{name}: {value} is outside [{minimum}, {upper}]")
+            if multiple_of is not None and value % multiple_of != 0:
+                raise argparse.ArgumentTypeError(f"{name}: {value} is not a multiple of {multiple_of}")
+            if value not in values:
+                values.append(value)
+        if not values:
+            raise argparse.ArgumentTypeError(f"{name}: empty list {text!r}")
+        return values
+
+    return parse
 
 
 def default_x_ctas(sm_count: int) -> str:
@@ -317,6 +340,11 @@ def mib_to_bytes(value: int) -> int:
 
 def round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def bytes_per_iteration(config: BenchConfig) -> int:
+    """Bytes the whole grid moves in one kernel iteration; every warp issues its own UBLKCPs."""
+    return config.x_ctas * config.warps_per_sm * config.y_copy_per_iter * config.z_bytes_per_inst
 
 
 def import_cudart():
@@ -341,11 +369,7 @@ def check_cuda_error(cudart, result, what: str):
 def enable_peer_access_0_to_1() -> None:
     cudart = import_cudart()
     check_cuda_error(cudart, cudart.cudaSetDevice(0), "cudaSetDevice(0)")
-    can_access = check_cuda_error(
-        cudart,
-        cudart.cudaDeviceCanAccessPeer(0, 1),
-        "cudaDeviceCanAccessPeer(0, 1)",
-    )[0]
+    can_access = check_cuda_error(cudart, cudart.cudaDeviceCanAccessPeer(0, 1), "cudaDeviceCanAccessPeer(0, 1)")[0]
     if int(can_access) == 0:
         raise RuntimeError("device 0 cannot access peer device 1")
 
@@ -366,39 +390,94 @@ def pointer_owner_device(ptr: int) -> int | None:
     return getattr(attrs, "device", None)
 
 
-def smem_capacity_bytes() -> int:
-    major, minor = torch.cuda.get_device_capability(0)
-    arch = f"sm_{major}{minor}"
-    try:
-        return int(cutlass.utils.get_smem_capacity_in_bytes(arch))
-    except Exception:
-        if major >= 10:
-            return 227 * 1024
-        return 99 * 1024
+def smem_capacity_bytes(architecture: str) -> int:
+    """Opt-in dynamic SMEM per CTA, preferring the driver so a new arch needs no table entry."""
+    cudart = import_cudart()
+    attribute = getattr(cudart.cudaDeviceAttr, "cudaDevAttrMaxSharedMemoryPerBlockOptin", None)
+    if attribute is not None:
+        capacity = check_cuda_error(
+            cudart, cudart.cudaDeviceGetAttribute(attribute, 0), "cudaDeviceGetAttribute(MaxSharedMemoryPerBlockOptin)"
+        )[0]
+        return int(capacity)
+    return int(cutlass.utils.get_smem_capacity_in_bytes(architecture))
 
 
-def validate_environment() -> int:
+def resolve_architecture() -> str:
+    """Map the bound compute capability to an arch string, rejecting untested parts."""
+    capability = tuple(torch.cuda.get_device_capability(0))
+    peer_capability = tuple(torch.cuda.get_device_capability(1))
+    if capability != peer_capability:
+        raise RuntimeError(f"device 0 is {capability} but device 1 is {peer_capability}; both must match")
+    architecture = supported_architectures.get(capability)
+    if architecture is None:
+        known = ", ".join(f"{cc}={arch}" for cc, arch in supported_architectures.items())
+        raise RuntimeError(f"compute capability {capability} is not supported by this benchmark; known: {known}")
+    # cute.compile autodetects the arch from the live device, so a stale
+    # CUTE_DSL_ARCH would silently retarget the kernel away from these GPUs.
+    configured = os.environ.get("CUTE_DSL_ARCH")
+    if configured and not configured.startswith(architecture):
+        raise RuntimeError(f"CUTE_DSL_ARCH={configured!r} does not target {architecture} of the bound devices")
+    return architecture
+
+
+def validate_environment() -> DeviceEnvironment:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
     if torch.cuda.device_count() != 2:
-        raise RuntimeError(
-            f"this benchmark requires exactly 2 CUDA devices, got {torch.cuda.device_count()}"
-        )
-    major, _minor = torch.cuda.get_device_capability(0)
-    if major < 10:
-        raise RuntimeError("UBLKCP benchmark expects a Blackwell-class GPU (sm_100+)")
-    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        raise RuntimeError(f"this benchmark requires exactly 2 CUDA devices, got {torch.cuda.device_count()}")
+    architecture = resolve_architecture()
     enable_peer_access_0_to_1()
-    return sm_count
+    return DeviceEnvironment(
+        architecture=architecture,
+        sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+        smem_capacity=smem_capacity_bytes(architecture),
+    )
 
 
-def make_arg_parser(sm_count: int) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--x_ctas", default=default_x_ctas(sm_count))
-    parser.add_argument("--y_copy_per_iter", default="1,2,4,8")
-    parser.add_argument("--z_bytes_per_inst", default="128,256,512,1024,2048")
-    parser.add_argument("--w_comm_mbytes", default="256")
-    parser.add_argument("--mode", choices=("pull", "push", "all"), default="all")
+def make_arg_parser(environment: DeviceEnvironment) -> argparse.ArgumentParser:
+    sm_count = environment.sm_count
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--mode",
+        choices=("pull", "push", "all"),
+        default="all",
+        help="pull reads from the remote GPU into SMEM, push writes SMEM out to the remote GPU.",
+    )
+    parser.add_argument(
+        "--x_ctas",
+        type=int_list_arg("x_ctas", maximum=sm_count),
+        default=default_x_ctas(sm_count),
+        help=f"CTAs to launch, one per SM, up to the {sm_count} SMs of this device.",
+    )
+    parser.add_argument(
+        "--warps_per_sm",
+        type=int_list_arg("warps_per_sm", maximum=max_warps_per_sm),
+        default=str(max_warps_per_sm),
+        help=f"UBLKCP-issuing warps per SM, up to {max_warps_per_sm}.",
+    )
+    parser.add_argument(
+        "--y_copy_per_iter",
+        type=int_list_arg("y_copy_per_iter"),
+        default="1",
+        help="UBLKCP instructions each warp keeps in flight per iteration.",
+    )
+    parser.add_argument(
+        "--z_bytes_per_inst",
+        type=int_list_arg(
+            "z_bytes_per_inst",
+            minimum=bytes_per_inst_granularity,
+            maximum=max_bytes_per_inst,
+            multiple_of=bytes_per_inst_granularity,
+        ),
+        default="128,256,512,1024,2048",
+        help=(f"Bytes moved by one UBLKCP: multiple of {bytes_per_inst_granularity} B, up to {max_bytes_per_inst} B."),
+    )
+    parser.add_argument(
+        "--w_comm_mbytes",
+        type=int_list_arg("w_comm_mbytes"),
+        default="256",
+        help="Total NVLink traffic per measurement point, in MiB.",
+    )
     parser.add_argument(
         "--pull_clock_stats",
         action="store_true",
@@ -421,32 +500,24 @@ def make_arg_parser(sm_count: int) -> argparse.ArgumentParser:
 
 def iter_configs(args: argparse.Namespace) -> Iterable[BenchConfig]:
     modes: list[Mode] = ["pull", "push"] if args.mode == "all" else [args.mode]
-    for mode in modes:
-        for x in parse_int_list(args.x_ctas):
-            for y in parse_int_list(args.y_copy_per_iter):
-                for z in parse_int_list(args.z_bytes_per_inst):
-                    for w in parse_int_list(args.w_comm_mbytes):
-                        yield BenchConfig(
-                            mode,
-                            x,
-                            y,
-                            z,
-                            w,
-                            args.pull_clock_stats,
-                            args.push_clock_stats,
-                        )
-
-
-def compile_config(
-    config: BenchConfig, local_sink, clock_stats, remote_base_ptr, iters: int
-):
-    @cute.jit
-    def launcher(
-        local_sink: cute.Tensor,
-        clock_stats: cute.Tensor,
-        remote_base_ptr: cute.Pointer,
-        base_offset: Int32,
+    for mode, x_ctas, warps_per_sm, y_copy, z_bytes, w_mbytes in itertools.product(
+        modes, args.x_ctas, args.warps_per_sm, args.y_copy_per_iter, args.z_bytes_per_inst, args.w_comm_mbytes
     ):
+        yield BenchConfig(
+            mode=mode,
+            x_ctas=x_ctas,
+            warps_per_sm=warps_per_sm,
+            y_copy_per_iter=y_copy,
+            z_bytes_per_inst=z_bytes,
+            w_comm_mbytes=w_mbytes,
+            pull_clock_stats=args.pull_clock_stats,
+            push_clock_stats=args.push_clock_stats,
+        )
+
+
+def compile_config(config: BenchConfig, local_sink, clock_stats, remote_base_ptr, iters: int):
+    @cute.jit
+    def launcher(local_sink: cute.Tensor, clock_stats: cute.Tensor, remote_base_ptr: cute.Pointer, base_offset: Int32):
         launch_ublkcp_bench(
             local_sink,
             clock_stats,
@@ -459,42 +530,19 @@ def compile_config(
             config.x_ctas,
             config.y_copy_per_iter,
             config.z_bytes_per_inst,
+            config.warps_per_sm,
         )
 
-    return cute.compile(
-        launcher,
-        local_sink,
-        clock_stats,
-        remote_base_ptr,
-        0,
-    )
+    return cute.compile(launcher, local_sink, clock_stats, remote_base_ptr, 0)
 
 
-def run_one_config(
-    config: BenchConfig,
-    sm_count: int,
-    smem_capacity: int,
-    remote_buf: torch.Tensor,
-) -> BenchResult:
-    if config.x_ctas <= 0 or config.x_ctas > sm_count:
-        return skipped_result(config, f"x_ctas must be in [1, {sm_count}]")
-    if config.y_copy_per_iter <= 0:
-        return skipped_result(config, "y_copy_per_iter must be positive")
-    if config.z_bytes_per_inst <= 0 or config.z_bytes_per_inst % 128 != 0:
-        return skipped_result(
-            config, "z_bytes_per_inst must be a positive multiple of 128"
-        )
-    if config.w_comm_mbytes <= 0:
-        return skipped_result(config, "w_comm_mbytes must be positive")
-
-    bytes_per_iter = (
-        config.x_ctas * NUM_WARPS * config.y_copy_per_iter * config.z_bytes_per_inst
-    )
+def run_one_config(config: BenchConfig, smem_capacity: int, remote_buf: torch.Tensor) -> BenchResult:
+    bytes_per_iter = bytes_per_iteration(config)
     requested_bytes = mib_to_bytes(config.w_comm_mbytes)
     iters = max(1, math.ceil(requested_bytes / bytes_per_iter))
     actual_bytes = iters * bytes_per_iter
-    shared_bytes = NUM_WARPS * config.y_copy_per_iter * config.z_bytes_per_inst
-    shared_bytes_with_mbar = round_up(NUM_WARPS * 8, 16) + shared_bytes
+    shared_bytes = config.warps_per_sm * config.y_copy_per_iter * config.z_bytes_per_inst
+    shared_bytes_with_mbar = shared_bytes + round_up(config.warps_per_sm * 8, 16)
     if shared_bytes_with_mbar > smem_capacity:
         return skipped_result(
             config,
@@ -505,73 +553,59 @@ def run_one_config(
             shared_bytes=shared_bytes_with_mbar,
         )
 
-    buffer_bytes = max(mib_to_bytes(DEFAULT_BUFFER_MIB), actual_bytes)
+    buffer_bytes = max(mib_to_bytes(default_buffer_mib), actual_bytes)
     buffer_bytes = round_up(buffer_bytes, 128)
     buffer_mib = math.ceil(buffer_bytes / (1024 * 1024))
 
     torch.cuda.set_device(0)
-    local_sink_t = torch.empty(
-        (config.x_ctas * NUM_WARPS * iters,), dtype=torch.int32, device="cuda"
-    )
+    warp_slots = config.x_ctas * config.warps_per_sm
+    local_sink_t = torch.empty((warp_slots * iters,), dtype=torch.int32, device="cuda")
     local_sink = from_dlpack(local_sink_t).mark_layout_dynamic()
-    clock_stats_t = torch.empty(
-        (config.x_ctas * NUM_WARPS * 2,), dtype=torch.int64, device="cuda"
-    )
+    clock_stats_t = torch.empty((warp_slots * 2,), dtype=torch.int64, device="cuda")
     clock_stats = from_dlpack(clock_stats_t).mark_layout_dynamic()
 
     if remote_buf.numel() < buffer_bytes:
         raise RuntimeError(
-            f"remote buffer has {remote_buf.numel()} bytes, need {buffer_bytes}; "
-            "internal allocation bug"
+            f"remote buffer has {remote_buf.numel()} bytes, need {buffer_bytes}; internal allocation bug"
         )
     remote_ptr = int(remote_buf.data_ptr())
     if remote_ptr % 128 != 0:
-        raise RuntimeError(
-            f"remote buffer pointer is not 128B aligned: 0x{remote_ptr:x}"
-        )
+        raise RuntimeError(f"remote buffer pointer is not 128B aligned: 0x{remote_ptr:x}")
     owner = pointer_owner_device(remote_ptr)
     if owner is not None and int(owner) != 1:
         raise RuntimeError(f"remote pointer owner device is {owner}, expected 1")
-    remote_base_ptr = make_ptr(
-        Uint8, remote_ptr, cute.AddressSpace.gmem, assumed_align=128
-    )
+    remote_base_ptr = make_ptr(Uint8, remote_ptr, cute.AddressSpace.gmem, assumed_align=128)
 
     print(
-        f"compile mode={config.mode} x={config.x_ctas} y={config.y_copy_per_iter} "
-        f"z={config.z_bytes_per_inst} w={config.w_comm_mbytes}MiB iters={iters}"
+        f"compile mode={config.mode} x={config.x_ctas} warps={config.warps_per_sm} "
+        f"y={config.y_copy_per_iter} z={config.z_bytes_per_inst} "
+        f"w={config.w_comm_mbytes}MiB iters={iters}"
     )
     compiled = compile_config(config, local_sink, clock_stats, remote_base_ptr, iters)
 
     def run_once(offset: int) -> float:
         local_sink_t.zero_()
-        if (config.mode == "push" and config.push_clock_stats) or (
-            config.mode == "pull" and config.pull_clock_stats
-        ):
+        if (config.mode == "push" and config.push_clock_stats) or (config.mode == "pull" and config.pull_clock_stats):
             clock_stats_t.zero_()
         torch.cuda.synchronize(0)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        compiled(
-            local_sink,
-            clock_stats,
-            remote_base_ptr,
-            offset,
-        )
+        compiled(local_sink, clock_stats, remote_base_ptr, offset)
         end.record()
         end.synchronize()
         return float(start.elapsed_time(end))
 
     max_offset = max(0, buffer_bytes - actual_bytes)
     offset_step = round_up(actual_bytes, 128)
-    for i in range(DEFAULT_WARMUPS):
+    for i in range(default_warmups):
         offset = 0 if max_offset == 0 else (i * offset_step) % (max_offset + 1)
         offset -= offset % 128
         run_once(offset)
 
     timings = []
-    for i in range(DEFAULT_REPEATS):
-        raw_offset = (DEFAULT_WARMUPS + i) * offset_step
+    for i in range(default_repeats):
+        raw_offset = (default_warmups + i) * offset_step
         offset = 0 if max_offset == 0 else raw_offset % (max_offset + 1)
         offset -= offset % 128
         timings.append(run_once(offset))
@@ -580,12 +614,13 @@ def run_one_config(
     ms_median = statistics.median(timings)
     ms_mean = statistics.mean(timings)
     if config.mode == "push" and config.push_clock_stats:
-        print_clock_stats(clock_stats_t, "push_smem_reuse_wait_cycles")
+        print_clock_stats(clock_stats_t, "push_smem_reuse_wait_cycles", config.warps_per_sm)
     if config.mode == "pull" and config.pull_clock_stats:
-        print_clock_stats(clock_stats_t, "pull_data_arrival_wait_cycles")
+        print_clock_stats(clock_stats_t, "pull_data_arrival_wait_cycles", config.warps_per_sm)
     return BenchResult(
         mode=config.mode,
         x_ctas=config.x_ctas,
+        warps_per_sm=config.warps_per_sm,
         y_copy_per_iter=config.y_copy_per_iter,
         z_bytes_per_inst=config.z_bytes_per_inst,
         w_comm_mbytes=config.w_comm_mbytes,
@@ -617,6 +652,7 @@ def skipped_result(
     return BenchResult(
         mode=config.mode,
         x_ctas=config.x_ctas,
+        warps_per_sm=config.warps_per_sm,
         y_copy_per_iter=config.y_copy_per_iter,
         z_bytes_per_inst=config.z_bytes_per_inst,
         w_comm_mbytes=config.w_comm_mbytes,
@@ -640,13 +676,14 @@ def skipped_result(
 def print_result(result: BenchResult) -> None:
     if result.skipped:
         print(
-            f"SKIP mode={result.mode} x={result.x_ctas} y={result.y_copy_per_iter} "
-            f"z={result.z_bytes_per_inst} w={result.w_comm_mbytes}MiB: {result.skipped}"
+            f"SKIP mode={result.mode} x={result.x_ctas} warps={result.warps_per_sm} "
+            f"y={result.y_copy_per_iter} z={result.z_bytes_per_inst} "
+            f"w={result.w_comm_mbytes}MiB: {result.skipped}"
         )
         return
     print(
-        f"{result.mode:4s} x={result.x_ctas:3d} y={result.y_copy_per_iter:2d} "
-        f"z={result.z_bytes_per_inst:5d} w={result.w_comm_mbytes:5d}MiB "
+        f"{result.mode:4s} x={result.x_ctas:3d} warps={result.warps_per_sm:1d} "
+        f"y={result.y_copy_per_iter:2d} z={result.z_bytes_per_inst:5d} w={result.w_comm_mbytes:5d}MiB "
         f"iters={result.iters:6d} min={result.ms_min:8.3f} ms "
         f"median={result.ms_median:8.3f} ms "
         f"BW(min-time)={result.gbps_min_time:8.2f} GB/s "
@@ -657,16 +694,16 @@ def print_result(result: BenchResult) -> None:
     )
 
 
-def _format_stat_entry(flat_idx: int, cycles: int) -> str:
+def _format_stat_entry(flat_idx: int, cycles: int, warps_per_sm: int) -> str:
     cta_warp, slot = divmod(flat_idx, 2)
-    cta, warp = divmod(cta_warp, NUM_WARPS)
+    cta, warp = divmod(cta_warp, warps_per_sm)
     name = "min" if slot == 0 else "max"
     return f"(cta={cta}, warp={warp}, {name}={cycles})"
 
 
-def print_clock_stats(clock_stats_t: torch.Tensor, label: str, topk: int = 10) -> None:
+def print_clock_stats(clock_stats_t: torch.Tensor, label: str, warps_per_sm: int, topk: int = 10) -> None:
     stats_cpu = clock_stats_t.detach().cpu().reshape(-1)
-    stats_3d = clock_stats_t.detach().cpu().reshape(-1, NUM_WARPS, 2)
+    stats_3d = clock_stats_t.detach().cpu().reshape(-1, warps_per_sm, 2)
     mins = stats_3d[:, :, 0].reshape(-1)
     maxs = stats_3d[:, :, 1].reshape(-1)
 
@@ -676,12 +713,12 @@ def print_clock_stats(clock_stats_t: torch.Tensor, label: str, topk: int = 10) -
     print(f"  {label}_min_top10:")
     for idx in min_order:
         flat_idx = idx * 2
-        print(f"    {_format_stat_entry(flat_idx, int(stats_cpu[flat_idx]))}")
+        print(f"    {_format_stat_entry(flat_idx, int(stats_cpu[flat_idx]), warps_per_sm)}")
 
     print(f"  {label}_max_top10:")
     for idx in max_order:
         flat_idx = idx * 2 + 1
-        print(f"    {_format_stat_entry(flat_idx, int(stats_cpu[flat_idx]))}")
+        print(f"    {_format_stat_entry(flat_idx, int(stats_cpu[flat_idx]), warps_per_sm)}")
 
 
 def write_csv(path: str | Path, results: list[BenchResult]) -> None:
@@ -693,20 +730,14 @@ def write_csv(path: str | Path, results: list[BenchResult]) -> None:
             writer.writerow(result.__dict__)
 
 
-def allocate_remote_buffer(configs: list[BenchConfig], sm_count: int) -> torch.Tensor:
+def allocate_remote_buffer(configs: list[BenchConfig]) -> torch.Tensor:
     max_actual = 0
     for config in configs:
-        if config.x_ctas <= 0 or config.x_ctas > sm_count:
-            continue
-        if config.y_copy_per_iter <= 0 or config.z_bytes_per_inst <= 0:
-            continue
-        bytes_per_iter = (
-            config.x_ctas * NUM_WARPS * config.y_copy_per_iter * config.z_bytes_per_inst
-        )
+        bytes_per_iter = bytes_per_iteration(config)
         requested = mib_to_bytes(config.w_comm_mbytes)
         actual = max(1, math.ceil(requested / bytes_per_iter)) * bytes_per_iter
         max_actual = max(max_actual, actual)
-    buffer_bytes = round_up(max(mib_to_bytes(DEFAULT_BUFFER_MIB), max_actual), 128)
+    buffer_bytes = round_up(max(mib_to_bytes(default_buffer_mib), max_actual), 128)
     torch.cuda.set_device(1)
     remote = torch.empty((buffer_bytes,), dtype=torch.uint8, device="cuda")
     remote.fill_(0x5A)
@@ -715,23 +746,23 @@ def allocate_remote_buffer(configs: list[BenchConfig], sm_count: int) -> torch.T
 
 
 def main() -> int:
-    sm_count = validate_environment()
-    parser = make_arg_parser(sm_count)
+    environment = validate_environment()
+    parser = make_arg_parser(environment)
     args = parser.parse_args()
 
     configs = list(iter_configs(args))
-    remote_buf = allocate_remote_buffer(configs, sm_count)
-    smem_capacity = smem_capacity_bytes()
+    remote_buf = allocate_remote_buffer(configs)
 
     print(
-        f"device0={torch.cuda.get_device_name(0)!r} device1={torch.cuda.get_device_name(1)!r} "
-        f"sm_count={sm_count} smem_capacity={smem_capacity} B "
+        f"arch={environment.architecture} device0={torch.cuda.get_device_name(0)!r} "
+        f"device1={torch.cuda.get_device_name(1)!r} sm_count={environment.sm_count} "
+        f"smem_capacity={environment.smem_capacity} B "
         f"remote_buffer={remote_buf.numel() / (1024 * 1024):.1f} MiB"
     )
 
     results = []
     for config in configs:
-        result = run_one_config(config, sm_count, smem_capacity, remote_buf)
+        result = run_one_config(config, environment.smem_capacity, remote_buf)
         results.append(result)
         print_result(result)
 

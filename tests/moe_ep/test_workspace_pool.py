@@ -138,6 +138,27 @@ def test_base_prepare_workspace_pools_and_destroy_refcounts():
     ws2.destroy.assert_called_once()
 
 
+def test_capture_release_does_not_consume_pool_reference(monkeypatch):
+    import torch
+
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams
+
+    cls = _fake_backend_cls()
+    backend = cls(object(), pool_key=("capture-retry",))
+    ws = backend.prepare_workspace(
+        BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+        FleetParams(num_experts=2, max_tokens_per_rank=4, token_hidden_size=8),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="graph capture"):
+        backend.destroy(ws)
+    assert id(ws) in _pool()._KEY_BY_ID
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    backend.destroy(ws)
+    ws.destroy.assert_called_once()
+
+
 def test_base_prepare_workspace_unpooled_when_key_none():
     from flashinfer.moe_ep import BootstrapConfig, FleetParams
 

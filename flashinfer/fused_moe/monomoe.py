@@ -78,8 +78,8 @@ def has_monomoe() -> bool:
 def get_scratchpad_size_bytes() -> int:
     """Return the global scratchpad size (bytes) required by the kernel.
 
-    Sourced from the C++ ``sizeof(MoEGemmSpec<Dims>)`` so the buffer can never
-    desync from the kernel's struct layout.
+    The size is sourced from the C++ ``sizeof(MoEGemmSpec<Dims>)`` expression,
+    so the buffer can never desync from the kernel's struct layout.
     """
     mod = _get_monomoe_module()
     return int(mod.monomoe_scratchpad_size())

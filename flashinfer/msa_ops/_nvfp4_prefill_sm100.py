@@ -179,7 +179,11 @@ DETERMINISTIC_CONTEXT_TOKENS = UNION_TABLE_SLOTS * _PAGE_SIZE
 # route's memory cost and because it caps occupancy at 2 CTAs/SM.
 _DYNAMIC_SMEM_BYTES = 98848
 
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm100a", (10, 3): "sm103a"}
+_SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm100a",
+    (10, 3): "sm103a",
+    (10, 7): "sm107a",
+}
 
 # e2m1 value table indexed by the 4-bit code; even elements occupy the low
 # nibble of each packed byte.
@@ -588,7 +592,7 @@ def check_surface(
         if tensor.device != q.device:
             return _reject(f"{name} must be on the same device as q")
     if _target_for(q.device) is None:
-        return _reject("this route requires compute capability 10.0 or 10.3")
+        return _reject("this route requires compute capability 10.0, 10.3 or 10.7")
     toolkit = toolkit_decline_reason()
     if toolkit is not None:
         return _reject(toolkit)
@@ -1010,7 +1014,7 @@ def run(
     capturing = _is_capturing()
     if not capturing:
         logger.info_once(
-            "FlashInfer NVFP4 MSA prefill kernel active on compute capability 10.0/10.3"
+            "FlashInfer NVFP4 MSA prefill kernel active on compute capability 10.0/10.3/10.7"
         )
     _dispatch(
         module,

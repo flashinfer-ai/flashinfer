@@ -18,10 +18,15 @@ limitations under the License.
 # Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
 # This helps AOT script to override envs.
 
+import base64
 import functools
+import getpass
+import hashlib
 import logging
 import os
 import pathlib
+import platform
+import re
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
@@ -67,15 +72,79 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
 )
 
-FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+# NOTE(Windows): On Windows the full output paths for JIT-compiled CUDA objects
+# can easily exceed the 260-char MAX_PATH limit: the longest module directory
+# names leave fewer than 20 characters for the cache root.
+# On Linux/macOS we keep the conventional layout: $HOME/.cache/flashinfer/...
+# On Windows the default is a short per-user root at the drive root,
+# %SYSTEMDRIVE%\_fij_<tag>: six characters derived from the account SID, so two
+# accounts get distinct roots; the user name stands in when the SID cannot be
+# read, and a root two accounts would share is refused by the owner-only check
+# below, never shared.
+FLASHINFER_CACHE_DIR: pathlib.Path
+
+
+def _windows_user_tag() -> str:
+    """Six characters that identify the account: a hash of its SID, else its name."""
+    from ._windows_acl import current_user_sid
+
+    sid = current_user_sid()
+    if sid:
+        digest = hashlib.sha256(sid.encode("ascii")).digest()
+        return base64.b32encode(digest)[:6].decode("ascii").lower()
+    try:
+        user = getpass.getuser()
+    except (ImportError, OSError, KeyError):
+        user = ""
+    # DOMAIN\user and user@domain forms carry the account name only.
+    user = user.rsplit("\\", 1)[-1].split("@", 1)[0]
+    return re.sub(r"[^a-z0-9]", "", user.lower())[:6] or "user"
+
+
+if os.name == "nt":
+    FLASHINFER_CACHE_DIR = pathlib.Path(
+        os.getenv(
+            "FLASHINFER_CACHE_DIR",
+            f"{os.getenv('SYSTEMDRIVE', 'C:')}/_fij_{_windows_user_tag()}",
+        )
+    )
+    # The default sits at the drive root, where any local account could create it
+    # first: make it owner-only here, before any subdirectory is created, and
+    # refuse one that another account owns. An explicit FLASHINFER_CACHE_DIR is
+    # the user's own choice and is left alone.
+    if os.getenv("FLASHINFER_CACHE_DIR") is None:
+        from ._windows_acl import ensure_private_dir
+
+        ensure_private_dir(FLASHINFER_CACHE_DIR)
+else:
+    FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
+
+_VERSION_MISMATCH_HINT = (
+    "Run `flashinfer download-kernels` to install matching kernel wheels, or set "
+    "FLASHINFER_DISABLE_VERSION_CHECK=1 to use the installed version anyway."
+)
+
+
+def _check_cubin_version(package_version: str) -> None:
+    # NOTE(yiyang): skip version check for editable/source installs where
+    # flashinfer_version falls back to "0.0.0+unknown" (no _build_meta.py).
+    if (
+        not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+        and flashinfer_version != "0.0.0+unknown"
+        and package_version != flashinfer_version
+    ):
+        raise RuntimeError(
+            f"flashinfer-cubin version ({package_version}) does not match "
+            f"flashinfer version ({flashinfer_version}). {_VERSION_MISMATCH_HINT}"
+        )
 
 
 def _get_cubin_dir():
     """
     Get the cubin directory path with the following priority:
     1. Environment variable FLASHINFER_CUBIN_DIR
-    2. flashinfer-cubin package if installed
+    2. flashinfer-cubin package if installed and its version matches
     3. Default cache directory
     """
     # First check environment variable
@@ -93,23 +162,21 @@ def _get_cubin_dir():
     if has_flashinfer_cubin():
         import flashinfer_cubin
 
-        flashinfer_cubin_version = flashinfer_cubin.__version__
-        # Allow bypassing version check with environment variable
-        # NOTE(yiyang): skip version check for editable/source installs where
-        # flashinfer_version falls back to "0.0.0+unknown" (no _build_meta.py).
-        if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
-            and flashinfer_version != "0.0.0+unknown"
-            and flashinfer_version != flashinfer_cubin_version
-        ):
-            raise RuntimeError(
-                f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
-                f"flashinfer version ({flashinfer_version}). "
-                "Please install the same version of both packages. "
-                "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+        # NOTE: a mismatched wheel is ignored instead of failing the import. It
+        # is usually left behind by a flashinfer-python upgrade, and the CLI
+        # command that replaces it (`flashinfer download-kernels`) must import
+        # this module first.
+        try:
+            _check_cubin_version(flashinfer_cubin.__version__)
+        except RuntimeError as error:
+            logger.warning(
+                "Ignoring incompatible flashinfer-cubin package (cubins will be "
+                "downloaded on demand to %s): %s",
+                FLASHINFER_CACHE_DIR / "cubins",
+                error,
             )
-
-        return pathlib.Path(flashinfer_cubin.get_cubin_dir())
+        else:
+            return pathlib.Path(flashinfer_cubin.get_cubin_dir())
 
     # Fall back to default cache directory
     return FLASHINFER_CACHE_DIR / "cubins"
@@ -150,9 +217,7 @@ def _check_jit_cache_version(distribution: str, package_version: str) -> None:
     ):
         raise RuntimeError(
             f"{distribution} version ({package_version}) does not match "
-            f"flashinfer version ({flashinfer_version}). "
-            "Please install the same version of both packages. "
-            "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+            f"flashinfer version ({flashinfer_version}). {_VERSION_MISMATCH_HINT}"
         )
 
 
@@ -179,7 +244,19 @@ def _get_aot_providers() -> Tuple[AOTProvider, ...]:
 
     import flashinfer_jit_cache
 
-    _check_jit_cache_version("flashinfer-jit-cache", flashinfer_jit_cache.__version__)
+    # NOTE: like a mismatched flashinfer-cubin, a mismatched shim is ignored so
+    # that `flashinfer download-kernels` can still import FlashInfer to replace it.
+    try:
+        _check_jit_cache_version(
+            "flashinfer-jit-cache", flashinfer_jit_cache.__version__
+        )
+    except RuntimeError as error:
+        logger.warning(
+            "Ignoring incompatible flashinfer-jit-cache package (kernels will be "
+            "JIT-compiled instead): %s",
+            error,
+        )
+        return ()
     providers = []
     for provider in flashinfer_jit_cache.get_jit_cache_providers():
         try:
@@ -266,9 +343,14 @@ def _provider_target_compatibility_score(
     return max(scores) if scores else None
 
 
+def jit_library_name(module_name: str) -> str:
+    """File name of a module's shared library: module.dll on Windows (short paths), <name>.so elsewhere."""
+    return "module.dll" if platform.system() == "Windows" else f"{module_name}.so"
+
+
 def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
     """Resolve the best installed AOT artifact for each visible CUDA target."""
-    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
     if fallback_path.exists():
         return (AOTArtifact("flashinfer-python", fallback_path, None),)
 
@@ -287,7 +369,9 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
             )
             if compatibility_score is None:
                 continue
-            provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
+            provider_path = (
+                provider.jit_cache_dir / module_name / jit_library_name(module_name)
+            )
             if provider_path.exists():
                 artifact = AOTArtifact(
                     provider.provider_id,
@@ -303,7 +387,7 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
 
 def get_aot_path(module_name: str) -> pathlib.Path:
     """Return the primary path for an AOT module, or its stable fallback path."""
-    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
     artifacts = get_aot_artifacts(module_name)
     return artifacts[0].path if artifacts else fallback_path
 

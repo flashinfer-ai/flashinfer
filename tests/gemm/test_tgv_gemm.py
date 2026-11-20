@@ -66,8 +66,8 @@ def _blockscaled_tgv_case(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
 def test_tgv_gemm_sm100(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
     """Test tgv_gemm_sm100 with autotuner integration."""
     device = torch.device("cuda")
-    if not _match_sm_version(device, ["100", "103"]):
-        pytest.skip("TGV GEMM requires SM100, SM103 architecture")
+    if not _match_sm_version(device, ["100", "103", "107"]):
+        pytest.skip("TGV GEMM requires SM100, SM103, SM107 architecture")
 
     if sf_dtype is not None:
         a, b, a_descale, b_descale, bias, reference = _blockscaled_tgv_case(
@@ -123,6 +123,20 @@ def test_tgv_gemm_sm100(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
     )
     print(f"PDL Cosine similarity: {cos_sim_pdl:.6f}", flush=True)
     assert cos_sim_pdl > 0.99
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_tgv_gemm_sm100_rejects_k_not_multiple_of_8(dtype):
+    """K * 2 bytes must be a multiple of 16 for TMA, so K=2049 must be rejected."""
+    device = torch.device("cuda")
+    if not _match_sm_version(device, ["100", "103", "107"]):
+        pytest.skip("TGV GEMM requires SM100, SM103, SM107 architecture")
+
+    m, n, k = 8, 256, 2049
+    A = torch.randn(m, k, device=device, dtype=dtype)
+    B = torch.randn(n, k, device=device, dtype=dtype).t()  # column major
+    with pytest.raises(ValueError, match="K divisible by 8"):
+        tgv_gemm_sm100(A, B, bias=None)
 
 
 if __name__ == "__main__":

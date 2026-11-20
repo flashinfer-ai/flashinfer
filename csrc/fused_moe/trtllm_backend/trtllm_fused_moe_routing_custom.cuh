@@ -27,6 +27,7 @@
 //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
 
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -50,6 +51,8 @@ bool launchClusterKernelBlockDim256(Data const& data, void* stream);
 bool launchClusterKernelBlockDim512(Data const& data, void* stream);
 bool launchClusterKernelBlockDim1024(Data const& data, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
+bool launchBlockPermutationKernel(Data const& data, void* stream);
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream);
 bool launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist,
                                  void* stream);
 bool launchBlockScoresKernel(Data const& data, void* stream);
@@ -93,8 +96,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
   static constexpr int totalExpertCounts = BlockKernelMaxNumTokens * MaxNumExperts;
-  __shared__ int8_t __attribute((aligned(128))) smemOffset[totalExpertCounts];
-  __shared__ int8_t __attribute((aligned(128))) smemKIdx[totalExpertCounts];
+  __shared__ int8_t __align__(128) smemOffset[totalExpertCounts];
+  __shared__ int8_t __align__(128) smemKIdx[totalExpertCounts];
 
   using Scan = cub::BlockScan<int32_t, NumThreadsBlock>;
   __shared__ typename Scan::TempStorage tempStorage;
@@ -112,6 +115,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   // then wait on primary grid
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Downstream kernels wait on this grid before reading any routing output (the batched
+    // GEMMs guard every routing-dependent load with a grid dependency), so they can launch
+    // and run their prologue while this kernel computes the routing.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -266,6 +273,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
               mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
   }
@@ -312,14 +320,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
-  // The downstream kernels depend on all routing outputs being visible.
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
@@ -441,6 +441,10 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Downstream kernels wait on this grid before reading any routing output (the batched
+    // GEMMs guard every routing-dependent load with a grid dependency), so they can launch
+    // and run their prologue while this kernel computes the routing.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -598,6 +602,8 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
                 mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
           }
           params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
+          initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2),
+                                 mnLimit1);
         }
       }
     }
@@ -648,12 +654,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
@@ -766,10 +766,10 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
     }
   }
 
-  __cluster_barrier_arrive();
-  __cluster_barrier_wait();
-
   if (params.mPtrScores != nullptr) {
+    // The permutation reads the top-k results of the whole cluster from shared memory.
+    __cluster_barrier_arrive();
+    __cluster_barrier_wait();
     routingPermutation<KernelParams, BaseType, ClusterBlockDim, ClusterNumWarps,
                        KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/false>(
         params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
@@ -790,8 +790,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Cl
   static constexpr int NumWarpsBlock = ClusterBlockDim / WarpSize;
   static_assert(ClusterBlockDim % WarpSize == 0);
   static_assert(ClusterBlockDim <= NumThreads);
-  __shared__ TypePacked __attribute((
-      aligned(128))) smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
+  __shared__ TypePacked __align__(128)
+      smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
   routingIndicesClusterKernelBody<KernelParams, BaseType, ClusterBlockDim, NumWarpsBlock>(
       params, smemPackedScoreIdx);
 }
@@ -899,6 +899,62 @@ bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
                         stream);
   return queryPolicyHasCompiledTier(data);
 }
+
+// Single-CTA permutation of precomputed top-k ids: the cluster kernel's histogram, scan and
+// permutation without its cluster barriers and distributed shared memory reads.
+template <typename KernelParams>
+__global__ void __launch_bounds__(NumThreads)
+    routingIndicesBlockPermutationKernel(KernelParams params) {
+  using InputT = typename KernelParams::InputT;
+  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+  routingPermutation<KernelParams, BaseType, NumThreads, NumThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true, int32_t,
+                     /*NumBlocks=*/1>(params, /*smemPackedScoreIdx=*/nullptr, warpIdx,
+                                      /*clusterBlockRank=*/0);
+}
+
+bool launchBlockPermutationKernel(Data const& data, void* stream) {
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockPermutationKernel, /*numBlocks=*/1,
+                        NumThreads, /*smemSize=*/0, stream);
+  return queryPolicyHasCompiledTier(data);
+}
+
+// Permutation of precomputed top-k ids over a cluster of NumBlocksPerSmallCluster CTAs: fewer
+// distributed shared memory reads and cheaper cluster barriers than the full cluster for batches
+// a single CTA permutes too slowly.
+template <typename KernelParams>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+__global__ void __cluster_dims__(NumBlocksPerSmallCluster, 1, 1) __launch_bounds__(NumThreads)
+    routingIndicesSmallClusterPermutationKernel(KernelParams params) {
+  using InputT = typename KernelParams::InputT;
+  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+  routingPermutation<KernelParams, BaseType, NumThreads, NumThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true, int32_t,
+                     NumBlocksPerSmallCluster>(params, /*smemPackedScoreIdx=*/nullptr, warpIdx,
+                                               blockIdx.x);
+}
+#else
+__global__ void __launch_bounds__(NumThreads)
+    routingIndicesSmallClusterPermutationKernel(KernelParams /* params */) {
+  assert(false && "routingIndicesSmallClusterPermutationKernel is only supported on SM90+");
+}
+#endif
+
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream) {
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesSmallClusterPermutationKernel,
+                        NumBlocksPerSmallCluster, NumThreads, /*smemSize=*/0, stream);
+  return queryPolicyHasCompiledTier(data);
+}
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
 
 #endif  // FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL || FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE
@@ -916,6 +972,11 @@ bool launchClusterKernel(Data const& data, void* stream) {
       data.mNumTokens >= 32 && data.mNumTokens <= 64;
   if (useWidePermutationCluster) {
     return launchClusterKernelBlockDim512(data, stream);
+  }
+  // A permutation-only launch has no warp-per-token score phase; its per-expert histogram,
+  // offsets and permutation spread over all threads, so the full-width cluster is the fastest.
+  if (data.mPtrScores == nullptr) {
+    return launchClusterKernelBlockDim1024(data, stream);
   }
 
   // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
@@ -1203,14 +1264,14 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
     static constexpr bool kNeedsAux = PolicyPairNeedsAux<PreProc, PostProc>::value;
     static constexpr int kAuxSize = kNeedsAux ? MaxNumExperts : 1;
 
-    static constexpr float invalidScoreFloat = -INFINITY;
+    static constexpr float invalidScoreFloat = -std::numeric_limits<float>::infinity();
 
     // Per-expert smem arrays:
     //   smemBiased[e] = topK selection key for expert e
     //   smemAux[e]    = auxiliary data for expert e (only used / written when
     //                   PolicyPairNeedsAux<PreProc, PostProc>::value is true)
-    __shared__ BaseType __attribute((aligned(128))) smemBiased[MaxNumExperts];
-    __shared__ BaseType __attribute((aligned(128))) smemAuxStorage[kAuxSize];
+    __shared__ BaseType __align__(128) smemBiased[MaxNumExperts];
+    __shared__ BaseType __align__(128) smemAuxStorage[kAuxSize];
     BaseType* auxPtr = kNeedsAux ? smemAuxStorage : smemBiased;
 
     auto block = cg::this_thread_block();
@@ -1265,10 +1326,8 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
                   LaneTopKNumWorkerWarps <= kBlockScoresKernelBlockDim / WarpSize &&
                   LaneTopKMergeValuesPerLane <= 64 &&
                   PostprocessSupportsLaneOwnedTopK<PostProc>::value) {
-      __shared__ BaseType
-          __attribute((aligned(128))) smemIntermediateScores[LaneTopKNumIntermediate];
-      __shared__ int32_t
-          __attribute((aligned(128))) smemIntermediateExperts[LaneTopKNumIntermediate];
+      __shared__ BaseType __align__(128) smemIntermediateScores[LaneTopKNumIntermediate];
+      __shared__ int32_t __align__(128) smemIntermediateExperts[LaneTopKNumIntermediate];
 
       if (warpIdx < LaneTopKNumWorkerWarps) {
         BaseType localScores[LaneTopKValuesPerWorkerLane];
@@ -1613,22 +1672,16 @@ void run(Data const& data, void* stream) {
   // The two kernels overlap via cudaTriggerProgrammaticLaunchCompletion()
   // and cudaGridDependencySynchronize().
   //
-  // Dispatch rule (derived from a policy × (E, K) × BS sweep, see
-  // `bench_routing_sweep.py` + `bench_routing_analyze.py`):
+  // Dispatch rule (derived from a routing-only sweep of every routingCustom policy over
+  // E in {128..1024}, K in {4..22}, BS in [1, 256] on SM100, SM103 and SM107):
   //
-  //   useSplit = useSingleCluster && !useSingleBlock && numExperts >= 160
+  //   Few experts (E < 160): split when K >= 8 and BS * K >= 1536, where the fused kernel's
+  //   per-thread K-sized state dominates (up to 2.4x for E=128, K=22).
+  //   Sigmoid+bias policies (DeepSeekV3 nGroup=1, MiniMax2) with E >= 160: always split.
+  //   Other policies with E >= 160: split when BS > 64, or when E >= 512, 10 <= K <= 16 and
+  //   BS >= 32. Below that the fused single-cluster kernel is faster than the scores kernel
+  //   plus the PDL handoff.
   //   plus the bounded high-E/high-K static-block boundary selected above.
-  //
-  // Why this rule (measured on B200 across {Default, Renormalize,
-  // DeepSeekV3_nGrp1, MiniMax2} policies, BS ∈ [17, 256]):
-  //   - At `numExperts >= 160` split wins on average for every policy:
-  //     1.17× (Renormalize 160/8) up to 3.62× (DeepSeekV3 1024/32).
-  //   - At `numExperts = 128`, split's two-kernel overhead (launch + PDL
-  //     handoff) approximately cancels the single-cluster savings.  Default
-  //     128/8 is ~1.0×; DeepSeekV3 / MiniMax2 128/8 show ~1.11× but
-  //     Renormalize 128/8 is ~1.06× — not worth the complexity.
-  //   - Below the cluster range, block/dynblock remains the default; the bounded high-E/high-K
-  //     static-block boundary above is the measured exception.
   //
   // Env-var override for benchmarking, applies to *both* the single-cluster
   // split path and the large-BS topK kernel choice:
@@ -1659,8 +1712,18 @@ void run(Data const& data, void* stream) {
         "support block-per-token; the request is ignored.");
   }
 
-  bool useSplitTopKPath = useSingleCluster && !useSingleBlock && policySupportsBlockPerToken &&
-                          (data.mNumExperts >= NumExperts160Experts);
+  bool const splitBeatsFusedCluster = [&] {
+    if (data.mNumExperts < NumExperts160Experts) {
+      return data.mTopK >= 8 && data.mNumTokens * data.mTopK >= 1536;
+    }
+    if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias) {
+      return true;
+    }
+    return data.mNumTokens > 64 || (data.mNumExperts >= 512 && data.mTopK >= 10 &&
+                                    data.mTopK <= 16 && data.mNumTokens >= 32);
+  }();
+  bool useSplitTopKPath =
+      useSingleCluster && !useSingleBlock && policySupportsBlockPerToken && splitBeatsFusedCluster;
   if (forceMode == ForceMode::kOn && useSingleCluster && !useSingleBlock &&
       policySupportsBlockPerToken) {
     useSplitTopKPath = true;

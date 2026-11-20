@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import sys
 from ctypes import (
     CFUNCTYPE,
     POINTER,
@@ -59,15 +60,12 @@ class DLTensor(ctypes.Structure):
     ]
 
 
-# Deleter type for DLManagedTensor
-DLManagedTensorDeleter = CFUNCTYPE(
-    None, POINTER(ctypes.c_void_p)
-)  # Not used directly here
-
-
 # Define DLManagedTensor structure, with deleter prototype void(*deleter)(DLManagedTensor*)
 class DLManagedTensor(ctypes.Structure):
     pass
+
+
+_DLManagedTensorPointer = POINTER(DLManagedTensor)
 
 
 DLManagedTensor._fields_ = [
@@ -77,22 +75,60 @@ DLManagedTensor._fields_ = [
 ]
 
 
-# A no-op deleter that doesn't perform any operation
+_Py_IncRef = ctypes.PYFUNCTYPE(None, c_void_p)(("Py_IncRef", ctypes.pythonapi))
+_Py_DecRef = ctypes.PYFUNCTYPE(None, c_void_p)(("Py_DecRef", ctypes.pythonapi))
+_PyCapsule_New = ctypes.PYFUNCTYPE(
+    ctypes.py_object, c_void_p, ctypes.c_char_p, c_void_p
+)(("PyCapsule_New", ctypes.pythonapi))
+_PyCapsule_IsValid = ctypes.PYFUNCTYPE(c_int, c_void_p, ctypes.c_char_p)(
+    ("PyCapsule_IsValid", ctypes.pythonapi)
+)
+_PyCapsule_GetPointer = ctypes.PYFUNCTYPE(c_void_p, c_void_p, ctypes.c_char_p)(
+    ("PyCapsule_GetPointer", ctypes.pythonapi)
+)
+_DLPACK_CAPSULE_NAME = b"dltensor"
+
+
+class _DLPackContext:
+    def __init__(self, managed_tensor, shape, strides, owner):
+        self.managed_tensor = managed_tensor
+        self.shape = shape
+        self.strides = strides
+        self.owner = owner
+        # PyCapsule stores only a function pointer, not a Python reference.
+        self.capsule_deleter = _delete_capsule
+
+
 @CFUNCTYPE(None, POINTER(DLManagedTensor))
-def no_op_deleter(dmt_ptr):
-    # You can also call cudaFree here if you want to free memory when the tensor's lifecycle ends
-    pass
+def _delete_managed_tensor(ptr, _decref=_Py_DecRef, _is_finalizing=sys.is_finalizing):
+    # ctypes acquires the GIL for this callback. Keep late shutdown consumers
+    # alive rather than releasing Python objects during interpreter teardown.
+    if _is_finalizing():
+        return
+    context = ptr.contents.manager_ctx
+    ptr.contents.manager_ctx = None
+    if context:
+        _decref(context)
 
 
-# Wrapper class to prevent Python garbage collection of DLPack-related objects
+@CFUNCTYPE(None, c_void_p)
+def _delete_capsule(
+    capsule,
+    _is_valid=_PyCapsule_IsValid,
+    _get_pointer=_PyCapsule_GetPointer,
+    _delete=_delete_managed_tensor,
+    _cast=ctypes.cast,
+    _pointer_type=_DLManagedTensorPointer,
+    _name=_DLPACK_CAPSULE_NAME,
+):
+    # Consuming a capsule renames it to used_dltensor and transfers cleanup
+    # to the consumer. An unconsumed capsule still owns its descriptor.
+    if _is_valid(capsule, _name):
+        _delete(_cast(_get_pointer(capsule, _name), _pointer_type))
+
+
 class CapsuleWrapper:
-    """
-    A wrapper class that holds references to the PyCapsule and its associated data.
-
-    This class prevents Python's garbage collector from collecting the shape_array and
-    managed_tensor objects while the capsule is still in use. It serves as a container
-    to maintain the lifecycle of all DLPack-related objects.
-    """
+    """A DLPack capsule and its metadata, retained for callers inspecting the view."""
 
     def __init__(self, capsule, shape_array, managed_tensor):
         """
@@ -113,7 +149,7 @@ class CapsuleWrapper:
 
 
 def create_dlpack_capsule(
-    ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id
+    ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id, *, owner=None
 ):
     """
     Parameters:
@@ -123,9 +159,9 @@ def create_dlpack_capsule(
       num_segments: Number of segments
       torch_dtype: torch dtype
       dev_id: device id.
+      owner: optional allocation owner to retain until the consumer releases storage.
     Returns:
-      A PyCapsule object compliant with DLPack specification, which can be directly converted to a
-      tensor using torch.utils.dlpack.from_dlpack
+      A CapsuleWrapper whose capsule can be consumed by torch.utils.dlpack.from_dlpack.
     """
     bits_per_elements = 0
     dldata_type_code = 0
@@ -166,26 +202,22 @@ def create_dlpack_capsule(
     dltensor.shape = ctypes.cast(shape_array, POINTER(c_int64))
     dltensor.strides = ctypes.cast(stride_array, POINTER(c_int64))
     dltensor.byte_offset = 0
-    # Construct DLManagedTensor and set deleter to no-op (you can also call cudaFree here)
     managed_tensor = DLManagedTensor()
     managed_tensor.dl_tensor = dltensor
-    managed_tensor.manager_ctx = None
-    managed_tensor.deleter = no_op_deleter
-    # Note: Must ensure that shape_array and managed_tensor are not garbage collected by Python,
-    # A simple way is to attach them to the capsule object.
-    # Call PyCapsule_New to create capsule
-    PyCapsule_New = ctypes.pythonapi.PyCapsule_New
-    PyCapsule_New.restype = c_void_p
-    PyCapsule_New.argtypes = [c_void_p, ctypes.c_char_p, c_void_p]
-    # Allocate managed_tensor on the heap (note that pointer returns a pointer)
-    managed_tensor_ptr = pointer(managed_tensor)
-    # The capsule name must be "dltensor", as required by the DLPack specification
-    capsule_ptr = PyCapsule_New(managed_tensor_ptr, b"dltensor", None)
-    # Convert capsule_ptr to Python object
-    capsule = ctypes.cast(capsule_ptr, ctypes.py_object).value
-    # To prevent shape_array and managed_tensor from being collected, we attach them as attributes to the capsule
-    capsule_wrapper = CapsuleWrapper(capsule, shape_array, managed_tensor)
-    return capsule_wrapper
+    managed_tensor.deleter = _delete_managed_tensor
+    context = _DLPackContext(managed_tensor, shape_array, stride_array, owner)
+    managed_tensor.manager_ctx = id(context)
+    # This reference belongs to DLPack, not to a Python tensor. Dtype views
+    # can outlive that tensor while sharing its underlying storage.
+    _Py_IncRef(id(context))
+    try:
+        capsule = _PyCapsule_New(
+            pointer(managed_tensor), _DLPACK_CAPSULE_NAME, _delete_capsule
+        )
+    except BaseException:
+        _delete_managed_tensor(pointer(managed_tensor))
+        raise
+    return CapsuleWrapper(capsule, shape_array, managed_tensor)
 
 
 def pack_strided_memory(
@@ -195,6 +227,8 @@ def pack_strided_memory(
     num_segments: int,
     dtype: torch.dtype,
     dev_id: int,
+    *,
+    owner=None,
 ) -> torch.Tensor:
     r"""Pack a strided device allocation as a PyTorch tensor view.
 
@@ -215,6 +249,9 @@ def pack_strided_memory(
         Element dtype of the resulting tensor.
     dev_id : int
         CUDA device ID hosting ``ptr``.
+    owner : object, optional
+        Allocation owner retained until the last tensor or storage view is
+        released. Without it, the caller must keep the allocation alive.
 
     Returns
     -------
@@ -223,7 +260,7 @@ def pack_strided_memory(
     """
     # Create a new capsule each time
     capsule_wrapper = create_dlpack_capsule(
-        ptr, segment_size, segment_stride, num_segments, dtype, dev_id
+        ptr, segment_size, segment_stride, num_segments, dtype, dev_id, owner=owner
     )
     torch_tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
     torch_tensor._capsule_wrapper = capsule_wrapper

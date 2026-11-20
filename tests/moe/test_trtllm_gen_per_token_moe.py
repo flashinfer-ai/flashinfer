@@ -20,8 +20,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 from typing import Dict
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -32,8 +33,10 @@ from flashinfer import (
     nvfp4_quantize,
 )
 from flashinfer.fused_moe import (
+    trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
@@ -44,7 +47,7 @@ from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
-from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
+from tests.quantization.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
 from . import utils as moe_utils
 from .trtllm_gen_fused_moe_utils import (
     check_accuracy,
@@ -59,22 +62,13 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 # The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
 # it); shape fan-out kept to boundary corners.
-@pytest.mark.parametrize("num_tokens", [1, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 4096])
-@pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize("num_experts", [32])
-@pytest.mark.parametrize("top_k", [4])
-@pytest.mark.parametrize("use_4over6", [False, True])
-@pytest.mark.parametrize("weights_use_4over6", [False, True])
-@pytest.mark.parametrize(
-    "activation_type",
-    [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Relu2, id="Relu2"),
-    ],
-)
-@pytest.mark.parametrize("zero_rows", [False, True])
-def test_routed_fused_moe(
+def _skip_unless_sm10x(device: torch.device) -> None:
+    if get_compute_capability(device)[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+
+def _per_token_routed_case(
+    *,
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
@@ -84,11 +78,16 @@ def test_routed_fused_moe(
     weights_use_4over6: bool,
     activation_type: ActivationType,
     zero_rows: bool,
+    device: torch.device,
 ):
-    device = torch.device("cuda:0")
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    """Build per-token NVFP4 inputs for the routed flat APIs and the reference.
+
+    Returns ``(kwargs, reference, parts)``; ``kwargs`` is the keyword form of
+    the ``trtllm_fp4_block_scale_routed_moe`` call and ``parts`` holds the
+    routing, the dequantized FC2 weights and the reference FC2 input. The
+    activation is quantized under the ambient 4over6 environment; the weights
+    under ``weights_use_4over6``.
+    """
     enable_pdl = device_support_pdl(device)
 
     is_gated = activation_type.is_gated
@@ -232,6 +231,9 @@ def test_routed_fused_moe(
     expert_out = torch.zeros(
         num_tokens * top_k, hidden_size, device=device, dtype=torch.bfloat16
     )
+    intermediate = torch.zeros(
+        num_tokens * top_k, intermediate_size, device=device, dtype=torch.bfloat16
+    )
     for e in range(num_experts):
         mask = flat_ids == e  # [num_tokens*top_k]
         e_hidden = flat_hidden[mask]  # [n_e, hidden_size]
@@ -241,6 +243,7 @@ def test_routed_fused_moe(
             inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
         else:
             inter_e = F.relu(up_gate_e) ** 2  # [n_e, intermediate_size]
+        intermediate[mask] = inter_e
         expert_out[mask] = inter_e @ w2_dequant[e].T  # [n_e, hidden_size]
     # Weighted sum back to [num_tokens, hidden_size]
     reference = (
@@ -325,47 +328,89 @@ def test_routed_fused_moe(
         torch.bfloat16
     ).view(torch.int16)
 
-    # ======== Launch MoE ========
-    from functools import partial
+    kwargs = dict(
+        topk_ids=packed_tensor,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=w13_shuffled,
+        gemm1_weights_scale=w13_scale_shuffled,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=w2_shuffled,
+        gemm2_weights_scale=w2_scale_shuffled,
+        gemm2_bias=None,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.TopK.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type.value,
+        per_token_scale=per_token_scale_inv,
+    )
+    parts = dict(
+        topk_ids=topk_ids,
+        expert_weights=expert_weights,
+        w2_dequant=w2_dequant,
+        intermediate=intermediate.view(num_tokens, top_k, intermediate_size),
+    )
+    return kwargs, reference, parts
 
-    fn = partial(
-        trtllm_fp4_block_scale_routed_moe,
-        packed_tensor,
-        None,  # routing_bias
-        hidden_states,
-        hidden_states_scale,
-        w13_shuffled,
-        w13_scale_shuffled,
-        None,  # w13_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
-        w2_shuffled,
-        w2_scale_shuffled,
-        None,  # w2_bias
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        0,  # local_expert_offset
-        num_experts,
-        None,  # routed_scaling_factor
-        RoutingMethodType.TopK.value,
-        True,  # do_finalize
-        enable_pdl,
-        activation_type.value,  # act_type
-        per_token_scale_inv,
-        None,
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("use_4over6", [False, True])
+@pytest.mark.parametrize("weights_use_4over6", [False, True])
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
+@pytest.mark.parametrize("zero_rows", [False, True])
+def test_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    use_4over6: bool,
+    weights_use_4over6: bool,
+    activation_type: ActivationType,
+    zero_rows: bool,
+):
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, reference, _ = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=use_4over6,
+        weights_use_4over6=weights_use_4over6,
+        activation_type=activation_type,
+        zero_rows=zero_rows,
+        device=device,
     )
 
-    from flashinfer.autotuner import autotune
-
     with autotune(False):
-        result = fn()[0]
+        result = trtllm_fp4_block_scale_routed_moe(**kwargs)[0]
 
     torch.cuda.synchronize()
 
@@ -375,3 +420,437 @@ def test_routed_fused_moe(
         assert torch.all(result == 0)
         return
     check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)
+
+
+# The autouse fixture keys on the ``use_4over6`` parameter: it pins every
+# FLASHINFER_NVFP4_4OVER6* variable, so the environment legs below differ only
+# in the on/off switch and ``NVFP44Over6Config()`` names the same recipe.
+@pytest.mark.parametrize("use_4over6", [True])
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
+    """``nvfp4_4over6=`` must select exactly the kernel the environment selects.
+
+    Per-token GEMM2-input requantization is the only place the fused MoE reads
+    the recipe, so this is where an explicit recipe must be bit-identical to
+    the environment it replaces, and ``None`` must ignore an environment that
+    turns 4over6 on. The default recipe exercises the candidate search; the
+    ``e4m3_max=256`` recipe also moves the per-token global scale
+    (``globalScaleInv``) from ``1/(448*6)`` to ``1/(256*6)``.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, _reference, _ = _per_token_routed_case(
+        num_tokens=64,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=32,
+        top_k=4,
+        use_4over6=True,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+
+    def run(**recipe):
+        with autotune(False):
+            out = trtllm_fp4_block_scale_routed_moe(**kwargs, **recipe)[0]
+        torch.cuda.synchronize()
+        return out.clone()
+
+    e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
+    with moe_utils.env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256):
+        env_on = run()
+        none_under_env_on = run(nvfp4_4over6=None)
+    with moe_utils.nvfp4_4over6_env(False):
+        env_off = run()
+        pinned_under_env_off = run(nvfp4_4over6=recipe)
+
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("expert_parallel", [False, True])
+def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
+    """``fc2_input_out`` receives exactly the GEMM2 input the kernel consumes.
+
+    One token runs a small tile (8x4 scale layout), 1024 tokens a large one
+    (128x4). Expert parallelism leaves the slots of non-local experts zeroed.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
+    kwargs, _reference, parts = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    num_local = num_experts // 2 if expert_parallel else num_experts
+    for name in (
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    ):
+        kwargs[name] = kwargs[name][:num_local].contiguous()
+    kwargs["local_num_experts"] = num_local
+
+    # Larger than the batch, as a CUDA-graph buffer would be; poisoned so that
+    # unwritten rows show.
+    rows = num_tokens + 3
+    codes = torch.full(
+        (rows, top_k, intermediate_size // 2), 0xFF, dtype=torch.uint8, device=device
+    )
+    scales = torch.full(
+        (rows, top_k, intermediate_size // 16), 0xFF, dtype=torch.uint8, device=device
+    ).view(torch.float8_e4m3fn)
+    token_scales = torch.full((rows, top_k), float("nan"), device=device)
+    fc2_input_out = (codes, scales, token_scales)
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    def run(capture: bool) -> None:
+        with autotune(False):
+            trtllm_fp4_block_scale_routed_moe(
+                **kwargs,
+                output=output,
+                fc2_input_out=fc2_input_out if capture else None,
+            )
+
+    run(False)
+    plain = output.clone()
+    run(True)
+    torch.cuda.synchronize()
+    # The copy does not change the result.
+    assert torch.equal(output, plain)
+    assert (codes[num_tokens:] == 0xFF).all()
+    assert torch.isnan(token_scales[num_tokens:]).all()
+
+    local = parts["topk_ids"] < num_local  # [num_tokens, top_k]
+    codes_t = codes[:num_tokens]
+    scales_t = scales[:num_tokens].view(torch.uint8)
+    token_scales_t = token_scales[:num_tokens]
+    assert (codes_t[~local] == 0).all() and (scales_t[~local] == 0).all()
+    assert (token_scales_t[~local] == 0).all()
+    assert (token_scales_t[local] > 0).all()
+
+    fc2_input = e2m1_and_ufp8sf_scale_to_float(
+        codes_t.reshape(num_tokens * top_k, -1).cpu(),
+        scales_t.reshape(-1).cpu(),
+        torch.tensor([1.0], device="cpu"),
+        16,
+        1,
+        False,
+    ).to(device)
+    fc2_input = (fc2_input * token_scales_t.reshape(-1, 1)).view(
+        num_tokens, top_k, intermediate_size
+    )
+
+    # It is the activation, quantized to NvFP4 ...
+    if local.any():
+        ref = parts["intermediate"][local].float()
+        rel = (fc2_input[local] - ref).norm() / ref.norm()
+        assert rel < 0.15, rel
+
+    # ... and GEMM2 + finalize over it reproduce the kernel output.
+    recon = torch.zeros(num_tokens, hidden_size, device=device)
+    for e in range(num_local):
+        token, slot = (parts["topk_ids"] == e).nonzero(as_tuple=True)
+        weight = parts["expert_weights"][token, slot].float().unsqueeze(1)
+        out_e = fc2_input[token, slot] @ parts["w2_dequant"][e].float().T
+        recon.index_add_(0, token, weight * out_e)
+    if recon.norm() == 0:
+        assert (plain == 0).all()
+    else:
+        rel = (plain.float() - recon).norm() / recon.norm()
+        assert rel < 1e-2, rel
+
+    # CUDA-graph replay writes the same bytes.
+    eager = [t.view(torch.uint8).clone() for t in fc2_input_out]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(True)
+    for t in fc2_input_out:
+        t.view(torch.uint8).zero_()
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want in zip(fc2_input_out, eager, strict=True):
+        assert torch.equal(got.view(torch.uint8)[:num_tokens], want[:num_tokens])
+    assert torch.equal(output, plain)
+
+
+def _fc2_input_out_buffers(
+    rows: int, top_k: int, intermediate_size: int, device: torch.device
+):
+    """Poisoned ``(codes, block_scales, token_scales)`` buffers."""
+    codes = torch.full(
+        (rows, top_k, intermediate_size // 2), 0xFF, dtype=torch.uint8, device=device
+    )
+    scales = torch.full(
+        (rows, top_k, intermediate_size // 16), 0xFF, dtype=torch.uint8, device=device
+    ).view(torch.float8_e4m3fn)
+    token_scales = torch.full((rows, top_k), float("nan"), device=device)
+    return codes, scales, token_scales
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+def test_fc2_input_out_from_logits(num_tokens: int):
+    """Routing from logits fills ``fc2_input_out`` in the kernel's slot order.
+
+    The FC2 input of a (token, expert) pair does not depend on the routing
+    weights, so the copy must match, slot for slot, the one a routed call
+    writes for the expert IDs the routing kernel selected.
+    """
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    hidden_size, intermediate_size, num_experts, top_k = 1024, 2048, 32, 4
+    kwargs, _reference, _parts = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    del kwargs["topk_ids"]
+    # Distinct logits per token, so the selected set has no ties.
+    routing_logits = (
+        torch.rand(num_tokens, num_experts, device=device)
+        .argsort(dim=1)
+        .to(torch.bfloat16)
+    )
+    replay_ids = torch.full((num_tokens, top_k), -1, dtype=torch.int16, device=device)
+    from_logits = _fc2_input_out_buffers(num_tokens, top_k, intermediate_size, device)
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    def run(capture: bool) -> None:
+        with autotune(False):
+            trtllm_fp4_block_scale_moe(
+                routing_logits=routing_logits,
+                **kwargs,
+                output=output,
+                routing_replay_out=replay_ids,
+                fc2_input_out=from_logits if capture else None,
+            )
+
+    run(False)
+    plain = output.clone()
+    run(True)
+    torch.cuda.synchronize()
+    assert torch.equal(output, plain)
+    want_ids = routing_logits.float().topk(top_k, dim=1).indices
+    assert torch.equal(
+        replay_ids.long().sort(dim=1).values, want_ids.sort(dim=1).values
+    )
+
+    # The weights only enter at finalize; any value gives the same FC2 input.
+    weights = torch.full((num_tokens, top_k), 1.0 / top_k, device=device)
+    packed = (replay_ids.to(torch.int32) << 16) | (
+        weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+    routed = _fc2_input_out_buffers(num_tokens, top_k, intermediate_size, device)
+    with autotune(False):
+        trtllm_fp4_block_scale_routed_moe(
+            topk_ids=packed, **kwargs, fc2_input_out=routed
+        )
+    torch.cuda.synchronize()
+    for got, want in zip(from_logits, routed, strict=True):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    assert (from_logits[2] > 0).all()
+
+
+def test_fc2_input_out_valid_intermediate_size():
+    """With ``valid_intermediate_size`` the buffers keep the padded width and
+    the leading valid columns hold the GEMM2 input."""
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k = (
+        64,
+        1024,
+        2048,
+        32,
+        4,
+    )
+    valid = 1920
+    kwargs, _reference, parts = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    codes, scales, token_scales = _fc2_input_out_buffers(
+        num_tokens, top_k, intermediate_size, device
+    )
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    def run(capture: bool) -> None:
+        with autotune(False):
+            trtllm_fp4_block_scale_routed_moe(
+                **kwargs,
+                output=output,
+                valid_intermediate_size=valid,
+                fc2_input_out=(codes, scales, token_scales) if capture else None,
+            )
+
+    run(False)
+    plain = output.clone()
+    run(True)
+    torch.cuda.synchronize()
+    assert torch.equal(output, plain)
+    assert (token_scales > 0).all()
+
+    fc2_input = e2m1_and_ufp8sf_scale_to_float(
+        codes.reshape(num_tokens * top_k, -1).cpu(),
+        scales.view(torch.uint8).reshape(-1).cpu(),
+        torch.tensor([1.0], device="cpu"),
+        16,
+        1,
+        False,
+    ).to(device)
+    fc2_input = (fc2_input * token_scales.reshape(-1, 1)).view(
+        num_tokens, top_k, intermediate_size
+    )[..., :valid]
+
+    ref = parts["intermediate"][..., :valid].float()
+    rel = (fc2_input - ref).norm() / ref.norm()
+    assert rel < 0.15, rel
+
+    # GEMM2 contracts over the valid columns only.
+    recon = torch.zeros(num_tokens, hidden_size, device=device)
+    for e in range(num_experts):
+        token, slot = (parts["topk_ids"] == e).nonzero(as_tuple=True)
+        weight = parts["expert_weights"][token, slot].float().unsqueeze(1)
+        out_e = fc2_input[token, slot] @ parts["w2_dequant"][e].float()[:, :valid].T
+        recon.index_add_(0, token, weight * out_e)
+    rel = (plain.float() - recon).norm() / recon.norm()
+    assert rel < 1e-2, rel
+
+
+def test_fc2_input_out_requires_per_token_scale():
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    kwargs, _reference, _ = _per_token_routed_case(
+        num_tokens=8,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=32,
+        top_k=4,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    fc2_input_out = (
+        torch.empty(8, 4, 1024, dtype=torch.uint8, device=device),
+        torch.empty(8, 4, 128, dtype=torch.uint8, device=device),
+        torch.empty(8, 4, dtype=torch.float32, device=device),
+    )
+    kwargs["per_token_scale"] = None
+    with pytest.raises(Exception, match="per_token_scale"), autotune(False):
+        trtllm_fp4_block_scale_routed_moe(**kwargs, fc2_input_out=fc2_input_out)
+
+
+def test_fc2_input_out_bypasses_trace_apply():
+    """A registered Trace Apply solution replaces the plain call (the control) but
+    would not fill ``fc2_input_out``, so a call that asks for the copy runs the
+    kernel."""
+    import flashinfer.fused_moe as fused_moe
+    import flashinfer.trace_apply as ta
+    from flashinfer.trace_apply.apply import (
+        _registry_by_fi_api,
+        bind_namespace,
+        build_extractor_maps,
+        extract_axes,
+    )
+
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    num_tokens, hidden_size, intermediate_size, top_k = 8, 1024, 2048, 4
+    kwargs, _reference, _ = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=32,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    reg = _registry_by_fi_api()
+    key = next(k for k in reg if k.endswith(".trtllm_fp4_block_scale_routed_moe"))
+    original, templates = reg[key]
+    namespace = bind_namespace(original, (), kwargs)
+    name = templates[0].definition_name(
+        extract_axes(build_extractor_maps(templates), namespace)
+    )
+    calls: list = []
+
+    def solution(*args, **kw):
+        calls.append(1)
+        return [
+            torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        ]
+
+    codes = torch.full(
+        (num_tokens, top_k, intermediate_size // 2),
+        0xFF,
+        dtype=torch.uint8,
+        device=device,
+    )
+    fc2_input_out = (
+        codes,
+        torch.empty(
+            num_tokens, top_k, intermediate_size // 16, dtype=torch.uint8, device=device
+        ),
+        torch.empty(num_tokens, top_k, dtype=torch.float32, device=device),
+    )
+    ta.enable_apply({name: solution})
+    try:
+        with autotune(False):
+            # Looked up at call time: Trace Apply patches the flashinfer modules.
+            fused_moe.trtllm_fp4_block_scale_routed_moe(**kwargs)
+            assert calls, (
+                f"the control: the solution replaces the plain call {ta.stats()}"
+            )
+            seen = len(calls)
+            fused_moe.trtllm_fp4_block_scale_routed_moe(
+                **kwargs, fc2_input_out=fc2_input_out
+            )
+        torch.cuda.synchronize()
+        assert len(calls) == seen, "the solution ran for a call with fc2_input_out"
+        assert not (codes == 0xFF).all(), "fc2_input_out was not written"
+        assert ta.stats().get(key, {}).get("fallback_fc2_input_out", 0) >= 1
+    finally:
+        ta.disable_apply()

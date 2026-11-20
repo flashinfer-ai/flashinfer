@@ -154,7 +154,12 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeKV = typename Params::DTypeKV;
   using IdType = typename Params::IdType;
+#ifdef _WIN32
+  constexpr uint32_t vec_size =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM / 32UL);
+#else
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+#endif
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -195,8 +200,9 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
         num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
       }
       std::tie(max_num_pages_per_batch, new_batch_size) =
-          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
-                                                              std::max(128 / page_size, 1U));
+          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+              max_grid_size, gdy, num_pages,
+              std::max((unsigned int)128 / (unsigned int)page_size, (unsigned int)1U));
       if (new_batch_size == batch_size && !enable_cuda_graph) {
         // do not use partition-kv kernel for short sequence, when not using CUDAGraph
         split_kv = false;
@@ -218,9 +224,14 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
   using DTypeKV = typename Params::DTypeKV;
   using IdType = typename Params::IdType;
 
+#ifdef _WIN32
+  constexpr uint32_t vec_size_ckv =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM_CKV / 32UL);
+#else
+  constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
+#endif
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-    constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
     constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
     constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
@@ -261,8 +272,9 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
         num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
       }
       std::tie(max_num_pages_per_batch, new_batch_size) =
-          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
-                                                              std::max(128 / page_size, 1U));
+          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+              max_grid_size, gdy, num_pages,
+              std::max((unsigned int)128 / (unsigned int)page_size, (unsigned int)1U));
       if (new_batch_size == batch_size && !enable_cuda_graph) {
         // do not use partition-kv kernel for short sequence, when not using CUDAGraph
         split_kv = false;
@@ -548,8 +560,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
                                    int32_t fixed_split_size, bool disable_split_kv,
-                                   int64_t uniform_q_len, uint32_t head_dim_qk = 0,
-                                   uint32_t kv_dtype_bytes = 2) {
+                                   int64_t uniform_q_len, bool fixed_uniform_q_len,
+                                   uint32_t head_dim_qk = 0, uint32_t kv_dtype_bytes = 2) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -642,6 +654,13 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
         enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
         cta_tile_q, min_kv_chunk_size);
+    // fixed_uniform_q_len: every plan of this CUDA graph carries the same uniform_q_len (the
+    // tensor-core decode wrapper builds qo_indptr itself), so every replay has exactly
+    // total_num_tiles_q query tiles. Past the split budget the search above then returns the
+    // whole KV in every replay, no request is ever split, and the merge path is not needed.
+    if (fixed_uniform_q_len && uniform_q_len > 0 && total_num_tiles_q > max_batch_size_if_split) {
+      split_kv = false;
+    }
   }
   // step 3: split qo_indptr and kv_indptr
   uint32_t new_batch_size = 0;
@@ -771,7 +790,8 @@ inline cudaError_t PrefillPlanImpl(
     bool disable_split_kv,
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
-    int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
+    int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
+    uint32_t kv_dtype_bytes = 2) {
   (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -796,7 +816,7 @@ inline cudaError_t PrefillPlanImpl(
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
                              enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
-                             uniform_q_len, head_dim_qk, kv_dtype_bytes);
+                             uniform_q_len, fixed_uniform_q_len, head_dim_qk, kv_dtype_bytes);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -938,7 +958,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int32_t fixed_split_size, bool disable_split_kv,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
-                               int64_t uniform_q_len, cudaStream_t stream,
+                               int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
                                uint32_t kv_dtype_bytes = 2) {
   size_t used_float_workspace_size = 0;
   size_t used_int_workspace_size = 0;
@@ -948,7 +968,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
                                window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-                               uniform_q_len, stream, kv_dtype_bytes);
+                               uniform_q_len, fixed_uniform_q_len, stream, kv_dtype_bytes);
 }
 
 template <typename IdType>
@@ -957,17 +977,17 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len, cudaStream_t stream,
-    uint32_t kv_dtype_bytes = 2) {
+    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len,
+    bool fixed_uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
   PrefillPlanInfo plan_info;
-  return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
-                                /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
-                                /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
-                                /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h,
-                                kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
-                                head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-                                sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
-                                num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
+  return PrefillPlanImpl<false>(
+      float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+      /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
+      /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
+      /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows,
+      batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+      enable_cuda_graph, sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
+      num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream, kv_dtype_bytes);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
@@ -1368,7 +1388,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   merge_indptr.push_back(partial_o_nnz);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
-    int kv_len_limit = f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), 1L));
+    int kv_len_limit =
+        f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), (int64_t)1L));
     if (cluster_tile_q >= 64) {
       // chunked-prefill workloads are much more expensive than decode
       // so we use a smaller kv_len_limit for chunked-prefill workloads
@@ -1679,8 +1700,11 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     }
     return ceil_div(x, 256) * 256;
   };
-
+#ifdef _WIN32
+  int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), (int64_t)1L));
+#else
   int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
+#endif
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);

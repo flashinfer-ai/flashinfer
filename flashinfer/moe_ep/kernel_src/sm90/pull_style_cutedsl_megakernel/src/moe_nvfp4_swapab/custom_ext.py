@@ -306,6 +306,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         fc1_ready_counter_ptr: Optional[Pointer] = None,
         token_cluster_size: int = 1,
         fc1_done_per_cta_token: bool = False,
+        enable_fc2_done_peek: bool = True,
     ):
         super().__init__(workspace=None)
         if sf_vec_size <= 0:
@@ -321,6 +322,12 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         self.fc1_ready_counter_ptr = fc1_ready_counter_ptr
         self.token_cluster_size = token_cluster_size
         self.fc1_done_per_cta_token = fc1_done_per_cta_token
+        if not isinstance(enable_fc2_done_peek, bool):
+            raise TypeError(
+                "enable_fc2_done_peek must be a Python bool so it remains a "
+                "compile-time scheduler policy."
+            )
+        self.enable_fc2_done_peek = enable_fc2_done_peek
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -367,6 +374,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         result.fc1_ready_counter_ptr = new_ready_ptr
         result.token_cluster_size = self.token_cluster_size
         result.fc1_done_per_cta_token = self.fc1_done_per_cta_token
+        result.enable_fc2_done_peek = self.enable_fc2_done_peek
         return result
 
     # --------------------------------------------------------------
@@ -426,25 +434,23 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
                             base_work.phase_and_peek | peek_bit
                         )
 
-            # fc2 tiles can skip the later TMA-B spin (existing path).
-            if is_fc2:
-                counter_ptr = self.fc1_done_counter_ptr + done_counter_slot
-                # peek_only=True: single ld.cg + cmp, returns Boolean.
-                # ``self.fc2_spin_threshold`` was Int32-coerced in __init__.
-                peek_ready = spin_wait(
-                    counter_ptr,
-                    lambda v: v >= self.fc2_spin_threshold,
-                    peek_only=True,
-                )
-                # Pack peek bit into slot 7's bit 16.  Use the runtime-if
-                # assign-an-iter-arg-int idiom (same pattern as
-                # ``_advance_expert_within_phase`` for phase-aware tile
-                # count selection); avoids relying on Boolean->Int32
-                # implicit casts whose presence is dialect-version-dependent.
-                peek_bit = Int32(0)
-                if peek_ready:
-                    peek_bit = Int32(PeekReadyBit)
-                new_phase_and_peek = base_work.phase_and_peek | peek_bit
+            # Segmented FC1 readiness uses a bitmap, not this scalar threshold.
+            # Its TMA-B loader performs the authoritative acquire instead.
+            if cutlass.const_expr(self.enable_fc2_done_peek):
+                if is_fc2:
+                    counter_ptr = self.fc1_done_counter_ptr + done_counter_slot
+                    # peek_only=True: single ld.cg + cmp, returns Boolean.
+                    # ``self.fc2_spin_threshold`` was Int32-coerced in __init__.
+                    peek_ready = spin_wait(
+                        counter_ptr,
+                        lambda v: v >= self.fc2_spin_threshold,
+                        peek_only=True,
+                    )
+                    # Pack peek bit into slot 7's bit 16.
+                    peek_bit = Int32(0)
+                    if peek_ready:
+                        peek_bit = Int32(PeekReadyBit)
+                    new_phase_and_peek = base_work.phase_and_peek | peek_bit
 
         return SwapABSwigluFp4Fc12WorkTileInfo(
             expert_idx=base_work.expert_idx,
@@ -604,6 +610,7 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
         result.fc2_spin_threshold = base.fc2_spin_threshold
         result.fc1_ready_counter_ptr = base.fc1_ready_counter_ptr
         result.token_cluster_size = base.token_cluster_size
+        result.enable_fc2_done_peek = base.enable_fc2_done_peek
         result.cluster_m = self.cluster_m
         result.fc1_done_per_cta_token = self.fc1_done_per_cta_token
         return result

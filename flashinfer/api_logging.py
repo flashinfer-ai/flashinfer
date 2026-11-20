@@ -32,6 +32,27 @@ import importlib
 import torch
 
 
+def _warn_from_external_caller(message: str, category: type[Warning]) -> None:
+    """Emit a warning at the first caller outside the FlashInfer package.
+
+    Callers own warning messages, categories and any deduplication. Walking the
+    frames keeps attribution independent of internal decorators and helpers.
+    """
+    frame = inspect.currentframe()
+    stacklevel = 1
+    package = __package__
+    try:
+        while frame is not None:
+            module = frame.f_globals.get("__name__", "")
+            if module != package and not module.startswith(package + "."):
+                break
+            stacklevel += 1
+            frame = frame.f_back
+    finally:
+        del frame
+    warnings.warn(message, category, stacklevel=stacklevel)
+
+
 # Helper function to substitute %i with process ID in file paths
 def _substitute_process_id(path: str) -> str:
     """
@@ -2488,6 +2509,7 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                     if "Wrapper" in class_name or class_name in [
                         "BatchMLAPagedAttentionWrapper",
                         "MoELayer",
+                        "NVFP4KVMaterializer",
                     ]:
                         func_name = f"{class_name}.{func_name}"
                         self_id = id(args[0])
@@ -2603,6 +2625,25 @@ def experimental_auto_backends_allowed() -> bool:
     and is not a hot-path concern.
     """
     return os.environ.get(_EXPERIMENTAL_AUTO_ENV_VAR, "0") == "1"
+
+
+_CAKE_AUTO_CANDIDATES_ENV_VAR = "FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES"
+
+
+def cake_auto_candidates_enabled() -> bool:
+    """Return whether automatic selection may add Cake backends as candidates.
+
+    Several APIs append their Cake backend as the last candidate of a measured
+    selection (``flashinfer.autotune()`` or ``MoELayer``'s per-bucket timing).
+    The appended candidate never changes the untuned default, which stays the
+    first candidate, and wins only when it measures faster.
+    ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes those candidates.
+    Explicit ``backend="cake"`` is not affected. Experimental Cake backends
+    additionally need ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
+
+    The environment variable is read on every call.
+    """
+    return os.environ.get(_CAKE_AUTO_CANDIDATES_ENV_VAR, "0") != "1"
 
 
 def _experimental_auto_backends_message(feature: str) -> str:

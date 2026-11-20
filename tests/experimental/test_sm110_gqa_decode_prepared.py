@@ -29,6 +29,17 @@ _SHAPES = [
     (1, 4096, [3968], 95604),
 ]
 _SHAPE_ARGUMENTS = ("batch", "capacity", "lengths", "seed")
+
+
+def _one_split_route(batch, capacity):
+    """The size rule above 128 keys: 64-token tiles for one request over at most 256 keys or two
+    requests over at most 512, the four-slot 64-token ring for longer caches of one or two
+    requests, 32-token tiles for three or more requests."""
+    if batch >= 3:
+        return "split_n32_direct"
+    return "split_n64_direct" if capacity <= 256 * batch else "split_n64_r4_direct"
+
+
 _REQUIRES_SM110 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (11, 0),
     reason="requires an exact SM110 GPU",
@@ -117,40 +128,68 @@ def test_prepared_matches_fp32_reference_and_owns_output(
 
 @_REQUIRES_SM110
 @pytest.mark.parametrize(_SHAPE_ARGUMENTS, _SHAPES[1:])
-def test_explicit_one_split_uses_original_long(batch, capacity, lengths, seed):
+def test_explicit_one_split_is_the_size_rule(batch, capacity, lengths, seed):
+    """``num_splits=1`` and ``None`` select the same one-split route: the direct build of the split-KV
+    kernel the size rule names above 128 keys (``_one_split_route``)."""
     inputs = _inputs(batch, capacity, lengths, seed)
     expected = _reference(inputs)
     prepared = prepare_sm110_gqa_decode(inputs, num_splits=1)
     actual = launch_sm110_gqa_decode_prepared(prepared)
     torch.cuda.synchronize()
 
-    assert prepared["route"] == "long"
+    assert prepared["route"] == _one_split_route(batch, capacity)
+    assert prepared["route"] == prepare_sm110_gqa_decode(inputs)["route"]
     assert prepared["num_splits"] == 1
+    assert prepared["grid"] == (1, batch * 8, 1)
     torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
 
 
 @_REQUIRES_SM110
-@pytest.mark.parametrize(_SHAPE_ARGUMENTS, _SHAPES[2:])
-def test_explicit_ten_splits_matches_reference(batch, capacity, lengths, seed):
+@pytest.mark.parametrize("num_splits", [2, 4, 8, 10, 16])
+@pytest.mark.parametrize(_SHAPE_ARGUMENTS, _SHAPES)
+def test_explicit_splits_match_reference(batch, capacity, lengths, seed, num_splits):
+    """Every accepted split count above one launches the run-time-split program of the shape's tile
+    (64-token tiles for one or two requests over at most 4095 keys, 32-token tiles otherwise) with
+    that many splits (splits past the key count merge as zeros)."""
     inputs = _inputs(batch, capacity, lengths, seed)
     expected = _reference(inputs)
-    prepared = prepare_sm110_gqa_decode(inputs, num_splits=10)
+    prepared = prepare_sm110_gqa_decode(inputs, num_splits=num_splits)
     actual = launch_sm110_gqa_decode_prepared(prepared)
     torch.cuda.synchronize()
 
-    assert prepared["num_splits"] == 10
+    assert prepared["route"] == (
+        "split_n64" if batch <= 2 and capacity <= 4095 else "split_n32"
+    )
+    assert prepared["num_splits"] == num_splits
+    assert prepared["grid"] == (num_splits, batch * 8, 1)
     torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+    completed = prepared["workspace"][-1]
+    assert torch.equal(completed, torch.zeros_like(completed))
 
 
 @_REQUIRES_SM110
-def test_unlisted_shape_uses_original_long():
-    inputs = _inputs(2, 65, [1, 65], 95701)
+@pytest.mark.parametrize(
+    ("batch", "capacity", "lengths", "route"),
+    [
+        (1, 64, [1], "short"),
+        (1, 65, [65], "long"),
+        (1, 128, [100], "long"),
+        (1, 129, [129], "split_n64_direct"),
+        (2, 65, [1, 65], "split_n64_direct"),
+        (2, 300, [37, 300], "split_n64_direct"),
+        (1, 257, [257], "split_n64_r4_direct"),
+        (2, 513, [1, 513], "split_n64_r4_direct"),
+        (3, 100, [1, 50, 100], "split_n32_direct"),
+    ],
+)
+def test_size_rule_routes(batch, capacity, lengths, route):
+    inputs = _inputs(batch, capacity, lengths, 95701)
     expected = _reference(inputs)
     prepared = prepare_sm110_gqa_decode(inputs)
     actual = launch_sm110_gqa_decode_prepared(prepared)
     torch.cuda.synchronize()
 
-    assert prepared["route"] == "long"
+    assert prepared["route"] == route
     torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
 
 
@@ -229,8 +268,26 @@ def test_prepared_rejects_output_alias(alias):
 
 
 @_REQUIRES_SM110
-@pytest.mark.parametrize("num_splits", [True, 3, 10])
-def test_prepared_rejects_unsupported_b4_splits(num_splits):
+@pytest.mark.parametrize("num_splits", [True, 3, 0, 32])
+def test_prepared_rejects_unsupported_splits(num_splits):
     inputs = _inputs(4, 256, [64, 127, 191, 256], 95902)
-    with pytest.raises(ValueError, match="num_splits|exported split tile"):
+    with pytest.raises(ValueError, match="num_splits must be None or an integer"):
         prepare_sm110_gqa_decode(inputs, num_splits=num_splits)
+
+
+@_REQUIRES_SM110
+@pytest.mark.parametrize(
+    ("batch", "capacity", "num_splits"),
+    [(1, 32, None), (1, 63, 1), (1, 32, 4), (2, 48, None)],
+)
+def test_prepared_rejects_caches_below_the_short_tma_box(batch, capacity, num_splits):
+    """Unchanged public behaviour: a cache of fewer than 64 tokens raises the previous
+    release's error (the short route's 64-token TMA box) and launches nothing."""
+    inputs = _inputs(batch, capacity, [capacity] * batch, 95903)
+    inputs["O"].fill_(float("nan"))
+    with pytest.raises(
+        ValueError,
+        match=r"TMA box \(64, 64, 1, 1\) exceeds resolved global dims for 'K'",
+    ):
+        prepare_sm110_gqa_decode(inputs, num_splits=num_splits)
+    assert torch.isnan(inputs["O"]).all().item()

@@ -232,7 +232,7 @@ Validate dispatch+combine correctness at world=8 via the **comm-matrix `--valida
 `--gres`** on this cluster). The exact runner:
 ```bash
 srun --ntasks-per-node=8 --container-image=$RW/flashinfer-ep-pt2605.sqsh --container-mounts=$RW:/host \
-  bash -lc 'EP_SYNC=/host/sync_ht NCCL_GIN_TYPE=3 bash /host/<checkout>/benchmarks/run_ep_matrix_one_pt.sh \
+  bash -lc 'EP_SYNC=/host/sync_ht NCCL_GIN_TYPE=3 bash /host/<checkout>/benchmarks/moe_ep/core/comm/run_ep_matrix_one_pt.sh \
     --algorithm ht --layout fl --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate'
 # LL: --algorithm ll --layout em --tokens 128 --validate
 ```
@@ -303,10 +303,10 @@ Validate the **LL** path first (§5) — it maps cleanly and has no such open po
 ```bash
 # per-rank wrapper; file:// rendezvous on a shared mount
 EP_SYNC=/shared/ep_sync srun --ntasks-per-node=8 \
-    benchmarks/run_ep_matrix_one.sh <bench_ep_matrix.py args>
-# or the single-process driver:
-torchrun --nproc_per_node=8 benchmarks/bench_moe_ep.py \
-    --tokens 8192 --world-size 8 --backend nccl_ep --quant bf16
+    benchmarks/moe_ep/core/comm/run_ep_matrix_one.sh <bench_ep_matrix.py args>
+# or the nccl_ep / nixl_ep layer benchmark (one process per GPU):
+torchrun --nproc_per_node=8 benchmarks/moe_ep/bench_moe_ep_fleet.py \
+    --tokens 8192 --backend nccl_ep --quant bf16
 ```
 
 ### 7.2 End-to-end serving perf (the comparison matrix)

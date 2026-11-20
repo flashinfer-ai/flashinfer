@@ -60,6 +60,8 @@ class TllmGenFmhaRunner {
 
   TllmGenFmhaRunner() = default;
 
+  int smVersion() const { return mSM; }
+
   // Check if fmha is supported.
   bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) {
     return mKernel->checkIfKernelExist(runnerParams).first;
@@ -69,6 +71,11 @@ class TllmGenFmhaRunner {
   std::pair<bool, std::string> isSupportedWithInfo(
       TllmGenFmhaRunnerParams const& runnerParams) const {
     return mKernel->checkIfKernelExist(runnerParams);
+  }
+
+  // Query only the initial dense-MLA head tiling, without loading a cubin.
+  int getMlaInitialHeadDivisor(TllmGenFmhaRunnerParams const& runnerParams) const {
+    return mKernel->getMlaInitialHeadDivisor(runnerParams);
   }
 
   // Run the fmha kernel.

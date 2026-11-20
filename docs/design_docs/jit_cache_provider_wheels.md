@@ -188,7 +188,8 @@ flashinfer install-jit-cache-wheel --mode minimal --sm sm120f
 ```
 
 Without `--sm`, the CLI uses the visible CUDA devices. `--sm` may be repeated
-when preparing an image on a different machine. Each provider is self-contained
+when preparing an image on a different machine, and implies `--mode minimal`
+when no mode is given; combining it with `--mode all` is an error. Each provider is self-contained
 for its declared target. Minimal mode ranks only providers named by that shim,
 so SM86 currently selects `sm80` because it is the closest compatible published
 target, not because SM86 is a special case. No cross-major baseline is added.
@@ -246,7 +247,7 @@ would conceal.
 
 Relevant CUDA compatibility references:
 
-- [CUDA C Programming Guide: Binary Compatibility](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#binary-compatibility)
+- [CUDA Programming Guide: Binary Compatibility](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/cuda-platform.html#binary-compatibility)
 - [Blackwell Compatibility Guide](https://docs.nvidia.com/cuda/blackwell-compatibility-guide/index.html)
 
 ## Provider Builds
@@ -284,7 +285,7 @@ to the shim version.
 On an AArch64 Docker host, the experiment can be built with:
 
 ```bash
-scripts/build_jit_cache_provider_wheelhouse.sh
+scripts/infra/build_jit_cache_provider_wheelhouse.sh
 ```
 
 The wrapper defaults to target `12.1a`, local version `cu130`, one NVCC thread,
@@ -307,7 +308,7 @@ label. This chooses the `nightly/cu134` PyTorch index and CUDA 13.4 builder:
 ```bash
 FLASHINFER_LOCAL_VERSION=cu134 \
 FLASHINFER_JIT_CACHE_PROVIDER_ARCH=12.1a \
-scripts/build_jit_cache_provider_wheelhouse.sh
+scripts/infra/build_jit_cache_provider_wheelhouse.sh
 ```
 
 `--print-config` resolves and prints this configuration without starting Docker.
@@ -325,7 +326,7 @@ JIT-disabled GPU gate with:
 
 ```bash
 FLASHINFER_DISABLE_JIT=1 \
-python scripts/smoke_test_jit_cache_provider.py --provider sm121a
+python scripts/infra/smoke_test_jit_cache_provider.py --provider sm121a
 ```
 
 The initial DGX Spark build produced a 250,767,917-byte provider wheel containing

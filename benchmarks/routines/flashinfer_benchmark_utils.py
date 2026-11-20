@@ -30,6 +30,7 @@ output_column_dict = {
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "softmax_rescale_threshold_log2",
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
@@ -55,6 +56,7 @@ output_column_dict = {
         "intermediate_size",
         "num_experts",
         "top_k",
+        "block_m",
         "n_group",
         "topk_group",
         "routed_scaling_factor",
@@ -67,10 +69,14 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "weight_dtype",
         "activation_type",
+        "swiglu_limit",
         "quant_variant",
         "autotune",
         "tactic",
         "refcheck_passed",
+        "relative_l2",
+        "pairwise_relative_l2",
+        "runner_backend_key",
         "fp4_mode",
         "cold_l2_cache",
         "prequantized_median_time",
@@ -82,13 +88,6 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
-    ],
-    "moe_comm": [
-        "num_tokens",
-        "num_experts",
-        "top_k",
-        "ep_size",
-        "max_num_tokens",
     ],
     "allreduce_comm": [
         "num_tokens",
@@ -130,6 +129,8 @@ output_column_dict = {
         "temperature",
         "num_speculate_tokens",
         "filter_apply_order",
+        "per_row_top_k",
+        "top_k_max",
         "max_len",
         "num_rows",
     ],
@@ -158,6 +159,17 @@ output_column_dict = {
         "weight_dtype",
         "has_z",
         "dt_softplus",
+        "conv_tokens_per_sequence",
+        "conv_seq_lens",
+        "conv_bias",
+        "conv_speculative",
+        "conv_initial_state",
+        "conv_layout",
+        "conv_input_row_stride",
+        "conv_graph_refcheck_passed",
+        "conv_workspace_bytes",
+        "conv_host_submit_us",
+        "conv_cuda_ops",
     ],
     "gdn": [
         "num_q_heads",
@@ -168,6 +180,7 @@ output_column_dict = {
         "pool_mode",
         "update_state",
         "use_qk_l2norm",
+        "use_cp",
     ],
     "kda": [
         # Which variant the policy chose, and whether this device's thresholds
@@ -202,6 +215,7 @@ output_column_dict = {
         "refcheck",
         "no_cuda_graph",
         "use_cupti",
+        "capture_telemetry",
         "allow_output_mismatch",
         "random_seed",
         "case_tag",
@@ -216,7 +230,6 @@ full_output_columns = (
     + output_column_dict["dsv4_sparse_mla"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
-    + output_column_dict["moe_comm"]
     + output_column_dict["allreduce_comm"]
     + output_column_dict["mixed_comm"]
     + output_column_dict["norm"]
@@ -260,6 +273,7 @@ benchmark_apis = {
         "cute_dsl_fp4_block_scale_moe",
         "cute_dsl_bf16_moe",
         "b12x_fused_moe",
+        "alphamoe_nvfp4_aligned_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
     ],
@@ -267,9 +281,6 @@ benchmark_apis = {
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
     "unified_moe": [
         "unified_moe",
-    ],
-    "moe_comm": [
-        "moe_a2a_dispatch_combine",
     ],
     "allreduce_comm": [
         "allreduce_fusion",
@@ -299,6 +310,8 @@ benchmark_apis = {
     ],
     "sampling": [
         "softmax",
+        "log_softmax",
+        "log_probs",
         "sampling_from_probs",
         "sampling_from_logits",
         "top_k_sampling_from_probs",
@@ -331,6 +344,8 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
     ],
     "gdn": [
         "gated_delta_rule_decode",
@@ -462,6 +477,7 @@ routine_cc_to_supported_backends = {
             "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
+            "prims-ts",
         ],
         "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
         "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
@@ -493,7 +509,15 @@ routine_cc_to_supported_backends = {
             "trtllm-native",
             "prims-ts",
         ],
-        "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "10.7": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
         "12.0": [
             "fa2",
             "auto",
@@ -531,6 +555,15 @@ routine_cc_to_supported_backends = {
             "trtllm-native",
             "prims-ts",
         ],
+        "10.7": [
+            "fa2",
+            "cudnn",
+            "cudnn-native",
+            "cutlass",
+            "cute-dsl",
+            "trtllm-native",
+            "prims-ts",
+        ],
         "12.0": [
             "fa2",
             "cudnn",
@@ -552,7 +585,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
         "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native"],
+        "10.7": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "prims-ts"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
@@ -575,9 +608,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
+        "10.0": ["cutlass", "auto", "batch_invariant"],
+        "10.3": ["cutlass", "auto", "batch_invariant"],
+        "10.7": ["cutlass", "cute-dsl", "auto", "batch_invariant"],
         "12.0": [],
         "12.1": [],
     },
@@ -601,6 +634,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cudnn"],
         "10.3": ["cudnn"],
+        "10.7": ["cudnn", "cute-dsl"],
         "12.0": ["cudnn"],
         "12.1": ["cudnn"],
     },
@@ -610,8 +644,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
-        "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
+        "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn", "batch_invariant"],
+        "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn", "batch_invariant"],
+        "10.7": ["cutlass", "cute-dsl", "trtllm", "batch_invariant"],
         "11.0": ["cutlass", "cudnn"],
         "12.0": ["cutlass", "cudnn"],
         "12.1": ["cutlass", "cudnn"],
@@ -624,6 +659,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["tinygemm"],
         "10.0": ["tinygemm"],
         "10.3": ["tinygemm"],
+        "10.7": ["tinygemm"],
         "11.0": ["tinygemm"],
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
@@ -686,6 +722,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": [],
         "12.1": [],
     },
@@ -711,11 +748,16 @@ routine_cc_to_supported_backends = {
         "12.0": ["b12x"],
         "12.1": ["b12x"],
     },
+    "alphamoe_nvfp4_aligned_moe": {
+        "10.0": ["alphamoe"],
+        "10.3": ["alphamoe"],
+    },
     # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
-    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
+    # Blackwell and Rubin; backend support checks enforce runtime requirements.
     "unified_nvfp4_moe": {
         "10.0": ["unified"],
         "10.3": ["unified"],
+        "10.7": ["unified"],
     },
     # NORM
     "rmsnorm": {
@@ -726,6 +768,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cute-dsl"],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -737,6 +780,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cute-dsl"],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -748,6 +792,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cute-dsl"],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -759,6 +804,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cute-dsl"],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -770,6 +816,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cute-dsl"],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -781,19 +828,21 @@ routine_cc_to_supported_backends = {
         "9.0": ["cute-dsl"],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
     "layernorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "cute-dsl"],
+        "8.0": ["cuda", "cute-dsl"],
+        "8.6": ["cuda", "cute-dsl"],
+        "8.9": ["cuda", "cute-dsl"],
+        "9.0": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "10.7": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {
@@ -804,6 +853,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -815,6 +865,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
@@ -827,8 +878,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda", "cute-dsl"],
-        "10.3": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl", "batch_invariant"],
+        "10.3": ["cuda", "cute-dsl", "batch_invariant"],
+        "10.7": ["cuda", "cute-dsl", "batch_invariant"],
         "12.0": ["cuda", "cute-dsl"],
         "12.1": ["cuda", "cute-dsl"],
     },
@@ -838,8 +890,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda", "cute-dsl"],
-        "10.3": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl", "batch_invariant"],
+        "10.3": ["cuda", "cute-dsl", "batch_invariant"],
+        "10.7": ["cuda", "batch_invariant"],
         "12.0": ["cuda", "cute-dsl"],
         "12.1": ["cuda", "cute-dsl"],
     },
@@ -849,8 +902,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda", "cute-dsl"],
-        "10.3": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl", "batch_invariant"],
+        "10.3": ["cuda", "cute-dsl", "batch_invariant"],
+        "10.7": ["cuda", "cute-dsl", "batch_invariant"],
         "12.0": ["cuda", "cute-dsl"],
         "12.1": ["cuda", "cute-dsl"],
     },
@@ -862,6 +916,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -872,10 +927,35 @@ routine_cc_to_supported_backends = {
         "8.6": ["cuda"],
         "8.9": ["cuda"],
         "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
+        "10.0": ["cuda", "batch_invariant"],
+        "10.3": ["cuda", "batch_invariant"],
+        "10.7": ["cuda", "batch_invariant"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
+    },
+    "log_softmax": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["batch_invariant"],
+        "10.3": ["batch_invariant"],
+        "10.7": ["batch_invariant"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "log_probs": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["batch_invariant"],
+        "10.3": ["batch_invariant"],
+        "10.7": ["batch_invariant"],
+        "12.0": [],
+        "12.1": [],
     },
     "sampling_from_probs": {
         "7.5": ["cuda"],
@@ -885,6 +965,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -896,6 +977,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -907,6 +989,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -918,6 +1001,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -929,6 +1013,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -940,6 +1025,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -951,6 +1037,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -962,6 +1049,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -973,6 +1061,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -984,6 +1073,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -995,6 +1085,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1006,6 +1097,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1017,6 +1109,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1028,6 +1121,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1042,6 +1136,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1053,6 +1148,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1064,6 +1160,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1075,6 +1172,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1086,6 +1184,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1097,6 +1196,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1108,6 +1208,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
@@ -1119,10 +1220,19 @@ routine_cc_to_supported_backends = {
         "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
+        "10.7": ["cuda"],
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
     # MAMBA
+    "causal_conv1d_fn": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
+    "causal_conv1d_update": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
     "selective_state_update": {
         "7.5": ["flashinfer", "triton"],
         "8.0": ["flashinfer", "triton"],
@@ -1131,6 +1241,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["flashinfer", "triton"],
         "10.0": ["flashinfer", "triton"],
         "10.3": ["flashinfer", "triton"],
+        "10.7": ["flashinfer", "triton"],
         "11.0": ["flashinfer", "triton"],
         "12.0": ["flashinfer", "triton"],
         "12.1": ["flashinfer", "triton"],
@@ -1141,9 +1252,10 @@ routine_cc_to_supported_backends = {
         "8.0": [],
         "8.6": [],
         "8.9": [],
-        "9.0": ["flashinfer", "triton"],
-        "10.0": ["flashinfer", "triton"],
-        "10.3": ["flashinfer", "triton"],
+        "9.0": ["flashinfer", "cute", "triton"],
+        "10.0": ["flashinfer", "cute", "cake_gdn", "triton"],
+        "10.3": ["flashinfer", "cute", "cake_gdn", "triton"],
+        "10.7": ["flashinfer", "cute", "cake_gdn", "triton", "rubin", "rubin_ugpu"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],
@@ -1156,6 +1268,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["flashinfer", "triton"],
         "10.0": ["flashinfer", "triton"],
         "10.3": ["flashinfer", "triton"],
+        "10.7": ["flashinfer", "triton"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],
@@ -1168,7 +1281,8 @@ routine_cc_to_supported_backends = {
         "9.0": ["flashinfer", "fla"],
         "10.0": ["flashinfer", "fla"],
         "10.3": ["flashinfer", "fla"],
-        "11.0": [],
+        "10.7": ["flashinfer"],
+        "11.0": ["flashinfer"],
         "12.0": [],
         "12.1": [],
     },
@@ -1182,8 +1296,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": [],
+        "10.0": ["flashinfer"],
         "10.3": [],
+        "10.7": [],
         "11.0": [],
         "12.0": [
             "flashinfer",
@@ -1231,3 +1346,118 @@ def enum_type(enum_class):
             ) from e
 
     return converter
+
+
+def probe_backends(backends, run_backend, *inputs, only=None):
+    """Run each backend once (those in ``only`` when given) and drop the ones that raise, printing the reason.
+
+    The batch-invariant classes (``batch_invariant=True``) raise ``BatchInvariantUnsupportedError`` instead
+    of falling back when the shape, dtype or device is outside their contract; the routines that filter
+    their backends by the compute-capability table probe that backend here before timing it.
+    """
+    for backend in list(backends):
+        if only is not None and backend not in only:
+            continue
+        try:
+            run_backend(backend, *inputs)
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends.remove(backend)
+    return backends
+
+
+def _tensor_bits(t: torch.Tensor) -> torch.Tensor:
+    """The tensor's bit pattern as an integer tensor of the same width (NaN payloads compare as bits)."""
+    int_dtype = {
+        1: torch.uint8,
+        2: torch.int16,
+        4: torch.int32,
+        8: torch.int64,
+    }[t.element_size()]
+    return t.contiguous().view(int_dtype)
+
+
+def check_batch_invariance(
+    label,
+    run_rows,
+    num_rows,
+    reference,
+    row_dim=0,
+    verbose=0,
+):
+    """Bitwise batch-invariance check of a ``batch_invariant`` backend's output.
+
+    The batch-invariant mode (``batch_invariant=True``) promises that a row's output bits depend only on
+    that row's inputs, never on the batch it is computed in. ``--refcheck`` therefore checks the bits, not a
+    tolerance: ``run_rows(rows)`` runs the operator on the sub-batch made of the rows ``rows`` (an int64 index
+    tensor on the device) and returns the output -- a tensor, or a tuple of tensors -- with the rows on
+    ``row_dim``; ``reference`` is the output of the whole batch (``rows = arange(num_rows)``) in the same form.
+
+    Checks: run-to-run (the whole batch again), a sub-batch (a contiguous slice of rows alone equals those
+    rows of the whole batch), a row alone (one row by itself equals its row of the whole batch) and a
+    permutation (the rows in another order equal the whole batch's rows in that order).
+
+    Raises AssertionError on the first mismatch, whatever ``--allow_output_mismatch`` says: a differing
+    bit is a broken contract, not a tolerance miss. Returns the names of the checks that ran.
+    """
+
+    def as_tuple(x):
+        return tuple(x) if isinstance(x, (tuple, list)) else (x,)
+
+    def select(ts, rows):
+        return tuple(t.index_select(row_dim, rows) for t in ts)
+
+    def compare(check, out, expected):
+        out = as_tuple(out)
+        if len(out) != len(expected):
+            raise AssertionError(
+                f"[{label}] batch-invariance check '{check}': {len(out)} outputs, expected {len(expected)}"
+            )
+        for i, (o, e) in enumerate(zip(out, expected, strict=True)):
+            if tuple(o.shape) != tuple(e.shape) or o.dtype != e.dtype:
+                raise AssertionError(
+                    f"[{label}] batch-invariance check '{check}': output {i} is {tuple(o.shape)} {o.dtype}, "
+                    f"the whole batch's rows are {tuple(e.shape)} {e.dtype}"
+                )
+            ob, eb = _tensor_bits(o), _tensor_bits(e)
+            if not torch.equal(ob, eb):
+                num_diff = int((ob != eb).sum().item())
+                raise AssertionError(
+                    f"[{label}] batch-invariance check '{check}' FAILED: output {i} differs from the whole "
+                    f"batch's rows in {num_diff} / {ob.numel()} elements ({num_diff / ob.numel() * 100:.4f}%)"
+                )
+
+    ref = as_tuple(reference)
+    if num_rows <= 0:
+        return []
+    device = ref[0].device
+    all_rows = torch.arange(num_rows, device=device, dtype=torch.int64)
+    checks = []
+
+    compare("run-to-run", run_rows(all_rows), ref)
+    checks.append("run-to-run")
+
+    if num_rows >= 2:
+        lo = num_rows // 4
+        hi = min(num_rows, max(lo + 1, lo + (num_rows + 1) // 2))
+        rows = all_rows[lo:hi]
+        compare(f"sub-batch rows [{lo}, {hi})", run_rows(rows), select(ref, rows))
+        checks.append(f"sub-batch [{lo}, {hi})")
+
+        r = num_rows // 2
+        rows = all_rows[r : r + 1]
+        compare(f"row {r} alone", run_rows(rows), select(ref, rows))
+        checks.append(f"row {r} alone")
+
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        perm = torch.randperm(num_rows, generator=gen).to(device)
+        compare("permutation", run_rows(perm), select(ref, perm))
+        checks.append("permutation")
+
+    if verbose >= 1:
+        print(
+            f"[REFCHECK] {label}: batch-invariance checks passed bit for bit ({', '.join(checks)})"
+        )
+    return checks

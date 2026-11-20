@@ -10,6 +10,9 @@ For every (n, k) x m problem this script times six things after autotuning:
                          (no LoRA correction), as the lower-bound baseline
   5. BF16 GEMM         : dense BF16 residual GEMM + bias; timed but hidden
   6. FP8 per-tensor    : dense FP8 residual GEMM; timed but hidden
+  7. cake              : the Cake fused SVDQuant programs (``backend="cake"``;
+                         SM100/SM103, CUDA >= 13.0) on the fused operands, as a
+                         seventh timed arm when --svdquant-backend cake is given
 
 The reported algorithmic TFLOPS/s count matmul operations only:
   * fused GEMM:      2*m*n*k + 2*m*n*rank
@@ -21,7 +24,10 @@ are not included in the operation count.
 
 The LoRA rank defaults to 32; pass e.g. --ranks 32,64,96,128 to sweep.
 The SVDQuant backend defaults to auto; pass --svdquant-backend fused or
---svdquant-backend unfused to override implementation selection.
+--svdquant-backend unfused to override implementation selection, or
+--svdquant-backend cake (SM100/SM103) to add the Cake arm beside the CUTLASS
+fused arm; svdquant_linear then keeps its automatic selection, because its
+quantizer has no Cake implementation.
 
 Timing uses flashinfer.testing bench_gpu_time (CUPTI preferred, automatic
 fallback to CUDA events). CUDA Graph replay is enabled by default; pass
@@ -133,6 +139,7 @@ def _build_case(m, n, k, rank, device):
         "d": d,
         "bias": bias,
         "out_fused": torch.empty(m, n, dtype=torch.bfloat16, device=device),
+        "out_cake": torch.empty(m, n, dtype=torch.bfloat16, device=device),
         "out_fp4": torch.empty(m, n, dtype=torch.bfloat16, device=device),
         "out_bf16": torch.empty(m, n, dtype=torch.bfloat16, device=device),
         "x_fp8": x_fp8.unsqueeze(0),
@@ -172,6 +179,7 @@ def bench_one(
     unfused_backend=None,
     use_cuda_graph=True,
     cold_l2_cache=False,
+    cake_arm=False,
 ):
     c = _build_case(m, n, k, rank, device)
 
@@ -221,6 +229,20 @@ def bench_one(
             backend=unfused_backend,
         )
 
+    def run_cake(xq, wq, x_sf, w_sf, alpha, d, l1, bias, out):
+        mm_nvfp4_svdquant(
+            xq,
+            wq,
+            x_sf,
+            w_sf,
+            alpha,
+            d,
+            l1,
+            bias=bias,
+            out=out,
+            backend="cake",
+        )
+
     def run_mm_fp4(xq, wq, x_sf, w_sf, alpha, out):
         mm_fp4(
             xq,
@@ -266,6 +288,7 @@ def bench_one(
         c["bias"],
         c["out_fused"],
     )
+    cake_args = (*fused_args[:-1], c["out_cake"])
     svdquant_linear_args = (
         c["x"],
         c["wq"],
@@ -304,6 +327,17 @@ def bench_one(
             run_mm_fp4(*mm_fp4_args)
             run_residual_gemm(*residual_gemm_args)
             run_fp8_per_tensor(*fp8_args)
+    # The Cake arm has no tuner: one call builds and warms its routed program; a
+    # shape outside its shape rule is reported as nan.
+    cake_supported = False
+    if cake_arm:
+        from flashinfer.cake_nvfp4_svdquant_gemm_backend import is_supported
+
+        cake_supported = is_supported(
+            m=m, n=n, k=k, rank=rank, has_bias=True, device=device
+        )
+        if cake_supported:
+            run_cake(*cake_args)
     torch.cuda.synchronize()
 
     bench_kwargs = dict(
@@ -335,6 +369,11 @@ def bench_one(
     fp8_per_tensor_us = _median_us(
         bench_gpu_time(run_fp8_per_tensor, input_args=fp8_args, **bench_kwargs)
     )
+    cake_us = (
+        _median_us(bench_gpu_time(run_cake, input_args=cake_args, **bench_kwargs))
+        if cake_supported
+        else float("nan")
+    )
 
     return (
         fused_us,
@@ -343,6 +382,7 @@ def bench_one(
         mm_fp4_us,
         residual_gemm_us,
         fp8_per_tensor_us,
+        cake_us,
     )
 
 
@@ -368,11 +408,13 @@ def main():
     )
     parser.add_argument(
         "--svdquant-backend",
-        choices=("auto", "fused", "unfused"),
+        choices=("auto", "fused", "unfused", "cake"),
         default="auto",
         help=(
             "SVDQuant implementation policy: auto tunes fused versus unfused on "
-            "SM120; fused or unfused forces that implementation (default: auto)"
+            "SM120; fused or unfused forces that implementation; cake adds the "
+            "Cake fused arm on SM100/SM103 (svdquant_linear stays auto) "
+            "(default: auto)"
         ),
     )
     parser.add_argument(
@@ -404,7 +446,10 @@ def main():
     device = torch.device("cuda")
     mm_fp4_backend = "cutlass" if major == 10 else "b12x"
     unfused_backend = "cute-dsl-unfused" if major == 12 else None
+    cake_arm = False
     if major == 12:
+        if args.svdquant_backend == "cake":
+            parser.error("--svdquant-backend cake is only available on SM100/SM103")
         svdquant_backend = {
             "auto": "auto",
             "fused": "cute-dsl",
@@ -413,6 +458,7 @@ def main():
     else:
         if args.svdquant_backend == "unfused":
             parser.error("--svdquant-backend unfused is only available on SM120/SM121")
+        cake_arm = args.svdquant_backend == "cake"
         svdquant_backend = "cutlass" if args.svdquant_backend == "fused" else "auto"
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{major}{minor})")
     print(f"mm_fp4 baseline backend: {mm_fp4_backend}")
@@ -426,6 +472,7 @@ def main():
         "(residual only; scales, quantization, LoRA-down, and LoRA-up excluded)"
     )
     print(f"unfused oracle backend: {unfused_backend or 'not available'}")
+    print(f"cake arm: {'mm_nvfp4_svdquant(backend=cake)' if cake_arm else 'off'}")
     print(f"execution mode: {'CUDA graph' if args.cuda_graph else 'eager'}")
     print(f"L2 mode: {'cold' if args.cold_l2_cache else 'warm'}")
     print("Timing: median GPU time in us (CUPTI preferred, CUDA-event fallback)")
@@ -435,7 +482,8 @@ def main():
         f"{'n':>6} {'k':>6} {'m':>6} {'R':>5} | "
         f"{'svdquant_linear us':>18} {'gain vs BF16':>13} {'gain vs FP8':>12} | "
         f"{'residual_fp4/fused':>20} {'residual_fp4 TF/s/us':>22} | "
-        f"{'fusion gain':>11} {'fused TF/s/us':>17} {'unfused TF/s/us':>19}"
+        f"{'fusion gain':>11} {'fused TF/s/us':>17} {'unfused TF/s/us':>19} | "
+        f"{'cake TF/s/us':>17} {'cake/fused':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -450,6 +498,7 @@ def main():
                     mm_fp4_us,
                     residual_gemm_us,
                     fp8_per_tensor_us,
+                    cake_us,
                 ) = bench_one(
                     m,
                     n,
@@ -461,10 +510,13 @@ def main():
                     unfused_backend,
                     args.cuda_graph,
                     args.cold_l2_cache,
+                    cake_arm,
                 )
                 fused_flops, _, mm_fp4_flops = _matmul_flops(m, n, k, rank)
                 fused_tflops = _tflops_per_sec(fused_flops, fused_us)
                 unfused_tflops = _tflops_per_sec(fused_flops, unfused_us)
+                cake_tflops = _tflops_per_sec(fused_flops, cake_us)
+                cake_speedup = fused_us / cake_us if cake_us > 0 else float("nan")
                 mm_fp4_tflops = _tflops_per_sec(mm_fp4_flops, mm_fp4_us)
                 gain_over_bf16 = (
                     (residual_gemm_us / svdquant_linear_us - 1.0) * 100.0
@@ -492,7 +544,9 @@ def main():
                     f"{mm_fp4_tflops:>10.2f}/{mm_fp4_us:<9.2f} | "
                     f"{fusion_gain:>10.1f}% "
                     f"{fused_tflops:>8.2f}/{fused_us:<8.2f} "
-                    f"{unfused_tflops:>9.2f}/{unfused_us:<9.2f}"
+                    f"{unfused_tflops:>9.2f}/{unfused_us:<9.2f} | "
+                    f"{cake_tflops:>8.2f}/{cake_us:<8.2f} "
+                    f"{cake_speedup:>10.3f}"
                 )
             print("-" * len(header))
 

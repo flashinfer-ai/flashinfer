@@ -29,6 +29,8 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.comm import pcie_ipc_all_reduce_trace
 from ..jit.comm import gen_pcie_ipc_comm_module
 from ..utils import register_custom_op
+from .pcie_ipc_collectives._constants import AR_MAX_BLOCKS, PACK_BYTES
+from .pcie_ipc_collectives._lifecycle import bind_stream, joint_check, release_workspace
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 from .pcie_ipc_policy import IpcLaunchConfig, get_pcie_ipc_launch_config
 from .pcie_ipc_topology import resolve_pcie_ipc_profile
@@ -103,6 +105,7 @@ def get_pcie_ipc_comm_module():
         all_reduce=all_reduce,
         memop_supported=module.pcie_ipc_memop_supported,
         set_memop_enabled=module.pcie_ipc_set_memop_enabled,
+        set_ce_slow_hops=module.pcie_ipc_set_ce_slow_hops,
     )
 
 
@@ -155,12 +158,19 @@ class PcieIpcAllReduceWorkspace:
         instead of probing for it. The label does not pick a kernel; it
         partitions the tune cache so two topologies do not read each other's
         measurements. Probing is collective and runs before any allocation.
+    ce_slow_hops : int, optional
+        Force the mask of ring hops that cross the CPU interconnect (bit h is
+        the hop from rank h to rank h+1) instead of deriving it from the probe.
+        It shapes the pipelined copy-engine ring's chunks on SM120 and keys the
+        tune cache; a wrong mask costs speed, not correctness.
     tune_cache : str, optional
         Where tuned configurations are read from at construction and written by
         :meth:`tune`. Defaults to ``FLASHINFER_AUTOTUNE_DIR`` (or the workspace
         directory). Give the same path to both, or a tuned result will not be
         found by the next process.
 
+    Notes
+    -----
     Launch configurations start from a seed default that is workable rather
     than fast (see :mod:`~flashinfer.comm.pcie_ipc_policy`). Tune once to
     replace it with measurements from this machine; the result is persisted and
@@ -184,10 +194,11 @@ class PcieIpcAllReduceWorkspace:
         group: ProcessGroup,
         max_numel: int,
         dtype: torch.dtype = torch.bfloat16,
-        max_blocks: int = 128,
+        max_blocks: int = AR_MAX_BLOCKS,
         profile: Optional[str] = None,
         tune_batches: Optional[Sequence[int]] = None,
         tune_cache: Optional[str] = None,
+        ce_slow_hops: Optional[int] = None,
     ) -> None:
         # Construction is a staged transaction. Every rank must execute the same
         # sequence of collectives, so a rank that finds a problem does NOT raise
@@ -207,6 +218,7 @@ class PcieIpcAllReduceWorkspace:
         self.max_blocks = max_blocks
         self.profile = ""
         self.memop_supported = False
+        self.slow_hops = 0
         self.profile_reason = ""
         # Resolved launch configurations, keyed exactly. Consulted before any
         # AutoTuner call because even a pure cache lookup there takes a global
@@ -237,7 +249,7 @@ class PcieIpcAllReduceWorkspace:
             error = f"dtype {dtype} unsupported; expected one of {_SUPPORTED_DTYPES}"
         else:
             self.elem_size = torch.empty((), dtype=dtype).element_size()
-            pack_elems = 16 // self.elem_size
+            pack_elems = PACK_BYTES // self.elem_size
             if max_numel <= 0 or max_numel % pack_elems != 0:
                 # The kernels address the scratch in 16-byte packs, so a
                 # capacity that is not a whole number of packs is rejected by
@@ -248,6 +260,13 @@ class PcieIpcAllReduceWorkspace:
                 )
             elif max_blocks <= 0:
                 error = f"max_blocks must be positive, got {max_blocks}"
+            elif ce_slow_hops is not None and not (
+                0 <= ce_slow_hops < (1 << self.world_size)
+            ):
+                error = (
+                    f"ce_slow_hops must be a mask of {self.world_size} hops, "
+                    f"got {ce_slow_hops}"
+                )
 
         # Layout must be identical on every rank, or one of them reads a peer
         # slab at the wrong offsets. Gather the config alongside the outcome so
@@ -258,6 +277,7 @@ class PcieIpcAllReduceWorkspace:
             "elem_size": self.elem_size,
             "max_blocks": max_blocks,
             "profile": profile,
+            "ce_slow_hops": ce_slow_hops,
             # Buckets pick which shape a tuned entry is reused for, so ranks
             # that disagree would resolve different configurations.
             "tune_batches": self._tune_batches,
@@ -291,6 +311,12 @@ class PcieIpcAllReduceWorkspace:
         self.memop_supported = self.world_size in (4, 8) and all(
             entry["memop_supported"] for entry in prepared
         )
+        # Only the pipelined ring reads the mask, and only stream-publication
+        # groups run it. Every rank derived it from the same gathered probe.
+        if self.memop_supported:
+            self.slow_hops = (
+                decision.slow_hops if ce_slow_hops is None else int(ce_slow_hops)
+            )
 
         # --- stage 3: allocate and share, then bind --------------------------
         # NOTE: create_shared_buffer() runs its own all_gather_object and
@@ -305,6 +331,8 @@ class PcieIpcAllReduceWorkspace:
             )
             if self.memop_supported:
                 module.set_memop_enabled(self._handle, True)
+                if self.slow_hops:
+                    module.set_ce_slow_hops(self._handle, self.slow_hops)
             # init() zeroes this rank's slab; no peer may push into it until
             # every rank has done so.
             torch.cuda.synchronize(self.device)
@@ -340,27 +368,14 @@ class PcieIpcAllReduceWorkspace:
         when require_identical is false; callers receive the successful entries
         and choose one protocol for the whole group.
         """
-        gathered: List[Optional[dict]] = [None] * self.world_size
-        dist.all_gather_object(gathered, local, group=self.group)
-        entries = [g for g in gathered if g is not None]
-
-        failed = {i: g["error"] for i, g in enumerate(entries) if g.get("error")}
-        if failed:
-            raise ValueError(f"pcie ipc workspace failed while {what}: {failed}")
-
-        mismatched = {
-            key: [g[key] for g in entries]
-            for key in local
-            if require_identical
-            and key != "error"
-            and len({repr(g[key]) for g in entries}) > 1
-        }
-        if mismatched:
-            raise ValueError(
-                "every rank must build the workspace with identical arguments, "
-                f"but these differ across the group: {mismatched}"
-            )
-        return entries
+        return joint_check(
+            self.group,
+            self.world_size,
+            local,
+            what,
+            collective_name="pcie ipc workspace",
+            require_identical=require_identical,
+        )
 
     @property
     def handle(self) -> int:
@@ -385,19 +400,7 @@ class PcieIpcAllReduceWorkspace:
         on the same workspace is still unsupported and cannot be checked from
         here.
         """
-        if torch.cuda.is_current_stream_capturing():
-            return
-        current = torch.cuda.current_stream(self.device)
-        if self._stream is None:
-            self._stream = current
-        elif current != self._stream:
-            raise RuntimeError(
-                "this workspace is already bound to "
-                f"{self._stream}, but all_reduce was called on {current}. "
-                "One workspace serves one stream: its epoch and arrival "
-                "counters assume the calls sharing it are totally ordered. "
-                "Build a second workspace for the second stream."
-            )
+        self._stream = bind_stream(self.device, self._stream, "all_reduce")
 
     def rebind_stream(self) -> None:
         """Allow the next call to come from a different stream.
@@ -493,6 +496,7 @@ class PcieIpcAllReduceWorkspace:
             self.max_blocks,
             self.max_numel,
             self.memop_supported,
+            self.slow_hops,
         )
         self._joint_check(
             {
@@ -537,11 +541,19 @@ class PcieIpcAllReduceWorkspace:
             return
         self._warned_untuned = True
         if self._tune_cache_exists:
+            # Stream-publication workspaces also key on the ring's slow hops,
+            # which follow the rank-to-GPU mapping and can be pinned with
+            # ce_slow_hops= so tuning and serving agree.
+            hops = (
+                f", stream publication, slow_hops={self.slow_hops:#x}"
+                if self.memop_supported
+                else ""
+            )
             warnings.warn(
                 f"PCIe IPC all-reduce loaded {self._tune_cache} but it holds no "
                 f"entry for this workspace ({self.world_size} ranks, "
                 f"max_numel={self.max_numel}, max_blocks={self.max_blocks}, "
-                f"profile={self.profile}); it was tuned for a different one, so "
+                f"profile={self.profile}{hops}); it was tuned for a different one, so "
                 "every shape falls back to a seed configuration. Re-tune with "
                 "this workspace's parameters, or build it with the ones the "
                 "cache was written for.",
@@ -1112,19 +1124,11 @@ class PcieIpcAllReduceWorkspace:
         Collective: every rank must call this, and the peer unmapping is
         separated from the free by a barrier inside ``free_shared_buffer``.
         """
-        if self._handle is not None:
-            # all_reduce() launches asynchronously, so a collective may still be
-            # running or spinning on this slab. free_shared_buffer() unmaps the
-            # peers, and unmapping memory a live kernel is still touching is a
-            # use-after-free -- wait for the device before tearing anything
-            # down. This is the conservative choice; a stream-scoped wait would
-            # need the workspace to track every stream it has been used on.
-            torch.cuda.synchronize(self.device)
-            get_pcie_ipc_comm_module().dispose(self._handle)
-            self._handle = None
-        if self._ipc_ptrs is not None:
-            free_shared_buffer(self._ipc_ptrs, group=self.group)
-            self._ipc_ptrs = None
+        release_workspace(
+            self,
+            dispose=lambda handle: get_pcie_ipc_comm_module().dispose(handle),
+            free=free_shared_buffer,
+        )
         if self._tune_group is not None:
             dist.destroy_process_group(self._tune_group)
             self._tune_group = None

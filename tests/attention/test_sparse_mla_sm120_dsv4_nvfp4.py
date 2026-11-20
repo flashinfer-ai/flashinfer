@@ -552,14 +552,15 @@ def test_nvfp4_sparse_mla_rejects_strided_optional_tensors(
     "topk,chunks_per_block,topk_len", [(128, 2, 111), (512, 6, 389)]
 )
 @pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("page_size", [64, 32, 48])
 def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
-    topk: int, chunks_per_block: int, topk_len: int, with_sink: bool
+    topk: int, chunks_per_block: int, topk_len: int, with_sink: bool, page_size: int
 ) -> None:
     """Cover the direct and two-split epilogues with online quantization."""
     _require_sm120()
-    torch.manual_seed(20260902 + topk + int(with_sink))
+    torch.manual_seed(20260902 + topk + int(with_sink) + page_size)
     num_tokens, num_heads = 2, 128
-    num_pages, page_size = 16, 64
+    num_pages = 16 * 64 // page_size
     kv_bf16 = (
         torch.randn(
             num_pages,
@@ -735,16 +736,17 @@ def test_nvfp4_sparse_mla_shared_wrapper_normalizes_singleton_indices(
     torch.testing.assert_close(lse_3d, lse_2d, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512)])
+@pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512), (32, 512)])
 @pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("main_page_size", [64, 32])
 def test_nvfp4_sparse_mla_decode_dual_cache_matches_reference(
-    extra_page_size: int, extra_topk: int, with_sink: bool
+    extra_page_size: int, extra_topk: int, with_sink: bool, main_page_size: int
 ) -> None:
     """Main and C4A/C128A cache sections share one online softmax."""
     _require_sm120()
-    torch.manual_seed(20260904 + extra_page_size + int(with_sink))
+    torch.manual_seed(20260904 + extra_page_size + int(with_sink) + main_page_size)
     num_tokens, num_heads, main_topk = 2, 128, 128
-    main_pages, main_page_size = 8, 64
+    main_pages = 8 * 64 // main_page_size
     extra_pages = max(16, (extra_topk + extra_page_size - 1) // extra_page_size)
     main_bf16 = (
         torch.randn(
@@ -871,12 +873,15 @@ def test_nvfp4_sparse_mla_decode_dual_cache_matches_reference(
     torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_heads", [16, 32, 64])
-def test_nvfp4_sparse_mla_supported_head_counts(num_heads: int) -> None:
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64])
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_nvfp4_sparse_mla_supported_head_counts(
+    num_heads: int, num_tokens: int
+) -> None:
     """Decode and prefill share the vLLM padded-head dispatch set."""
     _require_sm120()
-    torch.manual_seed(20260905 + num_heads)
-    num_tokens, topk = 1, 128
+    torch.manual_seed(20260905 + num_heads + num_tokens)
+    topk = 128
     kv_bf16 = (
         torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
     ).clamp(-1, 1)

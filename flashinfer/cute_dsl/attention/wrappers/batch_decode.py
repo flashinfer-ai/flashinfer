@@ -944,7 +944,7 @@ class BatchDecodeCuteDSLWrapper:
             Whether to launch with Programmatic Dependent Launch (PDL).
             Default ``True``. Set to ``False`` to disable PDL when the
             target device does not support it. See
-            https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
 
         Note
         ----
@@ -1476,7 +1476,7 @@ class BatchDecodePagedCuteDSLWrapper:
             Whether to launch with Programmatic Dependent Launch (PDL).
             Default ``True``. Set to ``False`` to disable PDL when the
             target device does not support it. See
-            https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
 
         Note
         ----

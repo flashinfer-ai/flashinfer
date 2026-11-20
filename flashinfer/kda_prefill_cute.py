@@ -18,8 +18,10 @@ This module keeps its FlashInfer-facing validation, allocation, stream, and
 state semantics separate from the kernel source.
 """
 
+import contextlib
+import contextvars
 import math
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
@@ -28,10 +30,11 @@ from .kda_prefill import (
     _bind_workspace,
     _check_output_does_not_overlap_inputs,
     _identity_seq_order,
+    _supports_strided_qkv,
 )
 from .utils import get_compute_capability
 
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _HEAD_DIM = 128
 _CHUNK_SIZE = 16
 
@@ -128,12 +131,13 @@ def _is_cute_dsl_kda_prefill_eligible(
         not q.is_cuda
         or get_compute_capability(q.device) not in _SUPPORTED_COMPUTE_CAPABILITIES
         or q.dtype != torch.bfloat16
-        or not q.is_contiguous()
     ):
         return False
 
     batch_size, token_count, num_heads, head_dim = q.shape
     if batch_size <= 0 or token_count <= 1 or num_heads <= 0 or head_dim != _HEAD_DIM:
+        return False
+    if not _supports_strided_qkv(q):
         return False
     for tensor in (k, v):
         if (
@@ -141,7 +145,7 @@ def _is_cute_dsl_kda_prefill_eligible(
             or tensor.device != q.device
             or tensor.dtype != torch.bfloat16
             or tensor.shape != q.shape
-            or not tensor.is_contiguous()
+            or not _supports_strided_qkv(tensor)
         ):
             return False
     if (
@@ -302,8 +306,27 @@ def _is_cute_dsl_kda_prefill_eligible(
     return _is_cute_dsl_kda_runtime_available()
 
 
+# The two BT=16 routes ("decomp" and the persistent "engine") do not agree bitwise; the batch-invariant class pins one.
+_ROUTE_MODE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "flashinfer_kda_cute_route", default=None
+)
+
+
+@contextlib.contextmanager
+def force_route(mode: Optional[str]) -> Iterator[None]:
+    """Pin the CuTe-DSL KDA prefill to one route ("engine" or "decomp") for the calls inside the block (context-local)."""
+    if mode not in (None, "auto", "engine", "decomp"):
+        raise ValueError(f"unknown cute-dsl KDA route {mode!r}")
+    token = _ROUTE_MODE.set(None if mode == "auto" else mode)
+    try:
+        yield
+    finally:
+        _ROUTE_MODE.reset(token)
+
+
 def _get_compiled_cute_dsl_kda(
     *,
+    mode: Optional[str] = None,
     lower_bound: float,
     state_dtype: torch.dtype,
     has_state_in: bool,
@@ -333,7 +356,7 @@ def _get_compiled_cute_dsl_kda(
         has_state_ckpt=has_state_ckpt,
         has_state_indices=has_state_indices,
         has_checkpoint_state_indices=has_checkpoint_state_indices,
-        mode=None,
+        mode=mode,
     )
 
 
@@ -382,7 +405,7 @@ def _run_cute_dsl_kda_prefill(
     else:
         out = output
     _check_output_does_not_overlap_inputs(
-        out,
+        output,
         q=q,
         k=k,
         v=v,
@@ -457,7 +480,9 @@ def _run_cute_dsl_kda_prefill(
             )
         cu_seqlens = cu_seqlens.to(torch.int64)
 
+    route = _ROUTE_MODE.get()
     compiled = _get_compiled_cute_dsl_kda(
+        **({} if route is None else {"mode": route}),
         lower_bound=float(lower_bound),
         state_dtype=state_dtype,
         has_state_in=initial_state is not None,

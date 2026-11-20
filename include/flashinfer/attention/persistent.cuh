@@ -175,7 +175,7 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
   }
 }
 
-template <typename KTraits_, typename Params_>
+template <typename KTraits_, typename Params_, bool EQUAL_KV_STRIDES>
 struct BlockBatchPagedAttentionPersistent {
   using KTraits = KTraits_;
   using Params = Params_;
@@ -265,10 +265,12 @@ struct BlockBatchPagedAttentionPersistent {
              v_smem_offset_w = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_V>(
                  warp_idx * KTraits::KV_THR_LAYOUT_ROW + lane_idx / KTraits::KV_THR_LAYOUT_COL,
                  lane_idx % KTraits::KV_THR_LAYOUT_COL);
-    size_t
-        thr_local_kv_offset_k[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q];
-    size_t
-        thr_local_kv_offset_v[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q];
+    constexpr uint32_t NUM_KV_OFFSETS =
+        NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q;
+    // Equal data strides share offsets, while K/V bases and scale-factor addressing stay separate.
+    size_t thr_local_kv_offsets[NUM_KV_OFFSETS * (EQUAL_KV_STRIDES ? 1 : 2)];
+    size_t* thr_local_kv_offset_k = thr_local_kv_offsets;
+    size_t* thr_local_kv_offset_v = thr_local_kv_offsets + (EQUAL_KV_STRIDES ? 0 : NUM_KV_OFFSETS);
 
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
@@ -326,9 +328,11 @@ struct BlockBatchPagedAttentionPersistent {
       prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
                                kv_indices, thr_local_kv_offset_k);
-      prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                               kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
-                               kv_indices, thr_local_kv_offset_v);
+      if constexpr (!EQUAL_KV_STRIDES) {
+        prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                 kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
+                                 kv_indices, thr_local_kv_offset_v);
+      }
       page_produce_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
                                       kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset_k,
                                       kv_end, warp_idx, lane_idx);
@@ -355,9 +359,11 @@ struct BlockBatchPagedAttentionPersistent {
             prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                                      packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h,
                                      k_stride_n, block_size, kv_indices, thr_local_kv_offset_k);
-            prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                     packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h,
-                                     v_stride_n, block_size, kv_indices, thr_local_kv_offset_v);
+            if constexpr (!EQUAL_KV_STRIDES) {
+              prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                       packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h,
+                                       v_stride_n, block_size, kv_indices, thr_local_kv_offset_v);
+            }
             cp_async::wait_group<1>();
             __syncthreads();
 
@@ -650,7 +656,7 @@ struct BlockBatchReductionPersistent {
 };
 
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
-          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+          MaskMode MASK_MODE, bool EQUAL_KV_STRIDES, typename AttentionVariant, typename Params>
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream) {
@@ -688,9 +694,10 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   smem_size = max(smem_size, ReductionKTraits::SMEM_SIZE);
 
   // Launch persistent kernel
-  auto kernel = PersistentKernelTemplate<BlockBatchPagedAttentionPersistent<KTraits1, Params>,
-                                         BlockBatchPagedAttentionPersistent<KTraits2, Params>,
-                                         BlockBatchReductionPersistent<ReductionKTraits>>;
+  auto kernel = PersistentKernelTemplate<
+      BlockBatchPagedAttentionPersistent<KTraits1, Params, EQUAL_KV_STRIDES>,
+      BlockBatchPagedAttentionPersistent<KTraits2, Params, EQUAL_KV_STRIDES>,
+      BlockBatchReductionPersistent<ReductionKTraits>>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   dim3 nblks(num_blks_x, num_blks_y);

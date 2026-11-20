@@ -85,7 +85,7 @@ Hardware and software requirements
 #    pip install 'jax[cuda12]'
 #
 #
-# Three packages are required beyond a standard JAX environment:
+# Two packages are required beyond a standard JAX environment:
 #
 #
 # .. list-table::
@@ -310,7 +310,7 @@ print(f"JIT cache:  {jit_env.FLASHINFER_GEN_SRC_DIR.parent}")
 #
 #    FFN(x) = SiLU(W1 * x) * (W2 * x)
 #
-# where * is elementwise multiply.
+# where * denotes elementwise multiplication.
 #
 # In practice, implementations often compute both linear projections in one matmul by using a weight with twice the hidden width, producing a tensor of shape ``[..., 2H]``. Here, hidden size ``H`` is just the width of the model's internal feature vectors. And in gated FFNs, we temporarily double it (``2H``) to compute two parallel projections before combining them back to size ``H``:
 #

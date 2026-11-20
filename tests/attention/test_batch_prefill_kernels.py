@@ -19,12 +19,19 @@ import math
 import numpy
 import pytest
 import torch
-from tests.test_helpers.jit_utils import gen_prefill_attention_modules
-from tests.test_helpers.paged_kv import make_padded_paged_kv_view
+from tests.jit.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.attention.test_helpers.paged_kv import make_padded_paged_kv_view
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
-from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_chunked,
+    ref_single_prefill,
+)
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
@@ -94,7 +101,15 @@ def _assert_no_ref_mismatch(mismatch_counts):
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
 )
-def warmup_jit():
+def warmup_jit(request):
+    # NVFP4-only shards do not use this fp16/fp8 warmup grid.
+    if all(
+        "nvfp4" in item.name
+        for item in request.session.items
+        if item.module is request.module
+    ):
+        yield
+        return
     flashinfer.jit.build_jit_specs(
         gen_prefill_attention_modules(
             [torch.float16],  # q_dtypes
@@ -114,20 +129,31 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
-@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
-@pytest.mark.parametrize("page_size", [1, 5, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.parametrize(
+    "kv_len,qo_len,causal",
+    [
+        (kv_len, qo_len, causal)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+        for causal in [False, True]
+    ],
+)
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "page_size": [1, 5, 16],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "head_dim": [64, 128, 256],
+        "kv_layout": ["NHD"],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
+        "use_cuda_graph": [False, True],
+        "logits_soft_cap": [0.0],
+        "return_lse": [True],
+        "contiguous_kv": [True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -637,20 +663,31 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
-@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
-@pytest.mark.parametrize("page_size", [1, 5, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.parametrize(
+    "kv_len,qo_len,causal",
+    [
+        (kv_len, qo_len, causal)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+        for causal in [False, True]
+    ],
+)
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "page_size": [1, 5, 16],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "head_dim": [128, 256],
+        "kv_layout": ["NHD"],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
+        "use_cuda_graph": [False, True],
+        "logits_soft_cap": [0.0],
+        "return_lse": [True],
+        "contiguous_kv": [True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_prefill_with_tuple_paged_kv_cache(
     batch_size,
     kv_len,
@@ -882,18 +919,29 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
-@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
-@pytest.mark.parametrize("page_size", [1, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.parametrize(
+    "kv_len,qo_len",
+    [
+        (kv_len, qo_len)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+    ],
+)
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "page_size": [1, 16],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "head_dim": [128, 256],
+        "kv_layout": ["NHD"],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
+        "logits_soft_cap": [0.0],
+        "return_lse": [True],
+        "contiguous_kv": [True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_prefill_with_paged_kv_cache_custom_mask(
     batch_size,
     kv_len,
@@ -999,16 +1047,27 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
-@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize(
+    "kv_len,qo_len,causal",
+    [
+        (kv_len, qo_len, causal)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+        for causal in [False, True]
+    ],
+)
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "head_dim": [64, 128, 256],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
+        "logits_soft_cap": [0.0],
+        "return_lse": [True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size,
     kv_len,
@@ -1168,15 +1227,26 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
-@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize(
+    "kv_len,qo_len",
+    [
+        (kv_len, qo_len)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+    ],
+)
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "head_dim": [128, 256],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA", "ALIBI"],
+        "logits_soft_cap": [0.0, 30.0],
+        "return_lse": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     batch_size,
     kv_len,
@@ -1484,7 +1554,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_paged_kv_cache_nvfp4(
@@ -2240,7 +2310,7 @@ def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len
 @pytest.mark.parametrize("qo_len", [64, 128])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_ragged_kv_cache_nvfp4(
@@ -2877,3 +2947,65 @@ def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
     assert wrapper._max_q_len == int(q_lens.max())
     assert type(wrapper._max_kv_len) is int
     assert wrapper._max_kv_len == int(kv_lens.max())
+
+
+@pytest.mark.parametrize(
+    "use_cuda_graph,retained_cudnn", [(False, False), (True, False), (True, True)]
+)
+def test_batch_prefill_fa2_plan_skips_kv_lens_buffer(use_cuda_graph, retained_cudnn):
+    """fa2 reads kv lengths from the page table, so plan() leaves the device kv
+    length buffer alone instead of copying the host lengths into it. A CUDA graph
+    wrapper still holding a cuDNN capture from an earlier plan keeps the copy,
+    since that graph reads the buffer."""
+    page_size = 16
+    q_lens = torch.tensor([17, 33], dtype=torch.int32)
+    kv_lens = torch.tensor([100, 256], dtype=torch.int32)
+    num_pages = (kv_lens + page_size - 1) // page_size
+    qo_indptr = torch.nn.functional.pad(
+        torch.cumsum(q_lens, 0, dtype=torch.int32), (1, 0)
+    )
+    kv_indptr = torch.nn.functional.pad(
+        torch.cumsum(num_pages, 0, dtype=torch.int32), (1, 0)
+    )
+    num_kv_pages = int(kv_indptr[-1])
+
+    graph_buffers = {}
+    if use_cuda_graph:
+        graph_buffers = dict(
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.empty(3, dtype=torch.int32, device="cuda"),
+            paged_kv_indptr_buf=torch.empty(3, dtype=torch.int32, device="cuda"),
+            paged_kv_indices_buf=torch.empty(
+                num_kv_pages, dtype=torch.int32, device="cuda"
+            ),
+            paged_kv_last_page_len_buf=torch.empty(2, dtype=torch.int32, device="cuda"),
+        )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa2",
+        **graph_buffers,
+    )
+    if retained_cudnn:
+        # What a cuDNN capture from an earlier plan leaves on the wrapper.
+        wrapper._cudnn_q_lens_buffer = torch.zeros(2, dtype=torch.int32, device="cuda")
+    wrapper._kv_lens_buffer.fill_(-1)
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        torch.arange(num_kv_pages, dtype=torch.int32, device="cuda"),
+        kv_lens - (num_pages - 1) * page_size,
+        8,
+        8,
+        128,
+        page_size,
+        causal=True,
+        q_data_type=torch.float16,
+    )
+    torch.cuda.synchronize()
+
+    assert wrapper._backend == "fa2"
+    if retained_cudnn:
+        torch.testing.assert_close(wrapper._kv_lens_buffer[:2].cpu(), kv_lens)
+    else:
+        assert bool((wrapper._kv_lens_buffer == -1).all())

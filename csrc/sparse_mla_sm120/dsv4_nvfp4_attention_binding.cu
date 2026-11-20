@@ -61,8 +61,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   TVM_FFI_ICHECK(!extra_topk_length.has_value() || dual)
       << "extra_topk_length requires an extra cache";
   const auto layout = parse_nvfp4_paged_layout(kv_cache);
-  TVM_FFI_ICHECK_EQ(layout.page_size, execution::FixedPageSize)
-      << "NVFP4 attention supports page_size=64";
+  TVM_FFI_ICHECK_GT(layout.page_size, 0) << "NVFP4 attention requires a positive page_size";
   Dsv4Nvfp4AttentionParams p{};
   p.q = static_cast<const bf16*>(q.data_ptr());
   p.cache = static_cast<const uint8_t*>(kv_cache.data_ptr());
@@ -72,6 +71,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   p.num_tokens = tokens;
   p.sm_scale = static_cast<float>(sm_scale);
   p.lse_scale = static_cast<float>(lse_scale);
+  p.page_size = layout.page_size;
   p.page_stride_bytes = layout.page_stride_bytes;
   auto length_pointer = [&](Optional<TensorView> value, const char* name) -> const int* {
     if (!value.has_value()) return nullptr;
@@ -102,7 +102,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
     const auto extra_layout = parse_nvfp4_paged_layout(cache);
     TVM_FFI_ICHECK(
         execution::visit_extra_page(extra_layout.page_size, [](auto) { return true; }).supported)
-        << "NVFP4 extra cache page_size must be 2 or 64";
+        << "NVFP4 extra cache page_size must be 2, 32, or 64";
     p.extra_cache = static_cast<const uint8_t*>(cache.data_ptr());
     p.extra_indices = static_cast<const int32_t*>(idx.data_ptr());
     p.extra_page_size = extra_layout.page_size;
@@ -163,7 +163,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
     const auto& m = prepared->metadata;
     TVM_FFI_ICHECK(
         m.tokens == tokens && m.heads == heads && m.topk == topk && m.extra_topk == p.extra_topk &&
-        m.page_stride_bytes == p.page_stride_bytes &&
+        m.page_size == p.page_size && m.page_stride_bytes == p.page_stride_bytes &&
         m.extra_page_stride_bytes == p.extra_page_stride_bytes &&
         m.extra_page_size == p.extra_page_size && m.has_lengths == topk_length.has_value() &&
         m.has_extra_lengths == extra_topk_length.has_value() && m.has_sink == attn_sink.has_value())

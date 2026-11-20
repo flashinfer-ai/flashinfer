@@ -117,8 +117,8 @@ def bsa_attn_sm100_blk128_fwd(
         assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch(q.device.index)
-    assert arch in (100, 103), (
-        f"bsa_attn_sm100_blk128_fwd only supports SM100/SM103, got SM{arch}"
+    assert arch in (100, 103, 107), (
+        f"bsa_attn_sm100_blk128_fwd only supports SM100/SM103/SM107, got SM{arch}"
     )
     assert num_head % num_head_kv == 0
 

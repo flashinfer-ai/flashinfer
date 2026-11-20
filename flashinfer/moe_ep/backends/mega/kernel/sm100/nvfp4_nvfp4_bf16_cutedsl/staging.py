@@ -14,6 +14,25 @@ def _use_fused_stage() -> bool:
     return os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
 
 
+def require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights):
+    """The specified input quantizer has one fused, aligned staging path."""
+    if (
+        not hidden_states.is_cuda
+        or hidden_states.dtype != torch.bfloat16
+        or not hidden_states.is_contiguous()
+        or hidden_states.data_ptr() % 16
+        or hidden_states.shape[1] % 64
+        or topk_ids.shape[1] > 128
+        or any(
+            not t.is_contiguous() or t.data_ptr() % 16 for t in (topk_ids, topk_weights)
+        )
+        or topk_weights.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        raise ValueError(
+            "batch_invariant NVFP4 staging requires aligned contiguous CUDA BF16 activations, aligned contiguous routes, hidden divisible by 64 and top_k <= 128"
+        )
+
+
 def stage_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -24,6 +43,7 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     norm_const: float = 1.0,
+    batch_invariant: bool = False,
 ) -> None:
     """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales.
 
@@ -56,7 +76,9 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if _use_fused_stage() and fused_quant_stage_supported(
+    if batch_invariant:
+        require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights)
+    if (batch_invariant or _use_fused_stage()) and fused_quant_stage_supported(
         hidden_states, quant_type="nvfp4"
     ):
         fused_quant_stage(
@@ -69,6 +91,7 @@ def stage_mega_moe_inputs(
             topk_weights_out,
             quant_type="nvfp4",
             norm_const=norm_const,
+            batch_invariant=batch_invariant,
         )
         return
 
@@ -160,4 +183,41 @@ def validate_nvfp4_forward_inputs(
         raise MoEEpConfigError(
             f"scales.shape[1] ({scales.shape[1]}) must be >= {hidden_sf_cols} "
             f"for hidden={hidden}"
+        )
+
+
+def validate_fc1_activation_per_token_scale(
+    scale: torch.Tensor | None,
+    *,
+    num_tokens: int,
+    enabled: bool,
+) -> None:
+    """Check ``MoEEpTensors.fc1_activation_per_token_scale`` against the config.
+
+    The per-token scale is a compile-time kernel switch
+    (``enable_fc1_activation_per_token_scale``), so the tensor must be present
+    iff the switch is on; when present it is ``(num_tokens,)`` fp32 CUDA.
+    """
+    if not enabled:
+        if scale is not None:
+            raise MoEEpConfigError(
+                "MoEEpTensors.fc1_activation_per_token_scale was provided but the "
+                "kernel config has enable_fc1_activation_per_token_scale=False"
+            )
+        return
+    if scale is None:
+        raise MoEEpConfigError(
+            "MoEEpTensors.fc1_activation_per_token_scale is required when "
+            "enable_fc1_activation_per_token_scale=True"
+        )
+    if not scale.is_cuda:
+        raise MoEEpConfigError("fc1_activation_per_token_scale must be a CUDA tensor")
+    if scale.dtype != torch.float32:
+        raise MoEEpConfigError(
+            f"fc1_activation_per_token_scale must be float32, got {scale.dtype}"
+        )
+    if scale.shape != (num_tokens,):
+        raise MoEEpConfigError(
+            f"fc1_activation_per_token_scale must have shape ({num_tokens},), "
+            f"got {tuple(scale.shape)}"
         )

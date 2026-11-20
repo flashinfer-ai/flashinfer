@@ -14,6 +14,7 @@
 
 """TraceTemplates for GEMM operations."""
 
+import functools
 import math
 from typing import Any, cast
 
@@ -699,6 +700,7 @@ def _mm_bf16_fp4_cute_dsl_init(
         nvfp4_quantize,
         prepare_bf16_fp4_weights,
     )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
@@ -706,7 +708,7 @@ def _mm_bf16_fp4_cute_dsl_init(
     major, minor = torch.cuda.get_device_capability(torch.device(device))
     if not mm_bf16_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
         raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
-    if (major, minor) in ((10, 0), (10, 3)):
+    if _cute_dsl_uses_sm100_layout(major, minor):
         raise NotImplementedError(
             f"SM{major}{minor} prepares a different cute-dsl layout; use "
             "mm_bf16_fp4_cute_dsl_sm100_trace"
@@ -756,12 +758,13 @@ def _mm_bf16_fp4_cute_dsl_sm100_init(
         nvfp4_quantize,
         prepare_bf16_fp4_weights,
     )
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
         raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if not _cute_dsl_uses_sm100_layout(major, minor):
         raise NotImplementedError(
             f"this template describes the SM100/103 cute-dsl layout; got "
             f"SM{major}{minor}"
@@ -918,15 +921,140 @@ mm_bf16_fp4_cute_dsl_sm100_trace = TraceTemplate(
 )
 
 
+def _mm_bf16_fp4_native_reference(
+    a, b, b_descale, alpha=None, block_size=16, out_dtype=None, out=None
+):
+    """Decode canonical NVFP4 bytes and padded 128x4 E4M3 block scales."""
+    n, k_half = b.shape
+    k = k_half * 2
+    sf_bytes = _unswizzle_sf_128x4(
+        b_descale.view(torch.uint8).reshape(-1), n, k // block_size
+    ).contiguous()
+    sf = sf_bytes.view(torch.float8_e4m3fn).float().repeat_interleave(block_size, 1)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=b.device,
+    )
+    codes = torch.stack((b & 15, b >> 4), dim=-1).long().reshape(n, k)
+    weight = lut[codes] * sf
+    if alpha is not None:
+        weight = weight * alpha.float()
+    result_dtype = out.dtype if out is not None else (out_dtype or a.dtype)
+    result = (a.float() @ weight.T).to(result_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+cast(Any, _mm_bf16_fp4_native_reference)._trace_reference_dependencies = (
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
+def _mm_bf16_fp4_native_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_packed: int = 0,  # derived
+    SF_dim_0: int = 0,  # derived from N/K padding
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build canonical weights without creating an alternate representation."""
+    del SF_dim_0, K_packed
+    from flashinfer import nvfp4_quantize  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("native mm_bf16_fp4 init requires CUDA")
+    if torch.cuda.get_device_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        raise NotImplementedError("native mm_bf16_fp4 requires SM120/121")
+    if M < 1 or block_size != 16:
+        raise NotImplementedError("native mm_bf16_fp4 requires M>=1 and block_size=16")
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = 2688.0 / w.float().abs().max()
+    b, sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    return dict(
+        a=a,
+        b=b,
+        b_descale=sf.reshape(-1),
+        alpha=g_w.reciprocal().reshape(1),
+        backend="cute-dsl-native",
+        block_size=block_size,
+    )
+
+
+@functools.cache
+def _mm_bf16_fp4_native_trace(scale_ndim):
+    """Preserve the caller's view of the contiguous canonical scale buffer."""
+    return TraceTemplate(
+        op_type="gemm_bf16_fp4",
+        name_prefix=f"mm_bf16_fp4_cute_dsl_native_sf{scale_ndim}d",
+        description=(
+            "BF16 x NVFP4 GEMM with canonical uint8 weights and padded 128x4-swizzled "
+            "E4M3 block scales on SM120/121. No alternate weight preparation; M>=1."
+        ),
+        axes={
+            "M": Var(),
+            "N": Const(),
+            "K": Const(),
+            "K_packed": Const(),
+            "block_size": Const(),
+            **{f"SF_dim_{i}": Const() for i in range(scale_ndim)},
+        },
+        inputs={
+            "A": Tensor(["M", "K"], param="a"),
+            "B": Tensor(["N", "K_packed"], param="b"),
+            "b_descale": Tensor(
+                [f"SF_dim_{i}" for i in range(scale_ndim)],
+                description="Contiguous 128x4-swizzled E4M3 buffer, including N/K padding.",
+            ),
+            "alpha": Tensor(["1"], optional=True),
+            "block_size": Scalar("int32"),
+            "out_dtype": Scalar("dtype", optional=True),
+            "out": Tensor(["M", "N"], optional=True),
+        },
+        outputs={
+            "C": Tensor(
+                ["M", "N"],
+                dtype="bfloat16",
+                dtype_from="out",
+                dtype_from_scalar="out_dtype",
+            )
+        },
+        constraints=["K == K_packed * 2", "block_size == 16", "M >= 1"],
+        tags=["status:verified", "quantization:fp4"],
+        reference=_mm_bf16_fp4_native_reference,
+        check=_fp4_gemm_check,
+        init=_mm_bf16_fp4_native_init if scale_ndim == 1 else None,
+    )
+
+
+mm_bf16_fp4_native_trace = _mm_bf16_fp4_native_trace(1)
+
+
 def mm_bf16_fp4_trace_dispatch(**kwargs):
     """Return the TraceTemplate for an ``mm_bf16_fp4`` call by backend.
 
     ``prepare_bf16_fp4_weights`` produces three distinct layouts: cute-dsl on
     SM12x tile-packs the weight into int32, cute-dsl on SM100/103 keeps the
     canonical uint8 weight but hands back a 6-D scale view, and cudnn keeps the
-    canonical weight with linear 2-D scales.  Pass as
+    canonical weight with linear 2-D scales. The explicit cute-dsl-native
+    backend consumes the contiguous canonical 128x4 scale buffer directly. Pass as
     ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
+    if kwargs.get("backend") == "cute-dsl-native":
+        sf = kwargs.get("b_descale")
+        return _mm_bf16_fp4_native_trace(sf.ndim if sf is not None else 1)
     b = kwargs.get("b")
     if b is not None and b.dtype == torch.int32:
         return mm_bf16_fp4_cute_dsl_trace
@@ -939,6 +1067,8 @@ def mm_bf16_fp4_trace_dispatch(**kwargs):
 # Expose the templates so _attach_fi_trace auto-registers them for the
 # consistency tests (same pattern as the MoE routing dispatchers).
 mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_bf16_fp4_native_trace,
+    _mm_bf16_fp4_native_trace(2),
     mm_bf16_fp4_cudnn_trace,
     mm_bf16_fp4_cute_dsl_trace,
     mm_bf16_fp4_cute_dsl_sm100_trace,
@@ -958,6 +1088,13 @@ def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
     A_f = A.to(torch.float32) * A_scale.to(torch.float32)
     B_f = B.to(torch.float32) * B_scale.to(torch.float32)
     return torch.matmul(A_f, B_f).to(dtype)
+
+
+def _bmm_fp8_bias_reference(A, B, A_scale, B_scale, dtype, bias):
+    """Reference per-tensor FP8 BMM with a bias: dequantize, matmul, add the bias."""
+    A_f = A.to(torch.float32) * A_scale.to(torch.float32)
+    B_f = B.to(torch.float32) * B_scale.to(torch.float32)
+    return (torch.matmul(A_f, B_f) + bias.to(torch.float32)).to(dtype)
 
 
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
@@ -1086,6 +1223,34 @@ bmm_fp8_trace = TraceTemplate(
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
 
+# A separate definition, so the unbiased one and the solutions written for it
+# (called with one positional argument per input) stay as they are.
+bmm_fp8_bias_trace = TraceTemplate(
+    op_type="bmm_fp8",
+    name_prefix="bmm_fp8_bias",
+    description=bmm_fp8_trace.description
+    + " A bias of length N is added to every row.",
+    axes=dict(bmm_fp8_trace.axes),
+    inputs={
+        **bmm_fp8_trace.inputs,
+        "bias": Tensor(["N"], description="Output dtype; shared by every batch."),
+    },
+    outputs=dict(bmm_fp8_trace.outputs),
+    tags=list(bmm_fp8_trace.tags),
+    reference=_bmm_fp8_bias_reference,
+    check=_gemm_check,
+)
+
+
+def bmm_fp8_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for a ``bmm_fp8`` call: the bias variant when a
+    bias is given. Pass as ``trace=bmm_fp8_trace_dispatch`` to ``@flashinfer_api``.
+    """
+    return bmm_fp8_bias_trace if kwargs.get("bias") is not None else bmm_fp8_trace
+
+
+bmm_fp8_trace_dispatch.templates = [bmm_fp8_trace, bmm_fp8_bias_trace]  # type: ignore[attr-defined]
+
 
 def _bmm_mxfp8_init(
     *,
@@ -1173,6 +1338,18 @@ bmm_mxfp8_trace = TraceTemplate(
 )
 
 
+def bmm_mxfp8_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for a ``bmm_mxfp8`` call. MXFP8 output (``out_scale``) has
+    no template yet, so it resolves to None: tracing records nothing and Trace Apply keeps
+    the original call, since a registered solution cannot fill ``out_scale``."""
+    if kwargs.get("out_scale") is not None:
+        return None
+    return bmm_mxfp8_trace
+
+
+bmm_mxfp8_trace_dispatch.templates = [bmm_mxfp8_trace]  # type: ignore[attr-defined]
+
+
 # ── tinygemm_bf16 (small bf16 GEMM with bias) ────────────────────────────────
 
 
@@ -1257,6 +1434,8 @@ def _fmha_v2_prefill_deepseek_reference(
     scale_bmm2=None,
     return_lse: bool = False,
     lse=None,
+    scale_bmm1_d=None,
+    scale_bmm2_d=None,
     **_unused,
 ) -> torch.Tensor:
     """Reference for fmha_v2_prefill_deepseek: per-batch causal SDPA on
@@ -1264,19 +1443,25 @@ def _fmha_v2_prefill_deepseek_reference(
     Mutates ``out`` in-place; returns it.
     """
     B, S, H, D = query.shape
-    s = float(scale_bmm1 or scale_softmax)
+    if scale_bmm1_d is not None:
+        scale_bmm1 = scale_bmm1_d.item()
+    if scale_bmm2_d is not None:
+        scale_bmm2 = scale_bmm2_d.item()
+    s = float(scale_bmm1) if scale_bmm1 is not None else 1.0
     b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
     q = query.to(torch.float32)
     k = key.to(torch.float32)
     v = value.to(torch.float32)
+    heads_per_kv = H // key.shape[2]
     # Per head, per batch: causal attention.
     for batch in range(B):
         for h in range(H):
-            logits = q[batch, :, h] @ k[batch, :, h].T * s
+            kv_h = h // heads_per_kv
+            logits = q[batch, :, h] @ k[batch, :, kv_h].T * s
             mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
             logits = logits + mask
             attn = torch.softmax(logits, dim=-1)
-            out[batch, :, h] = (attn @ v[batch, :, h] * b2).to(out.dtype)
+            out[batch, :, h] = (attn @ v[batch, :, kv_h] * b2).to(out.dtype)
     return out
 
 
@@ -1295,23 +1480,31 @@ def _fmha_v2_prefill_sm120_reference(
     causal: bool = True,
     return_lse: bool = False,
     lse=None,
+    scale_bmm1_d=None,
+    scale_bmm2_d=None,
     **_unused,
 ) -> torch.Tensor:
-    """Reference for FP8 SM120 FMHA v2 standard self-attention."""
+    """Reference for FP8 SM120 FMHA v2 MHA/GQA self-attention."""
     B, S, H, D = query.shape
-    s = float(scale_bmm1 or scale_softmax)
+    if scale_bmm1_d is not None:
+        scale_bmm1 = scale_bmm1_d.item()
+    if scale_bmm2_d is not None:
+        scale_bmm2 = scale_bmm2_d.item()
+    s = float(scale_bmm1) if scale_bmm1 is not None else 1.0
     b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
     q = query.to(torch.float32)
     k = key.to(torch.float32)
     v = value.to(torch.float32)
+    heads_per_kv = H // key.shape[2]
     for batch in range(B):
         for h in range(H):
-            logits = q[batch, :, h] @ k[batch, :, h].T * s
+            kv_h = h // heads_per_kv
+            logits = q[batch, :, h] @ k[batch, :, kv_h].T * s
             if causal:
                 mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
                 logits = logits + mask
             attn = torch.softmax(logits, dim=-1)
-            out[batch, :, h] = (attn @ v[batch, :, h] * b2).to(out.dtype)
+            out[batch, :, h] = (attn @ v[batch, :, kv_h] * b2).to(out.dtype)
     return out
 
 
@@ -1321,19 +1514,46 @@ def _fmha_v2_prefill_deepseek_init(
     seq_len: int = 128,
     scale_size: int = 1,
     num_heads: int = 32,
-    head_dim: int = 128,
+    head_dim: int = 192,
+    head_dim_vo: int = 128,
+    num_kv_heads: int | None = None,
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for ``fmha_v2_prefill_deepseek``."""
+    if head_dim in (128, 256):
+        inputs = _fmha_v2_prefill_sm120_init(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            scale_size=scale_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            device=device,
+            seed=seed,
+        )
+        inputs.pop("causal")
+        return inputs
     del scale_size
     torch.manual_seed(seed)
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
     q = torch.randn(
         batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    out = torch.empty_like(q)
+    k = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn(
+        batch_size,
+        seq_len,
+        num_kv_heads,
+        head_dim_vo,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    out = torch.empty(
+        batch_size, seq_len, num_heads, head_dim_vo, dtype=torch.bfloat16, device=device
+    )
     return {
         "query": q,
         "key": k,
@@ -1342,7 +1562,8 @@ def _fmha_v2_prefill_deepseek_init(
         "num_heads": int(num_heads),
         "head_dim": int(head_dim),
         "seq_len": int(seq_len),
-        "scale_softmax": 1.0 / math.sqrt(head_dim),
+        "scale_softmax": 0.0,
+        "scale_bmm1": 1.0 / math.sqrt(head_dim),
     }
 
 
@@ -1353,6 +1574,7 @@ def _fmha_v2_prefill_sm120_init(
     scale_size: int = 1,
     num_heads: int = 32,
     head_dim: int = 128,
+    num_kv_heads: int | None = None,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1367,9 +1589,11 @@ def _fmha_v2_prefill_sm120_init(
         return quantized, scale.item()
 
     shape = (batch_size, seq_len, num_heads, head_dim)
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+    kv_shape = (batch_size, seq_len, num_kv_heads, head_dim)
     q, q_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
-    k, k_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
-    v, v_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
+    k, k_scale = quantize(torch.randn(kv_shape, dtype=torch.bfloat16, device=device))
+    v, v_scale = quantize(torch.randn(kv_shape, dtype=torch.bfloat16, device=device))
     out = torch.empty(shape, dtype=torch.bfloat16, device=device)
     return {
         "query": q,
@@ -1394,11 +1618,17 @@ def _fmha_v2_prefill_sm120_init(
     }
 
 
+_fmha_v2_prefill_deepseek_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _fmha_v2_prefill_sm120_init,
+)
+
+
 fmha_v2_prefill_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="fmha_v2_prefill_deepseek",
     description=(
-        "DeepSeek-specific FMHA v2 prefill: separate Q/K/V tensors, "
+        "DeepSeek MLA, GLM-4.7-Flash 256-dimension MLA context, and 128-dimension GQA "
+        "FMHA v2 prefill: separate Q/K/V tensors, "
         "fixed seq_len, causal SDPA per batch. Mutates ``out`` in-place."
     ),
     axes={
@@ -1406,14 +1636,16 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "head_dim_vo": Var(),
+        "num_kv_heads": Var(),
         "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim_vo"]),
         "out": Tensor(
-            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            ["batch_size", "seq_len", "num_heads", "head_dim_vo"],
             description="In-place output buffer.",
         ),
         "num_heads": Scalar("int32"),
@@ -1435,7 +1667,7 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     },
     outputs={
         "out": Tensor(
-            ["batch_size", "seq_len", "num_heads", "head_dim"], dtype_from="query"
+            ["batch_size", "seq_len", "num_heads", "head_dim_vo"], dtype_from="out"
         ),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
@@ -1455,12 +1687,13 @@ fmha_v2_prefill_sm120_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "num_kv_heads": Var(),
         "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_kv_heads", "head_dim"]),
         "out": Tensor(
             ["batch_size", "seq_len", "num_heads", "head_dim"],
             description="In-place output buffer.",
@@ -2510,7 +2743,7 @@ def _nvfp4_quantize_smooth_init(
 nvfp4_quantize_smooth_trace = TraceTemplate(
     op_type="quantize_nvfp4_smooth",
     description=(
-        "Smooth + NVFP4 quantize: (xq, sf) = nvfp4-quantize(x * pre_quant_scale). "
+        "Smooth + NVFP4 quantization: (xq, sf) = nvfp4-quantize(x * pre_quant_scale). "
         "SM100/SM103 and SM120/SM121 fuse smoothing into quantization; the "
         "SM120/SM121 path uses CuTe DSL. Both use ue4m3 block "
         "scales, 128x4 swizzled layout, and SF vector size 16."
@@ -2657,3 +2890,177 @@ svdquant_linear_trace = TraceTemplate(
     tags=["quantization:fp4"],
     init=_svdquant_linear_init,
 )
+
+
+# ── mm_bf16_fp8 / mm_fp16_fp8 (16-bit activation, FP8 e4m3 weight, per-tensor scale) ─
+
+
+@torch.no_grad()
+def _mm_16bit_fp8_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    bias=None,
+    **_unused,
+) -> torch.Tensor:
+    """``a @ (b.float() * alpha).T + bias`` with the e4m3 weight dequantized
+    exactly in fp32 and one rounding into ``a``'s dtype.  ``a`` is ``(..., K)``;
+    its leading dimensions are kept."""
+    a32 = a.to(torch.float32)
+    w = b.to(torch.float32) * alpha.to(torch.float32).reshape(())
+    res = a32 @ w.T
+    if bias is not None:
+        res = res + bias.to(torch.float32)
+    return res.to(a.dtype)
+
+
+def _mm_bf16_fp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.mm_bf16_fp8`` (2-D activation).
+
+    Sourced from ``tests/gemm/test_mm_bf16_fp8.py``: a ``randn`` bf16
+    activation and a ``randn`` weight quantized per tensor to e4m3 (mirrored
+    as ``per_tensor_fp8_quantize``); ``alpha`` is the dequant multiplier.
+    """
+    del scalar
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    b, inv_scale = per_tensor_fp8_quantize(b_16)
+    return {"a": a, "b": b, "alpha": inv_scale.reshape(1)}
+
+
+def _mm_fp16_fp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.mm_fp16_fp8`` (2-D activation): as
+    ``_mm_bf16_fp8_init`` with a float16 activation."""
+    del scalar
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.float16, device=device)
+    b_16 = torch.randn(N, K, dtype=torch.float16, device=device)
+    b, inv_scale = per_tensor_fp8_quantize(b_16)
+    return {"a": a, "b": b, "alpha": inv_scale.reshape(1)}
+
+
+_MM_16BIT_FP8_INITS = {
+    torch.bfloat16: _mm_bf16_fp8_init,
+    torch.float16: _mm_fp16_fp8_init,
+}
+
+
+def _mm_16bit_fp8_a_dims(a_ndim: int):
+    """Leading dimension names of an ``(..., K)`` activation of ``a_ndim``
+    dimensions: none for a vector, ``M`` for a matrix, ``batch`` / ``seq_len``
+    for the usual 3-D hidden state, ``lead<i>`` beyond that."""
+    if a_ndim <= 1:
+        return []
+    if a_ndim == 2:
+        return ["M"]
+    if a_ndim == 3:
+        return ["batch", "seq_len"]
+    return [f"lead{i}" for i in range(a_ndim - 1)]
+
+
+_MM_16BIT_FP8_NAMES = {torch.bfloat16: "mm_bf16_fp8", torch.float16: "mm_fp16_fp8"}
+
+
+@functools.lru_cache(maxsize=None)
+def _mm_16bit_fp8_trace(
+    a_dtype: torch.dtype, a_ndim: int, scale_ndim: int
+) -> TraceTemplate:
+    """The template of ``mm_bf16_fp8`` / ``mm_fp16_fp8`` (by ``a_dtype``) for an
+    ``a`` of ``a_ndim`` dimensions and an ``alpha`` of ``scale_ndim`` (0 or 1)
+    dimensions: the API accepts any leading shape on ``a`` and a ``()`` or
+    ``(1,)`` scale, and the trace names the ranks it actually saw.  ``K`` is
+    read off ``a``'s last dimension."""
+    name = _MM_16BIT_FP8_NAMES[a_dtype]
+    dtype_name = str(a_dtype).removeprefix("torch.")
+    short = name.split("_")[1]  # bf16 / fp16
+    lead = _mm_16bit_fp8_a_dims(a_ndim)
+    axes: "dict[str, Var | Const]" = {dim: Var() for dim in lead}
+    axes["N"] = Const()
+    axes["K"] = Const(extract=lambda kw: int(kw["a"].shape[-1]))
+    scale_dims = []
+    scale_desc = "Per-tensor dequant scale of b, a 0-d fp32 tensor."
+    if scale_ndim == 1:
+        axes["scalar"] = Var(description="alpha tensor length (1).")
+        scale_dims = ["scalar"]
+        scale_desc = "Per-tensor dequant scale of b, shape (1,)."
+    common = a_ndim == 2 and scale_ndim == 1
+    name_prefix = name
+    if not common:
+        name_prefix += f"_a{a_ndim}d" + ("_alpha0d" if scale_ndim == 0 else "")
+    return TraceTemplate(
+        op_type=f"gemm_{short}_fp8",
+        name_prefix=name_prefix,
+        description=(
+            f"W8A16 GEMM: out = a @ (b * alpha).T + bias. a is {dtype_name} "
+            "(..., K); b is float8_e4m3fn [N, K] with one per-tensor fp32 "
+            "scale alpha, dequantized inside the kernel."
+        ),
+        axes=axes,
+        inputs={
+            "a": Tensor(lead + ["K"], dtype=dtype_name),
+            "b": Tensor(
+                ["N", "K"],
+                dtype="float8_e4m3fn",
+                description="FP8 e4m3 weight in torch.nn.Linear layout [N, K].",
+            ),
+            "alpha": Tensor(scale_dims, dtype="float32", description=scale_desc),
+            "bias": Tensor(
+                ["N"], dtype=dtype_name, optional=True, description="Bias in a's dtype."
+            ),
+        },
+        outputs={
+            "out": Tensor(lead + ["N"], dtype=dtype_name),
+        },
+        tags=["status:verified", "quantization:float8_e4m3fn"],
+        reference=_mm_16bit_fp8_reference,
+        check=_gemm_check,
+        init=_MM_16BIT_FP8_INITS[a_dtype] if common else None,
+    )
+
+
+mm_bf16_fp8_trace = _mm_16bit_fp8_trace(torch.bfloat16, 2, 1)
+mm_fp16_fp8_trace = _mm_16bit_fp8_trace(torch.float16, 2, 1)
+
+
+def _mm_16bit_fp8_dispatch(a_dtype: torch.dtype):
+    def dispatch(**kwargs):
+        a = kwargs.get("a")
+        alpha = kwargs.get("alpha")
+        a_ndim = a.ndim if a is not None else 2
+        scale_ndim = min(alpha.ndim, 1) if alpha is not None else 1
+        return _mm_16bit_fp8_trace(a_dtype, a_ndim, scale_ndim)
+
+    dispatch.__doc__ = (
+        f"Return the ``{_MM_16BIT_FP8_NAMES[a_dtype]}`` TraceTemplate matching the "
+        "call's ranks.  Passed as ``trace=`` to ``@flashinfer_api``."
+    )
+    # Registered for the consistency tests (the generic sample builder cannot
+    # form a 0-d input, so the alpha0d variants are covered by
+    # tests/trace/test_mm_bf16_fp8_trace.py).
+    dispatch.templates = [  # type: ignore[attr-defined]
+        _mm_16bit_fp8_trace(a_dtype, 2, 1),
+        _mm_16bit_fp8_trace(a_dtype, 1, 1),
+        _mm_16bit_fp8_trace(a_dtype, 3, 1),
+    ]
+    return dispatch
+
+
+mm_bf16_fp8_trace_dispatch = _mm_16bit_fp8_dispatch(torch.bfloat16)
+mm_fp16_fp8_trace_dispatch = _mm_16bit_fp8_dispatch(torch.float16)

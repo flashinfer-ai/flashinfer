@@ -19,6 +19,7 @@ Global compilation context management for FlashInfer.
 
 import functools
 import os
+import platform
 import torch
 import logging
 
@@ -46,16 +47,36 @@ def cutlass_supports_sm107() -> bool:
             text = arch_header.read_text()
         except OSError:
             continue
-        # Header found and readable: its Sm107 declaration is authoritative.
-        return "struct Sm107" in text
+        # CUTLASS declaring Sm107 is necessary but not sufficient; nvcc must agree.
+        return "struct Sm107" in text and _nvcc_supports_sm107()
     return False
+
+
+@functools.lru_cache(maxsize=1)
+def _nvcc_supports_sm107() -> bool:
+    """Can the nvcc we will actually invoke emit compute_107a? False on any error."""
+    import subprocess
+
+    from flashinfer.jit.cpp_ext import get_cuda_path
+
+    try:
+        nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
+        out = subprocess.run(
+            [nvcc, "--list-gpu-arch"], capture_output=True, text=True, timeout=60
+        )
+        if out.returncode != 0:
+            return False
+        return "compute_107" in out.stdout
+    except Exception as e:
+        logger.warning(f"Could not query nvcc for compute_107a support: {e}.")
+        return False
 
 
 class CompilationContext:
     COMMON_NVCC_FLAGS = [
         "-DFLASHINFER_ENABLE_FP8_E8M0",
         "-DFLASHINFER_ENABLE_FP4_E2M1",
-    ]
+    ] + (["-Xcompiler /Zc:preprocessor"] if platform.system() == "Windows" else [])
 
     @staticmethod
     def _normalize_cuda_arch(major: int, minor: int) -> tuple[int, str]:
@@ -147,7 +168,10 @@ class CompilationContext:
         # bundled CUTLASS lacks native compute_107a support; once CUTLASS adds
         # it, callers that opt in with map_sm107_to_100f get native sm107a
         # automatically, with no code change.
-        apply_sm107_mapping = map_sm107_to_100f and not cutlass_supports_sm107()
+        # Second clause is unconditional: callers that never opt in must not emit it.
+        apply_sm107_mapping = (
+            map_sm107_to_100f and not cutlass_supports_sm107()
+        ) or not _nvcc_supports_sm107()
 
         flags = []
         for major, minor in sorted(supported_cuda_archs):
