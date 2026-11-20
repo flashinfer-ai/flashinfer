@@ -2894,6 +2894,7 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_clc", 512, 128, 255),
         ("mla_bf16_clc", 1024, 128, 255),
         ("mla_bf16_clc", 2048, 128, 255),
+        ("mla_bf16_clc", 4096, 128, 255),
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
