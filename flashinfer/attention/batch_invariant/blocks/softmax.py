@@ -221,15 +221,16 @@ def unit_loop(
     cS = cute.make_identity_tensor((Q_ROWS, T))
     tScS = qk_thr_mma.partition_C(cS)
     HWM = st.hw_rowmax
+    LC = st.s_load_cols  # columns per load of the whole row
     if cutlass.const_expr(HWM):
-        # the load returns each 32-column piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
+        # the load returns each piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
         # is the max.f32 join of the pieces -- the same exact maximum as the register tree
         ld_full = cute.make_copy_atom(
-            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(LC)), ACC_DTYPE
         )
     else:
         ld_full = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(LC)), ACC_DTYPE
         )
     tiled_full = tcgen05.make_tmem_copy(ld_full, tStS)
     thr_full = tiled_full.get_slice(thread_idx)
@@ -240,7 +241,7 @@ def unit_loop(
     rRed = None
     if cutlass.const_expr(HWM):
         rRed = cute.make_rmem_tensor(((1, 1), *tFcS.shape[1:]), ACC_DTYPE)
-        assert cute.size(rRed) == T // 32, cute.size(rRed)
+        assert cute.size(rRed) == T // LC, cute.size(rRed)
     one_slice = kpt == T  # one warpgroup: the slice is the row, loaded once
     # two warpgroups on whole rows: each loads ONLY its key slice, forms the slice's maximum and exchanges it with the other
     # warpgroup through shared memory (fmax is exact and order-free, so the maximum of the two partials is the row maximum: a
@@ -406,7 +407,7 @@ def unit_loop(
                 sf.append(rF[i])
             if cutlass.const_expr(HWM):
                 sr = []
-                for i in cutlass.range_constexpr(T // 32):
+                for i in cutlass.range_constexpr(T // LC):
                     sr.append(rRed[i])
                 m_t = max3_tree(
                     sr

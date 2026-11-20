@@ -255,6 +255,12 @@ class StaticPlan:
         # tile whenever one warpgroup worked alone; at D = 128 its P exchange and four-slice stats payload would also not leave room for
         # the third ring slot next to the two Q tiles and the smem O_m
         self.rep_ok = g <= REP_ROWS and not q2
+        # TMEM columns per load of the softmax's whole-row copy of S: 32-column pieces; 64-column pieces (two loads per tile and
+        # warpgroup) under the paired placement at D = 64 on the 228 KB parts with the hardware row maximum (sm_103), the one build
+        # they measured faster in (slower for the one-warpgroup body and on sm_107). The same columns reach the same registers
+        self.s_load_cols = (
+            64 if q2 and D == 64 and hw_rowmax and self.cap < (300 << 10) else 32
+        )
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (
