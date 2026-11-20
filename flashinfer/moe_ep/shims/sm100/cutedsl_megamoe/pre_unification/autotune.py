@@ -44,6 +44,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invari
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
     default_knobs,
     describe_invalid_knobs,
+    fit_bf16_mxfp8_stages,
     is_valid,
     is_valid_bf16,
     is_valid_bf16_for_config,
@@ -905,10 +906,15 @@ def autotune_bf16_mxfp8_mega_moe(
 
     cfg = frontend.config
     if candidates is None:
-        candidates = bf16_mxfp8_candidates(
-            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
-            batch_invariant=cfg.batch_invariant,
-        )
+        candidates = [
+            fit_bf16_mxfp8_stages(
+                knobs, hidden=cfg.hidden, num_total_experts=cfg.num_total_experts
+            )
+            for knobs in bf16_mxfp8_candidates(
+                enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
+                batch_invariant=cfg.batch_invariant,
+            )
+        ]
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the

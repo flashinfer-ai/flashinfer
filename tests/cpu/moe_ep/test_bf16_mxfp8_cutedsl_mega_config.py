@@ -84,6 +84,7 @@ def test_mixed_knobs_and_candidates():
             "transform_buffer": "smem",
             "accumulator_overlap": False,
             "transform_k_tile": 128,
+            "num_weight_stages": None,
             "num_activation_stages": None,
             "runtime_mma_split": False,
         }
@@ -107,9 +108,23 @@ def test_mixed_knobs_and_candidates():
         "transform_buffer": "smem",
         "accumulator_overlap": False,
         "transform_k_tile": 128,
+        "hidden": 4096,
+        "num_total_experts": 256,
     }
     assert is_valid_bf16_mxfp8({**smem_n256, "num_activation_stages": 3})
     assert not is_valid_bf16_mxfp8({**smem_n256, "num_activation_stages": 4})
+    # The dispatch buffer grows with hidden: w6a5 fits H4096 but not H7168.
+    assert is_valid_bf16_mxfp8({**knobs, "hidden": 4096, "num_total_experts": 512})
+    assert not is_valid_bf16_mxfp8(
+        {**knobs, "num_activation_stages": 6, "hidden": 4096, "num_total_experts": 512}
+    )
+    assert not is_valid_bf16_mxfp8({**knobs, "hidden": 7168, "num_total_experts": 384})
+    fitted = default_knobs(256, dtype="bf16_mxfp8", hidden=7168, num_total_experts=384)
+    assert (fitted["num_weight_stages"], fitted["num_activation_stages"]) == (5, 5)
+    assert (
+        default_knobs(256, dtype="bf16_mxfp8", hidden=4096, num_total_experts=512)
+        == knobs
+    )
     assert not is_valid_bf16_mxfp8({**knobs, "num_activation_stages": 1})
     assert {c.get("num_activation_stages") for c in candidates} == {None, 5}
     assert all(is_valid_bf16_mxfp8(c) for c in candidates)
