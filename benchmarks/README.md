@@ -54,14 +54,22 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `BlockSparseAttentionWrapper`, `VariableBlockSparseAttentionWrapper` - block-sparse (VSA) attention, backends `fa2`, `fa3`, `cutile`, `vsa_sm100_blk64`, `vsa_sm120_blk64`.
     - `top_k_varlen` - DSA indexer top-K KV selection (`radix`, `gvr`, `gvr_2`, `radix_cutlass`, `radix_filter`, `auto`); `--topk_mode prefill` (windowed `row_starts` mode) and `--page_size` (fused page-table output) are served by `gvr_2`/`auto`.
 - GEMM:
-    - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
-    - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
+    - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling (cutlass, trtllm, cutile (K-major), cute-dsl (SM107), auto). `--input_dtype fp8_e5m2 --mat2_dtype fp8_e5m2` (both operands) and `--scale_granularity_m 128` (= `gemm_fp8_nt_blockscaled`; needs `--tile_size 128` and `m % 128 == 0`) are CUTLASS-only modes.
+    - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling (cutlass; with K-major scales also cutile, deepgemm = `group_deepgemm_fp8_nt_groupwise`, cute-dsl = `group_gemm_fp8_nt_groupwise_contiguous`).
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
-    - `mm_mxfp8` - Dense MXFP8 matrix multiplication.
-    - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
-    - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
+    - `mm_mxfp8` / `bmm_mxfp8` - Dense / batched MXFP8 matrix multiplication.
+    - `mm_fp8` - Matrix multiplication with FP8 inputs (trtllm_low_latency with pre-shuffled weights, cutedsl_low_latency, cublas, cudnn, cutlass, auto, and prims-ts = `flashinfer.gemm.fp8_linear`).
+    - `mm_fp4` - Matrix multiplication with NVFP4 / MXFP4 inputs (prims-ts = `flashinfer.gemm.fp4_linear`, NVFP4 + 128x4 only).
+    - `mm_bf16_fp4` - BF16 activation x NVFP4 weight matrix multiplication.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - `tinygemm_bf16` - Small-M BF16 GEMM.
+    - `router_gemm` - The shape-specialized MoE router GEMMs `mm_M1_16_K{k}_N{n}[_bf16]` (picked by `--k`, `--n`, `--out_dtype`).
+    - `group_gemm_mxfp4_nt_groupwise` - MXFP8 x MXFP4 grouped GEMM (CUTLASS).
+    - `masked_grouped_gemm` - Masked (G, max_m, K) grouped GEMM: deepgemm (`batch_deepgemm_fp8_nt_groupwise`), cute-dsl (`grouped_gemm_nt_masked`), cutile (`masked_bmm` / `masked_scaled_bmm`).
+    - `grouped_mm` - Ragged (`m_indptr`) grouped GEMM: cudnn (`grouped_mm_{bf16,fp8,mxfp8,fp4}`), cutile (`ragged_bmm` / `ragged_scaled_bmm`).
+    - `mm_nvfp4_svdquant` - NVFP4 GEMM with a fused rank-r LoRA-up correction (SVDQuant).
+    - `fused_linear` - PrimsTS dense FP8 / NVFP4 GEMM with a fused `linear`, `swiglu` or `qkv_qknorm_rope` epilogue.
     - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
@@ -350,7 +358,11 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
 | `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
-| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
+| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend), `tinygemm_bf16`, `mm_nvfp4_svdquant`, `fused_linear` (`linear` / `swiglu` epilogues only) |
+| `--scale_granularity_m`  | `gemm_fp8_nt_groupwise`: rows per A scale; `128` benchmarks `gemm_fp8_nt_blockscaled` (CUTLASS only)       |
+| `--expected_m`           | `masked_grouped_gemm`: mean valid rows per group (default `m // 2`)                                        |
+| `--rank`                 | `mm_nvfp4_svdquant`: LoRA rank (multiple of 32)                                                            |
+| `--epilogue`             | `fused_linear`: `linear`, `swiglu` (output N/2) or `qkv_qknorm_rope` (N % 384 == 0)                        |
 
 ### MOE Flags
 | Flag                     | Description                                                                                                 |
@@ -571,14 +583,23 @@ Legend:
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
 | **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
-| **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass, batch_invariant | cutlass, batch_invariant |  |
-| **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
-| **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass, batch_invariant | cudnn, cublas, cutlass, batch_invariant | cudnn, cublas |
-| **mm_fp8** |  |  |  |  |  | trtllm_low_latency | trtllm_low_latency |  |
-| **mm_mxfp8** |  |  |  |  |  | cutlass, cute-dsl, trtllm, cudnn, batch_invariant | cutlass, cute-dsl, trtllm, cudnn, batch_invariant | cutlass, cudnn |
-| **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass, batch_invariant | cudnn, trtllm, cutlass, batch_invariant | cudnn |
-| **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv, batch_invariant | cudnn, cutlass, tgv, batch_invariant |  |
-| **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass |  |
+| **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass, trtllm, cutile, auto, batch_invariant | cutlass, trtllm, cutile, auto, batch_invariant | cutlass, cutile, auto |
+| **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass, cutile, deepgemm, cute-dsl | cutlass, cutile, deepgemm, cute-dsl | cutlass, cutile |
+| **bmm_fp8** |  |  |  | cudnn, cublas, auto | cudnn, cublas, auto | cudnn, cublas, cutlass, auto, batch_invariant | cudnn, cublas, cutlass, auto, batch_invariant | cudnn, cublas, cutlass, auto |
+| **mm_fp8** |  |  |  | cublas, cudnn, auto | cublas, cudnn, auto | trtllm_low_latency, cutedsl_low_latency, cublas, cudnn, cutlass, prims-ts, auto | trtllm_low_latency, cutedsl_low_latency, cublas, cudnn, cutlass, prims-ts, auto | cublas, cudnn, cutlass, auto |
+| **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass, cute-dsl, cutedsl_low_latency, prims-ts, auto, batch_invariant | cudnn, trtllm, cutlass, cute-dsl, cutedsl_low_latency, prims-ts, auto, batch_invariant | cudnn, cutlass, cute-dsl, b12x, auto |
+| **mm_mxfp8** |  |  |  |  |  | cutlass, cute-dsl, cutedsl_low_latency, trtllm, cudnn, auto, batch_invariant | cutlass, cute-dsl, cutedsl_low_latency, trtllm, cudnn, auto, batch_invariant | cutlass, cudnn, b12x, auto |
+| **bmm_mxfp8** |  |  |  |  |  | cudnn, auto | cudnn, auto | cudnn, cutlass, auto |
+| **mm_bf16_fp4** |  |  |  |  |  | cudnn, cute-dsl, blackwell-native, blackwell-tiled | cudnn, cute-dsl, blackwell-native, blackwell-tiled | cudnn, cute-dsl, cute-dsl-native |
+| **mm_bf16** |  | cudnn, cublaslt, auto | cudnn, cublaslt, auto | cudnn, cublaslt, auto | cudnn, cublaslt, tinygemm, cutile, auto | cudnn, cutlass, tgv, cublaslt, tinygemm, cutile, cute-dsl, auto, batch_invariant | cudnn, cutlass, tgv, cublaslt, tinygemm, cutile, cute-dsl, auto, batch_invariant | cudnn, cublaslt, tinygemm, cutile, auto |
+| **bmm_bf16** |  | cudnn, auto | cudnn, auto | cudnn, auto | cudnn, cutile, auto | cudnn, cutlass, cutile, tgv, auto | cudnn, cutlass, cutile, tgv, auto | cudnn, cutile, auto |
+| **tinygemm_bf16** |  |  |  |  | tinygemm | tinygemm | tinygemm | tinygemm |
+| **router_gemm** |  |  |  |  | dsv3 | dsv3 | dsv3 |  |
+| **group_gemm_mxfp4_nt_groupwise** |  |  |  |  |  | cutlass | cutlass | cutlass |
+| **masked_grouped_gemm** |  |  |  |  | cutile | deepgemm, cute-dsl, cutile | deepgemm, cute-dsl, cutile | cutile |
+| **grouped_mm** |  | cudnn | cudnn | cudnn | cudnn, cutile | cudnn, cutile | cudnn, cutile | cudnn, cutile |
+| **mm_nvfp4_svdquant** |  |  |  |  |  | cutlass, auto | cutlass, auto | cute-dsl, cute-dsl-unfused, cutlass-sm120, auto |
+| **fused_linear** |  |  |  |  |  | prims-ts | prims-ts |  |
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
