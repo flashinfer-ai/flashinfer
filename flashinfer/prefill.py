@@ -2528,8 +2528,12 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # PRECISION (part of the API contract, stated in the dispatch docstring):
 # shifted P rounds from fp32 to bf16; finite e4m3 V converts exactly to
 # bf16. PV accumulates in fp32; normalized bf16 split partials merge in
-# fp32 before V descale. Wider P exponent range is not extra significand
-# precision: small contributions can still round away.
+# fp32 before V descale. BF16 has 7 fraction bits versus the previous FP16
+# operand's 10: the wider exponent range reduces significand precision.
+# Nearly equal probabilities can round to the same value, so signed-value
+# cancellation can miss the default accuracy tolerance even for finite inputs.
+# FP32 accumulation does not recover these discarded probability bits. Native
+# FA3 is not a guaranteed remedy; no higher-precision specialized mode is offered.
 # Auto prefers stock through maximum KV 128 for one request, or 256 for
 # multiple requests; explicit specialized plans retain the full domain.
 #
@@ -3449,7 +3453,15 @@ def _gqa_dec_fp8q_sm90_dispatch(
     diagnostic only: another wrapper may overwrite it concurrently).
     Capture-safe: no sync, no compilation; the only allocation is the output
     tensor when the caller did not pass one (the stock path allocates it in
-    the same place)."""
+    the same place).
+
+    Probability operands round to BF16 before FP32 PV accumulation. BF16's
+    wider exponent range has 7 fraction bits versus the previous FP16's 10.
+    Cancellation-sensitive finite inputs can therefore miss the default
+    accuracy tolerance; FP32 accumulation cannot restore discarded bits.
+    Native FA3 is not a guaranteed remedy, and this specialized backend
+    does not offer a selectable higher-precision probability mode.
+    """
     global _gqa_dec_fp8q_sm90_announced
     state = getattr(wrapper, "_gqa_dec_fp8q_sm90_state", None)
     if state is None:

@@ -1479,6 +1479,78 @@ def test_gap_analytic_and_mutated_descale_replay():
         previous = out.clone()
 
 
+def test_cancellation_precision_control_and_changed_descale_replay():
+    """Retain the known BF16 probability cancellation limit, without relaxing RTOL."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    b = _make_batch([2048], device)
+    q = torch.zeros_like(b["q"], dtype=torch.float32)
+    q[:, :, 0] = 1
+    k = torch.zeros_like(b["k_cache"], dtype=torch.float32)
+    k.reshape(-1, H_KV, HEAD_DIM)[::2, :, 0] = 1
+    v = torch.full_like(b["v_cache"], -448, dtype=torch.float32)
+    v.reshape(-1, H_KV, HEAD_DIM)[::2] = 448
+    b["q"].copy_(q)
+    b["k_cache"].copy_(k)
+    b["v_cache"].copy_(v)
+    q, kv = b["q"], (b["k_cache"], b["v_cache"])
+    qd = torch.tensor([math.sqrt(HEAD_DIM) / 1024], device=device)
+    vd = torch.ones(1, device=device)
+    wrapper = _plan_wrapper(b, device, use_cuda_graph=True, backend="auto")
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    before = _gqa_dec_fp8q_sm90_stats()["runs_dispatched_capturing"]
+    graph = _capture(wrapper, q, kv, out, q_scale=qd, v_scale=vd)
+    assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == before + 1
+
+    n = torch.arange(2043, 2049, device=device, dtype=torch.float64).view(QL, 1, 1)
+    positive = torch.floor((n + 1) / 2)
+    negative = torch.floor(n / 2)
+    excess = math.expm1(float(qd[0]) / math.sqrt(HEAD_DIM))
+    analytic = (
+        448 * ((positive - negative) + positive * excess) / (n + positive * excess)
+    )
+    known = torch.tensor(
+        [0.4375, 0.21875] * 3, device=device, dtype=torch.bfloat16
+    ).view(QL, 1, 1)
+    assert torch.equal(analytic.to(torch.bfloat16), known)
+    failures = []
+    initial = None
+    for value_scale in (1, 2):
+        vd.fill_(value_scale)
+        expected = (analytic * value_scale).to(torch.bfloat16).expand_as(out)
+        assert torch.equal(
+            _reference(b, q_descale=qd, v_descale=vd, compute_dtype=torch.float64),
+            expected,
+        )
+        before = _gqa_dec_fp8q_sm90_stats()["runs_dispatched"]
+        eager = wrapper.run(q, kv, q_scale=qd, v_scale=vd)
+        assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched"] == before + 1
+        _poison_and_replay(graph, out)
+        assert torch.isfinite(out).all()
+        assert torch.equal(out.view(torch.int16), eager.view(torch.int16))
+        if initial is None:
+            initial = out.clone()
+        else:
+            # Power-of-two V descale changes must be observed by the retained graph.
+            assert torch.equal(out, initial * value_scale)
+            assert not torch.equal(out, initial)
+        ratio = _matched_ratio(out, expected)
+        error = float((out.float() - expected.float()).abs().max())
+        # Fixture-specific regression ceiling, NOT a relaxed accuracy tolerance.
+        # The known /1024 cancellation loses at most 0.21875 at V descale 1.
+        # Multiplication by 2 is exact for these finite BF16 outputs.
+        assert error <= 0.21875 * value_scale, (value_scale, error)
+        if ratio < MATCHED:
+            failures.append((value_scale, ratio, error))
+    if failures:
+        # Reach this only after oracle, routing, graph and bounded-error checks.
+        # Improved probability operands can pass without retaining today's loss.
+        pytest.xfail(
+            "Known BF16 probability cancellation precision limit "
+            f"(V descale, matched ratio, max absolute error): {failures}"
+        )
+
+
 def test_signed_packed_v_lanes_keep_order():
     _sm90_or_skip()
     device = torch.device("cuda:0")
