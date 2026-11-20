@@ -618,8 +618,8 @@ routine_cc_to_supported_backends = {
     # 10.0 / 10.3 / 10.7 rows are pipecleaned on B200 / B300 / GR100 (a backend
     # the guard allows stays listed even if it fails to build; the trial call
     # drops it at run time); 9.0, 11.0 and 12.x rows are guard-backed only.
-    # cutlass flashinfer/gemm/gemm_base.py:10237, trtllm :10256, cutile :10305 (K-major only),
-    # cute-dsl :10334 (SM107 only). auto picks cute-dsl/cutlass (:10383).
+    # cutlass flashinfer/gemm/gemm_base.py, trtllm, cutile (K-major only),
+    # cute-dsl (SM107 only). auto picks cute-dsl/cutlass.
     "gemm_fp8_nt_groupwise": {
         "7.5": [],
         "8.0": [],
@@ -633,8 +633,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutlass", "cutile", "auto"],
         "12.1": ["cutlass", "cutile", "auto"],
     },
-    # common check flashinfer/gemm/gemm_base.py:10884 gates every backend; cutile has no
-    # per-backend checker (comment at :11068 names a missing one).
+    # common check flashinfer/gemm/gemm_base.py gates every backend; cutile has no
+    # per-backend checker (a comment in the file names a missing one).
     # deepgemm = group_deepgemm_fp8_nt_groupwise (:11621),
     # cute-dsl = group_gemm_fp8_nt_groupwise_contiguous (:11775).
     # SM12x raises for num_groups > 1 (:10950); the probe drops it.
@@ -651,7 +651,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutlass", "cutile"],
         "12.1": ["cutlass", "cutile"],
     },
-    # cudnn flashinfer/gemm/gemm_base.py:9958, cublas :9971, cutlass :9984, cute-dsl :10002 (SM107 only).
+    # cudnn flashinfer/gemm/gemm_base.py, cublas, cutlass, cute-dsl (SM107 only).
     "bmm_fp8": {
         "7.5": [],
         "8.0": [],
@@ -665,9 +665,9 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cublas", "cutlass", "auto"],
         "12.1": ["cudnn", "cublas", "cutlass", "auto"],
     },
-    # trtllm_low_latency flashinfer/gemm/gemm_base.py:5943, cublas :5970, cudnn :5976, cutlass :5984,
-    # cutedsl_low_latency :6021; prims-ts = flashinfer.gemm.fp8_linear
-    # (flashinfer/prims_ts/gemm/api.py:51, support.py:16).
+    # trtllm_low_latency flashinfer/gemm/gemm_base.py, cublas, cudnn, cutlass,
+    # cutedsl_low_latency; prims-ts = flashinfer.gemm.fp8_linear
+    # (flashinfer/prims_ts/gemm/api.py, support.py).
     "mm_fp8": {
         "7.5": [],
         "8.0": [],
@@ -705,7 +705,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cublas", "cudnn", "cutlass", "auto"],
         "12.1": ["cublas", "cudnn", "cutlass", "auto"],
     },
-    # cudnn flashinfer/gemm/gemm_base.py:12795, cutlass :12857 (SM120/121 only).
+    # cudnn flashinfer/gemm/gemm_base.py, cutlass (SM120/121 only).
     "bmm_mxfp8": {
         "7.5": [],
         "8.0": [],
@@ -719,9 +719,9 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cutlass", "auto"],
         "12.1": ["cudnn", "cutlass", "auto"],
     },
-    # cudnn flashinfer/gemm/gemm_base.py:8075, trtllm :8117, cutlass :8144, cute-dsl :8172,
-    # cutedsl_low_latency :8231, b12x :8268; prims-ts = flashinfer.gemm.fp4_linear
-    # (prims_ts/gemm/api.py:51). cake (experimental) is not benchmarked.
+    # cudnn flashinfer/gemm/gemm_base.py, trtllm, cutlass, cute-dsl,
+    # cutedsl_low_latency, b12x; prims-ts = flashinfer.gemm.fp4_linear
+    # (prims_ts/gemm/api.py). cake (experimental) is not benchmarked.
     "mm_fp4": {
         "7.5": [],
         "8.0": [],
@@ -762,9 +762,9 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cutlass", "cute-dsl", "b12x", "auto"],
         "12.1": ["cudnn", "cutlass", "cute-dsl", "b12x", "auto"],
     },
-    # flashinfer/gemm/gemm_bf16_fp4.py: cudnn :73, cute-dsl :112,
-    # blackwell-native/-tiled :140; cute-dsl-native
-    # gemm/kernels/native_bf16_fp4/support.py:39.
+    # flashinfer/gemm/gemm_bf16_fp4.py: cudnn, cute-dsl,
+    # blackwell-native/-tiled; cute-dsl-native
+    # gemm/kernels/native_bf16_fp4/support.py.
     "mm_bf16_fp4": {
         "7.5": [],
         "8.0": [],
@@ -778,8 +778,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cute-dsl", "cute-dsl-native"],
         "12.1": ["cudnn", "cute-dsl", "cute-dsl-native"],
     },
-    # cutlass flashinfer/gemm/gemm_base.py:6472, trtllm :6502, cute-dsl :6530, cutedsl_low_latency :6552,
-    # cudnn :6583; b12x flashinfer/gemm/gemm_mm_mxfp8_cute_dsl.py:49.
+    # cutlass flashinfer/gemm/gemm_base.py, trtllm, cute-dsl, cutedsl_low_latency,
+    # cudnn; b12x flashinfer/gemm/gemm_mm_mxfp8_cute_dsl.py.
     "mm_mxfp8": {
         "7.5": [],
         "8.0": [],
@@ -817,8 +817,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutlass", "cudnn", "b12x", "auto"],
         "12.1": ["cutlass", "cudnn", "b12x", "auto"],
     },
-    # cutlass flashinfer/gemm/gemm_base.py:366, cublaslt :394, cudnn :425, tgv :441, cute-dsl :474,
-    # cutile :534, tinygemm :562 (no SM107).
+    # Guards: the per-backend `_<backend>_mm_bf16_requirement` functions in
+    # flashinfer/gemm/gemm_base.py (tinygemm is also on SM107).
     "mm_bf16": {
         "7.5": [],
         "8.0": ["cudnn", "cublaslt", "auto"],
@@ -852,6 +852,7 @@ routine_cc_to_supported_backends = {
             "cutlass",
             "tgv",
             "cublaslt",
+            "tinygemm",
             "cutile",
             "cute-dsl",
             "auto",
@@ -861,7 +862,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
         "12.1": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
     },
-    # cutlass flashinfer/gemm/gemm_base.py:857, cudnn :870, cutile :882, tgv :901.
+    # cutlass flashinfer/gemm/gemm_base.py, cudnn, cutile, tgv.
     # cake (:923, experimental) is not benchmarked.
     "bmm_bf16": {
         "7.5": [],
@@ -876,7 +877,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cutile", "auto"],
         "12.1": ["cudnn", "cutile", "auto"],
     },
-    # flashinfer/gemm/routergemm.py:773.
+    # flashinfer/gemm/routergemm.py.
     "tinygemm_bf16": {
         "7.5": [],
         "8.0": [],
@@ -890,7 +891,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # mm_M1_16_K*_N* shape checks, flashinfer/gemm/routergemm.py:98-197.
+    # mm_M1_16_K*_N* shape checks, flashinfer/gemm/routergemm.py.
     # The API has no backend argument; dsv3 labels the family.
     "router_gemm": {
         "7.5": [],
@@ -905,7 +906,7 @@ routine_cc_to_supported_backends = {
         "12.0": [],
         "12.1": [],
     },
-    # flashinfer/gemm/gemm_base.py:11121 also lists 110, but dispatch has no SM110 path
+    # flashinfer/gemm/gemm_base.py also lists 110, but dispatch has no SM110 path
     # (:11352 raises 'Unsupported device'), so 11.0 is left out.
     "group_gemm_mxfp4_nt_groupwise": {
         "7.5": [],
@@ -920,10 +921,10 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
     },
-    # deepgemm = batch_deepgemm_fp8_nt_groupwise flashinfer/gemm/gemm_base.py:12042; cute-dsl =
-    # grouped_gemm_nt_masked (gemm/kernels/grouped_gemm_masked_wrapper.py:189-291:
+    # deepgemm = batch_deepgemm_fp8_nt_groupwise flashinfer/gemm/gemm_base.py; cute-dsl =
+    # grouped_gemm_nt_masked (gemm/kernels/grouped_gemm_masked_wrapper.py:
     # SM100/103 and SM107 kernels, SM110 rejected); cutile = masked_bmm
-    # flashinfer/gemm/gemm_base.py:1131 (bf16) / masked_scaled_bmm :1493 (block-scaled, no SM90).
+    # flashinfer/gemm/gemm_base.py (bf16) / masked_scaled_bmm (block-scaled, no SM90).
     "masked_grouped_gemm": {
         "7.5": [],
         "8.0": [],
@@ -937,9 +938,9 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutile"],
         "12.1": ["cutile"],
     },
-    # cudnn = grouped_mm_{bf16,fp8,mxfp8,fp4} flashinfer/grouped_mm/core.py:41,174,308,452
+    # cudnn = grouped_mm_{bf16,fp8,mxfp8,fp4} flashinfer/grouped_mm/core.py,174,308,452
     # (fp8 from 8.9, mxfp8/fp4 from 10.0; the dtype probe drops the rest);
-    # cutile = ragged_bmm flashinfer/gemm/gemm_base.py:1289 / ragged_scaled_bmm :1589.
+    # cutile = ragged_bmm flashinfer/gemm/gemm_base.py / ragged_scaled_bmm.
     "grouped_mm": {
         "7.5": [],
         "8.0": ["cudnn"],
@@ -953,8 +954,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cutile"],
         "12.1": ["cudnn", "cutile"],
     },
-    # flashinfer/gemm/gemm_svdquant.py: cutlass :636, cute-dsl(-unfused) :663,
-    # cutlass-sm120 :681. cake (:641, experimental) is not benchmarked.
+    # flashinfer/gemm/gemm_svdquant.py: cutlass, cute-dsl(-unfused),
+    # cutlass-sm120. cake (:641, experimental) is not benchmarked.
     "mm_nvfp4_svdquant": {
         "7.5": [],
         "8.0": [],
@@ -968,7 +969,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"],
         "12.1": ["cute-dsl", "cute-dsl-unfused", "auto"],
     },
-    # flashinfer/prims_ts/gemm/api.py:51 (fp8/fp4 linear, swiglu, qkv_qknorm_rope).
+    # flashinfer/prims_ts/gemm/api.py (fp8/fp4 linear, swiglu, qkv_qknorm_rope).
     "fused_linear": {
         "7.5": [],
         "8.0": [],

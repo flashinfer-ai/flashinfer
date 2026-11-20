@@ -1808,17 +1808,31 @@ def testMmFp4(args):
         if backend == "batch_invariant":
             return flashinfer.gemm.mm_fp4(
                 a=input_fp4,
-                b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
+                b=mat2_fp4.T,
                 a_descale=input_inv_s,
-                b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha_for(backend),
+                b_descale=mat2_inv_s.T,
+                alpha=alpha if use_nvfp4 else alpha_for_cute_dsl_mxfp4,
                 out_dtype=res_dtype,
                 block_size=block_size,
                 use_8x4_sf_layout=not use_128x4_sf_layout,
-                backend=backend,
+                backend="auto",
                 use_nvfp4=use_nvfp4,
                 enable_pdl=args.enable_pdl,
+                batch_invariant=True,
             )
+        return flashinfer.gemm.mm_fp4(
+            a=input_fp4,
+            b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
+            a_descale=input_inv_s,
+            b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
+            alpha=alpha_for(backend),
+            out_dtype=res_dtype,
+            block_size=block_size,
+            use_8x4_sf_layout=not use_128x4_sf_layout,
+            backend=backend,
+            use_nvfp4=use_nvfp4,
+            enable_pdl=args.enable_pdl,
+        )
 
     for backend in backends:
         # Skip autotune check for now (handled separately below)
