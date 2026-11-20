@@ -523,7 +523,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         swapped_knobs_blockscaled,
         token_tile_default,
     )
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     space = grouped_knobs_blockscaled()
     assert len(space) == 72 and all(
@@ -819,7 +819,7 @@ def test_layer_matches_the_class_composition(act):
     the quantizer's reference on the intermediate, ``mm_fp4`` + the CPU GEMM2 chain, the CPU combine: bit for bit, for
     every activation of the layer, at the instruction class the part runs."""
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     T, k, H, I, E = 120, 4, 512, 256, 16
     chain = activation_of(act)
@@ -865,7 +865,7 @@ def test_swapped_body_equals_the_dense_class_per_expert_at_every_token_tile():
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import (
         swapped_knobs_blockscaled,
     )
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     f32_chain = W4A4Chain("plain", "silu", "f32", (), "none")
     relu2_chain = W4A4Chain("act", "relu2", "bf16", (), "w4a4")
@@ -1039,7 +1039,7 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits():
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     T, k, H, I, E = 257, 6, 512, 256, 32
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=2)
@@ -1799,7 +1799,7 @@ def test_poisoned_intermediates_do_not_reach_the_bits(body, act):
 
     from flashinfer.fused_moe.batch_invariant.api_nvfp4 import fused_moe_nvfp4
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     T, k, H, I, E = 64, 8, 256, 64, 256
     chain = activation_of(act)
@@ -1846,7 +1846,7 @@ def test_instruction_classes_on_the_part():
         grouped_gemm_nvfp4,
     )
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     T, k, H, I, E = 96, 2, 1024, 512, 8
     # per-element exponent spreads inside every row and weight: the scaled products differ in magnitude, so the fp32 folds of
@@ -2317,13 +2317,13 @@ def test_hardware_arith_class_is_deterministic_invariant_and_the_table_models_co
         DENSE_TAIL,
         F32_CHAIN,
         MoEWeightsNVFP4,
+        expert_classes,
         fused_moe_nvfp4,
         grouped_gemm_nvfp4,
     )
     from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import rank_grouped_nvfp4
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
         MoENvfp4Spec,
-        expert_classes,
         spec_fingerprint_nvfp4,
     )
     from flashinfer.batch_invariant.quantization.nvfp4_schedule import sf_numel
@@ -2559,7 +2559,7 @@ def test_every_record_computes_the_class_at_long_k_on_every_instruction_class_of
         swapped_knobs_blockscaled,
     )
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     T, k, H, I, E = 16, 2, 4096, 2048, 8
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
@@ -2650,7 +2650,7 @@ def _static_ladder(T, k, H, I, E, act, seed, gs_pow2=True):
         swapped_knobs_blockscaled,
     )
     from flashinfer.fused_moe.batch_invariant.spec import ACTS
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     gated = act in ACTS
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed, gated=gated)
@@ -2954,7 +2954,7 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
         default_configs_nvfp4,
     )
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import expert_classes
 
     k, H, I, E = 8, 256, 128, 64
     bad = (-1, E, 1 << 30)

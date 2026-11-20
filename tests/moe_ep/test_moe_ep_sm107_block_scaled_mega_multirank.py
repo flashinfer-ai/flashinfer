@@ -1,4 +1,7 @@
-"""EP2/EP4/EP8 SM107 block-scaled MegaMoE: MoEEpLayer vs Torch oracle.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""EP2/EP4/EP8/EP16/EP32 SM107 MegaMoE: MoEEpLayer vs Torch oracle.
 
 Runs ONLY under its own torchrun invocation (``run_tests.sh mega_sm107``)::
 
@@ -54,6 +57,13 @@ MAX_TOKENS = 128
 
 # Relative L2 limits for kernel vs Torch outputs, not per-element error bounds.
 _REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06, "mxfp4": 0.06}
+
+
+@pytest.fixture(autouse=True)
+def ep_geometry(monkeypatch):
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > NUM_EXPERTS:
+        monkeypatch.setitem(globals(), "NUM_EXPERTS", max(64, world))
 
 
 def _require_cuda() -> None:
@@ -788,5 +798,146 @@ def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine, early, ikr
         if graph is not None:
             graph.reset()
         for layer in layers:
+            layer.destroy()
+        finalize_moe_ep_runtime(runtime)
+
+
+def _assert_collective_reference(actual, expected, kind):
+    import torch.distributed as dist
+
+    from tests.moe_ep.sm107_test_utils import assert_reference
+
+    failure = None
+    try:
+        assert_reference(actual, expected, kind)
+    except AssertionError as error:
+        failure = str(error)
+    failed = torch.tensor(int(failure is not None), device="cuda", dtype=torch.int32)
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    assert not failed.item(), failure or "reference failed on another rank"
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("family", ["inference", "genphase"])
+def test_transformed_expert_updates_in_captured_graph(family, monkeypatch):
+    """Replicate experts into physical slots and update their captured weights."""
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+    from tests.moe_ep.sm107_test_utils import canonical_reference, quantize, weight_pack
+
+    rank, world = _launcher_ranks()
+    if world < 2:
+        pytest.skip("requires torchrun with at least two ranks")
+    # Keep the same replicated expert bank at every EP width.
+    for name, value in dict(
+        HIDDEN=512,
+        INTERMEDIATE=256,
+        NUM_EXPERTS=64,
+        TOP_K=4,
+        NUM_TOKENS=16,
+        MAX_TOKENS=32,
+    ).items():
+        monkeypatch.setitem(globals(), name, value)
+    bootstrap = BootstrapConfig(rank=rank, world_size=world)
+    ensure_moe_ep_cuda_device(bootstrap)
+    kind = "mxfp4_mxfp8"
+    cfg = _megakernel_config(
+        kind,
+        kernel_variant=family,
+        apply_routing_weights_before_fc2=False,
+        **(
+            dict(cluster_shape_mn=(4, 1), fc2_use_bulk=True)
+            if family == "genphase"
+            else {}
+        ),
+    )
+    kernel = create_mega_kernel(cfg)
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, kernel.runtime_requirements(bootstrap)
+    )
+    layer = None
+    graph = None
+    try:
+        w13, w2, x, _, scores = _global_problem(world)
+        logical_experts = NUM_EXPERTS // 2
+        ids = (
+            torch.arange(world * NUM_TOKENS * TOP_K, device="cuda").reshape(
+                world, NUM_TOKENS, TOP_K
+            )
+            % logical_experts
+        )
+        count = NUM_EXPERTS // world
+        local = slice(rank * count, (rank + 1) * count)
+        fleet = FleetParams(
+            num_experts=NUM_EXPERTS,
+            max_tokens_per_rank=MAX_TOKENS,
+            token_hidden_size=HIDDEN,
+        )
+
+        def prepare(a, b):
+            pack, _, _ = weight_pack(a, b, kind)
+            local_pack = PrequantizedMoEWeights(
+                *(
+                    getattr(pack, name)[local]
+                    for name in ("w13", "w2", "w13_scale", "w2_scale")
+                )
+            )
+            return pack, kernel.preprocess_weights(local_pack, fleet)
+
+        original_pack, transformed = prepare(w13, w2)
+        replica_w13 = torch.cat((w13[:logical_experts], w13[:logical_experts]))
+        replica_w2 = torch.cat((w2[:logical_experts], w2[:logical_experts]))
+        replica_pack, replica_weights = prepare(replica_w13, replica_w2)
+        changed_w2 = replica_w2.clone()
+        changed_w2[logical_experts:] *= 0.5
+        changed_pack, changed_weights = prepare(replica_w13, changed_w2)
+        pointers = tuple(t.data_ptr() for pair in transformed for t in pair)
+        layer = MoEEpLayer(
+            bootstrap=BootstrapConfig(
+                rank=rank, world_size=world, auto_bootstrap=False
+            ),
+            fleet_params=fleet,
+            weights=None,
+            backend=MegaConfig(megakernel=cfg, transformed_weights=transformed),
+        )
+        transformed = layer.get_transformed_weights()
+        t = MoEEpTensors(x[rank].clone(), ids[rank].clone(), scores[rank].clone())
+        layer.warmup(t)
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            output = layer.forward(t)
+
+        def replay(pack):
+            dist.barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            xq, sf = quantize(t.hidden_states, kind)
+            reference = canonical_reference(
+                xq, sf, t.topk_ids, t.topk_weights, pack, kind, early=False
+            )
+            _assert_collective_reference(output, reference, kind)
+
+        replay(original_pack)
+        baseline = output.clone()
+        t.topk_ids[::2].add_(logical_experts)
+        for pack, replacement in (
+            (replica_pack, replica_weights),
+            (changed_pack, changed_weights),
+        ):
+            for dst_pair, src_pair in zip(transformed, replacement, strict=True):
+                for dst, src in zip(dst_pair, src_pair, strict=True):
+                    dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            assert tuple(v.data_ptr() for pair in transformed for v in pair) == pointers
+            replay(pack)
+            _assert_collective_reference(output[1::2], baseline[1::2], kind)
+            if pack is replica_pack:
+                _assert_collective_reference(output, baseline, kind)
+    finally:
+        if graph is not None:
+            graph.reset()
+        if layer is not None:
             layer.destroy()
         finalize_moe_ep_runtime(runtime)

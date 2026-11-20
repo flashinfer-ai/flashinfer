@@ -59,11 +59,6 @@ from cutlass.tensor_utils import LayoutEnum
 from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-# FlashInfer's copy of the DSL's persistent tile scheduler (the DSL's own module is deprecated and warns per use)
-from flashinfer.cute_dsl.attention.fmha.helpers import (
-    static_persistent_tile_scheduler as tile_scheduler,
-)
-
 from ....batch_invariant.fp_interface.cute import CuteF32
 from ..generator import BREUSE_FMTS, Knobs, MainloopBlock
 from ..spec import SF_ATOM_KBLOCKS, SF_ATOM_ROWS, SF_VEC, EpilogueChain, sf_bytes  # noqa: F401  (sf_bytes re-exported)
@@ -81,8 +76,8 @@ from .operands import (
     THREADS,
     TMA_WARP,
     TMEM_ARCH,
-    build_grid,
 )
+from .scheduler import SchedParams, TileScheduler, build_grid
 
 E8M0_DTYPE = cutlass.Float8E8M0FNU  # the MX block scale
 E4M3_DTYPE = cutlass.Float8E4M3FN  # the NVFP4 block scale (and the MXFP8 element)
@@ -188,19 +183,18 @@ class BlockScaledPlan:
         knobs: Knobs,
         c_dtype,
         c_layout,
-        chunks: int = 1,
+        cta_chunks: bool = False,
         k_blocks: Optional[int] = None,
     ):
-        """``chunks``: the class's chunk count; with ``knobs.cta_chunks`` the CTA folds all of them (``self.cta_chunks``) and
-        the TMEM holds the running sum next to the accumulator stages (``sum_stage``). ``k_blocks``: the instruction K steps
-        per smem stage (the lowering's inner radix; default the format's one 128-byte atom of K) -- a placement of the same
-        fold (the grouped swapped decode body stages two atoms)."""
+        """``cta_chunks``: the in-CTA chunk fold (the CTA folds every chunk of its tile; the count is a runtime value of
+        the kernel, the operands' batch extent) -- the TMEM holds the running sum next to the accumulator stages
+        (``sum_stage``). ``k_blocks``: the instruction K steps per smem stage (the lowering's inner radix; default the
+        format's one 128-byte atom of K) -- a placement of the same fold (the grouped swapped decode body stages two
+        atoms)."""
         assert knobs.well_formed(self.IN_FMT) and knobs.use_tma_store, knobs
+        assert not cta_chunks or knobs.cta_chunks, knobs
         self.knobs = knobs
-        self.chunks = chunks
-        self.cta_chunks = (
-            chunks if (knobs.cta_chunks and chunks > 1) else 1
-        )  # chunks folded inside the CTA (1: none)
+        self.cta_chunks = cta_chunks
         self.block = MainloopBlock(
             self.IN_FMT, k_block_override=knobs.k_block, inner_steps=k_blocks
         )  # the record's k-block (the lowering's inner radix) unless ``k_blocks`` names the steps per stage; the block's
@@ -308,7 +302,7 @@ class BlockScaledPlan:
         # one accumulator stage = tile N columns (two tile-N blocks for the B-reuse record: one accumulator per 256-row half);
         # the in-CTA chunk fold adds one more accumulator-shaped buffer, the running sum (stage index `sum_stage`)
         acc_cols = tn * (2 if self.breuse else 1)
-        n_sum = 1 if self.cta_chunks > 1 else 0
+        n_sum = 1 if self.cta_chunks else 0
         self.num_acc_stage = (
             1
             if acc_cols * (2 + n_sum) + self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
@@ -816,13 +810,14 @@ def blockscaled_producer_loop(
     a_mcast_mask,
     b_mcast_mask,
     sfb_mcast_mask,
-    chunks: cutlass.Constexpr = 1,
+    chunks=1,
+    cc: cutlass.Constexpr = False,
 ):
     """The dense producer with the scale factors: per tile, per k-tile ascending from ``k_tile0`` (0, or the first k-tile of
     this CTA's chunk in the in-cluster split), one ring slot holds A, B, SFA and SFB of that k-tile. A 64-wide N tile reads
     half of a 128-row SFB atom (tile n -> atom n // 2); the 192-wide tile's addressing lives in the SFB coordinate tensor.
-    ``chunks > 1`` (the in-CTA chunk fold): the operands are the split class's ``(rows, Kc, C)`` views and the chunks of a
-    tile are streamed in order."""
+    ``cc`` (the in-CTA chunk fold, static) with ``chunks`` its runtime count: the operands are the split class's
+    ``(rows, Kc, C)`` views and the chunks of a tile are streamed in order."""
     tn = st.cta_tile_shape_mnk[1]
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
@@ -833,7 +828,7 @@ def blockscaled_producer_loop(
             sfb_n = coord[1] // (
                 SF_ATOM_ROWS // tn
             )  # 64-wide: half an atom; narrow (swap_ab): one tile at atom 0
-        if cutlass.const_expr(chunks == 1):
+        if cutlass.const_expr(not cc):
             ab_producer = blockscaled_produce_ktiles(
                 k_tile_cnt,
                 k_tile0,
@@ -1011,7 +1006,8 @@ def blockscaled_mma_loop(
     sSFB: cute.Tensor,
     tiled_mma_bkeep=None,
     tiled_mma_breuse=None,
-    chunks: cutlass.Constexpr = 1,
+    chunks=1,
+    cc: cutlass.Constexpr = False,
 ):
     """The ``kstep`` fold issued by ``MainloopBlock.lowering()`` (``canon.BlockedFold``): blocks (= smem stages, k-tiles
     ascending) of ``inner`` block-scaled instructions ascending, ``ACCUMULATE`` off on the fold's first step only
@@ -1022,10 +1018,10 @@ def blockscaled_mma_loop(
     rows (placement, decided per tile). The B-reuse record (``st.breuse``) issues two instructions per step, one per
     256-row half of the tile (``tCrA`` / ``tCtSFA`` / ``tCtAcc`` mode 1), on the same B fragment: the first keeps B in
     the collector buffer (``tiled_mma_bkeep``, FILL), the second consumes it (``tiled_mma_breuse``, LASTUSE); each half is
-    its own accumulator with the same K order from +0, so every output element's fold is unchanged. ``chunks > 1`` (the
-    in-CTA chunk fold, ``Knobs.cta_chunks``): ``k_tile_cnt`` is the k-tiles of ONE chunk and the fold is issued once per
-    chunk, chunks ascending, each from +0 into the next accumulator stage and committed to the epilogue, which folds the
-    chunk partials in order (``blocks/epilogue.py``)."""
+    its own accumulator with the same K order from +0, so every output element's fold is unchanged. ``cc`` (the in-CTA
+    chunk fold, ``Knobs.cta_chunks``, static) with ``chunks`` its runtime count: ``k_tile_cnt`` is the k-tiles of ONE chunk
+    and the fold is issued once per chunk, chunks ascending, each from +0 into the next accumulator stage and committed to
+    the epilogue, which folds the chunk partials in order (``blocks/epilogue.py``)."""
     assert cute.size(tCrA, mode=[2]) == lowering.inner, (
         "one smem stage must hold exactly the lowering's inner steps"
     )
@@ -1044,7 +1040,7 @@ def blockscaled_mma_loop(
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         n_tile = work_tile.tile_idx[1]
-        if cutlass.const_expr(chunks == 1):
+        if cutlass.const_expr(not cc):
             ab_consumer, acc_state = blockscaled_mma_fold(
                 lowering,
                 st,
@@ -1281,12 +1277,13 @@ class BlockScaledGemm:
         knobs: Knobs,
         in_fmt: str,
         out_fmt: str,
-        chunks: int = 1,
+        cta_chunks: bool = False,
         plan_cls=None,
         enable_pdl: bool = False,
     ):
-        """``chunks``: the operands' batch extent L (1, or the split class's chunk count: the K chunk is the batch index of
-        the workspace split AND of the in-CTA chunk fold, whose C has L = 1 and whose CTA folds the chunks itself).
+        """``cta_chunks``: the in-CTA chunk fold (the operands are the split class's ``(rows, Kc, C)`` views with the chunk
+        count C as their batch extent, a runtime value; C has L = 1 and the CTA folds the chunks itself). The persistent
+        grid, the swizzle size and the raster order are Int32 arguments of the call (``blocks/scheduler.py``).
         ``plan_cls``: the record's plan (default: the format's in :data:`PLANS`; the mixed classes hand over their own,
         the swapped decode records' with the operand formats exchanged: ``blocks/blockscaled_mx_mixed.py``).
         ``enable_pdl``: programmatic dependent launch -- the kernel waits for the preceding grid before its first operand
@@ -1297,8 +1294,8 @@ class BlockScaledGemm:
         self.plan_cls = plan_cls or PLANS[in_fmt]
         assert in_fmt == self.plan_cls.IN_FMT, (in_fmt, self.plan_cls.IN_FMT)
         self.cluster_shape_mn = knobs.cluster_shape_mn
-        self.chunks = chunks
-        self.cta_chunks = chunks if (knobs.cta_chunks and chunks > 1) else 1
+        assert not cta_chunks or knobs.cta_chunks, knobs
+        self.cta_chunks = cta_chunks
         self.out_fmt = out_fmt
         self.chain = EpilogueChain.for_class(out_fmt, self.scaled)
         assert self.chain.scaled == self.scaled and self.chain.out_fmt == out_fmt
@@ -1311,13 +1308,19 @@ class BlockScaledGemm:
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         c: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, None)
+        self._launch(
+            a, b, sfa, sfb, c, max_active_clusters, swizzle, raster_m, stream, None
+        )
 
     # host side (trace time)
-    def _launch(self, a, b, sfa, sfb, c, max_active_clusters, stream, alpha):
+    def _launch(
+        self, a, b, sfa, sfb, c, max_active_clusters, swizzle, raster_m, stream, alpha
+    ):
         plan_cls = self.plan_cls
         # the API's byte-packed 4-bit operands as fp4 tensors of the logical K, per operand (the mixed classes pack one)
         if cutlass.const_expr(plan_cls.A_DT.width == 4):
@@ -1331,7 +1334,7 @@ class BlockScaledGemm:
             sfb, b.shape[0], b.shape[1], b.shape[2], plan_cls.SF_VEC, plan_cls.SF_DT
         )
         st = plan_cls(
-            self.knobs, c.element_type, LayoutEnum.from_tensor(c), self.chunks
+            self.knobs, c.element_type, LayoutEnum.from_tensor(c), self.cta_chunks
         )
         self.st = st
         assert OUT_DT[self.out_fmt] is c.element_type, (self.out_fmt, c.element_type)
@@ -1346,12 +1349,14 @@ class BlockScaledGemm:
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         tma = BlockScaledTmaSetup(st, a, b, sfa_t, sfb_t, c)
         self.num_tma_load_bytes = tma.tx_bytes
-        params, grid = build_grid(st, c, max_active_clusters)
+        params, grid = build_grid(st, c, max_active_clusters, swizzle, raster_m)
         cluster = (*self.cluster_shape_mn, 1)
         if cutlass.const_expr(st.cluster_k > 1):
             # one tile per cluster: as many persistent "clusters" as tiles; the physical cluster is the K group
-            params, grid1 = build_grid(st, c, 1 << 24)
+            params, grid1 = build_grid(st, c, 1 << 24, swizzle, raster_m)
             grid, cluster = (st.cluster_k, 1, grid1[2]), (st.cluster_k, 1, 1)
+        # the in-CTA chunk fold's count: the operands' batch extent (dynamic)
+        n_chunks = a.shape[2] if self.cta_chunks else None
         self.kernel(
             st.tiled_mma,
             st.tiled_mma_sfb,
@@ -1377,6 +1382,7 @@ class BlockScaledGemm:
             alpha,
             st.tiled_mma_bkeep,
             st.tiled_mma_breuse,
+            n_chunks,
         ).launch(
             grid=grid,
             block=[THREADS, 1, 1],
@@ -1409,12 +1415,17 @@ class BlockScaledGemm:
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged,
         epi_tile: cute.Tile,
-        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+        tile_sched_params: SchedParams,
         alpha_t: Optional[cute.Tensor],
         tiled_mma_bkeep: Optional[cute.TiledMma] = None,
         tiled_mma_breuse: Optional[cute.TiledMma] = None,
+        n_chunks=None,
     ):
         st = self.st
+        cc = (
+            st.cta_chunks
+        )  # the in-CTA chunk fold (static); its count is the operands' batch extent
+        chunk_count = n_chunks if cc else 1
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -1654,20 +1665,18 @@ class BlockScaledGemm:
             st.sf_vec,
             cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
         )
-        pipeline_init_wait(cluster_shape_mn=sync_shape)
-
         # the scheduler: the persistent one; for the in-cluster split the K group is folded out of the block index (one tile
-        # per cluster, the tile sequence shared by the C ranks)
+        # per cluster, the tile sequence shared by the C ranks); created (its first tile decoded) before the barrier init
+        # completes, so the decode overlaps the wait
         sched_bidx, sched_grid = cute.arch.block_idx(), cute.arch.grid_dim()
         if cutlass.const_expr(C > 1):
             sched_bidx = (Int32(0), Int32(0), sched_bidx[2])
             sched_grid = (Int32(1), Int32(1), sched_grid[2])
+        tile_sched = TileScheduler.create(tile_sched_params, sched_bidx, sched_grid)
+        pipeline_init_wait(cluster_shape_mn=sync_shape)
 
         # --- roles
         if warp_idx == TMA_WARP:
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
-                tile_sched_params, sched_bidx, sched_grid
-            )
             blockscaled_producer_loop(
                 st,
                 k_tile_cnt,
@@ -1689,7 +1698,8 @@ class BlockScaledGemm:
                 a_full_mcast_mask,
                 b_full_mcast_mask,
                 sfb_full_mcast_mask,
-                st.cta_chunks,
+                chunks=chunk_count,
+                cc=cc,
             )
             if cutlass.const_expr(self.enable_pdl):
                 # every load issued: the next grid's prologue may start
@@ -1708,9 +1718,6 @@ class BlockScaledGemm:
                     dtype=st.sf_dtype,
                 ),
                 tCtSFB_layout,
-            )
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
-                tile_sched_params, sched_bidx, sched_grid
             )
             blockscaled_mma_loop(
                 self.lowering,
@@ -1731,7 +1738,8 @@ class BlockScaledGemm:
                 sSFB,
                 tiled_mma_bkeep,
                 tiled_mma_breuse,
-                st.cta_chunks,
+                chunks=chunk_count,
+                cc=cc,
             )
         sC = smem.allocate_tensor(
             element_type=st.c_dtype,
@@ -1744,9 +1752,6 @@ class BlockScaledGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
-                tile_sched_params, sched_bidx, sched_grid
-            )
             if cutlass.const_expr(C > 1):
                 blockscaled_cluster_epilogue_loop(
                     st,
@@ -1780,7 +1785,8 @@ class BlockScaledGemm:
                     epi_tile,
                     acc_pipeline,
                     alpha,
-                    st.cta_chunks,
+                    chunks=chunk_count,
+                    cc=cc,
                 )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
@@ -1805,7 +1811,11 @@ class ScaledBlockScaledGemm(BlockScaledGemm):
         sfb: cute.Tensor,
         c: cute.Tensor,
         alpha: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, sfa, sfb, c, max_active_clusters, stream, alpha)
+        self._launch(
+            a, b, sfa, sfb, c, max_active_clusters, swizzle, raster_m, stream, alpha
+        )

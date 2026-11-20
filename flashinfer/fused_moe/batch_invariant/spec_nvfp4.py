@@ -21,8 +21,10 @@ TransformerEngine recipe of :mod:`flashinfer.batch_invariant.quantization`):
 
 The W4A4 class therefore *contains* the per-token quantization class at row lengths ``H`` and ``I`` (its fingerprints are
 part of this class's) and the dense NVFP4 GEMM classes of the two expert weight shapes (the instruction class per weight
-shape by the dense rule, :func:`flashinfer.gemm.batch_invariant.schedule.fp4_class_for`: a function of the shape and the
-architecture family only, never of the batch). Every S-expression here is the Lean model's (``MoENvfp4.lean``).
+shape by the dense rule, :func:`flashinfer.gemm.batch_invariant.schedule.fp4_class_for`, applied to the two weight shapes by
+:func:`.api_nvfp4.expert_classes`: a function of the shape and the architecture family only, never of the batch; the rule is
+a dispatcher function, so it lives outside this module, which the kernels' cache key includes). Every S-expression here is
+the Lean model's (``MoENvfp4.lean``).
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ import hashlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ...batch_invariant.fp_interface import exact as fp32
-from ...gemm.batch_invariant.schedule import fp4_class_for
 from ...gemm.batch_invariant.spec import NVFP4_FMTS
 from ...gemm.batch_invariant.spec import spec_fingerprint as gemm_fingerprint
 from . import spec as S
@@ -169,14 +170,6 @@ def static_inv2(fp: Any, gs: Any) -> Any:
     """GEMM2's static factor ``inv2[e] = div(1, gs2[e])``: the quantizer's ``div``, formed once per expert on the host and read by
     the kernel as given."""
     return fp.div(fp.const(1.0), gs)
-
-
-def expert_classes(
-    H: int, I: int, family: Optional[str], gated: bool = True
-) -> Tuple[str, str]:
-    """The NVFP4 instruction class of each expert weight by the dense rule: GEMM1 on ``(2I, H)`` (``(I, H)`` ungated), GEMM2
-    on ``(H, I)``; a function of the weight shapes and the architecture family only."""
-    return fp4_class_for(2 * I if gated else I, H, family), fp4_class_for(H, I, family)
 
 
 class MoENvfp4Spec(S.MoESpec):

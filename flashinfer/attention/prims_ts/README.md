@@ -70,8 +70,13 @@ metadata values back to the host. FMHA preserves initialized caller scratch
 by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
-capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch and re-zero it when workspace-layout inputs change; wrappers
+capture. Their default `validate=True` checks geometry and device support;
+FMHA also checks packed-Q offset values. For already-validated inputs,
+`validate=False` skips those repeated checks and offset readbacks while
+preserving alias resolution and the same internal policy cache. The caller
+owns hardware, geometry, dtype and metadata validity; a cold policy lookup
+may still query device properties. Zero caller-owned FMHA scratch before its
+first trusted standalone launch and re-zero it when workspace-layout inputs change; wrappers
 initialize control storage by default. Alternatively, FMHA plans for one
 device may share one buffer of at least the largest size returned for them:
 zero the whole buffer once, bind the same full tensor to every plan (not
@@ -203,6 +208,36 @@ Validation reads metadata values on the host. With `validate=False`, callers own
 shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime conditions.
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
+
+### Context-parallel MLA decode
+
+MLA decode compiles `plan(cp_world=1, cp_interleave_size=1)` and accepts
+`run(cp_rank=0)` as a runtime integer. `seq_lens_kv` is the global logical
+request length, including current Q tokens. Page tables and planned
+`max_kv_len` remain rank-local capacity. Global token `t` belongs to rank
+`(t // cp_interleave_size) % cp_world`, and each local cache stores its owned
+tokens in global order. Token interleaving uses size 1; page interleaving may
+use size 128 independently of the physical cache page size.
+
+For interleave I and world C, global prefix n maps to local count
+`n // (I*C) * I + clamp(n % (I*C) - cp_rank*I, 0, I)`. Dense rows use the full
+global length; causal row i uses `global_length - actual_Q + i + 1`. Packed
+`actual_Q` comes from that request's `qo_indptr` delta, not the planned maximum.
+The kernel derives these prefixes without a separate bounds tensor or prep
+launch. Global lengths and Q offsets remain graph-live runtime metadata;
+`cp_rank` is a runtime scalar captured by value. `run(validate=False)` performs
+no device-to-host metadata readback.
+
+For CP>1, empty local prefixes return zero O and optional base-2 LSE `-inf`,
+including fully empty ranks. `plan(zero_empty_rows=False)` skips neutral-row
+initialization but retains CP masking; empty-row results are unspecified,
+not preserved. Callers must sanitize those rows before consumption/merging.
+The default is `True`; it is ignored for CP=1 and does not change workspace
+sizing. CP=1 preserves ordinary dense/causal behavior. One-shot MLA exposes
+the same CP arguments, and workspace sizing takes matching compile-time
+`cp_world` and `cp_interleave_size`.
+See the [MLA contract](kernels/mla_decode/README.md) for validation,
+empty-cache, and workspace details.
 
 ## QToken-KvBlock-Sparse-Attention interface
 
@@ -646,13 +681,17 @@ plan selects the recipe at compile time with `vc_config=VCAttentionConfig(...)`;
 the plan's Q/K dtype selects the Q/K side:
 
 * **VC-Attention-QK16** (`q_dtype`/`k_dtype` bf16): Q and K stay bf16.
-* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.float8_e4m3fn`): the paper's
-  low-bit Q/K. K is centred by its per-head channel mean, Q and K are rotated by
-  the normalised 128-point Hadamard matrix and quantized to E4M3 with one scale
-  per 128-token Q block and per 128-token K tile.
+* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.int8` on SM100/B200,
+  `torch.float8_e4m3fn` elsewhere): the paper's low-bit Q/K. K is centred by its
+  per-head channel mean, Q and K are rotated by the normalised 128-point Hadamard
+  matrix and quantized with one scale per 128-token Q block and per 128-token K
+  tile. `vc_quantize_fp8` / `vc_quantize_repair` write E4M3 codes and
+  `vc_quantize_int8` / `vc_quantize_repair_int8` INT8 codes (SM100 only);
+  `VCAttentionPreprocessor` follows the device, as the paper configures B200
+  (INT8) and B300 (E4M3), which `vc_qk8_dtype(device)` returns.
 
 Every run passes the (permuted) K, the E4M3 V residuals and
-`vc=VCAttentionParams(...)`; QK8 runs pass the E4M3 Q and the Q/K scales too:
+`vc=VCAttentionParams(...)`; QK8 runs pass the coded Q and the Q/K scales too:
 
 ```text
 K'      = (K - mean_tokens(K)) H,  Q' = Q H              (QK8 only; H: 128-point Hadamard)
@@ -668,16 +707,27 @@ group of 16 tiles, so the row-max correction covers them. `VCAttentionPreprocess
 turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
 schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
 denoising steps, the permutation is refreshed every `perm_refresh_every` steps
-inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
-the two preparations (bf16/fp16 inputs with `head_dim=128`). QK16 plans require
-bf16 Q/K; QK8 preparation accepts bf16 or fp16 inputs and produces E4M3 Q/K.
+inside that window and kept afterwards. A new generation cold-starts the k-means
+from fixed seed rows. The rows are one host draw from `VC_KMEANS_SEED` and every
+batch element and head shares them. A generation depends neither on the previous
+one nor on the other elements of the batch. The caller's global generator is
+untouched. A CUDA graph runner that replays one graph per step kind passes
+`prepare(..., mode=...)` with `cold`, `warm`, `keep` or `plain` in place of a
+step. For a joint sequence pass
+`prepare(..., grouped_tokens=(start, stop))` with the video token range. Only
+those tokens are grouped. The text or audio tokens follow them in input order. A
+text key grouped among the video keys would precede the long video tail in the
+rows attending to it. That tail would round to zero against the row maximum.
+`vc_quantize` and `vc_quantize_fp8` are the two preparations (bf16/fp16 inputs
+with `head_dim=128`). QK16 plans require bf16 Q/K; QK8 preparation accepts bf16
+or fp16 inputs and produces E4M3 Q/K.
 The quantizers live in
 `flashinfer.attention.prims_ts.vc_attention.quantization`; the `vc_attention`
 package holds the operand contract.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K dtype | `torch.bfloat16` (QK16) or `torch.float8_e4m3fn` (QK8) |
+| Q/K dtype | `torch.bfloat16` (QK16); `torch.int8` on SM100/B200 or `torch.float8_e4m3fn` on SM103 (QK8, `vc_qk8_dtype(device)`); VC plans are rejected on SM107 |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
 | Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed_query=False`, `mask_type="dense"`; QK16 runs the two-CTA UMMA form, QK8 follows the device default |
@@ -705,7 +755,7 @@ off and a positive `repair_tiles`.
 
 ```python
 from flashinfer.attention.prims_ts import (
-    BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor,
+    BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor, vc_qk8_dtype,
 )
 
 wrappers = {}
@@ -721,15 +771,16 @@ prep = VCAttentionPreprocessor()
 ops = prep.prepare(k_bf16, v_bf16, denoise_step=(step, num_steps))
 out = wrappers[ops.demean].run(q_bf16, ops.k, ops.v, vc=ops.params)
 
-# VC-Attention-QK8 plans E4M3 Q/K and passes Q to the preprocessor, again with
-# one plan per demean phase.
+# VC-Attention-QK8 plans the device's Q/K code type and passes Q to the
+# preprocessor, again with one plan per demean phase.
+qk8 = vc_qk8_dtype("cuda")
 wrappers8 = {}
 for demean in (True, False):
     wrappers8[demean] = BatchPrefillTSWrapper()
     wrappers8[demean].plan(
         device="cuda", batch_size=1, max_q_len=S, max_kv_len=S,
         num_qo_heads=H, num_kv_heads=H, head_dim=128,
-        q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
+        q_dtype=qk8, k_dtype=qk8, v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),
     )
 ops8 = prep.prepare(k_bf16, v_bf16, q=q_bf16, denoise_step=(step, num_steps))

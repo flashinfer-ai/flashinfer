@@ -18,7 +18,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -45,13 +45,11 @@ from .operands import (
     ACC_DTYPE,
     BAR_CORRECTION,
     BAR_TMEM_ALLOC,
-    IN_DTYPE,
     Q_ROWS,
-    REGS_OTHER,
-    REGS_SOFTMAX,
     TMEM_COLS,
     StaticPlan,
     TmaSetup,
+    shared_storage_struct,
 )
 from .producer import load_loop, load_loop_q2
 from .softmax import softmax_loop
@@ -90,8 +88,9 @@ def tmem_views(
 
 
 class AttentionKernel:
-    """``AttentionKernel(D, g, page, kv_slots, n_wg)`` compiled once per static tuple; shapes, strides, the
-    page table, the work units and the scale are runtime arguments."""
+    """``AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, cap)`` compiled once per static tuple; shapes, strides, the
+    page table, the work units and the scale are runtime arguments. ``cap`` is the shared-memory capacity the smem plan is
+    checked against (0: the current device's)."""
 
     def __init__(
         self,
@@ -102,6 +101,8 @@ class AttentionKernel:
         n_wg: int = 1,
         q2: bool = False,
         ragged: bool = False,
+        hw_rowmax: bool = False,
+        cap: int = 0,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
@@ -112,6 +113,8 @@ class AttentionKernel:
             q2,
             ragged,
         )
+        self.hw_rowmax = hw_rowmax
+        self.cap = cap
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -139,44 +142,19 @@ class AttentionKernel:
         parameter, never a quantity that reaches the bits (I10). ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor."""
         st = StaticPlan(
-            self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged
+            self.D,
+            self.g,
+            self.page,
+            self.kv_slots,
+            self.n_wg,
+            self.q2,
+            self.ragged,
+            self.hw_rowmax,
+            self.cap,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
-
-        @cute.struct
-        class SharedStorage:
-            q_mbar: cute.struct.MemRange[Int64, 2 * st.q_stages]
-            kv_mbar: cute.struct.MemRange[Int64, 2 * st.n_slots]
-            s_mbar: cute.struct.MemRange[Int64, 2 * st.s_stages]
-            p_mbar: cute.struct.MemRange[Int64, 2 * max(st.s_stages, st.n_q)]
-            o_mbar: cute.struct.MemRange[Int64, 2 * st.n_q]
-            stats_mbar: cute.struct.MemRange[Int64, 2 * st.stats_slots]
-            tmem_dealloc_mbar: Int64
-            tmem_holding_buf: Int32
-            s_fold: Int32
-            s_alpha: cute.struct.MemRange[Float32, st.stats_slots * Q_ROWS]
-            s_m: cute.struct.MemRange[Float32, st.stats_slots * Q_ROWS]
-            s_r: cute.struct.MemRange[
-                Float32, st.stats_slots * 4 * st.n_slices * Q_ROWS
-            ]
-            s_p: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.n_wg * 3 * 32 * 16], 16
-            ]
-            sOm: cute.struct.Align[
-                cute.struct.MemRange[
-                    Float32, st.n_q * Q_ROWS * st.D if st.om_smem else 4
-                ],
-                16,
-            ]
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[IN_DTYPE, st.q_tiles * st.q_tile_elems], 1024
-            ]
-            sKV: cute.struct.Align[
-                cute.struct.MemRange[IN_DTYPE, st.n_slots * st.kv_slot_elems], 1024
-            ]
-
-        self.shared_storage = SharedStorage
+        self.shared_storage = shared_storage_struct(st)
         self.kernel(
             tma.atom_q,
             tma.tensor_q,
@@ -362,11 +340,14 @@ class AttentionKernel:
             cute.make_layout((st.stats_slots, Q_ROWS))
         )  # ... m' and the slices' row-sum partials (late)
         s_r = storage.s_r.get_tensor(
-            cute.make_layout((st.stats_slots, 4 * st.n_slices, Q_ROWS))
+            cute.make_layout((st.stats_slots, st.r_slices, Q_ROWS))
         )
         s_p_all = storage.s_p.get_tensor(
-            cute.make_layout((st.n_wg, 3, 32, 16))
-        )  # per warpgroup: the P slices of its warps 1..3
+            cute.make_layout((st.n_wg, 3, 32, 16) if st.rep_ok else (1, 1, 1, 4))
+        )  # per warpgroup: the P slices of its warps 1..3 (a stub without the replicated placement)
+        s_mx = storage.s_mx.get_tensor(
+            cute.make_layout((2, st.n_slices, Q_ROWS))
+        )  # the key slices' row-maximum partials, exchanged between the softmax warpgroups (two tile parities)
         qk_thr_mma = qk_tiled_mma.get_slice(0)
         qks_thr_mma = qks_tiled_mma.get_slice(0)
         pv_thr_mma = pv_tiled_mma.get_slice(0)
@@ -385,7 +366,7 @@ class AttentionKernel:
 
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)
             if cutlass.const_expr(st.q2):
                 for u in range(bidx, num_units, grid_size):
                     ua = 2 * u
@@ -446,13 +427,13 @@ class AttentionKernel:
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
                 st, qk_thr_mma, pv_thr_mma, p_tmem_layout, tmem_ptr
             )
-            # the S accumulator per ring slot of K: the whole S (one slot per tile) or its two 64-column halves (half-tile slots); stage 0
+            # the S accumulator per ring slot of K: the whole S (one slot per tile; two 64-column halves with half-tile slots); stage 0
             # (a tile's stage adds stage * tmem_s_stride columns: mma.py)
             ss_shape = qks_thr_mma.partition_shape_C((Q_ROWS, st.slot_keys))
             ss_layout = qks_thr_mma.make_fragment_C(ss_shape).layout
@@ -555,7 +536,10 @@ class AttentionKernel:
             warp_idx < R.correction_warps[0]
         ):  # the softmax warpgroups: one code copy, warpgroup k = key slice k (dynamic)
             k = cute.arch.make_warp_uniform(warp_idx // 4)
-            cute.arch.setmaxregister_increase(REGS_SOFTMAX)
+            if cutlass.const_expr(R.regs_softmax > R.regs_launch):
+                cute.arch.setmaxregister_increase(R.regs_softmax)
+            else:
+                cute.arch.setmaxregister_decrease(R.regs_softmax)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
@@ -580,6 +564,7 @@ class AttentionKernel:
                         s_m,
                         s_r,
                         s_p_all,
+                        s_mx,
                         c,
                         nc,
                         window_left,
@@ -604,6 +589,7 @@ class AttentionKernel:
                         s_m,
                         s_r,
                         s_p_all,
+                        s_mx,
                         c,
                         nc,
                         window_left,
@@ -748,4 +734,4 @@ class AttentionKernel:
             ).arrive_and_wait()
             tmem.free(tmem_ptr)
         if warp_idx >= R.empty_warps[0]:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)

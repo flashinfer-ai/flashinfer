@@ -122,6 +122,13 @@ class SfuTables:
         h.update(self.rcp.view(torch.int32).numpy().tobytes())
         return h.hexdigest()[:16]
 
+    def eval(self, op: str, x: float) -> float:
+        """The part's ``ex2`` or ``rcp`` of one binary32 value by the CPU model (:func:`ex2_hw` / :func:`rcp_hw`); the term
+        evaluators call the bound tables, so this module stays out of the kernel modules' import closure."""
+        t = torch.tensor([x], dtype=torch.float32)
+        y = ex2_hw(t, self) if op == "ex2" else rcp_hw(t, self)
+        return float(y[0].item())
+
 
 def dump_tables(device: torch.device) -> SfuTables:
     """Evaluate both primitives on the device over their tables' arguments."""

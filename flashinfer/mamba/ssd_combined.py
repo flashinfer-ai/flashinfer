@@ -437,6 +437,14 @@ class SSDCombined:
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
+        initial_state_slots: Optional[torch.Tensor] = None,
+        final_state_slots: Optional[torch.Tensor] = None,
+        initial_state_flags: Optional[torch.Tensor] = None,
+        null_slot_id: int = -1,
+        checkpoint_token_indices: Optional[torch.Tensor] = None,
+        checkpoint_state_slots: Optional[torch.Tensor] = None,
+        checkpoint_states: Optional[torch.Tensor] = None,
     ):
         """Prepare a call shape eagerly so that :meth:`run` on it is a pure
         launch that can be recorded into a CUDA graph (Cake backend only).
@@ -447,13 +455,18 @@ class SSDCombined:
         kernel; the arguments are those of :meth:`run` that determine the
         shape.  Run the shape eagerly once after preparing it and before
         capturing it (the host shim resolves its kernel handles on the first
-        launch).  After ``prepare(..., return_final_states=True)`` eager
+        launch).  After ``prepare(..., return_final_states=True)`` without
+        ``final_states`` eager
         :meth:`run` calls on the shape return the same static final-states
         buffer every time (overwritten by each launch) instead of fresh
         storage; a warm call captured without ``prepare`` allocates its
         outputs from the graph's private pool.  Returns the
         :class:`~flashinfer.mamba.cake_ssd_combined.PreparedSSDCombined`
-        record.  The CuTe backend has no prepared submission and raises
+        record.  A state-slot call (``initial_state_slots`` /
+        ``final_state_slots``) is prepared with the ``initial_state_flags``,
+        ``null_slot_id`` and checkpoint arguments it runs with; a call
+        without slot vectors takes its checkpoint arguments per :meth:`run`
+        only.  The CuTe backend has no prepared submission and raises
         :class:`NotImplementedError`.
         """
 
@@ -482,6 +495,14 @@ class SSDCombined:
             num_seqs=num_seqs,
             cu_seqlens=cu_seqlens,
             out=out,
+            final_states=final_states,
+            initial_state_slots=initial_state_slots,
+            final_state_slots=final_state_slots,
+            initial_state_flags=initial_state_flags,
+            null_slot_id=null_slot_id,
+            checkpoint_token_indices=checkpoint_token_indices,
+            checkpoint_state_slots=checkpoint_state_slots,
+            checkpoint_states=checkpoint_states,
         )
 
     # -- buffer cache helpers --------------------------------------------------
@@ -598,6 +619,11 @@ class SSDCombined:
         return_final_states: bool = True,
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
+        initial_state_slots: Optional[torch.Tensor] = None,
+        final_state_slots: Optional[torch.Tensor] = None,
+        initial_state_flags: Optional[torch.Tensor] = None,
+        null_slot_id: int = -1,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
@@ -623,7 +649,8 @@ class SSDCombined:
                 CuTe backend requires it in varlen mode (it supplies the
                 sequence count); the Cake backend starts from zero state when
                 it is omitted and takes the count from ``seq_chunk_cumsum``
-                or ``num_seqs``.
+                or ``num_seqs``.  With ``initial_state_slots`` it is a state
+                pool ``[num_slots, nheads, headdim, dstate]`` instead.
             seq_idx: Optional int32/int64 packed-sequence IDs of shape
                 ``[batch, seqlen]``.  IDs must be non-decreasing along the
                 packed token axis and lie in ``[0, num_seqs)``; neither is
@@ -664,10 +691,22 @@ class SSDCombined:
             checkpoint_state_slots: Optional contiguous int32 vector mapping
                 each sequence to a row in ``checkpoint_states``.  Negative entries
                 disable capture.  Must be provided with the other checkpoint
-                arguments.  Supported by the Cake backend.
+                arguments.  Supported by the Cake backend.  In a state-slot
+                call (``initial_state_slots`` / ``final_state_slots``) it may
+                be strided like the slot vectors, and an entry equal to
+                ``null_slot_id`` disables capture too.
             checkpoint_states: Optional caller-owned contiguous output with shape
                 ``[num_checkpoints, nheads, headdim, dstate]`` and state dtype.
-                Supported by the Cake backend.
+                Supported by the Cake backend.  In a state-slot call it is a
+                state pool with the layout of ``initial_state_slots``' pool and
+                may be the initial and / or final pool tensor itself; its
+                rows must then be distinct and disjoint from every initial
+                row read and final row written in the call, the sequence's
+                own included (unchecked: the host never reads slot values).
+                In the ``cu_seqlens`` form every token in ``(start, end]``
+                of a sequence is captured; in the ``seq_idx`` triple form
+                only a token at a segment end of ``chunk_indices`` /
+                ``chunk_offsets``.
             out: Optional caller-owned contiguous output storage.  Its layout
                 is the backend's kernel layout: chunked
                 ``[batch, nheads, headdim, nchunks, chunk_size]`` for the CuTe
@@ -700,13 +739,67 @@ class SSDCombined:
                 untouched sequences stay exact and the offending tokens'
                 outputs are undefined.  Rejected by the CuTe backend, which
                 takes the ``seq_idx`` triple.
+            final_states: Optional caller-owned contiguous output with shape
+                ``[num_seqs, nheads, headdim, dstate]`` (``[batch, ...]`` in
+                batched mode) and the state dtype, written in place.  It
+                requires ``return_final_states=True`` and must not overlap
+                ``initial_states`` or ``checkpoint_states``.  Without it the
+                final states are allocated per call, and with
+                ``return_final_states=False`` no final-state storage is
+                allocated.  Supported by the Cake backend.  With
+                ``final_state_slots`` it is a state pool
+                ``[num_slots, nheads, headdim, dstate]`` instead.
+            initial_state_slots: Optional int32 ``[num_seqs]`` vector
+                (packed-varlen mode, Cake backend), possibly strided: sequence
+                ``i``'s slot is element ``i * stride(0)``, e.g. column 0 of a
+                ``[num_seqs, 1 + num_spec]`` slot table.  With it
+                ``initial_states`` is a state pool
+                ``[num_slots, nheads, headdim, dstate]`` whose rows are dense
+                ``[nheads, headdim, dstate]`` blocks, possibly strided apart
+                (16-byte aligned base and row stride), and sequence ``i``
+                starts from row ``initial_state_slots[i]``; a slot outside
+                ``[0, num_slots)`` (e.g. -1) or equal to ``null_slot_id``
+                starts from zero state.  Slot values are read only on the
+                device, so a captured CUDA graph replays with the vector's
+                contents at replay time.
+            final_state_slots: Optional int32 ``[num_seqs]`` vector
+                (packed-varlen mode, Cake backend), possibly strided like
+                ``initial_state_slots``.  With it ``final_states`` is a state
+                pool of the same layout and sequence ``i`` stores its final
+                state to row ``final_state_slots[i]``; a slot outside
+                ``[0, num_slots)`` (e.g. -1) or equal to ``null_slot_id``
+                stores nothing.  Final slots in ``[0, num_slots)`` must be
+                unique.  ``final_states`` may be the ``initial_states`` pool
+                when both slot vectors are given (a sequence's final slot may
+                equal its own initial slot; an initial row may be shared by
+                several sequences when no sequence writes it; any other
+                aliasing across sequences is undefined).
+            initial_state_flags: Optional contiguous bool or uint8
+                ``[num_seqs]`` vector (requires ``initial_state_slots``, so a
+                runner constructed with ``has_initial_states=True``).  A
+                sequence whose flag is 0 starts from zero state whatever its
+                initial slot, so one slot vector can address an in-place
+                pool while new sequences start from zero.  Read on the
+                device only.
+            null_slot_id: The slot value that means "no row" in every slot
+                vector of a state-slot call: -1 (default; already outside
+                every pool) or a row index in ``[0, 2**31 - 1]``, e.g. 0 for
+                a cache whose row 0 is a placeholder block.  When not -1 it
+                requires a slot vector on every state side the call binds:
+                ``initial_states`` without ``initial_state_slots`` or
+                ``return_final_states=True`` without ``final_state_slots``
+                (dense rows addressed by sequence index, which the null slot
+                could name) raises ``ValueError``.  A dense
+                ``checkpoint_states`` tensor of a state-slot call skips each
+                ``checkpoint_state_slots`` entry equal to it.
 
         Returns:
             A pair containing token-major output with shape
             ``[batch, seqlen, nheads, headdim]`` and either the final states or
             ``None`` when ``return_final_states`` is false.  The Cake backend
-            returns ``out`` itself; the CuTe backend returns a view of the
-            chunked ``out`` buffer.
+            returns ``out`` itself and a given ``final_states`` itself (the
+            pool with ``final_state_slots``); the CuTe backend returns a view
+            of the chunked ``out`` buffer.
         """
         # Keep backend-independent public validation ahead of dispatch so Cake
         # and CuTe expose the same exception type and message for shared API
@@ -823,6 +916,11 @@ class SSDCombined:
                 return_final_states=return_final_states,
                 num_seqs=num_seqs,
                 cu_seqlens=cu_seqlens,
+                final_states=final_states,
+                initial_state_slots=initial_state_slots,
+                final_state_slots=final_state_slots,
+                initial_state_flags=initial_state_flags,
+                null_slot_id=null_slot_id,
             )
 
         if any(
@@ -846,6 +944,17 @@ class SSDCombined:
                 "cu_seqlens requires SSDCombined backend='cake'; the CuTe backend "
                 "takes the seq_idx / chunk_indices / chunk_offsets varlen form"
             )
+        if final_states is not None:
+            raise ValueError(
+                "caller-owned final_states require SSDCombined backend='cake'"
+            )
+        if (
+            initial_state_slots is not None
+            or final_state_slots is not None
+            or initial_state_flags is not None
+            or null_slot_id != -1
+        ):
+            raise ValueError("state slots require SSDCombined backend='cake'")
 
         _, _, ngroups, dstate = B.shape
 
@@ -1070,6 +1179,12 @@ def ssd_combined_fwd(
     return_final_states: bool = True,
     num_seqs: Optional[int] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    state_dtype: Optional[torch.dtype] = None,
+    final_states: Optional[torch.Tensor] = None,
+    initial_state_slots: Optional[torch.Tensor] = None,
+    final_state_slots: Optional[torch.Tensor] = None,
+    initial_state_flags: Optional[torch.Tensor] = None,
+    null_slot_id: int = -1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 
@@ -1093,6 +1208,7 @@ def ssd_combined_fwd(
         initial_states: Optional BF16, FP16, or FP32 initial states of shape
             ``[num_seqs, nheads, headdim, dstate]`` in packed-varlen mode, or
             ``[batch, nheads, headdim, dstate]`` in batched mode. Its dtype
+            must match ``state_dtype`` when that is given and otherwise
             selects the state dtype. When omitted in packed-varlen mode the
             scan starts from zero state and the sequence count comes from
             ``seq_chunk_cumsum`` or ``num_seqs``.
@@ -1114,11 +1230,15 @@ def ssd_combined_fwd(
             absolute; negative entries disable capture.
         checkpoint_state_slots: Optional contiguous int32 vector mapping each
             sequence to a row in ``checkpoint_states``. Negative entries
-            disable capture.
+            disable capture. In a state-slot call it may be strided and an
+            entry equal to ``null_slot_id`` disables capture too.
         checkpoint_states: Optional caller-owned contiguous checkpoint output
             with shape ``[num_checkpoints, nheads, headdim, dstate]`` and the
             selected state dtype. All three checkpoint arguments must be
-            supplied together.
+            supplied together. In a state-slot call it is a state pool (it
+            may be the initial and / or final pool tensor; its rows disjoint
+            from every initial and final row of the call). See
+            :meth:`SSDCombined.run`.
         out: Optional caller-owned contiguous token-major output storage with
             shape ``[batch, seqlen, nheads, headdim]``, written directly by the
             kernels. A fresh tensor is allocated when omitted.
@@ -1131,23 +1251,76 @@ def ssd_combined_fwd(
             the segment metadata themselves (no ``chunk_indices`` /
             ``chunk_offsets``; ``seq_idx`` optional).  See
             :meth:`SSDCombined.run`.
+        state_dtype: Optional state dtype (``torch.bfloat16``,
+            ``torch.float16`` or ``torch.float32``) of the initial, final and
+            checkpoint states.  When omitted it is taken from
+            ``initial_states``, else ``final_states``, else
+            ``checkpoint_states``, else ``torch.bfloat16``.  Every given state
+            tensor must have this dtype.
+        final_states: Optional caller-owned contiguous final-state output of
+            shape ``[num_seqs, nheads, headdim, dstate]`` with the state
+            dtype, written in place and returned.  It requires
+            ``return_final_states=True`` and must not overlap
+            ``initial_states`` or ``checkpoint_states``.  Without it the
+            final states are allocated per call; with
+            ``return_final_states=False`` no final-state storage is
+            allocated.
+        initial_state_slots: Optional int32 ``[num_seqs]`` vector
+            (packed-varlen mode), possibly strided (a column of a slot
+            table).  With it ``initial_states`` is a state pool
+            ``[num_slots, nheads, headdim, dstate]`` (rows may be strided;
+            16-byte aligned base and row stride) and sequence ``i`` starts
+            from row ``initial_state_slots[i]``; -1, ``null_slot_id`` or any
+            slot outside ``[0, num_slots)`` starts from zero state.  See
+            :meth:`SSDCombined.run`.
+        final_state_slots: Optional int32 ``[num_seqs]`` vector
+            (packed-varlen mode), possibly strided.  With it ``final_states``
+            is a state pool and sequence ``i`` stores its final state to row
+            ``final_state_slots[i]``; -1, ``null_slot_id`` or any slot
+            outside ``[0, num_slots)`` stores nothing.  ``final_states`` may
+            be the ``initial_states`` pool when both slot vectors are given.
+        initial_state_flags: Optional contiguous bool or uint8 ``[num_seqs]``
+            vector (requires ``initial_state_slots``): a sequence whose flag
+            is 0 starts from zero state whatever its initial slot.
+        null_slot_id: The "no row" slot value of a state-slot call: -1
+            (default) or a row index, e.g. 0 for a cache whose row 0 is a
+            placeholder block.  When not -1, every state side the call binds
+            needs a slot vector (a dense initial or returned final side
+            raises ``ValueError``); checkpoint slots equal to it are skipped.
 
     Returns:
         A pair containing the token-major output ``out`` with shape
         ``[batch, seqlen, nheads, headdim]`` and either final states of shape
-        ``[num_seqs, nheads, headdim, dstate]`` or ``None`` when
+        ``[num_seqs, nheads, headdim, dstate]`` (``final_states`` itself when
+        given, the pool with ``final_state_slots``) or ``None`` when
         ``return_final_states`` is false.
     """
 
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
-    state_dtype = (
-        initial_states.dtype
-        if initial_states is not None
-        else checkpoint_states.dtype
-        if checkpoint_states is not None
-        else torch.bfloat16
-    )
+    if state_dtype is None:
+        state_dtype = next(
+            (
+                states.dtype
+                for states in (initial_states, final_states, checkpoint_states)
+                if states is not None
+            ),
+            torch.bfloat16,
+        )
+    elif state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "state_dtype must be torch.bfloat16, torch.float16 or "
+            f"torch.float32, got {state_dtype}"
+        )
+    for name, states in (
+        ("initial_states", initial_states),
+        ("final_states", final_states),
+        ("checkpoint_states", checkpoint_states),
+    ):
+        if states is not None and states.dtype != state_dtype:
+            raise ValueError(
+                f"{name} dtype {states.dtype} doesn't match state_dtype {state_dtype}"
+            )
     config = _SSDCombinedRunnerConfig(
         chunk_size=128,
         nheads=nheads,
@@ -1194,4 +1367,9 @@ def ssd_combined_fwd(
         return_final_states=return_final_states,
         num_seqs=num_seqs,
         cu_seqlens=cu_seqlens,
+        final_states=final_states,
+        initial_state_slots=initial_state_slots,
+        final_state_slots=final_state_slots,
+        initial_state_flags=initial_state_flags,
+        null_slot_id=null_slot_id,
     )
