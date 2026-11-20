@@ -72,6 +72,10 @@ DEVICE_PARAMETERS = (
     "MOE_SWIGLU_LIMIT",
     "MOE_CODEC_OVF_BLOCKS",
     "MOE_LSA_COPIERS",
+    "MOE_ACTIVATION",
+    "MOE_ACT_P0",
+    "MOE_ACT_P1",
+    "MOE_RETURN_CODEC",
 )
 _NVCC_FLAGS = (
     "-cubin",
@@ -101,8 +105,8 @@ GIN_BACKENDS: dict[str, tuple[int, tuple[str, ...]]] = {
 # clamp, 4096 tokens per rank, default ``all_gin`` transport (copier-free flavor), EP4 and
 # EP8, for every GIN backend.  Other parameter sets compile on first use.
 AOT_DEVICE_PARAMETERS: tuple[tuple[int, ...], ...] = (
-    (4, 256, 6, 4096, 4096, 2048, 1, 10, 16, 1),
-    (8, 256, 6, 4096, 4096, 2048, 1, 10, 16, 1),
+    (4, 256, 6, 4096, 4096, 2048, 1, 10, 16, 1, 0, 0, 0, 0),
+    (8, 256, 6, 4096, 4096, 2048, 1, 10, 16, 1, 0, 0, 0, 0),
 )
 
 
