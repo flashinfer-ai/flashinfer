@@ -319,7 +319,8 @@ Programmatic use
    result.applied         # enable_apply() return value
 
 ``installed_packages()`` returns ``[(package, callable)]`` for the packages
-``load_packages`` installed and ``release_packages`` has not released. An
+``load_packages`` installed and ``release_packages`` has not released, one per
+Definition: a later load for a Definition replaces its entry. An
 engine that routes its own call sites uses it to pair each Definition with the
 callable of the same package; a package refused at load is not listed, and a
 forked child gets a binding of its own.
