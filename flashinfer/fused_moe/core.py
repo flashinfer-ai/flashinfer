@@ -2850,12 +2850,12 @@ def _trtllm_fp4_records_moe(
     act_out = (
         act_out if act_out is None or iv == inter else pad(act_out, (0, inter - iv))
     )
-    # (token, k) order: each (token, k) its own row, -1 on other ranks' experts.
-    rows = torch.arange(ids.numel(), dtype=torch.int32, device=ids.device)
-    rows = torch.where(((ids >= 0) & (ids < experts)).view(-1), rows, -1)
     out = out if narrow is None else narrow.copy_(out[:, : narrow.shape[1]])
     res = [out] if finalize else [y, weights]
-    res += [rows] if lora is not None or not finalize else []
+    if lora is not None or not finalize:
+        # (token, k) order: each (token, k) its own row, -1 on other ranks' experts.
+        rows = torch.arange(ids.numel(), dtype=torch.int32, device=ids.device)
+        res.append(torch.where(((ids >= 0) & (ids < experts)).view(-1), rows, -1))
     return res + ([act_out] if lora is not None else [])
 
 
