@@ -202,8 +202,8 @@ def parse_sampling_args(line, parser):
     parser.add_argument(
         "--deterministic",
         action=BooleanOptionalAction,
-        default=True,
-        help="Use deterministic sampling (default: true).",
+        default=None,
+        help="Override the routine's default deterministic mode.",
     )
     parser.add_argument(
         "--with_softmax",
@@ -212,6 +212,18 @@ def parse_sampling_args(line, parser):
     )
 
     args = parser.parse_args(line)
+    if args.routine in {"softmax", "top_k_mask_logits"}:
+        if args.deterministic is not None:
+            parser.error(f"{args.routine} has no deterministic mode")
+        del args.deterministic  # CSV backfill leaves unsupported options blank.
+    elif args.deterministic is None:
+        args.deterministic = args.routine not in {
+            "top_k",
+            "top_k_page_table_transform",
+            "top_k_ragged_transform",
+            "top_k_renorm_probs",
+            "top_p_renorm_probs",
+        }
     if args.with_softmax and args.routine not in {
         "sampling_from_probs",
         "top_k_sampling_from_probs",
@@ -399,7 +411,7 @@ def testSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.shape = }")
         print(f"[VVERBOSE] {probs.dtype = }")
 
-    sampling_input = probs.log() if args.with_softmax else probs
+    sampling_input = probs.log() / args.temperature if args.with_softmax else probs
 
     def run_backend(backend, probs):
         if args.with_softmax:
@@ -609,7 +621,7 @@ def testTopKSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.dtype = }")
         print(f"[VVERBOSE] {top_k = }")
 
-    sampling_input = probs.log() if args.with_softmax else probs
+    sampling_input = probs.log() / args.temperature if args.with_softmax else probs
 
     def run_backend(backend, probs):
         if args.with_softmax:
@@ -719,7 +731,7 @@ def testTopPSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.dtype = }")
         print(f"[VVERBOSE] {top_p = }")
 
-    sampling_input = probs.log() if args.with_softmax else probs
+    sampling_input = probs.log() / args.temperature if args.with_softmax else probs
 
     def run_backend(backend, probs):
         if args.with_softmax:
@@ -837,7 +849,7 @@ def testTopKTopPSamplingFromProbs(args):
         print(f"[VVERBOSE] {top_p = }")
         print(f"[VVERBOSE] {filter_apply_order = }")
 
-    sampling_input = probs.log() if args.with_softmax else probs
+    sampling_input = probs.log() / args.temperature if args.with_softmax else probs
 
     def run_backend(backend, probs):
         if args.with_softmax:
@@ -1081,7 +1093,7 @@ def testMinPSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.dtype = }")
         print(f"[VVERBOSE] {min_p = }")
 
-    sampling_input = probs.log() if args.with_softmax else probs
+    sampling_input = probs.log() / args.temperature if args.with_softmax else probs
 
     def run_backend(backend, probs):
         if args.with_softmax:
@@ -1193,7 +1205,9 @@ def testTopKRenormProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+            return flashinfer.sampling.top_k_renorm_probs(
+                probs, top_k, is_deterministic=args.deterministic
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1325,7 +1339,9 @@ def testTopPRenormProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+            return flashinfer.sampling.top_p_renorm_probs(
+                probs, top_p, is_deterministic=args.deterministic
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1740,7 +1756,9 @@ def testTopK(args):
 
     def run_backend(backend, input_tensor):
         if backend == "cuda":
-            return flashinfer.top_k(input_tensor, top_k)
+            return flashinfer.top_k(
+                input_tensor, top_k, deterministic=args.deterministic
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1899,7 +1917,11 @@ def testTopKPageTableTransform(args):
     def run_backend(backend, input_scores, src_page_table, lengths):
         if backend == "cuda":
             return flashinfer.top_k_page_table_transform(
-                input_scores, src_page_table, lengths, top_k
+                input_scores,
+                src_page_table,
+                lengths,
+                top_k,
+                deterministic=args.deterministic,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -2049,7 +2071,7 @@ def testTopKRaggedTransform(args):
     def run_backend(backend, input_scores, offsets, lengths):
         if backend == "cuda":
             return flashinfer.top_k_ragged_transform(
-                input_scores, offsets, lengths, top_k
+                input_scores, offsets, lengths, top_k, deterministic=args.deterministic
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")

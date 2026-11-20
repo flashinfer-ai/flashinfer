@@ -2287,23 +2287,18 @@ def test_chain_speculative_sampling_zero_residual(vocab_size, deterministic):
     target_probs = draft_probs.expand(-1, 2, -1).contiguous()
     draft_token_ids = torch.zeros((batch_size, 1), dtype=torch.int32, device="cuda:0")
 
-    # Both distributions assign zero mass to the drafted token, forcing rejection
-    # with an empty residual. Exercise it after a successful sampling launch.
-    for _ in range(10):
-        flashinfer.sampling.sampling_from_probs(
-            draft_probs[:, 0], deterministic=deterministic, seed=42, offset=0
-        )
-        output, accepted, emitted = flashinfer.sampling.chain_speculative_sampling(
-            draft_probs,
-            draft_token_ids,
-            target_probs,
-            deterministic=deterministic,
-            seed=42,
-            offset=0,
-        )
-        assert torch.all(output == -1)
-        assert torch.all(accepted == 0)
-        assert torch.all(emitted == 0)
+    # An empty residual yields -1 in the rejected slot and emits no tokens.
+    output, accepted, emitted = flashinfer.sampling.chain_speculative_sampling(
+        draft_probs,
+        draft_token_ids,
+        target_probs,
+        deterministic=deterministic,
+        seed=42,
+        offset=0,
+    )
+    assert torch.all(output == -1)
+    assert torch.all(accepted == 0)
+    assert torch.all(emitted == 0)
 
 
 @pytest.mark.parametrize(

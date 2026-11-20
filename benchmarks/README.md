@@ -433,8 +433,10 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 
 ### Sampling Flags
 
-Sampling uses deterministic kernels by default; pass `--no-deterministic` to
-measure the non-deterministic path. For the five probability-based samplers,
+Sampling routines preserve their API defaults. Token samplers default to deterministic
+mode, while top-k selection, transforms and renormalization default to non-deterministic
+mode. Pass `--deterministic` or `--no-deterministic` to override the mode. Softmax
+and top-k masking leave the deterministic CSV field empty. For the five probability-based samplers,
 `--with_softmax` includes a float32 PyTorch softmax in the timed call. Without
 this flag, probability preparation is outside the timing. Both options are
 recorded in CSV output. The unified entry point uses CUPTI by default:
