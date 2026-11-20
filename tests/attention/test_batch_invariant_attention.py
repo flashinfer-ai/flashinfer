@@ -1188,6 +1188,74 @@ def test_sm_count_and_grid_do_not_change_bits():
 
 
 @needs_device
+@pytest.mark.parametrize("decode", [True, False])
+def test_run_attention_runs_the_plan_s_kv_indptr(decode):
+    """The plan owns the page-table offsets: the descriptor table carries every request's first page-table entry and page count
+    next to its query offset and KV length, the kernels run with the plan's own kv_indptr, and run_attention accepts the array the
+    plan was built from or an equal copy (host or device) and rejects one that differs or has another length. The bits do not
+    depend on which equal tensor the caller passes."""
+    from flashinfer.attention.batch_invariant import engine
+
+    D = 128
+    pr = (
+        Problem([1] * 6, [900, 1500, 2100, 300, 4096, 777], 32, 8, D, 16, seed=23)
+        if decode
+        else Problem([200, 33, 1000], [2000, 500, 1000], 32, 8, D, 16, seed=24)
+    )
+    cfg = engine.default_config(D=D)
+    planned = engine.plan_attention(
+        pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, D, 16, -1, cfg, None, pr.device
+    )
+    assert planned.kv_indptr is not None
+    assert torch.equal(planned.kv_indptr, pr.kv_indptr)
+    assert planned.kv_indptr.data_ptr() != pr.kv_indptr.data_ptr()  # a snapshot
+
+    def run(plan, kv_indptr):
+        return bits(
+            engine.run_attention(
+                plan,
+                pr.q,
+                pr.k_nhd,
+                pr.v_nhd,
+                kv_indptr,
+                pr.kv_indices,
+                1.0 / math.sqrt(D),
+                -1,
+                "NHD",
+                None,
+                cfg,
+            )
+        )
+
+    ref = run(planned, pr.kv_indptr)
+    wrapper = run_decode(pr)[0] if decode else run_paged_prefill(pr)
+    assert torch.equal(ref, bits(wrapper))
+    assert torch.equal(run(planned, planned.kv_indptr), ref)  # the snapshot itself
+    assert torch.equal(run(planned, pr.kv_indptr.clone()), ref)  # an equal copy
+    assert torch.equal(run(planned, pr.kv_indptr.cpu()), ref)  # the host array
+    from_host = engine.plan_attention(
+        pr.qo_indptr.cpu(),
+        pr.kv_indptr.cpu(),
+        pr.kv_last.cpu(),
+        32,
+        8,
+        D,
+        16,
+        -1,
+        cfg,
+        None,
+        pr.device,
+    )  # a plan built from host arrays (the wrappers' way) runs with the device array
+    assert torch.equal(run(from_host, pr.kv_indptr), ref)
+    with pytest.raises(ValueError, match="differs from the plan"):
+        run(
+            planned, pr.kv_indptr + 1
+        )  # the same page counts at moved offsets: another page table
+    with pytest.raises(ValueError, match="entries at run_attention"):
+        run(planned, pr.kv_indptr[:-1])
+
+
+@needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
 def test_config_agreement(D):
     """R3: every member of the configuration space (ring depth, unit kind, softmax warpgroups, fold placement, small-unit body)
@@ -1927,6 +1995,25 @@ def test_lse_buffer_refusals(kind):
                 return_lse=True,
                 lse_layout="HN",
             )
+    # a strided q is packed into a copy for the kernels: a buffer over the caller's own q storage is refused all the same
+    # (the store would change the caller's queries), a disjoint one is written
+    wide = torch.zeros(4, 8, 256, dtype=torch.bfloat16, device=dev)
+    q_strided = wide[:, :, ::2]
+    q_strided.copy_(args[0])
+    assert not q_strided.is_contiguous()
+    strided_args = (q_strided,) + tuple(args[1:])
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.run(
+            *strided_args,
+            lse=wide.view(torch.float32).reshape(-1)[:32].view(4, 8),
+            return_lse=True,
+        )
+    assert torch.equal(bits(q_strided), bits(args[0]))
+    lse_buf = torch.empty(4, 8, dtype=torch.float32, device=dev)
+    got = w.run(*strided_args, lse=lse_buf, return_lse=True)
+    assert got[1] is lse_buf
+    assert torch.equal(bits(got[0]), expected[0])
+    assert torch.equal(bits(got[1]), expected[1])
     got = w.run(*args, return_lse=True)
     assert torch.equal(bits(got[0]), expected[0])
     assert torch.equal(bits(got[1]), expected[1])
@@ -1958,8 +2045,9 @@ def sink_reference(pr: Problem, sinks, window_left=-1):
         sink_attention_unified,
     )
 
+    # the helper returns the query's dtype: fp32 queries (the bf16 values, exactly) keep the reference unrounded
     out = sink_attention_unified(
-        pr.q,
+        pr.q.float(),
         pr.k_rag,
         pr.v_rag,
         sinks,
@@ -1987,7 +2075,8 @@ def sink_reference(pr: Problem, sinks, window_left=-1):
         lses.append(torch.logsumexp(s, dim=-1).t())
         tok_q += ql
         tok_kv += kl
-    return out.float(), torch.cat(lses)
+    assert out.dtype == torch.float32
+    return out, torch.cat(lses)
 
 
 def _multi_token_decode(pr, q_len, layout="NHD", **run_kw):
@@ -2452,7 +2541,8 @@ def test_sinks_edge_values(D):
     """The step's corner values. A sink far above every score: ``a`` underflows to ``+0``, the outputs are ``+0`` and the
     base-2 LSE is ``mul(sink, LOG2E)`` (``l' = 1``). A sink far below (or ``-inf``): ``b = +0``, the bits of the row without
     sinks. A sink whose scaled logit equals the row's scaled maximum: ``a = b = 1``. ``+inf`` and NaN sinks give NaN on
-    their heads only."""
+    their heads only. The step sees the sink's base-2 value ``mul(sink, LOG2E)``: a finite sink whose base-2 value
+    overflows binary32 is the sink of that infinity (NaN on its head above, the row without sinks below)."""
     from flashinfer.attention.batch_invariant.spec import LOG2E
     from flashinfer.batch_invariant.sampling.mufu_device import lg2_device
 
@@ -2466,24 +2556,31 @@ def test_sinks_edge_values(D):
     sinks[2] = float("-inf")
     sinks[3] = float("inf")
     sinks[4] = float("nan")
+    sinks[5] = 3.0e38
+    sinks[6] = -3.0e38
+    log2e = torch.tensor(LOG2E, dtype=torch.float32)
+    assert bool(torch.isfinite(sinks[5:7]).all())
+    assert (sinks[5:7].cpu() * log2e).tolist() == [float("inf"), float("-inf")]
     res = run_paged_prefill(pr, run_kw=dict(LSE, sinks=sinks))
     out, lse = _both(res)
-    assert torch.equal(out[:, 5:], ref[:, 5:]) and torch.equal(
-        lse[:, 5:], ref_lse[:, 5:]
+    assert torch.equal(out[:, 7:], ref[:, 7:]) and torch.equal(
+        lse[:, 7:], ref_lse[:, 7:]
     )
     assert bool((out[:, 0] == 0).all())  # +0, bit for bit
     big = torch.tensor(1.0e4, dtype=torch.float32) * torch.tensor(
         LOG2E, dtype=torch.float32
     )
     assert bool((res[1][:, 0].cpu() == big).all())
-    for h in (1, 2):
+    for h in (1, 2, 6):
         assert torch.equal(out[:, h], plain[:, h])
         assert torch.equal(lse[:, h], plain_lse[:, h])
-    for h in (3, 4):
+    for h in (3, 4, 5):
         assert bool(torch.isnan(res[0][:, h].float()).all())
         assert bool(torch.isnan(res[1][:, h]).all())
     (dec, dec_lse), last = run_decode(pr, run_kw=dict(LSE, sinks=sinks))
-    keep = [h for h in range(pr.Hq) if h not in (3, 4)]
+    assert bool(torch.isnan(dec[:, 5].float()).all())
+    assert bool(torch.isnan(dec_lse[:, 5]).all())
+    keep = [h for h in range(pr.Hq) if h not in (3, 4, 5)]
     assert torch.equal(bits(dec)[:, keep], out[last][:, keep])
     assert torch.equal(bits(dec_lse)[:, keep], lse[last][:, keep])
     # a row with one key has l = 1 and its base-2 LSE without sinks is its scaled maximum mul(m, c), bit for bit; where a
@@ -2600,6 +2697,29 @@ def test_sinks_refusals(kind):
             w.run(*args, out=out_buf)
         else:
             w.run(*args, out=out_buf, sinks=out_buf.view(torch.float32).reshape(-1)[:8])
+    # sinks inside the caller's LSE buffer: refused in both layouts (under "HN" the kernels write a (total_q, Hq) buffer
+    # of their own and the transposed copy lands in the caller's), accepted where the buffer is not written (no return_lse)
+    for layout in ("NH", "HN") if kind else ("NH",):
+        lse_buf = torch.zeros(
+            (4, 8) if layout == "NH" else (8, 4), dtype=torch.float32, device=dev
+        )
+        inside = lse_buf.view(-1)[8:16]
+        inside.copy_(good)
+        lse_kw = dict(lse=lse_buf, lse_layout=layout) if kind else dict(lse=lse_buf)
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            if kind == 2:
+                w._sinks = inside
+                w.run(*args, return_lse=True, **lse_kw)
+            else:
+                w.run(*args, return_lse=True, sinks=inside, **lse_kw)
+        assert torch.equal(inside, good)
+        if kind == 2:
+            w._sinks = inside
+            unused = w.run(*args, **lse_kw)
+        else:
+            unused = w.run(*args, sinks=inside, **lse_kw)
+        assert torch.equal(bits(unused), expected)
+        assert torch.equal(inside, good)
     assert torch.equal(bits(run(good)), expected)
     from flashinfer.attention.batch_invariant import engine
 
@@ -2612,6 +2732,179 @@ def test_sinks_refusals(kind):
         with pytest.raises(ValueError):
             engine.run_attention(*eargs, sinks=sinks)
     assert torch.equal(bits(engine.run_attention(*eargs, sinks=good)), expected)
+    # the LSE buffer counts as written only when the LSE is requested
+    lse_buf = torch.zeros(4, 8, dtype=torch.float32, device=dev)
+    inside = lse_buf.view(-1)[8:16]
+    inside.copy_(good)
+    with pytest.raises(ValueError):
+        engine.run_attention(*eargs, sinks=inside, lse=lse_buf, return_lse=True)
+    unused = engine.run_attention(*eargs, sinks=inside, lse=lse_buf)
+    assert torch.equal(bits(unused), expected)
+    assert torch.equal(inside, good)
+
+
+def _run_sinks(kind, w, args, sinks, **kw):
+    """``run()`` with ``sinks`` the way each wrapper takes them (``None``: without)."""
+    if kind == 2:
+        w._sinks = sinks
+        return w.run(*args, **kw)
+    return w.run(*args, **kw) if sinks is None else w.run(*args, sinks=sinks, **kw)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_has_sinks_declaration(kind):
+    """``plan(has_sinks=True | False)`` declares which member every ``run()`` of the plan is: a run that departs from it
+    raises, ``None`` leaves the choice to each run, and a new ``plan()`` replaces the declaration."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=49)
+    good = sink_logits(pr)
+    options = {} if kind == 0 else {"causal": True}
+    w, args, plan_args, kwargs = _wrapper_case(kind, pr)
+    plain = bits(_run_sinks(kind, w, args, None)).clone()
+    sunk = bits(_run_sinks(kind, w, args, good)).clone()
+    assert not torch.equal(plain, sunk)
+
+    # declared with sinks: a wrapper that was never given any (the ragged ``_sinks`` unset) raises on every entry point
+    w, args, plan_args, kwargs = _wrapper_case(kind, pr, has_sinks=True)
+    for call in (w.run, w.run_return_lse):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=True"):
+            call(*args)
+    for call in (w.forward, w.forward_return_lse):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=True"):
+            call(*args, **options)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=True"):
+        _run_sinks(kind, w, args, None)
+    assert torch.equal(bits(_run_sinks(kind, w, args, good)), sunk)
+    if kind == 2:  # the deprecated entry points read the same attribute
+        assert torch.equal(bits(w.forward(*args, **options)), sunk)
+
+    w.plan(*plan_args, **{**kwargs, "has_sinks": False})
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="has_sinks=False"):
+        _run_sinks(kind, w, args, good)
+    if kind == 2:
+        for call in (w.forward, w.forward_return_lse):
+            with pytest.raises(
+                bi.BatchInvariantUnsupportedError, match="has_sinks=False"
+            ):
+                call(*args, **options)
+    assert torch.equal(bits(_run_sinks(kind, w, args, None)), plain)
+    assert torch.equal(bits(w.forward(*args, **options)), plain)
+
+    kwargs.pop("has_sinks")
+    w.plan(*plan_args, **kwargs)
+    assert torch.equal(bits(_run_sinks(kind, w, args, good)), sunk)
+    assert torch.equal(bits(_run_sinks(kind, w, args, None)), plain)
+
+
+@needs_device
+def test_has_sinks_declaration_under_graph_capture():
+    """The declaration is checked in Python at ``run()``: a captured ``run()`` replays as without it."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=50)
+    good = sink_logits(pr)
+    w, args, _, _ = _wrapper_case(1, pr, has_sinks=True)
+    expected = bits(w.run(*args, sinks=good)).clone()
+    out = torch.empty_like(pr.q)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(*args, sinks=good, out=out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+@pytest.mark.parametrize("declared", [True, False])
+def test_has_sinks_is_refused_without_batch_invariant(kind, declared):
+    """The declaration belongs to the batch-invariant plan: the regular wrappers refuse a value instead of ignoring it."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=51)
+    w = getattr(flashinfer, WRAPPERS[kind])(workspace(pr.device, mb=64), "NHD")
+    kwargs = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    paged = (pr.kv_indptr, pr.kv_indices, pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page)
+    if kind == 0:
+        plan_args = paged
+    elif kind == 1:
+        plan_args = (pr.qo_indptr, *paged)
+    else:
+        plan_args = (pr.qo_indptr, pr.kv_indptr_rag, pr.Hq, pr.Hkv, pr.D)
+    if kind:
+        kwargs["causal"] = True
+    with pytest.raises(ValueError, match="has_sinks") as e:
+        w.plan(*plan_args, **kwargs, has_sinks=declared)
+    assert not isinstance(e.value, bi.BatchInvariantUnsupportedError)
+    w.plan(*plan_args, **kwargs, has_sinks=None)
+
+
+def _cpu_plan(engine, device="cpu", **kw):
+    qo = torch.tensor([0, 1, 2], dtype=torch.int32)
+    kv = torch.tensor([0, 2, 5], dtype=torch.int32)
+    last = torch.tensor([3, 16], dtype=torch.int32)
+    planned = engine.plan_attention(
+        qo, kv, last, 8, 2, 128, 16, -1, None, None, torch.device(device), **kw
+    )
+    return planned, kv
+
+
+def test_engine_has_sinks_declaration():
+    """``engine.plan_attention(has_sinks=)`` carries the declaration on the planned record and ``run_attention`` raises
+    ``ValueError`` before any launch (device-free: the check precedes every kernel)."""
+    from flashinfer.attention.batch_invariant import engine
+
+    q = torch.zeros(2, 8, 128, dtype=torch.bfloat16)
+    cache = torch.zeros(5, 16, 2, 128, dtype=torch.bfloat16)
+    indices = torch.arange(5, dtype=torch.int32)
+    sinks = torch.zeros(8)
+    assert _cpu_plan(engine)[0].has_sinks is None
+    for declared, given, text in (
+        (True, None, "has_sinks=True"),
+        (False, sinks, "has_sinks=False"),
+    ):
+        planned, kv = _cpu_plan(engine, has_sinks=declared)
+        assert planned.has_sinks is declared
+        with pytest.raises(ValueError, match=text):
+            engine.run_attention(
+                planned, q, cache, cache, kv, indices, 128**-0.5, sinks=given
+            )
+
+
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_has_sinks_is_a_trailing_keyword_of_plan(op):
+    import inspect
+
+    cls = getattr(flashinfer, op)
+    plan = cls._plan_impl if hasattr(cls, "_plan_impl") else cls.plan
+    last = list(inspect.signature(plan).parameters.values())[-1]
+    assert last.name == "has_sinks" and last.default is None
+    assert last.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=needs_device)])
+def test_unused_operand_placeholder_is_one_per_device(device, monkeypatch):
+    """The operand a launch without LSE / sinks passes for them is one tensor per device: two plans share it and a
+    ``plan()`` allocates none."""
+    from flashinfer.attention.batch_invariant import engine
+
+    first, _ = _cpu_plan(engine, device)
+    shared = engine.unused_operand(device)
+    assert first.lse_unused is shared
+    assert shared.shape == (1,) and shared.dtype == torch.float32
+    assert shared.device == first.desc.device
+    cached = dict(engine._UNUSED_OPERAND)
+    made = []
+    real_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        made.append(real_empty(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(torch, "empty", empty)
+    second, _ = _cpu_plan(engine, device)
+    monkeypatch.undo()
+    assert second.lse_unused is shared
+    assert all(t is not shared for t in made)
+    assert set(engine._UNUSED_OPERAND) == set(cached)
+    assert engine._UNUSED_OPERAND[engine._resolve_device(device)] is shared
 
 
 @needs_device
@@ -3359,10 +3652,18 @@ def test_planner_decode_arrays_equal_the_reference():
             qo, indptr, last, Hq, Hkv, D, page, null_requests=null, **opts
         )
         if null:
-            got = P.build_decode_plan(np.array(kv_lens), q_len, Hq, Hkv, D, **opts)
+            got = P.build_decode_plan(
+                np.array(kv_lens), q_len, Hq, Hkv, D, kv_indptr=np.array(indptr), **opts
+            )
         else:
             got = P.build_array_plan(
-                np.array(q_lens), np.array(kv_lens), Hq, Hkv, D, **opts
+                np.array(q_lens),
+                np.array(kv_lens),
+                Hq,
+                Hkv,
+                D,
+                kv_indptr=np.array(indptr),
+                **opts,
             )
         # the next step of a decode loop, planned from this plan: the reference's tables again, whether or not the batch
         # kept its shape (every Q tile on the same key tiles) and only its KV lengths were rewritten
@@ -3385,6 +3686,7 @@ def test_planner_decode_arrays_equal_the_reference():
             D,
             null_requests=null,
             previous=got,
+            kv_indptr=np.array(grown_indptr),
             **opts,
         )
         assert got_next.desc == ref_next.desc and got_next.groups == ref_next.groups

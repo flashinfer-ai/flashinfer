@@ -127,7 +127,7 @@ class MegaPlan:
                 cfg,
                 megakernel=kernel,
                 preprocess_weights=False,
-                transformed_weights=prototype._get_transformed_weights(),
+                transformed_weights=prototype.get_transformed_weights(),
             ),
         )
         self.output = output
@@ -155,7 +155,7 @@ class MegaPlan:
                     )
                 self.layer.stage_inputs(tensors)
                 self.layer._kernel.ep_prepare_fixed(
-                    self.layer._workspace, self.layer._get_transformed_weights()
+                    self.layer._workspace, self.layer.get_transformed_weights()
                 )
 
             Collective(self.layer._bootstrap).prepare(prepare_fixed)
@@ -170,7 +170,7 @@ class MegaPlan:
             self.layer._kernel.ep_force_tune(
                 self.layer._ensure_workspace(),
                 tensors,
-                self.layer._get_transformed_weights(),
+                self.layer.get_transformed_weights(),
                 (
                     tensors.output
                     if tensors.output is not None

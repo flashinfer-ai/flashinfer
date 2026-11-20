@@ -31,6 +31,7 @@ from typing import (
 
 import torch
 
+from flashinfer.api_logging import cake_auto_candidates_enabled
 from flashinfer.autotune_cache import _ManagedCacheRecord
 from flashinfer.tllm_utils import delay_kernel, get_trtllm_utils_module
 from flashinfer.utils import (
@@ -53,6 +54,7 @@ from flashinfer.autotuner.protocol import (
     _protocol_cache_key,
     _tuning_scope,
 )
+from flashinfer.autotuner._resources import tuning_resources_scope
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
@@ -987,6 +989,10 @@ def autotune(
     for each operation.  When ``tune_mode=True``, uncovered shapes are profiled
     on the fly; when ``False``, only previously cached results are used.
 
+    Compile workers requested by an operation are created lazily and shared
+    across nested tuning contexts. They are released when the outermost
+    tuning-enabled context exits, including when tuning raises an exception.
+
     .. note::
         The ``cache`` parameter is **experimental**. Concurrent readers are
         supported. Namespaced product records use single-writer semantics and
@@ -1237,7 +1243,8 @@ def autotune(
         raise
 
     try:
-        yield
+        with tuning_resources_scope() if tune_mode else contextlib.nullcontext():
+            yield
     finally:
         _tuning_scope.reset(scope_token)
         with tuner._lock:
@@ -1358,6 +1365,38 @@ def set_autotune_process_group(
 def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     """Return the process group previously passed to ``set_autotune_process_group``."""
     return _tune_process_group
+
+
+def cake_auto_candidate_open(runner_class_name: str) -> bool:
+    """Whether ``backend="auto"`` lists the automatic Cake runner of this class now.
+
+    The runner is always the last candidate, so the tuner selects it only
+    while tuning or from a cache entry of its class
+    (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
+    no selection, so it is left out: the call keeps the runner list and host
+    cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
+    always leaves it out, and so does tuning under an autotune process group
+    (:func:`cake_group_tuning`).
+    """
+    return (
+        cake_auto_candidates_enabled()
+        and not cake_group_tuning()
+        and AutoTuner.get().may_select_runner_class(runner_class_name)
+    )
+
+
+def cake_group_tuning() -> bool:
+    """Whether the tuner now tunes under an autotune process group
+    (:func:`set_autotune_process_group`).
+
+    Group tuning requires every rank to list the same runners for an op. The
+    automatic Cake candidates are offered per operands, per tuning bucket of
+    the rank-local batch and per rank-local build outcome, so ranks could
+    disagree; they are left out while a group tunes, and every rank lists the
+    other backends only. Outside tuning the group checks nothing, and Cake is
+    listed as without a group.
+    """
+    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
 
 
 class _TuningGroupError(RuntimeError):
@@ -2084,6 +2123,10 @@ class AutoTuner:
         # (custom_op, requested profile) pairs already logged as served from
         # the largest tuned bucket (see _top_tuned_profile).
         self._logged_top_bucket: set[tuple[str, tuple[tuple[int, ...], ...]]] = set()
+        # Per-op memo of _has_tune_data's in-memory scan, valid for one value of
+        # _dirty_seq (every winner publication bumps it; clear_cache resets it
+        # and empties this memo).
+        self._tune_data_memo: dict[str, tuple[int, bool]] = {}
         # Set when new profiling results are added; cleared on save.
         self._dirty = False
         self._dirty_seq = 0
@@ -2273,6 +2316,41 @@ class AutoTuner:
         if local.active:
             return local.store
         return self._managed_cache
+
+    def _has_tune_data(self, custom_op: str) -> bool:
+        """Whether ``choose_one`` could return anything but the fallback for ``custom_op``.
+
+        A conservative precondition for callers that would otherwise pay the
+        lookup for an op nothing tuned: True in tuning mode, under replay
+        diagnostics, with a managed store attached, with bundled configs
+        enabled, with user-loaded configs present, or when an in-memory winner
+        partition holds an entry of the op.  False means every source
+        :meth:`search_cache` consults is empty for the op, so the lookup would
+        fall back to ``(runners[0], -1)``.  The in-memory scan is memoised per
+        op for the current ``_dirty_seq`` (every publication bumps it).
+        """
+        local = self._v2_local
+        if (
+            self.is_tuning_mode
+            or local.replay_report is not None
+            or local.strict_replay
+            or self._active_managed_store is not None
+            or self._file_configs
+            or os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+        ):
+            return True
+        seq = self._dirty_seq
+        memo = self._tune_data_memo.get(custom_op)
+        if memo is not None and memo[0] == seq:
+            return memo[1]
+        with self._lock:
+            found = any(k.custom_op == custom_op for k in self.profiling_cache) or any(
+                k.custom_op == custom_op
+                for part in self._winner_partitions.values()
+                for k in part
+            )
+            self._tune_data_memo[custom_op] = (seq, found)
+        return found
 
     @property
     def _in_v2_context(self) -> bool:
@@ -5656,6 +5734,7 @@ class AutoTuner:
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
             self._logged_top_bucket.clear()
+            self._tune_data_memo.clear()
             self._dirty = False
             self._dirty_seq = 0
             self._winner_partitions.clear()

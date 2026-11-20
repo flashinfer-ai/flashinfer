@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -56,7 +54,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_a7c926e4f62a2e693b44(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M)
+kernel_cake_warp_decode_a7c926e4f62a2e693b44(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M, int* __restrict__ route_experts, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -73,29 +71,46 @@ kernel_cake_warp_decode_a7c926e4f62a2e693b44(__nv_bfloat16* __restrict__ route_o
     int token = blockIdx.y;
     int route_base = token * 4;
     float weights[4];
+    bool oks[4];
     int rows[4];
     if (feature < M && token < num_tokens) {
         weights[0] = (float)route_weights[route_base];
+        oks[0] = (unsigned int)route_experts[route_base] < (unsigned int)num_experts;
         weights[1] = (float)route_weights[route_base + 1];
+        oks[1] = (unsigned int)route_experts[route_base + 1] < (unsigned int)num_experts;
         weights[2] = (float)route_weights[route_base + 2];
+        oks[2] = (unsigned int)route_experts[route_base + 2] < (unsigned int)num_experts;
         weights[3] = (float)route_weights[route_base + 3];
+        oks[3] = (unsigned int)route_experts[route_base + 3] < (unsigned int)num_experts;
         #pragma unroll
         for (int slot = 0; slot < 4; slot++) {
-            rows[slot] = route_slots[route_base + slot];
+            rows[slot] = ((oks[slot]) ? route_slots[route_base + slot] : 0);
         }
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature < M && token < num_tokens) {
         __nv_bfloat16 partials[4];
-        partials[0] = route_outputs[rows[0] * route_stride + feature];
-        partials[1] = route_outputs[rows[1] * route_stride + feature];
-        partials[2] = route_outputs[rows[2] * route_stride + feature];
-        partials[3] = route_outputs[rows[3] * route_stride + feature];
+        partials[0] = 0.0f;
+        if (oks[0]) {
+            partials[0] = route_outputs[rows[0] * route_stride + feature];
+        }
+        partials[1] = 0.0f;
+        if (oks[1]) {
+            partials[1] = route_outputs[rows[1] * route_stride + feature];
+        }
+        partials[2] = 0.0f;
+        if (oks[2]) {
+            partials[2] = route_outputs[rows[2] * route_stride + feature];
+        }
+        partials[3] = 0.0f;
+        if (oks[3]) {
+            partials[3] = route_outputs[rows[3] * route_stride + feature];
+        }
         float value = 0.0f;
-        value = __fmaf_rn((float)partials[0], weights[0], value);
-        value = __fmaf_rn((float)partials[1], weights[1], value);
-        value = __fmaf_rn((float)partials[2], weights[2], value);
-        value = __fmaf_rn((float)partials[3], weights[3], value);
+        value = ((oks[0]) ? __fmaf_rn((float)partials[0], weights[0], value) : value);
+        value = ((oks[1]) ? __fmaf_rn((float)partials[1], weights[1], value) : value);
+        value = ((oks[2]) ? __fmaf_rn((float)partials[2], weights[2], value) : value);
+        value = ((oks[3]) ? __fmaf_rn((float)partials[3], weights[3], value) : value);
         *(reinterpret_cast<__nv_bfloat16*>(output + (token * M + feature)) + (0)) = (__nv_bfloat16)value;
     }
 }

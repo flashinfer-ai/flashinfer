@@ -17,6 +17,11 @@ tensor of per-head sink logits, selects the class's sink member (``spec.sink_mer
 of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
 row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
 are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+A run with sinks and a run without are two members with different bits, so ``plan(..., has_sinks=True | False)`` declares
+which one the plan's runs are: a ``run()`` that departs from the declaration raises (``None``, the default, leaves the
+choice to each run). The check is made in Python at ``run()``, so capturing ``run()`` into a CUDA graph is unaffected.
+The values are not checked: a sink whose base-2 value ``mul(sinks[h], LOG2E)`` overflows binary32 (a magnitude above about
+``2.36e38``) is a sink of that infinity, and a ``+inf`` or NaN sink gives NaN on its head's rows (``spec.sink_merge``).
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture -- unless the wrapper is the decode wrapper built with
@@ -137,6 +142,9 @@ class BatchInvariantAttention:
         self._fixed: Optional[engine.FixedLaunch] = None
         self._frozen_plan: Optional[tuple] = None
         self._frozen_run: Optional[tuple] = None
+        self._has_sinks: Optional[bool] = (
+            None  # the sinks declaration of a use_cuda_graph=True wrapper's plans
+        )
         self._qo_buffer: Optional[torch.Tensor] = None
         self._max_rows: Optional[int] = (
             None  # the packed query rows a plan may hold (prefill)
@@ -312,8 +320,11 @@ class BatchInvariantAttention:
         seq_lens: Optional[torch.Tensor] = None,
         kv_indptr_host: Optional[torch.Tensor] = None,
         fast: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``disable_split_kv`` plans
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``has_sinks`` declares
+        whether every ``run()`` of this plan is given sinks (``True`` / ``False``: a run that departs from it raises);
+        ``None`` leaves the choice to each run. ``disable_split_kv`` plans
         fused units and ``fixed_split_size`` of ``None`` / ``-1`` is the wrappers' "no fixed size" (both placements); a positive
         ``fixed_split_size`` is refused -- the chunk length is a class constant -- except under ``use_cuda_graph=True``, where
         it is accepted and not used, as serving engines pass it on every replan. ``seq_lens`` (decode) must be the KV
@@ -652,6 +663,7 @@ class BatchInvariantAttention:
                 max_page,
                 fast,
                 qo_indptr,
+                has_sinks,
             )
             return
         try:
@@ -668,6 +680,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                has_sinks=has_sinks,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -689,6 +702,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    has_sinks=has_sinks,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -696,12 +710,10 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from a
-        # snapshot: a later in-place change by the caller cannot reach a plan built from the old values; the plan is published only once
-        # everything it runs with exists
-        kv_indptr_dev = kv_indptr.to(
-            device=self.device, dtype=torch.int32, non_blocking=non_blocking, copy=True
-        ).contiguous()
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
+        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets), kv_indices' is
+        # taken here; a later in-place change by the caller cannot reach a plan built from the old values, and the plan is published
+        # only once everything it runs with exists
         kv_indices_dev = (
             kv_indices.to(
                 device=self.device,
@@ -714,7 +726,7 @@ class BatchInvariantAttention:
         )
         self._planned = planned
         self._config = config
-        self._kv_indptr = kv_indptr_dev
+        self._kv_indptr = planned.kv_indptr
         self._kv_indices = kv_indices_dev
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
@@ -745,6 +757,7 @@ class BatchInvariantAttention:
         max_page: int,
         fast: bool,
         qo_indptr: Optional[torch.Tensor] = None,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """The plan of a ``use_cuda_graph=True`` wrapper: the first builds the fixed launch, every one is written into its
         tables and the wrapper's page-table buffers (``engine.FixedLaunch``), after the frozen options are checked. A prefill
@@ -774,6 +787,23 @@ class BatchInvariantAttention:
                 "the options of the wrapper's first plan (a captured graph holds them); only the KV lengths and the page "
                 "table may change",
             )
+        # the sinks declaration selects the captured kernels: the first one given is the wrapper's, and a plan without one
+        # (a fast replan has no such argument) keeps it
+        if has_sinks is not None:
+            if self._has_sinks is not None and bool(has_sinks) != self._has_sinks:
+                raise unsupported(
+                    CLASS,
+                    f"a plan() of a use_cuda_graph=True wrapper with has_sinks={has_sinks} after has_sinks={self._has_sinks}",
+                    "the sinks declaration of the wrapper's first plan (a captured graph holds the kernels it selects)",
+                )
+            if self._frozen_run is not None and self._frozen_run[2] != bool(has_sinks):
+                raise unsupported(
+                    CLASS,
+                    f"has_sinks={has_sinks} on a use_cuda_graph=True wrapper whose first run() was "
+                    + ("with" if self._frozen_run[2] else "without")
+                    + " sinks",
+                    "the presence of sinks of the wrapper's first run()",
+                )
         total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         if self._fixed is None:
             decode = self.kind == "decode"
@@ -790,6 +820,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 max_rows=None if decode else self._max_rows,
+                kv_indptr=indptr_buf,
             )
         else:
             from dataclasses import replace
@@ -808,6 +839,7 @@ class BatchInvariantAttention:
             config,
             fixed=self._fixed,
             non_blocking=non_blocking,
+            has_sinks=self._has_sinks if has_sinks is None else bool(has_sinks),
         )
         # the captured kernels read the page table from the wrapper's buffers: refreshed here unless the caller's tensors are
         # those buffers
@@ -824,6 +856,8 @@ class BatchInvariantAttention:
             ):
                 continue
             buf[: src.numel()].copy_(src, non_blocking=non_blocking)
+        if has_sinks is not None:
+            self._has_sinks = bool(has_sinks)
         self._planned = planned
         self._config = config
         self._kv_indptr = indptr_buf
@@ -926,6 +960,13 @@ class BatchInvariantAttention:
         per-head sink logits of the sink member."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        mismatch = engine.sinks_declaration_mismatch(self._planned.has_sinks, sinks)
+        if mismatch is not None:
+            raise unsupported(
+                CLASS,
+                mismatch,
+                "the same sinks choice at every run() of the plan (a new plan() changes the declaration)",
+            )
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
@@ -1027,6 +1068,7 @@ class BatchInvariantAttention:
                     f"{name} of shape {tuple(t.shape)} (strides {tuple(t.stride())}) at run()",
                     f"the planned {self.kv_layout} geometry {want}",
                 )
+        q_source = q
         if not q.is_contiguous():
             q = q.contiguous()
         if q.data_ptr() % 16:
@@ -1060,7 +1102,9 @@ class BatchInvariantAttention:
             nh_shape = (q.shape[0], Hq)
             if lse is not None:
                 shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
-                bad = engine.check_lse_buffer(lse, q, out, k, v, shape)
+                bad = engine.check_lse_buffer(
+                    lse, q, out, k, v, shape, q_source=q_source
+                )
                 if bad is not None:
                     raise unsupported(
                         CLASS,
@@ -1089,7 +1133,9 @@ class BatchInvariantAttention:
                     "the LSE mode and the presence of sinks of the wrapper's first run() (they select the captured kernels)",
                 )
         if sinks is not None:
-            bad = engine.check_sinks(sinks, Hq, self.device, (out, lse_nh))
+            # the HN layout's copy writes the caller's buffer after the launch
+            written = (out, lse_nh, lse if return_lse else None)
+            bad = engine.check_sinks(sinks, Hq, self.device, written)
             if bad is not None:
                 raise unsupported(
                     CLASS,

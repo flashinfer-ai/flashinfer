@@ -21,13 +21,15 @@ kernels compute the class's term:
 from __future__ import annotations
 
 import functools
+import threading
 import weakref
-from typing import Dict, Optional, Sequence, Tuple
+from collections import OrderedDict
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from ..support import unsupported
+from ..support import byte_range, unsupported
 from .spec import CHUNK, CLASS, HEAD_DIM
 
 _IO = torch.bfloat16
@@ -52,6 +54,37 @@ def pool_key(pool: torch.Tensor) -> Tuple[int, int, int, torch.device]:
         int(pool.shape[1]),
         pool.device,
     )
+
+
+def refuse_shared(name: str, buffer: torch.Tensor, others) -> None:
+    """A buffer the call writes may share no memory with another argument: ``others`` are ``(name, value)`` pairs."""
+    lo, hi = byte_range(buffer)
+    for other_name, other in others:
+        if isinstance(other, torch.Tensor) and other.device == buffer.device:
+            a, b = byte_range(other)
+            if lo < b and a < hi:
+                raise unsupported(
+                    CLASS,
+                    f"{name} that shares memory with {other_name}",
+                    "a buffer of its own",
+                )
+    if overlaps_a_pool(buffer):
+        raise unsupported(
+            CLASS,
+            f"{name} that shares memory with a state pool of the class",
+            "a buffer of its own",
+        )
+
+
+def overlaps_a_pool(t: torch.Tensor) -> bool:
+    """Whether ``t`` shares memory with any slot of a registered pool on its device."""
+    lo, hi = byte_range(t)
+    for (base, offset, HV, dev), gp in list(_POOLS.items()):
+        start = base + 4 * offset
+        end = start + 4 * gp.slots * HV * HEAD_DIM * HEAD_DIM
+        if dev == t.device and lo < end and start < hi:
+            return True
+    return False
 
 
 def capturing(device: torch.device) -> bool:
@@ -141,6 +174,68 @@ def _pinned(
         _raise_if_misaligned(e)
         raise
     return out
+
+
+_ZERO: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+#: replaced index tensors, kept so that a launch still queued on another stream never reads freed memory
+_RETIRED: List[torch.Tensor] = []
+
+
+_ZERO_LOCK = threading.Lock()
+_INDEX: "OrderedDict[tuple, Tuple[torch.Tensor, ...]]" = OrderedDict()
+_INDEX_LOCK = threading.Lock()
+
+
+def index_tensors(
+    kind: str, offs: Sequence[int], dev: torch.device, build, dtypes=(torch.int32,)
+):
+    """Device index tensors derived from the host offsets (``build()`` returns one list per dtype), complete when
+    returned and never written. The last 16 are kept, keyed by stream, so a call with the offsets of an earlier one
+    copies nothing."""
+    key = (kind, dev, torch.cuda.current_stream(dev).cuda_stream, tuple(offs))
+    with _INDEX_LOCK:
+        got = _INDEX.get(key)
+        if got is not None:
+            _INDEX.move_to_end(key)
+            return got
+    got = tuple(
+        torch.tensor(values, dtype=dtype, device=dev)
+        for values, dtype in zip(build(), dtypes, strict=True)
+    )
+    with _INDEX_LOCK:
+        _INDEX[key] = got
+        while len(_INDEX) > 16:
+            _INDEX.popitem(last=False)
+    return got
+
+
+def _grown(cached, dev, HV, N) -> Tuple[torch.Tensor, torch.Tensor]:
+    if cached is not None:
+        state = cached[0]
+    else:
+        state = torch.zeros(1, HV, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=dev)
+    skip = torch.full((max(2 * N, 64),), -1, dtype=torch.int32, device=dev)
+    if cached is not None:
+        _RETIRED.append(cached[1])
+    # returned only once filled: another stream may use them next
+    torch.cuda.current_stream(dev).synchronize()
+    return state, skip
+
+
+def zero_state_prefill(rows, cu, offs, scale, out) -> torch.Tensor:
+    """The class's term for whole sequences from the zero state: one pinned launch, no pool read or written."""
+    v = rows[2]
+    dev, HV, N = v.device, int(v.shape[1]), len(offs) - 1
+    cached = _ZERO.get((dev, HV))
+    if cached is None or cached[1].numel() < N:
+        with _ZERO_LOCK:
+            cached = _ZERO.get((dev, HV))
+            if cached is None or cached[1].numel() < N:
+                cached = _ZERO[(dev, HV)] = _grown(cached, dev, HV, N)
+    state, skip = cached
+    if cu is None:
+        (cu,) = index_tensors("cu", offs, dev, lambda: (offs,))
+    return _pinned(rows, cu, list(offs), state, skip[:N], skip[:N], scale, output=out)
 
 
 class GdnPool:

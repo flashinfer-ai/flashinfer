@@ -82,6 +82,15 @@ def check_lse_layout(lse_layout: str) -> None:
         raise ValueError(f"lse_layout must be one of {LSE_LAYOUTS}, got {lse_layout!r}")
 
 
+def check_has_sinks_undeclared(has_sinks: Optional[bool]) -> None:
+    """``plan(has_sinks=)`` is a declaration of the batch-invariant attention; the other backends take sinks per ``run()``."""
+    if has_sinks is not None:
+        raise ValueError(
+            f"has_sinks={has_sinks} is only supported with batch_invariant=True; "
+            "without it, leave has_sinks unset and pass sinks at run()."
+        )
+
+
 class GPUArchitectureError(Exception):
     """Custom exception for GPU architecture-related errors."""
 

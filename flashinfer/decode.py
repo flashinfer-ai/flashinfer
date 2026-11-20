@@ -75,6 +75,7 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
+    check_has_sinks_undeclared,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -2271,6 +2272,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2346,6 +2357,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         use_token_head_sf: bool = False,
         indptr_host: Optional[torch.Tensor] = None,
         fast: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """``plan()`` of the batch-invariant class; ``fast`` is the replan of :func:`fast_decode_plan`."""
         assert self._batch_invariant is not None
@@ -2377,6 +2389,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             seq_lens=seq_lens,
             kv_indptr_host=indptr_host,
             fast=fast,
+            has_sinks=has_sinks,
         )
         self._batch_size = len(indptr) - 1
         self._num_qo_heads = num_qo_heads
@@ -2420,6 +2433,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -2470,8 +2484,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 disable_split_kv=disable_split_kv,
                 q_len_per_req=q_len_per_req,
                 use_token_head_sf=use_token_head_sf,
+                has_sinks=has_sinks,
             )
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         indptr = indptr.contiguous()
@@ -5809,6 +5825,11 @@ def fast_decode_plan(
     ``use_cuda_graph=True`` without device readbacks (``global_override_indptr_cpu``
     is the host copy of ``indptr``, every last-page length is 1 at page size 1,
     the page indices are not range-checked).
+
+    Outside CUDA graphs, ``indptr``, ``indices`` and ``last_page_len`` become the
+    wrapper's buffers without copying, so they must already be on the wrapper's
+    device; a ``ValueError`` is raised otherwise. Use
+    :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
     if getattr(self, "_batch_invariant", None) is not None:
         return self._plan_batch_invariant(
@@ -5973,6 +5994,22 @@ def fast_decode_plan(
                 f"this wrapper was planned with {frozen_q_len}, got "
                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
             )
+    if not self.is_cuda_graph_enabled:
+        # Outside CUDA graphs the metadata tensors become the wrapper's
+        # buffers as-is and run() hands their pointers to the kernel, so they
+        # must already be on the wrapper's device; plan() is the path that
+        # copies host metadata over. Checked before any plan state changes.
+        for name, tensor in (
+            ("indptr", indptr),
+            ("indices", indices),
+            ("last_page_len", last_page_len),
+        ):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} must be on the wrapper's device {self.device}, got "
+                    f"{tensor.device}; plan host metadata with "
+                    "BatchDecodeWithPagedKVCacheWrapper.plan(wrapper, ...)"
+                )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:

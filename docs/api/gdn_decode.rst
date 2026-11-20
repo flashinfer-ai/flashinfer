@@ -17,6 +17,29 @@ recurrent gated delta-rule update for the current decode step.
     gated_delta_rule_mtp
     gated_delta_rule_replayssm_commit
 
+Cake pretranspose decode alignment
+----------------------------------
+
+With a ``[pool_size, HV, V, K]`` state pool (``initial_state``),
+``backend="auto"`` and ``backend="cake_gdn"`` first check the tensors against
+the Cake kernels' contract (among others: CUDA tensors, BF16 q/k/v/a/b and
+output, FP32 ``A_log`` and ``dt_bias``, a BF16 or FP32 state, int32 slot
+indices, K = V = 128). A call that passes it raises ``ValueError``, under
+``backend="auto"`` as under ``backend="cake_gdn"`` and for every row and GPU,
+unless q and k start at a 16-byte aligned address (8-byte with an FP32 state),
+v and the output at an 8-byte aligned one, and the state pool and
+``intermediate_states_buffer`` at a 16-byte aligned one. ``backend="auto"``
+does not fall back to the FlashInfer kernels here: they assume 16-byte (FP32
+state) or 32-byte (BF16 state) aligned q, k, v, output and state. On a call
+the Cake kernels run, the other tensors need only the alignment of their
+element type.
+
+The Cake kernels add the q, k, v and state strides to those vector addresses.
+A view with a stride (of a dimension longer than 1) that is not a whole number
+of those vectors, for example q rows 132 elements apart with a BF16 state, is
+not served by them: ``backend="auto"`` runs the FlashInfer kernel and
+``backend="cake_gdn"`` raises ``CakeGDNUnsupportedError``.
+
 Rubin T=1 bf16-state decode (SM107)
 -----------------------------------
 
@@ -26,7 +49,10 @@ Rubin-tuned kernel under ``backend="auto"``. It requests each 64-row state tile
 at once into shared memory, prefetches a later tile into L2 and issues fewer
 instructions; outputs and the updated state are bitwise equal to the generic
 kernel. ``backend="rubin"`` forces it (any batch size, Rubin only) and
-``backend="flashinfer"`` keeps the generic kernel.
+``backend="flashinfer"`` keeps the generic kernel. The Rubin kernel compiles
+a strided state pool with its strides baked into 16-byte state copies, so
+``backend="auto"`` runs it only when the pool's slot, head and row strides are
+multiples of 8 elements and keeps the generic kernel otherwise.
 
 uGPU localization: Rubin is built from two dies, each with its own SMs and
 memory. Allocate the state pool with :func:`ugpu_state_pool` (layout
@@ -42,6 +68,58 @@ and run the two halves back to back on the current stream.
     :toctree: ../generated
 
     ugpu_state_pool
+
+Locality-domain FP32 decode state (SM107a)
+------------------------------------------
+
+The K-major FP32 decode state of ``gated_delta_rule_decode`` can be homed on
+the two dies of a Rubin GPU: :func:`localize_gdn_decode_state` copies a
+``[B, HV, K, V]`` state into one allocation whose batch rows ``[0, rows0)`` are
+in die 0's memory and the rest in die 1's (by default half the rows on each
+die). Pass the returned tensor as ``state`` from then on. A T=1 call on it with
+``backend="auto"`` or ``backend="cake_gdn"`` runs the locality-domain twin of
+the Cake nontranspose kernel: one launch over both dies whose CTAs take the
+batch rows of their own die first. The output and the updated state are bitwise
+equal to the whole-GPU kernel's.
+
+The twin covers contiguous T=1 calls with BF16 q/k/v/a/b and output, FP32
+``A_log`` and ``dt_bias`` and ``use_qk_l2norm=True``, at H=16 / HV=32 from B=48
+on (scale ``K ** -0.5`` or 1.0), on 212-SM devices, and needs a CUDA 13.5
+toolkit and driver. Two fallbacks apply:
+
+- A call the Cake kernels serve but the twin does not (another row, a view of
+  part of the state, a copy of it), or one whose twin fails to build, load or
+  launch, runs the whole-GPU Cake kernel, with the same bits.
+- A call the Cake kernels do not serve (for example FP16 inputs, a BF16
+  ``dt_bias``, non-contiguous inputs or ``use_qk_l2norm=False``) runs the
+  FlashInfer kernel under ``backend="auto"`` and raises
+  ``CakeGDNUnsupportedError`` under ``backend="cake_gdn"``.
+
+A T=1 call with the contiguous BF16 and FP32 tensors listed above and
+K = V = 128 raises ``ValueError``, under ``backend="auto"`` as under
+``backend="cake_gdn"`` and for every row and GPU, if q or k does not start at
+an 8-byte aligned address or the state does not start at a 16-byte aligned
+one. ``backend="auto"`` does not fall back to the FlashInfer kernel here: that
+kernel assumes 16-byte aligned q, k, v, output and state, also on the calls
+that ``backend="auto"`` hands to it. On a call the Cake kernels run, the other
+tensors need only the alignment of their element type.
+
+The helper returns ``state`` itself, without a copy, under CUDA graph capture
+and wherever it does not home the state (for example a row the twin does not
+cover); otherwise it returns a new homed copy. So
+``localize_gdn_decode_state(state, H, scale) is state`` means only that no copy
+was made, not which kernel a call runs: a call on a state that was never homed
+never runs the twin, but a state that was already homed stays homed, and a call
+of a listed row on it can still run the twin. The homed copy is a new
+allocation that the CUDA driver makes outside PyTorch's caching allocator
+(``torch.cuda.memory_allocated()`` does not count it); the input state stays
+allocated until the caller drops it. Make one eager call before a CUDA graph
+capture, and keep the state alive as long as a graph that reads it.
+
+.. autosummary::
+    :toctree: ../generated
+
+    localize_gdn_decode_state
 
 ReplaySSM speculative verification (SM100/SM103, SM120)
 -------------------------------------------------------
