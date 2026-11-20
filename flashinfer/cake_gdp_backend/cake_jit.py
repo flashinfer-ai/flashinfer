@@ -65,6 +65,20 @@ take the pool's dtype as ``state_dtype`` (``torch.float32`` by default) and
 consider the records of that dtype only, so an FP16 pool runs the twin of the
 program an FP32 pool would run.
 
+An FP16 call also has a launch class: its round count (``philox_rounds``, 0
+without a seed) and whether it stores per-token snapshots
+(``ssm_state_indices`` given).  A selection cell of an FP16 record may bound
+the round count (``rounds_at_least`` / ``rounds_at_most``, inclusive) and name
+the snapshot use (``snapshot``); an absent key admits every value.  Two FP16
+programs have a sibling built with ``snapshot_noise``: the ``l8r4`` program of
+16 tokens and the runtime program of three Householder updates.  The sibling
+draws a launch's random bits once into shared memory instead of at each store,
+which pays only when the launch stores snapshots; it keeps its program's body,
+variant and band and stores the same bits.  Its cells admit the stochastic
+calls with snapshots of the measured cell, and its plain program's cells admit
+every other call of the band, so every call still selects exactly one program
+and an FP16 pool still runs the body and variant an FP32 pool would run.
+
 Prefill: the ``prefill`` route holds the single-pass programs of two kernel
 bodies: the V6 fork-order body (``body`` ``prefill_sm90_v6``: the plain, the
 initial-state and the pool-indexed flag sets, final state stored) and the
@@ -98,8 +112,8 @@ count``); ``l8r2``;
 eight rows
 per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
-count up to ``max_t_steps``), ``use_qk_l2norm`` and, on an FP16-pool record,
-``state_dtype``.  Prefill: the six flags
+count up to ``max_t_steps``), ``use_qk_l2norm``, on an FP16-pool record
+``state_dtype`` and on a sibling ``snapshot_noise``.  Prefill: the six flags
 ``use_initial_state``, ``use_state_indices``, ``store_final_state``,
 ``unit_gates``, ``unit_beta`` and ``segment_pass`` beside the defaults of the
 kernel's build signature (the I/O dtype ``bf16``, the WY solve arm, the O
@@ -872,12 +886,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "snapshot": False,
+            },
+        ],
     },
     "cake_gdp_1a3d01a5826508d64a06": {
         "arches": [
@@ -4402,6 +4426,165 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
+    "cake_gdp_b047f2f1a20630e6f36b": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "snapshot_noise": True,
+            "state_dtype": "f16",
+            "t_steps": 16,
+            "use_qk_l2norm": True,
+            "variant": "l8r4",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_b047f2f1a20630e6f36b",
+        "kernel_symbol": "kernel_cake_gdp_b047f2f1a20630e6f36b",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 61824,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_b047f2f1a20630e6f36b",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_above": 2,
+            "kind": "state_heads_between",
+            "rounds_at_least": 5,
+            "snapshot": True,
+        },
+    },
     "cake_gdp_b81854850bf4b769295c": {
         "arches": [
             "sm_90a",
@@ -6615,6 +6798,164 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
+    "cake_gdp_efdf403e0df822bfc83f": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 3,
+            "snapshot_noise": True,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l4r4",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_efdf403e0df822bfc83f",
+        "kernel_symbol": "kernel_cake_gdp_efdf403e0df822bfc83f",
+        "launch": {
+            "block": (
+                64,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 61824,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_efdf403e0df822bfc83f",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "kind": "state_heads_between",
+            "rounds_at_least": 10,
+            "snapshot": True,
+        },
+    },
     "cake_gdp_f0b0248a8e7d3ad6047d": {
         "arches": [
             "sm_90a",
@@ -7393,7 +7734,20 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "kind": "state_heads_between",
+                "rounds_at_most": 9,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "kind": "state_heads_between",
+                "snapshot": False,
+            },
+        ],
     },
     "cake_gdp_f65e08f2c35db6ffe971": {
         "arches": [
@@ -8312,6 +8666,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_8e26e2c2d0cb0a7fbee9",
             "cake_gdp_16d24c9e19fa73fe57ee",
             "cake_gdp_f5d305e6f05978caca3c",
+            "cake_gdp_b047f2f1a20630e6f36b",
+            "cake_gdp_efdf403e0df822bfc83f",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
@@ -8364,6 +8720,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_8e26e2c2d0cb0a7fbee9",
             "cake_gdp_16d24c9e19fa73fe57ee",
             "cake_gdp_f5d305e6f05978caca3c",
+            "cake_gdp_b047f2f1a20630e6f36b",
+            "cake_gdp_efdf403e0df822bfc83f",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
@@ -8550,24 +8908,56 @@ def route_modules(
     return tuple(names)
 
 
-def _selects(rule: Any, state_heads: int, sm_count: int, arch: str) -> bool:
-    """Whether a static program's band admits ``state_heads = B x HV`` on a device of ``sm_count`` SMs of ``arch``:
-    ``above < state_heads <= at_most`` (``at_most`` ``None`` = unbounded) within the wave bounds
-    ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads > ctas_per_sm_above x sm_count`` and the
-    inclusive ``state_heads >= ctas_per_sm_at_least x sm_count`` / ``state_heads < ctas_per_sm_below x sm_count``
-    when the rule carries them.  A cell naming ``arches`` applies on those architectures only (a band that differs
-    per architecture); a list of such cells is a band of several intervals and admits when any cell does.  ``None``
-    (a runtime program) admits everything."""
+def _selects(
+    rule: Any,
+    state_heads: int,
+    sm_count: int,
+    arch: str,
+    *,
+    philox_rounds: int = 0,
+    snapshot: bool = False,
+) -> bool:
+    """Whether a program's rule admits ``state_heads = B x HV`` on a device of ``sm_count`` SMs of ``arch`` in the
+    launch class (``philox_rounds``, ``snapshot``): ``above < state_heads <= at_most`` (``at_most`` ``None`` =
+    unbounded) within the wave bounds ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads >
+    ctas_per_sm_above x sm_count`` and the inclusive ``state_heads >= ctas_per_sm_at_least x sm_count`` /
+    ``state_heads < ctas_per_sm_below x sm_count`` when the rule carries them.  An FP16 record's cell may also bound
+    the launch class: ``rounds_at_least <= philox_rounds <= rounds_at_most`` (inclusive; an absent bound is open;
+    ``philox_rounds`` is 0 for a call that rounds to nearest even) and ``snapshot`` equal to the cell's when it
+    names one (``True`` for a call that stores per-token snapshots).  A cell naming ``arches`` applies on those
+    architectures only (a band that differs per architecture); a list of such cells is a band of several intervals
+    and admits when any cell does.  ``None`` (a runtime program without cells) admits everything."""
 
     if rule is None:
         return True
     if isinstance(rule, list):
-        return any(_selects(cell, state_heads, sm_count, arch) for cell in rule)
+        return any(
+            _selects(
+                cell,
+                state_heads,
+                sm_count,
+                arch,
+                philox_rounds=philox_rounds,
+                snapshot=snapshot,
+            )
+            for cell in rule
+        )
     kind = rule["kind"]
     if kind != "state_heads_between":
         raise ValueError(f"unknown Cake GDP decode selection rule: {kind!r}")
     arches = rule.get("arches")
     if arches is not None and arch not in arches:
+        return False
+    rounds_at_least, rounds_at_most = (
+        rule.get("rounds_at_least"),
+        rule.get("rounds_at_most"),
+    )
+    if rounds_at_least is not None and philox_rounds < int(rounds_at_least):
+        return False
+    if rounds_at_most is not None and philox_rounds > int(rounds_at_most):
+        return False
+    wanted = rule.get("snapshot")
+    if wanted is not None and bool(snapshot) != bool(wanted):
         return False
     state_heads, sm_count = int(state_heads), int(sm_count)
     at_most = rule["at_most"]
@@ -8601,24 +8991,61 @@ def selected_module(
     sm_count: int,
     use_qk_l2norm: bool = True,
     state_dtype: torch.dtype = torch.float32,
+    philox_rounds: int = 0,
+    use_ssm_state_indices: bool = False,
 ) -> str:
     """The one module a public call launches on ``arch`` for ``num_tokens`` tokens of ``state_heads = B x HV``
-    state heads on a device of ``sm_count`` SMs (``sm_count(device_index)``) over a ``state_dtype`` state pool.
+    state heads on a device of ``sm_count`` SMs (``sm_count(device_index)``) over a ``state_dtype`` state pool, in
+    the launch class of the call: its Philox round count ``philox_rounds`` (0 for a call that rounds to nearest
+    even and for an FP32 pool) and whether it stores per-token snapshots (``use_ssm_state_indices``).  Both are
+    host values, so the choice reads no tensor.
 
     This is the band rule of the kernel (its ``band_variant``), spelled once as the records' ``select_rule``
     leaves: a route carries static-token-count programs (``build["t_steps"]`` = the call's ``T``), each owning a
     band of state-head counts (``above < state_heads <= at_most`` within optional wave bounds, multiples of the SM
     count; a band of several intervals is a list of such cells, and a cell may name the ``arches`` it applies to),
-    and one runtime-token-count program (``build["t_steps"]`` ``None``, ``T`` up to ``build["max_t_steps"]``) for
-    every other call.  Exactly one static program may admit a call; the runtime program is the fallback.  Only the
-    records of the pool's dtype take part (``build["state_dtype"]``, ``"f32"`` when absent): an FP16 record has
-    the band of its FP32 twin, so both pools select the same program body.
+    and runtime-token-count programs (``build["t_steps"]`` ``None``, ``T`` up to ``build["max_t_steps"]``) for
+    every other call.  Exactly one static program may admit a call; else the admitting runtime program with the
+    fewest ``max_t_steps`` runs (two such programs are an error).  Only the records of the pool's dtype take part
+    (``build["state_dtype"]``, ``"f32"`` when absent): an FP16 record has the band of its FP32 twin, so both pools
+    select the same program body and variant.  The cells of an FP16 record may also bound the launch class
+    (:func:`_selects`): a ``snapshot_noise`` sibling admits the stochastic calls with snapshots of its cell and its
+    plain program every other call, so they split the band of one FP32 program between them.  An FP32 record has
+    no class keys, so its choice does not depend on the launch class.
+
+    The choice is a function of these host values only, so it is cached: an eager call pays one lookup.
     """
 
-    num_tokens, state_heads = int(num_tokens), int(state_heads)
+    return _selected_module_cached(
+        arch,
+        int(num_householder),
+        int(num_tokens),
+        int(state_heads),
+        int(sm_count),
+        bool(use_qk_l2norm),
+        state_dtype,
+        int(philox_rounds),
+        bool(use_ssm_state_indices),
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _selected_module_cached(
+    arch: str,
+    num_householder: int,
+    num_tokens: int,
+    state_heads: int,
+    sm_count: int,
+    use_qk_l2norm: bool,
+    state_dtype: torch.dtype,
+    philox_rounds: int,
+    snapshot: bool,
+) -> str:
+    """:func:`selected_module` of normalized host values (an error is raised again on every call, not cached)."""
+
     if num_tokens < 1:
         raise ValueError("num_tokens must be positive")
-    if int(sm_count) < 1:
+    if sm_count < 1:
         raise ValueError("sm_count must be positive")
     route_modules(arch, num_householder, use_qk_l2norm)  # an unknown route raises here
     names = _route_names(arch, num_householder, use_qk_l2norm, state_dtype)
@@ -8627,35 +9054,53 @@ def selected_module(
             f"the {route_key(num_householder, use_qk_l2norm)!r} route on {arch!r} has no program for a "
             f"{state_dtype} state pool"
         )
+
+    def admits(name: str) -> bool:
+        return _selects(
+            MODULES[name]["select_rule"],
+            state_heads,
+            sm_count,
+            arch,
+            philox_rounds=philox_rounds,
+            snapshot=snapshot,
+        )
+
     static = [
         name
         for name in names
-        if MODULES[name]["build"]["t_steps"] == num_tokens
-        and _selects(MODULES[name]["select_rule"], state_heads, sm_count, arch)
+        if MODULES[name]["build"]["t_steps"] == num_tokens and admits(name)
     ]
     if len(static) > 1:
         raise ValueError(
             f"{len(static)} static programs of the {route_key(num_householder, use_qk_l2norm)!r} route on {arch!r} "
-            f"admit T={num_tokens}, {state_heads} state heads: {static}"
+            f"admit T={num_tokens}, {state_heads} state heads, philox_rounds={philox_rounds}, "
+            f"use_ssm_state_indices={snapshot}: {static}"
         )
     if static:
         return static[0]
-    runtime = sorted(
-        (
-            name
-            for name in names
-            if MODULES[name]["build"]["t_steps"] is None
-            and MODULES[name]["build"]["max_t_steps"] >= num_tokens
-        ),
-        key=lambda name: MODULES[name]["build"]["max_t_steps"],
-    )
+    runtime = [
+        name
+        for name in names
+        if MODULES[name]["build"]["t_steps"] is None
+        and MODULES[name]["build"]["max_t_steps"] >= num_tokens
+        and admits(name)
+    ]
     if not runtime:
         raise ValueError(
             f"no exported module of the {route_key(num_householder, use_qk_l2norm)!r} route on {arch!r} admits "
-            f"T={num_tokens} tokens (at most "
+            f"T={num_tokens} tokens, {state_heads} state heads, philox_rounds={philox_rounds}, "
+            f"use_ssm_state_indices={snapshot} (T at most "
             f"{max_num_tokens(arch, num_householder, use_qk_l2norm, state_dtype=state_dtype)})"
         )
-    return runtime[0]
+    fewest = min(MODULES[name]["build"]["max_t_steps"] for name in runtime)
+    tied = [name for name in runtime if MODULES[name]["build"]["max_t_steps"] == fewest]
+    if len(tied) > 1:
+        raise ValueError(
+            f"{len(tied)} runtime programs of the {route_key(num_householder, use_qk_l2norm)!r} route on {arch!r} "
+            f"admit T={num_tokens}, {state_heads} state heads, philox_rounds={philox_rounds}, "
+            f"use_ssm_state_indices={snapshot}: {tied}"
+        )
+    return tied[0]
 
 
 # Prefill: the single-pass route, the six flags a ``prefill_flags`` select rule

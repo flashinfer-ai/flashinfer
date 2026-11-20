@@ -46,7 +46,7 @@
 #define CAKE_STR_(x) #x
 #define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ KV, float* __restrict__ fp8_lut, int* __restrict__ page_table, int* __restrict__ sparse_indices, int* __restrict__ row_batches, int* __restrict__ row_seq_lens, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, float* __restrict__ sinks, int num_heads, int qk_dim, int value_dim, int kv_stride, int page_size, int page_table_width, int sparse_width, int use_sparse, float softmax_scale, float bmm2_scale, int enable_sink, int write_lse);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_c5f637fcd75d965a649f(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ KV, float* __restrict__ fp8_lut, int* __restrict__ page_table, int* __restrict__ sparse_indices, int* __restrict__ row_batches, int* __restrict__ row_seq_lens, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, float* __restrict__ sinks, int num_heads, int qk_dim, int value_dim, int kv_stride, int page_size, int page_table_width, int sparse_width, int use_sparse, float softmax_scale, float bmm2_scale, int enable_sink, int write_lse);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -160,9 +160,9 @@ void Run(TensorView arg_Q, TensorView arg_KV, TensorView arg_fp8_lut, TensorView
   dim3 block(32u, 1u, 1u);
 
   cudaError_t launch_status = cudaLaunchKernel(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95), grid, block, kargs, 16384u, stream);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_c5f637fcd75d965a649f), grid, block, kargs, 16384u, stream);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernel for kernel_cake_trtllm_mla_blackwell_6ba043a3192bee6bfe95 failed: "
+      << "cudaLaunchKernel for kernel_cake_trtllm_mla_blackwell_c5f637fcd75d965a649f failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS

@@ -217,6 +217,52 @@ def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
     assert not torch.equal(pool_facade, pool_before)
 
 
+@pytest.mark.parametrize("seeded", (False, True))
+def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
+    seeded: bool, monkeypatch
+) -> None:
+    """A facade call over an FP16 pool that stores per-token snapshots at T = 10 (the runtime program of three
+    Householder updates) launches that program's ``snapshot_noise`` sibling with 10 Philox rounds and the plain
+    program when it rounds to nearest even; output and pool bits equal the backend's."""
+    if not loader.route_applies(
+        device_capability=get_compute_capability(_device()),
+        num_householder=3,
+        num_tokens=10,
+        state_dtype=torch.float16,
+    ):
+        pytest.skip("no FP16-pool program on this device")
+    launched: list[str] = []
+    original = loader.run_module
+
+    def recording(name, values, **kwargs):
+        launched.append(name)
+        return original(name, values, **kwargs)
+
+    monkeypatch.setattr(loader, "run_module", recording)
+    inputs = _inputs(3, 10, torch.Generator(device=_device()).manual_seed(SEED + 11))
+    inputs["initial_state"] = inputs["initial_state"].half()
+    ssm = torch.full((4, 10), -1, dtype=torch.int32, device=_device())
+    ssm[:, -1] = torch.tensor((1, 3, 6, 5), dtype=torch.int32, device=_device())
+    ssm[0, 4] = 8
+    inputs["ssm_state_indices"] = ssm
+    if seeded:
+        inputs["rand_seed"] = torch.tensor(
+            [-12345], dtype=torch.int64, device=_device()
+        )
+        inputs["philox_rounds"] = 10
+    pool_before = inputs["initial_state"].clone()
+    out, pool = cake_gated_delta_product_mtp(**inputs)
+    pool_facade = pool.clone()
+    inputs["initial_state"].copy_(pool_before)
+    out_backend, _ = backend.cake_gated_delta_product_mtp(**inputs)
+    assert len(launched) == 2 and launched[0] == launched[1], launched
+    sibling = bool(loader.MODULES[launched[0]]["build"].get("snapshot_noise"))
+    assert sibling == seeded, launched
+    assert _same_bits(out, out_backend)
+    assert _same_bits(pool_facade, inputs["initial_state"])
+    assert not torch.equal(pool_facade[8], pool_before[8])
+
+
 def test_unsupported_state_dtype_is_reported() -> None:
     """A state pool dtype outside float32 / float16 is refused by both predicates with ``False`` (no raise)."""
     assert is_cake_gdp_supported(_device(), state_dtype=torch.bfloat16) is False
