@@ -32,6 +32,8 @@ from cutlass.cute.typing import (
     Optional,
 )
 
+from ...cute_dsl.utils import mbarrier_wait_acquire_cluster
+
 from .qmul4 import (
     dequantize_nvfp4x8_ldsm,
 )
@@ -2169,8 +2171,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                                 mbar_ptr=remote_stats_mbar,
                             )
 
-                cute.arch.fence_acq_rel_cta()
-                cute.arch.mbarrier_wait(cga_partial_mbar, phase=0)
+                mbarrier_wait_acquire_cluster(cga_partial_mbar, Int32(0))
 
                 if cutlass.const_expr(tiles_dm == 2):
                     merge_heads = self.logical_grouped_heads

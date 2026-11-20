@@ -246,3 +246,24 @@ def test_long_decode_and_empty_splits(d, length, splits, monkeypatch):
     assert torch.all((out.float() - expected).abs() <= bound)
     eager = paged_decode_residue(*args, num_splits=splits)
     torch.testing.assert_close(out, eager, atol=0, rtol=0)
+
+
+def test_cga_wait_acquires_peer_writes(tmp_path, monkeypatch):
+    from cutlass import cute
+
+    from flashinfer.experimental.resserve_resattn import host
+
+    compile_kernel = cute.compile
+
+    def compile_with_ptx(*args, **kwargs):
+        kwargs["options"] += f" --keep-ptx --dump-dir {tmp_path}"
+        return compile_kernel(*args, **kwargs)
+
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    monkeypatch.setattr(cute, "compile", compile_with_ptx)
+    host._compiled.__wrapped__(12, 2, 128, "cga_sharded", 128)
+    (ptx_path,) = tmp_path.glob("*.ptx")
+    ptx = ptx_path.read_text()
+    # The relaxed cluster wait and restricted acquire fence order peer DSMEM stores.
+    wait = ptx.index("mbarrier.try_wait.parity.relaxed.cluster")
+    assert "fence.acquire.sync_restrict::shared::cluster.cluster" in ptx[wait:]
