@@ -3458,13 +3458,22 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
          ffi::TensorView cum_seq_lens_q, int64_t max_q_len, ffi::TensorView sinks,
          ffi::TensorView out) {
   if (q.shape()[0] == 0) TVM_FFI_THROW(ValueError) << "q must contain at least one token";
+  if (seq_lens.shape()[0] == 0)
+    TVM_FFI_THROW(ValueError) << "seq_lens must contain at least one request";
   if (seq_lens.shape()[0] + 1 != cum_seq_lens_q.shape()[0])
     TVM_FFI_THROW(ValueError) << "cum_seq_lens_q must have seq_lens.shape[0] + 1 entries";
   for (const auto& tensor : {q, swa, ckv, out}) {
     if (reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 != 0)
       TVM_FFI_THROW(ValueError) << "q, swa, ckv and out must be 16-byte aligned";
   }
-  DLDevice dev = q.device();
+  const DLDevice dev = q.device();
+  if (dev.device_type != kDLCUDA) TVM_FFI_THROW(ValueError) << "q must be a CUDA tensor";
+  for (const auto& tensor :
+       {swa, ckv, sparse_indices, sparse_topk_lens, seq_lens, cum_seq_lens_q, sinks, out}) {
+    const DLDevice other = tensor.device();
+    if (other.device_type != dev.device_type || other.device_id != dev.device_id)
+      TVM_FFI_THROW(ValueError) << "all operands must be on the same CUDA device as q";
+  }
   if (!supported_device_ordinal(dev.device_id))
     TVM_FFI_THROW(ValueError) << "unsupported specialized device ordinal: " << dev.device_id;
   cudaStream_t stream =

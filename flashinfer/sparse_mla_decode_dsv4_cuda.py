@@ -167,6 +167,10 @@ def supported_with_reasons(
         ),
         ("no_remap_buffer", extras.get("remapped_sparse_indices_buffer") is None),
         (
+            "no_multi_ctas_kv_counter_buffer",
+            extras.get("multi_ctas_kv_counter_buffer") is None,
+        ),
+        (
             "no_rope_quant",
             extras.get("dsv4_inv_rope_cos_sin_cache") is None
             and extras.get("dsv4_output_scale") is None,
@@ -341,8 +345,7 @@ def maybe_dispatch_specialized(
             ]
             DISPATCH_STATS["fallback"] += 1
             return None
-        DISPATCH_STATS["specialized"] += 1
-        return _run_specialized(
+        result = _run_specialized(
             mod,
             query,
             swa_kv_cache,
@@ -355,6 +358,8 @@ def maybe_dispatch_specialized(
             sinks,
             out,
         )
+        DISPATCH_STATS["specialized"] += 1
+        return result
     if backend == "specialized":
         raise ValueError(
             "backend='specialized' cannot serve this call and is never "

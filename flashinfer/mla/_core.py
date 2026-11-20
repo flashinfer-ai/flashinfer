@@ -2292,6 +2292,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 extra_sparse_indices=extra_sparse_indices,
                 extra_sparse_topk_lens=extra_sparse_topk_lens,
                 sparse_indices_are_storage_offsets=(sparse_indices_are_storage_offsets),
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
                 dsv4_inv_rope_cos_sin_cache=dsv4_inv_rope_cos_sin_cache,
                 dsv4_output_scale=dsv4_output_scale,

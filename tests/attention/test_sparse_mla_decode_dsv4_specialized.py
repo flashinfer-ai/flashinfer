@@ -278,6 +278,14 @@ def test_cuda_graph_replay_matches_eager(monkeypatch):
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
 
+    # Same addresses, but the six tokens now see only 1..6 SWA columns.
+    inp["seq_lens"].fill_(6)
+    gold = _reference(inp).float()
+    assert (gold - eager.float()).abs().max().item() > 0.024
+    out.fill_(float("nan"))
+    g.replay()
+    _assert_close(out, gold)
+
 
 @requires_sm103
 def test_invalid_table_entries_never_reach_a_gather():
@@ -488,6 +496,49 @@ def test_eager_length_validation(monkeypatch, backend, name, value, message):
     assert before == spec_mod.DISPATCH_STATS
 
 
+def _ffi_run(mod, inp):
+    mod.sparse_mla_decode_dsv4_run(
+        inp["q"],
+        inp["swa_kv_cache"],
+        inp["compressed_kv_cache"],
+        inp["sparse_indices"],
+        inp["sparse_topk_lens"],
+        inp["seq_lens"],
+        inp["cum_seq_lens_q"],
+        inp["max_q_len"],
+        inp["sinks"],
+        inp["out"],
+    )
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "case", ["cpu_query", "cpu_metadata", "other_gpu", "empty_requests"]
+)
+def test_ffi_rejects_invalid_operands(case):
+    if case == "other_gpu" and torch.cuda.device_count() < 2:
+        pytest.skip("cross-device operand requires two visible GPUs")
+    inp = _direct_inputs(1, [6])
+    inp["out"] = torch.empty_like(inp["q"])
+    if case == "cpu_query":
+        inp["q"] = inp["q"].cpu()
+        message = "q must be a CUDA tensor"
+    elif case == "cpu_metadata":
+        inp["seq_lens"] = inp["seq_lens"].cpu()
+        message = "same CUDA device as q"
+    elif case == "other_gpu":
+        other = 1 if inp["q"].device.index == 0 else 0
+        inp["out"] = inp["out"].to(torch.device("cuda", other))
+        message = "same CUDA device as q"
+    else:
+        inp["seq_lens"] = inp["seq_lens"][:0]
+        inp["cum_seq_lens_q"] = inp["cum_seq_lens_q"][:1]
+        message = "at least one request"
+    mod = spec_mod.get_sparse_mla_decode_dsv4_module()
+    with pytest.raises(ValueError, match=message):
+        _ffi_run(mod, inp)
+
+
 @requires_sm103
 @pytest.mark.parametrize(
     "operand,reason",
@@ -508,18 +559,7 @@ def test_offset_view_alignment(monkeypatch, operand, reason):
     assert inp[operand].is_contiguous() and inp[operand].data_ptr() % 16 == 2
     mod = spec_mod.get_sparse_mla_decode_dsv4_module()
     with pytest.raises(ValueError, match="16-byte aligned"):
-        mod.sparse_mla_decode_dsv4_run(
-            inp["q"],
-            inp["swa_kv_cache"],
-            inp["compressed_kv_cache"],
-            inp["sparse_indices"],
-            inp["sparse_topk_lens"],
-            inp["seq_lens"],
-            inp["cum_seq_lens_q"],
-            6,
-            inp["sinks"],
-            inp["out"],
-        )
+        _ffi_run(mod, inp)
     with pytest.raises(ValueError, match=reason):
         _api(inp, out=inp["out"], backend="specialized")
 
@@ -535,6 +575,67 @@ def test_offset_view_alignment(monkeypatch, operand, reason):
     with pytest.raises(ReachedStock):
         _api(inp, out=inp["out"])
     assert [reason] == spec_mod.LAST_FALLBACK_REASONS
+
+
+@requires_sm103
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_loaded_specialization_run_error_propagates(monkeypatch, backend):
+    from types import SimpleNamespace
+
+    from flashinfer.mla import _core
+
+    inp = _direct_inputs(1, [6])
+    error = RuntimeError("specialized launch failed")
+
+    def run(*args):
+        raise error
+
+    monkeypatch.setattr(
+        spec_mod, "_MODULE", SimpleNamespace(sparse_mla_decode_dsv4_run=run)
+    )
+    monkeypatch.setattr(spec_mod, "_WARMED", set())
+    monkeypatch.setattr(
+        _core, "_resolve_dsv4_sparse_mla_backend", lambda *_: pytest.fail("stock retry")
+    )
+    before = dict(spec_mod.DISPATCH_STATS)
+    with pytest.raises(RuntimeError) as exc:
+        _api(inp, backend=backend)
+    assert exc.value is error
+    assert before == spec_mod.DISPATCH_STATS
+    assert not spec_mod._WARMED
+
+
+@requires_sm103
+def test_counter_buffer_routes_to_trtllm():
+    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
+
+    inp = _make_inputs(1, 6, 1024, seed=83)
+    gold = _reference(inp).float()
+    dev = inp["q"].device
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    size = get_trtllm_gen_multi_ctas_kv_counter_bytes(1, H, sms)
+    buf = torch.zeros(size, dtype=torch.uint8, device=dev)
+    before = dict(spec_mod.DISPATCH_STATS)
+    reason = "no_multi_ctas_kv_counter_buffer"
+    with pytest.raises(ValueError, match=reason):
+        _api(inp, backend="specialized", multi_ctas_kv_counter_buffer=buf)
+    assert before == spec_mod.DISPATCH_STATS
+    _assert_close(_api(inp, multi_ctas_kv_counter_buffer=buf), gold)
+    assert [reason] == spec_mod.LAST_FALLBACK_REASONS
+    assert spec_mod.DISPATCH_STATS["fallback"] == before["fallback"] + 1
+
+    # Explicit TRTLLM is the oracle for the stock size diagnostic.
+    short = buf[:-1]
+    with pytest.raises(ValueError) as stock:
+        _api(inp, backend="trtllm-gen", multi_ctas_kv_counter_buffer=short)
+    with pytest.raises(ValueError) as auto:
+        _api(inp, multi_ctas_kv_counter_buffer=short)
+    assert str(auto.value) == str(stock.value)
+    assert [reason] == spec_mod.LAST_FALLBACK_REASONS
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+    _assert_close(_api(inp, multi_ctas_kv_counter_buffer=None), gold)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1
+    assert spec_mod.DISPATCH_STATS["fallback"] == before["fallback"] + 2
 
 
 @requires_sm103
