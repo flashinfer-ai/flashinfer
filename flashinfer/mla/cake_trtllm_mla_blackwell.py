@@ -675,8 +675,19 @@ _WORKSPACE_CACHE_CAPACITY = 32
 # (batch * q_len) at which it measured faster than the value-split program it
 # replaces on that device.  The smallest max_seq_len is a tuning-bucket edge
 # (``_round_to_seq_len_bucket``), so every max_seq_len of a bucket selects one
-# domain.  A device that is not listed never selects it.
-_SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {("sm_103a", 152): (1025, 18)}
+# domain.  A device that is not listed never selects it.  Change a range by
+# editing its entry below (the auto offer table's units must keep their domain;
+# its consistency test checks both edges of every listed max_seq_len bucket).
+_SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {
+    # B200: every measured cell of max_seq_len buckets 4096 to 16384 (1 to 18
+    # query rows, page 32 and 64, uniform, varied, padded and sink lengths) ran
+    # faster than the value-split program beyond noise; bucket 2048 had slower
+    # cells up to its upper edge, so the range starts at bucket 4096.
+    ("sm_100a", 148): (2049, 18),
+    # GB300: provisional, until its stateless A/B against the value-split
+    # program is measured.
+    ("sm_103a", 152): (1025, 18),
+}
 # Most KV splits the split-KV reducer merges.
 _SPLITKV_MAX_SPLIT = 32
 

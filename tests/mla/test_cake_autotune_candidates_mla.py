@@ -1797,9 +1797,9 @@ def test_cake_miss_runs_the_tuned_first_stage_winner(monkeypatch, fresh_tuner, m
 # generated for the device, see ``_one_wave_route``) and with the longest-first
 # order program (128, and 300 with a partial last order CTA); FP8 page 64 has one
 # domain. Sinks make every BF16 row VQUARTER, with several work items per cluster
-# above 18 rows. The split-KV geometries (max_seq_len past 1024, few rows) reach
-# the split-KV program on the devices ``_SPLITKV_RANGE`` lists. The tail domains
-# never join backend="auto".
+# above 18 rows. The split-KV geometries (max_seq_len bucket 4096, few rows) reach
+# the split-KV program on the devices whose ``_SPLITKV_RANGE`` covers them (B200
+# from 2049, GB300 from 1025). The tail domains never join backend="auto".
 _PARITY_GEOMETRIES = {
     "bf16_p32_vquarter": (torch.bfloat16, 32, 4),
     "bf16_p32_vhalf": (torch.bfloat16, 32, 32),
@@ -1811,7 +1811,7 @@ _PARITY_GEOMETRIES = {
     "fp8_p64_small": (torch.float8_e4m3fn, 64, 4),
     "fp8_p64_large": (torch.float8_e4m3fn, 64, 128),
     "bf16_p32_splitkv": (torch.bfloat16, 32, 4, 4096),
-    "bf16_p64_splitkv": (torch.bfloat16, 64, 4, 2048),
+    "bf16_p64_splitkv": (torch.bfloat16, 64, 4, 3072),
 }
 
 # Variants: padded requests have seq_lens 0 (every third request); with q_len 2
@@ -1846,8 +1846,8 @@ _AUTO_SKIPPED_VARIANTS = {
 def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
     """Skip the expected cells: variants backend="auto" never offers, FP8 with
     sinks (the tail program), CLC with bmm2_scale != 1, the one-wave CLC
-    geometry on a device without that program and the split-KV geometries on a
-    device ``_SPLITKV_RANGE`` does not list."""
+    geometry on a device without that program and the split-KV geometries
+    outside the device's ``_SPLITKV_RANGE``."""
     dtype = _PARITY_GEOMETRIES[geometry][0]
     if "sinks" in variant and dtype != torch.bfloat16:
         pytest.skip("FP8 with sinks takes the tail program, which never joins")
@@ -1857,8 +1857,13 @@ def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
         pytest.skip("the CLC domain requires bmm2_scale == 1")
     if geometry == "bf16_p32_clc_one_wave" and not _one_wave_route(arch, num_sms):
         pytest.skip(f"no one-wave CLC program for {arch} with {num_sms} SMs")
-    if "splitkv" in geometry and (arch, num_sms) not in cake_module._SPLITKV_RANGE:
-        pytest.skip(f"no split-KV domain for {arch} with {num_sms} SMs")
+    if "splitkv" in geometry:
+        _, _, rows, max_seq_len = _PARITY_GEOMETRIES[geometry]
+        limits = cake_module._SPLITKV_RANGE.get((arch, num_sms))
+        if limits is None or max_seq_len < limits[0] or rows > limits[1]:
+            pytest.skip(
+                f"no split-KV domain for {geometry} on {arch} with {num_sms} SMs"
+            )
 
 
 def _parity_case(geometry, q_len=1, seed=0):

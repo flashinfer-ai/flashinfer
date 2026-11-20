@@ -2117,11 +2117,45 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             },
             "mla_bf16_native_split8_pdl",
         ),
-        # Devices not listed (B200, B300) and callers without arch never select it.
+        # B200: from max_seq_len 2049, the first max_seq_len of tuning bucket
+        # 4096, up to 18 query rows.
         (
-            {"arch": "sm_100a", "num_sms": 148, "max_seq_len": 4096},
+            {
+                "arch": "sm_100a",
+                "num_sms": 148,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2048,
+            },
             "mla_bf16_vquarter",
         ),
+        (
+            {
+                "arch": "sm_100a",
+                "num_sms": 148,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2049,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {"arch": "sm_100a", "num_sms": 148, "max_seq_len": 4096},
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_100a",
+                "num_sms": 148,
+                "batch_size": 19,
+                "q_len": 1,
+                "total_q": 19,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vhalf",
+        ),
+        # Devices not listed (B300 and other SM counts) and callers without arch
+        # never select it.
         (
             {"arch": "sm_103a", "num_sms": 148, "max_seq_len": 4096},
             "mla_bf16_vquarter",
@@ -2564,16 +2598,16 @@ def _blackwell_resident() -> int:
 
 
 def _list_splitkv_device(domain: str, monkeypatch) -> None:
-    """For a split-KV case, list the current device in ``_SPLITKV_RANGE`` as GB300
-    is listed (from max_seq_len 1025, up to 18 query rows), so the case reaches the
-    split-KV program of every Blackwell device, including the sm_100a build that no
-    device selects yet."""
+    """For a split-KV case, list the current device in ``_SPLITKV_RANGE`` from
+    max_seq_len 1025 up to 18 query rows, so the case reaches the split-KV
+    program on every Blackwell device, also one that is not listed or whose
+    listed range starts at a longer max_seq_len (B200: 2049)."""
     from flashinfer.mla import cake_trtllm_mla_blackwell as module
 
     if domain != "mla_bf16_splitkv":
         return
     facts = module._device_facts(torch.cuda.current_device())
-    if facts not in module._SPLITKV_RANGE:
+    if module._SPLITKV_RANGE.get(facts) != (1025, 18):
         monkeypatch.setattr(
             module, "_SPLITKV_RANGE", {**module._SPLITKV_RANGE, facts: (1025, 18)}
         )
