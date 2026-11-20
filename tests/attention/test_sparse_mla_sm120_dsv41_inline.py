@@ -297,6 +297,40 @@ def _inline_view(footer: torch.Tensor, fmt, span: int, pitch: int = 0) -> torch.
     return view
 
 
+def _assert_inline_and_footer_decode_accuracy(
+    actual, footer_output, q, cache, indices, extra_cache=None, extra_indices=None
+):
+    """Check both cache-layout routes against FP64 attention on the same KV.
+
+    This is a cache-addressing and numerical-accuracy test, not a fusion test.
+    The footer kernel's output is another result being checked, not the oracle.
+    Inline decode uses 32-candidate probability quantization and different KV
+    splits, so the two kernels need not produce identical BF16 rounding. Their
+    independent reference decodes the footer bytes, gathers the logical sparse
+    indices, and computes dense FP64 softmax/PV without either kernel's helpers.
+    Fused/separate-stage equivalence is covered by the decode fusion tests.
+    """
+    from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1
+
+    q = q.reshape(-1, q.shape[-2], 512).double()
+    gathered, masks = [], []
+    for packed, ids in ((cache, indices), (extra_cache, extra_indices)):
+        if packed is None:
+            continue
+        decoded = dequantize_kv_dsv4_1(packed).reshape(-1, 512).double()
+        gathered.append(decoded[ids.clamp_min(0).long()])
+        masks.append(ids >= 0)
+    kv = torch.cat(gathered, dim=1)
+    scores = q @ kv.transpose(1, 2) * 512**-0.5
+    scores.masked_fill_(~torch.cat(masks, dim=1)[:, None], -torch.inf)
+    expected = scores.softmax(-1) @ kv
+    for output in (actual, footer_output):
+        output = output.reshape_as(expected).double()
+        assert torch.isfinite(output).all()
+        error = (output - expected).norm() / expected.norm().clamp_min(1e-30)
+        assert error.item() < 0.03, error.item()
+
+
 def _assert_prefill_output_rounding(actual, expected):
     # CuTe and legacy FP8 prefill have different FP32 reduction trees. Bound
     # the resulting BF16 rounding difference while retaining a global error gate.
@@ -379,7 +413,12 @@ def test_inline_attention_matches_footer(
     )
     torch.cuda.synchronize()
     assert torch.isfinite(ref_out).all()
-    if tokens > 64 and precision != "bf16" and extra != "fp4":
+    if tokens <= 64 and precision != "bf16" and extra != "fp4":
+        _assert_inline_and_footer_decode_accuracy(
+            out, ref_out, q, footer, indices, extra_footer, extra_indices
+        )
+        torch.testing.assert_close(lse, ref_lse, atol=2e-6, rtol=0)
+    elif tokens > 64 and precision != "bf16" and extra != "fp4":
         _assert_prefill_output_rounding(out, ref_out)
         torch.testing.assert_close(lse, ref_lse, atol=2e-6, rtol=0)
     else:
@@ -417,8 +456,9 @@ def test_inline_padded_row_pitches_match_footer(
     )
     fp4 = extra == "fp4"
 
-    def run(scale_format, cache, extra_cache, idx, extra_idx):
+    def run(scale_format, cache, extra_cache, idx, extra_idx, impl="auto"):
         wrapper = flashinfer.mla.SparseMLASm120Wrapper(
+            backend="sparse",
             kv_scale_format=scale_format,
             extra_kv_fp4=fp4,
             compute_precision=precision,
@@ -434,11 +474,25 @@ def test_inline_padded_row_pitches_match_footer(
             extra_kv_cache=extra_cache,
             extra_indices=extra_idx,
             return_lse=True,
+            impl=impl,
         )
         return out, lse
 
     main_span, extra_span = main_bs + 3, extra_bs + 2
-    ref_out, ref_lse = run("ue8m0_g32", footer, extra_footer, indices, extra_indices)
+    # Auto may intentionally select different algorithms for footer and
+    # inline caches. Test pitch invariance within the same format and policy.
+    if precision == "default" and not fp4:
+        ref_out, ref_lse = run(
+            "ue8m0_g32_inline",
+            _footer_to_inline(footer, *_FP8),
+            _footer_to_inline(extra_footer, *_FP8),
+            indices,
+            extra_indices,
+        )
+    else:
+        ref_out, ref_lse = run(
+            "ue8m0_g32", footer, extra_footer, indices, extra_indices
+        )
     out, lse = run(
         "ue8m0_g32_inline",
         _inline_view(footer, _FP8, main_span, main_pitch),
@@ -449,6 +503,29 @@ def test_inline_padded_row_pitches_match_footer(
     torch.cuda.synchronize()
     assert torch.equal(out, ref_out)
     assert torch.equal(lse, ref_lse)
+
+    # Pin both CuTe schedules to retain exact cross-format checks, including
+    # page gaps and independent main/extra row pitches.
+    if precision == "default" and not fp4:
+        for impl in ("decode-splitkv", "decode"):
+            ref_out, ref_lse = run(
+                "ue8m0_g32",
+                footer,
+                extra_footer,
+                indices,
+                extra_indices,
+                impl,
+            )
+            out, lse = run(
+                "ue8m0_g32_inline",
+                _inline_view(footer, _FP8, main_span, main_pitch),
+                _inline_view(extra_footer, _FP8, extra_span, extra_pitch),
+                _row_indices(indices, main_bs, main_span),
+                _row_indices(extra_indices, extra_bs, extra_span),
+                impl,
+            )
+            assert torch.equal(out, ref_out)
+            assert torch.equal(lse, ref_lse)
 
 
 def _metadata(scale_format, cache, extra_cache, indices, extra_indices, fp4):
@@ -553,7 +630,9 @@ def test_inline_one_row_pages_with_row_pitch_match_footer(
         None if extra_footer is None else _footer_to_inline(extra_footer, *_FP4),
     )
     torch.cuda.synchronize()
-    if tokens > 64 and precision != "bf16" and extra != "fp4":
+    if tokens <= 64 and precision != "bf16" and extra != "fp4":
+        _assert_inline_and_footer_decode_accuracy(out, ref, q, footer, indices)
+    elif tokens > 64 and precision != "bf16" and extra != "fp4":
         _assert_prefill_output_rounding(out, ref)
     else:
         assert torch.equal(out, ref)
@@ -662,7 +741,12 @@ def test_dsv4_entry_inline_formats_match_footer(fp4, sm12x):
         _footer_to_inline(extra_footer, *(_FP4 if fp4 else _FP8)),
     )
     torch.cuda.synchronize()
-    assert torch.equal(out, ref)
+    if fp4:
+        assert torch.equal(out, ref)
+    else:
+        _assert_inline_and_footer_decode_accuracy(
+            out, ref, q, footer, idx, extra_footer, extra_idx
+        )
 
 
 def test_cake_rejects_inline_formats(sm12x):

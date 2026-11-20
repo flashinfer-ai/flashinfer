@@ -44,13 +44,19 @@ def test_prebuild_selection_preserves_pytest_skip_and_fixture_ownership():
 
 def test_prebuild_respects_worker_and_host_budgets(monkeypatch):
     """A host prebuild allowance cannot override a smaller per-worker limit."""
-    monkeypatch.setattr(prebuild.os, "sched_getaffinity", lambda pid: set(range(64)))
+    # raising=False: Windows has no sched_getaffinity; prebuild_workers()
+    # falls back to os.cpu_count() there, but the patched value still wins.
+    monkeypatch.setattr(
+        prebuild.os, "sched_getaffinity", lambda pid: set(range(64)), raising=False
+    )
     monkeypatch.setenv("MAX_JOBS", "3")
     monkeypatch.setenv("FLASHINFER_JIT_PREBUILD_MAX_JOBS", "8")
     assert prebuild.prebuild_workers() == 3
     monkeypatch.setenv("FLASHINFER_JIT_PREBUILD_MAX_JOBS", "2")
     assert prebuild.prebuild_workers() == 2
-    monkeypatch.setattr(prebuild.os, "sched_getaffinity", lambda pid: {0})
+    monkeypatch.setattr(
+        prebuild.os, "sched_getaffinity", lambda pid: {0}, raising=False
+    )
     assert prebuild.prebuild_workers() == 1
 
 

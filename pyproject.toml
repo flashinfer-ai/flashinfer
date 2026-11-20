@@ -132,7 +132,12 @@ exclude = [
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
 # next to its module.
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
-"flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json", "mm_mxfp8_specialized_sm107_workloads.json"]
+"flashinfer" = [
+  "_build_meta.py",
+  "mla_kv_pack_fp8_workloads.json",
+  "top_p_renorm_probs_specialized_workloads.json",
+  "mm_mxfp8_specialized_sm107_workloads.json",
+]
 # The private loader imports this hyphenated source tree from package data.
 "flashinfer.moe_ep.kernel_src.sm100" = [
   "kimi-k3-megamoe/**/*.py",
@@ -143,7 +148,7 @@ exclude = [
   "kimi-k3-megamoe/NOTICE",
 ]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
-"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md", "export_manifest.json"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.prims_ts.moe" = [
   "prims_ts_moe_configs.json",
@@ -270,7 +275,7 @@ exclude = [
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
-  # DKG filtered top-k kernels, vendored verbatim from dynamic-kernel-generator
+  # Filtered top-k kernel sources.
   # (see the provenance header in each file). Kept byte-faithful so upstream
   # fixes can be re-applied by re-vendoring. The two reported errors are typing
   # artifacts, not defects: `_get_num_sms` memoises via a function attribute,

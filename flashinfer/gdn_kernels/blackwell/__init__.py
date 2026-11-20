@@ -17,10 +17,21 @@ except (ImportError, RuntimeError):
 
 try:
     from .cake_gdn_cp_backend import (
+        chunk_gated_delta_rule_gdn_cp_paged_sm100 as _chunk_gated_delta_rule_gdn_cp_paged_sm100,
         chunk_gated_delta_rule_gdn_cp_sm100 as _chunk_gated_delta_rule_gdn_cp_sm100,
+        gdn_cp_paged_rejection_reason as _gdn_cp_paged_rejection_reason,
     )
 except (ImportError, RuntimeError):
     _chunk_gated_delta_rule_gdn_cp_sm100 = None  # type: ignore
+    _chunk_gated_delta_rule_gdn_cp_paged_sm100 = None  # type: ignore
+    _gdn_cp_paged_rejection_reason = None  # type: ignore
+
+try:
+    from .cake_gdn_affine_split import (
+        chunk_gated_delta_rule_gdn_affine_split_sm100 as _chunk_gated_delta_rule_gdn_affine_split_sm100,
+    )
+except (ImportError, RuntimeError):
+    _chunk_gated_delta_rule_gdn_affine_split_sm100 = None  # type: ignore
 
 __all__ = [
     "chunk_gated_delta_rule_sm100",

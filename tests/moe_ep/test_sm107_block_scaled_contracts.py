@@ -800,3 +800,180 @@ def test_ikr_requires_early_weighting():
             reduce_topk_in_kernel=True,
             apply_routing_weights_before_fc2=False,
         )
+
+
+@pytest.mark.parametrize("tanh_sigmoid,warpgroups", [(False, 1), (True, 1), (True, 2)])
+def test_rubin_execution_options_reach_kernel(monkeypatch, tanh_sigmoid, warpgroups):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        block_scaled,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cfg = block_scaled.Sm107BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=65,
+        num_topk=3,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        fc2_use_bulk=True,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        use_tanh_sigmoid=tanh_sigmoid,
+        epilogue_warpgroups=warpgroups,
+    )
+    kernel = block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    assert kernel.epilogue.use_tanh_sigmoid == tanh_sigmoid
+    assert kernel.epilogue.epilogue_warpgroups == warpgroups
+
+
+def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    common = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=3584,
+        intermediate=3072,
+        num_experts=896,
+        topk=16,
+        max_tokens=64,
+        device="test-device",
+    )
+    for index, (tanh_sigmoid, warpgroups) in enumerate(
+        ((False, 1), (True, 1), (True, 2))
+    ):
+        entry = knob_cache.make_record(
+            {"marker": index},
+            **common,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+        )
+        knob_cache.write_record(entry)
+    for index, (tanh_sigmoid, warpgroups) in enumerate(
+        ((False, 1), (True, 1), (True, 2))
+    ):
+        result = knob_cache.lookup_knobs(
+            **common,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+        )
+        assert result == {"marker": index}
+
+
+def _native_inference_kernel(monkeypatch, **overrides):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import src
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.api import (
+        ImplDesc,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cls = src.RubinInferenceMegaMoE
+    initialize = cls.__init__
+
+    def build(instance, problem, implementation):
+        initialize(instance, problem, ImplDesc(dict(implementation) | overrides))
+
+    cfg = _config(
+        hidden=384, intermediate=256, quant_kind="mxfp8_e4m3", fc2_use_bulk=True
+    )
+    with mock.patch.object(cls, "__init__", build):
+        return block_scaled.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+
+
+def test_native_communication_settings_have_distinct_compiled_names(monkeypatch):
+    base = dict(
+        comm_clusters=1,
+        comm_warps=(4, 4),
+        token_back_mode="standalone_warps",
+        work_id_mode="atomic_counter",
+    )
+    kernel = _native_inference_kernel(monkeypatch, **base)
+    changes = [
+        {},
+        dict(comm_clusters=2),
+        dict(token_back_on_compute_ctas=True),
+        dict(comm_warps=(5, 4)),
+        dict(comm_stage_depths=(1, 2)),
+        dict(token_back_chunk_bytes=kernel.token_back_chunk_bytes * 2),
+        dict(dispatch_sf_group=4),
+        dict(token_back_schedule_mode="atomic_counter"),
+    ]
+    kernels = [
+        _native_inference_kernel(monkeypatch, **(base | change)) for change in changes
+    ]
+    assert len({kernel.name() for kernel in kernels}) == len(changes)
+    assert len({kernel._aot_symbol_name() for kernel in kernels}) == len(changes)
+
+
+def test_native_fused_token_back_schedule_has_distinct_compiled_name(monkeypatch):
+    base = dict(work_id_mode="atomic_counter", token_back_mode="standalone_warps")
+    default = _native_inference_kernel(monkeypatch, **base)
+    static = _native_inference_kernel(
+        monkeypatch, **base, token_back_schedule_mode="static"
+    )
+    assert default.name() != static.name()
+
+
+def test_native_inference_rejects_clc_before_launch(monkeypatch):
+    with pytest.raises(
+        ValueError, match="inference requires grid_stride or atomic_counter"
+    ):
+        _native_inference_kernel(monkeypatch, work_id_mode="cluster_launch_control")
+
+
+def test_native_dedup_build_has_its_own_compiled_identity(monkeypatch):
+    ordinary = _native_inference_kernel(
+        monkeypatch, token_back_mode="reuse_dispatch_warps"
+    )
+    dedup = _native_inference_kernel(
+        monkeypatch, token_back_mode="reuse_dispatch_warps", combine_dedup=True
+    )
+    assert ordinary.name() != dedup.name()
+    assert ordinary._aot_symbol_name() != dedup._aot_symbol_name()
+
+
+@pytest.mark.parametrize("world", [1, 4, 16, 32, 64])
+@pytest.mark.parametrize("early", [False, True])
+def test_genphase_ll_halves_have_disjoint_storage(monkeypatch, world, early):
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cfg = _config(
+        num_total_experts=world * 4,
+        world_size=world,
+        hidden=512,
+        intermediate=256,
+        max_tokens_per_rank=17,
+        num_topk=3,
+        quant_kind="mxfp8_e4m3",
+        kernel_variant="genphase",
+        cluster_shape_mn=(4, 1),
+        fc2_use_bulk=True,
+        apply_routing_weights_before_fc2=early,
+    )
+    kernel = Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    workspace, communication = kernel._device_workspace, kernel.token_comm
+    regions = [
+        communication.topk_index_inbox_region,
+        communication.count_ll_inbox_region,
+        communication.plain_sf_ll_region,
+        communication.refine_row_source_ll_region,
+    ]
+    if early:
+        regions.append(communication.topk_score_inbox_region)
+    for name in regions:
+        region = workspace.region(name)
+        assert region.shape[0] == 2
+        assert region.reset == "zero_on_first_allocate"
+        half_bytes = workspace.stride(name)[0] * 8
+        assert workspace.nbytes(name) == 2 * half_bytes
+        assert workspace.offset(name) >= workspace.tail_reset_bytes(region.buffer_space)
+    assert workspace.region(communication.refine_work_counter_region).shape == (2,)
+    ready = workspace.region(communication.ll_reset_ready_region)
+    done = workspace.region(communication.ll_reset_done_region)
+    assert ready.reset == "tail_reset"
+    assert done.reset == "zero_on_first_allocate"
+    assert workspace.offset(done.name) >= workspace.tail_reset_bytes("local")
+    assert "_llparity" in kernel.name()

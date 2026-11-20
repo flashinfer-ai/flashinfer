@@ -191,6 +191,7 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     ws.output_activation = torch.empty(4, 128, device="cuda", dtype=torch.bfloat16)
     ws.shared_workspace = torch.zeros(4096, device="cuda", dtype=torch.uint8)
     ws.local_workspace = torch.zeros_like(ws.shared_workspace)
+    ws.tmp_workspace = torch.zeros_like(ws.shared_workspace)
     ws._pre_reduced_activation = torch.empty(4, 2, 128, device="cuda")
     ws._symmetric_base = ws.shared_workspace.data_ptr()
     ws._peer_offsets = (0,)
