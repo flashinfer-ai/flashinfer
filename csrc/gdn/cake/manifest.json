@@ -15646,6 +15646,64 @@
         "SCALE": 1.0
       },
       "tma_abi": "grid_constant"
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain_fae50a52c6",
+        "params": {
+          "DYNAMIC_SMEM_BYTES": 51328,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "28b72fe4fdf8ddef",
+        "template": "host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain_7f7a9ecd9c68",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain_de015d883e2d.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      },
+      "tma_abi": "grid_constant"
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain_103f8fdb5e",
+        "params": {
+          "DYNAMIC_SMEM_BYTES": 51328,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "0cfc7aaef5826cbe",
+        "template": "host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain_d02a5dc2d8b5",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain_de015d883e2d.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      },
+      "tma_abi": "grid_constant"
     }
   ]
 }

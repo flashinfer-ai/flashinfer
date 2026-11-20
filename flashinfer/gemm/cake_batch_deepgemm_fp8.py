@@ -130,6 +130,12 @@ def serving_config(
     hint, so at ``expected_m=1`` a group can still span several M blocks; with
     ``n_l2_group=1`` the two CTAs of such a group would compute different M
     blocks and the output would be wrong.
+
+    ``cta_reserve`` is a measured schedule choice: the grid is the SM count less
+    the reserve, in whole CTA pairs. On 212-SM devices the full grid (reserve 0)
+    is faster from ``expected_m`` 36 up (by 2-11% at ``expected_m`` 36 to 4096 on
+    every measured shape) and slower at ``expected_m`` 32 and below, which keep
+    the default reserve.
     """
     if k == 7168:
         if expected_m <= 1:
@@ -138,6 +144,8 @@ def serving_config(
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:
             cta_reserve = 8 if arch == "sm_103a" else 20
+        elif sm_count == 212 and expected_m >= 36:
+            cta_reserve = 0
         else:
             cta_reserve = 24
         return 5, 2, "evict_normal", cta_reserve, 8
@@ -145,6 +153,8 @@ def serving_config(
         return 5, 3, "evict_normal", 0, 8
     if expected_m == 2:
         return 5, 2, "evict_normal", 20, 8
+    if sm_count == 212 and expected_m >= 36:
+        return 5, 2, "evict_normal", 0, 8
     return 5, 2, "evict_normal", 24, 8
 
 
@@ -530,9 +540,11 @@ def _domain_homing(
     """``(g_cut, sm_table)`` when ``b`` covers the whole allocation
     :func:`localize_weights` returned (that tensor or a full alias of it: an
     ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same shape;
-    not a view of part of it, not a copy) on a device with a probed SM table,
-    else ``None``.  ``g_cut`` is the group of ``b`` nearest to its die cut (the
-    twin's result does not depend on it).  Reads the record the allocation's
+    not a view of part of it, not a copy) on a device with a probed SM table
+    whose memory runs at its full clock
+    (:func:`flashinfer.cake_locality.memory_at_full_clock`), else ``None``.
+    ``g_cut`` is the group of ``b`` nearest to its die cut (the twin's result
+    does not depend on it).  Reads the record the allocation's
     storage carries (:func:`flashinfer.cake_locality.tensor_homing`), not the
     allocation registry.  A shape :func:`localize_weights` refuses
     (:func:`domain_serving_routed` is False) plans unhomed even when its ``b`` was
@@ -543,7 +555,7 @@ def _domain_homing(
     if b.numel() * b.element_size() != homed.nbytes:
         return None
     table = cake_locality.sm_table(index)
-    if table is None:
+    if table is None or not cake_locality.memory_at_full_clock(index):
         return None
     n, k = int(b.shape[1]), int(b.shape[2])
     key = ("routed", arch, sm_count, table.counts, n, k, groups)
@@ -1520,7 +1532,9 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     packed-scale serving shape (``(N, K)`` in ``PACKED_NK``, ``B`` in
     ``PACKED_GROUPS``) on an SM107a device, no die class of the device's SM count
     routes every ``expected_m`` of that shape to a twin, the device has no SM
-    table (:func:`flashinfer.cake_locality.sm_table` is ``None``), some
+    table (:func:`flashinfer.cake_locality.sm_table` is ``None``), its memory
+    does not run at its full clock
+    (:func:`flashinfer.cake_locality.memory_at_full_clock` is ``False``), some
     ``expected_m`` of that shape selects a serving program without a twin listed
     in the cell of the device's dies (:func:`domain_serving_routed`), or the cut
     is not a multiple of the allocation granularity of locality-domain memory.
@@ -1546,8 +1560,21 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     the time of plain weights at ``expected_m`` 2-64.  The twin's gain comes
     from die-local memory reads and was measured with the memory at its full
     clock.  On a device whose memory ran at a lower clock (driver 620.43, 3186
-    of 4752 MHz) the twin route took 0.99-1.06x the time of plain weights at
-    ``expected_m <= 64``; keep plain weights on such a device.
+    of 4752 MHz) the twin route took 1.01-1.08x the time of plain weights at
+    ``expected_m <= 64`` and 0.92-0.95x at 512 and 4096 with plain weights on
+    the reserved grid, and 1.01-1.14x at every measured ``expected_m`` (1 to
+    4096) with plain weights on the full grid from ``expected_m`` 36.  So this
+    returns ``b`` unhomed on a device whose memory clock NVML reads below
+    :data:`flashinfer.cake_locality.MEMORY_CLOCK_FRACTION` of its maximum, or
+    cannot read (:func:`flashinfer.cake_locality.memory_at_full_clock`), and
+    weights homed there take the whole-GPU route.
+
+    On 212-SM devices, plain weights run their serving program on the full grid
+    from ``expected_m`` 36; the homed twin is unchanged.  For ``B=64`` weights of
+    ``(4096, 7168)``, plain weights then took 0.95x the time of homed weights at
+    ``expected_m`` 64 and 512 and 0.97x at 4096.  Homed weights stay faster at
+    smaller ``expected_m``: plain weights took 1.04x their time at 36 and
+    1.10-1.35x at 1-32.
 
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
@@ -1590,7 +1617,7 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     ):
         return b
     table = cake_locality.sm_table(index)
-    if table is None:
+    if table is None or not cake_locality.memory_at_full_clock(index):
         return b
     if not domain_serving_routed(arch, sm_count, table.counts, n, k, groups):
         return b

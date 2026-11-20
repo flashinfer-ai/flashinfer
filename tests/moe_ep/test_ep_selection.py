@@ -533,7 +533,7 @@ def test_numerical_contract_covers_activation_recipe_and_combine(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.automatic import (
         ep_tuning_contract,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledMoeConfig,
     )
     from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
@@ -1057,7 +1057,7 @@ def test_shared_stager_does_not_bootstrap_a_kernel_package():
                 )
                 staged = plan._stage(tensors)
                 assert (staged.topk_ids[1:] == -1).all()
-                assert "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" not in sys.modules
+                assert "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification" not in sys.modules
                 assert sys.modules["common"] is other
             """),
         ],
@@ -1117,7 +1117,7 @@ def test_fixed_mega_preparation_is_coordinated_before_launch(monkeypatch, peer_f
         _bootstrap=object(),
         _workspace=object(),
         _megakernel_config=SimpleNamespace(knobs={}),
-        _get_transformed_weights=lambda: (),
+        get_transformed_weights=lambda: (),
         _kernel=SimpleNamespace(ep_prepare_fixed=lambda *a: events.append("compile")),
         stage_inputs=lambda t: events.append("stage"),
         compute_staged=lambda **kwargs: events.append("launch"),
@@ -1141,7 +1141,7 @@ def test_skipping_outer_tuning_preserves_explicit_mega_knobs(monkeypatch):
         _mega_config=MegaConfig(kernel),
         _kernel=Mock(),
         _bootstrap=BootstrapConfig(1, 0),
-        _get_transformed_weights=lambda: (),
+        get_transformed_weights=lambda: (),
     )
     construct = Mock()
     monkeypatch.setattr(selection, "MoEEpMegaLayer", construct)

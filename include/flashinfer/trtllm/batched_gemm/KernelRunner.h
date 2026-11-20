@@ -102,6 +102,7 @@ enum class EltwiseActType {
   // act = relu(x0) ^ 2
   // where x0 is the output of the Gemm.
   Relu2,
+  ClampedRelu2 = static_cast<int>(batchedGemm::gemm::EltwiseActType::ClampedRelu2),
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {

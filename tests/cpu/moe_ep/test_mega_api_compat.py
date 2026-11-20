@@ -163,7 +163,7 @@ def test_new_finalize_validation_is_preserved():
     assert cls(1024, 8, finalize_mode=FinalizeMode.CAKE).do_finalize is True
 
 
-_SHIM = "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim"
+_SHIM = "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification"
 
 
 @pytest.mark.cpu_only
@@ -172,7 +172,7 @@ _SHIM = "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim"
 )
 def test_blackwell_next_routing_aliases(name):
     module = importlib.import_module(
-        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe"
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources"
     )
     cls = getattr(module, name)
     geometry = dict(
@@ -232,7 +232,6 @@ def test_frozen_shim_config_aliases_and_replace():
     "module_name,class_name",
     [
         ("nvfp4", "MegaMoENvfp4Inputs"),
-        ("mxfp8", "MegaMoEMxfp8Inputs"),
         ("bf16_mxfp8", "MegaMoEBf16Mxfp8Inputs"),
     ],
 )
@@ -287,20 +286,23 @@ def test_cache_accepts_old_and_new_keywords(tmp_path, monkeypatch):
     [
         "compute_megamoe_reference_bf16",
         "compute_megamoe_reference_bf16_mxfp8",
-        "compute_megamoe_reference_mxfp8",
     ],
 )
 def test_reference_accepts_legacy_keyword_without_duplicate_argument(name, monkeypatch):
     helpers = importlib.import_module(f"{_SHIM}.kernel_helpers")
     function = getattr(helpers, name)
+
+    def reference(apply_topk_in_fc1=False):
+        return {"apply_topk_in_fc1": apply_topk_in_fc1}
+
     monkeypatch.setattr(
         helpers.importlib,
         "import_module",
         lambda *_: SimpleNamespace(
             **{
-                name: lambda **kwargs: kwargs,
-                "compute_megamoe_reference": lambda **kwargs: kwargs,
-                "compute_megamoe_reference_mxfp8_bf16": lambda **kwargs: kwargs,
+                name: reference,
+                "compute_megamoe_reference": reference,
+                "compute_megamoe_reference_mxfp8_bf16": reference,
             }
         ),
     )

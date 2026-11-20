@@ -87,7 +87,7 @@ class ForwardExecution:
         }
 
     def make_trial(self, workspace):
-        from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
         config = dataclasses.replace(
             self.backend._kernel_config,
@@ -101,10 +101,10 @@ class ForwardExecution:
         return _ForwardTrial(self, backend, workspace)
 
     def tune(self, l1, l2, workspace, *, force_tune=False, **kwargs):
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             _choose_protocol,
         )
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
             RubinTuningProtocol,
         )
 

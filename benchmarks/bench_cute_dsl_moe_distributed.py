@@ -1370,19 +1370,18 @@ def _benchmark_distributed_megamoe(
         )
 
     try:
-        route()
-        layer.warmup(tensors)
-        if args.megamoe_knobs == "auto":
-            if variant.use_nvfp4_activations:
-                from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
-                    nvfp4_candidates,
-                )
+        from contextlib import nullcontext
+        from flashinfer import autotune_v2
 
-                # W4A4 applies its winner directly to the frontend config.
-                config = layer._workspace._frontend.config
-                knobs = {name: getattr(config, name) for name in nvfp4_candidates()[0]}
-            else:
-                knobs = layer._kernel._autotune_winner
+        route()
+        with (
+            autotune_v2(persistent_cache=False)
+            if args.megamoe_knobs == "auto"
+            else nullcontext()
+        ):
+            layer.warmup(tensors)
+        if args.megamoe_knobs == "auto":
+            knobs = layer.get_tuned_knobs()
             _print_json(
                 "MEGAMOE_TACTIC_JSON",
                 {

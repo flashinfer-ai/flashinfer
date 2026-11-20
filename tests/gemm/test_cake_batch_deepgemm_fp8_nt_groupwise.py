@@ -1077,6 +1077,11 @@ def _require_domain():
     table = cake_locality.sm_table(device)
     assert table is not None, "the SM table probe failed on a dual-die SM107a GPU"
     assert sum(table.counts) == sm_count
+    if not cake_locality.memory_at_full_clock(device):
+        pytest.skip(
+            f"memory clock {cake_locality._MEMORY_CLOCKS.get(device)} (current, "
+            "max MHz) is below the full clock: batch DeepGEMM FP8 routes no twin"
+        )
     return device, table
 
 
@@ -1264,6 +1269,36 @@ def test_domain_serving_plan_of_listed_cells():
                 arch, sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
             )
             assert plan.route == _SERVING_ROUTE
+
+
+@_host_only
+def test_serving_grid_reserve():
+    """The whole serving program's grid: the SM count less the measured CTA
+    reserve. 212-SM devices run the full grid from expected_m 36 up; every other
+    SM count, and smaller expected_m, keep the reserve they had."""
+
+    def grid(arch, sm_count, k, expected_m):
+        plan = serving_plan(
+            arch, sm_count, 64, 512, 7168 if k == 2048 else 4096, k, expected_m
+        )
+        assert plan.route == _SERVING_ROUTE
+        return plan.stages[0].grid[0]
+
+    for k in (7168, 2048):
+        assert grid("sm_107a", 212, k, 1) == 212
+        assert grid("sm_107a", 212, k, 2) == 212 - (16 if k == 7168 else 20)
+        for expected_m in (4, 8, 16, 32, 35):
+            assert grid("sm_107a", 212, k, expected_m) == 188
+        for expected_m in (36, 64, 512, 4096):
+            assert grid("sm_107a", 212, k, expected_m) == 212
+            assert serving_config(512, k, expected_m, 212, "sm_107a")[3] == 0
+        for arch, sm_count, reserve in (
+            ("sm_100a", 148, 20 if k == 7168 else 24),
+            ("sm_103a", 148, 8 if k == 7168 else 24),
+            ("sm_107a", 216, 24),
+        ):
+            for expected_m in (36, 64, 4096):
+                assert serving_config(512, k, expected_m, sm_count, arch)[3] == reserve
 
 
 @_host_only
@@ -1893,6 +1928,34 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
         out = no_table.launch()
         torch.cuda.synchronize()
         _assert_valid_rows_close(out, reference, masked_m)
+    # The memory clock check, read again: below the full clock the device keeps
+    # its SM table but takes the whole program; at the full clock the route is
+    # the same as before.
+    routed = domain_serving_routed(
+        "sm_107a", device_sm_count(device), table.counts, *nk, groups
+    )
+    for clocks, routes in (((3186, 4752), False), ((4752, 4752), True)):
+        with monkeypatch.context() as patch:
+            patch.setattr(cake_locality, "_memory_clocks", lambda index, c=clocks: c)
+            cake_locality._forget()
+            try:
+                probed = cake_locality.sm_table(device)
+                assert probed is not None and probed.counts == table.counts
+                assert torch.equal(probed.entries, table.entries)
+                assert cake_locality.memory_at_full_clock(device) == routes
+                localized = localize_weights(b)
+                assert (localized is not b) == (routes and routed)
+                public = prepare_batch_deepgemm_fp8_nt_groupwise(
+                    a, homed, a_packed, b_packed, masked_m, expected_m
+                )
+                assert public.route == (
+                    DOMAIN_SERVING_ROUTE if routes and routed else _SERVING_ROUTE
+                )
+                out = public.launch()
+                torch.cuda.synchronize()
+                _assert_valid_rows_close(out, reference, masked_m)
+            finally:
+                cake_locality._forget()
     # Float32 scales on a device without a route chain still raise.
     if device_sm_count(torch.cuda.current_device()) not in (216,):
         with pytest.raises(ValueError, match="SMs"):
@@ -2116,6 +2179,7 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
 
     monkeypatch.setattr(cake_locality, "homing", registry)
     monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: table)
+    monkeypatch.setattr(cake_locality, "memory_at_full_clock", lambda device=None: True)
     monkeypatch.setattr(module, "domain_serving_routed", lambda *args: True)
     monkeypatch.setattr(module, "_PLANS", {})
     assert cake_locality.tensor_homing(b) is record

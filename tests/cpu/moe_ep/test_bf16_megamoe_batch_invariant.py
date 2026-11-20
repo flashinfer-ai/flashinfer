@@ -23,7 +23,7 @@ from flashinfer.moe_ep.batch_invariant.spec import (
     SPEC_VERSION,
     spec_fingerprint,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.bf16 import (
     MegaMoEBf16Config,
     MegaMoEBf16Frontend,
 )
@@ -193,7 +193,7 @@ def test_sm107_wrong_compile_target_fails_before_collective_allocation(monkeypat
     from cutlass.base_dsl import Arch
     from cutlass.cutlass_dsl import CuTeDSL
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16
 
     try:
         Arch["sm_107a"]
@@ -244,8 +244,8 @@ def test_smem_capacity_uses_explicit_arch_or_current_device(monkeypatch):
 
 def test_sm107_resource_filter_and_receipt_share_the_same_arch(monkeypatch):
     import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
     )
 
@@ -294,7 +294,7 @@ def test_cache_separates_sm107_math_even_with_identical_device_names(
     monkeypatch, tmp_path
 ):
     import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     key = dict(
@@ -354,7 +354,7 @@ def test_low_level_config_rejects_unvalidated_mode(field, value):
     ],
 )
 def test_pinned_and_reapplied_knobs_cannot_bypass_admission(knobs):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
         with_checked_knobs,
         with_knobs,
@@ -407,10 +407,10 @@ def test_signature_pins_arithmetic_and_excludes_batch_and_scheduling():
 
 
 def test_geometry_variants_preserve_the_receipt_but_compile_separately():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.autotune import (
         bf16_candidates,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
         with_checked_knobs,
     )
@@ -449,7 +449,7 @@ def test_geometry_variants_preserve_the_receipt_but_compile_separately():
 
 @pytest.mark.parametrize("geometry", ALLOWED_PLAN_CONFIGS)
 def test_geometry_overrides_derive_cta_and_cluster_consistently(geometry):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
         with_checked_knobs,
         with_knobs,
@@ -486,7 +486,7 @@ def test_geometry_overrides_derive_cta_and_cluster_consistently(geometry):
     ],
 )
 def test_explicit_geometry_conflicts_fail_closed(knobs):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
         with_knobs,
     )
@@ -515,7 +515,7 @@ def test_explicit_geometry_conflicts_fail_closed(knobs):
 def test_tile_staging_cannot_extend_canonical_padding(
     hidden, intermediate, stage_k, compatible
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
         with_checked_knobs,
     )
@@ -536,7 +536,7 @@ def test_tile_staging_cannot_extend_canonical_padding(
 
 
 def test_autotune_filters_geometry_by_shape_and_keeps_k64_fallback(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
 
     monkeypatch.setattr(
         autotune,
@@ -568,7 +568,7 @@ def test_default_plan_filter_is_quiet_but_explicit_invalid_plans_warn(
     monkeypatch, hidden, intermediate, tile
 ):
     import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
 
     monkeypatch.setattr(policy, "bf16_batch_invariant_arch", lambda: "sm_100")
     monkeypatch.setattr(
@@ -600,7 +600,7 @@ def test_resource_admission_depends_on_shape_experts_and_token_back(monkeypatch)
         bf16_plan_smem_bytes,
     )
     from flashinfer.moe_ep.batch_invariant.spec import PlanConfig
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
         is_valid_bf16_for_config,
         with_checked_knobs,
     )
@@ -638,7 +638,10 @@ def test_factory_admits_selected_plan_when_default_exceeds_smem(
 
     import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
     from flashinfer.moe_ep.batch_invariant.spec import PlanConfig
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16, knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        bf16,
+        knob_cache,
+    )
 
     monkeypatch.setattr(policy, "bf16_batch_invariant_arch", lambda: "sm_100")
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
@@ -710,7 +713,7 @@ def test_factory_rejects_invalid_selected_plan_before_allocation(
     monkeypatch, overrides, message
 ):
     import flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant as policy
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16
 
     monkeypatch.setattr(policy, "bf16_batch_invariant_arch", lambda: "sm_100")
     monkeypatch.setattr(
@@ -783,7 +786,10 @@ def test_new_geometry_cache_records_invalidate_v2_and_roundtrip_tuples(
     import json
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16, knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        bf16,
+        knob_cache,
+    )
 
     cache_path = tmp_path / "knobs.json"
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(cache_path))
@@ -837,7 +843,7 @@ def test_new_geometry_cache_records_invalidate_v2_and_roundtrip_tuples(
 def test_shape_incompatible_cached_geometry_fails_before_workspace_allocation(
     monkeypatch, tmp_path
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
@@ -890,7 +896,7 @@ from flashinfer.moe_ep import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
 Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
     intermediate_size=256, top_k=2, batch_invariant=True
 )
-prefix = 'flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe'
+prefix = 'flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification'
 assert not any(name == prefix or name.startswith(prefix + '.') for name in sys.modules)
 """
     result = subprocess.run(
@@ -994,7 +1000,7 @@ def test_outer_selector_accepts_schedule_variants_of_one_calculation(candidate):
 
 
 def test_autotune_only_receives_admitted_candidates(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
 
     safe = {
         "load_balance_mode": "atomic_counter",
@@ -1021,7 +1027,7 @@ def test_autotune_only_receives_admitted_candidates(monkeypatch):
 def test_cache_separates_legacy_policy_versions_and_weight_placement(
     monkeypatch, tmp_path
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     key = dict(
@@ -1068,7 +1074,7 @@ def test_cache_separates_legacy_policy_versions_and_weight_placement(
 
 
 def test_poisoned_cache_fails_before_allocating_or_launching(monkeypatch, tmp_path):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
@@ -1092,7 +1098,7 @@ def test_poisoned_cache_fails_before_allocating_or_launching(monkeypatch, tmp_pa
 def test_public_backend_propagates_and_isolates_policy(monkeypatch):
     import torch
 
-    import flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe as package
+    import flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification as package
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.backend import (
         Bf16CutedslMegaKernelBackend,
     )
@@ -1138,7 +1144,7 @@ def test_cache_requires_the_arithmetic_fingerprint(monkeypatch, tmp_path):
     import torch
 
     from flashinfer.batch_invariant import fingerprint
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     path = tmp_path / "receipts.json"
@@ -1180,7 +1186,7 @@ def test_cache_requires_the_arithmetic_fingerprint(monkeypatch, tmp_path):
 def test_cache_isolates_fp32_clamp_bits(monkeypatch, tmp_path):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "clamps.json"))
