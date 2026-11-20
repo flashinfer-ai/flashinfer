@@ -59,6 +59,7 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
     rank-consistent fallback decision.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         tp_size: int,
@@ -91,6 +92,7 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
             enable_pdl=enable_pdl,
         )
 
+    @flashinfer_api
     def check_support(self, local_supported: bool) -> bool:
         """Collectively agree on a local ``supports_*`` result before capture.
 
@@ -105,6 +107,7 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
             raise RuntimeError("workspace has been destroyed")
         return self._impl
 
+    @flashinfer_api
     def destroy(self) -> None:
         """Release the mailbox once in-flight work on every rank is done."""
         if self._impl is not None:
@@ -112,6 +115,7 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
             dist.barrier(self._group)
             self._impl = None
 
+    @flashinfer_api
     def compile(
         self,
         *,
@@ -131,6 +135,7 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
         )
 
 
+@flashinfer_api
 def supports_moe_finalize_rmsnorm_allreduce(
     workspace: MNNVLCuteDSLMoEFinalizeAllReduceWorkspace,
     routed_rows: torch.Tensor,

@@ -99,6 +99,7 @@ class _AllGatherWorkspace(Generic[_Impl]):
         self._group = group
         self._impl: _Impl | None = create()
 
+    @flashinfer_api
     def check_support(self, local_supported: bool) -> bool:
         """Collectively agree on a local ``supports_*`` result before capture.
 
@@ -113,6 +114,7 @@ class _AllGatherWorkspace(Generic[_Impl]):
             raise RuntimeError("workspace has been destroyed")
         return self._impl
 
+    @flashinfer_api
     def destroy(self) -> None:
         """Release the mailbox once in-flight work on every rank is done."""
         if self._impl is not None:
@@ -132,6 +134,7 @@ class _AllGatherWorkspace(Generic[_Impl]):
 
 
 class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDualNorm]):
+    @flashinfer_api
     def __init__(
         self,
         tp_size: int,
@@ -157,6 +160,7 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDual
             ),
         )
 
+    @flashinfer_api
     def compile(
         self,
         *,
@@ -190,6 +194,7 @@ def _norm_constants(
     )
 
 
+@flashinfer_api
 def supports_all_gather_gated_residual_next_rmsnorm(
     workspace: MNNVLCuteDSLAllGatherDualNormWorkspace,
     branch_shard: torch.Tensor,
@@ -290,6 +295,7 @@ def all_gather_gated_residual_next_rmsnorm(
 class MNNVLCuteDSLAllGatherNormQuantWorkspace(
     _AllGatherWorkspace[LLAllGatherNormQuant]
 ):
+    @flashinfer_api
     def __init__(
         self,
         tp_size: int,
@@ -324,11 +330,13 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
             ),
         )
 
+    @flashinfer_api
     def compile(self, *, eps: float, gain_center: float = 0.0) -> None:
         """Compile one constant set ahead of time, e.g. before graph capture."""
         self.impl.compiled(_NormQuantConstants(float(eps), float(gain_center)))
 
 
+@flashinfer_api
 def supports_push_plane(
     push_plane: PushPlane, max_token_num: int, hidden_dim: int
 ) -> bool:
@@ -351,6 +359,7 @@ def supports_push_plane(
     )
 
 
+@flashinfer_api
 def supports_all_gather_rmsnorm_fp4_quantize(
     workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
     shard: torch.Tensor | None,
