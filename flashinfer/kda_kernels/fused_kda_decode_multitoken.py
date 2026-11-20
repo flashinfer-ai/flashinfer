@@ -44,9 +44,11 @@ import cuda.bindings.driver as cuda
 import torch
 import tvm_ffi  # noqa: F401 -- TVM FFI supplies the active PyTorch stream
 
+from ..cute_dsl.utils import mbarrier_wait_acquire_cluster
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..norm import utils as norm_utils
 from .fused_kda_decode import _device_index, _device_sm_count
+
 
 _D = 128
 _W = 4
@@ -577,9 +579,11 @@ def _kda_kernel(
             slot = mail_ptr + (rank * T + tid)
             for p in cutlass.range_constexpr(SPLIT):
                 norm_utils.store_shared_remote(tot, slot, mbar, cutlass.Int32(p))
-        cute.arch.fence_acq_rel_cta()
+        # The peer ranks' st.async complete-tx release at cluster scope: acquire
+        # at cluster scope before sMail is read (the wait carries the acquire,
+        # so no separate CTA-scope fence is needed here).
         if tid == 0:
-            cute.arch.mbarrier_wait(mbar, 0)
+            mbarrier_wait_acquire_cluster(mbar, cutlass.Int32(0))
         cute.arch.barrier()
         if tid < T:
             tot = cutlass.Float32(0.0)

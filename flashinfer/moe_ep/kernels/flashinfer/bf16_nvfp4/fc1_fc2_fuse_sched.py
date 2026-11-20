@@ -21,6 +21,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir import ir
 
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import iket
 
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
@@ -35,6 +36,22 @@ from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
     mbarrier_arrive_expect_tx_on_peer,
     store_i32_to_peer_cluster_smem_async,
 )
+
+
+@cute.jit
+def _cluster_pipeline_consumer_wait_acquire_cluster(
+    cluster_pipeline, consumer_state
+) -> None:
+    """``consumer_wait`` that acquires at cluster scope.
+
+    The leader CTA completes every peer's copy of the full barrier with
+    ``st.async ... mbarrier::complete_tx``, a release at cluster scope, which the
+    pipeline's default ``.acquire.cta`` wait does not synchronize with.
+    """
+    mbarrier_wait_acquire_cluster(
+        cluster_pipeline.sync_object_full.get_barrier(consumer_state.index),
+        consumer_state.phase,
+    )
 
 
 # =============================================================================
@@ -646,7 +663,11 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ds.producer_state.advance()
 
         # --- Consumer side (all CTAs sched warp threads) ---
-        cluster_pipeline.consumer_wait(ds.consumer_state)
+        # The leader's st.async complete-tx releases at cluster scope: acquire
+        # at cluster scope before the broadcast slot is read.
+        _cluster_pipeline_consumer_wait_acquire_cluster(
+            cluster_pipeline, ds.consumer_state
+        )
         cluster_idx = broadcast_tensor[0]
         cute.arch.fence_acq_rel_cta()
         cluster_pipeline.sync_object_empty.arrive(ds.consumer_state.index, Int32(0))
