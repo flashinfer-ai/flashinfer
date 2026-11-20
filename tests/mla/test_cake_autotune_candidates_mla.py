@@ -6,7 +6,7 @@ lists, a comparison of that winner with Cake's generated Blackwell route. These
 tests check that the first stage keeps its op, runners, config and cache entries;
 that Cake joins only the second stage, only for listed units, requests it serves,
 while the tuner may select it and never while an autotune process group tunes;
-that the committed offer table is empty and well formed; that a tuning bucket
+that the committed offer table is well formed and lists only measured units; that a tuning bucket
 offers Cake only when every batch the bucket serves is listed and launches the
 programs of the profiled batch; that Cake is profiled only against a first-stage
 winner and a Cake choice stays valid only while that winner does; that an
@@ -19,7 +19,7 @@ updates that bypass torch's version counter and under CUDA-graph replay with
 updated inputs (also two graphs replayed on two streams at once).
 
 Tests that need Cake offered replace the offer table with a synthetic one: the
-committed table is derived from measurements and offers nothing until then.
+committed table is derived from measurements on B200 and GB300 only.
 """
 
 import pytest
@@ -939,13 +939,21 @@ def test_offer_table_well_formed():
     _check_offer_table(_SYNTHETIC_OFFERS)
 
 
-def test_committed_offer_table_offers_nothing(monkeypatch, cake_families):
-    """Until measurements derive it, the committed table is empty: no device
-    offers Cake, and no Cake program or FP8 decode table is built. No GPU
-    needed."""
+def test_committed_offer_table_unlisted_units_offer_nothing(monkeypatch, cake_families):
+    """Units the measured table does not list offer nothing: devices without
+    measurements, requests with sinks and FP8 with 32-token pages. No Cake
+    program or FP8 decode table is built for them. No GPU needed."""
     built, _ = cake_families
-    assert core._CAKE_MLA_AUTO_OFFERS == {}
-    for arch, num_sms in (("sm_100a", 148), ("sm_103a", 152)):
+    table = core._CAKE_MLA_AUTO_OFFERS
+    assert set(table) <= {
+        (arch, num_sms, dtype, page_size, q_len, False)
+        for arch, num_sms in (("sm_100a", 148), ("sm_103a", 152))
+        for dtype in ("bfloat16", "float8_e4m3fn")
+        for page_size in (32, 64)
+        for q_len in (1, 2)
+    }
+    assert not any(key[2] == "float8_e4m3fn" and key[3] == 32 for key in table)
+    for arch, num_sms in (("sm_100a", 132), ("sm_103a", 148), ("sm_100a", 152)):
         monkeypatch.setattr(
             cake_module, "_device_facts", lambda i, a=arch, n=num_sms: (a, n)
         )
@@ -963,24 +971,30 @@ def test_committed_offer_table_offers_nothing(monkeypatch, cake_families):
                                 has_sinks,
                                 max_seq_len,
                             )
-                            for domain in _DOMAINS:
-                                assert not core._cake_mla_auto_offered(
-                                    arch,
-                                    num_sms,
-                                    dtype,
-                                    page_size,
-                                    domain,
-                                    q_len,
-                                    has_sinks,
-                                    max_seq_len,
-                                    4,
-                                )
         for page_size in (32, 64):
             runner = _staged(_cpu_runner(torch.bfloat16, page_size))
             inputs = _cpu_inputs(torch.bfloat16, 4)
             assert runner.get_valid_tactics(inputs, _bucket(4, 8)) == []
             assert not runner.validate_tactic(inputs, WINNER)
             assert not runner.supports(inputs)
+    for arch, num_sms in (("sm_100a", 148), ("sm_103a", 152)):
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            for page_size in (32, 64):
+                for q_len in (1, 2):
+                    for max_seq_len in (512, 1024, 4096, 16384):
+                        assert not core._cake_mla_auto_offer_ranges(
+                            arch, num_sms, dtype, page_size, q_len, True, max_seq_len
+                        )
+                        if dtype == torch.float8_e4m3fn and page_size == 32:
+                            assert not core._cake_mla_auto_offer_ranges(
+                                arch,
+                                num_sms,
+                                dtype,
+                                page_size,
+                                q_len,
+                                False,
+                                max_seq_len,
+                            )
     assert not built, "an unlisted unit built a Cake program"
     assert not cake_module._FP8_LUTS, "an unlisted unit created the FP8 decode table"
 
