@@ -259,7 +259,7 @@ def test_staging_preserves_masked_scores(
     ids = torch.arange(topk, device="cuda", dtype=torch.int64).repeat(live, 1)
     scores = torch.rand(live, topk, device="cuda", dtype=score_dtype)
     ws = SimpleNamespace(
-        config=SimpleNamespace(num_total_experts=8),
+        config=SimpleNamespace(num_total_experts=8, shared_expert=None),
         x=torch.empty((capacity, xq.shape[1]), device="cuda", dtype=xq.dtype),
         x_sf=torch.empty((capacity, sf.shape[1]), device="cuda", dtype=sf.dtype),
         topk_idx=torch.empty(capacity, topk, device="cuda", dtype=torch.int32),

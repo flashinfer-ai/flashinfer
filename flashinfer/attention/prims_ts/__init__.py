@@ -54,6 +54,7 @@ from .sage import SageAttentionConfig, SageAttentionParams
 from .vc_attention import (
     VCAttentionConfig,
     VCAttentionParams,
+    vc_qk8_dtype,
 )
 from .vc_attention.quantization import (
     VCAttentionPreprocessor,
@@ -69,6 +70,7 @@ __all__ = [
     "VCAttentionConfig",
     "VCAttentionParams",
     "VCAttentionPreprocessor",
+    "vc_qk8_dtype",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",
     "block_sparse_attention_with_paged_kv_cache",

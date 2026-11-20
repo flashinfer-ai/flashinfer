@@ -46,6 +46,7 @@ struct TileN8Fc2Args {
   int grid_m;
   int max_tiles;
   int K_tiles;
+  int num_experts;
 };
 
 inline bool EncodeTileN8Fc2Map(CUtensorMap* out, CUtensorMapDataType type, uint32_t rank, const void* data,
@@ -129,6 +130,7 @@ inline bool EncodeTileN8Fc2(TileN8Fc2Args* args, bool gather, const void* weight
   args->grid_m = static_cast<int>(hidden / 128);
   args->max_tiles = static_cast<int>(extent);
   args->K_tiles = static_cast<int>((intermediate + 255) / 256);
+  args->num_experts = static_cast<int>(experts);
   return true;
 }
 

@@ -47,20 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_EXPERT_COUNTS_OFF 0
-#define SMEM_EXPERT_COUNTS_STAGE_BYTES 2048
-#define SMEM_EXPERT_COUNTS_STRIDE 2048
-#define SMEM_EXPERT_TILE_OFFSETS_OFF 2048
-#define SMEM_EXPERT_TILE_OFFSETS_STAGE_BYTES 2052
-#define SMEM_EXPERT_TILE_OFFSETS_STRIDE 2052
-#define SMEM_EXPERT_SCATTER_OFFSETS_OFF 4112
-#define SMEM_EXPERT_SCATTER_OFFSETS_STAGE_BYTES 2048
-#define SMEM_EXPERT_SCATTER_OFFSETS_STRIDE 2048
-#define SMEM_SCAN_VALUES_OFF 6160
-#define SMEM_SCAN_VALUES_STAGE_BYTES 64
-#define SMEM_SCAN_VALUES_STRIDE 64
-#define SMEM_TOTAL 6272
 #define THREADS 256
 #define MAX_EXPERTS 512
 #define TILE_N 8
@@ -90,7 +76,7 @@ kernel_cake_warp_decode_30aabe6953736fdeda01(int* __restrict__ route_experts, in
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* expert_counts = reinterpret_cast<int*>(smem_raw + 0);
     const int expert_counts_addr = smem + 0;
     int* expert_tile_offsets = reinterpret_cast<int*>(smem_raw + 2048);
