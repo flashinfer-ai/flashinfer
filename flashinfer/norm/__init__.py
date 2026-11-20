@@ -1308,6 +1308,9 @@ def rmsnorm(
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
+        Passing either True or False explicitly keeps backend="auto"
+        on the incumbent path, so toggling PDL preserves its numerical behavior.
+        The specialized backend currently supports only non-PDL launches.
     backend: str
         One of ``("auto", "specialized", "cuda", "cutedsl")``.
         ``"specialized"`` selects the specialized SM90 serve-shape kernels
@@ -1394,7 +1397,7 @@ def _rmsnorm_impl(
         # dtype/shape/token counts): pre-gate misses are not counted.
         if (
             _try_rmsnorm_serve_sm90 is not None
-            and enable_pdl is not True
+            and enable_pdl is None
             and input.dim() == 2
             and not _USE_CUDA_NORM
             and _rmsnorm_serve_auto_eligible(input)

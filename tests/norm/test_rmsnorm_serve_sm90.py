@@ -186,7 +186,9 @@ def test_incompatible_captured_target_declines_only_cute_variant():
         import pytest
         import torch
         import flashinfer.norm as norm
+        import importlib
 
+        serve = importlib.import_module("flashinfer.norm.kernels.rmsnorm_serve_sm90")
         torch.cuda.set_device(int(sys.argv[1]))
         assert norm._dsl_captured_arch() == 'sm_100a'
         # Use an auto-admitted shape so this exercises the architecture refusal.
@@ -585,7 +587,8 @@ def test_cuda_variant_single_row_strides(monkeypatch):
     torch.testing.assert_close(out, _ref(x, w), atol=0.01, rtol=0.02)
 
 
-def test_explicit_pdl_preserved(monkeypatch):
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_explicit_pdl_preserved(monkeypatch, enable_pdl):
     _sm90_or_skip()
     monkeypatch.setenv(VARIANT_ENV, "cuda")
     monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", False)
@@ -594,11 +597,11 @@ def test_explicit_pdl_preserved(monkeypatch):
     module = Mock()
     monkeypatch.setattr(flashinfer.norm, "get_norm_module", lambda: module)
     x, w = _case(tokens=4)
-    flashinfer.norm.rmsnorm(x, w, enable_pdl=True)
+    flashinfer.norm.rmsnorm(x, w, enable_pdl=enable_pdl)
     with pytest.raises(NotImplementedError, match="PDL"):
         flashinfer.norm.rmsnorm(x, w, backend="specialized", enable_pdl=True)
     module.rmsnorm.assert_called_once()
-    assert module.rmsnorm.call_args.args[-1] is True
+    assert module.rmsnorm.call_args.args[-1] is enable_pdl
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["calls"] == 1
     assert stats["fallback_reasons"] == {"specialized: PDL not supported": 1}
