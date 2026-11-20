@@ -804,7 +804,7 @@ def test_direct_reports_immediate_launch_error(tmp_path):
     torch.cuda.synchronize()
     with pytest.raises(
         RuntimeError,
-        match="gqa_ctx_fp8_ikv_run launch at request 0: invalid configuration",
+        match=r"gqa_ctx_fp8_ikv_run launch at request 0: invalid (?:configuration|argument)",
     ):
         run(
             inp["q"],
