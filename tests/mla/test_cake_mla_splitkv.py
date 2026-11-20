@@ -19,7 +19,9 @@ the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
   the query;
 - empty splits (rows much shorter than ``max_seq_len``) ignore stale shared memory;
 - the split-KV scratch is keyed by the split count and never cached under stream
-  capture or in the stateless mode.
+  capture or in the stateless mode;
+- the ``max_seq_len`` field of the ``backend="auto"`` decision memo keeps the side
+  of the split-KV range start, also a start inside a bucket (no GPU needed).
 """
 
 import math
@@ -29,6 +31,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.mla import _core as core
 from flashinfer.mla import cake_trtllm_mla_blackwell as cake_module
 from flashinfer.utils import get_compute_capability
 
@@ -579,3 +582,55 @@ def test_splitkv_scratch_keyed_by_split_count_and_never_cached_in_capture(
     eager = _cake(query, kv_cache, block_tables, seq_lens, 8192, stateless=True)
     torch.cuda.synchronize()
     assert torch.equal(out, eager)
+
+
+@pytest.mark.parametrize("start", [2049, 3000, 4097])
+def test_auto_memo_seq_len_follows_the_splitkv_range(monkeypatch, start):
+    """The field that stands for max_seq_len in the ``backend="auto"`` decision
+    memo key (``_mla_auto_memo_seq_len``) keeps the side of the device's
+    split-KV range start a max_seq_len is on, also for a start inside a bucket
+    and a KV tile (3000), so all values of one field select one domain: split-KV
+    for 4 query rows from the start on, VQUARTER below it. A device without a
+    range has no side (``None``). No GPU needed."""
+    facts = ("sm_100a", 148)
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: facts)
+    monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", {facts: (start, 18)})
+    domains = {}
+    for max_seq_len in range(1, 8193):
+        field = core._mla_auto_memo_seq_len(max_seq_len, 0)
+        assert field[2] == (max_seq_len >= start), max_seq_len
+        domain = cake_module.select_domain(
+            dtype=torch.bfloat16,
+            num_heads=NUM_HEADS,
+            qk_dim=QK_DIM,
+            value_dim=LATENT,
+            qk_nope_head_dim=128,
+            page_size=32,
+            topk=0,
+            uses_shared_paged_kv_idx=True,
+            ragged_query=False,
+            enable_sink=False,
+            skip_softmax=False,
+            wants_lse=False,
+            bmm2_scale=1.0,
+            total_q=4,
+            max_seq_len=max_seq_len,
+            batch_size=4,
+            q_len=1,
+            table_width=256,
+            kv_lens=None,
+            num_sms=facts[1],
+            arch=facts[0],
+        )
+        assert domains.setdefault(field, domain) == domain, max_seq_len
+    assert set(domains.values()) == {
+        cake_module.DOMAIN_BF16_SPLITKV,
+        cake_module.DOMAIN_BF16_VQUARTER,
+    }
+    below, at = (core._mla_auto_memo_seq_len(value, 0) for value in (start - 1, start))
+    assert below != at
+    if start == 3000:
+        # Same bucket and KV tile count: only the side tells them apart.
+        assert below[:2] == at[:2]
+    monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", {})
+    assert core._mla_auto_memo_seq_len(4096, 0)[2] is None

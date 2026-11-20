@@ -15,8 +15,10 @@ the first stage's winner; that the memo state and the tuning buckets are what th
 accessors and the unmemoized computation give; that an
 untuned call never selects Cake and every Cake miss runs the first stage's
 selection; that a repeated lookup-only call of a listed batch reuses the
-decision of both stages exactly while the tuner and its settings are unchanged;
-that a tuned call is correct whichever candidate wins; that a forced
+decision of both stages exactly while the tuner and its settings are unchanged,
+also when the caller changes max_seq_len on every call (one selection per
+bucket and KV tile count, the same runner, tactic, Cake launch and output as
+without the memo); that a tuned call is correct whichever candidate wins; that a forced
 Cake selection matches TRTLLM-GEN (bmm2_scale, q_len > 1) on live rows while
 padded rows output exact zeros; that it reads no host state and launches only
 the kernels of explicit ``backend="cake"``; and that it stays correct after input
@@ -2418,6 +2420,153 @@ def test_cake_families_memo_follows_the_splitkv_range(
     assert runner._families(inputs, (4,)) is None
 
 
+# max_seq_len values across the bucket edges 128 to 4096 and the KV tile edges
+# of their neighbourhoods.
+_SWEPT_MAX_SEQ_LENS = sorted(
+    {
+        *range(1, 300),
+        *range(480, 560),
+        *range(880, 1160),
+        *range(1900, 2200),
+        *range(2940, 3060),
+        *range(3960, 4240),
+    }
+)
+
+# (dtype, page size, batch) on every domain the candidate launches on the
+# simulated 148-SM SM100a device: BF16 VQUARTER, VHALF, the CLC program in one
+# wave and with the work order, FP8 page 64 (its split count reads max_seq_len),
+# and BF16 split-KV from the device's split-KV range on (VQUARTER below it; its
+# split count reads max_seq_len).
+_SWEPT_GEOMETRIES = (
+    (torch.bfloat16, 32, 4),
+    (torch.bfloat16, 32, 32),
+    (torch.bfloat16, 32, 64),
+    (torch.bfloat16, 32, 128),
+    (torch.bfloat16, 64, 4),
+    (torch.float8_e4m3fn, 64, 16),
+    (torch.float8_e4m3fn, 64, 128),
+)
+
+
+def _offer_every_bucket(monkeypatch, max_seq_lens, arch="sm_100a", num_sms=148):
+    """A synthetic offer table listing every candidate domain for every batch
+    and every max_seq_len bucket of ``max_seq_lens`` (no sinks, q_len 1)."""
+    buckets = sorted({_round_to_seq_len_bucket(value) for value in max_seq_lens})
+    table = {
+        (arch, num_sms, dtype_name, page_size, 1, False): tuple(
+            (domain, bucket, 1, core._CAKE_MLA_MAX_ROWS)
+            for domain in (*_DOMAINS, cake_module.DOMAIN_BF16_SPLITKV)
+            for bucket in buckets
+        )
+        for dtype_name in ("bfloat16", "float8_e4m3fn")
+        for page_size in (32, 64)
+    }
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", table)
+    # A placeholder FP8 decode table for the CPU tensors: _launch_plan resolves.
+    monkeypatch.setattr(cake_module, "_FP8_LUTS", {torch.device("cpu"): torch.zeros(1)})
+
+
+@pytest.mark.parametrize("splitkv_start", [2049, 3000])
+def test_auto_memo_seq_len_holds_what_the_decision_reads(
+    monkeypatch, cake_families, splitkv_start
+):
+    """Every ``max_seq_len`` with the same memo field
+    (``_mla_auto_memo_seq_len``) has the same offered batch ranges, Cake
+    cache-key extras, launched families and resolved Cake launch (domain and
+    split counts included), derived without the memos, for every candidate
+    domain, across max_seq_len bucket and KV tile edges and the start of the
+    device's split-KV range, also one that is not a bucket edge; the memoized
+    ranges and families equal that derivation for every value. A caller
+    varying max_seq_len in the last 121 values of a bucket has one field, and
+    the values of a bucket have one per KV tile count. No GPU needed."""
+    arch, num_sms = "sm_100a", 148
+    monkeypatch.setattr(
+        cake_module, "_SPLITKV_RANGE", {(arch, num_sms): (splitkv_start, 18)}
+    )
+    _offer_every_bucket(monkeypatch, _SWEPT_MAX_SEQ_LENS)
+    for dtype, page_size, batch_size in _SWEPT_GEOMETRIES:
+        inputs = _cpu_inputs(dtype, batch_size)
+        reads = {}
+        for max_seq_len in _SWEPT_MAX_SEQ_LENS:
+            runner = _cpu_runner(dtype, page_size, max_seq_len)
+            ranges = tuple(
+                (first, last)
+                for _, first, last in core._cake_mla_auto_offer_ranges(
+                    arch, num_sms, dtype, page_size, 1, False, max_seq_len
+                )
+            )
+            families = runner._launched_families(
+                dtype, 1, NUM_HEADS, QK_DIM, 32, batch_size, arch, num_sms
+            )
+            plan = runner._launch_plan(inputs)
+            label = (dtype, page_size, batch_size, max_seq_len)
+            assert families is not None, label
+            assert plan is not None, label
+            assert (
+                core._cake_mla_auto_batch_ranges(
+                    0, dtype, page_size, 1, False, max_seq_len
+                )
+                == ranges
+            ), label
+            assert runner._families(inputs, (batch_size,)) == families, label
+            read = (ranges, runner.get_cache_key_extras(inputs), families, plan[0])
+            field = core._mla_auto_memo_seq_len(max_seq_len, 0)
+            assert reads.setdefault(field, read) == read, label
+        if dtype == torch.float8_e4m3fn and batch_size == 16:
+            # The FP8 page-64 split count follows the KV tile count (2 to 4
+            # here), which the field therefore keeps.
+            assert len({read[3] for read in reads.values()}) > 1
+        if dtype == torch.bfloat16 and batch_size == 4:
+            # Split-KV from the range's start on, VQUARTER below it.
+            assert len({read[2] for read in reads.values()}) == 2
+    for top in (256, 1024, 2048):
+        fields = {
+            core._mla_auto_memo_seq_len(value, 0) for value in range(top - 120, top + 1)
+        }
+        assert len(fields) == 1
+        fields = {
+            core._mla_auto_memo_seq_len(value, 0)
+            for value in range(top // 2 + 1, top + 1)
+        }
+        assert len(fields) == max(1, top // 256)
+    # A range start inside a bucket's KV tile splits that tile's values.
+    fields = {core._mla_auto_memo_seq_len(value, 0) for value in range(2049, 4097)}
+    assert len(fields) == 16 + (splitkv_start % 128 != 1)
+
+
+def test_auto_memo_stays_bounded_when_max_seq_len_varies(
+    monkeypatch, fresh_tuner, cake_families, synthetic_offers
+):
+    """A caller varying max_seq_len adds at most one memoized decision per
+    value of the memo field (one per KV tile count, 519 for max_seq_len 1 to
+    65536), one offered-ranges entry per bucket, and the decision memo is
+    cleared past ``_CAKE_MLA_MEMO_LIMIT`` entries. No GPU needed."""
+    max_seq_lens = range(1, 65537)
+    fields = {core._mla_auto_memo_seq_len(value, 0) for value in max_seq_lens}
+    assert len(fields) == 65536 // 128 + 7
+    for max_seq_len in max_seq_lens:
+        core._cake_mla_auto_batch_ranges(0, torch.bfloat16, 64, 1, False, max_seq_len)
+    assert len(core._CAKE_MLA_RANGES_MEMO[0][2]) == 17
+    assert sum(key[0] == "ranges" for key in core._CAKE_MLA_TABLE_MEMO) == 17
+
+    monkeypatch.setattr(core, "_CAKE_MLA_MEMO_LIMIT", 8)
+    state = core._mla_cake_memo_state(fresh_tuner)
+    assert state is not None
+    runners = [_FakeTrtllmGen()]
+    for field in sorted(fields):
+        core._mla_cake_auto_memo_put(
+            fresh_tuner,
+            ("call", field),
+            state,
+            core._CAKE_MLA_AUTO_OFFERS,
+            runners,
+            (runners[0], -1),
+            None,
+        )
+        assert 0 < len(core._CAKE_MLA_AUTO_MEMO) <= 9
+
+
 def test_cake_preparation_launches_nothing():
     """The tuner's preparation call does not launch the decode (``_ready``
     built the programs). No GPU needed."""
@@ -3865,6 +4014,268 @@ def test_auto_without_a_cake_result_memoizes_the_first_stage(monkeypatch, fresh_
     assert lookups[0] == 1 and len(results) == 1
     assert executed == [(type(runner), tactic)]
     _assert_matches_reference(output, case, "gate opened")
+
+
+# --- A caller changing max_seq_len on every call (seq_lens clamped to it) ---
+
+# (dtype, page size, batch, top of the max_seq_len bucket): the BF16 CLC
+# program with the work order, the FP8 page-64 program, whose split count reads
+# the KV tile count, and BF16 split-KV (4 rows, bucket 4096) on the devices
+# whose split-KV range covers that bucket, whose split count reads it too (the
+# "edges" values cross into bucket 2048, VQUARTER there).
+_VARYING_GEOMETRIES = {
+    "bf16_p32_clc": (torch.bfloat16, 32, 128, 1024),
+    "fp8_p64": (torch.float8_e4m3fn, 64, 16, 2048),
+    "bf16_p32_splitkv": (torch.bfloat16, 32, 4, 4096),
+}
+
+
+def _varying_max_seq_lens(pattern, top):
+    """``inc``: the last 121 values of the bucket of ``top``, in order;
+    ``rand``: 40 seeded draws from that bucket; ``edges``: values on both
+    sides of the bucket's lower edge and of KV tile edges, revisited."""
+    if pattern == "inc":
+        return list(range(top - 120, top + 1))
+    if pattern == "rand":
+        generator = torch.Generator().manual_seed(top)
+        draws = torch.randint(top // 2 + 1, top + 1, (40,), generator=generator)
+        return draws.tolist()
+    low = top // 2
+    return [top, low + 1, low, low + 128, low + 129, top - 128, top - 127, low, top]
+
+
+def _offer_max_seq_lens(monkeypatch, case, max_seq_lens):
+    """Offer the unit of ``case`` (its tuning bucket of batches) for the
+    bucket of every value of ``max_seq_lens``, on each domain Cake launches
+    there (two where the device's split-KV range starts inside the bucket)."""
+    arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
+    query = case["query"]
+    page_size = case["kv_cache"].shape[-2]
+    inputs = [query, case["block_tables"], case["seq_lens"], _nan_out(case)]
+    units = set()
+    first, last = _bucket_range(query.shape[0])
+    for max_seq_len in max_seq_lens:
+        runner = _cpu_runner(
+            query.dtype, page_size, max_seq_len, bmm2_scale=case["bmm2_scale"]
+        )
+        domain = runner._domain(inputs, num_sms, arch=arch)
+        assert domain is not None, max_seq_len
+        units.add((domain, _round_to_seq_len_bucket(max_seq_len), first, last))
+    key = (
+        arch,
+        num_sms,
+        core._cake_mla_dtype_name(query.dtype),
+        page_size,
+        query.shape[1],
+        False,
+    )
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: tuple(sorted(units))})
+
+
+def _varying_call(case, max_seq_len):
+    """``case`` with ``max_seq_len`` and its seq_lens clamped to it."""
+    return dict(
+        case, max_seq_len=max_seq_len, seq_lens=case["seq_lens"].clamp(max=max_seq_len)
+    )
+
+
+def _unrecorded(spies, function, *args):
+    """``function(*args)``, dropping what the list ``spies`` recorded meanwhile."""
+    marks = [len(spy) for spy in spies]
+    result = function(*args)
+    for spy, mark in zip(spies, marks, strict=True):
+        del spy[mark:]
+    return result
+
+
+def _decode_selections(calls):
+    return sum(op == core._MLA_DECODE_OP for op, _, _ in calls)
+
+
+def _memo_fields(max_seq_lens):
+    device_index = torch.cuda.current_device()
+    return {core._mla_auto_memo_seq_len(value, device_index) for value in max_seq_lens}
+
+
+def _check_varying_max_seq_lens(monkeypatch, case, max_seq_lens):
+    """Force Cake for ``case``, offered for every bucket of ``max_seq_lens``,
+    and call it with each of them (seq_lens clamped), first with the memo
+    cleared before each call, then with the memo: the second pass runs the
+    first's runners, tactics and Cake launches, selects once per memo field,
+    and every output equals explicit ``backend="cake"`` bit for bit. Returns
+    the resolved launches."""
+    _force_cake(monkeypatch, case)
+    _offer_max_seq_lens(monkeypatch, case, max_seq_lens)
+    calls = _spy_choose_one(monkeypatch)
+    configs = _count_tuning_configs(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
+    launches = _spy_cake_forward(monkeypatch)
+    executed = _spy_runner_calls(monkeypatch)
+    spies = (calls, results, launches, executed)
+    variants = [_varying_call(case, value) for value in max_seq_lens]
+
+    def run(memoized):
+        core._CAKE_MLA_AUTO_MEMO.clear()
+        for spy in spies:
+            spy.clear()
+        configs[0] = 0
+        with autotune(False):
+            for variant in variants:
+                if not memoized:
+                    core._CAKE_MLA_AUTO_MEMO.clear()
+                output = _decode(dict(variant, out=_nan_out(case)))
+                explicit = _unrecorded(
+                    spies,
+                    _explicit_cake,
+                    variant,
+                    variant["seq_lens"],
+                    variant["block_tables"],
+                )
+                torch.cuda.synchronize()
+                label = (memoized, variant["max_seq_len"])
+                assert torch.equal(output, explicit), label
+        assert len(launches) == len(variants)
+        assert all(runner._plan is not None for runner in launches)
+        plans = [(runner._plan[0], runner._plan[3]) for runner in launches]
+        return list(executed), plans
+
+    selected, plans = run(memoized=False)
+    assert configs[0] == _decode_selections(calls) == len(results) == len(variants)
+    fields = _memo_fields(max_seq_lens)
+    assert run(memoized=True) == (selected, plans)
+    assert len(core._CAKE_MLA_AUTO_MEMO) == len(fields)
+    assert configs[0] == _decode_selections(calls) == len(results) == len(fields)
+    assert all(_name(runner) == "cake" for runner, _ in results)
+    assert len(selected) == len(variants)
+    assert all(cls is core._CakeTrtllmMlaBlackwellRunner for cls, _ in selected)
+    return [launch for launch, _ in plans]
+
+
+@pytest.mark.parametrize("pattern", ["inc", "rand", "edges"])
+@pytest.mark.parametrize("geometry", sorted(_VARYING_GEOMETRIES))
+def test_auto_reuses_the_decision_across_max_seq_len_of_a_bucket(
+    monkeypatch, clean_tuner, geometry, pattern
+):
+    """A caller that changes max_seq_len on every call (seq_lens clamped to
+    it) selects once per value of the memo field (``_mla_auto_memo_seq_len``):
+    one memoized decision, one tuning config, one first-stage selection and
+    one second stage per value, none on the other calls. Every call runs the
+    runner, tactic and resolved Cake launch the unmemoized path (the memo
+    cleared before each call) runs for its max_seq_len, and its output equals,
+    bit for bit, explicit ``backend="cake"`` with the same max_seq_len."""
+    _require_cake_arch()
+    dtype, page_size, batch_size, top = _VARYING_GEOMETRIES[geometry]
+    case = _make_case(
+        dtype=dtype, page_size=page_size, batch_size=batch_size, max_seq_len=top
+    )
+    _check_varying_max_seq_lens(monkeypatch, case, _varying_max_seq_lens(pattern, top))
+
+
+@pytest.mark.parametrize("splitkv_start", [None, 3000])
+def test_auto_decision_follows_the_splitkv_range_across_max_seq_len(
+    monkeypatch, clean_tuner, splitkv_start
+):
+    """A caller changing max_seq_len across the start of the device's split-KV
+    range (the committed start, a bucket edge, or 3000, inside a bucket and a
+    KV tile) gets one decision on each side: the calls launch the split-KV
+    program from the start on and the value-split one below it, each with the
+    launch, runner and output of the unmemoized path and of explicit
+    ``backend="cake"`` for its max_seq_len."""
+    _require_cake_arch()
+    facts = cake_module._device_facts(torch.cuda.current_device())
+    if splitkv_start is not None:
+        monkeypatch.setitem(cake_module._SPLITKV_RANGE, facts, (splitkv_start, 18))
+    limits = cake_module._SPLITKV_RANGE.get(facts)
+    if limits is None:
+        pytest.skip(f"no split-KV range on {facts}")
+    start = limits[0]
+    max_seq_lens = [start - 129, start - 1, start, start + 1, start + 127]
+    max_seq_lens += [start - 1, start, start + 128, start - 128, start + 1]
+    case = _make_case(
+        batch_size=4,
+        page_size=32,
+        max_seq_len=_round_to_seq_len_bucket(max(max_seq_lens)),
+    )
+    launches = _check_varying_max_seq_lens(monkeypatch, case, max_seq_lens)
+    for value, launch in zip(max_seq_lens, launches, strict=True):
+        splitkv = launch.kind == cake_module._LAUNCH_SPLITKV
+        assert splitkv == (value >= start), value
+
+
+@pytest.mark.parametrize("cake_wins", [True, False])
+def test_tuned_auto_across_max_seq_len_matches_the_unmemoized_selection(
+    monkeypatch, fresh_tuner, cake_wins
+):
+    """Tuned at max_seq_len 1024 only, a caller changing max_seq_len across KV
+    tile counts and buckets (seq_lens clamped to it) runs on every call the
+    runner and tactic the unmemoized path (the memo cleared before each call)
+    selects for that max_seq_len: a first-stage winner keyed by the KV tile
+    count (monolithic CuTe DSL) or the bucket, and a Cake choice that beat it,
+    are not reused for another one. It selects once per value of the memo
+    field. Each output equals the unmemoized call's bit for bit where two
+    unmemoized calls agree, a Cake output equals explicit ``backend="cake"``
+    bit for bit, and every output matches the reference."""
+    _require_cake_arch()
+    case = _make_case(batch_size=4, page_size=64)
+    max_seq_lens = [1024, 1000, 897, 896, 800, 769, 768, 1024, 640, 513, 512, 897]
+    max_seq_lens += [300, 1024]
+    _offer_max_seq_lens(monkeypatch, case, max_seq_lens)
+    monkeypatch.setattr(
+        core.AutoTuner,
+        "_profile_single_kernel",
+        _profile_times(
+            {
+                "_BatchMLAPagedAttentionTrtllmGenBackend": 3.0,
+                core._CAKE_MLA_RUNNER: 1.0 if cake_wins else 9.0,
+            }
+        ),
+    )
+    with autotune(True, tuning_buckets=TUNING_BUCKETS):
+        _decode(case)
+    if not cake_wins:
+        # Cake won elsewhere, so the second stage runs for this unit too.
+        _hold_cake_entry(fresh_tuner)
+    calls = _spy_choose_one(monkeypatch)
+    configs = _count_tuning_configs(monkeypatch)
+    executed = _spy_runner_calls(monkeypatch)
+    variants = [_varying_call(case, value) for value in max_seq_lens]
+
+    def run(memoized):
+        core._CAKE_MLA_AUTO_MEMO.clear()
+        calls.clear()
+        executed.clear()
+        configs[0] = 0
+        outputs = []
+        with autotune(False):
+            for variant in variants:
+                if not memoized:
+                    core._CAKE_MLA_AUTO_MEMO.clear()
+                outputs.append(_decode(dict(variant, out=_nan_out(case))))
+        torch.cuda.synchronize()
+        assert len(executed) == len(variants)
+        return list(executed), outputs
+
+    selected, expected = run(memoized=False)
+    assert configs[0] == _decode_selections(calls) == len(variants)
+    repeated = run(memoized=False)[1]
+    memoized, outputs = run(memoized=True)
+    fields = _memo_fields(max_seq_lens)
+    assert len(core._CAKE_MLA_AUTO_MEMO) == len(fields)
+    assert configs[0] == _decode_selections(calls) == len(fields)
+    assert memoized == selected
+    for variant, (runner_class, _), output, first, second in zip(
+        variants, selected, outputs, expected, repeated, strict=True
+    ):
+        label = f"max_seq_len {variant['max_seq_len']} ({runner_class.__name__})"
+        if torch.equal(first, second):
+            assert torch.equal(output, first), label
+        if runner_class is core._CakeTrtllmMlaBlackwellRunner:
+            explicit = _explicit_cake(
+                variant, variant["seq_lens"], variant["block_tables"]
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(output, explicit), label
+        _assert_matches_reference(output, variant, label)
 
 
 def test_dispatcher_keeps_no_closure_cells():
