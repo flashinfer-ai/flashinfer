@@ -49,7 +49,6 @@ from flashinfer.fused_moe.core import (
 from flashinfer.quantization.fp4_quantization import block_scale_interleave
 from flashinfer.utils import get_compute_capability
 from tests.moe.test_cute_dsl_fused_moe import (
-    _sm8x_or_sm90,
     check_accuracy,
     compute_reference_moe_fp4,
 )
@@ -63,8 +62,8 @@ def _sm100_family() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not (_sm100_family() or _sm8x_or_sm90),
-    reason="TRTLLM MXFP4 unified tests require SM80 to SM90, SM100, SM103, or SM107",
+    not _sm100_family(),
+    reason="TRTLLM MXFP4 unified tests require SM100, SM103, or SM107",
 )
 
 

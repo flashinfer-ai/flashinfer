@@ -241,10 +241,8 @@ Utility Functions
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
     preprocess_moe_weights_for_sm90_mixed_gemm_humming
-    cutlass_nvfp4_sm80_weights
-    trtllm_nvfp4_sm80_weights
-    cute_dsl_w4a16_sm80_weights
-    cute_dsl_w4a16_sm80_supported
+    prepare_records_mxfp4_weights
+    prepare_records_nvfp4_weights
     fused_topk_deepseek
     hash_topk
 

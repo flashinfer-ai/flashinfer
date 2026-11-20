@@ -206,12 +206,9 @@ class MmaTensorOpComputeBWithF16 {
   MmaTensorOpComputeBWithF16() {}
 
   /// Performs a warp-level matrix multiply-accumulate operation
-  /// (on SM80+ only over the first LiveMBlocks mma rows; D keeps C in the rows after them)
-  template <int LiveMBlocks = MmaIterations::kRow>
-  CUTLASS_DEVICE void operator()(FragmentC& D, TransformedFragmentA const& A,
-                                 TransformedFragmentB const& B, FragmentC const& C,
-                                 int const warp_tileB_k_offset,
-                                 platform::integral_constant<int, LiveMBlocks> = {}) const {
+  CUTLASS_DEVICE
+  void operator()(FragmentC& D, TransformedFragmentA const& A, TransformedFragmentB const& B,
+                  FragmentC const& C, int const warp_tileB_k_offset) const {
     using MmaOperandA = typename ArchMmaOperator::FragmentA;
     using MmaOperandB = typename ArchMmaOperator::FragmentB;
     using MmaOperandC = typename ArchMmaOperator::FragmentC;
@@ -249,7 +246,7 @@ class MmaTensorOpComputeBWithF16 {
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     // Serpentine visitation order maximizing reuse of Ra
     CUTLASS_PRAGMA_UNROLL
-    for (int m = 0; m < LiveMBlocks; ++m) {
+    for (int m = 0; m < MmaIterations::kRow; ++m) {
       CUTLASS_PRAGMA_UNROLL
       for (int n = 0; n < MmaIterations::kColumn; ++n) {
         int n_serpentine = ((m % 2) ? (MmaIterations::kColumn - 1 - n) : n);

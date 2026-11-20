@@ -80,15 +80,12 @@ from ...quantization.kernels.nvfp4_quantize import (
 from ...quantization.nvfp4_quantization_utils import (
     nvfp4_per_token_scale_inv,
     NVFP4_PER_TOKEN_SCALE_RTOL,
-    NVFP4_4OVER6_CODE_STANDARD,
     _UNSET,
     NVFP44Over6Config,
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
-from ...utils import supported_compute_capability
-from ..prepare import _sm80_records, cute_dsl_w4a16_sm80_supported
-from ..prepare import cute_dsl_w4a16_sm80_weights, cutlass_nvfp4_sm80_weights
+from ...utils import check_shape_dtype_device, supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -116,7 +113,6 @@ from .tuner import (
     CuteDslFusedMoERunner,
     CuteDslFusedMoEW4A16Runner,
     W4A16_MOE_TACTICS,
-    W4A16_SM80_TACTICS,
     _get_arch_tactics,
 )
 
@@ -168,9 +164,6 @@ def _check_clamped_relu2_supported(
         and torch.cuda.get_device_capability(device) == (10, 7)
     ):
         raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
-    if device.type == "cuda" and torch.cuda.is_available():
-        if torch.cuda.get_device_capability(device)[0] < 10:
-            raise ValueError("ActivationType.ClampedRelu2 is not supported below SM100")
 
 
 #: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
@@ -1123,9 +1116,8 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM80 to SM90 (on the SM80 kernels, with tactics for W4A16 only),
-    SM100, SM103, and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
-    SM100 and SM103.
+    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
+    SM100 and SM103. SM80 to SM90 run the records path of :func:`cute_dsl_fused_moe`.
 
     Attributes:
         num_experts: Total number of experts.
@@ -1599,6 +1591,20 @@ class CuteDslMoEWrapper:
         torch.Tensor
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+            # Below SM100: the functional API's records path under this configuration.
+            return cute_dsl_fused_moe(
+                x, x_sf, token_selected_experts, token_final_scales, w1_weight, w1_weight_sf,
+                w1_alpha, fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, self.num_experts,
+                self.top_k, self.num_local_experts, self.local_expert_offset, self.output_dtype,
+                enable_pdl=self.enable_pdl, activation_type=self.activation_type.value,
+                swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
+                swiglu_limit=self.swiglu_limit, situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta, quant_mode=self.quant_mode,
+                per_token_scale=per_token_scale, tactic=tactic, nvfp4_4over6=nvfp4_4over6,
+                clamped_relu2_limit=self.clamped_relu2_limit,
+                routing_weights_before_fc2=self.routing_weights_before_fc2,
+            )  # fmt: skip
         validate_pre_fc2_options(
             self.routing_weights_before_fc2,
             per_token_scale=per_token_scale is not None,
@@ -1689,10 +1695,6 @@ class CuteDslMoEWrapper:
         recipe_kwargs = _cute_dsl_recipe_kwargs(
             nvfp4_4over6, self.quant_mode, per_token_scale
         )
-        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            return _cute_dsl_fused_moe_sm80(
-                runner, inputs, tactic, op_name, **recipe_kwargs
-            )
         if tactic is not None:
             return runner(inputs, tactic=tactic, **recipe_kwargs)
 
@@ -1715,14 +1717,6 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
-        if torch.cuda.get_device_capability(self.device)[0] < 10:
-            # Below SM100 only the W4A16 records take tactics.
-            records = self.quant_mode == "w4a16" and cute_dsl_w4a16_sm80_supported(
-                self.num_experts, self.num_local_experts, self.local_expert_offset,
-                self.output_dtype, self.activation_type, self.swiglu_alpha, self.swiglu_beta,
-                self.swiglu_limit, self.situ_beta,
-            )  # fmt: skip
-            return list(W4A16_SM80_TACTICS) if records else []
         if self.routing_weights_before_fc2:
             return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab and self.quant_mode != "w4a16":
@@ -1875,113 +1869,6 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-def _cute_dsl_fused_moe_sm80(
-    runner, inputs, tactic, op_name=None, nvfp4_4over6=_UNSET, fc1_input_scale=None
-):
-    """Runs ``runner`` on the CUTLASS SM80 kernels (W4A8 as W4A16 with MXFP8 activations, on SM90
-    the FP8 mixed-input GEMM), converting weights unless given operands. As from SM100 the GEMM2
-    input is standard NVFP4, or per token the pinned 4over6 recipe, else the environment's.
-    From the public APIs (``op_name``), W4A16 converts MMA-layout scales to records where they
-    run, tuned under ``op_name`` unless given ``tactic``."""
-    from ..core import _trtllm_fp4_nvfp4_4over6_code, get_cutlass_fused_moe_module
-    from ..core import _records_moe_sm80, _w4a16_moe_sm80
-
-    w4a16 = isinstance(runner, CuteDslFusedMoEW4A16Runner)
-    _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
-    supported = cute_dsl_w4a16_sm80_supported(
-        runner.num_experts, runner.num_local_experts, runner.local_expert_offset,
-        runner.output_dtype, runner.activation_type, runner.swiglu_alpha, runner.swiglu_beta,
-        runner.swiglu_limit, runner.situ_beta,
-    )  # fmt: skip
-    if w4a16 and supported and op_name and inputs[4].dim() == 6:
-        r1, r2 = cute_dsl_w4a16_sm80_weights(*inputs[3:5], *inputs[6:8], gated)
-        inputs = [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
-    if w4a16 and op_name and tactic is None and inputs[4].dim() == 2:
-        _, tactic = AutoTuner.get().choose_one(
-            op_name, [runner], runner.tuning_config, inputs
-        )
-    if _sm80_records(inputs[4 if w4a16 else 5]):  # cute_dsl_w4a16_sm80_weights
-        w4a4 = getattr(runner, "quant_mode", None) == "w4a4" and len(inputs) == 12
-        if not supported or not (w4a16 or w4a4):
-            raise ValueError(
-                "Below SM100 CuTe-DSL records run SwiGLU with default parameters or ReLU2 over all "
-                "experts, W4A4 without per-token scales; pass block scales otherwise."
-            )
-        if w4a16:
-            return _w4a16_moe_sm80(inputs, tactic, gated)
-        # W4A4: GEMM1 quantizes its output to GEMM2's standard NVFP4 input, the recipe here.
-        x, x_sf, ids, scales, w1, r1, alpha1, fc2_scale, w2, r2, alpha2, out = inputs
-        if fc1_input_scale is not None and x.shape != out.shape:
-            raise ValueError(f"fc1_input_scale takes x of shape {tuple(out.shape)}.")
-        x_fp4 = (
-            (x.view(torch.uint8), x_sf.view(torch.uint8).view(len(x), -1), False)
-            if fc1_input_scale is None  # else BF16, quantized under it in the prep
-            else (x.contiguous(), fc1_input_scale.float().reshape(1), False)
-        )
-        # One FC2 input scale, as CUTLASS reads.
-        inputs = [
-            out.new_empty(out.shape), ids, scales, w1, r1, alpha1, w2, r2, alpha2, out,
-            fc2_scale.reshape(-1)[:1], None,
-        ]  # fmt: skip
-        if tactic in (None, -1):
-            return _records_moe_sm80(inputs, gated, x_fp4)
-        return _w4a16_moe_sm80(inputs, tactic, gated, x_fp4=x_fp4)
-    w4a8 = getattr(runner, "quant_mode", None) == "w4a8"
-    situ = runner.situ_beta is not None
-    if not (w4a16 or w4a8 or runner.quant_mode == "w4a4") or tactic not in (None, -1):
-        raise NotImplementedError(
-            "Below SM100 CuTe-DSL MoE runs W4A4, W4A8 and W4A16, without tactics."
-        )
-    if w4a16:  # no activation scales
-        inputs = [inputs[0], None, *inputs[1:6], None, *inputs[6:]]
-    x, x_sf, experts, scales, w1, s1, alpha1, fc2_scale, w2, s2, alpha2 = inputs[:11]
-    out = inputs[-1]
-    major, minor = torch.cuda.get_device_capability(x.device)
-    if s1.dtype not in (out.dtype, torch.int32):  # int32: SM90 W4A8's operands
-        mma_bytes = (5, 2, 4, 0, 1, 3)  # MMA-layout scale bytes are 128x4 swizzled
-        w1, s1, w2, s2 = cutlass_nvfp4_sm80_weights(
-            w1, s1.permute(mma_bytes), w2, s2.permute(mma_bytes), out.dtype, gated, mx=w4a8,
-            sm90=w4a8 and major == 9,  # on the FP8 mixed-input GEMM, as CUTLASS MoE
-        )  # fmt: skip
-    if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
-        w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
-    code = NVFP4_4OVER6_CODE_STANDARD
-    quant_scales = [s1, alpha1, s2, alpha2]  # W4A8 as W4A16, x_sf holding MXFP8 scales
-    if not (w4a16 or w4a8):
-        # CUTLASS reads only the presence of an FC1 activation scale (W4A4): any FP32 scalar does.
-        fc1_act = alpha1.reshape(-1)[0]
-        quant_scales = [fc1_act, s1, alpha1, fc2_scale.reshape(-1)[0], s2, alpha2]
-        quant_scales += inputs[11:-1]  # per-token activation scales
-        x_sf = x_sf.view(x.shape[0], -1)
-        if x_sf.shape[1] % 4 or not x_sf.is_contiguous():  # K padded to 64
-            x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
-        if len(quant_scales) == 7:
-            if nvfp4_4over6 is not _UNSET:
-                _check_gemm2_input_scale(fc2_scale, resolve_nvfp4_4over6(nvfp4_4over6))
-            code = _trtllm_fp4_nvfp4_4over6_code(nvfp4_4over6, inputs[11], x)
-    experts_here, offset = runner.num_local_experts, runner.local_expert_offset
-    per_expert = (
-        lambda v: None if v is None else torch.full((experts_here,), v, device=x.device)
-    )
-    swiglu = (runner.swiglu_alpha, runner.swiglu_beta, runner.swiglu_limit)
-    if swiglu == (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT):
-        swiglu = (None, None, None)
-    with torch.cuda.device(x.device):
-        get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
-            out, x, experts - offset if offset else experts.contiguous(), scales.float(),
-            w1, None, w2, None, out.dtype, quant_scales, x_sf,
-            *map(per_expert, (None,) * 3 if situ else swiglu), None,  # SiTU takes none of them
-            per_expert(runner.situ_beta),
-            per_expert(runner.situ_linear_beta or (float("inf") if situ else None)), False,
-            # Local expert ids, as EP rank 0 of 2: ids outside the local experts are skipped.
-            ep_size=1 if experts_here == runner.num_experts else 2, ep_rank=0,
-            enable_pdl=None if runner.enable_pdl else False,  # None: on where the device has PDL
-            activation_type=ActivationType.Situ if situ else ActivationType(runner.activation_type),
-            use_mxfp8_act_scaling=w4a8, nvfp4_4over6_code=code,
-        )  # fmt: skip
-    return out
-
-
 @supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe(
@@ -2027,13 +1914,14 @@ def cute_dsl_fused_moe(
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     swap_ab: bool = False,
     routing_weights_before_fc2: bool = False,
-    fc1_input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM80 to SM90 (on the SM80 kernels, with tactics for W4A16 only),
-    SM100, SM103, and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
-    SM100 and SM103. This is the simple functional API; for CUDA-graph support
+    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
+    SM100 and SM103. SM80 to SM90 run W4A4 and W4A16 on the records of
+    :func:`prepare_records_nvfp4_weights` in ``w1_weight_sf`` and ``w2_weight_sf``, W4A8 on
+    those of :func:`prepare_records_mxfp4_weights` (their global scales in the alphas).
+    This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
@@ -2058,17 +1946,11 @@ def cute_dsl_fused_moe(
         projection for non-gated activations).
     w1_weight_sf : torch.Tensor
         Scale factors for ``w1_weight``.
-        Below SM100 W4A16 also takes ``cute_dsl_w4a16_sm80_weights`` records here and in
-        ``w2_weight_sf`` where ``cute_dsl_w4a16_sm80_supported``; the weights give only shapes.
     w1_alpha : torch.Tensor
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
         W4A8, W8A8, and W4A16.
-    fc1_input_scale : Optional[torch.Tensor]
-        Below SM100, with ``cute_dsl_w4a16_sm80_weights`` records for W4A4: one FP32
-        global scale under which BF16 ``x`` (``x_sf=None``) is quantized to NVFP4 as
-        the records route it, as standard activations. Rejected elsewhere.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -2233,6 +2115,81 @@ def cute_dsl_fused_moe(
     """
     quant_mode = _canonicalize_quant_mode(quant_mode)
     recipe_kwargs = _cute_dsl_recipe_kwargs(nvfp4_4over6, quant_mode, per_token_scale)
+    if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+        # Below SM100 W4A4, W4A16 and W4A8 run on records (prepare_records_nvfp4_weights;
+        # W4A8 prepare_records_mxfp4_weights, their global scales in the alphas), which hold
+        # the weights too, in the weight-scale slots: the weights give only shapes.
+        # localized_* (per-domain copies of these weights) only steer the SM100 kernels.
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_clamped_relu2_config(
+            activation, clamped_relu2_limit, x.device
+        )
+        validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        w4a4, pt = quant_mode == "w4a4", per_token_scale is not None
+        w4a8 = quant_mode == "w4a8"  # MXFP8 x, GEMM2's input MXFP8 as on SM100
+        validate_pre_fc2_routing(
+            routing_weights_before_fc2, quant_mode, activation, output_dtype,
+            per_token_scale=pt, localized_weights=localized_weights is not None,
+        )  # fmt: skip
+        x16 = (torch.bfloat16, torch.float16)
+        if (
+            quant_mode not in ("w4a4", "w4a16", "w4a8")
+            or (x.dtype in x16) == (w4a4 or w4a8)
+            or output_dtype not in x16
+            or (quant_mode == "w4a16" and x.dtype != output_dtype)
+            or (x_sf is None or fc2_input_scale is None) == w4a4
+            or (w4a8 and (x.dtype != torch.float8_e4m3fn or x_sf is None))
+            or (pt and not w4a4)
+        ):
+            raise NotImplementedError(
+                "Below SM100 CuTe-DSL MoE runs W4A4, W4A16 and W4A8 on records: BF16 or FP16 "
+                "output (the W4A16 input of that type), per token with W4A4."
+            )
+        recipe = resolve_nvfp4_4over6(nvfp4_4over6) if pt else None  # as on SM100
+        if pt and nvfp4_4over6 is not _UNSET:
+            _check_gemm2_input_scale(fc2_input_scale, recipe)
+        from ..core import _records_moe
+
+        shape = (x.shape[0], w2_weight.shape[1])
+        if moe_output is None:
+            moe_output = x.new_empty(shape, dtype=output_dtype)
+        else:
+            check_shape_dtype_device(moe_output, shape, None, None, "moe_output")
+        ids = token_selected_experts
+        if local_expert_offset:  # local ids; the other ranks' are skipped
+            ids = ids - local_expert_offset
+        inputs = [x, ids, token_final_scales, w1_weight_sf, w1_alpha]
+        inputs += [w2_weight_sf, w2_alpha, moe_output]
+        if w4a4:  # per token GEMM2 quantizes its rows under fc2_input_scale
+            x_sf = x_sf.view(torch.uint8).reshape(x.shape[0], -1)
+            inputs[0] = x.view(torch.uint8)
+            inputs += [x_sf] + (
+                [None, fc2_input_scale] if pt else [fc2_input_scale, None]
+            )
+            inputs += [None, per_token_scale]
+        elif w4a8:  # its E8M0 scales [tokens, K / 32]
+            inputs[0] = x.view(torch.uint8)
+            inputs += [x_sf.view(torch.uint8).reshape(x.shape[0], -1), None, None]
+        from ..core import _RecordsExt
+
+        situ, inf = situ_beta is not None, float("inf")
+        rw = token_final_scales if routing_weights_before_fc2 else None
+        if rw is not None:  # GEMM1 weights its rows, the top-k sum adds them
+            inputs[2] = torch.ones_like(rw)
+        ext = _RecordsExt(
+            ActivationType.Situ if situ else activation,
+            (None, None, clamped_relu2_limit),
+            (situ_beta, situ_linear_beta or inf, inf)
+            if situ
+            else (1.0, 0.0, inf)  # GeGLU-tanh reads none of them, as on SM100
+            if activation == ActivationType.GegluTanh
+            else (swiglu_alpha, swiglu_beta, swiglu_limit),
+            rw=rw,
+            x_fmt=int(w4a8),
+            fq=int(w4a8),
+        )
+        inter = w2_weight.shape[2] * 2
+        return _records_moe(inputs, inter, gated, 8192, tactic, recipe=recipe, ext=ext)
     _require_cute_dsl_arch_for(x.device, native_only=True)
     if swap_ab:
         from ..prepare import _cute_dsl_gated_weight_group_size
@@ -2258,20 +2215,8 @@ def cute_dsl_fused_moe(
         _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight, swap_ab)
         if torch.cuda.get_device_capability(x.device) == (10, 7):
             raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
-    elif quant_mode == "w4a4" and fc1_input_scale is None and x.dtype != torch.uint8:
+    elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
-    if fc1_input_scale is not None and (  # BF16 x, quantized in the SM80 records' prep
-        quant_mode != "w4a4" or x.dtype is not torch.bfloat16 or x_sf is not None
-        or fc2_input_scale is None or per_token_scale is not None or localized_weights is not None
-        or fc1_input_scale.numel() != 1 or not fc1_input_scale.is_floating_point()
-        or not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] >= 10
-        or not _sm80_records(w1_weight_sf)
-    ):  # fmt: skip
-        raise ValueError(
-            "Below SM100 fc1_input_scale is one floating-point scale for BF16 x with W4A4 records "
-            "(cute_dsl_w4a16_sm80_weights) and fc2_input_scale, without x_sf, per_token_scale "
-            "or localized_weights."
-        )
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -2422,11 +2367,6 @@ def cute_dsl_fused_moe(
 
     if swap_ab:
         op_name += "::SwapAB"
-    if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-        return _cute_dsl_fused_moe_sm80(
-            runners[0], inputs, tactic, op_name, fc1_input_scale=fc1_input_scale,
-            **recipe_kwargs,
-        )  # fmt: skip
     if tactic is not None:
         return runners[0](inputs, tactic=tactic, aux_stream=aux_stream, **recipe_kwargs)
 
@@ -2484,7 +2424,6 @@ def cute_dsl_fused_moe_nvfp4(
     autotune_use_cuda_graph: bool = False,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
-    fc1_input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -2539,7 +2478,6 @@ def cute_dsl_fused_moe_nvfp4(
         autotune_use_cuda_graph=autotune_use_cuda_graph,
         nvfp4_4over6=nvfp4_4over6,
         clamped_relu2_limit=clamped_relu2_limit,
-        fc1_input_scale=fc1_input_scale,
     )
 
 

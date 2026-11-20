@@ -52,7 +52,6 @@ from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..prepare import W4A16_SM80_TACTICS, _sm80_records
 from ._inputs_helper import CuteDslMoEInputsHelper
 from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
@@ -1340,9 +1339,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
 
         from .moe_utils import get_max_num_permuted_tokens
 
-        x = inputs[0]
-        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            return list(W4A16_SM80_TACTICS) if _sm80_records(inputs[4]) else []
         w1_weight = inputs[3]
         w2_weight = inputs[6]
         num_tokens = inputs[0].shape[0]
@@ -1423,10 +1419,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 f"moe_output must have shape {(num_tokens, hidden_size)}, "
                 f"got {tuple(moe_output.shape)}"
             )
-        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            from .fused_moe import _cute_dsl_fused_moe_sm80
-
-            return _cute_dsl_fused_moe_sm80(self, inputs, tactic)
         return launch_w4a16_moe(
             x=x,
             token_selected_experts=token_selected_experts,

@@ -35,6 +35,9 @@ from .api import (  # noqa: F401
     # Unified configs and packs
     B12xNvfp4Config,
     B12xW4A16Config,
+    RecordsNvfp4Bf16Config,
+    RecordsNvfp4Config,
+    RecordsMxfp4Config,
     BackendOptions,
     CakeStepFunConfig,
     CudnnFrostBf16Config,
@@ -100,6 +103,9 @@ from .da_runtime import (  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    RecordsNvfp4Bf16Runner,
+    RecordsNvfp4Runner,
+    RecordsMxfp4Runner,
     CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
@@ -198,14 +204,12 @@ from .core import (
 )
 
 from .prepare import (
-    cute_dsl_w4a16_sm80_supported,
-    cute_dsl_w4a16_sm80_weights,
-    cutlass_nvfp4_sm80_weights,
     interleave_cute_dsl_moe_weights,
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
+    prepare_records_mxfp4_weights,
+    prepare_records_nvfp4_weights,
     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
-    trtllm_nvfp4_sm80_weights,
 )
 
 from ..tllm_enums import (
@@ -358,6 +362,12 @@ __all__ = [
     "B12xNvfp4Runner",
     "B12xW4A16Config",
     "B12xW4A16Runner",
+    "RecordsNvfp4Bf16Config",
+    "RecordsNvfp4Bf16Runner",
+    "RecordsNvfp4Config",
+    "RecordsNvfp4Runner",
+    "RecordsMxfp4Config",
+    "RecordsMxfp4Runner",
     "BackendOptions",
     "CakeStepFunConfig",
     "CudnnFrostBf16Config",
@@ -468,12 +478,11 @@ __all__ = [
     "convert_to_block_layout",
     "cutlass_fused_moe",
     "cutlass_fused_moe_workspace_size",
-    "cute_dsl_w4a16_sm80_supported",
-    "cute_dsl_w4a16_sm80_weights",
-    "cutlass_nvfp4_sm80_weights",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_cute_dsl_moe_weights",
     "interleave_moe_weights_for_sm90_mixed_gemm",
+    "prepare_records_mxfp4_weights",
+    "prepare_records_nvfp4_weights",
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm103_module",
@@ -509,7 +518,6 @@ __all__ = [
     "trtllm_fused_moe_workspace_size",
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
-    "trtllm_nvfp4_sm80_weights",
     "fused_topk_deepseek",
     "AlphaMoERoutePlan",
     "allocate_alphamoe_route_plan",

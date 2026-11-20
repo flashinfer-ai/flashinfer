@@ -68,12 +68,6 @@ struct LoraParams {
 
   cudaEvent_t* memcpy_event_ptr;
 
-  // Below SM100, TRT-LLM's LoRA: FC1 deltas ((k, token) rows of the FC1 width), added to GEMM1's
-  // rows as their biases (permuted into fc1_row_biases), and GEMM2's inputs out in fc2_inputs.
-  void const* fc1_deltas = nullptr;
-  void* fc1_row_biases = nullptr;
-  void* fc2_inputs = nullptr;
-
   LoraParams() = default;
 
   LoraParams(int num_reqs, int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
@@ -350,20 +344,6 @@ struct QuantParams {
         : fc1_scales_ptrs(fc1_scales_ptrs), fc2_scales_ptrs(fc2_scales_ptrs) {}
   } fp8_block_scaling;
 
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100 MXFP8 x MXFP4: the MXFP8 input, and permuted GEMM1 rows' wide flags (E8M0 244-254).
-  struct RestoredMxfp8Inputs {
-    void const* codes = nullptr;
-    uint8_t const* sf = nullptr;
-    bool swizzled_sf = false;
-    int const* wide_rows = nullptr;
-    int const* permuted_row_to_unpermuted_row = nullptr;
-  } restored_mxfp8;
-
-  // Below SM100 BF16 W4A16 on small-M: GEMM1 row r reads token w4a16_token_rows[r] % the tokens.
-  int const* w4a16_token_rows = nullptr;
-#endif
-
   static QuantParams Int(void const* fc1_weight_scales, void const* fc2_weight_scales) {
     QuantParams qp;
     qp.wo = {fc1_weight_scales, fc2_weight_scales};
@@ -436,11 +416,6 @@ struct QuantParams {
     qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale,
                   fc2_global_scale};
     qp.fp4.nvfp4_4over6_code = nvfp4_4over6_code;
-#if defined(FLASHINFER_FP4_SW_CVT)
-    qp.groupwise = GroupWise(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
-                             fc1_weight_block_scale, fc2_weight_block_scale)
-                       .groupwise;
-#endif
     return qp;
   }
 
@@ -516,10 +491,8 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool use_mxfp8_act_scaling, bool min_latency_mode,
-                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-                      // Below SM100: per-token NVFP4 activation scales (num_rows,), and
-                      // skip_finalize leaving GEMM2's rows (FC2 biases added) in final_output.
-                      float const* per_token_scale = nullptr, bool skip_finalize = false) = 0;
+                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+                      cudaStream_t stream) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -655,9 +628,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_wfp4afp8 = false;
   static constexpr bool use_fp4 = false;
 #endif
-  static constexpr bool use_restored_fp4 = kRestoredFp4 && use_fp4;
-  static constexpr bool use_restored_mx = use_restored_fp4 && use_fp8_input;
-  using GemmInputType = std::conditional_t<use_restored_fp4, BackBoneType, T>;
 
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
   static constexpr bool use_sm90_wfp4afp8 =
@@ -666,9 +636,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       use_sm90_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
   static constexpr bool use_native_wfp4afp8 =
       use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kDisabled;
-  // SM90 MXFP8 x MXFP4, which takes TRT-LLM's and CuTe-DSL's contracts as the restored runners do.
-  static constexpr bool use_sm90_mx =
-      use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
   static_assert(Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kDisabled || use_wfp4afp8,
                 "Sm90Wfp4Afp8ScaleMode is only valid for FP8 activation x FP4 weight.");
   static_assert(!use_sm90_wfp4afp8 || !IsMXFPX,
@@ -683,8 +650,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   // We introduce this as a separate parameter, so that if we ever remove the above condition we can
   // decouple BackBoneType and OutputType easily. For now these are required to be equivalent
-  static_assert(std::is_same_v<OutputType, BackBoneType> ||
-                    (use_restored_mx && std::is_same_v<BackBoneType, __nv_bfloat16>),
+  static_assert(std::is_same_v<OutputType, BackBoneType>,
                 "Scale and bias types must match OutputType");
 
  public:
@@ -751,11 +717,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
               bool use_mxfp8_act_scaling, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-              float const* per_token_scale = nullptr, bool skip_finalize = false) override;
+              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+              cudaStream_t stream) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
-  static void gemm1(MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX,
+  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
                                   Sm90Wfp4Afp8Mode>& gemm_runner,
                     // This argument must not be null if fp8 block scaling is being used.
                     // The gemm_runner will be ignored in that case. NOTE: it would
@@ -783,7 +749,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
 
   static void gemm2(
-      MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
+      MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
           gemm_runner,
       DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
       void* const gemm_output, OutputType* const final_output,
@@ -802,7 +768,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl, float const* row_scales = nullptr, bool skip_finalize = false);
+      bool enable_pdl);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the
   // correct type
@@ -983,7 +949,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
     // We just check if its supported because we need to know when calculating workspace size
     return ((moe_gemm_runner_.supportsTmaWarpSpecialized() &&
              !std::is_same_v<T, UnfusedGemmOutputType>) ||
-            use_fp8 || use_restored_fp4);
+            use_fp8);
   }
 
   bool mayHaveFinalizeFused() const {
@@ -1052,7 +1018,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                               int64_t const expanded_num_rows, int64_t const seq_len,
                               bool const use_awq, cudaStream_t stream);
 
-  MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>
+  MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>
       moe_gemm_runner_;
   std::unique_ptr<DeepSeekBlockScaleGemmRunner> blockscale_gemm_runner_;
 

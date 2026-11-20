@@ -56,7 +56,6 @@ from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
-from .test_trtllm_gen_per_token_moe import _skip_unless_sm10x
 from .trtllm_gen_fused_moe_utils import (
     FP4Moe,
     FP8BlockScaleMoe,
@@ -86,7 +85,9 @@ def _run_trtllm_gen_routed_fused_moe_case(
     gemm1_beta: torch.Tensor | None = None,
     gemm1_clamp_limit: torch.Tensor | None = None,
 ):
-    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -1828,7 +1829,9 @@ def test_fp8_block_scale_moe_fused_shared_routing_replay_cuda_graph():
 @pytest.mark.parametrize("num_shared", [1, 2])
 def test_fp4_block_scale_moe_fused_shared_routing_replay(num_tokens, num_shared):
     """FP4 sibling of the fused-shared routed-only replay contract."""
-    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     hidden_size = 1024
     intermediate_size = 512
     num_experts = 16

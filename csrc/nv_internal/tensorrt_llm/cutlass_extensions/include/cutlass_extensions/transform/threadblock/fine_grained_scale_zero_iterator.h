@@ -136,8 +136,7 @@ class FineGrainedScaleZeroIterator<Shape_, Element_, layout::RowMajor, 0, Alignm
     row_groupsize64_ = threadblock_offset.row();
     group_size_ = group_size;
 
-    // threadblock_offset.row() counts 64-wide k blocks; groups may be narrower (E2M1: 16).
-    const LongIndex tb_row_byte_offset = threadblock_offset.row() * 64 / group_size *
+    const LongIndex tb_row_byte_offset = threadblock_offset.row() / (group_size / 64) *
                                          params_.stride_ * sizeof_bits<Element>::value / 8;
     const LongIndex tb_col_byte_offset =
         threadblock_offset.column() * sizeof_bits<Element>::value / 8;

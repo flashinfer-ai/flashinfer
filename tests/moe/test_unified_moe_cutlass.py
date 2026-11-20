@@ -123,9 +123,9 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
-    assert CutlassBf16Config.supported(80)
+    assert not CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
-    assert CutlassNvfp4Config.supported(90)
+    assert not CutlassNvfp4Config.supported(90)
     assert not CutlassFp8BlockConfig.supported(100)
     assert not CutlassMxfp8Config.supported(90)
     assert not CutlassMxfp8Config.supported(110)
@@ -1836,13 +1836,13 @@ def test_cutlass_reuses_geometric_workspace_capacities(monkeypatch):
         runner._ensure_workspace(32, 256)
 
 
-def _is_cutlass_bf16_runtime_supported(config_cls=CutlassBf16Config) -> bool:
+def _is_cutlass_bf16_runtime_supported() -> bool:
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
     arch = major * 10 + minor
-    if not config_cls.supported(arch):
+    if not CutlassBf16Config.supported(arch):
         return False
     if arch == 90:
         return is_sm90a_supported(device)
@@ -1856,7 +1856,7 @@ def _is_cutlass_bf16_runtime_supported(config_cls=CutlassBf16Config) -> bool:
         return is_sm120a_supported(device)
     if arch == 121:
         return is_sm121a_supported(device)
-    return arch in (80, 86, 87, 89)
+    return arch == 89
 
 
 cutlass_bf16_required = pytest.mark.skipif(
@@ -2566,12 +2566,12 @@ def _is_cutlass_nvfp4_runtime_supported() -> bool:
         return is_sm110a_supported(device)
     if arch in (120, 121):
         return is_sm12x_supported(device)
-    return arch < 100
+    return False
 
 
 cutlass_nvfp4_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires a supported CUTLASS NVFP4 GPU and CUDA toolkit",
+    reason="requires SM100/SM110/SM12x CUTLASS NVFP4 GPU and CUDA toolkit",
 )
 
 
@@ -2829,7 +2829,7 @@ def test_cutlass_nvfp4_autotuned_compound_tactic_and_cuda_graph():
 
 
 def _is_cutlass_fp8_runtime_supported() -> bool:
-    return _is_cutlass_bf16_runtime_supported(CutlassFp8PerTensorConfig)
+    return _is_cutlass_bf16_runtime_supported()
 
 
 cutlass_fp8_required = pytest.mark.skipif(
@@ -2860,7 +2860,7 @@ def _is_cutlass_mxfp8_runtime_supported() -> bool:
 
 cutlass_mxfp8_mxfp4_required = pytest.mark.skipif(
     not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires a supported CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
+    reason="requires SM100/SM110/SM12x CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
 )
 
 cutlass_mxfp8_required = pytest.mark.skipif(

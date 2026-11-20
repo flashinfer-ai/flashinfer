@@ -208,28 +208,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type>(mOutputDtype);
     }
-#if defined(FLASHINFER_FP4_SW_CVT)
-    if (isWMxfp4AMxfp8Quant()) {
-      mInnerDimMultiplier = 16;
-      if (mOutputDtype == dl_float16) {  // BF16 backbone and biases
-        mKernelRunner =
-            std::make_unique<kernels::CutlassMoeFCRunner<kernels::Fp4Type, kernels::Fp4Type, half,
-                                                         __nv_fp8_e4m3, __nv_bfloat16>>();
-      } else if (mOutputDtype == dl_bfloat16) {
-        mKernelRunner =
-            std::make_unique<kernels::CutlassMoeFCRunner<kernels::Fp4Type, kernels::Fp4Type,
-                                                         __nv_bfloat16, __nv_fp8_e4m3>>();
-      }
-    }
-    if (isSm90WMxfp4AMxfp8Quant()) {
-      TVM_FFI_ICHECK_EQ(sm, 90) << "uint8 MXFP4 weights with MXFP8 activations need SM90";
-      mInnerDimMultiplier = 2;
-      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
-      mKernelRunner =
-          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, false, false,
-                             kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
-    }
-#endif
 
 #if 0
     // PHASE3_POST_MMA_PLACEHOLDER: future SM90 post-MMA MXFP4 paths should use
@@ -372,10 +350,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu,
               Optional<TensorView> workspace_buffer = Optional<TensorView>{},
-              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv,
-              Optional<TensorView> permuted_rows = Optional<TensorView>{},
-              bool skip_finalize = false, Optional<TensorView> fc1_deltas = Optional<TensorView>{},
-              Optional<TensorView> fc2_inputs = Optional<TensorView>{}) {
+              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
@@ -385,20 +360,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_CONTIGUOUS(input);
     CHECK_CONTIGUOUS(output);
     CHECK_CONTIGUOUS(token_selected_experts);
-#if defined(FLASHINFER_FP4_SW_CVT)  // FP4 weights: K padded to 64 (cutlass_nvfp4_sm80_weights)
-    for (auto const& [w, name] : {std::pair{fc1_expert_weights, "fc1_expert_weights"},
-                                  std::pair{fc2_expert_weights, "fc2_expert_weights"}}) {
-      int64_t const row = (w.size(2) + 3) / 4 * 4;
-      TVM_FFI_ICHECK(mInnerDimMultiplier == 16
-                         ? w.stride(2) == 1 && w.stride(1) == row &&
-                               (w.size(0) == 1 || w.stride(0) == w.size(1) * row)
-                         : w.IsContiguous())
-          << name << " must be contiguous, below SM100 FP4 rows with K padded to 64";
-    }
-#else
     CHECK_CONTIGUOUS(fc1_expert_weights);
     CHECK_CONTIGUOUS(fc2_expert_weights);
-#endif
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
@@ -420,12 +383,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_DIM(3, fc1_expert_weights);
     CHECK_DIM(3, fc2_expert_weights);
 
-    auto const bias_dtype = kRestoredMxfp4 && isWMxfp4AMxfp8Quant() ? dl_bfloat16 : mOutputDtype;
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
       CHECK_CONTIGUOUS(fc1_expert_biases.value());
       CHECK_CONTIGUOUS(fc2_expert_biases.value());
-      CHECK_INPUT_TYPE(fc1_expert_biases.value(), bias_dtype);
-      CHECK_INPUT_TYPE(fc2_expert_biases.value(), bias_dtype);
+      CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
+      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
 
       CHECK_DIM(2, fc1_expert_biases.value());
       CHECK_DIM(2, fc2_expert_biases.value());
@@ -466,8 +428,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int64_t hidden_size = fc2_expert_weights.size(1);
     int64_t inter_size = fc2_expert_weights.size(2) * mInnerDimMultiplier;
 
-    if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant() || isWMxfp4AFp8HummingQuant() ||
-        isSm90WMxfp4AMxfp8Quant()) {
+    if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant() || isWMxfp4AFp8HummingQuant()) {
       // MXFP4 weights are required to bealigned to 128 bytes
       TVM_FFI_ICHECK_EQ(hidden_size % 128, 0)
           << "hidden_size must be divisible by 128 for MXFP4 weights";
@@ -511,66 +472,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                              quant_scales, base_activation_type, nvfp4_4over6_code);
     kernels::MoeMinLatencyParams min_latency_params{};
 
-    float const* per_token_scale = nullptr;
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
-#if defined(FLASHINFER_FP4_SW_CVT)
-    // Below SM100 a 7th NVFP4 quant scale gives per-token activation scales, one per input row.
-    if (isNvfp4Quant() && quant_scales.value().size() == 7) {
-      TensorView const token_scale = quant_scales.value()[6];
-      CHECK_DEVICE(token_scale, input);
-      per_token_scale = checkedActivationScale(token_scale, num_rows, "per-token scale");
-    }
-
-    // Finalize writes each row's leading output.size(1) columns, in 16-byte vectors.
-    CHECK_DIM(2, output);
-    int64_t const unpadded_hidden_size = output.size(1);
-    int64_t const expanded_rows = num_rows * experts_per_token;
-    int64_t const output_rows = skip_finalize ? expanded_rows : num_rows;
-    TVM_FFI_ICHECK(
-        output.size(0) == output_rows && unpadded_hidden_size <= hidden_size &&
-        (unpadded_hidden_size == hidden_size || (!skip_finalize && unpadded_hidden_size % 8 == 0)))
-        << "output must be [" << output_rows << ", " << hidden_size
-        << "], or narrower by whole 8-column vectors, got [" << output.size(0) << ", "
-        << unpadded_hidden_size << "]";
-    TVM_FFI_ICHECK(!skip_finalize || permuted_rows.has_value())
-        << "skipping finalize takes permuted_rows";
-    if (permuted_rows.has_value()) {
-      CHECK_INPUT_AND_TYPE(permuted_rows.value(), dl_int32);
-      TVM_FFI_ICHECK_EQ(permuted_rows.value().numel(), expanded_rows);
-      workspace_info.src_to_dest_map = permuted_rows.value().data_ptr();
-    }
-    // Not the LoRA plugin (use_lora stays false): only TRT-LLM MoE's FC1 deltas and GEMM2 inputs.
-    Tensor fc1_row_biases;
-    if (fc1_deltas.has_value()) {
-      CHECK_INPUT_AND_TYPE(fc1_deltas.value(), bias_dtype);
-      fc1_row_biases =
-          alloc_tensor({expanded_rows, fc1_expert_weights.size(1)}, bias_dtype, input.device());
-      CHECK_SHAPE(fc1_deltas.value(), fc1_row_biases);
-      lora_params.fc1_deltas = fc1_deltas.value().data_ptr();
-      lora_params.fc1_row_biases = fc1_row_biases.data_ptr();
-    }
-    if (fc2_inputs.has_value()) {
-      // NVFP4 codes (inter_size / 2 bytes a row), MXFP8 ones, or 16-bit activations.
-      int64_t const row_bytes = isWMxfp4AMxfp8Quant() || isSm90WMxfp4AMxfp8Quant() ? inter_size
-                                : quant_scales.has_value() && quant_scales.value().size() == 6
-                                    ? inter_size / 2
-                                    : inter_size * 2;
-      CHECK_INPUT(fc2_inputs.value());
-      TVM_FFI_ICHECK(fc2_inputs.value().size(0) == expanded_rows &&
-                     fc2_inputs.value().numel() * get_element_size(fc2_inputs.value()) ==
-                         expanded_rows * row_bytes)
-          << "fc2_inputs must be " << expanded_rows << " rows of " << row_bytes << " bytes";
-      lora_params.fc2_inputs = fc2_inputs.value().data_ptr();
-    }
-#else
-    TVM_FFI_ICHECK(!permuted_rows.has_value() && !skip_finalize && !fc1_deltas.has_value() &&
-                   !fc2_inputs.has_value())
-        << "permuted_rows, skip_finalize, fc1_deltas and fc2_inputs are below SM100 only";
     // HACK Define default values for parameters we don't have good values for
     int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
-#endif
-    bool const use_lora = false;  // No lora support yet
+    bool const use_lora = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -586,7 +492,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
-        min_latency_mode, min_latency_params, enable_pdl, stream, per_token_scale, skip_finalize);
+        min_latency_mode, min_latency_params, enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -814,7 +720,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
                       : -1;
     int64_t group_size =
-        (isWFP4A16Quant() || isWMxfp4AFp8HummingQuant() || isSm90WMxfp4AMxfp8Quant())
+        (isWFP4A16Quant() || isWMxfp4AFp8HummingQuant())
             ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
             : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
@@ -856,8 +762,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       auto activation_dtype =
           (mUseW4GroupScaling && !isWFP4A16Quant()) ? dl_float8_e4m3fn : mActivationDtype;
       activation_dtype = isNvfp4Quant() ? dl_int64 : activation_dtype;
-      // Below SM100 MXFP8 x MXFP4 runs on the restored NVFP4 runner, profiled as NVFP4.
-      if (kRestoredMxfp4 && isWMxfp4AMxfp8Quant()) activation_dtype = dl_int64;
       int64_t const unpadded_hidden_size_profiler = hidden_size;  // HACK no padding by default
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
@@ -954,15 +858,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type, Optional<TensorView> workspace_buffer,
-                 int64_t nvfp4_4over6_code, Optional<TensorView> permuted_rows, bool skip_finalize,
-                 Optional<TensorView> fc1_deltas, Optional<TensorView> fc2_inputs) {
+                 int64_t nvfp4_4over6_code) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, clamped_relu2_limit, situ_beta,
                    situ_linear_beta, swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank,
                    cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
                    enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
-                   nvfp4_4over6_code, permuted_rows, skip_finalize, fc1_deltas, fc2_inputs);
+                   nvfp4_4over6_code);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -1035,7 +938,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUsePackedWeights = false;
   bool mUseFusedFinalize = true;
   kernels::Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
-  static constexpr bool kRestoredMxfp4 = kernels::kRestoredFp4;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
@@ -1512,48 +1414,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<float const*>(fc1_expert_residual_scale.data_ptr()), nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
           static_cast<float const*>(fc2_expert_residual_scale.data_ptr()), false, false);
-    } else if (isSm90WMxfp4AMxfp8Quant()) {
-      TVM_FFI_ICHECK(quant_scales.has_value() && quant_scales.value().size() == 4)
-          << "Expecting 4 quant scales for SM90 MXFP8 x MXFP4 quantization";
-
-      auto const& fc1_weight_block = quant_scales.value()[0];
-      auto const& fc1_global = quant_scales.value()[1];
-      auto const& fc2_weight_block = quant_scales.value()[2];
-      auto const& fc2_global = quant_scales.value()[3];
-      CHECK_INPUT_AND_TYPE(fc1_weight_block, dl_int32);
-      CHECK_INPUT_AND_TYPE(fc2_weight_block, dl_int32);
-      CHECK_DIM(5, fc1_weight_block);
-      CHECK_DIM(5, fc2_weight_block);
-      int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
-      TVM_FFI_ICHECK(fc1_weight_block.size(0) == num_experts_on_rank &&
-                     fc1_weight_block.size(1) * 64 == inter_size * fc1_n_mult &&
-                     fc1_weight_block.size(2) * 128 == hidden_size &&
-                     fc1_weight_block.size(3) == 16 && fc1_weight_block.size(4) == 4)
-          << "fc1 Humming-style folded weight scale must be "
-             "(num_experts_on_rank, inter_size"
-          << (fc1_n_mult == 2 ? " * 2" : "") << " / 64, hidden_size / 128, 16, 4)";
-      TVM_FFI_ICHECK(fc2_weight_block.size(0) == num_experts_on_rank &&
-                     fc2_weight_block.size(1) * 64 == hidden_size &&
-                     fc2_weight_block.size(2) * 128 == inter_size &&
-                     fc2_weight_block.size(3) == 16 && fc2_weight_block.size(4) == 4)
-          << "fc2 Humming-style folded weight scale must be "
-             "(num_experts_on_rank, hidden_size / 64, inter_size / 128, 16, 4)";
-      CHECK_INPUT_TYPE(fc1_global, dl_float32);
-      CHECK_INPUT_TYPE(fc2_global, dl_float32);
-      TVM_FFI_ICHECK(fc1_global.ndim() == 1 && fc1_global.size(0) == num_experts_on_rank &&
-                     fc2_global.ndim() == 1 && fc2_global.size(0) == num_experts_on_rank)
-          << "fc1 and fc2 global sizes must be (num_experts_on_rank,)";
-
-      auto params = kernels::QuantParams::MXFP8MXFP4(
-          static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
-          static_cast<float const*>(fc1_global.data_ptr()),
-          static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-          static_cast<float const*>(fc2_global.data_ptr()));
-      // The SM90 grouped GEMM reads the weight block scales through fp8_mxfp4.
-      params.fp8_mxfp4.fc1.weight_block_scale = params.mxfp8_mxfp4.fc1.weight_block_scale;
-      params.fp8_mxfp4.fc2.weight_block_scale = params.mxfp8_mxfp4.fc2.weight_block_scale;
-      return params;
-    } else if (isWMxfp4AMxfp8Quant() && !kRestoredMxfp4) {
+    } else if (isWMxfp4AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
           << "Expecting quant scales for W4A8_MXFP4_MXFP8 quantization";
@@ -1615,41 +1476,26 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
     }
 
-    else if (isNvfp4Quant() || isWMxfp4AMxfp8Quant()) {
+    else if (isNvfp4Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for nvfp4 quantization";
-#if defined(FLASHINFER_FP4_SW_CVT)
-      // Below SM100: 4 scales (weight block and global) mean W4A16, a 7th adds per-token scales.
-      auto const num_scales = quant_scales.value().size();
-      TVM_FFI_ICHECK(num_scales == 4 || num_scales == 6 || num_scales == 7)
-          << "Expecting 4, 6 or 7 quant scales for nvfp4 quantization";
-      bool const w4a16 = num_scales == 4;
-      // Below SM100: [E, K / 16, N] in the output type (BF16 for MXFP8 x MXFP4), K padded to 64.
-      auto const weight_block_dtype = isWMxfp4AMxfp8Quant() ? dl_bfloat16 : mOutputDtype;
-#else
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 6)
           << "Expecting 6 quant scales for nvfp4 quantization";
-      constexpr bool w4a16 = false;
-#endif
 
-      // W4A16 has no activation global scales: the expert global scales stand in for the checks.
-      auto const& fc1_act_global = quant_scales.value()[w4a16 ? 1 : 0];
-      auto const& fc1_weight_block = quant_scales.value()[w4a16 ? 0 : 1];
-      auto const& fc1_global = quant_scales.value()[w4a16 ? 1 : 2];
+      auto const& fc1_act_global = quant_scales.value()[0];
+      auto const& fc1_weight_block = quant_scales.value()[1];
+      auto const& fc1_global = quant_scales.value()[2];
       auto const& fc2_act_global = quant_scales.value()[3];
-      auto const& fc2_weight_block = quant_scales.value()[w4a16 ? 2 : 4];
-      auto const& fc2_global = quant_scales.value()[w4a16 ? 3 : 5];
+      auto const& fc2_weight_block = quant_scales.value()[4];
+      auto const& fc2_global = quant_scales.value()[5];
 
-#if !defined(FLASHINFER_FP4_SW_CVT)
       // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
       constexpr int FP8_PER_INT32 = 4;
-      auto const weight_block_dtype = dl_int32;
-#endif
       // Check types
       CHECK_INPUT_TYPE(fc1_act_global, dl_float32);
-      CHECK_INPUT_TYPE(fc1_weight_block, weight_block_dtype);
+      CHECK_INPUT_TYPE(fc1_weight_block, dl_int32);
       CHECK_INPUT_TYPE(fc1_global, dl_float32);
       CHECK_INPUT_TYPE(fc2_act_global, dl_float32);
-      CHECK_INPUT_TYPE(fc2_weight_block, weight_block_dtype);
+      CHECK_INPUT_TYPE(fc2_weight_block, dl_int32);
       CHECK_INPUT_TYPE(fc2_global, dl_float32);
       // Check ranks
       TVM_FFI_ICHECK_LE(fc1_act_global.ndim(), 1)
@@ -1663,23 +1509,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       // Check shapes
       TVM_FFI_ICHECK(fc1_act_global.ndim() == 0 || fc1_act_global.size(0) == num_experts_on_rank)
           << "fc1 act global must be scalar or (num_experts_on_rank,)";
-#if defined(FLASHINFER_FP4_SW_CVT)
-      auto const check_block = [&](auto const& block, int64_t k, int64_t n, char const* msg) {
-        TVM_FFI_ICHECK(block.size(0) == num_experts_on_rank &&
-                       block.size(1) * 16 ==
-                           TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                               k, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) &&
-                       block.size(2) == n)
-            << msg;
-      };
-      check_block(fc1_weight_block, hidden_size,
-                  isGatedActivation(base_activation_type) ? inter_size * 2 : inter_size,
-                  "fc1 weight block size must be (num_experts_on_rank, padded hidden_size // 16, "
-                  "fc1 rows)");
-      check_block(fc2_weight_block, inter_size, hidden_size,
-                  "fc2 weight block size must be (num_experts_on_rank, padded inter_size // 16, "
-                  "hidden_size)");
-#else
       if (isGatedActivation(base_activation_type)) {
         TVM_FFI_ICHECK(
             fc1_weight_block.size(0) == num_experts_on_rank &&
@@ -1707,13 +1536,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             << "fc1 weight block size must be (num_experts_on_rank, inter_size, hidden_size // 4 "
                "// block_scale_vector_size)";
       }
-#endif
 
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
           << "fc2 act global must be scalar or (num_experts_on_rank,)";
-#if !defined(FLASHINFER_FP4_SW_CVT)
       TVM_FFI_ICHECK(
           fc2_weight_block.size(0) == num_experts_on_rank &&
           fc2_weight_block.size(1) ==
@@ -1725,18 +1552,17 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4))
           << "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
              "block_scale_vector_size)";
-#endif
       TVM_FFI_ICHECK_EQ(fc2_global.size(0), num_experts_on_rank)
           << "fc2 global size must be (num_experts_on_rank,)";
 
       return kernels::QuantParams::FP4(
-          w4a16 ? nullptr : static_cast<float const*>(fc1_act_global.data_ptr()),
+          static_cast<float const*>(fc1_act_global.data_ptr()),
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
           static_cast<float const*>(fc1_global.data_ptr()),
-          w4a16 ? nullptr : static_cast<float const*>(fc2_act_global.data_ptr()),
+          static_cast<float const*>(fc2_act_global.data_ptr()),
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-          static_cast<float const*>(fc2_global.data_ptr()), !w4a16 && fc1_act_global.ndim() == 1,
-          !w4a16 && fc2_act_global.ndim() == 1, nvfp4_4over6_code);
+          static_cast<float const*>(fc2_global.data_ptr()), fc1_act_global.ndim() == 1,
+          fc2_act_global.ndim() == 1, nvfp4_4over6_code);
     } else if (mUseDeepSeekFP8BlockScaling) {
       auto const& fc1_scales = quant_scales.value()[0];
       auto const& fc2_scales = quant_scales.value()[1];
@@ -1804,9 +1630,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
            mWeightDtype == dl_float8_e4m3fn && mUseMxfp8ActScaling;
   }
 
-  bool isMxfp8ActScalingQuant() const {
-    return isWMxfp8AMxfp8Quant() || isWMxfp4AMxfp8Quant() || isSm90WMxfp4AMxfp8Quant();
-  }
+  bool isMxfp8ActScalingQuant() const { return isWMxfp8AMxfp8Quant() || isWMxfp4AMxfp8Quant(); }
 
   bool isNvfp4Quant() const {
     return mWeightDtype == dl_int64 &&
@@ -1836,12 +1660,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   bool isWMxfp4AMxfp8Quant() const {
     return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 && mUseMxfp8ActScaling;
-  }
-
-  // SM90 MXFP8 x MXFP4 on uint8 weights, built below SM100 only.
-  bool isSm90WMxfp4AMxfp8Quant() const {
-    return kRestoredMxfp4 && mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_uint8 &&
-           mUseMxfp8ActScaling && !mUsePackedWeights;
   }
 };
 

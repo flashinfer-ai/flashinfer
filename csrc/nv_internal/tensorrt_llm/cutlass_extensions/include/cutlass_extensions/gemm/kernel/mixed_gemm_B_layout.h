@@ -109,10 +109,6 @@ struct LayoutDetailsB<TypeA, uint4b_t, Arch,
   using Operator = cutlass::arch::OpMultiplyAddDequantizeInterleavedBToA;
 };
 
-// E2M1 (NVFP4) weights: the INT4 row permutation and column interleave, no bias or nibble reorder.
-template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, float_e2m1_t, Arch> : LayoutDetailsB<TypeA, uint4b_t, Arch> {};
-
 }  // namespace kernel
 }  // namespace gemm
 }  // namespace cutlass

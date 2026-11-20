@@ -2188,7 +2188,7 @@ def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     core decodes the same byte.
     """
     return Float32(
-        target_inline_asm(
+        llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
@@ -2281,7 +2281,7 @@ def cvt_e4m3x2_to_f16x2_pair(
     packed_u32: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
     """Decode 4 packed E4M3 bytes into two f16x2 registers."""
-    res = target_inline_asm(
+    res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(i32, i32)>"),
         [Uint32(packed_u32).ir_value(loc=loc, ip=ip)],
         """
@@ -2429,7 +2429,7 @@ def fp4_decode_4bytes(
     packed_u32: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
     """Decode 4 packed FP4 bytes into four f16x2 registers."""
-    res = target_inline_asm(
+    res = llvm.inline_asm(
         ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>"),
         [Uint32(packed_u32).ir_value(loc=loc, ip=ip)],
         """
@@ -2485,7 +2485,7 @@ def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
 def cvt_fp32x2_to_e2m1x2(v0: Float32, v1: Float32, *, loc=None, ip=None) -> Uint32:
     """Convert two f32 values into one packed E2M1 byte."""
     return Uint32(
-        target_inline_asm(
+        llvm.inline_asm(
             T.i32(),
             [
                 Float32(v0).ir_value(loc=loc, ip=ip),
@@ -2562,7 +2562,7 @@ def fp4_dot4_sum(
 ) -> Float32:
     """Decode 4 FP4 bytes and dot with four f16x2 inputs."""
     return Float32(
-        target_inline_asm(
+        llvm.inline_asm(
             T.f32(),
             [
                 Uint32(u_packed).ir_value(loc=loc, ip=ip),
@@ -2622,7 +2622,7 @@ def fp4_dot8_sum(
 ) -> Float32:
     """Decode 8 FP4 bytes and dot with eight f16x2 inputs."""
     return Float32(
-        target_inline_asm(
+        llvm.inline_asm(
             T.f32(),
             [
                 Uint32(u_a).ir_value(loc=loc, ip=ip),

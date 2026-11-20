@@ -95,8 +95,6 @@ struct MoeFCGemm {
   using ElementA = typename MapArguments::ElementA;
   using LayoutA = typename MapArguments::LayoutA;
   using ElementB = typename MapArguments::ElementB;
-  // E2M1 (NVFP4) weights carry scales like INT8 and INT4, one per 16 K values.
-  static constexpr bool kE2m1B = platform::is_same<float_e2m1_t, ElementB>::value;
   using LayoutB = typename MapArguments::LayoutB;
   using ElementC = typename Epilogue::OutputTileIterator::Element;
   using LayoutC = typename MapArguments::LayoutC;
@@ -163,10 +161,6 @@ struct MoeFCGemm {
 
     // Included so we can use Gemm Universal
     int batch_stride_D = 0;
-#if defined(FLASHINFER_FP4_SW_CVT)
-    // E2M1 weights with per-token activations: FP32 scale per row of A, padded by a tile.
-    float const* row_scales = nullptr;
-#endif
 
     //
     // Methods
@@ -217,7 +211,7 @@ struct MoeFCGemm {
           gemm_k(gemm_k),
           host_problem_sizes(nullptr) {
       if (platform::is_same<uint8_t, ElementB>::value ||
-          platform::is_same<uint4b_t, ElementB>::value || kE2m1B) {
+          platform::is_same<uint4b_t, ElementB>::value) {
         assert(weight_scales);
       }
       this->gather_A_indices = nullptr;
@@ -251,9 +245,6 @@ struct MoeFCGemm {
     int const* gather_A_indices;
     int const* gather_B_indices;
     int const* scatter_D_indices;
-#if defined(FLASHINFER_FP4_SW_CVT)
-    float const* row_scales = nullptr;
-#endif
 
     //
     // Methods
@@ -288,11 +279,7 @@ struct MoeFCGemm {
           C_is_broadcast(args.C_is_broadcast),
           gather_A_indices(args.gather_A_indices),
           gather_B_indices(args.gather_B_indices),
-          scatter_D_indices(args.scatter_D_indices) {
-#if defined(FLASHINFER_FP4_SW_CVT)
-      row_scales = args.row_scales;
-#endif
-    }
+          scatter_D_indices(args.scatter_D_indices) {}
 
     CUTLASS_HOST_DEVICE
     void update(Arguments const& args, void* workspace = nullptr, int tile_count = 0) {
@@ -311,9 +298,6 @@ struct MoeFCGemm {
       gather_A_indices = args.gather_A_indices;
       gather_B_indices = args.gather_B_indices;
       scatter_D_indices = args.scatter_D_indices;
-#if defined(FLASHINFER_FP4_SW_CVT)
-      row_scales = args.row_scales;
-#endif
     }
   };
 
@@ -339,7 +323,7 @@ struct MoeFCGemm {
 
   static Status can_implement(Arguments const& args) {
     if constexpr (platform::is_same<uint8_t, ElementB>::value ||
-                  platform::is_same<uint4b_t, ElementB>::value || kE2m1B) {
+                  platform::is_same<uint4b_t, ElementB>::value) {
       if (args.weight_scales == nullptr) {
         CUTLASS_TRACE_HOST(
             "MoeFCGemm::can_implement() - weight scales are required for uint8_t and uint4b_t");
@@ -411,8 +395,7 @@ struct MoeFCGemm {
       }
 
       if constexpr (isFinegrained(Mma::QuantOp)) {
-        if (kE2m1B ? args.group_size != 16
-                   : args.group_size != 128 && args.group_size != args.gemm_k) {
+        if (args.group_size != 128 && args.group_size != args.gemm_k) {
           return Status::kErrorNotSupported;
         }
       }
@@ -460,15 +443,6 @@ struct MoeFCGemm {
       int thread_id, typename IteratorScale::TensorCoord const& threadblock_offset,
       int group_size) {
     return IteratorScale(params, pointer_scale, extent, thread_id, threadblock_offset);
-  }
-
-  /// Calls run(platform::integral_constant<int, K>{}) with K = live clamped to [1, MaxK].
-  template <int MaxK, typename Run>
-  CUTLASS_DEVICE static void run_with_live_m_blocks(int const live, Run&& run) {
-    if constexpr (MaxK > 1) {
-      if (live < MaxK) return run_with_live_m_blocks<MaxK - 1>(live, run);
-    }
-    run(platform::integral_constant<int, MaxK>{});
   }
 
   CUTLASS_DEVICE
@@ -594,46 +568,10 @@ struct MoeFCGemm {
                 {scale_row_extent, problem_size.n()}, thread_idx, tb_offset_scale,
                 params.group_size);
 
-        if constexpr (kE2m1B && Operator::MmaIterations::kRow >= 4) {
-          // Only mma rows covering problem rows run, a mainloop per warp-uniform count (no per-mma
-          // branch). One or two rows keep one mainloop: one skips nothing, two measured slower.
-          int const warp_m = warp_idx % (WarpCount::kM * WarpCount::kN) % WarpCount::kM;
-          int const warp_rows = problem_size.m() - threadblock_offset.m() - warp_m * WarpShape::kM;
-          int const live_m_blocks =
-              __shfl_sync(0xffffffff, ceil_div(warp_rows, InstructionShape::kM), 0);
-          run_with_live_m_blocks<Operator::MmaIterations::kRow>(live_m_blocks, [&](auto live) {
-            mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale,
-                accumulators, live);
-          });
-        } else {
-          mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale,
-              accumulators);
-        }
+        mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale, accumulators);
       } else {
         mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
       }
-
-#if defined(FLASHINFER_FP4_SW_CVT)
-      if constexpr (kE2m1B) {
-        if (params.row_scales) {
-          // Each accumulator row times its FP32 scale, read in the accumulators' own fragment
-          // layout: a column-major view with zero column stride repeats row_scales[row].
-          using IteratorC = typename Operator::IteratorC;
-          using IteratorRowScale = warp::MmaTensorOpAccumulatorTileIterator<
-              typename IteratorC::Shape, float, layout::ColumnMajor,
-              typename IteratorC::InstructionShape, typename IteratorC::OpDelta>;
-          int const warp_m = warp_idx % (WarpCount::kM * WarpCount::kN) % WarpCount::kM;
-          float* row_scale = const_cast<float*>(params.row_scales) + rows_to_jump +
-                             threadblock_offset.m() + warp_m * IteratorC::Shape::kRow;
-          typename IteratorRowScale::Fragment scales;
-          IteratorRowScale({row_scale, layout::ColumnMajor(0)}, lane_idx).load(scales);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < scales.size(); ++i) {
-            accumulators[i] *= scales[i];
-          }
-        }
-      }
-#endif
 
       //
       // Epilogue

@@ -1077,6 +1077,9 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   while (grid.x <= multiProcessorCount && block.x > 64) {
     grid.x *= 2;
     block.x = (block.x + 1) / 2;
+#if defined(FLASHINFER_FP4_SW_CVT)
+    block.x += block.x % 2;  // below SM100 two lanes share each scale: keep them in one block
+#endif
   }
 
   // TODO: Should relax this to allow any grid size.

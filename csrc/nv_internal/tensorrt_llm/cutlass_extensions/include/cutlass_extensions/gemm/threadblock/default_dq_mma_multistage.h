@@ -231,9 +231,8 @@ struct DqMma<
                 "Mma multistage must dequantize after ldsm");
 
   static_assert(platform::is_same<ElementB, uint8_t>::value ||
-                    platform::is_same<ElementB, uint4b_t>::value ||
-                    platform::is_same<ElementB, float_e2m1_t>::value,
-                "Element B must be uint8, uint4 or e2m1");
+                    platform::is_same<ElementB, uint4b_t>::value,
+                "Element B must be uint8 or uint4");
 
   static cutlass::arch::CacheOperation::Kind const CacheOpA =
       ((sizeof_bits<ElementA>::value * kAlignmentA) == 128) ? cutlass::arch::CacheOperation::Global

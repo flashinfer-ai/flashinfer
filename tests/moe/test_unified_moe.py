@@ -2668,16 +2668,22 @@ class TestRunnerBoundaryValidation:
 def _is_unified_nvfp4_arch() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
         torch.device("cuda")
-    ) in ((8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7))
+    ) in ((10, 0), (10, 3), (10, 7))
 
 
 sm100_required = pytest.mark.skipif(
     not _is_unified_nvfp4_arch(),
-    reason="Unified NVFP4 MoE requires SM80 to SM90, SM100, SM103, or SM107",
+    reason="Unified NVFP4 MoE requires SM100, SM103, or SM107",
 )
 
 
-cute_dsl_sm100_required = sm100_required
+cute_dsl_sm100_required = pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
+    ),
+    reason="CuTeDSL unified MoE requires SM100, SM103, or SM107",
+)
 
 
 # Small-scale geometry for fast accuracy + dispatch tests.
@@ -2854,8 +2860,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
     ),
 )
 def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swap_ab):
-    cc = get_compute_capability(torch.device("cuda"))
-    if swap_ab and cc not in ((10, 0), (10, 3)):
+    if swap_ab and get_compute_capability(torch.device("cuda")) == (10, 7):
         pytest.skip("swap_ab requires SM100 or SM103")
     if (
         get_compute_capability(torch.device("cuda")) == (10, 7)
@@ -2972,9 +2977,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
             )
 
         reference = exact_reference(activation)
-        # Below SM100 the kernels sum in another order than this split reference.
-        if cc[0] >= 10:
-            assert_w4a16_bits(actual, reference)
+        assert_w4a16_bits(actual, reference)
         # The same packed inputs must distinguish the intended formula from
         # a counterfactual with matching gated/non-gated geometry.
         if activation.type in (ActivationType.Swiglu, ActivationType.GegluTanh):
@@ -2989,9 +2992,6 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         assert not torch.equal(
             actual.view(torch.int16), control_reference.view(torch.int16)
         ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
-        if cc[0] < 10:
-            torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
-            assert not torch.allclose(actual, control_reference, atol=2e-2, rtol=2e-2)
     elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         reference = _compute_ref(act_pack, tensors, shape, activation)
         passed, pct, atol = check_accuracy(actual, reference)
@@ -3241,9 +3241,6 @@ def _make_bf16_packs_and_config(
     reading is numerically distinguishable.  One native view is prepared per
     entry of ``backend_configs``.
     """
-    arch = get_compute_capability(torch.device("cuda"))
-    if not any(c.supported(arch[0] * 10 + arch[1]) for c in backend_configs):
-        pytest.skip("No BF16 MoE backend in backend_configs supports this GPU")
     local_num_experts = local_num_experts or num_experts
     max_tokens = max_tokens or max(num_tokens, 8192)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3849,8 +3846,6 @@ class TestTrtllmRoutedPackingContract:
 
     @pytest.mark.parametrize("local_expert_offset", [0, 32, 96])
     def test_pack_inputs_keeps_global_ids(self, spec, local_expert_offset):
-        if spec.id == "bf16" and get_compute_capability(torch.device("cuda"))[0] < 10:
-            pytest.skip("TRTLLM BF16 MoE requires SM100, SM103, or SM107")
         device = torch.device("cuda", torch.cuda.current_device())
         num_experts = 128
         local_num_experts = 32
@@ -4734,6 +4729,8 @@ class TestFusedSharedExpertsBackendGating:
             if r.supports_fused_shared_experts
         }
         assert supporting == {
+            "RecordsMxfp4Runner",
+            "RecordsNvfp4Runner",
             "TrtllmFp4RoutedRunner",
             "TrtllmFp8BlockRunner",
         }, (

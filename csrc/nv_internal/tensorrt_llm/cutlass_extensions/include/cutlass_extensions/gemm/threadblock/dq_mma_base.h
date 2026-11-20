@@ -67,12 +67,8 @@ class DqMmaBase {
 
   static_assert(DequantOp != WeightOnlyQuantOp::UNDEFINED, "");
 
-  // E2M1 (NVFP4) weights have a scale per 16 values of K, so a stage holds kK / 16 rows of them.
-  static constexpr int kScaleRowsPerStage =
-      platform::is_same<typename Policy_::Operator::ElementB, float_e2m1_t>::value ? Shape::kK / 16
-                                                                                   : 1;
   // Finegrained scales get streamed in via cp.async
-  static constexpr int ScalebiasStages = isFinegrained(DequantOp) ? Stages * kScaleRowsPerStage : 1;
+  static constexpr int ScalebiasStages = isFinegrained(DequantOp) ? Stages : 1;
   // We always have scales.
   static constexpr int ScaleElementsPerStage = Shape::kN;
   // We sometimes have a bias

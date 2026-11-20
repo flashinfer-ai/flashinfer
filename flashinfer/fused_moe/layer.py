@@ -40,6 +40,9 @@ from .api import (
     CudnnFrostMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    RecordsNvfp4Bf16Config,
+    RecordsNvfp4Config,
+    RecordsMxfp4Config,
     CakeStepFunConfig,
     CakeWarpDecodeConfig,
     CudnnGroupedGemmBf16Config,
@@ -86,6 +89,9 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    RecordsNvfp4Bf16Runner,
+    RecordsNvfp4Runner,
+    RecordsMxfp4Runner,
     CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
@@ -179,6 +185,9 @@ _RunnerT = Union[
     TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    RecordsNvfp4Bf16Runner,
+    RecordsNvfp4Runner,
+    RecordsMxfp4Runner,
 ]
 
 # Map backend-config class -> runner class
@@ -227,6 +236,9 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     TrtllmMxInt4Config: TrtllmMxInt4RoutedRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
+    RecordsNvfp4Bf16Config: RecordsNvfp4Bf16Runner,
+    RecordsNvfp4Config: RecordsNvfp4Runner,
+    RecordsMxfp4Config: RecordsMxfp4Runner,
     BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
 }
 

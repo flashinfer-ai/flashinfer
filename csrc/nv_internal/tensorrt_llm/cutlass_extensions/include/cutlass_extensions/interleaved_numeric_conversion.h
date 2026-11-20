@@ -27,7 +27,6 @@
 #include "cutlass/array.h"
 #include "cutlass/half.h"
 #include "cutlass/numeric_types.h"
-#include "flashinfer/vec_dtypes.cuh"
 
 namespace cutlass {
 
@@ -392,27 +391,6 @@ struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint4b_t, N> {
 
   CUTLASS_DEVICE
   result_type operator()(source_type const& s) { return convert(s); }
-};
-
-// E2M1 (NVFP4) codes to FP16/BF16 exactly, element i from nibble i: FlashInfer's e2m1x8_to_16bx8.
-template <typename T, int N>
-struct FastInterleavedAndBiasedNumericArrayConverter<T, float_e2m1_t, N> {
-  static_assert(!(N % 8), "N must be multiple of 8.");
-
-  using result_type = Array<T, N>;
-  using source_type = Array<float_e2m1_t, N>;
-  using DType16 = std::conditional_t<platform::is_same<T, half_t>::value, half, __nv_bfloat16>;
-
-  CUTLASS_DEVICE
-  result_type operator()(source_type const& source) {
-    result_type result;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 8; ++i) {
-      flashinfer::e2m1x8_to_16bx8<DType16>(reinterpret_cast<uint32_t const*>(&source)[i],
-                                           reinterpret_cast<uint32_t*>(&result) + 4 * i);
-    }
-    return result;
-  }
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

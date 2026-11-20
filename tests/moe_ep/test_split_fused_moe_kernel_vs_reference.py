@@ -603,7 +603,6 @@ def test_split_w4a8_global_routing_matches_local_routing(compute_backend):
 @pytest.mark.parametrize(
     ("arch", "expected"),
     [
-        (80, False),
         (90, False),
         (100, True),
         (103, True),
@@ -619,7 +618,6 @@ def test_split_w4a8_global_routing_matches_local_routing(compute_backend):
 )
 def test_trtllm_routed_moe_supported_architectures(config_cls, arch, expected):
     """CPU-only: lock down the backend support contract."""
-    expected |= config_cls is TrtllmFp4Config and arch < 100
     assert config_cls.supported(arch) is expected
 
 

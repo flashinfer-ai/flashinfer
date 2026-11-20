@@ -43,7 +43,6 @@ from .cubin_loader import (
     ensure_symlink,
     verify_symlinked_headers,
 )
-from .fp4_quantization import sw_cvt_nvcc_flags
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 from .trtllm_gen_metainfo import (
     BLACKWELL_CUBIN_ARCHS,
@@ -229,7 +228,6 @@ def gen_cutlass_fused_moe_sm90_module(
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
-        "-DFLASHINFER_FP4_SW_CVT",
     ]
     module_name = None
     if enable_prebuilt_d:
@@ -244,37 +242,45 @@ def gen_cutlass_fused_moe_sm90_module(
     )
 
 
-# SM80 to SM89: NVFP4 runs on the SM80 16-bit x E2M1 kernels, with the FP4 conversions in software.
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm89_nvcc_flags + [
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
-        "-DENABLE_FP4",
-        "-DFLASHINFER_FP4_SW_CVT",
-        "-DFLASHINFER_FP4_QUANT_NO_TMA",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
 
 
-def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
-    defines = ["ENABLE_BF16", "ENABLE_FP8", "ENABLE_FP4", "USING_OSS_CUTLASS_MOE_GEMM"]
-    nvcc_flags = sw_cvt_nvcc_flags("80") + [f"-D{d}" for d in defines]
-    return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
+def gen_w4a16_moe_sm80_module(
+    recipe=None, exact: bool = False, act: Optional[int] = None, f16: bool = False
+) -> JitSpec:
+    """NVFP4 MoE records kernels (BF16, or FP16 if ``f16``, or NVFP4 activations): sm_80 code for SM80 to SM89,
+    sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT),
+    with the 4over6 ``recipe`` (an ``NVFP44Over6Config``) and without fast math if ``exact``
+    (FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH), a module each; with ``act`` (an
+    ``ActivationType``) the GEMMs' epilogue extensions for that activation."""
+    from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_cache_key
 
-
-def gen_w4a16_moe_sm80_module() -> JitSpec:
-    """NVFP4 MoE records kernels (BF16 or NVFP4 activations): sm_80 code for SM80 to SM89,
-    sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT)."""
     majors = {major for major, _ in current_compilation_context.TARGET_CUDA_ARCHS}
     flags = [f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors]
     if not flags:
         raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
     defines = "ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 FLASHINFER_FP4_SW_CVT FLASHINFER_FP4_SW_CVT_FFMA"
+    name = "w4a16_moe_sm80"
+    if recipe is not None:
+        defines += f" RECORDS_E4M3_MAX={recipe.e4m3_max} RECORDS_ERR_MODE={int(recipe.err_mode)}"
+        defines += f" RECORDS_ERR_FAST={int(recipe.err_use_fast_math)}"
+        name += "_" + nvfp4_4over6_cache_key(recipe)
+    if exact:
+        defines, name = defines + " RECORDS_EXACT", name + "_exact"
+    if act is not None:
+        defines, name = defines + f" RECORDS_ACT={int(act)}", name + f"_act{int(act)}"
+    if f16:
+        defines, name = defines + " RECORDS_F16", name + "_f16"
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     return gen_jit_spec(
-        "w4a16_moe_sm80",
+        name,
         [jit_env.FLASHINFER_CSRC_DIR / "w4a16_moe_sm80.cu"],
         extra_cuda_cflags=flags + [f"-D{d}" for d in defines.split()],
         extra_include_paths=[nv_internal, nv_internal / "include"],
@@ -361,10 +367,6 @@ def gen_cutlass_fused_moe_module(
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
     ]
-    if "-DFLASHINFER_FP4_SW_CVT" in nvcc_flags:  # NVFP4 input quantizer below SM100
-        sources.append(
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu"
-        )
 
     return gen_jit_spec(
         module_name or f"fused_moe_{device_arch}",

@@ -38,13 +38,6 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
-// Below SM100 NVFP4, and MXFP8 x MXFP4 with MXFP8 input, run restored on the SM80 E2M1 GEMMs.
-#if defined(FLASHINFER_FP4_SW_CVT)
-constexpr bool kRestoredFp4 = true;
-#else
-constexpr bool kRestoredFp4 = false;
-#endif
-
 template <typename AType, typename BType, typename BScaleType, typename OType>
 struct GroupedGemmInput {
   AType const* A = nullptr;
@@ -69,14 +62,6 @@ struct GroupedGemmInput {
 
   cudaStream_t stream = 0;
   cutlass_extensions::CutlassGemmConfig gemm_config;
-
-  // NVFP4 weights with per-token activations: FP32 scale per row of A, padded by a GEMM tile.
-  float const* row_scales = nullptr;
-  // The SM80 FP4 small-M kernel only: GEMM row r reads A's row a_rows[r] % a_tokens when a_rows is
-  // given, and rows without row scales take their expert's expert_scales[e] when given.
-  int const* a_rows = nullptr;
-  int a_tokens = 0;
-  float const* expert_scales = nullptr;
 };
 
 struct TmaWarpSpecializedGroupedGemmInput {
@@ -325,7 +310,6 @@ class MoeGemmRunner {
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
 #endif
-  static constexpr bool use_restored_fp4 = kRestoredFp4 && use_fp4;
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
   static constexpr bool use_sm90_wfp4afp8 =
       use_wfp4afp8 && Sm90Wfp4Afp8Mode != Sm90Wfp4Afp8ScaleMode::kDisabled;

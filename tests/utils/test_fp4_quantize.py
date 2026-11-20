@@ -81,6 +81,7 @@ BATCH_SHAPES = [
     (2, 128, 64),
     (3, 256, 128),
     (1, 120, 64),
+    (2, 4, 2880),  # the expert kernels halve their block width to an odd 45 (from 360)
     (128, 2048, 2048),
     # TMA path (m >= 1024, k % 512 == 0) with a partial last 16-row tile per batch
     (4, 1040, 1024),

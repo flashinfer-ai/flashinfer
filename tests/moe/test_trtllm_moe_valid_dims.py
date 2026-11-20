@@ -31,7 +31,6 @@ from flashinfer.utils import (
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
 )
-from .test_trtllm_gen_per_token_moe import _skip_unless_sm10x
 
 # The contract mirrored by this file (identical to TensorRT-LLM's
 # mxFp4BlockScaleMoe.cpp / fp4BlockScaleMoe.cpp), for a declared valid_hidden_size:
@@ -582,7 +581,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
+    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
+        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
 
     from flashinfer import ActivationType
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
@@ -792,7 +792,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
+    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
+        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
 
     from flashinfer import ActivationType
     from flashinfer.fp4_quantization import block_scale_interleave
@@ -1109,7 +1110,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
 def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
-    _skip_unless_sm10x(torch.device("cuda"), (8, 9, 10))
+    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
+        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
 
     from flashinfer import ActivationType
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe

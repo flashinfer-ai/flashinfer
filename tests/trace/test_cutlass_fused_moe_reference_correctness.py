@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _check,
-    _skip_if_not_sm80,
+    _skip_if_not_sm100,
 )
 
 # Peak host RSS 155-208 GiB on B200/GB200/GB300 (flashinfer-ci nightlies, 2026-10).
@@ -42,7 +42,7 @@ def test_cutlass_fused_moe_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.moe import cutlass_fused_moe_trace
 
-    _skip_if_not_sm80()
+    _skip_if_not_sm100()
     torch.manual_seed(0)
     T = shape_kwargs["seq_len"]
     E = shape_kwargs["num_experts"]

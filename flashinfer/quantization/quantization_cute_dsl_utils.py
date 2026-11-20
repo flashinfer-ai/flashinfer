@@ -28,7 +28,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ..cute_dsl.fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
-from ..cute_dsl.fp4_common import target_inline_asm
+from ..cute_dsl.fp4_common import cvt_e2m1x8_f32, target_inline_asm
 from .nvfp4_quantization_utils import NVFP44Over6Config, NVFP44Over6ErrMode
 
 
@@ -494,57 +494,6 @@ def bfloat2_to_float2_scaled(
     f1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
 
     return Float32(f0), Float32(f1)
-
-
-@dsl_user_op
-def cvt_e2m1x8_f32(
-    v0: Float32,
-    v1: Float32,
-    v2: Float32,
-    v3: Float32,
-    v4: Float32,
-    v5: Float32,
-    v6: Float32,
-    v7: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> Uint32:
-    """
-    Convert eight float32 values to eight E2M1 (4-bit) values packed into uint32.
-
-    Uses cvt.rn.satfinite.e2m1x2.f32 PTX instruction to convert pairs of f32
-    to pairs of 4-bit E2M1 values, then packs all 8 values into a single u32.
-    """
-    return Uint32(
-        target_inline_asm(
-            T.i32(),
-            [
-                Float32(v0).ir_value(loc=loc, ip=ip),
-                Float32(v1).ir_value(loc=loc, ip=ip),
-                Float32(v2).ir_value(loc=loc, ip=ip),
-                Float32(v3).ir_value(loc=loc, ip=ip),
-                Float32(v4).ir_value(loc=loc, ip=ip),
-                Float32(v5).ir_value(loc=loc, ip=ip),
-                Float32(v6).ir_value(loc=loc, ip=ip),
-                Float32(v7).ir_value(loc=loc, ip=ip),
-            ],
-            """
-            {
-                .reg .b8 byte0, byte1, byte2, byte3;
-                cvt.rn.satfinite.e2m1x2.f32 byte0, $2, $1;
-                cvt.rn.satfinite.e2m1x2.f32 byte1, $4, $3;
-                cvt.rn.satfinite.e2m1x2.f32 byte2, $6, $5;
-                cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $7;
-                mov.b32 $0, {byte0, byte1, byte2, byte3};
-            }
-            """,
-            "=r,f,f,f,f,f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 # =============================================================================

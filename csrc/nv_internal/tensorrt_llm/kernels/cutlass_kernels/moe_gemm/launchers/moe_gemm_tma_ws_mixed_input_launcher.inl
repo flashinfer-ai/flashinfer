@@ -224,8 +224,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
       std::is_same_v<KernelSchedule, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>,
       cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong,
       cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>;  // Epilogue to launch
-  constexpr bool use_exact_block_scale =
-      ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0;
   constexpr bool use_fused_e8m0_scale =
       ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0;
   constexpr bool use_single_warpgroup =
@@ -252,10 +250,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
                       SmallKTileN == 40 || SmallKTileN == 64)),
                 "Unsupported single-warpgroup tile shape.");
 
-  // Exact mode has no alpha and passes no token-scale array, so the epilogue scales by 1.
-  constexpr bool use_token_scale_epilogue = use_fused_e8m0_scale || use_exact_block_scale;
   using FusionOperation =
-      std::conditional_t<use_token_scale_epilogue,
+      std::conditional_t<use_fused_e8m0_scale,
                          cutlass::epilogue::fusion::PtrArrayPerTokenScaledAcc<
                              ElementD, ElementAccumulator, ElementAccumulator>,
                          cutlass::epilogue::fusion::LinearCombination<
@@ -282,9 +278,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
                              sizeof(typename CollectiveEpilogue::SharedStorage))>>;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
       ArchTag, OperatorClass, cute::tuple<ElementB, ElementScale>, LayoutB_Transpose*, AlignmentB,
-      std::conditional_t<use_exact_block_scale, cute::tuple<ElementA, ElementScale>, ElementA>,
-      LayoutA_Transpose*, AlignmentA, ElementAccumulator, TileShape, ClusterShape, StageCountType,
-      KernelSchedule, ScaleMode>::CollectiveOp;
+      ElementA, LayoutA_Transpose*, AlignmentA, ElementAccumulator, TileShape, ClusterShape,
+      StageCountType, KernelSchedule, ScaleMode>::CollectiveOp;
 
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
   using GemmKernel =
@@ -302,9 +297,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
   Args arguments;
 
   decltype(arguments.epilogue.thread) fusion_args;
-  if constexpr (use_token_scale_epilogue) {
+  if constexpr (use_fused_e8m0_scale) {
     fusion_args.token_scale_default = ElementAccumulator(1);
-    fusion_args.token_scale_ptr_array = use_exact_block_scale ? nullptr : inputs.alpha_scales;
+    fusion_args.token_scale_ptr_array = inputs.alpha_scales;
   } else {
     fusion_args.alpha = use_mxfp4_weight ? 1 : 0;
     fusion_args.beta = 0;
@@ -404,10 +399,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
         precomputed_workspace.work_tiles_per_worker;
   }
   arguments.mainloop.ptr_A_prebuilt_tma_desc = precomputed_workspace.prebuilt_tma_desc_A;
-  if constexpr (use_exact_block_scale) {
-    arguments.mainloop.ptr_ActivationScale =
-        reinterpret_cast<ElementScale const**>(hopper_inputs.fpX_block_scaling_factors_act);
-  }
   arguments.mainloop.ptr_B_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_B;
   if constexpr (!use_single_warpgroup) {
     arguments.epilogue.ptr_D_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_D;

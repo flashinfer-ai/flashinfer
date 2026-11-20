@@ -947,6 +947,11 @@ python scripts/generate_moe_activation_matrix.py --write
 | `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
+| `records_mxfp4` | `RecordsMxfp4Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `records_mxfp4` | `RecordsMxfp4Config` | `MXFP4×MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `records_mxfp4` | `RecordsMxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `records_nvfp4` | `RecordsNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `records_nvfp4_bf16` | `RecordsNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
 | `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `ReLU2` |

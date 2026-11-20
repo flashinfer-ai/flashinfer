@@ -56,7 +56,6 @@
 
 #include "../include/moe_gemm_kernels.h"
 #include "./launchers/fused_moe_gemm_launcher_sm80.h"
-#include "./launchers/moe_gemm_small_m_launcher_sm80.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
 #include "./launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "./moe_gemm_template_dispatch_tma_ws.h"
@@ -163,12 +162,6 @@ struct genericMoeGemmKernelLauncher {
         epilogue_op.alpha_ptr_array = inputs.alpha_scales;
       }
 #endif
-      // NVFP4: each expert's global scale, in the row scales if any (none for the occupancy query).
-      if constexpr (std::is_same_v<CutlassWeightType, cutlass::float_e2m1_t>) {
-        TLLM_CHECK_WITH_INFO(inputs.occupancy || inputs.alpha_scales || inputs.row_scales,
-                             "FP4 weights take alpha_scale_ptr_array or row scales.");
-        epilogue_op.alpha_ptr_array = inputs.row_scales ? nullptr : inputs.alpha_scales;
-      }
 
       // Finally, set up the kernel.
       // MSVC workaround: use MoeGemmKernelTraits helper to force MSVC to fully
@@ -221,9 +214,6 @@ struct genericMoeGemmKernelLauncher {
           reinterpret_cast<CutlassGemmOutputType const*>(inputs.biases), inputs.bias_is_broadcast,
           reinterpret_cast<CutlassGemmOutputType*>(inputs.C), inputs.total_tokens_including_expert,
           inputs.n, inputs.k);
-#if defined(FLASHINFER_FP4_SW_CVT)
-      args.row_scales = inputs.row_scales;
-#endif
 
       GemmGrouped gemm;
 
@@ -284,14 +274,12 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
 #endif
 #if defined(ENABLE_FP4)
   constexpr bool isFp4 = std::is_same_v<T, Fp4Type>;
-  constexpr bool isFp4Weight = std::is_same_v<WeightType, Fp4Type>;
 #else
   constexpr bool isFp4 = false;
-  constexpr bool isFp4Weight = false;
 #endif
 
   if constexpr ((Stages == 2 || Arch::kMinComputeCapability >= 80) &&
-                (!isFp8 || std::is_same_v<Arch, cutlass::arch::Sm89>) && !isFp4 && !isFp4Weight) {
+                (!isFp8 || std::is_same_v<Arch, cutlass::arch::Sm89>) && !isFp4) {
     // dispatch for quant op type
     auto* launcher = tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<
         T, WeightType, GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag,
@@ -308,11 +296,6 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
                            ThreadblockShape, WarpShape, Stages>::call;
     }
     launcher(inputs, sm_count_);
-  } else if constexpr (isFp4Weight) {
-    // E2M1 weights: a 16-bit scale per 16 K values.
-    tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<
-        T, WeightType, GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY,
-        EpilogueTag, ThreadblockShape, WarpShape, Stages>::call(inputs, sm_count_);
   } else {
     TLLM_THROW("Cutlass gemm. Not instantiated for arch %d with stages set to %d",
                Arch::kMinComputeCapability, Stages);
@@ -593,9 +576,8 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<
     T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getAmpereConfigs(int sm) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
-  static constexpr auto weight_only_flag = std::is_same<T, WeightType>::value && !use_restored_fp4
-                                               ? CutlassGemmConfig::NONE
-                                               : CutlassGemmConfig::WEIGHT_ONLY;
+  static constexpr auto weight_only_flag =
+      std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
   static constexpr auto simt_only_flag =
       std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp8_only_flag =
@@ -607,8 +589,7 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
-  if (!(tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
-        use_restored_fp4) ||
+  if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
       (use_w4afp8 && sm != 89) || use_wfp4a16) {
     return {};
   }
@@ -701,17 +682,6 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
         tma_ws_configs.end());
   }
 
-  if (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act && sm == 90) {
-    // MXFP8 x MXFP4 exact block exponents are generated for these configs only.
-    using Tile = cutlass_extensions::CutlassTileConfigSM90;
-    for (Tile tile :
-         {Tile::CtaShape128x128x128B, Tile::CtaShape128x256x128B, Tile::CtaShape128x64x128B,
-          Tile::CtaShape128x32x128B, Tile::CtaShape128x16x128B}) {
-      tma_ws_configs.emplace_back(tile, cutlass_extensions::MainloopScheduleType::COOPERATIVE,
-                                  cutlass_extensions::EpilogueScheduleType::AUTO,
-                                  cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
-    }
-  }
   auto swap_ab_configs = tma_ws_configs;
   std::transform(swap_ab_configs.begin(), swap_ab_configs.end(), std::back_inserter(tma_ws_configs),
                  [](auto& config) {
@@ -786,7 +756,7 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
   constexpr bool ENABLE_FUSED_GATED_ACTIVATION = true;
   return (activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu) &&
          std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8 &&
-         !use_restored_fp4 && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) &&
+         (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) &&
          ENABLE_FUSED_GATED_ACTIVATION;
 }
 
@@ -828,31 +798,6 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Af
                        "Hopper input information is set for non specialized implementation");
   TLLM_CHECK_WITH_INFO(sm_ >= 90 || !inputs.gemm_config.is_tma_warp_specialized,
                        "Hopper configuration provided for non-Hopper architecture");
-
-  if constexpr (use_restored_fp4) {
-    // The A operand holds the activations restored to the output type.
-    if constexpr (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefault>) {
-      using Restored = GroupedGemmInput<OutputType, WeightType, ScaleBiasType, OutputType>;
-      static_assert(sizeof(Restored) == sizeof(inputs), "only the A pointer type differs");
-      auto const& restored = reinterpret_cast<Restored const&>(inputs);
-      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
-        // The CUDA-kernel tactic runs the small-M kernel on the inputs it supports.
-        if (inputs.gemm_config.enableCudaKernel &&
-            cutlass_kernels_oss::sm80FP4SmallMSupports(restored)) {
-          cutlass_kernels_oss::sm80FP4SmallMGemm(restored);
-          return;
-        }
-      }
-      TLLM_CHECK_WITH_INFO(!inputs.a_rows && !inputs.expert_scales,
-                           "Token rows and expert scales go to the small-M kernel only");
-      cutlass_kernels_oss::dispatchMoeGemmToCutlass<OutputType, WeightType, ScaleBiasType,
-                                                    cutlass::arch::Sm80, EpilogueTag>(
-          restored, multi_processor_count_);
-    } else {
-      TLLM_THROW("NVFP4 below SM100 has no fused epilogue activation");
-    }
-    return;
-  }
 
   if (sm_ >= 75 && sm_ < 80) {
 #if defined(ENABLE_FP4)

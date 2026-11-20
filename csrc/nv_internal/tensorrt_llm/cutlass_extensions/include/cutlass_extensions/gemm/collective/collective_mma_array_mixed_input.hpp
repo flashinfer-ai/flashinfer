@@ -51,8 +51,6 @@ namespace cutlass::gemm::collective {
 enum class MixedInputScaleMode {
   kPostMma = 0,
   kPreMmaE8M0,
-  // MXFP4 weight x MXFP8 activation: FP8 MMA per K=32 block, then both block exponents in FP32.
-  kExactBlockE8M0,
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

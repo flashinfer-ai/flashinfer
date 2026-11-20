@@ -108,8 +108,6 @@ from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
     gen_alphamoe_nvfp4_sm100_module,
-    gen_cutlass_fused_moe_sm80_module,
-    gen_cutlass_fused_moe_sm89_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -981,11 +979,9 @@ def gen_all_modules(
         if has_sm80 and get_cuda_version() >= Version("12.8"):
             jit_specs.append(gen_fp4_quantization_sm80_module())
             jit_specs.append(gen_mxfp8_quantization_sm100_module("80"))
-            jit_specs.append(gen_cutlass_fused_moe_sm80_module())
-        if has_sm89:  # SM89 devices load their own CUTLASS MoE module
-            jit_specs.append(gen_cutlass_fused_moe_sm89_module())
         if has_sm80 or has_sm90:  # one module for the records' SM80/SM90 targets
             jit_specs.append(gen_w4a16_moe_sm80_module())
+            jit_specs.append(gen_trtllm_gen_routing_module())  # FP4 MoE routing
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
