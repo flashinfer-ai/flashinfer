@@ -247,7 +247,9 @@ class TestFp4Fc1Validation:
         compute_warp_layout(tile16)
         assert tile16.warp_layout.num_load_b_warps == 2
         assert tile16.warp_layout.num_load_sfb_warps == 4
-        assert tile16.warp_layout.num_padding_warps == 1
+        # The two-CTA LDGSTS relay occupies the former padding slot.
+        assert tile16.warp_layout.num_sync_warps == 1
+        assert tile16.warp_layout.num_padding_warps == 0
         assert tile16.warp_layout.threads_per_cta == 20 * 32
 
     def test_batch_m_shuffled_matrix_requires_complete_shuffle_fragment(self):
@@ -1022,14 +1024,17 @@ class TestFp4Fc1HT:
             bias_type=int(BiasType.NONE),
             has_gemm1_clamp_limit=1,
             epilogue_regs=96,
-            mma_regs=80,
-            load_regs=80,
-            load_sf_regs=80,
-            load_a_regs=64,
-            load_sfa_regs=80,
-            copy_sf_regs=80,
-            workid_regs=80,
-            padding_regs=80,
+            # Eight epilogue warps plus the SF relay need 28 CTA warps;
+            # release registers from loaders/control to fund the epilogue.
+            mma_regs=48,
+            load_regs=48,
+            load_sf_regs=48,
+            load_a_regs=48,
+            load_sfa_regs=48,
+            copy_sf_regs=48,
+            workid_regs=48,
+            padding_regs=48,
+            sync_regs=48,
         )
         assert result, "batch-M tileN-256 E2M1 FC1 output quantization failed"
 

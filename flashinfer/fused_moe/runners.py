@@ -86,6 +86,7 @@ from .api import (
     _CUTILE_NVFP4_ARCHS,
     _CUTILE_W4A16_ARCHS,
     _PRIMS_TS_ARCHS,
+    PrimsTsConfig,
     # Typed activation values
     ActivationConfig,
     GELU,
@@ -7540,8 +7541,8 @@ CakeStepFunRunner.supported_activation_classes_by_quant = {
 class PrimsTsRunner(_TrtllmRunnerBase):
     """Unified adapter over the inner ``PrimsTs*MoERunner`` classes.
 
-    Routing and finalize stay on the TRT-LLM Gen module loaded by
-    ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
+    Routing uses the TRT-LLM Gen module; native Rubin FC2 can fuse finalize.
+    Other tactics retain the separate finalizer. GEMMs use the Prims-TS CuTe-DSL
     batched path. Weight and activation layouts match the corresponding
     TRT-LLM prepare helpers, except DeepSeekFp8 weight payloads, which are
     shuffled with epilogue tile 64, and the BlockMajorK MXFP4×MXFP8 weights
@@ -7602,7 +7603,10 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
     def _check_support(self) -> None:
         super()._check_support()
-        from flashinfer.prims_ts.utils import is_prims_ts_available
+        from flashinfer.prims_ts.utils import (
+            is_prims_ts_arch_available,
+            is_prims_ts_available,
+        )
         from flashinfer.tllm_enums import RoutingMethodType
         from flashinfer.utils import get_compute_capability
 
@@ -7615,8 +7619,19 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         arch = compute_capability[0] * 10 + compute_capability[1]
         if arch not in _PRIMS_TS_ARCHS:
             raise NotImplementedError(
-                f"{type(self).__name__} is enabled only on SM100/SM103, "
+                f"{type(self).__name__} is enabled only on SM100/SM103/SM107, "
                 f"got SM{compute_capability[0]}{compute_capability[1]}."
+            )
+        if not is_prims_ts_arch_available(*compute_capability):
+            raise RuntimeError(
+                f"PrimsTsRunner requires a CuTe DSL that natively targets SM{arch}."
+            )
+        if arch == 107 and self.config.quant.pair != (
+            QuantFormat.NVFP4,
+            QuantFormat.NVFP4,
+        ):
+            raise NotImplementedError(
+                "PrimsTsRunner on SM107 is qualified for NVFP4×NVFP4 only."
             )
         if self.config.experts.intermediate_size % 128 != 0:
             raise NotImplementedError(
@@ -7711,12 +7726,61 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
             return int(WeightLayout.BlockMajorK)
-        # FP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
+        if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            options = next(
+                (c for c in self.config.backend if isinstance(c, PrimsTsConfig)),
+                PrimsTsConfig(),
+            )
+            return int(getattr(WeightLayout, options.nvfp4_weight_layout))
+        # MXFP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
         # [experts, K_bytes / block, Mn, block]; the rank tells them apart.
-        is_fp4 = self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
-        if is_fp4 and view is not None and view["gemm1_weights"].dim() == 4:
+        if (
+            self._pair[0] == QuantFormat.MXFP4
+            and view is not None
+            and view["gemm1_weights"].dim() == 4
+        ):
             return int(WeightLayout.BlockMajorK)
         return int(WeightLayout.MajorK)
+
+    def _validate_fp4_tensors(self, act, view, hidden_size):
+        from flashinfer.tllm_enums import WeightLayout
+
+        is_nvfp4 = self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+        if is_nvfp4 and self._weight_layout() == int(WeightLayout.BlockMajorK):
+            # Validate physical storage before making logical views solely for
+            # the shared dtype/scale validator. No payload is copied or changed.
+            logical_view = dict(view)
+            for name, n, k in (
+                (
+                    "gemm1_weights",
+                    self._intermediate_size
+                    * (2 if self.config.activation.is_gated else 1),
+                    hidden_size,
+                ),
+                ("gemm2_weights", hidden_size, self._intermediate_size),
+            ):
+                tensor = view[name]
+                expected = (self._num_weight_rows, k // 256, n, 128)
+                if (
+                    k % 256
+                    or tuple(tensor.shape) != expected
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must have contiguous BlockMajorK shape {expected}, "
+                        f"got {tuple(tensor.shape)}."
+                    )
+                logical_view[name] = tensor.view(self._num_weight_rows, n, k // 2)
+            view = logical_view
+        elif is_nvfp4:
+            for name in ("gemm1_weights", "gemm2_weights"):
+                if view[name].dim() != 3:
+                    raise ValueError(
+                        f"{name} must have MajorK shape [experts, rows, K_bytes] "
+                        f"for nvfp4_weight_layout='MajorK', got "
+                        f"{tuple(view[name].shape)}."
+                    )
+        return super()._validate_fp4_tensors(act, view, hidden_size)
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -7753,6 +7817,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             self._inner = PrimsTsNvfp4MoERunner(
                 **common,
                 use_per_token_scaling=self._per_token,
+                use_fused_finalize=self.config.finalize.use_fused_finalize,
             )
         elif pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             self._inner = PrimsTsMxfp4Mxfp8MoERunner(**common)

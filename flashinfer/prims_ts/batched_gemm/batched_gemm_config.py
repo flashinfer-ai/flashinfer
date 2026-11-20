@@ -26,6 +26,8 @@ from cutlass.experimental import primitives as prims
 
 from flashinfer.tllm_enums import WeightLayout
 
+from .epilogue_schedule import normalize_epilogue_steps, resolve_preload_epilogue
+
 
 # `SmemSfLdgstsResource._tail_cp_async_wait_group` lowers the runtime
 # `cp.async.wait_group` drain for short K depths by hand-rolling one branch
@@ -57,6 +59,7 @@ TMA_MAX_SWIZZLE_BYTES = 128
 TMA_SWIZZLE_ATOM_BYTES = 16
 MAX_NON_SWAP_TMEM_FRAGMENTS = 2
 MAX_NON_SWAP_GATED_OUTPUT_COLS_PER_CALL = 32
+MAX_NON_SWAP_NVFP4_GATED_OUTPUT_COLS_PER_CALL = 64
 
 # shuffleMatrix transposes an 8-row group against the remaining rows in each
 # block.  This formula is the source of truth for both host preprocessing and
@@ -263,6 +266,24 @@ class BatchedGemmConfig:
     honored or rejected. ``warp_layout`` holds the resolved task assignments
     and register budgets; resolving it never changes these requests.
     ``validate_config`` checks the supported combinations without mutation.
+
+    **Meaning of "dense" in tuning options:** ``dense_*`` names the ordinary
+    GEMM fast path. Its shared TMA pipeline operates on regular matrix tiles
+    without MoE activation or scale-factor routing. The implementation targets
+    Rubin NVFP4, non-swapped ``BATCH_M``, tile N=K=256, R128c4 scale factors,
+    and physical 2xY CGAs, with tile256 and tile512 variants.
+
+    Routed tile512 also reuses the M-fragment MMA and plain-output epilogue.
+    Its optional split weight pipeline fuses B/SFB while retaining separate
+    routed A/SFA loaders; see :attr:`uses_routed_weight_pipeline`.
+
+    This is an optimization-family name, not a claim that other GEMM kernels
+    use sparse matrices, nor a general promise of support for every epilogue.
+    Each option has its own constraints, enforced by ``validate_config``.
+    In particular, ``dense_`` does not itself mean "one expert":
+    :attr:`dense_single_expert` separately requests that specialization and
+    requires ``num_experts=top_k=1`` at launch. Individual variants, such as
+    the eight-warp epilogue, can require that option explicitly.
     """
 
     # --- Architecture / shape ---
@@ -298,7 +319,10 @@ class BatchedGemmConfig:
     """Preferred physical CGA Y dimension (``1``, ``2``, or ``4``)."""
 
     fallback_cluster_dim_x: int = 0
-    """Fallback physical CGA X dimension; ``0`` disables flexible launch."""
+    """Fallback physical CGA X dimension; ``0`` disables flexible launch.
+
+    Preferred 2x1 must use a fixed launch and rejects an enabled fallback.
+    """
 
     fallback_cluster_dim_y: int = 1
     """Fallback physical CGA Y dimension when flexible launch is enabled."""
@@ -415,6 +439,17 @@ class BatchedGemmConfig:
     128, or 64 for padded formats (MXFP4 staged as 8-bit), whose TMA boxes are
     exactly 64B wide (:attr:`block_major_k_bytes`). The layout always applies
     to the weight operand: A when :attr:`is_swap_ab`, B otherwise.
+    """
+
+    gated_weight_group_size: int = 1
+    """Number of consecutive up/gate weight rows in each gated storage group.
+
+    The default stores U0,G0,U1,G1. The non-swap NVFP4/SwiGLU epilogue may
+    use 64 to store U0..U63,G0..G63, matching its two 64-register fragments.
+    Under a low initial register limit, each fragment uses two x32 loads.
+    The host runner permutes weights and their scale factors together.
+    Optional shuffleMatrix permutation follows this grouping; MajorK or
+    BlockMajorK packing then defines the physical weight storage.
     """
 
     # --- Pipeline stages ---
@@ -598,8 +633,18 @@ class BatchedGemmConfig:
     """Persistent CTA rasterization order, as a :class:`CtaRasterOrder` value.
 
     ``ALONG_M`` visits M tiles first; ``ALONG_N`` visits N tiles first. TRTLLM-gen
-    exposes these as ``ctaSwizzleType=rasterizeAlongM/rasterizeAlongN``, but no
-    additional CTA swizzle is applied here.
+    exposes these as ``ctaSwizzleType=rasterizeAlongM/rasterizeAlongN``.
+    :attr:`cta_raster_group_m` optionally interleaves M clusters within N order.
+    """
+
+    cta_raster_group_m: int = 1
+    """Number of neighboring preferred M clusters to interleave in N order.
+
+    One preserves ordinary rasterization. Larger groups visit the same N
+    cluster for each M cluster before advancing N, improving weight locality
+    when neighboring M clusters belong to the same expert. An incomplete final
+    M group retains ordinary N order. Requires the dense fused pipeline and
+    persistent N rasterization; physical cluster offsets remain unchanged.
     """
 
     transpose_mma_output: int = 1
@@ -652,6 +697,249 @@ class BatchedGemmConfig:
     scales). See :attr:`uses_global_scales` for the effective value.
     """
 
+    # --- Dense GEMM tuning; "dense" is defined in the class docstring above. ---
+    dense_rolled_mma: int = 0
+    """Acquire the accumulator once, then use one K loop including the first tile."""
+
+    dense_async_sf: int = 0
+    """Keep fused UTCCP and MMA in their ordered async stream, as DKG does."""
+
+    dense_m_repeats: int = 1
+    """Independent 128-row fragments per CTA (two for the dense tile512 path).
+
+    Tile512 supports multiple experts with generic expert lookup and a problem
+    N divisible by tile_n, preserving the weight scale-factor expert stride.
+    Non-swap routed A (LDGSTS/TMA) and LDGSTS SFA retain separate loader tasks.
+    """
+
+    dense_b_reuse: int = 0
+    """Retain B in the SM107 collector across the two M-fragment MMAs."""
+
+    dense_local_barrier: int = 0
+    """Use group-2 local completion addresses, matching DKG's TMA lowering.
+
+    Requires CGA specialization. Native TMA-A routing also supports this
+    for separate B/SFB pipelines; gather4 A keeps its leader mapping.
+    """
+
+    dense_dkg_store_order: int = 0
+    """Wait for C-store ring reuse after commit, matching DKG's epilogue.
+
+    Requires :attr:`dense_rolled_epilogue`; applies to its non-swapped,
+    non-gated TMA-store path. Other epilogue paths retain their own waits.
+    """
+
+    dense_rolled_epilogue: int = 0
+    """Keep the dense epilogue's subtile loop in generated code.
+
+    Supports the non-gated dense path and non-swapped NVFP4/SwiGLU output
+    on dense or native routed tile256/tile512. Requires TMA stores without
+    a TMEM overlap window. Preferred/fallback CGAs retain separate bodies;
+    only the subtile calls within each epilogue become a runtime loop.
+    Disabled by default; :attr:`dense_preload_epilogue` takes precedence
+    on its supported plain 16-bit output paths.
+    """
+
+    dense_preload_epilogue: int = 0
+    """Retain packed 16-bit output in registers before releasing the accumulator.
+
+    With four warps, tile512 stores its first N64 fragment, retains the other
+    seven in 224 packed registers per thread, and releases TMEM before their
+    stores. With eight warps, each group loads half of every N64 fragment;
+    all eight fragments occupy 128 packed registers per thread. Set
+    :attr:`dense_preload_store_prefix_fragments` to 2 to store two first and
+    retain six in 96 packed registers. By default TMEM is released before the
+    retained fragments' stores; :attr:`epilogue_tmem_release` can delay it.
+    Both groups cooperate through one or two shared C
+    scratch stages.
+    Requires 248/256 registers for four warps or 144/160/168/176 for eight, N64
+    fragments, and plain FP16/BF16 output. Optional per-expert global scaling
+    is applied in FP32 before conversion and register packing.
+    Four-warp fused MoE finalization instead stages the complete output tile
+    in shared memory before releasing TMEM; see :attr:`uses_full_tile_finalize`.
+    """
+
+    dense_preload_store_prefix_fragments: int = 0
+    """N64 fragments stored before TMEM release by the eight-warp preload.
+
+    Only 0 and 2 are supported. Default 0 disables prefix stores: retain all
+    eight fragments and store them after TMEM release. With 2, store the
+    first two, retain six in 96 packed registers per thread, release TMEM,
+    then store the remaining six. This reduces register pressure, especially
+    with FP32 global output scaling; it does not require scaling to be enabled.
+    A nonzero value requires dense_preload_epilogue=1 and
+    dense_epilogue_warps=8, with its plain FP16/BF16 output restrictions.
+    This option does not control the four-warp preload schedules.
+    The preload, retained-vector size and store tasks share this compile-time
+    count so every fragment is written exactly once. With fuse_moe_finalize,
+    prefix fragments are staged in shared memory before TMEM release; bulk
+    reduction waits until the remaining fragments complete each N256 row.
+    """
+
+    epilogue_steps: tuple = ()
+    """Explicit compile-time EpilogueStep sequence; empty uses legacy presets.
+
+    Counts describe ordered N64 fragments. The plan derives SMEM slots, bulk
+    source-read waits and writer barriers. Supports plain-output preload and
+    interleaved group1 NVFP4 FC1. FC1 counts are per four-warp group (four
+    fragments with eight warps, eight with four); two fragments fill a C slot.
+    Cannot be combined with legacy prefix/read/staging/release controls.
+    """
+
+    epilogue_tmem_load_width: int = 0
+    """Preload read width: 0 resolves the existing mapping, or explicitly 32/64.
+
+    Eight cooperative warps require 32, four-warp full-tile finalization
+    requires 64, and plain four-warp preload retains its mixed-width schedule.
+    See ``epilogue_schedule.py`` for supported combinations and named presets.
+    """
+
+    epilogue_tmem_load_ahead: int = -1
+    """Pending preload reads: -1 preserves the existing schedule; 0/1 is explicit.
+
+    Eight-warp prefix-zero preload supports serial or one-read-ahead loads.
+    Other schedules currently require their original setting. The final
+    register-heavy reads remain serial even with one-read-ahead enabled.
+    """
+
+    epilogue_smem_staging: int = 0
+    """0: resolve existing schedule; 1: fragment ring; 2: complete output tile.
+
+    Fragment-ring preload stages the prefix and retains the tail in registers.
+    Full-tile staging requires four-warp fused finalization and two C stages.
+    Both stage converted output. Ownership determines layout, fences and waits.
+    """
+
+    epilogue_tmem_release: int = 0
+    """0/1: release after preload; 2: release after the output-store task.
+
+    All accumulator reads finish before either release point. Setting 2 delays
+    MMA reuse until output issue/source-read waits finish; it does not promise
+    global completion of asynchronous stores. Tail draining remains required.
+    """
+
+    fuse_moe_finalize: int = 0
+    """Scatter weighted BF16 FC2 rows directly into the token output.
+
+    Requires native Rubin NVFP4 BatchM with four/eight-warp preload and global
+    expert scales. The caller supplies original router coefficients, routing
+    index maps and a zeroed token output. Router weights multiply FP32
+    accumulators before conversion; bulk BF16 atomic reductions combine
+    experts in unspecified order. Full
+    N256 rows use padded shared-memory scratch; operand stage counts must
+    leave room for it. Use the separate finalizer for deterministic FP32
+    accumulation.
+    The legacy four-warp profile uses two C scratch stages: stage both 128-row halves before
+    releasing TMEM, then reduce both halves in one bulk group per thread.
+    Explicit epilogue_steps can instead emit and reuse a single C slot.
+    Eight warps retain the configurable register preload/prefix schedule.
+    """
+
+    dense_streaming_c: int = 0
+    """Use an L2 evict-first hint for packed-epilogue output TMA stores.
+
+    Requires dense_preload_epilogue. Default 0 preserves normal output cache
+    retention; enable only after considering reuse by the following kernel.
+    """
+
+    dense_a_l2_promotion: int = 0
+    """L2 promotion bytes for dense activation TMA descriptors: 0, 128, or 256.
+
+    Applies to full and partitioned A descriptors; B and scale-factor maps
+    keep their default policy. Independent of the A/SFA evict-last hint.
+    Supports dense shared pipelines and routed tile512 TMA A. LDGSTS has no
+    TensorMap promotion policy. Default 0 disables promotion.
+    """
+
+    dense_retain_a: int = 0
+    """Prefer retaining dense activation operands and their scales in L2.
+
+    Adds an L2 evict-last hint to A/SFA loads, leaving B/SFB unchanged.
+    Supports dense TMA and routed tile512 TMA/LDGSTS. Default 0 keeps normal
+    input caching; this does not retain activations in shared memory.
+    """
+
+    dense_epilogue_warps: int = 4
+    """Four or eight warps for the dense/native-routed rolled epilogue.
+
+    NVFP4/SwiGLU uses two four-warp groups to partition N, each with its own
+    persistent C scratch ring and TMA store queue. Both groups release TMEM
+    through the shared accumulator pipeline after completing their reads.
+    For plain FP16/BF16 output without preloading, the independent groups have
+    their own C scratch rings and store queues. This requires single-expert
+    output, at most 128 registers, and complete C rings per M fragment.
+    With dense_preload_epilogue, both groups share one scratch ring and store
+    queue; multiple experts are supported. See its register requirements.
+    All eight-warp paths require output without bias or per-token scaling.
+    """
+
+    dense_split_tma_pipeline: int = 0
+    """Use independent A/SFA and B/SFB rings and loader warps.
+
+    Each pair shares a stage cursor and completion barrier. Reuse waits cover
+    only the CTAs sharing that pair, allowing weights and activations to
+    advance independently. Operand and SF depths must match within each pair.
+    Requires dense_fuse_tma_loads, persistent scheduling, and no work throttle.
+    Routed tile512 fuses only B/SFB, keeping A/SFA loaders and their relay.
+    Its weight cursor is independent of A, permitting five A/six B stages.
+    """
+
+    dense_fuse_tma_loads: int = 0
+    """Issue dense A/B/SFA/SFB loads from one task with one shared cursor.
+
+    dense_split_tma_pipeline instead creates one loader and cursor per pair.
+
+    Requires :attr:`dense_partition_tma_loads` and either the non-routed
+    shared pipeline or a routed weight pipeline or fused native routed loaders.
+    """
+
+    dense_specialize_tma_cga: int = 0
+    """Compile preferred/fallback dense CGA bodies within one kernel.
+
+    Supports the dense shared pipeline, routed tile512, or native-SFA TMA-A
+    routing, with a 2x1x1 fallback. A cluster-wide runtime branch selects the
+    body for the actual shape; other GEMM configurations remain excluded.
+    """
+
+    _active_cga_shape: tuple[int, int, int] | None = None
+
+    dense_single_expert: int = 0
+    """Specialize expert-map coordinates to zero for a validated dense launch.
+
+    Requires :attr:`dense_fuse_tma_pipeline` and ``num_experts=top_k=1`` at launch.
+    This assumption is explicit; the ``dense_`` naming prefix alone does not
+    select it for other options.
+    """
+
+    dense_partition_tma_loads: int = 0
+    """Distribute shared-pipeline A/SFA slices across Y and SFB slices across X.
+
+    Requires the dense shared pipeline or routed tile512 weight pipeline,
+    tile M=128/256 per CTA, preferred Y=1/2/4, a 2x1 fallback, and no TMA
+    OOB optimization.
+    Each issuer multicasts a disjoint slice. A complete stage in each receiving
+    CTA is unchanged, so full-barrier bytes and empty-barrier consumer counts
+    stay unchanged. Loader participation (and hence CLC arrivals) increases.
+    With routed tile512, partitions TMA A gather4 rows across Y and SFB
+    slices across X. LDGSTS A/SFA remain CTA-local. Flexible routed TMA A
+    requires static CGA specialization so each body has a fixed slice size.
+    """
+
+    dense_fuse_tma_pipeline: int = 0
+    """Share dense NVFP4 A/B/SFA/SFB pipeline barriers on Rubin. ``0``/``1``.
+
+    "Dense" refers to the GEMM fast path defined in the class docstring.
+    Supports non-routed batch-M GEMM with tile N=K=256, matched operand/SF
+    stage counts, and physical 2xY CGAs, including the tile512 M extension.
+    Fused loaders also support 4xY: every atom arms its local full barrier,
+    while the first X atom supplies multicast B and partitioned SFB payloads.
+    MMA waits and releases once per K tile.
+    Multi-atom CGAs arm one local full barrier for the total operand bytes;
+    single-atom CGAs retain four local arrivals. The shared empty barrier uses
+    the union of operand release destinations for the active CGA. SFB is
+    multicast across each row, including a single 2x1 atom.
+    """
+
     fuse_sf_copy_to_mma: int = 0
     """Fuse the scale-factor SMEM-to-TMEM copy into the MMA task. ``0``/``1``.
 
@@ -660,6 +948,37 @@ class BatchedGemmConfig:
     does not require a tile-256 accumulator layout.
     """
 
+    routed_native_sfa: int = 0
+    """Stage routed SFA in row order with LDGSTS.128 and 128x128b UTCCP.
+
+    Opt-in Rubin NVFP4 tile256/tile512 path; the MMA descriptor and TMEM
+    scale stride must use the matching native layout for each M fragment.
+    Supports fused LDGSTS A/SFA or separate TMA A and native SFA loaders.
+    TMA-A with CLC also supports a 2x1 fallback; partitioned gather4
+    requires CGA specialization. The static tile queue remains fixed-CGA.
+    """
+
+    routed_low_smem: int = 0
+    """Use the measured tile256 payload layout with controls below byte1024.
+
+    Restricted to eight operand stages, two accumulator stages and one
+    BF16 scratch slot. Other configurations keep the standard allocator.
+    """
+
+    routed_sfa_first: int = 0
+    """Place native routed SFA before the other SMEM payloads. ``0``/``1``.
+
+    Preserves alignment, pipeline registration and relative order of the
+    remaining allocations. This changes addresses, not SF layout or copy
+    scheduling. Requires routed_native_sfa and excludes routed_low_smem,
+    which selects a separate fixed tile256 layout.
+    """
+
+    static_persistent_clusters: int = 0
+    """Resident cluster budget for STATIC_PERSISTENT; supplied by the host."""
+
+    fused_a_single_commit: int = 0
+    """Commit the shared LDGSTS A/SFA completion ring once per fused loader."""
     fuse_operand_sf_loads: int = 0
     """Fuse each operand load with its scale-factor load. ``0``/``1``.
 
@@ -843,6 +1162,9 @@ class BatchedGemmConfig:
         return _resolve_warp_layout(self)
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "epilogue_steps", normalize_epilogue_steps(self.epilogue_steps)
+        )
         # Normalize effective format flags once. Invalid values remain visible
         # to validation rather than being silently converted to booleans.
         if self.use_shuffled_matrix in (0, 1) and self.is_swap_ab:
@@ -855,6 +1177,17 @@ class BatchedGemmConfig:
     def compile_signature(self) -> dict:
         """Effective constexpr inputs, independent of defaults and resolution history."""
         result = {f.name: getattr(self, f.name) for f in fields(self) if f.init}
+        plan = self.preload_epilogue_plan
+        if self.epilogue_steps:
+            result["epilogue_steps"] = plan.signature()
+        elif plan is not None:
+            # AUTO and an equivalent explicit preset name the same kernel.
+            result.update(
+                epilogue_tmem_load_width=plan.load_width,
+                epilogue_tmem_load_ahead=plan.load_ahead,
+                epilogue_smem_staging=int(plan.staging),
+                epilogue_tmem_release=int(plan.release),
+            )
         result.update(asdict(self.warp_layout))
         result["route_sfs_act"] = self.sf_route
         for name in ("load_regs", "load_sf_regs", "copy_sf_regs"):
@@ -879,7 +1212,54 @@ class BatchedGemmConfig:
     @property
     def tile_m(self) -> int:
         """Rows staged per CTA by the implemented operand layouts."""
-        return 128
+        return 128 * self.dense_m_repeats
+
+    @property
+    def uses_routed_tile512(self) -> bool:
+        """Tile512 with routed A and LDGSTS SFA loaders.
+
+        The two M fragments share MMA/epilogue code with dense tile512.
+        Routed loaders retain completion relays; B/SFB may use a dense pair.
+        """
+        return (
+            self.dense_m_repeats == 2
+            and not self.is_swap_ab
+            and self.has_routed_act
+            and self.uses_ldgsts_routed_sfs
+        )
+
+    @property
+    def uses_routed_weight_pipeline(self) -> bool:
+        """Keep the dense B/SFB pair independent of routed activation rings."""
+        return bool(
+            (
+                self.uses_routed_tile512
+                or (
+                    self.routed_native_sfa
+                    and self.has_tma_route
+                    and not self.is_swap_ab
+                )
+                or (self.fuse_operand_sf_loads and not self.is_swap_ab)
+            )
+            and self.dense_split_tma_pipeline
+        )
+
+    @property
+    def partitions_routed_tma_a(self) -> bool:
+        return bool(
+            self.uses_routed_weight_pipeline
+            and self.has_tma_route
+            and self.dense_partition_tma_loads
+        )
+
+    @property
+    def routed_a_y_partitions(self) -> int:
+        """Static issuer count for the specialized gather4 body."""
+        return (
+            (self._active_cga_shape or self.preferred_cluster_shape)[1]
+            if self.partitions_routed_tma_a
+            else 1
+        )
 
     @property
     def is_rubin(self) -> bool:
@@ -1358,9 +1738,9 @@ class BatchedGemmConfig:
         return self.tmem_sf_cols("b")
 
     def _tmem_sf_tile_mn(self, operand: str) -> int:
-        """Return the M/N tile extent for a SF ``operand`` (``tile_m`` for "a", ``tile_n`` for "b")."""
+        """Rows/columns addressed by one MMA's scale base, excluding M repeats."""
         if operand == "a":
-            return self.tile_m
+            return 128
         if operand == "b":
             return self.tile_n
         raise ValueError(f"Unsupported scale-factor operand: {operand}")
@@ -1379,7 +1759,9 @@ class BatchedGemmConfig:
         """
         if not self.has_input_block_scaling:
             return 0
-        return tmem_sf_cols(
+        if self.routed_native_sfa and operand == "a":
+            return 4 * self.dense_m_repeats
+        return (self.dense_m_repeats if operand == "a" else 1) * tmem_sf_cols(
             self._tmem_sf_tile_mn(operand),
             self.tile_k,
             self._tmem_sf_vec_size(operand),
@@ -1390,6 +1772,8 @@ class BatchedGemmConfig:
         """Return the TMEM column stride for one four-vector SF group
         of ``operand`` (``"a"``/``"b"``).
         """
+        if self.routed_native_sfa and operand == "a":
+            return 2
         return tmem_sf_col_stride(
             self._tmem_sf_tile_mn(operand),
             self.mma_k,
@@ -1409,8 +1793,8 @@ class BatchedGemmConfig:
 
     @property
     def tmem_c_cols_per_stage(self) -> int:
-        """TMEM columns per accumulator stage (= :attr:`tile_n`)."""
-        return tmem_d_cols_per_stage(self.tile_n)
+        """TMEM columns for all M fragments in one accumulator stage."""
+        return self.dense_m_repeats * tmem_d_cols_per_stage(self.tile_n)
 
     @property
     def num_bytes_a_per_stage(self) -> int:
@@ -1504,7 +1888,33 @@ class BatchedGemmConfig:
         """SMEM bytes for one epilogue C tile
         (``epi_tile_m * epi_tile_n * dtype_c_bits / 8``).
         """
+        if self.fuse_moe_finalize:
+            return (
+                self.epi_tile_m * self.finalize_smem_row_stride * self.dtype_c_bits // 8
+            )
         return self.epi_tile_m * self.epi_tile_n * self.dtype_c_bits // 8
+
+    @property
+    def finalize_smem_row_stride(self) -> int:
+        # Bulk reductions need contiguous rows rather than TMA swizzling.
+        # A 16-byte pad keeps each row aligned and separates neighboring
+        # lanes' vector stores across banks instead of a 128-byte stride.
+        return self.tile_n + 8
+
+    @property
+    def uses_full_tile_finalize(self) -> bool:
+        """Stage both M128 halves before TMEM release, then scatter owned rows.
+
+        Four warps own complete rows, so no cross-warp N-fragment assembly is
+        needed. Validation requires two C scratch stages for this schedule.
+        """
+        plan = self.preload_epilogue_plan
+        return plan is not None and plan.full_tile
+
+    @cached_property
+    def preload_epilogue_plan(self):
+        """Compile-time data-lifetime plan shared by TMEM, SMEM and store tasks."""
+        return resolve_preload_epilogue(self)
 
     @property
     def tma_store_cols(self) -> int:
@@ -1712,7 +2122,16 @@ class BatchedGemmConfig:
     @property
     def non_swap_epilogue_subtile_cnt(self) -> int:
         """Schedule calls needed to drain one non-swap accumulator tile."""
-        return max(1, self.tile_n // self.non_swap_epilogue_cols_per_call)
+        # Gated cols_per_call already includes all epilogue warpgroups.
+        # Applying the plain-output division as well would skip half the tile.
+        plain_warpgroups = (
+            1 if self.has_gated_epilogue else self.dense_epilogue_warps // 4
+        )
+        return (
+            self.dense_m_repeats
+            * max(1, self.tile_n // self.non_swap_epilogue_cols_per_call)
+            // plain_warpgroups
+        )
 
     @property
     def uses_tmem_overlap_window(self) -> bool:
@@ -1809,8 +2228,27 @@ class BatchedGemmConfig:
             and bool(self.use_tma_store)
             and self.num_stages_c_smem > 1
             and not self.use_deepseek_fp8
-            and not self.has_output_block_scaling
-            and (not self.has_gated_epilogue or self.uses_16bit_gated_tma_c_scratch)
+            and (
+                self.uses_non_swap_fp4_gated_tma_c_scratch
+                or (
+                    not self.has_output_block_scaling
+                    and (
+                        not self.has_gated_epilogue
+                        or self.uses_16bit_gated_tma_c_scratch
+                    )
+                )
+            )
+        )
+
+    @property
+    def uses_non_swap_fp4_gated_tma_c_scratch(self) -> bool:
+        """Whether each BatchM epilogue group stages a gated NVFP4 TMA box."""
+        return (
+            not self.is_swap_ab
+            and bool(self.use_tma_store)
+            and self.uses_fp4_output_quant
+            and not self.uses_mx_output_quant
+            and self.has_gated_epilogue
         )
 
     @property
@@ -1884,6 +2322,12 @@ class BatchedGemmConfig:
         reserves packed per-warpgroup storage for every active TMA stage, plus
         the gated-MX FP32 absmax exchange scratch.
         """
+        if self.uses_non_swap_fp4_gated_tma_c_scratch:
+            return (
+                self.num_bytes_c_tma_store_per_group
+                * self.num_stages_c_smem
+                * self.num_epilogue_warpgroups
+            )
         if self.uses_deepseek_fp8_split_epilogue_tma_c_scratch:
             return (
                 (self.tile_m // 2)
@@ -1899,7 +2343,11 @@ class BatchedGemmConfig:
             return (
                 bytes_per_group * self.num_stages_c_smem * self.num_epilogue_warpgroups
             )
-        stage_bytes = self.num_bytes_c_per_stage * self.num_stages_c_smem
+        stage_bytes = (
+            self.num_bytes_c_per_stage
+            * self.num_stages_c_smem
+            * (1 if self.dense_preload_epilogue else self.dense_epilogue_warps // 4)
+        )
         if self.use_tma_store and self.has_output_block_scaling and self.is_swap_ab:
             packed_store_bytes = (
                 self.num_bytes_c_tma_store_per_group
@@ -1924,6 +2372,8 @@ class BatchedGemmConfig:
         paths as well.
         """
         if self.uses_16bit_gated_tma_c_scratch:
+            return False
+        if self.dense_fuse_tma_pipeline:
             return False
         return not self.is_persistent and not self.has_cast_a
 
@@ -2161,8 +2611,16 @@ class BatchedGemmConfig:
 
     @property
     def is_persistent(self) -> bool:
-        """True for dynamic persistent CLC scheduling (:attr:`tile_scheduler` == PERSISTENT)."""
-        return self.tile_scheduler == int(TileScheduler.PERSISTENT)
+        """True for CLC or queued static persistent scheduling."""
+        return self.tile_scheduler in (
+            int(TileScheduler.PERSISTENT),
+            int(TileScheduler.STATIC_PERSISTENT),
+        )
+
+    @property
+    def is_static_persistent(self) -> bool:
+        """Static cluster-stride scheduling through a local two-stage queue."""
+        return self.tile_scheduler == int(TileScheduler.STATIC_PERSISTENT)
 
     @property
     def raster_along_m(self) -> bool:
@@ -2379,6 +2837,33 @@ class BatchedGemmConfig:
         return self.sf_route == int(RouteImpl.LDGSTS)
 
     @property
+    def uses_ldgsts_sf_relay(self) -> bool:
+        """Forward CTA-local SF copy completion to the two-CTA consumer."""
+        return bool(
+            self.uses_two_cta_mma
+            and self.has_input_block_scaling
+            and self.has_routed_sfs
+            and self.uses_ldgsts_routed_sfs
+        )
+
+    @property
+    def uses_ldgsts_relay(self) -> bool:
+        return bool(
+            self.uses_two_cta_mma and (self.has_gather or self.uses_ldgsts_sf_relay)
+        )
+
+    @property
+    def shares_ldgsts_a_sfa_pipeline(self) -> bool:
+        """A/SFA can share barriers when MMA owns both matching ring slots."""
+        return bool(
+            self.uses_ldgsts_sf_relay
+            and self.has_gather
+            and not self.is_swap_ab
+            and self.fuse_sf_copy_to_mma
+            and self.num_stages_a == self.num_stages_smem_sfa
+        )
+
+    @property
     def uses_tma_routed_sfs(self) -> bool:
         """Whether routed SF use TMA gather4."""
         return self.sf_route == int(RouteImpl.TMA)
@@ -2526,6 +3011,27 @@ def _pack_warp_layout(cfg: BatchedGemmConfig, layout: _WarpOrder) -> None:
                     f"Fused {operand.upper()}/SF loader requires equal warp counts"
                 )
             setattr(cfg, sf_name, operand_count)
+    if cfg.dense_fuse_tma_loads:
+        layout = (
+            _WarpOrder(
+                (
+                    "epilogue",
+                    "gather",
+                    "load_a",
+                    "load_sfa",
+                    "load_b",
+                    "mma",
+                    "sync",
+                    "workid",
+                )
+            )
+            if cfg.uses_routed_weight_pipeline
+            else (
+                _WarpOrder(("epilogue", "load_a", "load_b", "mma", "workid"))
+                if cfg.dense_split_tma_pipeline
+                else _WarpOrder(("epilogue", "load_a", "mma", "workid"))
+            )
+        )
     warp_idx = 0
     for task_name in layout.task_order:
         routed_task = "load_b" if cfg.is_swap_ab else "load_a"
@@ -2545,6 +3051,13 @@ def _pack_warp_layout(cfg: BatchedGemmConfig, layout: _WarpOrder) -> None:
         setattr(cfg, task.index_field, warp_idx)
         warp_idx += int(getattr(cfg, task.count_field))
 
+    if cfg.dense_fuse_tma_loads:
+        if not cfg.dense_split_tma_pipeline:
+            cfg.load_b_warp_idx = cfg.load_a_warp_idx
+        if not cfg.uses_routed_weight_pipeline:
+            cfg.load_sfa_warp_idx = cfg.load_a_warp_idx
+        cfg.load_sfb_warp_idx = cfg.load_b_warp_idx
+    # Task-level setmaxnreg requires complete four-warp groups.
     total_warps = ((warp_idx + 3) // 4) * 4
     cfg.padding_warp_idx = warp_idx
     cfg.num_padding_warps = total_warps - warp_idx
@@ -2587,14 +3100,14 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         )
         return
 
-    # LDGSTS needs the gather task and, for separate operand loads, SyncTask.
-    # Use the general layout below, which assigns both pipeline participants.
+    # LDGSTS A needs the general gather-task layout below. TMA A with LDGSTS
+    # scales can use this overlap layout, but must reserve its SF relay warp.
     if cfg.use_tile256_tmem_overlap and not cfg.has_gather:
         cfg.num_mma_warps = 1
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
 
-        cfg.num_sync_warps = 0
+        cfg.num_sync_warps = int(cfg.uses_ldgsts_sf_relay)
         cfg.num_workid_warps = 1 if cfg.is_persistent else 0
 
         cfg.epilogue_warp_idx = 0
@@ -2615,6 +3128,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                             "load_sfb",
                             "load_a",
                             "load_sfa",
+                            "sync",
                             "mma",
                             "workid",
                         )
@@ -2649,6 +3163,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                         "load_sfb",
                         "load_a",
                         "load_sfa",
+                        "sync",
                         "mma",
                         "workid",
                     )
@@ -2659,6 +3174,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                         "load_sfa",
                         "load_b",
                         "load_sfb",
+                        "sync",
                         "mma",
                         "workid",
                     )
@@ -2681,6 +3197,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                     "load_sfb",
                     "load_a",
                     "load_sfa",
+                    "sync",
                     "mma",
                     "workid",
                 )
@@ -2726,6 +3243,8 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         return
 
     cfg.num_epilogue_warps = 8 if (cfg.is_fp8_mma and cfg.tile_n == 256) else 4
+    if cfg.dense_epilogue_warps == 8:
+        cfg.num_epilogue_warps = 8
     cfg.epilogue_warp_idx = 0
     cfg.num_cast_a_warps = 0
     cfg.num_mma_warps = 1
@@ -2792,11 +3311,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         else:
             cfg.num_load_a_warps = routed_warps
 
-    cfg.num_sync_warps = (
-        1
-        if cfg.uses_two_cta_mma and cfg.has_gather and not cfg.fuse_operand_sf_loads
-        else 0
-    )
+    cfg.num_sync_warps = 1 if cfg.uses_ldgsts_relay else 0
     cfg.num_workid_warps = 1 if cfg.is_persistent else 0
     # CopySf warps copy scale factors to TMEM before the MMA. The compact low-N
     # SFB path needs the 4-warp STTM warpgroup; all bulk S2T paths use one warp
@@ -2825,8 +3340,9 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                 (
                     "epilogue",
                     "gather",
-                    "load_a",
+                    "load_a" if cfg.is_swap_ab else "load_b",
                     "mma",
+                    "sync",
                     "workid",
                 )
             ),
@@ -2910,6 +3426,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                     "load_a",
                     "load_sfa",
                     "mma",
+                    "sync",
                     "workid",
                 )
             ),
@@ -3057,6 +3574,10 @@ def _ldgsts_sfb_base_producer_commit_prefetch_depth(cfg: BatchedGemmConfig) -> i
 
 def _ldgsts_sfb_producer_commit_prefetch_depth(cfg: BatchedGemmConfig) -> int:
     """Return the host-derived delayed SFB commit depth consumed by resources."""
+    if cfg.uses_ldgsts_sf_relay:
+        # Hardware completion arrivals let the loader fill the ring without
+        # delaying commits or draining cp.async groups in the issuing warp.
+        return 0
     return min(
         _ldgsts_sfb_base_producer_commit_prefetch_depth(cfg),
         cfg.ldgsts_sfb_producer_commit_prefetch_depth,
@@ -3097,7 +3618,12 @@ def _validate_pipeline_stage_counts(cfg: BatchedGemmConfig) -> None:
     if cfg.is_persistent:
         _validate_pipeline_stage_count(cfg, "num_stages_workid")
 
-    if cfg.has_gather and cfg.uses_two_cta_mma and cfg.num_stages_a != cfg.num_stages_b:
+    if (
+        cfg.has_gather
+        and cfg.uses_two_cta_mma
+        and not cfg.uses_routed_weight_pipeline
+        and cfg.num_stages_a != cfg.num_stages_b
+    ):
         raise ValueError(
             "2-CTA gather requires num_stages_a == num_stages_b, got "
             f"{cfg.num_stages_a} and {cfg.num_stages_b}"
@@ -3176,9 +3702,10 @@ def validate_config(
     if cfg.tile_scheduler not in (
         int(TileScheduler.STATIC),
         int(TileScheduler.PERSISTENT),
+        int(TileScheduler.STATIC_PERSISTENT),
     ):
         raise ValueError(
-            f"tile_scheduler must be STATIC or PERSISTENT, got {cfg.tile_scheduler}"
+            f"tile_scheduler must be STATIC, PERSISTENT or STATIC_PERSISTENT, got {cfg.tile_scheduler}"
         )
 
     if cfg.cta_raster_order not in (
@@ -3190,6 +3717,16 @@ def validate_config(
         )
     if cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N) and not cfg.is_persistent:
         raise ValueError("cta_raster_order=ALONG_N requires persistent scheduling")
+
+    if cfg.cta_raster_group_m not in (1, 2, 4, 8):
+        raise ValueError("cta_raster_group_m must be 1, 2, 4, or 8")
+    if cfg.cta_raster_group_m > 1 and not (
+        cfg.is_persistent and not cfg.raster_along_m and cfg.dense_fuse_tma_pipeline
+    ):
+        raise ValueError(
+            "cta_raster_group_m > 1 requires persistent N rasterization "
+            "and dense_fuse_tma_pipeline"
+        )
 
     if cfg.umma_cta_count not in (1, 2):
         raise ValueError(
@@ -3213,6 +3750,11 @@ def validate_config(
             "physical CGA must have Z=1 and at most 16 CTAs, got "
             f"{cfg.preferred_cluster_shape}"
         )
+    if cfg.preferred_cluster_shape == (2, 1, 1) and cfg.fallback_cluster_shape:
+        raise ValueError(
+            "preferred CGA 2x1 requires a fixed launch; disable fallback "
+            "with fallback_cluster_dim_x=0"
+        )
     from .batched_gemm_cga import has_multiple_umma_atoms, is_flexible_cga
 
     if has_multiple_umma_atoms(cfg) or is_flexible_cga(cfg):
@@ -3235,10 +3777,6 @@ def validate_config(
                 raise ValueError(
                     f"fallback CGA must have Z=1 and at most 16 CTAs, got {fallback}"
                 )
-            if fallback == cfg.preferred_cluster_shape:
-                raise ValueError(
-                    f"fallback CGA must differ from the preferred CGA, got {fallback}"
-                )
             if preferred_x % fallback_x != 0 or preferred_y % fallback_y != 0:
                 raise ValueError(
                     "fallback CGA dimensions must divide the preferred CGA "
@@ -3249,6 +3787,66 @@ def validate_config(
     _validate_pipeline_stage_counts(cfg)
     _validate_output_store_dtype(cfg)
 
+    nvfp4_swiglu_output = cfg.dtype_c == int(DType.E2M1) and cfg.act_kind == int(
+        ActKind.SWIGLU
+    )
+    eight_warp_nvfp4_swiglu = (
+        nvfp4_swiglu_output
+        and cfg.is_rubin
+        and cfg.is_nvfp4_mma
+        and cfg.uses_non_swap_fp4_gated_tma_c_scratch
+    )
+    if cfg.dense_epilogue_warps not in (4, 8):
+        raise ValueError("dense_epilogue_warps must be 4 or 8")
+    if cfg.dense_preload_store_prefix_fragments not in (0, 2):
+        raise ValueError("dense_preload_store_prefix_fragments must be 0 or 2")
+    if cfg.dense_preload_store_prefix_fragments and not (
+        cfg.dense_preload_epilogue and cfg.dense_epilogue_warps == 8
+    ):
+        raise ValueError(
+            "dense_preload_store_prefix_fragments requires "
+            "dense_preload_epilogue=1 and dense_epilogue_warps=8"
+        )
+    if (
+        cfg.dense_epilogue_warps == 8
+        and cfg.epilogue_regs > 128
+        and not cfg.dense_preload_epilogue
+        and not eight_warp_nvfp4_swiglu
+    ):
+        raise ValueError(
+            "eight dense epilogue warps currently require epilogue_regs <= 128"
+        )
+    if cfg.dense_epilogue_warps == 8 and not (
+        cfg.dense_rolled_epilogue
+        and not cfg.is_swap_ab
+        and not cfg.use_max_tmem_overlap
+        and (
+            eight_warp_nvfp4_swiglu
+            or (
+                (cfg.dense_single_expert or cfg.dense_preload_epilogue)
+                and cfg.dtype_c in (int(DType.FP16), int(DType.BF16))
+                and cfg.act_kind == int(ActKind.NONE)
+                and cfg.non_swap_tmem_load_num_regs == cfg.tma_store_cols
+            )
+        )
+        and cfg.bias_type == int(BiasType.NONE)
+        and not cfg.has_per_token_sf_a
+        and not cfg.has_per_token_sf_b
+        and not cfg.use_tma_oob_opt
+        and cfg.epi_tile_m == 128
+    ):
+        raise ValueError(
+            "eight dense epilogue warps require plain dense or Rubin "
+            "NVFP4/SwiGLU rolled TMA output"
+        )
+    if (
+        cfg.dense_epilogue_warps == 8
+        and not eight_warp_nvfp4_swiglu
+        and (cfg.tile_n // (2 * cfg.non_swap_tmem_load_num_regs))
+        % cfg.num_stages_c_smem
+    ):
+        raise ValueError("eight dense epilogue warps require complete C scratch rings")
+
     if cfg.has_cast_a and cfg.dtype_c not in (
         int(DType.BF16),
         int(DType.FP16),
@@ -3258,8 +3856,141 @@ def validate_config(
             f"got {cfg.dtype_c}"
         )
 
-    if cfg.tile_m != 128:
-        raise ValueError(f"Only tile_m=128 supported, got {cfg.tile_m}")
+    if cfg.dense_m_repeats not in (1, 2):
+        raise ValueError("dense_m_repeats must be 1 or 2")
+    _validate_binary_config_option("dense_b_reuse", cfg.dense_b_reuse)
+    if cfg.dense_b_reuse and cfg.dense_m_repeats != 2:
+        raise ValueError("dense_b_reuse requires dense_m_repeats=2")
+    if cfg.dense_m_repeats == 2 and not (
+        (cfg.dense_fuse_tma_pipeline or cfg.uses_routed_tile512)
+        and cfg.is_rubin
+        and cfg.is_nvfp4_mma
+        and not cfg.is_swap_ab
+        and cfg.uses_two_cta_mma
+        and cfg.tile_n == cfg.tile_k == 256
+        and cfg.fuse_sf_copy_to_mma
+        and cfg.smem_sfa_layout == int(SfLayout.R128c4)
+        and cfg.smem_sfb_layout == int(SfLayout.R128c4)
+        and (
+            (
+                cfg.dense_rolled_epilogue
+                and cfg.dtype_c in (int(DType.FP16), int(DType.BF16))
+                and cfg.act_kind == int(ActKind.NONE)
+            )
+            or nvfp4_swiglu_output
+        )
+        and (cfg.mma_m, cfg.mma_n, cfg.mma_k) == (256, 256, 128)
+        and not cfg.use_max_tmem_overlap
+        and cfg.num_stages_tmem_acc == 1
+        and cfg.use_tma_store
+        and not cfg.use_tma_oob_opt
+        and not cfg.has_per_token_sf_a
+        and not cfg.has_per_token_sf_b
+        and cfg.bias_type == int(BiasType.NONE)
+        and cfg.epi_tile_m == 128
+        and cfg.dense_async_sf
+    ):
+        raise ValueError(
+            "dense_m_repeats=2 requires Rubin non-swap two-CTA NVFP4 with "
+            "a dense shared pipeline or separate routed A/LDGSTS SFA pipelines, "
+            "tile_n=tile_k=256, R128c4 scales, fused SF copy/MMA, "
+            "MMA256x256x128, one non-overlapping accumulator stage, "
+            "async scale copies, and rolled plain FP16/BF16 or NVFP4/SwiGLU TMA output without "
+            "bias/per-token scaling (epilogue M128)"
+        )
+
+    if cfg.dense_a_l2_promotion not in (0, 128, 256):
+        raise ValueError("dense_a_l2_promotion must be 0, 128, or 256")
+    if cfg.dense_a_l2_promotion and not (
+        cfg.dense_fuse_tma_pipeline or (cfg.uses_routed_tile512 and cfg.has_tma_route)
+    ):
+        raise ValueError(
+            "dense_a_l2_promotion requires dense_fuse_tma_pipeline or routed tile512 TMA A"
+        )
+
+    _validate_binary_config_option("dense_retain_a", cfg.dense_retain_a)
+    if cfg.dense_retain_a and not (
+        cfg.dense_fuse_tma_pipeline or cfg.uses_routed_tile512
+    ):
+        raise ValueError(
+            "dense_retain_a requires dense_fuse_tma_pipeline or routed tile512"
+        )
+
+    _validate_binary_config_option("fuse_moe_finalize", cfg.fuse_moe_finalize)
+    if cfg.fuse_moe_finalize and not (
+        cfg.is_rubin
+        and cfg.is_nvfp4_mma
+        and not cfg.is_swap_ab
+        and not cfg.has_routed_act
+        and not cfg.dense_single_expert
+        and cfg.dense_preload_epilogue
+        and cfg.dense_epilogue_warps in (4, 8)
+        and cfg.dtype_c == int(DType.BF16)
+        and cfg.uses_global_scales
+    ):
+        raise ValueError(
+            "fuse_moe_finalize requires native Rubin NVFP4 BatchM FC2, "
+            "four/eight-warp preload, BF16 output and global scales"
+        )
+
+    _validate_binary_config_option("dense_streaming_c", cfg.dense_streaming_c)
+    if cfg.dense_streaming_c and not cfg.dense_preload_epilogue:
+        raise ValueError("dense_streaming_c requires dense_preload_epilogue")
+
+    _validate_binary_config_option("dense_preload_epilogue", cfg.dense_preload_epilogue)
+    # Resolve explicit schedule controls even when preload is disabled, so
+    # unsupported knobs cannot be silently ignored by a different epilogue.
+    resolve_preload_epilogue(cfg)
+    if cfg.dense_preload_epilogue and not (
+        cfg.sm_arch == 107
+        and not cfg.is_swap_ab
+        and cfg.tile_n == 256
+        and cfg.dense_m_repeats == 2
+        and cfg.dense_epilogue_warps in (4, 8)
+        and (
+            cfg.dense_dkg_store_order or (cfg.epilogue_steps and cfg.has_gated_epilogue)
+        )
+        and (
+            (cfg.dtype_c in (int(DType.FP16), int(DType.BF16)) and cfg.epi_tile_n == 64)
+            or (
+                cfg.epilogue_steps
+                and cfg.has_gated_epilogue
+                and cfg.uses_non_swap_fp4_gated_tma_c_scratch
+                and cfg.epi_tile_n == 128
+            )
+        )
+        and cfg.tmem_ldst_max_num_regs == 64
+        and cfg.num_stages_c_smem
+        in ((1, 2) if cfg.epilogue_steps or cfg.dense_epilogue_warps == 8 else (2,))
+        and cfg.epilogue_regs
+        in ((144, 160, 168, 176) if cfg.dense_epilogue_warps == 8 else (248, 256))
+    ):
+        raise ValueError(
+            "dense_preload_epilogue requires SM107 tile512, four or eight epilogue warps, "
+            "FP16/BF16 output (or explicit group1 NVFP4 FC1 steps), N64 fragments, DKG store order, two C stages for four "
+            "warps or one/two for eight, "
+            "248/256 registers for four warps or 144/160/168/176 for eight"
+        )
+
+    if cfg.dense_m_repeats == 2:
+        # Generic expert lookup expresses the SFB expert stride in N tiles.
+        # A partial final tile would select the wrong expert's scale rows.
+        if not cfg.dense_single_expert and problem_mnk is not None:
+            _, problem_n, _ = problem_mnk
+            if isinstance(problem_n, int) and problem_n % cfg.tile_n != 0:
+                raise ValueError(
+                    "tile512 with generic expert lookup requires problem N to be "
+                    f"a multiple of tile_n={cfg.tile_n} for weight scale indexing, "
+                    f"got {problem_n}"
+                )
+        operand_bytes = (
+            cfg.num_bytes_a_per_stage * cfg.num_stages_a
+            + cfg.num_bytes_b_smem_per_stage * cfg.num_stages_b
+            + cfg.num_bytes_sfa_per_stage * cfg.num_stages_smem_sfa
+            + cfg.num_bytes_sfb_per_stage * cfg.num_stages_smem_sfb
+        )
+        if operand_bytes + cfg.num_bytes_c_smem_scratch > cfg.smem_capacity_bytes:
+            raise ValueError("tile512 operand and epilogue stages exceed SMEM capacity")
 
     if cfg.sm_arch not in (100, 103, 107):
         raise ValueError(f"sm_arch must be 100, 103, or 107, got {cfg.sm_arch}")
@@ -3471,10 +4202,14 @@ def validate_config(
     if cfg.epi_tile_n % 8 != 0:
         raise ValueError(f"epi_tile_n must be a multiple of 8, got {cfg.epi_tile_n}")
 
-    if not cfg.is_swap_ab and cfg.epi_tile_m != cfg.tile_m:
+    # Dense tile512 drains one 128-row epilogue fragment per M repeat.
+    # All other Batch-M paths still require a full tile in one fragment.
+    if not cfg.is_swap_ab and cfg.epi_tile_m * cfg.dense_m_repeats != cfg.tile_m:
         raise ValueError(
             "Batch-M epilogues store whole tile_m-row tiles; epi_tile_m must "
-            f"equal tile_m, got epi_tile_m={cfg.epi_tile_m}, tile_m={cfg.tile_m}"
+            "equal tile_m / dense_m_repeats, got "
+            f"epi_tile_m={cfg.epi_tile_m}, tile_m={cfg.tile_m}, "
+            f"dense_m_repeats={cfg.dense_m_repeats}"
         )
 
     if cfg.use_shuffled_matrix and not cfg.is_swap_ab:
@@ -3521,15 +4256,38 @@ def validate_config(
             f"epi_tile_n={cfg.epi_tile_n}, "
             f"step_cols={cfg.non_swap_gated_accumulator_cols_per_step}"
         )
+    if cfg.gated_weight_group_size not in (1, 64):
+        raise ValueError("gated_weight_group_size must be 1 or 64")
+    if cfg.gated_weight_group_size == 64 and not (
+        not cfg.is_swap_ab
+        and cfg.dtype_c == int(DType.E2M1)
+        and cfg.act_kind == int(ActKind.SWIGLU)
+        and cfg.epi_tile_n == 128
+        and cfg.non_swap_tmem_load_num_regs == 64
+        and cfg.non_swap_gated_output_cols_per_call == 64
+        and (
+            cfg.num_epilogue_warpgroups == 1
+            or (cfg.dense_epilogue_warps == 8 and cfg.dense_rolled_epilogue)
+        )
+    ):
+        raise ValueError(
+            "gated_weight_group_size=64 requires non-swap NVFP4/SwiGLU, "
+            "epi_tile_n=128, two 64-register TMEM fragments, four epilogue "
+            "warps (or eight with the rolled epilogue)"
+        )
+    gated_output_cols_limit = (
+        MAX_NON_SWAP_NVFP4_GATED_OUTPUT_COLS_PER_CALL
+        if cfg.uses_fp4_output_quant and not cfg.uses_mx_output_quant
+        else MAX_NON_SWAP_GATED_OUTPUT_COLS_PER_CALL
+    )
     if (
         not cfg.is_swap_ab
         and cfg.has_gated_epilogue
-        and cfg.non_swap_gated_output_cols_per_call
-        > MAX_NON_SWAP_GATED_OUTPUT_COLS_PER_CALL
+        and cfg.non_swap_gated_output_cols_per_call > gated_output_cols_limit
     ):
         raise ValueError(
             "Non-swap gated epilogue supports at most "
-            f"{MAX_NON_SWAP_GATED_OUTPUT_COLS_PER_CALL} output columns per "
+            f"{gated_output_cols_limit} output columns per "
             f"call, got {cfg.non_swap_gated_output_cols_per_call} "
             f"(epi_tile_n={cfg.epi_tile_n}, "
             f"load_regs={cfg.non_swap_tmem_load_num_regs})"
@@ -3643,6 +4401,306 @@ def validate_config(
         )
     if cfg.fuse_sf_copy_to_mma != 0 and not cfg.has_input_block_scaling:
         raise ValueError("fuse_sf_copy_to_mma requires block-scaled MMA operands")
+    for name in (
+        "routed_native_sfa",
+        "routed_low_smem",
+        "routed_sfa_first",
+        "fused_a_single_commit",
+    ):
+        _validate_binary_config_option(name, getattr(cfg, name))
+    if cfg.routed_sfa_first and (not cfg.routed_native_sfa or cfg.routed_low_smem):
+        raise ValueError(
+            "routed_sfa_first requires routed_native_sfa=1 and routed_low_smem=0"
+        )
+    if cfg.fused_a_single_commit and not (
+        cfg.fuse_operand_sf_loads
+        and not cfg.is_swap_ab
+        and cfg.shares_ldgsts_a_sfa_pipeline
+    ):
+        raise ValueError(
+            "fused_a_single_commit requires fused non-swap LDGSTS A/SFA with equal stage depths"
+        )
+    if cfg.fuse_operand_sf_loads and not cfg.is_swap_ab and not cfg.routed_native_sfa:
+        raise ValueError("non-swap fused operand/SF loaders require routed_native_sfa")
+    if cfg.routed_native_sfa and not (
+        cfg.is_rubin
+        and cfg.is_nvfp4_mma
+        and not cfg.is_swap_ab
+        and cfg.has_routed_act
+        and cfg.uses_ldgsts_routed_sfs
+        and (
+            (cfg.fuse_operand_sf_loads and cfg.fused_a_single_commit)
+            or (
+                cfg.route_act == int(RouteImpl.TMA)
+                and not cfg.fuse_operand_sf_loads
+                and not cfg.fused_a_single_commit
+            )
+        )
+        and cfg.fuse_sf_copy_to_mma
+        and cfg.dense_m_repeats in (1, 2)
+        and (cfg.tile_n, cfg.tile_k, cfg.mma_k) == (256, 256, 128)
+        and (cfg.mma_m, cfg.mma_n) == (256, 256)
+        and cfg.sf_layout_a == cfg.sf_layout_b == int(SfLayout.R128c4)
+        and cfg.preferred_cluster_shape[0] in (2, 4)
+        and cfg.preferred_cluster_shape[1] in (1, 2, 4)
+        and cfg.preferred_cluster_shape[2] == 1
+        and (
+            cfg.fallback_cluster_shape is None
+            or (
+                cfg.has_tma_route
+                and not cfg.is_static_persistent
+                and cfg.fallback_cluster_shape == (2, 1, 1)
+            )
+        )
+        and cfg.warp_layout.num_load_a_warps
+        in ((4, 8) if cfg.route_act == int(RouteImpl.TMA) else (4,))
+        and cfg.warp_layout.num_load_sfa_warps == 4
+        and (
+            (cfg.dtype_c == int(DType.BF16) and cfg.act_kind == int(ActKind.NONE))
+            or nvfp4_swiglu_output
+        )
+        and not cfg.use_max_tmem_overlap
+        and cfg.is_persistent
+        # CLC MoE launches reserve the worst-case routed-token extent. Skip
+        # unused routing records before native loaders read their expert IDs.
+        and (not cfg.use_early_exit or not cfg.is_static_persistent)
+        and not cfg.use_pdl
+    ):
+        raise ValueError(
+            "routed_native_sfa requires Rubin NVFP4 tile256/tile512 with a 2xY or 4xY CGA (Y=1/2/4; optional 2x1 fallback for TMA-A with CLC), four fused LDGSTS A/SFA warps or four/eight TMA A warps with four native SFA warps, BF16/no activation or NVFP4/SwiGLU output, and persistent scheduling without PDL (early exit requires CLC)"
+        )
+    if cfg.is_static_persistent and not (
+        cfg.routed_native_sfa
+        and not cfg.use_work_throttle
+        and cfg.num_stages_workid == 2
+        and isinstance(cfg.static_persistent_clusters, int)
+        and cfg.static_persistent_clusters > 0
+    ):
+        raise ValueError(
+            "STATIC_PERSISTENT requires routed_native_sfa, two work stages, no work throttle and a positive static_persistent_clusters budget"
+        )
+    if cfg.routed_native_sfa and problem_mnk is not None:
+        _, problem_n, problem_k = problem_mnk
+        if isinstance(problem_n, int) and problem_n % cfg.tile_n:
+            raise ValueError(
+                "routed_native_sfa requires problem_n to be a multiple of "
+                "tile_n=256 for weight scale indexing"
+            )
+        if isinstance(problem_k, int) and problem_k % cfg.tile_k:
+            raise ValueError(
+                "routed_native_sfa requires problem_k to be a multiple of "
+                "tile_k=256 for aligned 16-byte scale rows"
+            )
+    if cfg.routed_low_smem and not (
+        cfg.routed_native_sfa
+        and (
+            cfg.fuse_operand_sf_loads
+            or (cfg.has_tma_route and cfg.uses_routed_weight_pipeline)
+        )
+        and cfg.dense_m_repeats == 1
+        and cfg.num_stages_a
+        == cfg.num_stages_b
+        == cfg.num_stages_smem_sfa
+        == cfg.num_stages_smem_sfb
+        == 8
+        and cfg.num_stages_tmem_acc == 2
+        and (
+            cfg.num_stages_c_smem == 1
+            or (
+                cfg.uses_non_swap_fp4_gated_tma_c_scratch
+                and 1 <= cfg.num_stages_c_smem <= 4
+            )
+        )
+        and cfg.num_bytes_c_smem_scratch <= 16384
+        and cfg.num_stages_workid == (2 if cfg.is_static_persistent else 3)
+    ):
+        raise ValueError(
+            "routed_low_smem requires native tile256 with fused LDGSTS A/SFA or TMA-A/shared weights, eight operand stages, two accumulator stages, one C scratch stage (up to four for gated NVFP4, within 16 KiB) and two static/three CLC work stages"
+        )
+    _validate_binary_config_option("dense_rolled_mma", cfg.dense_rolled_mma)
+    if cfg.dense_rolled_mma and not (
+        (
+            cfg.dense_fuse_tma_loads
+            or cfg.uses_routed_tile512
+            or cfg.fuse_operand_sf_loads
+        )
+        and cfg.fuse_sf_copy_to_mma
+        and not cfg.use_max_tmem_overlap
+    ):
+        raise ValueError(
+            "dense_rolled_mma requires fused dense loaders or routed tile512 "
+            "without max overlap"
+        )
+    _validate_binary_config_option("dense_async_sf", cfg.dense_async_sf)
+    if cfg.dense_async_sf and not (
+        cfg.fuse_sf_copy_to_mma
+        and (cfg.dense_fuse_tma_loads or cfg.uses_routed_tile512)
+    ):
+        raise ValueError(
+            "dense_async_sf requires fused SF copy/MMA and dense loaders or routed tile512"
+        )
+    _validate_binary_config_option("dense_local_barrier", cfg.dense_local_barrier)
+    if cfg.dense_local_barrier and not (
+        (cfg.dense_fuse_tma_loads or (cfg.routed_native_sfa and cfg.has_tma_route))
+        and cfg.dense_specialize_tma_cga
+    ):
+        raise ValueError(
+            "dense_local_barrier requires fused loaders or native-SFA TMA-A, "
+            "with static CGA specialization"
+        )
+    _validate_binary_config_option("dense_dkg_store_order", cfg.dense_dkg_store_order)
+    if cfg.dense_dkg_store_order and not cfg.dense_rolled_epilogue:
+        raise ValueError("dense_dkg_store_order requires the rolled dense epilogue")
+    if cfg.dense_dkg_store_order and cfg.has_gated_epilogue:
+        raise ValueError("dense_dkg_store_order requires non-gated output")
+    _validate_binary_config_option("dense_rolled_epilogue", cfg.dense_rolled_epilogue)
+    if cfg.dense_rolled_epilogue and not (
+        (
+            cfg.dense_fuse_tma_pipeline
+            or cfg.uses_routed_tile512
+            or (cfg.routed_native_sfa and nvfp4_swiglu_output)
+        )
+        and not cfg.uses_tmem_overlap_window
+        and (
+            not cfg.has_gated_epilogue
+            or (nvfp4_swiglu_output and cfg.uses_non_swap_fp4_gated_tma_c_scratch)
+        )
+        and cfg.use_tma_store
+    ):
+        raise ValueError(
+            "dense_rolled_epilogue requires non-overlap TMA output: a non-gated "
+            "dense epilogue or non-swap dense/native-routed NVFP4/SwiGLU"
+        )
+    _validate_binary_config_option("dense_fuse_tma_loads", cfg.dense_fuse_tma_loads)
+    if cfg.dense_fuse_tma_loads and not (
+        (cfg.dense_fuse_tma_pipeline or cfg.uses_routed_weight_pipeline)
+        and cfg.dense_partition_tma_loads
+    ):
+        raise ValueError(
+            "dense_fuse_tma_loads requires partitioned loads and either the dense "
+            "shared pipeline or routed tile512 split weight pipeline"
+        )
+    _validate_binary_config_option(
+        "dense_specialize_tma_cga", cfg.dense_specialize_tma_cga
+    )
+    if cfg.dense_specialize_tma_cga and not (
+        (
+            cfg.dense_fuse_tma_pipeline
+            or cfg.uses_routed_tile512
+            or (cfg.routed_native_sfa and cfg.has_tma_route)
+        )
+        and cfg.fallback_cluster_shape == (2, 1, 1)
+    ):
+        raise ValueError(
+            "dense_specialize_tma_cga requires the dense shared pipeline or "
+            "routed tile512 or native-SFA TMA-A, with a 2x1 fallback"
+        )
+    _validate_binary_config_option("dense_single_expert", cfg.dense_single_expert)
+    if cfg.dense_single_expert and not cfg.dense_fuse_tma_pipeline:
+        raise ValueError(
+            "dense_single_expert requires the non-routed dense shared pipeline"
+        )
+    _validate_binary_config_option(
+        "dense_partition_tma_loads", cfg.dense_partition_tma_loads
+    )
+    if cfg.dense_partition_tma_loads:
+        # Native paired loaders also support separate B/SFB barriers.
+        if not (
+            cfg.dense_fuse_tma_pipeline
+            or cfg.uses_routed_weight_pipeline
+            or (
+                cfg.fuse_operand_sf_loads
+                and not cfg.is_swap_ab
+                and cfg.routed_native_sfa
+            )
+        ):
+            raise ValueError(
+                "dense_partition_tma_loads requires dense_fuse_tma_pipeline or "
+                "a routed weight pipeline or fused native routed loaders"
+            )
+        if (
+            cfg.tile_m not in (128, 256)
+            or cfg.preferred_cluster_shape[1] not in (1, 2, 4)
+            or cfg.fallback_cluster_shape not in (None, (2, 1, 1))
+            or cfg.use_tma_oob_opt
+        ):
+            raise ValueError(
+                "dense_partition_tma_loads requires tile_m=128/256, Y=1/2/4, "
+                "fallback 2x1, no TMA OOB optimization"
+            )
+    _validate_binary_config_option(
+        "dense_fuse_tma_pipeline", cfg.dense_fuse_tma_pipeline
+    )
+    if cfg.dense_fuse_tma_pipeline:
+        if not (
+            cfg.is_rubin
+            and cfg.is_nvfp4_mma
+            and not cfg.is_swap_ab
+            and not cfg.has_routed_act
+            and not cfg.has_routed_sfs
+            and cfg.uses_two_cta_mma
+            and cfg.tile_n == 256
+            and cfg.tile_k == 256
+            and cfg.fuse_sf_copy_to_mma
+            and cfg.smem_sfa_layout == int(SfLayout.R128c4)
+            and cfg.smem_sfb_layout == int(SfLayout.R128c4)
+            and cfg.preferred_cluster_shape[0] in (2, 4)
+            and (cfg.preferred_cluster_shape[0] == 2 or cfg.dense_fuse_tma_loads)
+            and not cfg.use_pdl
+        ):
+            raise ValueError(
+                "dense_fuse_tma_pipeline requires Rubin non-routed batch-M NVFP4 "
+                "tile_n=tile_k=256, R128c4 scale factors, 2xY CGAs "
+                "(or 4xY with dense_fuse_tma_loads=1), "
+                "fuse_sf_copy_to_mma=1, and use_pdl=0"
+            )
+        if cfg.dense_split_tma_pipeline:
+            if (
+                cfg.num_stages_a != cfg.num_stages_smem_sfa
+                or cfg.num_stages_b != cfg.num_stages_smem_sfb
+            ):
+                raise ValueError("split pipelines require matching operand/SF depths")
+        elif (
+            len(
+                {
+                    cfg.num_stages_a,
+                    cfg.num_stages_b,
+                    cfg.num_stages_smem_sfa,
+                    cfg.num_stages_smem_sfb,
+                }
+            )
+            != 1
+        ):
+            raise ValueError(
+                "dense_fuse_tma_pipeline requires equal A/B/SFA/SFB stages"
+            )
+    _validate_binary_config_option(
+        "dense_split_tma_pipeline", cfg.dense_split_tma_pipeline
+    )
+    if cfg.dense_split_tma_pipeline and (
+        (not cfg.dense_fuse_tma_loads and not cfg.fuse_operand_sf_loads)
+        or not cfg.is_persistent
+        or cfg.use_work_throttle
+    ):
+        raise ValueError(
+            "dense_split_tma_pipeline requires fused loaders, persistent scheduling, and no work throttling"
+        )
+    if (
+        cfg.fuse_operand_sf_loads
+        and cfg.uses_routed_weight_pipeline
+        and not cfg.dense_partition_tma_loads
+    ):
+        raise ValueError("paired routed weights require partitioned SFB multicast")
+    if cfg.uses_routed_weight_pipeline and cfg.num_stages_b != cfg.num_stages_smem_sfb:
+        raise ValueError("routed weight pipeline requires matching B/SFB depths")
+    if (
+        cfg.partitions_routed_tma_a
+        and cfg.fallback_cluster_shape
+        and not cfg.dense_specialize_tma_cga
+    ):
+        raise ValueError(
+            "partitioned routed TMA A requires static CGA specialization with a fallback"
+        )
     _validate_binary_config_option(
         "fuse_operand_sf_loads",
         cfg.fuse_operand_sf_loads,
@@ -3652,12 +4710,11 @@ def validate_config(
             cfg.has_input_block_scaling
             and cfg.has_gather
             and cfg.uses_two_cta_mma
-            and cfg.is_swap_ab
             and cfg.uses_ldgsts_routed_sfs
             and cfg.tile_n >= 128
         ):
             raise ValueError(
-                "fuse_operand_sf_loads requires clustered swap-AB LDGSTS "
+                "fuse_operand_sf_loads requires clustered LDGSTS "
                 "activation and scale-factor routing with tile_n >= 128"
             )
         if not cfg.fuse_sf_copy_to_mma:
@@ -4324,6 +5381,15 @@ def compute_launch_grid(
     cluster_m, cluster_n, _ = cfg.preferred_cluster_shape
     grid_m = ((launch_num_tiles_m + cluster_m - 1) // cluster_m) * cluster_m
     grid_n = ((launch_num_tiles_n + cluster_n - 1) // cluster_n) * cluster_n
+    if cfg.is_static_persistent:
+        return (
+            cluster_m,
+            cluster_n,
+            min(
+                grid_m * grid_n // (cluster_m * cluster_n),
+                cfg.static_persistent_clusters,
+            ),
+        )
     if cfg.is_persistent and not cfg.raster_along_m:
         return (
             cluster_m,

@@ -72,6 +72,50 @@ def test_rubin_mapper_materializes_2x_mma_k(mapper, expected_mma_k):
         )
 
 
+def test_default_falls_back_from_invalid_register_budgets():
+    # These legacy N=256 rows match the dtype/layout but cannot construct a
+    # task manager. Explicit requests must retain the diagnostic and their IDs.
+    mapper = map_trtllm_nvfp4_moe_tactic
+    with pytest.raises(ValueError, match="different num_registers"):
+        mapper([256, 0], sm_arch=107)
+    pair = mapper([-1, -1], sm_arch=107)
+    assert pair.tile_n != 256
+    assert pair == mapper([pair.tile_n, pair.moe_config_index], sm_arch=107)
+
+
+def test_default_tries_remaining_pairs_before_another_tile(monkeypatch):
+    from flashinfer.prims_ts.moe import config_mapper
+
+    # Reject the first pair as if one of its stages failed schedule admission.
+    # The default must try the next stable pair ID at the same token tile.
+    validate = config_mapper._ensure_pair_buildable
+    visited = []
+
+    def reject_first_pair(pair, **kwargs):
+        visited.append((pair.tile_n, pair.moe_config_index))
+        if pair.moe_config_index == 0:
+            raise ValueError("Rejected FC2 schedule")
+        return validate(pair, **kwargs)
+
+    monkeypatch.setattr(config_mapper, "_ensure_pair_buildable", reject_first_pair)
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [-1, -1], sm_arch=107, num_tokens=32, top_k=2, num_local_experts=8
+    )
+    assert (pair.tile_n, pair.moe_config_index) == (8, 1)
+    assert visited[:2] == [(8, 0), (8, 1)]
+
+
+def test_default_reports_no_buildable_pair_after_exhausting_candidates(monkeypatch):
+    from flashinfer.prims_ts.moe import config_mapper
+
+    def reject_all_pairs(*args, **kwargs):
+        raise ValueError("Rejected schedule")
+
+    monkeypatch.setattr(config_mapper, "_ensure_pair_buildable", reject_all_pairs)
+    with pytest.raises(ValueError, match="No buildable local Prims-TS MoE config"):
+        map_trtllm_nvfp4_moe_tactic([-1, -1], sm_arch=107)
+
+
 def test_blackwell_mapper_never_exposes_rubin_mma_k():
     configs = _expanded_prims_ts_json_configs(100)
     assert all(cfg.options.get("mma_k") != 128 for cfg in configs)

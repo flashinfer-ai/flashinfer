@@ -967,6 +967,9 @@ def build_nvfp4_launch_io(
     top_k: int,
     intermediate_size: int,
     hidden_size: int,
+    finalize_output: torch.Tensor | None = None,
+    finalize_scales: torch.Tensor | None = None,
+    finalize_route_map: torch.Tensor | None = None,
     per_token_sf_a: torch.Tensor | None = None,
     per_token_sf_b: torch.Tensor | None = None,
 ) -> dict:
@@ -1013,12 +1016,58 @@ def build_nvfp4_launch_io(
     )
     logical_token_capacity = _logical_token_capacity(
         fc=fc,
-        output_buf=output_buf,
+        # FC1's activation buffer bounds the routed row capacity even when
+        # fused FC2 has no expanded output allocation.
+        output_buf=gemm1_output if cfg.fuse_moe_finalize else output_buf,
         total_num_padded_tokens=total_num_padded_tokens,
         routed_token_capacity=routed_token_capacity,
     )
+    if cfg.fuse_moe_finalize:
+        if (
+            fc != "fc2"
+            or finalize_output is None
+            or finalize_scales is None
+            or finalize_route_map is None
+        ):
+            raise ValueError(
+                "fused FC2 requires output, router coefficients and expanded indices"
+            )
+        if (
+            finalize_output.shape != (num_tokens, hidden_size)
+            or finalize_output.dtype != torch.bfloat16
+            or not finalize_output.is_contiguous()
+            or finalize_output.device != hidden_states.device
+        ):
+            raise ValueError(
+                "finalize_output must be contiguous BF16 [tokens, hidden] on the input device"
+            )
+        if (
+            finalize_scales.shape != (num_tokens, top_k)
+            or finalize_scales.dtype != torch.bfloat16
+            or not finalize_scales.is_contiguous()
+            or finalize_scales.device != hidden_states.device
+        ):
+            raise ValueError(
+                "finalize_scales must be contiguous BF16 [tokens, top_k] on the input device"
+            )
+        if (
+            finalize_route_map.ndim != 1
+            or finalize_route_map.numel() < logical_token_capacity
+            or finalize_route_map.dtype != torch.int32
+            or not finalize_route_map.is_contiguous()
+            or finalize_route_map.device != hidden_states.device
+        ):
+            raise ValueError(
+                "finalize_route_map must contain an int32 expanded index per routed row"
+            )
+        output_buf = finalize_output
     if not cfg.is_swap_ab:
-        raise ValueError("NVFP4 MoE expects swapAB Prims-TS configs")
+        if c_row_stride or sf_c_m_offset:
+            raise ValueError("NVFP4 BatchM MoE does not support partitioned outputs")
+        if per_token_sf_a is not None or per_token_sf_b is not None:
+            raise ValueError("NVFP4 BatchM MoE does not support per-token scales")
+        # Also validate the native Rubin N/K alignment before making TMA maps.
+        cfg = _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
     if tile_idx.numel() != mn_limit.numel():
         raise ValueError(
             f"tile_idx/mn_limit capacity mismatch: {tile_idx.numel()} vs {mn_limit.numel()}"
@@ -1084,13 +1133,18 @@ def build_nvfp4_launch_io(
     )
     _validate_swap_ab_cluster_span(cfg, out_hidden)
 
-    m_val, n_val, k_val, l_val = (
-        out_hidden,
-        logical_token_capacity,
-        in_hidden,
-        num_experts,
-    )
-    logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    output_hidden = out_hidden // 2 if cfg.has_gated_epilogue else out_hidden
+    k_val, l_val = in_hidden, num_experts
+    if cfg.is_swap_ab:
+        m_val, n_val = out_hidden, logical_token_capacity
+        logical_output_m = output_hidden
+        kernel_a, kernel_b = weights, activation_compact
+        sf_a, sf_b = weights_scale, activation_scale
+    else:
+        m_val, n_val = logical_token_capacity, out_hidden
+        logical_output_m = logical_token_capacity
+        kernel_a, kernel_b = activation_compact, weights
+        sf_a, sf_b = activation_scale, weights_scale
     if cfg.has_output_block_scaling:
         if output_buf.dtype != torch.uint8:
             raise ValueError(f"{fc} NVFP4 C output must use packed uint8 storage")
@@ -1101,8 +1155,8 @@ def build_nvfp4_launch_io(
     c_row_stride_val = _validate_c_output_layout(
         fc=fc,
         output_buf=output_buf,
-        logical_output_m=logical_output_m,
-        output_n=n_val,
+        logical_output_m=output_hidden,
+        output_n=num_tokens if cfg.fuse_moe_finalize else logical_token_capacity,
         c_row_stride=c_row_stride,
         logical_elements_per_storage_element=(2 if cfg.has_output_block_scaling else 1),
     )
@@ -1110,24 +1164,24 @@ def build_nvfp4_launch_io(
         fc=fc,
         cfg=cfg,
         sf_c_m_offset=sf_c_m_offset,
-        logical_output_m=logical_output_m,
+        logical_output_m=output_hidden,
         pitch=c_row_stride_val,
     )
     if cfg.has_output_block_scaling:
         _validate_block_scaled_sf_output(
             fc=fc,
             output_scale=output_scale,
-            logical_output_m=logical_output_m,
-            output_n=n_val,
+            logical_output_m=output_hidden,
+            output_n=logical_token_capacity,
             pitch=c_row_stride_val,
             sf_block_size=cfg.output_sf_block_size_c,
             sf_layout=cfg.sf_layout_c,
             m_offset=sf_c_m_offset_val,
         )
-    kernel_a = weights
-    kernel_b = activation_compact
-    sf_a = weights_scale
-    sf_b = activation_scale
+    if not cfg.is_swap_ab:
+        # The ABI's pitch is along logical M. Batch-M stores contiguous hidden
+        # rows and derives its C/SF-C strides from N; no output repack is needed.
+        c_row_stride_val = logical_output_m
     bias_torch = _select_bias(
         fc=fc,
         cfg=cfg,
@@ -1270,7 +1324,22 @@ def build_nvfp4_launch_io(
             assumed_align=16,
         )
 
+    finalize_scale_dp = make_ptr(
+        cutlass.BFloat16,
+        finalize_scales.data_ptr() if cfg.fuse_moe_finalize else dummy_data_ptr,
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    finalize_route_dp = make_ptr(
+        cutlass.Int32,
+        finalize_route_map.data_ptr() if cfg.fuse_moe_finalize else dummy_data_ptr,
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+
     _keepalive = [
+        finalize_scales,
+        finalize_route_map,
         kernel_a,
         kernel_b,
         sf_a,
@@ -1293,6 +1362,8 @@ def build_nvfp4_launch_io(
     ]
 
     return {
+        "finalize_scale_dp": finalize_scale_dp,
+        "finalize_route_dp": finalize_route_dp,
         "cfg": cfg,
         "launch_early_exit_max_token_ctas": launch_early_exit_max_token_ctas,
         "M": m_val,

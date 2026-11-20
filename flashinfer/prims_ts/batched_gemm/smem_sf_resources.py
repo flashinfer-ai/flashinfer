@@ -38,22 +38,20 @@ from cutlass.experimental.task_scheduling.resources import (
 from .batched_gemm_config import (
     MAX_PRODUCER_COMMIT_PREFETCH_DEPTH,
     BatchedGemmConfig,
-    SfLayout,
-    SfSmemToTmemCopy,
     TMEM_SF_PACK_SIZE_BYTES,
 )
 from .batched_gemm_cga import (
     CgaPolicy,
-    cga_tma_masks,
+    load_input_tma,
     has_multiple_umma_atoms,
-    needs_extended_tma_multicast,
+    tma_y_partition_offset,
+    _retained_a_cache_policy,
 )
-from .mixed_cga_ts import override_tma_umma_pipeline, override_umma_atom_pipeline
+from .mixed_cga_ts import create_input_tma_pipeline, override_umma_atom_pipeline
 from .cache_policy import make_weight_l2_cache_hint
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from .smem_descriptor import build_tcgen05_smem_desc
 from cutlass.experimental import primitives as prims
-from cutlass.pipeline.sm100 import PipelineTmaUmma
 
 Constexpr = cutlass.Constexpr
 
@@ -75,12 +73,7 @@ class SmemSfAResource(MemoryResource):
     mixed_cga_kind: Constexpr[str] = "sfa"
 
     def create_pipeline(self, pipeline_config):
-        result = super().create_pipeline(pipeline_config)
-        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
-            # SFA's payload may be local, but a TMA-to-UMMA pipeline must still
-            # route its barriers to the current physical 2-CTA atom.
-            return override_tma_umma_pipeline(self.cfg, result, "sfa")
-        return result
+        return create_input_tma_pipeline(self, pipeline_config)
 
     def __post_init__(self):
         if self._alloc_sfa is None:
@@ -149,104 +142,55 @@ class SmemSfAResource(MemoryResource):
         sfk_block = coord_sfa_k * Int32(
             self.cfg.tile_k // sf_vec_size // TMEM_SF_PACK_SIZE_BYTES
         )
-        stage_base = self.smem_buf.subview(
-            self.cfg.smem_sfa_stage_stride_bytes * stage_info.stage_idx
-        )
-        if prims.elect_sync():
-            if cutlass.const_expr(
-                self.cfg.use_tile256_tmem_overlap
-                or self.cfg.is_mx_mma
-                or self.cfg.has_cast_a
-                or self.cfg.is_nvfp4_mma
-            ):
-                # Generated R128c4 SF TMA uses [256, 2, K/(sfBlock*4), outer/128].
-                self._tma_load(
-                    stage_base,
-                    self.tma_sfa_desc,
-                    (Int32(0), Int32(0), sfk_block, coord_sfa_mn),
-                    stage_info.barrier,
-                )
-            else:
-                self._tma_load(
-                    stage_base,
-                    self.tma_sfa_desc,
-                    (Int32(0), sfk_block, coord_sfa_mn),
-                    stage_info.barrier,
-                )
+        sfk_partition = sfk_block + tma_y_partition_offset(self.cfg, 4)
+        # Each 128-row fragment retains the R128c4 layout. Y issuers
+        # multicast disjoint K blocks in both fragments; both loads count
+        # toward the shared full barrier before either MMA consumes them.
+        fragment_bytes = self.cfg.num_bytes_sfa_per_stage // self.cfg.dense_m_repeats
+        for m_fragment in cutlass.range_constexpr(self.cfg.dense_m_repeats):
+            stage_base = self.smem_buf.subview(
+                self.cfg.smem_sfa_stage_stride_bytes * stage_info.stage_idx
+                + tma_y_partition_offset(self.cfg, fragment_bytes)
+                + m_fragment * fragment_bytes
+            )
+            if prims.elect_sync():
+                if cutlass.const_expr(
+                    self.cfg.use_tile256_tmem_overlap
+                    or self.cfg.is_mx_mma
+                    or self.cfg.has_cast_a
+                    or self.cfg.is_nvfp4_mma
+                ):
+                    # Generated R128c4 SF TMA uses [256, 2, K/(sfBlock*4), outer/128].
+                    self._tma_load(
+                        stage_base,
+                        self.tma_sfa_desc,
+                        (
+                            Int32(0),
+                            Int32(0),
+                            sfk_partition,
+                            (coord_sfa_mn + m_fragment),
+                        ),
+                        stage_info.barrier,
+                    )
+                else:
+                    self._tma_load(
+                        stage_base,
+                        self.tma_sfa_desc,
+                        (Int32(0), sfk_block, (coord_sfa_mn + m_fragment)),
+                        stage_info.barrier,
+                    )
 
     @cute.jit
     def _tma_load(self, smem_dst, tma_desc, coords, barrier):
-        """Single-CTA or per-CTA cluster TMA load for SFA."""
-        if cutlass.const_expr(self.cfg.has_cast_a):
-            prims.cp_async_bulk_tensor_shared_cluster_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                [],
-            )
-        elif cutlass.const_expr(self.cfg.uses_two_cta_mma):
-            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "sfa")):
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "sfa")
-                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-                prims.cp_async_bulk_tensor_shared_cluster_global(
-                    smem_dst,
-                    tma_desc,
-                    coords,
-                    barrier,
-                    [],
-                    multicast_mask=mcast_mask,
-                    group=self.cfg.cta_group,
-                    l2_cache_hint=self.weight_l2_cache_hint,
-                )
-                return
-            if cutlass.const_expr(self.cfg.is_mx_mma):
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = nonnegative_div(
-                    cta_rank, self.cfg.umma_cta_count
-                ) * Int32(self.cfg.umma_cta_count)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-                prims.cp_async_bulk_tensor_shared_cluster_global(
-                    smem_dst,
-                    tma_desc,
-                    coords,
-                    barrier,
-                    [],
-                    multicast_mask=mcast_mask,
-                    group=self.cfg.cta_group,
-                    l2_cache_hint=self.weight_l2_cache_hint,
-                )
-                return
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.umma_cta_count) * Int32(
-                self.cfg.umma_cta_count
-            )
-            barrier = prims.mapa(barrier, lead_cta_rank)
-            barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-            prims.cp_async_bulk_tensor_shared_cluster_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                [],
-                multicast_mask=mcast_mask,
-                group=self.cfg.cta_group,
-                l2_cache_hint=self.weight_l2_cache_hint,
-            )
-        else:
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                l2_cache_hint=self.weight_l2_cache_hint,
-            )
+        load_input_tma(
+            self.cfg,
+            "sfa",
+            smem_dst,
+            tma_desc,
+            coords,
+            barrier,
+            l2_cache_hint=self.weight_l2_cache_hint,
+        )
 
     @consumer_work(returns=(desc_a_s2t_base, smem_sfa_stage_ptr))
     @cute.jit
@@ -279,12 +223,7 @@ class SmemSfBResource(MemoryResource):
     mixed_cga_kind: Constexpr[str] = "sfb"
 
     def create_pipeline(self, pipeline_config):
-        result = super().create_pipeline(pipeline_config)
-        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
-            # Keep barrier routing atom-relative independently of SFB payload
-            # multicast; compact/local non-UMMA pipelines fail the type check.
-            return override_tma_umma_pipeline(self.cfg, result, "sfb")
-        return result
+        return create_input_tma_pipeline(self, pipeline_config)
 
     def __post_init__(self):
         if self._alloc_sfb is None:
@@ -346,9 +285,19 @@ class SmemSfBResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.smem_sfb_stage_stride_bytes * stage_info.stage_idx
         )
+        x_partition = Int32(0)
+        if cutlass.const_expr(self.cfg.dense_partition_tma_loads):
+            x_partition = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            ) & Int32(1)
+            stage_base = stage_base.subview(
+                x_partition * Int32(self.cfg.num_bytes_sfb_per_stage // 2)
+            )
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_split_r128c4_sfb_tma_desc):
-                outer_tile = coord_sfb_mn * Int32((self.cfg.tile_n + 127) // 128)
+                outer_tile = (
+                    coord_sfb_mn * Int32((self.cfg.tile_n + 127) // 128) + x_partition
+                )
                 self._tma_load(
                     stage_base,
                     self.tma_sfb_desc,
@@ -373,80 +322,7 @@ class SmemSfBResource(MemoryResource):
 
     @cute.jit
     def _tma_load(self, smem_dst, tma_desc, coords, barrier):
-        """Single-CTA or per-CTA cluster TMA load for SFB."""
-        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
-            if cutlass.const_expr(
-                self.cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                and self.cfg.smem_sfb_layout == int(SfLayout.R8c4)
-            ):
-                # Generated compact-SFB kernels use per-CTA cluster-space TMA
-                # without CTA-group multicast, so each CTA's local mbarrier is
-                # completed independently.
-                prims.cp_async_bulk_tensor_shared_cluster_global(
-                    smem_dst,
-                    tma_desc,
-                    coords,
-                    barrier,
-                    [],
-                )
-                return
-            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "sfb")):
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "sfb")
-                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-                prims.cp_async_bulk_tensor_shared_cluster_global(
-                    smem_dst,
-                    tma_desc,
-                    coords,
-                    barrier,
-                    [],
-                    multicast_mask=mcast_mask,
-                    group=self.cfg.cta_group,
-                )
-                return
-            if cutlass.const_expr(self.cfg.is_mx_mma):
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = nonnegative_div(
-                    cta_rank, self.cfg.umma_cta_count
-                ) * Int32(self.cfg.umma_cta_count)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-                prims.cp_async_bulk_tensor_shared_cluster_global(
-                    smem_dst,
-                    tma_desc,
-                    coords,
-                    barrier,
-                    [],
-                    multicast_mask=mcast_mask,
-                    group=self.cfg.cta_group,
-                )
-                return
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.umma_cta_count) * Int32(
-                self.cfg.umma_cta_count
-            )
-            barrier = prims.mapa(barrier, lead_cta_rank)
-            barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-            prims.cp_async_bulk_tensor_shared_cluster_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                [],
-                multicast_mask=mcast_mask,
-                group=self.cfg.cta_group,
-            )
-        else:
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-            )
+        load_input_tma(self.cfg, "sfb", smem_dst, tma_desc, coords, barrier)
 
     @consumer_work(returns=(desc_b_s2t_base, smem_sfb_stage_ptr))
     @cute.jit
@@ -510,6 +386,10 @@ class SmemSfGatherResource(MemoryResource):
     smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_sfb_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    @property
+    def mixed_cga_kind(self):
+        return "sf" + self._operand
 
     def __post_init__(self):
         if self._alloc_sf is None:
@@ -1025,7 +905,7 @@ class SmemSfLdgstsResource(MemoryResource):
             else self.cfg.warp_layout.num_load_sfa_warps
         )
         num_threads = max(1, num_load_warps) * 32
-        elts_per_load = 4
+        elts_per_load = 16 if self.cfg.routed_native_sfa and not is_b else 4
         total_elts = tile_rows * sf_k
         loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
             num_threads * elts_per_load
@@ -1067,7 +947,7 @@ class SmemSfLdgstsResource(MemoryResource):
             self.cfg.input_sf_block_size_b if is_b else self.cfg.input_sf_block_size_a
         )
         sf_k = self.cfg.tile_k // sf_block_size
-        elts_per_load = 4
+        elts_per_load = 16 if self.cfg.routed_native_sfa and not is_b else 4
         total_elts = tile_rows * sf_k
 
         if cutlass.const_expr(is_b):
@@ -1165,7 +1045,7 @@ class SmemSfLdgstsResource(MemoryResource):
         k_sf_offset = coord_k * Int32(sf_k)
         num_col_blocks = sf_k // TMEM_SF_PACK_SIZE_BYTES
         total_elts = tile_rows * sf_k
-        elts_per_load = 4
+        elts_per_load = 16 if self.cfg.routed_native_sfa and not is_b else 4
         num_threads = max(1, num_load_warps) * 32
         loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
             num_threads * elts_per_load
@@ -1191,7 +1071,9 @@ class SmemSfLdgstsResource(MemoryResource):
             gmem_offset = routed_row * self.sf_gmem_stride + k_sf_offset + col_in_tile
             gmem_src = self.sf_gmem_ptr.data_ptr() + gmem_offset
 
-            if cutlass.const_expr(use_r128c4):
+            if cutlass.const_expr(self.cfg.routed_native_sfa and not is_b):
+                smem_offset = thread_base
+            elif cutlass.const_expr(use_r128c4):
                 data_blk_row = nonnegative_div(row_in_tile, 128)
                 data_blk_col = nonnegative_div(col_in_tile, 4)
                 row_in_blk = nonnegative_mod(row_in_tile, 128)
@@ -1214,11 +1096,30 @@ class SmemSfLdgstsResource(MemoryResource):
 
             # BS=1 leaves most routed rows padded. Predicate invalid rows so
             # they do not issue zero-byte cp.async instructions.
-            prims.inline_ptx_hl(
-                "cp.async.ca.shared.global.L2::128B [{$r0}], [{$r1}], 4;",
-                read_only_args=[smem_dst.data_ptr(), gmem_src],
-                pred=is_valid,
-            )
+            if cutlass.const_expr(self.cfg.routed_native_sfa and not is_b):
+                # One contiguous 16-byte scale row per lane; 128dp UTCCP
+                # consumes this layout directly without the R128c4 shuffle.
+                prims.inline_ptx_hl(
+                    "cp.async.cg.shared.global [{$r0}], [{$r1}], 16;",
+                    read_only_args=[smem_dst.data_ptr(), gmem_src],
+                    pred=is_valid,
+                )
+            elif cutlass.const_expr(self.cfg.dense_retain_a and not is_b):
+                prims.inline_ptx_hl(
+                    "cp.async.ca.shared.global.L2::cache_hint.L2::128B [{$r0}], [{$r1}], 4, {$r2};",
+                    read_only_args=[
+                        smem_dst.data_ptr(),
+                        gmem_src,
+                        _retained_a_cache_policy(),
+                    ],
+                    pred=is_valid,
+                )
+            else:
+                prims.inline_ptx_hl(
+                    "cp.async.ca.shared.global.L2::128B [{$r0}], [{$r1}], 4;",
+                    read_only_args=[smem_dst.data_ptr(), gmem_src],
+                    pred=is_valid,
+                )
 
         # Non-cluster route-SF LDGSTS uses an AsyncLoad full barrier, so the
         # following producer_commit lowers to cp.async.mbarrier.arrive.noinc.

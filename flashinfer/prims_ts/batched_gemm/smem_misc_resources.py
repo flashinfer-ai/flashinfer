@@ -23,13 +23,18 @@ import cutlass.pipeline as pipeline
 from cutlass.experimental import primitives as prims
 from cutlass.pipeline.sm100 import PipelineClcFetchAsync, PipelineTmaUmma
 
-from cutlass.experimental.task_scheduling.enums import PipelineType, TileSchedulerType
+from cutlass.experimental.task_scheduling.enums import (
+    PipelineType,
+    TileSchedulerType,
+    WorkAttr,
+)
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     StageInfo,
     TaskLocalVariable,
     WorkQueue,
+    WorkTileInfo,
     consumer_work,
 )
 from cutlass.utils.dynamic_persistent_tile_scheduler import (
@@ -39,6 +44,7 @@ from cutlass.utils.dynamic_persistent_tile_scheduler import (
 from .batched_gemm_config import BatchedGemmConfig
 from .batched_gemm_cga import (
     active_cga_coords,
+    static_queue_consumer_threads,
     active_clc_consumer_threads,
     has_multiple_umma_atoms,
     host_clc_consumer_threads,
@@ -55,6 +61,22 @@ class MixedCgaClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileSchedule
     N rasterization packs preferred-cluster tiles into grid Z; fallback
     cluster leaders additionally carry X/Y offsets within those tiles.
     """
+
+    def __init__(self, *args, raster_group_m=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raster_group_m = raster_group_m
+
+    def __new_from_mlir_values__(self, values):
+        restored = super().__new_from_mlir_values__(values)
+        return type(self)(
+            restored.params,
+            restored.cta_id_in_cluster,
+            restored._num_tiles_executed,
+            restored._clc_response_ptr,
+            restored._block_idx,
+            insert_fence=self.insert_fence,
+            raster_group_m=self.raster_group_m,
+        )
 
     @cute.jit
     def _swizzle_and_rasterize(
@@ -80,6 +102,17 @@ class MixedCgaClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileSchedule
         batch_l, cluster_minor = divmod(
             cluster_minor_batch, self.params.cluster_shape_minor_fdd
         )
+        if cutlass.const_expr(self.raster_group_m > 1):
+            # Interleave neighboring M clusters before advancing N. This
+            # brings reuse of each expert's weights closer in the CLC order.
+            # Leave an incomplete final M group in its original N order so
+            # the permutation introduces neither padding nor duplicate tiles.
+            count_m, count_n, _ = self.params.problem_layout_ncluster_mnl.shape
+            group_base = cluster_minor // self.raster_group_m * self.raster_group_m
+            if group_base + self.raster_group_m <= count_m:
+                linear = (cluster_minor % self.raster_group_m) * count_n + cluster_major
+                cluster_minor = group_base + linear % self.raster_group_m
+                cluster_major = linear // self.raster_group_m
         cluster_shape_m, cluster_shape_n = self.params.cluster_shape_mn
         # Preferred leaders have x_idx=y_idx=0. Fallback leaders may start
         # inside that preferred tile; preserve their offsets. The caller adds
@@ -263,7 +296,7 @@ class BatchedGemmWorkQueue(WorkQueue):
 
     def create_tile_scheduler(self):
         if (
-            not has_multiple_umma_atoms(self.cfg)
+            (not has_multiple_umma_atoms(self.cfg) and self.cfg.cta_raster_group_m == 1)
             or self.tile_scheduler_config.tile_scheduler_type
             != TileSchedulerType.ClcDynamicPersistent
         ):
@@ -285,6 +318,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             cutlass.Int32(0),
             self.tile_scheduler_config.response_ptr,
             (bidx, bidy, bidz),
+            raster_group_m=self.cfg.cta_raster_group_m,
         )
 
     @cute.jit
@@ -436,11 +470,126 @@ class ProxyClusterBarrierResource(MemoryResource):
         task, so use the same cluster-scoped async proxy release fence as the
         generated low-latency kernels before ProducerCommit releases MMA.
         """
-        prims.fence_proxy_async_release_sync_restrict()
+        # The native fused path has only cp.async payload writes. Its
+        # completion waits and proxy arrivals order the asynchronous readers;
+        # generic SMEM publication fences still belong to queues/epilogues.
+        if cutlass.const_expr(
+            not (self.cfg.routed_native_sfa and self.cfg.fuse_operand_sf_loads)
+        ):
+            prims.fence_proxy_async_release_sync_restrict()
 
     @consumer_work(returns=consumer_stage_idx)
     @cute.jit
     def consumer_work(self, stage_info: StageInfo) -> cutlass.Int32:
         """Make cross-CTA SMEM writes visible and publish the ready stage."""
-        prims.fence_proxy_async_acquire_sync_restrict()
+        if cutlass.const_expr(
+            not (self.cfg.routed_native_sfa and self.cfg.fuse_operand_sf_loads)
+        ):
+            prims.fence_proxy_async_acquire_sync_restrict()
         return stage_info.stage_idx
+
+    @cute.jit
+    def consumer_aux_work(self, stage_info: StageInfo) -> None:
+        """Acquire visibility for SF copy tasks; MMA owns the proxy release."""
+        if cutlass.const_expr(
+            not (self.cfg.routed_native_sfa and self.cfg.fuse_operand_sf_loads)
+        ):
+            prims.fence_proxy_async_acquire_sync_restrict()
+
+
+@dataclass(kw_only=True, init=False)
+class StaticBatchedGemmWorkQueue(BatchedGemmWorkQueue):
+    """Per-CTA static tile queue, published by a dedicated scheduler warp."""
+
+    def create_tile_scheduler(self):
+        return WorkQueue.create_tile_scheduler(self)
+
+    def create_pipeline(self, pipeline_config):
+        rank = cute.arch.block_idx_in_cluster()
+        if has_multiple_umma_atoms(self.cfg):
+            consumers = cutlass.Int32(0)
+            for i in range(
+                self.cfg.preferred_cluster_shape[0]
+                * self.cfg.preferred_cluster_shape[1]
+            ):
+                consumers += cutlass.Int32(rank == i) * static_queue_consumer_threads(
+                    self.cfg, i
+                )
+        else:
+            peer = static_queue_consumer_threads(self.cfg, 1)
+            leader = static_queue_consumer_threads(self.cfg, 0)
+            consumers = cutlass.Int32(peer) + cutlass.Int32(rank == 0) * (leader - peer)
+        return pipeline.PipelineAsync.create(
+            barrier_storage=pipeline_config.barrier_ptr,
+            num_stages=pipeline_config.num_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, consumers),
+            defer_sync=True,
+        )
+
+    @cute.jit
+    def _tile_record(self, index):
+        ptr = cute.recast_ptr(
+            self.tile_scheduler_config.response_ptr, dtype=cutlass.Int32
+        )
+        return cute.make_tensor(
+            ptr, cute.make_layout((4, self.cfg.num_stages_workid), stride=(1, 4))
+        )[(None, index)]
+
+    @cute.jit
+    def _read_static_record(self, index):
+        record = self._tile_record(index)
+        return WorkTileInfo((record[0], record[1], record[2]), record[3] != 0)
+
+    @cute.jit
+    def initial_work_tile_info(self):
+        # Task initialization has already created its private pipeline state.
+        tile = self.tile_scheduler.initial_work_tile_info()
+        result = WorkTileInfo(tile.tile_idx, tile.is_valid_tile)
+        if cute.arch.warp_idx() != self.cfg.warp_layout.workid_warp_idx:
+            self.pipeline.consumer_wait(self.consumer_state)
+            result = self._read_static_record(self.consumer_state.index)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            self.pipeline.consumer_release(self.consumer_state)
+            self.consumer_state.advance()
+        return result
+
+    @cute.jit
+    def _get_and_advance_work_tile_impl(self, stage_info):
+        result = self._read_static_record(stage_info.stage_idx)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        return result
+
+    @cute.jit
+    def _fetch_work_tile_impl(self, stage_info):
+        record = self._tile_record(stage_info.stage_idx)
+        tile = stage_info.work_tile
+        with cute.arch.elect_one():
+            record[0] = tile.tile_idx[0]
+            record[1] = tile.tile_idx[1]
+            record[2] = tile.tile_idx[2]
+            record[3] = cutlass.Int32(tile.is_valid_tile)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        prims.barrier_cta_sync(barrier_id=4, thread_count=32)
+
+    @consumer_work(returns=("work_tile",), work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def advance_static_tile(self, stage_info):
+        self.tile_scheduler.advance_to_next_work()
+        tile = self.tile_scheduler.get_current_work()
+        return WorkTileInfo(tile.tile_idx, tile.is_valid_tile)
+
+    @cute.jit
+    def producer_tail(self):
+        self.pipeline.producer_acquire(self.producer_state)
+        record = self._tile_record(self.producer_state.index)
+        with cute.arch.elect_one():
+            record[0] = cutlass.Int32(0)
+            record[1] = cutlass.Int32(0)
+            record[2] = cutlass.Int32(0)
+            record[3] = cutlass.Int32(0)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        prims.barrier_cta_sync(barrier_id=4, thread_count=32)
+        self.pipeline.producer_commit(self.producer_state)
+        self.producer_state.advance()
+        self.pipeline.producer_tail(self.producer_state)

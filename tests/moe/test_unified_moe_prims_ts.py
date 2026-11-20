@@ -173,13 +173,13 @@ class TestPrimsTsBackendOptions:
         }
         assert not PrimsTsRunner.supports_fused_shared_experts
 
-    def test_sm100_family_only(self):
+    def test_supported_architectures(self):
         opts = BackendOptions((PrimsTsConfig(),))
         assert eval(repr(opts)) == opts
         assert opts.valid_for(90) == []
         assert opts.valid_for(100) == list(opts)
         assert opts.valid_for(103) == list(opts)
-        assert opts.valid_for(107) == []
+        assert opts.valid_for(107) == list(opts)
         assert opts.valid_for(120) == []
 
     def test_repr_round_trip(self):
@@ -188,6 +188,12 @@ class TestPrimsTsBackendOptions:
         cfg = PrimsTsConfig()
         assert repr(cfg) == "PrimsTsConfig()"
         assert eval(repr(cfg), vars(fused_moe)) == cfg
+        cfg = PrimsTsConfig(nvfp4_weight_layout="BlockMajorK")
+        assert eval(repr(cfg), vars(fused_moe)) == cfg
+
+    def test_invalid_weight_layout(self):
+        with pytest.raises(ValueError, match="nvfp4_weight_layout"):
+            PrimsTsConfig(nvfp4_weight_layout="unknown")
 
     def test_registered_and_opt_in(self):
         assert _BACKEND_RUNNERS[PrimsTsConfig] is PrimsTsRunner
@@ -195,6 +201,41 @@ class TestPrimsTsBackendOptions:
 
 
 class TestPrimsTsPrepare:
+    @pytest.mark.parametrize("quant,hidden", ((_BF16, 256), (_NVFP4, 128)))
+    def test_block_major_k_rejects_invalid_preparation(self, quant, hidden):
+        with pytest.raises(ValueError, match="NVFP4"):
+            PrimsTsConfig.prepare_weights(
+                torch.empty(0),
+                torch.empty(0),
+                quant=quant,
+                num_local_experts=1,
+                hidden_size=hidden,
+                intermediate_size=256,
+                nvfp4_weight_layout="BlockMajorK",
+            )
+
+    @pytest.mark.parametrize(
+        "layout,shape",
+        [
+            ("BlockMajorK", (32, 1024, 512)),
+            ("MajorK", (32, 4, 1024, 128)),
+        ],
+    )
+    def test_nvfp4_rejects_mismatched_weight_storage(self, layout, shape):
+        runner = PrimsTsRunner(
+            _config(
+                backend=PrimsTsConfig(nvfp4_weight_layout=layout),
+                execution=ExecutionConfig(enable_pdl=False),
+            ),
+            torch.device("cpu"),
+        )
+        with pytest.raises(ValueError, match=f"{layout} shape"):
+            runner._validate_fp4_tensors(
+                None,
+                {"gemm1_weights": torch.empty(shape, dtype=torch.uint8)},
+                1024,
+            )
+
     def test_prepare_weights_rejects_unsupported_pairs(self):
         with pytest.raises(ValueError, match="does not support"):
             PrimsTsConfig.prepare_weights(
@@ -252,6 +293,9 @@ class TestPrimsTsUnifiedValidation:
             "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
         )
         monkeypatch.setattr(
+            "flashinfer.prims_ts.utils.is_prims_ts_arch_available", lambda *args: True
+        )
+        monkeypatch.setattr(
             "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
         )
 
@@ -265,10 +309,24 @@ class TestPrimsTsUnifiedValidation:
 
     def test_unsupported_arch_rejected(self, monkeypatch):
         monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: (10, 7)
+            "flashinfer.utils.get_compute_capability", lambda _: (12, 0)
         )
         runner = self._runner(_config())
         with pytest.raises(NotImplementedError, match="SM100/SM103"):
+            runner.check_support()
+
+    def test_rubin_requires_native_dsl(self, monkeypatch):
+        monkeypatch.setattr(
+            "flashinfer.utils.get_compute_capability", lambda _: (10, 7)
+        )
+        runner = self._runner(_config())
+        runner.check_support()
+        with pytest.raises(NotImplementedError, match="NVFP4×NVFP4 only"):
+            self._runner(_config(variant=_BF16)).check_support()
+        monkeypatch.setattr(
+            "flashinfer.prims_ts.utils.is_prims_ts_arch_available", lambda *args: False
+        )
+        with pytest.raises(RuntimeError, match="natively targets SM107"):
             runner.check_support()
 
     def test_bf16_rejects_per_token_scale_config(self):
