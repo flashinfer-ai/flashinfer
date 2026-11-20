@@ -199,6 +199,51 @@ def test_routed_tile512_ldgsts_proxy_rejects_unequal_ab_depths():
         validate_config(make_config(**options))
 
 
+@pytest.mark.parametrize("scheduler", ["static", "clc"])
+@pytest.mark.parametrize("tile_m", [256, 512])
+@pytest.mark.parametrize(
+    "paired,dense,producer",
+    [
+        pytest.param(1, 0, "PairedBSfBLoad", id="paired"),
+        pytest.param(0, 1, "DenseWeightLoad", id="tma_a"),
+        pytest.param(1, 1, None, id="conflicting"),
+    ],
+)
+def test_routed_weight_ring_has_one_producer(
+    scheduler, tile_m, paired, dense, producer
+):
+    from flashinfer.prims_ts.batched_gemm.routed_config import routed_options
+
+    options = routed_options(
+        collective_tile_m=tile_m,
+        scheduler=scheduler,
+        weight_pipeline="shared",
+        max_active_clusters=2,
+    )
+    options.update(
+        fuse_operand_sf_loads=paired,
+        fused_a_single_commit=paired,
+        dense_fuse_tma_loads=dense,
+        route_act=int(RouteImpl.LDGSTS if paired else RouteImpl.TMA),
+    )
+    cfg = make_config(**options)
+    assert cfg.uses_routed_weight_pipeline and cfg.dense_partition_tma_loads
+    if producer is None:
+        with pytest.raises(
+            ValueError, match="dense_fuse_tma_loads.*fuse_operand_sf_loads"
+        ):
+            validate_config(cfg)
+        return
+
+    tasks, *_ = _build_schedule_validate(cfg, num_k_tiles=9)
+    for resource in ("SmemB", "SmemSfB"):
+        assert [
+            task.name
+            for task in tasks
+            if any(dst.name == resource for dst in task.dst_resources)
+        ] == [producer]
+
+
 @pytest.mark.parametrize("route_a", [RouteImpl.LDGSTS, RouteImpl.TMA])
 @pytest.mark.parametrize("wide_cga", [False, True])
 @pytest.mark.parametrize("warps,sfa_stages", [(2, 5), (4, 5), (4, 3)])

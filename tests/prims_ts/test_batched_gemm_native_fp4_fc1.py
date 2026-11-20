@@ -161,10 +161,19 @@ def test_native_fp4_fc1_ragged_routing_gpu():
 @pytest.mark.arch_rubin
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
-    "tile_m,cga,load_warps",
-    [(256, (2, 1), 4), (256, (4, 2), 8), (512, (2, 4), 8), (512, (4, 4), 4)],
+    "tile_m,cga,load_warps,automatic_width",
+    [
+        (256, (2, 1), 4, False),
+        (256, (4, 2), 8, False),
+        (512, (2, 4), 8, False),
+        (512, (4, 4), 4, False),
+        pytest.param(256, (2, 1), 4, True, id="auto-2x1"),
+        pytest.param(512, (2, 4), 8, True, id="auto-2x4"),
+    ],
 )
-def test_native_fp4_fc1_padding_graph_replay(monkeypatch, tile_m, cga, load_warps):
+def test_native_fp4_fc1_padding_graph_replay(
+    monkeypatch, tile_m, cga, load_warps, automatic_width
+):
     """Change full/empty/partial prefixes in captured graphs with reused SMEM.
 
     Compare against real zero-fill gathers, including SF-C, to catch omitted
@@ -179,6 +188,8 @@ def test_native_fp4_fc1_padding_graph_replay(monkeypatch, tile_m, cga, load_warp
 
     options = fc1_options(tile_m, cga, routed=True)
     options["num_load_a_warps"] = load_warps
+    if automatic_width:
+        options["cluster_dim_x"] = 0
     rows_per_expert = make_config(**options).tile_token
     experts = 3
     io = runner._build_launch_io(

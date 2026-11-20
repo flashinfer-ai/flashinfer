@@ -841,7 +841,7 @@ def complete_input_tma_bytes(
     the omitted SMEM payload is unobserved; this does not zero-fill it.
     """
     _, owners, _, _ = cga_tma_masks(cfg, operand)
-    max_ctas = cfg.cluster_dim_x * cfg.cluster_dim_y
+    max_ctas = cfg.preferred_cluster_shape[0] * cfg.preferred_cluster_shape[1]
     if cutlass.const_expr(cfg.fallback_cluster_shape is not None):
         max_ctas = max(
             max_ctas, cfg.fallback_cluster_shape[0] * cfg.fallback_cluster_shape[1]

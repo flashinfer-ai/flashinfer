@@ -359,12 +359,16 @@ def test_native_tile512_host_route_padding_and_grid(experts, n, cga):
     assert compute_launch_grid(static_cfg, **args) == (*cga, 2)
 
 
-def test_native_fixture_host_route_padding():
+@pytest.mark.parametrize("cluster_x", [2, 4])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_native_fixture_host_route_padding(cluster_x, repeated):
     import torch
     from flashinfer.prims_ts.batched_gemm.tools.routed import routed_inputs
 
     index = torch.arange(3 * 512, dtype=torch.int32)
     routes = (index * 17 + index // 512) % 512
+    if repeated:
+        routes.fill_(511)
 
     class Fixture:
         def load(self, name):
@@ -377,15 +381,55 @@ def test_native_fixture_host_route_padding():
             num_experts=3,
             top_k=3,
             tile_size=256,
-            cluster_dim_in_token=4,
+            cluster_dim_in_token=cluster_x,
         )
     for expert, start in enumerate(layout.padded_starts[:-1]):
         assert (
             layout.expanded_to_token[start : start + 512]
             == routes[expert * 512 : (expert + 1) * 512].tolist()
         )
-        assert layout.expanded_to_token[start + 512 : start + 1024] == [0] * 512
-        assert layout.expanded_to_expert[start + 512 : start + 1024] == [-1] * 512
+        padding = 256 * cluster_x - 512
+        assert (
+            layout.expanded_to_token[start + 512 : start + 512 + padding]
+            == [0] * padding
+        )
+        assert (
+            layout.expanded_to_expert[start + 512 : start + 512 + padding]
+            == [-1] * padding
+        )
+
+
+@pytest.mark.parametrize("cluster_x", [2, 4])
+@pytest.mark.parametrize(
+    "invalid", ["float", "int64", "short", "long", "negative", "too_large"]
+)
+def test_native_fixture_host_rejects_invalid_routes(cluster_x, invalid):
+    import torch
+    from types import SimpleNamespace
+    from flashinfer.prims_ts.batched_gemm.tools.routed import routed_inputs
+
+    routes = torch.zeros(3 * 512, dtype=torch.int32)
+    if invalid in ("float", "int64"):
+        routes = routes.to(torch.float32 if invalid == "float" else torch.int64)
+    elif invalid == "short":
+        routes = routes[:-1]
+    elif invalid == "long":
+        routes = torch.cat((routes, routes[:1]))
+    else:
+        routes[-1] = -1 if invalid == "negative" else 512
+    original = runner._make_token_layout
+    with (
+        pytest.raises(ValueError, match="route fixture"),
+        routed_inputs(runner, SimpleNamespace(load=lambda name: routes)),
+    ):
+        runner._make_token_layout(
+            num_tokens=512,
+            num_experts=3,
+            top_k=3,
+            tile_size=256,
+            cluster_dim_in_token=cluster_x,
+        )
+    assert runner._make_token_layout is original
 
 
 @pytest.mark.parametrize("partitioned", [False, True])

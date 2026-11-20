@@ -38,17 +38,24 @@ def routed_inputs(runner, fixture, *, seed=1111):
         assert kwargs["num_tokens"] == 512
         assert kwargs["top_k"] == kwargs["num_experts"]
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        routes = (
-            fixture.load("route").tolist()
-            if fixture
-            else torch.randint(
+        expected_routes = sum(layout.tokens_per_expert)
+        if fixture:
+            route_data = fixture.load("route")
+            if route_data.dtype != torch.int32:
+                raise ValueError("route fixture must have dtype torch.int32")
+            if route_data.numel() != expected_routes:
+                raise ValueError(f"route fixture must contain {expected_routes} IDs")
+            if ((route_data < 0) | (route_data >= 512)).any().item():
+                raise ValueError("route fixture IDs must be in [0, 512)")
+            routes = route_data.reshape(-1).tolist()
+        else:
+            routes = torch.randint(
                 0,
                 512,
-                (sum(layout.tokens_per_expert),),
+                (expected_routes,),
                 generator=generator,
                 dtype=torch.int32,
             ).tolist()
-        )
         # Wider token CGAs may pad each 512-row expert to 1024 rows. Keep
         # the same valid gathers and insert padding separately per expert.
         if len(routes) != layout.total_padded_tokens:

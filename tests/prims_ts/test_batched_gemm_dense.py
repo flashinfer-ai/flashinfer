@@ -944,8 +944,80 @@ def test_grouped_n_raster_rejects_invalid_configs(overrides):
         validate_config(_preloaded_epilogue_config(**overrides))
 
 
+@pytest.mark.parametrize("group_m", [1, 2, 4, 8])
+def test_grouped_n_raster_early_exit_preserves_valid_tiles(monkeypatch, group_m):
+    from types import SimpleNamespace
+    import cutlass
+    from cutlass.experimental.task_scheduling.enums import TileSchedulerType
+    from cutlass.experimental.task_scheduling.resources import TileSchedulerConfig
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.smem_misc_resources import (
+        BatchedGemmWorkQueue,
+        MixedCgaClcDynamicPersistentTileScheduler,
+    )
+
+    cfg = _dense_config(
+        cluster_dim_y=1,
+        cta_raster_order=int(CtaRasterOrder.ALONG_N),
+        cta_raster_group_m=group_m,
+        use_early_exit=1,
+        use_clc_fast_drain=1,
+    )
+    validate_config(cfg)
+    queue = BatchedGemmWorkQueue(
+        name="WorkQueue",
+        cfg=cfg,
+        tile_scheduler_config=TileSchedulerConfig(
+            tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
+            tile_scheduler_params=None,
+        ),
+        num_non_exiting_ctas_value=1,
+    )
+    count_m, count_n = 2 * group_m + 1, 3
+    scheduler = SimpleNamespace(
+        raster_group_m=group_m,
+        params=SimpleNamespace(
+            swizzle_size=1,
+            _raster_along_m=False,
+            cluster_shape_major_fdd=count_n,
+            cluster_shape_minor_fdd=count_m,
+            problem_layout_ncluster_mnl=SimpleNamespace(shape=(count_m, count_n, 1)),
+            cluster_shape_mn=cfg.preferred_cluster_shape[:2],
+        ),
+    )
+    rasterize = python_body(
+        MixedCgaClcDynamicPersistentTileScheduler._swizzle_and_rasterize
+    )
+    should_skip = python_body(BatchedGemmWorkQueue.should_skip_work_tile)
+    maybe_drain = python_body(BatchedGemmWorkQueue._maybe_fast_drain_skipped_tile)
+    monkeypatch.setattr(cutlass, "Int32", int)
+    skipped = False
+    drained = []
+    monkeypatch.setattr(queue, "_get_consumer_var_from_ts", lambda _: skipped)
+    monkeypatch.setattr(queue, "_clc_fast_drain_all", lambda: drained.append(True))
+
+    visited = []
+    for z in range(count_m * count_n):
+        tile_idx = rasterize(scheduler, 0, 0, z)
+        skipped = should_skip(queue, SimpleNamespace(tile_idx=tile_idx))
+        if not skipped:
+            visited.append(tile_idx)
+        maybe_drain(queue)
+        if drained:
+            break
+
+    # With grouping, the first inactive M cluster precedes valid N tiles.
+    # Ordinary early exit must skip that cluster without cancelling later work.
+    assert visited == [(0, n, 0) for n in range(count_n)]
+    assert bool(drained) == (group_m == 1)
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("weight_layout", ["MajorK", "BlockMajorK"])
+@pytest.mark.parametrize("early_exit", [0, 1])
 @pytest.mark.parametrize(
     "cluster_y,group_m,experts,tokens,top_k,mixed",
     [
@@ -955,7 +1027,15 @@ def test_grouped_n_raster_rejects_invalid_configs(overrides):
     ],
 )
 def test_tile512_grouped_n_raster_gpu(
-    monkeypatch, weight_layout, cluster_y, group_m, experts, tokens, top_k, mixed
+    monkeypatch,
+    weight_layout,
+    early_exit,
+    cluster_y,
+    group_m,
+    experts,
+    tokens,
+    top_k,
+    mixed,
 ):
     import torch
     from dataclasses import fields
@@ -979,6 +1059,8 @@ def test_tile512_grouped_n_raster_gpu(
         cta_raster_order=int(CtaRasterOrder.ALONG_N),
         cta_raster_group_m=group_m,
         weight_layout=int(WeightLayout[weight_layout]),
+        use_early_exit=early_exit,
+        use_clc_fast_drain=early_exit,
     )
 
     def bounded_sf(shape, *, cfg, device, layout_kind):
@@ -991,6 +1073,7 @@ def test_tile512_grouped_n_raster_gpu(
         top_k=top_k,
         problem_n=2304,
         problem_k=768,
+        early_exit_max_token_ctas=128 if early_exit else 0,
         repeat_launches=3,
         output_guard_elements=256,
         require_mixed_cga_runtime=mixed,
