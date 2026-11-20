@@ -616,6 +616,7 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    *,
     key_sets: Optional[KeySets] = None,
     ranges: Optional[torch.Tensor] = None,
 ) -> _Planned:
