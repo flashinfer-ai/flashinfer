@@ -59,6 +59,4 @@ def test_causal_conv1d_benchmark_samples(monkeypatch):
         for line in (benchmarks / "samples" / name).read_text().splitlines():
             args = entry.parse_args(shlex.split(line))
             assert args.refcheck and args.use_cupti and not args.no_cuda_graph
-            assert set(args.backends) == (
-                {"flashinfer", "triton"} if args.width <= 4 else {"flashinfer"}
-            )
+            assert set(args.backends) == {"flashinfer", "triton"}

@@ -100,10 +100,8 @@ def parse_causal_conv1d_args(line, parser):
                 "seq_lens requires a nonempty prefill batch, one nonnegative length per sequence, and no --varlen"
             )
         args.seq_len = max(args.seq_lens)
-    if args.width > 4 and "triton" in args.backends:
+    if args.width > 4 and ("triton" in args.backends or args.refcheck):
         parser.error("the Triton reference implements widths up to 4")
-    if args.width > 4 and args.speculative and args.refcheck:
-        parser.error("--refcheck has no speculative reference above width 4")
     args.activation = None if args.activation == "none" else args.activation
     if args.speculative and args.routine == "causal_conv1d_fn":
         parser.error("--speculative applies to causal_conv1d_update")
@@ -111,35 +109,6 @@ def parse_causal_conv1d_args(line, parser):
 
 
 @torch.inference_mode()
-def _oracle(x, weight, bias, state, lengths, slots, initial, activation):
-    """FP64 reference for widths the Triton reference lacks; updates state in place."""
-    depth = weight.shape[1] - 1
-    taps = weight.double()
-    out = torch.empty_like(x)
-    begin = 0
-    for length, slot, use_state in zip(
-        lengths, slots.tolist(), initial.tolist(), strict=True
-    ):
-        if not length:
-            continue
-        past = state[slot, :, :depth].T.double()
-        full = torch.cat(
-            (
-                past if use_state else torch.zeros_like(past),
-                x[begin : begin + length].double(),
-            )
-        )
-        value = sum(full[k : k + length] * taps[:, k] for k in range(depth + 1))
-        if bias is not None:
-            value = value + bias.double()
-        if activation is not None:
-            value = torch.nn.functional.silu(value)
-        out[begin : begin + length] = value.to(out.dtype)
-        state[slot, :, :depth] = full[-depth:].T.to(state.dtype)
-        begin += length
-    return out
-
-
 def run_causal_conv1d_test(args, *, profile_only=False):
     # routines.mamba adds the existing reference directory to sys.path.
     from triton_reference.causal_conv1d_triton import (
@@ -224,17 +193,6 @@ def run_causal_conv1d_test(args, *, profile_only=False):
                 out=output,
                 activation=args.activation,
             )
-        if backend == "oracle":
-            return _oracle(
-                x,
-                weight,
-                bias,
-                state,
-                lengths,
-                slots,
-                initial if prefill else torch.ones_like(initial),
-                args.activation,
-            )
         if prefill:
             return triton_prefill(
                 x.T,
@@ -282,10 +240,8 @@ def run_causal_conv1d_test(args, *, profile_only=False):
 
     passed = graph_passed = None
     if args.refcheck and "flashinfer" in backends:
-        # Widths above 4 have no Triton reference and check against the FP64 oracle.
-        reference_backend = "triton" if args.width <= 4 else "oracle"
         reference_state = clean.clone()
-        reference = call(reference_backend, reference_state).clone()
+        reference = call("triton", reference_state).clone()
         candidate_state = clean.clone()
         candidate = call("flashinfer", candidate_state).clone()
         torch.testing.assert_close(candidate, reference, atol=1e-3, rtol=1e-2)
@@ -300,7 +256,7 @@ def run_causal_conv1d_test(args, *, profile_only=False):
             for backend, expected, expected_state in (
                 ("flashinfer", candidate, candidate_state),
                 ("triton", reference, reference_state),
-            )[: 1 if args.width > 4 else 2]:
+            ):
                 graph_state = clean.clone()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):

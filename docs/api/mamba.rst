@@ -72,8 +72,8 @@ not alias their input operands.
 The unified benchmark compares complete calls, including state updates,
 against the repository's framework Triton reference. ``--width`` and
 ``--activation`` select the convolution; the Triton reference covers widths up
-to 4, so wider cases run ``--backends flashinfer`` and ``--refcheck`` compares
-against an FP64 reference instead. ``--input_row_stride``
+to 4, so wider cases run ``--backends flashinfer`` without ``--refcheck``.
+``--input_row_stride``
 sets the input row stride in elements and defaults to ``--dim``. Reference checks use
 separate initial state snapshots, and state resets and JIT compilation are
 outside timing. Reported bandwidth is a logical-byte estimate, not measured
