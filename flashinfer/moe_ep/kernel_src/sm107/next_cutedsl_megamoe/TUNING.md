@@ -510,6 +510,19 @@ Standard inference owns a separate temporary buffer sized by the native
 kernel. The adapter retains it across graph replay and replaces it when
 rebuilding execution state. GenPhase keeps its existing workspace interface.
 
+### Explicit decode scheduling
+
+GenPhase accepts `schedule_policy=('decode', None)` with
+`work_id_mode='atomic_counter'`. The second value is an optional positive FC1
+lead; `None` schedules all FC1 tiles of a stream before its FC2 tiles. Shared
+experts and batch-invariant execution are not supported with this schedule.
+Multirank N64 retains grouped scheduling.
+
+Select this schedule explicitly when comparing a provider integration that used
+it. Match `epi_flag_batches` too: `(1, 4)` and the default `(4, 2)` have different
+completion schedules. Defaults and the automatic tuning menu are unchanged;
+validate the chosen settings on the application's routing and full decode graph.
+
 ## Quantized combine selection
 
 Set `combine_dtype="nvfp4"` or `combine_dtype="mxfp8"` on a Rubin backend

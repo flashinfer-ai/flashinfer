@@ -19,9 +19,16 @@ _ROOT = (
 
 def test_export_manifest_matches_sources():
     manifest = json.loads((_ROOT.parent / "export_manifest.json").read_text())
+    overlay = json.loads(
+        (_ROOT.parent / "activation_overlay_manifest.json").read_text()
+    )["files"]
     files = manifest["files"]
+    assert set(overlay) <= set(files)
     assert set(files) == {str(path.relative_to(_ROOT)) for path in _ROOT.rglob("*.py")}
     for name, digest in files.items():
+        if name in overlay:
+            assert overlay[name]["upstream_sha256"] == digest, name
+            digest = overlay[name]["overlay_sha256"]
         assert hashlib.sha256((_ROOT / name).read_bytes()).hexdigest() == digest, name
 
 

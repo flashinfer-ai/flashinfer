@@ -284,3 +284,45 @@ def test_prequantized_ingestion_rejects_invalid_contract(corruption):
         preprocess_prequantized_block_scaled_weights(
             *tensors, quant_kind="nvfp4", hidden_size=128, intermediate_size=64
         )
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_clamped_relu2_prequantized_weights_preserve_bytes(gated):
+    # Distinct rows catch accidental gate/up interleaving in the nongated path.
+    hidden, intermediate = 384, 192 if gated else 256
+    gen = torch.Generator().manual_seed(73)
+    w1 = torch.randn(2, (2 if gated else 1) * intermediate, hidden, generator=gen)
+    w2 = torch.randn(2, hidden, intermediate, generator=gen)
+    q1, sf1 = quantize_mxfp8_block32(w1, torch.float8_e4m3fn)
+    q2, sf2 = quantize_mxfp8_block32(w2, torch.float8_e4m3fn)
+    transformed = preprocess_prequantized_block_scaled_weights(
+        q1,
+        q2,
+        sf1,
+        sf2,
+        quant_kind="mxfp8_e4m3",
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        gated=gated,
+    )
+    canonical = preprocess_block_scaled_weights(
+        w1, w2, quant_kind="mxfp8_e4m3", intermediate_size=intermediate, gated=gated
+    )
+    for (data, scale), (cq, cs), q, sf in zip(
+        transformed, canonical, (q1, q2), (sf1, sf2), strict=True
+    ):
+        if gated and q is q1:
+            q = interleave_gate_up_16(
+                q.view(torch.uint8), intermediate_size=intermediate
+            )
+            sf = interleave_gate_up_16(
+                sf.view(torch.uint8), intermediate_size=intermediate
+            )
+        torch.testing.assert_close(
+            data.permute(0, 2, 1).view(torch.uint8), q.view(torch.uint8)
+        )
+        for e in range(2):
+            restored = from_blocked(scale[e].view(torch.uint8), q.shape[1], sf.shape[2])
+            torch.testing.assert_close(restored, sf[e].view(torch.uint8))
+        torch.testing.assert_close(data.view(torch.uint8), cq.view(torch.uint8))
+        torch.testing.assert_close(scale.view(torch.uint8), cs.view(torch.uint8))

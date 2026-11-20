@@ -26,8 +26,11 @@ import torch
 
 from flashinfer.moe_ep._compat import deprecated_aliases
 
+from .activation import fc1_rows_per_intermediate
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
+
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
 SfAtomRows = 128  # to_blocked pads rows to 128 (32x4 atoms x 4-row group)
 SfAtomCols = 4
@@ -268,6 +271,7 @@ def preprocess_block_scaled_weights(
     quant_kind: str,
     intermediate_size: int,
     chunk_rows: int = 128,
+    gated: bool = True,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     """Quantize one expert at a time, with bounded row-wise scratch storage.
 
@@ -296,14 +300,20 @@ def preprocess_block_scaled_weights(
     experts, rows, hidden = w13.shape
     if experts <= 0 or hidden <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
-    if rows != 2 * intermediate_size or w2.shape != (
+    fc1_rows = (2 if gated else 1) * intermediate_size
+    if rows != fc1_rows or w2.shape != (
         experts,
         hidden,
         intermediate_size,
     ):
-        raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
+        raise ValueError(
+            f"canonical weight shapes must match FC1 {(experts, fc1_rows, hidden)} "
+            f"and FC2 {(experts, hidden, intermediate_size)}."
+        )
     intermediate_alignment = (
-        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+        4 * sf_vec
+        if not gated or quant_kind in ("mxfp4", "mxfp4_mxfp8")
+        else 2 * sf_vec
     )
     if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
@@ -350,7 +360,7 @@ def preprocess_block_scaled_weights(
                 scales[expert, offset : offset + swizzled.numel()].copy_(swizzled)
         return data.permute(0, 2, 1), scales.view(sf_dtype)
 
-    return transform(w13, gate_up=True), transform(w2, gate_up=False)
+    return transform(w13, gate_up=gated), transform(w2, gate_up=False)
 
 
 def preprocess_prequantized_block_scaled_weights(
@@ -362,13 +372,15 @@ def preprocess_prequantized_block_scaled_weights(
     quant_kind: str,
     hidden_size: int,
     intermediate_size: int,
+    gated: bool = True,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     """Convert canonical packed weights and raw block scales without requantizing.
 
-    FC1 contains all gate rows followed by all up rows. Both data and scales
+    With gated=True, FC1 contains all gate rows followed by all up rows. Both data and scales
     undergo the same 16-row interleave before scales are padded and swizzled.
     Packed FP4 data may use uint8 storage; scale tensors must carry their FP8 dtype
-    so that the scale encoding is explicit.
+    so that the scale encoding is explicit. With gated=False, FC1 has I rows
+    and retains its row order (the nongated layout).
     """
     allowed_data: Tuple[torch.dtype, ...]
     if quant_kind == "nvfp4":
@@ -393,14 +405,16 @@ def preprocess_prequantized_block_scaled_weights(
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
     intermediate_alignment = (
-        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+        4 * sf_vec
+        if not gated or quant_kind in ("mxfp4", "mxfp4_mxfp8")
+        else 2 * sf_vec
     )
     if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the SM107 scale-vector alignment."
         )
     legs = (
-        ("w13", w13, w13_scale, 2 * intermediate_size, hidden_size),
+        ("w13", w13, w13_scale, (2 if gated else 1) * intermediate_size, hidden_size),
         ("w2", w2, w2_scale, hidden_size, intermediate_size),
     )
     for name, weight, scale, rows, cols in legs:
@@ -432,7 +446,7 @@ def preprocess_prequantized_block_scaled_weights(
             data = data.clone()
         return data.view(data_dtype).permute(0, 2, 1), swizzled.view(sf_dtype)
 
-    return transform(w13, w13_scale, gate_up=True), transform(
+    return transform(w13, w13_scale, gate_up=gated), transform(
         w2, w2_scale, gate_up=False
     )
 
@@ -535,6 +549,7 @@ def compute_megamoe_reference_sm107_block_scaled(
     weight_scales_are_swizzled: bool = False,
     combine_dtype: str = "bf16",
     return_fp32: bool = False,
+    activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     fc1_alpha: Optional[torch.Tensor] = None,
@@ -554,8 +569,16 @@ def compute_megamoe_reference_sm107_block_scaled(
     before the logical transpose view): ``fc1_weight_k_major
     (E, 2I, hidden[packed])`` with the 16-interleaved gate/up N axis and raw SF
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
-    raw SF ``(E, hidden, I/vec)``.
+    raw SF ``(E, hidden, I/vec)``. Nongated FC1 uses I rather than 2I rows,
+    with no gate/up interleave.
     """
+    fc1_rows = fc1_rows_per_intermediate(activation)
+    nongated = fc1_rows == 1
+    if nongated and any(
+        v is not None
+        for v in (gate_up_clamp, situ_beta, situ_linear_beta, swiglu_alpha, swiglu_beta)
+    ):
+        raise ValueError("clamped_relu2 uses a fixed scale of 16")
     if situ_beta is None and situ_linear_beta is not None:
         raise ValueError("situ_linear_beta requires situ_beta.")
     if (swiglu_alpha is None) != (swiglu_beta is None):
@@ -564,7 +587,7 @@ def compute_megamoe_reference_sm107_block_scaled(
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
     hidden = fc2_weight_k_major.shape[1]
-    intermediate = fc1_out // 2
+    intermediate = fc1_out // fc1_rows
 
     x = _dequant_activation(quant_kind, x_data, x_sf, tokens, hidden)
 
@@ -579,28 +602,33 @@ def compute_megamoe_reference_sm107_block_scaled(
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
         sf1, sf2 = fc1_weight_sf_raw[local_e], fc2_weight_sf_raw[local_e]
         if weight_scales_are_swizzled:
-            sf1 = from_blocked(sf1, 2 * intermediate, hidden // vec)
+            sf1 = from_blocked(sf1, fc1_out, hidden // vec)
             sf2 = from_blocked(sf2, hidden, intermediate // vec)
         w1 = _dequant_weight_k_major(quant_kind, fc1_weight_k_major[local_e], sf1)
-        fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
+        fc1 = x[src_t] @ w1.transpose(
+            0, 1
+        )  # (v, I) nongated; otherwise (v, 2I) with gate/up stripes
         if fc1_alpha is not None:
             fc1 = fc1 * fc1_alpha[local_e]
-        pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
-        gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
-        if gate_up_clamp is not None:
-            gate = gate.clamp(max=gate_up_clamp)
-            up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
-        if situ_beta is not None:
-            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-            if situ_linear_beta is not None:
-                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
-            act = (up * gate).reshape(-1, intermediate)
-        elif swiglu_alpha is not None:
-            act = (
-                (up + swiglu_beta) * gate * torch.sigmoid(swiglu_alpha * gate)
-            ).reshape(-1, intermediate)
+        if nongated:
+            act = (16.0 * torch.tanh(torch.relu(fc1) / 16.0)).square()
         else:
-            act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
+            pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
+            gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
+            if gate_up_clamp is not None:
+                gate = gate.clamp(max=gate_up_clamp)
+                up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
+            if situ_beta is not None:
+                gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+                if situ_linear_beta is not None:
+                    up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+                act = (up * gate).reshape(-1, intermediate)
+            elif swiglu_alpha is not None:
+                act = (
+                    (up + swiglu_beta) * gate * torch.sigmoid(swiglu_alpha * gate)
+                ).reshape(-1, intermediate)
+            else:
+                act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
         if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).

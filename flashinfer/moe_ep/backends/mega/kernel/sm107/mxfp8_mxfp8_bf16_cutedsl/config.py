@@ -18,10 +18,13 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
 
     The kernel fuses dispatch, FC1, activation, FC2, and combine with BF16 output.
     It uses E8M0 scales per 32 values and 16-row gate/up stripes. SwiGLU is the default;
-    SiTU requires both positive, finite beta parameters.
+    SiTU requires both positive, finite beta parameters. 'clamped_relu2' is
+    nongated: ``(16*tanh(relu(x)/16))**2`` using hardware tanh. It requires
+    MXFP8 E4M3 GenPhase and FC1 weights [E, I, H], with no gate/up interleave.
+    Inputs must be finite; hardware fmax maps NaN FC1 values to zero.
     """
 
-    intermediate_size: int  # width after activation; FC1 N is 2*intermediate_size
+    intermediate_size: int  # FC1 N is I for clamped_relu2, otherwise 2*I
     top_k: int
     kernel_name: str = "sm107_mxfp8_mxfp8_bf16_cutedsl"
     kind: Sm107Mxfp8Kind = "mxfp8_e4m3"
@@ -50,7 +53,7 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # search during an enabled FlashInfer autotune warmup, before capture.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
-    activation: Literal["swiglu", "situ"] = "swiglu"
+    activation: Literal["swiglu", "situ", "clamped_relu2"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
     swiglu_alpha: Optional[float] = field(default=None, kw_only=True)
