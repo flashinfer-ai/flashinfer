@@ -3,10 +3,12 @@
 Eight generated programs, each one source compiled for both architectures:
 four normal schedules (BM128 with the N tile 128/160/224/256), three swap-AB
 schedules for small M (BN128 with the M tile 16/32/48) and the BK128 schedule
-with per-128 A scales (BM128 x BN224). Tile counts and the SM count are runtime
-arguments; the route is chosen from the problem shape by ``select_route``.
-``PROGRAMS`` and ``ROUTES`` are populated by the generated-program export; do
-not edit them by hand.
+with per-128 A scales (BM128 x BN224), plus one split-K program (the swap-AB
+BM16 schedule in three K slices with a fixed-order fp32 combine, SM100a only)
+selected for exactly the problems of ``_SPLIT_K_ADOPTED``. Tile counts and the
+SM count are runtime arguments; the route is chosen from the problem shape by
+``select_route``. ``PROGRAMS`` and ``ROUTES`` are populated by the
+generated-program export; do not edit them by hand.
 """
 
 from __future__ import annotations
@@ -26,10 +28,80 @@ class _Program(TypedDict):
 
 
 PROGRAMS: dict[str, _Program] = {
-    "cake_deepgemm_mixed_gemm_20bec5dc16309a77b8c4": {
+    "cake_deepgemm_mixed_gemm_1703f20cc39512449eef": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_20bec5dc16309a77b8c4_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_20bec5dc16309a77b8c4_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_1703f20cc39512449eef_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_1703f20cc39512449eef_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "tma_buffer",
+                "SFA",
+            ],
+            [
+                "tma_buffer",
+                "SFB",
+            ],
+            [
+                "tma_buffer",
+                "A",
+            ],
+            [
+                "tma_buffer",
+                "B",
+            ],
+            [
+                "tma_buffer",
+                "C_tma",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "N",
+            ],
+            [
+                "parameter",
+                "K",
+            ],
+            [
+                "parameter",
+                "grid_m",
+            ],
+            [
+                "parameter",
+                "grid_n",
+            ],
+            [
+                "parameter",
+                "K_tiles",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+    },
+    "cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2": {
+        "sources": [
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -104,80 +176,10 @@ PROGRAMS: dict[str, _Program] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_mixed_gemm_215099de8776807fb433": {
+    "cake_deepgemm_mixed_gemm_717435d4482e8127d628": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_215099de8776807fb433_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_215099de8776807fb433_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            [
-                "tma_buffer",
-                "SFA",
-            ],
-            [
-                "tma_buffer",
-                "SFB",
-            ],
-            [
-                "tma_buffer",
-                "A",
-            ],
-            [
-                "tma_buffer",
-                "B",
-            ],
-            [
-                "tma_buffer",
-                "C_tma",
-            ],
-            [
-                "parameter",
-                "M",
-            ],
-            [
-                "parameter",
-                "N",
-            ],
-            [
-                "parameter",
-                "K",
-            ],
-            [
-                "parameter",
-                "grid_m",
-            ],
-            [
-                "parameter",
-                "grid_n",
-            ],
-            [
-                "parameter",
-                "K_tiles",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-    },
-    "cake_deepgemm_mixed_gemm_7951ef4c2b789eb6ced5": {
-        "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_7951ef4c2b789eb6ced5_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_7951ef4c2b789eb6ced5_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_717435d4482e8127d628_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_717435d4482e8127d628_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -252,10 +254,10 @@ PROGRAMS: dict[str, _Program] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e": {
+    "cake_deepgemm_mixed_gemm_883f34018b1552e06e4b": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_883f34018b1552e06e4b_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_883f34018b1552e06e4b_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -330,10 +332,10 @@ PROGRAMS: dict[str, _Program] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_mixed_gemm_91df6d765e8a0d343acd": {
+    "cake_deepgemm_mixed_gemm_b50e49418a858200ba74": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_91df6d765e8a0d343acd_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_91df6d765e8a0d343acd_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b50e49418a858200ba74_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b50e49418a858200ba74_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -408,10 +410,10 @@ PROGRAMS: dict[str, _Program] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_mixed_gemm_a0f125c27e5a860a3f90": {
+    "cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_a0f125c27e5a860a3f90_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_a0f125c27e5a860a3f90_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -486,10 +488,10 @@ PROGRAMS: dict[str, _Program] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d": {
+    "cake_deepgemm_mixed_gemm_cf879c06884e138be329": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_cf879c06884e138be329_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_cf879c06884e138be329_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -564,10 +566,10 @@ PROGRAMS: dict[str, _Program] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_mixed_gemm_ce64deed53f017813730": {
+    "cake_deepgemm_mixed_gemm_efc6d85403b86b926c99": {
         "sources": [
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_ce64deed53f017813730_kernel.cu",
-            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_ce64deed53f017813730_binding.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_efc6d85403b86b926c99_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_efc6d85403b86b926c99_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -640,19 +642,105 @@ PROGRAMS: dict[str, _Program] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+        ],
+    },
+    "cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6": {
+        "sources": [
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6_kernel.cu",
+            "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "tma_buffer",
+                "A",
+            ],
+            [
+                "tma_buffer",
+                "B",
+            ],
+            [
+                "tma_buffer",
+                "SFA",
+            ],
+            [
+                "tma_buffer",
+                "SFB",
+            ],
+            [
+                "tma_buffer",
+                "C_tma",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "N",
+            ],
+            [
+                "parameter",
+                "K",
+            ],
+            [
+                "parameter",
+                "grid_m",
+            ],
+            [
+                "parameter",
+                "grid_n",
+            ],
+            [
+                "parameter",
+                "K_tiles",
+            ],
+            [
+                "parameter",
+                "SCHED_DIV",
+            ],
+            [
+                "parameter",
+                "TAIL_DIV",
+            ],
+            [
+                "buffer",
+                "WS",
+            ],
+            [
+                "buffer",
+                "CNT",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "arches": [
+            "sm_100a",
         ],
     },
 }
 
 ROUTES = {
-    "bk128_bm128_bn224_s6_ga128": "cake_deepgemm_mixed_gemm_215099de8776807fb433",
-    "normal_bm128_bn128_s7_ga32": "cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e",
-    "normal_bm128_bn160_s7_ga32": "cake_deepgemm_mixed_gemm_7951ef4c2b789eb6ced5",
-    "normal_bm128_bn224_s6_ga32": "cake_deepgemm_mixed_gemm_a0f125c27e5a860a3f90",
-    "normal_bm128_bn256_s5_ga32": "cake_deepgemm_mixed_gemm_20bec5dc16309a77b8c4",
-    "swap_ab_bm16_bn128_s12_ga32": "cake_deepgemm_mixed_gemm_ce64deed53f017813730",
-    "swap_ab_bm32_bn128_s11_ga32": "cake_deepgemm_mixed_gemm_91df6d765e8a0d343acd",
-    "swap_ab_bm48_bn128_s10_ga32": "cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d",
+    "bk128_bm128_bn224_s6_ga128": "cake_deepgemm_mixed_gemm_1703f20cc39512449eef",
+    "normal_bm128_bn128_s7_ga32": "cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2",
+    "normal_bm128_bn160_s7_ga32": "cake_deepgemm_mixed_gemm_883f34018b1552e06e4b",
+    "normal_bm128_bn224_s6_ga32": "cake_deepgemm_mixed_gemm_efc6d85403b86b926c99",
+    "normal_bm128_bn256_s5_ga32": "cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6",
+    "swap_ab_bm16_bn128_s12_ga32": "cake_deepgemm_mixed_gemm_cf879c06884e138be329",
+    "swap_ab_bm16_bn128_s12_ga32_sk3": "cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6",
+    "swap_ab_bm32_bn128_s11_ga32": "cake_deepgemm_mixed_gemm_717435d4482e8127d628",
+    "swap_ab_bm48_bn128_s10_ga32": "cake_deepgemm_mixed_gemm_b50e49418a858200ba74",
 }
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -669,6 +757,15 @@ _SCHEDULES = {
     "swap_ab_bm48_bn128_s10_ga32": ("swap_ab", 48, 128, 0),
     "bk128_bm128_bn224_s6_ga128": ("bk128", 128, 224, 32),
 }
+# Adopted split-K programs: the swap-AB BM16 schedule in S K slices with a fixed last-arriver fp32 combine through a plan-internal
+# workspace and per-tile arrival counters (zeroed once per plan, reset by the kernel). Selected for exactly the measured problems
+# below, keyed by (num_sms, M, N, K); num_sms is the architecture key (148 = SM100a). Every other problem keeps the shipped program.
+_SPLIT_K_ADOPTED = {(148, 16, 4608, 5120): 3}
+# (base schedule, S) -> split program name; the base schedule's tile axes and raster apply to every slice.
+_SPLIT_K_PROGRAMS = {
+    ("swap_ab_bm16_bn128_s12_ga32", 3): "swap_ab_bm16_bn128_s12_ga32_sk3"
+}
+_SPLIT_K_BASE = {name: key for key, name in _SPLIT_K_PROGRAMS.items()}
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -734,10 +831,22 @@ def select_route(m: int, n: int, k: int, *, num_sms: int, gran_k_a: int = 32) ->
             "ceil(N/128); M>128 needs an even ceil(M/128) or an even ceil(N/128); gran_k_a=128 needs an even "
             "ceil(M/128) and N>=224"
         )
-    return min(fitting, key=lambda name: _rank(name, m, n, k, num_sms))
+    best = min(fitting, key=lambda name: _rank(name, m, n, k, num_sms))
+    split_k = _SPLIT_K_ADOPTED.get((num_sms, m, n, k))
+    if split_k is None:
+        return best
+    if (best, split_k) not in _SPLIT_K_PROGRAMS:
+        raise RuntimeError(
+            f"split-K adoption names S={split_k} for (num_sms={num_sms}, M={m}, N={n}, K={k}) but the selected schedule {best} has no "
+            "such split program"
+        )
+    return _SPLIT_K_PROGRAMS[(best, split_k)]
 
 
 def route_geometry(name: str, m: int, n: int, k: int, gran_k_a: int) -> dict[str, int]:
+    split_k = 1
+    if name in _SPLIT_K_BASE:
+        name, split_k = _SPLIT_K_BASE[name]
     family, block_m, block_n, _store_n = _SCHEDULES[name]
     grid_m, grid_n = _ceil_div(m, block_m), _ceil_div(n, block_n)
     # Divisor of the persistent raster: swap-AB groups GROUP_N N tiles per M tile, the other
@@ -747,7 +856,7 @@ def route_geometry(name: str, m: int, n: int, k: int, gran_k_a: int) -> dict[str
         sched_divisor, tail_divisor = grid_m * GROUP_N, grid_n % GROUP_N or GROUP_N
     else:
         sched_divisor, tail_divisor = grid_n * GROUP_M, grid_m % GROUP_M or GROUP_M
-    return dict(
+    geometry = dict(
         grid_m=grid_m,
         grid_n=grid_n,
         K_tiles=k // BLOCK_K,
@@ -758,6 +867,17 @@ def route_geometry(name: str, m: int, n: int, k: int, gran_k_a: int) -> dict[str
         sfb_words=scale_words(k, 32),
         sfb_mn=aligned_mn(n),
     )
+    if split_k > 1:
+        # Slice-major items (bid = slice * tiles + tile, decoded in-kernel); one fp32 workspace slot of block_n * block_m values per
+        # (slice, tile) and one u32 arrival counter per tile.
+        tiles = grid_m * grid_n
+        geometry.update(
+            split_k=split_k,
+            split_tiles=tiles,
+            counter_elems=tiles,
+            workspace_elems=split_k * tiles * block_n * block_m,
+        )
+    return geometry
 
 
 def _fast_divmod(divisor: int):
@@ -823,6 +943,9 @@ class MixedGemmPlan:
     and this device's SM count, and loads the program; ``run()`` submits the one
     kernel launch on the current stream with the tensor maps encoded by value.
     Changing tensor addresses or layouts requires a new plan; contents may change.
+    A split-K route owns a plan-internal fp32 workspace and arrival counters;
+    like the output, they are per plan (two concurrent ``run()`` calls of one
+    plan on two streams race on them).
     """
 
     def __init__(self, a, b, a_scales, b_scales, *, m=None, out=None, gran_k_a=32):
@@ -889,11 +1012,23 @@ class MixedGemmPlan:
             grid_y=self.grid[1],
             grid_z=self.grid[2],
         )
+        retained = tensors
+        if geometry.get("split_k", 1) > 1:
+            # Plan-internal split-K buffers: the fp32 partial workspace and the per-tile arrival counters, zeroed ONCE here; the
+            # kernel's last arriver resets each counter, so repeat launches and graph replays need no memset.
+            workspace = torch.empty(
+                (geometry["workspace_elems"],), dtype=torch.float32, device=a.device
+            )
+            counters = torch.zeros(
+                (geometry["counter_elems"],), dtype=torch.uint32, device=a.device
+            )
+            bindings.update(WS=workspace, CNT=counters)
+            retained = tensors + (workspace, counters)
         self._entry = load_program(arch, self.program)
         self._args = tuple(
             bindings[name] for _kind, name in PROGRAMS[self.program]["arg_plan"]
         )
-        self._retained = tensors
+        self._retained = retained
 
     def run(self):
         import tvm_ffi

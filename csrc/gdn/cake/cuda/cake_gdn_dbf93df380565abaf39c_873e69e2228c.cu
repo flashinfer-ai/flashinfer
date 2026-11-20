@@ -38,12 +38,21 @@
 #define rows_per_group (TILE_V / 8)
 #define num_blocks ((TILE_V + 31) / 32)
 #define block_rows (rows_per_group / num_blocks)
+#ifndef LAUNCH_MIN_BLOCKS
 #define LAUNCH_MIN_BLOCKS 1
+#endif
+#ifndef CAKE_GDN_KERNEL_SYMBOL
+#define CAKE_GDN_KERNEL_SYMBOL kernel_cake_gdn_dbf93df380565abaf39c
+#endif
 
 extern "C" {
 
+#if LAUNCH_MIN_BLOCKS > 0
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_dbf93df380565abaf39c(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long v_stride_p0, long long v_stride_p2, long long q_stride_p0, long long q_stride_p2, long long k_stride_p0, long long k_stride_p2, long long a_stride_p0, long long a_stride_p2, long long b_stride_p0, long long b_stride_p2)
+#else
+__global__ __launch_bounds__(128) void
+#endif
+CAKE_GDN_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long v_stride_p0, long long v_stride_p2, long long q_stride_p0, long long q_stride_p2, long long k_stride_p0, long long k_stride_p2, long long a_stride_p0, long long a_stride_p2, long long b_stride_p0, long long b_stride_p2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

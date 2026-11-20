@@ -291,7 +291,11 @@ class TmemOResource(DecodeGenResourceBase):
                     # the next pair once the K steps have covered 64 tokens.
                     k_steps_per_block = 64 // mma_k_step
                     block_pair_desc_units = (
-                        2 * 64 * cfg.headdim * cfg.v_dtype_bytes // SMEM_DESC_UNIT_BYTES
+                        2
+                        * 64
+                        * cfg.headdim
+                        * cfg.pv_dtype_bytes
+                        // SMEM_DESC_UNIT_BYTES
                     )
                     iter_v_desc = v_desc + Int32(
                         (k_step // k_steps_per_block) * block_pair_desc_units
@@ -359,6 +363,10 @@ class TmemOResource(DecodeGenResourceBase):
             cfg
         )
 
+        if cutlass.const_expr(cfg.use_keeps_mma_ab):
+            # SMEM keeps a complete staging band; MMA/TMEM own only live columns.
+            mma_n = min(mma_n, cfg.headdim - head_dim_stage_idx * cfg.head_dim_kv_stage)
+
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             # Full-headDim path: all V columns for this O stage live in one
             # contiguous TMEM stage selected by the TS pipeline stage index.
@@ -417,8 +425,15 @@ class TmemOResource(DecodeGenResourceBase):
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
                         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            # TMEM packs 4 / pv_dtype_bytes tokens per column.
                             v_operand = prims.make_tmem_ptr(
-                                v_desc + Int32((ki + 1) * _mma_k_step_pv(cfg) // 4),
+                                v_desc
+                                + Int32(
+                                    (ki + 1)
+                                    * _mma_k_step_pv(cfg)
+                                    * cfg.pv_dtype_bytes
+                                    // 4
+                                ),
                                 Int32,
                             )
                         else:
@@ -499,13 +514,22 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
                         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            # TMEM packs 4 / pv_dtype_bytes tokens per column.
                             v_operand = prims.make_tmem_ptr(
-                                v_desc + Int32((ki + 1) * _mma_k_step_pv(cfg) // 4),
+                                v_desc
+                                + Int32(
+                                    (ki + 1)
+                                    * _mma_k_step_pv(cfg)
+                                    * cfg.pv_dtype_bytes
+                                    // 4
+                                ),
                                 Int32,
                             )
                         else:
                             v_operand = v_operand + Int32(
-                                (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_pv else 128
+                                (min(cfg.head_dim_kv_stage, 128) * 2)
+                                if cfg.use_fp8_pv
+                                else 128
                             )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(

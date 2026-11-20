@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import flashinfer.gdn_decode as gdn_decode
 from flashinfer.jit import cake_gdn as cake_gdn
 from flashinfer.gdn_decode import (
     gated_delta_rule_decode as public_nontranspose_decode,
@@ -148,8 +149,8 @@ def _reference(
     return out.unsqueeze(1).to(torch.bfloat16).contiguous(), state.contiguous()
 
 
-def _load(batch_size: int):
-    route = cake_gdn.select_cake_gdn_decode_variant(
+def _route(batch_size: int):
+    return cake_gdn.select_cake_gdn_decode_variant(
         arch=_arch(),
         batch_size=batch_size,
         io_dtype="bfloat16",
@@ -163,6 +164,10 @@ def _load(batch_size: int):
         seq_len=1,
         use_qk_l2norm=True,
     )
+
+
+def _load(batch_size: int):
+    route = _route(batch_size)
     return route, cake_gdn.load_cake_gdn_kernel(route.variant_name, _arch())
 
 
@@ -324,6 +329,8 @@ def _launch_prefill(
         0,
         _SCALE,
         4,
+        # Launch ABI v2: total_tokens (4 sequences of 64) after num_seqs.
+        4 * 64,
         4,
         num_v_heads,
         total_tiles,
@@ -341,7 +348,11 @@ def _launch(
     state: torch.Tensor | None = None,
     grid_x: int | None = None,
 ) -> None:
-    blocks_per_state = 8 if batch_size < 32 else 1
+    # The grid is ``blocks_per_state`` CTAs per state head; the count is the selected
+    # record's (the CC 10.7 small band runs the four-CTA body), never re-derived here.
+    blocks_per_state = cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+        _route(batch_size).variant_name
+    )
     entry(
         tensors["q"],
         tensors["k"],
@@ -956,14 +967,20 @@ def _launch_bf16_serving(
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 32])
+# B 1 / 9: small band (mid4 on sm_107a); 10 / 20 / 21 / 31: the upper small band (the
+# TMA-state hqsplit_tma3 body on sm_107a, the small body elsewhere); 32 .. 64: the large
+# band (the TMA-state hqsplit_tma3 body on sm_107a, the large body elsewhere).
+@pytest.mark.parametrize("batch_size", [1, 9, 10, 20, 21, 31, 32, 34, 35, 37, 64])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
     expected_out, expected_state = _reference(tensors, initial_state)
     route, entry = _load(batch_size)
-    assert route.route_id.endswith(
-        "nontranspose_small" if batch_size < 32 else "nontranspose_large"
+    band = "small" if batch_size < 32 else "large"
+    assert f"nontranspose_{band}" in route.route_id
+    assert (
+        route.route_id
+        == cake_gdn.cake_gdn_nontranspose_fp32_t1_route(batch_size, _arch())[1]
     )
 
     stream = torch.cuda.Stream()
@@ -997,6 +1014,371 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
     graph.replay()
     stream.synchronize()
 
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+def _require_tma_state_route(batch_size: int):
+    route, entry = _load(batch_size)
+    record = cake_gdn._kernel_record(route.variant_name)
+    if record["tma_abi"] != "grid_constant":
+        pytest.skip(f"{_arch()} runs no TMA-state nontranspose record")
+    return route, entry
+
+
+def test_tma_state_decode_graph_replays_the_state_each_capture_saw() -> None:
+    # The TMA-state body takes the state as a by-value tensor map of each call's state: a graph
+    # captured on one state tensor replays on that tensor, a second capture on another state
+    # tensor replays on its own, and neither replay touches the other tensor.
+    batch_size = 64
+    _require_tma_state_route(batch_size)
+    _, entry = _load(batch_size)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    other = (torch.randn_like(initial) * 0.01).contiguous()
+    other_initial = other.clone()
+    expected_out, expected_state = _reference(tensors, initial)
+    _, expected_other = _reference(tensors, other_initial)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _launch(entry, tensors, batch_size)
+        _launch(entry, tensors, batch_size, state=other)
+    stream.synchronize()
+    tensors["state"].copy_(initial)
+    other.copy_(other_initial)
+    first, second = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(first, stream=stream):
+        _launch(entry, tensors, batch_size)
+    with torch.cuda.graph(second, stream=stream):
+        _launch(entry, tensors, batch_size, state=other)
+    first.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+    assert torch.equal(other, other_initial)
+    after_first = tensors["state"].clone()
+    second.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(other, expected_other, atol=1e-3, rtol=1e-3)
+    assert torch.equal(tensors["state"], after_first)
+
+
+@pytest.mark.parametrize("batch_size", [12, 64])
+def test_tma_state_decode_tensor_map_follows_the_state_of_each_call(
+    batch_size: int,
+) -> None:
+    # The TMA-state host shim reuses the tensor map it encoded for the same (device,
+    # address, B, HV) and encodes a new one otherwise: calls alternating between state
+    # tensors, pool slices at other offsets, a state at a freed and reallocated address
+    # and a state of one batch less at the same address each update exactly their own
+    # state, bit for bit as the same call on a fresh copy, and leave the rest of the pool
+    # untouched.
+    _require_tma_state_route(batch_size)
+    _require_tma_state_route(batch_size - 1)
+    _, entry = _load(batch_size)
+    _, entry_less = _load(batch_size - 1)
+    tensors = _make_inputs(batch_size)
+    tensors_less = _make_inputs(batch_size - 1)
+    first = tensors["state"]
+    initial = first.clone()
+    second = (torch.randn_like(first) * 0.01).contiguous()
+    pool = (
+        torch.randn(
+            batch_size + 3, *first.shape[1:], device=first.device, dtype=first.dtype
+        )
+        * 0.01
+    ).contiguous()
+    slot_bytes = pool[0].numel() * pool.element_size()
+
+    def check(state: torch.Tensor, inputs: dict[str, torch.Tensor], kernel) -> None:
+        rows = state.shape[0]
+        pool_before = pool.clone()
+        copy = state.clone()
+        copy_out = torch.zeros_like(inputs["out"])
+        _launch(kernel, {**inputs, "out": copy_out}, rows, state=copy)
+        inputs["out"].zero_()
+        _launch(kernel, inputs, rows, state=state)
+        torch.cuda.synchronize()
+        assert torch.equal(state, copy)
+        assert torch.equal(inputs["out"], copy_out)
+        offset = state.data_ptr() - pool.data_ptr()
+        if 0 <= offset < pool.numel() * pool.element_size():
+            start = offset // slot_bytes
+            assert torch.equal(pool[:start], pool_before[:start])
+            assert torch.equal(pool[start + rows :], pool_before[start + rows :])
+        else:
+            assert torch.equal(pool, pool_before)
+
+    check(first, tensors, entry)
+    expected_out, expected_state = _reference(tensors, initial)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(first, expected_state, atol=1e-3, rtol=1e-3)
+    for state in (
+        second,
+        first,
+        pool[1 : 1 + batch_size],
+        pool[2 : 2 + batch_size],
+        second,
+        pool[1 : 1 + batch_size],
+    ):
+        check(state, tensors, entry)
+    check(pool[1:batch_size], tensors_less, entry_less)
+    check(pool[1 : 1 + batch_size], tensors, entry)
+    freed = second.clone()
+    check(freed, tensors, entry)
+    del freed
+    reallocated = (torch.randn_like(second) * 0.01).contiguous()
+    check(reallocated, tensors, entry)
+
+
+def test_tma_state_decode_refuses_a_misaligned_state_before_launch() -> None:
+    # The tensor map needs a 16-byte aligned base address: a contiguous state view at a
+    # 4-byte offset is refused by the host shim, the state is left untouched and the
+    # stream stays usable.
+    batch_size = 64
+    _require_tma_state_route(batch_size)
+    _, entry = _load(batch_size)
+    tensors = _make_inputs(batch_size)
+    numel = tensors["state"].numel()
+    flat = torch.zeros(numel + 4, device=tensors["state"].device, dtype=torch.float32)
+    misaligned = flat[1 : 1 + numel].view_as(tensors["state"])
+    misaligned.copy_(tensors["state"])
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+    before = misaligned.clone()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _launch(entry, tensors, batch_size, state=misaligned)
+    torch.cuda.synchronize()
+    assert torch.equal(misaligned, before)
+    initial = tensors["state"].clone()
+    expected_out, expected_state = _reference(tensors, initial)
+    _launch(entry, tensors, batch_size)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+# B 10 / 21: formerly the mid4_rc_kq128 twin; B 32: formerly the tilev32_x2 twin; B 64:
+# formerly the hqsplit twin.
+@pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
+@pytest.mark.parametrize("batch_size", [10, 21, 32, 64])
+def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma(
+    batch_size: int, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No sm_107a record from 10 rows on runs a state whose base is not 16-byte aligned: the
+    # pointer twins it replaces move the state with 16-byte vector loads and stores (a
+    # misaligned-address fault), and the TMA-state record needs an aligned tensor-map
+    # base.  Through the public API the misaligned call is refused before the row
+    # resolves its launch, with the state untouched; the same call on an aligned state
+    # runs the TMA-state record and matches a direct launch of that record bit for bit.
+    # The aligned call resolves the row's launch once (an empty launch table here).
+    route, entry = _require_tma_state_route(batch_size)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    numel = initial.numel()
+    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
+    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
+    selected: list[str] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        selected.append(chosen.variant_name)
+        return chosen
+
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
+
+    def call(state: torch.Tensor) -> None:
+        public_nontranspose_decode(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            state=state,
+            A_log=tensors["A_log"],
+            a=tensors["a"],
+            dt_bias=tensors["dt_bias"],
+            b=tensors["b"],
+            output=tensors["out"],
+            backend=backend,
+        )
+
+    for offset in (1, 2, 3):
+        flat = torch.zeros(numel + 4, device=initial.device, dtype=torch.float32)
+        misaligned = flat[offset : offset + numel].view_as(initial)
+        misaligned.copy_(initial)
+        assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            call(misaligned)
+        torch.cuda.synchronize()
+        assert torch.equal(misaligned, initial)
+    assert selected == []
+    assert gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES == {}
+
+    tensors["out"].zero_()
+    call(tensors["state"])
+    torch.cuda.synchronize()
+    assert selected == [route.variant_name]
+    assert list(gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES.values()) == [
+        (entry, batch_size * 32)
+    ]
+    assert cake_gdn._kernel_record(route.variant_name)["tma_abi"] == "grid_constant"
+    assert torch.equal(tensors["out"], direct["out"])
+    assert torch.equal(tensors["state"], direct["state"])
+    expected_out, expected_state = _reference(tensors, initial)
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+_NONTRANSPOSE_ARGS = ("q", "k", "v", "state", "A_log", "a", "dt_bias", "b", "out")
+
+
+def _run_nontranspose(tensors: dict[str, torch.Tensor], scale: float = _SCALE):
+    return gdn_decode._run_cake_gdn_decode_nontranspose(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        state=tensors["state"],
+        A_log=tensors["A_log"],
+        a=tensors["a"],
+        dt_bias=tensors["dt_bias"],
+        b=tensors["b"],
+        scale=scale,
+        output=tensors["out"],
+        use_qk_l2norm=True,
+    )
+
+
+# B 9: small band; 10 / 20: the upper small band from 10 rows (hqsplit_tma3 on sm_107a);
+# 21 / 32: the upper small / large band of every architecture.
+@pytest.mark.parametrize("batch_size", [9, 10, 20, 21, 32])
+def test_public_nontranspose_decode_resolves_each_row_launch_once(
+    batch_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The public nontranspose decode resolves the route, loads the entry and derives the
+    # grid on the first call of a row (device, B, H, HK, HV, scale, l2norm) and reuses
+    # them on every later call: each call runs the resolved record bit for bit as a
+    # direct launch of it; another scale or batch is another row; a row the resolver
+    # refuses is never stored and is refused again.
+    route, entry = _load(batch_size)
+    calls: list[tuple[str, int, float]] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        calls.append(
+            (chosen.variant_name, kwargs["batch_size"], float(kwargs["scale"]))
+        )
+        return chosen
+
+    def refusing_spy(**kwargs):
+        calls.append(("refused", kwargs["batch_size"], float(kwargs["scale"])))
+        return select(**kwargs)
+
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
+    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
+    blocks_per_state = cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+        route.variant_name
+    )
+    launches: dict = {}
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", launches)
+    for _ in range(3):
+        tensors["state"].copy_(initial)
+        tensors["out"].zero_()
+        assert _run_nontranspose(tensors) is tensors["out"]
+        torch.cuda.synchronize()
+        assert torch.equal(tensors["out"], direct["out"])
+        assert torch.equal(tensors["state"], direct["state"])
+    assert calls == [(route.variant_name, batch_size, _SCALE)]
+    device_index = tensors["q"].get_device()
+    assert launches == {
+        (device_index, batch_size, 16, 16, 32, _SCALE, True): (
+            entry,
+            batch_size * 32 * blocks_per_state,
+        )
+    }
+    _run_nontranspose(tensors, scale=1.0)
+    _run_nontranspose(tensors, scale=1.0)
+    smaller = _make_inputs(batch_size - 1)
+    _run_nontranspose(smaller)
+    _run_nontranspose(smaller)
+    torch.cuda.synchronize()
+    assert [call[1:] for call in calls] == [
+        (batch_size, _SCALE),
+        (batch_size, 1.0),
+        (batch_size - 1, _SCALE),
+    ]
+    assert len(launches) == 3
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", refusing_spy)
+    for _ in range(2):
+        with pytest.raises(cake_gdn.CakeGDNUnsupportedError):
+            _run_nontranspose(tensors, scale=0.5)
+    assert calls[3:] == [("refused", batch_size, 0.5)] * 2
+    assert len(launches) == 3
+
+
+def _non_contiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
+    wide = torch.zeros(
+        *tensor.shape[:-1],
+        2 * tensor.shape[-1],
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    view = wide[..., ::2]
+    view.copy_(tensor)
+    assert view.shape == tensor.shape and not view.is_contiguous()
+    return view
+
+
+@pytest.mark.parametrize("name", _NONTRANSPOSE_ARGS)
+def test_nontranspose_decode_refuses_each_malformed_tensor_before_launch(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each tensor of an exact row, on the CPU, of another dtype, twice as wide or
+    # non-contiguous, is refused before any launch with the error and message of its
+    # check (device, then dtype, then exact contiguous shape); no launch is stored and
+    # the state and output are untouched.  The exact row then runs.
+    batch_size = 10
+    launches: dict = {}
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", launches)
+    tensors = _make_inputs(batch_size)
+    tensors["out"].fill_(3.0)
+    state_before = tensors["state"].clone()
+    out_before = tensors["out"].clone()
+    original = tensors[name]
+    other_dtype = {torch.bfloat16: torch.float16, torch.float32: torch.float64}[
+        original.dtype
+    ]
+    cases = (
+        (original.cpu(), "requires one CUDA device"),
+        (original.to(other_dtype), "requires BF16 I/O/gates and FP32 state/decay"),
+        (
+            torch.cat([original, original], dim=-1),
+            "requires exact contiguous T=1 tensors",
+        ),
+        (_non_contiguous_copy(original), "requires exact contiguous T=1 tensors"),
+    )
+    for bad, message in cases:
+        with pytest.raises(cake_gdn.CakeGDNUnsupportedError) as error:
+            _run_nontranspose({**tensors, name: bad})
+        assert str(error.value) == "GDN non-CP nontranspose decode " + message
+        torch.cuda.synchronize()
+        assert launches == {}
+        assert torch.equal(tensors["state"], state_before)
+        assert torch.equal(tensors["out"], out_before)
+    _run_nontranspose(tensors)
+    torch.cuda.synchronize()
+    assert len(launches) == 1
+    expected_out, expected_state = _reference(tensors, state_before)
     torch.testing.assert_close(
         tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
     )
@@ -1535,7 +1917,7 @@ def test_public_cake_gdn_fp32_mtp_verify_is_cuda_graph_safe():
     )
 
 
-@pytest.mark.parametrize("batch_size", (1, 32))
+@pytest.mark.parametrize("batch_size", (1, 24, 32))
 def test_public_cake_gdn_fp32_nontranspose_t1_matches_independent_recurrence_on_stream(
     batch_size,
 ):
@@ -1664,6 +2046,403 @@ def test_public_cake_gdn_decode_rejects_mismatched_cuda_device_before_launch(
         _call_public_fp32_t1_validation(tensors)
 
 
+# (state dtype, B, T, H, HV, disable_state_update, checkpoint steps)
+_PRETRANSPOSE_ALIGNMENT_ROWS = [
+    # BF16 T=1: vec8 t16 / vec8occ t64 / wide128 (vec8occ t16 / vec8 t32 / vec8occ t32
+    # on sm_107a; vec8r56 t16 on sm_103a).
+    ("bf16", 4, 1, 16, 32, False, 0),
+    ("bf16", 16, 1, 16, 32, False, 0),
+    ("bf16", 32, 1, 16, 32, False, 0),
+    # BF16 verify on the tile16 body, BF16 checkpoint on the wide body.
+    ("bf16", 4, 4, 4, 8, True, 4),
+    ("bf16", 8, 4, 16, 64, False, 5),
+    # FP32 T=1: splitv8 (splitv8 / reg_ost / tilev32 / tilev32_ord_outlate_ld_grp on
+    # sm_107a).
+    ("fp32", 1, 1, 16, 32, False, 0),
+    ("fp32", 4, 1, 16, 32, False, 0),
+    ("fp32", 16, 1, 16, 32, False, 0),
+    ("fp32", 64, 1, 16, 32, False, 0),
+    # FP32 MTP verify and update rows.
+    ("fp32", 1, 2, 16, 32, True, 2),
+    ("fp32", 4, 4, 16, 32, False, 4),
+    ("fp32", 16, 4, 16, 32, False, 4),
+]
+# The FlashInfer kernels the public pretranspose decode can fall back to.
+_PRETRANSPOSE_FALLBACKS = (
+    "_gated_delta_rule_bf16_state",
+    "_gated_delta_rule_bf16_state_mtp",
+    "_gated_delta_rule_t1_rubin",
+    "gated_delta_rule_mtp",
+    "run_pretranspose_decode",
+)
+
+
+def _pretranspose_alignment_route(
+    state_dtype, batch_size, seq_len, num_q_heads, num_v_heads, disable, cache_steps
+):
+    # BF16 and FP32 MTP rows take fused-QKV views; FP32 T=1 rows contiguous tensors.
+    try:
+        return cake_gdn.select_cake_gdn_decode_variant(
+            arch=_arch(),
+            batch_size=batch_size,
+            io_dtype="bfloat16",
+            state_dtype="bfloat16" if state_dtype == "bf16" else "float32",
+            head_size=_HEAD_SIZE,
+            layout="pretranspose",
+            num_k_heads=num_q_heads,
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            scale=_SCALE,
+            seq_len=seq_len,
+            use_qk_l2norm=True,
+            strided_inputs=state_dtype == "bf16" or seq_len > 1,
+            disable_state_update=disable,
+            cache_intermediate_states=cache_steps > 0,
+            cache_steps=cache_steps,
+        )
+    except cake_gdn.CakeGDNUnsupportedError as error:
+        pytest.skip(f"no Cake pretranspose route for this row: {error}")
+
+
+def _make_pretranspose_alignment_inputs(
+    state_dtype, batch_size, seq_len, num_q_heads, num_v_heads, cache_steps
+) -> dict:
+    if state_dtype == "bf16":
+        return _make_bf16_serving_inputs(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_q_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            strided_inputs=True,
+            cache_steps=cache_steps,
+        )
+    tensors = _make_fp32_mtp_inputs(batch_size=batch_size, seq_len=seq_len)
+    if seq_len == 1:
+        for name in ("q", "k", "v", "a", "b", "state"):
+            tensors[name] = tensors[name].contiguous()
+        tensors["intermediate_state"] = None
+    return tensors
+
+
+def _call_public_pretranspose(
+    tensors: dict, *, backend: str, disable_state_update: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return public_pretranspose_decode(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        state=None,
+        A_log=tensors["A_log"],
+        a=tensors["a"],
+        dt_bias=tensors["dt_bias"],
+        b=tensors["b"],
+        output=tensors["out"],
+        use_qk_l2norm=True,
+        initial_state=tensors["state"],
+        initial_state_indices=tensors["initial_state_indices"],
+        output_state_indices=tensors["output_state_indices"],
+        intermediate_states_buffer=tensors["intermediate_state"],
+        disable_state_update=disable_state_update,
+        backend=backend,
+    )
+
+
+def _misaligned_copy(tensor: torch.Tensor, offset_bytes: int) -> torch.Tensor:
+    # A contiguous copy of ``tensor`` whose base is ``offset_bytes`` past a 16-byte
+    # aligned address.
+    offset = offset_bytes // tensor.element_size()
+    numel = tensor.numel()
+    flat = torch.empty(numel + offset, device=tensor.device, dtype=tensor.dtype)
+    view = flat[offset : offset + numel].view_as(tensor)
+    view.copy_(tensor)
+    assert view.is_contiguous() and view.data_ptr() % 16 == offset_bytes
+    return view
+
+
+@pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
+@pytest.mark.parametrize(
+    "state_dtype,batch_size,seq_len,num_q_heads,num_v_heads,disable_state_update,cache_steps",
+    _PRETRANSPOSE_ALIGNMENT_ROWS,
+)
+def test_public_pretranspose_decode_refuses_misaligned_views_before_launch(
+    state_dtype,
+    batch_size,
+    seq_len,
+    num_q_heads,
+    num_v_heads,
+    disable_state_update,
+    cache_steps,
+    backend,
+    monkeypatch,
+):
+    # Contiguous views at an unaligned storage offset: the Cake pretranspose kernels
+    # read q and k in up to 16-byte vectors (8-byte with an FP32 state), v and the
+    # output in 8-byte vectors and move the state and the checkpoint in up to 16-byte
+    # copies, so such a view would fault asynchronously.  Through the public API it is
+    # refused before the row resolves, under backend="auto" as under "cake_gdn" (no
+    # fallback either), with the state, the output and the checkpoint untouched; the
+    # same call on the aligned tensors then runs the row's record and matches the
+    # reference recurrence.
+    route = _pretranspose_alignment_route(
+        state_dtype,
+        batch_size,
+        seq_len,
+        num_q_heads,
+        num_v_heads,
+        disable_state_update,
+        cache_steps,
+    )
+    tensors = _make_pretranspose_alignment_inputs(
+        state_dtype, batch_size, seq_len, num_q_heads, num_v_heads, cache_steps
+    )
+    if state_dtype == "bf16":
+        expected = _bf16_serving_reference(tensors)
+    else:
+        expected = _fp32_mtp_reference(tensors)
+    written = [
+        name
+        for name in ("state", "out", "intermediate_state")
+        if tensors[name] is not None
+    ]
+    before = {name: tensors[name].clone() for name in written}
+    backing_before = tensors["state_backing"].clone() if seq_len > 1 else None
+    selected: list[str] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        selected.append(chosen.variant_name)
+        return chosen
+
+    def fell_back(*args, **kwargs):
+        raise AssertionError("fell back to a FlashInfer kernel")
+
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
+    for name in _PRETRANSPOSE_FALLBACKS:
+        monkeypatch.setattr(gdn_decode, name, fell_back)
+
+    cases = [
+        ("q", 8 if state_dtype == "bf16" else 4),
+        ("k", 2),
+        ("v", 4),
+        ("out", 2),
+        ("state", 8),
+    ]
+    if cache_steps:
+        cases.append(("intermediate_state", 8))
+    for name, offset in cases:
+        misaligned = _misaligned_copy(tensors[name], offset)
+        with pytest.raises(ValueError, match="aligned"):
+            _call_public_pretranspose(
+                {**tensors, name: misaligned},
+                backend=backend,
+                disable_state_update=disable_state_update,
+            )
+        torch.cuda.synchronize()
+        for written_name in written:
+            assert torch.equal(tensors[written_name], before[written_name])
+        if name in before:
+            assert torch.equal(misaligned, before[name])
+    assert selected == []
+
+    returned_out, returned_state = _call_public_pretranspose(
+        tensors, backend=backend, disable_state_update=disable_state_update
+    )
+    torch.cuda.synchronize()
+    assert selected == [route.variant_name]
+    assert returned_out is tensors["out"]
+    assert returned_state is tensors["state"]
+    out, state, cache = tensors["out"], tensors["state"], tensors["intermediate_state"]
+    if state_dtype == "bf16":
+        expected_out, expected_cache, expected_final = expected
+        torch.testing.assert_close(
+            out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        if cache_steps:
+            torch.testing.assert_close(
+                cache[:, :seq_len].float(), expected_cache.float(), atol=1e-2, rtol=1e-2
+            )
+            assert torch.equal(tensors["state_backing"], backing_before)
+        else:
+            write_indices = tensors["output_state_indices"].long()
+            torch.testing.assert_close(
+                state.index_select(0, write_indices).float(),
+                expected_final.float(),
+                atol=1e-2,
+                rtol=1e-2,
+            )
+    elif seq_len == 1:
+        expected_out, _, expected_final = expected
+        active = torch.where(tensors["initial_state_indices"] >= 0)[0]
+        torch.testing.assert_close(
+            out.index_select(0, active).float(),
+            expected_out.index_select(0, active).float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        write_indices = tensors["output_state_indices"].index_select(0, active).long()
+        torch.testing.assert_close(
+            state.index_select(0, write_indices),
+            expected_final.index_select(0, active),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+    else:
+        _assert_fp32_mtp_result(
+            tensors,
+            expected,
+            disable_state_update=disable_state_update,
+            backing_before=backing_before,
+        )
+
+
+# One view per case whose strides break the Cake kernels' vector alignment:
+# (state dtype, B, T, H, HV, disable_state_update, checkpoint steps, tensor, padded
+# dimension).  The stride of the padded dimension sits half a vector past a whole
+# number of vectors: q and k rows 132 elements (264 bytes) apart with a BF16 state, v
+# rows and FP32-state q and k rows 130 elements (260 bytes) apart, and pool slots or
+# FP32 heads 8 bytes past a whole number of 16-byte vectors.  Under backend="auto" the
+# cases reach each FlashInfer kernel such a view can fall back to: the BF16 T=1 kernels
+# (from B * HV = 512 the wide one; on sm_107a the Rubin kernel for the v view and the
+# wide one for the pool, whose slot stride the Rubin kernel cannot be built for), the
+# BF16 MTP kernels and the FP32 MTP kernel.
+_STRIDE_FALLBACK_CASES = {
+    "bf16_t1_q": ("bf16", 4, 1, 16, 32, False, 0, "q", 2),
+    "bf16_t1_k": ("bf16", 4, 1, 16, 32, False, 0, "k", 2),
+    "bf16_t1_v": ("bf16", 4, 1, 16, 32, False, 0, "v", 2),
+    "bf16_t1_state": ("bf16", 4, 1, 16, 32, False, 0, "state", 0),
+    "bf16_t1_wide_v": ("bf16", 16, 1, 16, 32, False, 0, "v", 2),
+    "bf16_t1_wide_state": ("bf16", 16, 1, 16, 32, False, 0, "state", 0),
+    "bf16_verify_v": ("bf16", 4, 4, 4, 8, True, 4, "v", 2),
+    "bf16_checkpoint_q": ("bf16", 8, 4, 16, 64, False, 5, "q", 2),
+    "bf16_checkpoint_k": ("bf16", 8, 4, 16, 64, False, 5, "k", 2),
+    "bf16_checkpoint_state": ("bf16", 8, 4, 16, 64, False, 5, "state", 0),
+    "fp32_mtp_q": ("fp32", 4, 4, 16, 32, False, 4, "q", 2),
+    "fp32_mtp_k": ("fp32", 4, 4, 16, 32, False, 4, "k", 2),
+    "fp32_mtp_v": ("fp32", 4, 4, 16, 32, False, 4, "v", 2),
+    "fp32_mtp_state_head": ("fp32", 4, 4, 16, 32, False, 4, "state", 1),
+    "fp32_mtp_state_slot": ("fp32", 4, 4, 16, 32, False, 4, "state", 0),
+}
+_STRIDE_FALLBACK_OK = "cake-gdn-stride-fallback: bitwise equal"
+
+
+def _alignment_breaking_copy(
+    tensor: torch.Tensor, name: str, state_dtype: str, padded_dim: int
+) -> torch.Tensor:
+    # A copy of ``tensor`` whose stride of ``padded_dim`` is half a vector longer than
+    # packed: the vectors of q and k are 16 bytes with a BF16 state (8 with an FP32
+    # state), those of v 8 bytes and those of the state 16 bytes.
+    align = 16 if name == "state" or (state_dtype == "bf16" and name != "v") else 8
+    packed = tensor.shape[padded_dim + 1 :].numel()
+    backing = torch.empty(
+        *tensor.shape[: padded_dim + 1],
+        packed + align // 2 // tensor.element_size(),
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    view = backing[..., :packed].view(tensor.shape)
+    view.copy_(tensor)
+    assert not gdn_decode._cake_gdn_strides_keep_alignment(view, align)
+    return view
+
+
+def _same_layout_copy(tensor: torch.Tensor) -> torch.Tensor:
+    copy = torch.empty_strided(
+        tensor.shape, tensor.stride(), device=tensor.device, dtype=tensor.dtype
+    )
+    copy.copy_(tensor)
+    return copy
+
+
+def _run_pretranspose_stride_fallback_child(case_name: str) -> None:
+    (
+        state_dtype,
+        batch_size,
+        seq_len,
+        num_q_heads,
+        num_v_heads,
+        disable_state_update,
+        cache_steps,
+        name,
+        padded_dim,
+    ) = _STRIDE_FALLBACK_CASES[case_name]
+    tensors = _make_pretranspose_alignment_inputs(
+        state_dtype, batch_size, seq_len, num_q_heads, num_v_heads, cache_steps
+    )
+    if state_dtype == "fp32":
+        # A packed pool and distinct live slots: the case's view is the only layout
+        # that differs from a plain call, and the comparison covers every batch row.
+        tensors["state"] = tensors["state"].contiguous()
+        device = tensors["q"].device
+        tensors["initial_state_indices"] = torch.arange(
+            1, 2 * batch_size, 2, device=device, dtype=torch.int32
+        )
+        tensors["output_state_indices"] = tensors["initial_state_indices"] + 1
+    view = _alignment_breaking_copy(tensors[name], name, state_dtype, padded_dim)
+    selected: list[str] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        selected.append(chosen.variant_name)
+        return chosen
+
+    cake_gdn.select_cake_gdn_decode_variant = spy
+
+    def run(backend: str, target: torch.Tensor) -> dict:
+        # Fresh copies of the written tensors, in the layout of the call's tensors.
+        values = {**tensors, name: target}
+        for written in ("out", "state", "intermediate_state"):
+            if values[written] is not None:
+                values[written] = _same_layout_copy(values[written])
+        values["out"], _ = _call_public_pretranspose(
+            values, backend=backend, disable_state_update=disable_state_update
+        )
+        torch.cuda.synchronize()
+        return values
+
+    try:
+        run("cake_gdn", view)
+    except cake_gdn.CakeGDNUnsupportedError as error:
+        assert "keep their vector alignment" in str(error), error
+    else:
+        raise AssertionError("backend='cake_gdn' served an alignment-breaking view")
+    strided = run("auto", view)
+    assert selected == [], selected
+    contiguous = run("flashinfer", view.contiguous())
+    for written in ("out", "state", "intermediate_state"):
+        if strided[written] is not None:
+            assert torch.equal(strided[written], contiguous[written]), written
+    print(_STRIDE_FALLBACK_OK)
+
+
+@pytest.mark.parametrize("case_name", tuple(_STRIDE_FALLBACK_CASES))
+def test_public_pretranspose_decode_falls_back_on_alignment_breaking_strides(
+    case_name,
+):
+    # A q, k, v or state view whose strides break the Cake kernels' vector alignment is
+    # refused by backend="cake_gdn" before the row resolves; backend="auto" runs a
+    # FlashInfer kernel on it, with the bits backend="flashinfer" gives on a contiguous
+    # copy of the view (on sm_107a from B * HV = 512 "auto" runs the Rubin kernel, which
+    # is bitwise equal to the generic one, unless a pool stride is not a multiple of 8
+    # elements).  In a child process: a misaligned access would poison this one.
+    _pretranspose_alignment_route(*_STRIDE_FALLBACK_CASES[case_name][:7])
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--cake-gdn-stride-fallback",
+            case_name,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    combined = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined
+    assert _STRIDE_FALLBACK_OK in completed.stdout, combined
+
+
 def _run_public_decode_invalid_slot_child(case_name):
     if "fp32_" in case_name:
         tensors = _make_public_fp32_t1_validation_inputs()
@@ -1770,3 +2549,10 @@ if (
     and sys.argv[1] == "--cake-gdn-invalid-slot"
 ):
     _run_public_decode_invalid_slot_child(sys.argv[2])
+
+if (
+    __name__ == "__main__"
+    and len(sys.argv) == 3
+    and sys.argv[1] == "--cake-gdn-stride-fallback"
+):
+    _run_pretranspose_stride_fallback_child(sys.argv[2])

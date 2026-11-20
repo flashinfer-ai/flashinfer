@@ -84,6 +84,16 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
                                       cudaStream_t stream = 0, bool enable_pdl = false);
 
+// Copy the permuted rows written by invokeNvfp4QuantAndPerTokenScale back to expanded
+// (token * topK + slot) order with linear block scales. Expanded rows that map to no
+// permuted row (expanded_idx_to_permuted_idx < 0, e.g. a non-local expert) are zeroed.
+void invokeNvfp4PermutedRowsToExpanded(uint32_t m, uint32_t n,
+                                       int32_t const* expanded_idx_to_permuted_idx,
+                                       uint8_t const* weight, uint8_t const* scale,
+                                       float const* perTokenScale, QuantizationSFLayout sfLayout,
+                                       uint8_t* weightOut, uint8_t* scaleOut,
+                                       float* perTokenScaleOut, cudaStream_t stream = 0);
+
 template <typename T>
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, T const* SFIn,
                                 T* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
@@ -96,6 +106,16 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
                              int32_t* SFOutput, QuantizationSFLayout layout,
                              int multiProcessorCount, bool enable_pdl = false,
                              cudaStream_t stream = 0);
+
+// MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul (see
+// cvt_fp16_to_mxfp8_expert). n must be a positive multiple of 32 and padded_n a multiple of 128
+// that is at least n; input must be aligned to 16 * sizeof(T) bytes and output to 16 bytes.
+// numExperts * m must fit in int32 and numExperts be at most 12287.
+template <typename T>
+void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_n, T const* input,
+                                       int32_t const* mask, bool use_silu_and_mul, uint8_t* output,
+                                       uint32_t* SFOutput, int multiProcessorCount,
+                                       bool enable_pdl = false, cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm

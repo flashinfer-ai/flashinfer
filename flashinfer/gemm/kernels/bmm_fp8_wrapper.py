@@ -133,7 +133,7 @@ def _create_fake_tensors(
     handle any M, N, K values at runtime. This is important for LLM inference where
     M (sequence length) varies per request and avoids recompilation when N or K change.
 
-    :return: Tuple of (a_fake, b_fake, c_fake, scale_fake, stream_fake)
+    :return: Tuple of (a_fake, b_fake, c_fake, a_scale_fake, b_scale_fake, stream_fake)
     """
     a_stride_order = _get_stride_order(a_major, "a")
     b_stride_order = _get_stride_order(b_major, "b")
@@ -164,8 +164,13 @@ def _create_fake_tensors(
         assumed_align=16,
     )
 
-    # Create fake scale tensor for CUDA graph compatibility
-    scale_fake = cute.runtime.make_fake_compact_tensor(
+    # One fake tensor per input scale; the kernel multiplies them on device.
+    a_scale_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (1,),
+        assumed_align=4,
+    )
+    b_scale_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (1,),
         assumed_align=4,
@@ -174,7 +179,7 @@ def _create_fake_tensors(
     # Create fake stream that uses environment stream at runtime
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    return a_fake, b_fake, c_fake, scale_fake, stream_fake
+    return a_fake, b_fake, c_fake, a_scale_fake, b_scale_fake, stream_fake
 
 
 def _compile_and_create_tensor_api(
@@ -182,14 +187,15 @@ def _compile_and_create_tensor_api(
     a_fake,
     b_fake,
     c_fake,
-    scale_fake,
+    a_scale_fake,
+    b_scale_fake,
     stream_fake,
     cluster_shape_mn: Tuple[int, int],
 ) -> Callable:
     """Compile a GEMM kernel and return a tensor API closure.
 
     :param gemm_kernel: The GEMM kernel instance (SM107PersistentDenseGemmKernel)
-    :param a_fake, b_fake, c_fake, scale_fake, stream_fake: Fake tensors for compilation
+    :param a_fake, b_fake, c_fake, a_scale_fake, b_scale_fake, stream_fake: Fake tensors for compilation
     :param cluster_shape_mn: Cluster shape for computing max active clusters
     :return: A closure that accepts torch tensors directly via TVM-FFI
     """
@@ -205,7 +211,8 @@ def _compile_and_create_tensor_api(
         c_fake,
         max_active_clusters,
         stream_fake,
-        scale_fake,
+        a_scale_fake,
+        b_scale_fake,
         lambda x: x,  # identity epilogue
         options="--enable-tvm-ffi",
     )
@@ -215,11 +222,12 @@ def _compile_and_create_tensor_api(
         a_tensor: torch.Tensor,
         b_tensor: torch.Tensor,
         c_tensor: torch.Tensor,
-        output_scale_tensor: torch.Tensor,
+        a_scale_tensor: torch.Tensor,
+        b_scale_tensor: torch.Tensor,
     ) -> None:
         """Runtime API that passes torch tensors directly via TVM-FFI.
 
-        The output_scale_tensor is a 1-element Float32 tensor on GPU, avoiding
+        The scale tensors are 1-element Float32 tensors on GPU, avoiding
         host-device synchronization that would break CUDA graph capture.
         """
         # TVM-FFI handles FP8 dtype conversion internally
@@ -228,7 +236,8 @@ def _compile_and_create_tensor_api(
             a_tensor,
             b_tensor,
             c_tensor,
-            output_scale_tensor,
+            a_scale_tensor,
+            b_scale_tensor,
         )
 
     return tensor_api
@@ -256,8 +265,8 @@ def _get_compiled_bmm_sm107(
     Returns a closure that accepts torch tensors directly without
     per-call tensor wrapping overhead.
     """
-    a_fake, b_fake, c_fake, scale_fake, stream_fake = _create_fake_tensors(
-        ab_dtype, c_dtype, a_major, b_major, c_major
+    a_fake, b_fake, c_fake, a_scale_fake, b_scale_fake, stream_fake = (
+        _create_fake_tensors(ab_dtype, c_dtype, a_major, b_major, c_major)
     )
 
     gemm = _sm107_gemm_kernel_cls()(
@@ -272,7 +281,14 @@ def _get_compiled_bmm_sm107(
     )
 
     return _compile_and_create_tensor_api(
-        gemm, a_fake, b_fake, c_fake, scale_fake, stream_fake, cluster_shape_mn
+        gemm,
+        a_fake,
+        b_fake,
+        c_fake,
+        a_scale_fake,
+        b_scale_fake,
+        stream_fake,
+        cluster_shape_mn,
     )
 
 
@@ -298,13 +314,14 @@ def _compile_and_run_bmm_sm107(
     use_tma_store: bool,
     swizzle_size: int,
     raster_along: Literal["m", "n"],
-    output_scale_tensor: torch.Tensor,
+    a_scale_tensor: torch.Tensor,
+    b_scale_tensor: torch.Tensor,
 ):
     """Compile (if needed) and run the BMM kernel for SM107.
 
-    :param output_scale_tensor: 1-element Float32 tensor on GPU containing the scale.
-                                For FP8 GEMM, this is typically a_scale * b_scale.
-                                Using a tensor avoids host-device sync for CUDA graph compatibility.
+    :param a_scale_tensor: 1-element Float32 tensor on GPU; the kernel multiplies it with
+                           b_scale_tensor in its epilogue, so no host-side product is needed.
+    :param b_scale_tensor: 1-element Float32 tensor on GPU.
     """
     batch, m, k = a_tensor.shape
 
@@ -330,7 +347,7 @@ def _compile_and_run_bmm_sm107(
 
     # Run kernel - tensors passed directly via TVM-FFI
     # Actual M, N, K dimensions are determined at runtime from tensor shapes
-    tensor_api(a_tensor, b_tensor, c_tensor, output_scale_tensor)
+    tensor_api(a_tensor, b_tensor, c_tensor, a_scale_tensor, b_scale_tensor)
 
 
 def _detect_major_dim(tensor: torch.Tensor, dim_names: Tuple[str, str]) -> str:
@@ -495,6 +512,13 @@ _DEFAULT_SM107_CONFIG = (
 )  # Same as SM107_AUTOTUNE_CONFIGS[0]
 
 
+def _as_fp32_scalar_tensor(scale: torch.Tensor) -> torch.Tensor:
+    """Return ``scale`` as a 1-element fp32 view; casts only when the dtype differs."""
+    if scale.dtype == torch.float32 and scale.numel() == 1:
+        return scale.reshape(1)
+    return scale.float().reshape(1)
+
+
 def bmm_fp8_cute_dsl(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -561,8 +585,9 @@ def bmm_fp8_cute_dsl(
     b_major = _detect_major_dim(b, ("k", "n"))
     c_major = "n"
 
-    # Compute combined scale as a tensor to fuse into the kernel epilogue
-    combined_scale_tensor = (a_scale * b_scale).float().view(1)
+    # The kernel forms a_scale * b_scale itself; only reshape here (no extra launch).
+    a_scale_tensor = _as_fp32_scalar_tensor(a_scale)
+    b_scale_tensor = _as_fp32_scalar_tensor(b_scale)
 
     if arch == "sm107":
         # Get SM107 config - use specified index or default
@@ -597,7 +622,8 @@ def bmm_fp8_cute_dsl(
             use_tma_store=use_tma_store,
             swizzle_size=swizzle_size,
             raster_along=raster_along,
-            output_scale_tensor=combined_scale_tensor,
+            a_scale_tensor=a_scale_tensor,
+            b_scale_tensor=b_scale_tensor,
         )
     return out
 

@@ -30,12 +30,42 @@ from .trace.templates.sampling import (
 )
 from .utils import (
     _get_cache_buf,
+    _get_stream_cache_buf,
     check_shape_dtype_device,
     get_compute_capability,
     get_shared_bytes_per_block_optin,
     register_custom_op,
     register_fake_op,
 )
+
+# RadixRowState's global histograms and inter-CTA counters require 1 MiB.
+_ROW_STATES_NBYTES = 1024 * 1024
+
+
+def _get_row_states_buffer(
+    name: str, device: torch.device, num_bytes: int = _ROW_STATES_NBYTES
+) -> torch.Tensor:
+    """Return zeroed ``row_states`` scratch for one multi-CTA radix top-k launch.
+
+    The multi-CTA radix kernels (``RadixTopKKernel_Unified`` and the mask-logits
+    and renorm-probs kernels in ``include/flashinfer/topk.cuh``, and the CuTe-DSL
+    varlen kernel in ``topk_varlen/kernels/radix_topk.py``) need zeroed
+    histograms and arrival counters when they start. Their last CTA zeroes those
+    again before it exits, every other field is re-initialised per row before
+    use, and the single-CTA regime never touches the buffer. A buffer zeroed
+    once therefore stays valid for every later launch that is ordered after the
+    previous one; only launches that may overlap need separate buffers
+    (flashinfer-ai/flashinfer#3618).
+
+    Outside CUDA graph capture, launches on one stream are ordered, so this
+    returns the current stream's cached buffer, zeroed when it was allocated.
+    Under capture the replay stream is unknown and two graphs may replay
+    concurrently, so each captured call gets its own allocation from the graph's
+    private pool, whose captured memset re-zeroes it on every replay.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+    return _get_stream_cache_buf(name, num_bytes, device, zero_init=True)
 
 
 class TopKTieBreak(IntEnum):
@@ -1029,15 +1059,7 @@ def top_k(
             return sorted_values, sorted_indices
         return output_values, indices
 
-    # Allocate row_states buffer for multi-CTA path
-    # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
-    # mode and ~300 groups for non-deterministic mode)
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{input.device}",
-        1024 * 1024,  # 1MB
-        input.device,
-        zero_init=True,
-    )
+    row_states_buffer = _get_row_states_buffer("radix_topk_row_states", input.device)
 
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
@@ -1295,13 +1317,7 @@ def top_k_page_table_transform(
     if clusters_eligible:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
-    )
+    row_states_buffer = _get_row_states_buffer("radix_topk_row_states", device)
 
     if out is None:
         out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
@@ -1471,13 +1487,7 @@ def top_k_ragged_transform(
     if clusters_eligible:
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
-    )
+    row_states_buffer = _get_row_states_buffer("radix_topk_row_states", device)
 
     # Allocate output
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)

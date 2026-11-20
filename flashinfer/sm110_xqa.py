@@ -30,14 +30,17 @@ def prepare(
     v_scale: float = 1.0,
     workspace: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     partition_tokens: Optional[int] = None,
-    kernel: str = "tcgen05",
+    kernel: str = "auto",
 ) -> Any:
     """Prepare exact-SM110a attention and return a backend PreparedAttention.
 
     D128 supports one FP16 decode query with contiguous KV. D512 supports
     uniform or packed tree queries with FP16/E4M3 contiguous or page128 KV and
-    two physical kernel families: ``kernel="tcgen05"`` (default) or
-    ``kernel="register_mma"`` (warp-level MMA path).
+    two tcgen05 schedules: ``kernel="auto"`` (default) picks ``"pair"`` for
+    E4M3 KV with an even number of 128-row Q tiles per KV head and ``"tmem"``
+    otherwise; both names also select their schedule explicitly. The retired
+    ``tcgen05`` and ``register_mma*`` tree names raise ``ValueError``. D128
+    decode takes ``kernel="auto"`` or its previous name ``"tcgen05"``.
     Preparation validates metadata, compiles and may allocate output/workspace;
     call it before timing or graph capture. The returned plan's ``run()`` uses
     the caller's current CUDA stream. See the SM110 XQA backend README for the

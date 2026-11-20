@@ -90,6 +90,14 @@ recapture.
 
 .. currentmodule:: flashinfer.decode
 
+.. note::
+
+   Compatibility: CUDA-core decode now raises ``ValueError`` for
+   ``disable_split_kv=True`` in ``plan()``, ``fast_decode_plan()``, and
+   ``workspace_size()``. Previously this flag was silently ignored on that
+   path. To disable split-KV, select ``backend="fa2", use_tensor_cores=True``.
+   Leave the flag at ``False`` to retain CUDA-core decode.
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, forward, forward_return_lse
@@ -195,6 +203,10 @@ single kernel launch.
 
     .. automethod:: __init__
 
+.. autoclass:: BatchDecodeWithAttentionSinkWrapper
+
+    .. automethod:: __init__
+
 
 SM120 NVFP4 Attention
 ---------------------
@@ -216,6 +228,12 @@ MLA (Multi-head Latent Attention) is an attention mechanism proposed in DeepSeek
 and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
 .. currentmodule:: flashinfer.mla
+
+Sliding-window MLA (SM90)
+-------------------------
+
+.. autofunction:: batch_decode_with_kv_cache_mla_swa
+.. autofunction:: get_mla_swa_workspace_size_bytes
 
 PageAttention for MLA
 ---------------------
@@ -250,10 +268,30 @@ PageAttention for MLA
 
 .. note::
 
-    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), one
-    query token runs the Cake split decode kernel and several tokens run the
-    decode or the single-launch prefill kernel as chosen by
-    ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` (DeepSeek-V4 sparse MLA
+    Experimental ``SparseMLASm120Wrapper.run_mega`` for FP8 caches with ``backend="sparse"``
+    fuses query RoPE, sparse attention, inverse output RoPE, and per-32-value
+    FP8 E4M3 output quantization. Inputs are BF16 ``q[T,H,512]``, int32
+    ``positions[T]``, and FP32 ``cos_sin[num_positions,64]``. Output buffers
+    are float8_e4m3fn ``output[T,H,512]`` and uint8 ``output_scales[T,H,16]``
+    (UE8M0). Positions, the RoPE table, and output buffers must be contiguous.
+
+    RoPE rotates adjacent pairs in the final 64 features. Each RoPE table
+    row contains 32 cosines followed by 32 sines. Q uses forward rotation;
+    output uses inverse rotation at the same query position. This follows
+    FlashMLA's
+    `RoPE parameters <https://github.com/deepseek-ai/FlashMLA/blob/395cb3afbb331fef7b1b21e9340861b9436b42d8/csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h#L27-L31>`_.
+    Positions must be in bounds and input/output storage must not overlap.
+    Q normalization and sparse-index construction are caller responsibilities.
+    Cached keys must already have RoPE applied. Output uses ``[T,H,512]``.
+    Warm up before CUDA graph capture. Other attention keywords follow
+    ``run`` semantics, including sparse lengths, the second cache and LSE.
+
+.. note::
+
+    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every
+    call runs the Cake split decode kernel or the single-launch prefill kernel
+    as chosen by ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` from the
+    token, head and candidate counts and the SM count (DeepSeek-V4 sparse MLA
     SM120 tracker: flashinfer#4254).
 
 .. note::

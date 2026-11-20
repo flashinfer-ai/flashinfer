@@ -38,10 +38,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define THREADS 1
 
 #include <math_constants.h>
-
 extern "C" {
 
-__global__ __launch_bounds__(1) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_barrier(unsigned int* __restrict__ local_counter, unsigned int* __restrict__ target_counter, unsigned long long multicast_address, unsigned int ep_size)
 {
     const int tid = threadIdx.x;
@@ -54,18 +53,18 @@ kernel_cake_mok_barrier(unsigned int* __restrict__ local_counter, unsigned int* 
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
-    unsigned int _atomic_old_0 = atomicAdd(target_counter, ep_size);
-    unsigned int target = _atomic_old_0 + ep_size;
+    // === Task calls (declaration order) ===
+    unsigned int _atomic_fetch_add_0 = atomicAdd(target_counter, ep_size);
+    unsigned int target = _atomic_fetch_add_0 + ep_size;
     asm volatile("multimem.red.release.sys.global.add.s32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(multicast_address)), "r"((int)(1)) : "memory");
     asm volatile("fence.proxy.alias;" ::: "memory");
-    uint32_t _relaxed_ld_0;
-    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_relaxed_ld_0) : "l"(local_counter) : "memory");
-    unsigned int value = _relaxed_ld_0;
-    while (value < target) {
-        uint32_t _relaxed_ld_1;
-        asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_relaxed_ld_1) : "l"(local_counter) : "memory");
-        value = _relaxed_ld_1;
+    unsigned int _poll_0_first;
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_poll_0_first) : "l"(local_counter) : "memory");
+    unsigned int _poll_0 = _poll_0_first;
+    while (_poll_0 < target) {
+        unsigned int _poll_0_next;
+        asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_poll_0_next) : "l"(local_counter) : "memory");
+        _poll_0 = _poll_0_next;
     }
     asm volatile("fence.acquire.sys;" ::: "memory");
 }

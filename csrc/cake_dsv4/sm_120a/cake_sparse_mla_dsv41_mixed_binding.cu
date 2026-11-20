@@ -66,43 +66,7 @@ constexpr MergeBody kMergeBodies[kNumMergeBodies] = {
     CAKE_SM120_DSV41_MIXED_FOR_EACH_MERGE_BODY(CAKE_SM120_DSV41_MIXED_MERGE_BODY)};
 #undef CAKE_SM120_DSV41_MIXED_MERGE_BODY
 
-void CheckDevice(const TensorView& tensor, const char* name, DLDevice device, int64_t alignment) {
-  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
-  TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
-      << name << " must be on the same CUDA device as q";
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, ValueError)
-      << name << " must be " << alignment << "-byte aligned";
-}
-
-void CheckDtype(const TensorView& tensor, const char* name, DLDataType dtype, const char* dtype_name) {
-  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dtype), ValueError)
-      << name << " must be " << dtype_name;
-}
-
-void CheckRows(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, int64_t dim, DLDevice device) {
-  CheckDevice(tensor, name, device, 16);
-  CheckDtype(tensor, name, dl_bfloat16, "bfloat16");
-  TVM_FFI_CHECK(tensor.ndim() == 3 && tensor.size(0) == tokens && tensor.size(1) == heads && tensor.size(2) == dim,
-                ValueError)
-      << name << " must have shape [" << tokens << ", " << heads << ", " << dim << "]";
-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
-}
-
-void CheckLse(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, DLDevice device) {
-  CheckDevice(tensor, name, device, 4);
-  CheckDtype(tensor, name, dl_float32, "float32");
-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) == heads, ValueError)
-      << name << " must have shape [" << tokens << ", " << heads << "]";
-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
-}
-
-void CheckIndices(const TensorView& tensor, const char* name, int64_t tokens, DLDevice device) {
-  CheckDevice(tensor, name, device, 4);
-  CheckDtype(tensor, name, dl_int32, "int32");
-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) >= 1, ValueError)
-      << name << " must have shape [" << tokens << ", topk] with topk >= 1";
-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
-}
+#include "cake_sparse_mla_sm120_host_checks.h"
 
 // The caches arrive as flat uint8 views over the pool's storage span (the Python wrapper flattens the
 // [pages, (1,) page_size, (1,) bytes] layouts and padded page strides); the page geometry is explicit.

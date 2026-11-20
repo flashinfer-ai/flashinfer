@@ -349,16 +349,23 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
               Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu,
-              Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
+              Optional<TensorView> workspace_buffer = Optional<TensorView>{},
+              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
         << "smart_router is supported in min_latency mode";
 
+    CHECK_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(token_selected_experts);
+    CHECK_CONTIGUOUS(fc1_expert_weights);
+    CHECK_CONTIGUOUS(fc2_expert_weights);
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
+      CHECK_CONTIGUOUS(token_final_scales.value());
       CHECK_INPUT_TYPE(token_final_scales.value(), dl_float32)
     }
     if (mWeightDtype == dl_uint4x2) {
@@ -377,6 +384,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_DIM(3, fc2_expert_weights);
 
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
+      CHECK_CONTIGUOUS(fc1_expert_biases.value());
+      CHECK_CONTIGUOUS(fc2_expert_biases.value());
       CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
       CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
 
@@ -460,7 +469,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             quant_scales, base_activation_type);
+                                             quant_scales, base_activation_type, nvfp4_4over6_code);
     kernels::MoeMinLatencyParams min_latency_params{};
 
     // TODO: support lora in the future
@@ -518,13 +527,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                          Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                          ActivationType base_activation_type = ActivationType::Swiglu,
-                         Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
+                         Optional<TensorView> workspace_buffer = Optional<TensorView>{},
+                         int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
+    CHECK_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(token_selected_experts);
+    CHECK_CONTIGUOUS(fc1_expert_weights);
+    CHECK_CONTIGUOUS(fc2_expert_weights);
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
+      CHECK_CONTIGUOUS(token_final_scales.value());
       CHECK_INPUT_TYPE(token_final_scales.value(), dl_float32)
     }
     if (mWeightDtype == dl_uint4x2) {
@@ -543,6 +559,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_DIM(3, fc2_expert_weights);
 
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
+      CHECK_CONTIGUOUS(fc1_expert_biases.value());
+      CHECK_CONTIGUOUS(fc2_expert_biases.value());
       CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
       CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
       CHECK_DIM(2, fc1_expert_biases.value());
@@ -633,7 +651,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             quant_scales, base_activation_type);
+                                             quant_scales, base_activation_type, nvfp4_4over6_code);
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -768,12 +786,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       mProfileWorkspace =
           alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8, input.device());
 
-      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()),
+      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.value().data_ptr()),
                          expert_weights_ptr, enable_pdl, stream);
     }
 
     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-    mProfiler->runProfiler(num_rows, profile, static_cast<char*>(mProfileWorkspace.data_ptr()),
+    mProfiler->runProfiler(num_rows, profile,
+                           static_cast<char*>(mProfileWorkspace.value().data_ptr()),
                            expert_weights_ptr, enable_pdl, stream);
   }
 
@@ -838,13 +857,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
+                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
+                 int64_t nvfp4_4over6_code) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, clamped_relu2_limit, situ_beta,
                    situ_linear_beta, swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank,
                    cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
+                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
+                   nvfp4_4over6_code);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -861,7 +882,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t ep_size, int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
                  bool enable_alltoall, bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
                  bool enable_pdl, int64_t base_activation_type,
-                 Optional<TensorView> workspace_buffer) {
+                 Optional<TensorView> workspace_buffer, int64_t nvfp4_4over6_code) {
             runMoeMinLantency(
                 output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                 fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
@@ -869,7 +890,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                 situ_linear_beta, swizzled_input_sf, num_active_experts_per_node,
                 experts_to_token_score, active_expert_global_ids, tp_size, tp_rank, ep_size,
                 ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
+                enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
+                nvfp4_4over6_code);
           });
     } else if (name == "get_workspace_size") {
       return Function::FromTyped([this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,
@@ -887,14 +909,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         return static_cast<int64_t>(common::calculateTotalWorkspaceSize(ws.data(), ws.size()));
       });
     } else {
-      return Function(nullptr);
+      return std::nullopt;
     }
   }
 
  private:
   struct WorkspaceInfo {
-    Tensor workspace{};     // owns allocation when caller does not provide a buffer
-    void* workspace_ptr{};  // raw pointer valid in both cases
+    Optional<Tensor> workspace;  // owns allocation when caller does not provide a buffer
+    void* workspace_ptr{};       // raw pointer valid in both cases
     void* src_to_dest_map{};
   };
 
@@ -907,7 +929,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   // number of elements packed into the inner dimension of a matrix
   // e.g. 16 nvfp4 elements are packed into a single int64 element
   int64_t mInnerDimMultiplier;
-  Tensor mProfileWorkspace;
+  Optional<Tensor> mProfileWorkspace;
 
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;
@@ -1161,7 +1183,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     } else {
       info.workspace =
           alloc_tensor({static_cast<int64_t>(total_workspace_size)}, dl_int8, expected_device);
-      info.workspace_ptr = info.workspace.data_ptr();
+      info.workspace_ptr = info.workspace.value().data_ptr();
     }
     info.src_to_dest_map =
         common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace_ptr), moe_workspace_size);
@@ -1172,7 +1194,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   kernels::QuantParams getQuantParams(
       int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
       Optional<Array<Tensor>> quant_scales,
-      ActivationType base_activation_type = ActivationType::Swiglu) const {
+      ActivationType base_activation_type = ActivationType::Swiglu,
+      int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) const {
     if (isWMxfp8AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
@@ -1539,7 +1562,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<float const*>(fc2_act_global.data_ptr()),
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
           static_cast<float const*>(fc2_global.data_ptr()), fc1_act_global.ndim() == 1,
-          fc2_act_global.ndim() == 1);
+          fc2_act_global.ndim() == 1, nvfp4_4over6_code);
     } else if (mUseDeepSeekFP8BlockScaling) {
       auto const& fc1_scales = quant_scales.value()[0];
       auto const& fc2_scales = quant_scales.value()[1];

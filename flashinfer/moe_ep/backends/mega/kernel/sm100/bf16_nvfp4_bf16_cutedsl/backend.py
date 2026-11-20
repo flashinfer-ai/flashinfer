@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
@@ -17,6 +17,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from ..common.bf16_staging import validate_bf16_forward_inputs
 from .config import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .weights import (
@@ -38,7 +39,7 @@ def _resolve_gate_up_clamp(config):
 
 
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
-class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_nvfp4_bf16_cutedsl"
@@ -46,9 +47,8 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
-        self.supports_unfinalized_output = not config.do_finalize
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
-        self._autotune_winner: dict | None = None
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_cutedsl_runtime_requirements(bootstrap)
@@ -58,9 +58,21 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         if torch.cuda.is_available():
             cc = torch.cuda.get_device_capability()
-            if cc not in ((10, 0), (10, 3)):
-                raise MoEEpArchError("W4A16 MegaMoE requires SM100 or SM103")
+            if cc not in (
+                ((10, 0), (10, 3), (10, 7))
+                if self._kernel_config.batch_invariant
+                else ((10, 0), (10, 3))
+            ):
+                raise MoEEpArchError("W4A16 MegaMoE architecture is unsupported")
         config = self._kernel_config
+        if config.batch_invariant:
+            from ..common.batch_invariant import (
+                bf16_batch_invariant_arch,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            self._arithmetic_arch = bf16_batch_invariant_arch()
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -116,8 +128,29 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
-            defer_topk_reduce=not k.do_finalize,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=(1 if k.batch_invariant else None),
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+            activation=k.activation,
+            swiglu_alpha=k.swiglu_alpha,
+            swiglu_beta=k.swiglu_beta,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
+            handoff_norm=k.fc1_norm_const is not None,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.a16_batch_invariant import a16_batch_invariant_fingerprint
+
+        return a16_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -136,9 +169,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
             activation_clamp=config.activation_clamp,
-            apply_topk_in_fc1=config.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(config.apply_routing_weights_before_fc2),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
-            defer_topk_reduce=not config.do_finalize,
+            use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             fc1_alpha=config.fc1_alpha,
             fc2_alpha=config.fc2_alpha,
             fc1_norm_const=config.fc1_norm_const,
@@ -148,8 +181,10 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             situ_beta=config.situ_beta,
             situ_linear_beta=config.situ_linear_beta,
             knobs=self._workspace_knobs(fleet_params),
+            batch_invariant=config.batch_invariant,
         )
-        if not config.do_finalize:
+        workspace._epilogue_default_ones = torch.ones_like(workspace.fc1_alpha)
+        if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fleet_params.max_tokens_per_rank * config.top_k,
                 dtype=torch.int32,
@@ -157,9 +192,13 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             ).view(fleet_params.max_tokens_per_rank, config.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if config.apply_topk_in_fc1
+                if config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
+            if config.batch_invariant:
+                workspace._unfinalized_weights = torch.empty_like(
+                    workspace.topk_weights
+                )
         return workspace
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
@@ -173,16 +212,18 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
-            id(self.ep_comm_group),
+            id(self._ep_comm_group),
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             fleet_params.token_hidden_size,
             config.intermediate_size,
             config.top_k,
             _resolve_gate_up_clamp(config),
-            config.apply_topk_in_fc1,
+            config.apply_routing_weights_before_fc2,
             config.enable_in_kernel_fc2_reduce,
-            config.do_finalize,
+            config.finalize_mode,
+            config.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             epilogue_pool_key(config.fc1_alpha),
             epilogue_pool_key(config.fc2_alpha),
             epilogue_pool_key(config.fc1_norm_const),
@@ -234,6 +275,14 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 raise MoEEpConfigError(
                     f"{name} must be FP32 [local_experts] on the activation device"
                 )
+        if (
+            self._kernel_config.batch_invariant
+            and t.fc1_norm_const is not None
+            and self._kernel_config.fc1_norm_const is None
+        ):
+            raise MoEEpConfigError(
+                "BI handoff normalization must be selected when constructing the layer"
+            )
 
     def validate_capture_ready(
         self, workspace: Any, transformed_weights: TransformedMegaWeights
@@ -286,12 +335,18 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 )
         destinations = []
         epilogue_sources = []
-        for source, destination in (
-            (t.fc1_alpha, workspace.fc1_alpha),
-            (t.fc2_alpha, workspace.fc2_alpha),
-            (t.fc1_norm_const, workspace.fc1_norm_const),
-        ):
-            if source is not None:
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            source = getattr(t, name)
+            if source is None:
+                source = getattr(self._kernel_config, name)
+            destination = getattr(workspace, name)
+            if source is None:
+                source = workspace._epilogue_default_ones
+            if isinstance(source, (int, float)):
+                destination.fill_(source)
+            else:
+                # Resolve live configuration tensors on every call without
+                # lending their storage to mutable workspace scalars.
                 destinations.append(destination)
                 epilogue_sources.append(source)
         if epilogue_sources:
@@ -308,8 +363,10 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             else:
                 # Batch the common contiguous CUDA copies into one launch.
                 torch._foreach_copy_(destinations, epilogue_sources)
-        if t.fc1_norm_const is not None:
-            workspace._use_fc1_norm_const = True
+        workspace._use_fc1_norm_const = (
+            t.fc1_norm_const is not None
+            or self._kernel_config.fc1_norm_const is not None
+        )
         # Keep the same sources through every autotune capture and final call.
         workspace._staging_inputs = sources
 
@@ -323,7 +380,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if self.supports_unfinalized_output:
-            raise ValueError("do_finalize=False requires compute_unfinalized()")
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         try:
             if self._autotune_pending:
                 from ......cute_dsl.megamoe.bf16_nvfp4 import (
@@ -369,7 +426,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if not self.supports_unfinalized_output:
-            raise ValueError("compute_unfinalized() requires do_finalize=False")
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
         if workspace._staging_inputs is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
         num_tokens = workspace._staging_inputs[0].shape[0]
@@ -387,6 +444,17 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
             workspace._frontend._warm_staging_variants()
             assert partials is not None
+            if self._kernel_config.batch_invariant:
+                ids = workspace.topk_idx[:num_tokens]
+                valid = (ids >= 0) & (ids < workspace.num_total_experts)
+                scores = (
+                    torch.ones_like(workspace.topk_weights[:num_tokens])
+                    if self._kernel_config.apply_routing_weights_before_fc2
+                    else workspace.topk_weights[:num_tokens]
+                )
+                workspace._unfinalized_weights[:num_tokens].copy_(
+                    torch.where(valid, scores, 0.0)
+                )
             return (
                 partials.view(num_tokens * self._kernel_config.top_k, workspace.hidden),
                 workspace._unfinalized_weights[:num_tokens],

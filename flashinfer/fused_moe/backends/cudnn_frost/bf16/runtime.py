@@ -8,7 +8,6 @@ or cuDNN Frost graph compiler is needed in the deployed process.
 from __future__ import annotations
 
 import functools
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +26,11 @@ from ..runtime import (
     _load_kernel as _load_kernel,
     _load_source as _load_source,
     _read_source as _read_source,
+    _read_manifest as _read_manifest,
+    bind_kernel as bind_kernel,
+    cache_discovery,
+    discovery_binding as discovery_binding,
+    source_binding as source_binding,
     _tactic_digest as _tactic_digest,
     _validate_abi as _validate_abi,
     artifact_root as artifact_root,
@@ -45,6 +49,9 @@ class CudnnFrostGroupedGemm1Kernel:
     contract: dict[str, Any]
     tactic_metadata: dict[str, Any]
     launch_tail: tuple[str, ...]
+    source_parameters: dict | None = None
+    template_path: Path | None = None
+    source_identity: str = ""
 
     @property
     def activation(self):
@@ -59,13 +66,21 @@ class CudnnFrostGroupedGemm1Kernel:
         return self.tactic_metadata.get("swap_ab", False)
 
     @property
+    def quantizes_output(self) -> bool:
+        return False
+
+    @property
+    def gathers_input(self) -> bool:
+        return self.contract.get("moe_mode") == "gather"
+
+    @property
     def tactic(self) -> tuple[str, str, str]:
         """Stable identity suitable for FlashInfer's persisted autotuner."""
 
         return (
             "cudnn_frost-grouped-swiglu-v2",
             self.artifact_id,
-            _tactic_digest(self.source_sha256),
+            _tactic_digest(self.source_identity or self.source_sha256),
         )
 
 
@@ -79,16 +94,13 @@ def _cached_artifact_roots() -> tuple[Path, ...]:
     return (packaged,) if packaged.is_dir() else ()
 
 
-def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
+def _read_root(
+    root: Path, *, include_gather: bool = False
+) -> list[CudnnFrostGroupedGemm1Kernel]:
     path = root / _MANIFEST
     if not path.is_file():
         return []
-    payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 2:
-        raise RuntimeError(f"{path}: unsupported cuDNN Frost manifest schema")
-    kernels = payload.get("kernels")
-    if not isinstance(kernels, list):
-        raise RuntimeError(f"{path}: 'kernels' must be a list")
+    kernels = _read_manifest(path)["kernels"]
 
     result: list[CudnnFrostGroupedGemm1Kernel] = []
     seen: set[str] = set()
@@ -103,7 +115,20 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
         activation = contract_activation(raw.get("contract", {}))
         if activation not in ACTIVATIONS or op != f"grouped_gemm1_{activation}":
             raise RuntimeError(f"Invalid FC1 activation contract: {artifact_id}")
-        _validate_abi(raw, op)
+        if any(
+            raw["contract"].get(key) != "bfloat16"
+            for key in ("token_dtype", "weight_dtype", "output_dtype")
+        ):
+            raise RuntimeError(f"invalid BF16 numerical contract: {artifact_id}")
+        gather = raw["contract"].get("moe_mode") == "gather"
+        _validate_abi(raw, f"{op}_gather" if gather else op)
+        if gather and (
+            raw["arch"] != "sm_107a"
+            or raw.get("launch", {}).get("prefix") != ["token_index"]
+        ):
+            raise RuntimeError(f"invalid BF16 GATHER contract: {artifact_id}")
+        if gather and not include_gather:
+            continue
         source_path, actual = _read_source(root, raw)
         workspace_bytes = int(raw.get("workspace_bytes", -1))
         if workspace_bytes < 0 or workspace_bytes % 128:
@@ -132,16 +157,23 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
                 contract=dict(raw.get("contract", {})),
                 tactic_metadata=dict(raw.get("tactic", {})),
                 launch_tail=launch_tail,
+                **source_binding(root, raw, actual),
             )
         )
-    return result
+    return [bound for k in result if (bound := discovery_binding(k)) is not None]
 
 
-@functools.lru_cache(maxsize=8)
+@cache_discovery
 def _discover(
     roots: tuple[Path, ...],
+    *,
+    include_gather: bool = False,
 ) -> tuple[CudnnFrostGroupedGemm1Kernel, ...]:
-    kernels = [kernel for root in roots for kernel in _read_root(root)]
+    kernels = [
+        kernel
+        for root in roots
+        for kernel in _read_root(root, include_gather=include_gather)
+    ]
     identities = [kernel.artifact_id for kernel in kernels]
     if len(identities) != len(set(identities)):
         raise RuntimeError("duplicate cuDNN Frost kernel id across artifact roots")

@@ -203,7 +203,19 @@ then the heuristic table).  The autotune candidate set is the heuristic
 winner plus every geometry that wins some bucket of the table (19 today
 — tile / cluster / ping-pong together with the row's `group_hint` and
 `tail_split_pairs`, derived programmatically) crossed with both validated
-token-back modes — 38 candidates.
+token-back modes — 38 candidates.  From 1024 tokens per rank (one active
+dispatch warp, no `dedup_dispatch`), every `epi_warps` candidate also gets
+three dispatch-pull variants (rotation alone; three rows in flight in the
+4-slot buffer, without and with rotation; see `dispatch_pull_batch` below),
+ping-pong candidates the rotation only (batching never measured faster on
+them) — 81 candidates.  Blockwise also gets the swap-AB M256 N72/N80 cga(1,1,1)
+`epi_warps` tiles (40 candidates, 89 from 1024 tokens per rank).
+
+Online autotuning controls `compact_pull_buffer` through each tactic instead
+of preserving the caller's bool. Applying any knob dict, including `{}`,
+resets omitted pull fields to the compact, serial, unrotated defaults;
+`apply_knobs(None)` leaves the current config unchanged. Explicit pull
+overrides are described in the field entries below.
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
@@ -225,7 +237,8 @@ token-back modes — 38 candidates.
   drop-driver defaults for the rest (non-swap (64, 128, 128), swap-AB
   (256, 32, 128), (128, 32, 128) with ping-pong; cluster (1, 1, 1)).
   Kernel-legal geometry: non-swap M∈{64}, N∈{128,256}; swap-AB M∈{128,256},
-  N∈{8,16,32,64,128} (N=8 = wgmma m64n8k32, admitted 2026-09-10 and used by
+  N∈{8,16,32,64,128}, blockwise also N∈{72,80} with M=256 (see below)
+  (N=8 = wgmma m64n8k32, admitted 2026-09-10 and used by
   the per_tensor 32/64/128 rows; bit-exact for per_tensor
   ping-pong / cooperative and blockwise ping-pong / cooperative
   since 2026-09-10 — the blockwise token-scale box (n×4 fp32 = n·16 B) used
@@ -272,7 +285,10 @@ token-back modes — 38 candidates.
   the same contract as the Blackwell MXFP8 kernel's `generate_c`.  Read it
   back from `symm_buffer.fc1_c` after the launch; segment offsets are
   `sum(round_up(count[i], 128), i < e)` over the per-expert routed-token
-  counts.  Store path (both layouts): the values go straight from the
+  counts. Blockwise swap-AB N72/N80 requires `generate_c=False`; config
+  validation rejects the combination because its 128-row expert padding
+  does not align the activation-SF TMA bases to N72/N80.
+  Store path (both layouts): the values go straight from the
   wgmma fragments to GMEM as 16-byte stores after a lane transpose —
   non-swap: a quad holds 64 consecutive raw columns of one row for each
   pair of gate/up groups, two `shfl.bfly` levels across `lane_mod` give
@@ -326,6 +342,44 @@ token-back modes — 38 candidates.
   pt2048 +2.3), blockwise −0.25% (no bucket beyond −1.2%); geomean e2e
   +0.55%, compute +0.79%.  Output-invariant; `False` restores the 4-slot
   buffer for A/B (`--no-compact-pull-buffer` on the bench).
+- `dispatch_pull_batch` (default 1) / `dispatch_pull_rotate` (default
+  False) — rows in flight per active dispatch warp, and the per-pass
+  rotation of the warp -> row assignment (pass k takes row
+  `k*G + (g + k) % G` of the G global dispatch warps).  Output-invariant
+  tactic fields, shared with packed FP4 (see SKILL.md).  A batch above 1
+  keeps its rows in the idle slots of the 4-slot buffer, so it needs
+  `compact_pull_buffer=False`, `epi_warps` token-back, no `dedup_dispatch`
+  or `grouped_token_back`, and batch x `active_dispatch_warps` <= 4;
+  rotation needs `epi_warps` token-back.  Left unset they follow the tactic
+  (the heuristic table keeps the serial, unrotated pull); an explicit value
+  wins with `knobs=None` or a knob dict, and an explicit batch above 1 takes
+  the 4-slot buffer. Explicit pull values and tactic overrides are validated
+  together using the final `active_dispatch_warps`. The backend rejects
+  explicit pull values with `knobs="auto"`, including batch 1 and rotation
+  False. Measured
+  on H200 (1830 MHz, in-process A/B against the serial compact pull,
+  2026-11): H2560/I640/E512/top-10/EP2 per_tensor M64N256 cga(1,1,1) —
+  batch 3 + rotation 0.914 / 0.867 / 0.842 / 0.830 at 2048 / 4096 / 8192 /
+  16384 tokens per rank (0.964 at 1024), rotation alone 0.92-0.97;
+  blockwise M64N256 cga(2,2,1) — batch 3 without rotation 0.877 / 0.858 /
+  0.822 / 0.808 (1.003 at 1024); swap-AB ping-pong M128N128 — within
+  +-2% up to 8192, 0.95 at 16384.  On H7168/I3072/E384/top-6/EP4 the
+  4-slot buffer costs 21 KiB of AB-stage SMEM and the GEMM dominates:
+  rotation 0.99-1.01, batches 0.5-6.6% slower.  Hence autotune
+  candidates, not defaults.
+- Blockwise swap-AB N72/N80 (M=256, 2026-11) — one task holds an expert's
+  65-80 rows, where N64 needs a second, nearly empty tile and blockwise N128
+  spills (728-byte stack; N72 has none, N80 24 bytes, N64 about 100
+  bytes).  The shim pads the activation-SF pool to a multiple of N (the SF
+  TMA addresses a tile as `(expert SF base + tile * N) // N`; every
+  power-of-two tile keeps 128). These tiles require `generate_c=False`;
+  config validation rejects `generate_c=True` before kernel construction.
+  Outputs are byte-identical to N64.
+  Measured on H200 (H2560/I640/E512/top-10/EP2, blockwise, batch 3, against
+  the best non-swap M64N256 with the same pull): N72 0.978 / 0.910 at 1664 /
+  1792 tokens per rank (65 / 70 rows per expert), N80 + rotation 0.970 at
+  2048 (80 rows); outside 65-80 rows, and on H7168/E384/EP4, the non-swap
+  tiles stay ahead or tie.  Autotune candidates only.
 - `fold_producer_warps` (default True; requires `active_dispatch_warps == 1`)
   — folds the TMA-A / TMA-B / scheduler warps into the three idle
   dispatch-warpgroup slots and drops the separate producer warpgroup
@@ -783,8 +837,8 @@ and the per-process source/command records.
 ### Paired output stores and zero-count updates (2026-09-18)
 
 Paired BF16 output stores reuse row-address calculations and write adjacent
-values together. The MXFP4 path requires M256/N64/K256, complete channel
-clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
+values together. The MXFP4 path requires M256 with N64, N72 or N80 and K128
+or K256 (K128 joined in October 2026), complete channel clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
 and neither dispatch deduplication nor in-kernel top-k reduction. Other
 layouts use scalar stores. Zero-count elision skips zero local count updates
 when dispatch deduplication is disabled; grid rendezvous, empty-expert/rank
@@ -881,14 +935,79 @@ of a complete tactic does not isolate the speedup of any one field.
 
 ### Bounded candidates and cache replay
 
-The normal MXFP4 list starts from 17 deduplicated base tactics drawn from the
-block-permutation and published-exact manifests and two H20-derived anchors.
-For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 23;
+The normal MXFP4 list starts from 22 deduplicated base tactics drawn from the
+block-permutation and published-exact manifests, two H20-derived anchors,
+and five K128 candidates for intermediate widths such as 640. The folded
+M256/N64/K128 CGA1x1x1 group-330 candidate was measured on H100 and H200.
+An H200 sweep at H2560/I640/E512/EP2 adds an unfolded M256/N16/K128
+CGA1x1x1 group-330 candidate with two dispatch warps and FC1 store offload,
+folded N64 CGA1x1x1 candidates with groups 264 and 132, and a folded N64
+CGA1x2x1 group-132 tail-pair candidate. All five use one scheduler stage;
+the folded candidates use one dispatch warp, early FC1 publication and
+direct FC1 stores. For this shape, the complete eligible union grew from
+three to eight candidates; since October 2026 the shape also has its own
+per-bucket default table, whose entries and N72/N80 tilings join the union
+(see below).
+For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 28;
 three large-token configurations and 12 distinct tail-pair neighbors bring
-the total to 38. Every model considers the same bounded extension catalog,
+the total to 43. Every model considers the same bounded extension catalog,
 then filters candidates through tile alignment and strategy eligibility.
-Other shapes can therefore have fewer than 38 candidates. Token capacity
-changes ordering, not the union; the untuned heuristic buckets are unchanged.
+Other shapes can therefore have fewer than 43 candidates. Tuning skips the
+candidates with dispatch-side token-back (`reuse_dispatch_warps`, two of the
+43): that path can give intermittent run-to-run output differences whose
+cause is open. An explicit `token_back_mode` still selects it, and the untuned
+defaults of the published-exact routing profile still use it above 512
+tokens per rank. Token capacity
+changes the ordering of this union; the per-bucket defaults and their N72/N80
+tilings described below then add table- and capacity-dependent members.
+
+The pull-buffer fields are tactic fields. `compact_pull_buffer` sizes the
+pull buffer for the active dispatch warps. `dispatch_pull_batch` keeps 1-4
+rows in flight per active dispatch warp in the idle slots of the full buffer
+(`dispatch_pull_batch * active_dispatch_warps <= 4`, `epi_warps` token-back,
+neither dedup nor grouped token-back); with a batch above 1, `flag_batch` has
+no effect. `dispatch_pull_rotate` rotates the rows a warp takes on each pass
+and is not combined with dispatch-side token-back. Explicit values override a
+cached or default tactic: an explicit compact buffer or dispatch-side
+`token_back_mode` drops the tactic's batch to 1 (a dispatch-side mode also its
+rotation), and an explicit batch above 1 drops the tactic's compact buffer.
+
+Untuned launches use per-bucket defaults measured on H200 with
+block-permutation routing in October 2026
+(`shim/mxfp4_optimization.py::_FUSED_DEFAULTS`). They cover the FP8
+heuristic's 13 buckets (8 to 32768 tokens per rank) and store complete
+tactics, including the strategy and pull-buffer fields. Each table serves
+only the shape it was measured on: the K256 table H7168/I3072/E384/top-6/EP4
+and the K128 table H2560/I640/E512/top-10/EP2. Other shapes and the
+published-exact profile keep the legacy 8-bucket heuristic. A folded M256 N64
+default then takes the token-tile width of 64, 72 or 80 that needs the
+fewest tiles for the balanced rows per expert,
+`max_tokens * top_k * EP / experts`; ties keep N64. One N72 or N80 task holds
+an expert's 65-72 or 65-80 rows where N64 needs a second, nearly empty tile.
+On H200, H2560/I640/E512/top-10/EP2 at 2048 tokens (80 rows per expert) runs
+N80 at 0.85x the N64 time and at 1792 tokens N72 at 0.79x. Fewer tiles do not
+always win: at 8192 tokens (320 rows per expert) N80 measured 1.006x. Equal
+tile counts measured 3-15% slower.
+Routing that spreads rows across a tile boundary can favor N72 even at equal
+balanced tile counts (H7168/I3072/E384/top-6/EP4 at 1024 and 2048 tokens:
+0.88x and 0.93x), so the N72 and N80 tilings of the capacity's bucket default
+join the candidates together with the selected table's tactics; tuning
+therefore always measures the default. NV candidates and NV cache provenance
+exclude these MXFP4 defaults. NV instead adds the N72/N80 tilings of its
+reference default for the capacity bucket (NV tuning version v3) when that
+default is a folded N64 tile; other shapes keep them only where they are
+legal. A scale-ring default is tiled on its lockstep (sf0) core: the
+two-slot ring needs four AB stages, which N72/N80 tiles do not fit, so
+H7168/I3072/E384/EP4 NV tuning gains these tilings above 256 tokens. There
+the sf0 N72 tiling measured 0.89x the scale-ring default
+at 1024 tokens and 0.92x the NV default at 2048 tokens. The NV reference
+defaults without the scale ring (every bucket but 512 and 1024 tokens) take
+the same row rule as MXFP4. Against their N64 tiles that measured 0.61x at
+1152 tokens (N72), 0.87x at 1280 (N80), 0.75x at 2304 (N72), 0.94x at 2560
+(N80), 0.87x at 4608 (N72), 0.95x at 5120 (N80), and 0.98x, 0.94x and 0.94x
+at 8192, 16384 and 32768 tokens (N80); capacities with equal tile counts,
+such as 2048 and 4096 tokens, keep N64. The tail-pair candidates are still
+derived from the legacy table.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
 `hopper_mxfp4_candidates` list. The default public scorer takes
@@ -1084,3 +1203,12 @@ tactics. Do not treat one cache-or-heuristic run as that full campaign.
 For controlled comparisons, hold shape, routing, data, timed regions and
 complete tactics fixed, then run the six formal processes independently of
 selection. Record source identity and actual clocks with the samples.
+
+
+## NVFP4
+
+The K16/E4M3 NVFP4 specialization lives under `shim/`, with a
+separate backend and compilation identity. Its implementation, numerical
+contract and validation commands are documented in
+[moe_ep_sm90_nvfp4.md](../../../../../docs/design_docs/moe_ep_sm90_nvfp4.md).
+Current MXFP4 measurements in this document are not NVFP4 measurements.

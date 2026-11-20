@@ -9,8 +9,9 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer import cake_concat_mla_kv_quant_fp8, mla_kv_pack
-from flashinfer.jit import cake_concat_mla_kv_quant_fp8 as mla_kv_pack_jit
+from flashinfer import mla_kv_pack
+from flashinfer.jit.cake_concat_mla_kv_quant_fp8 import HG1, HG2, HG3, HG4, PROGRAMS
+from flashinfer.jit.cake_program import GRID_ARGS
 from flashinfer.utils import get_compute_capability
 
 NOPE, ROPE, V = 128, 64, 128
@@ -20,7 +21,7 @@ def _cake_dispatches_here() -> bool:
     """The Cake programs are built for the exact compute capabilities 10.0 and
     10.3 only."""
     return torch.cuda.is_available() and (
-        mla_kv_pack_jit.concat_mla_kv_quant_fp8_target_for_capability(
+        mla_kv_pack.cake_target_for_capability(
             get_compute_capability(torch.device("cuda"))
         )
         is not None
@@ -206,78 +207,89 @@ def test_head_group_plan_matches_the_cake_launcher(
     assert mla_kv_pack._plan_grid(T, H, head_group) == (grid, warps_per_token)
 
 
-def test_every_head_count_has_a_delivered_route():
-    """Every H in the allowlist resolves to a delivered program at every token count."""
+def test_every_head_count_has_a_delivered_program():
+    """Every H in the allowlist resolves to a generated program at every token
+    count, and every generated program serves one head group."""
     for T in (1, 2048, 2049, 131072):
         for H in range(1, 129):
-            key = mla_kv_pack_jit.route_key(mla_kv_pack._plan_head_group(T, H))
-            assert key in mla_kv_pack_jit.ROUTES, (T, H, key)
-    assert mla_kv_pack_jit.head_groups() == (1, 2, 3, 4)
+            head_group = mla_kv_pack._plan_head_group(T, H)
+            assert head_group in mla_kv_pack._CAKE_PROGRAMS, (T, H, head_group)
+    assert tuple(sorted(mla_kv_pack._CAKE_PROGRAMS)) == (1, 2, 3, 4)
+    assert mla_kv_pack._CAKE_PROGRAMS == {1: HG1, 2: HG2, 3: HG3, 4: HG4}
+    assert set(mla_kv_pack._CAKE_PROGRAMS.values()) == set(PROGRAMS)
+    assert len({program.name for program in PROGRAMS}) == len(PROGRAMS) == 4
+
+
+def test_every_program_states_the_pack_launch():
+    """Every generated program is the pack kernel at one head group: the same
+    exact targets, the kernel symbol of its own name, the eight-warp block, no
+    cluster, no dynamic shared memory, no PDL, not cooperative."""
+    for program in PROGRAMS:
+        assert program.targets == ("sm_100a", "sm_103a")
+        assert program.kernel == f"kernel_{program.name}"
+        assert program.block == (32 * mla_kv_pack._WARPS_PER_CTA, 1, 1)
+        assert program.cluster == (1, 1, 1)
+        assert program.launch_record() == {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        }
+        assert program.tensors == ("kv_nope", "k_pe", "key", "value")
+        assert program.args[-3:] == GRID_ARGS
+        assert program.args[: len(program.tensors)] == program.tensors
 
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
-    [((10, 0), "sm100a"), ((10, 3), "sm103a"), ((9, 0), None), ((12, 0), None)],
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a"), ((9, 0), None), ((12, 0), None)],
 )
 def test_exact_architecture_router(capability, expected):
-    assert (
-        mla_kv_pack_jit.concat_mla_kv_quant_fp8_target_for_capability(capability)
-        == expected
-    )
+    for program in PROGRAMS:
+        assert program.target_for(capability) == expected
+    assert mla_kv_pack.cake_target_for_capability(capability) == expected
 
 
 def test_architecture_router_rejects_cross_routing(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    monkeypatch.setattr(mla_kv_pack, "get_compute_capability", lambda _device: (12, 0))
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
-        mla_kv_pack_jit.concat_mla_kv_quant_fp8_target(torch.device("cuda"))
+        mla_kv_pack._cake_target(HG4, torch.device("cuda"))
+    monkeypatch.setattr(mla_kv_pack, "get_compute_capability", lambda _device: (10, 3))
+    assert mla_kv_pack._cake_target(HG1, torch.device("cuda")) == "sm_103a"
 
 
-def test_launch_args_follow_the_generated_arg_plan():
-    record = {
-        "arg_plan": [
-            ["buffer", "kv_nope"],
-            ["buffer", "k_pe"],
-            ["buffer", "key"],
-            ["buffer", "value"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_heads"],
-            ["parameter", "head_pairs"],
-            ["parameter", "warps_per_token"],
-            ["parameter", "k_pe_row_stride"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ]
-    }
-    values = {
-        "kv_nope": "kv",
-        "k_pe": "pe",
-        "key": "k",
-        "value": "v",
-        "num_tokens": 7,
-        "num_heads": 12,
-        "head_pairs": 6,
-        "warps_per_token": 2,
-        "k_pe_row_stride": 576,
-    }
-    assert cake_concat_mla_kv_quant_fp8.launch_args(record, values, (2, 1, 1)) == (
-        "kv",
-        "pe",
-        "k",
-        "v",
-        7,
-        12,
-        6,
-        2,
-        576,
-        2,
-        1,
-        1,
+def test_host_arguments_follow_the_program_order():
+    """The host assembles the binding's positional call from the program's
+    argument order: the four tensors, the five launch scalars, the grid; a
+    row-strided ``k_pe`` passes its row stride in elements."""
+    T, H = 7, 12
+    kv = torch.empty(T, H, NOPE + V, dtype=torch.bfloat16)
+    workspace = torch.empty(T, 576, dtype=torch.bfloat16)
+    pe = workspace[:, 512:]
+    key = torch.empty(T, H, NOPE + ROPE, dtype=torch.float8_e4m3fn)
+    value = torch.empty(T, H, V, dtype=torch.float8_e4m3fn)
+    head_group = mla_kv_pack._plan_head_group(T, H)
+    grid_x, warps_per_token = mla_kv_pack._plan_grid(T, H, head_group)
+    values = mla_kv_pack._cake_launch_values(
+        kv, pe, key, value, warps_per_token=warps_per_token, grid_x=grid_x
     )
-    with pytest.raises(RuntimeError, match="unsupported argument"):
-        cake_concat_mla_kv_quant_fp8.launch_args(
-            {"arg_plan": [["tma_buffer", "kv_nope"]]}, values, (1, 1, 1)
-        )
+    program = mla_kv_pack._CAKE_PROGRAMS[head_group]
+    assert set(values) == set(program.args)
+    arguments = [values[name] for name in program.args]
+    assert all(a is b for a, b in zip(arguments[:4], (kv, pe, key, value), strict=True))
+    assert arguments[4:] == [T, H, 6, 3, 576, grid_x, 1, 1]
+    assert (head_group, grid_x, warps_per_token) == (2, 3, 3)
+    for other in PROGRAMS:
+        assert set(other.args) == set(values), other.name
+    # One token: the row stride is never dereferenced and the guards admit any
+    # value, so the dense stride is passed (the binding checks the stride atoms).
+    odd = torch.empty(1, 100, dtype=torch.bfloat16)[:, 36:]
+    assert odd.stride() == (100, 1) and mla_kv_pack._k_pe_rows_admissible(odd)
+    one = mla_kv_pack._cake_launch_values(
+        kv[:1], odd, key[:1], value[:1], warps_per_token=3, grid_x=1
+    )
+    assert one["k_pe_row_stride"] == ROPE and one["num_tokens"] == 1
 
 
 def test_allowlist_guards_are_gpu_free():
@@ -639,7 +651,7 @@ def test_stats_hook_reports_compile_footprint():
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
     assert stats["module_loaded"] and stats["precompiled"]
     assert stats["compiled_variants"] >= 1
-    assert stats["distinct_kernels_for_allowlist"] == len(mla_kv_pack_jit.ROUTES) == 4
+    assert stats["distinct_kernels_for_allowlist"] == len(PROGRAMS) == 4
     assert stats["allowlist_loaded"]
     assert not stats["module_errors"]
 
@@ -689,9 +701,10 @@ def test_capture_before_jit_takes_fallback():
     """Capturing a head group whose module is not loaded yet must not JIT inside
     the capture: the stock path serves that capture, byte-exactly."""
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    target = mla_kv_pack_jit.concat_mla_kv_quant_fp8_target(torch.device("cuda"))
     # Head group 1 (H <= 2) is rarely warmed by the other tests; force the cold state.
     head_group = mla_kv_pack._plan_head_group(256, 1)
+    program = mla_kv_pack._CAKE_PROGRAMS[head_group]
+    target = mla_kv_pack._cake_target(program, torch.device("cuda"))
     saved = mla_kv_pack._cake_modules.pop((target, head_group), None)
     try:
         kv, pe = _inputs(256, 1)

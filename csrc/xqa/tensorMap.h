@@ -2,6 +2,8 @@
 
 #include <cuda.h>
 
+#include <cstdint>
+
 uint32_t getElemBytes(CUtensorMapDataType_enum dataType);
 
 CUtensorMap makeTensorMapForContiguousKVCache(void const* addr, CUtensorMapDataType_enum dataType,

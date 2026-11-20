@@ -33,10 +33,19 @@ from flashinfer.fused_moe import (
     SiTU,
     SwiGLU,
     TrtllmFp4Config,
-    trtllm_fp4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.api import _DEFAULT_BACKEND
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from tests.moe.cake_warp_decode_reference import (
+    TARGETS,
+    Fixture,
+    Geometry as _GpuGeometry,
+    assert_close,
+    prepare_fixture,
+    prepare_launch,
+    reference,
+    run_cake,
+)
 
 
 @dataclass
@@ -166,7 +175,6 @@ def _runner(
     runner._prepared_workspaces = {}
     runner._workspace_receipt_finalizers = {}
     runner._workspace_stream_claims = {}
-    runner._topk_validation_receipts = OrderedDict()
     return runner, module
 
 
@@ -177,6 +185,7 @@ def _activation_pack(
     mode: RoutingInputMode = RoutingInputMode.UnpackedPrecomputed,
     weights_dtype: torch.dtype = torch.bfloat16,
     topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
     hidden_size: int = 2048,
 ) -> MoEActivationPack:
     return MoEActivationPack(
@@ -185,7 +194,9 @@ def _activation_pack(
         topk_ids
         if topk_ids is not None
         else _TensorSpec((num_tokens, top_k), torch.int32),
-        _TensorSpec((num_tokens, top_k), weights_dtype),
+        topk_weights
+        if topk_weights is not None
+        else _TensorSpec((num_tokens, top_k), weights_dtype),
         routing_input_mode=mode,
     )
 
@@ -232,7 +243,7 @@ def _weight_pack(
     return weights, view
 
 
-def test_config_is_explicit_exact_sm100_sm103_and_not_default():
+def test_config_is_exact_sm100_sm103_and_last_default_entry():
     config = CakeWarpDecodeConfig(backend="cake")
     assert repr(config) == "CakeWarpDecodeConfig(backend='cake')"
     assert config.supported(100)
@@ -240,7 +251,15 @@ def test_config_is_explicit_exact_sm100_sm103_and_not_default():
     assert not config.supported(101)
     assert not config.supported(107)
     assert _BACKEND_RUNNERS[CakeWarpDecodeConfig] is CakeWarpDecodeRunner
-    assert not any(isinstance(item, CakeWarpDecodeConfig) for item in _DEFAULT_BACKEND)
+    # The default list holds only the default-candidate entry, and holds it
+    # last; an explicit config is never part of it.
+    assert [
+        item for item in _DEFAULT_BACKEND if isinstance(item, CakeWarpDecodeConfig)
+    ] == [CakeWarpDecodeConfig(default_candidate=True)]
+    assert _DEFAULT_BACKEND.candidates[-1] == CakeWarpDecodeConfig(
+        default_candidate=True
+    )
+    assert config not in tuple(_DEFAULT_BACKEND)
     with pytest.raises(ValueError, match="must be 'cake'"):
         CakeWarpDecodeConfig(backend="auto")
 
@@ -750,71 +769,67 @@ def test_stream_workspace_cache_fails_closed_at_limit_and_retains_streams():
     assert (65, geometry) not in runner._workspace_cache
 
 
-def test_topk_validation_receipt_reuses_one_tensor_version_during_capture(
-    monkeypatch,
-):
+# Ids outside [0, num_experts) drop their routing slot inside the kernels, so
+# the host path accepts every int32 value and never reads topk_ids.
+_DROPPED_EXPERT_IDS = (-1, 60, 67, 2**31 - 1, -(2**31))
+
+
+def _forbid_host_reads(monkeypatch) -> None:
+    def _host_read(*args, **kwargs):
+        raise AssertionError("Cake warp decode read a tensor on the host")
+
+    for name in ("item", "tolist", "__bool__", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, _host_read)
+
+
+def test_runner_keeps_no_routing_validation_state():
+    runner, _ = _runner()
+    for name in (
+        "_MAX_TOPK_VALIDATION_RECEIPTS",
+        "_topk_validation_receipts",
+        "_validate_expert_id_range",
+        "_topk_version",
+    ):
+        assert not hasattr(runner, name), name
+
+
+@pytest.mark.parametrize("dropped_id", _DROPPED_EXPERT_IDS)
+def test_pack_passes_dropped_expert_ids_without_host_reads(monkeypatch, dropped_id):
     runner, _ = _runner()
     topk_ids = torch.zeros((7, 4), dtype=torch.int32)
-    act = _activation_pack(topk_ids=topk_ids)
+    topk_ids[0, 1] = dropped_id
+    topk_ids[3] = dropped_id  # a token without a valid slot
+    _forbid_host_reads(monkeypatch)
+
+    inputs = runner.pack_inputs(_activation_pack(topk_ids=topk_ids), _weight_pack()[0])
+
+    assert inputs[4] is topk_ids
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_capture_accepts_new_and_mutated_topk_ids(monkeypatch, inference):
+    runner, module = _runner()
     weights, _ = _weight_pack()
-
-    runner.pack_inputs(act, weights)
+    warm = runner.pack_inputs(_activation_pack(), weights)
+    if inference:
+        with torch.inference_mode():
+            topk_ids = torch.full((7, 4), -1, dtype=torch.int32)
+    else:
+        topk_ids = torch.full((7, 4), -1, dtype=torch.int32)
     monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
-    runner.pack_inputs(act, weights)
+    _forbid_host_reads(monkeypatch)
 
-    topk_ids[0, 0] = 1
-    with pytest.raises(RuntimeError, match="exact tensor version"):
-        runner.pack_inputs(act, weights)
+    captured = runner.pack_inputs(_activation_pack(topk_ids=topk_ids), weights)
+    if inference:
+        with torch.inference_mode():
+            topk_ids[0, 0] = 2**31 - 1
+    else:
+        topk_ids[0, 0] = 2**31 - 1
+    replayed = runner.pack_inputs(_activation_pack(topk_ids=topk_ids), weights)
 
-
-def test_capture_rejects_unvalidated_topk_ids(monkeypatch):
-    runner, _ = _runner()
-    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
-
-    with pytest.raises(RuntimeError, match="exact tensor version"):
-        runner.pack_inputs(
-            _activation_pack(topk_ids=torch.zeros((7, 4), dtype=torch.int32)),
-            _weight_pack()[0],
-        )
-
-
-def test_inference_tensor_receipt_is_reusable_during_capture(monkeypatch):
-    runner, _ = _runner()
-    with torch.inference_mode():
-        topk_ids = torch.zeros((7, 4), dtype=torch.int32)
-    act = _activation_pack(topk_ids=topk_ids)
-    weights, _ = _weight_pack()
-
-    runner.pack_inputs(act, weights)
-    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
-    runner.pack_inputs(act, weights)
-
-
-def test_topk_validation_receipt_limit_fails_without_eviction(monkeypatch):
-    runner, _ = _runner()
-    monkeypatch.setattr(runner, "_MAX_TOPK_VALIDATION_RECEIPTS", 2)
-    first = torch.zeros((7, 4), dtype=torch.int32)
-    second = torch.ones((7, 4), dtype=torch.int32)
-    third = torch.full((7, 4), 2, dtype=torch.int32)
-
-    runner._validate_expert_id_range(first, 60)
-    runner._validate_expert_id_range(second, 60)
-    with pytest.raises(RuntimeError, match="at most 64"):
-        runner._validate_expert_id_range(third, 60)
-
-    assert list(runner._topk_validation_receipts) == [id(first), id(second)]
-
-
-@pytest.mark.parametrize("invalid_id", [-1, 60])
-def test_pack_rejects_out_of_range_expert_ids(invalid_id):
-    runner, _ = _runner()
-    topk_ids = torch.zeros((7, 4), dtype=torch.int32)
-    topk_ids[0, 0] = invalid_id
-    with pytest.raises(ValueError, match="0 <= id < 60"):
-        runner.pack_inputs(
-            _activation_pack(topk_ids=topk_ids),
-            _weight_pack()[0],
-        )
+    assert captured[4] is topk_ids and replayed[4] is topk_ids
+    assert captured[1] is warm[1] and replayed[1] is warm[1]
+    assert len(module.prepare_calls) == 1
 
 
 def test_forward_selects_workspace_for_its_current_stream(monkeypatch):
@@ -1096,56 +1111,45 @@ def test_pack_rejects_mode_tokens_weights_and_extra_fields():
 # ---------------------------------------------------------------------------
 # GPU numerical parity on exact SM100 / SM103 devices.
 #
-# Ported from the correctness matrix of benchmarks/cake_warp_decode.py. The
-# TRT-LLM NVFP4 routed MoE is the public reference for the SwiGLU and SiTU
-# geometries. The standalone SiLU geometry has no public NVFP4 peer, so its rows
-# check finiteness and launch-to-launch repeatability only.
+# The fixture, the public TRT-LLM NVFP4 reference and the launch helpers live in
+# tests/moe/cake_warp_decode_reference.py and are shared with the clamped SM100
+# test. The TRT-LLM NVFP4 routed MoE is the public reference for the SwiGLU and
+# SiTU geometries. The standalone SiLU geometry has no public NVFP4 peer, so its
+# rows check finiteness and launch-to-launch repeatability only.
 # ---------------------------------------------------------------------------
 
-_GPU_MAX_TOKENS = 32
 _GPU_SEED = 20260205
-_GPU_ATOL = 1e-2
-_GPU_RTOL = 1e-2
-_GPU_QUANT = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
 
 
-@dataclass
-class _GpuGeometry:
-    name: str
-    hidden_size: int
-    intermediate_size: int
-    num_experts: int
-    top_k: int
-    token_counts: tuple[int, ...]
-    activation: object = SwiGLU()
-
-    @property
-    def has_public_reference(self) -> bool:
-        return isinstance(self.activation, (SwiGLU, SiTU))
-
-    @property
-    def uses_activation_params(self) -> bool:
-        return self.activation.is_gated and self.activation != SwiGLU()
-
-
-# Token counts are the schedule / route-packer boundaries of each geometry.
+# Token counts are the schedule / route-packer boundaries of each geometry plus
+# the rows that reach kernels no boundary row launches (named by the short hash
+# of their generated source file). Rows that differ only in workfeed CTAs launch
+# the same kernels and are not listed.
 _GPU_GEOMETRIES = (
-    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
-    _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
-    _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
-    _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
-    _GpuGeometry("e128_i768_k8", 2048, 768, 128, 8, (1, 2, 8, 9, 10, 16, 32)),
-    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
-    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 32)),
-    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
-    _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 2, 32)),
+    # T2: sm103 finalize ecc88726. T4: sm100 FC2 984506f0. T5: sm103 finalize b13a3c73.
+    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 3, 4, 5, 32)),
+    _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 32)),
+    _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
+    _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),
+    # T7: sm100 FC2 5c23234a. T11: sm103 FC1 5304d683. T18: sm100 finalize
+    # f5eac8f9. T21: sm103 FC2 c5afe5ba.
+    _GpuGeometry(
+        "e128_i768_k8", 2048, 768, 128, 8, (1, 7, 8, 9, 10, 11, 15, 16, 18, 21, 32)
+    ),
+    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 6, 11, 12, 32)),
+    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 18, 19, 30, 32)),
+    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 5, 6, 8, 25, 26, 32)),
+    _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 32)),
     _GpuGeometry(
         "e128_i3072_k4_swiglu_oa",
         6144,
         3072,
         128,
         4,
-        (1, 2, 32),
+        # T4: first sm100 packed row. T5: sm100 FC1 5312a738 and FC2 8acc0c77.
+        # sm103: fused route-pack FC1 dec95a54 (T1..T15) or 89860cc8 (T16..T32),
+        # then FC2 372605d6.
+        (1, 3, 4, 5, 15, 16, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     _GpuGeometry(
@@ -1154,14 +1158,16 @@ _GPU_GEOMETRIES = (
         3072,
         896,
         16,
-        (1, 2, 32),
+        # T3: sm100 finalize fc64115f.
+        (1, 2, 3, 32),
         SiTU(gate_scale=4.0, linear_scale=25.0),
     ),
     # Sharded per-partition slices (fused route packing on every token count).
     _GpuGeometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
     _GpuGeometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
     _GpuGeometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
-    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
+    # T8, T10: linear-grid FC2 cd21fb85 (T9 keeps the pool FC2 b0e329ce).
+    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 8, 9, 10, 16, 32)),
 )
 _GPU_ROWS = [
     pytest.param(geometry, num_tokens, id=f"{geometry.name}-t{num_tokens:02d}")
@@ -1174,29 +1180,17 @@ def _gpu_target() -> str:
     if not torch.cuda.is_available():
         pytest.skip("Cake warp decode GPU parity requires a CUDA device")
     capability = torch.cuda.get_device_capability(torch.device("cuda"))
-    targets = {(10, 0): "sm100a", (10, 3): "sm103a"}
-    if capability not in targets:
+    if capability not in TARGETS:
         pytest.skip(
             "Cake warp decode GPU parity requires exact SM100 or SM103, "
             f"got SM{capability[0]}{capability[1]}"
         )
-    return targets[capability]
-
-
-def _gpu_routing(geometry: _GpuGeometry, device: torch.device):
-    tokens = torch.arange(_GPU_MAX_TOKENS, device=device, dtype=torch.int64)[:, None]
-    ranks = torch.arange(geometry.top_k, device=device, dtype=torch.int64)[None, :]
-    ids = ((tokens * 17 + ranks * 29) % (geometry.num_experts - 1) + 1).to(torch.int32)
-    ids[:, 0] = 0
-    raw_weights = (geometry.top_k + 1 - ranks).expand(_GPU_MAX_TOKENS, -1).float()
-    raw_weights = raw_weights + (tokens % 5).float() * 0.03125
-    weights = (raw_weights / raw_weights.sum(dim=1, keepdim=True)).to(torch.bfloat16)
-    return ids.contiguous(), weights.contiguous()
+    return TARGETS[capability]
 
 
 @functools.lru_cache(maxsize=1)
-def _gpu_fixture(geometry_name: str) -> SimpleNamespace:
-    """Quantize one geometry's activations and expert weights with the public API.
+def _gpu_fixture(geometry_name: str) -> Fixture:
+    """Prepare one geometry with the shared harness, seeded by its matrix index.
 
     One geometry is cached at a time: the largest geometry holds tens of GB of
     expert weights, and the parity rows are ordered geometry-major.
@@ -1206,145 +1200,7 @@ def _gpu_fixture(geometry_name: str) -> SimpleNamespace:
         for index, geometry in enumerate(_GPU_GEOMETRIES)
         if geometry.name == geometry_name
     )
-    device = torch.device("cuda")
-    torch.manual_seed(_GPU_SEED + index)
-    hidden = torch.randn(
-        _GPU_MAX_TOKENS, geometry.hidden_size, device=device, dtype=torch.bfloat16
-    )
-    gate_rows = 2 if geometry.activation.is_gated else 1
-    w1 = torch.randn(
-        geometry.num_experts,
-        geometry.intermediate_size * gate_rows,
-        geometry.hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    w1 *= 0.02
-    w2 = torch.randn(
-        geometry.num_experts,
-        geometry.hidden_size,
-        geometry.intermediate_size,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    w2 *= 0.02
-    hidden_q, hidden_scale = TrtllmFp4Config.prepare_activations(
-        hidden, quant=_GPU_QUANT
-    )
-    weight_view = CakeWarpDecodeConfig.prepare_weights(
-        w1,
-        w2,
-        quant=_GPU_QUANT,
-        num_local_experts=geometry.num_experts,
-        hidden_size=geometry.hidden_size,
-        intermediate_size=geometry.intermediate_size,
-        activation=geometry.activation,
-        device=device,
-    )
-    del w1, w2
-    topk_ids, topk_weights = _gpu_routing(geometry, device)
-    return SimpleNamespace(
-        geometry=geometry,
-        hidden_states_q=hidden_q,
-        hidden_states_scale=hidden_scale,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        weight_view=weight_view,
-    )
-
-
-def _gpu_reference(fixture: SimpleNamespace, num_tokens: int) -> torch.Tensor:
-    """Run the public TRT-LLM NVFP4 routed MoE on the same physical tensors."""
-    geometry = fixture.geometry
-    view = fixture.weight_view
-    device = fixture.hidden_states_q.device
-    official_beta = view.get("gemm1_beta")
-    official_clamp_limit = view.get("gemm1_clamp_limit")
-    if geometry.name == "e128_i3072_k4_swiglu_oa":
-        # The public baseline consumes beta and clamp in raw-accumulator units.
-        official_beta = view["gemm1_beta"] / view["output1_scale_gate_scalar"]
-        official_clamp_limit = (
-            view["gemm1_clamp_limit"] / view["output1_scale_gate_scalar"]
-        )
-    output = torch.empty(
-        num_tokens, geometry.hidden_size, dtype=torch.bfloat16, device=device
-    )
-    result = trtllm_fp4_block_scale_routed_moe(
-        topk_ids=(fixture.topk_ids[:num_tokens], fixture.topk_weights[:num_tokens]),
-        routing_bias=None,
-        hidden_states=fixture.hidden_states_q[:num_tokens],
-        hidden_states_scale=fixture.hidden_states_scale[:num_tokens],
-        gemm1_weights=view["gemm1_weights"],
-        gemm1_weights_scale=view["gemm1_weights_scale"],
-        gemm1_bias=None,
-        gemm1_alpha=view.get("gemm1_alpha"),
-        gemm1_beta=official_beta,
-        gemm1_clamp_limit=official_clamp_limit,
-        gemm2_weights=view["gemm2_weights"],
-        gemm2_weights_scale=view["gemm2_weights_scale"],
-        gemm2_bias=None,
-        output1_scale_scalar=view["output1_scale_scalar"],
-        output1_scale_gate_scalar=view["output1_scale_gate_scalar"],
-        output2_scale_scalar=view["output2_scale_scalar"],
-        num_experts=geometry.num_experts,
-        top_k=geometry.top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=geometry.intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=geometry.num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=RoutingMethodType.TopK.value,
-        do_finalize=True,
-        enable_pdl=True,
-        activation_type=geometry.activation.type.value,
-        per_token_scale=None,
-        output=output,
-        tune_max_num_tokens=_GPU_MAX_TOKENS,
-    )
-    if isinstance(result, (list, tuple)):
-        result = result[0]
-    assert result.data_ptr() == output.data_ptr()
-    return output
-
-
-def _gpu_run_cake(
-    module,
-    fixture: SimpleNamespace,
-    num_tokens: int,
-    output: torch.Tensor,
-    workspace: torch.Tensor,
-    receipt: int,
-) -> torch.Tensor:
-    geometry = fixture.geometry
-    view = fixture.weight_view
-    inputs = (
-        output,
-        workspace,
-        fixture.hidden_states_q[:num_tokens],
-        fixture.hidden_states_scale[:num_tokens],
-        fixture.topk_ids[:num_tokens],
-        fixture.topk_weights[:num_tokens],
-        view["gemm1_weights"],
-        view["gemm1_weights_scale"],
-        view["gemm2_weights"],
-        view["gemm2_weights_scale"],
-        view["output1_scale_scalar"],
-        view["output1_scale_gate_scalar"],
-        view["output2_scale_scalar"],
-    )
-    if geometry.uses_activation_params:
-        module.cake_fused_moe_warp_decode_with_activation_params(
-            *inputs,
-            view.get("gemm1_alpha"),
-            view.get("gemm1_beta"),
-            view.get("gemm1_clamp_limit"),
-            receipt,
-            True,
-        )
-    else:
-        module.cake_fused_moe_warp_decode(*inputs, receipt, True)
-    return output
+    return prepare_fixture(geometry, _GPU_SEED + index)
 
 
 @pytest.mark.parametrize("geometry,num_tokens", _GPU_ROWS)
@@ -1355,29 +1211,13 @@ def test_gpu_output_matches_public_nvfp4_reference(geometry, num_tokens):
     module = cake_warp_decode_jit.get_cake_fused_moe_warp_decode_module(
         target, device=device
     )
-    shape = (
-        num_tokens,
-        geometry.hidden_size,
-        geometry.intermediate_size,
-        geometry.num_experts,
-        geometry.top_k,
-    )
-    workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
-    assert workspace_size > 0
-    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
-    output = torch.empty(
-        num_tokens, geometry.hidden_size, dtype=torch.bfloat16, device=device
-    )
-    receipt = int(
-        module.cake_fused_moe_warp_decode_prepare_workspace(workspace, *shape)
-    )
-    assert receipt > 0
+    output, workspace, receipt = prepare_launch(module, fixture, num_tokens)
     try:
-        first = _gpu_run_cake(
+        first = run_cake(
             module, fixture, num_tokens, output, workspace, receipt
         ).clone()
         output.fill_(float("nan"))
-        second = _gpu_run_cake(
+        second = run_cake(
             module, fixture, num_tokens, output, workspace, receipt
         ).clone()
         torch.cuda.synchronize(device)
@@ -1387,6 +1227,6 @@ def test_gpu_output_matches_public_nvfp4_reference(geometry, num_tokens):
     assert torch.isfinite(first.float()).all()
     assert torch.equal(second, first), "repeated launch changed the output"
     if geometry.has_public_reference:
-        expected = _gpu_reference(fixture, num_tokens)
+        expected = reference(fixture, num_tokens)
         torch.cuda.synchronize(device)
-        torch.testing.assert_close(first, expected, atol=_GPU_ATOL, rtol=_GPU_RTOL)
+        assert_close(first, expected)

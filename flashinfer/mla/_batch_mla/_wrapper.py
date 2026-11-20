@@ -32,6 +32,9 @@ from ._backends.cute_dsl_modular_backend import (
 from ._backends.cute_dsl_monolithic_backend import (
     _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
+from ._backends.cute_dsl_rubin_mtp_backend import (
+    _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
+)
 from ._backends.cutile_backend import (
     _BatchMLAPagedAttentionCutileBackend,
 )
@@ -99,6 +102,7 @@ class _BatchMLAPagedAttentionCuteDslBackend:
     _candidate_types: ClassVar[tuple[type[_ConcreteWrapperBackendType], ...]] = (
         _BatchMLAPagedAttentionCuteDslMonolithicBackend,
         _BatchMLAPagedAttentionCuteDslModularBackend,
+        _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
     )
 
     @classmethod
@@ -138,6 +142,7 @@ _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "xqa": _BatchMLAPagedAttentionXqaBackend,
     "cute-dsl-monolithic": _BatchMLAPagedAttentionCuteDslMonolithicBackend,
     "cute-dsl-modular": _BatchMLAPagedAttentionCuteDslModularBackend,
+    "cute-dsl-rubin-mtp": _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
     "autotune": _BatchMLAPagedAttentionAutotuneBackend,  # dispatch wrapper, see _auto_policy.py
     "auto": _BatchMLAPagedAttentionAutoBackend,  # dispatch wrapper, see _auto_policy.py
     "cute-dsl": _BatchMLAPagedAttentionCuteDslBackend,  # dispatch wrapper
@@ -178,8 +183,8 @@ class BatchMLAPagedAttentionWrapper:
     representation.
 
     See :ref:`MLA Page Layout <mla-page-layout>` for the paged KV-cache layout
-    and the `FlashInfer MLA blog post
-    <http://flashinfer.ai/2025/02/10/flashinfer-deepseek-mla.html>`_ for the
+    and the `FlashInfer 0.2 release post
+    <https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html#fused-multi-head-latent-attention-mla-decoding-kernel>`_ for the
     computation and Matrix Absorption background.
     """
 
@@ -278,11 +283,15 @@ class BatchMLAPagedAttentionWrapper:
         kv_len_arr : Optional[torch.Tensor]
             Caller-reserved ``int32`` buffer of shape ``[batch_size]`` for CSR
             KV lengths. Used only with CUDA graphs.
-        backend : {"auto", "autotune", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"}
+        backend : {"auto", "autotune", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular", "cute-dsl-rubin-mtp"}
             Requested policy or concrete backend. ``"auto"`` selects a backend
             in :meth:`plan` based on architecture and request facts.
             See ``_auto_policy.py``.
             Explicit requests remain strict; ``"cute-dsl"`` is a family alias.
+            ``"cute-dsl-rubin-mtp"`` supports SM107 causal absorbed MLA with
+            uniform Q=2/4, 128 heads, latent/RoPE widths 512/64, page size
+            64/128, and FP8 E4M3 query, KV, and output tensors. It requires
+            a CuTe DSL compiler with native SM107 and mixed-CGA support.
             ``"autotune"`` benchmarks and selects among eligible backends during
             :meth:`run` inside ``with flashinfer.autotune(True):``.
             See ``_auto_policy.py``.
@@ -519,6 +528,8 @@ class BatchMLAPagedAttentionWrapper:
             Required log-sum-exp output mode.
         output_dtype : Optional[torch.dtype]
             Required output dtype; defaults to ``q_data_type``.
+            Set ``torch.float8_e4m3fn`` for Rubin MTP; monolithic CuTe also
+            supports this output dtype, while modular CuTe requires FP16/BF16.
         output_scale : {"none", "per-tensor"}
             Required output scaling mode.
         scale_mode : {"default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"}

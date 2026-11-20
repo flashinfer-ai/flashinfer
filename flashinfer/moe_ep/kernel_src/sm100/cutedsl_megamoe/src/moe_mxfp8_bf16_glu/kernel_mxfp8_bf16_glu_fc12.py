@@ -431,11 +431,20 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
     def name(self) -> str:
         weight = getattr(self, "a_dtype", "fp8")
         overlap = "_overlap2" if self.overlapping_accum else ""
+        bi_enabled = bool(getattr(self, "batch_invariant", False))
+        bi_variant = getattr(self, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             "sm100_swapab_mxfp8_bf16_glu_fc12_"
             f"{weight}_m{self.mma_tiler[0]}n{self.mma_tiler[1]}"
             f"k{self.tma_k_tile}{overlap}_2cta_"
             f"a{self.transformed_a_storage}"
+            + bi_suffix
         )
 
     def get_workspace_size_in_bytes(
@@ -503,6 +512,8 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             in_kernel_fc2_reduce=self.fc2_in_kernel_topk_reduce,
             token_back_by_dispatch=self.token_back_by_dispatch,
             gate_up_clamp=self.gate_up_clamp,
+            batch_invariant=getattr(self, "batch_invariant", False),
+            batch_invariant_activation=getattr(self, "batch_invariant_activation", None),
             epi_flag_batch=self.epi_flag_batch,
             accumulator_overlap=self.overlapping_accum,
         )
@@ -1872,12 +1883,24 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         else:
             tCrA = tiled_mma.make_fragment_A(sATransformed)
 
+        # Count complete raw-TMA macro tiles, then expand each macro tile into
+        # its transform/MMA substages.  This matters for the overlap path,
+        # where one K128 TMA stage feeds two K64 compute stages: computing the
+        # K64 count first can produce an odd count and floor-dividing it later
+        # would drop the final partial K128 stage.  The padded compute substage
+        # is safe because TMA zero-fills coordinates outside the tensor extent.
         k_tile_cnt_fc1 = (
-            fc1_weight_gemm.shape[1] + self.mma_tiler[2] - 1
-        ) // self.mma_tiler[2]
+            (
+                fc1_weight_gemm.shape[1] + self.tma_k_tile - 1
+            )
+            // self.tma_k_tile
+        ) * self.tma_k_reuse
         k_tile_cnt_fc2 = (
-            fc2_weight_gemm.shape[1] + self.mma_tiler[2] - 1
-        ) // self.mma_tiler[2]
+            (
+                fc2_weight_gemm.shape[1] + self.tma_k_tile - 1
+            )
+            // self.tma_k_tile
+        ) * self.tma_k_reuse
 
         if warp_idx == self.sched_warp_id:
             if cutlass.const_expr(self.enable_token_comm):

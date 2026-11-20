@@ -8,7 +8,8 @@ from tests.trace.reference_utils import (
     _skip_if_not_sm100,
 )
 
-pytestmark = pytest.mark.solo
+# Peak host RSS 155-208 GiB on B200/GB200/GB300 (flashinfer-ci nightlies, 2026-10).
+pytestmark = pytest.mark.node_exclusive
 
 
 @pytest.mark.parametrize(

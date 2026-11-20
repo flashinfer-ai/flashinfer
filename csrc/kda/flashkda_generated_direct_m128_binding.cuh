@@ -3,6 +3,12 @@
 
 #include <Python.h>
 
+#if __has_include(<tvm/ffi/base_detail.h>)
+#include <tvm/ffi/base_detail.h>
+#else
+#include <tvm/ffi/base_details.h>
+#endif
+
 #if defined(FLASHKDA_GENERATED_DIRECT_SOURCE_ABI)
 #include <ATen/ATen.h>
 #include <torch/csrc/autograd/python_variable.h>
@@ -24,6 +30,12 @@
 #include "flashkda_generated_binding_common.cuh"
 
 namespace flashinfer::flash_kda_generated {
+
+#if __has_include(<tvm/ffi/base_detail.h>)
+namespace ffi_detail = tvm::ffi::detail;
+#else
+namespace ffi_detail = tvm::ffi::details;
+#endif
 
 #if FLASHKDA_GENERATED_ABI_VARIANT == FLASHKDA_GENERATED_VARIANT_SERVING
 struct GeneratedCheckpointMapWords {
@@ -269,7 +281,7 @@ static inline ffi::ObjectRef MakeDirectM128PythonLauncher(int64_t handle) {
   TVM_FFI_ICHECK(status == 0 && opaque_handle != nullptr)
       << "failed to wrap direct-M128 native launcher";
   return ffi::ObjectRef(
-      ffi::details::ObjectUnsafe::ObjectPtrFromOwned<ffi::Object>(
+      ffi_detail::ObjectUnsafe::ObjectPtrFromOwned<ffi::Object>(
           reinterpret_cast<TVMFFIObject*>(opaque_handle)));
 }
 

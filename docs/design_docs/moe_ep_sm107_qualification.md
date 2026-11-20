@@ -65,18 +65,35 @@ topology. See the [NVSHMEM environment variable reference](https://docs.nvidia.c
 | Prequantized inputs | Matching data format; scales are `[T, H/16]` E4M3 for NVFP4 or `[T, H/32]` E8M0 for MXFP8; uint8 scale storage is interpreted as raw bytes. Pass the logical scale columns, excluding internal workspace communication padding. |
 | Activation | SwiGLU by default; SiTU requires both positive, finite beta parameters and excludes gate/up clamps |
 | Normalization | NVFP4 accepts positive, finite local-expert FP32 vectors for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`. Per-call values override config defaults; if both omit a value, staging uses one. MXFP8 and MXFP4/MXFP8 do not accept these scalars. |
-| Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores; repeated masked slots are allowed |
+| Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores for valid routes; repeated masked slots are allowed |
 | Output | BF16; owned tensor by default; workspace views expire on the next workspace use or destruction |
 | Graphs and pooling | Warm up eagerly on every rank before capture; sequential, stream-ordered use of a shared workspace |
 | Determinism | In-kernel FC2 reduction is opt-in and requires early routing weights; repeatability must be characterized separately |
 
-Routing value checks use device assertions so they remain active on graph
-replay without a host synchronization. Invalid routing can invalidate the
+Scores for masked (`-1`) routes may be NaN or infinite. Staging preserves
+them; dispatch and reduction exclude masked routes. Caller tensors are unchanged.
+
+Prequantized inputs use a route-staging kernel to copy IDs and convert scores to
+FP32. Activation and scale bytes are copied unchanged.
+Eligible BF16 inputs use fused quantization and staging for NVFP4 or MXFP8;
+unsupported layouts and score dtypes retain the Torch path. Set
+`FLASHINFER_MEGA_FUSED_STAGE=0` to use Torch staging. When enabled, routing
+validation runs inside eligible NVFP4 or MXFP8 staging launches; other paths
+retain separate checks.
+
+Routing value checks are off by default; the caller is responsible for valid
+routing. Set `FLASHINFER_SM107_MEGA_CHECK_ROUTES=1` to check ID ranges, duplicate
+IDs and finite scores. Neither setting sanitizes non-finite scores on active
+routes. Metadata checks and staging remain active. Set the
+variable before warmup and graph capture; existing graphs must be recaptured
+to change their validation behavior.
+
+When enabled, routing value checks use device assertions so they remain active
+on graph replay without a host synchronization. Invalid routing can invalidate the
 worker's CUDA context, as with other invalid CUDA indexing operations.
-Use separate worker processes for negative device-assertion tests. Valid
-masked routes are supported; their combine slots are cleared each launch.
-This clearing and routing validation have a performance cost that belongs
-in the measured kernel and full-forward spans respectively.
+Use separate worker processes for negative device-assertion tests. Separate
+BF16, NVFP4 and MXFP8 reducers mask invalid routes without clearing combine
+slots. In-kernel reduction still initializes its accumulation output.
 
 The shim rounds physical token capacity up by at most three rows to keep
 four-int router loads in bounds. The public live-token limit is unchanged.
@@ -90,8 +107,8 @@ Change tensor contents in place; recapture for a new shape/count, or mask
 inactive rows while retaining the captured shape.
 
 BF16 Rubin kernels, training, local fused-routing MegaMoE, FP4 activations
-with E8M0 scales, and cross-node communication are not part of this implementation. BF16 input
-staging uses Torch operations; its cost is included in full-forward measurements.
+with E8M0 scales, and cross-node communication are not part of this implementation.
+Input staging is included in full-forward measurements.
 
 ## SiTU and prequantized weights
 
@@ -126,6 +143,14 @@ tensors must have the stated dtype; explicitly reinterpret raw scale bytes
 with `.view(dtype)` first. Do not pass already interleaved/swizzled tensors
 through this canonical ingestion path; those belong in `transformed_weights`.
 
+`layer.get_transformed_weights()` returns writable aliases of the actual prepared
+weight and scale tensors, in the backend's runtime layout. Serving frameworks
+can register per-expert views of these tensors for EPLB. Migrate both projections
+and both scale tensors together, plus separately supplied per-expert normalization
+state when present. The caller owns logical-to-physical routing and must finish
+old readers and transfers before switching placement. In-place updates retain
+captured bindings when addresses, physical capacity, and EP membership stay fixed.
+
 Select the mixed format with `Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig`.
 The backend name lists activation, weight, and output formats in that order;
 the upstream quantization tag is `mxfp4_mxfp8`. Both FC1 inputs and the
@@ -137,7 +162,7 @@ rounding.
 For [K3 routed experts](https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json),
 use H=3584, I=3072, 896 total experts, top-k=16,
 `activation="situ"`, `situ_beta=4.0`, and `situ_linear_beta=25.0`.
-Set `apply_topk_in_fc1=False` to apply routing weights after FC2; the default
+Set `apply_routing_weights_before_fc2=False` to apply routing weights after FC2; the default
 applies them before intermediate quantization and can round differently.
 The geometry regression uses synthetic checkpoint-format tensors. It does
 not cover the model's latent projections, shared experts, or engine integration.
@@ -178,9 +203,12 @@ Per-call tensors on `MoEEpTensors` override the matching config tensor. An
 omitted override restores the config default, or one if the config also omits
 it. Scalars have shape `[E_local]`, are contiguous FP32 tensors on the input
 device, and follow local expert order. Their device assertions remain active
-in graph replay. Values are copied into stable workspace buffers on every
-forward, including empty batches, so sequential pooled layers do not share
-stale values. Update captured source tensor contents in place for graph replay.
+in graph replay. Contiguous FP32 per-call tensors are bound as launch
+arguments on every forward, including empty batches, so sequential pooled
+layers do not share stale values; keep them alive while launches or captured
+graphs use them. Other values are copied into stable workspace buffers, and an
+omitted scalar resets its buffer to one. Update captured source tensor
+contents in place for graph replay.
 
 For `quantize_input=False`, input bytes and scales are copied unchanged;
 `input_norm_const` does not requantize them. The caller must supply alphas
@@ -284,3 +312,36 @@ Engine integration and whole-model serving benchmarks are separate follow-ups.
 
 Device-kernel fixes belong in the upstream kernel repository. Re-export them
 and update `VENDOR.md`; keep `kernel_src/**/src/` byte-identical to that export.
+
+## Distributed tests and caller-managed expert placement
+
+`tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py` runs the same
+format and configuration matrix at EP2, EP4, EP8, EP16 and EP32. Its expert bank
+grows when needed to give every rank physical expert slots. The suite covers
+changing live counts, empty ranks, pooled graphs, masked routing and captured
+expert updates. The expert-update test uses the same 64-slot bank at every
+width and checks both standard and GenPhase kernels.
+
+Use `torchrun` with one process per GPU, matching the total EP width. Every GPU
+must belong to one verified NVLink direct-access domain. The graph/epoch suite
+in `test_sm107_routing_graph_multirank.py` also accepts these widths. EP16/32
+runs remain optional and do not add a mandatory 32-GPU CI job.
+
+Expert placement and replication policy belong to the caller. Route IDs name
+physical slots, with the same contiguous number of slots owned by each rank;
+include replicas in `num_experts`. The caller can supply final backend-layout
+weights through `MegaConfig.transformed_weights`. Preserve the tensor addresses,
+shapes, strides, dtypes and owners across graph replays. Update both packed
+payloads and scales, plus format-specific scalar inputs where applicable.
+Changing the original checkpoint after preprocessing does not update these
+transformed tensors.
+
+Complete previous executions before reusing slots. Order weight, scale and route
+updates before the next replay, and coordinate the placement change across ranks
+before entering the next collective. Keep the layer, workspace, captured inputs
+and transformed weights alive through the final replay. The placement test
+checks MXFP4 weights/MXFP8 activations with both standard and GenPhase kernels:
+it installs replicas, remaps part of the routing to them, then changes replica
+weights while preserving unaffected rows. This validates the storage/routing
+contract; transport of expert weights and serving-framework policy are caller
+responsibilities.

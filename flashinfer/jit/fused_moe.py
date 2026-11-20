@@ -16,7 +16,10 @@ limitations under the License.
 
 import os
 import platform
-from typing import List, Optional
+import shlex
+import shutil
+from pathlib import Path
+from typing import List, Optional, Union
 
 from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
@@ -28,7 +31,12 @@ from .core import (
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
 )
-from .cpp_ext import host_compiler_is_gcc, is_cuda_version_at_least
+from .cpp_ext import (
+    get_cuda_path,
+    host_compiler_is_gcc,
+    is_cuda_version_at_least,
+    is_windows,
+)
 from .cubin_loader import (
     get_artifact,
     get_meta_hash,
@@ -41,6 +49,7 @@ from .trtllm_gen_metainfo import (
     RUBIN_CUBIN_ARCHS,
     write_filtered_metainfo,
 )
+from .windows_header_overlay import get_windows_header_overlay
 
 
 def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
@@ -54,6 +63,45 @@ def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
         properties = torch.cuda.get_device_properties(torch.cuda.current_device())
         # H20 and H20-3e expose 78 SMs, unlike H100 and H200.
         return properties.multi_processor_count == 78
+    except Exception:  # noqa: BLE001 - an unknown device must use the generic path
+        return False
+
+
+_SM90_MOE_H100_PREBUILT_D_MODULE = "fused_moe_90_h100_prebuilt_d"
+
+
+def _should_enable_sm90_moe_h100_prebuilt_d_descriptor() -> bool:
+    """Return whether to use the H100-specific prebuilt-D JIT variant.
+
+    Only the measured H100 SXM 80GB (HBM3, 132 SMs) qualifies; other H100
+    variants keep the generic module. Select the variant when its AOT artifact
+    is installed or the required JIT commands can be found; otherwise keep
+    the generic module available to AOT-only deployments.
+    """
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        return False
+
+    try:
+        import torch
+
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        if not (
+            properties.major == 9
+            and properties.name == "NVIDIA H100 80GB HBM3"
+            and properties.multi_processor_count == 132
+        ):
+            return False
+        if jit_env.get_aot_artifacts(_SM90_MOE_H100_PREBUILT_D_MODULE):
+            return True
+        # Ninja uses CXX (or c++) for the host sources and link step.
+        cxx = shlex.split(os.environ.get("CXX", "c++"))
+        if not cxx or shutil.which(cxx[0]) is None:
+            return False
+        # Ninja also needs the CUDA toolkit root for headers and libraries,
+        # even when the compiler executable is overridden separately.
+        cuda_path = get_cuda_path()
+        nvcc = os.environ.get("FLASHINFER_NVCC") or str(Path(cuda_path) / "bin/nvcc")
+        return shutil.which(nvcc) is not None and shutil.which("ninja") is not None
     except Exception:  # noqa: BLE001 - an unknown device must use the generic path
         return False
 
@@ -160,7 +208,16 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
-def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
+def gen_cutlass_fused_moe_sm90_module(
+    use_fast_build: bool = False, *, enable_prebuilt_d: bool = True
+) -> JitSpec:
+    """Generate the SM90 cutlass fused MoE JitSpec.
+
+    With ``enable_prebuilt_d`` (the default), an H20 (which takes precedence)
+    or a measured H100 SXM selects its prebuilt-D module variant; every other
+    device gets the generic module. ``False`` always returns the generic module,
+    so AOT builds do not depend on the build host's GPU.
+    """
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
@@ -173,9 +230,13 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
     module_name = None
-    if _should_enable_sm90_moe_prebuilt_d_descriptor():
-        nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
-        module_name = "fused_moe_90_h20_prebuilt_d"
+    if enable_prebuilt_d:
+        if _should_enable_sm90_moe_prebuilt_d_descriptor():
+            nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
+            module_name = "fused_moe_90_h20_prebuilt_d"
+        elif _should_enable_sm90_moe_h100_prebuilt_d_descriptor():
+            nvcc_flags.append("-DFLASHINFER_SM90_MOE_H100_PREBUILT_D_DESCRIPTOR=1")
+            module_name = _SM90_MOE_H100_PREBUILT_D_MODULE
     return gen_cutlass_fused_moe_module(
         nvcc_flags, "90", use_fast_build, module_name=module_name
     )
@@ -328,7 +389,19 @@ def _manifest_host_compile_flags() -> List[str]:
     return ["-Xcompiler", "-fno-schedule-insns"]
 
 
-def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
+def trtllm_gen_fused_moe_build_inputs(
+    module_name: str,
+    enable_rubin: bool = False,
+    nvcc_flags: Optional[List[str]] = None,
+) -> tuple[List[Path], List[str], List[Union[str, Path]]]:
+    """Host sources, nvcc flags, and include paths of a trtllm-gen fused-MoE module.
+
+    Resolves the BMM artifact (manifest header, export headers) into the
+    per-module export root ``module_name`` so the public module and the Cake
+    StepFun module (which compiles the same host sources with its own flags)
+    share one plumbing. ``nvcc_flags`` defaults to the current compilation
+    context's Blackwell/Rubin architecture flags.
+    """
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
@@ -336,7 +409,6 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     # and the module name still differ between the two variants.
     bmm_path = ArtifactPath.TRTLLM_GEN_BMM
     bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM
-    module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
     rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
     include_path = f"{bmm_path}/include"
     header_name = "flashinferMetaInfo"
@@ -360,15 +432,26 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
+    canonical_export_path = jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path
     # Per-module export-header root: the Blackwell and Rubin variants must not
-    # share this symlink, or an AOT build (all modules generated, then compiled)
-    # lets the last gen_* call's target win and skews the other module's ABI.
+    # share generated headers, or the last generated module can skew the other
+    # module's ABI during AOT builds.
     gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
-    symlink_path = (
-        gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
-    )
-    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
-    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+    if is_windows:
+        verify_symlinked_headers(canonical_export_path, BMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = get_windows_header_overlay(
+            canonical_export_path,
+            module_name,
+            BMM_EXPORT_HEADERS,
+            ("flashinfer", "trtllm", "batched_gemm", "trtllmGen_bmm_export"),
+        )
+    else:
+        symlink_path = (
+            gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
+        )
+        ensure_symlink(symlink_path, canonical_export_path)
+        verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+        windows_header_overlay = None
 
     # flashinferMetaInfo.h is generated by trtllm_gen_metainfo.py, which filters
     # the manifest to only include architectures the module can actually reach.
@@ -381,67 +464,82 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
         RUBIN_CUBIN_ARCHS if enable_rubin else BLACKWELL_CUBIN_ARCHS,
     )
 
-    # currently only support Blackwell (SM107 compiles as sm100f)
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12],
-        map_sm107_to_100f=True,
-    )
+    if nvcc_flags is None:
+        # currently only support Blackwell (SM107 compiles as sm100f)
+        nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10, 12],
+            map_sm107_to_100f=True,
+        )
 
+    sources = [
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
+    ]
+    cflags = [
+        "-DTLLM_GEN_EXPORT_INTERFACE",
+        "-DTLLM_GEN_EXPORT_FLASHINFER",
+        *rubin_flags,
+        "-DTLLM_ENABLE_CUDA",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
+        *_manifest_host_compile_flags(),
+        *nvcc_flags,
+    ]
+    include_paths: List[Union[str, Path]] = [
+        # On Windows the export headers come from a patched overlay instead of
+        # a symlink (see windows_header_overlay.py); it must come first.
+        *([windows_header_overlay] if windows_header_overlay is not None else []),
+        # gen_root supplies both the export-header symlink and the
+        # arch-filtered flashinferMetaInfo.h; the artifact's own include/
+        # dir is deliberately not on the path so the unfiltered manifest
+        # cannot be picked up instead.
+        gen_root,
+        jit_env.FLASHINFER_GEN_SRC_DIR,
+        jit_env.FLASHINFER_CUBIN_DIR,
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
+    ]
+    return sources, cflags, include_paths
+
+
+def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
+    module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
+    sources, cflags, include_paths = trtllm_gen_fused_moe_build_inputs(
+        module_name, enable_rubin
+    )
     return gen_jit_spec(
         module_name,
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
-        ],
-        extra_cuda_cflags=[
-            "-DTLLM_GEN_EXPORT_INTERFACE",
-            "-DTLLM_GEN_EXPORT_FLASHINFER",
-            *rubin_flags,
-            "-DTLLM_ENABLE_CUDA",
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-            "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
-            *_manifest_host_compile_flags(),
-        ]
-        + nvcc_flags,
-        extra_include_paths=[
-            # gen_root supplies both the export-header symlink and the
-            # arch-filtered flashinferMetaInfo.h; the artifact's own include/
-            # dir is deliberately not on the path so the unfiltered manifest
-            # cannot be picked up instead.
-            gen_root,
-            jit_env.FLASHINFER_GEN_SRC_DIR,
-            jit_env.FLASHINFER_CUBIN_DIR,
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
-        ],
+        sources,
+        extra_cuda_cflags=cflags,
+        extra_include_paths=include_paths,
     )
 
 

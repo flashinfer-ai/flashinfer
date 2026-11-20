@@ -42,6 +42,49 @@ if not hasattr(cute.nvgpu, "OperandMajorMode"):
         cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
 
 
+def _primitives():
+    """``cutlass.experimental.primitives``, imported when a kernel first needs it.
+
+    The namespace exists from CuTe DSL 4.7; importing it here instead of at
+    module scope keeps ``flashinfer.cute_dsl`` importable on an older DSL.
+    """
+    try:
+        import cutlass.experimental.primitives as prims
+    except ImportError as e:
+        raise RuntimeError(
+            "mbarrier_wait_acquire_cluster needs CuTe DSL 4.7 or newer"
+        ) from e
+    return prims
+
+
+def _try_wait_parity_relaxed_cluster(mbar_ptr, phase):
+    prims = _primitives()
+    return prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    )
+
+
+def _fence_acquire_sync_restrict():
+    prims = _primitives()
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
+
+@cute.jit
+def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None:
+    """Wait at cluster scope on a barrier that a peer CTA's ``st.async`` completes.
+
+    A relaxed cluster-scope wait followed by an acquire fence restricted to
+    ``shared::cluster``: the acquire pattern of the PTX memory model without the
+    L1 invalidation an ``.acquire.cluster`` wait would cost.
+    """
+    while not _try_wait_parity_relaxed_cluster(mbar_ptr, phase):
+        pass
+    _fence_acquire_sync_restrict()
+
+
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b
@@ -438,6 +481,47 @@ def convert_sf_to_mma_layout(
     sf_6d = sf_6d.permute(3, 4, 1, 5, 2, 0)
 
     return sf_6d  # Return strided view, NOT contiguous
+
+
+def convert_row_major_sf_to_mma_layout(
+    sf: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 32,
+) -> torch.Tensor:
+    """Convert row-major (unswizzled) block scales to the 6D MMA layout.
+
+    Checkpoints store block scales row-major, one ``uint8`` (E8M0) per
+    ``sf_vec_size`` elements along K, e.g. ``[num_groups, m, k // sf_vec_size]`` for
+    stacked expert weights. This swizzles them (``block_scale_interleave``) and
+    returns the same view as :func:`convert_sf_to_mma_layout`, so it matches
+    ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` followed by that function.
+
+    Args:
+        sf: ``uint8`` (or ``float8_e8m0fnu``) scales of shape
+            ``(num_groups, m, ceil(k / sf_vec_size))``, or ``(m, ceil(k / sf_vec_size))``
+            when ``num_groups == 1``.
+        m: Rows of the quantized matrix.
+        k: Columns (the quantized dimension) of the matrix before block scaling.
+        num_groups: Number of stacked matrices (e.g. experts).
+        sf_vec_size: Elements per scale (32 for MXFP8).
+
+    Returns:
+        Scales in the 6D MMA layout ``(32, 4, m_tiles, 4, k_tiles, num_groups)``.
+    """
+    from ..quantization.fp4_quantization import block_scale_interleave
+
+    sf_k = ceil_div(k, sf_vec_size)
+    if sf.dtype != torch.uint8:
+        sf = sf.view(torch.uint8)
+    if tuple(sf.shape) not in ((num_groups, m, sf_k), (m, sf_k)):
+        raise ValueError(
+            f"Row-major scales must have shape ({num_groups}, {m}, {sf_k}), "
+            f"got {tuple(sf.shape)}"
+        )
+    swizzled = block_scale_interleave(sf.reshape(num_groups, m, sf_k).contiguous())
+    return convert_sf_to_mma_layout(swizzled, m, k, num_groups, sf_vec_size)
 
 
 def convert_sf_from_mma_layout(

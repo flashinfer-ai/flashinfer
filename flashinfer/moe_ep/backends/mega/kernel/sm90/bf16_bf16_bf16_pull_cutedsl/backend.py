@@ -251,7 +251,7 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
                 autotune_hopper_bf16_mega_moe,
             )
 
-            autotune_hopper_bf16_mega_moe(
+            self._autotune_winner = autotune_hopper_bf16_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],

@@ -3,7 +3,7 @@
 flashinfer.mhc
 ==============
 
-Multi-head residual Combination (mHC) kernels used by Agentic-style residual
+Multi-head residual combination (mHC) kernels used by Agentic-style residual
 mixing with a fixed ``HC=4`` sub-head layout.
 
 .. currentmodule:: flashinfer.mhc

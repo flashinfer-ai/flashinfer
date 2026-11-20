@@ -19,10 +19,12 @@
 #include <flashinfer/allocator.h>
 
 #include <cassert>
+#include <flashinfer/utils.cuh>
 #include <iostream>
 #include <iterator>
 #include <type_traits>
 #include <typeinfo>
+#include <utility>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
@@ -38,10 +40,11 @@ namespace gemm {
 // SM120 uses Cooperative schedule with 128x128x128 tile shape
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
-                                            DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
-                                            float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
-                                            int l, cudaStream_t stream) {
+cudaError_t CutlassGroupwiseScaledGEMMSM120Default(void* float_buffer,
+                                                   size_t float_buffer_size_in_bytes,
+                                                   DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
+                                                   float* SFB_ptr, DTypeOut* D_ptr, int m, int n,
+                                                   int k, int l, cudaStream_t stream) {
   // SM120/SM121 only supports these specific scale granularities
   static_assert(ScaleGranularityM == 1 || ScaleGranularityM == 128,
                 "SM120/SM121 only supports ScaleGranularityM = 1 or 128");
@@ -145,7 +148,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   size_t workspace_size = Gemm::get_workspace_size(arguments);
 
   if (workspace_size > float_buffer_size_in_bytes) {
-    return cudaErrorInsufficientDriver;
+    return cudaErrorInvalidValue;
   }
 
   // Pass workspace pointer only if needed
@@ -169,6 +172,169 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
 #else
   return cudaErrorNotSupported;
 #endif
+}
+
+// Computes D^T = B^T @ A^T so the tokens sit on the N axis, where the tile can be 32 or 64 wide
+// instead of 128. The output is written column-major (n, m), the same memory as row-major (m, n).
+template <int TileN, typename EpilogueTileShape, int ScaleGranularityM, int ScaleGranularityN,
+          int ScaleGranularityK, bool ScaleMajorK, typename DTypeIn, typename DTypeOut>
+cudaError_t CutlassGroupwiseScaledGEMMSM120SwapAB(void* float_buffer,
+                                                  size_t float_buffer_size_in_bytes, DTypeIn* A_ptr,
+                                                  DTypeIn* B_ptr, float* SFA_ptr, float* SFB_ptr,
+                                                  DTypeOut* D_ptr, int m, int n, int k, int l,
+                                                  cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  using namespace cute;
+
+  std::swap(m, n);
+  std::swap(A_ptr, B_ptr);
+  std::swap(SFA_ptr, SFB_ptr);
+
+  using ElementA = DTypeIn;
+  using LayoutA = cutlass::layout::RowMajor;
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+
+  using ElementB = DTypeIn;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+
+  using ElementD = DTypeOut;
+  using LayoutD = cutlass::layout::ColumnMajor;
+  constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+  using ElementAccumulator = float;
+  using ElementCompute = float;
+
+  using MmaTileShape_MNK = Shape<_128, Int<TileN>, _128>;
+  using ClusterShape_MNK = Shape<_1, _1, _1>;
+
+  using ScaleConfig = std::conditional_t<
+      ScaleMajorK,
+      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
+                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
+                                                 ScaleGranularityK, UMMA::Major::MN,
+                                                 UMMA::Major::MN>>;
+
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, MmaTileShape_MNK, ClusterShape_MNK,
+      EpilogueTileShape, ElementAccumulator, ElementCompute, void, LayoutD, AlignmentD, ElementD,
+      LayoutD, AlignmentD, cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      sizeof(typename CollectiveEpilogue::SharedStorage))>;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
+      cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB, cute::tuple<LayoutB, LayoutSFB>,
+      AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK, StageCount,
+      cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
+
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                           CollectiveEpilogue, void>;
+
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, l));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, l));
+  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, l));
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, l));
+
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, l));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, l));
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, l},
+      {A_ptr, stride_A, B_ptr, stride_B, SFA_ptr, layout_SFA, SFB_ptr, layout_SFB},
+      {{}, nullptr, stride_C, D_ptr, stride_D}};
+
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = 0.0f;
+
+  Gemm gemm;
+
+  cutlass::Status status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorNotSupported;
+  }
+
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+
+  if (workspace_size > float_buffer_size_in_bytes) {
+    return cudaErrorInvalidValue;
+  }
+
+  void* kernel_workspace = nullptr;
+  if (workspace_size > 0) {
+    kernel_workspace = float_buffer;
+  }
+
+  status = gemm.initialize(arguments, kernel_workspace);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorNotSupported;
+  }
+
+  status = gemm.run(stream);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+
+  return cudaSuccess;
+#else
+  return cudaErrorNotSupported;
+#endif
+}
+
+// With per-token scales, swap-AB fills a 32- or 64-wide token tile at decode batch sizes, where
+// the 128x128 tile leaves most of its rows empty. The 32 and 192 cutoffs come from a sweep of 10
+// FP8 linear shapes on a 188-SM GPU; SGLang's 128 and 256 cutoffs cost 5.7-6.7% more.
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
+          typename DTypeIn, typename DTypeOut>
+cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                            DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
+                                            float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
+                                            int l, cudaStream_t stream) {
+  if constexpr (ScaleGranularityM == 1) {
+    if (m <= 32) {
+      return CutlassGroupwiseScaledGEMMSM120SwapAB<
+          32, cutlass::epilogue::collective::EpilogueTileAuto, ScaleGranularityM, ScaleGranularityN,
+          ScaleGranularityK, ScaleMajorK>(float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr,
+                                          SFA_ptr, SFB_ptr, D_ptr, m, n, k, l, stream);
+    }
+    if (m <= 192) {
+      int device;
+      int num_sms;
+      FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+      FLASHINFER_CUDA_CALL(
+          cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+      // A fixed m <= 192 cutoff ran up to 1.17x slower than the 128x128 tile at m = 112-128 and
+      // n >= 14336, where the 64-wide token tile needs one more wave of CTAs.
+      int64_t weight_tiles = static_cast<int64_t>(ceil_div(n, 128)) * l;
+      int64_t waves_tile_64 = ceil_div(weight_tiles * ceil_div(m, 64), num_sms);
+      int64_t waves_tile_128 = ceil_div(weight_tiles * ceil_div(m, 128), num_sms);
+      if (waves_tile_64 <= waves_tile_128) {
+        return CutlassGroupwiseScaledGEMMSM120SwapAB<64, cute::Shape<cute::_128, cute::_32>,
+                                                     ScaleGranularityM, ScaleGranularityN,
+                                                     ScaleGranularityK, ScaleMajorK>(
+            float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, D_ptr, m, n,
+            k, l, stream);
+      }
+    }
+  }
+  return CutlassGroupwiseScaledGEMMSM120Default<ScaleGranularityM, ScaleGranularityN,
+                                                ScaleGranularityK, ScaleMajorK>(
+      float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, D_ptr, m, n, k, l,
+      stream);
 }
 
 }  // namespace gemm

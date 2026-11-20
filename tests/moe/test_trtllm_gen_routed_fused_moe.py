@@ -70,8 +70,6 @@ from .trtllm_gen_fused_moe_utils import (
     routing_reference_topk,
 )
 
-pytestmark = pytest.mark.solo
-
 
 def _run_trtllm_gen_routed_fused_moe_case(
     num_tokens: int,

@@ -16,10 +16,17 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
 from flashinfer.utils import is_sm90a_supported
+
+
+# H100 CI peak GPU memory: 73.5 GiB.
+pytestmark = pytest.mark.gpu_exclusive
 
 
 @pytest.mark.parametrize("seq_len", [11, 99, 1763, 9999, 32767])

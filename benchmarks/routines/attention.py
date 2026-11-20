@@ -26,6 +26,7 @@ from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.utils import (
+    get_compute_capability,
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_sm12x_supported,
@@ -108,8 +109,12 @@ def _get_prims_ts_module():
     return prims_ts
 
 
-def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
-    """Helper for checking if PrimTS supports the given dtypes."""
+def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype, *, is_nvfp4_kv):
+    """Return whether PrimTS decode supports the Q/KV/output dtype combination.
+
+    NVFP4 K/V is stored as packed ``torch.uint8`` bytes; ``is_nvfp4_kv``
+    names that format instead of inferring it from the storage dtype.
+    """
     return (
         (
             q_dtype == torch.float16
@@ -118,14 +123,26 @@ def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
         )
         or (
             q_dtype == torch.bfloat16
-            and kv_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+            and (is_nvfp4_kv or kv_dtype in (torch.bfloat16, torch.float8_e4m3fn))
             and out_dtype == torch.bfloat16
         )
         or (
             q_dtype == torch.float8_e4m3fn
-            and kv_dtype in (torch.float8_e4m3fn, torch.uint8)
-            and out_dtype in (torch.float16, torch.float8_e4m3fn)
+            and (is_nvfp4_kv or kv_dtype == torch.float8_e4m3fn)
+            and out_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         )
+    )
+
+
+def _prims_ts_decode_supports_head_dim(head_dim, q_dtype, *, is_nvfp4_kv):
+    """Return whether PrimTS decode supports ``head_dim`` for these dtypes.
+
+    H64/128/192/256 support every dtype above. H512 is qualified only for FP8 Q
+    with NVFP4 K/V (``_validate_headdim_512``); other H512 dtypes have not been
+    validated yet.
+    """
+    return head_dim in (64, 128, 192, 256) or (
+        head_dim == 512 and q_dtype == torch.float8_e4m3fn and is_nvfp4_kv
     )
 
 
@@ -183,7 +200,7 @@ def _validate_prims_ts_context_samples(
     kv_indptr,
     num_qo_heads,
     num_kv_heads,
-    sm_scale,
+    softmax_scale,
     output_scale,
     causal,
     paged_kv_indices=None,
@@ -249,7 +266,9 @@ def _validate_prims_ts_context_samples(
             v_matrix = v_matrix[:visible_kv]
 
         q_vector = q[q_begin + query_idx, query_head].float()
-        probabilities = torch.softmax(torch.mv(k_matrix, q_vector) * sm_scale, dim=0)
+        probabilities = torch.softmax(
+            torch.mv(k_matrix, q_vector) * softmax_scale, dim=0
+        )
         expected = torch.matmul(probabilities, v_matrix) * output_scale
         actual = out[q_begin + query_idx, query_head].float()
         difference = actual - expected
@@ -527,6 +546,20 @@ def parse_attention_args(line, parser):
             "'modular'/'monolithic' force that impl. If unset (default), "
             "cute_dsl_impl is not passed and the API default ('auto') is used, "
             "preserving existing behavior and perf baselines."
+        ),
+    )
+    parser.add_argument(
+        "--mla_softmax_rescale_threshold_log2",
+        type=float,
+        default=0.0,
+        help=(
+            "BatchMLAPagedAttentionWrapper routine with the prims-ts backend only "
+            "(ignored by other routines): passed to BatchMLADecodePagedTSWrapper."
+            "plan(tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=...)). "
+            "A positive value skips the "
+            "O rescale while a K tile raises a row maximum by at most this many "
+            "binades (bound: 8 for FP8, 32 for BF16); FP8 P is then quantized at "
+            "448 * 2**-T instead of 448. 0 (default) keeps the exact rescale."
         ),
     )
     parser.add_argument(
@@ -836,7 +869,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             backends.remove("auto")
 
     if "prims-ts" in backends:
-        if not _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, o_data_type):
+        if not _prims_ts_decode_supports_dtypes(
+            q_dtype, kv_dtype, o_data_type, is_nvfp4_kv=is_nvfp4_kv
+        ):
             _drop_backend(
                 backends,
                 "prims-ts",
@@ -850,11 +885,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires matching K/V dtypes, except QK-BF16/PV-FP8",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 256):
+        elif head_dim_qk != head_dim_vo or not _prims_ts_decode_supports_head_dim(
+            head_dim_qk, q_dtype, is_nvfp4_kv=is_nvfp4_kv
+        ):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {64, 128, 256}",
+                "requires equal QK/VO head dimensions in {64, 128, 192, 256}, "
+                "or 512 with FP8 Q and NVFP4 K/V",
             )
         elif page_size not in (4, 16, 32, 64, 128):
             _drop_backend(
@@ -873,16 +911,25 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         elif args.enable_pdl:
             print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
 
+    if speculative_decode and spec_dec_mask_mode == "full":
+        while "trtllm-gen" in backends:
+            _drop_backend(
+                backends,
+                "trtllm-gen",
+                "uses implicit causal masking and does not support full-mask speculative decode",
+            )
+        if "trtllm-native" in backends and get_compute_capability(device)[0] == 10:
+            while "trtllm-native" in backends:
+                _drop_backend(
+                    backends,
+                    "trtllm-native",
+                    "with backend=auto resolves to causal trtllm-gen on SM10x and "
+                    "does not support full-mask speculative decode",
+                )
+
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
-
-    if speculative_decode and spec_dec_mask_mode == "full" and "trtllm-gen" in backends:
-        print(
-            "[WARNING] trtllm-gen wrapper backend applies implicit causal masking to "
-            "the draft block and ignores the non-causal (DFlash) mask; refcheck "
-            "against trtllm-native may mismatch."
-        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1106,7 +1153,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     prims_ts_kv_cache = None
     prims_ts_kv_scale_factors = None
     prims_ts_out = None
-    prims_ts_bmm2_scale = None
+    prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_mask_type = (
@@ -1142,7 +1189,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 kv_cache_for_trt[:, 1].copy_(v_dequant)
         else:
             prims_ts_kv_cache = kv_cache.contiguous()
-        prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
+        prims_ts_output_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
@@ -1153,14 +1200,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             head_dim_qk,
             page_size,
             s_kv,
-            max_seq_len_q=s_qo,
+            max_q_len=s_qo,
             packed_query=False,
-            q_data_type=q_dtype,
-            k_data_type=kv_dtype,
-            v_data_type=v_dtype,
-            o_data_type=o_data_type,
+            q_dtype=q_dtype,
+            k_dtype=kv_dtype,
+            v_dtype=v_dtype,
+            out_dtype=o_data_type,
             mask_type=prims_ts_mask_type,
-            seq_lens=actual_seq_lens_kv.flatten().tolist(),
+            seq_lens_kv=actual_seq_lens_kv.flatten().tolist(),
             workspace_buffer=workspace_buffer,
         )
 
@@ -1250,8 +1297,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 kv_scale_factors=prims_ts_kv_scale_factors,
-                bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=prims_ts_bmm2_scale,
+                softmax_scale=scale if k_scale is None else k_scale * scale,
+                output_scale=prims_ts_output_scale,
                 out=out,
                 validate=False,
             )
@@ -1343,8 +1390,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 kv_scale_factors=prims_ts_kv_scale_factors,
-                bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=prims_ts_bmm2_scale,
+                softmax_scale=scale if k_scale is None else k_scale * scale,
+                output_scale=prims_ts_output_scale,
                 out=prims_ts_out,
                 validate=False,
             ),
@@ -1623,11 +1670,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires matching K/V dtypes, except QK-BF16/PV-FP8",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 256):
+        elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 192, 256):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {128, 256}",
+                "requires equal QK/VO head dimensions in {128, 192, 256}",
             )
         elif page_size not in (16, 32, 64, 128):
             _drop_backend(
@@ -1879,7 +1926,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     prims_ts_k_cache = None
     prims_ts_out = None
-    prims_ts_sm_scale = None
+    prims_ts_softmax_scale = None
     prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
@@ -1891,12 +1938,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
         _v_scale = prims_ts_v_scale if prims_ts_v_scale is not None else 1.0
-        prims_ts_sm_scale = _q_scale * _k_scale * scale
+        prims_ts_softmax_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers_prims_ts.plan(
             device=device,
             batch_size=batch_size,
-            max_seq_len_q=s_qo,
+            max_q_len=s_qo,
             max_kv_len=s_kv,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
@@ -1907,7 +1954,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             out_dtype=o_data_type,
             page_size=page_size,
             mask_type="causal" if causal else "dense",
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             uniform_packed_lengths=not args.random_actual_seq_len,
             has_q_offset=causal and s_qo != s_kv,
@@ -1954,11 +2001,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
         elif backend == "cudnn":
-            # cuDNN uses NHD layout and the wrapper API
+            # K/V cache tensors use [pages, heads, page_size, dim] (HND).
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    "NHD",
+                    "HND",
                     backend="cudnn",
                 )
             )
@@ -2125,6 +2172,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 qo_indptr,
                 block_tables,
                 actual_seq_lens_kv_device.flatten(),
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
                 out=out,
                 validate=False,
             )
@@ -2231,7 +2280,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             kv_indptr=kv_indptr,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             causal=causal,
             paged_kv_indices=kv_indices,
@@ -2251,6 +2300,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     qo_indptr,
                     block_tables,
                     actual_seq_lens_kv_device.flatten(),
+                    max_q_len=s_qo,
+                    max_kv_len=s_kv,
                     out=prims_ts_out,
                     validate=False,
                 ),
@@ -2266,7 +2317,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     kv_indptr=kv_indptr,
                     num_qo_heads=num_qo_heads,
                     num_kv_heads=num_kv_heads,
-                    sm_scale=prims_ts_sm_scale,
+                    softmax_scale=prims_ts_softmax_scale,
                     output_scale=prims_ts_output_scale,
                     causal=causal,
                     paged_kv_indices=kv_indices,
@@ -2574,11 +2625,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 "prims-ts",
                 "supports FP16, BF16, and FP8 E4M3 inputs only",
             )
-        elif (head_dim_qk, head_dim_vo) not in ((128, 128), (192, 128), (256, 256)):
+        elif (head_dim_qk, head_dim_vo) not in (
+            (128, 128),
+            (192, 128),
+            (192, 192),
+            (256, 256),
+        ):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires QK/VO head dimensions (128,128), (192,128), or (256,256)",
+                "requires QK/VO head dimensions (128,128), (192,128), (192,192), or (256,256)",
             )
         elif num_qo_heads % num_kv_heads != 0:
             _drop_backend(backends, "prims-ts", "requires Hq to be divisible by Hkv")
@@ -2846,7 +2902,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         v = (v / v_scale).to(kv_dtype)
 
     prims_ts_out = None
-    prims_ts_sm_scale = None
+    prims_ts_softmax_scale = None
     prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
@@ -2860,13 +2916,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
         _v_scale = v_scale if v_scale is not None else 1.0
-        prims_ts_sm_scale = _q_scale * _k_scale * scale
+        prims_ts_softmax_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers["prims-ts"] = prims_ts.BatchPrefillTSWrapper()
         backend_wrappers["prims-ts"].plan(
             device=q.device,
             batch_size=batch_size,
-            max_seq_len_q=s_qo,
+            max_q_len=s_qo,
             max_kv_len=s_kv,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
@@ -2874,9 +2930,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             head_dim_vo=head_dim_vo,
             q_dtype=q.dtype,
             k_dtype=k.dtype,
-            packed=True,
+            packed_query=True,
             mask_type="causal" if causal else "dense",
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             out_dtype=out_dtype,
         )
@@ -3049,6 +3105,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 v,
                 qo_indptr,
                 kv_indptr,
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
                 out=out,
                 validate=False,
             )
@@ -3147,7 +3205,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             kv_indptr=kv_indptr,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             causal=causal,
         )
@@ -3164,6 +3222,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     v,
                     qo_indptr,
                     kv_indptr,
+                    max_q_len=s_qo,
+                    max_kv_len=s_kv,
                     out=prims_ts_out,
                     validate=False,
                 ),
@@ -3179,7 +3239,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     kv_indptr=kv_indptr,
                     num_qo_heads=num_qo_heads,
                     num_kv_heads=num_kv_heads,
-                    sm_scale=prims_ts_sm_scale,
+                    softmax_scale=prims_ts_softmax_scale,
                     output_scale=prims_ts_output_scale,
                     causal=causal,
                 )
@@ -3383,6 +3443,9 @@ def testBatchMLAPagedAttentionWrapper(args):
     # CuTe DSL decode kernel). None => do not pass cute_dsl_impl, keeping the
     # API default ('auto') so existing cases and perf baselines are unchanged.
     mla_cute_dsl_impl_arg = getattr(args, "mla_cute_dsl_impl", None)
+    mla_softmax_rescale_threshold_log2 = float(
+        getattr(args, "mla_softmax_rescale_threshold_log2", 0.0)
+    )
     if mla_cute_dsl_impl_arg is not None:
         mla_api_extra_kwargs["cute_dsl_impl"] = mla_cute_dsl_impl_arg
 
@@ -3421,6 +3484,12 @@ def testBatchMLAPagedAttentionWrapper(args):
         ]:
             print("[INFO] Cutlass MLA backend does not support FP8. Skipping.")
             remove_cutlass = True
+        if num_qo_heads != 128:
+            print(
+                "[INFO] Cutlass MLA backend requires 128 heads; "
+                f"got {num_qo_heads}. Skipping."
+            )
+            remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
     if "trtllm-native" in backends:
@@ -3458,6 +3527,11 @@ def testBatchMLAPagedAttentionWrapper(args):
             )
         elif args.enable_pdl:
             print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
+    if mla_softmax_rescale_threshold_log2 != 0.0 and "prims-ts" not in backends:
+        print(
+            "[WARNING] --mla_softmax_rescale_threshold_log2 applies only to "
+            "prims-ts; ignoring it."
+        )
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -3637,13 +3711,16 @@ def testBatchMLAPagedAttentionWrapper(args):
             head_dim_kpe,
             page_size,
             s_kv,
-            max_seq_len_q=s_qo,
+            max_q_len=s_qo,
             packed_query=False,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-            o_data_type=torch.bfloat16,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=torch.bfloat16,
             mask_type="causal",
             workspace_buffer=workspace_buffer,
+            tuning=prims_ts.MLAAttentionTuning(
+                softmax_rescale_threshold_log2=mla_softmax_rescale_threshold_log2
+            ),
         )
 
     direct_out = None
@@ -3788,8 +3865,8 @@ def testBatchMLAPagedAttentionWrapper(args):
                     kv_cache,
                     block_tables,
                     actual_seq_lens_kv.flatten(),
-                    bmm1_scale=sm_scale,
-                    bmm2_scale=1.0,
+                    softmax_scale=sm_scale,
+                    output_scale=1.0,
                     out=out,
                     validate=False,
                 )
@@ -3940,8 +4017,8 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_cache,
                 block_tables,
                 actual_seq_lens_kv.flatten(),
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0,
+                softmax_scale=sm_scale,
+                output_scale=1.0,
                 out=prims_ts_out,
                 validate=False,
             ),
@@ -4049,6 +4126,11 @@ def testBatchMLAPagedAttentionWrapper(args):
                 # Same null-preserving rule for cute_dsl_impl.
                 if mla_cute_dsl_impl_arg is not None:
                     cur_res["cute_dsl_impl"] = mla_cute_dsl_impl_arg
+                # Same null-preserving rule for the prims-ts skip-correction threshold.
+                if backend == "prims-ts" and mla_softmax_rescale_threshold_log2 != 0.0:
+                    cur_res["softmax_rescale_threshold_log2"] = (
+                        mla_softmax_rescale_threshold_log2
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

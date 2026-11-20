@@ -1,125 +1,151 @@
-# Vendoring record: next_cutedsl_megamoe
+# Rubin inference sources
 
-This directory contains one upstream kernel snapshot.
-[SKILL.md](SKILL.md) describes updates; [TUNING.md](TUNING.md) covers measurements.
+`src/` contains standard and GenPhase inference, with their dependencies in
+`src/common/` and `src/sources/`.
 
-## Upstream
-
-- **Source**: the kernel team's `cutedsl_megamoe` repository; see the shared
-  [acknowledgements](../../sm100/cutedsl_megamoe/ACKNOWLEDGEMENT.md).
-- **Vendored commit**:
-  `1667b47a3c911ecade464ab524baf192a0bf5962`,
-  committed 2026-09-16, the upstream `main` snapshot selected for this refresh.
-- **Last synced**: 2026-09-16, using the upstream exporter from that same commit.
-  Previous drop: `92dd334af2eeedb36087834354b58ace08e880c6` (2026-08-15), inherited
-  from FlashInfer PR #4601. The older `47881ad2` reference described equivalent
-  inference files in that previous drop; it is not the current source pin.
-- **Exporter**: `next/export_src.py` at the vendored commit,
-  SHA-256 `a1deca5d171a4ba92ee56b5ee82f064d5dc8f44cdf52b9ce49c88d46f10fb523`.
-- **Selected kernels**: `RubinInferenceMegaMoE` and `RubinInferenceGenphaseMegaMoE`.
-  Their dependency closure is exported to `src/sources/`: 32 implementation
-  modules and nine generated package initializers, 41 files total.
-- **Verification**: two independent exports at the pinned commit produced
-  identical file lists and bytes. The local comment edit is listed below.
-  The exporter validates internal import closure and rejects
-  unresolved imports and dependencies outside its external-module allowlist.
-
-The export command, from a checkout at the pinned SHA, is:
-
-```bash
-python next/export_src.py \
-    --kernels RubinInferenceMegaMoE RubinInferenceGenphaseMegaMoE \
-    --dst-dir "${FI_EXPORT_STAGE:?}/sources"
+```text
+next_cutedsl_megamoe/
+├── shim/                    # FlashInfer adapters, staging and tuning
+├── src/
+│   ├── __init__.py           # lazy Rubin entry points
+│   ├── common/              # preprocessing, quantization and device helpers
+│   └── sources/             # communication, helpers and Rubin kernels
+└── export_manifest.json
 ```
 
-The destination must be absent or empty and its parent must exist. Preserve the
-export manifest/log and file hashes with the integration evidence.
+## Source and export
 
-## Policy
+- Source revision: `70a6878de7852ed837d6a4dfc1572728226fbbc4`.
+- Shared-runtime revision: `1695115c1fb703f4f1d2ad9076944e4876a3ae01`.
+- Source with retained patches: `b4de2eefce3aeb02f107829bd6257e72b23aa5a6`,
+  recorded as `patch_revision` in `export_manifest.json`.
+- Exporter: `export_src.py` at the retained-patch revision above,
+  SHA-256 `d71f28ed0d4028758e8024e831c049726923f112d30d33447be2db74149e89b5`.
+- Entry points: `RubinInferenceMegaMoE` and `RubinInferenceGenphaseMegaMoE`.
+- Exported Python files: 69, including 11 generated package initializers.
 
-- `src/` is a **verbatim copy of the pinned upstream export output**. Do not
-  hand-edit, format or inject files into it. Compare it with a regenerated
-  export, rather than expecting every generated file to match a raw upstream path.
-- All FlashInfer adaptation lives in `shim/`, re-exported through `__init__.py`;
-  backends import the package API, never raw `sources` modules.
-- Device-kernel and exporter fixes go upstream first, then re-export. Any
-  unavoidable local exception must be recorded below until upstream absorbs it.
-  See the shared [vendoring rules](../../README.md).
+From the provider checkout containing those revisions and patches, export with:
 
-## Scope of this drop
+```bash
+python export_src.py \
+    --kernels RubinInferenceMegaMoE RubinInferenceGenphaseMegaMoE \
+    --modules \
+        common.cute_ref_ops common.direct_meta common.dsl_helpers \
+        common.fc_tile_timeline_host common.host_utils common.inputs_process \
+        common.megamoe_constants common.moe_utils common.pipeline_timing \
+        common.pipeline_timing_host common.ptx_helpers common.route_reset \
+        common.token_segments common.utils \
+    --dst-dir "${FI_EXPORT_STAGE:?}/raw"
+```
 
-The generic inference entry point is `RubinInferenceMegaMoE`
-(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
-backends expose SwiGLU and SiTU with BF16 output. BF16 combine supports separate
-and in-kernel reduction; `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`
-require separate reduction. They accept canonical prequantized weights; NVFP4
-also supports non-unit normalization and per-expert correction tensors.
-Shared helpers, schedulers, communication and workspace code come from the
-same pinned snapshot.
-
-`RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`) is selected
-with `kernel_variant="genphase"`. It requires uniform `(4, 1)` clusters,
-`fc2_use_bulk=True`, and at most 1024 tokens per rank. Combine remains BF16.
-Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
-SiTU requires both beta parameters, matching the exported kernel.
-
-`combine_dtype="nvfp4"` selects the existing quantized FC2 return path.
-It sends packed E2M1 values with a BF16 amax per 16 elements.
-`combine_dtype="mxfp8"` sends E4M3 values with an E8M0 scale per 32 elements.
-Both formats use the generic inference kernel. Training kernels and the local
-fused-routing kernel are not selected; the latter supplies one dependency through an export marker.
-No upstream tester, build metadata or repository scaffolding is vendored.
-
-## Compiler contract and validation
-
-The shim requires native `sm_107a` and `cutlass.utils.rubin_helpers`, available
-in public `nvidia-cutlass-dsl==4.8.0.dev0` and compatible newer builds. Install the
-`sm107` extra and set `CUTE_DSL_ARCH=sm_107a` before Python imports the DSL.
-The shim checks capabilities and the target captured at import.
-
-The older `92dd334` payload passed integration correctness at FlashInfer revision
-`9a414e73c8f4246746b281f98db2217a515819cb`, including EP2/4/8. That evidence is for
-the older drop. At FlashInfer `0f710df8`, this export passed 187 host/CUDA checks,
-72 single-GPU cases, and 34 distributed cases per rank at EP2, EP4, and EP8,
-with no skips. See the
-[qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
-for coverage and the separate reference-decoder regression.
-Tuning-cache entries use revision `sm107-block-scaled-1667b47a-runtime-options-v1`.
-The cache identity includes the kernel variant and combine format, along with
-activation, beta parameters, and clamp settings.
+Set `FI_EXPORT_STAGE` to an existing staging directory outside the checkout.
+Its `raw/` destination must be absent or empty. The explicit `--modules` list
+preserves this drop's shared-runtime selection, including modules used directly
+by the FlashInfer shim.
 
 ## Export transformations
 
-Upstream's exporter materializes three `COPY_FROM_IMPORT` markers at the pinned commit:
+The exporter resolves dependencies, rewrites imports within the exported package
+and generates lazy root entry points. It materializes these source aliases;
+paths are relative to the provider checkout and exported `src/`, respectively:
 
-| Exported file under `src/sources/kernel_src/` | Upstream source under `next/sources/kernel_src/` |
+| Provider source | Exported file |
 | --- | --- |
-| `rubin/inference/mega/topk_reduce.py` | `blackwell/inference/mega/topk_reduce.py` |
-| `rubin/custom_mix_cga_helpers.py` | `blackwell/custom_mix_cga_helpers.py` |
-| `rubin/inference/mega/tma_gather.py` | `rubin/inference/local_mega/tma_gather.py` |
+| `sources/kernel_src/blackwell/custom_mix_cga_helpers.py` | `sources/kernel_src/rubin/custom_mix_cga_helpers.py` |
+| `sources/kernel_src/rubin/inference/local_mega/tma_gather.py` | `sources/kernel_src/rubin/inference/mega/tma_gather.py` |
 
-It also generates nine `__init__.py` files and rewrites one import statement in
-`block_scaled_swap_ab_fc12_epilogue.py` from scheduler package re-exports to the
-implementation modules. The generated root exposes the two selected aliases;
-intermediate package initializers are empty. These are upstream exporter
-transformations, not manual FlashInfer patches.
+Apply the release-preparation patch before installing the export. Its SHA-256
+must match `cleanup_patch_sha256` in `export_manifest.json`. With
+`FI_RELEASE_PATCH` set to that patch's absolute path:
 
-## Local differences
+```bash
+patch --batch --forward --no-backup-if-mismatch -p1 \
+    -d "${FI_EXPORT_STAGE:?}/raw" -i "${FI_RELEASE_PATCH:?}"
+```
 
-The comment above `pusher_cta_count` in
-`src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py`
-describes the residency requirement without device-specific counts. Kernel
-logic and configuration values are unchanged. All other exported files match
-the pinned upstream export.
+The manifest hashes describe the files after release preparation. Verify every
+file and the complete file list before replacing `src/`. The exporter and
+release patch are maintained with the provider export records and are not
+included in this package. Keep the export log and file hashes with those records.
+Source changes belong in the provider before regeneration; do not edit or format
+the installed export. Run the affected adapter, numerical and graph-replay tests.
 
-## Related trees
+## Retained changes and integration
 
-`sm100/cutedsl_megamoe` and the SM90 drop are separate snapshots. This Rubin
-drop comes from upstream's `next/` generation, with relative imports and the
-`api.py` component model; it does not replace the older SM100 packages.
+The drop retains FlashInfer's route-ID forwarding and invalid-route masking
+for separate reduction. GenPhase uses the provider's self-validating combine
+and tail protocol, masking invalid scores before reduction. Top-k counts above
+the polled reducer's 31-slot limit use the static reducer and wait for peer
+stores at the tail barrier.
+Shared GenPhase uses the same static reduction for top-k counts above 31.
+Multi-stage communication validates dispatch scale groups and uses the registered
+per-stage chunk size for token-back copies.
 
-## Consumers
+GenPhase includes native N64 gather support for NVFP4, MXFP8 E4M3 and
+MXFP4/MXFP8, retaining the MXFP8 two-CTA cluster option.
+Gather padding uses distinct in-bounds source rows. A cluster barrier keeps
+peer CTAs alive until shared-memory accesses finish.
+The export also retains one-row Gather4 descriptors, counted TMEM
+synchronization, invalid-route histogram and scatter guards, and initialization
+checks for partial outputs. Standard inference keeps CTA0 reset for small
+workspaces on its unsplit, non-deduplicated route. GenPhase waits for the router
+before resetting the tail. Native decode scheduling, scale refinement and the
+last-arriver/epoch protocol remain in place.
 
-- `backends/mega/kernel/sm107/nvfp4_nvfp4_bf16_cutedsl/`
-- `backends/mega/kernel/sm107/mxfp8_mxfp8_bf16_cutedsl/`
-- `backends/mega/kernel/sm107/mxfp8_mxfp4_bf16_cutedsl/`
+The adapter forwards `use_tanh_sigmoid` and `epilogue_warpgroups`, with defaults
+`False` and `1`. Two epilogue warpgroups require standard inference, BF16 bulk
+combine and `token_back_mode="epi_warps"`. Both settings stay fixed during
+tuning and have separate cache identities.
+
+FlashInfer owns `shim/`, including workspace allocation, weight preparation
+and staging extensions. Public selectors and the Blackwell packages retain
+their existing locations. See [TUNING.md](TUNING.md) for the measurement protocol.
+
+Standard inference uses a caller-owned temporary buffer, retained by the
+adapter across launches and graph replay. GenPhase retains its local-workspace
+interface. Shared-expert execution remains disabled by default. Set
+`shared_expert=Sm107SharedExpertConfig(...)` and supply replicated shared
+weights through `MoEWeightPack.shared_expert` to add the shared FFN output.
+Standard inference also exposes `combine_dedup` for early-weighted BF16 bulk
+return. See [TUNING.md](TUNING.md) for the supported combinations.
+
+The communication components complete FC1-row bulk stores before publishing
+their READY counters, including partial batches. Reading a staging buffer is
+not sufficient to establish completion of those destination writes.
+
+Local corrections initialize FC1 scale padding through the last valid writer
+and retain 16-byte routed-output alignment. Optional shared-term loads still
+require 32 bytes.
+
+`patch_revision` records the source with the review corrections: communication
+settings have distinct compiled names, split-CTA FC1 scores follow the selected
+routing-weight position, and deduplicated reduction uses 128-bit output stores.
+Inference rejects CLC work IDs because its communication and reset protocol
+requires a fixed persistent CTA set. Ordinary kernel names are unchanged.
+Deduplicated reduction has a distinct output-store cache suffix. GenPhase
+names include `_llparity` because its LL workspace layout changed.
+
+
+## Communication lifetime and batch-invariant paths
+
+GenPhase alternates two halves of its LL inboxes and refine counter. This
+keeps a new call from overwriting words a peer still reads from the preceding
+call. Call tags avoid zero at epoch wrap, and payload-ready notifications
+cover every peer above 32 ranks as well. Workspace sizing includes both halves;
+they are zeroed on allocation and remain outside the per-call reset spans.
+
+Sparse LL words are cleared in the selected half at counter rollover, with
+an all-rank barrier before publication. This prevents an inactive word from
+matching a tag reused by the next counter cycle. The SF-plain path needs no
+rollover clear.
+
+The export retains FlashInfer's opt-in batch-invariant activation, quantization
+and ordered-reduction recipes for NVFP4, MXFP4 and MXFP8. Their fixed instruction
+N, two-CTA split, activation signature and compiled identity are preserved.
+GenPhase uses the ordinary BF16 combine wire for these ordered reductions.
+The standard temporary buffer is prepared with the other local allocations
+before any rank enters the symmetric heap.
+
+These compatibility branches import `flashinfer.moe_ep.batch_invariant`.
+The composed exporter's external-module allowlist includes `flashinfer`;
+those modules stay in FlashInfer and are not copied into `src/`.
