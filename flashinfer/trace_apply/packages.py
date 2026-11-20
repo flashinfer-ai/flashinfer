@@ -79,6 +79,7 @@ __all__ = [
     "SealedPackageError",
     "check_target_hardware",
     "import_entry",
+    "installed_packages",
     "load_packages",
     "release_packages",
     "setup_stats",
@@ -755,6 +756,9 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
 #: sealed one and stays), and drops their preloaded entries; a Definition a
 #: captured binding serves is kept, identities and all.
 _preloaded_solutions: set[tuple[str, str, str]] = set()
+#: {digest: package} of the packages ``load_packages`` installed and
+#: ``release_packages`` has not released; a forked child inherits it.
+_installed: dict[str, SealedPackage] = {}
 _bound_lock = threading.Lock()
 #: {(digest, pid): SetupBoundCallable} — one binding per package and process,
 #: so a repeat ``import_entry`` returns the identical object and the states it
@@ -972,6 +976,9 @@ def release_packages(*, allow_frozen: bool = False) -> None:
     for definition, name, _ in sorted(releasing):
         apply.unregister_preloaded(definition, name)
     _preloaded_solutions.difference_update(releasing)
+    for digest, package in list(_installed.items()):
+        if package.operation not in kept:
+            del _installed[digest]
     failures: list[SetupStateError] = []
     for bound in released:
         try:
@@ -983,6 +990,17 @@ def release_packages(*, allow_frozen: bool = False) -> None:
             f"{len(failures)} of {len(released)} setup-bearing bindings failed to "
             "release: " + "; ".join(str(error) for error in failures)
         ) from failures[0]
+
+
+def installed_packages() -> list[tuple[SealedPackage, Callable[..., Any]]]:
+    """The sealed packages installed, each with its callable for this process.
+
+    What ``load_packages`` installed, minus what ``release_packages`` released;
+    a package refused at load is never listed. An engine that routes its own
+    call sites pairs each Definition with the callable of the same package,
+    without repeating the load. A forked child gets a binding of its own.
+    """
+    return [(package, import_entry(package)) for package in _installed.values()]
 
 
 def setup_stats() -> dict[str, dict[str, Any]]:
@@ -1120,6 +1138,7 @@ def load_packages(
                 definition, name, fn, solution_hash=solutions[definition].hash()
             )
             _preloaded_solutions.add((definition, name, solutions[definition].hash()))
+        _installed.update({package.digest: package for package in result.packages})
         if solutions:
             result.applied = apply.enable_apply({**current, **solutions})
     return result

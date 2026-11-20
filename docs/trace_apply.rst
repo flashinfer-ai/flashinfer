@@ -204,7 +204,9 @@ call. Callers quiesce their calls first. ``setup_stats()`` returns ``{definition
 binding that a CUDA-graph capture has observed is never released, by
 ``release_packages()`` or by its own ``release()`` (a ``SetupStateError``):
 captured graphs replay against the state addresses, so the state is kept for
-the life of the process and stays in ``setup_stats()``. A setup-bearing
+the life of the process and stays in ``setup_stats()``. An engine that has
+destroyed every graph that captured the binding passes ``allow_frozen=True`` to
+either call, and the binding releases like any other. A setup-bearing
 solution loaded through the curated path is bound the same way but registered
 nowhere: ``disable_apply()`` drops it without teardown, and neither call sees
 it. Nothing runs at process exit.
@@ -315,6 +317,12 @@ Programmatic use
    result.callables       # {(definition, solution name): imported entry point}
    result.errors          # {digest: reason} for refusals when strict=False
    result.applied         # enable_apply() return value
+
+``installed_packages()`` returns ``[(package, callable)]`` for the packages
+``load_packages`` installed and ``release_packages`` has not released. An
+engine that routes its own call sites uses it to pair each Definition with the
+callable of the same package; a package refused at load is not listed, and a
+forked child gets a binding of its own.
 
 A verified package's entry point can also be imported on its own:
 ``import_entry(verify_package(root, digest))`` returns the sealed callable (for
