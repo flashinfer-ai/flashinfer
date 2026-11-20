@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend of the Cake Gated DeltaProduct (GDP) kernels (``K = 128``,
-``V = 64``, up to four Householder updates per token, FP32 state) as one
+``V = 64``, up to four Householder updates per token, FP32 recurrence) as one
 self-contained package (the host API bodies, the ``cake_jit`` registry and
 loader glue and the generated CUDA sources under ``csrc/``): the decode /
 MTP-verification kernels behind :mod:`flashinfer.cake_gdp`
-(:func:`cake_gated_delta_product_mtp`; SM90 / SM100 / SM103) and the chunked varlen
+(:func:`cake_gated_delta_product_mtp`; SM90 / SM100 / SM103 / SM107) and the chunked varlen
 prefill kernels behind
 ``flashinfer.gdp_prefill.chunk_gated_delta_product(..., backend="cake")``
 (:func:`cake_chunk_gated_delta_product`; SM90).  The stable,
@@ -36,6 +36,7 @@ from . import cake_jit as _loader
 from .cake_jit import (
     ARCH_BY_CAPABILITY,
     ARCHES,
+    F16_STATE_ALIGNMENT_BYTES,
     HEAD_SIZE_K,
     HEAD_SIZE_V,
     NUM_HOUSEHOLDER,
@@ -68,6 +69,12 @@ _KERNEL_DTYPE = torch.bfloat16
 # kernel sources.
 _QK_ALIGNMENT_BYTES = 8
 _OUTPUT_ALIGNMENT_BYTES = 8
+# The state pool dtypes: FP32 everywhere, FP16 where the registry ships FP16-pool
+# programs (SM100 / SM103 / SM107: the stores round with the hardware ``cvt.rs``).
+_STATE_DTYPES = (torch.float32, torch.float16)
+# Stochastic rounding of an FP16 pool: the accepted Philox round counts.
+PHILOX_ROUNDS_MIN = 5
+PHILOX_ROUNDS_MAX = 16
 
 
 def _device_index(device: torch.device) -> int:
@@ -93,22 +100,29 @@ def is_cake_gdp_supported(
     num_tokens: Optional[int] = None,
     *,
     use_qk_l2norm: bool = True,
+    state_dtype: torch.dtype = torch.float32,
 ) -> bool:
-    """Whether ``device`` (and optionally ``num_householder`` / ``num_tokens``) has an exported route."""
+    """Whether ``device`` (and optionally ``num_householder`` / ``num_tokens``) has an exported route for a
+    ``state_dtype`` state pool (``torch.float32``, or ``torch.float16`` on SM100 / SM103 / SM107)."""
 
     device = torch.device(device)
-    if device.type != "cuda":
+    if device.type != "cuda" or state_dtype not in _STATE_DTYPES:
         return False
     arch = arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
     if arch is None:
         return False
+    supported = supported_num_householder(arch, use_qk_l2norm, state_dtype=state_dtype)
     if num_householder is None:
-        return bool(supported_num_householder(arch, use_qk_l2norm))
-    if int(num_householder) not in supported_num_householder(arch, use_qk_l2norm):
+        return bool(supported)
+    if int(num_householder) not in supported:
         return False
     if num_tokens is None:
         return True
-    return 1 <= int(num_tokens) <= max_num_tokens(arch, num_householder, use_qk_l2norm)
+    return (
+        1
+        <= int(num_tokens)
+        <= max_num_tokens(arch, num_householder, use_qk_l2norm, state_dtype=state_dtype)
+    )
 
 
 def _check_tensor(
@@ -218,18 +232,31 @@ def _index_input(
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _state_pool(tensor: torch.Tensor, *, heads: int, device: torch.device) -> None:
-    """The FP32 state pool ``[pool_size, HV, V, K]`` is read and written in place: dense rows of ``K`` elements,
-    strides that are multiples of :data:`STATE_STRIDE_ELEMENTS` and a :data:`STATE_ALIGNMENT_BYTES`-aligned base
-    (the kernels stage a head's rows with 16-byte asynchronous copies).  A pool of another layout is refused: its
-    slots are the caller's state and cannot be copied behind the caller's back."""
+def _state_pool(
+    tensor: torch.Tensor, *, heads: int, device: torch.device, arch: str
+) -> None:
+    """The state pool ``[pool_size, HV, V, K]`` is read and written in place: dense rows of ``K`` elements,
+    strides that are multiples of :data:`STATE_STRIDE_ELEMENTS` and an aligned base -- FP32:
+    :data:`STATE_ALIGNMENT_BYTES` (the kernels stage a head's rows with 16-byte asynchronous copies); FP16:
+    :data:`F16_STATE_ALIGNMENT_BYTES` (8-byte pieces), on an architecture with FP16-pool programs only.  A pool of
+    another dtype or layout is refused: its slots are the caller's state and cannot be copied behind the caller's
+    back."""
 
     if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
         raise ValueError("initial_state must be a [pool_size, HV, 64, 128] tensor")
     if tensor.device != device:
         raise ValueError(f"initial_state must live on {device}, got {tensor.device}")
-    if tensor.dtype != torch.float32:
-        raise ValueError(f"initial_state must be float32, got {tensor.dtype}")
+    if tensor.dtype not in _STATE_DTYPES:
+        raise ValueError(
+            f"initial_state must be float32 or float16, got {tensor.dtype}"
+        )
+    if tensor.dtype == torch.float16 and not supported_num_householder(
+        arch, state_dtype=torch.float16
+    ):
+        raise ValueError(
+            "a float16 state pool needs the hardware stochastic rounding of SM100 / SM103 / SM107 "
+            f"(cvt.rs); {arch} has no float16-pool program"
+        )
     pool_size = int(tensor.shape[0])
     if tuple(tensor.shape[1:]) != (heads, HEAD_SIZE_V, HEAD_SIZE_K):
         raise ValueError(
@@ -247,10 +274,55 @@ def _state_pool(tensor: torch.Tensor, *, heads: int, device: torch.device) -> No
         raise ValueError(
             f"initial_state strides must be multiples of {STATE_STRIDE_ELEMENTS} elements, got {strides}"
         )
-    if tensor.data_ptr() % STATE_ALIGNMENT_BYTES:
+    alignment = (
+        STATE_ALIGNMENT_BYTES
+        if tensor.dtype == torch.float32
+        else F16_STATE_ALIGNMENT_BYTES
+    )
+    if tensor.data_ptr() % alignment:
         raise ValueError(
-            f"initial_state must have a {STATE_ALIGNMENT_BYTES}-byte aligned base address"
+            f"a {tensor.dtype} initial_state must have a {alignment}-byte aligned base address"
         )
+
+
+def _rounding(
+    pool: torch.Tensor, rand_seed: Optional[torch.Tensor], philox_rounds: int
+) -> tuple[torch.Tensor, int]:
+    """The seed tensor and round count of a float16 pool's launch.  With ``rand_seed`` the stores round
+    stochastically with ``philox_rounds`` Philox rounds (an ``int`` from :data:`PHILOX_ROUNDS_MIN` to
+    :data:`PHILOX_ROUNDS_MAX`); the seed is a one-element int64 tensor on the pool's device, read by the kernel.
+    Without one they round to nearest even (0 rounds), and the seed argument is never read: the pool's first eight
+    bytes viewed as int64 when the pool's storage offset allows it (no allocation), else a one-element int64
+    placeholder."""
+
+    if rand_seed is None:
+        # The kernel loads the seed only when philox_rounds != 0, so this argument is never read.  The int64 view
+        # of the pool's first four elements relies on the 8-byte base alignment _state_pool has checked; torch
+        # also needs the storage offset to be a multiple of four elements, which fails only for a storage whose
+        # own base is not 8-byte aligned (an UntypedStorage slice, DLPack): that pool gets a per-call placeholder.
+        if pool.storage_offset() % 4 == 0:
+            return pool.as_strided((4,), (1,)).view(torch.int64), 0
+        return pool.new_empty((1,), dtype=torch.int64), 0
+    if not isinstance(rand_seed, torch.Tensor):
+        raise TypeError("rand_seed must be a torch.Tensor")
+    if rand_seed.dtype != torch.int64 or rand_seed.numel() != 1:
+        raise ValueError(
+            f"rand_seed must be a one-element int64 tensor, got {rand_seed.dtype} with "
+            f"{rand_seed.numel()} elements"
+        )
+    if rand_seed.device != pool.device:
+        raise ValueError(
+            f"rand_seed must live on the state pool's device {pool.device}, got {rand_seed.device}"
+        )
+    if isinstance(philox_rounds, bool) or not isinstance(philox_rounds, int):
+        raise TypeError(
+            f"philox_rounds must be an int, got {type(philox_rounds).__name__}"
+        )
+    if not PHILOX_ROUNDS_MIN <= philox_rounds <= PHILOX_ROUNDS_MAX:
+        raise ValueError(
+            f"philox_rounds must be {PHILOX_ROUNDS_MIN} to {PHILOX_ROUNDS_MAX} with a rand_seed, got {philox_rounds}"
+        )
+    return rand_seed.reshape(1), philox_rounds
 
 
 def cake_gated_delta_product_mtp(
@@ -269,8 +341,10 @@ def cake_gated_delta_product_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,
+    rand_seed: Optional[torch.Tensor] = None,
+    philox_rounds: int = 10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gated DeltaProduct decode / MTP verification over an FP32 state pool.
+    """Gated DeltaProduct decode / MTP verification over an FP32 or FP16 state pool.
 
     The body of :func:`flashinfer.cake_gdp.cake_gated_delta_product_mtp`; see
     that function for the full documentation of the arguments and semantics.
@@ -327,7 +401,16 @@ def cake_gated_delta_product_mtp(
     )
     a = _model_input(a, "a", shape=(B, T, HV), device=device, dtype=model_dtype)
     b = _model_input(b, "b", shape=(B, T, n, HV), device=device, dtype=model_dtype)
-    _state_pool(initial_state, heads=HV, device=device)
+    _state_pool(initial_state, heads=HV, device=device, arch=arch)
+    state_dtype = initial_state.dtype
+    rounds = 0  # the launch class of an FP32 pool: its stores do not round
+    if state_dtype == torch.float16:
+        seed, rounds = _rounding(initial_state, rand_seed, philox_rounds)
+    elif rand_seed is not None:
+        raise ValueError(
+            "rand_seed selects the stochastic rounding of a float16 state pool; "
+            "a float32 pool stores the state without rounding"
+        )
     A_log = _vector_input(
         A_log,
         "A_log",
@@ -377,11 +460,13 @@ def cake_gated_delta_product_mtp(
         num_householder=n,
         num_tokens=T,
         use_qk_l2norm=use_qk_l2norm,
+        state_dtype=state_dtype,
     ):
         raise ValueError(
             f"no exported Cake GDP decode program for num_householder={n}, T={T}, "
             f"use_qk_l2norm={use_qk_l2norm} on {arch}: the route {route_key(n, use_qk_l2norm)!r} admits T up to "
-            f"{max_num_tokens(arch, n, use_qk_l2norm)}; exported routes: {sorted(_loader.ROUTES.get(arch, {}))}"
+            f"{max_num_tokens(arch, n, use_qk_l2norm, state_dtype=state_dtype)} for a {state_dtype} pool; "
+            f"exported routes: {sorted(_loader.ROUTES.get(arch, {}))}"
         )
 
     out_shape = (B, T, HV, HEAD_SIZE_V)
@@ -417,6 +502,11 @@ def cake_gated_delta_product_mtp(
         B * HV,
         sm_count=_loader.sm_count(_device_index(device)),
         use_qk_l2norm=use_qk_l2norm,
+        state_dtype=state_dtype,
+        # The launch class (host values, so a captured call keeps its program): an FP16 pool's round count and
+        # whether the call stores per-token snapshots pick a program's snapshot_noise sibling where it is faster.
+        philox_rounds=rounds,
+        use_ssm_state_indices=bool(use_scatter),
     )
     values: dict[str, object] = {
         "q": q,
@@ -437,6 +527,9 @@ def cake_gated_delta_product_mtp(
         "disable_state_update": int(disable_state_update),
         "use_ssm_state_indices": use_scatter,
     }
+    if state_dtype == torch.float16:
+        values["rand_seed"] = seed
+        values["philox_rounds"] = rounds
     # The loader binds the current torch stream of the *current* device; make that the
     # tensors' device so a call made while another device is current keeps the order
     # of the stream its inputs were produced on.

@@ -1092,9 +1092,10 @@ class TgvGemmCuteExtKernel:
         # TMEM → RMEM (one tcgen05.ld for the 64×8 tile).
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
 
-        # tcgen05.ld is async — fence makes the result visible to (a) the
-        # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
-        # on bar_tmem_alloc phase 1.
+        # tcgen05.ld is async — wait for it so the rAcc.load() below sees
+        # the result. tcgen05.fence::before_thread_sync then orders the
+        # retired load before MMA's dealloc_tmem, which follows our
+        # bar_tmem_alloc phase-1 arrival.
         cute.arch.fence_view_async_tmem_load()
         _tcgen05_fence(before=True)
 
