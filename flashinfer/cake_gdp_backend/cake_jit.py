@@ -16,7 +16,7 @@ limitations under the License.
 Host plan and loader glue of the Cake Gated DeltaProduct (GDP) kernels
 (``K = 128``, ``V = 64``, ``n <= 4`` Householder updates per token, FP32
 recurrence): the decode / MTP-verification programs (``role`` ``"decode"``;
-SM90 / SM100 / SM103) and the chunked varlen prefill programs (``role``
+SM90 / SM100 / SM103 / SM107) and the chunked varlen prefill programs (``role``
 ``"prefill"``; SM90).
 
 Every module below is one mechanically exported production build: a CUDA
@@ -57,8 +57,8 @@ A decode record reads and writes a state pool of one dtype, its build's
 ``state_dtype``: ``"f16"`` for an FP16 pool, absent for an FP32 pool (the
 default).  Every FP16 record is the twin of the FP32 record of the same route,
 body, variant and token count, with the same band, and is delivered on SM100 /
-SM103 only: its stores round the FP32 state with the hardware ``cvt.rs``
-instruction.  Its kernel takes two more arguments, the int64 ``rand_seed``
+SM103 / SM107 only: its stores round the FP32 state with the hardware
+``cvt.rs`` instruction.  Its kernel takes two more arguments, the int64 ``rand_seed``
 tensor it reads on the device and the Philox round count ``philox_rounds``
 (``0`` rounds to nearest even and reads no seed).  The dispatch functions
 take the pool's dtype as ``state_dtype`` (``torch.float32`` by default) and
@@ -284,6 +284,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -440,6 +441,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -597,6 +599,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -741,6 +744,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -908,6 +912,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -1242,6 +1247,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -1382,6 +1388,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "arches": [
                     "sm_100a",
                     "sm_103a",
+                    "sm_107a",
                 ],
                 "at_most": None,
                 "kind": "state_heads_between",
@@ -1590,6 +1597,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -1736,6 +1744,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -1877,6 +1886,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2018,6 +2028,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2164,6 +2175,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2304,6 +2316,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "arches": [
                     "sm_100a",
                     "sm_103a",
+                    "sm_107a",
                 ],
                 "at_most": None,
                 "ctas_per_sm_at_most": 2,
@@ -2325,6 +2338,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2470,6 +2484,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2616,6 +2631,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2757,6 +2773,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -2902,6 +2919,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3057,6 +3075,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3212,6 +3231,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3363,6 +3383,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3520,6 +3541,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3660,6 +3682,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3816,6 +3839,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -3972,6 +3996,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4128,6 +4153,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4285,6 +4311,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4430,6 +4457,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -4777,6 +4805,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5072,6 +5101,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5228,6 +5258,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5384,6 +5415,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5540,6 +5572,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -5680,6 +5713,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "arches": [
                     "sm_100a",
                     "sm_103a",
+                    "sm_107a",
                 ],
                 "at_most": None,
                 "ctas_per_sm_above": 2,
@@ -5887,6 +5921,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6043,6 +6078,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6199,6 +6235,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6356,6 +6393,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6502,6 +6540,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6646,6 +6685,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6802,6 +6842,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -6948,19 +6989,31 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-            "rounds_at_least": 10,
-            "snapshot": True,
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "kind": "state_heads_between",
+                "rounds_at_least": 10,
+                "snapshot": True,
+                "arches": ["sm_100a", "sm_103a"],
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "kind": "state_heads_between",
+                "rounds_at_least": 16,
+                "snapshot": True,
+                "arches": ["sm_107a"],
+            },
+        ],
     },
     "cake_gdp_f0b0248a8e7d3ad6047d": {
         "arches": [
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -7106,6 +7159,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -7438,6 +7492,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -7589,6 +7644,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -7740,6 +7796,14 @@ MODULES: dict[str, dict[str, Any]] = {
                 "at_most": None,
                 "kind": "state_heads_between",
                 "rounds_at_most": 9,
+                "arches": ["sm_100a", "sm_103a"],
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "kind": "state_heads_between",
+                "rounds_at_most": 15,
+                "arches": ["sm_107a"],
             },
             {
                 "above": 0,
@@ -7754,6 +7818,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -7900,6 +7965,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_90a",
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             [
@@ -8040,6 +8106,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "arches": [
                     "sm_100a",
                     "sm_103a",
+                    "sm_107a",
                 ],
                 "at_most": None,
                 "ctas_per_sm_above": 4,
@@ -8728,17 +8795,73 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_717ce3c684b41c37e673",
         ],
     },
+    "sm_107a": {
+        "decode_nh1": [
+            "cake_gdp_78fc9caafee16e2af047",
+            "cake_gdp_f3f05058d0b4a43f6589",
+        ],
+        "decode_nh2": [
+            "cake_gdp_3342c82179fa758b0570",
+            "cake_gdp_aa7f7810c60fe76c14a6",
+        ],
+        "decode_nh3": [
+            "cake_gdp_f2f0c7abbf10082a6996",
+            "cake_gdp_e156ee45668b2455e46d",
+            "cake_gdp_4d40c98af90453032200",
+            "cake_gdp_fefa1931e0ddadb74891",
+            "cake_gdp_e3643cae4c9fe94f434c",
+            "cake_gdp_159ecba6294f1c73ed91",
+            "cake_gdp_27eb88658ee4bdc4ae35",
+            "cake_gdp_32a3f37f5ef3015142a5",
+            "cake_gdp_46ef1a68db53b4c532e9",
+            "cake_gdp_f0b0248a8e7d3ad6047d",
+            "cake_gdp_a226c899893599e679a3",
+            "cake_gdp_f65e08f2c35db6ffe971",
+            "cake_gdp_1a3d01a5826508d64a06",
+            "cake_gdp_3cbdef34ce5b580c2216",
+            "cake_gdp_5970bfa6676087a3ce92",
+            "cake_gdp_450bb0db3b79acafa419",
+            "cake_gdp_c51f69d9ac126bbaab36",
+            "cake_gdp_585a5ea4cbdd07f1b2a8",
+            "cake_gdp_dbd09ba202e904a29148",
+            "cake_gdp_8f4ad44e524af3f3cbb9",
+            "cake_gdp_0f9d4678110f025383b2",
+            "cake_gdp_e1047159db983943d97b",
+            "cake_gdp_c3cf32174475946d9c35",
+            "cake_gdp_6bb51453cd15a43da9c2",
+            "cake_gdp_5bc4ef21b6e7aefed05f",
+            "cake_gdp_ee0cdd5d391a7f594356",
+            "cake_gdp_cbb122ec06d8e7bfbdab",
+            "cake_gdp_9bfd49d6bbbb3d849f30",
+            "cake_gdp_0c31b01fa2a76d426c5f",
+            "cake_gdp_72b6872c98ed9abf0bdf",
+            "cake_gdp_bc76e12e0c247b44a27d",
+            "cake_gdp_7e4385817ba59915bc61",
+            "cake_gdp_bb55d7d5e4db0d95acce",
+            "cake_gdp_8e26e2c2d0cb0a7fbee9",
+            "cake_gdp_16d24c9e19fa73fe57ee",
+            "cake_gdp_f5d305e6f05978caca3c",
+            "cake_gdp_b047f2f1a20630e6f36b",
+            "cake_gdp_efdf403e0df822bfc83f",
+        ],
+        "decode_nh4": [
+            "cake_gdp_3425d6511e4eab4896cd",
+            "cake_gdp_717ce3c684b41c37e673",
+        ],
+    },
 }
 
 # One verified build per architecture: H100 / H200 (``sm_90a``), B200 / GB200
-# (``sm_100a``) and B300 / GB300 (``sm_103a``).  Every architecture is compiled
+# (``sm_100a``), B300 / GB300 (``sm_103a``) and R200 / VR200 (``sm_107a``; the
+# programs and bands of ``sm_100a``).  Every architecture is compiled
 # with its exact ``-gencode`` flag set (``build.json`` ``arch_flags``); there is
 # no family fallback.
-ARCHES = ("sm_90a", "sm_100a", "sm_103a")
+ARCHES = ("sm_90a", "sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (9, 0): "sm_90a",
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
 }
 HEAD_SIZE_K = 128
 HEAD_SIZE_V = 64

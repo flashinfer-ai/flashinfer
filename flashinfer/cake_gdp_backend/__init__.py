@@ -18,7 +18,7 @@ Backend of the Cake Gated DeltaProduct (GDP) kernels (``K = 128``,
 self-contained package (the host API bodies, the ``cake_jit`` registry and
 loader glue and the generated CUDA sources under ``csrc/``): the decode /
 MTP-verification kernels behind :mod:`flashinfer.cake_gdp`
-(:func:`cake_gated_delta_product_mtp`; SM90 / SM100 / SM103) and the chunked varlen
+(:func:`cake_gated_delta_product_mtp`; SM90 / SM100 / SM103 / SM107) and the chunked varlen
 prefill kernels behind
 ``flashinfer.gdp_prefill.chunk_gated_delta_product(..., backend="cake")``
 (:func:`cake_chunk_gated_delta_product`; SM90).  The stable,
@@ -70,7 +70,7 @@ _KERNEL_DTYPE = torch.bfloat16
 _QK_ALIGNMENT_BYTES = 8
 _OUTPUT_ALIGNMENT_BYTES = 8
 # The state pool dtypes: FP32 everywhere, FP16 where the registry ships FP16-pool
-# programs (SM100 / SM103: the stores round with the hardware ``cvt.rs``).
+# programs (SM100 / SM103 / SM107: the stores round with the hardware ``cvt.rs``).
 _STATE_DTYPES = (torch.float32, torch.float16)
 # Stochastic rounding of an FP16 pool: the accepted Philox round counts.
 PHILOX_ROUNDS_MIN = 5
@@ -103,7 +103,7 @@ def is_cake_gdp_supported(
     state_dtype: torch.dtype = torch.float32,
 ) -> bool:
     """Whether ``device`` (and optionally ``num_householder`` / ``num_tokens``) has an exported route for a
-    ``state_dtype`` state pool (``torch.float32``, or ``torch.float16`` on SM100 / SM103)."""
+    ``state_dtype`` state pool (``torch.float32``, or ``torch.float16`` on SM100 / SM103 / SM107)."""
 
     device = torch.device(device)
     if device.type != "cuda" or state_dtype not in _STATE_DTYPES:
@@ -254,7 +254,7 @@ def _state_pool(
         arch, state_dtype=torch.float16
     ):
         raise ValueError(
-            "a float16 state pool needs the hardware stochastic rounding of SM100 / SM103 "
+            "a float16 state pool needs the hardware stochastic rounding of SM100 / SM103 / SM107 "
             f"(cvt.rs); {arch} has no float16-pool program"
         )
     pool_size = int(tensor.shape[0])
