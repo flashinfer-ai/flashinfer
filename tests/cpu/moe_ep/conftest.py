@@ -4,6 +4,15 @@ import pytest
 
 
 @pytest.fixture
+def host_only_cuda(monkeypatch):
+    """Keep host admission and cache tests independent of visible GPUs."""
+    import torch
+
+    # Device-specific tests can override discovery after this fixture runs.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+
+@pytest.fixture
 def stubbed_fleet_registry():
     """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
     from unittest import mock

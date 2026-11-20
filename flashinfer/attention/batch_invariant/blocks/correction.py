@@ -17,8 +17,12 @@ row's statistics chain**. Per tile it receives from the softmax warpgroups ``alp
   output rows (mode 0), or the raw fp32 ``O_c`` rows and ``(m, l)`` to the workspace slot (mode 1, folded
   by ``fixup.py``).
 
-TMEM traffic goes through ``tcgen05.copy.Ld32x32bOp`` / ``St32x32bOp`` in ``CT``-column pieces (16: the
-warpgroup runs at 96 registers when there are two softmax warpgroups).
+TMEM traffic goes through ``tcgen05.copy.Ld32x32bOp`` / ``St32x32bOp`` in ``CT``-column pieces (``StaticPlan.ct``: 32 at
+128 registers, 16 below, 8 under the paired placement whose warpgroup carries two Q tiles' chains at 96). A merge with an ``O_m``
+operand holds one piece of each operand in the two register buffers, so its pieces go one TMEM round trip at a time; the unit's
+first merge and the single-chunk epilogue copy have no ``O_m`` operand and keep two O_c pieces in flight (``first_merge_tmem``,
+``copy_oc_to_om_tmem``) -- the epilogue's round trips sit on the unit boundary of short units, where the softmax waits for the
+correction warpgroup to be free.
 
 The running merged state ``O_m`` lives in TMEM at D <= 128 (``S | P | O_c | O_m`` <= 448 columns) and in a per-CTA
 global scratch at D = 256 (``st.om_tmem`` False: TMEM holds ``S | P | O_c`` = 448; the scratch row of this CTA and
@@ -50,9 +54,18 @@ from ..spec import chunk_len
 from .operands import ACC_DTYPE, BAR_FOLD, IN_DTYPE, OM_VEC, Q_ROWS, om_scratch_blocks
 
 
-CT = 16  # TMEM columns per load / store with two softmax warpgroups (96 registers); 32 with one (StaticPlan.ct)
-MERGE_DEPTH = 4  # O_m pieces of the global-scratch merge in flight (register buffers): the loads of pieces i+1 .. i+3 are issued before piece i
-# is merged, so the eight dependent L2 round trips of the D = 256 merge become ~two (the correction runs at 208 registers)
+CT = 16  # TMEM columns per load / store with two softmax warpgroups (96 registers); 32 with one, 8 under the paired placement (StaticPlan.ct)
+PIECE_BUFS = {
+    80: 2,
+    96: 2,
+    128: 2,
+    160: 3,
+    208: 4,
+}  # register buffers (CT columns each) of the correction per register budget. The rescale issues the TMEM loads of that many O_c
+# pieces before the first multiply, so their latencies overlap instead of one load, multiply, store round trip per piece (the
+# store of a piece and the load of the next would otherwise be kept in program order: the compiler cannot tell the TMEM
+# addresses apart); the global-scratch merge (D = 256) keeps that many minus one O_m pieces in flight ahead of their merges
+# (``merge_global_pipelined``). No piece of either is live during the other
 
 
 def om_piece(gOm: cute.Tensor, i: int, CT: int) -> cute.Tensor:
@@ -80,34 +93,93 @@ def rescale_tile(
     tiled_st,
     tLDc: cute.Tensor,
     tSTc: cute.Tensor,
-    rO: cute.Tensor,
+    bufs,
     n_pieces: cutlass.Constexpr,
     CT: cutlass.Constexpr,
 ):
     """One tile's rescale: take its alpha; when the tile continues a chunk (``cont``: a previous PV of the chunk
-    exists), wait for that PV and rescale the rows whose maximum moved."""
+    exists), wait for that PV and rescale the rows whose maximum moved. ``bufs``: the register buffers (one piece each)
+    whose loads are in flight together (``RESCALE_BUFS``)."""
     sth = stats_cons.wait_and_advance()
     alpha = s_alpha[(sth.index, row)]
     sth.release()
     if cont:
         oh = o_cons.wait_and_advance()  # PV(n-1) complete
         if warp_active & cute.arch.vote_any_sync(alpha != Float32(1.0)):
-            for i in cutlass.range_constexpr(n_pieces):
-                cute.copy(
-                    tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
-                )
-                for e in cutlass.range_constexpr(
-                    0, cute.size(rO), 2
-                ):  # mul(O, alpha) two elements per mul.rn.f32x2
-                    y0, y1 = CuteF32.mul2((rO[e], rO[e + 1]), (alpha, alpha))
-                    rO[e] = y0
-                    rO[e + 1] = y1
-                cute.copy(
-                    tiled_st, rO, cute.make_tensor(tSTc.iterator + i * CT, tSTc.layout)
-                )
+            rescale_pieces(tiled_ld, tiled_st, tLDc, tSTc, bufs, alpha, n_pieces, CT)
         cute.arch.fence_view_async_tmem_store()
         oh.release()
     return stats_cons, o_cons, alpha
+
+
+def rescale_pieces(tiled_ld, tiled_st, tLDc, tSTc, bufs, alpha, n_pieces, CT):
+    """``O_c *= alpha`` piece by piece (``mul.rn`` per element, two per ``mul.rn.f32x2``), the loads of ``len(bufs)`` pieces
+    issued before their multiplies and stores. Plain Python: trace-time structure."""
+    depth = len(bufs)
+    for i0 in range(0, n_pieces, depth):
+        k = min(depth, n_pieces - i0)
+        for b in range(k):
+            cute.copy(
+                tiled_ld,
+                cute.make_tensor(tLDc.iterator + (i0 + b) * CT, tLDc.layout),
+                bufs[b],
+            )
+        for b in range(k):
+            rO = bufs[b]
+            for e in range(0, cute.size(rO), 2):
+                y0, y1 = CuteF32.mul2((rO[e], rO[e + 1]), (alpha, alpha))
+                rO[e] = y0
+                rO[e + 1] = y1
+            cute.copy(
+                tiled_st,
+                rO,
+                cute.make_tensor(tSTc.iterator + (i0 + b) * CT, tSTc.layout),
+            )
+
+
+def merge_elems(rO, rM, a1, a2, first_merge_const: bool):
+    """``rM = fma(O_c, a2, mul(O_m, a1))`` per element (``fma(O_c, a2, +0)`` on the unit's first merge), two elements per
+    ``mul.rn.f32x2`` / ``fma.rn.f32x2``: the same per-element ops as the scalar form (a packing placement). Plain Python."""
+    for e in range(0, cute.size(rO), 2):
+        if first_merge_const:
+            m0 = Float32(0.0)
+            m1 = Float32(0.0)
+        else:
+            m0, m1 = CuteF32.mul2((rM[e], rM[e + 1]), (a1, a1))
+        y0, y1 = CuteF32.fma2((rO[e], rO[e + 1]), (a2, a2), (m0, m1))
+        rM[e] = y0
+        rM[e + 1] = y1
+
+
+def first_merge_elems(rO, a2):
+    """``rO = fma(O_c, a2, +0)`` in place: the unit's first merge (``merge_elems`` with the init state). Plain Python."""
+    for e in range(0, cute.size(rO), 2):
+        y0, y1 = CuteF32.fma2(
+            (rO[e], rO[e + 1]), (a2, a2), (Float32(0.0), Float32(0.0))
+        )
+        rO[e] = y0
+        rO[e + 1] = y1
+
+
+def normalize_elems(rM, inv, rOut):
+    """The epilogue's ``cvt_bf16(add(mul(O, inv), +0))`` per element, two per ``mul.rn.f32x2`` / ``add.rn.f32x2``. Plain Python."""
+    zero = Float32(0.0)
+    for e in range(0, cute.size(rM), 2):
+        y0, y1 = CuteF32.mul2((rM[e], rM[e + 1]), (inv, inv))
+        z0, z1 = CuteF32.add2((y0, y1), (zero, zero))
+        rOut[e] = z0.to(IN_DTYPE)
+        rOut[e + 1] = z1.to(IN_DTYPE)
+
+
+def store_out_piece(rOut, mO, out_row, i, CT, D):
+    """Piece ``i`` of the output row (bf16) to ``mO``."""
+    cute.autovec_copy(
+        rOut,
+        cute.make_tensor(
+            mO.iterator + cute.assume(out_row.to(Int64) * D + i * CT, divby=8),
+            cute.make_layout((cute.size(rOut),)),
+        ),
+    )
 
 
 def _pairwise_add(vals):
@@ -163,8 +235,7 @@ def merge_piece(
     """``rM = fma(O_c piece (in rO), a2, mul(O_m piece, a1))`` with the O_m piece from TMEM (``om_tmem``) or from this row's
     global scratch ``gOm`` (``+0`` on the unit's first merge: the init state)."""
     if first_merge:
-        for e in cutlass.range_constexpr(cute.size(rO)):
-            rM[e] = CuteF32.fma(rO[e], a2, Float32(0.0))
+        merge_elems(rO, rM, a1, a2, True)
     else:
         if cutlass.const_expr(om_tmem):
             cute.copy(
@@ -172,8 +243,7 @@ def merge_piece(
             )
         else:
             cute.autovec_copy(om_piece(gOm, i, CT), rM)
-        for e in cutlass.range_constexpr(cute.size(rO)):
-            rM[e] = CuteF32.fma(rO[e], a2, CuteF32.mul(rM[e], a1))
+        merge_elems(rO, rM, a1, a2, False)
 
 
 @cute.jit
@@ -198,25 +268,18 @@ def merge_global_pipelined(
     first_merge,
     a1: Float32,
     a2: Float32,
-    inv: Float32,
     tiled_ld,
     tLDc: cute.Tensor,
     gOm,
     rO: cute.Tensor,
     rMs,
-    rOut: cute.Tensor,
-    mO: cute.Tensor,
-    out_row: Int32,
-    row_valid,
     n_pieces: cutlass.Constexpr,
     CT: cutlass.Constexpr,
-    to_output: cutlass.Constexpr,
-    D: cutlass.Constexpr,
 ):
     """The chunk merge with ``O_m`` in the global scratch, software-pipelined ``len(rMs)`` deep: the ``O_m`` pieces ``i + 1 .. i + depth - 1``
     are in flight (one register buffer each) while piece ``i`` is merged -- ``fma(O_c, a2, mul(O_m, a1))`` per element, exactly
-    ``merge_piece``'s arithmetic -- and written back to the scratch (interior chunk end) or normalised to the output row (``to_output``:
-    the fused unit's epilogue). A placement: the dependent L2 round trips of the D = 256 merge overlap each other."""
+    ``merge_piece``'s arithmetic -- and written back to the scratch. A placement: the dependent L2 round trips of the D = 256 merge
+    overlap each other."""
     depth = len(rMs)
     if first_merge:
         rMa = rMs[0]
@@ -224,24 +287,8 @@ def merge_global_pipelined(
             cute.copy(
                 tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
             )
-            for e in cutlass.range_constexpr(cute.size(rO)):
-                rMa[e] = CuteF32.fma(rO[e], a2, Float32(0.0))
-            if cutlass.const_expr(to_output):
-                for e in cutlass.range_constexpr(cute.size(rO)):
-                    rOut[e] = CuteF32.add(CuteF32.mul(rMa[e], inv), Float32(0.0)).to(
-                        IN_DTYPE
-                    )
-                if row_valid:
-                    cute.autovec_copy(
-                        rOut,
-                        cute.make_tensor(
-                            mO.iterator
-                            + cute.assume(out_row.to(Int64) * D + i * CT, divby=8),
-                            cute.make_layout((cute.size(rO),)),
-                        ),
-                    )
-            else:
-                cute.autovec_copy(rMa, om_piece(gOm, i, CT))
+            merge_elems(rO, rMa, a1, a2, True)
+            cute.autovec_copy(rMa, om_piece(gOm, i, CT))
     else:
         for i in cutlass.range_constexpr(
             min(depth - 1, n_pieces)
@@ -255,24 +302,120 @@ def merge_global_pipelined(
             cute.copy(
                 tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
             )
-            for e in cutlass.range_constexpr(cute.size(rO)):
-                cur[e] = CuteF32.fma(rO[e], a2, CuteF32.mul(cur[e], a1))
-            if cutlass.const_expr(to_output):
-                for e in cutlass.range_constexpr(cute.size(rO)):
-                    rOut[e] = CuteF32.add(CuteF32.mul(cur[e], inv), Float32(0.0)).to(
-                        IN_DTYPE
-                    )
-                if row_valid:
-                    cute.autovec_copy(
-                        rOut,
-                        cute.make_tensor(
-                            mO.iterator
-                            + cute.assume(out_row.to(Int64) * D + i * CT, divby=8),
-                            cute.make_layout((cute.size(rO),)),
-                        ),
-                    )
-            else:
-                cute.autovec_copy(cur, om_piece(gOm, i, CT))
+            merge_elems(rO, cur, a1, a2, False)
+            cute.autovec_copy(cur, om_piece(gOm, i, CT))
+
+
+@cute.jit
+def merge_global_to_output(
+    first_merge,
+    a1: Float32,
+    a2: Float32,
+    inv: Float32,
+    tiled_ld,
+    tLDc: cute.Tensor,
+    gOm,
+    rO: cute.Tensor,
+    rMs,
+    rOut: cute.Tensor,
+    mO: cute.Tensor,
+    out_row: Int32,
+    row_valid,
+    n_pieces: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+    D: cutlass.Constexpr,
+):
+    """``merge_global_pipelined``'s merge of the unit's last chunk with the running state in the global scratch, normalised into the
+    output rows piece by piece instead of written back: the fused unit's epilogue when ``O_m`` is not in TMEM."""
+    depth = len(rMs)
+    if first_merge:
+        rMa = rMs[0]
+        for i in cutlass.range_constexpr(n_pieces):
+            cute.copy(
+                tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
+            )
+            merge_elems(rO, rMa, a1, a2, True)
+            normalize_elems(rMa, inv, rOut)
+            if row_valid:
+                store_out_piece(rOut, mO, out_row, i, CT, D)
+    else:
+        for i in cutlass.range_constexpr(min(depth - 1, n_pieces)):
+            cute.autovec_copy(om_piece(gOm, i, CT), rMs[i % depth])
+        for i in cutlass.range_constexpr(n_pieces):
+            cur = rMs[i % depth]
+            if cutlass.const_expr(i + depth - 1 < n_pieces):
+                cute.autovec_copy(
+                    om_piece(gOm, i + depth - 1, CT), rMs[(i + depth - 1) % depth]
+                )
+            cute.copy(
+                tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
+            )
+            merge_elems(rO, cur, a1, a2, False)
+            normalize_elems(cur, inv, rOut)
+            if row_valid:
+                store_out_piece(rOut, mO, out_row, i, CT, D)
+
+
+@cute.jit
+def first_merge_tmem(
+    a2: Float32,
+    tiled_ld,
+    tiled_st,
+    tLDc: cute.Tensor,
+    tSTm,
+    rO: cute.Tensor,
+    rM: cute.Tensor,
+    n_pieces: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+):
+    """The unit's first merge into the TMEM ``O_m`` (``fma(O_c, a2, +0)``: no ``O_m`` operand, so both register buffers take O_c
+    pieces and two TMEM loads are in flight instead of one)."""
+    for i0 in cutlass.range_constexpr(0, n_pieces, 2):
+        cute.copy(tiled_ld, cute.make_tensor(tLDc.iterator + i0 * CT, tLDc.layout), rO)
+        if cutlass.const_expr(i0 + 1 < n_pieces):
+            cute.copy(
+                tiled_ld,
+                cute.make_tensor(tLDc.iterator + (i0 + 1) * CT, tLDc.layout),
+                rM,
+            )
+        first_merge_elems(rO, a2)
+        cute.copy(tiled_st, rO, cute.make_tensor(tSTm.iterator + i0 * CT, tSTm.layout))
+        if cutlass.const_expr(i0 + 1 < n_pieces):
+            first_merge_elems(rM, a2)
+            cute.copy(
+                tiled_st,
+                rM,
+                cute.make_tensor(tSTm.iterator + (i0 + 1) * CT, tSTm.layout),
+            )
+
+
+@cute.jit
+def copy_oc_to_om_tmem(
+    tiled_ld,
+    tiled_st,
+    tLDc: cute.Tensor,
+    tSTm,
+    rO: cute.Tensor,
+    rM: cute.Tensor,
+    n_pieces: cutlass.Constexpr,
+    CT: cutlass.Constexpr,
+):
+    """``O_m = O_c`` (a single-chunk unit's epilogue hands the accumulator over before normalising), two pieces' loads in flight."""
+    for i0 in cutlass.range_constexpr(0, n_pieces, 2):
+        cute.copy(tiled_ld, cute.make_tensor(tLDc.iterator + i0 * CT, tLDc.layout), rO)
+        if cutlass.const_expr(i0 + 1 < n_pieces):
+            cute.copy(
+                tiled_ld,
+                cute.make_tensor(tLDc.iterator + (i0 + 1) * CT, tLDc.layout),
+                rM,
+            )
+        cute.copy(tiled_st, rO, cute.make_tensor(tSTm.iterator + i0 * CT, tSTm.layout))
+        if cutlass.const_expr(i0 + 1 < n_pieces):
+            cute.copy(
+                tiled_st,
+                rM,
+                cute.make_tensor(tSTm.iterator + (i0 + 1) * CT, tSTm.layout),
+            )
 
 
 @cute.jit
@@ -299,34 +442,25 @@ def merge_chunk(
     oh = o_cons.wait_and_advance()
     if warp_active:
         if cutlass.const_expr(om_tmem):
-            for i in cutlass.range_constexpr(n_pieces):
-                cute.copy(
-                    tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
+            if first_merge:
+                first_merge_tmem(
+                    a2, tiled_ld, tiled_st, tLDc, tSTm, rO, rM, n_pieces, CT
                 )
-                merge_piece(
-                    i, first_merge, a1, a2, om_tmem, tiled_ld, tLDm, gOm, rO, rM, CT
-                )
-                store_om_piece(i, om_tmem, tiled_st, tSTm, gOm, rM, CT)
+            else:
+                for i in cutlass.range_constexpr(n_pieces):
+                    cute.copy(
+                        tiled_ld,
+                        cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout),
+                        rO,
+                    )
+                    merge_piece(
+                        i, first_merge, a1, a2, om_tmem, tiled_ld, tLDm, gOm, rO, rM, CT
+                    )
+                    store_om_piece(i, om_tmem, tiled_st, tSTm, gOm, rM, CT)
             cute.arch.fence_view_async_tmem_store()
         else:
             merge_global_pipelined(
-                first_merge,
-                a1,
-                a2,
-                Float32(1.0),
-                tiled_ld,
-                tLDc,
-                gOm,
-                rO,
-                rMs,
-                rM,
-                rM,
-                Int32(0),
-                False,
-                n_pieces,
-                CT,
-                False,
-                1,
+                first_merge, a1, a2, tiled_ld, tLDc, gOm, rO, rMs, n_pieces, CT
             )
     cute.arch.fence_view_async_tmem_load()
     oh.release()
@@ -348,8 +482,10 @@ def epilogue(
     mode,
     o_cons,
     tiled_ld,
+    tiled_st,
     tLDc: cute.Tensor,
     tLDm,
+    tSTm,
     gOm,
     rO: cute.Tensor,
     rM: cute.Tensor,
@@ -365,14 +501,66 @@ def epilogue(
     om_tmem: cutlass.Constexpr,
     WS: cutlass.Constexpr,
 ):
-    oh = (
-        o_cons.wait_and_advance()
-    )  # the unit's last PV complete; held until the reads below are done
+    """The unit's end. Mode 0 with ``O_m`` in TMEM: the accumulator is folded into ``O_m`` (the last chunk's merge when the unit has
+    several chunks, a copy otherwise), the accumulator stage is RELEASED -- the next unit's first PV may start -- and the output rows
+    are normalised from ``O_m`` (``cvt_bf16(add(mul(O, div(1, l)), +0))``) afterwards: the same values through the same ops, only the
+    home of the unit's final fp32 state differs (a placement), and the tensor core no longer waits for the normalisation and the
+    output stores, which cost more than every tile of a short unit. Mode 0 with ``O_m`` elsewhere: merged straight into the output
+    rows while the stage is held. Mode 1: the raw fp32 ``O_c`` rows and ``(m, l)`` to the workspace slot (``fixup.py`` folds them),
+    the stage released after the reads."""
+    oh = o_cons.wait_and_advance()  # the unit's last PV complete
     if mode == 0:
-        if warp_active:
-            if cutlass.const_expr(not om_tmem):
-                if multi:  # the last chunk's merge from the global scratch, pipelined, into the output
-                    merge_global_pipelined(
+        if cutlass.const_expr(om_tmem):
+            if warp_active:
+                if multi:  # the last chunk's merge, as merge_chunk's
+                    if first_merge:
+                        first_merge_tmem(
+                            a2, tiled_ld, tiled_st, tLDc, tSTm, rO, rM, n_pieces, CT
+                        )
+                    else:
+                        for i in cutlass.range_constexpr(n_pieces):
+                            cute.copy(
+                                tiled_ld,
+                                cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout),
+                                rO,
+                            )
+                            merge_piece(
+                                i,
+                                first_merge,
+                                a1,
+                                a2,
+                                om_tmem,
+                                tiled_ld,
+                                tLDm,
+                                gOm,
+                                rO,
+                                rM,
+                                CT,
+                            )
+                            store_om_piece(i, om_tmem, tiled_st, tSTm, gOm, rM, CT)
+                else:
+                    copy_oc_to_om_tmem(
+                        tiled_ld, tiled_st, tLDc, tSTm, rO, rM, n_pieces, CT
+                    )
+                cute.arch.fence_view_async_tmem_store()
+            cute.arch.fence_view_async_tmem_load()
+            oh.release()
+            if warp_active:
+                for i in cutlass.range_constexpr(n_pieces):
+                    cute.copy(
+                        tiled_ld,
+                        cute.make_tensor(tLDm.iterator + i * CT, tLDm.layout),
+                        rM,
+                    )
+                    normalize_elems(rM, inv, rOut)
+                    if row_valid:
+                        store_out_piece(rOut, mO, out_row, i, CT, D)
+        else:
+            # O_m outside TMEM (the global scratch, or shared memory under the paired placement): a round trip through it would cost
+            # more than the hold saves, so the last chunk is merged (or the single chunk read) straight into the output rows
+            if warp_active:
+                if multi:
+                    merge_global_to_output(
                         first_merge,
                         a1,
                         a2,
@@ -388,7 +576,6 @@ def epilogue(
                         row_valid,
                         n_pieces,
                         CT,
-                        True,
                         D,
                     )
                 else:
@@ -398,58 +585,11 @@ def epilogue(
                             cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout),
                             rO,
                         )
-                        for e in cutlass.range_constexpr(cute.size(rO)):
-                            rOut[e] = CuteF32.add(
-                                CuteF32.mul(rO[e], inv), Float32(0.0)
-                            ).to(IN_DTYPE)
+                        normalize_elems(rO, inv, rOut)
                         if row_valid:
-                            cute.autovec_copy(
-                                rOut,
-                                cute.make_tensor(
-                                    mO.iterator
-                                    + cute.assume(
-                                        out_row.to(Int64) * D + i * CT, divby=8
-                                    ),
-                                    cute.make_layout((cute.size(rO),)),
-                                ),
-                            )
-            else:
-                for i in cutlass.range_constexpr(n_pieces):
-                    cute.copy(
-                        tiled_ld,
-                        cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout),
-                        rO,
-                    )
-                    if multi:  # the last chunk's merge, as merge_chunk's
-                        merge_piece(
-                            i,
-                            first_merge,
-                            a1,
-                            a2,
-                            om_tmem,
-                            tiled_ld,
-                            tLDm,
-                            gOm,
-                            rO,
-                            rM,
-                            CT,
-                        )
-                    else:
-                        for e in cutlass.range_constexpr(cute.size(rO)):
-                            rM[e] = rO[e]
-                    for e in cutlass.range_constexpr(cute.size(rO)):
-                        rOut[e] = CuteF32.add(CuteF32.mul(rM[e], inv), Float32(0.0)).to(
-                            IN_DTYPE
-                        )
-                    if row_valid:
-                        cute.autovec_copy(
-                            rOut,
-                            cute.make_tensor(
-                                mO.iterator
-                                + cute.assume(out_row.to(Int64) * D + i * CT, divby=8),
-                                cute.make_layout((cute.size(rO),)),
-                            ),
-                        )
+                            store_out_piece(rOut, mO, out_row, i, CT, D)
+            cute.arch.fence_view_async_tmem_load()
+            oh.release()
     else:
         if warp_active:
             for i in cutlass.range_constexpr(n_pieces):
@@ -470,8 +610,8 @@ def epilogue(
             if row_valid:
                 mWs[(slot_base + row).to(Int64) * WS + D] = m_r
                 mWs[(slot_base + row).to(Int64) * WS + D + 1] = l_r
-    cute.arch.fence_view_async_tmem_load()
-    oh.release()
+        cute.arch.fence_view_async_tmem_load()
+        oh.release()
     return o_cons
 
 
@@ -540,13 +680,16 @@ def correction_loop(
         tLDm = thr_ld.partition_S(tOtOm_i)
         tSTm = thr_st.partition_D(tOtOm_i)
     tLDcO = thr_ld.partition_D(tOcO_i)
-    rO = cute.make_rmem_tensor(tLDcO.shape, ACC_DTYPE)
-    rM = cute.make_rmem_tensor(tLDcO.shape, ACC_DTYPE)
-    # the O_m piece buffers of the pipelined global merge (D = 256): MERGE_DEPTH of them (one at D <= 128, where the merge is in TMEM)
-    rMs = tuple(
+    # the piece buffers (PIECE_BUFS): rO (the O_c piece), rM (the merged piece) and, when O_m is in the global scratch, the rest for the
+    # O_m pieces in flight of the pipelined merge (rMs = (rM, ...)); the rescale uses them all
+    bufs = tuple(
         cute.make_rmem_tensor(tLDcO.shape, ACC_DTYPE)
-        for _ in range(MERGE_DEPTH if not om_tmem else 1)
+        for _ in range(PIECE_BUFS[st.roles.regs_correction])
     )
+    rO = bufs[0]
+    rM = bufs[1]
+    rMs = bufs[1:] if not om_tmem else (rM,)
+    rescale_bufs = bufs
     n_el = cute.size(rO)
     rOut = cute.make_rmem_tensor(cute.make_layout((n_el,)), IN_DTYPE)
     n_pieces = D // CT
@@ -593,7 +736,7 @@ def correction_loop(
             tiled_st,
             tLDc,
             tSTc,
-            rO,
+            rescale_bufs,
             n_pieces,
             CT,
         )
@@ -652,8 +795,10 @@ def correction_loop(
         mode,
         o_cons,
         tiled_ld,
+        tiled_st,
         tLDc,
         tLDm,
+        tSTm,
         gOm,
         rO,
         rM,
@@ -787,8 +932,8 @@ def corr_tile_q2(
     nc: Float32,
 ):
     """One KV tile of one Q tile in the paired placement: ``correction_loop``'s tile step verbatim (alpha and the O_c rescale, the
-    statistics chain, the interior chunk merge into O_m in TMEM). The two-stage stats ring holds both tiles' entries interleaved (two
-    per tile per Q tile): this Q tile's two, then the other's two are skipped."""
+    statistics chain, the interior chunk merge into the Q tile's O_m in smem). The two-stage stats ring holds both tiles' entries
+    interleaved (two per tile per Q tile): this Q tile's two, then the other's two are skipped."""
     TPC = st.tpc
     CT = st.ct
     n_pieces = st.D // CT
@@ -806,7 +951,7 @@ def corr_tile_q2(
         tiled_st,
         tLDc,
         tSTc,
-        rO,
+        (rO, rM),
         n_pieces,
         CT,
     )
@@ -1059,8 +1204,10 @@ def correction_loop_q2(
             mode_a,
             o_cons_a,
             tiled_ld,
+            tiled_st,
             tLDc_a,
             tLDm_a,
+            tSTm_a,
             gOm_a,
             rO,
             rM,
@@ -1093,8 +1240,10 @@ def correction_loop_q2(
             mode_b,
             o_cons_b,
             tiled_ld,
+            tiled_st,
             tLDc_b,
             tLDm_b,
+            tSTm_b,
             gOm_b,
             rO,
             rM,

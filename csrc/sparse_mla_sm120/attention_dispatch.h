@@ -16,6 +16,8 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& params,
                                      const execution::ExecutionPlan& plan, cudaStream_t stream);
 cudaError_t dispatch_dsv32(const execution::AttentionParams& params,
                            const execution::ExecutionPlan& plan, cudaStream_t stream);
+cudaError_t dispatch_legacy_decode(const execution::AttentionParams& params,
+                                   const execution::ExecutionPlan& plan, cudaStream_t stream);
 cudaError_t dispatch_decode(const execution::AttentionParams& params,
                             const execution::ExecutionPlan& plan, cudaStream_t stream);
 }  // namespace flashinfer::sparse_mla_sm120

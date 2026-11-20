@@ -68,6 +68,14 @@
       "type": "const",
       "value": 4,
       "description": "Fixed query length per request."
+    },
+    "cp_world": {
+      "type": "const",
+      "value": 1
+    },
+    "cp_interleave_size": {
+      "type": "const",
+      "value": 1
     }
   },
   "constraints": [
@@ -78,7 +86,8 @@
     "max_pages_per_seq * page_size >= max_kv_len",
     "min(seq_lens_kv) >= 1",
     "max(seq_lens_kv) <= max_kv_len",
-    "seq_len_q >= 1"
+    "seq_len_q >= 1",
+    "0 <= cp_rank < cp_world"
   ],
   "inputs": {
     "query": {
@@ -111,7 +120,7 @@
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Required per-request KV lengths supplied to run()."
+      "description": "Global logical request lengths, including the current Q tokens."
     },
     "qo_indptr": {
       "shape": [
@@ -136,6 +145,11 @@
       "dtype": "bool",
       "optional": true,
       "description": "Whether to validate per-run tensors and metadata values."
+    },
+    "cp_rank": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
     }
   },
   "outputs": {

@@ -71,6 +71,12 @@ enum class Activation : uint8_t {
   kSiTU,
 };
 
+// Both layouts drop every route whose expert id lies outside [0, local_num_experts) inside the
+// kernels: the route adds nothing to the output, its weight never enters the sum, and a token
+// with no live route outputs +0. Direct FC1/FC2 programs compute such a route as expert 0, so
+// their loads stay in bounds, and the finalizer discards it. Packers skip the route and write no
+// route slot for it; the finalizer checks the id itself and never reads that slot. No host code
+// reads the ids.
 enum class RouteLayout : uint8_t {
   kDirect = 0,
   kGpuPacked,
@@ -1444,6 +1450,7 @@ struct Invocation {
   void* workspace;
   const void* hidden_states_q;
   const void* hidden_states_scale;
+  // int32 [num_tokens, top_k]. Ids outside [0, local_num_experts) drop their route (see RouteLayout).
   const void* topk_ids;
   const void* topk_weights;
   const void* gemm1_weights;

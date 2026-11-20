@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from flashinfer.mamba import SSDCombined
+from flashinfer.mamba import cake_ssd_combined
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -235,6 +236,111 @@ def _pad_stream(value: torch.Tensor, pad: int) -> torch.Tensor:
     return torch.cat((value, padding), dim=1).contiguous()
 
 
+def _state_slot_arm(
+    args: argparse.Namespace,
+    arm: dict,
+    initial_states: torch.Tensor,
+    sequence_lengths: list[int],
+) -> tuple[SSDCombined, dict, dict]:
+    """The Cake varlen arm through a page-like state pool: one row-strided
+    pool (row 0 a null block, each row followed by 4096 padding elements)
+    serves the initial, final and, with ``--checkpoint-pool``, checkpoint
+    states in place; the slot vectors are column 0 of a ``[num_seqs,
+    --slots-step]`` table, each sequence reads its initial row with
+    probability ``--flags-frac`` (none with ``--no-initial-states``; the
+    count is reported as ``initial_state_reads``), and each checkpoint
+    lands on the first chunk end inside its sequence (else its end) in a
+    second block column.  Returns the runner, the run arguments and the
+    arm's report fields."""
+
+    num_sequences = len(sequence_lengths)
+    nheads = args.nheads
+    row, pad = nheads * 64 * 128, 4096
+    rows = 2 * num_sequences + 1
+    storage = torch.zeros(rows * (row + pad), dtype=torch.bfloat16, device="cuda")
+    pool = storage.as_strided(
+        (rows, nheads, 64, 128), (row + pad, 64 * 128, 128, 1), pad
+    )
+    generator = torch.Generator().manual_seed(args.seed)
+    order = torch.randperm(rows - 1, generator=generator) + 1
+    table = torch.zeros((num_sequences, args.slots_step), dtype=torch.int32)
+    table[:, 0] = order[:num_sequences]
+    table = table.cuda()
+    slots = table[:, 0]
+    pool[slots.long()] = initial_states
+    states: dict = dict(
+        initial_states=pool,
+        initial_state_slots=slots,
+        final_states=pool,
+        final_state_slots=slots,
+    )
+    # Every timed call after the first reads the final rows the previous call
+    # stored into the same pool rows (the work does not depend on their
+    # values); all-zero flags start each sequence from zero state instead.
+    flags_kind, initial_state_reads = None, num_sequences
+    timed_initial_states = "carried_from_previous_call"
+    if args.flags_frac is not None:
+        flags_kind = "frac"
+        # One independent draw per sequence: report the actual count.
+        flags = torch.rand(num_sequences, generator=generator) < args.flags_frac
+        initial_state_reads = int(flags.sum())
+        timed_initial_states = "carried_for_flagged_sequences"
+        states["initial_state_flags"] = flags.cuda()
+    elif args.no_initial_states:
+        # Every call, the timed ones included, starts each sequence from zero
+        # state, like the dense arm, and still stores its final row.
+        flags_kind, initial_state_reads = "all_zero", 0
+        timed_initial_states = "zero_flags"
+        states["initial_state_flags"] = torch.zeros(
+            num_sequences, dtype=torch.bool, device="cuda"
+        )
+    if args.checkpoint_pool:
+        starts = np.cumsum([0, *sequence_lengths[:-1]])
+        tokens = [
+            min(int(start) + length, (int(start) // 128 + 1) * 128)
+            for start, length in zip(starts, sequence_lengths, strict=True)
+        ]
+        blocks = torch.zeros((num_sequences, 2), dtype=torch.int32)
+        blocks[:, 1] = order[num_sequences : 2 * num_sequences]
+        states.update(
+            checkpoint_token_indices=torch.tensor(
+                tokens, dtype=torch.int32, device="cuda"
+            ),
+            checkpoint_state_slots=blocks.cuda()[:, 1],
+            checkpoint_states=pool,
+            null_slot_id=0,
+        )
+    cake_ssd_combined._LOOKBACK_STATE_SLOTS = args.slot_route == "lookback"
+    runner = SSDCombined(
+        chunk_size=128,
+        nheads=nheads,
+        headdim=64,
+        dstate=128,
+        ngroups=args.ngroups,
+        io_dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        has_d=True,
+        d_has_hdim=False,
+        has_initial_states=True,
+        has_varlen=True,
+        has_z=args.has_z,
+        seq_idx_dtype=torch.int32,
+        backend="cake",
+    )
+    arguments = {**arm["arguments"], **states, "num_seqs": None}
+    fields = {
+        "slots_step": args.slots_step,
+        "flags_frac": args.flags_frac,
+        "initial_state_flags": flags_kind,
+        "initial_state_reads": initial_state_reads,
+        "timed_initial_states": timed_initial_states,
+        "checkpoint_pool": args.checkpoint_pool,
+        "slot_route": args.slot_route,
+        "pool_row_stride": row + pad,
+    }
+    return runner, arguments, fields
+
+
 def main() -> None:
     _require_cupti()
     parser = argparse.ArgumentParser()
@@ -260,7 +366,8 @@ def main() -> None:
         "--no-initial-states",
         action="store_true",
         help="run Cake with initial_states=None (zero state); the CuTe arm gets "
-        "explicit zero states since it requires them in varlen mode",
+        "explicit zero states since it requires them in varlen mode and the "
+        "state-slot arm all-zero initial_state_flags",
     )
     parser.add_argument("--has-z", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -269,7 +376,55 @@ def main() -> None:
     parser.add_argument("--ngroups", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=100)
+    parser.add_argument(
+        "--state-slots",
+        action="store_true",
+        help="also time the Cake varlen arm through an in-place state pool "
+        "with slot vectors (implied by the three options below)",
+    )
+    parser.add_argument(
+        "--slots-step",
+        type=int,
+        default=1,
+        help="slot vectors are column 0 of a [num_seqs, N] slot table",
+    )
+    parser.add_argument(
+        "--flags-frac",
+        type=float,
+        help="pass initial_state_flags; each sequence independently reads its "
+        "initial-state row with this probability (the actual count is "
+        "reported as initial_state_reads)",
+    )
+    parser.add_argument(
+        "--checkpoint-pool",
+        action="store_true",
+        help="store one checkpoint per sequence into the state pool (null_slot_id=0)",
+    )
+    parser.add_argument(
+        "--slot-route",
+        choices=("lookback", "three_phase"),
+        default="lookback",
+        help="slot program of the calls the chunk-parallel rule sends to the "
+        "look-back program: its slot twin or the three-phase slot twin",
+    )
     args = parser.parse_args()
+    state_slots = (
+        args.state_slots
+        or args.slots_step != 1
+        or args.flags_frac is not None
+        or args.checkpoint_pool
+    )
+    if state_slots and args.mode != "varlen":
+        raise ValueError("the state-slot arm requires --mode varlen")
+    if args.slots_step < 1:
+        raise ValueError("--slots-step must be positive")
+    # NaN fails the chained comparison too.
+    if args.flags_frac is not None and not 0.0 <= args.flags_frac <= 1.0:
+        raise ValueError("--flags-frac must be in [0, 1]")
+    if args.no_initial_states and args.flags_frac is not None:
+        raise ValueError(
+            "--flags-frac reads initial states; it conflicts with --no-initial-states"
+        )
 
     torch.manual_seed(args.seed)
     if args.mode == "batched":
@@ -360,8 +515,9 @@ def main() -> None:
 
     outputs = {}
     timings = {}
+    runners = {}
     for backend, arm in arms.items():
-        runner = SSDCombined(
+        runner = runners[backend] = SSDCombined(
             chunk_size=128,
             nheads=args.nheads,
             headdim=64,
@@ -410,6 +566,59 @@ def main() -> None:
             repeat_iters=args.repetitions,
         )
         timings[backend] = float(np.median(samples))
+
+    slot_fields = None
+    if state_slots:
+        runner, arguments, slot_fields = _state_slot_arm(
+            args, arms["cake"], initial_states, sequence_lengths
+        )
+        out = torch.empty(
+            batch, seqlen, args.nheads, 64, dtype=torch.bfloat16, device="cuda"
+        )
+
+        def invoke_slots(runner=runner, arguments=arguments, out=out):
+            return runner.run(*arms["cake"]["tensors"], **arguments, out=out)
+
+        slot_out, _ = invoke_slots()
+        # The timed calls keep updating the pool in place: read the final rows
+        # of this first call now. shape.initial_states describes the dense arms
+        # and these first-call diagnostics; the slot timing reads the rows the
+        # previous call stored (timed_initial_states).
+        final_rows = arguments["final_state_slots"].long()
+        slot_final = arguments["final_states"][final_rows].clone()
+        slot_fields["program"] = runner._cake_runner.last_program_name
+        flags = arguments.get("initial_state_flags")
+        if flags is None or args.no_initial_states:
+            # All-zero flags run the dense arm's no-initial-state workload.
+            dense_out, dense_final = outputs["cake"]
+            slot_fields["out_vs_cake_reference"] = "dense_cake"
+        else:
+            # A sequence whose flag is 0 starts from a zero state whatever its
+            # pool row holds: compare with a dense Cake call on the
+            # flag-masked initial states, so both sides run one recurrence.
+            masked = initial_states * flags.view(-1, 1, 1, 1).to(initial_states.dtype)
+            # --flags-frac excludes --no-initial-states, so the dense Cake
+            # runner takes explicit initial states.
+            dense_runner = runners["cake"]
+            dense_arguments = {
+                **arms["cake"]["arguments"],
+                "initial_states": masked,
+                "num_seqs": None,
+            }
+            dense_out, dense_states = dense_runner.run(
+                *arms["cake"]["tensors"], **dense_arguments, out=torch.empty_like(out)
+            )
+            dense_final = dense_states[:num_sequences]
+            slot_fields["out_vs_cake_reference"] = "dense_cake_flag_masked_states"
+        slot_fields["out_vs_cake"] = _diagnostic(slot_out, dense_out)
+        slot_fields["final_states_vs_cake"] = _diagnostic(slot_final, dense_final)
+        samples = bench_gpu_time(
+            invoke_slots,
+            enable_cupti=True,
+            dry_run_iters=args.warmup,
+            repeat_iters=args.repetitions,
+        )
+        timings["cake_slots"] = float(np.median(samples))
 
     reference_out, reference_states = _fp64_reference(
         x,
@@ -464,6 +673,9 @@ def main() -> None:
         "speedup": timings["cute"] / timings["cake"],
         "timing_backend": "cupti",
     }
+    if slot_fields is not None:
+        report["cake_slots_ms"] = timings["cake_slots"]
+        report["cake_slots"] = slot_fields
     print(json.dumps(report, sort_keys=True))
     _validate_report(report, require_qualified_row=args.require_qualified_row)
 
