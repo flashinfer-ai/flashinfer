@@ -9,7 +9,10 @@ while the tuner may select it and never while an autotune process group tunes;
 that the committed offer table is well formed and lists only measured units; that a tuning bucket
 offers Cake only when every batch the bucket serves is listed and launches the
 programs of the profiled batch; that Cake is profiled only against a first-stage
-winner and a Cake choice stays valid only while that winner does; that an
+winner and a Cake choice stays valid only while that winner does; that the
+second stage times cold-L2 chains of launches while the first keeps its single
+cold replay; that the memo state and the tuning buckets are what the tuner's
+accessors and the unmemoized computation give; that an
 untuned call never selects Cake and every Cake miss runs the first stage's
 selection; that a repeated lookup-only call of a listed batch reuses the
 decision of both stages exactly while the tuner and its settings are unchanged;
@@ -25,12 +28,16 @@ committed table is derived from measurements on B200 and GB300 only.
 """
 
 import contextlib
+import itertools
 import os
+import threading
+from dataclasses import replace
 
 import pytest
 import torch
 
 import flashinfer
+from flashinfer.api_logging import cake_auto_candidates_enabled
 from flashinfer.autotuner import (
     AutoTuner,
     DynamicDim,
@@ -512,6 +519,224 @@ def test_cake_gate_memo_follows_the_tuner_state(monkeypatch, fresh_tuner):
     assert core._mla_cake_candidate_open(fresh_tuner, state)
     assert core._mla_cake_candidate_open(fresh_tuner, state)
     assert len(gates) == 7
+
+
+def _memo_state_through_accessors(tuner):
+    """``_mla_cake_memo_state`` read through the tuner's accessors and
+    ``cake_auto_candidates_enabled`` (the reference of its inlined reads)."""
+    if tuner.is_tuning_mode or tuner._managed_cache is not None:
+        return None
+    skip_ops = tuner._effective_skip_ops
+    if core._MLA_DECODE_OP in skip_ops or core._MLA_CAKE_MARGIN_OP in skip_ops:
+        return None
+    local = tuner._v2_local
+    if (
+        local.active
+        or local.replay_report is not None
+        or local.strict_replay
+        or local.measure is not None
+    ):
+        return None
+    stack = tuner._get_override_stack()
+    return (
+        autotuner_module._winner_sources_generation,
+        tuple(stack[-1][:3]) if stack else None,
+        (
+            os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"),
+            cake_auto_candidates_enabled(),
+        ),
+    )
+
+
+def test_memo_state_reads_the_switch_and_stacks_as_the_tuner(
+    monkeypatch, fresh_tuner
+):
+    """The memo state reads the Cake switch on every call, compared as
+    ``cake_auto_candidates_enabled`` compares it (also flipped between two
+    calls), and the thread's skip_ops and override stacks as the tuner's
+    accessors read them, also in a thread that never created them. No GPU
+    needed."""
+    tuner = fresh_tuner
+    states = []
+    for value in (None, "1", "0", "", "true", " 1", "1", None):
+        if value is None:
+            monkeypatch.delenv(DISABLE_ENV, raising=False)
+        else:
+            monkeypatch.setenv(DISABLE_ENV, value)
+        state = core._mla_cake_memo_state(tuner)
+        assert state == _memo_state_through_accessors(tuner), value
+        assert state[2] == core._mla_cake_memo_settings(), value
+        assert state[2][1] == cake_auto_candidates_enabled(), value
+        states.append(state)
+    enabled = [True, False, True, True, True, True, False, True]
+    assert [state[2][1] for state in states] == enabled
+    monkeypatch.delenv(DISABLE_ENV, raising=False)
+    bundled = os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    with monkeypatch.context() as patch:
+        patch.setenv(
+            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0" if bundled == "1" else "1"
+        )
+        state = core._mla_cake_memo_state(tuner)
+        assert state == _memo_state_through_accessors(tuner)
+        assert state != states[0]
+
+    contexts = (
+        lambda: autotune(False),
+        lambda: autotune(False, tuning_buckets=(1, 2, 4)),
+        lambda: autotune(False, round_up=True),
+        lambda: autotune(False, skip_ops="another_op"),
+        lambda: autotune(False, skip_ops=core._MLA_DECODE_OP),
+        lambda: autotune(False, skip_ops=core._MLA_CAKE_MARGIN_OP),
+    )
+    for index, context in enumerate(contexts):
+        with context():
+            state = core._mla_cake_memo_state(tuner)
+            assert state == _memo_state_through_accessors(tuner), index
+            with autotune(False, skip_ops="nested_op"):
+                state = core._mla_cake_memo_state(tuner)
+                assert state == _memo_state_through_accessors(tuner), index
+
+    results = []
+
+    def fresh_thread():
+        # No stack was created in this thread before the first read.
+        first = core._mla_cake_memo_state(tuner)
+        results.append((first, _memo_state_through_accessors(tuner)))
+
+    thread = threading.Thread(target=fresh_thread)
+    thread.start()
+    thread.join()
+    assert results and results[0][0] == results[0][1] is not None
+
+
+class _Workspace:
+    """A workspace buffer of ``nbytes`` bytes, for the bucket computation."""
+
+    def __init__(self, nbytes):
+        self.nbytes = nbytes
+
+    def numel(self):
+        return self.nbytes
+
+    def element_size(self):
+        return 1
+
+
+def test_decode_buckets_skip_the_cute_dsl_search_with_trtllm_gen(monkeypatch):
+    """With TRTLLM-GEN listed the buckets are the hybrid buckets of its cap
+    (8192, at least the CuTe DSL cap), without the CuTe DSL workspace search,
+    and the memoized tuple is returned on every call. No GPU needed."""
+
+    def no_search(*args, **kwargs):
+        raise AssertionError("the CuTe DSL workspace search ran")
+
+    monkeypatch.setattr(core, "_resolve_cute_dsl_workspace_sizer", no_search)
+    expected = get_hybrid_num_tokens_buckets(core._TRTLLM_GEN_MLA_MAX_BATCH)
+    results = [
+        core._compute_mla_decode_buckets(
+            _Workspace(nbytes),
+            runner_names,
+            q_len,
+            NUM_HEADS,
+            LATENT,
+            max_seq_len,
+            torch.device("cpu"),
+            "auto",
+            None,
+        )
+        for runner_names in (("trtllm-gen",), ("trtllm-gen", "cute-dsl"))
+        for q_len in (1, 2, 4)
+        for max_seq_len in (128, 16384)
+        for nbytes in (0, 128 << 20)
+    ]
+    assert all(result == expected for result in results)
+    assert all(result is results[0] for result in results)
+
+
+def _reference_decode_buckets(
+    nbytes, runner_names, q_len, max_seq_len, num_sms, impl, sinks
+):
+    """``_compute_mla_decode_buckets`` before memoization: the CuTe DSL
+    workspace search runs whenever CuTe DSL is listed."""
+    cap = 0
+    if "trtllm-gen" in runner_names:
+        cap = core._TRTLLM_GEN_MLA_MAX_BATCH
+    if "cute-dsl" in runner_names:
+        sizer, resolved = core._resolve_cute_dsl_workspace_sizer(impl, sinks, False)
+        lo, hi = 1, core._TRTLLM_GEN_MLA_MAX_BATCH
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            _, workspace_bytes = core._call_cute_dsl_workspace_sizer(
+                sizer, resolved, mid, q_len, NUM_HEADS, LATENT, num_sms, max_seq_len
+            )
+            if workspace_bytes <= nbytes:
+                lo = mid
+            else:
+                hi = mid - 1
+        cap = max(cap, lo)
+    return get_hybrid_num_tokens_buckets(max(1, cap))
+
+
+def test_decode_buckets_match_the_unmemoized_computation(monkeypatch):
+    """The buckets equal those of the unmemoized computation over runner
+    sets, q_len, max_seq_len, workspace sizes, SM counts, CuTe DSL
+    implementations and sinks (also on a repeated, memoized call); where the
+    unmemoized computation raises for CuTe DSL alone, so does the memoized
+    one. No GPU needed."""
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    num_sms = {"value": 148}
+    monkeypatch.setattr(
+        cute_dsl_utils, "get_num_sm", lambda device: num_sms["value"]
+    )
+    trtllm_gen_buckets = get_hybrid_num_tokens_buckets(
+        core._TRTLLM_GEN_MLA_MAX_BATCH
+    )
+    sinks_tensor = torch.zeros(NUM_HEADS, dtype=torch.float32)
+    checked = 0
+    for case in itertools.product(
+        (148, 160),
+        (("trtllm-gen",), ("cute-dsl",), ("trtllm-gen", "cute-dsl")),
+        (1, 2, 4),
+        (128, 1024, 4096, 16384),
+        (0, 1 << 20, 16 << 20, 128 << 20),
+        ("auto", "modular", "monolithic"),
+        (None, [sinks_tensor]),
+    ):
+        sms, runner_names, q_len, max_seq_len, nbytes, impl, sinks = case
+        num_sms["value"] = sms
+        args = (
+            _Workspace(nbytes),
+            runner_names,
+            q_len,
+            NUM_HEADS,
+            LATENT,
+            max_seq_len,
+            torch.device("cpu"),
+            impl,
+            sinks,
+        )
+        try:
+            expected = _reference_decode_buckets(
+                nbytes, runner_names, q_len, max_seq_len, sms, impl, sinks
+            )
+        except ValueError:
+            if "trtllm-gen" in runner_names:
+                # No CuTe DSL search, and so no error, with TRTLLM-GEN listed.
+                actual = core._compute_mla_decode_buckets(*args)
+                assert actual == trtllm_gen_buckets, case
+            else:
+                with pytest.raises(ValueError):
+                    core._compute_mla_decode_buckets(*args)
+            continue
+        for _ in range(2):
+            assert core._compute_mla_decode_buckets(*args) == expected, case
+        checked += 1
+    assert checked > 0
 
 
 def test_untuned_auto_builds_no_cake_runner(monkeypatch, fresh_tuner):
@@ -1334,6 +1559,83 @@ def test_cake_not_selected_at_a_tie(stages):
         ("_MlaStageOneWinnerRunner", WINNER)
     }
     assert stages.select(4) == (stages.runners[1], -1)
+
+
+def _record_policies(monkeypatch):
+    """Records ``(profiled runner class, L2 policy)`` of every measurement of
+    the stubbed profiling of ``_Stages``."""
+    recorded = []
+    profile = AutoTuner._profile_single_kernel
+
+    def record(tuner, runner, inputs, tactic, tuning_config, **kwargs):
+        recorded.append((type(runner).__name__, tuning_config.l2_cache_policy))
+        return profile(tuner, runner, inputs, tactic, tuning_config, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record)
+    return recorded
+
+
+_CHAIN_POLICY = f"cold-chain:{core._MLA_CAKE_MARGIN_CHAIN_LAUNCHES}"
+
+
+def test_second_stage_times_a_cold_chain(monkeypatch, stages):
+    """The second stage times cold-L2 chains of launches on query and output
+    lanes; the first stage keeps its config object and its single cold
+    replay. The second stage's winners carry the chained policy, so a
+    strict-replay lookup hits with it and misses with the single-replay
+    policy. No GPU needed."""
+    first = stages.config
+    assert first is core._mla_decode_tuning_config(
+        buckets=stages.BUCKETS, num_pages=8, profile_seq_len=1024
+    )
+    assert (first.cold_chain_launches, first.profile_arena_input_indices) == (1, ())
+    assert first.l2_cache_policy == "cold"
+    second = core._mla_cake_margin_tuning_config(first, stages.ranges)
+    assert second.uses_cold_chain and second.l2_cache_policy == _CHAIN_POLICY
+    assert core._MLA_CAKE_MARGIN_CHAIN_LAUNCHES > 1
+    assert second.profile_arena_input_indices == (0, 3)  # query, out
+    # Besides the buckets, only the chain differs from the first stage.
+    single = replace(second, cold_chain_launches=1, profile_arena_input_indices=())
+    assert replace(single, dynamic_tensor_specs=first.dynamic_tensor_specs) == first
+
+    recorded = _record_policies(monkeypatch)
+    runner, tactic = stages.select(4, tune=True)
+    assert _name(runner) == "cake" and tactic == WINNER
+    policies = {}
+    for name, policy in recorded:
+        policies.setdefault(name, set()).add(policy)
+    assert policies == {
+        "_FakeTrtllmGen": {"cold"},
+        "_FakeCuteDsl": {"cold"},
+        "_MlaStageOneWinnerRunner": {_CHAIN_POLICY},
+        core._CAKE_MLA_RUNNER: {_CHAIN_POLICY},
+    }
+    stored = {
+        (key.custom_op, policy[policy.index("l2_cache_policy") + 1])
+        for (_, key), policy in stages.tuner._profiling_cache_policies.items()
+    }
+    assert stored == {
+        (core._MLA_DECODE_OP, "cold"),
+        (core._MLA_CAKE_MARGIN_OP, _CHAIN_POLICY),
+    }
+
+    monkeypatch.setattr(stages.tuner._v2_local, "strict_replay", True)
+    runner, tactic = stages.select(4)
+    assert _name(runner) == "cake" and tactic == WINNER
+    monkeypatch.setattr(
+        core, "_mla_cake_margin_tuning_config", lambda config, ranges: single
+    )
+    assert stages.select(4) == (stages.runners[1], -1)
+
+
+def test_round_up_second_stage_keeps_the_single_cold_replay(monkeypatch, stages):
+    """Under ``autotune(round_up=True)`` the second stage uses the first
+    stage's config, with its single cold replay. No GPU needed."""
+    recorded = _record_policies(monkeypatch)
+    with autotune(False, round_up=True):
+        stages.select(4, tune=True)
+    assert any(name == core._CAKE_MLA_RUNNER for name, _ in recorded)
+    assert {policy for _, policy in recorded} == {"cold"}
 
 
 def test_untuned_call_never_selects_cake(stages):
