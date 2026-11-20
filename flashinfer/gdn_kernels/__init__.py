@@ -120,11 +120,13 @@ except (ImportError, RuntimeError):
 
 try:
     from .blackwell import (
+        _chunk_gated_delta_rule_gdn_affine_split_sm100,
         _chunk_gated_delta_rule_gdn_cp_sm100,
         chunk_gated_delta_rule_sm100,
         cp_delta_rule_dsl_sm100,
     )
 except (ImportError, RuntimeError):
+    _chunk_gated_delta_rule_gdn_affine_split_sm100 = None  # type: ignore
     _chunk_gated_delta_rule_gdn_cp_sm100 = None  # type: ignore
     chunk_gated_delta_rule_sm100 = None  # type: ignore
     cp_delta_rule_dsl_sm100 = None  # type: ignore

@@ -33,30 +33,47 @@
 // Callback into the python function that will get us the requested cubin.
 void (*callbackGetCubin)(const char* path, const char* sha256) = nullptr;
 
+// Looked up through ctypes on every JIT library: exported from the DLL on Windows, default
+// visibility elsewhere even when a library is otherwise built with hidden host symbols.
+#if defined(_WIN32)
+#define FLASHINFER_CUBIN_LOADER_EXPORT __declspec(dllexport)
+#else
+#define FLASHINFER_CUBIN_LOADER_EXPORT __attribute__((visibility("default")))
+#endif
+
 // Set the python callback, called by the python code using ctypes.
-// Looked up through ctypes on every JIT library, so keep default visibility even when a library
-// is otherwise built with hidden host symbols.
-extern "C" __attribute__((visibility("default"))) void FlashInferSetCubinCallback(
+extern "C" FLASHINFER_CUBIN_LOADER_EXPORT void FlashInferSetCubinCallback(
     void (*callback)(const char* path, const char* sha256)) {
   callbackGetCubin = callback;
 }
 
 // Thread-local variable that stores the current cubin.
-// It is reset on every call to `getCubin()`.
+// It is cleared on every call to `getCubin()` before the callback runs.
 thread_local std::string current_cubin;
 
 // Called by the callback to set the current cubin.
-extern "C" __attribute__((visibility("default"))) void FlashInferSetCurrentCubin(const char* binary,
-                                                                                 int size) {
+extern "C" FLASHINFER_CUBIN_LOADER_EXPORT void FlashInferSetCurrentCubin(const char* binary,
+                                                                         int size) {
   current_cubin = std::string(binary, size);
 }
 
-// Get the cubin from the python callback.
-// This is the API for the native library to use.
+/**
+ * Get the cubin from the python callback. This is the API for the native library to use.
+ *
+ * @param name The artifact path of the cubin.
+ * @param sha256 The expected checksum, passed through to the callback.
+ * @return The cubin bytes. Empty when the callback delivered nothing (a failed download or
+ *         checksum, which the Python loader logs). The caller decides whether that is fatal: a
+ *         checked driver load of empty data fails with a CUresult like any other bad cubin.
+ */
 std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");
   }
+  // Never hand back the previous call's data when the callback sets nothing.
+  current_cubin.clear();
   callbackGetCubin(name.c_str(), sha256.c_str());
   return current_cubin;
 }
+
+#undef FLASHINFER_CUBIN_LOADER_EXPORT

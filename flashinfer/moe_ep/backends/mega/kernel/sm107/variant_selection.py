@@ -17,6 +17,7 @@ from .....core.tuning_state import AutoTuningState
 from .....core.validation.common import MoEEpConfigError
 from .forward_tuning import ForwardExecution
 from .automatic import prepared_for_serving, record_prepared
+from .shared_expert import Sm107SharedExpertWeights
 
 if TYPE_CHECKING:
     from .....config import FleetParams
@@ -100,6 +101,8 @@ class RubinVariantBackend(MegaKernelBackend):
     )
     supports_output_view = True
     supports_auto_workspaces = True
+
+    supports_shared_expert = True
 
     def __init__(self, config, backend_type):
         super().__init__(config)
@@ -204,6 +207,8 @@ class RubinVariantBackend(MegaKernelBackend):
                     kernel_variant=variant,
                     allow_in_kernel_fc2_reduce=self._config.in_kernel_fc2_reduce
                     and cfg.combine_dtype == "bf16",
+                    combine_dedup=cfg.combine_dedup,
+                    token_back_mode=cfg.token_back_mode,
                 ):
                     if not is_valid_sm107(knobs, cfg):
                         continue
@@ -257,6 +262,9 @@ class RubinVariantBackend(MegaKernelBackend):
             raise RuntimeError(
                 "Warm up pending variant tuning before CUDA graph capture"
             )
+        from .shared_expert import bind_shared_weights
+
+        bind_shared_weights(workspace.workspace, weights)
         workspace.workspace.prepare(*weights)
 
     def stage_inputs(self, t, workspace, *, quantize_input):
@@ -340,7 +348,7 @@ class _VariantProtocol:
         self,
         backend: RubinVariantBackend,
         owner: VariantWorkspace,
-        weights: TransformedMegaWeights,
+        weights: TransformedMegaWeights | Sm107SharedExpertWeights,
         output: torch.Tensor | None,
         *,
         candidates: dict[str, list[dict]] | None = None,
@@ -368,8 +376,11 @@ class _VariantProtocol:
             self.tensors,
             quantize_input=owner.quantize_input,
             output=self.output,
+            shared_weights=getattr(self.weights, "shared", None),
         )
         # Native compatibility covers numerical settings, SM budget and environment.
+        if isinstance(self.weights, Sm107SharedExpertWeights):
+            owner.workspace.bind_shared_weights(self.weights.shared)
         native = RubinTuningProtocol(
             self.output,
             self.weights[0],
@@ -407,7 +418,7 @@ class _VariantProtocol:
         kernel = backend._backend(record["variant"], record["knobs"])
         workspace = kernel._allocate_workspace(owner.fleet)
         _prepare_collectively(
-            lambda: workspace.prepare(*self.weights),
+            lambda: kernel.ep_prepare_fixed(workspace, self.weights),
             backend.ep_world_size,
             backend.ep_comm_group if backend.ep_world_size > 1 else None,
         )
@@ -550,7 +561,10 @@ class _VariantProtocol:
                     self.tensors,
                     quantize_input=owner.quantize_input,
                     output=self.output,
+                    shared_weights=getattr(self.weights, "shared", None),
                 )
+                if isinstance(self.weights, Sm107SharedExpertWeights):
+                    workspace.bind_shared_weights(self.weights.shared)
                 kernel.stage_inputs(
                     self.tensors, workspace, quantize_input=owner.quantize_input
                 )
@@ -566,6 +580,14 @@ class _VariantProtocol:
                         kernel_variant=variant,
                         allow_in_kernel_fc2_reduce=backend._config.in_kernel_fc2_reduce
                         and workspace.config.combine_dtype == "bf16",
+                        **(
+                            dict(
+                                combine_dedup=True,
+                                token_back_mode=workspace.config.token_back_mode,
+                            )
+                            if workspace.config.combine_dedup
+                            else {}
+                        ),
                     )
                 )
                 protocol = RubinTuningProtocol(

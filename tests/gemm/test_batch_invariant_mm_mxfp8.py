@@ -365,7 +365,7 @@ def test_tactic_encoding_round_trips():
         for cfg in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)[::41]:
             t = tuning.knobs_to_tactic(cfg)
             assert (
-                len(t) == 12
+                len(t) == 13
                 and tuning.knobs_from_tactic(t) == cfg
                 and tuning.knobs_from_tactic(list(t)) == cfg
             )
@@ -830,6 +830,39 @@ def test_public_api_skips_backend_selection(monkeypatch):
     )
     bi_mm(a, b, sfa, sfb)
     assert flashinfer.mm_mxfp8.suitable_auto_backends is sentinel
+
+
+@needs_device
+@pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    a, sfa = adv_mx(M, K, 181)
+    b, sfb = weight(N, K, 182)
+    ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb))
+    assert torch.equal(bits(bi_mm(a, b, sfa, sfb)), ref)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    assert bi_mm(a, b, sfa, sfb, out=out) is out and torch.equal(bits(out), ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        bi_mm(a, b, sfa, sfb, out=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            bi_mm(a, b, sfa, sfb, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    buf = torch.empty(M * max(2 * N, K), dtype=torch.uint8, device="cuda")
+    alias_a = buf[: M * K].view(E4).view(M, K)
+    alias_out = buf[: 2 * M * N].view(torch.bfloat16).view(M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_mm(alias_a, b, sfa, sfb, out=alias_out)
 
 
 @needs_device

@@ -356,13 +356,27 @@ def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
     templates = ssd_combined_trace_dispatch.templates
-    assert len(templates) == 12
-    assert len({id(template) for template in templates}) == 12
+    assert len(templates) == 84
+    assert len({id(template) for template in templates}) == 84
+    # A final-state pool (varlen_slots / varlen_fslots) is written only when
+    # final states are returned. A slot schema names its state dtype and its
+    # seq_idx dtype; the dense names carry neither.
     assert {template.name_prefix for template in templates} == {
         f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}"
-        for mode in ("batched", "varlen")
+        for mode in (
+            "batched",
+            "varlen",
+            *(
+                f"{slots}_{state}_sidx_{seq_idx}"
+                for slots in ("varlen_islots", "varlen_slots", "varlen_fslots")
+                for state in ("bf16", "f16", "f32")
+                for seq_idx in ("i32", "i64")
+            ),
+        )
         for d_layout in ("none", "vector", "matrix")
         for final_suffix in ("no_final", "final")
+        if final_suffix == "final"
+        or not mode.startswith(("varlen_slots_", "varlen_fslots_"))
     }
 
 
@@ -396,6 +410,10 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
     }
     if d_layout == "vector":
         kwargs["D"] = torch.empty(nheads, dtype=torch.bfloat16)
+        # Caller-owned output storage is token-major, like the returned out.
+        kwargs["out"] = torch.empty(
+            batch_size, seqlen, nheads, headdim, dtype=torch.bfloat16
+        )
     elif d_layout == "matrix":
         kwargs["D"] = torch.empty(nheads, headdim, dtype=torch.bfloat16)
 
@@ -435,6 +453,17 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
     assert ("D" in definition["inputs"]) == (d_layout != "none")
     assert ("seq_idx" in definition["inputs"]) == (mode == "varlen")
     assert definition["inputs"]["out"]["optional"] is True
+    assert definition["inputs"]["out"]["shape"] == [
+        "batch_size",
+        "seqlen",
+        "nheads",
+        "headdim",
+    ]
+    assert definition["inputs"]["out"]["dtype"] == "bfloat16"
+    assert "nchunks" not in definition["axes"]
+    # Dense state tensors stay optional inputs.
+    assert definition["inputs"]["initial_states"]["optional"] is True
+    assert definition["inputs"]["final_states"]["optional"] is True
     assert "param" not in definition["outputs"]["out"]
     assert definition["outputs"]["checkpoint_states"]["optional"] is True
     assert definition["outputs"]["checkpoint_states"]["param"] == "checkpoint_states"
@@ -443,9 +472,205 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
         assert definition["outputs"]["seq_chunk_cumsum"]["optional"] is True
         assert definition["outputs"]["seq_chunk_cumsum"]["param"] == "seq_chunk_cumsum"
     assert ("final_states" in definition["outputs"]) == return_final_states
+    # The base revision's positional destination order; the API's
+    # (out, final_states) tuple binds by name.
+    assert list(definition["outputs"]) == [
+        "out",
+        "checkpoint_states",
+        *(["seq_chunk_cumsum"] if mode == "varlen" else []),
+        *(["final_states"] if return_final_states else []),
+    ]
     if return_final_states:
         assert definition["outputs"]["final_states"]["dtype"] == expected_state_dtype
+        assert definition["outputs"]["final_states"]["param"] == "final_states"
     json.dumps(definition, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("initial_pool", "final_pool", "return_final_states", "null_slot_id"),
+    (
+        (True, True, True, 0),
+        (True, False, False, 0),
+        # A dense state side requires null_slot_id=-1.
+        (True, False, True, -1),
+        (False, True, True, -1),
+    ),
+    ids=("both_pools", "initial_pool_no_final", "initial_pool", "final_pool"),
+)
+@pytest.mark.parametrize("d_layout", ("none", "vector", "matrix"))
+def test_ssd_combined_fi_trace_state_slot_pools(
+    d_layout, initial_pool, final_pool, return_final_states, null_slot_id
+):
+    """A call reading or writing states through slot vectors traces a packed
+    varlen slot schema: a state tensor given with its slot vector (a strided
+    column here) is a required pool with its own row axis, the other state
+    side keeps one optional row per sequence (a returned dense final state is
+    allocated unless the caller gives final_states, not written into a caller
+    pool), the flags have one entry per sequence, ``null_slot_id`` is an int32
+    scalar (-1 when a state side is dense, as the API requires) and the
+    checkpoint pool has its own row axis."""
+
+    module = __import__(
+        "flashinfer.mamba.ssd_combined",
+        fromlist=["ssd_combined_fwd"],
+    )
+    seqlen, nheads, headdim, ngroups, dstate = 256, 8, 64, 8, 128
+    num_sequences, initial_rows, final_rows = 3, 7, 5
+    state_shape = (nheads, headdim, dstate)
+    kwargs = {
+        "x": torch.empty(1, seqlen, nheads, headdim, dtype=torch.bfloat16),
+        "dt": torch.empty(1, seqlen, nheads, dtype=torch.float32),
+        "A": torch.empty(nheads, dtype=torch.float32),
+        "B": torch.empty(1, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "C": torch.empty(1, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "dt_limit": (0.0, float("inf")),
+        "cu_seqlens": torch.tensor([0, 100, 200, seqlen], dtype=torch.int32),
+        "null_slot_id": null_slot_id,
+        "checkpoint_token_indices": torch.tensor([50, -1, 210], dtype=torch.int32),
+        "checkpoint_state_slots": torch.tensor([5, 0, 6], dtype=torch.int32),
+        "checkpoint_states": torch.empty(
+            initial_rows, *state_shape, dtype=torch.float16
+        ),
+        "return_final_states": return_final_states,
+    }
+    if initial_pool:
+        kwargs.update(
+            initial_states=torch.empty(initial_rows, *state_shape, dtype=torch.float16),
+            initial_state_slots=torch.tensor(
+                [[4, 9], [-1, 9], [0, 9]], dtype=torch.int32
+            )[:, 0],
+            initial_state_flags=torch.tensor([True, False, True]),
+        )
+    else:
+        kwargs["initial_states"] = torch.empty(
+            num_sequences, *state_shape, dtype=torch.float16
+        )
+    if final_pool:
+        kwargs.update(
+            final_states=torch.empty(final_rows, *state_shape, dtype=torch.float16),
+            final_state_slots=torch.tensor([1, 3, -1], dtype=torch.int32),
+        )
+    if d_layout == "vector":
+        kwargs["D"] = torch.empty(nheads, dtype=torch.bfloat16)
+    elif d_layout == "matrix":
+        kwargs["D"] = torch.empty(nheads, headdim, dtype=torch.bfloat16)
+
+    definition = module.ssd_combined_fwd.fi_trace(**kwargs)
+
+    modes = {
+        (True, True): "varlen_slots",
+        (True, False): "varlen_islots",
+        (False, True): "varlen_fslots",
+    }
+    mode = modes[initial_pool, final_pool]
+    final_suffix = "final" if return_final_states else "no_final"
+    assert definition["name"].startswith(
+        f"ssd_combined_{mode}_f16_sidx_i64_d_{d_layout}_{final_suffix}_"
+    )
+    axes = definition["axes"]
+    assert axes["cu_seqlens_size"]["type"] == "var"
+    assert ("initial_state_rows" in axes) == initial_pool
+    assert ("final_state_rows" in axes) == final_pool
+    inputs = definition["inputs"]
+    pool_axes = ["nheads", "headdim", "dstate"]
+    initial_axis = "initial_state_rows" if initial_pool else "num_sequences"
+    final_axis = "final_state_rows" if final_pool else "num_sequences"
+    assert inputs["initial_states"]["shape"] == [initial_axis, *pool_axes]
+    assert inputs["final_states"]["shape"] == [final_axis, *pool_axes]
+    # A slot vector requires its pool.
+    assert inputs["initial_states"].get("optional", False) is (not initial_pool)
+    assert inputs["final_states"].get("optional", False) is (not final_pool)
+    assert inputs["out"]["shape"] == ["batch_size", "seqlen", "nheads", "headdim"]
+    for name, pool in (
+        ("initial_state_slots", initial_pool),
+        ("final_state_slots", final_pool),
+    ):
+        assert (name in inputs) == pool, name
+        if pool:
+            assert inputs[name]["shape"] == ["num_sequences"], name
+            assert inputs[name]["dtype"] == "int32", name
+            assert inputs[name]["optional"] is True, name
+    # The flags gate reads of initial pool rows only.
+    assert ("initial_state_flags" in inputs) == initial_pool
+    if initial_pool:
+        assert inputs["initial_state_flags"]["shape"] == ["num_sequences"]
+        # The caller's bool flags are traced as their uint8 view.
+        assert inputs["initial_state_flags"]["dtype"] == "uint8"
+        assert inputs["initial_state_flags"]["optional"] is True
+    assert inputs["null_slot_id"]["dtype"] == "int32"
+    assert inputs["null_slot_id"]["optional"] is True
+    assert inputs["checkpoint_states"]["shape"] == ["num_checkpoints", *pool_axes]
+    assert "null_slot_id" in inputs["checkpoint_state_slots"].get("description", "")
+    assert inputs["cu_seqlens"]["shape"] == ["cu_seqlens_size"]
+    assert inputs["cu_seqlens"]["dtype"] == "int32"
+    for name in ("cu_seqlens", "seq_idx", "chunk_indices", "chunk_offsets"):
+        assert inputs[name]["optional"] is True, name
+    assert ("final_states" in definition["outputs"]) == return_final_states
+    # The dense positional destination order; the API's (out, final_states)
+    # tuple binds by name.
+    assert list(definition["outputs"]) == [
+        "out",
+        "checkpoint_states",
+        "seq_chunk_cumsum",
+        *(["final_states"] if return_final_states else []),
+    ]
+    # The cu_seqlens form runs the int64 seq_idx runner.
+    assert inputs["seq_idx"]["dtype"] == "int64"
+    if return_final_states:
+        final = definition["outputs"]["final_states"]
+        assert final["shape"] == [final_axis, *pool_axes]
+        assert final["dtype"] == "float16"
+        # The caller's pool, or the caller's dense [num_sequences, ...]
+        # final_states when given (else a fresh tensor is returned).
+        assert final["param"] == "final_states"
+    json.dumps(definition, allow_nan=False)
+
+
+def test_ssd_combined_fi_trace_state_slots_unaligned_seqlen():
+    """The slot schemas (Cake only) take any positive sequence length: no
+    ``seqlen % chunk_size`` constraint, unlike the dense schemas, which
+    keep it."""
+
+    module = __import__(
+        "flashinfer.mamba.ssd_combined",
+        fromlist=["ssd_combined_fwd"],
+    )
+    seqlen, nheads, headdim, ngroups, dstate = 130, 8, 64, 8, 128
+    tensors = {
+        "x": torch.empty(1, seqlen, nheads, headdim, dtype=torch.bfloat16),
+        "dt": torch.empty(1, seqlen, nheads, dtype=torch.float32),
+        "A": torch.empty(nheads, dtype=torch.float32),
+        "B": torch.empty(1, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "C": torch.empty(1, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "dt_limit": (0.0, float("inf")),
+    }
+    pool = torch.empty(4, nheads, headdim, dstate, dtype=torch.bfloat16)
+    definition = module.ssd_combined_fwd.fi_trace(
+        **tensors,
+        cu_seqlens=torch.tensor([0, seqlen], dtype=torch.int32),
+        initial_states=pool,
+        initial_state_slots=torch.tensor([2], dtype=torch.int32),
+        final_states=pool,
+        final_state_slots=torch.tensor([2], dtype=torch.int32),
+    )
+    assert definition["name"].startswith(
+        "ssd_combined_varlen_slots_bf16_sidx_i64_d_none_final_"
+    )
+    assert definition["axes"]["seqlen"]["type"] == "var"
+    assert definition["axes"]["chunk_size"]["value"] == 128
+    assert "seqlen % chunk_size == 0" not in definition["constraints"]
+    for constraint in (
+        "nheads % ngroups == 0",
+        "chunk_size == 128",
+        "headdim == 64",
+        "dstate == 128",
+    ):
+        assert constraint in definition["constraints"], constraint
+    json.dumps(definition, allow_nan=False)
+
+    dense = module.ssd_combined_fwd.fi_trace(**tensors)
+    assert dense["name"].startswith("ssd_combined_batched_d_none_final_")
+    assert "seqlen % chunk_size == 0" in dense["constraints"]
 
 
 def test_packed_kda_decode_fi_trace_resolves_singleton_without_output():
