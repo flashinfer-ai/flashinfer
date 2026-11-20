@@ -68,6 +68,9 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
+- `moe_sm120_mxfp8_swapab/sm120_mma.py` emits scalar-scale MMA directly in PTX
+  for compatibility with CuTeDSL releases that removed the intermediate
+  SM120 MMA operation. Keep this fix until it is included in the upstream drop.
 - Sanitization (2026-09-14): internal release-scrub markers removed across
   `src/` (`moe_persistent_scheduler.py`, `mega_reference.py`, `moe_utils.py`
   in both kernel packages), the marker-wrapped internal-example
