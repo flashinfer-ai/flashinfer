@@ -628,3 +628,32 @@ def test_specialized_off_envelope_raises():
     # "auto" routes the same call to the composable reference path instead.
     y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=SM_SCALE, backend="auto")
     assert _matched(y, _ref(q, kv, idx)) >= 0.999
+
+
+@pytest.mark.parametrize("nq", [1, 13])
+def test_graph_replay_enters_and_leaves_wide_repair(nq):
+    _sm90_or_skip()
+    q, kv, idx, sl, ws = _make_case(B=1, QL=nq, kv_lens=(1,))
+    q.zero_()
+    rope = torch.zeros(KPE, device=q.device)
+    _write_token(kv, 0, 1.0, [1.0] * 4, rope)
+
+    def run():
+        return sparse_mla_decode_sm90(
+            q, kv, idx, sl, ws, sm_scale=1.0, backend="specialized"
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    for scale in (1.0, 65536.0, 1.0):
+        _write_token(kv, 0, 1.0, [scale] * 4, rope)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.full_like(out, scale), rtol=0, atol=0)
