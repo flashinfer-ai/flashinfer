@@ -3023,7 +3023,8 @@ class BatchSparseMLADecodePagedTSWrapper:
 
         Call after `plan`, including `plan(compile=False)`. This scheduling hint
         neither loads nor builds a kernel. An executable plan still requires
-        `plan(compile=True)`, which handles concurrent cache changes.
+        `plan(compile=True)`. A process-local executable remains usable if its
+        disk export is later evicted; this query only describes the disk cache.
         """
         state = self._state
         if state is None:

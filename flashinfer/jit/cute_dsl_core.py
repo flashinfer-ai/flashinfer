@@ -23,6 +23,7 @@ import shutil
 import sys
 import sysconfig
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable, Optional, Sequence
 
 from filelock import FileLock
@@ -35,6 +36,24 @@ from ._cute_dsl_source import (
 )
 
 _META_FILENAME = "meta.json"
+
+
+# CuTe DSL compiler options are process-global, even for distinct kernels.
+_compile_lock = RLock()
+
+
+def _reset_compile_lock() -> None:
+    global _compile_lock
+    _compile_lock = RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_compile_lock)
+
+
+def _compile_in_process(compile_fn: Callable[[], Any]) -> Any:
+    with _compile_lock:
+        return compile_fn()
 
 
 def cute_dsl_cache_disabled() -> bool:
@@ -177,31 +196,41 @@ class JitSpecCuteDsl(JitSpec):
     def meta_path(self) -> Path:
         return self.module_dir / _META_FILENAME
 
+    def _cached_entry(self, *, load: bool) -> Any:
+        # meta.json is the generation's commit marker, published after the
+        # object. Keep its inode alive across the lookup to detect replacement
+        # without writing a lock file on cache hits.
+        try:
+            with self.meta_path.open() as marker:
+                try:
+                    metadata = json.load(marker)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return None
+                if metadata != self.expected_meta or not self.object_path.is_file():
+                    return None
+                value = self._load_from_disk() if load else True
+                if os.path.samestat(os.fstat(marker.fileno()), self.meta_path.stat()):
+                    return value
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        return None
+
     @property
     def is_compiled(self) -> bool:
-        return (
-            self.object_path.exists()
-            and _read_meta(self.meta_path) == self.expected_meta
-        )
+        return self._cached_entry(load=False) is True
 
     def get_library_path(self) -> Path:
         return self.object_path
 
     def try_load(self) -> Optional[Any]:
-        """The cached kernel iff its ``.o`` exists and meta.json matches."""
-        with FileLock(self.module_lock_path, thread_local=False):
-            if not self.is_compiled:
-                return None
-            try:
-                kernel = self._load_from_disk()
-                logger.debug(f"Loaded cached CuTe-DSL kernel from {self.object_path}")
-                return kernel
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load cached CuTe-DSL kernel from {self.object_path}: "
-                    f"{e}. Recompiling."
-                )
-                return None
+        """The cached kernel iff its object and metadata belong to the same generation."""
+        try:
+            return self._cached_entry(load=True)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load cached CuTe-DSL kernel {self.object_path}: {e}. Recompiling."
+            )
+            return None
 
     def build(self) -> None:
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
@@ -213,18 +242,20 @@ class JitSpecCuteDsl(JitSpec):
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
-        self._compiled_kernel = (self.export_compile_fn or self.compile_fn)()
+        self._compiled_kernel = _compile_in_process(
+            self.export_compile_fn or self.compile_fn
+        )
         exported = False
         with FileLock(self.module_lock_path, thread_local=False):
-            if (
-                self.module_dir.exists()
-                and _read_meta(self.meta_path) != self.expected_meta
-            ):
-                logger.info(
-                    f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
-                )
-                shutil.rmtree(self.module_dir, ignore_errors=True)
             try:
+                if (
+                    self.module_dir.exists()
+                    and _read_meta(self.meta_path) != self.expected_meta
+                ):
+                    logger.info(
+                        f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
+                    )
+                    shutil.rmtree(self.module_dir)
                 self._export()
                 exported = True
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
@@ -235,7 +266,9 @@ class JitSpecCuteDsl(JitSpec):
 
         if self.export_compile_fn is not None:
             # An engine-less kernel can only run after a successful export and reload.
-            self._compiled_kernel = None if exported else self.compile_fn()
+            self._compiled_kernel = (
+                None if exported else _compile_in_process(self.compile_fn)
+            )
 
     def compile_and_persist(self) -> None:
         """Compile unconditionally, then commit under the module lock.
@@ -267,12 +300,12 @@ class JitSpecCuteDsl(JitSpec):
         is best-effort (``build()`` logs and continues on failure) and the
         on-disk cache can be disabled outright.
         """
-        with FileLock(self.module_lock_path, thread_local=False):
-            if self.is_compiled:
-                return self._load_from_disk()
-            if self._compiled_kernel is not None:
-                return self._compiled_kernel
-            raise RuntimeError(f"No valid cached CuTe-DSL kernel for {self.name}")
+        kernel = self._cached_entry(load=True)
+        if kernel is not None:
+            return kernel
+        if self._compiled_kernel is not None:
+            return self._compiled_kernel
+        raise RuntimeError(f"No valid cached CuTe-DSL kernel for {self.name}")
 
     def _load_from_disk(self) -> Any:
         import cutlass.cute as cute
@@ -371,7 +404,7 @@ def build_and_load_cute_dsl_kernel(
     function.
     """
     if cute_dsl_cache_disabled():
-        return compile_fn()
+        return _compile_in_process(compile_fn)
 
     # If any key source is unreadable (missing file, __file__ unavailable
     # under exotic packaging), bypass the disk cache rather than skipping the
@@ -384,7 +417,7 @@ def build_and_load_cute_dsl_kernel(
                 f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
                 f"({e}); bypassing the disk cache for this kernel."
             )
-            return compile_fn()
+            return _compile_in_process(compile_fn)
 
     spec = JitSpecCuteDsl(
         module_name,

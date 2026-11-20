@@ -34,9 +34,10 @@ pattern for their own name functions.
 
 from concurrent.futures import ThreadPoolExecutor
 import inspect
+import multiprocessing
 from pathlib import Path
 import re
-from threading import Barrier, Event
+from threading import Event
 
 import pytest
 from filelock import FileLock, Timeout
@@ -470,28 +471,103 @@ def cute_dsl_cache(monkeypatch, tmp_path):
     return cute_dsl_core
 
 
-@pytest.mark.cpu_only
-def test_different_kernels_compile_concurrently(cute_dsl_cache):
-    cache = cute_dsl_cache
-    compiling = Barrier(3, timeout=5)
+def _compile_in_worker(tmp_path, name, compiling):
+    from flashinfer.jit import cute_dsl_core as cache
+
+    cache.jit_env.FLASHINFER_JIT_DIR = tmp_path
 
     def compile_kernel():
-        compiling.wait()
+        compiling.wait(timeout=30)
         return _ExportedKernel(b"kernel")
 
-    specs = [
-        cache.JitSpecCuteDsl("shared", name, compile_kernel, "source")
-        for name in ("a", "b", "c")
+    spec = cache.JitSpecCuteDsl("shared", name, compile_kernel, "source")
+    spec.compile_and_persist()
+
+
+@pytest.mark.cpu_only
+def test_different_kernels_compile_concurrently(cute_dsl_cache, tmp_path):
+    cache = cute_dsl_cache
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    workers = [
+        ctx.Process(target=_compile_in_worker, args=(tmp_path, name, barrier))
+        for name in ("a", "b")
     ]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [
-            pool.submit(specs[0].build_and_load),
-            pool.submit(specs[1].build_and_load),
-            pool.submit(specs[2].compile_and_persist),
-        ]
-        assert [f.result(timeout=10) for f in futures] == [b"kernel", b"kernel", None]
-    assert all(spec.is_compiled for spec in specs)
-    assert specs[2].load() == b"kernel"
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=90)
+            assert worker.exitcode == 0
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+                worker.join()
+    for name in ("a", "b"):
+        spec = cache.JitSpecCuteDsl(
+            "shared", name, lambda: pytest.fail("cache miss"), "source"
+        )
+        assert spec.build_and_load() == b"kernel"
+
+
+@pytest.mark.cpu_only
+def test_compiler_options_are_isolated_between_threads(cute_dsl_cache):
+    cache = cute_dsl_cache
+    entered, release, attempted = Event(), Event(), Event()
+    options = []
+
+    def compile_first():
+        options.append("first")
+        entered.set()
+        assert release.wait(timeout=10)
+        assert options.pop() == "first"
+        return _ExportedKernel(b"first")
+
+    def compile_second():
+        assert options == []
+        return _ExportedKernel(b"second")
+
+    def second_build():
+        attempted.set()
+        return cache.build_and_load_cute_dsl_kernel("shared", "second", compile_second)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            cache.build_and_load_cute_dsl_kernel, "shared", "first", compile_first
+        )
+        try:
+            assert entered.wait(timeout=10)
+            second = pool.submit(second_build)
+            assert attempted.wait(timeout=10)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release.set()
+        assert first.result(timeout=10) == b"first"
+        assert second.result(timeout=10) == b"second"
+
+
+@pytest.mark.cpu_only
+def test_cache_read_discards_a_replaced_generation(cute_dsl_cache, monkeypatch):
+    cache = cute_dsl_cache
+
+    def make(key):
+        return cache.JitSpecCuteDsl(
+            "shared", "a", lambda: _ExportedKernel(b"kernel"), key
+        )
+
+    first, replacement = make("one"), make("two")
+    first.compile_and_persist()
+
+    def load_then_replace():
+        value = first.object_path.read_bytes()
+        replacement.compile_and_persist()
+        return value
+
+    monkeypatch.setattr(first, "_load_from_disk", load_then_replace)
+    assert first.try_load() is None
+    assert not first.is_compiled and replacement.is_compiled
 
 
 @pytest.mark.cpu_only
@@ -527,6 +603,13 @@ def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch)
             release.set()
         assert first.result(timeout=10) == second.result(timeout=10) == b"kernel"
     assert len(builds) == 1
+
+    # A hot immutable cache needs no writable lock directory.
+    monkeypatch.setattr(
+        cache, "get_tmpdir", lambda: pytest.fail("read-only cache hit requested a lock")
+    )
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    assert spec().is_compiled and spec().build_and_load() == b"kernel"
 
 
 @pytest.mark.cpu_only

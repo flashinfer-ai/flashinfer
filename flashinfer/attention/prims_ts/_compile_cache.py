@@ -128,16 +128,17 @@ def build_and_load_attention_kernel(
 ) -> Any:
     """Build or load under the caller's selected CUDA device context."""
     from ...jit.cute_dsl_core import (
+        _compile_in_process,
         build_and_load_cute_dsl_kernel,
         cute_dsl_cache_disabled,
     )
 
     if cute_dsl_cache_disabled():
-        return compile_fn()
+        return _compile_in_process(compile_fn)
 
     name = _attention_kernel_name(kind, spec, options, extra)
     if name is None:
-        return compile_fn()
+        return _compile_in_process(compile_fn)
     return build_and_load_cute_dsl_kernel(
         f"prims_ts_{family}",
         name,
