@@ -226,7 +226,6 @@ class SwapsPlan:
         self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
-        self.ranged = False  # the causal class alone: the ranged class's batches take the row body (blocks/operands.StaticPlan.ranged)
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
