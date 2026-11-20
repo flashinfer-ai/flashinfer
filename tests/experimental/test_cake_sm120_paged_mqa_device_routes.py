@@ -485,7 +485,15 @@ def _grid(catalog):
     for low, high in policy["device_rule"]["ctx_windows"].values():
         hints |= {low - 1, low, high - 1, high}
     hints.discard(0)
-    devices = [(170, 170), (188, 188), (84, 84), (169, 170), (188, 170)]
+    devices = [
+        (110, 110),
+        (170, 170),
+        (188, 188),
+        (84, 84),
+        (109, 110),
+        (169, 170),
+        (188, 170),
+    ]
     return (
         geometries,
         batches,
