@@ -800,3 +800,10 @@ def test_contract_violations_raise_value_error():
     bad_gate["output_gate"] = strided
     with pytest.raises(ValueError, match="output_gate"):
         run_api(bad_gate, backend="specialized")
+
+
+@pytest.mark.parametrize("lengths", [(6001, 5999), (8001, 5999), (8192, 8191)])
+def test_long_two_request_unequal_lengths_without_spare_pages(lengths, monkeypatch):
+    inputs = make_inputs(lengths, seed=sum(lengths), spare_pages=0)
+    out = run_route(inputs, "w7", monkeypatch)
+    assert_close_at_gate(out, run_ref(inputs))

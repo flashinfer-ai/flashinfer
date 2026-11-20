@@ -1222,7 +1222,8 @@ def _cache_tile(cache, row, nslot, BN: tl.constexpr, DC: tl.constexpr,
 def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                 BT: tl.constexpr, RW: tl.constexpr, MK: tl.constexpr,
                 BN: tl.constexpr, NHC: tl.constexpr, DC: tl.constexpr,
-                PWC: tl.constexpr, SC: tl.constexpr, HOST_DESC: tl.constexpr):
+                PWC: tl.constexpr, SC: tl.constexpr, HOST_DESC: tl.constexpr,
+                WSPEC: tl.constexpr):
     """Dedicated B=2 long-row kernel: inline dense and sparse TMA paths.
 
     Keeping the cold retry in this entry point is important: Triton's SM107
@@ -1294,7 +1295,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
         mr = tl.zeros([RW], tl.float32)
         minc = tl.min(tl.where(rv, rcnt, 0x7FFFFFFF), 0)
         nfull = minc // BN
-        for kw in tl.range(0, nfull, warp_specialize=HOST_DESC):
+        for kw in tl.range(0, nfull, warp_specialize=WSPEC):
             w0 = kw * BN
             kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
             vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
@@ -1307,7 +1308,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             acc = tl.dot(pl, vt,
                          tl.dot(ph, vt, acc, out_dtype=tl.float32),
                          out_dtype=tl.float32)
-        for kw in tl.range(nfull, nw, warp_specialize=HOST_DESC):
+        for kw in tl.range(nfull, nw, warp_specialize=WSPEC):
             w0 = kw * BN
             kt = tl.trans(_cache_tile(KD, base + w0, NSLOT, BN, DC, HOST_DESC))
             vt = _cache_tile(VD, base + w0, NSLOT, BN, DC, HOST_DESC)
@@ -1324,7 +1325,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
                          out_dtype=tl.float32)
         dlt = tl.where(rcnt > 0, mx * cc, 0.0)
         if tl.max(tl.abs(dlt)) > 8.0:
-            mr = mx * cc
+            mr = tl.where(rcnt > 0, mx * cc, 0.0)
             acc = tl.zeros([RW, DC], tl.float32)
             li = tl.zeros([RW], tl.float32)
             for kw in range(0, nfull):
@@ -1373,7 +1374,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
         acc = tl.zeros([RW, DC], tl.float32)
         li = tl.zeros([RW], tl.float32)
         mx = tl.full([RW], -1.0e30, tl.float32)
-        for kw in tl.range(0, nw, num_stages=1, warp_specialize=HOST_DESC,
+        for kw in tl.range(0, nw, num_stages=1, warp_specialize=WSPEC,
                            disable_licm=True,
                            disallow_acc_multi_buffer=True):
             w0 = wlo + kw * BN
@@ -1426,7 +1427,7 @@ def _qsa_w7_tma(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
             acc = _pv_half_pair(pp16, vt, acc)
         dlt = tl.where(rcnt > 0, mx * cc, 0.0)
         if tl.max(tl.abs(dlt)) > 8.0:
-            mr = mx * cc
+            mr = tl.where(rcnt > 0, mx * cc, 0.0)
             p = tl.zeros([MK], tl.int32)
             if BN == 128:
                 si = p[:, None] + ii[None, :]
@@ -2348,19 +2349,23 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
             num_stages=(2 if T == 256 else
                         (3 if short_bn == 32 else SR_STAGES)))
         return
-    if T == 16382 and B == 2 and "w7" not in _NO_WSPEC:
-        w7_bt, w7_rw, w7_mk, w7_bn, stages = (
-            (5, 32, 16, 64, 1) if _SMALL_NATIVE_Q_TILE else (21, 128, 32, 128, 2)
-        )
+    if B == 2 and T >= 12000 and "w7" not in _NO_WSPEC:
+        host_desc = bool(_HTMA)
+        if _SMALL_NATIVE_Q_TILE:
+            # Share each 64-slot cache tile across ten tokens with host TMA.
+            # Keep the five-token pointer schedule when descriptors are absent.
+            w7_bt, w7_rw = (10, 64) if host_desc else (5, 32)
+            w7_mk, w7_bn, stages = 16, 64, 1
+        else:
+            w7_bt, w7_rw, w7_mk, w7_bn, stages = 21, 128, 32, 128, 2
         w7_nprog = (T + w7_bt - 1) // w7_bt + 1
-        host_desc = bool(_HTMA) and not _SMALL_NATIVE_Q_TILE
         kd, vd = _desc(k_cache, v_cache, w7_bn, nslot) if host_desc else (k_cache, v_cache)
         try:
             _qsa_w7_tma[(w7_nprog,)](
                 q, gate, k_cache, v_cache, kd, vd,
                 packed, cu_seqlens, page_base, out,
                 T, nslot, BT=w7_bt, RW=w7_rw, MK=w7_mk, BN=w7_bn,
-                HOST_DESC=host_desc,
+                HOST_DESC=host_desc, WSPEC=host_desc and not _SMALL_NATIVE_Q_TILE,
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
                 num_warps=8, num_stages=stages)
             return
