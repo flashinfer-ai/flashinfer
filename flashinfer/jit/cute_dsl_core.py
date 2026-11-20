@@ -24,12 +24,12 @@ import sys
 import sysconfig
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, TextIO
 
 from filelock import FileLock
 
 from . import env as jit_env
-from .core import JitSpec, get_tmpdir, logger
+from .core import JitSpec, MissingJITCacheError, get_tmpdir, logger
 from ._cute_dsl_source import (
     _hash_source_files,
     cute_dsl_strict_cache_key as cute_dsl_strict_cache_key,
@@ -180,6 +180,7 @@ class JitSpecCuteDsl(JitSpec):
         # Retained by build() as a fallback when the artifact cannot be loaded
         # from the disk cache because persistence failed or it was invalidated.
         self._compiled_kernel: Optional[Any] = None
+        self._exported_without_engine = False
 
     @property
     def lock_path(self) -> Path:
@@ -195,6 +196,15 @@ class JitSpecCuteDsl(JitSpec):
     @property
     def meta_path(self) -> Path:
         return self.module_dir / _META_FILENAME
+
+    def _same_cache_generation(self, marker: TextIO) -> Optional[bool]:
+        """False if the marker was replaced or removed, None if it cannot be checked."""
+        try:
+            return os.path.samestat(os.fstat(marker.fileno()), self.meta_path.stat())
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            return None
 
     def _cached_entry(self, *, load: bool) -> Any:
         # meta.json is the generation's commit marker, published after the
@@ -214,14 +224,15 @@ class JitSpecCuteDsl(JitSpec):
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 return None
 
-            value = self._load_from_disk() if load else True
-
             try:
-                if os.path.samestat(os.fstat(marker.fileno()), self.meta_path.stat()):
-                    return value
-            except OSError:
-                return None
-        return None
+                value = self._load_from_disk() if load else True
+            except Exception:
+                # A sibling can invalidate the object after the existence check.
+                # Preserve genuine loader errors for the same (or unknown) generation.
+                if self._same_cache_generation(marker) is False:
+                    return None
+                raise
+            return value if self._same_cache_generation(marker) else None
 
     @property
     def is_compiled(self) -> bool:
@@ -250,6 +261,7 @@ class JitSpecCuteDsl(JitSpec):
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
+        self._exported_without_engine = False
         self._compiled_kernel = _compile_in_process(
             self.export_compile_fn or self.compile_fn
         )
@@ -263,6 +275,8 @@ class JitSpecCuteDsl(JitSpec):
                     logger.info(
                         f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
                     )
+                    # Retire the generation before removing any of its objects.
+                    self.meta_path.unlink(missing_ok=True)
                     shutil.rmtree(self.module_dir)
                 self._export()
                 exported = True
@@ -273,19 +287,24 @@ class JitSpecCuteDsl(JitSpec):
                 )
 
         if self.export_compile_fn is not None:
+            self._exported_without_engine = exported
             # An engine-less kernel can only run after a successful export and reload.
             self._compiled_kernel = (
                 None if exported else _compile_in_process(self.compile_fn)
             )
 
-    def compile_and_persist(self) -> None:
-        """Compile unconditionally, then commit under the module lock.
+    def compile_and_persist(self, *, force: bool = True) -> None:
+        """Build and publish the artifact. Meant for parallel precompilation workers.
 
-        Meant for parallel precompilation workers.
-        Persistence is best-effort; on-demand callers can retain the compiled
-        kernel in memory when exporting fails.
+        The default forces a rebuild. With force=False, workers filling a cache
+        share a published specialization, including one built while waiting.
+        Persistence is best-effort; load() can return an in-process fallback.
         """
+        if not force and self.is_compiled:
+            return
         with FileLock(self.lock_path, thread_local=False):
+            if not force and self.is_compiled:
+                return
             self._timed_build()
 
     def load(self) -> Any:
@@ -311,6 +330,14 @@ class JitSpecCuteDsl(JitSpec):
         kernel = self._cached_entry(load=True)
         if kernel is not None:
             return kernel
+        if self._compiled_kernel is None and self._exported_without_engine:
+            if os.environ.get("FLASHINFER_DISABLE_JIT"):
+                raise MissingJITCacheError(
+                    f"JIT compilation is disabled and the export for {self.name} was invalidated",
+                    spec=self,
+                )
+            self._compiled_kernel = _compile_in_process(self.compile_fn)
+            self._exported_without_engine = False
         if self._compiled_kernel is not None:
             return self._compiled_kernel
         raise RuntimeError(f"No valid cached CuTe-DSL kernel for {self.name}")

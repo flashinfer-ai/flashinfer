@@ -579,6 +579,21 @@ def test_cache_read_discards_a_replaced_generation(cute_dsl_cache, monkeypatch):
     with pytest.raises(PermissionError, match="cache read denied"):
         replacement.load()
 
+    rmtree = cache.shutil.rmtree
+
+    def remove_retired_directory(path):
+        assert not replacement.meta_path.exists()
+        rmtree(path)
+
+    monkeypatch.setattr(cache.shutil, "rmtree", remove_retired_directory)
+
+    def invalidate_during_load():
+        make("three").compile_and_persist()
+        raise FileNotFoundError("sibling invalidated the object")
+
+    monkeypatch.setattr(replacement, "_load_from_disk", invalidate_during_load)
+    assert replacement.load() is replacement._compiled_kernel
+
 
 @pytest.mark.cpu_only
 def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch):
@@ -602,17 +617,33 @@ def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch)
         export(path)
 
     monkeypatch.setattr(first_spec, "_export_object", blocked_export)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    missed = Event()
+
+    class CacheFillingSpec(cache.JitSpecCuteDsl):
+        @property
+        def is_compiled(self):
+            hit = super().is_compiled
+            if not hit:
+                missed.set()
+            return hit
+
+    waiter = CacheFillingSpec("shared", "same", compile_kernel, "source")
+    with ThreadPoolExecutor(max_workers=3) as pool:
         first = pool.submit(first_spec.build_and_load)
         try:
             assert exporting.wait(timeout=5)
             with pytest.raises(Timeout), FileLock(spec().lock_path, timeout=0):
                 pytest.fail("the publishing worker must still hold the kernel lock")
             second = pool.submit(spec().build_and_load)
+            filling = pool.submit(waiter.compile_and_persist, force=False)
+            assert missed.wait(timeout=5)
         finally:
             release.set()
+        assert filling.result(timeout=10) is None
         assert first.result(timeout=10) == second.result(timeout=10) == b"kernel"
     assert len(builds) == 1
+    spec().compile_and_persist()
+    assert len(builds) == 2  # Explicit unconditional rebuild.
 
     # A hot immutable cache needs no writable lock directory.
     monkeypatch.setattr(
