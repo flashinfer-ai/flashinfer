@@ -101,7 +101,7 @@ void dequantize_nvfp4_to_bf16(const void* nvfp4_packed_input, const float* globa
   EP_HOST_ASSERT(hidden_dim % kElemNumPerAccess == 0);
   int hidden_access_num = hidden_dim / kElemNumPerAccess;
   int grid_size = std::min(token_num, get_sm_count());
-  int block_size = std::min(1024, ceil_div(hidden_access_num, 32));
+  int block_size = 256;
   EP_HOST_ASSERT(grid_size > 0 and block_size > 0);
   SETUP_LAUNCH_CONFIG(grid_size, block_size, stream);
   LAUNCH_KERNEL(&cfg, dequantize_nvfp4_to_bf16_kernel, nvfp4_packed_input, global_scale_per_token,
