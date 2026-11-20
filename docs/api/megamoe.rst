@@ -105,7 +105,7 @@ global expert assignment counts differ by at most one. Routing coefficients
 are generated softmax weights, not the output of a learned router. Inputs use
 FP8 E4M3 values with scale 1/128 per 128 elements; generated MXFP4 weight scale
 bytes are 122 through 124. This is a synthetic balanced fixture, not the
-historical R405 input or a measured customer routing trace.
+checkpoint replay or a measured customer routing trace.
 
 Equal-total-token runs with the same seed therefore use the same global input
 rows, routes, coefficients and source weights across EP partitions. Equal

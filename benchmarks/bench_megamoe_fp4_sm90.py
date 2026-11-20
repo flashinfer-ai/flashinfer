@@ -2,8 +2,8 @@
 
 Tokens are per rank by default; ``--token-scope total`` requires exact division
 by EP. Global row/expert seeds keep a fixed total workload identical across EP
-partitions. Generated routing is globally balanced by default; it is not a
-historical R405 fixture. JSON retains every rank sample; optional CSV reports both the median
+partitions. Generated routing is globally balanced by default. JSON retains
+every rank sample; optional CSV reports both the median
 of per-sample rank maxima and the maximum of per-rank medians.
 
 ``--reference-runner`` accepts a single-host canonical-weight source adapter
