@@ -818,11 +818,11 @@ def _attention_operands(
     hit = _ROUTES.get(key)
     record, items, split, tail = _route(*key) if hit is None else hit
     # Positional binding in the record's ``arg_plan`` order (buffers, parameters,
-    # the PDL launch flag, grid).
+    # the PDL launch flag, grid).  The bindings take the float8_e4m3fn Q/K/V as they are.
     args: Tuple[Any, ...] = (
-        q.view(torch.uint8),
-        k.view(torch.uint8),
-        v.view(torch.uint8),
+        q,
+        k,
+        v,
         out,
         lse_arg,
         q_scale,

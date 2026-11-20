@@ -374,6 +374,24 @@ def _refusal_table(ops: dict):
             "q must use torch.float8_e4m3fn, got torch.bfloat16",
         ),
         (
+            "q_uint8",
+            dict(q=q.view(torch.uint8)),
+            TypeError,
+            "q must use torch.float8_e4m3fn, got torch.uint8",
+        ),
+        (
+            "k_uint8",
+            dict(k=k.view(torch.uint8)),
+            TypeError,
+            "k must use torch.float8_e4m3fn, got torch.uint8",
+        ),
+        (
+            "v_uint8",
+            dict(v=v.view(torch.uint8)),
+            TypeError,
+            "v must use torch.float8_e4m3fn, got torch.uint8",
+        ),
+        (
             "q_strided",
             dict(q=_fp8((2, 4, 128, 128)).transpose(1, 2)),
             ValueError,

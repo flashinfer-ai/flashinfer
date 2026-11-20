@@ -1231,9 +1231,9 @@ def test_run_module_matches_the_host_api():
     out = torch.empty_like(out_api)
     lse = torch.empty_like(lse_api)
     values = {
-        "q": c["q8"].view(torch.uint8),
-        "k": c["k8"].view(torch.uint8),
-        "v": c["v8"].view(torch.uint8),
+        "q": c["q8"],
+        "k": c["k8"],
+        "v": c["v8"],
         "out": out,
         "lse": lse,
         "q_scale": c["q_scale"],
@@ -1261,6 +1261,18 @@ def test_run_module_matches_the_host_api():
     loader.run_module("attention", values, device_index=torch.cuda.current_device())
     torch.cuda.synchronize()
     assert torch.equal(out, out_api) and torch.equal(lse, lse_api)
+    # The attention bindings take float8_e4m3fn Q/K/V and refuse other dtypes by name,
+    # before any launch.
+    out.fill_(float("nan"))
+    for name in ("q", "k", "v"):
+        for dtype in (torch.uint8, torch.int8):
+            bad = {**values, name: values[name].view(dtype)}
+            with pytest.raises(TypeError, match=f"{name} dtype mismatch: expected "):
+                loader.run_module(
+                    "attention", bad, device_index=torch.cuda.current_device()
+                )
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all()
 
 
 @requires_sm100
