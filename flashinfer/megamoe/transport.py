@@ -122,9 +122,13 @@ class MegaMoENcclTransport:
         int
             Index of the window in this transport.
         """
-        return int(self.module.megamoe_sm90_transport_alloc_window(self._live(), nbytes))
+        return int(
+            self.module.megamoe_sm90_transport_alloc_window(self._live(), nbytes)
+        )
 
-    def window_tensor(self, index: int, dtype: torch.dtype = torch.int8) -> torch.Tensor:
+    def window_tensor(
+        self, index: int, dtype: torch.dtype = torch.int8
+    ) -> torch.Tensor:
         """This rank's window ``index`` as a flat tensor of ``dtype`` sharing the window memory."""
         handle = self._live()
         pointer = int(self.module.megamoe_sm90_transport_window_pointer(handle, index))
@@ -139,7 +143,9 @@ class MegaMoENcclTransport:
         """Load/store pointers of window ``index`` on every rank; 0 for ranks on other nodes."""
         return [
             int(p)
-            for p in self.module.megamoe_sm90_transport_peer_pointers(self._live(), index)
+            for p in self.module.megamoe_sm90_transport_peer_pointers(
+                self._live(), index
+            )
         ]
 
     def peer_handle(self, index: int) -> _PeerPointers:
@@ -148,7 +154,9 @@ class MegaMoENcclTransport:
 
     def window_handle(self, index: int) -> int:
         """``ncclWindow_t`` of window ``index`` as an integer, for GIN puts."""
-        return int(self.module.megamoe_sm90_transport_window_handle(self._live(), index))
+        return int(
+            self.module.megamoe_sm90_transport_window_handle(self._live(), index)
+        )
 
     @property
     def dev_comm_pointer(self) -> int:
