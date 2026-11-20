@@ -52,6 +52,16 @@ written (with ``lse_layout="HN"`` the transposed copy covers the whole buffer). 
 refused as in eager mode, with no key at all too. The page indices are range-checked at the first plan only (a check is a
 device readback, and later plans run before every replay). The ragged prefill wrapper refuses ``use_cuda_graph=True``.
 
+Memory of a ``use_cuda_graph=True`` wrapper, kept for its lifetime besides the caller's buffers (``engine.FixedLaunch``): one
+int32 table of ``8 + 16 U (32 U under the paired placement) + 10 G + 10 F`` entries on the device and two page-locked host
+copies of it (the staging blocks of the non-blocking replans), ``G`` int32 arrival counters, and at head dim 256 a per-CTA
+scratch of ``128 x 256`` fp32 for every CTA of the launch grid (one CTA per SM). ``U`` is the unit capacity, the larger of the
+fused plan's units and ``engine.GRAPH_UNIT_WAVES`` units per SM; the fused units are ``batch x Hkv x ceil(q_len_per_req / tpt)``
+for decode and ``Hkv x (ceil(max_rows / tpt) + slots - 1)`` for prefill (``tpt = 128 // (Hq / Hkv)`` tokens per Q tile);
+``G`` is the fused units and ``F`` at most ``G`` (prefill: at most ``U / 2``). The tables therefore grow with the row
+capacity and the slot count, the scratch with neither. The public wrappers allocate their own integer workspace on top
+(device and page-locked host, for the other backends' planners), which this class does not use.
+
 Inference mode: the fixed launch's tables and the page-table buffers are written in place at every plan, under
 ``torch.inference_mode()`` whatever the caller's mode, so a wrapper may be built, planned, captured and replanned on either
 side of it (and under ``torch.no_grad()``).
