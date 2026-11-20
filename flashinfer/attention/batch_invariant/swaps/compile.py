@@ -66,7 +66,7 @@ def get_compiled_swaps(
         s_ws = (
             cute.sym_int64()
         )  # fp32 elements of the workspace: beyond 2^31 on large batches
-        s_nb1, s_nidx = cute.sym_int(32), cute.sym_int(32)
+        s_nidx = cute.sym_int(32)
         q_fake = cute.runtime.make_fake_tensor(
             bf16,
             (D, s_hq, s_tq),
@@ -112,9 +112,6 @@ def get_compiled_swaps(
         desc_fake = cute.runtime.make_fake_tensor(
             i32, (s_nunits, 16), (16, 1), assumed_align=16
         )
-        indptr_fake = cute.runtime.make_fake_tensor(
-            i32, (s_nb1,), (1,), assumed_align=4
-        )
         indices_fake = cute.runtime.make_fake_tensor(
             i32, (s_nidx,), (1,), assumed_align=4
         )
@@ -130,7 +127,6 @@ def get_compiled_swaps(
             groups_fake,
             counters_fake,
             desc_fake,
-            indptr_fake,
             indices_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(-1.0),
