@@ -45,3 +45,19 @@ def test_problem_size_accepts_one_noncurrent_gpu(monkeypatch, provide_out):
     if not provide_out:
         args[-1] = None
     assert _check_mm_mxfp8_problem_size(*args, use_8x4_sf_layout=False)
+
+
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_public_rejects_host_scale_before_routing(monkeypatch, backend):
+    from flashinfer import mm_mxfp8
+    from flashinfer.gemm import gemm_base as gemm
+
+    def unexpected_route(*args, **kwargs):
+        pytest.fail("invalid operands reached backend selection")
+
+    monkeypatch.setattr(gemm, "specialized_mm_mxfp8_eligible", unexpected_route)
+    monkeypatch.setattr(gemm, "get_compute_capability", unexpected_route)
+    args = _mxfp8_metadata()
+    args[3].device = torch.device("cpu")
+    with pytest.raises(ValueError, match="b_descale must"):
+        mm_mxfp8(*args[:4], out=args[4], backend=backend, use_8x4_sf_layout=False)
