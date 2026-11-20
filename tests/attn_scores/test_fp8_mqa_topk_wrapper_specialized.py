@@ -711,3 +711,215 @@ def test_auto_exhausted_configuration_raises():
             num_heads=32,
             compression_ratio=4,
         )
+
+
+def _region_fixture(*, backend="auto", max_bs=1, declared=False):
+    inp = _mk([8192], [8192], seed=91)
+    # Exact quarter-integer scores keep the sampled ranking oracle strict.
+    inp["q"] = (inp["q"].float() * 4).round().div(4).to(torch.float8_e4m3fn)
+    inp["k"] = (inp["k"].float() * 4).round().div(4).to(torch.float8_e4m3fn)
+    inp["weights"].fill_(0.125)
+    wrapper = FP8MQATopKWrapper(
+        backend=backend,
+        max_context_length=8192,
+        max_chunk_size=8192,
+        max_batch_size=max_bs,
+        device="cuda",
+        num_heads=H,
+        compression_ratio=RATIO,
+        num_keys=inp["k"].shape[0],
+        declare_specialized_contract=declared,
+    )
+    wrapper.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    return inp, wrapper
+
+
+def _plan_live(wrapper, length):
+    prefix = torch.tensor([0, length], dtype=torch.int32, device="cuda")
+    # The row budget deliberately differs from the live prefix.
+    wrapper.plan(prefix, prefix, num_query_rows=8192)
+
+
+def _check_live_prefix(inp, out, length):
+    assert out.shape == (8192, TOPK)
+    assert bool((out[length:] == -1).all())
+    for i in sorted({0, 3, length // 2, length - 1}):
+        sample = dict(
+            q=inp["q"][i : i + 1],
+            k=inp["k"],
+            k_scale=inp["k_scale"],
+            q_lens=[1],
+            kv_lens=[i + 1],
+            starts=[0],
+        )
+        _assert_weighted_topk(sample, out[i : i + 1], inp["weights"][i : i + 1])
+
+
+@requires_sm103
+@requires_validated_toolkit
+@pytest.mark.parametrize("length", [122, 2047, 2048, 4096, 4097, 8192])
+def test_auto_live_length_performance_region(length):
+    inp, wrapper = _region_fixture()
+    _plan_live(wrapper, length)
+    assert wrapper.resolved_backend == (
+        "specialized" if 2048 <= length <= 4096 else "cutedsl"
+    )
+    out = wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
+    _check_live_prefix(inp, out, length)
+
+
+@requires_sm103
+@requires_validated_toolkit
+@pytest.mark.parametrize("backend,max_bs", [("specialized", 1), ("auto", 2)])
+def test_b1_performance_region_preserves_other_domains(backend, max_bs):
+    inp, wrapper = _region_fixture(backend=backend, max_bs=max_bs)
+    _plan_live(wrapper, 8192)
+    assert wrapper.resolved_backend == "specialized"
+    out = wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
+    _check_live_prefix(inp, out, 8192)
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_auto_region_replan_uses_new_prefix_and_preserves_bindings(monkeypatch):
+    inp, wrapper = _region_fixture(declared=True)
+    second = inp["k"].float().flip(0).to(inp["k"].dtype)
+    wrapper.prepare_pool(second, k_scale=inp["k_scale"])
+    router = wrapper._capacity_plan
+    make = router._make_cutedsl
+    replayed = []
+
+    def tracked_replacement():
+        replacement = make()
+        prepare = replacement.prepare_pool
+
+        def tracked_prepare(k, **kwargs):
+            result = prepare(k, **kwargs)
+            replayed.append(k.data_ptr())
+            return result
+
+        monkeypatch.setattr(replacement, "prepare_pool", tracked_prepare)
+        return replacement
+
+    monkeypatch.setattr(router, "_make_cutedsl", tracked_replacement)
+    for length, expected in (
+        (2304, "specialized"),
+        (4096, "specialized"),
+        (8192, "cutedsl"),
+        (2304, "cutedsl"),
+    ):
+        _plan_live(wrapper, length)
+        assert wrapper.resolved_backend == expected
+        if expected == "cutedsl":
+            # Check replay before an eager run could lazily prepare a binding.
+            assert replayed == [inp["k"].data_ptr(), second.data_ptr()]
+        out = torch.empty(8192, TOPK, dtype=torch.int32, device="cuda")
+        wrapper.run(inp["q"], inp["weights"], second, k_scale=inp["k_scale"], out=out)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.run(
+                inp["q"], inp["weights"], second, k_scale=inp["k_scale"], out=out
+            )
+        out.fill_(-7)
+        graph.replay()
+        _check_live_prefix({**inp, "k": second}, out, length)
+        # Replanning explicitly invalidates captures; discard before replan.
+        del graph
+        torch.cuda.synchronize()
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_outside_region_auto_capture_keeps_live_weight_scale_semantics():
+    inp, wrapper = _region_fixture()  # No specialized declaration.
+    _plan_live(wrapper, 8192)
+    assert wrapper.resolved_backend == "cutedsl"
+    out = torch.empty(8192, TOPK, dtype=torch.int32, device="cuda")
+    wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out)
+    before = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out)
+    inp["weights"][:, 0].mul_(3)
+    inp["k_scale"][:256].mul_(2)
+    graph.replay()
+    _check_live_prefix(inp, out, 8192)
+    assert not torch.equal(before, out)
+    assert wrapper.repair_error.item() == 0
+
+
+@requires_sm103
+@requires_validated_toolkit
+@pytest.mark.parametrize("previous_plan", [False, True])
+@pytest.mark.parametrize("failure", ["second_binding", "plan"])
+def test_auto_region_failed_replacement_is_retryable(
+    previous_plan, failure, monkeypatch
+):
+    inp, wrapper = _region_fixture()
+    second = inp["k"].float().flip(0).to(inp["k"].dtype)
+    wrapper.prepare_pool(second, k_scale=inp["k_scale"])
+    router = wrapper._capacity_plan
+    if previous_plan:
+        _plan_live(wrapper, 2304)
+    old_active = router._active
+    wrapper.repair_error.fill_(4)
+    make = router._make_cutedsl
+
+    def faulty_replacement():
+        replacement = make()
+        prepare = replacement.prepare_pool
+        calls = 0
+
+        def fail_prepare(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected second binding failure")
+            return prepare(*args, **kwargs)
+
+        def fail_plan(*args, **kwargs):
+            raise RuntimeError("injected plan failure")
+
+        if failure == "second_binding":
+            monkeypatch.setattr(replacement, "prepare_pool", fail_prepare)
+        else:
+            monkeypatch.setattr(replacement, "plan", fail_plan)
+        return replacement
+
+    monkeypatch.setattr(router, "_make_cutedsl", faulty_replacement)
+    with pytest.raises(RuntimeError, match="injected"):
+        _plan_live(wrapper, 8192)
+    assert router._active is old_active
+    assert wrapper.repair_error.item() == 4
+    assert wrapper.resolved_backend == "specialized"
+    assert len(router._bindings) == 2
+    if previous_plan:
+        assert wrapper.active_shape == (2304, 1)
+        out = wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
+        _check_live_prefix(inp, out, 2304)
+    monkeypatch.setattr(router, "_make_cutedsl", make)
+    _plan_live(wrapper, 8192)
+    assert wrapper.resolved_backend == "cutedsl"
+    out = wrapper.run(inp["q"], inp["weights"], second, k_scale=inp["k_scale"])
+    _check_live_prefix({**inp, "k": second}, out, 8192)
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_auto_region_keeps_specialized_only_capacity():
+    inp = _mk([122], [122], seed=92)
+    wrapper = FP8MQATopKWrapper(
+        backend="auto",
+        max_context_length=122,
+        max_chunk_size=122,  # CuTe requires a multiple of 64.
+        max_batch_size=1,
+        device="cuda",
+        num_heads=H,
+        compression_ratio=RATIO,
+        num_keys=inp["k"].shape[0],
+    )
+    wrapper.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    wrapper.plan(inp["qo"], inp["kv"], num_query_rows=122)
+    assert wrapper.resolved_backend == "specialized"
+    out = wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
+    _assert_weighted_topk(inp, out, inp["weights"])

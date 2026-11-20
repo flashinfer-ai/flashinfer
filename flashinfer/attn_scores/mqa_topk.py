@@ -81,6 +81,14 @@ class FP8MQATopKWrapper:
     declaration returns all ``-1`` rows and sets ``repair_error`` bit 16
     rather than a selection computed from stale values.
 
+    For single-request capacity (max_batch_size=1), auto prefers specialized
+    only for full-prefill live lengths 2048 through 4096. This is a bounded
+    completed-call performance policy measured on GB300/CUDA 13.0, not a
+    universal latency guarantee. Other lengths use CuTe when it can serve the
+    configuration; that resolution stays CuTe on later replans. Explicit
+    specialized and multi-request capacities
+    retain their existing supported domains.
+
     Construct outside capture, plan once per step, and run once per layer.
     Prepare every K/scale binding before capture. Keep this wrapper and all
     capture inputs alive until the caller discards its graphs. Calls on a
@@ -323,7 +331,7 @@ class FP8MQATopKWrapper:
 
 class _AutoTopKPlan:
     """Router plan for ``backend="auto"``: prefers the "specialized"
-    backend when the static configuration and CUDA toolkit allow, and
+    backend when the configuration, toolkit and planned workload allow, and
     demotes to "cutedsl" on the first rejected ``prepare_pool``/``plan``
     (replaying already-prepared bindings). "auto" carries no behavior of
     its own — every call is served by one of the named backends.
@@ -456,24 +464,56 @@ class _AutoTopKPlan:
         return out
 
     def plan(self, qo_indptr, kv_indptr, **kw):
-        if self._active is None:
+        cand = self._cand if self._active is None else self._active
+        name = self._cand_name if self._active is None else self._active_name
+        reason = None
+        performance_miss = False
+        if name == "specialized":
             try:
-                out = self._cand.plan(qo_indptr, kv_indptr, **kw)
+                state = cand._prepare_plan(qo_indptr, kv_indptr, **kw)
             except ValueError as e:
-                self._demote(str(e))
-                out = self._cand.plan(qo_indptr, kv_indptr, **kw)
-            self._active = self._cand
-            self._active_name = self._cand_name
+                reason = str(e)
+            else:
+                # Completed public-wrapper measurements on GB300 qualify this
+                # bounded B1 region. Use validated live prefixes, not capacity.
+                # CuTe cannot serve max_batch_size > 1, even with one live
+                # request, so those configurations retain specialized support.
+                if self._options["max_batch_size"] == 1 and not (
+                    2048 <= state["T"] <= 4096
+                ):
+                    reason = "single-request length outside measured auto region"
+                    performance_miss = True
+                else:
+                    cand._commit_plan(state)
+            if reason is not None:
+                try:
+                    replacement = self._make_cutedsl()
+                    for k, k_scale in self._bindings:
+                        replacement.prepare_pool(k, k_scale=k_scale)
+                    out = replacement.plan(qo_indptr, kv_indptr, **kw)
+                except ValueError:
+                    if not performance_miss:
+                        raise
+                    # Performance preference must not remove configurations
+                    # that only specialized can serve (e.g. unaligned capacity).
+                    cand._commit_plan(state)
+                    reason, out = None, None
+                else:
+                    # Publish only after bindings and the incoming plan succeed.
+                    # A failed fallback leaves the prior specialized state usable.
+                    cand, name = replacement, "cutedsl"
+            else:
+                out = None
         else:
-            out = self._active.plan(qo_indptr, kv_indptr, **kw)
-        if self._active_name == "specialized":
-            # a run-time ContractViolation can still fall back to cutedsl,
-            # which must replay the bindings and this plan: keep both logs
-            # (the pinned tensors are the caller's long-lived pools and
-            # small prefix arrays)
+            out = cand.plan(qo_indptr, kv_indptr, **kw)
+        self._cand, self._cand_name = cand, name
+        self._active, self._active_name = cand, name
+        if reason is not None:
+            self._demote_reason = reason
+        if name == "specialized":
             self._last_plan = (qo_indptr, kv_indptr, dict(kw))
         else:
-            # cutedsl is terminal: no fallback can follow, stop pinning
+            # CuTe is terminal, including later replans back into the region.
             self._bindings = []
             self._last_plan = None
         return out

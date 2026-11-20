@@ -266,7 +266,7 @@ class SpecializedTopKPlan:
             "backend='specialized' takes q/weights directly at run()"
         )
 
-    def plan(
+    def _prepare_plan(
         self,
         qo_indptr,
         kv_indptr,
@@ -362,7 +362,7 @@ class SpecializedTopKPlan:
         if num_query_rows is not None:
             _require(t <= int(num_query_rows), "live rows exceed num_query_rows")
         visible = torch.cat(vis_rows)
-        self._state = dict(
+        return dict(
             T=t,
             B=b,
             required_keys=kv[-1] // _RATIO,
@@ -382,9 +382,31 @@ class SpecializedTopKPlan:
                 < visible.clamp(max=_TOPK).unsqueeze(1)
             ).to(dev),
         )
-        self.active_shape = (t, b)
+
+    def _commit_plan(self, state):
+        # Auto may decline a prepared plan before publishing it. Keep the
+        # previous state intact until the complete replacement is ready.
         self.repair_error.zero_()
-        return None
+        self._state = state
+        self.active_shape = (state["T"], state["B"])
+
+    def plan(
+        self,
+        qo_indptr,
+        kv_indptr,
+        *,
+        num_query_rows=None,
+        next_n=None,
+        host_length_hints=None,
+    ):
+        state = self._prepare_plan(
+            qo_indptr,
+            kv_indptr,
+            num_query_rows=num_query_rows,
+            next_n=next_n,
+            host_length_hints=host_length_hints,
+        )
+        self._commit_plan(state)
 
     def run(self, q, weights, k, *, k_scale, out=None, q_scale=None):
         _require(self._state is not None, "plan must run before run")
