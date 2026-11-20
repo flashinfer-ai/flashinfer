@@ -20,7 +20,7 @@ launched by its ``launch_umma`` (``_use_persistent``) for w_ring = 16 and H <= 2
 there are at least 4 (T <= 6) or 16 (T >= 7) (request, head) items per resident CTA slot
 (4 per SM). Same math, same results (bitwise).
 
-Persistent layout (study log: /home/scratch.ameyn_gpu_3/kda_umma_dram_log.md):
+Persistent layout:
   * grid = 4 CTAs / SM. Work items = (request, head), item = request * H + head. CTA c
     starts with item c; warp 0 claims every further item from a global counter
     (``_work_counters``: [claim, done], the last CTA of a launch resets them) and posts
