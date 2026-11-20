@@ -42,17 +42,32 @@ def kda_oo_umma_auto_ok(device: torch.device, T: int) -> bool:
 
 
 # Persistent grid (CTAs stride over the work items) where it measured faster on B200
-# (H=12, ncu, B 16-2048): T > 8 (dense 1.04-1.10x, drop-in 1.09-1.12x) and T <= 4
-# (dense T=1 up to 1.05x, drop-in 1.03-1.05x, else even); at 5 <= T <= 8 one item
-# per CTA (persistent 0-2 % slower dense, up to 10 % drop-in). Tests set _PERSISTENT
-# to force either grid.
+# (H=12, ncu, B 128 / 2048): T > 8 (dense 1.01-1.11x with the next-item input
+# prefetch, drop-in 1.07-1.12x) and the drop-in at T <= 4 (1.00-1.03x); else one item
+# per CTA (dense T <= 8: the persistent grid 1-8 % slower; drop-in T 5-8 even to 9 %
+# slower). The persistent grid is sized num_sms * ctas_per_sm(T), the occupancy the
+# build's min_blocks_per_mp bound guarantees; where that bound is forced to 1 (SM107,
+# below) the residency is not known (registers may then limit it), so those parts keep
+# one item per CTA, which lets the hardware fill each SM with however many CTAs fit.
+# The next-item input prefetch (registers loaded during the current item) is on for
+# the dense persistent grid only (drop-in T = 16 0.98x, mixed elsewhere). Tests set
+# _PERSISTENT / _PREFETCH_NEXT to force either choice.
 _PERSISTENT: Optional[bool] = None
+_PREFETCH_NEXT: Optional[bool] = None
 
 
-def _use_persistent(T: int) -> bool:
+def _use_persistent(T: int, min_blocks: Optional[int], dropin: bool) -> bool:
     if _PERSISTENT is not None:
         return _PERSISTENT
-    return T <= 4 or T > 8
+    if min_blocks is not None:
+        return False
+    return T > 8 or (dropin and T <= 4)
+
+
+def _use_prefetch_next(dropin: bool) -> bool:
+    if _PREFETCH_NEXT is not None:
+        return _PREFETCH_NEXT
+    return not dropin
 
 
 def run_kda_oo_umma(
@@ -91,11 +106,13 @@ def run_kda_oo_umma(
     min_blocks = (
         1 if tuple(torch.cuda.get_device_capability(device)) == (10, 7) else None
     )
-    persistent = _use_persistent(T)
+    persistent = _use_persistent(T, min_blocks, vllm_dropin)
+    prefetch_next = persistent and _use_prefetch_next(vllm_dropin)
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     key = (
         gdn_device_target(device).compile_key,
         persistent,
+        prefetch_next,
         num_sms,
         bool(g_v4),
         min_blocks,
@@ -127,6 +144,7 @@ def run_kda_oo_umma(
             q_heads=H,
             num_sms=num_sms,
             persistent=persistent,
+            prefetch_next=prefetch_next,
         )
         fn = cute.compile[gdn_compile_options(device)](kernel, *args)
         _KERNELS[key] = fn

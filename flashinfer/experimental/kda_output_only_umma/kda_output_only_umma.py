@@ -30,9 +30,10 @@ key / (scaled) query of the query head i_h = hv / (HV / H):
 u_t is also the RecoverSSM correction (emit mode).
 
 Work item = (sequence b, value head hv), item = b * HV + hv; 1-D grid of 160-thread
-CTAs, one item per CTA or (``persistent``) min(items, SMs * CTAs/SM) CTAs striding
-over the items (removes the ~1 us per-CTA launch gap; picked per T / mode on the
-host). Per item:
+CTAs, one item per CTA (a constant one-trip loop) or (``persistent``) min(items,
+SMs * CTAs/SM) CTAs striding over the items (removes the ~1 us per-CTA launch gap;
+picked per T / mode on the host; ``prefetch_next`` loads the next item's q / k / gate /
+beta words into registers during the current item). Per item:
   warp 0   : mbarrier inits + TMEM allocation (32 columns) at entry; TMA of the bf16
              state (two 16 KB SW128 K halves), v-row bulk copies, the UMMA issue.
   warps 1-4: consumers: row-layout L2 norm (q / k and the gate rows as 16-B chunks,
@@ -455,6 +456,7 @@ class KdaOutputOnlyUmma:
         q_heads: Optional[int] = None,
         num_sms: Optional[int] = None,
         persistent: bool = False,
+        prefetch_next: bool = True,
     ):
         assert 1 <= T <= 16, T
         self.T = T
@@ -482,6 +484,8 @@ class KdaOutputOnlyUmma:
         self.KT = 8 if T <= 8 else 16  # Ktil rows (T live)
         self.num_threads = 160  # warp 0: TMA / UMMA / TMEM; warps 1-4: consumers
         self.min_blocks = ctas_per_sm(T) if min_blocks is None else int(min_blocks)
+        # persistent: prefetch the next item's row inputs during this item's work
+        self.prefetch_next = bool(prefetch_next)
 
     @cute.jit
     def __call__(
@@ -717,7 +721,9 @@ class KdaOutputOnlyUmma:
         GRP = HV // H  # value heads per query head (GQA)
         # persistent: CTA bid takes items bid, bid + G, ... (item = b * HV + hv)
         n_items = Int32(gH0idx.layout.shape[0]) * HV
-        n_it = (n_items - Int32(bid) + Int32(G_) - 1) // Int32(G_)
+        n_it = Int32(1)  # one item per CTA: a constant trip count (loop folds away)
+        if cutlass.const_expr(self.persistent):
+            n_it = (n_items - Int32(bid) + Int32(G_) - 1) // Int32(G_)
 
         # ------------------------------------------------------------------ SMEM
         smem = cutlass.utils.SmemAllocator()
@@ -911,9 +917,17 @@ class KdaOutputOnlyUmma:
                 l16=l16,
                 ct=ct,
             )
+            # persistent grid: the next item's row inputs are loaded into registers
+            # while this item's UMMA / Gram / epilogue run (software pipelined)
+            PF_NEXT = self.persistent and self.prefetch_next
+            if cutlass.const_expr(PF_NEXT):
+                pf = self._load_inputs(Int32(bid), ctx)
             for it in cutlass.range(n_it, unroll=1):
                 item = Int32(bid) + it * Int32(G_)
-                pf = self._load_inputs(item, ctx)
+                if cutlass.const_expr(PF_NEXT):
+                    cur = pf
+                else:
+                    cur = self._load_inputs(item, ctx)
                 ph = it & 1
                 hv = item % HV
                 brow = item // HV
@@ -939,10 +953,10 @@ class KdaOutputOnlyUmma:
                     # previous item's epilogue done with the coefficient / beta block
                     _bar_sync_ua(1, 128)
                 tbase = tmem_addr[0]
-                xw = [pf[4 * p_ : 4 * p_ + 4] for p_ in range(NP)]
+                xw = [cur[4 * p_ : 4 * p_ + 4] for p_ in range(NP)]
                 NGW = 4 * ((T + 7) // 8) if self.g_v4 else T
-                graw = pf[4 * NP : 4 * NP + NGW]
-                braw = pf[4 * NP + NGW]
+                graw = cur[4 * NP : 4 * NP + NGW]
+                braw = cur[4 * NP + NGW]
                 if cutlass.const_expr(self.g_v4):
                     # stage the gate rows [t][K] for the channel-layout P2
                     for i in cutlass.range_constexpr((T + 7) // 8):
@@ -1112,6 +1126,14 @@ class KdaOutputOnlyUmma:
                 cute.arch.fence_view_async_shared()
                 U.fence_before_sync()
                 cute.arch.mbarrier_arrive(x_ready)
+                if cutlass.const_expr(PF_NEXT):
+                    # every input word of this item is consumed (X_r / Ktil / gate
+                    # staging / beta written): load the next item's (clamped to the
+                    # last item past the end; the values are then unused)
+                    nxt = item + Int32(G_)
+                    pf = self._load_inputs(
+                        _sel(nxt < n_items, nxt, n_items - 1, Int32), ctx
+                    )
                 _bar_sync_ua(1, 128)
 
                 # -------- P4: mma.sync Gram X_r . Ktil^T (fp32) -> coefficient tables; A
