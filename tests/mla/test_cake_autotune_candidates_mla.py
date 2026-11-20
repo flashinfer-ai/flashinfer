@@ -2881,7 +2881,7 @@ def test_tuned_auto_looks_up_the_second_stage_once(monkeypatch, fresh_tuner, cak
     """After tuning, repeated calls of one request look up the second stage
     once and then reuse its decision: Cake where it measured faster, equal to
     explicit ``backend="cake"`` bit for bit, and the first stage's winner
-    otherwise."""
+    where Cake lost this bucket but won another one."""
     _require_cake_arch()
     case = _make_case(batch_size=4, page_size=64)
     _offer_case(monkeypatch, case)
@@ -2897,6 +2897,9 @@ def test_tuned_auto_looks_up_the_second_stage_once(monkeypatch, fresh_tuner, cak
     )
     with autotune(True, tuning_buckets=TUNING_BUCKETS):
         _decode(case)
+    if not cake_wins:
+        # Cake won elsewhere, so the second stage runs for this unit too.
+        _hold_cake_entry(fresh_tuner)
     lookups = _count_margin_lookups(monkeypatch)
     results = _spy_stage_two(monkeypatch)
     with autotune(False):
