@@ -911,8 +911,14 @@ def test_single_sequence_shrink_excludes_formerly_live_split():
 
 @pytest.mark.parametrize("old_ql,new_ql", [(6, 2), (2, 6)])
 @pytest.mark.parametrize("selector", ["auto", "specialized"])
-def test_changed_query_length_never_refreshes_capture(old_ql, new_ql, selector, caplog):
+def test_changed_query_length_never_refreshes_capture(
+    old_ql, new_ql, selector, caplog, monkeypatch
+):
     _sm90_or_skip()
+    from flashinfer.jit.core import logger
+
+    # The JIT logger is constructed directly, outside the root logger tree.
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
     device = torch.device("cuda:0")
     batch = _make_batch([250], device, ql=old_ql)
     w, graph, out = _graph_wrapper_and_capture(batch, device, "fa3", selector)
