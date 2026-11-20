@@ -723,6 +723,28 @@ def _ld_shared_cluster_v4_u32(mapped_addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_shared_v4_u32(saddr, *, loc=None, ip=None):
+    """16B load from this CTA's own shared memory (ld.shared.v4.u32)."""
+    ret = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [saddr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [0])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [1])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [2])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [3])),
+    )
+
+
+@dsl_user_op
 def _st_shared_cluster_i32(mapped_addr, val, *, loc=None, ip=None):
     llvm.inline_asm(
         res=None,
@@ -5882,10 +5904,15 @@ class GvrClusKernel:
                 t = [cutlass.Int32(0)] * 4
                 p = [cutlass.Int32(0)] * 4
                 for r in cutlass.range_constexpr(ncs):
-                    mapped = C._mapa_shared_cluster_addr(
-                        hbase + boff, cutlass.Int32(r)
-                    )  # per-use mapa
-                    v0, v1, v2, v3 = C._ld_shared_cluster_v4_u32(mapped)
+                    if cutlass.const_expr(ncs == 1):
+                        # a solo row (rank 0 alone): its own histogram through
+                        # the CTA window, ordered by the caller's bar.sync
+                        v0, v1, v2, v3 = C._ld_shared_v4_u32(hbase + boff)
+                    else:
+                        mapped = C._mapa_shared_cluster_addr(
+                            hbase + boff, cutlass.Int32(r)
+                        )  # per-use mapa
+                        v0, v1, v2, v3 = C._ld_shared_cluster_v4_u32(mapped)
                     t[0] = t[0] + v0
                     t[1] = t[1] + v1
                     t[2] = t[2] + v2
