@@ -403,7 +403,8 @@ def atomic_or_cta(ptr, val):
 # ---------------------------------------------------------------------------
 # gpu-scope acq_rel global u64 atomicAdd (SPLIT slab protocol)
 # ---------------------------------------------------------------------------
-def atomic_add_u64_acq_rel_gpu(ptr, val):
+@dsl_user_op
+def atomic_add_u64_acq_rel_gpu(addr_i64, val, *, loc=None, ip=None):
     """atom.acq_rel.gpu.global.add.u64 returning the OLD value: the slab arrival.
 
     One RMW is both halves of the hand-off. Its release half publishes the
@@ -417,10 +418,48 @@ def atomic_add_u64_acq_rel_gpu(ptr, val):
     the same MEMBAR.ALL.GPU, while the acquire half needs only CCTL.IVALL, so
     the last CTA no longer pays a second GPU-scope fence.
 
-    ptr: cute Pointer to an Int64 gmem word; val: cutlass.Int64.
+    Inline asm so the PTX names the scope: the DSL form
+    (``cute.arch.atomic_add(..., sem="acq_rel", scope="gpu")``) emits
+    ``atom.global.acq_rel.add.u64``, which leaves the scope to the instruction
+    default, while PTX's memory model has every strong operation specify one.
+
+    addr_i64: Int64 byte address of the 8-byte-aligned gmem word; val: Int64.
     Packed arrival word: `cutlass.Int64(1 << 32) + cutlass.Int64(myn)`.
     """
-    return cutlass.Int64(cute.arch.atomic_add(ptr, val, sem="acq_rel", scope="gpu"))
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [addr_i64.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u64 $0, [$1], $2;",
+            "=l,l,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def atomic_add_u32_relaxed_gpu(addr_i64, val, *, loc=None, ip=None):
+    """atom.relaxed.gpu.global.add.u32 returning the OLD value: the slab
+    reservation. The scope is spelled out for the same reason as the arrival's
+    (the DSL's default form emits ``atom.global.add.u32``, semantics and scope
+    both implicit); relaxed .gpu is what that default means."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr_i64.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+            "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2867,13 +2906,9 @@ class GvrMainKernel:
                 if cutlass.const_expr(self.split):
                     # ---- SLAB HAND-OFF; exactly ONE attempt ----
                     if tidx == cutlass.Int32(0):
-                        pgo = cute.make_ptr(
-                            cutlass.Int32,
-                            goff_addr + row64 * cutlass.Int64(4),
-                            cute.AddressSpace.gmem,
-                            assumed_align=4,
+                        s_scal[3] = C.atomic_add_u32_relaxed_gpu(
+                            goff_addr + row64 * cutlass.Int64(4), myn
                         )
-                        s_scal[3] = cutlass.Int32(cute.arch.atomic_add(pgo, myn))
                     cute.arch.barrier()  # ---- barrier (slab offset) ----
                     base = s_scal[3]
                     if myn <= cutlass.Int32(SCPB):  # coalesced publish
@@ -2920,14 +2955,9 @@ class GvrMainKernel:
                             i = i + cutlass.Int32(BLK)
                     cute.arch.barrier()  # ---- barrier (slab publish) ----
                     if tidx == cutlass.Int32(0):  # release + acquire RMW
-                        pdon = cute.make_ptr(
-                            cutlass.Int64,
-                            gdon_addr + row64 * cutlass.Int64(8),
-                            cute.AddressSpace.gmem,
-                            assumed_align=8,
-                        )
                         s_pk[0] = C.atomic_add_u64_acq_rel_gpu(
-                            pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
+                            gdon_addr + row64 * cutlass.Int64(8),
+                            cutlass.Int64(1 << 32) + cutlass.Int64(myn),
                         )
                     cute.arch.barrier()  # ---- barrier (arrival word) ----
                     pk = s_pk[0]
