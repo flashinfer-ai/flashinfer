@@ -541,6 +541,12 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
             raise RuntimeError(
                 f"gvr_2 route: R={R} needs the SPLIT body (b={b}, n={n})"
             )
+        # the workspace holds the SPLIT arrival words of _MAXC rows; a row past
+        # them would share row 0's slab offset word
+        if SPLIT and b > _MAXC:
+            raise RuntimeError(
+                f"gvr_2 route: a SPLIT launch takes at most {_MAXC} rows (b={b})"
+            )
         # KPT ladder 1/2/4/8; grid = (R, b).
         kpt = 1 if k <= BLK else (2 if k <= 2 * BLK else (4 if k <= 4 * BLK else 8))
         # TSH-floor staging gate.  The CUDA form is a grid-uniform RUNTIME
@@ -836,6 +842,10 @@ def route_streaming(
         if R > 1 and not split_:
             raise RuntimeError(
                 f"gvr_2 route_streaming: R={R} needs the SPLIT body (b={b}, n={n})"
+            )
+        if split_ and b > _MAXC:  # the workspace's SPLIT rows: see route()
+            raise RuntimeError(
+                f"gvr_2 route_streaming: a SPLIT launch takes at most {_MAXC} rows (b={b})"
             )
         kpt = 1 if k <= blk_ else (2 if k <= 2 * blk_ else (4 if k <= 4 * blk_ else 8))
         tshg = bool(split_) and b > 15 and k <= 1024 and (n >> 2) <= 32768
