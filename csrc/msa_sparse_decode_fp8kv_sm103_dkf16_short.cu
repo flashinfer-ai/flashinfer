@@ -9,26 +9,18 @@
 
 namespace ffi = tvm::ffi;
 
-namespace dkf16short {
-static bool g_attrf[64] = {};  // per-device one-time attribute opt-in
-
-template <int NSTAGE, int CLU, int OCC, bool HALFOUT = false>
-static void setattrf() {
-  cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, HALFOUT>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_F(NSTAGE, CLU));
-  if (CLU > 8)
-    cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, HALFOUT>,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-  if (CLU > 1)
-    cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, HALFOUT>,
-                         cudaFuncAttributeClusterSchedulingPolicyPreference,
-                         cudaClusterSchedulingPolicyLoadBalancing);
+namespace msa_sm103 {
+void EnsureAttributes(const void* kernel, int smem, bool nonportable, bool load_balance);
 }
+
+namespace dkf16short {
 
 template <int NSTAGE, int CLU, int OCC, bool HALFOUT = false>
 static void launchf(int B, const void* qp, const void* kp, const void* vp, const void* tkp,
                     const void* ptp, const void* slp, void* op, int pages, int bpc, int nblk,
                     cudaStream_t stream) {
+  msa_sm103::EnsureAttributes(reinterpret_cast<const void*>(dkf_kernel<NSTAGE, CLU, OCC, HALFOUT>),
+                              SMEM_F(NSTAGE, CLU), CLU > 8, CLU > 1);
   for (int base = 0; base < B;) {
     const int chunk = min(B - base, 65535);
     dim3 grid(CLU, HALFOUT ? chunk * 2 : chunk);
@@ -57,24 +49,6 @@ void DirectKShortRun(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc,
   const int B = (int)q.shape()[0];
   const int pages = (int)ptab.shape()[1];
   const int nblk = pages < TOPKC ? pages : TOPKC;
-  int attr_di = 0;
-  cudaGetDevice(&attr_di);
-  if (!g_attrf[attr_di & 63]) {
-    setattrf<1, 16, 2>();
-    setattrf<1, 8, 2, true>();
-    setattrf<2, 8, 2, true>();
-    setattrf<1, 8, 2>();
-    setattrf<2, 8, 2>();
-    setattrf<1, 4, 2>();
-    setattrf<2, 4, 2>();
-    setattrf<1, 2, 2>();
-    setattrf<2, 2, 2>();
-    setattrf<1, 1, 2>();
-    setattrf<2, 1, 2>();
-    setattrf<1, 3, 2>();
-    setattrf<1, 3, 2, true>();
-    g_attrf[attr_di & 63] = true;
-  }
   const void* qp = q.data_ptr();
   const void* kp = kc.data_ptr();
   const void* vp = vc.data_ptr();

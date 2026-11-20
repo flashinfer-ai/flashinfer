@@ -262,7 +262,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   } else {
     pgr = pt[blkr >= 0 ? blkr : 0];
   }
-  unsigned vmask = __ballot_sync(0xffffffffu, (lane < 16) && (lane < lim) && (blkr >= 0));
+  unsigned vmask = __ballot_sync(
+      0xffffffffu, lane < 16 && lane < lim && blkr >= 0 && int64_t(blkr) * BLKT < seqlen);
   const int nb = __popc(vmask & 0xffffu);
   const bool needs_mask = (seqlen != pages * BLKT);
 
@@ -363,7 +364,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   for (int i = 0; i < 2; ++i)
 #pragma unroll
     for (int j = 0; j < 4; ++j) O[i][j] = 0.f;
-  float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+  float m0 = 0.f, m1 = 0.f, l0 = 0.f, l1 = 0.f;
 
   const uint32_t frow = (uint32_t)(((lane & 7) + ((lane >> 3) & 1) * 8) * FSTRIDE);
   const uint32_t fhalf = (uint32_t)((lane >> 4) * 16);
@@ -471,19 +472,10 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
                       fmaxf(fmaxf(lb.x, lb.y), fmaxf(lb.z, lb.w)));
     float bm1 = fmaxf(fmaxf(fmaxf(lc.x, lc.y), fmaxf(lc.z, lc.w)),
                       fmaxf(fmaxf(ld.x, ld.y), fmaxf(ld.z, ld.w)));
-    constexpr bool ONE_PAGE_CTA = (NSTAGE == 1 && (CLU == 16 || CLU == 3));
-    float nm0, nm1;
-    if constexpr (ONE_PAGE_CTA) {
-      nm0 = bm0;
-      nm1 = bm1;
-      m0 = bm0;
-      m1 = bm1;
-    } else {
-      nm0 = fmaxf(m0, bm0);
-      nm1 = fmaxf(m1, bm1);
+    float nm0 = j == 0 ? bm0 : fmaxf(m0, bm0);
+    float nm1 = j == 0 ? bm1 : fmaxf(m1, bm1);
+    if (j != 0) {
       float al0 = exp2f(m0 - nm0), al1 = exp2f(m1 - nm1);
-      m0 = nm0;
-      m1 = nm1;
 #pragma unroll
       for (int nd = 0; nd < 2; ++nd) {
         O[nd][0] *= al0;
@@ -494,6 +486,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       l0 *= al0;
       l1 *= al1;
     }
+    m0 = nm0;
+    m1 = nm1;
 
     float sum0 = 0.f, sum1 = 0.f;
 #pragma unroll
@@ -649,17 +643,18 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
     }
     for (int hi = htid; hi < nh; hi += HSTEP) {
       float wv[CLU];
-      float mm = -1e30f;
+      float mm = -INFINITY;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
         wv[c] = ml[2 * (hi * CLU + c)];
-        mm = fmaxf(mm, wv[c]);
+        if (ml[2 * (hi * CLU + c) + 1] > 0.f) mm = fmaxf(mm, wv[c]);
       }
       float den = 0.f;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
-        wv[c] = exp2f(wv[c] - mm);
-        den += ml[2 * (hi * CLU + c) + 1] * wv[c];
+        const float mass = ml[2 * (hi * CLU + c) + 1];
+        wv[c] = mass > 0.f ? exp2f(wv[c] - mm) : 0.f;
+        den += mass * wv[c];
       }
       float inv = (den > 0.f) ? (1.0f / den) : 0.f;
       float a0 = 0.f, a1 = 0.f;

@@ -9,8 +9,9 @@
 
 namespace ffi = tvm::ffi;
 
-// ---------------------------------------------------------------------------
-static bool g_attr_set[64] = {};  // per-device one-time attribute opt-in
+namespace msa_sm103 {
+void EnsureAttributes(const void* kernel, int smem, bool nonportable, bool load_balance);
+}
 
 template <int NSTAGE, int CLU, bool HALFOUT = false, bool QUARTER = false, bool HALFPAGE = false,
           int CTA_THREADS = 256, bool BF16_Q_F16_P = false>
@@ -22,6 +23,10 @@ static cudaError_t launch(int B, const void* qp, const void* kp, const void* vp,
   config.gridDim = grid;
   config.blockDim = dim3(CTA_THREADS);
   config.dynamicSmemBytes = SMEM_VARIANT(NSTAGE, CLU, HALFPAGE, BF16_Q_F16_P);
+  msa_sm103::EnsureAttributes(
+      reinterpret_cast<const void*>(
+          msa_kernel<NSTAGE, CLU, HALFOUT, QUARTER, HALFPAGE, CTA_THREADS, BF16_Q_F16_P>),
+      config.dynamicSmemBytes, CLU > 8, false);
   config.stream = stream;
   cudaLaunchAttribute scheduling{};
   if constexpr (COMPACT_FALLBACK(NSTAGE, CLU, HALFPAGE, BF16_Q_F16_P)) {
@@ -63,40 +68,6 @@ void C12Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
   int splits = 1;
   while (splits < cap && B * splits * 2 <= 304) splits *= 2;
   int bpc = (nblk + splits - 1) / splits;
-
-  int attr_di = 0;
-  cudaGetDevice(&attr_di);
-  if (!g_attr_set[attr_di & 63]) {
-    cudaFuncSetAttribute(msa_kernel<4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(4));
-    cudaFuncSetAttribute(msa_kernel<1, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 16>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    cudaFuncSetAttribute(msa_kernel<1, 16, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 16, true>, cudaFuncAttributeNonPortableClusterSizeAllowed,
-                         1);
-    cudaFuncSetAttribute(msa_kernel<1, 16, false, true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 16, false, true>,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    cudaFuncSetAttribute(msa_kernel<1, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 4, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 12, true, false, true, 128>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 12, true, false, true, 128>,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    cudaFuncSetAttribute(msa_kernel<1, 12, true, false, true, 128, true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
-    cudaFuncSetAttribute(msa_kernel<1, 12, true, false, true, 128, true>,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    cudaFuncSetAttribute(msa_kernel<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(2));
-    cudaFuncSetAttribute(msa_kernel<2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(2));
-    cudaFuncSetAttribute(msa_kernel<2, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(2));
-    g_attr_set[attr_di & 63] = true;
-  }
 
   const void* qp = q.data_ptr();
   const void* kp = kc.data_ptr();

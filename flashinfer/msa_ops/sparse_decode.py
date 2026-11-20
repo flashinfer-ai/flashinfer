@@ -314,11 +314,11 @@ def msa_sparse_decode_attention(
         being copied into, because a silent copy here is precisely the cost
         this parameter exists to remove.
 
-        Supported by the packed-NVFP4 paged-KV route on compute capability
-        10.0/10.3/10.7 and by the compute capability 9.0 route. Every other
-        route raises ``NotImplementedError`` when it is passed -- before any
-        device query, so a host tensor gets the same answer -- deliberately, so
-        that a caller cannot be handed the copy back without being told.
+        Supported by the SM103 specialized route (16-byte aligned, with no
+        overlap between the destination and any input), the packed-NVFP4
+        paged-KV route on compute capability 10.0/10.3/10.7, and the compute
+        capability 9.0 route. Off the specialized allowlist, ``"auto"`` uses
+        the stock route's ``out`` contract.
 
     backend : str
         One of ``("auto", "specialized", "cake", "cutedsl")``, each named
@@ -444,7 +444,8 @@ def msa_sparse_decode_attention(
     if out is not None and not sm90:
         raise NotImplementedError(
             "out= is implemented by the compute capability 10.0/10.3/10.7 "
-            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
+            "packed-NVFP4 paged-KV decode route, the SM103 specialized route, "
+            "and on SM90; the SM120/SM121 "
             "backend allocates its own output"
         )
     if not (sm90 or is_sm12x_supported(q.device)):

@@ -9,28 +9,20 @@
 
 namespace ffi = tvm::ffi;
 
-namespace dkf16c6b8 {
-static bool g_attrf[64] = {};  // per-device one-time attribute opt-in
-
-template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool HALFPAGE64 = false,
-          bool EARLY_TOPK = false>
-static void setattrf() {
-  cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, OSPLIT, HALFPAGE64, EARLY_TOPK>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_F(NSTAGE, CLU));
-  if (CLU > 8)
-    cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, OSPLIT, HALFPAGE64, EARLY_TOPK>,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-  if (CLU > 1)
-    cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, OSPLIT, HALFPAGE64, EARLY_TOPK>,
-                         cudaFuncAttributeClusterSchedulingPolicyPreference,
-                         cudaClusterSchedulingPolicyLoadBalancing);
+namespace msa_sm103 {
+void EnsureAttributes(const void* kernel, int smem, bool nonportable, bool load_balance);
 }
+
+namespace dkf16c6b8 {
 
 template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool HALFPAGE64 = false,
           bool EARLY_TOPK = false>
 static void launchf(int B, const void* qp, const void* kp, const void* vp, const void* tkp,
                     const void* ptp, const void* slp, void* op, int pages, int bpc, int nblk,
                     cudaStream_t stream) {
+  msa_sm103::EnsureAttributes(
+      reinterpret_cast<const void*>(dkf_kernel<NSTAGE, CLU, OCC, OSPLIT, HALFPAGE64, EARLY_TOPK>),
+      SMEM_F(NSTAGE, CLU), CLU > 8, CLU > 1);
   for (int base = 0; base < B;) {
     const int chunk = min(B - base, 65535 / OSPLIT);
     dim3 grid(CLU, chunk * OSPLIT);
@@ -61,34 +53,6 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
   const int B = (int)q.shape()[0];
   const int pages = (int)ptab.shape()[1];
   const int nblk = pages < TOPKC ? pages : TOPKC;
-  int attr_di = 0;
-  cudaGetDevice(&attr_di);
-  if (!g_attrf[attr_di & 63]) {
-    setattrf<1, 16, 2>();
-    setattrf<1, 16, 2, 2>();
-    setattrf<1, 16, 2, 4>();
-    setattrf<1, 8, 2, 2>();
-    setattrf<2, 8, 2, 2>();
-    setattrf<1, 8, 2>();
-    setattrf<2, 8, 2>();
-    setattrf<1, 4, 2>();
-    setattrf<2, 4, 2>();
-    setattrf<1, 2, 2>();
-    setattrf<2, 2, 2>();
-    setattrf<1, 1, 2>();
-    setattrf<2, 1, 2>();
-    setattrf<1, 3, 2>();
-    setattrf<1, 3, 2, 2>();
-    setattrf<1, 3, 2, 4>();
-    setattrf<1, 3, 2, 8>();
-    setattrf<1, 4, 2, 2>();
-    setattrf<1, 4, 2, 4>();
-    setattrf<1, 6, 2, 2, true>();
-    setattrf<1, 6, 2, 4, true>();
-    setattrf<1, 6, 1, 2, true>();
-    setattrf<1, 6, 1, 2, true, true>();
-    g_attrf[attr_di & 63] = true;
-  }
   const void* qp = q.data_ptr();
   const void* kp = kc.data_ptr();
   const void* vp = vc.data_ptr();

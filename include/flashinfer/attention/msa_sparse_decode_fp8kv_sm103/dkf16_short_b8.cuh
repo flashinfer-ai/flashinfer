@@ -375,7 +375,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(HALFPAGE64 ? 128 :
   for (int i = 0; i < 2; ++i)
 #pragma unroll
     for (int j = 0; j < 4; ++j) O[i][j] = 0.f;
-  float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+  float m0 = 0.f, m1 = 0.f, l0 = 0.f, l1 = 0.f;
 
   const int prow = (lane & 7) + ((lane >> 3) & 1) * 8;
   const uint32_t pbase = sptr(Pb) + (uint32_t)(prow * FSTRIDE + (lane >> 4) * 16);
@@ -471,7 +471,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(HALFPAGE64 ? 128 :
       bm1 = fmaxf(bm1, fmaxf(fmaxf(r1b.x, r1b.y), fmaxf(r1b.z, r1b.w)));
     }
 
-    float nm0 = fmaxf(m0, bm0), nm1 = fmaxf(m1, bm1);
+    float nm0 = j == 0 ? bm0 : fmaxf(m0, bm0);
+    float nm1 = j == 0 ? bm1 : fmaxf(m1, bm1);
     if (j != 0) {
       float al0 = exp2f(m0 - nm0), al1 = exp2f(m1 - nm1);
       if (warp < OWARPS) {
@@ -636,17 +637,18 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(HALFPAGE64 ? 128 :
     mbar_wait_local(merge_bar);
     for (int hi = htid; hi < nh; hi += HSTEP) {
       float wv[CLU];
-      float mm = -1e30f;
+      float mm = -INFINITY;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
         wv[c] = ml[2 * (hi * CLU + c)];
-        mm = fmaxf(mm, wv[c]);
+        if (ml[2 * (hi * CLU + c) + 1] > 0.f) mm = fmaxf(mm, wv[c]);
       }
       float den = 0.f;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
-        wv[c] = exp2f(wv[c] - mm);
-        den += ml[2 * (hi * CLU + c) + 1] * wv[c];
+        const float mass = ml[2 * (hi * CLU + c) + 1];
+        wv[c] = mass > 0.f ? exp2f(wv[c] - mm) : 0.f;
+        den += mass * wv[c];
       }
       // empty selection -> zero output (packed-backend convention)
       float inv = den > 0.f ? 1.0f / den : 0.f;

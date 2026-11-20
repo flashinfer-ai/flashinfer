@@ -1,5 +1,40 @@
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
+
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace msa_sm103 {
+void EnsureAttributes(const void* kernel, int smem, bool nonportable, bool load_balance) {
+  static std::mutex mutex;
+  static std::unordered_map<int, std::unordered_set<const void*>> configured;
+  auto check = [](cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "specialized msa decode: " << operation << ": "
+                                  << cudaGetErrorName(status) << ": " << cudaGetErrorString(status);
+    }
+  };
+  int device;
+  check(cudaGetDevice(&device), "cudaGetDevice");
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& kernels = configured[device];
+  if (kernels.count(kernel)) return;
+  check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem),
+        "setting dynamic shared memory");
+  if (nonportable) {
+    check(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+          "allowing nonportable cluster size");
+  }
+  if (load_balance) {
+    check(cudaFuncSetAttribute(kernel, cudaFuncAttributeClusterSchedulingPolicyPreference,
+                               cudaClusterSchedulingPolicyLoadBalancing),
+          "setting cluster scheduling policy");
+  }
+  kernels.insert(kernel);
+}
+}  // namespace msa_sm103
 
 void C12Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache, tvm::ffi::TensorView v_cache,
             tvm::ffi::TensorView topk, tvm::ffi::TensorView page_table,

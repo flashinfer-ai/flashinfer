@@ -309,7 +309,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     // second dependent global load.
     int row = early_row;
     blkr = early_blkr;  // warp-uniform: broadcast, no shuffle
-    nb = (blkr >= 0);
+    nb = (blkr >= 0 && int64_t(blkr) * BLKT + hoff < seqlen);
     // An empty rank (-1) lands on lane 31, whose row is 0 and whose pages are
     // never issued, so the shuffle index needs no select.
     pgr = __shfl_sync(0xffffffffu, row, blkr & 31);
@@ -329,7 +329,8 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     } else {
       pgr = ptab[b * pages + (blkr >= 0 ? blkr : 0)];
     }
-    unsigned vmask = __ballot_sync(0xffffffffu, (lane < 16) && (lane < lim) && (blkr >= 0));
+    unsigned vmask = __ballot_sync(
+        0xffffffffu, lane < 16 && lane < lim && blkr >= 0 && int64_t(blkr) * BLKT + hoff < seqlen);
     nb = __popc(vmask & 0xffffu);
   }
 
@@ -463,7 +464,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 #pragma unroll
       for (int j = 0; j < 4; ++j) O[i][j] = 0.f;
   }
-  float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+  float m0 = 0.f, m1 = 0.f, l0 = 0.f, l1 = 0.f;
 
   const int prow = (lane & 7) + ((lane >> 3) & 1) * 8;
   const int phalf = (lane >> 4) * 16;
@@ -594,22 +595,12 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       bm0 = fmaxf(bm0, __shfl_xor_sync(0xffffffffu, bm0, 2));
       bm1 = fmaxf(bm1, __shfl_xor_sync(0xffffffffu, bm1, 1));
       bm1 = fmaxf(bm1, __shfl_xor_sync(0xffffffffu, bm1, 2));
-      float nm0, nm1;
-      if constexpr (HALFPAGE) {
-        // The C12 B1-short route assigns exactly one 32-token quarter-page to
-        // each CTA.  Initialize online softmax from that sole tile instead of
-        // exponentiating -infinity and rescaling zero state.  Preserve the
-        // finite sentinel when a quarter of a partial page is fully masked.
-        nm0 = fmaxf(m0, bm0);
-        nm1 = fmaxf(m1, bm1);
-        m0 = nm0;
-        m1 = nm1;
-      } else {
-        nm0 = fmaxf(m0, bm0);
-        nm1 = fmaxf(m1, bm1);
+      // nb counts only tiles with a visible token. The first tile owns the
+      // initial maximum, regardless of its score magnitude.
+      float nm0 = j == 0 ? bm0 : fmaxf(m0, bm0);
+      float nm1 = j == 0 ? bm1 : fmaxf(m1, bm1);
+      if (j != 0) {
         float al0 = exp2f(m0 - nm0), al1 = exp2f(m1 - nm1);
-        m0 = nm0;
-        m1 = nm1;
         if ((!HALFOUT && !QUARTER) || warp < OWARPS) {
 #pragma unroll
           for (int nd = 0; nd < 2; ++nd) {
@@ -622,6 +613,8 @@ __global__ void __cluster_dims__(CLU, 1, 1)
         l0 *= al0;
         l1 *= al1;
       }
+      m0 = nm0;
+      m1 = nm1;
 
       float sum0 = 0.f, sum1 = 0.f;
       if (!HALFPAGE || warp < 4) {
@@ -806,10 +799,11 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       if (warp < nh) {
         const int cc = min(lane, 11);
         float2 t = *(const float2*)(ml + 2 * (warp * CLU + cc));
-        float mm = -1e30f;
+        const float mv = t.y > 0.f ? t.x : -INFINITY;
+        float mm = -INFINITY;
 #pragma unroll
-        for (int c = 0; c < 12; ++c) mm = fmaxf(mm, __shfl_sync(0xffffffffu, t.x, c));
-        float w = exp2f(t.x - mm);
+        for (int c = 0; c < 12; ++c) mm = fmaxf(mm, __shfl_sync(0xffffffffu, mv, c));
+        float w = t.y > 0.f ? exp2f(t.x - mm) : 0.f;
         float den = 0.f;
 #pragma unroll
         for (int c = 0; c < 12; ++c) den += __shfl_sync(0xffffffffu, t.y * w, c);
@@ -839,11 +833,11 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       if (warp == 0) {
         const int hi = lane / CLU;
         const int cc = lane - hi * CLU;
-        float mv = -1e30f, lv = 0.f;
+        float mv = -INFINITY, lv = 0.f;
         if (hi < nh) {
           float2 t = *(const float2*)(ml + 2 * (hi * CLU + cc));
-          mv = t.x;
           lv = t.y;
+          mv = lv > 0.f ? t.x : -INFINITY;
         }
         float mm;
         if constexpr ((CLU & (CLU - 1)) == 0) {
@@ -853,11 +847,11 @@ __global__ void __cluster_dims__(CLU, 1, 1)
             mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, off, CLU));
         } else {
           const int hbase = (hi < nh) ? hi * CLU : 0;
-          mm = -1e30f;
+          mm = -INFINITY;
 #pragma unroll
           for (int c = 0; c < CLU; ++c) mm = fmaxf(mm, __shfl_sync(0xffffffffu, mv, hbase + c));
         }
-        float w = exp2f(mv - mm);
+        float w = lv > 0.f ? exp2f(mv - mm) : 0.f;
         float den;
         if constexpr ((CLU & (CLU - 1)) == 0) {
           den = lv * w;

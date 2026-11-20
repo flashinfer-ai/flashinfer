@@ -9,12 +9,17 @@
 
 namespace ffi = tvm::ffi;
 
-static bool g_f16_attr[64] = {};  // per-device one-time attribute opt-in
+namespace msa_sm103 {
+void EnsureAttributes(const void* kernel, int smem, bool nonportable, bool load_balance);
+}
 
 template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1>
 static void launch(int B, const void* qp, const void* kp, const void* vp, const void* tkp,
                    const void* ptp, const void* slp, void* op, int pages, int bpc, int nblk,
                    cudaStream_t stream) {
+  msa_sm103::EnsureAttributes(
+      reinterpret_cast<const void*>(msaf16_kernel<NSTAGE, CLU, OCC, OSPLIT>),
+      SMEM_O(NSTAGE, CLU, OSPLIT), CLU > 8, CLU == 3 && OSPLIT > 1);
   const int chmax = 65535 / OSPLIT;
   for (int base = 0; base < B;) {
     const int chunk = min(B - base, chmax);
@@ -23,21 +28,13 @@ static void launch(int B, const void* qp, const void* kp, const void* vp, const 
         (const __nv_bfloat16*)qp + (size_t)base * HQ * DH, (const uint8_t*)kp, (const uint8_t*)vp,
         (const int*)tkp + (size_t)base * TOPKC, (const int*)ptp + (size_t)base * pages,
         (const int*)slp + base, (__nv_bfloat16*)op + (size_t)base * HQ * DH, pages, bpc, nblk);
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "specialized msa decode launch failed: "
+                                  << cudaGetErrorString(launch_status);
+    }
     base += chunk;
   }
-}
-
-template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool LOAD_BALANCE = false>
-static void setattr() {
-  cudaFuncSetAttribute(msaf16_kernel<NSTAGE, CLU, OCC, OSPLIT>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_O(NSTAGE, CLU, OSPLIT));
-  if (CLU > 8)
-    cudaFuncSetAttribute(msaf16_kernel<NSTAGE, CLU, OCC, OSPLIT>,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-  if constexpr (LOAD_BALANCE)
-    cudaFuncSetAttribute(msaf16_kernel<NSTAGE, CLU, OCC, OSPLIT>,
-                         cudaFuncAttributeClusterSchedulingPolicyPreference,
-                         cudaClusterSchedulingPolicyLoadBalancing);
 }
 
 void F16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::TensorView topk,
@@ -46,34 +43,6 @@ void F16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
   const int B = (int)q.shape()[0];
   const int pages = (int)ptab.shape()[1];
   const int nblk = pages < TOPKC ? pages : TOPKC;
-
-  int attr_di = 0;
-  cudaGetDevice(&attr_di);
-  if (!g_f16_attr[attr_di & 63]) {
-    setattr<1, 16, 1>();
-    setattr<1, 16, 1, 4>();
-    setattr<1, 16, 1, 2>();
-    setattr<1, 3, 1, 4, true>();
-    setattr<1, 3, 1, 8, true>();
-    setattr<1, 3, 1, 2, true>();
-    setattr<1, 3, 2, 2, true>();
-    setattr<1, 3, 1>();
-    setattr<1, 3, 2>();
-    setattr<1, 1, 2>();
-    setattr<2, 1, 2>();
-    setattr<3, 1, 2>();
-    setattr<1, 2, 2>();
-    setattr<2, 2, 2>();
-    setattr<3, 2, 2>();
-    setattr<1, 4, 2>();
-    setattr<2, 4, 2>();
-    setattr<3, 4, 2>();
-    setattr<1, 8, 2>();
-    setattr<2, 8, 2>();
-    // The former <1,4,4>/<1,8,4> occupancy-4 variants had no launch site and
-    // are incompatible with the P-aliases-Q layout (Q must be hoisted).
-    g_f16_attr[attr_di & 63] = true;
-  }
 
   const void* qp = q.data_ptr();
   const void* kp = kc.data_ptr();

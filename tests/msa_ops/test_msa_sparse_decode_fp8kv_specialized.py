@@ -140,6 +140,34 @@ def test_specialized_correct_and_routed(B, SEQ):
 
 
 @requires_sm103
+@pytest.mark.parametrize(
+    "B,SEQ", [(2, 384), (8, 384), (64, 384), (2, 2048), (4, 2048), (8, 512), (304, 512)]
+)
+def test_finite_negative_logits(B, SEQ):
+    inp = _make_inputs(B, SEQ)
+    # Constant V: every nonempty convex combination is exactly one. Row 0
+    # sees just one token (including wholly masked ranks in split pages);
+    # the last row has no selections. No second backend is the oracle.
+    for name in ("k", "v"):
+        inp[name] = torch.ones_like(inp[name], dtype=torch.float16).to(
+            torch.float8_e4m3fn
+        )
+    inp["seq_lens"][0] = 1
+    inp["topk"][0, 0, 1:] = -1
+    inp["topk"][0, -1] = -1
+    expected = torch.ones_like(inp["q"])
+    expected[-1].zero_()
+    for exponent in (90, 100):
+        inp["q"].fill_(-(2.0**exponent))
+        for backend in ("specialized", "auto"):
+            out = torch.full_like(expected, float("nan"))
+            before = spec_mod.DISPATCH_STATS["specialized"]
+            assert _api(inp, out=out, backend=backend) is out
+            assert spec_mod.DISPATCH_STATS["specialized"] == before + 1
+            assert torch.equal(out, expected), (exponent, backend)
+
+
+@requires_sm103
 def test_backend_semantics():
     inp = _make_inputs(4, 300, seed=1)
     gold = _reference(inp).float()
@@ -159,6 +187,30 @@ def test_backend_semantics():
 
 
 @requires_sm103
+def test_aliased_out_auto_matches_stock():
+    inp = _make_inputs(4, 512)
+    gold = _reference(inp).float()
+
+    def run(backend):
+        args = dict(inp, q=inp["q"].clone())
+        return _api(args, backend=backend, out=args["q"])
+
+    before = dict(spec_mod.DISPATCH_STATS)
+    try:
+        stock = run("cake")
+    except (ValueError, NotImplementedError) as exc:
+        with pytest.raises(type(exc)) as auto_exc:
+            run("auto")
+        assert str(auto_exc.value) == str(exc)
+    else:
+        _assert_close(stock, gold)
+        assert torch.equal(run("auto"), stock)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+    assert spec_mod.DISPATCH_STATS["fallback"] == before["fallback"] + 1
+    assert "out_overlaps_q" in spec_mod.LAST_FALLBACK_REASONS
+
+
+@requires_sm103
 def test_kill_switch_restores_stock():
     inp = _make_inputs(4, 300, seed=2)
     gold = _reference(inp).float()
@@ -173,6 +225,87 @@ def test_kill_switch_restores_stock():
             _api(inp, backend="specialized")
     finally:
         os.environ.pop(spec_mod.KILL_SWITCH_ENV, None)
+
+
+@pytest.fixture(scope="module")
+def fault_module(tmp_path_factory):
+    # Private test build: change launch geometry, not the production error
+    # check or Python exception path. No test switches in the shipped module.
+    from flashinfer.jit import msa_sparse_decode_fp8kv as jit
+
+    tmp = tmp_path_factory.mktemp("msa_launch_fault")
+    sources = []
+    for name in jit._SOURCES:
+        src = jit.jit_env.FLASHINFER_CSRC_DIR / name
+        if name.endswith("_f16core.cu"):
+            text = src.read_text()
+            for old, new in (
+                ("65535 / OSPLIT", "1"),
+                (
+                    "dim3 grid(CLU, chunk * OSPLIT);",
+                    "dim3 grid(B == 1 || base == 1 ? 0 : CLU, chunk * OSPLIT);",
+                ),
+            ):
+                assert text.count(old) == 1
+                text = text.replace(old, new)
+            src = tmp / name
+            src.write_text(text)
+        elif name.endswith("_dispatch.cu"):
+            # Only the attribute operation is replaced. Two consecutive
+            # failures on the same kernel prove the first wasn't cached.
+            text = src.read_text()
+            old = "cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem)"
+            assert text.count(old) == 1
+            text = "#include <cstdlib>\n" + text.replace(
+                old,
+                f'(std::getenv("MSA_TEST_FAIL_ATTR") ? cudaErrorInvalidValue : {old})',
+            )
+            src = tmp / name
+            src.write_text(text)
+        sources.append(src)
+    return jit.gen_jit_spec(
+        "msa_sparse_decode_fp8kv_sm103_launch_fault",
+        sources,
+        extra_cuda_cflags=jit.sm103a_nvcc_flags + ["--use_fast_math", "-lineinfo"],
+    ).build_and_load()
+
+
+@requires_sm103
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+@pytest.mark.parametrize("B", [1, 2])
+def test_f16_immediate_launch_rejection(fault_module, monkeypatch, B, backend):
+    monkeypatch.setattr(
+        spec_mod, "get_msa_sparse_decode_fp8kv_module", lambda: fault_module
+    )
+    inp = _make_inputs(B, 512)
+    out = torch.full_like(inp["q"], float("nan"))
+    gold = _reference(inp).float()
+    # The call itself must throw, without a stream sync or graph replay.
+    with pytest.raises(RuntimeError, match="specialized msa decode launch failed"):
+        _api(inp, out=out, backend=backend)
+    assert torch.isnan(out[-1]).all()
+    if B == 2:
+        _assert_close(out[:1], gold[:1])  # chunk 0 was already submitted
+
+
+@requires_sm103
+def test_failed_attribute_setup_not_cached(fault_module, monkeypatch):
+    monkeypatch.setattr(
+        spec_mod, "get_msa_sparse_decode_fp8kv_module", lambda: fault_module
+    )
+    # A different family than the rejected F16 launches: cold first use.
+    inp = _make_inputs(64, 384)
+    gold = _reference(inp).float()
+    out = torch.full_like(inp["q"], float("nan"))
+    monkeypatch.setenv("MSA_TEST_FAIL_ATTR", "1")
+    for backend in ("auto", "specialized"):
+        with pytest.raises(
+            RuntimeError, match="setting dynamic shared memory.*cudaErrorInvalidValue"
+        ):
+            _api(inp, out=out, backend=backend)
+        assert torch.isnan(out).all()
+    monkeypatch.delenv("MSA_TEST_FAIL_ATTR")
+    _assert_close(_api(inp, out=out, backend="specialized"), gold)
 
 
 @requires_sm103
@@ -252,7 +385,7 @@ def test_empty_selection_rows_produce_zero_output(B, SEQ):
 # 2. partial numerators must cross the cluster merge in fp32,
 # 3. NaN bytes in the unwritten tail of a partial last KV page must not
 #    reach the output through the PV mma,
-# 4. probabilities far below the max must survive f16 P staging.
+# 4. on single-CTA F16, probabilities far below the max must survive P staging.
 # The (B, SEQ) pairs below cover every kernel TU the dispatcher can select:
 # pages==3 -> c12 (B<=2) / direct-K b8 (B<=16) / direct-K short (else);
 # pages>=16 -> b8 (B<=2) / direct-K TMA (else); otherwise the native-F16
