@@ -607,7 +607,7 @@ def green8():
     green_contexts = pytest.importorskip("torch.cuda.green_contexts")
 
     # Keep the context and this exact stream alive throughout the test.
-    ctx = green_contexts.GreenContext(num_sms=8)
+    ctx = green_contexts.GreenContext.create(num_sms=8)
     yield ctx.Stream()
 
 
