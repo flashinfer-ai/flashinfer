@@ -563,7 +563,9 @@ def test_failed_submission_not_attributed(monkeypatch, route):
     )
     x, w = _case(tokens=2)
     with pytest.raises(RuntimeError, match="launch sentinel"):
-        flashinfer.norm.rmsnorm(x, w, backend=route, enable_pdl=False)
+        flashinfer.norm.rmsnorm(
+            x, w, backend=route, enable_pdl=None if route == "auto" else False
+        )
     assert specialist.call_count == int(route == "specialized")
     assert incumbent.call_count == int(route != "specialized")
     stats = _rmsnorm_serve_sm90_stats()
