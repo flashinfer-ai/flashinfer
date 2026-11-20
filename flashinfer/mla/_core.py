@@ -4435,45 +4435,50 @@ def _mla_cake_stage_two_tune(
     candidate) the tuner's own tolerance decides, as for other ops."""
     if tuner._in_v2_context:
         return tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
-    default = tuner._tie_tolerance
-    groups: Dict[float, Set[int]] = {}
-    for profile in tuner._generate_optimization_profiles(
-        _mla_effective_tuning_config(tuner, config), inputs
-    ):
-        batch = profile.get_opt_shapes()[0][0]
-        if not _in_batch_ranges(batch, batch_ranges):
-            continue  # Cake never serves it, so it is never timed.
-        time_ms = incumbent.profile_time(profile)
-        tolerance = default
-        if time_ms is not None:
-            # autotune() accepts tolerances below 1.
-            tie = min(_MLA_CAKE_STAGE_TWO_TIE_MS / time_ms, 0.5)
-            tolerance = max(default, tie)
-        groups.setdefault(tolerance, set()).add(batch)
-    tolerances: List[Tuple[float, Optional[FrozenSet[int]]]]
-    if len(groups) <= 1:
-        tolerances = [(next(iter(groups), default), None)]
-    else:
-        tolerances = [(tol, frozenset(batches)) for tol, batches in groups.items()]
-    stack = tuner._get_override_stack()
-    top = stack[-1] if stack else (None, False, None, None)
-    selection: Tuple[TunableRunner, Any] = (pair[0], -1)
-    try:
-        for tolerance, batches in tolerances:
-            incumbent._timed_batches = batches
-            pushed = tolerance != default
-            if pushed:
-                stack.append((*top[:3], tolerance, *top[4:]))
-            try:
-                # Every choose_one ends with the same lookup of the call's
-                # bucket, so the last one returns the call's selection.
-                selection = tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
-            finally:
+    # choose_one tunes under the tuner's lock (an RLock); holding it across
+    # the passes keeps another thread from changing the winners between them.
+    with tuner._lock:
+        default = tuner._tie_tolerance
+        groups: Dict[float, Set[int]] = {}
+        for profile in tuner._generate_optimization_profiles(
+            _mla_effective_tuning_config(tuner, config), inputs
+        ):
+            batch = profile.get_opt_shapes()[0][0]
+            if not _in_batch_ranges(batch, batch_ranges):
+                continue  # Cake never serves it, so it is never timed.
+            time_ms = incumbent.profile_time(profile)
+            tolerance = default
+            if time_ms is not None:
+                # autotune() accepts tolerances below 1.
+                tie = min(_MLA_CAKE_STAGE_TWO_TIE_MS / time_ms, 0.5)
+                tolerance = max(default, tie)
+            groups.setdefault(tolerance, set()).add(batch)
+        tolerances: List[Tuple[float, Optional[FrozenSet[int]]]]
+        if len(groups) <= 1:
+            tolerances = [(next(iter(groups), default), None)]
+        else:
+            tolerances = [(tol, frozenset(batches)) for tol, batches in groups.items()]
+        stack = tuner._get_override_stack()
+        top = stack[-1] if stack else (None, False, None, None)
+        selection: Tuple[TunableRunner, Any] = (pair[0], -1)
+        try:
+            for tolerance, batches in tolerances:
+                incumbent._timed_batches = batches
+                pushed = tolerance != default
                 if pushed:
-                    stack.pop()
-    finally:
-        incumbent._timed_batches = None
-    return selection
+                    stack.append((*top[:3], tolerance, *top[4:]))
+                try:
+                    # Every choose_one ends with the same lookup of the call's
+                    # bucket, so the last one returns the call's selection.
+                    selection = tuner.choose_one(
+                        _MLA_CAKE_MARGIN_OP, pair, config, inputs
+                    )
+                finally:
+                    if pushed:
+                        stack.pop()
+        finally:
+            incumbent._timed_batches = None
+        return selection
 
 
 def _mla_cake_stage_two(
