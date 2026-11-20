@@ -17,6 +17,25 @@ namespace ffi = tvm::ffi;
 // this TU keeps the host-side launch glue and the exported entry point.
 #include <flashinfer/attention/fp8_paged_mqa_topk_indexer_sm103/device.cuh>
 
+namespace {
+struct CheckedLaunch {
+  void* workspace;
+  cudaStream_t stream;
+
+  void Check(cudaError_t status) const {
+    if (status != cudaSuccess) {
+      if (workspace) cudaFreeAsync(workspace, stream);
+      throw std::runtime_error(cudaGetErrorString(status));
+    }
+  }
+
+  template <typename Kernel, typename... Args>
+  void operator()(const cudaLaunchConfig_t* cfg, Kernel kernel, Args... args) const {
+    Check(cudaLaunchKernelEx(cfg, kernel, args...));
+  }
+};
+}  // namespace
+
 // ------------------------------------------------------------------ host
 // Workspace is private to each invocation.  Allocation and release are
 // ordered on the caller's current stream, so overlapping calls on independent
@@ -55,6 +74,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
     else
       select_kernel<true, false><<<T, SEL_THREADS, 0, stream>>>(
           nullptr, p_pos, p_vis, p_cu, p_out, T, B, MAXCP * CPAGE, min_req_nblk, 0, 0);
+    CheckedLaunch{nullptr, stream}.Check(cudaGetLastError());
     return;
   }
 
@@ -98,6 +118,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
   // Disabled for the same compiler-version sensitivity as compact_hot.
   const bool w8_hybrid = false;
   const int smem = QTILE_B + ((compact_hot || per_cta >= 3) ? 3 : 2) * KTILE_B;
+  const CheckedLaunch launch{ws, stream};
   // The attribute belongs to the function, not the invocation.  All callers
   // publish the same upper bound; actual per-launch shared memory is unchanged.
   const void* score_func;
@@ -135,97 +156,55 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
       cfg.blockDim = dim3(SCORE_THREADS);
       cfg.dynamicSmemBytes = smem;
       cfg.stream = stream;
-      cudaLaunchKernelEx(&cfg, score_kernel_w0, p_qi, p_ck, p_pg, p_vis, score_ws);
+      launch(&cfg, score_kernel_w0, p_qi, p_ck, p_pg, p_vis, score_ws);
     } else {
-      dim3 g = w8_hybrid ? dim3(1, 180) : dim3(gx, (rows + M_TILE - 1) / M_TILE);
       cudaLaunchConfig_t cfg{};
-      cfg.gridDim = g;
+      cfg.gridDim = w8_hybrid ? dim3(1, 180) : dim3(gx, (rows + M_TILE - 1) / M_TILE);
       cfg.blockDim = dim3(SCORE_THREADS);
       cfg.dynamicSmemBytes = smem;
       cfg.stream = stream;
-      if (w8_hybrid) {
-        cudaLaunchKernelEx(&cfg, score_kernel<false, true, true, true>, p_qi, p_ck, p_pg, p_cu,
-                           p_vis, score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-      } else if (B == 1) {
-        if (output_workspace)
-          cudaLaunchKernelEx(&cfg, score_kernel<false, true, true>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-        else
-          cudaLaunchKernelEx(&cfg, score_kernel<false, true, false>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-      } else {
-        if (output_workspace)
-          cudaLaunchKernelEx(&cfg, score_kernel<false, false, true>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-        else
-          cudaLaunchKernelEx(&cfg, score_kernel<false, false, false>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-      }
+      auto score = w8_hybrid ? score_kernel<false, true, true, true>
+                   : B == 1  ? (output_workspace ? score_kernel<false, true, true>
+                                                 : score_kernel<false, true, false>)
+                             : (output_workspace ? score_kernel<false, false, true>
+                                                 : score_kernel<false, false, false>);
+      launch(&cfg, score, p_qi, p_ck, p_pg, p_cu, p_vis, score_ws, T, B, MAXCP, S, per_cta, row0,
+             row1);
     }
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(rows);
+    cfg.blockDim = dim3(SEL_THREADS);
+    cfg.stream = stream;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
     if (compact_hot) {
-      cudaLaunchAttribute attr{};
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr.val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t cfg{};
-      cfg.gridDim = dim3(rows);
-      cfg.blockDim = dim3(SEL_THREADS);
-      cfg.stream = stream;
-      cfg.attrs = &attr;
-      cfg.numAttrs = 1;
-      cudaLaunchKernelEx(&cfg, select_kernel_hot, (const uint32_t*)score_ws, p_pos, p_vis, p_out);
+      launch(&cfg, select_kernel_hot, (const uint32_t*)score_ws, p_pos, p_vis, p_out);
     } else {
-      cudaLaunchAttribute attr{};
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr.val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t cfg{};
-      cfg.gridDim = dim3(rows);
-      cfg.blockDim = dim3(SEL_THREADS);
-      cfg.stream = stream;
-      cfg.attrs = &attr;
-      cfg.numAttrs = 1;
+      auto select = [&](auto kernel) {
+        launch(&cfg, kernel, (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
+               min_req_nblk, S, row0);
+      };
       if (T == 16371 && B == 2 && MAXCP == 32 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 1>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
+        select(select_kernel<true, false, true, 1>);
       else if (T == 16350 && B == 3 && MAXCP == 22 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 2>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
+        select(select_kernel<true, false, true, 2>);
       else if (T == 16302 && B == 4 && MAXCP == 16 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 3>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
+        select(select_kernel<true, false, true, 3>);
       else if (T == 16300 && B == 5 && MAXCP == 13 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 4>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
+        select(select_kernel<true, false, true, 4>);
       else if (T == 16161 && B == 6 && MAXCP == 11 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 5>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
+        select(select_kernel<true, false, true, 5>);
       else if (T == 7561 && B == 1 && MAXCP == 30 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 6, true>,
-                           (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
-                           min_req_nblk, S, row0);
-      else if (MAXCP <= 64) {
-        if (B == 1)
-          cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 0, true>,
-                             (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
-                             min_req_nblk, S, row0);
-        else
-          cudaLaunchKernelEx(&cfg, select_kernel<true, false, true>, (const uint32_t*)score_ws,
-                             p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
-      } else {
-        if (B == 1)
-          cudaLaunchKernelEx(&cfg, select_kernel<false, false, true, 0, true>,
-                             (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
-                             min_req_nblk, S, row0);
-        else
-          cudaLaunchKernelEx(&cfg, select_kernel<false, false, true>, (const uint32_t*)score_ws,
-                             p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
-      }
-    }
-    // A rejected launch (illegal geometry, insufficient resources) must
-    // never let dependent kernels run on unproduced data or return success.
-    const cudaError_t launch_st = cudaGetLastError();
-    if (launch_st != cudaSuccess) {
-      if (ws) cudaFreeAsync(ws, stream);
-      throw std::runtime_error(cudaGetErrorString(launch_st));
+        select(select_kernel<true, false, true, 6, true>);
+      else if (MAXCP <= 64)
+        select(B == 1 ? select_kernel<true, false, true, 0, true>
+                      : select_kernel<true, false, true>);
+      else
+        select(B == 1 ? select_kernel<false, false, true, 0, true>
+                      : select_kernel<false, false, true>);
     }
   }
   if (ws) cudaFreeAsync(ws, stream);
@@ -279,6 +258,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
     else
       select_kernel<true, false><<<T, SEL_THREADS, 0, stream>>>(nullptr, p_pos, p_vis, p_cu, p_out,
                                                                 T, B, MAXCP * CPAGE, 0, 0);
+    CheckedLaunch{nullptr, stream}.Check(cudaGetLastError());
     return;
   }
 
@@ -322,6 +302,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
   // Disabled for the same compiler-version sensitivity as compact_hot.
   const bool w8_hybrid = false;
   const int smem = QTILE_B + ((compact_hot || per_cta >= 3) ? 3 : 2) * KTILE_B;
+  const CheckedLaunch launch{ws, stream};
   // Keep the same invariant per-function configuration on this compatibility
   // path. Actual per-launch shared-memory requirements are unchanged.
   const void* score_func;
@@ -359,97 +340,55 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
       cfg.blockDim = dim3(SCORE_THREADS);
       cfg.dynamicSmemBytes = smem;
       cfg.stream = stream;
-      cudaLaunchKernelEx(&cfg, score_kernel_w0, p_qi, p_ck, p_pg, p_vis, score_ws);
+      launch(&cfg, score_kernel_w0, p_qi, p_ck, p_pg, p_vis, score_ws);
     } else {
-      dim3 g = w8_hybrid ? dim3(1, 180) : dim3(gx, (rows + M_TILE - 1) / M_TILE);
       cudaLaunchConfig_t cfg{};
-      cfg.gridDim = g;
+      cfg.gridDim = w8_hybrid ? dim3(1, 180) : dim3(gx, (rows + M_TILE - 1) / M_TILE);
       cfg.blockDim = dim3(SCORE_THREADS);
       cfg.dynamicSmemBytes = smem;
       cfg.stream = stream;
-      if (w8_hybrid) {
-        cudaLaunchKernelEx(&cfg, score_kernel<false, true, true, true>, p_qi, p_ck, p_pg, p_cu,
-                           p_vis, score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-      } else if (B == 1) {
-        if (output_workspace)
-          cudaLaunchKernelEx(&cfg, score_kernel<false, true, true>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-        else
-          cudaLaunchKernelEx(&cfg, score_kernel<false, true, false>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-      } else {
-        if (output_workspace)
-          cudaLaunchKernelEx(&cfg, score_kernel<false, false, true>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-        else
-          cudaLaunchKernelEx(&cfg, score_kernel<false, false, false>, p_qi, p_ck, p_pg, p_cu, p_vis,
-                             score_ws, T, B, MAXCP, S, per_cta, row0, row1);
-      }
+      auto score = w8_hybrid ? score_kernel<false, true, true, true>
+                   : B == 1  ? (output_workspace ? score_kernel<false, true, true>
+                                                 : score_kernel<false, true, false>)
+                             : (output_workspace ? score_kernel<false, false, true>
+                                                 : score_kernel<false, false, false>);
+      launch(&cfg, score, p_qi, p_ck, p_pg, p_cu, p_vis, score_ws, T, B, MAXCP, S, per_cta, row0,
+             row1);
     }
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(rows);
+    cfg.blockDim = dim3(SEL_THREADS);
+    cfg.stream = stream;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
     if (compact_hot) {
-      cudaLaunchAttribute attr{};
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr.val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t cfg{};
-      cfg.gridDim = dim3(rows);
-      cfg.blockDim = dim3(SEL_THREADS);
-      cfg.stream = stream;
-      cfg.attrs = &attr;
-      cfg.numAttrs = 1;
-      cudaLaunchKernelEx(&cfg, select_kernel_hot, (const uint32_t*)score_ws, p_pos, p_vis, p_out);
+      launch(&cfg, select_kernel_hot, (const uint32_t*)score_ws, p_pos, p_vis, p_out);
     } else {
-      cudaLaunchAttribute attr{};
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr.val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t cfg{};
-      cfg.gridDim = dim3(rows);
-      cfg.blockDim = dim3(SEL_THREADS);
-      cfg.stream = stream;
-      cfg.attrs = &attr;
-      cfg.numAttrs = 1;
+      auto select = [&](auto kernel) {
+        launch(&cfg, kernel, (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
+               S, row0);
+      };
       if (T == 16371 && B == 2 && MAXCP == 32 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 1>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
+        select(select_kernel<true, false, true, 1>);
       else if (T == 16350 && B == 3 && MAXCP == 22 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 2>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
+        select(select_kernel<true, false, true, 2>);
       else if (T == 16302 && B == 4 && MAXCP == 16 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 3>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
+        select(select_kernel<true, false, true, 3>);
       else if (T == 16300 && B == 5 && MAXCP == 13 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 4>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
+        select(select_kernel<true, false, true, 4>);
       else if (T == 16161 && B == 6 && MAXCP == 11 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 5>, (const uint32_t*)score_ws,
-                           p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
+        select(select_kernel<true, false, true, 5>);
       else if (T == 7561 && B == 1 && MAXCP == 30 && S == PWIDTH && row0 == 0 && row1 == T)
-        cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 6, true>,
-                           (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S,
-                           row0);
-      else if (MAXCP <= 64) {
-        if (B == 1)
-          cudaLaunchKernelEx(&cfg, select_kernel<true, false, true, 0, true>,
-                             (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
-                             S, row0);
-        else
-          cudaLaunchKernelEx(&cfg, select_kernel<true, false, true>, (const uint32_t*)score_ws,
-                             p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
-      } else {
-        if (B == 1)
-          cudaLaunchKernelEx(&cfg, select_kernel<false, false, true, 0, true>,
-                             (const uint32_t*)score_ws, p_pos, p_vis, p_cu, p_out, T, B, max_nblk,
-                             S, row0);
-        else
-          cudaLaunchKernelEx(&cfg, select_kernel<false, false, true>, (const uint32_t*)score_ws,
-                             p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
-      }
-    }
-    // A rejected launch (illegal geometry, insufficient resources) must
-    // never let dependent kernels run on unproduced data or return success.
-    const cudaError_t launch_st = cudaGetLastError();
-    if (launch_st != cudaSuccess) {
-      if (ws) cudaFreeAsync(ws, stream);
-      throw std::runtime_error(cudaGetErrorString(launch_st));
+        select(select_kernel<true, false, true, 6, true>);
+      else if (MAXCP <= 64)
+        select(B == 1 ? select_kernel<true, false, true, 0, true>
+                      : select_kernel<true, false, true>);
+      else
+        select(B == 1 ? select_kernel<false, false, true, 0, true>
+                      : select_kernel<false, false, true>);
     }
   }
   if (ws) cudaFreeAsync(ws, stream);
@@ -472,4 +411,12 @@ void RunDispatch(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView c
     legacy::Run(qi, ck_cache, cpage_table, cu_seqlens, pos, visible, packed);
   }
 }
+static int64_t CompiledNvccRelease() {
+#if defined(__NVCC__) && defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__)
+  return (int64_t{__CUDACC_VER_MAJOR__} << 32) | __CUDACC_VER_MINOR__;
+#else
+  return 0;
+#endif
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(compiled_nvcc_release, CompiledNvccRelease);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_paged_mqa_topk_indexer_run, RunDispatch);

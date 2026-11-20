@@ -70,32 +70,34 @@ from ..jit.fp8_paged_mqa_topk_indexer import (
 KILL_SWITCH_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 
 
-@functools.cache
 def _jit_nvcc_release() -> str:
-    """The CUDA release of the nvcc the JIT build selects ("" when it
-    cannot be determined). torch.version.cuda describes torch's build, not
-    the compiler that builds this kernel, and the validated-toolkit
-    guarantee is about the compiler. Resolution mirrors the JIT build's
-    own: ``FLASHINFER_NVCC`` first, else ``<cuda_home>/bin/nvcc`` via the
-    same ``get_cuda_path`` the build uses — NOT whichever nvcc is first on
-    ``PATH``. When this returns "" no compiler was resolvable, and a JIT
-    build in the same environment fails rather than compiling silently
-    with an unchecked toolchain."""
+    """Probe the selected compiler, independently of torch's build release."""
+    import shutil
+
+    nvcc = _os.environ.get("FLASHINFER_NVCC")
+    if nvcc is None:
+        from ..jit.cpp_ext import get_cuda_path
+
+        try:
+            nvcc = _os.path.join(get_cuda_path(), "bin", "nvcc")
+        except (OSError, RuntimeError):
+            return ""
+    path = shutil.which(nvcc)
+    return _probe_nvcc(_os.path.abspath(path)) if path else ""
+
+
+@functools.cache
+def _probe_nvcc(path: str) -> str:
     import re
     import subprocess
 
     try:
-        from ..jit.cpp_ext import get_cuda_path
-
-        nvcc = _os.environ.get(
-            "FLASHINFER_NVCC", _os.path.join(get_cuda_path(), "bin", "nvcc")
-        )
         txt = subprocess.run(
-            [nvcc, "--version"], capture_output=True, text=True, timeout=30
+            [path, "--version"], capture_output=True, text=True, timeout=30, check=True
         ).stdout
-    except Exception:
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return ""
-    m = re.search(r"release (\d+\.\d+)", txt)
+    m = re.search(r"\brelease (\d+\.\d+)(?=[,\s]|$)", txt)
     return m.group(1) if m else ""
 
 
@@ -144,12 +146,12 @@ def _toolkit_validation_reasons() -> list:
             + ",".join(VALIDATED_CUDA_VERSIONS)
         ]
     _nvcc = _jit_nvcc_release()
-    if _nvcc and not _is_validated_release(_nvcc):
+    if not _is_validated_release(_nvcc):
         # the nvcc that compiles the JIT module differs from torch's CUDA
         # build and is not a validated toolkit
         return [
             "unvalidated_toolkit:nvcc_"
-            + _nvcc
+            + (_nvcc or "unknown")
             + ";validated="
             + ",".join(VALIDATED_CUDA_VERSIONS)
         ]
@@ -159,6 +161,12 @@ def _toolkit_validation_reasons() -> list:
 @functools.cache
 def get_fp8_paged_mqa_topk_indexer_module():
     mod = gen_fp8_paged_mqa_topk_indexer_module().build_and_load()
+    # Inspect the object actually returned, including on a disk-cache hit.
+    # Missing exports on older objects must fail before publication.
+    version = mod.compiled_nvcc_release()
+    release = f"{version >> 32}.{version & 0xFFFFFFFF}"
+    if release not in VALIDATED_CUDA_VERSIONS:
+        raise ValueError(f"unvalidated_toolkit:artifact_nvcc_{release}")
     _BUILT["ready"] = True
     return mod
 
@@ -256,8 +264,9 @@ def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible,
         return ["qi_not_cuda"]
     if torch.cuda.get_device_capability(qi.device) != (10, 3):
         return ["not_sm103"]
-    if torch.cuda.is_current_stream_capturing() and not _BUILT["ready"]:
-        return ["module_not_built_before_graph_capture"]
+    with torch.cuda.device(qi.device):
+        if torch.cuda.is_current_stream_capturing() and not _BUILT["ready"]:
+            return ["module_not_built_before_graph_capture"]
     return []
 
 
@@ -289,10 +298,16 @@ def fp8_paged_mqa_topk_indexer(
     cu_seqlens : torch.Tensor
         ``(batch_size + 1,)`` int32 cumulative query lengths.
     pos : torch.Tensor
-        ``(total_q,)`` int32 request-local token positions.
+        ``(total_q,)`` int32. Full prefill only: for every row ``t`` of
+        request ``r``, ``pos[t]`` must equal ``t - cu_seqlens[r]``. A
+        query window over a cached KV prefix is unsupported: the scorer
+        sizes the key extent from the query span. These metadata values
+        are caller preconditions, not checked by the Python dispatcher.
     visible : torch.Tensor
         ``(total_q,)`` int32 causally visible compressed-block counts
-        (``(pos + 1) // 4`` for standard causal prefill).
+        (``(pos + 1) // 4`` for standard causal prefill). The tail starts
+        at four times the visible block count and ends at ``pos`` or when
+        all 2051 token slots are filled, whichever comes first.
     out : torch.Tensor, optional
         ``(total_q, 2052)`` int32 contiguous destination; allocated when
         omitted.
@@ -320,22 +335,21 @@ def fp8_paged_mqa_topk_indexer(
             "fp8_paged_mqa_topk_indexer cannot serve this call; "
             f"fallback_reasons={reasons}"
         )
-    try:
-        get_fp8_paged_mqa_topk_indexer_module()
-    except Exception as e:  # pragma: no cover - environment-dependent
-        DISPATCH_STATS["rejected"] += 1
-        raise ValueError(
-            "fp8_paged_mqa_topk_indexer: specialized module unavailable "
-            f"({type(e).__name__}) and no stock path exists"
-        ) from e
-    DISPATCH_STATS["specialized"] += 1
-    if out is None:
-        out = torch.empty(
-            (qi.shape[0], PACKED_WIDTH), dtype=torch.int32, device=qi.device
-        )
-    mod = get_fp8_paged_mqa_topk_indexer_module()
     with torch.cuda.device(qi.device):
+        try:
+            mod = get_fp8_paged_mqa_topk_indexer_module()
+        except Exception as e:
+            DISPATCH_STATS["rejected"] += 1
+            raise ValueError(
+                f"fp8_paged_mqa_topk_indexer: specialized module unavailable ({e}) "
+                "and no stock path exists"
+            ) from e
+        if out is None:
+            out = torch.empty(
+                (qi.shape[0], PACKED_WIDTH), dtype=torch.int32, device=qi.device
+            )
         mod.fp8_paged_mqa_topk_indexer_run(
             qi, ck_cache, cpage_table, cu_seqlens, pos, visible, out
         )
+    DISPATCH_STATS["specialized"] += 1
     return out

@@ -3144,9 +3144,8 @@ __global__ void __launch_bounds__(SEL_THREADS, 16)
   }
 
   if (tid == 0) {  // causal tail of the open block + the valid-count column
-    const uint32_t pend = (uint32_t)p + 1u;
-    const int b = (int)(pend & ~3u);
-    const int tc = p >= -1 ? (int)(pend & 3u) : 0;
+    const int b = v * CRATIO;
+    const int tc = p < b ? 0 : min(p - b, CRATIO - 2) + 1;
     st_cs_v4(out + BTOPK * CRATIO, tc > 0 ? b : -1, tc > 1 ? b + 1 : -1, tc > 2 ? b + 2 : -1,
              BTOPK * CRATIO + tc);
   }

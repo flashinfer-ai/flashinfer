@@ -187,7 +187,18 @@ class FP8MQATopKWrapper:
         next_n: int | None = None,
         host_length_hints: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
-        """Stage original-token prefixes int32[2].
+        """Stage original-token prefixes for the selected backend.
+
+        Specialized (including auto resolved to specialized) takes a pair of
+        CUDA int32 ``[B+1]`` prefixes for full prefill, with equal Q and KV
+        lengths per request and 256-token-aligned KV starts. Plan eagerly;
+        ``host_length_hints`` is unsupported. Discard graphs using the old
+        specialized plan before replanning: replacing its metadata and scratch
+        invalidates addresses recorded by those graphs. Capture a new run
+        after eager preparation of the new plan.
+
+        The single-request prefix, error-bit and capturable-plan details below
+        describe cutedsl (including auto resolved to cutedsl).
 
         For query i, visible keys end at
         floor((KV - Q + i + 1) / compression_ratio).
@@ -202,11 +213,10 @@ class FP8MQATopKWrapper:
         Parameters
         ----------
         qo_indptr : torch.Tensor
-            CUDA int32 prefix array of shape ``[2]`` containing the query
-            offsets in original tokens for the single request.
+            CUDA int32 query offsets in original tokens: ``[2]`` for cutedsl,
+            ``[B+1]`` for specialized.
         kv_indptr : torch.Tensor
-            CUDA int32 prefix array of shape ``[2]`` containing the KV offsets
-            in original tokens for the single request.
+            CUDA int32 KV offsets in original tokens, same shape as ``qo_indptr``.
         num_query_rows : int, optional
             Extent of the supplied Q storage. Defaults to ``max_chunk_size``.
         next_n : int, optional
@@ -477,7 +487,7 @@ class _AutoTopKPlan:
         plan_ = self._resolved()
         if self._active_name != "specialized":
             return plan_.run(q, weights, k, k_scale=k_scale, out=out, q_scale=q_scale)
-        if torch.cuda.is_current_stream_capturing() and not self._declared:
+        if not self._declared and plan_._is_capturing():
             raise RuntimeError(
                 "auto: refusing to capture the specialized backend. Its "
                 "kernel reads neither weights nor k_scale, and a captured "

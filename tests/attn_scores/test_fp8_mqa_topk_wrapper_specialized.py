@@ -27,7 +27,8 @@ requires_sm103 = pytest.mark.skipif(
     reason="specialized backend is SM103-only",
 )
 requires_validated_toolkit = pytest.mark.skipif(
-    bool(_toolkit_validation_reasons()),
+    bool(_toolkit_validation_reasons())
+    and not any("nvcc_unknown;" in r for r in _toolkit_validation_reasons()),
     reason="specialized backend refuses unvalidated CUDA toolkits "
     "(same gate as dispatch, torch build + JIT nvcc)",
 )
@@ -128,6 +129,54 @@ def test_selection_matches_reference(kv_lens, q_lens):
     buf = torch.empty_like(gold)
     out2 = w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=buf)
     assert out2 is buf and torch.equal(out2, gold)
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_pool_bindings_cover_active_plan():
+    inp = _mk([2304], [2304], seed=51)
+    w = _wrapper(inp, max_bs=1)
+    other = {**inp, "k": inp["k"].float().neg().to(inp["k"].dtype)}
+    gold = [_reference_rows(i) for i in (inp, other)]
+    assert not torch.equal(*gold)
+    w.prepare_pool(other["k"], k_scale=other["k_scale"])
+    for i, ref in zip((inp, other), gold, strict=True):
+        got = w.run(i["q"], i["weights"], i["k"], k_scale=i["k_scale"])
+        assert torch.equal(got, ref)
+    with pytest.raises(ValueError, match="prepared K binding"):
+        w.run(inp["q"], inp["weights"], inp["k"].clone(), k_scale=inp["k_scale"])
+    small = inp["k"][:64].clone()
+    for clear in (False, True):
+        if clear:
+            w.clear_pools()
+        with pytest.raises(ValueError, match="pool too small"):
+            w.prepare_pool(small, k_scale=inp["k_scale"][:64])
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_discard_replan_recapture():
+    inp = _mk([512], [512], seed=52)
+    w = _wrapper(inp, max_bs=1)
+    out = torch.empty(512, TOPK, dtype=torch.int32, device="cuda")
+    for length in (512, 256):
+        prefix = inp["qo"].new_tensor([0, length])
+        w.plan(prefix, prefix)
+
+        def run():
+            w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out)
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        out.fill_(-2)
+        graph.replay()
+        cols = torch.arange(TOPK, device=out.device).expand_as(out)
+        rows = torch.arange(512, device=out.device)[:, None]
+        ref = torch.where((rows < length) & (cols < (rows + 1) // RATIO), cols, -1)
+        assert torch.equal(out, ref.int())
+        del graph  # do not replay a graph across replacement of its plan
 
 
 @requires_sm103
@@ -361,10 +410,11 @@ def test_auto_nonuniform_weights_eager_falls_back():
     wc.plan(inp["qo"], inp["kv"], num_query_rows=2304)
     ref = wc.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"])
     _assert_weighted_topk(inp, out, bad_w)
-    _assert_weighted_topk(inp, ref[: out.shape[0]], bad_w)
+    _assert_weighted_topk(inp, ref, bad_w)
     # the demoted wrapper keeps serving later calls
     out2 = w.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"])
-    _assert_weighted_topk(inp, out2[: out.shape[0]], bad_w)
+    assert w.resolved_backend == "cutedsl"
+    _assert_weighted_topk(inp, out2, bad_w)
 
 
 @requires_sm103
@@ -464,11 +514,13 @@ def test_captured_replay_enforces_contract_on_live_values(backend_kw):
 def test_auto_exhausted_configuration_raises():
     """auto with a configuration neither backend can serve raises, naming
     both reasons (specialized: wrong head count; cutedsl: multi-request)."""
-    if not _toolkit_validation_reasons():
-        match = "single-request|auto: no backend"
-    else:
-        match = "auto: no backend|single-request"
-    with pytest.raises(ValueError, match=match):
+    specialized = (
+        "validated CUDA toolkit" if _toolkit_validation_reasons() else "num_heads=4"
+    )
+    with pytest.raises(
+        ValueError,
+        match=rf"auto: no backend.*specialized: [^;]*{specialized}.*; cutedsl: .*single-request",
+    ):
         FP8MQATopKWrapper(
             max_context_length=4096,
             max_chunk_size=64,

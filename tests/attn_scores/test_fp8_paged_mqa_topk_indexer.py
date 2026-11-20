@@ -122,7 +122,8 @@ def _reference(inp):
                     sel, _ = torch.sort(sel)
                     toks = (sel.unsqueeze(1) * CR + arange_cr.view(1, -1)).reshape(-1)
                     tail0 = v * CR
-                    tail = torch.arange(tail0, int(pos_c[i]) + 1, device=dev)
+                    end = min(int(pos_c[i]) + 1, tail0 + WIDTH - toks.numel())
+                    tail = torch.arange(tail0, max(tail0, end), device=dev)
                     row = torch.cat([toks, tail])
                     packed[c0 + i, : row.numel()] = row.to(torch.int32)
                     packed[c0 + i, PW - 1] = row.numel()
@@ -156,7 +157,8 @@ def _api(inp, out=None, **kw):
 VALIDATED_CUDA_VERSIONS = pi.VALIDATED_CUDA_VERSIONS
 TOOLKIT_VALIDATED = not pi._toolkit_validation_reasons()
 requires_validated_toolkit = pytest.mark.skipif(
-    not TOOLKIT_VALIDATED,
+    not TOOLKIT_VALIDATED
+    and not any("nvcc_unknown;" in r for r in pi._toolkit_validation_reasons()),
     reason="dispatch refuses unvalidated CUDA toolkits "
     f"(cuda={torch.version.cuda}, validated={VALIDATED_CUDA_VERSIONS}); "
     "the refusal is covered by test_unvalidated_toolkit_refusal",
@@ -174,6 +176,54 @@ def test_cuda_130_admitted_with_workaround():
     assert pi._is_validated_release("13.0.1")  # major.minor extraction
     assert not pi._is_validated_release("12.9")
     assert not pi._is_validated_release("13.00")  # exact membership, no prefixes
+
+
+def test_nvcc_override_without_cuda_home(tmp_path, monkeypatch):
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(
+        cpp_ext, "get_cuda_path", lambda: pytest.fail("unexpected CUDA home lookup")
+    )
+    monkeypatch.setattr(torch.version, "cuda", "13.3")
+    for name, output, status, expected in [
+        ("good", "release 13.3,", 0, "13.3"),
+        ("older", "release 12.9,", 0, "12.9"),
+        ("newer", "release 13.10,", 0, "13.10"),
+        ("unknown", "no release", 0, ""),
+        ("failed", "release 13.3,", 1, ""),
+    ]:
+        compiler = tmp_path / name
+        compiler.write_text(f"#!/bin/sh\necho '{output}'\nexit {status}\n")
+        compiler.chmod(0o755)
+        monkeypatch.setenv("FLASHINFER_NVCC", str(compiler))
+        assert pi._jit_nvcc_release() == expected
+        if name == "good":
+            assert pi._toolkit_validation_reasons() == []
+        else:
+            with pytest.raises(
+                ValueError, match=f"unvalidated_toolkit:nvcc_{expected or 'unknown'};"
+            ):
+                # Admission precedes even the input geometry checks.
+                fp8_paged_mqa_topk_indexer(*([None] * 6))
+
+
+@pytest.mark.parametrize("release", [None, (12 << 32) | 9, (13 << 32) | 10])
+def test_loaded_artifact_must_attest_validated_release(release, monkeypatch):
+    from types import SimpleNamespace
+
+    mod = SimpleNamespace()
+    if release is not None:
+        mod.compiled_nvcc_release = lambda: release
+    monkeypatch.setattr(
+        pi,
+        "gen_fp8_paged_mqa_topk_indexer_module",
+        lambda: SimpleNamespace(build_and_load=lambda: mod),
+    )
+    monkeypatch.setattr(pi, "_BUILT", {"ready": False})
+    # Exercise the loader body, not a module admitted by an earlier test.
+    with pytest.raises(AttributeError if release is None else ValueError):
+        pi.get_fp8_paged_mqa_topk_indexer_module.__wrapped__()
+    assert not pi._BUILT["ready"]
 
 
 def _row_scores(inp, r, blocks):
@@ -256,6 +306,42 @@ def test_selection_contract_and_determinism(T, B):
 
 
 @requires_sm103
+@requires_validated_toolkit
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_capture_uses_input_device(monkeypatch):
+    dev = torch.cuda.current_device()
+    other = (dev + 1) % torch.cuda.device_count()
+    inp = _make_inputs(122, 1)
+    buf = inp["pos"].new_empty(122, PW)
+    gold = _reference(inp)
+    stream = torch.cuda.Stream(device=dev)
+    stream.wait_stream(torch.cuda.current_stream(dev))
+    with monkeypatch.context() as m:
+        m.setitem(pi._BUILT, "ready", False)
+        m.setattr(
+            pi,
+            "get_fp8_paged_mqa_topk_indexer_module",
+            lambda: pytest.fail("cold capture loaded module"),
+        )
+        cold = torch.cuda.CUDAGraph()
+        with (
+            torch.cuda.graph(cold, stream=stream),
+            torch.cuda.device(other),
+            pytest.raises(ValueError, match="module_not_built_before_graph_capture"),
+        ):
+            _api(inp, out=buf)
+    with torch.cuda.device(other):
+        _api(inp, out=buf)
+    stream.wait_stream(torch.cuda.current_stream(dev))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), torch.cuda.device(other):
+        _api(inp, out=buf)
+    buf.fill_(-2)
+    graph.replay()
+    assert torch.equal(buf, gold)
+
+
+@requires_sm103
 def test_unvalidated_toolkit_refusal():
     if TOOLKIT_VALIDATED:
         pytest.skip("validated toolkit: dispatch serves; refusal not reachable")
@@ -266,8 +352,48 @@ def test_unvalidated_toolkit_refusal():
 
 @requires_sm103
 @requires_validated_toolkit
+def test_visible_tail_and_low_index_ties():
+    inp = _make_inputs(2060, 1)
+    inp["qi"].zero_()  # every candidate ties, so only the first 512 survive
+    inp["visible"][2055] = 511
+    inp["visible"][2056] = 513
+    got = _api(inp)
+    assert torch.equal(got, _reference(inp))
+    # Independent closed-form rows: canonical rows with padding, and
+    # noncanonical rows on either side of the scoring threshold at capacity.
+    for pos, blocks, tail in [
+        (2044, 511, [2044]),
+        (2052, 512, [2052]),
+        (2055, 511, list(range(2044, 2051))),
+        (2056, 512, [2052, 2053, 2054]),
+    ]:
+        valid = list(range(4 * blocks)) + tail
+        assert got[pos].tolist() == valid + [-1] * (WIDTH - len(valid)) + [len(valid)]
+
+
+@requires_sm103
+@requires_validated_toolkit
 def test_rejection_semantics():
     inp = _make_inputs(949, 2, seed=3)
+    with pytest.raises(ValueError, match="qi_not_Tx4x128_fp8e4m3"):
+        _api({**inp, "qi": inp["qi"][0, 0, 0]})
+    with pytest.raises(ValueError, match="batch_size_zero"):
+        _api(
+            {
+                **inp,
+                "cpage_table": inp["cpage_table"][:0],
+                "cu_seqlens": inp["cu_seqlens"][:1],
+            }
+        )
+    with pytest.raises(ValueError, match="pos_not_contiguous"):
+        _api({**inp, "pos": inp["pos"].repeat_interleave(2)[::2]})
+    qi = inp["qi"]
+    offset = qi.new_empty(qi.numel() + 1)[1:].view_as(qi)
+    with pytest.raises(ValueError, match="qi_not_16B_aligned"):
+        _api({**inp, "qi": offset})
+    buf = inp["pos"].new_empty(949, PW)
+    with pytest.raises(ValueError, match="out_overlaps_pos"):
+        _api({**inp, "pos": buf.view(-1)[:949]}, out=buf)
     # off-allowlist raises with the fallback reasons (no stock path exists)
     with pytest.raises(ValueError, match="qi_not_Tx4x128_fp8e4m3"):
         _api({**inp, "qi": inp["qi"].to(torch.bfloat16)})
@@ -285,9 +411,10 @@ def test_rejection_semantics():
 
 @requires_sm103
 @requires_validated_toolkit
-def test_cuda_graph_replay_matches_eager():
-    inp = _make_inputs(949, 2, seed=5)
-    buf = torch.empty(949, PW, dtype=torch.int32, device="cuda")
+@pytest.mark.parametrize("T,B", [(949, 2), (2930, 1), (8448, 1)])
+def test_cuda_graph_replay_matches_eager(T, B):
+    inp = _make_inputs(T, B, seed=5)
+    buf = torch.empty(T, PW, dtype=torch.int32, device="cuda")
     _api(inp, out=buf)  # eager warmup builds the module before capture
     eager = buf.clone()
     g = torch.cuda.CUDAGraph()

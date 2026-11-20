@@ -188,7 +188,11 @@ class SpecializedTopKPlan:
             "backend='specialized' supports fp32 logits and weights",
         )
         _require(model_config is None, "backend='specialized' takes model_config=None")
-        self._device = torch.device(device)
+        self._device = (
+            _dev
+            if _dev.index is not None
+            else torch.device("cuda", torch.cuda.current_device())
+        )
         self._max_context_length = int(max_context_length)
         self._max_chunk_size = int(max_chunk_size)
         self._max_batch_size = int(max_batch_size)
@@ -227,8 +231,9 @@ class SpecializedTopKPlan:
             k_scale.is_cuda and k_scale.dtype == torch.float32,
             "specialized prepare_pool expects fp32 k_scale",
         )
+        _require(k.device == k_scale.device == self._device, "pool device mismatch")
         _require(
-            not torch.cuda.is_current_stream_capturing(),
+            not self._is_capturing(),
             "prepare_pool is not capturable",
         )
         if not bool(torch.all(k_scale == 1.0).item()):
@@ -240,8 +245,17 @@ class SpecializedTopKPlan:
             "backend='specialized' requires key storage in multiples of 64 "
             "rows (zero-copy paged view; pad the storage allocation)",
         )
+        if self._state is not None:
+            _require(
+                k.shape[0] >= self._state["required_keys"],
+                "prepared pool too small for planned prefixes",
+            )
         self._pools[k.data_ptr()] = k.view(-1, _PAGE_BLOCKS, 1, 128)
         return None
+
+    def _is_capturing(self):
+        with torch.cuda.device(self._device):
+            return torch.cuda.is_current_stream_capturing()
 
     def clear_pools(self):
         self._pools = {}
@@ -262,7 +276,7 @@ class SpecializedTopKPlan:
         host_length_hints=None,
     ):
         _require(
-            not torch.cuda.is_current_stream_capturing(),
+            not self._is_capturing(),
             "backend='specialized' plan is not capturable (host sync)",
         )
         _require(self._pools, "prepare_pool must run before plan")
@@ -277,7 +291,8 @@ class SpecializedTopKPlan:
         # and discovering that at run() is too late for backend='auto' to
         # demote to a working backend.
         try:
-            get_fp8_paged_mqa_topk_indexer_module()
+            with torch.cuda.device(self._device):
+                get_fp8_paged_mqa_topk_indexer_module()
         except Exception as e:
             raise ValueError(
                 f"backend='specialized' kernel module unavailable ({type(e).__name__})"
@@ -349,6 +364,7 @@ class SpecializedTopKPlan:
         self._state = dict(
             T=t,
             B=b,
+            required_keys=kv[-1] // _RATIO,
             pos=torch.cat(pos_rows).to(dev),
             visible=visible.to(dev),
             cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=dev),
@@ -407,7 +423,7 @@ class SpecializedTopKPlan:
             & torch.all(weights[:t] == weights[:t, :1])
             & torch.all(weights[:t, 0] > 0)
         )
-        if not torch.cuda.is_current_stream_capturing():
+        if not self._is_capturing():
             if not bool(contract_ok.item()):
                 if not bool(torch.all(k_scale == 1.0).item()):
                     raise ContractViolation(
