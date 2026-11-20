@@ -1106,8 +1106,16 @@ def test_unsupported_inputs_raise_and_nothing_runs():
             use_gate_in_kernel=True,
             beta_is_logit=True,
         )
-    with pytest.raises(BatchInvariantUnsupportedError):  # decode without a pool
-        recurrent_kda(*args, cu_seqlens=cu, batch_invariant=True, **_fused(p))
+    with pytest.raises(BatchInvariantUnsupportedError):  # slots without a pool
+        recurrent_kda(
+            *args,
+            cu_seqlens=cu,
+            ssm_state_indices=torch.arange(
+                cu.numel() - 1, dtype=torch.int32, device=cu.device
+            ),
+            batch_invariant=True,
+            **_fused(p),
+        )
     with pytest.raises(BatchInvariantUnsupportedError):  # fp16 activations
         recurrent_kda(
             *(a.to(torch.float16) for a in args), cu_seqlens=cu, **_fused(p), **base
