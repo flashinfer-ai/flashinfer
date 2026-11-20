@@ -506,7 +506,34 @@ def test_run_guard_declines_on_mismatched_arguments():
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
 
 
-def test_graph_capture_replays_bitwise_equal_to_eager():
+@pytest.mark.parametrize("entry", ["forward", "forward_return_lse"])
+def test_deprecated_forward_requires_soft_cap_replan(entry):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([16], device)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
+    assert _gqa_dec_fp8q_sm90_stats()["plans_prepared"] == 1
+    with pytest.raises(ValueError, match="Re-plan with logits_soft_cap"):
+        getattr(wrapper, entry)(
+            batch["q"],
+            (batch["k_cache"], batch["v_cache"]),
+            causal=True,
+            logits_soft_cap=30,
+        )
+    assert _gqa_dec_fp8q_sm90_stats()["backend_dispatches"] == {
+        "specialized": 0,
+        "composable": 0,
+    }
+
+
+@pytest.fixture
+def other_gpu_current():
+    _sm90_or_skip()
+    with torch.cuda.device(1 if torch.cuda.device_count() > 1 else 0):
+        yield
+
+
+def test_graph_capture_replays_bitwise_equal_to_eager(other_gpu_current):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([700, 76, 341, 1363], device)
@@ -517,26 +544,17 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     eager = wrapper.run(q, kv).clone()
     assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
 
-    graph = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        wrapper.run(q, kv, out=out)  # warmup on the side stream
-    torch.cuda.current_stream().wait_stream(stream)
-    with torch.cuda.graph(graph):
-        wrapper.run(q, kv, out=out)
+    graph = _capture(wrapper, q, kv, out)
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched_capturing"] == 1, stats
 
-    out.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
+    _poison_and_replay(graph, out)
     assert torch.equal(out, eager)
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
 
     # new content through the same buffers replays correctly
     q.copy_(_make_batch([700, 76, 341, 1363], device, seed=7)["q"])
-    graph.replay()
-    torch.cuda.synchronize()
+    _poison_and_replay(graph, out)
     eager2 = wrapper.run(q, kv)
     assert torch.equal(out, eager2)
 
@@ -970,8 +988,10 @@ def test_workspace_size_off_domain_auto_sizes_the_stock_plan(monkeypatch):
     assert in_domain == fa2_bf16
 
 
-@pytest.mark.parametrize("gap", [17, 18, 22])
-def test_small_probabilities_survive_fp16_p_staging(gap):
+@pytest.mark.parametrize(
+    "gap,single_key", [(17, False), (18, False), (22, False), (22, True)]
+)
+def test_small_probabilities_survive_fp16_p_staging(gap, single_key):
     """Softmax weights far below the maximum must contribute to P.V when V
     and its descale are large: the fp16 P staging carries a 2^PSHIFT power
     shift so they survive the conversion (an unshifted staging flushed them
@@ -988,6 +1008,9 @@ def test_small_probabilities_survive_fp16_p_staging(gap):
         (npages, PAGE, H_KV, HEAD_DIM), 448.0, dtype=torch.float32, device=device
     )
     v[0, 0, 0, :] = 0.0
+    if single_key:
+        v.zero_()
+        v[0, 1, 0, :] = 448.0  # visible on every query row
     batch = dict(
         q=q.to(torch.float8_e4m3fn),
         k_cache=k.to(torch.float8_e4m3fn),
@@ -1007,7 +1030,9 @@ def test_small_probabilities_survive_fp16_p_staging(gap):
     qd = torch.tensor(
         [gap * math.sqrt(HEAD_DIM) / 256.0], dtype=torch.float32, device=device
     )
-    vd = torch.tensor([256.0], dtype=torch.float32, device=device)
+    vd = torch.tensor(
+        [2**18 if single_key else 256.0], dtype=torch.float32, device=device
+    )
     wrapper = _plan_wrapper(batch, device, backend="auto")
     out = wrapper.run(
         batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=qd, v_scale=vd
@@ -1015,13 +1040,37 @@ def test_small_probabilities_survive_fp16_p_staging(gap):
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 1, stats
     ref = _reference(batch, q_descale=qd, v_descale=vd)
-    # every low-probability key carries positive V, so every row, head and
+    # At least one visible low-probability key carries positive V, so every row, head and
     # channel must retain a strictly positive contribution: a tolerance check
     # alone would accept zeros for the ~1e-3 reference values at gap 22
     assert bool((out.float() > 0).all())
     assert _matched_ratio(out, ref) >= MATCHED
     # the recovered contributions are small; hold them to a tight absolute bound
     assert float((out.float() - ref.float()).abs().max()) <= 2e-3
+
+
+def test_eight_auto_plans_retain_only_one_float_scratch_allocation():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([64, 64], device)
+    ws = torch.empty(256 << 20, dtype=torch.uint8, device=device)
+    wrappers = [flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws) for _ in range(8)]
+    float_storage_bytes = {ws.data_ptr(): ws.nbytes}
+    schedules = set()
+    for wrapper in wrappers:
+        _graph_plan(
+            wrapper,
+            *(
+                batch[k]
+                for k in ("qo_indptr", "kv_indptr", "kv_indices", "last_page_len")
+            ),
+        )
+        _, fbuf, ibuf, _ = wrapper._verify_native
+        storage = fbuf.untyped_storage()
+        float_storage_bytes[storage.data_ptr()] = storage.nbytes()
+        schedules.add(ibuf.data_ptr())
+    assert sum(float_storage_bytes.values()) == ws.nbytes
+    assert len(schedules) == len(wrappers)
 
 
 def _graph_batch_and_wrapper(device, kv_lens=(64, 64)):
@@ -1057,16 +1106,25 @@ def _graph_plan(wrapper, qo_indptr, kv_indptr, kv_indices, last_page_len):
     )
 
 
-def _capture(wrapper, q, kv, out):
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        wrapper.run(q, kv, out=out)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        wrapper.run(q, kv, out=out)
-    return graph
+def _capture(wrapper, q, kv, out, *args):
+    with torch.cuda.device(q.device):
+        stream = torch.cuda.Stream(device=q.device)
+        current = torch.cuda.current_stream(q.device)
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            wrapper.run(q, kv, *args, out=out)
+        current.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            wrapper.run(q, kv, *args, out=out)
+        return graph
+
+
+def _poison_and_replay(graph, out):
+    with torch.cuda.device(out.device):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.current_stream(out.device).synchronize()
 
 
 def _ref_with_indices(batch, kv_indices, kv_lens):
@@ -1086,7 +1144,9 @@ def _ref_with_indices(batch, kv_indices, kv_lens):
     return _reference(b)
 
 
-def test_native_positional_graph_survives_failed_then_successful_replan(monkeypatch):
+def test_native_positional_graph_survives_failed_then_successful_replan(
+    monkeypatch, other_gpu_current
+):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch, wrapper = _graph_batch_and_wrapper(device)
@@ -1095,7 +1155,7 @@ def test_native_positional_graph_survives_failed_then_successful_replan(monkeypa
     )
     _graph_plan(wrapper, qo, ki, ids, last)
     native, fbuf, ibuf, _ = wrapper._verify_native
-    assert fbuf.data_ptr() != wrapper._float_workspace_buffer.data_ptr()
+    assert fbuf is wrapper._float_workspace_buffer
     assert ibuf.data_ptr() != wrapper._int_workspace_buffer.data_ptr()
     q = batch["q"]
     kv = batch["k_cache"], batch["v_cache"]
@@ -1103,10 +1163,9 @@ def test_native_positional_graph_survives_failed_then_successful_replan(monkeypa
     sk = torch.ones(H_KV, dtype=torch.float32, device=device)
     sv = 3 * sk
     out = wrapper.run(q, kv, sq, sk, sv)
-    before = out.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        wrapper.run(q, kv, sq, sk, sv, out=out)
+    before = _plan_wrapper(batch, device, backend="fa3").run(q, kv, sq, sk, sv)
+    assert torch.equal(out, before)
+    graph = _capture(wrapper, q, kv, out, sq, sk, sv)
 
     def fail(f, i, pin, *args):
         assert i.data_ptr() != ibuf.data_ptr()
@@ -1119,8 +1178,7 @@ def test_native_positional_graph_survives_failed_then_successful_replan(monkeypa
         m.setattr(native, "plan", fail)
         with pytest.raises(ValueError, match="injected FA3 plan failure"):
             _graph_plan(wrapper, qo, ki, changed_ids, changed_last)
-    out.fill_(float("nan"))
-    graph.replay()
+    _poison_and_replay(graph, out)
     assert torch.equal(out, before)
     assert torch.equal(wrapper.run(q, kv, sq, sk, sv), before)
 
@@ -1133,8 +1191,7 @@ def test_native_positional_graph_survives_failed_then_successful_replan(monkeypa
     expected = stock.run(q, kv, sq, sk, sv)
     assert not torch.equal(expected, before)
     assert torch.equal(wrapper.run(q, kv, sq, sk, sv), expected)
-    out.fill_(float("nan"))
-    graph.replay()
+    _poison_and_replay(graph, out)
     assert torch.equal(out, expected)
 
 
@@ -1170,9 +1227,7 @@ def test_retained_graph_replay_follows_an_in_contract_replan():
         ),
     )
     eager = wrapper.run(batch["q"], kv)
-    out.fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize()
+    _poison_and_replay(graph, out)
     assert torch.equal(out, eager)
     assert _matched_ratio(out, _ref_with_indices(batch, new_indices, new_lens)) >= (
         MATCHED
@@ -1238,9 +1293,7 @@ def test_refused_replan_preserves_graph_and_eager(monkeypatch, change):
     assert torch.equal(wrapper._paged_kv_indices_buf, batch["kv_indices"])
     assert torch.equal(wrapper.run(batch["q"], kv), pre_eager)
     assert _matched_ratio(pre_eager, _reference(batch)) >= MATCHED
-    out.fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize()
+    _poison_and_replay(graph, out)
     # never a mix: the invalidated capture still computes the previous plan
     assert torch.equal(out, pre_eager)
 
@@ -1327,7 +1380,5 @@ def test_graph_q_partition_replan_is_rejected_before_state_changes():
         )
     # the rejected replan changed nothing: the capture still replays the
     # accepted plan bitwise
-    out.fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize()
+    _poison_and_replay(graph, out)
     assert torch.equal(out, eager)

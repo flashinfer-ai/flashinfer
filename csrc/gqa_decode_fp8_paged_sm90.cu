@@ -27,16 +27,11 @@
 // one-wave CTA budget (`share_of`, identical arithmetic in producer and
 // reducer); QK^T runs as fp8 mma (m16n8k32 e4m3, fp32 accumulate) on
 // cp.async-staged K pages; softmax statistics are fp32 online-softmax; the
-// P.V product accumulates in fp16 (m16n8k16 on power-of-two prescaled
-// values, exact for every finite e4m3 input). P is staged as
-// exp2(s - m + PSHIFT) so probabilities down to ~2^-(24+PSHIFT) of the row
-// maximum survive the fp16 conversion (an unshifted staging flushed
-// meaningful weights below 2^-24 to zero before P.V, erasing their
-// contribution when V and its descale are large); V is prescaled by
-// 2^-(4+PSHIFT), keeping the worst-case fp16 accumulation bounded by the
-// same 48-key x 24-tile x 448/16 = 32256 cap as the unshifted form (the
-// shift cancels between the row sums and the partial outputs at the
-// normalization). Per-split partial outputs (fp16) and LSEs (fp32, carrying
+// P.V product uses fp16 operands and fp32 accumulation. Stage P as
+// exp2(s - m + PSHIFT) to retain small probabilities; V converts exactly
+// from finite e4m3. Divide by the shifted row sum before storing bf16
+// split partials: their exponent range preserves small normalized values
+// until the reducer applies the V descale. The partials and LSEs (fp32, carrying
 // the same +PSHIFT bias, which cancels in the shift-invariant split merge)
 // land in a caller-owned workspace and a second kernel (`reduce_u4`)
 // merges the splits and applies the V descale, writing bf16. Both launches
@@ -54,8 +49,7 @@
 //    are the last 6 positions of the sequence);
 //  * the caller-owned uint8 workspace holds at least
 //    `plan_workspace_bytes(batch, max_pages_per_seq)` bytes (split partial
-//    outputs + LSEs + per-request share metadata + the long-context carry
-//    buffer when the page-table width requires it).
+//    outputs + LSEs + per-request share metadata).
 //
 // `run` performs no allocation, no synchronisation and no attribute queries
 // (the kernels use static shared memory only): it launches on the caller's
@@ -81,12 +75,8 @@
 #define SMAX 660
 // P is staged into fp16 as exp2(s - m + PSHIFT): probabilities down to
 // ~2^-(24+PSHIFT) of the running maximum survive the conversion instead of
-// flushing at fp16's 2^-24 subnormal floor. V carries a matching extra
-// 2^-PSHIFT prescale (total 2^-(4+PSHIFT)) so the fp16 P.V accumulator
-// keeps the original 48 * 24 * 448/16 = 32256 worst-case bound, and the
-// combined 2^(4+PSHIFT) factor is undone in one place (vsc) at the
-// normalization. PSHIFT is bounded by the e4m3->fp16 exactness of the V
-// prescale (4 + PSHIFT <= 15, so the smallest e4m3 subnormal stays exact).
+// flushing at fp16's 2^-24 subnormal floor. The same shift in the fp32
+// row sum cancels it at normalization.
 #define PSHIFT 11
 
 __device__ __forceinline__ int sw8(int row, int byte) {
@@ -101,13 +91,7 @@ __device__ __forceinline__ int sw16(int row, int h) {
 __device__ __forceinline__ uint32_t cvt8x2(uint32_t x) {
   uint32_t r;
   asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)(x & 0xffffu)));
-  // A power-of-two transform is exact for every finite e4m3 value down to
-  // the smallest subnormal (2^-9 * 2^-(4+PSHIFT) >= fp16's 2^-24).  With the
-  // 2^PSHIFT-staged P, 48 keys * 24 tiles * 2^PSHIFT * 448 * 2^-(4+PSHIFT)
-  // = 32256 stays below the FP16 accumulator range.
-  __half2 h =
-      __hmul2(*reinterpret_cast<__half2*>(&r), __float2half2_rn(1.0f / (float)(1 << (4 + PSHIFT))));
-  return *reinterpret_cast<uint32_t*>(&h);
+  return r;
 }
 __device__ __forceinline__ uint32_t smaddr(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -151,15 +135,15 @@ __device__ __forceinline__ void async_wait1() { asm volatile("cp.async.wait_grou
       : "+r"(d0), "+r"(d1)                                                                  \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
-#define WGMMA_PV_N64(D, O, A0, A1, A2, A3, B)                                                \
-  asm volatile(                                                                              \
-      "wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16 "                                  \
-      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, "                            \
-      "{%16,%17,%18,%19}, %20, 1, 1, 1, 1;"                                                  \
-      : "+r"(D[O + 0]), "+r"(D[O + 1]), "+r"(D[O + 2]), "+r"(D[O + 3]), "+r"(D[O + 4]),      \
-        "+r"(D[O + 5]), "+r"(D[O + 6]), "+r"(D[O + 7]), "+r"(D[O + 8]), "+r"(D[O + 9]),      \
-        "+r"(D[O + 10]), "+r"(D[O + 11]), "+r"(D[O + 12]), "+r"(D[O + 13]), "+r"(D[O + 14]), \
-        "+r"(D[O + 15])                                                                      \
+#define PV_D4(D, O) "+f"(D[O]), "+f"(D[(O) + 1]), "+f"(D[(O) + 2]), "+f"(D[(O) + 3])
+#define WGMMA_PV_N64(D, O, A0, A1, A2, A3, B)                                              \
+  asm volatile(                                                                            \
+      "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "                                \
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                            \
+      "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, "                 \
+      "{%32,%33,%34,%35}, %36, 1, 1, 1, 1;"                                                \
+      : PV_D4(D, O), PV_D4(D, O + 4), PV_D4(D, O + 8), PV_D4(D, O + 12), PV_D4(D, O + 16), \
+        PV_D4(D, O + 20), PV_D4(D, O + 24), PV_D4(D, O + 28)                               \
       : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "l"(B))
 
 __device__ __forceinline__ uint64_t wgmma_desc(const void* p) {
@@ -189,9 +173,9 @@ __device__ __forceinline__ uint64_t wgmma_desc(const void* p) {
         "=f"(D[4][2]), "=f"(D[4][3]), "=f"(D[5][0]), "=f"(D[5][1]), "=f"(D[5][2]), "=f"(D[5][3])  \
       : "l"(A), "l"(B))
 
-__device__ __forceinline__ uint32_t hmul2_bits(uint32_t x, __half2 y) {
-  __half2 z = __hmul2(*reinterpret_cast<__half2*>(&x), y);
-  return *reinterpret_cast<uint32_t*>(&z);
+__device__ __forceinline__ uint32_t pack_partial(float x, float y, float inv) {
+  __nv_bfloat162 pair = __floats2bfloat162_rn(x * inv, y * inv);
+  return *reinterpret_cast<uint32_t*>(&pair);
 }
 
 // Proportional whole-tile partitioning.  Each request receives a share of
@@ -243,8 +227,8 @@ template <bool ASYNC_Q, bool SINGLE>
 __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
     const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
     const int* __restrict__ bt, const int* __restrict__ sl, const float* __restrict__ qd,
-    const float* __restrict__ kd, __half* __restrict__ po, float* __restrict__ plse,
-    int2* __restrict__ pmeta, float2* __restrict__ carry, int B, int NB, int GSTRIDE) {
+    const float* __restrict__ kd, __nv_bfloat16* __restrict__ po, float* __restrict__ plse,
+    int2* __restrict__ pmeta, int B, int NB, int GSTRIDE) {
   // 1024-byte alignment: wgmma_desc encodes a zero matrix base offset, and
   // the 128-byte swizzle written by sw8/sw16 matches the hardware pattern
   // only when each matrix base is aligned to the 1024-byte swizzle repeat.
@@ -370,11 +354,8 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
   const float scale2 = 0.08838834764831845f * qd[r] * kd[r] * 1.4426950408889634f;
   __syncthreads();
 
-  uint32_t oa[32];
-#pragma unroll
-  for (int i = 0; i < 32; ++i) oa[i] = 0u;
+  float oa[64] = {};
   float m_a = -1e30f, m_b = -1e30f, l_a = 0.f, l_b = 0.f;
-  float cm_a = -1e30f, cm_b = -1e30f;
 
   const int ra = 16 * w + (lane >> 2);
   const int rb = ra + 8;
@@ -413,27 +394,6 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
     // The preceding tile's PV can overlap the next stage's cp.async
     // arrival.  Drain it before issuing copies into that aliased stage.
     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-    // The main loop retains the original FP16 register footprint. Only
-    // long splits drain a 24-tile subtotal to FP32 scratch, with its own
-    // softmax exponent so later maxima can rescale it at the next drain.
-    if (t && t % 24 == 0 && w < 3) {
-      const float ca = exp2f(cm_a - m_a), cb = exp2f(cm_b - m_b);
-#pragma unroll
-      for (int i = 0; i < 32; ++i) {
-        const size_t ix = ((size_t)bid * 32 + i) * 96 + tid;
-        float2 v = __half22float2(*reinterpret_cast<__half2*>(&oa[i]));
-        if (t > 24) {
-          float2 old = carry[ix];
-          float scale = (i & 1) ? cb : ca;
-          v.x = fmaf(old.x, scale, v.x);
-          v.y = fmaf(old.y, scale, v.y);
-        }
-        carry[ix] = v;
-        oa[i] = 0;
-      }
-      cm_a = m_a;
-      cm_b = m_b;
-    }
     if (t + 1 < ntile) {
       int nn = nb + BN;
 #pragma unroll
@@ -555,19 +515,8 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
         float ca = exp2f(m_a - mna), cb = exp2f(m_b - mnb);
         l_a *= ca;
         l_b *= cb;
-        // Rescale the PV subtotal in FP32: an FP16 rescale factor flushes to
-        // zero once the running max rises by ~25 log2 units, zeroing the old
-        // subtotal while l_a keeps its FP32 mass. The FP32 product still
-        // lands in FP16 range whenever the rescaled value itself does.
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          float2 va = __half22float2(*reinterpret_cast<__half2*>(&oa[2 * i]));
-          float2 vb = __half22float2(*reinterpret_cast<__half2*>(&oa[2 * i + 1]));
-          __half2 ra2 = __floats2half2_rn(va.x * ca, va.y * ca);
-          __half2 rb2 = __floats2half2_rn(vb.x * cb, vb.y * cb);
-          oa[2 * i] = *reinterpret_cast<uint32_t*>(&ra2);
-          oa[2 * i + 1] = *reinterpret_cast<uint32_t*>(&rb2);
-        }
+        for (int i = 0; i < 64; ++i) oa[i] *= (i & 2) ? cb : ca;
       }
       m_a = mna;
       m_b = mnb;
@@ -622,71 +571,41 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
       uint64_t b0 = wgmma_desc((char*)kv[stage][0] + kstep * (16 * 128));
       uint64_t b1 = wgmma_desc((char*)kv[stage][1] + kstep * (16 * 128));
       WGMMA_PV_N64(oa, 0, a0, a1, a2, a3, b0);
-      WGMMA_PV_N64(oa, 16, a0, a1, a2, a3, b1);
+      WGMMA_PV_N64(oa, 32, a0, a1, a2, a3, b1);
     }
     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
     stage ^= 1;
   }
   asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 
-  // Undo only the exact power-of-two PV prescale (the 2^-(4+PSHIFT) V
-  // prescale and the 2^PSHIFT P shift riding l) here. The per-sequence V
-  // descale is applied by the reducer in FP32: folding it into this FP16
-  // normalization would overflow the stored partials for a large descale
-  // (448 * 256 > 65504) and underflow them for a small one.
-  const float vsc = (float)(1 << (4 + PSHIFT));
+  // Both oa and l include the same P shift. Apply V descale only after merge.
   float la = l_a, lb = l_b, inva = 0.f, invb = 0.f;
   if (w < 3) {
     la += __shfl_xor_sync(0xffffffffu, la, 1);
     la += __shfl_xor_sync(0xffffffffu, la, 2);
     lb += __shfl_xor_sync(0xffffffffu, lb, 1);
     lb += __shfl_xor_sync(0xffffffffu, lb, 2);
-    inva = (la > 0.f) ? (vsc / la) : 0.f;
-    invb = (lb > 0.f) ? (vsc / lb) : 0.f;
-  }
-  __half2 inva2 = __float2half2_rn(inva), invb2 = __float2half2_rn(invb);
-
-  // Long splits have an FP32 subtotal. A large inverse also needs FP32
-  // normalization so scaling V cannot introduce an FP16 inverse overflow.
-  if (w < 3 && (ntile > 24 || fabsf(inva) > 65504.f || fabsf(invb) > 65504.f)) {
-    const float ca = exp2f(cm_a - m_a), cb = exp2f(cm_b - m_b);
-#pragma unroll
-    for (int i = 0; i < 32; ++i) {
-      float2 v = __half22float2(*reinterpret_cast<__half2*>(&oa[i]));
-      if (ntile > 24) {
-        const size_t ix = ((size_t)bid * 32 + i) * 96 + tid;
-        float2 old = carry[ix];
-        float scale = (i & 1) ? cb : ca;
-        v.x = fmaf(old.x, scale, v.x);
-        v.y = fmaf(old.y, scale, v.y);
-      }
-      float inv = (i & 1) ? invb : inva;
-      __half2 h = __floats2half2_rn(v.x * inv, v.y * inv);
-      oa[i] = *reinterpret_cast<uint32_t*>(&h);
-    }
-    // The accumulated partial has already been normalized in FP32.
-    inva2 = __float2half2_rn(1.f);
-    invb2 = inva2;
+    inva = (la > 0.f) ? (1.f / la) : 0.f;
+    invb = (lb > 0.f) ? (1.f / lb) : 0.f;
   }
 
   // Let the dependent reducer grid begin scheduling while this CTA drains
   // the coalesced partial-output and LSE epilogue.
   cudaTriggerProgrammaticLaunchCompletion();
 
-  __half* pob = po + (size_t)bid * (MROWS * 128);
+  __nv_bfloat16* pob = po + (size_t)bid * (MROWS * 128);
   __syncthreads();
   char* ob = (char*)kv[stage ^ 1];
 #pragma unroll
   for (int dt = 0; dt < 16; dt += 2) {
     if (w < 3) {
-      oa[2 * dt] = hmul2_bits(oa[2 * dt], inva2);
-      oa[2 * dt + 1] = hmul2_bits(oa[2 * dt + 1], invb2);
-      oa[2 * dt + 2] = hmul2_bits(oa[2 * dt + 2], inva2);
-      oa[2 * dt + 3] = hmul2_bits(oa[2 * dt + 3], invb2);
+      const float* p = &oa[4 * dt];
+      uint32_t a = pack_partial(p[0], p[1], inva), b = pack_partial(p[2], p[3], invb);
+      uint32_t c = pack_partial(p[4], p[5], inva), d = pack_partial(p[6], p[7], invb);
       int row = 16 * w + (lane & 15);
       int col = (dt + (lane >> 4)) * 8;
       uint32_t ad = smaddr(ob + sw16(row, col));
-      STM4(ad, oa[2 * dt], oa[2 * dt + 1], oa[2 * dt + 2], oa[2 * dt + 3]);
+      STM4(ad, a, b, c, d);
     }
   }
   // Every warp that staged partials above publishes its own generic-proxy
@@ -719,10 +638,10 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
 }
 
 __device__ __forceinline__ void acc8(float* A, uint4 v, float w) {
-  __half2 h0 = *reinterpret_cast<__half2*>(&v.x);
-  __half2 h1 = *reinterpret_cast<__half2*>(&v.y);
-  __half2 h2 = *reinterpret_cast<__half2*>(&v.z);
-  __half2 h3 = *reinterpret_cast<__half2*>(&v.w);
+  __nv_bfloat162 h0 = *reinterpret_cast<__nv_bfloat162*>(&v.x);
+  __nv_bfloat162 h1 = *reinterpret_cast<__nv_bfloat162*>(&v.y);
+  __nv_bfloat162 h2 = *reinterpret_cast<__nv_bfloat162*>(&v.z);
+  __nv_bfloat162 h3 = *reinterpret_cast<__nv_bfloat162*>(&v.w);
   A[0] = fmaf(w, __low2float(h0), A[0]);
   A[1] = fmaf(w, __high2float(h0), A[1]);
   A[2] = fmaf(w, __low2float(h1), A[2]);
@@ -739,9 +658,9 @@ __device__ __forceinline__ void acc8(float* A, uint4 v, float w) {
 // streaming over the partial buffer.
 template <int NTH, int NSLICE, bool SGL>
 __global__ __launch_bounds__(NTH, 2) void reduce_u4(
-    const __half* __restrict__ po, const float* __restrict__ plse, __nv_bfloat16* __restrict__ out,
-    const int* __restrict__ sl, const float* __restrict__ vd, const int2* __restrict__ pmeta, int B,
-    int GSTRIDE) {
+    const __nv_bfloat16* __restrict__ po, const float* __restrict__ plse,
+    __nv_bfloat16* __restrict__ out, const int* __restrict__ sl, const float* __restrict__ vd,
+    const int2* __restrict__ pmeta, int B, int GSTRIDE) {
   constexpr int DPC = 128 / NSLICE;
   constexpr int LANES = DPC / 8;
   constexpr int GROUPS = NTH / LANES;
@@ -789,7 +708,7 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
   const int d = ds * DPC + dl;
 
   const char* pb =
-      reinterpret_cast<const char*>(po) + (size_t)base * MROWS * 128 * sizeof(__half) + sw16(m, d);
+      reinterpret_cast<const char*>(po) + (size_t)base * MROWS * 128 * sizeof(*po) + sw16(m, d);
   const float* lb = plse + (size_t)m * GSTRIDE + base;
 
   __shared__ float sW[SMAX];
@@ -804,7 +723,7 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
   // Pull the first eight split vectors into registers before the LSE
   // reduction.  Their memory latency is then hidden by the max/exp/sum
   // chain; for B1 this covers the complete 512-split accumulation loop.
-  constexpr size_t ST = (size_t)MROWS * 128 * sizeof(__half);
+  constexpr size_t ST = (size_t)MROWS * 128 * sizeof(*po);
   constexpr int PFD = 8;
   int npf = (S > grp) ? ((S - 1 - grp) / GROUPS + 1) : 0;
   if (npf > PFD) npf = PFD;
@@ -917,26 +836,17 @@ struct GqaDecodeWsLayout {
   int lstride;
   size_t partial_bytes;
   size_t lse_bytes;
-  size_t carry_offset;
-  bool needs_carry;
   size_t total_bytes;
 };
 
-// Verbatim workspace arithmetic of the measured launcher: one-wave 528-CTA
-// budget for the captured single-request class, at least one CTA per
-// request over the unbounded-batch scope, carry storage only when the
-// page-table width can push a split past 24 tiles.
-GqaDecodeWsLayout gqa_decode_fp8_paged_sm90_ws_layout(int B, int NB) {
+// Subtotals stay in fp32 registers even on long splits; no carry buffer.
+GqaDecodeWsLayout gqa_decode_fp8_paged_sm90_ws_layout(int B) {
   GqaDecodeWsLayout L;
   L.grid = (B == 1) ? TMAX : (B > GMB ? B : GMB);
   L.lstride = (L.grid + 31) & ~31;
-  L.partial_bytes = (size_t)L.grid * MROWS * 128 * sizeof(__half);
+  L.partial_bytes = (size_t)L.grid * MROWS * 128 * sizeof(__nv_bfloat16);
   L.lse_bytes = (size_t)MROWS * L.lstride * sizeof(float);
-  L.carry_offset = L.partial_bytes + L.lse_bytes + ((B * sizeof(int2) + 127) & ~size_t(127));
-  const size_t max_tiles = ((size_t)NB * PAGE + BN - 1) / BN;
-  L.needs_carry = B == 1 ? max_tiles > size_t(TMAX) * 24 : max_tiles > 24;
-  L.total_bytes =
-      L.carry_offset + (L.needs_carry ? (size_t)L.grid * MROWS * 128 * sizeof(float) : 0);
+  L.total_bytes = L.partial_bytes + L.lse_bytes + B * sizeof(int2);
   return L;
 }
 
@@ -948,9 +858,7 @@ int64_t gqa_decode_fp8_paged_sm90_plan_workspace_bytes(int64_t batch_size,
                                                        int64_t max_pages_per_seq) {
   TVM_FFI_ICHECK_GE(batch_size, 1);
   TVM_FFI_ICHECK_GE(max_pages_per_seq, 1);
-  return (int64_t)gqa_decode_fp8_paged_sm90_ws_layout(static_cast<int>(batch_size),
-                                                      static_cast<int>(max_pages_per_seq))
-      .total_bytes;
+  return (int64_t)gqa_decode_fp8_paged_sm90_ws_layout(static_cast<int>(batch_size)).total_bytes;
 }
 
 // Launch the measured two-kernel sequence on the caller's current stream:
@@ -1022,7 +930,7 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   TVM_FFI_ICHECK_GE(k_descale.numel(), B);
   TVM_FFI_ICHECK_GE(v_descale.numel(), B);
 
-  const GqaDecodeWsLayout L = gqa_decode_fp8_paged_sm90_ws_layout(B, NB);
+  const GqaDecodeWsLayout L = gqa_decode_fp8_paged_sm90_ws_layout(B);
   TVM_FFI_ICHECK_GE((size_t)workspace.numel(), L.total_bytes)
       << "workspace too small: plan with plan_workspace_bytes(" << B << ", " << NB << ")";
   // The attention kernel stores split partials into the workspace with
@@ -1045,10 +953,9 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   const cudaStream_t stream = get_stream(q.device());
 
   char* scratch = static_cast<char*>(workspace.data_ptr());
-  __half* po = reinterpret_cast<__half*>(scratch);
+  __nv_bfloat16* po = reinterpret_cast<__nv_bfloat16*>(scratch);
   float* plse = reinterpret_cast<float*>(scratch + L.partial_bytes);
   int2* pmeta = reinterpret_cast<int2*>(scratch + L.partial_bytes + L.lse_bytes);
-  float2* carry = reinterpret_cast<float2*>(scratch + L.carry_offset);
 
   const uint8_t* qd = static_cast<const uint8_t*>(q.data_ptr());
   const uint8_t* kd = static_cast<const uint8_t*>(k_cache.data_ptr());
@@ -1062,10 +969,10 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
 
   if (B == 1) {
     attn_kernel<true, true><<<L.grid, NTHREAD, 0, stream>>>(qd, kd, vd, bt, slp, qds, kds, po, plse,
-                                                            pmeta, carry, B, NB, L.lstride);
+                                                            pmeta, B, NB, L.lstride);
   } else {
     attn_kernel<true, false><<<L.grid, NTHREAD, 0, stream>>>(qd, kd, vd, bt, slp, qds, kds, po,
-                                                             plse, pmeta, carry, B, NB, L.lstride);
+                                                             plse, pmeta, B, NB, L.lstride);
   }
   cudaLaunchAttribute attribute[1] = {};
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;

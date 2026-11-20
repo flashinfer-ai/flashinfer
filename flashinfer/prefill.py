@@ -2498,7 +2498,7 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 #   refusal reason — an explicitly selected backend never falls back; only
 #   ``"auto"`` routes around a refusal (to the composable path: exact
 #   dequantisation — bf16 holds every e4m3 value exactly — into the stock
-#   fa2 plan, never another fused backend).
+#   fa2 plan, except for positional per-head scales, which use native FA3).
 # - ``backend="auto"`` routes to ``"specialized"`` only on the dispatch
 #   allowlist (``gqa_fp8q_sm90_dispatch.json``, op key ``"decode"``); off the
 #   allowlist, auto keeps its stock resolution untouched.
@@ -2526,12 +2526,8 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # (1/sqrt(128)), and the measured envelope (batch <= 128, kv_len <= 262144).
 #
 # PRECISION (part of the API contract, stated in the dispatch docstring):
-# the kernel accumulates the P.V product in fp16 on power-of-two prescaled
-# operands (exact for every finite e4m3 value, range-bounded by the split
-# tiling) and merges splits in fp32 — the in-class arithmetic of an
-# fp8-Q/fp8-KV contract. It is deterministic (atomics-free, bit-stable); the
-# measured record (bit-determinism rerun, fresh-seed matched-ratio,
-# magnitude perturbations) accompanies the change.
+# the kernel stages shifted P and exact e4m3-to-fp16 V, accumulates P.V
+# in fp32, and merges normalized bf16 split partials in fp32.
 #
 # All allocation and compilation happen at plan time, outside CUDA-graph
 # capture; run() only launches on the current stream (re-queried per call),
@@ -4341,13 +4337,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             verify-decode kernel explicitly (``plan()`` raises for contracts it
             has no kernel for, and a plan or call it cannot serve raises with
             the refusal reason — an explicitly selected backend never falls
-            back); ``auto`` routes to it only on its dispatch allowlist and
-            otherwise keeps the stock resolution (auto-armed plans that
-            decline at run time are served by the composable path: exact
-            dequantisation into the stock fa2 kernel, never another fused
-            backend); an explicitly named stock backend is never served by it.
-            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the kernel
-            (auto: composable path; explicit: raise).
+            back). Off-domain ``auto`` plans keep stock resolution. Admitted
+            auto plans normally use bf16 dequantisation and FA2 on refusal;
+            positional FP8 scales use native FA3 per-head semantics instead.
+            Incompatible live graph replans raise. An explicitly named stock
+            backend is never replaced. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
+            disables the specialized kernel, not the stock routes.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
             CUTLASS primitives.
@@ -5196,8 +5191,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``backend="auto"`` routes to it only on the dispatch allowlist
             (8 query heads / 1 KV head / head_dim 128, page size 16, NHD,
             causal, uniform q_len == 6 per request, per-sequence float32
-            descales, batch <= 128, kv_len <= 262144). The specialized kernel
-            reads K and V as SEPARATE paged tensors whose pages are
+            descales, batch <= 128, kv_len <= 262144). Q/K/V descales must
+            be finite and positive. Scaled logits in base-2 units must stay
+            above the running-max floor of -1e20 (a Q times K descale product
+            below 3e13 suffices for finite e4m3 inputs). These are caller
+            preconditions; scale values are not checked on device or read
+            back during dispatch. The specialized kernel reads K and V as
+            SEPARATE paged tensors whose pages are
             contiguous 2048-byte lines (``page_size * head_dim`` elements per
             page); the combined contiguous 5-D ``paged_kv_cache`` tensor that
             ``run()`` otherwise accepts gives its K/V views a doubled page
@@ -5211,8 +5211,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``backend="specialized"``. Under
             ``backend="auto"`` a call the specialized kernel cannot serve
             falls back to the composable path — exact dequantisation (bf16
-            holds every e4m3 value exactly) into the stock fa2 kernel — never
-            to another fused backend; under explicit ``backend="specialized"``
+            holds every e4m3 value exactly) into the stock fa2 kernel, except
+            for positional scales as described below. Under explicit ``backend="specialized"``
             such a plan or call raises with the refusal reason (an explicitly
             selected backend never falls back), and a caller who names a
             stock backend (``fa2``, ``fa3``, ...) is never served by the
@@ -6227,14 +6227,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # provisioned byte capacities, not the FA2 scheduler's size
                 # estimate. In particular an exact-size FA2 reset may have
                 # made its integer buffer smaller than the stock FA3 reserve.
-                float_bytes = self._workspace_size
+                # Only the integer schedule persists between launches. FA2
+                # and FA3 use caller float scratch under the same stream and
+                # lifetime contract as an explicitly selected stock backend.
+                fbuf = self._float_workspace_buffer
                 int_bytes = max(8 * 1024 * 1024, self._int_workspace_buffer.nbytes)
                 prior = getattr(accepted, "_verify_native", None)
-                fbuf = prior[1] if prior is not None else None
-                if fbuf is None or fbuf.numel() < float_bytes:
-                    fbuf = torch.empty(
-                        float_bytes, device=self.device, dtype=torch.uint8
-                    )
                 ibuf = torch.empty(int_bytes, device=self.device, dtype=torch.uint8)
                 pin = torch.empty(
                     int_bytes, device="cpu", pin_memory=True, dtype=torch.uint8
@@ -6756,6 +6754,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"{q.dtype}. An explicitly selected backend never falls back "
                 "— pass an fp8 query or re-plan with backend='auto'"
             )
+        # Both deprecated forward entrypoints can change this option after
+        # planning. Every admitted verify plan has soft capping compiled out,
+        # including its stock modules. Check before *any* fallback decision.
+        if (
+            self._gqa_dec_fp8q_sm90_requested
+            and not self._gqa_dec_fp8q_sm90_explicit
+            and self._logits_soft_cap not in (None, 0.0)
+        ):
+            raise ValueError("Re-plan with logits_soft_cap before using soft capping")
         native_plan = None
         if getattr(self, "_gqa_dec_fp8q_sm90_requested", False) and is_float8(q):
             # fp8 Q on the SM90 paged route, armed by backend="specialized"
@@ -6763,10 +6770,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # verify-decode kernel at the supported contract, the composable
             # path (exact dequantisation into the stock fa2 plan) otherwise —
             # including under FLASHINFER_SPECIALIZED_KERNEL_DISABLE (or its
-            # deprecated per-kernel alias). The specialized
-            # kernel accumulates P.V in fp16 on power-of-two prescaled e4m3
-            # operands (exact per element, range-bounded by the split tiling);
-            # see the dispatcher section's precision note.
+            # deprecated per-kernel alias). Positional scales use FA3 below.
             if q.dtype != torch.float8_e4m3fn:
                 # e5m2 passes is_float8 but is NOT the planned external dtype:
                 # the specialized guard would decline it and the composable
