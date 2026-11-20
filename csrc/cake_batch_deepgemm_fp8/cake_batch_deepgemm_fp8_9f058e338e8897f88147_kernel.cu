@@ -531,11 +531,12 @@ kernel_cake_batch_deepgemm_fp8_9f058e338e8897f88147(const __grid_constant__ CUte
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 if (elect_sync()) {
+                    asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
                     asm volatile(
                         "{\n\t"
                         ".reg .b32 remAddr32;\n\t"
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                        "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
                         :: "r"(ce_addr), "r"(leader) : "memory");
                 }
@@ -922,11 +923,12 @@ kernel_cake_batch_deepgemm_fp8_9f058e338e8897f88147(const __grid_constant__ CUte
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
+                        asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
                         asm volatile(
                             "{\n\t"
                             ".reg .b32 remAddr32;\n\t"
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-                            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                            "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [remAddr32];\n\t"
                             "}"
                             :: "r"(sf_addr + (stage_2) * 8), "r"(leader_s) : "memory");
                     }
