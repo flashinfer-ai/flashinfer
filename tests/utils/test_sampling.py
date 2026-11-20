@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.jit.core import current_compilation_context
 from flashinfer.utils import device_support_pdl
 from tests.infra.test_helpers.parametrize import (
     parametrize_product,
@@ -3654,8 +3655,11 @@ def test_top_k_top_p_sampling_rejects_unaligned_input_as_stored(api, vocab_size,
 def test_split_row_sampling_reads_scalar_loaded_offset_view_in_place(api):
     # 8194 tokens make the SM90 split-row launch stage rows with scalar loads, which need
     # no alignment; the single-CTA kernels of other architectures read 8 bytes at once.
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("split-row rejection sampling requires SM90")
+    # The launch needs both an SM90 device and a kernel compiled for it: a build that
+    # targets an older architecture falls back to the single-CTA kernels.
+    targets = current_compilation_context.TARGET_CUDA_ARCHS
+    if torch.cuda.get_device_capability()[0] != 9 or all(m != 9 for m, _ in targets):
+        pytest.skip("split-row rejection sampling requires SM90 and an SM90 build")
 
     call, is_logits = _UNALIGNED_INPUT_CALLS[api]
     aligned = _unaligned_input(is_logits, 8194)
