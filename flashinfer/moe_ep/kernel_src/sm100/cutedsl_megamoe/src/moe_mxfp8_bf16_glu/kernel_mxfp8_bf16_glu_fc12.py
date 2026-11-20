@@ -140,11 +140,38 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
     _SmemMiscBudget = 2048
     _TmemColsTotal = 512
 
+    _DefaultBStages = {"smem": 3, "tmem": 4}
+
     _SupportedImplementationConfigs = {
         ((256, 128, 128), "tmem", False, 128),
         ((256, 256, 128), "smem", False, 128),
         ((256, 256, 128), "tmem", True, 64),
     }
+
+    @classmethod
+    def max_b_stages(
+        cls,
+        mma_tiler_mnk: Tuple[int, int, int],
+        transform_buffer: str,
+        accumulator_overlap: bool,
+        transform_k_tile: int,
+    ) -> int:
+        """Largest B depth whose tile buffers fit the SM100 SMEM limit."""
+        stages = cls._derive_pipeline_stages(
+            mma_tiler_mnk,
+            transform_buffer,
+            accumulator_overlap,
+            transform_k_tile,
+        )
+        smem_capacity = 232448
+        # Worst non-tile storage measured across implementations and knobs (N128/tmem).
+        smem_overhead = 10880
+        m, n, k = mma_tiler_mnk
+        cta_m, cta_n = m // 2, n // 2
+        fixed = smem_overhead + stages["a"] * cta_m * k
+        if transform_buffer == "smem":
+            fixed += stages["transformed_a"] * cta_m * k * 2
+        return (smem_capacity - fixed) // (cta_n * k * 2)
 
     @classmethod
     def _derive_pipeline_stages(
@@ -195,7 +222,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             "a": common_depth,
             "scale": common_depth,
             "transformed_a": common_depth,
-            "b": 2,
+            "b": cls._DefaultBStages[transform_buffer],
             "acc": 2,
         }
 
@@ -258,6 +285,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
         num_sched_stages: int = 2,
+        num_activation_stages: Optional[int] = None,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
@@ -306,6 +334,21 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 "clc_bundle_size is only meaningful for the dynamic CLC "
                 "scheduler; mixed FC12 requires force_static_sched=True."
             )
+        if num_activation_stages is not None and num_activation_stages < 2:
+            raise ValueError("num_activation_stages must be at least 2.")
+        if num_activation_stages is not None:
+            max_stages = self.max_b_stages(
+                mma_tiler_mnk,
+                transform_buffer,
+                accumulator_overlap,
+                transform_k_tile,
+            )
+            if num_activation_stages > max_stages:
+                raise ValueError(
+                    f"num_activation_stages must be at most {max_stages} for "
+                    f"{mma_tiler_mnk} with transform_buffer={transform_buffer!r}."
+                )
+
         self.mma_tiler_mnk = mma_tiler_mnk
         self.transform_buffer = transform_buffer
         self.overlapping_accum = accumulator_overlap
@@ -378,7 +421,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         # knobs to the runner.
         self.num_a_stage = pipeline_stages["a"]
         self.num_scale_stage = pipeline_stages["scale"]
-        self.num_b_stage = pipeline_stages["b"]
+        self.num_b_stage = pipeline_stages["b"] if num_activation_stages is None else num_activation_stages
         self.num_transformed_a_stage = pipeline_stages["transformed_a"]
         self.num_acc_stage = pipeline_stages["acc"]
         self.tmem_col_budget = self.get_tmem_col_budget(
