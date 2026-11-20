@@ -369,14 +369,27 @@ DEFAULT_RING = {
 # the noise), D = 256 has only 2
 
 
+DEFAULT_RING_LOWBIT = {
+    64: 4,
+    128: 2,
+    256: 2,
+}  # the low-bit-KV kernels: the shared memory a deeper ring would take goes to whole-slot stages of raw cache bytes
+# (blocks.operands.RAW_STAGING), which keep as many tiles in flight at half the bytes or less
+
+
 def default_config(D: int = 128, kv_fmt: str = "bf16"):
-    """The default placement of the class at head dim ``D``: the ring depth of ``DEFAULT_RING`` (4 / 4 / 2 at D = 64 / 128 / 256), one
-    softmax warpgroup, the planner's unit kind and fold placement (``plan.build_plan``: per head dim). The fp8-KV classes
+    """The default placement of the class at head dim ``D``: the ring depth of ``DEFAULT_RING`` (4 / 4 / 2 at D = 64 / 128 / 256;
+    ``DEFAULT_RING_LOWBIT`` for the low-bit-KV kernels), one softmax warpgroup, the planner's unit kind and fold placement (``plan.build_plan``: per head dim). The fp8-KV classes
     (``kv_fmt`` ``"e4m3"`` / ``"e5m2"``) take the row body for small units too (``small="rep"``: the Swaps-AB body has no
     conversion stage)."""
     assert kv_fmt in KV_FMTS, kv_fmt
+    lowbit = kv_fmt != "bf16"
     return AttnConfig(
-        DEFAULT_RING[D], "auto", 0, 1, small="rep" if kv_fmt != "bf16" else "swap"
+        (DEFAULT_RING_LOWBIT if lowbit else DEFAULT_RING)[D],
+        "auto",
+        0,
+        1,
+        small="rep" if lowbit else "swap",
     )
 
 

@@ -1,28 +1,31 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The conversion stage of the fp8-KV kernels (classes ``attention.e4m3kv`` / ``attention.e5m2kv``): the load warp and the two
-otherwise idle warps of the last warpgroup (``operands.Roles.convert_warps``, 96 threads) read the fp8 K and V tiles of every unit
-from global memory, widen each element to bf16 and write the ring slot bytes the TMA producer writes for a bf16 cache holding those
-values. The MMA warp, the softmax and the correction consume the ring exactly as in the bf16 kernel: the conversion is a
-placement of the class's exact ``widen`` leaves (``spec.kv_widen``), never an arithmetic step.
+"""The conversion stage of the fp8-KV kernels (classes ``attention.e4m3kv`` / ``attention.e5m2kv``): the load warp's TMA brings the
+raw fp8 K and V tiles of every unit into a staging buffer (``stage_unit``: the page boxes of the bf16 producer, one byte per
+element), and the conversion warps (``operands.Roles.convert_warps``) widen each element to bf16 and write the ring slot bytes the
+TMA producer writes for a bf16 cache holding those values (``convert_unit``). The MMA warp, the softmax and the correction consume
+the ring exactly as in the bf16 kernel: the conversion is a placement of the class's exact ``widen`` leaves (``spec.kv_widen``),
+never an arithmetic step.
 
-The NVFP4 variant (``st.fp4``) reads 8 packed bytes (16 e2m1 nibbles of one key) and the block's e4m3 scale byte per group and
-forms ``value * scale`` in binary32 (``cvt.rn.f16x2.e2m1x2`` / ``cvt.rn.f16x2.e4m3x2``, ``cvt.f32.f16``, ``mul.rn.f32``): a
-product of at most six significant bits within the bf16 range, exact at every step, then ``cvt.rn.bf16x2.f32`` moves bits. The
-ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``).
+The NVFP4 variant (``st.fp4``) stages 8 packed bytes (16 e2m1 nibbles of one key) per group, reads the block's e4m3 scale byte
+from global memory and forms ``value * scale`` in binary32 (``cvt.rn.f16x2.e2m1x2`` / ``cvt.rn.f16x2.e4m3x2``, ``cvt.f32.f16``,
+``mul.rn.f32``): a product of at most six significant bits within the bf16 range, exact at every step, then ``cvt.rn.bf16x2.f32``
+moves bits. The ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``).
 
 Exactness: every e4m3 and e5m2 value is a binary16 value, every binary16 value is a binary32 value, and every fp8 value has at most
 four significant bits, so the hardware chain ``cvt.rn.f16x2.<fmt>x2`` -> ``cvt.f32.f16`` -> ``cvt.rn.bf16x2.f32`` moves bits and
-rounds nothing (a NaN stays a NaN, an e5m2 infinity an infinity). The elements of a 16-byte global load (16 consecutive ``d`` of one
-key) land in two 16-byte granules of the SW128-swizzled slot (``mma.zero_v_tail`` addresses the same swizzle), so the slot ends up
+rounds nothing (a NaN stays a NaN, an e5m2 infinity an infinity). The 16 elements of a group (16 consecutive ``d`` of one key)
+land in two 16-byte granules of the SW128-swizzled slot (``mma.zero_v_tail`` addresses the same swizzle), so the slot ends up
 with element ``(key, d)`` at ``(d % 64) + 64 key + slot_keys * 64 * (d // 64)`` before the swizzle, as ``operands.ring_view_layout``
 places it.
 
-The slot order is the TMA producer's (``producer.load_loop``: ``K_lo``, then per tile ``K_{n+1}, V_n``, or with two S stages
-``K_lo, K_{lo+1}`` then ``V_n, K_{n+2}``), so the MMA warp's consumer sequence is unchanged; the ring pipeline is a thread-to-UMMA
-pipeline (``PipelineAsyncUmma``) whose full barrier takes the 96 arrivals after each thread's ``fence.proxy.async``. Keys past
-the request's pages read a clamped valid page (the TMA producer's rule) and keys past a ragged pool its last token: the softmax
-masks them and the MMA warp zeroes the V tail, as for the junk of a bf16 pool.
+A staging stage is ``raw_keys`` keys of raw cache rows (``operands.StaticPlan``); a ring slot is ``raw_per_slot``
+consecutive stages. The stage order is the TMA producer's slot order (``producer.load_loop``: ``K_lo``, then per tile
+``K_{n+1}, V_n``, or with two S stages ``K_lo, K_{lo+1}`` then ``V_n, K_{n+2}``), so the MMA warp's consumer sequence is
+unchanged; the ring pipeline is a thread-to-UMMA pipeline (``PipelineAsyncUmma``) whose full barrier takes one arrival per
+conversion thread after its ``fence.proxy.async``. Keys past the request's pages stage a clamped valid page (the TMA producer's
+rule) and keys past a ragged pool are zero-filled by the TMA: the softmax masks them and the MMA warp zeroes the V tail, as for
+the junk of a bf16 pool.
 """
 
 from __future__ import annotations
@@ -34,12 +37,13 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .operands import HALF
 from .producer import load_q_tile, q_tx_bytes
 
-GROUP = 16  # elements per conversion group: one 16-byte global load of one key's consecutive d, two 16-byte ring granules
+GROUP = 16  # elements per conversion group: 16 consecutive d of one key (16 staged bytes, 8 for NVFP4), two 16-byte ring granules
 
 
 def _cvt_asm(cvt: str) -> str:
@@ -214,103 +218,399 @@ def dequant_group(r_in: cute.Tensor, sf: Float32, r_out: cute.Tensor):
         r_out[4 * j + 3] = w3
 
 
+SF_AHEAD = 4  # rounds the NVFP4 block scale of a group is read from global memory ahead of its conversion
+
+
+@cute.jit
+def sf_offset(
+    st, mSF: cute.Tensor, blk: Int32, tok: Int32, kv_head: Int32, page_id: Int32
+):
+    """The offset in the NVFP4 block scales ``mSF`` (``(D / 16, page, Hkv, num_pages)`` bytes) of block ``blk`` of token ``tok``
+    of page ``page_id`` (the linear layout: the cache's own geometry)."""
+    return cute.crd2idx((blk, tok, kv_head, page_id), mSF.layout)
+
+
+@cute.jit
+def load_sf(
+    st,
+    key: Int32,
+    ka0: Int32,
+    blk: Int32,
+    pg0: Int32,
+    mSF: cute.Tensor,
+    sPg: cute.Tensor,
+    kv_ptr0: Int32,
+    kv_head: Int32,
+    r_sf: cute.Tensor,
+):
+    """The e4m3 block scale byte of block ``blk`` of stage key ``key`` (clamped to the stage; absolute key ``ka0 + key``) into
+    ``r_sf[0]``. The key's page is the one the load warp staged its cache bytes from (``sPg[pg0 + box]``); a ragged pool clamps
+    the token to the pool."""
+    if key > st.raw_keys - 1:
+        key = Int32(st.raw_keys - 1)
+    ka = ka0 + key
+    if cutlass.const_expr(st.ragged):
+        tok = kv_ptr0 + ka
+        last = mSF.shape[1] - 1
+        if tok > last:
+            tok = last
+        sfoff = sf_offset(st, mSF, blk, tok, kv_head, Int32(0))
+    else:
+        page_id = sPg[pg0 + key // st.raw_box_rows]
+        sfoff = sf_offset(st, mSF, blk, ka % st.page, kv_head, page_id)
+    r_sf[0] = cute.make_tensor(mSF.iterator + sfoff, cute.make_layout((1,)))[0].to(
+        Uint32
+    )
+
+
+@cute.jit
+def stage_slot(
+    st,
+    key0: Int32,
+    raw_prod,
+    atom: cute.CopyAtom,
+    tg: cute.Tensor,
+    ts: cute.Tensor,
+    sPg: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+    kv_head: Int32,
+):
+    """The raw cache bytes of one ring slot (``slot_keys`` keys of K or V from absolute key ``key0``): ``raw_per_slot`` staging
+    stages, each acquired and filled by ``raw_boxes`` TMA boxes of ``raw_box_rows`` keys of one page (``producer.issue_slot``'s
+    page and ragged addressing). The NVFP4 kernels record every box's page in the stage's side entries ``sPg`` before the box
+    is issued (the conversion threads address the block scales with it)."""
+    page = st.page
+    for sub in cutlass.range_constexpr(st.raw_per_slot):
+        h = raw_prod.acquire_and_advance()
+        for i in cutlass.range_constexpr(st.raw_boxes):
+            k0 = key0 + sub * st.raw_keys + i * st.raw_box_rows
+            if cutlass.const_expr(st.ragged):
+                for half in cutlass.range_constexpr(st.raw_halves):
+                    cute.copy(
+                        atom,
+                        tg[(None, (half, k0 // st.raw_box_rows, kv_head, 0))],
+                        ts[(None, i, half, h.index)],
+                        tma_bar_ptr=h.barrier,
+                    )
+            else:
+                pslot = k0 // page
+                if cutlass.const_expr(page <= st.raw_keys):
+                    box_in_page = Int32(0)
+                else:
+                    box_in_page = (k0 % page) // st.raw_box_rows
+                if pslot > n_pages - 1:
+                    pslot = n_pages - 1
+                page_id = mKvIndices[kv_ptr0 + pslot]
+                if cutlass.const_expr(st.fp4):
+                    sPg[h.index * st.raw_boxes + i] = page_id
+                for half in cutlass.range_constexpr(st.raw_halves):
+                    cute.copy(
+                        atom,
+                        tg[(None, (half, box_in_page, kv_head, page_id))],
+                        ts[(None, i, half, h.index)],
+                        tma_bar_ptr=h.barrier,
+                    )
+    return raw_prod
+
+
+@cute.jit
+def stage_tile(
+    st,
+    t: Int32,
+    raw_prod,
+    atom: cute.CopyAtom,
+    tg: cute.Tensor,
+    ts: cute.Tensor,
+    sPg: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+    kv_head: Int32,
+):
+    """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``producer.issue_tile``)."""
+    for sl in cutlass.range_constexpr(st.slots_per_tile):
+        raw_prod = stage_slot(
+            st,
+            t * st.T + sl * st.slot_keys,
+            raw_prod,
+            atom,
+            tg,
+            ts,
+            sPg,
+            mKvIndices,
+            kv_ptr0,
+            n_pages,
+            kv_head,
+        )
+    return raw_prod
+
+
+@cute.jit
+def stage_unit(
+    st,
+    raw_prod,
+    atom_k: cute.CopyAtom,
+    tK: cute.Tensor,
+    atom_v: cute.CopyAtom,
+    tV: cute.Tensor,
+    sRaw_view: cute.Tensor,
+    sPg: cute.Tensor,
+    mKvIndptr: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    req: Int32,
+    kv_head: Int32,
+    tile_lo: Int32,
+    tile_hi: Int32,
+):
+    """The raw K and V tiles of one unit into the staging buffer, in the TMA producer's slot order (``producer.load_loop``)."""
+    LA = st.qk_ahead
+    kv_ptr0 = mKvIndptr[req]
+    n_pages = mKvIndptr[req + 1] - kv_ptr0
+    if cutlass.const_expr(st.ragged):
+        tK = cute.domain_offset((0, kv_ptr0, 0, 0), tK)
+        tV = cute.domain_offset((0, kv_ptr0, 0, 0), tV)
+    box = (st.raw_bw, st.raw_box_rows, 1, 1)
+    gK = cute.zipped_divide(tK, box)
+    gV = cute.zipped_divide(tV, box)
+    sRg = cute.group_modes(
+        sRaw_view, 0, 4
+    )  # ((raw_bw, rows, 1, 1), boxes, halves, stages)
+    tKsK, tKgK = cpasync.tma_partition(atom_k, 0, cute.make_layout(1), sRg, gK)
+    tVsV, tVgV = cpasync.tma_partition(atom_v, 0, cute.make_layout(1), sRg, gV)
+    N = tile_hi - tile_lo
+    raw_prod = stage_tile(
+        st,
+        tile_lo,
+        raw_prod,
+        atom_k,
+        tKgK,
+        tKsK,
+        sPg,
+        mKvIndices,
+        kv_ptr0,
+        n_pages,
+        kv_head,
+    )
+    if cutlass.const_expr(LA == 2):
+        if N > 1:
+            raw_prod = stage_tile(
+                st,
+                tile_lo + 1,
+                raw_prod,
+                atom_k,
+                tKgK,
+                tKsK,
+                sPg,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+        for n in range(N):
+            raw_prod = stage_tile(
+                st,
+                tile_lo + n,
+                raw_prod,
+                atom_v,
+                tVgV,
+                tVsV,
+                sPg,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+            if n + 2 < N:
+                raw_prod = stage_tile(
+                    st,
+                    tile_lo + n + 2,
+                    raw_prod,
+                    atom_k,
+                    tKgK,
+                    tKsK,
+                    sPg,
+                    mKvIndices,
+                    kv_ptr0,
+                    n_pages,
+                    kv_head,
+                )
+    else:
+        for n in range(N):
+            if n + 1 < N:
+                raw_prod = stage_tile(
+                    st,
+                    tile_lo + n + 1,
+                    raw_prod,
+                    atom_k,
+                    tKgK,
+                    tKsK,
+                    sPg,
+                    mKvIndices,
+                    kv_ptr0,
+                    n_pages,
+                    kv_head,
+                )
+            raw_prod = stage_tile(
+                st,
+                tile_lo + n,
+                raw_prod,
+                atom_v,
+                tVgV,
+                tVsV,
+                sPg,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+    return raw_prod
+
+
+@cute.jit
+def load_group(st, key: Int32, rbase: Int32, sRaw: cute.Tensor, r_g8: cute.Tensor):
+    """The staged bytes of one group (stage key ``key``, clamped to the stage; ``rbase`` the byte offset of the thread's ``d0`` of
+    the stage's key 0) into ``r_g8``."""
+    EB = GROUP // 2 if st.fp4 else GROUP
+    if key > st.raw_keys - 1:
+        key = Int32(st.raw_keys - 1)
+    if cutlass.const_expr(st.raw_box_stride == st.raw_bw * st.raw_box_rows):
+        koff = key * st.raw_bw
+    else:
+        koff = (key // st.raw_box_rows) * st.raw_box_stride + (
+            key % st.raw_box_rows
+        ) * st.raw_bw
+    cute.autovec_copy(
+        cute.make_tensor(
+            sRaw.iterator + cute.assume(rbase + koff, divby=EB),
+            cute.make_layout((EB,)),
+        ),
+        r_g8,
+    )
+
+
 @cute.jit
 def convert_slot(
     st,
     key0: Int32,
     kv_prod,
-    mKV: cute.Tensor,
+    raw_cons,
     mSF: cute.Tensor,
     sKV_u32: cute.Tensor,
-    mKvIndices: cute.Tensor,
+    sRaw: cute.Tensor,
+    sPg: cute.Tensor,
     kv_ptr0: Int32,
-    n_pages: Int32,
     kv_head: Int32,
     ctid: Int32,
 ):
-    """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) of the low-bit cache ``mKV`` (``(D, page, Hkv,
-    num_pages)`` bytes for fp8, ``(D / 2, ...)`` packed nibbles for NVFP4 with the block scales ``mSF`` ``(D / 16, ...)``; under
-    ``st.ragged`` one page of ``total_kv`` tokens): acquire it, convert the slot's ``slot_keys x D`` elements in 16-element groups
-    dealt round-robin over the stage's threads, fence and commit."""
+    """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) from its staged raw bytes (``sRaw``: fp8 bytes, or
+    packed NVFP4 nibbles with the block scales ``mSF`` ``(D / 16, page, Hkv, num_pages)`` read from global memory through the
+    stage's page entries ``sPg``): acquire it, convert stage after stage in 16-element groups and commit. Thread ``ctid`` of the stage holds group ``ctid % (D / 16)`` of the
+    keys ``ctid // (D / 16) + round * KPI`` of a stage; the loop is compact and reads a round ahead of its conversion."""
     CT = st.roles.convert_threads
     GPK = st.D // GROUP  # groups per key
-    n_groups = st.slot_keys * GPK
+    KPI = CT // GPK  # keys the stage's threads cover per round
+    NI = (st.raw_keys + KPI - 1) // KPI
     EB = GROUP // 2 if st.fp4 else GROUP  # bytes of one group in the cache
+    EW = EB // 4
     h = kv_prod.acquire_and_advance()
-    r_in = cute.make_rmem_tensor(cute.make_layout((EB // 4,)), Uint32)
+    r_in = cute.make_rmem_tensor(cute.make_layout((2 * EW,)), Uint32)
     r_in8 = cute.make_tensor(
-        cute.recast_ptr(r_in.iterator, dtype=cutlass.Uint8), cute.make_layout((EB,))
+        cute.recast_ptr(r_in.iterator, dtype=cutlass.Uint8),
+        cute.make_layout((2 * EB,)),
     )
+    r_sf = cute.make_rmem_tensor(cute.make_layout((SF_AHEAD + 1,)), Uint32)
     r_out = cute.make_rmem_tensor(cute.make_layout((GROUP // 2,)), Uint32)
-    for i in cutlass.range_constexpr((n_groups + CT - 1) // CT):
-        gidx = ctid + i * CT
-        if gidx < n_groups:
-            key = gidx // GPK
-            d0 = (gidx % GPK) * GROUP
-            ka = key0 + key
-            e0 = (
-                d0 // 2 if cutlass.const_expr(st.fp4) else d0
-            )  # the group's first byte in the cache row
-            if cutlass.const_expr(st.ragged):
-                tok = kv_ptr0 + ka
-                last = mKV.shape[1] - 1
-                if tok > last:
-                    tok = last
-                off = cute.crd2idx((e0, tok, kv_head, Int32(0)), mKV.layout)
-                if cutlass.const_expr(st.fp4):
-                    sfoff = cute.crd2idx(
-                        (d0 // GROUP, tok, kv_head, Int32(0)), mSF.layout
-                    )
-            else:
-                pslot = ka // st.page
-                if pslot > n_pages - 1:
-                    pslot = n_pages - 1
-                page_id = mKvIndices[kv_ptr0 + pslot]
-                off = cute.crd2idx((e0, ka % st.page, kv_head, page_id), mKV.layout)
-                if cutlass.const_expr(st.fp4):
-                    sfoff = cute.crd2idx(
-                        (d0 // GROUP, ka % st.page, kv_head, page_id), mSF.layout
-                    )
-            cute.autovec_copy(
-                cute.make_tensor(
-                    mKV.iterator + cute.assume(off, divby=EB),
-                    cute.make_layout((EB,)),
-                ),
-                r_in8,
+    kt = ctid // GPK
+    d0 = (ctid % GPK) * GROUP
+    e0 = (
+        d0 // 2 if cutlass.const_expr(st.fp4) else d0
+    )  # the group's first byte in the cache row
+    for sub in cutlass.range_constexpr(st.raw_per_slot):
+        rh = raw_cons.wait_and_advance()
+        rbase = (
+            rh.index * st.raw_stage_bytes
+            + (e0 // st.raw_bw) * st.raw_half_bytes
+            + e0 % st.raw_bw
+        )
+        skey = sub * st.raw_keys
+        pg0 = rh.index * st.raw_boxes
+        load_group(st, kt, rbase, sRaw, r_in8)
+        if cutlass.const_expr(st.fp4):
+            for a in cutlass.range_constexpr(SF_AHEAD):
+                load_sf(
+                    st,
+                    kt + a * KPI,
+                    key0 + skey,
+                    d0 // GROUP,
+                    pg0,
+                    mSF,
+                    sPg,
+                    kv_ptr0,
+                    kv_head,
+                    cute.make_tensor(r_sf.iterator + a, cute.make_layout((1,))),
+                )
+        for i in cutlass.range(NI, unroll=1):
+            key = kt + i * KPI
+            load_group(
+                st,
+                key + KPI,
+                rbase,
+                sRaw,
+                cute.make_tensor(r_in8.iterator + EB, cute.make_layout((EB,))),
             )
             if cutlass.const_expr(st.fp4):
-                sf_byte = cute.make_tensor(
-                    mSF.iterator + sfoff, cute.make_layout((1,))
-                )[0]
-                dequant_group(r_in, e4m3_byte_to_f32(sf_byte.to(Uint32)), r_out)
-            else:
-                widen_group(st, r_in, r_out)
-            # the two 16-byte granules of the group in the SW128 slot (bf16 element offsets, then 32-bit words)
-            base = (
-                h.index * st.kv_slot_elems
-                + (d0 // HALF) * (st.slot_keys * HALF)
-                + key * HALF
-            )
-            gran = (d0 % HALF) // 8
-            g0 = base + ((gran ^ (key % 8)) * 8)
-            g1 = base + (((gran + 1) ^ (key % 8)) * 8)
-            cute.autovec_copy(
-                cute.make_tensor(r_out.iterator, cute.make_layout((4,))),
-                cute.make_tensor(
-                    sKV_u32.iterator + cute.assume(g0 // 2, divby=4),
-                    cute.make_layout((4,)),
-                ),
-            )
-            cute.autovec_copy(
-                cute.make_tensor(r_out.iterator + 4, cute.make_layout((4,))),
-                cute.make_tensor(
-                    sKV_u32.iterator + cute.assume(g1 // 2, divby=4),
-                    cute.make_layout((4,)),
-                ),
-            )
+                load_sf(
+                    st,
+                    key + SF_AHEAD * KPI,
+                    key0 + skey,
+                    d0 // GROUP,
+                    pg0,
+                    mSF,
+                    sPg,
+                    kv_ptr0,
+                    kv_head,
+                    cute.make_tensor(r_sf.iterator + SF_AHEAD, cute.make_layout((1,))),
+                )
+            if key < st.raw_keys:
+                if cutlass.const_expr(st.fp4):
+                    dequant_group(r_in, e4m3_byte_to_f32(r_sf[0]), r_out)
+                else:
+                    widen_group(st, r_in, r_out)
+                # the two 16-byte granules of the group in the SW128 slot (bf16 element offsets, then 32-bit words)
+                skk = skey + key
+                base = (
+                    h.index * st.kv_slot_elems
+                    + (d0 // HALF) * (st.slot_keys * HALF)
+                    + skk * HALF
+                )
+                gran = (d0 % HALF) // 8
+                g0 = base + ((gran ^ (skk % 8)) * 8)
+                g1 = base + (((gran + 1) ^ (skk % 8)) * 8)
+                cute.autovec_copy(
+                    cute.make_tensor(r_out.iterator, cute.make_layout((4,))),
+                    cute.make_tensor(
+                        sKV_u32.iterator + cute.assume(g0 // 2, divby=4),
+                        cute.make_layout((4,)),
+                    ),
+                )
+                cute.autovec_copy(
+                    cute.make_tensor(r_out.iterator + 4, cute.make_layout((4,))),
+                    cute.make_tensor(
+                        sKV_u32.iterator + cute.assume(g1 // 2, divby=4),
+                        cute.make_layout((4,)),
+                    ),
+                )
+            for j in cutlass.range_constexpr(EW):
+                r_in[j] = r_in[EW + j]
+            if cutlass.const_expr(st.fp4):
+                for a in cutlass.range_constexpr(SF_AHEAD):
+                    r_sf[a] = r_sf[a + 1]
+        rh.release()
     cute.arch.fence_view_async_shared()
     h.commit()
-    return kv_prod
+    return kv_prod, raw_cons
 
 
 @cute.jit
@@ -318,141 +618,141 @@ def convert_tile(
     st,
     t: Int32,
     kv_prod,
-    mKV: cute.Tensor,
+    raw_cons,
     mSF: cute.Tensor,
     sKV_u32: cute.Tensor,
-    mKvIndices: cute.Tensor,
+    sRaw: cute.Tensor,
+    sPg: cute.Tensor,
     kv_ptr0: Int32,
-    n_pages: Int32,
     kv_head: Int32,
     ctid: Int32,
 ):
     """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``producer.issue_tile``)."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
-        kv_prod = convert_slot(
+        kv_prod, raw_cons = convert_slot(
             st,
             t * st.T + sl * st.slot_keys,
             kv_prod,
-            mKV,
+            raw_cons,
             mSF,
             sKV_u32,
-            mKvIndices,
+            sRaw,
+            sPg,
             kv_ptr0,
-            n_pages,
             kv_head,
             ctid,
         )
-    return kv_prod
+    return kv_prod, raw_cons
 
 
 @cute.jit
 def convert_unit(
     st,
     kv_prod,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
+    raw_cons,
     mKsf: cute.Tensor,
     mVsf: cute.Tensor,
     sKV_u32: cute.Tensor,
+    sRaw: cute.Tensor,
+    sPg: cute.Tensor,
     mKvIndptr: cute.Tensor,
-    mKvIndices: cute.Tensor,
     req: Int32,
     kv_head: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
     ctid: Int32,
 ):
-    """The K and V tiles of one unit into the ring, in the TMA producer's slot order (``producer.load_loop``)."""
+    """The staged K and V tiles of one unit into the ring, in the TMA producer's slot order (``producer.load_loop``): the order
+    ``stage_unit`` staged them in."""
     LA = st.qk_ahead
     kv_ptr0 = mKvIndptr[req]
-    n_pages = mKvIndptr[req + 1] - kv_ptr0
     N = tile_hi - tile_lo
-    kv_prod = convert_tile(
+    kv_prod, raw_cons = convert_tile(
         st,
         tile_lo,
         kv_prod,
-        mK,
+        raw_cons,
         mKsf,
         sKV_u32,
-        mKvIndices,
+        sRaw,
+        sPg,
         kv_ptr0,
-        n_pages,
         kv_head,
         ctid,
     )
     if cutlass.const_expr(LA == 2):
         if N > 1:
-            kv_prod = convert_tile(
+            kv_prod, raw_cons = convert_tile(
                 st,
                 tile_lo + 1,
                 kv_prod,
-                mK,
+                raw_cons,
                 mKsf,
                 sKV_u32,
-                mKvIndices,
+                sRaw,
+                sPg,
                 kv_ptr0,
-                n_pages,
                 kv_head,
                 ctid,
             )
         for n in range(N):
-            kv_prod = convert_tile(
+            kv_prod, raw_cons = convert_tile(
                 st,
                 tile_lo + n,
                 kv_prod,
-                mV,
+                raw_cons,
                 mVsf,
                 sKV_u32,
-                mKvIndices,
+                sRaw,
+                sPg,
                 kv_ptr0,
-                n_pages,
                 kv_head,
                 ctid,
             )
             if n + 2 < N:
-                kv_prod = convert_tile(
+                kv_prod, raw_cons = convert_tile(
                     st,
                     tile_lo + n + 2,
                     kv_prod,
-                    mK,
+                    raw_cons,
                     mKsf,
                     sKV_u32,
-                    mKvIndices,
+                    sRaw,
+                    sPg,
                     kv_ptr0,
-                    n_pages,
                     kv_head,
                     ctid,
                 )
     else:
         for n in range(N):
             if n + 1 < N:
-                kv_prod = convert_tile(
+                kv_prod, raw_cons = convert_tile(
                     st,
                     tile_lo + n + 1,
                     kv_prod,
-                    mK,
+                    raw_cons,
                     mKsf,
                     sKV_u32,
-                    mKvIndices,
+                    sRaw,
+                    sPg,
                     kv_ptr0,
-                    n_pages,
                     kv_head,
                     ctid,
                 )
-            kv_prod = convert_tile(
+            kv_prod, raw_cons = convert_tile(
                 st,
                 tile_lo + n,
                 kv_prod,
-                mV,
+                raw_cons,
                 mVsf,
                 sKV_u32,
-                mKvIndices,
+                sRaw,
+                sPg,
                 kv_ptr0,
-                n_pages,
                 kv_head,
                 ctid,
             )
-    return kv_prod
+    return kv_prod, raw_cons
 
 
 @cute.jit
