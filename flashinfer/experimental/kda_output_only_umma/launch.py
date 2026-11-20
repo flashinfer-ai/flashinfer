@@ -29,8 +29,9 @@ def kda_oo_umma_unavailable_reason(device: torch.device, T: int) -> Optional[str
 
 
 # backend="auto" (with FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1) picks this kernel
-# up to this many tokens: B200 / H=12 measured it 1.05-1.28x faster than the WY
-# kernel at T <= 8 (dense) and 1.12-1.89x (drop-in), but 0.80-0.97x at T = 16.
+# up to this many tokens: B200 / H=12 (ncu, B 1-2048) measured it 1.03-1.25x faster
+# than the WY kernel at T <= 8 (dense) and 1.14-2.02x (drop-in); at T = 16 it is
+# about even (dense 0.96-0.98x at B >= 512, drop-in 0.94-1.06x), so not selected.
 _AUTO_T_MAX = 8
 
 
@@ -41,15 +42,17 @@ def kda_oo_umma_auto_ok(device: torch.device, T: int) -> bool:
 
 
 # Persistent grid (CTAs stride over the work items) where it measured faster on B200
-# (H=12, B 512-2048): T > 8 (both entries, 1.04-1.12x) and the drop-in at T <= 4
-# (1.03-1.05x); elsewhere one item per CTA. Tests set _PERSISTENT to force either.
+# (H=12, ncu, B 16-2048): T > 8 (dense 1.04-1.10x, drop-in 1.09-1.12x) and T <= 4
+# (dense T=1 up to 1.05x, drop-in 1.03-1.05x, else even); at 5 <= T <= 8 one item
+# per CTA (persistent 0-2 % slower dense, up to 10 % drop-in). Tests set _PERSISTENT
+# to force either grid.
 _PERSISTENT: Optional[bool] = None
 
 
-def _use_persistent(T: int, vllm_dropin: bool) -> bool:
+def _use_persistent(T: int) -> bool:
     if _PERSISTENT is not None:
         return _PERSISTENT
-    return T > 8 or (vllm_dropin and T <= 4)
+    return T <= 4 or T > 8
 
 
 def run_kda_oo_umma(
@@ -88,7 +91,7 @@ def run_kda_oo_umma(
     min_blocks = (
         1 if tuple(torch.cuda.get_device_capability(device)) == (10, 7) else None
     )
-    persistent = _use_persistent(T, vllm_dropin)
+    persistent = _use_persistent(T)
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     key = (
         gdn_device_target(device).compile_key,

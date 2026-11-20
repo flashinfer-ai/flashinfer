@@ -25,9 +25,10 @@ argument list and contract unchanged.
 ## Limitations
 
 SM10x only (tcgen05); K == V == 128; bf16 inputs and state pool (as the WY
-kernel); T in [1, 16]. Faster than the WY kernel at T <= 8 (B200, H = 12:
-1.05-1.28x dense, 1.12-1.89x drop-in) and slower at T = 16 (0.80-0.97x). Kernels
-are JIT-compiled per process.
+kernel); T in [1, 16]. B200, H = 12, ncu: faster than the WY kernel at T <= 8
+(1.03-1.25x dense, 1.14-2.02x drop-in); at T = 16 about even (dense 0.96-1.16x,
+0.96-0.98x at B >= 512; drop-in 0.94-1.06x), so automatic selection stays at
+T <= 8. Kernels are JIT-compiled per process.
 
 Shared with the WY kernel (not checked; same behaviour on both backends unless
 noted):
