@@ -68,6 +68,8 @@ def run_gemm_test(args):
         return testGroupedMm(args)
     elif args.routine == "mm_nvfp4_svdquant":
         return testMmNvfp4Svdquant(args)
+    elif args.routine == "mm_mxfp8_mxfp4":
+        return testMmMxfp8Mxfp4(args)
     elif args.routine == "fused_linear":
         return testFusedLinear(args)
     else:
@@ -231,7 +233,7 @@ def parse_gemm_args(line, parser):
         type=int,
         required=False,
         default=None,
-        help="masked_grouped_gemm: mean valid rows per group (default: m // 2).",
+        help="masked_grouped_gemm: requested mean valid rows per group (default: m // 2). The CSV records this request; the log prints the mean actually drawn.",
     )
     parser.add_argument(
         "--rank",
@@ -286,6 +288,7 @@ def parse_gemm_args(line, parser):
         "group_gemm_mxfp4_nt_groupwise": ["cutlass"],
         "mm_nvfp4_svdquant": ["cutlass"],
         "fused_linear": ["prims-ts"],
+        "mm_mxfp8_mxfp4": ["batch_invariant"],
     }
     if args.routine in default_backends and not has_backends_arg:
         args.backends = list(default_backends[args.routine])
@@ -413,7 +416,7 @@ def testGemmFp8NtGroupwise(args):
     if input_dtype != torch.float8_e4m3fn or scale_granularity_m != 1:
         for backend in [b for b in backends if b != "cutlass"]:
             print(
-                f"[INFO] {backend} only supports fp8_e4m3 with 1x{tile_size} A scales, removing {backend} from backends"
+                f"[WARNING] {backend} only supports fp8_e4m3 with 1x{tile_size} A scales, removing {backend} from backends"
             )
             backends.remove(backend)
 
@@ -421,18 +424,20 @@ def testGemmFp8NtGroupwise(args):
         remove_trtllm = False
         if scale_major_mode != "MN":
             print(
-                "[INFO] trtllm only supports MN scale_major_mode, removing trtllm from backends"
+                "[WARNING] trtllm only supports MN scale_major_mode, removing trtllm from backends"
             )
             remove_trtllm = True
         if k < 256 or k % 256 != 0:
             # The API only checks k >= 256; k % 256 == 128 aborts inside the
             # kernel runner ("unsupported tactic id") instead of raising.
             print(
-                "[INFO] trtllm only supports k >= 256 and k % 256 == 0, removing trtllm from backends"
+                "[WARNING] trtllm only supports k >= 256 and k % 256 == 0, removing trtllm from backends"
             )
             remove_trtllm = True
         if out_dtype != torch.bfloat16:
-            print("[INFO] trtllm only writes bfloat16, removing trtllm from backends")
+            print(
+                "[WARNING] trtllm only writes bfloat16, removing trtllm from backends"
+            )
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
@@ -716,7 +721,7 @@ def testGroupGemmFp8NtGroupwise(args):
     for backend in ["cutile", "deepgemm", "cute-dsl"]:
         if backend in backends and scale_major_mode != "K":
             print(
-                f"[INFO] {backend} only supports K scale_major_mode, removing {backend} from backends"
+                f"[WARNING] {backend} only supports K scale_major_mode, removing {backend} from backends"
             )
             backends.remove(backend)
     if len(backends) == 0:
@@ -770,7 +775,7 @@ def testGroupGemmFp8NtGroupwise(args):
             )
         except Exception as e:
             print(
-                f"[INFO] deepgemm backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] deepgemm backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends.remove("deepgemm")
 
@@ -786,7 +791,7 @@ def testGroupGemmFp8NtGroupwise(args):
         # check the boundaries (validate_indices=False), so an unaligned group
         # would silently use the wrong weights.
         print(
-            "[INFO] cute-dsl needs expert boundaries on 128 rows (m % 128 == 0), removing cute-dsl from backends"
+            "[WARNING] cute-dsl needs expert boundaries on 128 rows (m % 128 == 0), removing cute-dsl from backends"
         )
         backends.remove("cute-dsl")
 
@@ -1044,7 +1049,7 @@ def testBmmFp8(args):
             run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s)
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
 
@@ -1495,7 +1500,7 @@ def testBmmMxfp8(args):
     mxfp8_out = res_dtype == torch.float8_e4m3fn
     if mxfp8_out:
         for cur_backend in [b for b in backends if b != "cute-dsl"]:
-            print(f"[INFO] {cur_backend} backend does not support fp8_e4m3 output")
+            print(f"[WARNING] {cur_backend} backend does not support fp8_e4m3 output")
             backends.remove(cur_backend)
     ## Done parsing input arguments
 
@@ -1744,7 +1749,7 @@ def testMmFp4(args):
     if "prims-ts" in backends and not (use_nvfp4 and use_128x4_sf_layout):
         # flashinfer.gemm.fp4_linear: NVFP4 with 128x4 block scales only.
         print(
-            "[INFO] prims-ts only supports --use_nvfp4 with --use_128x4_sf_layout, removing prims-ts from backends"
+            "[WARNING] prims-ts only supports --use_nvfp4 with --use_128x4_sf_layout, removing prims-ts from backends"
         )
         backends.remove("prims-ts")
     if len(backends) == 0:
@@ -1790,7 +1795,7 @@ def testMmFp4(args):
             )
         except Exception as e:
             print(
-                f"[INFO] trtllm backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] trtllm backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends.remove("trtllm")
 
@@ -1900,7 +1905,7 @@ def testMmFp4(args):
             )
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
 
@@ -2186,7 +2191,7 @@ def testMmBf16Fp4(args):
             backend_runners[backend] = runner
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
 
@@ -2696,7 +2701,7 @@ def testMmBf16(args):
             run_backend(backend, a, b, bias, use_pdl, out_dtype)
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
 
@@ -2925,7 +2930,7 @@ def testTinygemmBf16(args):
             tinygemm_bf16(input, weight, outs[backend], bias=bias, use_pdl=use_pdl)
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
 
@@ -3111,7 +3116,7 @@ def testBmmBf16(args):
             )
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
 
@@ -3683,7 +3688,7 @@ def testMaskedGroupedGemm(args):
     for backend in list(backends):
         if dtype not in _MASKED_GROUPED_GEMM_DTYPES.get(backend, []):
             print(
-                f"[INFO] {backend} does not implement masked_grouped_gemm with input_dtype {dtype}, removing it from backends"
+                f"[WARNING] {backend} does not implement masked_grouped_gemm with input_dtype {dtype}, removing it from backends"
             )
             backends.remove(backend)
     if len(backends) == 0:
@@ -3703,11 +3708,12 @@ def testMaskedGroupedGemm(args):
     masked_m = _make_masked_m(
         G, expected_m, max_m, args.random_seed, device, align=align
     )
-    if align > 1:
-        print(
-            f"[INFO] masked_m rounded up to {align} rows for cutile {dtype}: "
-            f"mean {masked_m.float().mean().item():.1f} rows per group vs --expected_m {expected_m}"
-        )
+    # --expected_m is the request (and the CSV column); the rows drawn differ.
+    print(
+        f"[INFO] masked_m: mean {masked_m.float().mean().item():.1f} valid rows per group "
+        f"(--expected_m {expected_m}"
+        + (f", rounded up to {align} rows for cutile {dtype})" if align > 1 else ")")
+    )
     run_fns, refchecks = {}, {}
 
     for backend in list(backends):
@@ -3955,7 +3961,7 @@ def testGroupedMm(args):
     for backend in list(backends):
         if dtype not in _GROUPED_MM_DTYPES.get(backend, []):
             print(
-                f"[INFO] {backend} does not implement grouped_mm with input_dtype {dtype}, removing it from backends"
+                f"[WARNING] {backend} does not implement grouped_mm with input_dtype {dtype}, removing it from backends"
             )
             backends.remove(backend)
     if len(backends) == 0:
@@ -4255,6 +4261,105 @@ def testMmNvfp4Svdquant(args):
             "cutlass-sm120",
             "auto",
         ),
+    )
+
+
+def testMmMxfp8Mxfp4(args):
+    """
+    Test mm_mxfp8_mxfp4: MXFP8 activations (e4m3, one UE8M0 scale per 32
+    elements) times packed MXFP4 weights, a dense (m, k) x (n, k) GEMM.
+
+    The batch-invariant class is this operand pair's only dense kernel, so the
+    one backend is ``batch_invariant`` (the call passes batch_invariant=True;
+    the API has no backend argument). Operands come from the public
+    mxfp8_quantize / mxfp4_quantize in the 128x4 swizzled scale layout.
+    Refcheck: cosine similarity against the unquantized bf16 product, then the
+    bit-for-bit batch-invariance checks (sub-batch, one row, permutation).
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testMmMxfp8Mxfp4")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    m, n, k = args.m, args.n, args.k
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(f"Unsupported output dtype: {args.out_dtype}")
+    if k % 32 != 0 or n % 8 != 0:
+        raise ValueError("mm_mxfp8_mxfp4 requires k % 32 == 0 and n % 8 == 0")
+
+    a_val = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    b_val = (torch.randn(n, k, device=device) / np.sqrt(k)).to(torch.bfloat16)
+    a, a_sf = mxfp8_quantize(a_val, is_sf_swizzled_layout=True)
+    b_q, b_sf = flashinfer.mxfp4_quantize(b_val)
+    b = b_q.view(torch.uint8).t()  # the API takes the (k // 2, n) transpose
+    b_sf = b_sf.view(torch.uint8).reshape(-1).contiguous()
+    a_sf = a_sf.view(torch.uint8).reshape(-1).contiguous()
+    out = torch.empty(m, n, dtype=out_dtype, device=device)
+
+    def run(a=a, b=b, a_sf=a_sf, b_sf=b_sf, out=out):
+        return flashinfer.gemm.mm_mxfp8_mxfp4(
+            a,
+            b,
+            a_sf,
+            b_sf,
+            out_dtype=out_dtype,
+            out=out,
+            batch_invariant=True,
+            enable_pdl=args.enable_pdl,
+        )
+
+    run_fns = {"batch_invariant": run}
+    backends = _filter_and_probe(args, device, list(args.backends), run_fns)
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return []
+    refchecks = {}
+    if args.refcheck:
+        reference = a_val.float() @ b_val.float().T
+        refchecks["batch_invariant"] = lambda o: _cos_sim(reference, o)
+
+        def run_rows(rows):
+            a_rows, a_rows_sf = mxfp8_quantize(
+                a_val.index_select(0, rows), is_sf_swizzled_layout=True
+            )
+            return flashinfer.gemm.mm_mxfp8_mxfp4(
+                a_rows,
+                b,
+                a_rows_sf.view(torch.uint8).reshape(-1).contiguous(),
+                b_sf,
+                out_dtype=out_dtype,
+                batch_invariant=True,
+                enable_pdl=args.enable_pdl,
+            )
+
+        check_batch_invariance(
+            "mm_mxfp8_mxfp4/batch_invariant",
+            run_rows,
+            m,
+            run().clone(),
+            verbose=args.verbose,
+        )
+    problem_flops = 2 * m * n * k
+    problem_bytes = m * k + n * k // 2 + m * n * out_dtype.itemsize
+    return _bench_and_report(
+        args,
+        backends,
+        run_fns,
+        refchecks,
+        problem_flops,
+        problem_bytes,
+        {
+            "input_dtype": "mxfp8",
+            "out_dtype": str(out_dtype),
+            "enable_pdl": args.enable_pdl,
+        },
+        cos_sim_min=0.97,
+        autotune_backends=("batch_invariant",),
     )
 
 

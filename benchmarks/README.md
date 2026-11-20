@@ -55,7 +55,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `grouped_mm` - Ragged (`m_indptr`) grouped GEMM: cudnn (`grouped_mm_{bf16,fp8,mxfp8,fp4}`), cutile (`ragged_bmm` / `ragged_scaled_bmm`).
     - `mm_nvfp4_svdquant` - NVFP4 GEMM with a fused rank-r LoRA-up correction (SVDQuant).
     - `fused_linear` - PrimsTS dense FP8 / NVFP4 GEMM with a fused `linear`, `swiglu` or `qkv_qknorm_rope` epilogue.
-    - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
+    - `mm_mxfp8_mxfp4` - Dense MXFP8 x MXFP4 GEMM (`flashinfer.gemm.mm_mxfp8_mxfp4`). Its only kernel is the batch-invariant one, so the backend is `batch_invariant`.
+    - Batch-invariant mode: `--backends batch_invariant` runs `gemm_fp8_nt_groupwise`, `bmm_fp8`, `mm_fp4`, `mm_mxfp8`, `mm_bf16` and `mm_mxfp8_mxfp4` with `batch_invariant=True` (SM100 / SM103 / SM107). See [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
@@ -288,8 +289,8 @@ never on the batch size, the row's position in the batch or the kernel configura
   `cuda` / `cute-dsl` backends take the exact path the class computes.
 - `--autotune` makes the GEMM classes profile their top configurations through FlashInfer's autotuner (reported as
   `batch_invariant_autotune`); without it the class's dispatcher picks the configuration.
-- `log_softmax` and `log_probs` have the batch-invariant class as their only kernel, so `batch_invariant` is their
-  only backend and their default.
+- `log_softmax`, `log_probs` and `mm_mxfp8_mxfp4` have the batch-invariant class as their only kernel, so
+  `batch_invariant` is their only backend and their default.
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
@@ -335,7 +336,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend), `tinygemm_bf16`, `mm_nvfp4_svdquant`, `fused_linear` (`linear` / `swiglu` epilogues only) |
 | `--scale_granularity_m`  | `gemm_fp8_nt_groupwise`: rows per A scale; `128` benchmarks `gemm_fp8_nt_blockscaled` (CUTLASS only)       |
-| `--expected_m`           | `masked_grouped_gemm`: mean valid rows per group (default `m // 2`)                                        |
+| `--expected_m`           | `masked_grouped_gemm`: requested mean valid rows per group (default `m // 2`). The CSV column records this request; the log prints the mean actually drawn |
 | `--rank`                 | `mm_nvfp4_svdquant`: LoRA rank (multiple of 32)                                                            |
 | `--epilogue`             | `fused_linear`: `linear`, `swiglu` (output N/2) or `qkv_qknorm_rope` (N % 384 == 0)                        |
 
@@ -575,6 +576,7 @@ Legend:
 | **grouped_mm** |  | cudnn | cudnn | cudnn | cudnn, cutile | cudnn, cutile | cudnn, cutile | cudnn, cutile |
 | **mm_nvfp4_svdquant** |  |  |  |  |  | cutlass, auto | cutlass, auto | cute-dsl, cute-dsl-unfused, cutlass-sm120, auto |
 | **fused_linear** |  |  |  |  |  | prims-ts | prims-ts |  |
+| **mm_mxfp8_mxfp4** |  |  |  |  |  | batch_invariant | batch_invariant |  |
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
@@ -624,6 +626,29 @@ Legend:
 | **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
 | **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
+
+GEMM routines on the compute capabilities the table above has no column for (8.7 = Orin, 10.7 = Rubin, 11.0 = Thor, 12.1). Same source: `routine_cc_to_supported_backends` in `routines/flashinfer_benchmark_utils.py`.
+
+| GEMM routine | 8.7 | 10.7 | 11.0 | 12.1 |
+|---------|-----|-----|-----|-----|
+| **gemm_fp8_nt_groupwise** |  | cutlass, trtllm, cutile, cute-dsl, auto, batch_invariant | cutile | cutlass, cutile, auto |
+| **group_gemm_fp8_nt_groupwise** |  | cutlass, cutile, deepgemm, cute-dsl |  | cutlass, cutile |
+| **bmm_fp8** |  | cudnn, cublas, cutlass, cute-dsl, auto, batch_invariant | cudnn, cublas, cutlass, auto | cudnn, cublas, cutlass, auto |
+| **mm_fp8** |  | trtllm_low_latency, cutedsl_low_latency, cublas, cudnn, cutlass, prims-ts, auto | cublas, cudnn, cutlass, auto | cublas, cudnn, cutlass, auto |
+| **bmm_mxfp8** |  | cudnn, cute-dsl, auto | cudnn, auto | cudnn, cutlass, auto |
+| **mm_fp4** |  | cudnn, trtllm, cutlass, cute-dsl, cutedsl_low_latency, prims-ts, auto, batch_invariant | cudnn, cutlass, auto | cudnn, cutlass, cute-dsl, b12x, auto |
+| **mm_bf16_fp4** |  | cudnn, cute-dsl | cudnn, cute-dsl | cudnn, cute-dsl, cute-dsl-native |
+| **mm_mxfp8** |  | cutlass, cute-dsl, cutedsl_low_latency, trtllm, cudnn, auto, batch_invariant | cutlass, cudnn, auto | cutlass, cudnn, b12x, auto |
+| **mm_bf16** | cudnn, cublaslt, auto | cudnn, cutlass, tgv, cublaslt, tinygemm, cutile, cute-dsl, auto, batch_invariant | cudnn, cublaslt, tinygemm, cutile, auto | cudnn, cublaslt, tinygemm, cutile, auto |
+| **bmm_bf16** | cudnn, auto | cudnn, cutlass, cutile, tgv, auto | cudnn, cutile, auto | cudnn, cutile, auto |
+| **tinygemm_bf16** |  | tinygemm | tinygemm | tinygemm |
+| **router_gemm** |  | dsv3 |  |  |
+| **group_gemm_mxfp4_nt_groupwise** |  | cutlass |  | cutlass |
+| **masked_grouped_gemm** |  | deepgemm, cute-dsl | cutile | cutile |
+| **grouped_mm** |  | cudnn | cudnn, cutile | cudnn, cutile |
+| **mm_nvfp4_svdquant** |  | cutlass, auto |  | cute-dsl, cute-dsl-unfused, auto |
+| **fused_linear** |  | prims-ts |  |  |
+| **mm_mxfp8_mxfp4** |  | batch_invariant |  |  |
 
 Backend Legend:
 - fa2: FlashAttention2

@@ -47,6 +47,7 @@
 --routine bmm_fp8 --batch_size 1 --m 64 --n 4096 --k 4096 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "bmm_fp8_batch_invariant"
 --routine gemm_fp8_nt_groupwise --m 64 --n 4096 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "gemm_fp8_nt_groupwise_batch_invariant"
 --routine mm_mxfp8 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "mm_mxfp8_batch_invariant"
+--routine mm_mxfp8_mxfp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "mm_mxfp8_mxfp4_batch_invariant"
 --routine mm_fp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn cutlass batch_invariant --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command --case_tag "mm_fp4_nvfp4_batch_invariant"
 --routine mm_fp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn batch_invariant --use_128x4_sf_layout --refcheck -vv --generate_repro_command --case_tag "mm_fp4_mxfp4_batch_invariant"
 

@@ -274,6 +274,7 @@ benchmark_apis = {
         "grouped_mm",
         "mm_nvfp4_svdquant",
         "fused_linear",
+        "mm_mxfp8_mxfp4",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -970,6 +971,21 @@ routine_cc_to_supported_backends = {
         "11.0": [],
         "12.0": ["cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"],
         "12.1": ["cute-dsl", "cute-dsl-unfused", "auto"],
+    },
+    # flashinfer/gemm/gemm_mxfp8_mxfp4.py: the batch-invariant class is the
+    # pair's only dense kernel (SM100 / SM103 / SM107).
+    "mm_mxfp8_mxfp4": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["batch_invariant"],
+        "10.3": ["batch_invariant"],
+        "10.7": ["batch_invariant"],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
     },
     # flashinfer/prims_ts/gemm/api.py (fp8/fp4 linear, swiglu, qkv_qknorm_rope).
     "fused_linear": {
