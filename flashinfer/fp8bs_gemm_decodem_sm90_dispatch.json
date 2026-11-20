@@ -6,7 +6,15 @@
     "fp8_blockscale_gemm_sm90": {
       "form": "BF16 activations (internal fused 1x128 per-token-group quantization, no epsilon floor; FP32 quantization multiplier 448/amax for nonzero amax, identity for an all-zero group; reciprocal multiplier for dequantization), FP8 e4m3 weights (N, K), float32 128x128 block scale grid (ceil(N/128), K/128), BF16 output",
       "m_band": [1, 24],
-      "band_note": "the measured decode-M envelope (captured serve rows M in {1,2,4,8,12,16,24}); interior points admitted by band interpolation; larger M stays on the stock route",
+      "band_note": "Interpolate M within this inclusive band only for the paired (N,K) classes from the 12 captured H200 measurement rows. Other classes stay on stock under auto.",
+      "measured_nk_classes": [
+        [8192, 1536],
+        [2048, 7168],
+        [7168, 2048],
+        [2048, 2048],
+        [2624, 6144],
+        [6144, 2048]
+      ],
       "alignment": {"k_multiple_of": 128, "n_multiple_of": 64},
       "compute_capability": [9, 0]
     }

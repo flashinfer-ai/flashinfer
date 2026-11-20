@@ -116,7 +116,7 @@ def fp8_blockscale_gemm(
         raise ValueError(
             "fp8_blockscale_gemm: the fused-quantization FP8 block-scale "
             "GEMM contract is currently implemented on SM90 only (backends "
-            "'sm90' and 'specialized'). For pre-quantized FP8 inputs with "
+            "'deepgemm' and 'specialized'). For pre-quantized FP8 inputs with "
             "caller-computed block scales on newer architectures, use "
             "gemm_fp8_nt_blockscaled / gemm_fp8_nt_groupwise (a different "
             "contract: no fused activation quantization)."

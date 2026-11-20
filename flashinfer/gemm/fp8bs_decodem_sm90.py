@@ -14,8 +14,9 @@ Backend surface (#5667 semantics), driven from
 ``fp8_blockscale_gemm_sm90(..., backend=...)``:
 
 - ``"auto"`` (the public default) routes here only on the packaged
-  allowlist (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``);
-  otherwise it is exactly the stock route.
+  allowlist (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``): M is
+  interpolated within the decode band for measured (N, K) pairs only.
+  Otherwise it is exactly the stock route.
 - ``"specialized"`` selects this kernel explicitly; a call it cannot serve
   raises ``NotImplementedError`` with the refusal reason (also recorded in
   the dispatch stats) — an explicitly selected backend never falls back;
@@ -49,8 +50,7 @@ FP8BS_GEMM_BACKENDS = ("auto", "specialized", "deepgemm")
 
 _DISPATCH_FILE = "fp8bs_gemm_decodem_sm90_dispatch.json"
 
-# The measured decode-M envelope (captured serve rows span M in [1, 24];
-# interior points admitted by band interpolation, the study's banded form).
+# Kernel coverage limit, independent of the packaged auto policy.
 _M_MAX = 24
 # Retained for launch ABI stability; fused quantization does not use epsilon.
 _QUANT_EPS = 0.0
@@ -98,6 +98,14 @@ def _disabled() -> bool:
     return os.environ.get(SPECIALIZED_KERNEL_DISABLE_ENV, "0") not in ("", "0")
 
 
+def _positive_pair(value):
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(type(d) is int and d > 0 for d in value)
+    )
+
+
 @functools.cache
 def _dispatch_table() -> Optional[Dict[str, Any]]:
     """The packaged allowlist that gates ``backend="auto"`` routing (the
@@ -108,13 +116,49 @@ def _dispatch_table() -> Optional[Dict[str, Any]]:
 
         data = (importlib.resources.files("flashinfer") / _DISPATCH_FILE).read_text()
         table = json.loads(data)
-        if not isinstance(table.get("backends"), list):
+        if table.get("backends") != list(FP8BS_GEMM_BACKENDS):
             return None
-        if "fp8_blockscale_gemm_sm90" not in table.get("ops", {}):
+        op = table["ops"]["fp8_blockscale_gemm_sm90"]
+        band = op["m_band"]
+        if not _positive_pair(band) or not 1 <= band[0] <= band[1] <= _M_MAX:
+            return None
+        alignment = op["alignment"]
+        n_step, k_step = alignment["n_multiple_of"], alignment["k_multiple_of"]
+        if not all(type(v) is int and v > 0 for v in (n_step, k_step)):
+            return None
+        if n_step % 64 or k_step % 128:
+            return None
+        pairs = op["measured_nk_classes"]
+        if (
+            not isinstance(pairs, list)
+            or not pairs
+            or not all(
+                _positive_pair(pair) and pair[0] % n_step == 0 and pair[1] % k_step == 0
+                for pair in pairs
+            )
+        ):
+            return None
+        if len(set(map(tuple, pairs))) != len(pairs):
             return None
         return table
     except Exception:
         return None
+
+
+def _auto_refusal(m: int, n: int, k: int) -> Optional[str]:
+    table = _dispatch_table()
+    if table is None:
+        return "no_dispatch_table"
+    op = table["ops"]["fp8_blockscale_gemm_sm90"]
+    lo, hi = op["m_band"]
+    if not lo <= m <= hi:
+        return "m_band"
+    alignment = op["alignment"]
+    if n % alignment["n_multiple_of"] or k % alignment["k_multiple_of"]:
+        return "shape_alignment"
+    if [n, k] not in op["measured_nk_classes"]:
+        return "unmeasured_nk"
+    return None
 
 
 def _eligibility(
@@ -195,14 +239,20 @@ def _eligibility(
 def _get_module() -> Any:
     from ..jit.gemm import gen_fp8bs_gemm_decodem_sm90_module
 
+    spec = gen_fp8bs_gemm_decodem_sm90_module()
     if torch.cuda.is_current_stream_capturing():
-        raise GraphCaptureJitError(
-            "fp8bs_gemm_decodem_sm90: the specialized kernel is not built "
-            "yet and JIT compilation is not allowed under CUDA graph "
-            "capture. Call fp8_blockscale_gemm_sm90 once eagerly on an "
-            "allowlisted shape first."
-        )
-    module = gen_fp8bs_gemm_decodem_sm90_module().build_and_load()
+        # Loading a packaged or current on-disk module needs no compiler.
+        # Never enter build_and_load's compilation fallback during capture.
+        module = spec.try_load()
+        if module is None:
+            raise GraphCaptureJitError(
+                "fp8bs_gemm_decodem_sm90: the specialized kernel is not built "
+                "yet and JIT compilation is not allowed under CUDA graph "
+                "capture. Call fp8_blockscale_gemm_sm90 once eagerly on an "
+                "allowlisted shape first."
+            )
+    else:
+        module = spec.build_and_load()
     _stats["jit_build"] = "built"
     return module
 
@@ -221,8 +271,10 @@ def _fp8bs_decodem_try_dispatch(
     ``NotImplementedError`` with the refusal reason — an explicitly selected
     backend never falls back."""
     eligible, reason = _eligibility(input, weight, input_scale, weight_scale, out)
-    if eligible and requested == "auto" and _dispatch_table() is None:
-        eligible, reason = False, "no_dispatch_table"
+    if eligible and requested == "auto":
+        refusal = _auto_refusal(input.shape[0], weight.shape[0], input.shape[1])
+        if refusal is not None:
+            eligible, reason = False, refusal
     if not eligible:
         _fallback(f"{requested}: {reason}")
         if requested == "specialized":

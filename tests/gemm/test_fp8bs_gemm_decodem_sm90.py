@@ -44,6 +44,20 @@ def _make(M, N, K, seed=0, device="cuda"):
     return x, wq, ws
 
 
+def _admit_numerical_probe(monkeypatch, backend, shape):
+    # Only the numerical repro may opt this exact call into auto's native path.
+    import flashinfer.gemm.fp8bs_decodem_sm90 as mod
+
+    if backend == "auto":
+        original = mod._auto_refusal
+        assert original(*shape) == "unmeasured_nk"
+        monkeypatch.setattr(
+            mod,
+            "_auto_refusal",
+            lambda *dims: None if dims == shape else original(*dims),
+        )
+
+
 def _reference(x, wq, ws):
     """FP32 reference: quantize with 448/amax (1 for an all-zero group),
     then dequantize using the reciprocal multiplier before the dot product."""
@@ -120,9 +134,11 @@ def test_specialized_matches_reference(backend, shape):
         (4, 2048, 2048),
         (12, 2624, 6144),
         (24, 6144, 2048),
+        (20, 4096, 1024),  # HMMA, outside production auto policy
+        (2, 2048, 7168),  # compact split-14
     ],
 )
-def test_splitk_cancellation_exact(backend, shape):
+def test_splitk_cancellation_exact(backend, shape, monkeypatch):
     """Reviewer repro (exactly representable): BF16 activations all ones;
     each FP8 weight row is +1 for the first K/2 entries and -1 for the rest,
     with its first entry 2; unit scales.  The exact result is 1 everywhere.
@@ -135,7 +151,14 @@ def test_splitk_cancellation_exact(backend, shape):
     w[:, 0] = 2.0
     wq = w.to(torch.float8_e4m3fn)
     ws = torch.ones(((N + G - 1) // G, K // G), device="cuda", dtype=torch.float32)
+    if shape == (20, 4096, 1024):
+        _admit_numerical_probe(monkeypatch, backend, shape)
+    _reset_fp8bs_decodem_stats()
     out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    assert _fp8bs_decodem_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "deepgemm": 0,
+    }
     assert torch.equal(out, torch.ones_like(out)), (
         float(out.min()),
         float(out.max()),
@@ -147,7 +170,7 @@ def test_splitk_cancellation_exact(backend, shape):
 @requires_sm90
 @pytest.mark.parametrize("backend", ["auto", "specialized"])
 @pytest.mark.parametrize("exp", [-20, -34])
-def test_small_amax_matches_stock_quantization(backend, exp):
+def test_small_amax_matches_stock_quantization(backend, exp, monkeypatch):
     """Reviewer repro: tiny uniform activations with a compensating weight
     scale on a non-split route.  The exact result is 128; the pre-fix
     epsilon-clamped scale returned 135 (A=2**-20) or 0 (A=2**-34).
@@ -162,7 +185,13 @@ def test_small_amax_matches_stock_quantization(backend, exp):
     x = torch.full((M, K), 2.0**exp, device="cuda", dtype=torch.bfloat16)
     wq = torch.ones((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     ws = torch.full((1, 1), 2.0**-exp, device="cuda", dtype=torch.float32)
+    _admit_numerical_probe(monkeypatch, backend, (M, N, K))
+    _reset_fp8bs_decodem_stats()
     out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    assert _fp8bs_decodem_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "deepgemm": 0,
+    }
     assert torch.equal(out, torch.full_like(out, 128.0)), (
         float(out.min()),
         float(out.max()),
@@ -178,7 +207,8 @@ def test_small_amax_matches_stock_quantization(backend, exp):
 
 @requires_sm90
 @pytest.mark.parametrize("backend", ["auto", "specialized"])
-def test_normal_amax_below_replacement_floor(backend, record_property):
+def test_normal_amax_below_replacement_floor(backend, record_property, monkeypatch):
+    _admit_numerical_probe(monkeypatch, backend, (4, 64, G))
     # Both FP32 scale factors are normal. With the floor the maximum maps
     # near 420 and rounds to E4M3 416, rather than the unclamped 448.
     x = torch.full((4, G), (15 / 16) * 2.0**-117, device="cuda", dtype=torch.bfloat16)
@@ -447,7 +477,7 @@ def test_cold_auto_build_failure(monkeypatch, caplog, concurrent):
 
     import flashinfer.gemm.fp8bs_decodem_sm90 as mod
 
-    x, wq, ws = _make(4, 128, 256, seed=37)
+    x, wq, ws = _make(4, 2048, 2048, seed=37)
     ref = _reference(x, wq, ws)
     torch.cuda.synchronize(x.device)
     build = Mock(side_effect=RuntimeError("injected cold build failure"))
@@ -590,6 +620,22 @@ def test_native_rejection_and_recovery(
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"] == {"specialized": 1, "deepgemm": 0}
     assert st["fallback_reasons"] == {}
+
+
+@requires_sm90
+def test_unmeasured_class_auto_stock_explicit_specialized():
+    x, wq, ws = _make(24, 64, 16384, seed=41)
+    ref = _reference(x, wq, ws)
+    for backend, counts, reasons in (
+        ("auto", {"specialized": 0, "deepgemm": 1}, {"auto: unmeasured_nk": 1}),
+        ("specialized", {"specialized": 1, "deepgemm": 0}, {}),
+    ):
+        _reset_fp8bs_decodem_stats()
+        out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+        st = _fp8bs_decodem_stats()
+        assert st["backend_dispatches"] == counts
+        assert st["fallback_reasons"] == reasons
+        assert _rel_fro(out, ref) <= 0.03
 
 
 @requires_sm90
