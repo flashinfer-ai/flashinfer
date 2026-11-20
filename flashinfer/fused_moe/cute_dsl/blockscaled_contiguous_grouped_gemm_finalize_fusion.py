@@ -597,8 +597,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"mma_tiler_mn={mma_tiler_mn}, mma_tiler={mma_tiler}, mma_inst_shape={mma_inst_shape}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
-    # The evict-last output policy is only wired into the fused BF16 reduce;
-    # A evict-first alone would just drop A from L2.
     if use_l2_hints and not (
         use_fused_finalize and out_dtype_cutlass == cutlass.BFloat16
     ):

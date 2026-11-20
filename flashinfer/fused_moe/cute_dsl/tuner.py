@@ -140,27 +140,7 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 
 # GEMM2 epilogue variants (num_c_stage, num_store_warps, swizzle_size[,
 # use_l2_hints]), offered only on the (256, 256) 2-CTA tile with
-# raster_along_m=True, where they were
-# measured with benchmarks/bench_cute_dsl_moe_fc2_epilogue.py (B300, 384
-# experts, H=4096, I=768, top-k=20, balanced routing, 4k-54k tokens); FC2
-# speedups are over the best plain tactic:
-# * Swizzle only, (1, 0, s): keeps the default epilogue but visits s N tiles per
-#   M tile, so the output columns being reduced stay in L2. FC2 is 1.10-1.33x
-#   faster from 16k tokens, where the output outgrows L2, and neutral below.
-# * Store warps + swizzle, (2, w, s): w dedicated warps drain one of two smem C
-#   tiles while the epilogue fills the other. FC2 is 1.03-1.09x faster below
-#   16k tokens and 1.23-1.40x from 16k.
-# * L2 hints, (2, w, s, True): the store-warp epilogue also loads A
-#   evict-first and reduces the output evict-last in L2, so the A stream does
-#   not evict the output rows being reduced. At 54k tokens, (2, 2, 2) with
-#   hints is 1.22x faster than (1, 0, 2) (2.14 vs 2.62 ms at base clocks),
-#   1.16x of it from the hints; from 24k to 40k, swizzle 4 with hints is up
-#   to 1.06x faster. But (2, 2, 4) at 54k is 1.06x slower with them, so both
-#   variants are searched.
-# With autotuning, the whole MoE is 1.01-1.10x faster than the best plain
-# tactic below 24k tokens and 1.16-1.19x from 24k.
-# Store warps without swizzle and swizzle 8 lose at large token counts, and other
-# GEMM2 tiles did not benefit, so they are not searched.
+# raster_along_m=True.
 BLACKWELL_GEMM2_EPILOGUE_CANDIDATES: Tuple[Tuple[int, ...], ...] = (
     (1, 0, 2),
     (1, 0, 4),
@@ -458,8 +438,6 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
         }
     else:
         gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic
-        # An optional 4th element selects the GEMM2 store-warp epilogue:
-        # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]).
         (
             gemm2_mma_tiler_mn,
             gemm2_cluster_shape_mn,

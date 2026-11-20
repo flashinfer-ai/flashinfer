@@ -389,20 +389,19 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
-        :param num_c_stage: Number of smem C tiles. More than one requires
-            num_store_warps > 0 (the store warps drain one tile while the
-            epilogue fills the next).
+        :param num_c_stage: Number of smem C stages. More than one requires
+            num_store_warps > 0.
         :type num_c_stage: int
         :param num_store_warps: Number of dedicated warps issuing the per-row
             output bulk writes. 0 keeps the writes in the epilogue warps.
         :type num_store_warps: int
         :param swizzle_size: Grouped rasterization; with raster_along_m=True,
             swizzle_size N tiles are visited per M tile before moving to the
-            next M tile, which keeps the set of reduced output columns small
-            enough to stay in L2.
+            next M tile.
         :type swizzle_size: int
-        :param use_l2_hints: Load A evict-first and reduce the output
-            evict-last in L2. Requires num_store_warps > 0.
+        :param use_l2_hints: Load A with an L2 evict-first policy and reduce
+            the output with an L2 evict-last policy. Requires
+            num_store_warps > 0.
         :type use_l2_hints: bool
         """
 
@@ -415,22 +414,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         self.swizzle_size = swizzle_size
-        # num_store_warps > 0: dedicated warps issue the per-row bulk writes.
-        # The epilogue warps hand each filled smem C stage over through a
-        # full/empty mbarrier pipeline, so they can start the next tile while
-        # the store warps are still feeding the TMA unit.
         assert num_c_stage == 1 or num_store_warps > 0, (
             "num_c_stage > 1 requires num_store_warps > 0"
         )
         self.num_c_stage_req = num_c_stage
         self.num_store_warps = num_store_warps
         self.use_store_pipe = num_store_warps > 0
-        # L2 eviction hints of the store-warp epilogue: A is streamed once per
-        # swizzle group of N tiles, so it is loaded evict-first, and the
-        # reduced output rows are kept evict-last. Otherwise the A stream
-        # evicts the output columns being reduced, and their reductions
-        # round-trip through DRAM. Whether that wins depends on the shape
-        # (see BLACKWELL_GEMM2_EPILOGUE_CANDIDATES), so it is a tactic option.
         assert not use_l2_hints or num_store_warps > 0, (
             "use_l2_hints requires num_store_warps > 0"
         )
@@ -611,8 +600,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.num_smem_capacity,
             self.occupancy,
             num_c_stage=self.num_c_stage_req,
-            # Store-warp handoff: (valid rows, coord_n) + per-row output index
-            # for every C stage.
+            # c_info and c_token_idx.
             extra_smem_bytes=(
                 (self.cta_tile_shape_mnk[0] + 2) * 4 * self.num_c_stage_req
                 if self.use_store_pipe
@@ -1315,7 +1303,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sMetaTokenIdx = storage.meta_token_idx.get_tensor(meta_layout)
         sMetaScale = storage.meta_scale.get_tensor(meta_layout)
 
-        # Store-warp handoff info: (valid rows, coord_n) and output rows per C stage
         sCInfo = storage.c_info.get_tensor(
             cute.make_layout((2, self.num_c_stage), stride=(1, 2))
         )
@@ -2249,7 +2236,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
                 if cutlass.const_expr(self.use_store_pipe):
-                    # Wait until the store warps have drained this C stage.
                     c_pipeline.producer_acquire(c_producer_state)
                     c_stage = c_producer_state.index
 
@@ -2313,7 +2299,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     acc_consumer_state.advance()
 
                 if cutlass.const_expr(self.use_store_pipe):
-                    # Hand the filled C stage to the store warps.
                     sCTokenIdx[(epi_tidx, c_stage)] = token_idx
                     if epi_tidx == 0:
                         # With 2-CTA MMA the peer CTA's half of a tile can hold

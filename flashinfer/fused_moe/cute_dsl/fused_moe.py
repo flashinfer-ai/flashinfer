@@ -645,9 +645,6 @@ def _moe_core_impl(
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
-    # GEMM2 store-warp epilogue (Blackwell): raster order and
-    # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]); None keeps
-    # the default.
     gemm2_raster_along_m: bool = False,
     gemm2_epilogue: Optional[Tuple[int, ...]] = None,
     # Pre-allocated buffers (for CUDA graph)
@@ -735,11 +732,9 @@ def _moe_core_impl(
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
         gemm2_raster_along_m: GEMM2 tile raster order.
-        gemm2_epilogue: Optional GEMM2 store-warp epilogue
+        gemm2_epilogue: Optional GEMM2 epilogue
             (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
-            dedicated warps issue the output writes so they overlap the next
-            tile's math, and use_l2_hints (default False) loads A evict-first
-            and reduces the output evict-last in L2.
+            None keeps the default epilogue.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
