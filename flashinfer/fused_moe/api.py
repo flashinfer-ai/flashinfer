@@ -2934,9 +2934,12 @@ class W4A16MxFp4LatentConfig:
     reaches the kernel through ``backend=auto`` — timed by the cross-backend
     autotune shootout as a first-class candidate — with no opt-in.
 
-    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call by the flat
-    op) forces its composable reference path; dispatches through the layer
-    honor it identically.
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (deprecated alias:
+    ``FLASHINFER_W4A16_MXFP4_LATENT_MOE=0``) excludes this runner before
+    winner lookup on each layer call. Another eligible runner can serve;
+    without one, the layer raises ``NotImplementedError``. For the eager
+    flat op, ``backend="auto"`` uses the reference implementation while
+    explicit ``backend="specialized"`` raises.
     """
 
     @classmethod

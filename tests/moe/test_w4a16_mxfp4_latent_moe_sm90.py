@@ -231,9 +231,16 @@ def test_inconsistent_weight_structure_raises():
 @pytest.mark.parametrize("env,val", [(DISABLE_ENV, "1"), (DISABLE_ENV_LEGACY, "0")])
 def test_kill_switch_forces_the_reference_path(env, val, monkeypatch):
     _sm90_or_skip()
+    from flashinfer.fused_moe import w4a16_mxfp4_moe as flat
+
     monkeypatch.setenv(env, val)
-    args = _case(T=2)
-    w4a16_mxfp4_latent_routed_moe(*args, backend="auto")
+    monkeypatch.setattr(
+        flat, "_get_module", lambda: pytest.fail("specialized JIT reached")
+    )
+    args, expected = _combine_case(3)
+    args[-2][:, 3:] += EL  # only the three experts used by the analytic oracle
+    y = w4a16_mxfp4_latent_routed_moe(*args, backend="auto")
+    torch.testing.assert_close(y, expected, rtol=0, atol=0)
     stats = _w4a16_mxfp4_latent_moe_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert stats["backend_dispatches"]["reference"] == 1, stats
@@ -474,8 +481,7 @@ def test_unified_runner_dispatch_monkeypatched_launch(monkeypatch):
 def test_unified_runner_binds_weights_per_call(monkeypatch):
     """pack A, pack B, then forward(A) must use A's weights: the view is
     bound to the packed-inputs object, not exchanged through shared runner
-    state. A plain tensor list (the autotuner's profiling ABI) falls back
-    to the last packed view, which that path pairs correctly."""
+    state. A plain profiling list must carry the original call's metadata."""
     _fake_sm90(monkeypatch)
     layer = MoELayer(_unified_config(), device=torch.device("cpu"))
     runner = layer.runners[0]
@@ -489,18 +495,23 @@ def test_unified_runner_binds_weights_per_call(monkeypatch):
     seen = {}
 
     def _fake_flat(x_, w13p_, w13s_, w2p_, w2s_, ids_, w_, *, out=None, backend):
-        seen["w13_packed"] = w13p_
+        assert backend == "specialized"
+        seen["weights"] = (w13p_, w13s_, w2p_, w2s_)
         return torch.zeros_like(x_)
 
     monkeypatch.setattr(runner._flat, "w4a16_mxfp4_latent_routed_moe", _fake_flat)
     inputs_a = runner.pack_inputs(_act_pack(xa, ids_a, wa), pack_a)
     inputs_b = runner.pack_inputs(_act_pack(xb, ids_b, wb), pack_b)
-    runner.forward(inputs_a, tactic=-1)
-    assert seen["w13_packed"] is view_a["w13_packed"]
-    runner.forward(inputs_b, tactic=-1)
-    assert seen["w13_packed"] is view_b["w13_packed"]
-    runner.forward(list(inputs_b), tactic=-1)
-    assert seen["w13_packed"] is view_b["w13_packed"]
+    for inputs, kwargs, view in (
+        (inputs_a, {}, view_a),
+        (inputs_b, {}, view_b),
+        (list(inputs_a), runner.launch_kwargs_for(inputs_a), view_a),
+    ):
+        runner.forward(inputs, tactic=-1, **kwargs)
+        keys = ("w13_packed", "w13_scale", "w2_packed", "w2_scale")
+        assert all(t is view[k] for t, k in zip(seen["weights"], keys, strict=True))
+    with pytest.raises(RuntimeError, match="launch_kwargs_for"):
+        runner.forward(list(inputs_a), tactic=-1)
 
 
 def test_unified_runner_kill_switch_ineligible_cpu(monkeypatch):
@@ -637,6 +648,72 @@ def test_graph_workspace_ordered_and_independent(T):
         torch.testing.assert_close(y, oracle, rtol=0, atol=0)
 
 
+def _workspace_limits_in_fresh_process():
+    # The slot registry is process-lifetime; neither inherit nor exhaust the
+    # test worker's cache. Hopper has 32 pooled streams per priority.
+    args, expected = _combine_case(4)
+    small = (args[0][:3], *args[1:5], args[5][:3], args[6][:3])
+    cases = [small, (*small[:-1], -small[-1])]
+    outputs = [torch.empty_like(expected[:3]) for _ in cases]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs = [torch.cuda.CUDAGraph() for _ in cases]
+    with torch.cuda.stream(stream):
+        w4a16_mxfp4_latent_routed_moe(*small, out=outputs[0], backend="specialized")
+        for graph, inputs, out in zip(graphs, cases, outputs, strict=True):
+            with torch.cuda.graph(graph, stream=stream):
+                w4a16_mxfp4_latent_routed_moe(*inputs, out=out, backend="specialized")
+        with pytest.raises(RuntimeError, match="cannot grow a graph-pinned workspace"):
+            w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
+        for index in (0, 1, 0):
+            outputs[index].fill_(float("nan"))
+            graphs[index].replay()
+            oracle = expected[:3] if index == 0 else -expected[:3]
+            torch.testing.assert_close(outputs[index], oracle, atol=0, rtol=0)
+
+    # Fill the other 63 entries, reserving a non-default stream for overflow.
+    lanes = {stream.cuda_stream: stream}
+    for priority in (0, -1):
+        for _ in range(32):
+            s = torch.cuda.Stream(priority=priority)
+            lanes[s.cuda_stream] = s
+    assert len(lanes) == 64
+    lanes.pop(stream.cuda_stream)
+    overflow = lanes.popitem()[1]
+    out = torch.empty_like(expected[:3])
+    for s in [torch.cuda.default_stream(), *lanes.values(), overflow]:
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            w4a16_mxfp4_latent_routed_moe(*small, out=out, backend="specialized")
+        s.synchronize()  # one destination, no overlapping writers
+    torch.testing.assert_close(out, expected[:3], atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=overflow):
+        out.zero_()
+        with pytest.raises(
+            RuntimeError, match="capture requires a cached workspace slot"
+        ):
+            w4a16_mxfp4_latent_routed_moe(*small, out=out, backend="specialized")
+
+
+def test_graph_workspace_growth_and_slot_limit():
+    import multiprocessing
+
+    _sm90_or_skip()
+    child = multiprocessing.get_context("spawn").Process(
+        target=_workspace_limits_in_fresh_process
+    )
+    child.start()
+    try:
+        child.join(timeout=600)
+        assert not child.is_alive(), "workspace regression child timed out"
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+        child.join(timeout=10)
+
+
 def test_unified_layer_ep_rejected_sm90():
     _sm90_or_skip()
     config = _unified_config(
@@ -718,7 +795,12 @@ def test_unified_layer_prefill_path_matches_flat():
     assert m_flat >= 0.97 and m_layer >= 0.97, (m_layer, m_flat)
 
 
-def test_unified_layer_kill_switch_excludes_backend(monkeypatch):
+@pytest.mark.parametrize("env,val", [(DISABLE_ENV, "1"), (DISABLE_ENV_LEGACY, "0")])
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("alternate", [False, True])
+def test_unified_layer_kill_switch_excludes_backend(
+    monkeypatch, env, val, cached, alternate
+):
     """The kill switch disables the specialized kernel everywhere. Through
     the layer a disabled backend is INELIGIBLE (never a winner-selection
     candidate, whose timing runs under CUDA-graph capture where the
@@ -726,25 +808,46 @@ def test_unified_layer_kill_switch_excludes_backend(monkeypatch):
     runner the layer raises. The composable reference stays reachable
     through the flat op, whose "auto" routes around the refusal."""
     _sm90_or_skip()
-    x, w13p, w13s, w2p, w2s, _ids, w = _case(T=4, seed=25)
-    g = torch.Generator(device="cuda").manual_seed(26)
-    ids = torch.stack(
-        [torch.randperm(EL, generator=g, device="cuda")[:K] for _ in range(x.shape[0])]
-    ).to(torch.int32)
+    from types import SimpleNamespace
+    from flashinfer.fused_moe import w4a16_mxfp4_moe as flat
+
+    args, expected = _combine_case(3)
+    act = _act_pack(args[0], *args[-2:])
+    weights = _weight_pack(*args[1:5])
+
+    def disable():
+        monkeypatch.setenv(env, val)
+        monkeypatch.setattr(
+            flat, "_get_module", lambda: pytest.fail("specialized JIT reached")
+        )
+
+    if not cached:
+        disable()
     layer = MoELayer(_unified_config())
-    weight_pack = _weight_pack(w13p, w13s, w2p, w2s)
-    monkeypatch.setenv(DISABLE_ENV, "1")
+    # Exercise the real eligibility filter and winner cache. Make selection
+    # deterministic rather than relying on relative timings of two kernels.
+    monkeypatch.setattr(layer, "_select_winner", lambda a, w, runners: (runners[0], -1))
+    if alternate:
+        marker = torch.full_like(expected, -77)
+        layer.runners.append(
+            SimpleNamespace(
+                backend_key="test_alternate",
+                supported_routing_modes=(act.routing_input_mode,),
+                accepts=lambda a, w: True,
+                pack_inputs=lambda a, w: [a.hidden_states_q],
+                launch_kwargs_for=lambda inputs: {},
+                forward=lambda inputs, tactic: marker,
+            )
+        )
+    if cached:
+        torch.testing.assert_close(layer(act, weights), expected, rtol=0, atol=0)
+        assert layer.winner_backend == "w4a16_mxfp4_latent"
+        disable()
     _reset_w4a16_mxfp4_latent_moe_stats()
-    with pytest.raises(NotImplementedError, match="none of the usable backends"):
-        layer(_act_pack(x, ids, w), weight_pack)
-    y_auto = w4a16_mxfp4_latent_routed_moe(
-        x, w13p, w13s, w2p, w2s, ids, w, backend="auto"
-    )
-    stats = _w4a16_mxfp4_latent_moe_stats()
-    assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert stats["backend_dispatches"]["reference"] >= 1, stats
-    assert any("kill switch" in r for r in stats["fallback_reasons"]), stats
-    y_ref = w4a16_mxfp4_latent_routed_moe(
-        x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
-    )
-    assert torch.equal(y_auto, y_ref)
+    if alternate:
+        assert layer(act, weights) is marker
+        assert layer.winner_backend == "test_alternate"
+    else:
+        with pytest.raises(NotImplementedError, match="none of the usable backends"):
+            layer(act, weights)
+    assert _w4a16_mxfp4_latent_moe_stats()["calls"] == 0

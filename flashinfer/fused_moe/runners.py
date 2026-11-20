@@ -9614,8 +9614,8 @@ class _W4A16LatentPackedInputs(list):
     ``pack_inputs`` binds the prepared weight view to the object it returns
     (the ``MoERunner`` per-call metadata convention), so interleaved
     ``pack_inputs -> forward`` pairs cannot exchange weights. The autotuner's
-    profiling path synthesizes plain tensor lists; ``forward`` then falls
-    back to the runner's last packed view, which that path pairs correctly.
+    profiling path synthesizes plain tensor lists; ``launch_kwargs_for``
+    carries the original packed call's view to those launches.
     """
 
     def __init__(self, inputs: List[torch.Tensor], *, weight_view) -> None:
@@ -9678,7 +9678,6 @@ class W4A16MxFp4LatentRunner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.tuning_config = TuningConfig()
         self._flat: Any = None
-        self._view: dict[str, torch.Tensor] | None = None
 
     def _check_activation_parameters(self) -> None:
         if (
@@ -9801,10 +9800,12 @@ class W4A16MxFp4LatentRunner(MoERunner):
             allowed_weights_dtypes=(torch.float32,),
             require_contiguous=True,
         )
-        self._view = view
         return _W4A16LatentPackedInputs(
             [hidden_states, act.topk_ids, act.topk_weights], weight_view=view
         )
+
+    def launch_kwargs_for(self, inputs):
+        return {"w4a16_latent_weight_view": inputs.w4a16_latent_weight_view}
 
     def forward(
         self,
@@ -9820,15 +9821,13 @@ class W4A16MxFp4LatentRunner(MoERunner):
             raise ValueError(
                 f"{self.backend_key} expects [hidden, topk_ids, topk_weights]."
             )
-        # The weight view is bound to the packed-inputs object, so interleaved
-        # pack_inputs -> forward pairs use their own weights; profiling's
-        # synthesized plain lists fall back to the runner's last packed view.
         view = getattr(inputs, "w4a16_latent_weight_view", None)
         if view is None:
-            view = self._view
+            view = kwargs.get("w4a16_latent_weight_view")
         if view is None:
             raise RuntimeError(
-                "pack_inputs must be called before w4a16_mxfp4_latent forward."
+                "w4a16_mxfp4_latent forward requires packed inputs or the "
+                "original call's launch_kwargs_for(inputs)."
             )
         # The kernel module's own entry, with the backend named explicitly:
         # only the flat "auto" form refuses tuning-mode calls (it has no

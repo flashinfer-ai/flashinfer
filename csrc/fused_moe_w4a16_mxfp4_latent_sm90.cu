@@ -15,6 +15,7 @@ struct WorkspaceSlot {
   cudaStream_t stream = nullptr;
   void* ptr = nullptr;
   size_t size = 0;
+  bool pinned = false;  // Protected by enqueue_mu; graphs outlive the capture call.
   std::mutex enqueue_mu;
 };
 static WorkspaceSlot g_ws_slots[64];
@@ -70,6 +71,10 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
   size_t off_acc = off_h + cap * IH * sizeof(__half);
   int nout = T * LH;
   size_t need = off_acc + (size_t)nout * sizeof(float);
+  cudaStreamCaptureStatus capture_status;
+  check_cuda(cudaStreamIsCapturing(st, &capture_status), "cudaStreamIsCapturing");
+  TVM_FFI_ICHECK(capture_status != cudaStreamCaptureStatusInvalidated) << "invalidated capture";
+  const bool capturing = capture_status == cudaStreamCaptureStatusActive;
   WorkspaceSlot* slot = nullptr;
   {
     std::lock_guard<std::mutex> registry(g_ws_registry_mu);
@@ -79,7 +84,7 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
         break;
       }
     }
-    if (!slot) {
+    if (!slot && !capturing) {
       for (auto& s : g_ws_slots) {
         if (!s.used) {
           s.used = true;
@@ -98,7 +103,14 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
     // Keep host threads from interleaving launches onto the same stream; GPU
     // stream order protects reuse after this complete enqueue sequence.
     enqueue_guard = std::unique_lock<std::mutex>(slot->enqueue_mu);
+    if (capturing) {
+      TVM_FFI_ICHECK(need <= slot->size)
+          << "capture requires eager warm-up at the maximum token count on this stream";
+      // Pin before the first enqueue: even a partially recorded graph may refer to ptr.
+      slot->pinned = true;
+    }
     if (need > slot->size) {
+      TVM_FFI_ICHECK(!slot->pinned) << "cannot grow a graph-pinned workspace; use another stream";
       // Reset the cached state BEFORE (re)allocating so a failed allocation
       // can never leave the slot claiming a workspace it does not hold.
       if (slot->ptr) {
@@ -116,8 +128,10 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
     }
     ws_ptr = slot->ptr;
   } else {
-    // An unusually large number of live streams falls back to a unique,
-    // stream-ordered allocation rather than weakening correctness.
+    TVM_FFI_ICHECK(!capturing)
+        << "capture requires a cached workspace slot; warm up on the capture stream "
+           "(at most 64 device/stream slots)";
+    // Eager calls beyond the cache limit get a unique stream-ordered allocation.
     check_cuda(cudaMallocAsync(&fallback, need, st), "cudaMallocAsync(workspace)");
     ws_ptr = fallback;
   }

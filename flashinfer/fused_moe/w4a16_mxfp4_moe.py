@@ -73,14 +73,16 @@ CUDA-graph rules
   the decode cooperative kernel, ``T > 64`` the tensor-core prefill path),
   so a capture at a fixed shape pins exactly one path into the graph.
 - The internal workspace is cached per (device, stream) and grows only on an
-  eager call.  Capture therefore requires a prior eager warm-up call on the
-  capture stream with a token count >= the captured one (tracked per stream;
-  violating calls raise instead of allocating under capture).
+  eager call before first capture. Warm up at the largest token count the
+  stream will need, including later eager calls. Capture pins the slot's
+  capacity for the process lifetime: growth is rejected before freeing any
+  storage, even after the graph is destroyed. The native cache holds 64
+  (device, stream) pairs; uncached streams support eager calls only.
 - Graphs capture the workspace POINTER of their capture stream's slot:
   graphs captured on the same (device, stream) — and replays of one graph —
   share that workspace, so their replays must be ordered with respect to
-  each other (any stream may replay; it is concurrency between replays that
-  is forbidden).  Graphs that must replay concurrently must be captured on
+  each other and to eager calls using that slot, even if replay is issued
+  on another stream.  Graphs that must replay concurrently must be captured on
   distinct streams, whose slots hold distinct workspaces.
 - Autotune tuning mode raises on ``backend="auto"`` only: the flat auto form
   has a single fixed tactic and must not be enumerated into flat-path tactic
@@ -219,9 +221,6 @@ def _composable_reference(
 
 
 _module = None
-# (device_index, raw cuda stream) -> largest token count run eagerly, i.e.
-# the workspace the C++ side has already sized for that stream.
-_warmed_tokens: dict = {}
 
 
 def _killed() -> bool:
@@ -544,50 +543,17 @@ def w4a16_mxfp4_latent_routed_moe(
     # capture state is a property of the CURRENT device's current stream, so
     # inspect it (and run the kernel) with x's device current
     with torch.cuda.device(x.device):
-        capturing = torch.cuda.is_current_stream_capturing()
-        stream_key = (
-            x.device.index,
-            torch.cuda.current_stream(x.device).cuda_stream,
-        )
-        if capturing:
-            if _module is None:
-                raise RuntimeError(
-                    "w4a16_mxfp4_latent_routed_moe: the JIT module is not "
-                    "built; never built under CUDA-graph capture — run one "
-                    "eager call first"
-                )
-            if _warmed_tokens.get(stream_key, 0) < tokens:
-                raise RuntimeError(
-                    "w4a16_mxfp4_latent_routed_moe: workspace for this stream "
-                    f"is sized for <= {_warmed_tokens.get(stream_key, 0)} "
-                    f"tokens; capture at T={tokens} would allocate under "
-                    "capture.  Run one eager call with at least this token "
-                    "count on the capture stream first (and do not run a "
-                    "larger eager call on the same stream afterwards while "
-                    "the graph is in use)."
-                )
-        module = _get_module()
-        try:
-            module.w4a16_mxfp4_latent_routed_moe(
-                x,
-                w13_packed,
-                w13_scale,
-                w2_packed,
-                w2_scale,
-                topk_ids,
-                topk_weights,
-                out,
+        if torch.cuda.is_current_stream_capturing() and _module is None:
+            raise RuntimeError(
+                "w4a16_mxfp4_latent_routed_moe: the JIT module is not "
+                "built; never built under CUDA-graph capture — run one "
+                "eager call first"
             )
-        except Exception:
-            # a failed eager call can leave the native slot without the
-            # workspace this record promises; drop the record so the next
-            # capture guard re-warms instead of trusting stale capacity
-            if not capturing:
-                _warmed_tokens.pop(stream_key, None)
-            raise
+        # The native slot, not a Python warm-up record, owns capacity and pin state.
+        _get_module().w4a16_mxfp4_latent_routed_moe(
+            x, w13_packed, w13_scale, w2_packed, w2_scale, topk_ids, topk_weights, out
+        )
     _stats["backend_dispatches"]["specialized"] += 1
-    if not capturing and _warmed_tokens.get(stream_key, 0) < tokens:
-        _warmed_tokens[stream_key] = tokens
     return out
 
 
