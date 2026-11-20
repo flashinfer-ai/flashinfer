@@ -240,6 +240,7 @@ class SwapsPlan:
         # the K / V boxes of small pages are issued under the split placement, by kv_warps warps (the load warp alone otherwise)
         self.split = split_pages(page, ragged)
         self.kv_warps = SPLIT_WARPS if self.split else 1
+        self.split_loop = False  # the boxes unrolled at every page size: measured faster than the row body's loop in this body
         self.roles = Roles
         self.n_wg = 1  # one softmax warpgroup (fold_group's prefetch depth reads it)
         self.T = TILE_KEYS

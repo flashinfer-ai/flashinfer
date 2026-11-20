@@ -46,6 +46,7 @@ RING_BYTES = (
 )  # K/V bytes in flight per CTA at every D: 512 / D ring slots of 128 x D bf16
 SMEM_CAP = 227 << 10  # the opt-in dynamic smem of one CTA on sm_100 / sm_107
 SPLIT_WARPS = 3  # the warps that issue K / V boxes under the split placement: the load warp and the two otherwise idle warps
+SPLIT_LOOP_PAGE_MAX = 2  # the row body issues the boxes of pages of at most this many keys in a run-time loop (producer.issue_slot_split)
 SPLIT_PAGE_MAX = (
     4  # pages of at most this many keys take the split placement (split_pages)
 )
@@ -242,6 +243,7 @@ class StaticPlan:
         # the K / V boxes of small pages are issued under the split placement, by kv_warps warps (the load warp alone otherwise)
         self.split = split_pages(page, ragged)
         self.kv_warps = SPLIT_WARPS if self.split else 1
+        self.split_loop = self.split and page <= SPLIT_LOOP_PAGE_MAX
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (

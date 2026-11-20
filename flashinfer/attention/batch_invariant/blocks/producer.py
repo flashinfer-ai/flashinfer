@@ -66,18 +66,38 @@ def issue_slot_split(
         expected_tx=Int32(n_mine * st.halves * HALF * st.box_rows * 2)
     )
     ids = slot_page_ids(st, key0, mKvIndices, kv_ptr0, n_pages)
-    for i in cutlass.range_constexpr(part, st.boxes_per_slot, st.kv_warps):
-        kb = (
-            i * st.box_rows
-        )  # the box's first key in the slot; its page index is in lane kb % 32 of element kb // 32
-        page_id = cute.arch.shuffle_sync(ids[kb // 32], kb % 32)
-        for half in cutlass.range_constexpr(st.halves):
-            cute.copy(
-                atom,
-                tg[(None, (d_half0 + half, 0, kv_head, page_id))],
-                ts[(None, i, half, h.index)],
-                tma_bar_ptr=h.barrier,
-            )
+    if cutlass.const_expr(st.split_loop):
+        # a run-time loop (the block's z index is 0: it keeps the trip count out of the compiler's sight, so the loop is not
+        # unrolled). Unrolled, the boxes of a slot of 1- or 2-key pages are tens of kilobytes of straight-line code per call
+        # site and issuing warp, and in the row body every warp of the CTA, the softmax's included, waits on instruction fetch
+        _, _, bz = cute.arch.block_idx()
+        for i in range(part, st.boxes_per_slot + bz, st.kv_warps):
+            kb = (
+                i * st.box_rows
+            )  # the box's first key in the slot; its page index is in lane kb % 32 of element kb // 32
+            held = ids[0]
+            for j in cutlass.range_constexpr(1, st.slot_keys // 32):
+                if kb // 32 == j:
+                    held = ids[j]
+            page_id = cute.arch.shuffle_sync(held, kb % 32)
+            for half in cutlass.range_constexpr(st.halves):
+                cute.copy(
+                    atom,
+                    tg[(None, (d_half0 + half, 0, kv_head, page_id))],
+                    ts[(None, i, half, h.index)],
+                    tma_bar_ptr=h.barrier,
+                )
+    else:
+        for i in cutlass.range_constexpr(part, st.boxes_per_slot, st.kv_warps):
+            kb = i * st.box_rows
+            page_id = cute.arch.shuffle_sync(ids[kb // 32], kb % 32)
+            for half in cutlass.range_constexpr(st.halves):
+                cute.copy(
+                    atom,
+                    tg[(None, (d_half0 + half, 0, kv_head, page_id))],
+                    ts[(None, i, half, h.index)],
+                    tma_bar_ptr=h.barrier,
+                )
     return kv_prod
 
 
