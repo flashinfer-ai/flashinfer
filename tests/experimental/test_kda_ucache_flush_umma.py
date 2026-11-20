@@ -148,7 +148,7 @@ def test_umma_backend_dispatch():
             # 'auto' launches UMMA iff available and the auto policy is on.
             n0 = launches()
             _call(_make_case(4, hist, seed=11, t=t), "auto", t=t, w_ring=w_ring)
-            expect = int(why is None and disp._AUTO_UMMA)
+            expect = int(why is None and disp._auto_umma(torch.device("cuda")))
             assert launches() == n0 + expect
 
 

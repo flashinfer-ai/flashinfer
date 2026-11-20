@@ -2577,9 +2577,11 @@ except (ImportError, RuntimeError) as _e:  # pragma: no cover - no tcgen05 DSL
     _launch_umma = None
     _UMMA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
-# backend="auto" picks UMMA only when this is True (and the configuration is
-# supported). Off until the UMMA kernel is complete and measured.
-_AUTO_UMMA = False
+# backend="auto" picks UMMA (when the configuration is supported) on these compute
+# capabilities: measured faster than HMMA on B200 (SM100) at every T, batch and flush
+# rate swept (1.16-1.55x at T in {4, 8}). Other SM10x parts can still select it
+# explicitly with backend="umma".
+_AUTO_UMMA_CC = ((10, 0),)
 _BACKENDS = ("auto", "hmma", "umma")
 # Native draft lengths: the HMMA kernel builds T in {4, 8}; the UMMA kernel
 # T = 1..8 (kda_umma_unavailable_reason has the authoritative set).
@@ -2587,6 +2589,11 @@ _HMMA_T = (4, 8)
 # archs whose ptxas accepts cvt.rs (stochastic rounding), as the GDN UMMA kernel
 _CVT_RS_CC = ((10, 0), (10, 3), (10, 7))
 _UMMA_T_MAX = 8
+
+
+def _auto_umma(dev: torch.device) -> bool:
+    """Whether ``backend="auto"`` prefers UMMA on this device (see ``_AUTO_UMMA_CC``)."""
+    return tuple(torch.cuda.get_device_capability(dev)) in _AUTO_UMMA_CC
 
 
 def kda_umma_unavailable_reason(
@@ -2670,8 +2677,9 @@ def kda_delta_rule_mtp_ucache_flush(
       this file) or ``"umma"`` (tcgen05 / TMEM, SM10x,
       ``kda_replay_mtp_umma``). ``"umma"`` raises ``ValueError`` when
       ``kda_umma_unavailable_reason`` reports a reason; ``"auto"`` uses UMMA
-      only when it is available and ``_AUTO_UMMA`` is set, or when T is not
-      in {4, 8} (HMMA cannot build it). The UMMA backend ignores ``tma_late``.
+      when it is available on B200 (SM100, ``_AUTO_UMMA_CC``), or when T is not
+      in {4, 8} (HMMA cannot build it); otherwise HMMA (SM90, other SM10x parts,
+      ``pdl_trigger=True``). The UMMA backend ignores ``tma_late``.
     - ``initial_state_source`` is bf16 (default) or fp16. The fp16 pool is served by
       the UMMA backend only (``"hmma"`` raises ``ValueError``; ``"auto"`` routes it
       to UMMA and raises ``ValueError`` when UMMA is unavailable). Rings and
@@ -3013,7 +3021,7 @@ def kda_delta_rule_mtp_ucache_flush(
         _use_umma = (
             backend == "umma"
             or _needs_umma
-            or (backend == "auto" and _why is None and _AUTO_UMMA)
+            or (backend == "auto" and _why is None and _auto_umma(dev))
         )
 
     if _use_umma:

@@ -27,7 +27,8 @@ The SM10x tcgen05 / UMMA backend (`backend="umma"`,
 1..8 and an fp16 state pool (`initial_state_source` fp16; HMMA rejects it),
 with optional stochastic rounding of the flushed fp16 state
 (`stochastic_rounding="philox"` / `"lcg"`, `rand_seed`, `philox_rounds`; the
-GDN UMMA kernel's schemes). Tests: `tests/experimental/test_kda_ucache_flush_umma.py`
+GDN UMMA kernel's schemes). `backend="auto"` (the default) picks UMMA on B200
+(SM100) and HMMA elsewhere (SM90, other SM10x parts, `pdl_trigger=True`). Tests: `tests/experimental/test_kda_ucache_flush_umma.py`
 and `tests/experimental/test_kda_ucache_flush_umma_fp16.py`.
 
 Tests: `tests/experimental/test_kda_ucache_flush.py`. Benchmarks:
