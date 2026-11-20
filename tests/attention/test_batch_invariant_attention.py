@@ -5016,3 +5016,27 @@ def test_cuda_graph_sinks_declaration_and_neutral_arguments():
     unit.check([3000, 1500, 700], "fast")
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         unit.w.run(unit.q, cache, k_scale=0.5)
+
+
+@needs_device
+def test_cuda_graph_device_scale_tensors():
+    """Unit scales as device tensors under ``use_cuda_graph=True``: a tensor resolved by the warm-up ``run()`` is served
+    from memory inside the capture and the graph replays after replans; a tensor first seen inside a capture raises the
+    typed error instead of reading the device."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, 128, 16, seed=36)
+    cache = pr.cache("NHD")
+    one = torch.ones((), device=pr.device)
+    gd = _GraphDecode(pr, 1)
+    gd.run_kw.update(q_scale=one, k_scale=one, v_scale=one)
+    gd.check([300, 40, 129])  # warm-up, then capture
+    gd.check([3000, 1500, 700], "fast")
+    cold = _GraphDecode(pr, 1)
+    cold.plan([300, 40, 129])
+    cold.w.run(cold.q, cache, out=cold.out)  # a warm-up without the scale
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="capture"):
+            cold.w.run(
+                cold.q, cache, out=cold.out, k_scale=torch.ones((), device=pr.device)
+            )
+        cold.w.run(cold.q, cache, out=cold.out, k_scale=one)

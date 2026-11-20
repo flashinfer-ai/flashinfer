@@ -70,6 +70,117 @@ def test_non_unit_scales_raise(scales, named):
 
 
 @pytest.mark.parametrize(
+    "bad,named",
+    [
+        (True, "q_scale=True"),
+        (torch.tensor(1), "q_scale as a tensor of dtype torch.int64"),
+        (torch.tensor(True), "q_scale as a tensor of dtype torch.bool"),
+    ],
+)
+def test_scale_forms_that_are_not_numbers_raise(bad, named):
+    with pytest.raises(Unsupported) as e:
+        neutral.check_unit_scales(CLASS, (bad, None, None))
+    assert named in str(e.value)
+
+
+@needs_device
+def test_device_scale_tensors_are_read_once_per_version(monkeypatch):
+    """A one-element device tensor as a scale is read back once and remembered for the tensor object and its version: the
+    same tensor again costs no readback, an in-place write is read again (and refused when it is no longer one), another
+    tensor of the same value is its own entry, and nothing is read inside a CUDA-graph capture."""
+    reads = []
+    read = neutral._read_device_scale
+    monkeypatch.setattr(
+        neutral, "_read_device_scale", lambda t: reads.append(1) or read(t)
+    )
+    dev = torch.device("cuda")
+    one = torch.ones((), device=dev)
+    for _ in range(5):
+        neutral.check_unit_scales(CLASS, (one, one, None, one))
+    assert len(reads) == 1
+    assert neutral.resolve_scale(CLASS, "k_scale", one) == 1.0 and len(reads) == 1
+    other = torch.ones(1, device=dev, dtype=torch.float64)
+    neutral.check_unit_scales(CLASS, (one, other, other))
+    assert len(reads) == 2
+    one.mul_(0.5)  # an in-place write: a new version
+    with pytest.raises(Unsupported, match="q_scale=0.5"):
+        neutral.check_unit_scales(CLASS, (one,))
+    assert len(reads) == 3
+    one.fill_(1.0)
+    neutral.check_unit_scales(CLASS, (one,))
+    neutral.check_unit_scales(CLASS, (one,))
+    assert len(reads) == 4
+    # a class that owns the scale gets its value from the same resolver
+    quarter = torch.full((1,), 0.25, device=dev)
+    neutral.check_unit_scales(CLASS, (None, quarter), free=("k_scale",))
+    assert neutral.resolve_scale(CLASS, "k_scale", quarter) == 0.25
+    for bad, named in (
+        (torch.ones(2, device=dev), "as a tensor of 2 elements"),
+        (torch.ones(1, device=dev, dtype=torch.int32), "of dtype torch.int32"),
+    ):
+        with pytest.raises(Unsupported, match=named):
+            neutral.check_unit_scales(CLASS, (bad,))
+    # the entry goes with the tensor
+    key = id(other)
+    assert key in neutral._DEVICE_SCALES
+    del other
+    assert key not in neutral._DEVICE_SCALES
+    # inside a capture: a tensor seen before is served from memory, a new one raises without a readback
+    fresh = torch.ones((), device=dev)
+    before = len(reads)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        neutral.check_unit_scales(CLASS, (one,))
+        with pytest.raises(Unsupported, match="inside a CUDA-graph capture"):
+            neutral.check_unit_scales(CLASS, (fresh,))
+        torch.zeros(1, device=dev).add_(1)
+    assert len(reads) == before
+
+
+@needs_device
+@pytest.mark.parametrize("kind", ["decode", "paged", "ragged"])
+def test_wrappers_accept_device_unit_scales(kind, monkeypatch):
+    """Unit scales as one-element device tensors on the three wrappers: the bits of the call without scales, one readback
+    per tensor however many ``run()`` calls follow, and a non-unit value after an in-place write refused."""
+    reads = []
+    read = neutral._read_device_scale
+    monkeypatch.setattr(
+        neutral, "_read_device_scale", lambda t: reads.append(1) or read(t)
+    )
+    pr = Problem([3, 1, 40], [700, 37, 40], 32, 8, 128, 16, seed=5)
+    dev = pr.device
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    ws = workspace(dev)
+    if kind == "decode":
+        w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        w.plan(pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, **kw)
+        args = (pr.q[:3].contiguous(), pr.cache("NHD"))
+    elif kind == "paged":
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16, causal=True, **kw)  # fmt: skip
+        args = (pr.q, pr.cache("NHD"))
+    else:
+        w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        w.plan(pr.qo_indptr, pr.kv_indptr_rag, 32, 8, 128, causal=True, **kw)
+        args = (pr.q, *pr.ragged("NHD"))
+    ref = bits(w.run(*args)).clone()
+    scales = {n: torch.ones((), device=dev) for n in ("q_scale", "k_scale", "v_scale")}
+    for _ in range(4):
+        assert torch.equal(bits(w.run(*args, **scales)), ref)
+    assert len(reads) == 3
+    scales["v_scale"].mul_(2.0)
+    with pytest.raises(Unsupported, match="v_scale=2.0"):
+        w.run(*args, **scales)
+    assert len(reads) == 4
+
+
+@pytest.mark.parametrize(
     "size,disable,fused",
     [
         (None, False, False),
@@ -1037,8 +1148,10 @@ def test_ragged_and_forward_accept_unit_scales():
     assert torch.equal(bits(got), bits(want))
     with pytest.raises(Unsupported, match="o_scale=0.5"):
         w.run(pr.q, k, v, o_scale=0.5)
-    with pytest.raises(Unsupported, match="k_scale as a tensor on cuda"):
-        w.run(pr.q, k, v, k_scale=torch.ones(1, device=pr.device))
+    got = w.run(pr.q, k, v, k_scale=torch.ones(1, device=pr.device))
+    assert torch.equal(bits(got), bits(want))
+    with pytest.raises(Unsupported, match="k_scale=0.5"):
+        w.run(pr.q, k, v, k_scale=torch.full((1,), 0.5, device=pr.device))
     paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace(pr.device), "NHD", batch_invariant=True
     )
