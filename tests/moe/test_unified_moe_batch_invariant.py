@@ -520,10 +520,9 @@ def test_routing_terms_exact_model_orders_and_fill_rules():
 
 
 def test_activation_of_covers_every_activation_config():
-    """``activation_of`` maps every ``ActivationConfig`` subclass of the layer's API (found by introspection, built with
-    its defaults) and the listed configurations onto a chain of the class: gated exactly when the config is, a chain
-    name of the spec's tables with the declared number of binary32 parameters. The listed configurations are distinct
-    classes (distinct fingerprints), and all but the default ``SwiGLU`` differ from the default class's."""
+    """``activation_of`` maps supported configs to their declared chains and rejects Colonels-only ClampedReLU2.
+    The listed configurations are distinct classes (distinct fingerprints), and all but the default ``SwiGLU``
+    differ from the default class's."""
     import inspect
 
     from flashinfer.batch_invariant.fp_interface import exact as fp32
@@ -535,11 +534,14 @@ def test_activation_of_covers_every_activation_config():
         for _, c in inspect.getmembers(A, inspect.isclass)
         if issubclass(c, ActivationConfig) and c is not ActivationConfig
     }
-    assert len(classes) == 11
-    assert classes == set(BatchInvariantMoeRunner.supported_activation_classes)
-    assert {type(a) for a in ACTIVATIONS} == classes
+    supported = set(BatchInvariantMoeRunner.supported_activation_classes)
+    assert len(supported) == 11
+    assert classes == supported | {A.ClampedReLU2}
+    assert {type(a) for a in ACTIVATIONS} == supported
+    with pytest.raises(ValueError, match="no chain for"):
+        S.activation_of(A.ClampedReLU2())
     assert len(ACTIVATIONS) == len(ACTIVATION_IDS) == 15
-    for cfg in [c() for c in classes] + ACTIVATIONS:
+    for cfg in [c() for c in supported] + ACTIVATIONS:
         a = S.activation_of(cfg)
         assert isinstance(a, S.ActSpec) and a.gated == cfg.is_gated, cfg
         assert a.act in (S.ACTS if a.gated else S.UNGATED_ACTS), cfg

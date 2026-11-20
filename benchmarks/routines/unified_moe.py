@@ -22,6 +22,9 @@ from flashinfer.fused_moe import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeStepFunConfig,
+    ClampedReLU2,
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     CudnnFrostBf16Config,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
@@ -103,6 +106,7 @@ _BACKEND_CONFIGS = {
     ("bf16", "frost_low_latency"): FrostLowLatencyConfig,
     ("bf16", "cake_stepfun"): CakeStepFunConfig,
     ("bf16", "cudnn_frost"): CudnnFrostBf16Config,
+    ("bf16", "colonels"): ColonelsBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
     ("nvfp4", "b12x"): B12xNvfp4Config,
@@ -120,6 +124,7 @@ _BACKEND_CONFIGS = {
     ("deepseek_fp8", "cutlass"): CutlassFp8BlockConfig,
     ("deepseek_fp8", "trtllm"): TrtllmFp8BlockConfig,
     ("deepseek_fp8", "prims_ts"): PrimsTsConfig,
+    ("deepseek_fp8", "colonels"): ColonelsFp8BlockConfig,
     ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
     ("mxfp8", "cutile"): CuTileMxfp8Config,
     ("mxfp8", "cutlass"): CutlassMxfp8Config,
@@ -136,6 +141,7 @@ _BACKEND_CONFIGS = {
 # backends read BF16 and quantize in-kernel, or (_TIMED_INPUT_QUANTIZATION)
 # quantize inside the timed region through ``input_quantizer``.
 _PREQUANTIZED_ACTIVATIONS = (
+    ColonelsFp8BlockConfig,
     CutlassNvfp4Config,
     CutlassMxfp8Config,
     CudnnGroupedGemmMxfp8Config,
@@ -183,6 +189,7 @@ _ACTIVATIONS = {
     ActivationType.GegluTanh: GeGLUTanh,
     ActivationType.Situ: SiTU,
     ActivationType.Relu2: ReLU2,
+    ActivationType.ClampedRelu2: ClampedReLU2,
     ActivationType.Identity: Identity,
     ActivationType.Gelu: GELU,
     ActivationType.Relu: ReLU,
@@ -209,6 +216,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
             "frost_low_latency",
             "cake_stepfun",
             "cudnn_frost",
+            "colonels",
         ),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
@@ -419,7 +427,7 @@ def _prepare_weight_view(
         return config_type.prepare_bf16_weights(w1, w2, activation=activation)
     if config_type in _QUANT_AWARE_PREPARERS:
         return config_type.prepare_weights(w1, w2, quant=_quant_config(args), **common)
-    if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
+    if quant_variant == "bf16" or backend in ("cutlass", "cudnn", "colonels"):
         return config_type.prepare_weights(w1, w2, **common)
 
     if quant_variant.startswith(("fp8", "mxfp8")):
@@ -547,6 +555,10 @@ def _reference_activation(
         values = values.float()
         if isinstance(activation, ReLU2):
             result = F.relu(values).square()
+        elif isinstance(activation, ClampedReLU2):
+            result = (
+                activation.limit * torch.tanh(F.relu(values) / activation.limit)
+            ).square()
         elif isinstance(activation, Identity):
             result = values
         elif isinstance(activation, GELU):
@@ -595,7 +607,7 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         backend=BackendOptions((backend_config,)),
         finalize=MoEFinalizeConfig(do_finalize=True, use_fused_finalize=True),
         execution=ExecutionConfig(
-            enable_pdl=False,
+            enable_pdl=args.enable_pdl,
             tune_max_num_tokens=args.num_tokens,
         ),
     )
@@ -711,9 +723,6 @@ def run_unified_moe_test(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
     if args.generate_repro_command:
         print(f"[INFO] To reproduce this test case, run: {args.repro_command}")
-    if args.enable_pdl:
-        raise ValueError("unified_moe requires PDL disabled for backend parity")
-
     device = get_device(args)
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype is not torch.bfloat16:
@@ -963,6 +972,8 @@ def run_unified_moe_test(args):
         )
         if args.quant_variant.startswith(("fp8", "mxfp8")):
             weight_format = "mxfp8" if args.quant_variant.startswith("mxfp8") else "fp8"
+        elif args.quant_variant == "deepseek_fp8":
+            weight_format = "fp8_block_scale"
         weight_dtype = torch.uint8 if weight_format else torch.bfloat16
         tb_per_sec = calculate_moe_kernel_bandwidth(
             args.num_tokens,

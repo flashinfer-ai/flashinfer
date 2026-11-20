@@ -33,6 +33,8 @@ from ..autotuner import AutoTuner
 from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     BackendOptions,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -127,6 +129,7 @@ from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
+from .backends.colonels.runner import ColonelsRunnerBF16, ColonelsRunnerFP8
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
@@ -134,6 +137,8 @@ from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    ColonelsRunnerBF16,
+    ColonelsRunnerFP8,
     BatchInvariantMoeRunner,
     BatchInvariantFp8PerTensorRunner,
     FrostLowLatencyRunner,
@@ -182,7 +187,11 @@ _RunnerT = Union[
 ]
 
 # Map backend-config class -> runner class
+
+
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    ColonelsBf16Config: ColonelsRunnerBF16,
+    ColonelsFp8BlockConfig: ColonelsRunnerFP8,
     BatchInvariantBf16Config: BatchInvariantMoeRunner,
     FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,

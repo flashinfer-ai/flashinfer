@@ -894,6 +894,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `MXFP8×MXFP8` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `NVFP4×NVFP4` | `SwiGLUStep` |
+| `colonels_bf16` | `ColonelsBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2`, `ClampedReLU2` |
+| `colonels_fp8_block` | `ColonelsFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `cudnn_frost_bf16` | `CudnnFrostBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |

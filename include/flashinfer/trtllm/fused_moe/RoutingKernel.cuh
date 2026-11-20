@@ -200,6 +200,33 @@ __device__ __forceinline__ void initRoutingTilePadding(int32_t* tokenIdx, int32_
   }
 }
 
+// Optional padding for consumers that gather expanded token/top-k indices.
+// Cluster blocks share the aligned stores through rank and stride.
+template <typename Params>
+__device__ __forceinline__ void initRoutingExpandedIdxPadding(Params const& params, int32_t begin,
+                                                              int32_t end, int32_t rank = 0,
+                                                              int32_t stride = 1) {
+  if (!params.mFillExpandedIdxPadding) return;
+  int32_t* indices = params.mPtrPermutedIdxToExpandedIdx;
+  if (indices == nullptr) return;
+  int32_t const value = params.mExpandedIdxPadding;
+  // Keep vector stores aligned even when the caller supplies an offset view.
+  int32_t const head = min(
+      end,
+      begin + static_cast<int32_t>(
+                  (alignof(int4) - reinterpret_cast<uintptr_t>(indices + begin) % alignof(int4)) %
+                  alignof(int4)) /
+                  static_cast<int32_t>(sizeof(int32_t)));
+  int32_t const tail = head + (end - head) / 4 * 4;
+  if (rank == 0) {
+    for (int32_t i = begin; i < head; ++i) indices[i] = value;
+    for (int32_t i = tail; i < end; ++i) indices[i] = value;
+  }
+  for (int32_t i = head + rank * 4; i < tail; i += stride * 4) {
+    *reinterpret_cast<int4*>(indices + i) = make_int4(value, value, value, value);
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __host__ __device__ constexpr int32_t getBits(int32_t value, int idx) {
@@ -535,6 +562,12 @@ __device__ void routingPermutation(KernelParams params,
         offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
       }
 
+      // Share expanded-map padding across cluster blocks; a small batch may have
+      // only one tile per expert, leaving all other blocks idle in the CTA loop.
+      initRoutingExpandedIdxPadding(params, offset + count[e],
+                                    offset + numCta[e] * params.mTileTokensDim, clusterBlockRank,
+                                    NumBlocks);
+
       // write expert offsets to shared
       smemExpertOffset[expert] = offset + blockExpertOffset[e];
     }
@@ -836,6 +869,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
         initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+        initRoutingExpandedIdxPadding(params, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
   }
@@ -1217,6 +1251,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     }
     params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
     initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+    initRoutingExpandedIdxPadding(params, min(mnLimit1, mnLimit2), mnLimit1);
   }
 
   // get the padded offset associated with this expert (token-space, CGA granularity)

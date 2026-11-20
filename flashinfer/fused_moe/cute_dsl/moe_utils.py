@@ -727,6 +727,7 @@ def moe_sort(
     out_permuted_idx_to_expanded_idx: Optional[torch.Tensor] = None,
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    padding: int | None = None,
 ) -> Tuple[
     torch.Tensor,  # tile_idx_to_expert_idx
     torch.Tensor,  # tile_idx_to_mn_limit
@@ -776,6 +777,9 @@ def moe_sort(
         out_permuted_idx_to_expanded_idx: Pre-allocated buffer for permuted_idx_to_expanded_idx.
         out_total_num_padded_tokens: Pre-allocated buffer for total_num_padded_tokens.
         out_num_non_exiting_tiles: Pre-allocated buffer for num_non_exiting_tiles.
+        padding: Optional int32 value for unused rows within active tiles of
+            permuted_idx_to_expanded_idx. None leaves those rows untouched.
+            Entries beyond total_num_padded_tokens are always left untouched.
 
     Returns:
         tuple: A tuple of 6 elements:
@@ -787,7 +791,9 @@ def moe_sort(
                 Mapping from expanded index to permuted index.
                 -1 indicates a masked/non-local expert.
             - permuted_idx_to_expanded_idx: [max_num_permuted_tokens], int32
-                Mapping from permuted index to expanded index.
+                Mapping from permuted index to expanded index. Unused rows within
+                active tiles are filled with padding when provided; otherwise they
+                are untouched. Entries beyond total_num_padded_tokens are untouched.
             - total_num_padded_tokens: [1], int32 (device tensor)
                 Total number of padded tokens. Returned as tensor for CUDA graph compatibility.
             - num_non_exiting_tiles: [1], int32 (device tensor)
@@ -938,6 +944,7 @@ def moe_sort(
         expert_counts_ptr,
         # CUDA stream for CUDA graph compatibility
         cuda_stream_ptr,
+        padding,
     )
 
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility
