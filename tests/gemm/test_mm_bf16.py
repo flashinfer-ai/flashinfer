@@ -308,6 +308,19 @@ def test_mm_bf16_tgv_tactic_rejects():
     num_tactics = tgv_gemm_cute_ext.get_tgv_cute_ext_tactic_num()
     with pytest.raises(ValueError, match="not valid"):
         mm_bf16(a, b, backend="tgv", tactic=num_tactics)
+    with pytest.raises(ValueError, match="not valid"):
+        mm_bf16(a, b, backend="tgv", tactic=-1)
+    # skip_check=True skips the requirement checks; the tactic path still guards.
+    with pytest.raises(ValueError, match="backend='tgv'"):
+        mm_bf16(a, b, backend="cudnn", tactic=1, skip_check=True)
+    with pytest.raises(ValueError, match="backend='tgv'"):
+        mm_bf16(a, b, backend="tgv", tactic=-1, skip_check=True)
+    with pytest.raises(ValueError):
+        mm_bf16(a[:, :1020], b[:1020], backend="tgv", tactic=1, skip_check=True)
+    valid = tgv_gemm_cute_ext.get_tgv_cute_ext_valid_tactics(torch.device("cuda"))
+    if 29 not in valid:  # SM100/SM103: an SM107-only id is rejected
+        with pytest.raises(ValueError):
+            mm_bf16(a, b, backend="tgv", tactic=29)
     with pytest.raises(ValueError, match="batch_invariant"):
         mm_bf16(a, b, backend="auto", batch_invariant=True, tactic=1)
     with pytest.raises(ValueError, match="TGV backend supports bfloat16"):

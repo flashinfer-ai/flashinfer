@@ -1044,8 +1044,10 @@ def mm_bf16(
     tactic: Optional[int]
         TGV only (requires ``backend="tgv"``): run this TGV tactic id and skip
         the default and the autotuner, also inside ``autotune()``. Valid ids
-        are ``0 .. 28`` on SM100/SM103 and ``0 .. 46`` on SM107. For callers
-        that pick the tile per shape themselves. Defaults to ``None``.
+        are ``0 .. 28`` on SM100/SM103 and ``0 .. 46`` on SM107. An id is an
+        index into ``_TGV_CUTE_EXT_TACTIC_CONFIGS``; ids are stable and new
+        tiles are only appended. For callers that pick the tile per shape
+        themselves. Defaults to ``None``.
 
     Returns
     -------
@@ -1105,6 +1107,10 @@ def mm_bf16(
         )
 
     if tactic is not None:
+        # Also guards skip_check=True calls, which bypass the requirement checks.
+        if backend != "tgv" or tactic < 0:
+            raise ValueError(f"tactic={tactic} needs backend='tgv' and a valid id.")
+        _require_tma_bf16_k_alignment("TGV", a.shape[-1])
         from .kernels.tgv_gemm_cute_ext import run_tgv_cute_ext
 
         return run_tgv_cute_ext(a, b, bias, out, pdl, tactic)
