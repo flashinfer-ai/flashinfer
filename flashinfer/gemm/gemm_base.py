@@ -4962,6 +4962,13 @@ def _check_bmm_mxfp8_scale_shape(
                     f"{tuple(scale.shape)}."
                 )
         elif scale.ndim == 1:
+            if batch > 1 and rows % 128 != 0:
+                raise ValueError(
+                    f"bmm_mxfp8 expects a 3D {name} of shape {expected_shape} "
+                    f"when batch > 1 and rows ({rows}) is not a multiple of 128: "
+                    "a 1D scale cannot tell the folded batch*rows layout from the "
+                    "per-batch layout. Pass rank_preserving=True to mxfp8_quantize."
+                )
             if scale.numel() != expected_len:
                 raise ValueError(
                     f"bmm_mxfp8 expects {name} to contain {expected_len} "

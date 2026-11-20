@@ -133,10 +133,12 @@ def _per_batch_cos_sim(res, reference):
 
 
 # #3604 regression anchor: b>1 with m or n not a multiple of 128 needs a per-batch scale.
-@pytest.mark.parametrize("b,m,n,k", [(4, 130, 256, 256), (2, 200, 160, 512), (2, 130, 160, 160), (3, 64, 192, 288)])
-@pytest.mark.parametrize("scale_ndim", [3, 1])
+@pytest.mark.parametrize(
+    "b,m,n,k",
+    [(4, 130, 256, 256), (2, 200, 160, 512), (2, 130, 160, 160), (3, 64, 192, 288)],
+)
 @pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
-def test_bmm_mxfp8_per_batch_scale(b, m, n, k, scale_ndim, backend):
+def test_bmm_mxfp8_per_batch_scale(b, m, n, k, backend):
     compute_capability = get_compute_capability(torch.device("cuda"))
     if backend == "cudnn" and compute_capability[0] != 10:
         pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
@@ -148,9 +150,6 @@ def test_bmm_mxfp8_per_batch_scale(b, m, n, k, scale_ndim, backend):
     input_mxfp8, input_scale = _mxfp8_quantize_per_batch(input_mat)
     weight_mxfp8, weight_scale = _mxfp8_quantize_per_batch(weight)
     assert input_scale.shape == (b, (m + 127) // 128 * 128, (k // 32 + 3) // 4 * 4)
-    if scale_ndim == 1:
-        input_scale = input_scale.flatten()
-        weight_scale = weight_scale.flatten()
 
     with autotune(False):
         res = bmm_mxfp8(
@@ -168,25 +167,40 @@ def test_bmm_mxfp8_per_batch_scale(b, m, n, k, scale_ndim, backend):
     assert (cos_sim > 0.99).all(), f"per-batch cosine similarity {cos_sim.tolist()}"
 
 
-def test_bmm_mxfp8_rejects_folded_scale_for_unaligned_batches():
-    b, m, n, k = 4, 130, 256, 256
+def test_bmm_mxfp8_rejects_1d_scale_for_unaligned_batches():
+    b, m, n, k = 2, 200, 160, 512
     a = torch.empty((b, m, k), dtype=torch.float8_e4m3fn)
     bt = torch.empty((b, k, n), dtype=torch.float8_e4m3fn)
+    b_scale = torch.empty((b, n, k // 32), dtype=torch.uint8)
+    # Folded and per-batch 1D scales are both 8192 long here, so length cannot tell them apart.
     folded_a_scale = torch.empty(
         ((b * m + 127) // 128 * 128 * (k // 32),), dtype=torch.uint8
     )
-    b_scale = torch.empty((b * n * (k // 32),), dtype=torch.uint8)
-    with pytest.raises(ValueError, match="A_scale to contain 8192 elements"):
+    assert folded_a_scale.numel() == b * 256 * (k // 32)
+    with pytest.raises(ValueError, match=r"3D A_scale of shape \(2, 256, 16\)"):
         gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
             a, bt, folded_a_scale, b_scale
         )
     wrong_3d_scale = torch.empty((b, m, k // 32), dtype=torch.uint8)
-    with pytest.raises(ValueError, match=r"3D A_scale of shape \(4, 256, 8\)"):
+    with pytest.raises(ValueError, match=r"3D A_scale of shape \(2, 256, 16\)"):
         gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
             a, bt, wrong_3d_scale, b_scale
         )
     gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
-        a, bt, torch.empty((b, 256, k // 32), dtype=torch.uint8), b_scale
+        a,
+        bt,
+        torch.empty((b, 256, k // 32), dtype=torch.uint8),
+        torch.empty((b, 256, k // 32), dtype=torch.uint8),
+    )
+
+
+def test_bmm_mxfp8_accepts_1d_scale_for_aligned_batches():
+    b, m, n, k = 2, 128, 128, 128
+    a = torch.empty((b, m, k), dtype=torch.float8_e4m3fn)
+    bt = torch.empty((b, k, n), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((b * 128 * (k // 32),), dtype=torch.uint8)
+    gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
+        a, bt, scale, scale
     )
 
 

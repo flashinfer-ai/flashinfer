@@ -310,8 +310,8 @@ def _run_mxfp8_bmm_cute_dsl(a, b, out, backend, cfg):
         return
     nb, m, n = out.shape
     ref_q, ref_s = mxfp8_quantize(out.reshape(nb * m, n), True)
-    a_q, a_s = mxfp8_quantize(a, True)
-    b_q, b_s = mxfp8_quantize(b, True)
+    a_q, a_s = _mxfp8_quantize_bmm_operand(a)
+    b_q, b_s = _mxfp8_quantize_bmm_operand(b)
     q = torch.empty(out.shape, device=out.device, dtype=torch.float8_e4m3fn)
     need = ref_s.numel()
     scale = torch.full([need + 512], 0xAB, device=out.device, dtype=torch.uint8)
