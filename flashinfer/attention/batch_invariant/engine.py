@@ -1285,9 +1285,12 @@ def _run_attention_validated(
     if fixed is not None and fixed.null_requests:
         # a request without keys has no unit: its rows are zeros and its LSE -inf, written here ahead of the kernels (the
         # launch is the same for every plan, so the captured graph holds these fills whatever the batch)
-        out.zero_()
-        if lse_mode:
-            lse.fill_(float("-inf"))
+        with (
+            torch.inference_mode()
+        ):  # legal for the caller's buffers whichever side of inference mode made them
+            out.zero_()
+            if lse_mode:
+                lse.fill_(float("-inf"))
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     lse_view = lse.view(-1) if lse_mode else planned.lse_unused

@@ -5125,6 +5125,57 @@ def test_cuda_graph_sinks_declaration_and_neutral_arguments():
 
 
 @needs_device
+@pytest.mark.parametrize("kind", ["decode", "prefill"])
+def test_cuda_graph_wrappers_across_inference_mode(kind):
+    """A ``use_cuda_graph=True`` wrapper may be built, planned, captured and replanned on either side of
+    ``torch.inference_mode()`` (and under ``torch.no_grad()``): the fixed launch's tables and the page-table buffers are
+    written in place at every plan, whichever side created them, and the replays keep the eager bits."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, 128, 16, seed=37)
+
+    def make():
+        return _GraphDecode(pr, 1) if kind == "decode" else _GraphPrefill(pr, 400)
+
+    def step(g, i):
+        if (
+            kind == "decode"
+        ):  # the last one leaves a request without keys: its rows are filled ahead of the kernels
+            g.check(([300, 40, 129], [3000, 1500, 700], [513, 0, 64])[i])
+        else:
+            g.check(
+                *(
+                    ([100, 7, 30], [300, 40, 129]),
+                    ([0, 390, 10], [0, 3000, 700]),
+                    ([64, 64, 64], [513, 2049, 64]),
+                )[i]
+            )
+
+    with torch.inference_mode():
+        inside = (
+            make()
+        )  # the wrapper and its page-table buffers are created under inference mode
+    # the test's own in-place fills need normal tensors on this side
+    inside.q = inside.q.clone()
+    inside.out = torch.empty_like(inside.q)
+    inside.run_kw["out"] = inside.out
+    step(
+        inside, 0
+    )  # the first plan (the fixed launch's tables) and the capture outside
+    step(inside, 1)
+    with torch.inference_mode():
+        step(inside, 2)
+    with torch.no_grad():
+        step(inside, 0)
+    outside = make()
+    with torch.inference_mode():
+        step(outside, 0)  # the first plan and the capture inside
+        step(outside, 1)
+    step(outside, 2)
+    with torch.no_grad():
+        step(outside, 1)
+    step(outside, 0)
+
+
+@needs_device
 def test_cuda_graph_device_scale_tensors():
     """Unit scales as device tensors under ``use_cuda_graph=True``: a tensor resolved by the warm-up ``run()`` is served
     from memory inside the capture and the graph replays after replans; a tensor first seen inside a capture raises the

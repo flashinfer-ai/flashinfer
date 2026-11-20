@@ -52,6 +52,10 @@ written (with ``lse_layout="HN"`` the transposed copy covers the whole buffer). 
 refused as in eager mode, with no key at all too. The page indices are range-checked at the first plan only (a check is a
 device readback, and later plans run before every replay). The ragged prefill wrapper refuses ``use_cuda_graph=True``.
 
+Inference mode: the fixed launch's tables and the page-table buffers are written in place at every plan, under
+``torch.inference_mode()`` whatever the caller's mode, so a wrapper may be built, planned, captured and replanned on either
+side of it (and under ``torch.no_grad()``).
+
 A plan's execution state (the split-KV partials in the workspace, the arrival counters) is single-use per launch: two ``run()``
 calls of one plan must be stream-ordered, as with every FlashInfer wrapper's workspace; the counters reset themselves at every
 launch, so sequential reuse on one stream needs nothing more.
@@ -688,27 +692,31 @@ class BatchInvariantAttention:
             if slots:
                 config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         if self.graph:
-            self._plan_fixed(
-                config,
-                qo_host,
-                kv_indptr_host,
-                last_host,
-                kv_indptr,
-                kv_indices,
-                kv_last_page_len,
-                num_qo_heads,
-                num_kv_heads,
-                D,
-                page_size,
-                int(window_left),
-                float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D),
-                int(q_len_per_req),
-                non_blocking,
-                max_page,
-                fast,
-                qo_indptr,
-                has_sinks,
-            )
+            # the fixed launch's tables and the page-table buffers are written in place. Under inference mode the writes are legal
+            # for tensors created inside it (a wrapper built or first planned under torch.inference_mode()) and outside it alike,
+            # so a wrapper may be built, planned and replanned on either side
+            with torch.inference_mode():
+                self._plan_fixed(
+                    config,
+                    qo_host,
+                    kv_indptr_host,
+                    last_host,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_len,
+                    num_qo_heads,
+                    num_kv_heads,
+                    D,
+                    page_size,
+                    int(window_left),
+                    float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D),
+                    int(q_len_per_req),
+                    non_blocking,
+                    max_page,
+                    fast,
+                    qo_indptr,
+                    has_sinks,
+                )
             return
         try:
             planned = engine.plan_attention(
@@ -1227,5 +1235,6 @@ class BatchInvariantAttention:
             return out, lse_nh
         if lse is None:
             lse = torch.empty(nh_shape[::-1], dtype=torch.float32, device=self.device)
-        lse.copy_(lse_nh.t())
+        with torch.inference_mode():  # the caller's buffer may be an inference tensor
+            lse.copy_(lse_nh.t())
         return out, lse
