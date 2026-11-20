@@ -3625,12 +3625,18 @@ GRAPH_STEPS = (
         (64, 8, 8, 2, 16),
         (128, 32, 8, 4, 16),
         (256, 32, 8, 3, 1),
+        (128, 16, 8, 1, 1),
+        (64, 16, 8, 1, 2),
+        (256, 16, 8, 1, 4),
+        (128, 32, 8, 4, 1),
     ],
 )
 def test_cuda_graph_decode_replan_equals_eager(D, Hq, Hkv, q_len, page):
     """``use_cuda_graph=True`` on the decode wrapper: one capture of ``run()``, then replans with changing KV lengths (through
     ``plan``, ``fast_decode_plan`` and the ``begin_forward`` partial) each followed by a replay, give the bits of an eager
-    wrapper on the same batch -- the Swaps body (at most 8 live rows per unit) and the row body, pages of 1 and 16."""
+    wrapper on the same batch -- the Swaps body (at most 8 live rows per unit) and the row body, pages of 1 to 16 (the pool's
+    page table is a random permutation with junk pages in between: token-pool indices; pages of at most 4 keys take the split
+    placement of the K / V boxes in both bodies)."""
     pr = Problem([1, 1, 1], [5120, 5120, 5120], Hq, Hkv, D, page, seed=11)
     gd = _GraphDecode(pr, q_len)
     fixed = None
@@ -4177,13 +4183,17 @@ PREFILL_GRAPH_STEPS = (
         (128, 8, 8, 1),
         (64, 8, 8, 16),
         (128, 64, 8, 16),
+        (128, 16, 8, 1),
+        (64, 16, 8, 2),
+        (256, 16, 8, 4),
     ],
 )
 def test_cuda_graph_prefill_replan_equals_eager(D, Hq, Hkv, page):
     """``use_cuda_graph=True`` on the paged prefill wrapper: one capture of ``run()`` over capacity-shaped ``q`` / ``out``,
     then plans that change every slot's query and KV lengths (zero-length slots, prefixes growing across chunks, Q tiles
     of 128 rows and more, a full and a nearly empty bucket) each followed by a replay, give the bits of an eager wrapper
-    on the same batch in the planned rows and leave the rows beyond untouched."""
+    on the same batch in the planned rows and leave the rows beyond untouched. The page table is a random permutation of the
+    pool (token-pool indices at page size 1); pages of at most 4 keys take the split placement of the K / V boxes."""
     pr = Problem([1] * 4, [3000] * 4, Hq, Hkv, D, page, seed=21)
     gp = _GraphPrefill(pr, 700)
     for q_lens, kv_lens in PREFILL_GRAPH_STEPS:
@@ -4674,3 +4684,90 @@ def test_cuda_graph_plan_argument_spellings():
     for how in ("plan", "fast"):
         with pytest.raises(bi.BatchInvariantUnsupportedError):
             gd.plan([300, 40, 129], how, **dict(none, data_type=torch.float16))
+
+
+# ------------------------------------------------------------------------------------------------------ small pages
+def test_split_placement_rule_and_kernel_names():
+    """The split placement of the K / V boxes is a function of the page size alone (pages of at most 4 keys of a paged pool,
+    never the ragged pool) and part of a kernel's name, so a kernel built for one placement is never loaded for the other."""
+    from flashinfer.attention.batch_invariant.blocks import compile as row
+    from flashinfer.attention.batch_invariant.blocks.operands import split_pages
+    from flashinfer.attention.batch_invariant.swaps import compile as swaps
+
+    assert [p for p in (1, 2, 4, 8, 16, 32, 64, 128) if split_pages(p)] == [1, 2, 4]
+    assert not any(split_pages(p, True) for p in (1, 2, 4, 8, 16, 32, 64, 128))
+    assert row.kernel_name(128, 2, 1, 4) == "attn_d128_g2_p1_s4_w1_sp"
+    assert row.kernel_name(128, 2, 4, 4, fixed=True) == "attn_d128_g2_p4_s4_w1_sp_cg"
+    assert row.kernel_name(128, 2, 8, 4) == "attn_d128_g2_p8_s4_w1"
+    assert row.kernel_name(128, 2, 128, 4, ragged=True) == "attn_d128_g2_p128_s4_w1_rg"
+    assert swaps.kernel_name(128, 2, 1, 8) == "attn_swaps_d128_g2_p1_n8_sp"
+    assert (
+        swaps.kernel_name(128, 2, 2, 8, fixed=True) == "attn_swaps_d128_g2_p2_n8_sp_cg"
+    )
+    assert swaps.kernel_name(128, 2, 8, 8) == "attn_swaps_d128_g2_p8_n8"
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("page", [1, 2, 4])
+def test_small_pages_scattered_prefill_decode_chunked(D, page):
+    """Pages of 1, 2 and 4 keys with scattered page indices (a token pool: the page table is a random permutation of a pool with
+    junk pages in between), two query heads per KV head: the paged prefill gives the bits of the ragged prefill (whose K / V
+    load is one box per half: the split placement delivers the same bytes), in both pool layouts; the decode step of a
+    request's last token and a chunked prefill of its last tokens give that prefill's rows; and a request alone, in another
+    pool and page order, gives the bits it has in the batch."""
+    q_lens = kv_lens = [700, 1300, 257, 129, 31]
+    pr = Problem(q_lens, kv_lens, 16, 8, D, page, seed=41)
+    full = bits(run_paged_prefill(pr))
+    assert torch.equal(full, bits(run_ragged_prefill(pr)))
+    assert torch.equal(full, bits(run_paged_prefill(pr, "HND")))
+    rows = [
+        slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    kv_rows = [
+        slice(int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    # decode: every request's last token over all its keys (the Swaps body: two live rows per unit)
+    for layout in ("NHD", "HND"):
+        dec, last = run_decode(pr, layout)
+        assert torch.equal(bits(dec), full[last]), layout
+    # chunked prefill: the last tokens of every request over all its keys
+    tail = [200, 513, 129, 1, 31]
+    ch = Problem(tail, kv_lens, 16, 8, D, page, seed=42)
+    ch.q = torch.cat(
+        [pr.q[rows[i]][q_lens[i] - tail[i] :] for i in range(len(tail))]
+    ).contiguous()
+    ch.k_rag, ch.v_rag = pr.k_rag.clone(), pr.v_rag.clone()
+    ch = _repack(ch)
+    out_ch = bits(run_paged_prefill(ch))
+    off = 0
+    for i, n in enumerate(tail):
+        assert torch.equal(out_ch[off : off + n], full[rows[i]][q_lens[i] - n :]), i
+        off += n
+    # a request alone, in a fresh pool and page order, and the batch in another order
+    for i in (1, 3):
+        one = Problem([q_lens[i]], [kv_lens[i]], 16, 8, D, page, seed=43 + i)
+        one.q = pr.q[rows[i]].clone()
+        one.k_rag, one.v_rag = (
+            pr.k_rag[kv_rows[i]].clone(),
+            pr.v_rag[kv_rows[i]].clone(),
+        )
+        one = _repack(one)
+        assert torch.equal(bits(run_paged_prefill(one)), full[rows[i]]), i
+        dec1, _ = run_decode(one)
+        assert torch.equal(bits(dec1), full[rows[i]][-1:]), i
+    perm = [4, 2, 0, 3, 1]
+    pp = Problem(
+        [q_lens[i] for i in perm], [kv_lens[i] for i in perm], 16, 8, D, page, seed=47
+    )
+    pp.q = torch.cat([pr.q[rows[i]] for i in perm]).contiguous()
+    pp.k_rag = torch.cat([pr.k_rag[kv_rows[i]] for i in perm]).contiguous()
+    pp.v_rag = torch.cat([pr.v_rag[kv_rows[i]] for i in perm]).contiguous()
+    pp = _repack(pp)
+    permuted = bits(run_paged_prefill(pp))
+    off = 0
+    for i in perm:
+        assert torch.equal(permuted[off : off + q_lens[i]], full[rows[i]]), i
+        off += q_lens[i]
