@@ -4210,11 +4210,15 @@ class _MlaStageOneWinnerRunner(TunableRunner):
             for runner in self._runners
         )
 
-    def forward(self, inputs, tactic: Any = -1, **kwargs):
+    def forward(self, inputs, tactic: Any = -1, do_preparation: bool = False, **kwargs):
         for runner in self._runners:
             if isinstance(tactic, tuple) and type(runner).__name__ == tactic[0]:
-                return runner(inputs, tactic=tactic[1], **kwargs)
-        return self._runners[0](inputs, tactic=-1, **kwargs)
+                return runner(
+                    inputs, tactic=tactic[1], do_preparation=do_preparation, **kwargs
+                )
+        return self._runners[0](
+            inputs, tactic=-1, do_preparation=do_preparation, **kwargs
+        )
 
     def __hash__(self):
         # Cache-key extras carry the first-stage runners' identity.
@@ -4235,6 +4239,9 @@ def _mla_cake_margin_tuning_config(
     own; the candidates then still offer tactics only in the offered buckets,
     so only those are timed."""
     spec, *others = config.dynamic_tensor_specs
+    if callable(spec.gen_tuning_buckets):
+        # Generated per call: the second stage generates the first stage's.
+        return config
     buckets = tuple(sorted(set(spec.gen_tuning_buckets)))
     kept: Set[int] = set()
     for index, bucket in enumerate(buckets):
