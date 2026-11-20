@@ -236,6 +236,7 @@ def test_suggest_prims_ts_q_token_kv_block_sparse_group_size_rejects_invalid_ext
         {"q_dtype": torch.float32},
         {"q_dtype": "bfloat16"},
         {"split_kv": 1},
+        {"packed_query": 1},
     ),
 )
 def test_q_token_kv_block_sparse_recommendation_rejects_invalid_recipe(kwargs):
@@ -4533,7 +4534,7 @@ def test_attention_ts_nvfp4_cache_contract():
         logical_head_dim=64,
     )
     assert normalized[5] == 64
-    k_sf, v_sf, k_sf_page_stride, v_sf_page_stride = (
+    k_sf, v_sf, k_sf_strides, v_sf_strides = (
         decode_module._normalize_paged_kv_scale_factors(
             (scales, scales),
             k_cache=packed,
@@ -4542,8 +4543,16 @@ def test_attention_ts_nvfp4_cache_contract():
     )
     assert k_sf is scales
     assert v_sf is scales
-    assert k_sf_page_stride == scales.stride(0)
-    assert v_sf_page_stride == scales.stride(0)
+    assert k_sf_strides == v_sf_strides == scales.stride()[:3]
+    # D64 scale rows (4 bytes) are copied several tokens per TMA box row, so
+    # they must be token-contiguous; a transposed token-major view is not.
+    token_major = torch.empty((2, 64, 2, 4), dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="token-contiguous"):
+        decode_module._normalize_paged_kv_scale_factors(
+            (token_major.transpose(1, 2),) * 2,
+            k_cache=torch.empty((2, 2, 64, 32), dtype=torch.uint8),
+            logical_head_dim=64,
+        )
     with pytest.raises(ValueError, match="requires kv_scale_factors"):
         decode_module._normalize_paged_kv_scale_factors(
             None,
@@ -4771,6 +4780,39 @@ def test_attention_ts_decode_mixed_precision(
         seq_len_kv=seq_len_kv,
         seq_len_q=seq_len_q,
         page_size=page_size,
+    )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "head_dim,page_size,qkv_dtype",
+    [
+        (128, 4, "fp8q-nvfp4kv-bf16o"),
+        (128, 8, "fp8q-nvfp4kv-bf16o"),
+        (256, 4, "fp8q-nvfp4kv-bf16o"),
+        (256, 4, "fp8q-nvfp4kv"),
+        (256, 4, "bf16q-nvfp4kv"),
+    ],
+    ids=lambda value: str(value),
+)
+def test_attention_ts_decode_nvfp4_small_page_scale_fragments(
+    head_dim: int, page_size: int, qkv_dtype: str
+):
+    """Scale fragments below 128 bytes occupy padded SMEM slots.
+
+    Every converter, including the row-per-thread Keeps FP8 converter that
+    FP8 Q with BF16 output selects here, must skip that padding.
+    """
+    assert page_size * head_dim // 16 < 128
+    test_attention_ts_decode_mixed_precision(
+        batch_size=8,
+        seq_len_kv=2048,
+        seq_len_q=8,
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        page_size=page_size,
+        qkv_dtype=qkv_dtype,
     )
 
 
@@ -9977,6 +10019,90 @@ def test_attention_ts_decode_final_statistics(
     graph.replay()
     torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.05)
     torch.testing.assert_close(lse, expected, atol=0.015, rtol=0.002)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("packed", (False, True), ids=("uniform_q", "packed_q"))
+def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
+    """Persistent sink tiles stay in step when live-Q requests have no KV."""
+    from tests.attention.test_attention_ts_context import _softmax_statistics_reference
+
+    # Two requests per SM exceed one CTA wave, so the planner persists.
+    num_requests = 2 * torch.cuda.get_device_properties("cuda").multi_processor_count
+    heads, dim, page_size, nk = 8, 64, 32, 257
+    q_lens = tuple((3, 5, 7)[i % 3] if packed else 3 for i in range(num_requests))
+    case = _make_decode_case(
+        kv_lens=(nk,) * num_requests,
+        num_qo_heads=heads,
+        num_kv_heads=1,
+        head_dim=dim,
+        seq_len_q=max(q_lens),
+        page_size=page_size,
+        qkv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=12012,
+    )
+    offsets = None
+    if packed:
+        case, offsets = _pack_decode_case(case, q_lens)
+    sinks = torch.linspace(-4, 4, heads, device="cuda")
+    wrapper = BatchDecodePagedTSWrapper("HND")
+    wrapper.plan(
+        device="cuda",
+        batch_size=num_requests,
+        num_qo_heads=heads,
+        num_kv_heads=1,
+        head_dim=dim,
+        page_size=page_size,
+        max_kv_len=nk,
+        max_q_len=max(q_lens),
+        packed_query=packed,
+        q_dtype=torch.bfloat16,
+        mask_type="causal",
+        use_attention_sinks=True,
+        split_kv=False,
+    )
+    assert dict(wrapper._policy)["use_persistent_scheduler"] is True
+
+    # Tasks without skip_if still visit these tiles; they must not wait on the
+    # sink barrier that the skipping tasks never reach.
+    inactive = {1: 0, num_requests // 2: -1}
+    lengths = torch.full((num_requests,), nk, dtype=torch.int32, device="cuda")
+    for request, length in inactive.items():
+        lengths[request] = length
+    out = torch.full_like(case.q, 8)
+    wrapper.run(
+        case.q,
+        (case.k_cache, case.v_cache),
+        lengths,
+        case.block_tables,
+        qo_indptr=offsets,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+        attention_sinks=sinks,
+        out=out,
+    )
+
+    expected = torch.full_like(out, 8, dtype=torch.float32)
+    pages_per_request = (nk + page_size - 1) // page_size
+    bounds = offsets.tolist() if packed else None
+    for request in range(num_requests):
+        if request in inactive:
+            continue
+        rows = slice(bounds[request], bounds[request + 1]) if packed else request
+        pages = case.block_tables[request, :pages_per_request].long()
+        k, v = (
+            t[pages].transpose(1, 2).reshape(-1, 1, dim)[:nk]
+            for t in (case.k_cache, case.v_cache)
+        )
+        ref, _ = _softmax_statistics_reference(
+            case.q[rows], k, v, scale=case.softmax_scale, sinks=sinks
+        )
+        expected[rows] = ref * case.output_scale
+    torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
 
 
 @pytest.mark.parametrize(

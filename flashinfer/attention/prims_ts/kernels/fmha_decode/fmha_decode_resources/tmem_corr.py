@@ -506,19 +506,34 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> None:
         """Wait for all peer async cluster partial stores before local reduction."""
         _ = self
-        # Give every correction lane one nonblocking acquire attempt. When the
+        # Give every correction lane one nonblocking wait attempt. When the
         # short transaction is already complete this preserves the all-lane
         # fast path; otherwise only lane 0 continues polling. The existing
         # correction-group barrier publishes lane 0's ready point before any
         # reducer lane reads the distributed-SMEM partials.
+        # The peers' st.async complete-tx releases at cluster scope, so the
+        # wait must observe it at cluster scope; the default CTA scope does
+        # not synchronize with a thread of another CTA. The wait itself is
+        # relaxed and the acquire is a fence restricted to shared::cluster,
+        # which orders the distributed-SMEM reads without the L1 invalidation
+        # an acquire.cluster wait would cost.
         cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-            mbarrier, 0, time_limit=0
+            mbarrier,
+            0,
+            time_limit=0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
         )
         if warp_grp_thread_idx == Int32(0):
             while not cluster_transaction_ready:
                 cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-                    mbarrier, 0, time_limit=10_000_000
+                    mbarrier,
+                    0,
+                    time_limit=10_000_000,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
                 )
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
         prims.barrier_cta_sync(barrier_id, thread_count=barrier_threads)
 
     @cute.jit
@@ -767,6 +782,36 @@ class TmemCorrResource(DecodeGenResourceBase):
             # Preserve the return shape; one-instance epilogues only consume o0.
             return o0_vals, o0_vals
         return o0_vals, o1_vals
+
+    @cute.jit
+    def restore_permuted_v_rows(
+        self, o_vals: cutlass.Array, num_regs: Constexpr[int]
+    ) -> None:
+        """Undo the interleaved-NVFP4 V^T row order on loaded 16x256b O regs.
+
+        The V transform writes head-dim row 2l to lane l and 2l+1 to lane l+8
+        of every 16-lane block (one LDSM byte holds both rows), and PV keeps
+        that order in O. Thread t's first register pair is lane t/4 and its
+        second pair lane t/4+8, so natural rows t/4 and t/4+8 come from the
+        threads holding lanes (t/4)/2 and 4+(t/4)/2, at pair (t/4)&1. Runs
+        once per output tile, not per K/V tile.
+        """
+        _ = self
+        lane = cute.arch.lane_idx()
+        row = lane >> Int32(2)
+        src0 = ((row >> Int32(1)) << Int32(2)) + (lane & Int32(3))
+        src1 = src0 + Int32(16)
+        odd = (row & Int32(1)) == Int32(1)
+        for group in cutlass.range_constexpr(num_regs // 4):
+            for col in cutlass.range_constexpr(2):
+                first = o_vals[group * 4 + col]
+                second = o_vals[group * 4 + 2 + col]
+                a_first = cute.arch.shuffle_sync(first, src0)
+                a_second = cute.arch.shuffle_sync(second, src0)
+                b_first = cute.arch.shuffle_sync(first, src1)
+                b_second = cute.arch.shuffle_sync(second, src1)
+                o_vals[group * 4 + col] = cutlass.select_(odd, a_second, a_first)
+                o_vals[group * 4 + 2 + col] = cutlass.select_(odd, b_second, b_first)
 
     @cute.jit
     def _swaps_store_scaled_o_chunk(
@@ -4183,6 +4228,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                 num_o_chunks=num_o_chunks,
                 output_f32_regs=output_f32_regs,
             )
+        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+            self.restore_permuted_v_rows(o0_vals, output_f32_regs)
+            if cutlass.const_expr(cfg.num_insts_kv != 1):
+                self.restore_permuted_v_rows(o1_vals, output_f32_regs)
 
         if cutlass.const_expr(cfg.use_split_kv):
             # Split-KV tail: separate reduction stores normalized 16-bit O
@@ -4702,6 +4751,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                 num_o_chunks=num_o_chunks,
                 output_f32_regs=output_f32_regs,
             )
+        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+            self.restore_permuted_v_rows(o0_vals, output_f32_regs)
+            if cutlass.const_expr(cfg.num_insts_kv != 1):
+                self.restore_permuted_v_rows(o1_vals, output_f32_regs)
 
         if cutlass.const_expr(cfg.use_split_kv):
             # Publish this CTA's partial output and statistics. Standalone

@@ -1308,11 +1308,13 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
     return isinstance(kwargs.get(cache_param), torch.Tensor), out_dtype, q_mode
 
 
-# fi_trace retains builders by template identity, so repeated traces must reuse
-# their templates, including each supported encoded fragment size.
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, out_dtype: str | None, q_mode: str, encoded_page_size: int = 0
+    *,
+    combined: bool,
+    out_dtype: str | None,
+    q_mode: str,
+    encoded_page_size: int = 0,
 ):
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
@@ -1419,7 +1421,7 @@ def _make_attention_ts_decode_trace(
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return _FmhaDecodeTraceTemplatePatch(
+    template = _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
@@ -1441,6 +1443,7 @@ def _make_attention_ts_decode_trace(
         constraints=constraints,
         tags=["stage:decode", "backend:prims-ts", "status:experimental"],
     )
+    return template
 
 
 # Representative native/encoded layouts suffice for discovery. Other supported
@@ -1648,7 +1651,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return _FmhaDecodeTraceTemplatePatch(
+    template = _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
@@ -1688,6 +1691,7 @@ def _make_prims_ts_decode_wrapper_trace(
             f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
         ],
     )
+    return template
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1848,7 +1852,69 @@ prims_ts_decode_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templat
 )
 
 
-def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query: bool):
+def _with_prims_ts_mla_cp(
+    template: TraceTemplate,
+    *,
+    cp_world: int,
+    cp_interleave_size: int,
+    zero_empty_rows: bool,
+    one_shot: bool = False,
+) -> TraceTemplate:
+    """Record CP specialization separately from the runtime rank/global lengths."""
+    template.axes["cp_world"] = Const(abbrev="", value=cp_world)
+    template.axes["cp_interleave_size"] = Const(abbrev="", value=cp_interleave_size)
+    template.inputs["cp_rank"] = Scalar("int32", optional=True)
+    template.inputs[
+        "seq_lens_kv"
+    ].description = "Global logical request lengths, including the current Q tokens."
+    template.constraints.append("0 <= cp_rank < cp_world")
+    if one_shot:
+        template.inputs["cp_world"] = Scalar("int32", optional=True)
+        template.inputs["cp_interleave_size"] = Scalar("int32", optional=True)
+        template.inputs["zero_empty_rows"] = Scalar("bool", optional=True)
+    if cp_world != 1 or cp_interleave_size != 1:
+        template.name_prefix += f"_cp{cp_world}_i{cp_interleave_size}"
+    if cp_world > 1:
+        template.axes["zero_empty_rows"] = Const(abbrev="", value=int(zero_empty_rows))
+        if not zero_empty_rows:
+            template.name_prefix += "_no_zero_empty_rows"
+        template.constraints = [
+            "min(seq_lens_kv) >= 0" if item == "min(seq_lens_kv) >= 1" else item
+            for item in template.constraints
+            if item != "max(seq_lens_kv) <= max_kv_len"
+        ]
+        if "min(seq_lens_kv) >= 0" not in template.constraints:
+            template.constraints.append("min(seq_lens_kv) >= 0")
+        if not one_shot:
+            template.constraints.append(
+                "max(seq_lens_kv) // (cp_world * cp_interleave_size) * cp_interleave_size"
+                " + min(max(max(seq_lens_kv) % (cp_world * cp_interleave_size)"
+                " - cp_rank * cp_interleave_size, 0), cp_interleave_size) <= max_kv_len"
+            )
+        template.tags.append("context_parallel")
+        template.description += (
+            " Global token t belongs to (t // cp_interleave_size) % cp_world."
+            " Page tables and max_kv_len describe rank-local capacity. Local lengths"
+            " must not exceed that capacity. Causal row i uses global prefix"
+            " seq_lens_kv[b] - actual_Q + i + 1; packed actual_Q is its qo_indptr delta."
+        )
+        template.description += (
+            " Empty local prefixes produce zero output and, when requested, base-2 LSE -inf."
+            if zero_empty_rows
+            else " Empty-row results are unspecified; sanitize them before consumption or exclude them from merging."
+        )
+    return template
+
+
+@lru_cache(maxsize=None)
+def _make_prims_ts_decode_mla_one_shot_trace(
+    *,
+    rank4_cache: bool,
+    packed_query: bool,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
+):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
@@ -1880,13 +1946,13 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=f"prims_ts_decode_mla_one_shot{cache_suffix}{q_suffix}",
         description=(
             "One-shot PrimTS MLA decode over FlashInfer dense page tables. "
             "Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; "
-            "the wrapper derives omitted static Q/KV bounds before launch."
+            "the caller supplies the packed Q bound; omitted local KV capacity is derived before launch."
         ),
         axes=axes,
         inputs={
@@ -1929,11 +1995,22 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         ],
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
+    return _with_prims_ts_mla_cp(
+        template,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
+        one_shot=True,
+    )
 
 
 _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_one_shot_trace(
-        rank4_cache=rank4_cache, packed_query=packed_query
+        rank4_cache=rank4_cache,
+        packed_query=packed_query,
+        cp_world=1,
+        cp_interleave_size=1,
+        zero_empty_rows=True,
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
@@ -1942,11 +2019,18 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
 
 def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     kv_cache = kwargs.get("kv_cache")
-    key = (
-        isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
-        kwargs.get("qo_indptr") is not None,
+    base = _make_prims_ts_decode_mla_one_shot_trace(
+        rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
+        packed_query=kwargs.get("qo_indptr") is not None,
+        cp_world=int(kwargs.get("cp_world", 1)),
+        cp_interleave_size=int(kwargs.get("cp_interleave_size", 1)),
+        zero_empty_rows=(
+            bool(kwargs.get("zero_empty_rows", True))
+            if kwargs.get("cp_world", 1) > 1
+            else True
+        ),
     )
-    return _prims_ts_scale_trace(_PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key], kwargs)
+    return _prims_ts_scale_trace(base, kwargs)
 
 
 prims_ts_decode_mla_one_shot_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
@@ -1964,6 +2048,9 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -2043,7 +2130,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
@@ -2112,6 +2199,12 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             *threshold_tags,
         ],
     )
+    return _with_prims_ts_mla_cp(
+        template,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
+    )
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -2144,6 +2237,9 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -2156,6 +2252,9 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
     )
 
 
@@ -2173,6 +2272,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     packed_query = bool(state.packed_query)
+    cp_world = int(getattr(state, "cp_world", 1))
     required_metadata = (
         "block_tables",
         "seq_lens_kv",
@@ -2195,6 +2295,11 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         # Plan-state stand-ins in the trace tests predate the threshold field.
         softmax_rescale_threshold_log2=float(
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
+        ),
+        cp_world=cp_world,
+        cp_interleave_size=int(getattr(state, "cp_interleave_size", 1)),
+        zero_empty_rows=(
+            bool(getattr(state, "zero_empty_rows", True)) if cp_world > 1 else True
         ),
     )
     return _prims_ts_scale_trace(base, kwargs, bound=True)

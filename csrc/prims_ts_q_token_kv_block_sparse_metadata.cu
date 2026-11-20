@@ -115,7 +115,9 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
     CheckSameDevice(block_indices, *qo_indptr, "qo_indptr");
   }
 
-  TVM_FFI_ICHECK(group_size >= 1 && group_size <= 8) << "group_size must be in [1, 8]";
+  TVM_FFI_ICHECK((group_size >= 1 && group_size <= 8) ||
+                 (!QueryMajor && (group_size == 16 || group_size == 32)))
+      << "group_size must be in [1, 8], 16 or 32 (page-major membership planes)";
   TVM_FFI_ICHECK(sparse_block_size >= 4 && sparse_block_size <= 128 &&
                  (sparse_block_size & (sparse_block_size - 1)) == 0)
       << "sparse_block_size must be 4, 8, 16, 32, 64, or 128";
@@ -210,10 +212,12 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
   }
   TVM_FFI_ICHECK(page_capacity >= minimum_pages && page_capacity <= maximum_pages)
       << "sparse fragment capacity must cover the logical union bound";
+  // G9-G32 rows hold ceil(G / 8) byte planes (queries 8p..8p+7 in plane p).
   const int64_t membership_words =
-      group_size == 1 ? 0
-                      : (page_capacity + kQTokenKvBlockSparseMembershipsPerWord - 1) /
-                            kQTokenKvBlockSparseMembershipsPerWord;
+      group_size == 1
+          ? 0
+          : ((group_size + 7) / 8) * ((page_capacity + kQTokenKvBlockSparseMembershipsPerWord - 1) /
+                                      kQTokenKvBlockSparseMembershipsPerWord);
   TVM_FFI_ICHECK(page_capacity <= std::numeric_limits<int32_t>::max())
       << "QToken-KvBlock-Sparse-Attention page capacity must fit int32";
   TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.size(0), metadata_rows)
@@ -291,6 +295,7 @@ void Launch(TensorView block_indices, TensorView block_table, Optional<TensorVie
       geometry.membership_words,
       geometry.max_seq_len_kv,
       geometry.model_block_bound,
+      /*entry_map_blocks=*/0,  // chosen by the launcher
       geometry.model_radix_end_bit,
       geometry.sparse_block_size,
       BitWidth(geometry.sparse_block_size) - 1,
@@ -373,6 +378,23 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
             q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
             seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv, release_pdl,
             locator_head_multiplier, count_current_block_in_topk, fixed_query_len);
+}
+
+// Dynamic SMEM the G16/G32 metadata launch needs for a model prefix, or -1
+// when no G9-G32 map supports it; plan() compares it with the device limit.
+int64_t PrimsTSQTokenKvBlockSparseWideMetadataSmemBytes(int64_t group_size, int64_t max_seq_len_kv,
+                                                        int64_t sparse_block_size) {
+  TVM_FFI_ICHECK(group_size == 16 || group_size == 32) << "group_size must be 16 or 32";
+  TVM_FFI_ICHECK(max_seq_len_kv > 0 && max_seq_len_kv <= std::numeric_limits<int32_t>::max())
+      << "max_seq_len_kv must fit positive int32";
+  TVM_FFI_ICHECK(sparse_block_size >= 4 && sparse_block_size <= 128 &&
+                 (sparse_block_size & (sparse_block_size - 1)) == 0)
+      << "sparse_block_size must be 4, 8, 16, 32, 64, or 128";
+  const auto bound =
+      static_cast<int32_t>((max_seq_len_kv + sparse_block_size - 1) / sparse_block_size);
+  using flashinfer::attention::prims_ts::detail::QTokenKvBlockSparseWideMetadataMinSmemBytes;
+  return group_size == 16 ? QTokenKvBlockSparseWideMetadataMinSmemBytes<16>(bound)
+                          : QTokenKvBlockSparseWideMetadataMinSmemBytes<32>(bound);
 }
 
 // Prepared-plan entries; standalone metadata APIs retain byte membership.

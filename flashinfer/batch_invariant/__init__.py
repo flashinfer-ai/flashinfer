@@ -5,7 +5,7 @@
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
 proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
-operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``, ``kda``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -148,6 +148,31 @@ def _mm_fp4_fingerprint(
     fmt = fp4_class_for(N, K, family) if use_nvfp4 else mx_class_for("mxfp4", family)
     return spec_fingerprint(
         K, _out_fmt(out_dtype, "mm_fp4"), chunks_for(N, K, fmt), fmt
+    )
+
+
+def _mm_mxfp4w8a_fingerprint(
+    N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
+    from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
+    if N <= 0 or K <= 0:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} and K {K} must be positive"
+        )
+    gran = k_granule(fmt)
+    if K % gran:  # the operator's contract: the class exists for these weights only
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): K {K} must be a multiple of {gran} for the {fmt} class"
+        )
+    if N % 8:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} must be a multiple of 8"
+        )
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "mm_mxfp8_mxfp4"), chunks_for(N, K, fmt), fmt
     )
 
 
@@ -575,6 +600,15 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
+    # the mixed MX classes (e2m1 weights x e4m3 activations, UE8M0 scales per 32 on both) behind `mm_mxfp8_mxfp4`, the
+    # pair's only dense kernel in FlashInfer (both values of its `batch_invariant` flag run the class); the architecture is
+    # a dimension as for mm_mxfp8 (gemm.mxfp4w8a.*64 on SM107, gemm.mxfp4w8a.* elsewhere)
+    "mm_mxfp8_mxfp4": ClassInfo(
+        "gemm.mxfp4w8a",
+        ("N", "K", "out_dtype"),
+        _mm_mxfp4w8a_fingerprint,
+        ("arch",),
+    ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
     # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
@@ -666,6 +700,21 @@ def fingerprint(op: str, **dims) -> str:
     (``gemm.mxfp4.*128`` on SM107; ``gemm.nvfp4.*128`` on SM107 for the weight shapes its chunk rule leaves unsplit,
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
+    ``mm_mxfp8_mxfp4`` takes ``N, K`` and ``out_dtype``, and optionally ``arch`` as for ``mm_mxfp8``: the mixed-operand
+    block-scaled step of that architecture's instruction (e4m3 activations against e2m1 weights, 32 elements per step on
+    SM100 / SM103, 64 on SM107: ``gemm.mxfp4w8a.*`` and ``gemm.mxfp4w8a.*64``), the mixed classes' chunk count of the
+    weight shape, the chain's ``mul.rn`` by the caller's alpha and the conversion are the specification; the API's
+    ``batch_invariant`` flag does not enter it (both values run the class).
+
+    ``chunk_gated_delta_rule`` takes no dimension: the class ``gdn.bf16.c64`` is the native SM100 / SM103 / SM107 chunked GDN
+    prefill kernel without context parallelism (64-token chunks, fp32 state, log-domain gates and the Q / K l2-norm)
+    and the decode step kernel that computes its rows; the head counts, the batch, the slot and the position are not
+    dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
+
+    ``recurrent_kda`` takes no dimension: the class ``kda.bf16.c16`` is the native SM100 / SM103 / SM107 chunked KDA prefill
+    kernel on its pinned route (16-token chunks, fp32 state, the fused gate and Q / K normalization) and the decode
+    step kernel that computes its rows from the open chunk's cached rows; the head count, the batch, the slot and the position are
+    not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
 
     The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
     functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
@@ -686,6 +735,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("recurrent_kda")  # doctest: +SKIP
+    'kda-bf16-c16-engine-...'
     >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
     'moe-...'
 
@@ -693,6 +744,8 @@ def fingerprint(op: str, **dims) -> str:
     ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
     activation on the alpha-scaled accumulators and GEMM2's scaled chain are the specification; the static per-tensor
     scales, like the operands, are inputs.
+    >>> fingerprint("chunk_gated_delta_rule")  # doctest: +SKIP
+    'gdn-bf16-c64-...'
     """
     info = CLASSES.get(op)
     if info is None:
@@ -714,7 +767,8 @@ def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
     ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
     ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
-    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
+    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``; ``"gemm.mxfp4w8a"`` for the mixed MX classes behind
+    ``mm_mxfp8_mxfp4``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(
@@ -733,9 +787,13 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
+# The quantization, sampling, GDN and KDA classes register themselves here (their modules keep the mode's registry generic).
+from .gdn.classes import register as _register_gdn  # noqa: E402
+from .kda.classes import register as _register_kda  # noqa: E402
 from .quantization.classes import register as _register_quantization  # noqa: E402
 from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
 _register_sampling(CLASSES, ClassInfo)
+_register_gdn(CLASSES, ClassInfo)
+_register_kda(CLASSES, ClassInfo)

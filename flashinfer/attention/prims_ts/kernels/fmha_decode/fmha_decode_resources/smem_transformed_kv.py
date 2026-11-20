@@ -435,15 +435,14 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         layout. ``sf_idx`` includes the logical staged head-slice offset.
         """
         cfg = self.cfg
-        sf_bytes_per_token = Int32(cfg.smem_kv_sf_bytes_per_token)
         row_idx = elem_idx // Int32(cfg.head_dim_kv_stage)
         sf_idx = Int32(head_dim_stage_idx * (cfg.head_dim_kv_stage // 16)) + (
             elem_idx % Int32(cfg.head_dim_kv_stage)
         ) // Int32(16)
-        sf_offset = row_idx * sf_bytes_per_token + sf_idx
+        sf_offset = cfg.smem_kv_sf_row_offset(row_idx) + sf_idx
         if cutlass.const_expr(is_v):
             sf_offset = (
-                (row_idx // Int32(4)) * Int32(4) * sf_bytes_per_token
+                cfg.smem_kv_sf_row_offset((row_idx // Int32(4)) * Int32(4))
                 + sf_idx * Int32(4)
                 + row_idx % Int32(4)
             )
@@ -517,12 +516,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             addrspace=3,
         )
         scale_words = load_nvfp4_row_scale_words(
-            src_sf_base,
-            row,
-            head_dim_stage_idx,
-            sf_bytes_per_token=cfg.smem_kv_sf_bytes_per_token,
-            sf_tile_bytes=cfg.smem_kv_sf_tile_bytes,
-            is_v=is_v,
+            cfg, src_sf_base, row, head_dim_stage_idx, is_v=is_v
         )
         src_swizzle = (row >> Int32(1)) & Int32(3)
         # Stream each chunk through SM107's fallback conversion when the
