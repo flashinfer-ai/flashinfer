@@ -9,8 +9,9 @@ from ..api_logging import flashinfer_experimental_api
 def pack_nemotron_mxfp8_weights(fc1, fc1_scale, fc2, fc2_scale):
     """Pack 128 local experts without requantization, before graph capture.
 
-    FC1/FC2 are contiguous CUDA E4M3 tensors [128,4096,768]/[128,768,4096].
-    Scales are raw E8M0 bytes [128,4096,24]/[128,768,128], not swizzled.
+    FC1/FC2 are contiguous CUDA E4M3 tensors [128,I,H]/[128,H,I].
+    Supported (H,I) pairs are (768,4096) and (1536,7168). Scales are raw
+    E8M0 bytes [128,I,H/32]/[128,H,I/32], not swizzled.
     The returned immutable layout descriptor can be shared across bucket plans.
     """
     from ..experimental.nemotron_mxfp8.plan import pack_weights
@@ -35,7 +36,8 @@ def prepare_nemotron_mxfp8_local_experts(
     directly into the caller's NVLS buffer, on the caller's current stream.
     No distributed initialization or collective is performed by this API.
 
-    Targets SM103, hidden 768, intermediate 4096, top-k 10, 128 local experts.
+    Targets SM103, (hidden, intermediate) = (768, 4096) or (1536, 7168),
+    top-k 10, 128 local experts. Dimensions are inferred from packed weights.
     `max_tokens` is the gathered bucket capacity, not the rank-local capacity.
     `local_expert_offset` is 0/128/256/384. Hardware tanh is enabled by default;
     `hardware_tanh=False` selects the software numerical attribution control.

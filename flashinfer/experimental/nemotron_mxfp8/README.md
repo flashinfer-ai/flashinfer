@@ -1,6 +1,7 @@
 # Nemotron MXFP8 local experts
 
-Experimental GB300/SM103 operator for hidden size 768, intermediate size 4096,
+Experimental GB300/SM103 operator for (hidden, intermediate) sizes (768, 4096)
+and (1536, 7168),
 128 local experts, 512 global experts and top-k 10. Owner: helenn.
 It owns local kernels and workspace; the caller owns NVLS gather/reduce-scatter.
 There is no distributed initialization, MCore dependency or automatic dispatch.
@@ -101,14 +102,18 @@ Adapted from research commit `52e7da3f4791f059b5840d4ec210c7556b70c421`, using
 kernel-team snapshot `50d583aa0` and FlashInfer's existing shared primitives.
 Unchanged MXFP8 kernel/epilogue methods and the FC2 destination descriptor are
 reused directly; this package contains the Nemotron-specific overrides.
-The vendor `src/` drop is unchanged. Research timing/debug paths are excluded. Private kernels are specialized to the
+Shared MXFP8 staging hoists tail-branch temporaries for type-stable CuTe DSL
+compilation. Research timing/debug paths are excluded. Private kernels target the
 fixed local-expert configuration: no standalone FC1/FC2 diagnostics, alternate
 geometry, quantized combine output or in-kernel top-k reduction. The fused
 activation, lookup scheduler, pipeline sizing and detached cleanup are retained.
 
-Synthetic reference and graph checks do not establish checkpoint numerical
-qualification. Deployment experiments have matched research token outputs and
-reached about 17.4k tokens/s at 768 requests on GB300 EP4, but intermittent
-prefill slowdowns remain under investigation. Performance preservation and
-independent checkpoint qualification are required before claiming readiness.
-Experimental submission also requires a tracking issue and graduation target.
+Nano and Super reference, poisoned-slot, changed-route and CUDA graph tests passed
+on GB300 against this PR's SM100 vendor tree, including scales varying across
+experts, rows and columns and the largest admitted group hint. These checks do
+not establish independent full-checkpoint numerical qualification or downstream
+task quality. Deployment performance is reported separately in the PR.
+
+`run` accepts an optional `out`; omitting it allocates FP32 output. Pass the
+NVLS output explicitly for allocation-free composition. `group_hint` must fit
+a positive int32.

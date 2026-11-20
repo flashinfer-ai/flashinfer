@@ -23,7 +23,13 @@ class NativeNemotronTest(unittest.TestCase):
     def tearDown(self):
         torch.backends.cuda.matmul.allow_tf32 = self.original_tf32
 
-    def test_reference_poison_and_changed_route_graph(self):
+    def test_nano_reference_poison_and_changed_route_graph(self):
+        self.check_reference_poison_and_changed_route_graph(768, 4096)
+
+    def test_super_reference_poison_and_changed_route_graph(self):
+        self.check_reference_poison_and_changed_route_graph(1536, 7168)
+
+    def check_reference_poison_and_changed_route_graph(self, hidden, intermediate):
         if torch.cuda.get_device_capability() != (10, 3):
             self.skipTest("requires GB300 / SM103")
         from flashinfer.fused_moe.nemotron_mxfp8 import (
@@ -33,25 +39,40 @@ class NativeNemotronTest(unittest.TestCase):
 
         torch.manual_seed(17)
         # Two live experts; all 128 slots retain the production weight layout.
-        w1 = torch.zeros((128, 4096, 768), dtype=torch.float8_e4m3fn, device="cuda")
-        w2 = torch.zeros((128, 768, 4096), dtype=torch.float8_e4m3fn, device="cuda")
-        w1[:2].copy_((torch.randn((2, 4096, 768), device="cuda") / 32).to(w1.dtype))
-        w2[:2].copy_((torch.randn((2, 768, 4096), device="cuda") / 64).to(w2.dtype))
-        s1 = torch.full((128, 4096, 24), 127, dtype=torch.uint8, device="cuda")
-        s2 = torch.full((128, 768, 128), 127, dtype=torch.uint8, device="cuda")
+        w1 = torch.zeros(
+            (128, intermediate, hidden), dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        w2 = torch.zeros(
+            (128, hidden, intermediate), dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        w1[:2].copy_(
+            (torch.randn((2, intermediate, hidden), device="cuda") / 32).to(w1.dtype)
+        )
+        w2[:2].copy_(
+            (torch.randn((2, hidden, intermediate), device="cuda") / 64).to(w2.dtype)
+        )
+        s1 = torch.full(
+            (128, intermediate, hidden // 32), 127, dtype=torch.uint8, device="cuda"
+        )
+        s2 = torch.full(
+            (128, hidden, intermediate // 32), 127, dtype=torch.uint8, device="cuda"
+        )
         # Exercise blocked-scale packing with nonuniform scales and expert gaps.
         w1[127].copy_(w1[1])
         w1[1].zero_()
         w2[127].copy_(w2[1])
         w2[1].zero_()
-        s1.copy_((126 + torch.arange(24, device="cuda") % 3).to(torch.uint8))
-        s2.copy_((126 + torch.arange(128, device="cuda") % 3).to(torch.uint8))
+        experts = torch.arange(128, device="cuda")[:, None, None]
+        for scale in (s1, s2):
+            rows = torch.arange(scale.shape[1], device="cuda")[None, :, None]
+            columns = torch.arange(scale.shape[2], device="cuda")[None, None, :]
+            scale.copy_((126 + (experts + rows + columns) % 3).to(torch.uint8))
         weights = pack_nemotron_mxfp8_weights(w1, s1, w2, s2)
-        x = torch.randn((9, 768), device="cuda", dtype=torch.bfloat16)
+        x = torch.randn((9, hidden), device="cuda", dtype=torch.bfloat16)
         ids = torch.full((9, 10), -1, device="cuda", dtype=torch.int64)
         ids[:, 0], ids[:, 1] = 256, 383
         probs = torch.rand((9, 10), device="cuda")
-        out = torch.empty((9, 768), device="cuda")
+        out = torch.empty((9, hidden), device="cuda")
         plan = prepare_nemotron_mxfp8_local_experts(
             weights, max_tokens=9, local_expert_offset=256
         )
@@ -85,6 +106,7 @@ class NativeNemotronTest(unittest.TestCase):
                 plan.contribution_view()[:, slot].float() - terms
             ).norm() / terms.norm()
             self.assertLessEqual(local_error.item(), 0.01)
+        torch.testing.assert_close(plan.run(x, ids, probs), out, rtol=0, atol=0)
         eager = out.clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -94,7 +116,9 @@ class NativeNemotronTest(unittest.TestCase):
         other = prepare_nemotron_mxfp8_local_experts(
             weights, max_tokens=1, local_expert_offset=256
         )
-        other.run(x[:1], ids[:1], probs[:1], out=torch.empty((1, 768), device="cuda"))
+        other.run(
+            x[:1], ids[:1], probs[:1], out=torch.empty((1, hidden), device="cuda")
+        )
         graph.replay()
         torch.testing.assert_close(out, eager, rtol=0, atol=0)
         plan.contribution_view().fill_(float("nan"))
@@ -115,12 +139,12 @@ class NativeNemotronTest(unittest.TestCase):
         dense = prepare_nemotron_mxfp8_local_experts(
             weights, max_tokens=129, local_expert_offset=256
         )
-        dx = torch.randn((129, 768), device="cuda", dtype=torch.bfloat16)
+        dx = torch.randn((129, hidden), device="cuda", dtype=torch.bfloat16)
         di = torch.arange(1290, device="cuda").reshape(129, 10) % 128 + 256
         di[:, 0] = 256
         di[:, -1] = 511  # Remote expert must not contribute.
         dp = torch.rand((129, 10), device="cuda")
-        do = torch.empty((129, 768), device="cuda")
+        do = torch.empty((129, hidden), device="cuda")
         ref = torch.zeros_like(do)
         live = {expert: reference(dx, expert) for expert in (0, 127)}
         for slot in range(10):
@@ -133,7 +157,16 @@ class NativeNemotronTest(unittest.TestCase):
         dense.run(dx, di, dp, out=do)
         self.assertTrue(torch.isfinite(do).all().item())
         self.assertLessEqual(((do - ref).norm() / ref.norm()).item(), 0.015)
+        # Largest admitted hint, with expert zero empty: grouping must advance.
+        limit = prepare_nemotron_mxfp8_local_experts(
+            weights, max_tokens=9, local_expert_offset=256, group_hint=2**31 - 1
+        )
+        ids.fill_(-1)
+        ids[:, 0] = 383
+        plan.run(x, ids, probs, out=out)
+        torch.testing.assert_close(limit.run(x, ids, probs), out, rtol=0, atol=0)
         torch.cuda.synchronize()
+        limit.close()
         dense.close()
         graph.reset()
         plan.close()

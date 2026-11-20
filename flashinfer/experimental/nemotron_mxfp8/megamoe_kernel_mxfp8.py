@@ -53,9 +53,15 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
     """MegaMoE-complete fused dispatch + fc1 + fc2 + combine kernel (MXFP8)."""
 
     def __init__(
-        self, group_hint: int, *, max_tokens_per_rank: int, hardware_tanh: bool
+        self,
+        group_hint: int,
+        *,
+        max_tokens_per_rank: int,
+        hardware_tanh: bool,
+        hidden: int = 768,
+        intermediate: int = 4096,
     ) -> None:
-        super().__init__(group_hint)
+        super().__init__(group_hint, hidden=hidden, intermediate=intermediate)
         self.hardware_tanh = hardware_tanh
         self.detached_tail = True
         self.combine_format = CombineFormat.parse("bf16")
@@ -67,10 +73,10 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         self.local_rank = 0
         self.num_topk = 10
         self.max_tokens_per_rank = max_tokens_per_rank
-        self.hidden = self.hidden_bytes = 768
+        self.hidden = self.hidden_bytes = hidden
         self.num_experts_per_rank = self.num_total_experts = 128
-        self.intermediate_gateup = self.intermediate_downproj = 4096
-        self.sf_uint32_per_token = 6
+        self.intermediate_gateup = self.intermediate_downproj = intermediate
+        self.sf_uint32_per_token = hidden // 128
         # Non-swap-AB readiness counters count M-axis token tiles.
         self.cluster_tile_tokens = 128
 

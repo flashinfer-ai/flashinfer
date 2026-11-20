@@ -523,10 +523,13 @@ class DataPreprocess:
                     activation_sf[token_idx, (0, quant_chunk_idx // Int32(2))] = sf_e8m0
 
                 elif cutlass.const_expr(quant_round == full_quant_rounds and tail_quant_chunks != 0):
+                    # Define temporaries before lane predicates for type-stable DSL joins.
+                    quant_chunk_bf16 = cute.make_rmem_tensor((quant_vec,), cutlass.BFloat16)
+                    scaled = cute.make_rmem_tensor((quant_vec,), Float32)
+                    data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
                     values = cute.make_rmem_tensor((quant_vec,), Float32)
                     local_absmax = Float32(0.0)
                     if tid < Int32(tail_quant_chunks):
-                        quant_chunk_bf16 = cute.make_rmem_tensor((quant_vec,), cutlass.BFloat16)
                         cute.copy(lds_atom, s_quant_chunk[(None,), (quant_chunk_idx,)], quant_chunk_bf16)
                         values.store(quant_chunk_bf16.load().to(Float32))
                         for i in cutlass.range_constexpr(quant_vec):
@@ -534,15 +537,12 @@ class DataPreprocess:
 
                     paired_absmax = Float32(cute.arch.shuffle_sync_bfly(local_absmax, offset=1))
                     block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
+                    scale_f32 = Float32(cvt_f32_to_f8_to_f32(block_absmax * data_rcp_limit, cutlass.Float8E8M0FNU))
+                    sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
+                    acc_scale = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), fp32_max)
                     if tid < Int32(tail_quant_chunks):
-                        scale_f32 = Float32(cvt_f32_to_f8_to_f32(block_absmax * data_rcp_limit, cutlass.Float8E8M0FNU))
-                        sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
-                        acc_scale = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), fp32_max)
-
-                        scaled = cute.make_rmem_tensor((quant_vec,), Float32)
                         for i in cutlass.range_constexpr(quant_vec):
                             scaled[i] = values[i] * acc_scale
-                        data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
                         data.store(scaled.load().to(self.quant_dtype))
 
                         cute.copy(

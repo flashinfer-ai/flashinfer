@@ -28,6 +28,7 @@ class ContractTest(unittest.TestCase):
             {"local_expert_offset": 1},
             {"workers": 0},
             {"group_hint": -1},
+            {"group_hint": 2**31},
             {"hardware_tanh": "1"},
         ):
             args = dict(
@@ -41,6 +42,16 @@ class ContractTest(unittest.TestCase):
             args.update(overrides)
             with self.assertRaises(ValueError):
                 plan_module.LocalExpertPlan(**args)
+
+    def test_supported_expert_shapes(self):
+        for shape, expected in (
+            ((128, 4096, 768), (768, 4096)),
+            ((128, 7168, 1536), (1536, 7168)),
+        ):
+            self.assertEqual(plan_module._expert_shape(shape), expected)
+        for shape in ((64, 4096, 768), (128, 4096, 1536), (128, 7168), ()):
+            with self.assertRaises(ValueError):
+                plan_module._expert_shape(shape)
 
     def test_tensor_metadata_rejects_strides_dtype_and_shape(self):
         x = torch.zeros(4, 8)
@@ -76,6 +87,7 @@ class ContractTest(unittest.TestCase):
         plan._closed = False
         plan.device = torch.device("cpu")
         plan.max_tokens = 2
+        plan.hidden = 768
         plan.local_expert_offset = 256
         plan._local_ids, plan._local_probs = object(), object()
         plan._terms = object()
@@ -113,7 +125,16 @@ class ContractTest(unittest.TestCase):
                 return_value=types.SimpleNamespace(cuda_stream=17),
             ),
         ):
-            self.assertIs(plan.run(x, ids, probs, out=out), out)
+            with patch.object(
+                torch, "empty", side_effect=AssertionError("unexpected allocation")
+            ):
+                self.assertIs(plan.run(x, ids, probs, out=out), out)
+            with patch.object(torch, "empty", return_value=out) as allocate:
+                self.assertIs(plan.run(x, ids, probs), out)
+                allocate.assert_called_once_with(
+                    (2, 768), dtype=torch.float32, device=plan.device
+                )
+            calls = calls[:4]
         self.assertEqual(
             [c[0] for c in calls], ["mask", "stage", "compute_and_tail", "assemble"]
         )

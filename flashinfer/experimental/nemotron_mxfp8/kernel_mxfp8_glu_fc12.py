@@ -35,7 +35,7 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
     MoEFusedFc12SchedulerParams,
 )
-from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
+from moe_mxfp8_glu.custom_ext import GluMxFp8Fc12SchedExtension
 from common.host_utils import get_cutedsl_target_arch
 from moe_nvfp4_swapab.moe_utils import spin_wait
 from src.token_comm import TokenInPullTokenBackPush
@@ -63,7 +63,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
 
     GateUpInterleave: int = 32
 
-    def __init__(self, group_hint: int) -> None:
+    def __init__(
+        self, group_hint: int, *, hidden: int = 768, intermediate: int = 4096
+    ) -> None:
         # Fixed Nemotron geometry; the public plan validates the device and tensors.
         self.ab_dtype = cutlass.Float8E4M3FN
         self.c_dtype = cutlass.BFloat16
@@ -72,7 +74,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         self.cluster_shape_mn = (1, 1)
         self.use_2cta_instrs = False
         self.cta_group = tcgen05.CtaGroup.ONE
-        self.static_expert_shape = (128, 4096, 768)
+        self.static_expert_shape = (128, intermediate, hidden)
         self.force_static_sched = True
         self.clc_bundle_size = None
         self.num_sched_stages: Optional[int] = None

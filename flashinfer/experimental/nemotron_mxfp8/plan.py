@@ -48,18 +48,27 @@ class PackedWeights:
     fc2_scale: torch.Tensor
 
 
+def _expert_shape(shape):
+    if tuple(shape) not in ((128, 4096, 768), (128, 7168, 1536)):
+        raise ValueError(
+            "expected 128 experts with (intermediate, hidden) = (4096, 768) or (7168, 1536)"
+        )
+    return shape[2], shape[1]
+
+
 def pack_weights(fc1, fc1_scale, fc2, fc2_scale):
     """Pack canonical E4M3 weights and raw E8M0 scales without requantization."""
+    hidden, intermediate = _expert_shape(fc1.shape)
     device = fc1.device
     _check_device(device)
     for tensor, shape, name in (
-        (fc1, (128, 4096, 768), "fc1"),
-        (fc2, (128, 768, 4096), "fc2"),
+        (fc1, (128, intermediate, hidden), "fc1"),
+        (fc2, (128, hidden, intermediate), "fc2"),
     ):
         _tensor(tensor, shape, torch.float8_e4m3fn, device, name)
     for tensor, shape, name in (
-        (fc1_scale, (128, 4096, 24), "fc1_scale"),
-        (fc2_scale, (128, 768, 128), "fc2_scale"),
+        (fc1_scale, (128, intermediate, hidden // 32), "fc1_scale"),
+        (fc2_scale, (128, hidden, intermediate // 32), "fc2_scale"),
     ):
         if tensor.dtype not in (torch.uint8, torch.float8_e8m0fnu):
             raise ValueError(f"{name} must contain E8M0 bytes")
@@ -114,13 +123,23 @@ class LocalExpertPlan:
             type(workers) is not int
             or workers <= 0
             or type(group_hint) is not int
-            or group_hint <= 0
+            or not 0 < group_hint <= 2**31 - 1
         ):
-            raise ValueError("workers and group_hint must be positive integers")
+            raise ValueError(
+                "workers must be positive and group_hint must fit a positive int32"
+            )
         if type(hardware_tanh) is not bool:
             raise ValueError("hardware_tanh must be a bool")
         if not isinstance(weights, PackedWeights):
             raise TypeError("weights must come from pack_nemotron_mxfp8_weights")
+        if weights.fc1.ndim != 3:
+            raise ValueError("packed fc1 must have three dimensions")
+        hidden, intermediate = _expert_shape(
+            (weights.fc1.shape[0], weights.fc1.shape[2], weights.fc1.shape[1])
+        )
+        if max_tokens > (2**31 - 1) // (10 * hidden):
+            raise ValueError("max_tokens must fit int32 contribution addressing")
+        self.hidden = hidden
         device = weights.fc1.device
         _check_device(device)
         if torch.cuda.get_device_capability(device) != (10, 3):
@@ -128,17 +147,27 @@ class LocalExpertPlan:
         if workers > torch.cuda.get_device_properties(device).multi_processor_count:
             raise ValueError("worker count exceeds the device SM count")
         for tensor, shape, dtype, name in (
-            (weights.fc1, (128, 768, 4096), torch.float8_e4m3fn, "packed fc1"),
-            (weights.fc2, (128, 4096, 768), torch.float8_e4m3fn, "packed fc2"),
+            (
+                weights.fc1,
+                (128, hidden, intermediate),
+                torch.float8_e4m3fn,
+                "packed fc1",
+            ),
+            (
+                weights.fc2,
+                (128, intermediate, hidden),
+                torch.float8_e4m3fn,
+                "packed fc2",
+            ),
             (
                 weights.fc1_scale,
-                (128, 4096 * 24),
+                (128, intermediate * (hidden // 32)),
                 torch.float8_e8m0fnu,
                 "packed fc1 scale",
             ),
             (
                 weights.fc2_scale,
-                (128, 768 * 128),
+                (128, hidden * (intermediate // 32)),
                 torch.float8_e8m0fnu,
                 "packed fc2 scale",
             ),
@@ -168,14 +197,16 @@ class LocalExpertPlan:
 
         self._local_ids = empty((max_tokens, 10), torch.int64)
         self._local_probs = empty((max_tokens, 10), torch.float32)
-        self._x = empty((max_tokens, 768), torch.float8_e4m3fn)
-        self._sf = empty((max_tokens, 24), torch.float8_e8m0fnu)
+        self._x = empty((max_tokens, hidden), torch.float8_e4m3fn)
+        self._sf = empty((max_tokens, (hidden // 32)), torch.float8_e8m0fnu)
         self._ids = empty((max_tokens, 10), torch.int64)
         self._probs = empty((max_tokens, 10), torch.float32)
         self._kernel = Sm100NemotronMegaMoEMxfp8Kernel(
             group_hint=group_hint,
             max_tokens_per_rank=max_tokens,
             hardware_tanh=hardware_tanh,
+            hidden=hidden,
+            intermediate=intermediate,
         )
         local_bytes, shared_bytes = self._kernel.get_workspace_sizes()
         self._local = torch.zeros(local_bytes, dtype=torch.uint8, device=device)
@@ -186,7 +217,7 @@ class LocalExpertPlan:
                 0, self._kernel._shared_offsets["combine_quant"], region.nbytes
             )
             .view(torch.bfloat16)
-            .view(max_tokens, 10, 768)
+            .view(max_tokens, 10, hidden)
         )
         self._args = dict(
             activation=_cute(self._x),
@@ -213,7 +244,7 @@ class LocalExpertPlan:
         )
         # Compile input staging with a representative tensor; run() binds the
         # caller's gathered input directly, without adding an input copy.
-        dummy = empty((max_tokens, 768), torch.bfloat16)
+        dummy = empty((max_tokens, hidden), torch.bfloat16)
         self._stage_tail = (
             _cute(self._local_ids, 4),
             _cute(self._local_probs, 4),
@@ -224,7 +255,7 @@ class LocalExpertPlan:
             _cute(self._probs, 4),
         )
         self._stage = cute.compile(
-            DataPreprocess(10, 768, "mxfp8_e4m3"),
+            DataPreprocess(10, hidden, "mxfp8_e4m3"),
             _cute(dummy),
             *self._stage_tail,
             stream,
@@ -246,25 +277,35 @@ class LocalExpertPlan:
             self._terms,
             self._local_ids,
             self._local_probs,
-            empty((max_tokens, 768), torch.float32),
+            empty((max_tokens, hidden), torch.float32),
         )
 
-    def run(self, hidden_states, expert_ids, routing_weights, *, out):
+    def run(self, hidden_states, expert_ids, routing_weights, *, out=None):
         """Enqueue the complete local path on the current stream, returning `out`.
 
         Inputs have exactly the prepared bucket capacity. Use ID -1 for padding;
-        other global IDs must be in [0, 512). Output is contiguous FP32 [T, 768].
-        Values are not scanned on the host. Input/output storage must not overlap.
+        other global IDs must be in [0, 512). Output is contiguous FP32 [T, H].
+        Omitting `out` allocates an FP32 output. Values are not scanned on the host.
+        Input/output storage must not overlap.
         """
         if self._closed:
             raise RuntimeError("Nemotron plan is closed")
         if torch.cuda.current_device() != self.device.index:
             raise ValueError("select the plan's CUDA device before running")
+        if out is None:
+            out = torch.empty(
+                (self.max_tokens, self.hidden), dtype=torch.float32, device=self.device
+            )
         for tensor, shape, dtype, name in (
-            (hidden_states, (self.max_tokens, 768), torch.bfloat16, "hidden_states"),
+            (
+                hidden_states,
+                (self.max_tokens, self.hidden),
+                torch.bfloat16,
+                "hidden_states",
+            ),
             (expert_ids, (self.max_tokens, 10), torch.int64, "expert_ids"),
             (routing_weights, (self.max_tokens, 10), torch.float32, "routing_weights"),
-            (out, (self.max_tokens, 768), torch.float32, "out"),
+            (out, (self.max_tokens, self.hidden), torch.float32, "out"),
         ):
             _tensor(tensor, shape, dtype, self.device, name)
         import cuda.bindings.driver as cuda
@@ -291,7 +332,7 @@ class LocalExpertPlan:
         return out
 
     def contribution_view(self):
-        """Borrow BF16 [T, 10, 768] terms for diagnostics; invalid slots are undefined.
+        """Borrow BF16 [T, 10, H] terms for diagnostics; invalid slots are undefined.
 
         Order reads before the next run. This is not a snapshot and performs no
         synchronization. Consumers must mask loads using the current route IDs.

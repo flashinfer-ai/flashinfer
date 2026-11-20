@@ -153,7 +153,7 @@ class GroupedLookupScheduler:
             group_start = Int32(0)
             group_end = total_blocks
             if cutlass.const_expr(not self.single_group):
-                target_blocks = (Int32(params.group_hint) + n1 - Int32(1)) // n1
+                target_blocks = (Int32(params.group_hint) - Int32(1)) // n1 + Int32(1)
                 end_expert = cutlass.min(
                     self.upper_bound(target_blocks - Int32(1)), Int32(127)
                 )
