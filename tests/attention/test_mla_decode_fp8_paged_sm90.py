@@ -159,11 +159,16 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
 
 
 def _plan_wrapper(
-    batch, device, fp8q_backend="auto", sm_scale=SM_SCALE, use_profiler=False
+    batch,
+    device,
+    fp8q_backend="auto",
+    sm_scale=SM_SCALE,
+    use_profiler=False,
+    backend="auto",
 ):
     ws = torch.zeros(160 * 1024 * 1024, dtype=torch.uint8, device=device)
     w = BatchMLAPagedAttentionWrapper(
-        float_workspace_buffer=ws, backend="auto", fp8q_backend=fp8q_backend
+        float_workspace_buffer=ws, backend=backend, fp8q_backend=fp8q_backend
     )
     w.plan(
         qo_indptr=batch["qo_indptr"],
@@ -339,9 +344,14 @@ def test_fp8q_backend_stock_never_prepares():
     stats = _mla_dec_fp8q_sm90_stats()
     assert stats["plans_selector_dequant"] == 1, stats
     assert stats["plans_prepared"] == 0, stats
+    before = stats["runs_dequant_fallback"]
     out = _run(w, batch)  # served by dequant + stock
     stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dequant_fallback"] - before == 1
     assert stats["runs_dispatched"] == 0, stats
+    with pytest.raises(ValueError, match="q_scale must be a scalar"):
+        _run(w, batch, q_scale=torch.ones(2))
+    assert _mla_dec_fp8q_sm90_stats()["runs_dequant_fallback"] - before == 2
     ref = _reference(batch)
     assert _matched_ratio(out, ref) >= MATCHED
 
@@ -525,6 +535,66 @@ def test_misaligned_query_views_fall_back():
             ckv_scale=1.0,
             kpe_scale=1.0,
         )
+
+
+@pytest.mark.parametrize("ql", [1, 5])
+@pytest.mark.parametrize("selector", ["auto", "specialized"])
+def test_offset_kv_refused_before_fa3_launch(ql, selector, monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([128], device, ql=ql)
+    w = _plan_wrapper(batch, device, selector, backend="fa3")
+    assert w._mla_dec_fp8q_sm90_state is not None
+    kv = batch["kv"]
+    batch["kv"] = torch.empty(kv.numel() + 1, device=device, dtype=kv.dtype)[
+        1:
+    ].view_as(kv)
+    batch["kv"].copy_(kv)
+    assert batch["kv"].data_ptr() % 16 == 1
+    monkeypatch.setattr(
+        type(w._planned_backend),
+        "run_from_wrapper",
+        lambda *a, **kw: pytest.fail("unsafe FA3 handoff"),
+    )
+    error = RuntimeError if selector == "specialized" else ValueError
+    with pytest.raises(error, match="aligned"):
+        _run(w, batch)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert stats["runs_dequant_fallback"] == int(selector == "auto")
+
+
+@pytest.mark.parametrize("selector", ["auto", "specialized"])
+def test_offset_out_capture_and_post_plan_disable(selector, monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([128], device)
+    w = _plan_wrapper(batch, device, selector, backend="fa3")
+    out = torch.empty(QL * NH * CKV + 1, dtype=torch.bfloat16, device=device)[1:].view(
+        QL, NH, CKV
+    )
+    assert out.data_ptr() % 16 == 2
+    assert _run(w, batch, out=out) is out
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert _run(w, batch, out=out) is out
+    batch["kv"].fill_(2)
+    out.zero_()
+    graph.replay()
+    assert torch.equal(out, torch.full_like(out, 2))
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == 1
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    monkeypatch.setattr(
+        type(w._planned_backend),
+        "run_from_wrapper",
+        lambda *a, **kw: pytest.fail("unsafe FA3 handoff"),
+    )
+    if selector == "specialized":
+        with pytest.raises(RuntimeError, match="kill switch"):
+            _run(w, batch, out=out)
+    else:
+        with pytest.raises(ValueError, match="aligned out"):
+            _run(w, batch, out=out)
 
 
 def test_specialized_path_enforces_run_contract():
@@ -741,9 +811,15 @@ def test_keyless_causal_rows_match_stock(ql):
     stats = _mla_dec_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 0 and stats["plans_ineligible"] == 1, stats
 
+    before = stats["runs_dequant_fallback"]
     out = _run(w, batch)
     stats = _mla_dec_fp8q_sm90_stats()
-    assert stats["runs_dispatched"] == 0 and stats["runs_dequant_fallback"] >= 1
+    assert (
+        stats["runs_dispatched"] == 0 and stats["runs_dequant_fallback"] - before == 1
+    )
+    with pytest.raises(ValueError, match="q_scale must be a scalar"):
+        _run(w, batch, q_scale=torch.ones(2))
+    assert _mla_dec_fp8q_sm90_stats()["runs_dequant_fallback"] - before == 2
     out = out.float()
     # rows 0..ql-2 have empty causal windows: exact zeros, like stock
     assert torch.all(out[: ql - 1] == 0.0), out[:, 0, 0]
@@ -765,11 +841,10 @@ def test_kv_len_equal_to_q_len_stays_on_fast_path():
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
 
 
-def _graph_wrapper_and_capture(batch, device):
+def _graph_wrapper_and_capture(batch, device, backend="auto", selector="auto"):
     """Plan a use_cuda_graph wrapper on `batch`, capture one run into a
     caller-owned output buffer, and return (wrapper, graph, out)."""
     ws = torch.zeros(160 * 1024 * 1024, dtype=torch.uint8, device=device)
-    B = batch["kv_len_arr"].numel()
     w = BatchMLAPagedAttentionWrapper(
         float_workspace_buffer=ws,
         use_cuda_graph=True,
@@ -777,8 +852,8 @@ def _graph_wrapper_and_capture(batch, device):
         kv_indptr=batch["kv_indptr"].clone(),
         kv_indices=batch["kv_indices"].clone(),
         kv_len_arr=batch["kv_len_arr"].clone(),
-        backend="auto",
-        fp8q_backend="auto",
+        backend=backend,
+        fp8q_backend=selector,
     )
     w.plan(
         qo_indptr=batch["qo_indptr"],
@@ -794,7 +869,9 @@ def _graph_wrapper_and_capture(batch, device):
         q_data_type=torch.float8_e4m3fn,
         kv_data_type=torch.float8_e4m3fn,
     )
-    out = torch.empty((B * QL, NH, CKV), dtype=torch.bfloat16, device=device)
+    out = torch.empty(
+        (*batch["q"].shape[:-1], CKV), dtype=torch.bfloat16, device=device
+    )
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -805,6 +882,80 @@ def _graph_wrapper_and_capture(batch, device):
         _run(w, batch, out=out)
     assert _mla_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == 1
     return w, graph, out
+
+
+def test_single_sequence_shrink_excludes_formerly_live_split():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([256], device, ql=1)
+    batch["q"].zero_()
+    batch["kv"].fill_(9)
+    w, graph, out = _graph_wrapper_and_capture(batch, device, "fa3", "specialized")
+    graph.replay()
+    assert torch.equal(out, torch.full_like(out, 9))
+
+    # Kernel-level shrink: change only the live length in the captured input.
+    # Keep all four columns and the warm workspace (split 1 still has weight).
+    st = w._mla_dec_fp8q_sm90_state
+    assert st.block_table.shape == (1, 4)
+    st.seq_lens.fill_(64)
+    batch["kv_len_arr"].fill_(64)
+    batch["kv"][0].fill_(1)
+    ref = _reference(batch)
+    assert torch.equal(ref, torch.ones_like(ref))
+    out.zero_()
+    graph.replay()
+    assert torch.equal(out, ref)
+    assert torch.equal(_run(w, batch), ref)
+
+
+@pytest.mark.parametrize("old_ql,new_ql", [(6, 2), (2, 6)])
+@pytest.mark.parametrize("selector", ["auto", "specialized"])
+def test_changed_query_length_never_refreshes_capture(old_ql, new_ql, selector, caplog):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([250], device, ql=old_ql)
+    w, graph, out = _graph_wrapper_and_capture(batch, device, "fa3", selector)
+    graph.replay()
+    before = out.clone()
+    assert _matched_ratio(before, _reference(batch)) >= MATCHED
+    bufs = w._mla_dec_fp8q_sm90_bufs
+    saved = {k: bufs[k].clone() for k in ("block_table", "seq_lens")}
+    new = _make_batch([200], device, ql=new_ql)
+    new["kv_indices"] = new["kv_indices"].flip([0])
+    new["block_table"] = new["kv_indices"].view(1, 4)
+
+    def replan():
+        w.plan(
+            qo_indptr=new["qo_indptr"],
+            kv_indptr=new["kv_indptr"],
+            kv_indices=new["kv_indices"],
+            kv_len_arr=new["kv_len_arr"],
+            num_heads=NH,
+            head_dim_ckv=CKV,
+            head_dim_kpe=KPE,
+            page_size=PAGE,
+            causal=True,
+            sm_scale=SM_SCALE,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+        )
+
+    if selector == "specialized":
+        with pytest.raises(RuntimeError, match="capture geometry changed"):
+            replan()
+    else:
+        replan()
+        assert "discard them and capture anew" in caplog.text
+        assert w._mla_dec_fp8q_sm90_state is None
+        assert _matched_ratio(_run(w, new), _reference(new)) >= MATCHED
+        assert _mla_dec_fp8q_sm90_stats()["runs_dequant_fallback"] == 1
+    assert _mla_dec_fp8q_sm90_stats()["replans_refreshed_captured"] == 0
+    for k, value in saved.items():
+        assert torch.equal(bufs[k], value), k
+    out.zero_()
+    graph.replay()
+    assert torch.equal(out, before)
 
 
 def test_successful_replan_refreshes_captured_metadata():

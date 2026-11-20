@@ -46,8 +46,9 @@ deterministic (atomics-free, bit-stable); its measured record
 (allowance-row per-element error profile, fresh seeds, magnitude
 perturbations, bit-determinism) accompanies the change.
 
-All allocation, compilation and device queries happen at plan time, outside
-CUDA-graph capture; run() only launches on the current stream. The scalar
+Workspace allocation, compilation and device initialization happen at plan
+time, outside CUDA-graph capture. Specialized runs allocate an output if
+none is supplied, or a staging output if the caller's buffer is misaligned. The scalar
 Q/KV descales are written into plan-owned device buffers at run time; under
 CUDA-graph capture the values present at capture are baked into the graph
 (the same semantics as the baked sm_scale).
@@ -204,9 +205,8 @@ def _mla_dec_fp8q_sm90_prepare(
 ) -> None:
     """Plan-time half: decide eligibility, JIT-build the module (first time
     per process), build the dense block table and device kv-length vector,
-    and size the caller-owned split workspace and scale buffers. Everything
-    that allocates, compiles or queries the device happens here, outside
-    CUDA-graph capture; run() only launches."""
+    and size the caller-owned split workspace and scale buffers outside
+    CUDA-graph capture."""
     counters = _counters
     wrapper._mla_dec_fp8q_sm90_state = None
     counters["plans_seen"] += 1
@@ -437,6 +437,28 @@ def _mla_dec_fp8q_sm90_prepare(
                 )
                 return
             pps = int(bt_src.shape[1])
+        else:
+            indptr = md.kv_indptr.cpu().to(torch.int64)
+            indices = md.kv_indices
+            pprs = (indptr[1 : B + 1] - indptr[:B]).tolist()
+            pps = max(1, max(pprs) if pprs else 1)
+
+        geometry = (B, QL, pps)
+        capture_geometry = getattr(wrapper, "_mla_dec_fp8q_sm90_capture_geometry", None)
+        if use_graph and capture_geometry is not None and geometry != capture_geometry:
+            raise _GraphRealloc(
+                f"capture geometry changed ({capture_geometry} -> {geometry})"
+            )
+
+        # Reserve all other buffers before copying or clearing the block table.
+        # The one-page B>=5 planner can require up to min(256, pps) splits.
+        ns_max = max(1, min(256, pps))
+        ws_bytes = B * ns_max * QL * _NUM_HEADS * (_HEAD_DIM_CKV + 8)
+        workspace = _buf("workspace", max(ws_bytes, 16), torch.uint8)
+        seq_lens_buf = _buf("seq_lens", B, torch.int32)[:B]
+        q_descale = _buf("q_descale", 1, torch.float32)
+        k_descale = _buf("k_descale", 1, torch.float32)
+        if md.block_tables is not None:
             if use_graph:
                 # The captured graph binds the stable wrapper-owned buffer's
                 # address, so the new table's CONTENTS are copied through it
@@ -463,10 +485,6 @@ def _mla_dec_fp8q_sm90_prepare(
             else:
                 block_table = bt_src[:B].to(device=device, dtype=torch.int32)
         else:
-            indptr = md.kv_indptr.cpu().to(torch.int64)
-            indices = md.kv_indices
-            pprs = (indptr[1 : B + 1] - indptr[:B]).tolist()
-            pps = max(1, max(pprs) if pprs else 1)
             bt = bufs.get("block_table")
             if (
                 bt is None
@@ -498,26 +516,12 @@ def _mla_dec_fp8q_sm90_prepare(
             bt[:B][mask] = idx_dev[start : start + total]
             block_table = bt[:B]
 
-        seq_lens_buf = _buf("seq_lens", B, torch.int32)[:B]
         seq_lens_buf.copy_(
             kv_lens_host[:B].to(torch.int32).to(device), non_blocking=True
         )
-        # caller-owned split workspace, sized for the worst split count the
-        # launch arithmetic can choose for this (B, QL, pps) plan. The
-        # repaired launcher's B>=5 compact-dual path consumes ONE page per
-        # split (its pps_split is not forced even), so ns can reach pps; the
-        # other branches stay under this bound too, and every branch is
-        # capped at 256 splits in the launch arithmetic itself. The earlier
-        # two-page-only bound min(256, ceil(pps/2)) undersized exactly the
-        # ragged short-kv B>=5 class and run() refused fail-closed.
-        ns_max = min(256, pps) if pps > 1 else 1
-        ws_bytes = B * ns_max * QL * _NUM_HEADS * (_HEAD_DIM_CKV + 8)
-        workspace = _buf("workspace", max(ws_bytes, 16), torch.uint8)
-        q_descale = _buf("q_descale", 1, torch.float32)
-        k_descale = _buf("k_descale", 1, torch.float32)
     except _GraphRealloc as exc:
         counters["plans_ineligible"] += 1
-        if captured:
+        if captured and selector != "specialized":
             logger.warning(
                 "mla_decode_fp8_paged_sm90: this CUDA-graph replan cannot be "
                 "refreshed through the prepared buffers (%s); previously "
@@ -665,8 +669,9 @@ def _mla_dec_fp8q_sm90_dispatch(
     for bf16 q). Capture-safe: no sync except reading scalar scale tensors
     eagerly — under CUDA-graph capture a CUDA-tensor scale cannot be read
     and is rejected with a clear ValueError (pass float scales, or CPU
-    scalar tensors, when capturing) — no compilation; the only allocation
-    is the output tensor when the caller did not pass one."""
+    scalar tensors, when capturing). No compilation; specialized runs allocate
+    an output only for absent or misaligned caller buffers. Fallback allocates
+    the dequantised query."""
     global _announced
     state = getattr(wrapper, "_mla_dec_fp8q_sm90_state", None)
     counters = _counters
@@ -714,7 +719,6 @@ def _mla_dec_fp8q_sm90_dispatch(
                 "no prepared fast-path state exists for this plan; an "
                 "explicitly selected backend is never silently swapped"
             )
-        counters["runs_dequant_fallback"] += 1
         return None, _dequant_query(query, q_scale)
     # The guard computes only a reason string; _fallback runs ONCE, outside
     # the try block. _fallback itself raises under fp8q_backend='specialized'
@@ -847,6 +851,12 @@ def _mla_dec_fp8q_sm90_dispatch(
         state.k_descale.fill_(ks)
         state.graph_captured = True
         wrapper._mla_dec_fp8q_sm90_scales_captured = True
+        if getattr(wrapper, "_use_cuda_graph", False):
+            wrapper._mla_dec_fp8q_sm90_capture_geometry = (
+                state.batch_size,
+                state.q_len,
+                state.pps,
+            )
     elif state.graph_captured or state.scales_cached != (qs, ks):
         # Once any graph holds these buffers, a replay rewrites them to the
         # captured values behind the cache's back, so eager calls must always

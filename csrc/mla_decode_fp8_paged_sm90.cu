@@ -2161,8 +2161,7 @@ __global__ __launch_bounds__(32 * NWARPS, 1) void combine_kernel(
   const int chunk = blockIdx.y * GROUP + wp / PARTS;
   const int part = wp % PARTS;
 
-  // A nonpositive split span marks the single-sequence case, where every
-  // logical split is populated and no sequence-length round trip is needed.
+  // Table width bounds capacity, not the number of live splits, even at B=1.
   int nsb = ns;
   if (pps_split > 0) {
     const int span = PAGE * pps_split;
@@ -2801,7 +2800,7 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
 
   if (ns > 1) {
     const int nrows = B * rows_tot;
-    const int combine_span = (B == 1) ? 0 : pps_split;
+    const int combine_span = pps_split;
     if (B >= 5 && ns <= 72) {
       // Multi-batch rows have only a few splits.  Four independent 4-warp
       // CTAs keep the same total warp count as the 16-warp GROUP=4 block but

@@ -305,6 +305,12 @@ class BatchMLAPagedAttentionWrapper:
             or KV storage requires a backend with native split-input support.
             Existing non-FA graph plans allow one plan per wrapper. Use a new
             wrapper when preparing a different backend for a new capture.
+        fp8q_backend : {"auto", "specialized", "dequant"}
+            Execution selector for the SM90 E4M3-query/E4M3-cache route with
+            BF16 output; separate from the planner ``backend``. ``"auto"``
+            uses the all-FP8 kernel when eligible, otherwise dequantises Q for
+            the stock plan. ``"specialized"`` raises rather than substituting
+            that fallback. ``"dequant"`` never prepares the all-FP8 kernel.
         """
         if fp8q_backend not in ("auto", "specialized", "dequant"):
             raise ValueError(
@@ -926,6 +932,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor: ...
 
     # Output-and-LSE form -- ``return_lse=True`` returns ``(output, lse)``.
@@ -951,6 +958,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     # Deprecated separate-tensor output-only form. Pass split pairs through
@@ -978,6 +986,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor: ...
 
     # Deprecated separate-tensor output-and-LSE form. Pass split pairs through
@@ -1005,6 +1014,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @_warn_on_positional_mla_arguments
@@ -1029,7 +1039,7 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
-        q_scale: Optional[float] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
@@ -1101,6 +1111,12 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale, ckv_scale_arr, kpe_scale : optional
             Per-tensor or per-token FP8 KV-cache scales required by plans that
             selected ``scale_mode="kv-per-tensor"``.
+        q_scale : float or torch.Tensor, optional
+            Per-tensor query descale (default 1) for E4M3 queries on the SM90
+            FP8-query route. A non-None value is rejected off that route.
+            Specialization requires a finite positive value. For graph capture,
+            pass a Python float or a one-element CPU tensor: the value is baked
+            into the graph. Reading a CUDA scalar is supported only eagerly.
         sinks : Optional[torch.Tensor]
             Per-head sink values. This must be present exactly when the plan
             used ``use_sinks=True``.
@@ -1353,6 +1369,21 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         planned_backend = self._planned_backend
         assert planned_backend is not None
+        if _fp8q_route:
+            # Dequantisation replaced Q only. Check the KV leaves selected by
+            # layout lowering, and the actual store destination, on every exit
+            # to stock (including a kill switch set after planning).
+            kv_leaves = (
+                (kv_for_backend,)
+                if isinstance(kv_for_backend, torch.Tensor)
+                else kv_for_backend
+            )
+            if any(t.data_ptr() % 16 for t in kv_leaves):
+                raise ValueError(
+                    "fp8-Q stock fallback requires 16-byte aligned KV cache"
+                )
+            if out is not None and out.data_ptr() % 16:
+                raise ValueError("fp8-Q stock fallback requires 16-byte aligned out")
         return planned_backend.run_from_wrapper(
             query=query_for_backend,
             kv_cache=kv_for_backend,
