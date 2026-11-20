@@ -36,7 +36,9 @@ class Problem:
     the same keys packed along the token dimension (ragged). Every token's key at a given KV position is the same tensor in
     both layouts, so the paged and the ragged wrappers must give the same bits for the same token."""
 
-    def __init__(self, q_lens, kv_lens, Hq, Hkv, D, page, seed=0, device="cuda"):
+    def __init__(
+        self, q_lens, kv_lens, Hq, Hkv, D, page, seed=0, device="cuda", run_len=0
+    ):
         g = torch.Generator(device="cpu").manual_seed(seed)
         self.q_lens, self.kv_lens, self.Hq, self.Hkv, self.D, self.page = (
             list(q_lens),
@@ -77,6 +79,19 @@ class Problem:
         n_pages = [(L + page - 1) // page for L in kv_lens]
         pool_pages = sum(n_pages) + 7
         perm = torch.randperm(pool_pages, generator=g).tolist()
+        if run_len:
+            # a pool filled in runs: consecutive pages in chunks of 1 .. run_len pages, the chunks in a random order
+            cuts = [0]
+            while cuts[-1] < pool_pages:
+                cuts.append(
+                    min(
+                        pool_pages,
+                        cuts[-1]
+                        + int(torch.randint(1, run_len + 1, (1,), generator=g)),
+                    )
+                )
+            order = torch.randperm(len(cuts) - 1, generator=g).tolist()
+            perm = [pg for c in order for pg in range(cuts[c], cuts[c + 1])]
         self.kv_indices = torch.tensor(
             perm[: sum(n_pages)], dtype=torch.int32, device=device
         )
@@ -5347,13 +5362,13 @@ def test_split_placement_rule_and_kernel_names():
 
     assert [p for p in (1, 2, 4, 8, 16, 32, 64, 128) if split_pages(p)] == [1, 2, 4]
     assert not any(split_pages(p, True) for p in (1, 2, 4, 8, 16, 32, 64, 128))
-    assert row.kernel_name(128, 2, 1, 4) == "attn_d128_g2_p1_s4_w1_sp"
+    assert row.kernel_name(128, 2, 1, 4) == "attn_d128_g2_p1_s4_w1_spr"
     assert row.kernel_name(128, 2, 4, 4, fixed=True) == "attn_d128_g2_p4_s4_w1_sp_cg"
     assert row.kernel_name(128, 2, 8, 4) == "attn_d128_g2_p8_s4_w1"
     assert row.kernel_name(128, 2, 128, 4, ragged=True) == "attn_d128_g2_p128_s4_w1_rg"
-    assert swaps.kernel_name(128, 2, 1, 8) == "attn_swaps_d128_g2_p1_n8_sp"
+    assert swaps.kernel_name(128, 2, 1, 8) == "attn_swaps_d128_g2_p1_n8_spr"
     assert (
-        swaps.kernel_name(128, 2, 2, 8, fixed=True) == "attn_swaps_d128_g2_p2_n8_sp_cg"
+        swaps.kernel_name(128, 2, 2, 8, fixed=True) == "attn_swaps_d128_g2_p2_n8_spr_cg"
     )
     assert swaps.kernel_name(128, 2, 8, 8) == "attn_swaps_d128_g2_p8_n8"
     # one name per (placement, fixed launch, sinks) combination, in both bodies
@@ -5432,3 +5447,53 @@ def test_small_pages_scattered_prefill_decode_chunked(D, page):
     for i in perm:
         assert torch.equal(permuted[off : off + q_lens[i]], full[rows[i]]), i
         off += q_lens[i]
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("page", [1, 2, 4])
+@pytest.mark.parametrize("run_len", [3, 40, 100000])
+def test_small_pages_runs_of_consecutive_pages(D, page, run_len):
+    """Small pages whose indices come in runs of consecutive pool pages (a pool filled in order: short runs, long runs, one run
+    per pool): groups of 8 keys on consecutive pages load as one box, the others page by page, and the bits are those of the
+    same keys in a scattered pool and of the ragged layout -- prefill in both pool layouts, decode, and the fixed launch under
+    ``use_cuda_graph=True``."""
+    q_lens = kv_lens = [700, 1300, 257, 129, 31]
+    pr = Problem(q_lens, kv_lens, 16, 8, D, page, seed=51, run_len=run_len)
+    ref = bits(run_ragged_prefill(pr))
+    assert torch.equal(bits(run_paged_prefill(pr)), ref)
+    assert torch.equal(bits(run_paged_prefill(pr, "HND")), ref)
+    scattered = _repack(pr)  # the same keys behind a random page table
+    assert torch.equal(bits(run_paged_prefill(scattered)), ref)
+    dec, last = run_decode(pr)
+    assert torch.equal(bits(dec), ref[last])
+    dec_s, _ = run_decode(scattered)
+    assert torch.equal(bits(dec_s), ref[last])
+    # the fixed-launch kernels on the same tables
+    ws = workspace(pr.device)
+    n = len(kv_lens)
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "NHD",
+        batch_invariant=True,
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.zeros(n + 1, dtype=torch.int32, device=pr.device),
+        paged_kv_indices_buffer=torch.zeros(
+            pr.kv_indices.numel(), dtype=torch.int32, device=pr.device
+        ),
+        paged_kv_last_page_len_buffer=torch.zeros(
+            n, dtype=torch.int32, device=pr.device
+        ),
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    assert torch.equal(bits(w.run(pr.q[last].contiguous(), pr.cache("NHD"))), ref[last])
