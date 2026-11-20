@@ -1135,6 +1135,8 @@ MNNVL CuTe DSL Fused Collectives
     supports_all_gather_gated_residual_next_rmsnorm
     all_gather_gated_residual_next_rmsnorm
     MNNVLCuteDSLAllGatherNormQuantWorkspace
+    PushPlane
+    supports_push_plane
     supports_all_gather_rmsnorm_fp4_quantize
     all_gather_rmsnorm_fp4_quantize
 
