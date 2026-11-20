@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
+
 from .spec import TILE_KEYS, chunk_len
 
 DESC_FIELDS = 16
@@ -79,6 +81,8 @@ UNIT_BUBBLE = {
 FIXUP_BASE_COST = 2.9  # the fixup kernel's cost on the critical path beyond the attention kernel's end: a fixed part ...
 FIXUP_ROW_COST = 0.0012  # ... plus this per live row of its groups
 INKERNEL_FOLD_COST = 1.4  # the in-kernel last-arriver fold of a group of at most INKERNEL_MAX_CHUNKS chunks, per wave of groups
+ARRAY_PLAN_MIN_UNITS = 256  # batches of at least this many Q tiles whose units are all fused build their descriptor table as one
+# array (``fused_units_array``: the reference loop's rows in the same order, without a Python step per unit)
 WIDE_SPLIT_SM_FRACTION = 4  # merge-agnostic unit-kind rule of ``"auto"`` for units wider than INKERNEL_MAX_ROWS rows (prefill tiles): they
 # split only when the fused units would occupy fewer than 1 / this of the SMs. A wide split unit costs its 128 x D fp32 partial rows
 # and the fixup's fold of them, so a split that merely balances a part-filled machine loses to the fused unit; the narrow (decode)
@@ -125,7 +129,9 @@ assert ws_row(128) == WS_ROW
 
 @dataclass
 class Plan:
-    desc: List[List[int]] = field(default_factory=list)  # per unit
+    """``desc`` is the per-unit descriptor table as a list of rows. A plan built as one array (``fused_units_array``) holds the table
+    in ``desc_array`` and lists it only when ``desc`` is read; ``table()`` is the array while no list has been handed out."""
+
     groups: List[List[int]] = field(
         default_factory=list
     )  # per split group (ALL groups: the tests read every group's partials)
@@ -141,10 +147,30 @@ class Plan:
     )
     grid: int = 0  # the launch grid the planner chose for a Swaps-body batch (``swaps_unit_kinds``), 0 = min(units, SMs); a launch
     # parameter (I10): an explicit ``AttnConfig.grid`` overrides it
+    desc_array: Optional[np.ndarray] = field(
+        default=None, repr=False, compare=False
+    )  # the descriptor table as int32 rows when the planner built it as one array
+    _desc: Optional[List[List[int]]] = field(default=None, repr=False, compare=False)
+
+    @property
+    def desc(self) -> List[List[int]]:
+        if self._desc is None:
+            self._desc = self.desc_array.tolist() if self.desc_array is not None else []
+        return self._desc
+
+    @desc.setter
+    def desc(self, rows: List[List[int]]) -> None:
+        self._desc = rows
+        self.desc_array = None
+
+    def table(self) -> Optional[np.ndarray]:
+        """The descriptor table as an array, or ``None`` when the rows live in (or were handed out as) the ``desc`` list."""
+        return self.desc_array if self._desc is None else None
 
     @property
     def num_units(self) -> int:
-        return len(self.desc)
+        arr = self.table()
+        return len(arr) if arr is not None else len(self.desc)
 
     @property
     def fixup_groups(self) -> List[List[int]]:
@@ -407,6 +433,24 @@ def build_plan(
     T, C = TILE_KEYS, chunk_len(D)
     B = len(qo_indptr) - 1
     kv_lens = kv_lengths(kv_indptr, kv_last_page_len, page)
+    if split_policy != "split":
+        # every unit fused and no Swaps-body batch: the table as one array (the rows and the order of the loop below). "auto" fuses
+        # every tile from 2 x SM tiles up when the merged state is in TMEM (no narrow or wide split, no D = 256 decode-unit rule)
+        n_tiles, max_rows = fused_units_count(qo_indptr, Hkv, g, tpt)
+        if (
+            n_tiles >= ARRAY_PLAN_MIN_UNITS
+            and not (small_swap and max_rows <= swap_max_rows)
+            and (split_policy == "fused" or (n_tiles >= 2 * sm_count and om_in_tmem(D)))
+        ):
+            arr = fused_units_array(
+                qo_indptr, kv_indptr, kv_lens, Hkv, g, tpt, T, C, window_left
+            )
+            order = np.argsort(-(arr[:, F_TILE_HI] - arr[:, F_TILE_LO]), kind="stable")
+            wave = min(len(arr), grid if grid > 0 else sm_count)
+            arr = np.ascontiguousarray(arr[order][snake_index(len(arr), wave)])
+            plan = Plan(tokens_per_tile=tpt, g=g, ws_row=ws_row(D))
+            plan.desc_array = arr
+            return plan
     tiles = []  # (b, h, tok0, ntok, chunk_lo, chunk_hi, tile_lo, tile_hi, kv_len, q_len)
     for b in range(B):
         q_len = qo_indptr[b + 1] - qo_indptr[b]
@@ -578,3 +622,73 @@ def snake_order(units: list, grid: int) -> list:
         wave = units[start : start + grid]
         out.extend(wave[::-1] if w % 2 else wave)
     return out
+
+
+def snake_index(n: int, grid: int) -> np.ndarray:
+    """``snake_order`` as an index array: ``snake_order(units, grid)[i] == units[snake_index(len(units), grid)[i]]``."""
+    idx = np.arange(n)
+    if grid <= 0:
+        return idx
+    start = idx // grid * grid
+    end = np.minimum(start + grid, n)
+    return np.where((idx // grid) % 2 == 1, start + end - 1 - idx, idx)
+
+
+def fused_units_count(qo_indptr: Sequence[int], Hkv: int, g: int, tpt: int) -> tuple:
+    """``(units, widest rows)`` of a batch planned with every Q tile fused: one unit per KV head and ``tpt`` tokens of a request."""
+    q_lens = np.diff(np.asarray(qo_indptr, dtype=np.int64))
+    n_tiles = int((-(-q_lens // tpt)).sum()) * Hkv
+    max_rows = int(min(tpt, int(q_lens.max()))) * g if q_lens.size else 0
+    return n_tiles, max_rows
+
+
+def fused_units_array(
+    qo_indptr: Sequence[int],
+    kv_indptr: Sequence[int],
+    kv_lens: Sequence[int],
+    Hkv: int,
+    g: int,
+    tpt: int,
+    T: int,
+    C: int,
+    window_left: int,
+) -> np.ndarray:
+    """The descriptor rows of a batch whose units are all fused (mode 0, every present chunk of the tile), in ``build_plan``'s
+    generation order (request, Q tile, KV head) as an ``(units, DESC_FIELDS)`` int32 array: the loop's integer arithmetic per
+    column."""
+    qo = np.asarray(qo_indptr, dtype=np.int64)
+    kvp = np.asarray(kv_indptr, dtype=np.int64)
+    q_lens = qo[1:] - qo[:-1]
+    kvl = np.asarray(kv_lens, dtype=np.int64)
+    bad = np.flatnonzero((q_lens > 0) & (kvl < q_lens))
+    assert bad.size == 0, (
+        f"request {int(bad[0])}: kv_len {int(kvl[bad[0]])} < q_len {int(q_lens[bad[0]])} (bottom-right causal needs kv_len >= q_len)"
+    )
+    per_req = -(-q_lens // tpt)  # Q tiles per request (none for an empty request)
+    req = np.repeat(np.arange(q_lens.size), per_req)
+    tok0 = (np.arange(req.size) - (np.cumsum(per_req) - per_req)[req]) * tpt
+    q_len = q_lens[req]
+    kv_len = kvl[req]
+    ntok = np.minimum(tpt, q_len - tok0)
+    p_first = kv_len - q_len + tok0
+    l_max = p_first + ntok
+    lo_min = np.maximum(0, p_first - window_left) if window_left >= 0 else 0 * p_first
+    cols = [None] * DESC_FIELDS
+    cols[F_REQ] = req
+    cols[F_QTOK0] = tok0
+    cols[F_ROWS] = ntok * g
+    cols[F_CHUNK_LO] = lo_min // C
+    cols[F_CHUNK_HI] = -(-l_max // C)
+    cols[F_MODE] = cols[F_SLOT] = 0 * req
+    cols[F_KVLEN] = kv_len
+    cols[F_QLEN] = q_len
+    cols[F_TILE_LO] = lo_min // T
+    cols[F_TILE_HI] = -(-l_max // T)
+    cols[F_QBASE] = qo[req]
+    cols[F_GROUP] = 0 * req - 1
+    cols[F_KVPTR0] = kvp[req]
+    cols[F_NPAGES] = kvp[req + 1] - kvp[req]
+    cols[F_KVHEAD] = 0 * req
+    arr = np.repeat(np.stack(cols, axis=1), Hkv, axis=0)
+    arr[:, F_KVHEAD] = np.tile(np.arange(Hkv), req.size)
+    return arr.astype(np.int32)

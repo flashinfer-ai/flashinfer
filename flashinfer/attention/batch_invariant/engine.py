@@ -22,8 +22,10 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass
+from itertools import chain
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 
 from .plan import (
@@ -31,6 +33,7 @@ from .plan import (
     GRID_SEARCH_ARCHES,
     GROUP_FIELDS,
     build_plan,
+    snake_index,
     snake_order,
     ws_row,
 )
@@ -297,11 +300,77 @@ def pair_units(desc: list, grid: int = 0) -> list:
     return [row for ab in pairs for row in ab]
 
 
+def pair_units_array(desc: np.ndarray, grid: int = 0) -> np.ndarray:
+    """``pair_units`` over the descriptor table as an array (``Plan.table``): the same rows in the same order, without a Python step per
+    unit."""
+    from .plan import (
+        F_CHUNK_HI,
+        F_CHUNK_LO,
+        F_GROUP,
+        F_KVHEAD,
+        F_MODE,
+        F_QTOK0,
+        F_REQ,
+        F_ROWS,
+        F_TILE_HI,
+        F_TILE_LO,
+    )
+
+    n = len(desc)
+    if n == 0:
+        return desc.reshape(0, DESC_FIELDS)
+    key = (F_REQ, F_KVHEAD, F_CHUNK_LO, F_CHUNK_HI, F_MODE)
+    # the units of a bucket adjacent and in token order; then the buckets in the order of their first unit in ``desc``
+    by_key = np.lexsort((desc[:, F_QTOK0],) + tuple(desc[:, f] for f in key[::-1]))
+    keys = desc[by_key][:, list(key)]
+    first = np.ones(n, dtype=bool)
+    first[1:] = (keys[1:] != keys[:-1]).any(axis=1)
+    starts = np.flatnonzero(first)
+    sizes = np.diff(np.append(starts, n))
+    bucket_order = np.argsort(np.minimum.reduceat(by_key, starts), kind="stable")
+    rank = np.empty(len(starts), dtype=np.int64)
+    rank[bucket_order] = np.arange(len(starts))
+    units = by_key[np.argsort(rank[np.cumsum(first) - 1], kind="stable")]
+    sizes = sizes[bucket_order]
+    bucket = np.repeat(np.arange(len(sizes)), sizes)
+    pos = np.arange(n) - (np.cumsum(sizes) - sizes)[bucket]
+    a_at = np.flatnonzero(pos % 2 == 0)
+    has_b = pos[a_at] + 1 < sizes[bucket[a_at]]
+    a = desc[units[a_at]]
+    b = desc[units[np.where(has_b, a_at + 1, a_at)]]
+    b[~has_b, F_ROWS] = 0
+    b[~has_b, F_TILE_LO] = b[~has_b, F_TILE_HI] = a[~has_b, F_TILE_LO]
+    b[~has_b, F_GROUP] = -1
+    length = np.maximum(
+        a[:, F_TILE_HI] - a[:, F_TILE_LO], b[:, F_TILE_HI] - b[:, F_TILE_LO]
+    )
+    order = np.argsort(-length, kind="stable")
+    order = order[snake_index(len(order), min(len(order), grid))]
+    out = np.empty((2 * len(order), DESC_FIELDS), dtype=desc.dtype)
+    out[0::2] = a[order]
+    out[1::2] = b[order]
+    return out
+
+
+def rows_tensor(rows: list, fields: int, device: torch.device) -> torch.Tensor:
+    """A list of ``fields``-wide integer rows (a row of zeros when empty) as an int32 device tensor."""
+    if not rows:
+        rows = [[0] * fields]
+    flat = np.fromiter(
+        chain.from_iterable(rows), dtype=np.int32, count=len(rows) * fields
+    )
+    return torch.from_numpy(flat.reshape(len(rows), fields)).to(device)
+
+
 def swaps_n_pad(plan) -> int:
     """The Swaps-AB kernel's B-operand width for a plan whose units all have <= SWAPS_MAX_ROWS live rows (0 when some unit is wider: the row body)."""
     from .swaps.operands import n_pad_for
 
-    rows = max((d[2] for d in plan.desc), default=0)
+    table = plan.table()
+    if table is not None:
+        rows = int(table[:, 2].max()) if len(table) else 0
+    else:
+        rows = max((d[2] for d in plan.desc), default=0)
     return n_pad_for(rows) if 1 <= rows <= SWAPS_MAX_ROWS else 0
 
 
@@ -434,28 +503,26 @@ def plan_attention(
         grid_search=planner_grid_search(device),
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
-    desc = torch.tensor(
-        plan.desc if plan.desc else [[0] * DESC_FIELDS],
-        dtype=torch.int32,
-        device=device,
-    )
+    table = plan.table()  # the descriptor table as an array when the planner built it as one, else the rows of plan.desc
     if (
         config.q2
-        and len(plan.desc) >= Q2_MIN_UNITS_PER_SM[D] * sm
+        and plan.num_units >= Q2_MIN_UNITS_PER_SM[D] * sm
         and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))
     ):
-        paired = pair_units(plan.desc, sm)
+        if table is not None:
+            paired = pair_units_array(table, sm)
+            desc = torch.from_numpy(paired).to(device)
+        else:
+            paired = pair_units(plan.desc, sm)
+            desc = rows_tensor(paired, DESC_FIELDS, device)
         plan.num_launch = len(paired) // 2
-        desc = torch.tensor(paired, dtype=torch.int32, device=device)
-    groups = torch.tensor(
-        plan.groups if plan.groups else [[0] * GROUP_FIELDS],
-        dtype=torch.int32,
-        device=device,
-    )
+    elif table is not None and len(table):
+        desc = torch.from_numpy(table).to(device)
+    else:
+        desc = rows_tensor(plan.desc, DESC_FIELDS, device)
+    groups = rows_tensor(plan.groups, GROUP_FIELDS, device)
     fx = getattr(plan, "fixup_groups", plan.groups)
-    fixup_groups = torch.tensor(
-        fx if fx else [[0] * GROUP_FIELDS], dtype=torch.int32, device=device
-    )
+    fixup_groups = rows_tensor(fx, GROUP_FIELDS, device)
     need = max(1, plan.ws_rows) * ws_row(D)
     if (
         workspace is None or plan.ws_rows == 0
@@ -471,9 +538,8 @@ def plan_attention(
     # block per CTA in the row-interleaved layout of operands.OM_VEC, touched once per chunk end, L2-resident (26 MB at 204 CTAs x D = 256)
     from .blocks.operands import om_scratch_blocks
 
-    multi = any(d[6] == 0 and d[5] - d[4] > 1 for d in plan.desc)
     scr = 1
-    if om_scratch_blocks(D) and multi:
+    if om_scratch_blocks(D) and any(d[6] == 0 and d[5] - d[4] > 1 for d in plan.desc):
         n_cta = max(1, min(plan.num_units, max(sm, config.grid)))
         scr = n_cta * om_scratch_blocks(D) * 128 * D
     # the in-kernel fold's arrival counters: one per group, zero at every launch (the last arriver resets its group's counter)
