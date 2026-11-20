@@ -7,9 +7,14 @@ and on disk, so a kernel compiled for one part is never loaded for another.
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
-``(D, page, Hkv, num_pages)`` (NHD or HND pools: runtime strides), O as ``(total_q * Hq, D)``, the fp32
+``(D, page, Hkv, num_pages)`` (NHD or HND pools: runtime strides), O as ``(total_q * Hq, D)``, the fp32 LSE as
+``(total_q * Hq,)`` (written under a nonzero ``lse_mode``: 1 base 2, 2 base e; any one-element tensor otherwise), the fp32
+sinks as ``(Hq,)`` (read by a kernel compiled with ``sinks``; any one-element tensor otherwise), the fp32
 workspace flat, the fp32 per-CTA ``O_m`` scratch flat (``grid x 128 x D`` at D = 256, one element otherwise), the int32 split-group table ``(num_groups, GROUP_FIELDS)`` and the per-group arrival
-counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, 16)``, ``kv_indptr`` and ``kv_indices``.
+counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, 16)``, ``kv_indptr`` and ``kv_indices``, and the
+int32 counts table (``plan.COUNT_FIELDS``), which a kernel compiled for a fixed launch (``fixed``, part of the kernel's name) reads
+at entry for the unit count and the number of CTAs that walk the units; the other kernels take the unit count as an argument and
+never read the table (any int32 tensor).
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import cutlass.cute as cute
 from ....batch_invariant import jit
 from ..plan import GROUP_FIELDS
 from .kernel import AttentionKernel
+from .operands import run_pages, split_pages
 
 MODULE = "batch_invariant_attention"
 
@@ -36,13 +42,19 @@ def kernel_name(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
+    sinks: bool = False,
+    fixed: bool = False,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
         + ("_q2" if q2 else "")
         + ("_rg" if ragged else "")
+        + ("_sp" if split_pages(page, ragged) else "")
+        + ("r" if run_pages(page, ragged) else "")
         + ("_hwm" if hw_rowmax else "")
         + (f"_c{cap >> 10}" if cap else "")
+        + ("_sink" if sinks else "")
+        + ("_cg" if fixed else "")
     )
 
 
@@ -57,13 +69,20 @@ def get_compiled_attention(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
+    sinks: bool = False,
+    fixed: bool = False,
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
+    ``sinks``: the kernel of the class's sink member (the sink step where a row is completed); part of the kernel's name.
+    ``fixed``: the kernel of a fixed launch (``engine.FixedLaunch``: the unit count and the walking CTAs read from the counts
+    table); part of the kernel's name.
     ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0)."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap)
+    name = kernel_name(
+        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, sinks, fixed
+    )
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -109,6 +128,12 @@ def get_compiled_attention(
             (cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
+        lse_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
+        sink_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         ws_fake = cute.runtime.make_fake_tensor(f32, (s_ws,), (1,), assumed_align=16)
         scratch_fake = cute.runtime.make_fake_tensor(
             f32, (cute.sym_int(32),), (1,), assumed_align=16
@@ -128,14 +153,21 @@ def get_compiled_attention(
         indices_fake = cute.runtime.make_fake_tensor(
             i32, (s_nidx,), (1,), assumed_align=4
         )
+        counts_fake = cute.runtime.make_fake_tensor(
+            i32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap)
+        k = AttentionKernel(
+            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, sinks, fixed
+        )
         return cute.compile(
             k,
             q_fake,
             k_fake,
             v_fake,
             o_fake,
+            lse_fake,
+            sink_fake,
             ws_fake,
             scratch_fake,
             groups_fake,
@@ -147,7 +179,9 @@ def get_compiled_attention(
             cutlass.Float32(-1.0),
             cutlass.Int32(-1),
             cutlass.Int32(1),
+            counts_fake,
             cutlass.Int32(1),
+            cutlass.Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )

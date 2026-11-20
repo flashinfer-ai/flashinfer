@@ -35,7 +35,12 @@ from ..blocks.operands import (
     ACC_DTYPE,
     HALF,
     IN_DTYPE,
+    RUN_KEYS,
     SMEM_CAP,
+    SPLIT_LOOP_PAGE_MAX,
+    SPLIT_WARPS,
+    run_pages,
+    split_pages,
 )
 
 N_PADS = (
@@ -230,10 +235,24 @@ class SwapsPlan:
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
         self.D, self.g, self.page, self.n_pad = D, g, page, n_pad
+        self.sinks = False  # set by the kernel compiled for attention sinks
         self.ragged = (
             ragged  # the packed-token KV view (blocks/operands.StaticPlan.ragged)
         )
         assert not ragged or page == TILE_KEYS, (ragged, page)
+        # the K / V boxes of small pages are issued under the split placement, by kv_warps warps (the load warp alone otherwise)
+        self.split = split_pages(page, ragged)
+        self.kv_warps = SPLIT_WARPS if self.split else 1
+        self.split_loop = (
+            self.split and page <= SPLIT_LOOP_PAGE_MAX
+        )  # the boxes of 1- and 2-key pages in a run-time loop
+        self.runs = run_pages(
+            page, ragged
+        )  # run boxes (blocks.producer.issue_slot_runs)
+        self.run_tma: tuple = ()  # set by the kernel: the per-pool run atoms and TMA tensors
+        self.ring_run: object = (
+            None  # set by the kernel: the ring as run boxes address it
+        )
         self.roles = Roles
         self.n_wg = 1  # one softmax warpgroup (fold_group's prefetch depth reads it)
         self.T = TILE_KEYS
@@ -339,6 +358,22 @@ class SwapsPlan:
         self.kv_slab_layout = cute.make_composed_layout(
             self.swizzle, 0, self.slab_layout
         )
+        # the run box of the split placement: (64 d, page keys, 1, 8 / page consecutive pages) = 8 keys of one half, and the ring as
+        # run boxes address it: (d in half, key in page, 1, page in run, run, half, slot) -- the bytes of the page boxes it replaces
+        self.run_box = (HALF, min(page, RUN_KEYS), 1, max(1, RUN_KEYS // page))
+        run_stride = (1, HALF, 0, HALF * min(page, RUN_KEYS))
+        self.run_slab_layout = cute.make_composed_layout(
+            self.swizzle, 0, cute.make_layout(self.run_box, stride=run_stride)
+        )
+        self.run_view_layout = cute.make_composed_layout(
+            self.swizzle,
+            0,
+            cute.make_layout(
+                self.run_box + (self.T // RUN_KEYS, self.halves, self.n_slots),
+                stride=run_stride
+                + (HALF * RUN_KEYS, self.T * HALF, self.kv_slot_elems),
+            ),
+        )
         # the producer's view of Q: (d in half, head, token, half, stage): element (n, d) of the B operand at (d % 64) + 64 n + 64 n_pad (d // 64)
         self.q_box = (HALF, g, self.tokens_box)
         self.q_view_layout = cute.make_composed_layout(
@@ -389,3 +424,13 @@ class SwapsTma:
         self.atom_v, self.tensor_v = cpasync.make_tiled_tma_atom(
             op, mV, st.kv_slab_layout, (HALF, st.box_rows, 1, 1)
         )
+        # the run boxes of the split placement (the page boxes' atoms again where no build issues a run box)
+        self.atom_k_run, self.tensor_k_run = self.atom_k, self.tensor_k
+        self.atom_v_run, self.tensor_v_run = self.atom_v, self.tensor_v
+        if st.runs:
+            self.atom_k_run, self.tensor_k_run = cpasync.make_tiled_tma_atom(
+                op, mK, st.run_slab_layout, st.run_box
+            )
+            self.atom_v_run, self.tensor_v_run = cpasync.make_tiled_tma_atom(
+                op, mV, st.run_slab_layout, st.run_box
+            )

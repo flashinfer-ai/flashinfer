@@ -10,7 +10,9 @@ one class per head dim, ``spec.HEAD_DIMS``).
   plan / run call shapes on top of it.
 
 Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) or ``(num_pages, Hkv, page, D)``
-(HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16. The planner runs on
+(HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16 and, with ``return_lse``, the LSE member
+``(total_q, Hq)`` fp32 (``spec.lse_term``; base 2, or base e with ``lse_base="ln"``). ``sinks``, an fp32 ``(Hq,)`` tensor of
+per-head sink logits, selects the sink member (``spec.sink_merge``: one more merge per row, after its last chunk). The planner runs on
 host copies of the indptr arrays (as FlashInfer's ``plan`` does) and a plan runs with the index offsets it was
 built from: the descriptor table carries every request's query offset, KV length and page-table range, so
 ``run_attention`` launches the plan's own ``kv_indptr`` and rejects a differing one (``kv_indices`` is read at
@@ -24,17 +26,29 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 
 from .plan import (
+    ArrayPlan,
+    COUNT_FIELDS,
     DESC_FIELDS,
     GRID_SEARCH_ARCHES,
     GROUP_FIELDS,
+    N_FIXUP_GROUPS,
+    N_GROUPS,
+    N_UNITS,
+    N_WALK,
+    build_array_plan,
     build_plan,
+    lone_units_array,
+    pair_units_array,
     snake_order,
     ws_row,
 )
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, LN2, LOG2E, LSE_BASES, scale_log2
+
+LSE_MODES = {"log2": 1, "ln": 2}  # the kernels' ``lse_mode`` (0: no LSE store)
 
 
 PAGE_SIZES = (
@@ -356,6 +370,266 @@ class WorkspaceTooSmall(RuntimeError):
         self.needed = needed
 
 
+FIXUP_BLOCKS_PER_SM = 8  # the fixup launch of a prefill wrapper's fixed launch: about this many blocks per SM
+GRAPH_UNIT_WAVES = 32  # the unit capacity of a fixed launch is at least this many units per SM: room for the split kind of
+# the batches that leave the machine underfilled (the planner splits those into one unit per 512-key chunk), bounded so
+# that the tables stay small; a plan beyond it keeps its units fused
+
+
+def plan_counts(plan, walk: int) -> List[int]:
+    """The counts table of a plan under a fixed launch (``plan.COUNT_FIELDS`` int32): what its kernels read at entry in place
+    of launch arguments; ``walk`` CTAs of the launch grid walk the units."""
+    counts = [0] * COUNT_FIELDS
+    counts[N_UNITS] = plan.num_units if plan.num_launch is None else plan.num_launch
+    counts[N_GROUPS] = plan.num_groups
+    counts[N_FIXUP_GROUPS] = plan.num_fixup_groups
+    counts[N_WALK] = walk
+    return counts
+
+
+class FixedLaunch:
+    """The launch of a decode wrapper under ``use_cuda_graph=True``: everything a captured ``run()`` bakes into the graph is
+    fixed here, once, from the frozen query geometry (batch size, query tokens per request, heads, head dim, page size) and the
+    SM count -- the kernel (the Swaps body or the row body, by the live rows per unit), the launch grid (one CTA per SM; a
+    plan's own grid is the count of them that walk units, read from the counts table), the fixup launch and the addresses of
+    the tables the kernels read. ``fill`` writes a new plan into those tables, so a replay follows the last plan. Capacities: ``unit_cap`` units (the fused plan's count, which depends on the query geometry alone, or
+    ``GRAPH_UNIT_WAVES`` units per SM if that is more), ``group_cap`` split groups (one per fused unit at most) and
+    ``fixup_cap`` of them for the fixup kernel (each costs at least one unit of the budget); the partials take the whole float
+    workspace. ``unit_cap`` overrides the unit capacity (never below the fused plan's count). The planner keeps every plan
+    within them by fusing (``plan.budget_unit_kinds``): a placement, as is all of this."""
+
+    def __init__(
+        self,
+        batch: int,
+        q_len_per_req: Optional[int],
+        Hq: int,
+        Hkv: int,
+        D: int,
+        page: int,
+        config: "AttnConfig",
+        workspace: torch.Tensor,
+        device: torch.device,
+        sm_count: Optional[int] = None,
+        unit_cap: Optional[int] = None,
+        max_rows: Optional[int] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+    ):
+        from .blocks.operands import om_scratch_blocks
+        from .fixup import MAX_GRID_Y, THREADS, wide_vec
+        from .swaps.operands import n_pad_for
+
+        check_supported(D, Hq, Hkv, page)
+        decode = q_len_per_req is not None
+        assert config.well_formed(D) and not (decode and config.q2), config
+        assert decode or max_rows is not None
+        device = torch.device(device)
+        sm = sm_count if sm_count is not None else device_sm_count(device)
+        g = Hq // Hkv
+        tpt = 128 // g
+        self.batch = int(batch)
+        self.q_len_per_req = int(q_len_per_req) if decode else None
+        # the packed query rows a plan may hold; a decode wrapper's requests without keys are null requests
+        self.max_rows = self.batch * self.q_len_per_req if decode else int(max_rows)
+        self.null_requests = decode
+        self.heads, self.D, self.page, self.config = (
+            (int(Hq), int(Hkv)),
+            D,
+            page,
+            config,
+        )
+        self.sm_count = sm
+        if decode:
+            # every plan has the same Q tiles
+            fused_units = self.batch * Hkv * -(-self.q_len_per_req // tpt)
+            self.rows_max = min(tpt, self.q_len_per_req) * g
+        else:
+            # the Q tiles of any split of max_rows tokens over the request slots: every request rounds up at most once
+            tiles = -(-self.max_rows // tpt) + self.batch - 1 if self.max_rows else 0
+            fused_units = Hkv * tiles
+            self.rows_max = min(tpt, self.max_rows) * g
+        self.unit_cap = max(
+            1, fused_units, GRAPH_UNIT_WAVES * sm if unit_cap is None else unit_cap
+        )
+        self.group_cap = max(1, fused_units)
+        swaps = decode and config.small == "swap" and D in SWAPS_DIMS
+        # the body is one for the wrapper's lifetime: the Swaps body when every unit of every plan has at most
+        # SWAPS_MAX_ROWS live rows (a decode geometry), the row body otherwise -- and always for prefill, whose plans differ
+        self.n_pad = (
+            n_pad_for(self.rows_max)
+            if swaps and 1 <= self.rows_max <= SWAPS_MAX_ROWS
+            else 0
+        )
+        self.grid = max(1, min(config.grid or sm, self.unit_cap))
+        rows_per_block = THREADS // (D // wide_vec(D))
+        if decode:
+            self.fixup_cap = min(fused_units, self.unit_cap - fused_units)
+            self.fixup_grid_y = min(self.fixup_cap, MAX_GRID_Y)
+        else:
+            # a fixup group costs at least one unit beyond its tile's, and the tiles vary: at most half the capacity. Its
+            # launch is bounded too (the blocks stride over the groups beyond grid.y): a prefill group has up to 128 rows
+            self.fixup_cap = min(fused_units, self.unit_cap // 2)
+            self.fixup_grid_y = min(
+                self.fixup_cap,
+                max(1, FIXUP_BLOCKS_PER_SM * sm // -(-self.rows_max // rows_per_block)),
+            )
+        # the split partials: the whole workspace, as rows of ws_row(D) fp32
+        floats = workspace.numel() * workspace.element_size() // 4
+        self.row_budget = floats // ws_row(D)
+        if self.row_budget:
+            self.ws = (
+                workspace.view(torch.uint8)
+                .reshape(-1)[: floats * 4]
+                .view(torch.float32)
+            )
+        else:
+            self.ws = torch.empty(ws_row(D), dtype=torch.float32, device=device)
+        scr = 1
+        if not self.n_pad and om_scratch_blocks(D):
+            scr = self.grid * om_scratch_blocks(D) * 128 * D
+        self.scratch = torch.empty(scr, dtype=torch.float32, device=device)
+        # one int32 block: counts | descriptors | groups | fixup groups, refreshed from a page-locked staging block
+        self._sections = (
+            COUNT_FIELDS,
+            self.unit_cap * DESC_FIELDS * (2 if config.q2 else 1),
+            self.group_cap * GROUP_FIELDS,
+            max(1, self.fixup_cap) * GROUP_FIELDS,
+        )
+        self.table = torch.zeros(sum(self._sections), dtype=torch.int32, device=device)
+        self.counts, desc, groups, fixup_groups = self._views(self.table)
+        self.desc = desc.view(-1, DESC_FIELDS)
+        self.groups = groups.view(self.group_cap, GROUP_FIELDS)
+        self.fixup_groups = fixup_groups.view(-1, GROUP_FIELDS)
+        self.fold_counters = torch.zeros(
+            self.group_cap, dtype=torch.int32, device=device
+        )
+        self.lse_unused = torch.empty(1, dtype=torch.float32, device=device)
+        # the kv_indptr every plan of the launch runs with (the row body reads it; the Swaps body takes the page ranges from
+        # the descriptors): the caller's persistent buffer, which the caller refreshes, or the launch's own, refreshed by
+        # plan_attention
+        self.owns_kv_indptr = kv_indptr is None
+        self.kv_indptr = (
+            torch.zeros(self.batch + 1, dtype=torch.int32, device=device)
+            if kv_indptr is None
+            else kv_indptr
+        )
+        assert (
+            self.kv_indptr.dtype == torch.int32
+            and self.kv_indptr.numel() == self.batch + 1
+            and self.kv_indptr.is_contiguous()
+        )
+        # two staging blocks in turn: a block is rewritten only after the copy that last read it has run
+        self._stage = [
+            torch.zeros(sum(self._sections), dtype=torch.int32, pin_memory=True)
+            for _ in range(2)
+        ]
+        self._stage_views = [
+            np.split(block.numpy(), np.cumsum(self._sections)[:-1])
+            for block in self._stage
+        ]
+        self._staged = [[0, 0, 0], [0, 0, 0]]  # live ints per section of each block
+        self._on_device = [0, 0, 0]  # live ints per section of the device tables
+        # the plan in the tables: the next one of the same shape rewrites its KV lengths
+        self.last_plan: Optional[ArrayPlan] = None
+        self._copied: List[Optional[torch.cuda.Event]] = [None, None]
+        self._turn = 0
+
+    def _views(self, block: torch.Tensor) -> tuple:
+        return torch.split(block, self._sections)
+
+    def matches(self, batch, Hq, Hkv, D, page) -> bool:
+        return (self.batch, self.heads, self.D, self.page) == (
+            int(batch),
+            (int(Hq), int(Hkv)),
+            int(D),
+            int(page),
+        )
+
+    def fill(self, plan, non_blocking: bool = True) -> None:
+        """Write ``plan``'s tables (a ``plan.ArrayPlan``) over the fixed ones; beyond the plan's counts the device tables hold
+        null units and groups. Under the paired placement the unit table is the pair table: real pairs when the batch has
+        the units for it (the eager rule, ``Q2_MIN_UNITS_PER_SM``), else every unit alone in its pair, so the kernel is the
+        paired one for every plan."""
+        assert (
+            plan.num_units <= self.unit_cap
+            and plan.num_groups <= self.group_cap
+            and plan.num_fixup_groups <= self.fixup_cap
+            and plan.ws_rows <= self.row_budget
+        ), "the plan exceeds the fixed launch's capacity"
+        units = plan.desc_array
+        walk = self.config.grid or plan.grid or min(plan.num_units, self.sm_count)
+        if self.config.q2 and plan.launch_array is None:
+            if plan.num_units >= Q2_MIN_UNITS_PER_SM[self.D] * self.sm_count:
+                plan.launch_array = pair_units_array(units, self.sm_count)
+                walk = self.config.grid or min(
+                    plan.launch_array.shape[0] // 2, self.sm_count
+                )
+            else:
+                plan.launch_array = lone_units_array(units)
+            plan.num_launch, plan.walk = plan.launch_array.shape[0] // 2, walk
+        if self.config.q2:
+            units, walk = plan.launch_array, plan.walk
+        i = self._turn
+        self._turn = 1 - i
+        ev = self._copied[i]
+        if ev is not None and not ev.query():
+            ev.synchronize()
+        count = plan.num_units if plan.num_launch is None else plan.num_launch
+        walk = max(1, min(walk, self.grid))
+        # the row body walks its units on the whole launch grid: its plans have no grid of their own
+        assert self.n_pad or walk == max(1, min(count, self.grid)), (walk, self.grid)
+        counts, *sections = self._stage_views[i]
+        counts[:] = plan_counts(plan, walk)
+        extents = []
+        for k, (section, rows) in enumerate(
+            zip(
+                sections,
+                (units, plan.groups_array, plan.fixup_array),
+                strict=True,
+            )
+        ):
+            live = rows.size
+            section[:live] = rows.reshape(-1)
+            if self._staged[i][k] > live:
+                section[live : self._staged[i][k]] = 0
+            self._staged[i][k] = live
+            # what the device copy must cover: the plan's entries and the entries of the last plan they do not overwrite
+            extents.append(max(live, self._on_device[k]))
+            self._on_device[k] = live
+        with torch.cuda.device(self.table.device):
+            # the counts and the descriptors are adjacent: one copy; the group tables only when they hold entries
+            spans = (
+                (0, COUNT_FIELDS + extents[0]),
+                (COUNT_FIELDS + self._sections[1], extents[1]),
+                (COUNT_FIELDS + self._sections[1] + self._sections[2], extents[2]),
+            )
+            for start, n in spans:
+                if n:
+                    self.table[start : start + n].copy_(
+                        self._stage[i][start : start + n], non_blocking=non_blocking
+                    )
+            if ev is None:
+                ev = self._copied[i] = torch.cuda.Event()
+            ev.record()
+
+
+_UNUSED_OPERAND: Dict[torch.device, torch.Tensor] = {}
+
+
+def unused_operand(device: torch.device) -> torch.Tensor:
+    """The one-element fp32 tensor a launch passes for the LSE operand it does not write (``lse_mode`` 0: every LSE store is
+    under ``lse_mode > 0``) and the sink operand it does not read (a kernel without the sink step has no sink load): one per
+    device, kept for the process. Inside a CUDA-graph capture an uncached tensor is returned instead (it would come from
+    the graph's private pool)."""
+    device = _resolve_device(device)
+    t = _UNUSED_OPERAND.get(device)
+    if t is None:
+        t = torch.empty(1, dtype=torch.float32, device=device)
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return t
+        t = _UNUSED_OPERAND.setdefault(device, t)
+    return t
+
+
 class _Planned:
     def __init__(
         self,
@@ -366,9 +640,17 @@ class _Planned:
         scratch: Optional[torch.Tensor] = None,
         fixup_groups: Optional[torch.Tensor] = None,
         fold_counters: Optional[torch.Tensor] = None,
+        counts: Optional[torch.Tensor] = None,
+        fixed: Optional[FixedLaunch] = None,
     ):
         self.plan, self.desc, self.groups, self.ws = plan, desc, groups, ws
+        self.counts = counts  # the counts table of a fixed launch (plan.COUNT_FIELDS)
+        self.fixed = fixed  # the fixed launch this plan was written into (a wrapper under use_cuda_graph)
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
+        # the caller's workspace tensor the partials live in (set by plan_attention)
+        self.workspace: Optional[torch.Tensor] = None
+        # the packed rows of the requests without keys of a decode plan (None: no such request)
+        self.null_rows: Optional[torch.Tensor] = None
         self.ragged = False  # the packed-token KV layout (set by plan_attention)
         # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
         # and per Q tile, the configuration decides pairing and the unit body)
@@ -382,8 +664,15 @@ class _Planned:
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
-        self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
+        self.n_fixup_groups = plan.num_fixup_groups
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
+        # the kernels' LSE / sink operand of a launch without LSE / sinks; this reference keeps it alive for a captured graph
+        # (a fixed launch holds its own for the wrapper's lifetime)
+        self.lse_unused = (
+            fixed.lse_unused if fixed is not None else unused_operand(desc.device)
+        )
+        # the plan's sinks declaration (set by plan_attention)
+        self.has_sinks: Optional[bool] = None
 
 
 def plan_attention(
@@ -400,10 +689,90 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    fixed: Optional[FixedLaunch] = None,
+    non_blocking: bool = True,
+    has_sinks: Optional[bool] = None,
+    null_requests: bool = False,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
-    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
+    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer.
+    ``has_sinks``: declares whether every ``run_attention`` of this plan is given ``sinks`` (``True`` / ``False``: a run that
+    departs from it raises); ``None`` leaves the choice to each run.
+    ``fixed``: the plan is held to that launch's capacities and written into its tables (``FixedLaunch``; a request without keys
+    gets no unit); ``workspace`` and ``sm_count`` are the launch's, and the plan runs with the launch's ``kv_indptr`` buffer."""
+    if fixed is not None:
+        batch = qo_indptr.numel() - 1
+        q_lens = np.diff(qo_indptr.cpu().numpy().astype(np.int64, copy=False))
+        assert (
+            not ragged
+            and fixed.matches(batch, Hq, Hkv, D, page)
+            and int(q_lens.sum()) <= fixed.max_rows
+            and (
+                fixed.q_len_per_req is None
+                or bool((q_lens == fixed.q_len_per_req).all())
+            )
+        ), "the fixed launch was built for another query geometry"
+        from dataclasses import replace
+
+        # the unit kind and the fold placement are the planner's inputs and may differ from plan to plan; the kernel's are fixed
+        config = config or fixed.config
+        assert (
+            replace(
+                config,
+                split_policy=fixed.config.split_policy,
+                merge=fixed.config.merge,
+            )
+            == fixed.config
+        ), (config, fixed.config)
+        kv_host = kv_indptr.cpu().numpy().astype(np.int64, copy=False)
+        spans = np.diff(kv_host)
+        last = kv_last_page_len.cpu().numpy().astype(np.int64, copy=False)
+        fixed_plan = build_array_plan(
+            q_lens,
+            # a request without pages has no keys, whatever its last-page entry
+            np.where(spans > 0, (spans - 1) * page + last, 0),
+            Hq,
+            Hkv,
+            D,
+            window_left,
+            config.split_policy,
+            fixed.sm_count,
+            merge=config.merge,
+            small_swap=fixed.n_pad > 0,
+            swap_max_rows=SWAPS_MAX_ROWS,
+            grid=config.grid,
+            grid_search=planner_grid_search(fixed.table.device),
+            unit_budget=fixed.unit_cap,
+            row_budget=fixed.row_budget,
+            null_requests=fixed.null_requests,
+            previous=fixed.last_plan,
+            kv_indptr=kv_host,
+        )
+        fixed.last_plan = fixed_plan
+        fixed.fill(fixed_plan, non_blocking)
+        if fixed.owns_kv_indptr:
+            fixed.kv_indptr.copy_(kv_indptr.to(torch.int32), non_blocking=non_blocking)
+        planned = _Planned(
+            fixed_plan,
+            fixed.desc,
+            fixed.groups,
+            fixed.ws,
+            fixed.scratch,
+            fixed.fixup_groups,
+            fixed.fold_counters,
+            fixed.counts,
+            fixed,
+        )
+        planned.heads = (int(Hq), int(Hkv))
+        planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
+        planned.window_left = int(window_left)
+        planned.config = config
+        planned.page = int(page)
+        planned.has_sinks = None if has_sinks is None else bool(has_sinks)
+        planned.kv_indptr = fixed.kv_indptr
+        planned.workspace = workspace
+        return planned
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -432,6 +801,7 @@ def plan_attention(
         swap_max_rows=SWAPS_MAX_ROWS,
         grid=config.grid,
         grid_search=planner_grid_search(device),
+        null_requests=null_requests,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -487,15 +857,51 @@ def plan_attention(
         torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
     )
     planned.ragged = ragged
+    planned.workspace = workspace
     planned.heads = (int(Hq), int(Hkv))
     planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
     planned.config = config
     planned.page = int(page)
+    planned.has_sinks = None if has_sinks is None else bool(has_sinks)
     planned.kv_indptr = kv_indptr.to(
         device=device, dtype=torch.int32, copy=True
     ).contiguous()
+    if null_requests:
+        # the packed rows of the requests without keys: they have no unit, and run_attention fills them (null_row_values)
+        qo = qo_indptr.cpu().tolist()
+        kv = kv_indptr.cpu().tolist()
+        rows = [
+            r
+            for b in range(len(qo) - 1)
+            if kv[b + 1] == kv[b]
+            for r in range(qo[b], qo[b + 1])
+        ]
+        if rows:
+            planned.null_rows = torch.tensor(rows, dtype=torch.int64, device=device)
     return planned
+
+
+def null_row_values(sinks: Optional[torch.Tensor], lse_mode: int) -> tuple:
+    """The output element and the LSE of a row without keys, per head (``(Hq,)`` fp32 tensors, or the scalars ``+0`` and
+    ``-inf`` without sinks): what the class's steps give on the fold's init state ``(m, l, O) = (-inf, +0, +0)``, computed
+    here with binary32 operations since such a row has no unit. Without sinks the epilogue is never reached and the row
+    is ``+0`` with the LSE of the init state, ``-inf`` (``spec.lse_term``). With sinks it is the sink step on that state
+    (``spec.sink_merge``, ``c > 0``): ``s2 = mul(sink, LOG2E)``, ``m' = fmax(-inf, s2)``, ``a = EX2(add(-inf, -m'))``,
+    ``b = EX2(add(s2, -m'))``, ``l' = fma(+0, a, b)``, the LSE ``add(m', LG2(l'))`` (times ``LN2`` in base e) and the output
+    ``add(mul(+0, mul(a, div(1, l'))), +0)``. For a finite ``s2`` that is ``a = +0``, ``b = EX2(+0) = 1``, ``l' = 1``: the
+    output ``+0`` and the LSE the sink alone, ``add(s2, +0)``. Where ``s2`` is infinite or NaN, ``b`` or ``a`` is the
+    ``EX2`` of a NaN and the output and the LSE are NaN, as on a row with keys. Both cases are ``z = add(s2, -s2)`` (``+0``,
+    or NaN) for the output and ``add(s2, z)`` for the LSE, which is what is evaluated: ``EX2`` and ``LG2`` enter at
+    ``-inf``, ``+0``, ``1`` and NaN only, where they are exact."""
+    if sinks is None:
+        return 0.0, float("-inf")
+    s2 = sinks * LOG2E
+    z = s2 - s2
+    if not lse_mode:
+        return z, None
+    lse = s2 + z
+    return z, lse * LN2 if lse_mode == LSE_MODES["ln"] else lse
 
 
 def workspace_bytes(
@@ -540,6 +946,106 @@ def workspace_bytes(
     return plan.ws_rows * ws_row(D) * 4
 
 
+def plan_storage(planned: _Planned) -> tuple:
+    """The tensors a launch of the plan writes besides the output and the LSE buffer: the split-KV partials, the per-CTA
+    scratch and the caller's workspace tensor the partials live in. The caller's tensor counts whole, whatever prefix
+    this plan uses, so whether a buffer inside it is refused does not depend on the batch."""
+    return tuple(
+        t for t in (planned.workspace, planned.ws, planned.scratch) if t is not None
+    )
+
+
+def plan_tables(planned: _Planned) -> tuple:
+    """The plan's own tensors a launch reads: the descriptor and group tables, the ``kv_indptr`` snapshot, the arrival
+    counters and, under a fixed launch, the counts table."""
+    return tuple(
+        t
+        for t in (
+            planned.desc,
+            planned.groups,
+            planned.fixup_groups,
+            planned.fold_counters,
+            planned.kv_indptr,
+            planned.counts,
+        )
+        if t is not None
+    )
+
+
+def _overlaps_any(t: torch.Tensor, others) -> bool:
+    """Whether the contiguous ``t`` shares bytes with one of ``others`` (addresses compare on one device only)."""
+    return any(o.device == t.device and _output_overlaps_kv(t, o, o) for o in others)
+
+
+def check_lse_buffer(
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    out: Optional[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    shape: tuple,
+    q_source: Optional[torch.Tensor] = None,
+    storage=(),
+    tables=(),
+) -> Optional[str]:
+    """What is wrong with a caller's LSE buffer (``None`` when it can be written): a contiguous fp32 tensor of ``shape`` on
+    the queries' device whose bytes are disjoint from the output, the queries and the K / V caches (CTAs store LSE rows
+    while others still read their operands). ``q_source``: the caller's query tensor where ``q`` is a packed or reshaped
+    copy of it; the buffer must not share bytes with it either, since the store would change the caller's queries.
+    ``storage``: the plan's ``plan_storage``; an LSE row stored there would be read back as a split-KV partial.
+    ``tables``: the page-table tensors and the plan's ``plan_tables``; an LSE row stored there would be read as page
+    ids or descriptors."""
+    if lse.dtype != torch.float32:
+        return f"of dtype {lse.dtype}"
+    if tuple(lse.shape) != tuple(shape):
+        return f"of shape {tuple(lse.shape)}"
+    if lse.device != q.device:
+        return f"on {lse.device}"
+    if not lse.is_contiguous():
+        return "that is not contiguous"
+    if _output_overlaps_kv(lse, k, v):
+        return "that shares bytes with the KV cache"
+    if _output_overlaps_kv(lse, q, q if out is None else out):
+        return "that shares bytes with the queries or the output"
+    if q_source is not None and _output_overlaps_kv(lse, q_source, q_source):
+        return "that shares bytes with the queries or the output"
+    if _overlaps_any(lse, storage):
+        return "that shares bytes with the plan's workspace"
+    if _overlaps_any(lse, tables):
+        return "that shares bytes with the page table or the plan's tables"
+    return None
+
+
+def sinks_declaration_mismatch(has_sinks: Optional[bool], sinks) -> Optional[str]:
+    """How a run departs from its plan's ``has_sinks`` declaration (``None``: it does not, or nothing was declared)."""
+    if has_sinks is None or has_sinks == (sinks is not None):
+        return None
+    if has_sinks:
+        return "a run without sinks over a plan declared with has_sinks=True"
+    return "a run with sinks over a plan declared with has_sinks=False"
+
+
+def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[str]:
+    """What is wrong with a caller's ``sinks`` (``None`` when the kernels can read it): a contiguous fp32 ``(Hq,)`` tensor
+    on the queries' device, read in place at every launch (so a captured graph replays with the tensor's current values),
+    whose bytes none of the ``written`` tensors (the output, the LSE buffer, the plan's ``plan_storage``) share."""
+    if not isinstance(sinks, torch.Tensor):
+        return f"of type {type(sinks).__name__}"
+    if sinks.dtype != torch.float32:
+        return f"of dtype {sinks.dtype}"
+    if tuple(sinks.shape) != (Hq,):
+        return f"of shape {tuple(sinks.shape)}"
+    if sinks.device != device:
+        return f"on {sinks.device}"
+    if not sinks.is_contiguous():
+        return "that is not contiguous"
+    if _overlaps_any(sinks, [w for w in written if w is not None]):
+        return (
+            "that shares bytes with the output, the LSE buffer or the plan's workspace"
+        )
+    return None
+
+
 def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     """Conservative byte-span overlap for a contiguous output and nonnegative-strided caches.
 
@@ -575,6 +1081,9 @@ def plan_kv_indptr(planned: _Planned, kv_indptr: torch.Tensor) -> torch.Tensor:
     the snapshot runs as planned. A moved page table needs a new plan; ``kv_indices`` is read at run time."""
     snap = planned.kv_indptr
     assert snap is not None, "plan_attention records the plan's kv_indptr"
+    if planned.fixed is not None:
+        # a fixed launch runs with its own kv_indptr buffer, refreshed at every plan: the tables in it are the last plan's
+        return snap
     if kv_indptr is snap or (
         kv_indptr.device == snap.device
         and kv_indptr.dtype == snap.dtype
@@ -612,10 +1121,17 @@ def run_attention(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     ragged: bool = False,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    lse_base: str = "log2",
+    sinks: Optional[torch.Tensor] = None,
+):
     """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
     runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
-    and the snapshot runs uncompared); ``kv_indices`` is read at run time."""
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time. ``return_lse``: also return the LSE member
+    ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to ``lse`` when given; the output bits are the same
+    with and without it. ``sinks``: the fp32 ``(Hq,)`` per-head sink logits of the sink member (``None``: the class without
+    sinks)."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -630,6 +1146,11 @@ def run_attention(
     if planned.window_left is not None and int(window_left) != planned.window_left:
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
+        )
+    mismatch = sinks_declaration_mismatch(planned.has_sinks, sinks)
+    if mismatch is not None:
+        raise ValueError(
+            f"{mismatch}: make the same sinks choice at every run of the plan, or plan again with another has_sinks"
         )
     if ragged:
         # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
@@ -651,7 +1172,11 @@ def run_attention(
             assert cache.shape[1:] == (
                 (page, Hkv, D) if kv_layout == "NHD" else (Hkv, page, D)
             ), cache.shape
-    if planned.total_q is not None and int(total_q) != planned.total_q:
+    if planned.total_q is not None and (
+        int(total_q) < planned.total_q
+        if planned.fixed is not None
+        else int(total_q) != planned.total_q
+    ):
         raise ValueError(
             f"{total_q} query rows at run_attention over a plan built for {planned.total_q} (the units write the planned rows)"
         )
@@ -692,8 +1217,43 @@ def run_attention(
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
+    storage = plan_storage(planned)
+    if supplied_out and _overlaps_any(out, storage):
+        raise ValueError(
+            "out must not alias the plan's workspace: output rows and split-KV partials are stored by the same launch"
+        )
     c = check_sm_scale(sm_scale)
-    return _run_attention_validated(
+    lse_mode = 0
+    if return_lse:
+        if lse_base not in LSE_BASES:
+            raise ValueError(f"lse_base must be one of {LSE_BASES}, got {lse_base!r}")
+        lse_mode = LSE_MODES[lse_base]
+        if lse is None:
+            lse = torch.empty(total_q, Hq, dtype=torch.float32, device=q.device)
+        else:
+            bad = check_lse_buffer(
+                lse,
+                q,
+                out,
+                k_cache,
+                v_cache,
+                (total_q, Hq),
+                storage=storage,
+                tables=(kv_indptr, kv_indices, *plan_tables(planned)),
+            )
+            if bad is not None:
+                raise ValueError(
+                    f"lse must be a contiguous fp32 ({total_q}, {Hq}) tensor on {q.device} that aliases no operand; got one {bad}"
+                )
+    if not return_lse:
+        lse = None  # a buffer passed without return_lse is neither written nor returned
+    if sinks is not None:
+        bad = check_sinks(sinks, Hq, q.device, (out, lse, *storage))
+        if bad is not None:
+            raise ValueError(
+                f"sinks must be a contiguous fp32 ({Hq},) tensor on {q.device} that aliases no output and no workspace; got one {bad}"
+            )
+    _run_attention_validated(
         planned,
         q,
         k_cache,
@@ -706,7 +1266,11 @@ def run_attention(
         out,
         config,
         ragged,
+        lse=lse,
+        lse_mode=lse_mode,
+        sinks=sinks,
     )
+    return (out, lse) if return_lse else out
 
 
 def _run_attention_validated(
@@ -723,10 +1287,18 @@ def _run_attention_validated(
     config: AttnConfig,
     ragged: bool,
     enable_pdl: Optional[bool] = None,
+    lse: Optional[torch.Tensor] = None,
+    lse_mode: int = 0,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch after the public engine or wrapper has checked inputs; ``kv_indptr`` is the plan's snapshot (``plan_kv_indptr``), ``c``
     the binary32 log2 scale. ``enable_pdl``: launch the attention kernel as a programmatic dependent of the preceding kernel (None:
-    the device's default, ``device_support_pdl``)."""
+    the device's default, ``device_support_pdl``).
+    ``lse_mode`` 1 / 2 stores the base-2 / base-e LSE member of every row into ``lse`` (contiguous fp32, ``total_q * Hq``
+    elements); every kernel takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0.
+    ``sinks`` (validated fp32 ``(Hq,)``) selects the kernels compiled for the sink member (their own names): the fold that
+    completes a row takes the sink step. Without it the kernels, the launch and every bit are those of the class without
+    sinks."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -744,11 +1316,42 @@ def _run_attention_validated(
         kv_v = _kv_view(v_cache, kv_layout, Hkv, page, D)
     g = Hq // Hkv
     plan = planned.plan
-    if total_q == 0 or plan.num_units == 0:
+    fixed = planned.fixed
+    # the in-place fills below run under inference mode: legal for the caller's buffers whichever side of it made them
+    if fixed is not None and fixed.null_requests:
+        # a request without keys has no unit: its rows hold what the class gives on the init state (null_row_values: zeros
+        # and an LSE of -inf, or of the sink alone), written here ahead of the kernels. The launch is the same for every
+        # plan, so the captured graph fills every row whatever the batch and the kernels rewrite the rows with keys
+        with torch.inference_mode():
+            o_null, lse_null = null_row_values(sinks, lse_mode)
+            if sinks is None:
+                out.zero_()
+                if lse_mode:
+                    lse.fill_(lse_null)
+            else:
+                out.copy_(o_null.to(out.dtype)[None, :, None].expand_as(out))
+                if lse_mode:
+                    lse.copy_(lse_null.expand_as(lse))
+    elif planned.null_rows is not None:
+        # an eager plan with requests without keys: only their rows are filled, and a plan without any pays nothing
+        with torch.inference_mode():
+            o_null, lse_null = null_row_values(sinks, lse_mode)
+            if sinks is None:
+                out.index_fill_(0, planned.null_rows, o_null)
+                if lse_mode:
+                    lse.index_fill_(0, planned.null_rows, lse_null)
+            else:
+                out[planned.null_rows] = o_null.to(out.dtype)[:, None]
+                if lse_mode:
+                    lse[planned.null_rows] = lse_null
+    if total_q == 0 or (fixed is None and plan.num_units == 0):
         return out  # nothing to compute: no TMA descriptor over an empty query extent
     assert plan.g == g
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
+    lse_view = lse.view(-1) if lse_mode else planned.lse_unused
+    with_sinks = sinks is not None
+    sink_view = sinks if with_sinks else planned.lse_unused
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
     sm = device_sm_count(q.device)
     grid = (
@@ -760,7 +1363,16 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
-    n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
+    # a fixed launch's kernels read their counts from the plan's table; the others take them as arguments and are handed
+    # an int32 tensor they never read
+    counts = planned.counts if fixed is not None else planned.fold_counters
+    is_fixed = fixed is not None
+    if (
+        fixed is not None
+    ):  # the kernel and the grid of the fixed launch, whatever the plan
+        grid, n_pad = fixed.grid, fixed.n_pad
+    else:
+        n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
 
@@ -771,13 +1383,23 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+            D,
+            g,
+            page,
+            n_pad,
+            ragged,
+            arch_smem_cap(q.device),
+            pdl,
+            with_sinks,
+            is_fixed,
         )
         kernel(
             q_view,
             kv_k,
             kv_v,
             o_view,
+            lse_view,
+            sink_view,
             planned.ws,
             planned.groups,
             planned.fold_counters,
@@ -787,7 +1409,9 @@ def _run_attention_validated(
             float(-c),
             int(window_left),
             int(plan.num_units),
+            counts,
             int(grid),
+            int(lse_mode),
         )
     else:
         from .blocks.operands import arch_smem_cap as row_arch_smem_cap
@@ -802,7 +1426,17 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap
+                D,
+                g,
+                page,
+                DEFAULT_RING[D],
+                1,
+                False,
+                ragged,
+                hwm,
+                cap,
+                with_sinks,
+                is_fixed,
             )
         else:
             kernel = get_compiled_attention(
@@ -815,13 +1449,17 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
+                with_sinks,
+                is_fixed,
             )
-        if n_launch is not None:  # the paired placement walks pairs of units
+        if (
+            n_launch is not None and fixed is None
+        ):  # the paired placement walks pairs of units
             grid = max(
                 1, min(config.grid if config.grid else min(n_launch, sm), n_launch)
             )
         if (
-            planned.scratch.numel() > 1
+            planned.scratch.numel() > 1 and fixed is None
         ):  # O_m in the per-CTA global scratch: om_scratch_blocks(D) blocks per CTA
             from .blocks.operands import om_scratch_blocks
 
@@ -834,6 +1472,8 @@ def _run_attention_validated(
             kv_k,
             kv_v,
             o_view,
+            lse_view,
+            sink_view,
             planned.ws,
             planned.scratch,
             planned.groups,
@@ -845,22 +1485,48 @@ def _run_attention_validated(
             float(-c),
             int(window_left),
             int(n_launch if n_launch is not None else plan.num_units),
+            counts,
             int(grid),
+            int(lse_mode),
         )
-    fx = getattr(plan, "fixup_groups", plan.groups)
-    if fx:
+    fx = [] if fixed is not None else plan.fixup_groups
+    if fixed is not None:
+        # always launched when a plan of this geometry can hold a fixup group, over the capacity's grid: the blocks beyond
+        # the plan's groups fold nothing
+        if fixed.fixup_cap:
+            get_fixup(D, g, with_sinks, True)(
+                planned.ws,
+                o_view,
+                lse_view,
+                sink_view,
+                planned.fixup_groups,
+                float(c),
+                float(-c),
+                int(window_left),
+                int(Hq),
+                0,
+                counts,
+                int(fixed.fixup_grid_y),
+                int(fixed.rows_max),
+                int(lse_mode),
+            )
+    elif fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(
+        get_fixup(D, g, with_sinks)(
             planned.ws,
             o_view,
+            lse_view,
+            sink_view,
             planned.fixup_groups,
             float(c),
             float(-c),
             int(window_left),
             int(Hq),
             int(len(fx)),
+            counts,
             int(min(len(fx), MAX_GRID_Y)),
             int(max_rows),
+            int(lse_mode),
         )
     return out
 
@@ -879,8 +1545,13 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    lse_base: str = "log2",
+    sinks: Optional[torch.Tensor] = None,
+):
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned); ``(out, lse)`` with
+    ``return_lse``; ``sinks`` as in ``run_attention``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -910,4 +1581,8 @@ def attention_paged(
         kv_layout,
         out,
         config,
+        lse=lse,
+        return_lse=return_lse,
+        lse_base=lse_base,
+        sinks=sinks,
     )

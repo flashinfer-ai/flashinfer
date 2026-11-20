@@ -90,10 +90,22 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
-    from ..attention.batch_invariant.spec import spec_fingerprint
+def _attention_fingerprint(
+    head_dim: int, lse_base: Optional[str] = None, sinks: bool = False
+) -> str:
+    from ..attention.batch_invariant.spec import (
+        lse_fingerprint,
+        sink_fingerprint,
+        spec_fingerprint,
+    )
 
-    return spec_fingerprint(head_dim)
+    if not isinstance(sinks, bool):
+        raise ValueError(
+            f"sinks names the sink member of the class: True or False, got {sinks!r}"
+        )
+    if lse_base is not None:
+        return lse_fingerprint(head_dim, lse_base, sinks)
+    return sink_fingerprint(head_dim) if sinks else spec_fingerprint(head_dim)
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -610,15 +622,26 @@ CLASSES: Dict[str, ClassInfo] = {
         ("arch",),
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class; `lse_base` names the class's LSE
+    # member (`return_lse=True`), a receipt of its own per head dim and base; `sinks=True` names the sink member (a call with
+    # attention sinks), with its own output and LSE receipts
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16",
+        ("head_dim",),
+        _attention_fingerprint,
+        ("lse_base", "sinks"),
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16",
+        ("head_dim",),
+        _attention_fingerprint,
+        ("lse_base", "sinks"),
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16",
+        ("head_dim",),
+        _attention_fingerprint,
+        ("lse_base", "sinks"),
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -721,7 +744,13 @@ def fingerprint(op: str, **dims) -> str:
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    class's no-window sample row and covers windowed calls too. The optional ``lse_base`` (``"log2"`` or ``"ln"``) names the
+    LSE member the wrappers return with ``return_lse=True`` -- ``add.rn(mul.rn(m, c), lg2.approx.ftz(l))`` of the row's final
+    maximum and sum, times ``fp32(ln 2)`` in base e -- with its own receipt per head dim and base; the receipt without it is
+    the attention output's and does not depend on whether the LSE is requested. The optional ``sinks=True`` names the sink
+    member, the class of a call with attention sinks (one more merge per row, of its final state with a virtual key of the
+    head's sink logit: ``attn-bf16-d<D>-sink-...``, and with ``lse_base`` the LSE that includes the sink); the sink values are
+    per-call inputs, and the receipts without ``sinks`` are those of calls without sinks.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -739,6 +768,10 @@ def fingerprint(op: str, **dims) -> str:
     'kda-bf16-c16-engine-...'
     >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
     'moe-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, lse_base="ln")  # doctest: +SKIP
+    'attn-bf16-d128-lse-ln-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=64, sinks=True)  # doctest: +SKIP
+    'attn-bf16-d64-sink-...'
 
     ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
     ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
@@ -777,7 +810,20 @@ def class_name(op: str) -> str:
     return info.name
 
 
+#: The attention wrappers that accept ``use_cuda_graph=True`` together with ``batch_invariant=True`` (class names of
+#: :mod:`flashinfer`): the wrapper is built over persistent ``paged_kv_*`` buffers, ``run()`` is captured once and a
+#: ``plan()`` (for the decode wrapper also :func:`flashinfer.decode.fast_decode_plan`) before every replay refreshes what the
+#: captured launch follows, within the shape fixed at construction and at the first plan (the batch size and
+#: ``q_len_per_req`` of the decode wrapper; the request slots and the row capacity of the prefill wrapper) -- the contract
+#: stated in each wrapper's docstring. A wrapper that is not listed refuses the flag. Engines test membership here; how a
+#: listed wrapper holds its buffers (``bind_graph_buffers`` and the like) is private and may change.
+ATTENTION_CUDA_GRAPH_WRAPPERS = (
+    "BatchDecodeWithPagedKVCacheWrapper",
+    "BatchPrefillWithPagedKVCacheWrapper",
+)
+
 __all__ = [
+    "ATTENTION_CUDA_GRAPH_WRAPPERS",
     "CLASSES",
     "ClassInfo",
     "BatchInvariantUnsupportedError",

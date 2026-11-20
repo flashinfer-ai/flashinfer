@@ -18,7 +18,12 @@ column `d` the dataflow is
   bf16 `P` slices with `V` from `mul(O, alpha)` (one opaque `mma16` per 16 keys);
 * a **chunk**: the tile steps of its present tiles, ascending, from the init `(-inf, +0, +0)`;
 * the **row**: the present chunks merged in index order from the init state (`merge`);
-* the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`.
+* the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`;
+* the LSE member, a second output of the row's final `(m, l)`: `add(mul(m, c), lg2(l))` in base 2, its `mul` by
+  `fp32(ln 2)` in base e (`lg2` opaque, like `ex2`);
+* attention sinks, the member of a call with sinks: one more merge of the row's final `(m, l)` with a virtual key of the
+  head's sink logit and zero value (`sinkMerge`), after the last chunk merge and before the epilogue, whose normaliser
+  becomes `mul(a, div(1, l'))`; the LSE member is then `add(m', lg2(l'))`.
 
 Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
 a token depends on its position `p`, the window and the head, never on the batch, the page table
@@ -172,6 +177,174 @@ def epilogue (st : State) : ATerm := .cvt "bf16" (.add (.mul st.o (.div (.const 
 
 def output (P : Params) : ATerm := epilogue (fused P)
 
+/-! ## The LSE member (`spec.lse_term`) -/
+
+/-- `lse2 = add(mul(m, c), lg2(l))` as `term.sexpr` prints it (`lg2` is the opaque primitive `(op:lg2 l)`; the commutative
+`add` sorts its operands). -/
+def lse2Sexpr (st : State) : String :=
+  let (p, q) := sortPair (ATerm.mul st.m c).sexpr s!"(op:lg2 {st.l.sexpr})"
+  s!"(add {p} {q})"
+
+/-- `fp32(ln 2)` as the Python printer spells the constant. -/
+def ln2Const : String := "(const 0.6931471824645996)"
+
+/-- `lse_e = mul(lse2, LN2)`. -/
+def lseESexpr (st : State) : String :=
+  let (p, q) := sortPair (lse2Sexpr st) ln2Const
+  s!"(mul {p} {q})"
+
+def lse2 (P : Params) : String := lse2Sexpr (fused P)
+def lseE (P : Params) : String := lseESexpr (fused P)
+
+/-! ## One `(m, l)` for every output column and the LSE
+
+The statistics of the fold never read the output column: `tileStep` forms `m'` and `l'` from the scores (functions of
+`steps`, `T`, `p`, `win`, `row`) and the previous `(m, l)`, and `merge` forms them from the two states' `(m, l)`. So the
+output columns of a row and its LSE are normalised by one pair whatever the column, the LSE is the same string for every
+column's parameters, and `output` -- which has no LSE parameter -- is the same term whether or not the LSE is requested. -/
+
+/-- `P` with another output column. -/
+def Params.withD (P : Params) (d : Nat) : Params := { P with d := d }
+
+theorem tileStep_ml (P : Params) (d : Nat) (st st' : State) (hm : st.m = st'.m) (hl : st.l = st'.l) (t : Nat) :
+    (tileStep (P.withD d) st t).m = (tileStep P st' t).m ∧ (tileStep (P.withD d) st t).l = (tileStep P st' t).l := by
+  simp only [tileStep, Params.withD, Params.T, Params.visible, hm, hl, and_self]
+
+theorem tiles_ml (P : Params) (d : Nat) (ts : List Nat) (st st' : State) (hm : st.m = st'.m) (hl : st.l = st'.l) :
+    (ts.foldl (tileStep (P.withD d)) st).m = (ts.foldl (tileStep P) st').m ∧
+    (ts.foldl (tileStep (P.withD d)) st).l = (ts.foldl (tileStep P) st').l := by
+  induction ts generalizing st st' with
+  | nil => exact ⟨hm, hl⟩
+  | cons t ts ih =>
+    simp only [List.foldl]
+    have h := tileStep_ml P d st st' hm hl t
+    exact ih _ _ h.1 h.2
+
+theorem chunkState_ml (P : Params) (d j : Nat) :
+    (chunkState (P.withD d) j).m = (chunkState P j).m ∧ (chunkState (P.withD d) j).l = (chunkState P j).l := by
+  unfold chunkState
+  have ht : (P.withD d).tilesOfChunk j = P.tilesOfChunk j := rfl
+  rw [ht]
+  exact tiles_ml P d _ initState initState rfl rfl
+
+theorem merge_ml (a a' b b' : State) (ham : a.m = a'.m) (hal : a.l = a'.l) (hbm : b.m = b'.m) (hbl : b.l = b'.l) :
+    (merge a b).m = (merge a' b').m ∧ (merge a b).l = (merge a' b').l := by
+  simp only [merge, ham, hal, hbm, hbl, and_self]
+
+theorem chunks_ml (P : Params) (d : Nat) (js : List Nat) (acc acc' : State) (hm : acc.m = acc'.m) (hl : acc.l = acc'.l) :
+    (js.foldl (fun a j => merge a (chunkState (P.withD d) j)) acc).m = (js.foldl (fun a j => merge a (chunkState P j)) acc').m ∧
+    (js.foldl (fun a j => merge a (chunkState (P.withD d) j)) acc).l = (js.foldl (fun a j => merge a (chunkState P j)) acc').l := by
+  induction js generalizing acc acc' with
+  | nil => exact ⟨hm, hl⟩
+  | cons j js ih =>
+    simp only [List.foldl]
+    have hc := chunkState_ml P d j
+    have h := merge_ml acc acc' (chunkState (P.withD d) j) (chunkState P j) hm hl hc.1 hc.2
+    exact ih _ _ h.1 h.2
+
+/-- **One pair `(m, l)` for the whole row**: the final statistics do not depend on the output column. -/
+theorem stats_independent_of_column (P : Params) (d : Nat) :
+    (fused (P.withD d)).m = (fused P).m ∧ (fused (P.withD d)).l = (fused P).l := by
+  unfold fused
+  have hc : (P.withD d).presentChunks = P.presentChunks := rfl
+  rw [hc]
+  exact chunks_ml P d _ initState initState rfl rfl
+
+/-- The LSE member of every column's parameters is the same string: it reads the row's one `(m, l)`. -/
+theorem lse_independent_of_column (P : Params) (d : Nat) : lse2 (P.withD d) = lse2 P := by
+  unfold lse2 lse2Sexpr
+  rw [(stats_independent_of_column P d).1, (stats_independent_of_column P d).2]
+
+theorem lseE_independent_of_column (P : Params) (d : Nat) : lseE (P.withD d) = lseE P := by
+  unfold lseE lseESexpr lse2Sexpr
+  rw [(stats_independent_of_column P d).1, (stats_independent_of_column P d).2]
+
+/-- The LSE of the init state: `mul(-inf, c)` and `lg2(+0)`, both `-inf` on the device for the class's `c > 0`. No row of
+the class is empty (the planner requires `kv_len >= q_len`), so this is the term's value at the fold's start only. -/
+theorem lse_init : lse2Sexpr initState = "(add (mul (const -inf) (sym c)) (op:lg2 (const 0.0)))" := by decide
+
+/-! ## Attention sinks (`spec.sink_merge`)
+
+A call with sinks appends, per head, one virtual key to the softmax denominator: logit `sink` (natural-log units of the
+scaled score, so `mul(sink, fp32(log2 e))` in the fold's base-2 units; the scale `c` is not applied to it), value zero. It
+is one step on the row's FINAL state, after the chunk fold: `ms = mul(m, c)`, `s2 = mul(sink, LOG2E)`,
+`m' = fmax(ms, s2)`, `nm = mul(m', -1)`, `a = ex2(add(ms, nm))`, `b = ex2(add(s2, nm))`, `l' = fma(l, a, b)`. The tile
+steps, the chunk states and the chunk merges are those of the class without sinks: `sinkMerge` is applied to `fused P`
+and to nothing else. -/
+
+def sink : ATerm := .sym "sink"
+/-- `fp32(log2 e)` as the Python printer spells the constant. -/
+def log2e : ATerm := .const "1.4426950216293335"
+
+/-- The row's statistics after the sink step: the maximum over the keys and the sink in scaled base-2 units, the sum
+relative to it, and the rescale `a` of the keys' accumulator. -/
+structure SinkState where
+  m : ATerm
+  l : ATerm
+  a : ATerm
+  deriving DecidableEq, Repr, Inhabited
+
+/-- `spec.sink_merge`. -/
+def sinkMerge (st : State) : SinkState :=
+  let ms := ATerm.mul st.m c
+  let s2 := ATerm.mul sink log2e
+  let m := ATerm.fmax ms s2
+  let nm := ATerm.mul m (.const "-1.0")
+  let a := ATerm.ex2 (.add ms nm)
+  let b := ATerm.ex2 (.add s2 nm)
+  ⟨m, .fma st.l a b, a⟩
+
+/-- `spec.output_elem_sink`: the epilogue with the normaliser `mul(a, div(1, l'))` in the place of `div(1, l)`. -/
+def epilogueSink (st : State) : ATerm :=
+  let sk := sinkMerge st
+  .cvt "bf16" (.add (.mul st.o (.mul sk.a (.div (.const "1.0") sk.l))) (.const "0.0"))
+
+def outputSink (P : Params) : ATerm := epilogueSink (fused P)
+
+/-- `spec.lse_term_sink`: `add(m', lg2(l'))`; `m'` is in scaled units already. -/
+def lse2SinkSexpr (st : State) : String :=
+  let sk := sinkMerge st
+  let (p, q) := sortPair sk.m.sexpr s!"(op:lg2 {sk.l.sexpr})"
+  s!"(add {p} {q})"
+
+def lseESinkSexpr (st : State) : String :=
+  let (p, q) := sortPair (lse2SinkSexpr st) ln2Const
+  s!"(mul {p} {q})"
+
+def lse2Sink (P : Params) : String := lse2SinkSexpr (fused P)
+def lseESink (P : Params) : String := lseESinkSexpr (fused P)
+
+/-- The sink step reads the row's `(m, l)` alone. -/
+theorem sinkMerge_ml (st st' : State) (hm : st.m = st'.m) (hl : st.l = st'.l) : sinkMerge st = sinkMerge st' := by
+  simp only [sinkMerge, hm, hl]
+
+/-- **One sink step per row**: every output column of a row is normalised by the same merged statistics. -/
+theorem sinkStats_independent_of_column (P : Params) (d : Nat) :
+    sinkMerge (fused (P.withD d)) = sinkMerge (fused P) :=
+  sinkMerge_ml _ _ (stats_independent_of_column P d).1 (stats_independent_of_column P d).2
+
+theorem lseSink_independent_of_column (P : Params) (d : Nat) :
+    lse2Sink (P.withD d) = lse2Sink P ∧ lseESink (P.withD d) = lseESink P := by
+  unfold lse2Sink lseESink lseESinkSexpr lse2SinkSexpr
+  rw [sinkStats_independent_of_column P d]
+  exact ⟨rfl, rfl⟩
+
+/-- The member without sinks is the term it was: its epilogue reads the fold's state and no sink. -/
+theorem output_without_sinks (P : Params) : output P = epilogue (fused P) := rfl
+
+/-- The sink step is taken on the fold's final state, the one the class without sinks normalises. -/
+theorem outputSink_of_final_state (P : Params) : outputSink P = epilogueSink (fused P) := rfl
+
+/-- **The sink member is another class**: the same row with and without the step is a different term (a toy row, decided). -/
+theorem output_depends_on_sink : outputSink ⟨1, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨1, 2, 8, 9, -1, 0, 0⟩ := by native_decide
+
+/-- The sink step at the fold's init state: a row without keys would hold the sink alone (`mul(-inf, c) = -inf` for the
+class's `c > 0`, so `m' = s2`, `a = ex2(-inf) = +0`, `b = ex2(+0) = 1`, `l' = 1` on the device). -/
+theorem sinkMerge_init :
+    (sinkMerge initState).m = ATerm.fmax (.mul (.const "-inf") c) (.mul sink log2e) ∧
+    (sinkMerge initState).l = ATerm.fma (.const "0.0") (sinkMerge initState).a
+      (.ex2 (.add (.mul sink log2e) (.mul (sinkMerge initState).m (.const "-1.0")))) := ⟨rfl, rfl⟩
+
 /-! ## The split kernel: one chunk per CTA, an index-addressed workspace, the fixup fold -/
 
 /-- Slot `j` of the workspace holds chunk `j`'s state, whatever CTA `σ` computed it on. -/
@@ -188,6 +361,33 @@ for every unit kind, ring depth and grid the planner may choose). -/
 theorem splitKernel_eq_fused (P : Params) (σ : Nat → Nat) : splitKernel P σ = output P := rfl
 
 theorem splitKernel_assignment_irrelevant (P : Params) (σ τ : Nat → Nat) : splitKernel P σ = splitKernel P τ := rfl
+
+/-- The split kernel's LSE: the member of the state the fixup folds (the fixup kernel and the in-kernel fold alike). -/
+def splitLse2 (P : Params) (σ : Nat → Nat) : String := lse2Sexpr (fixup (workspace P σ) P.presentChunks)
+def splitLseE (P : Params) (σ : Nat → Nat) : String := lseESexpr (fixup (workspace P σ) P.presentChunks)
+
+/-- **The split kernel's LSE is the fused one**, for every assignment of chunks to CTAs. -/
+theorem splitLse_eq_fused (P : Params) (σ : Nat → Nat) : splitLse2 P σ = lse2 P ∧ splitLseE P σ = lseE P := ⟨rfl, rfl⟩
+
+/-- The split kernel under sinks: the partial rows carry no sink (`workspace` holds the chunk states of the class without
+sinks); the fold that completes the row takes the step once. -/
+def splitKernelSink (P : Params) (σ : Nat → Nat) : ATerm := epilogueSink (fixup (workspace P σ) P.presentChunks)
+def splitLse2Sink (P : Params) (σ : Nat → Nat) : String := lse2SinkSexpr (fixup (workspace P σ) P.presentChunks)
+def splitLseESink (P : Params) (σ : Nat → Nat) : String := lseESinkSexpr (fixup (workspace P σ) P.presentChunks)
+
+/-- **The sink step does not depend on where the row is completed**: the split kernel (the fixup kernel or the in-kernel
+fold) computes the fused unit's sink member, output and LSE, for every assignment of chunks to CTAs. -/
+theorem splitKernelSink_eq_fused (P : Params) (σ : Nat → Nat) : splitKernelSink P σ = outputSink P := rfl
+
+theorem splitLseSink_eq_fused (P : Params) (σ : Nat → Nat) :
+    splitLse2Sink P σ = lse2Sink P ∧ splitLseESink P σ = lseESink P := ⟨rfl, rfl⟩
+
+/-- A sink merged into a chunk's partial instead would be another term: the step is not a chunk merge that could be
+taken early (stated on symbolic states, decided). -/
+theorem sink_not_in_partials :
+    let a : State := ⟨.sym "ma", .sym "la", .sym "oa"⟩
+    let b : State := ⟨.sym "mb", .sym "lb", .sym "ob"⟩
+    (sinkMerge (merge a b)).l ≠ (merge ⟨(sinkMerge a).m, (sinkMerge a).l, a.o⟩ b).l := by decide
 
 /-- The merge is not associative as a dataflow: a CTA may hold exactly one chunk or all of them. A
 unit covering a proper prefix merged with a later state would compute a different term. -/
@@ -226,6 +426,47 @@ theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len
       = rowOutput steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) := by
   unfold prefillRow decodeRow
   simp only [Nat.add_sub_cancel]
+
+/-- The LSE member of a launch row (base 2; the base-e member is its `mul` by the constant). -/
+def rowLse (steps tbits C : Nat) (win : Int) (r : Row) : String := lse2 ⟨steps, tbits, C, r.p, win, r.row, 0⟩
+
+/-- **Prefill == decode for the LSE (R4)**, as for the output. -/
+theorem lse_prefill_decode_agree (steps tbits C : Nat) (win : Int) (kv_len q_len i h row : Nat)
+    (hi : i < q_len) (hq : q_len ≤ kv_len) :
+    rowLse steps tbits C win (prefillRow kv_len q_len i h row)
+      = rowLse steps tbits C win (decodeRow (kv_len - q_len + i + 1) h row) := by
+  unfold prefillRow decodeRow
+  simp only [Nat.add_sub_cancel]
+
+/-- **Batch invariance of the LSE (R2)**: equal rows give equal LSE terms whatever the batch. -/
+theorem lse_batch_invariance (steps tbits C : Nat) (win : Int) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    rowLse steps tbits C win (rows₁ r₁) = rowLse steps tbits C win (rows₂ r₂) := by
+  rw [h]
+
+/-- The sink member of a launch row: its output and its base-2 LSE. The row's head selects the sink value; in the term
+it is the leaf `sink`, like the row's own Q / K / V leaves. -/
+def rowOutputSink (steps tbits C : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
+  outputSink ⟨steps, tbits, C, r.p, win, r.row, d⟩
+def rowLseSink (steps tbits C : Nat) (win : Int) (r : Row) : String := lse2Sink ⟨steps, tbits, C, r.p, win, r.row, 0⟩
+
+/-- **Prefill == decode with sinks (R4)**, output and LSE. -/
+theorem sink_prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len q_len i h row : Nat)
+    (_hi : i < q_len) (_hq : q_len ≤ kv_len) :
+    rowOutputSink steps tbits C win d (prefillRow kv_len q_len i h row)
+      = rowOutputSink steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) ∧
+    rowLseSink steps tbits C win (prefillRow kv_len q_len i h row)
+      = rowLseSink steps tbits C win (decodeRow (kv_len - q_len + i + 1) h row) := by
+  unfold prefillRow decodeRow
+  simp only [Nat.add_sub_cancel, and_self]
+
+/-- **Batch invariance with sinks (R2)**: equal rows give equal outputs and LSEs whatever the batch. -/
+theorem sink_batch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    rowOutputSink steps tbits C win d (rows₁ r₁) = rowOutputSink steps tbits C win d (rows₂ r₂) ∧
+    rowLseSink steps tbits C win (rows₁ r₁) = rowLseSink steps tbits C win (rows₂ r₂) := by
+  rw [h]
+  exact ⟨rfl, rfl⟩
 
 /-- The launch applies the per-row term to every row; there is no batch parameter inside. -/
 def launch (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
@@ -318,6 +559,19 @@ computes the class term. -/
 theorem config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat) :
     kernel b₁ f₁ P σ = kernel b₂ f₂ P τ := by
   rw [kernel_eq_output, kernel_eq_output]
+
+/-- A row's output under a configuration in a call with sinks: the fused fold or the split kernel, then the one sink step. -/
+def kernelSink (b : Config) (fusedAuto : Bool) (P : Params) (σ : Nat → Nat) : ATerm :=
+  if b.policy == 2 || (b.policy == 0 && fusedAuto) then outputSink P else splitKernelSink P σ
+
+/-- **Configuration invariance with sinks (R3)**. -/
+theorem sink_config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat) :
+    kernelSink b₁ f₁ P σ = kernelSink b₂ f₂ P τ := by
+  have h : ∀ (b : Config) (f : Bool) (ρ : Nat → Nat), kernelSink b f P ρ = outputSink P := by
+    intro b f ρ
+    unfold kernelSink
+    split <;> rfl
+  rw [h, h]
 
 theorem space_invariant (space : List Config) :
     ∀ b₁ ∈ space, ∀ b₂ ∈ space, ∀ (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat), kernel b₁ f₁ P σ = kernel b₂ f₂ P τ :=

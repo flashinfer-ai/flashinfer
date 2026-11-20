@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
+
 from .spec import TILE_KEYS, chunk_len
 
 DESC_FIELDS = 16
@@ -108,6 +110,17 @@ GROUP_FIELDS = 10
     G_QBASE,
     G_REQ,
 ) = range(10)
+COUNT_FIELDS = 8
+# the counts of a plan under a fixed launch (int32), read at entry by the kernels compiled for it: the units the attention grid
+# walks, the split groups, the groups the fixup kernel folds, and the CTAs that walk the units (the CTAs of the launch grid beyond
+# them idle). Those kernels take the counts from this table in place of launch arguments, so a launch captured in a CUDA graph
+# -- one grid for every plan -- follows a new plan written into the same buffers
+(
+    N_UNITS,
+    N_GROUPS,
+    N_FIXUP_GROUPS,
+    N_WALK,
+) = range(4)
 WS_ROW = 132  # fp32 per partial row AT D = 128: O[0..D) then m at [D], l at [D+1] (padded to a 16-byte multiple).
 # Contract: the kernel writes exactly [0, D+2) of every partial row of a present chunk and the fixup
 # reads exactly those; the padding [D+2, WS_ROW) is never written nor read (the workspace is the
@@ -154,6 +167,14 @@ class Plan:
             for gr, ik in zip(self.groups, self.group_inkernel, strict=True)
             if not ik
         ]
+
+    @property
+    def num_groups(self) -> int:
+        return len(self.groups)
+
+    @property
+    def num_fixup_groups(self) -> int:
+        return len(self.group_inkernel) - sum(self.group_inkernel)
 
 
 def om_in_tmem(D: int) -> bool:
@@ -323,14 +344,36 @@ def swaps_unit_kinds(
     n = len(units)
     if n == 0:
         return [], 0
-    fused = [False] * n
     tpc = chunk_len(D) // TILE_KEYS
-    f_counts, f_fixup_rows, f_inkernel = _swaps_lengths(
-        units, fused, inkernel_max_chunks, tpc
+    split = [u[1][0] > 1 for u in units]
+    split_all, best_grid = swaps_decide(
+        n,
+        max(u[0] for u in units),
+        _swaps_lengths(units, [False] * n, inkernel_max_chunks, tpc),
+        _swaps_lengths(units, split, inkernel_max_chunks, tpc) if any(split) else None,
+        sm_count,
+        D,
+        grid_search,
     )
+    return (split, 0) if split_all else ([False] * n, best_grid)
+
+
+def swaps_decide(
+    n: int,
+    max_tiles: int,
+    fused_lengths: tuple,
+    split_lengths: Optional[tuple],
+    sm_count: int,
+    D: int,
+    grid_search: bool = True,
+) -> tuple:
+    """``swaps_unit_kinds`` over the length summaries of the batch (``_swaps_lengths``: every unit fused, and every multi-chunk
+    unit split -- ``None`` when no unit has a second chunk): ``(split, grid)``, whether the multi-chunk units split and, when
+    they do not, the fused walk's grid. ``n`` units, the longest of ``max_tiles`` tiles."""
+    f_counts, f_fixup_rows, f_inkernel = fused_lengths
     best_grid, best_cost = 0, float("inf")
     if grid_search:
-        grids = swaps_fused_grids(n, sm_count, D, max(u[0] for u in units))
+        grids = swaps_fused_grids(n, sm_count, D, max_tiles)
     else:
         # off the fitted parts: the full grid and the even-waves grid (the units spread over the full grid's wave count: no fitted
         # constant), so that a part-filled last wave does not stream alone
@@ -338,19 +381,14 @@ def swaps_unit_kinds(
         waves = -(-n // sm_count)
         even = -(-n // waves)
         thin_tail = 3 * (n - (waves - 1) * sm_count) < sm_count
-        if even not in grids and (
-            max(u[0] for u in units) >= GRID_LONG_TILES or thin_tail
-        ):
+        if even not in grids and (max_tiles >= GRID_LONG_TILES or thin_tail):
             grids.append(even)
     for g in grids:
         c = _swaps_walk_cost(f_counts, f_fixup_rows, f_inkernel, g, sm_count, D, False)
         if c <= best_cost:
             best_grid, best_cost = g, c
-    split = [u[1][0] > 1 for u in units]
-    if any(split):
-        s_counts, s_fixup_rows, s_inkernel = _swaps_lengths(
-            units, split, inkernel_max_chunks, tpc
-        )
+    if split_lengths is not None:
+        s_counts, s_fixup_rows, s_inkernel = split_lengths
         c = _swaps_walk_cost(
             s_counts, s_fixup_rows, s_inkernel, sm_count, sm_count, D, False
         )
@@ -362,8 +400,43 @@ def swaps_unit_kinds(
             )
         )
         if c < fused_cmp:
-            return split, 0
-    return fused, best_grid
+            return True, 0
+    return False, best_grid
+
+
+def budget_unit_kinds(
+    fused: Sequence[bool],
+    tiles: Sequence[int],
+    chunks: Sequence[int],
+    rows: Sequence[int],
+    unit_budget: int = 0,
+    row_budget: int = -1,
+) -> List[bool]:
+    """The unit kinds of a plan held to a fixed capacity: ``fused[i]`` is the kind the planner chose for Q tile ``i`` (``tiles[i]``
+    key tiles in ``chunks[i]`` chunks, ``rows[i]`` live rows); the result keeps a split tile split only while the plan stays within
+    ``unit_budget`` units (0: no bound) and ``row_budget`` partial rows of workspace (-1: no bound), and fuses the rest. The split
+    tiles are taken longest first, a whole class of equal length at a time, and the first class that does not fit ends the walk:
+    a split shortens the walk only when no longer unit stays fused. Within the budgets the kinds are the planner's own. A
+    placement: every choice computes the same bits."""
+    out = [True] * len(fused)
+    classes: Dict[int, List[int]] = {}
+    for i, f in enumerate(fused):
+        if not f:
+            classes.setdefault(tiles[i], []).append(i)
+    units, ws_rows = len(fused), 0
+    for length in sorted(classes, reverse=True):
+        members = classes[length]
+        extra = sum(chunks[i] - 1 for i in members)
+        need = sum(chunks[i] * rows[i] for i in members)
+        if (unit_budget > 0 and units + extra > unit_budget) or (
+            row_budget >= 0 and ws_rows + need > row_budget
+        ):
+            break
+        units += extra
+        ws_rows += need
+        for i in members:
+            out[i] = False
+    return out
 
 
 def build_plan(
@@ -383,6 +456,9 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
     grid_search: bool = True,
+    unit_budget: int = 0,
+    row_budget: int = -1,
+    null_requests: bool = False,
 ) -> Plan:
     """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
     live rows) takes the kinds and the launch grid of ``swaps_unit_kinds`` (a makespan model over the SM count: every unit fused on
@@ -398,7 +474,10 @@ def build_plan(
     ``INKERNEL_MAX_ROWS`` rows, the fixup kernel otherwise), ``"fixup"`` (always the kernel), ``"inkernel"``
     (always in-kernel); the same fold in the same order either way (R3: same bits).
     ``grid``: the persistent grid the launch will use (0: the planner's ``Plan.grid`` if it chose one, else ``min(units, sm_count)``),
-    so that the unit order's waves (``snake_order``) are the waves the CTAs actually walk."""
+    so that the unit order's waves (``snake_order``) are the waves the CTAs actually walk.
+    ``unit_budget`` / ``row_budget``: the fixed capacity of a launch captured in a CUDA graph (``budget_unit_kinds``: at most
+    ``unit_budget`` units and ``row_budget`` partial rows; the tiles beyond stay fused). ``null_requests``: a request with query tokens and no keys gets no unit (its output rows are
+    the caller's) instead of being refused."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -411,7 +490,7 @@ def build_plan(
     for b in range(B):
         q_len = qo_indptr[b + 1] - qo_indptr[b]
         kv_len = kv_lens[b]
-        if q_len == 0:
+        if q_len == 0 or (null_requests and kv_len == 0):
             continue
         assert kv_len >= q_len, (
             f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
@@ -481,7 +560,9 @@ def build_plan(
         )
         if plan.grid == min(len(tiles), sm_count):
             plan.grid = 0  # the default launch grid
-    for i, (b, h, tok0, ntok, clo, chi, tlo, thi, kv_len, q_len) in enumerate(tiles):
+    kinds: List[bool] = []  # per tile: fused?
+    for i, tile in enumerate(tiles):
+        ntok, clo, chi = tile[3:6]
         rows = ntok * g
         if swaps_kinds is not None:
             fused_unit = chi - clo == 1 or not swaps_kinds[i]
@@ -497,6 +578,20 @@ def build_plan(
                 or two_chunk_fused
                 or not (do_split or (split_small and rows <= INKERNEL_MAX_ROWS))
             )
+        kinds.append(fused_unit)
+    if unit_budget > 0 or row_budget >= 0:
+        kinds = budget_unit_kinds(
+            kinds,
+            [t[7] - t[6] for t in tiles],
+            [t[5] - t[4] for t in tiles],
+            [t[3] * g for t in tiles],
+            unit_budget,
+            row_budget,
+        )
+    for (b, h, tok0, ntok, clo, chi, tlo, thi, kv_len, q_len), fused_unit in zip(
+        tiles, kinds, strict=True
+    ):
+        rows = ntok * g
         if fused_unit:
             plan.desc.append(
                 [
@@ -578,3 +673,432 @@ def snake_order(units: list, grid: int) -> list:
         wave = units[start : start + grid]
         out.extend(wave[::-1] if w % 2 else wave)
     return out
+
+
+class ArrayPlan:
+    """A plan held as int32 arrays (``build_decode_plan``): the tables of ``Plan`` -- ``desc_array`` ``(units, DESC_FIELDS)``,
+    ``groups_array`` and ``fixup_array`` ``(groups, GROUP_FIELDS)`` -- ready to be copied to the device; ``desc`` / ``groups`` /
+    ``fixup_groups`` / ``group_inkernel`` give ``Plan``'s lists."""
+
+    num_launch: Optional[int] = (
+        None  # the pairs of the paired placement's table, set by the launch that builds it
+    )
+    launch_array: Optional[np.ndarray] = None  # that table
+    walk = 0  # ... and the CTAs that walk it
+    shape: Optional[tuple] = (
+        None  # what the tables depend on besides the KV lengths written in them (``build_array_plan``)
+    )
+
+    def __init__(
+        self,
+        desc: np.ndarray,
+        groups: np.ndarray,
+        inkernel: np.ndarray,
+        ws_rows: int,
+        tokens_per_tile: int,
+        g: int,
+        row: int,
+        grid: int = 0,
+    ):
+        self.desc_array, self.groups_array, self.inkernel_array = desc, groups, inkernel
+        self.grid = grid
+        self.fixup_array = groups[~inkernel]
+        self.ws_rows, self.tokens_per_tile, self.g, self.ws_row = (
+            ws_rows,
+            tokens_per_tile,
+            g,
+            row,
+        )
+
+    def same_shape(self, shape: tuple) -> bool:
+        """Whether a batch of this ``shape`` (the planner's arguments and every Q tile's tile and chunk range) has this
+        plan's tables up to the KV lengths."""
+        mine = self.shape
+        return (
+            mine is not None
+            and mine[0] == shape[0]
+            and all(
+                a.shape == b.shape and bool((a == b).all())
+                for a, b in zip(mine[1:], shape[1:], strict=True)
+            )
+        )
+
+    def with_kv_lens(self, kv_lens: np.ndarray, kv_indptr: np.ndarray) -> "ArrayPlan":
+        """This plan for other KV lengths of the same shape: the same units, groups and order; the lengths and the requests'
+        page-table ranges rewritten."""
+
+        def rewrite(table: np.ndarray) -> np.ndarray:
+            table = table.copy()
+            req = table[:, F_REQ]
+            table[:, F_KVLEN] = kv_lens[req]
+            table[:, F_KVPTR0] = kv_indptr[req]
+            table[:, F_NPAGES] = kv_indptr[req + 1] - kv_indptr[req]
+            return table
+
+        desc = rewrite(self.desc_array)
+        groups = self.groups_array.copy()
+        groups[:, G_KVLEN] = kv_lens[groups[:, G_REQ]]
+        plan = ArrayPlan(
+            desc,
+            groups,
+            self.inkernel_array,
+            self.ws_rows,
+            self.tokens_per_tile,
+            self.g,
+            self.ws_row,
+            self.grid,
+        )
+        plan.shape = self.shape
+        if self.launch_array is not None:
+            plan.launch_array = rewrite(self.launch_array)
+            plan.num_launch, plan.walk = self.num_launch, self.walk
+        return plan
+
+    @property
+    def num_units(self) -> int:
+        return self.desc_array.shape[0]
+
+    @property
+    def num_groups(self) -> int:
+        return self.groups_array.shape[0]
+
+    @property
+    def num_fixup_groups(self) -> int:
+        return self.fixup_array.shape[0]
+
+    @property
+    def desc(self) -> List[List[int]]:
+        return self.desc_array.tolist()
+
+    @property
+    def groups(self) -> List[List[int]]:
+        return self.groups_array.tolist()
+
+    @property
+    def fixup_groups(self) -> List[List[int]]:
+        return self.fixup_array.tolist()
+
+    @property
+    def group_inkernel(self) -> List[bool]:
+        return self.inkernel_array.tolist()
+
+
+def _length_counts(lengths: np.ndarray) -> Dict[int, int]:
+    values, counts = np.unique(lengths, return_counts=True)
+    return dict(zip(values.tolist(), counts.tolist(), strict=True))
+
+
+def build_decode_plan(
+    kv_lens: np.ndarray,
+    q_len: int,
+    Hq: int,
+    Hkv: int,
+    D: int,
+    window_left: int = -1,
+    split_policy: str = "auto",
+    sm_count: int = 204,
+    **kw,
+) -> "ArrayPlan":
+    """``build_array_plan`` for a decode batch: ``q_len`` query tokens per request, a request without keys a null request."""
+    kv_lens = np.asarray(kv_lens, dtype=np.int64)
+    return build_array_plan(
+        np.full(kv_lens.size, q_len, dtype=np.int64),
+        kv_lens,
+        Hq,
+        Hkv,
+        D,
+        window_left,
+        split_policy,
+        sm_count,
+        null_requests=True,
+        **kw,
+    )
+
+
+def build_array_plan(
+    q_lens: np.ndarray,
+    kv_lens: np.ndarray,
+    Hq: int,
+    Hkv: int,
+    D: int,
+    window_left: int = -1,
+    split_policy: str = "auto",
+    sm_count: int = 204,
+    q_rows: int = 128,
+    merge: str = "auto",
+    small_swap: bool = False,
+    swap_max_rows: int = INKERNEL_MAX_ROWS,
+    grid: int = 0,
+    grid_search: bool = True,
+    unit_budget: int = 0,
+    row_budget: int = -1,
+    null_requests: bool = False,
+    previous: Optional[ArrayPlan] = None,
+    kv_indptr: Optional[np.ndarray] = None,
+) -> ArrayPlan:
+    """``build_plan`` computed over arrays: request ``b`` has ``q_lens[b]`` query tokens over ``kv_lens[b]`` keys and its packed
+    rows start at ``sum(q_lens[:b])``. The tables and the grid are those of ``build_plan`` with the same arguments, entry for
+    entry (the planner a replan before every replay of a captured graph runs: its cost must not grow with a Python loop over
+    the units). A request without query tokens gets no unit; under ``null_requests`` neither does one without keys.
+    ``previous``: the last plan of the caller; when this batch differs from that one in its KV lengths alone, with every
+    Q tile on the same key tiles and chunks -- a decode loop between two tile boundaries --, the tables are that plan's with
+    the lengths rewritten (``ArrayPlan.with_kv_lens``), the same tables as planning afresh. ``kv_indptr``: the page-table
+    offsets the descriptors carry (``F_KVPTR0`` / ``F_NPAGES``); one key per page when omitted."""
+    assert merge in ("auto", "fixup", "inkernel"), merge
+    assert Hq % Hkv == 0, (Hq, Hkv)
+    g = Hq // Hkv
+    assert 1 <= g <= q_rows, g
+    tpt = q_rows // g
+    T, C = TILE_KEYS, chunk_len(D)
+    tpc = C // T
+    q_lens = np.asarray(q_lens, dtype=np.int64)
+    kv_lens = np.asarray(kv_lens, dtype=np.int64)
+    if kv_indptr is None:
+        kv_indptr = np.concatenate([[0], np.cumsum(kv_lens)])
+    kv_indptr = np.asarray(kv_indptr, dtype=np.int64)
+    q_base = np.cumsum(q_lens) - q_lens
+    keep = q_lens > 0
+    if null_requests:
+        keep &= kv_lens > 0
+    live = np.flatnonzero(keep)
+    short = live[kv_lens[live] < q_lens[live]]
+    assert not short.size, (
+        f"request {int(short[0]) if short.size else 0}: kv_len < q_len (bottom-right causal needs kv_len >= q_len)"
+    )
+    # the Q tiles in the planner's order: request, first token, KV head
+    tiles_r = -(-q_lens[live] // tpt)
+    req = np.repeat(np.arange(live.size), tiles_r)  # per (request, Q tile)
+    tok0 = (np.arange(req.size) - (np.cumsum(tiles_r) - tiles_r)[req]) * tpt
+    ntok = np.minimum(tpt, q_lens[live][req] - tok0)
+    p_first = kv_lens[live][req] - q_lens[live][req] + tok0
+    l_max = p_first + ntok
+    lo_min = (
+        np.maximum(0, p_first - window_left)
+        if window_left >= 0
+        else np.zeros_like(p_first)
+    )
+    shape = (
+        (Hq, Hkv, D, window_left, split_policy, sm_count, q_rows, merge)
+        + (small_swap, swap_max_rows, grid, grid_search, unit_budget, row_budget)
+        + (null_requests,),
+        q_lens,
+        live,
+        lo_min // T,
+        -(-l_max // T),
+    )
+    if previous is not None and previous.same_shape(shape):
+        return previous.with_kv_lens(kv_lens, kv_indptr)
+    n_tiles = req.size * Hkv
+
+    def tiles(a: np.ndarray) -> np.ndarray:
+        return np.repeat(a, Hkv)
+
+    b_t, tok_t = tiles(live[req]), tiles(tok0)
+    h_t = np.tile(np.arange(Hkv, dtype=np.int64), req.size)
+    kv_t, qlen_t, qbase_t = (
+        tiles(kv_lens[live][req]),
+        tiles(q_lens[live][req]),
+        tiles(q_base[live][req]),
+    )
+    rows_t = tiles(ntok) * g
+    clo_t, chi_t = tiles(lo_min // C), tiles(-(-l_max // C))
+    tlo_t, thi_t = tiles(lo_min // T), tiles(-(-l_max // T))
+    n_t = chi_t - clo_t
+    len_t = thi_t - tlo_t
+    multi = n_t > 1
+    # the unit kinds: build_plan's rules
+    swap_batch = small_swap and n_tiles > 0 and int(rows_t.max()) <= swap_max_rows
+    om_tmem = om_in_tmem(D) or swap_batch
+    inkernel_max_chunks = INKERNEL_MAX_CHUNKS if om_tmem else INKERNEL_MAX_CHUNKS_OF[D]
+    narrow = rows_t <= INKERNEL_MAX_ROWS
+    plan_grid = 0
+    if split_policy == "split":
+        fused = ~multi
+    elif split_policy == "fused" or n_tiles == 0:
+        fused = np.ones(n_tiles, dtype=bool)
+    elif swap_batch:
+        split_lengths = None
+        if multi.any():
+            first = np.minimum(thi_t, (clo_t + 1) * tpc) - tlo_t
+            last = thi_t - np.maximum(tlo_t, (chi_t - 1) * tpc)
+            counts = _length_counts(
+                np.concatenate([first[multi], last[multi], len_t[~multi]])
+            )
+            middle = int((n_t[multi] - 2).sum())
+            if middle:
+                counts[tpc] = counts.get(tpc, 0) + middle
+            folds_inkernel = multi & (n_t <= inkernel_max_chunks)
+            split_lengths = (
+                counts,
+                int(rows_t[multi & ~folds_inkernel].sum()),
+                int(folds_inkernel.sum()),
+            )
+        split_all, plan_grid = swaps_decide(
+            n_tiles,
+            int(len_t.max()),
+            (_length_counts(len_t), 0, 0),
+            split_lengths,
+            sm_count,
+            D,
+            grid_search,
+        )
+        if plan_grid == min(n_tiles, sm_count):
+            plan_grid = 0  # the default launch grid
+        fused = ~multi if split_all else np.ones(n_tiles, dtype=bool)
+    else:
+        do_split = np.where(
+            narrow, n_tiles < 2 * sm_count, WIDE_SPLIT_SM_FRACTION * n_tiles < sm_count
+        )
+        two_chunk_fused = (
+            (not om_tmem and 2 * n_tiles > sm_count)
+            & (n_t == 2)
+            & (rows_t >= FUSE2_MIN_ROWS)
+            & narrow
+        )
+        fused = ~multi | two_chunk_fused | ~(do_split | ((not om_tmem) & narrow))
+    # the fixed capacity: budget_unit_kinds
+    want = ~fused
+    if want.any() and (unit_budget > 0 or row_budget >= 0):
+        lengths, cls = np.unique(len_t[want], return_inverse=True)
+        extra = np.bincount(cls, weights=n_t[want] - 1, minlength=lengths.size)
+        need = np.bincount(cls, weights=(n_t * rows_t)[want], minlength=lengths.size)
+        units = n_tiles + np.cumsum(extra[::-1])  # the classes longest first
+        ws = np.cumsum(need[::-1])
+        fits = np.ones(lengths.size, dtype=bool)
+        if unit_budget > 0:
+            fits &= units <= unit_budget
+        if row_budget >= 0:
+            fits &= ws <= row_budget
+        kept = lengths.size if fits.all() else int(np.argmin(fits))
+        if kept:
+            fused = ~(want & (len_t >= lengths[::-1][kept - 1]))
+        else:
+            fused = np.ones(n_tiles, dtype=bool)
+    # the tables: one unit per fused tile, one per chunk of a split tile and a group for it, in tile order
+    split_t = ~fused
+    group_tiles = np.flatnonzero(split_t)
+    g_rows, g_n = rows_t[group_tiles], n_t[group_tiles]
+    g_size = g_n * g_rows
+    g_base = np.cumsum(g_size) - g_size
+    if merge == "inkernel":
+        inkernel = np.ones(group_tiles.size, dtype=bool)
+    elif merge == "fixup":
+        inkernel = np.zeros(group_tiles.size, dtype=bool)
+    else:
+        inkernel = (g_rows <= INKERNEL_MAX_ROWS) & (g_n <= inkernel_max_chunks)
+    groups = np.empty((group_tiles.size, GROUP_FIELDS), dtype=np.int32)
+    groups[:, G_SLOT] = g_base
+    groups[:, G_ROWS] = g_rows
+    groups[:, G_CHUNK_LO] = clo_t[group_tiles]
+    groups[:, G_NCHUNKS] = g_n
+    groups[:, G_QTOK0] = tok_t[group_tiles]
+    groups[:, G_KVHEAD] = h_t[group_tiles]
+    groups[:, G_KVLEN] = kv_t[group_tiles]
+    groups[:, G_QLEN] = qlen_t[group_tiles]
+    groups[:, G_QBASE] = qbase_t[group_tiles]
+    groups[:, G_REQ] = b_t[group_tiles]
+    base_t = np.zeros(n_tiles, dtype=np.int64)
+    base_t[group_tiles] = g_base
+    grp_t = np.full(n_tiles, -1, dtype=np.int64)
+    grp_t[group_tiles] = np.where(inkernel, np.arange(group_tiles.size), -1)
+    units_t = np.where(fused, 1, n_t)
+    tile = np.repeat(np.arange(n_tiles), units_t)
+    num_units = tile.size
+    split_u = split_t[tile]
+    chunk = clo_t[tile] + np.arange(num_units) - (np.cumsum(units_t) - units_t)[tile]
+    tile_lo = np.where(split_u, np.maximum(tlo_t[tile], chunk * tpc), tlo_t[tile])
+    tile_hi = np.where(split_u, np.minimum(thi_t[tile], (chunk + 1) * tpc), thi_t[tile])
+    desc = np.zeros((num_units, DESC_FIELDS), dtype=np.int32)
+    desc[:, F_REQ] = b_t[tile]
+    desc[:, F_QTOK0] = tok_t[tile]
+    desc[:, F_ROWS] = rows_t[tile]
+    desc[:, F_KVHEAD] = h_t[tile]
+    desc[:, F_CHUNK_LO] = np.where(split_u, chunk, clo_t[tile])
+    desc[:, F_CHUNK_HI] = np.where(split_u, chunk + 1, chi_t[tile])
+    desc[:, F_MODE] = split_u
+    desc[:, F_SLOT] = np.where(
+        split_u, base_t[tile] + (chunk - clo_t[tile]) * rows_t[tile], 0
+    )
+    desc[:, F_KVLEN] = kv_t[tile]
+    desc[:, F_QLEN] = qlen_t[tile]
+    desc[:, F_TILE_LO] = tile_lo
+    desc[:, F_TILE_HI] = tile_hi
+    desc[:, F_QBASE] = qbase_t[tile]
+    desc[:, F_GROUP] = np.where(split_u, grp_t[tile], -1)
+    desc[:, F_KVPTR0] = kv_indptr[b_t[tile]]
+    desc[:, F_NPAGES] = kv_indptr[b_t[tile] + 1] - kv_indptr[b_t[tile]]
+    # longest first (stable), then the waves of the launch grid in alternating direction: build_plan's order
+    if num_units:
+        order = np.argsort(tile_lo - tile_hi, kind="stable")
+        waves = min(num_units, grid if grid > 0 else (plan_grid or sm_count))
+        pos = np.arange(num_units)
+        start = pos // waves * waves
+        back = start + np.minimum(waves, num_units - start) - 1 - (pos - start)
+        desc = desc[order[np.where(pos // waves % 2 == 1, back, pos)]]
+    plan = ArrayPlan(
+        desc, groups, inkernel, int(g_size.sum()), tpt, g, ws_row(D), plan_grid
+    )
+    plan.shape = shape
+    return plan
+
+
+def _empty_partner(units: np.ndarray) -> np.ndarray:
+    """The empty B of a unit alone in its pair: no rows, an empty tile range, no group."""
+    empty = units.copy()
+    empty[:, F_ROWS] = 0
+    empty[:, F_TILE_HI] = empty[:, F_TILE_LO]
+    empty[:, F_GROUP] = -1
+    return empty
+
+
+def lone_units_array(desc: np.ndarray) -> np.ndarray:
+    """The paired placement's table (rows ``2 u`` and ``2 u + 1`` of pair ``u``) with every unit of ``desc`` alone in its pair,
+    in ``desc``'s order: what the paired kernel walks when the batch is not worth pairing."""
+    table = np.empty((2 * desc.shape[0], DESC_FIELDS), dtype=np.int32)
+    table[0::2] = desc
+    table[1::2] = _empty_partner(desc)
+    return table
+
+
+def pair_units_array(desc: np.ndarray, grid: int = 0) -> np.ndarray:
+    """``engine.pair_units`` over arrays, row for row: two units pair when they share the request, the KV head, the chunk
+    range and the kind -- consecutive Q tiles in token order; an odd one out gets an empty B; the pairs longest first in
+    waves of ``grid`` of alternating direction."""
+    n = desc.shape[0]
+    if n == 0:
+        return np.empty((0, DESC_FIELDS), dtype=np.int32)
+    keys = [desc[:, f] for f in (F_MODE, F_CHUNK_HI, F_CHUNK_LO, F_KVHEAD, F_REQ)]
+    by_key = np.lexsort(keys)
+    new = np.zeros(n, dtype=bool)
+    new[0] = True
+    for key in keys:
+        new[1:] |= key[by_key][1:] != key[by_key][:-1]
+    # buckets in the order of their first unit, a bucket's units in token order
+    first = np.empty(n, dtype=np.int64)
+    first[by_key] = np.minimum.reduceat(by_key, np.flatnonzero(new))[np.cumsum(new) - 1]
+    bucket = first
+    order = np.lexsort((desc[:, F_QTOK0], first))
+    sorted_bucket = bucket[order]
+    start = np.flatnonzero(np.r_[True, sorted_bucket[1:] != sorted_bucket[:-1]])
+    run = np.cumsum(np.r_[True, sorted_bucket[1:] != sorted_bucket[:-1]]) - 1
+    is_a = (np.arange(n) - start[run]) % 2 == 0
+    a_pos = np.flatnonzero(is_a)
+    has_b = (a_pos + 1 < n) & ~is_a[np.minimum(a_pos + 1, n - 1)]
+    a = desc[order[a_pos]]
+    b = _empty_partner(a)
+    b[has_b] = desc[order[a_pos[has_b] + 1]]
+    length = np.maximum(
+        a[:, F_TILE_HI] - a[:, F_TILE_LO], b[:, F_TILE_HI] - b[:, F_TILE_LO]
+    )
+    rank = np.argsort(-length, kind="stable")
+    pairs = rank.size
+    waves = min(pairs, grid)
+    if waves > 0:
+        pos = np.arange(pairs)
+        begin = pos // waves * waves
+        back = begin + np.minimum(waves, pairs - begin) - 1 - (pos - begin)
+        rank = rank[np.where(pos // waves % 2 == 1, back, pos)]
+    table = np.empty((2 * pairs, DESC_FIELDS), dtype=np.int32)
+    table[0::2] = a[rank]
+    table[1::2] = b[rank]
+    return table

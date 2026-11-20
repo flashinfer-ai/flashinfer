@@ -45,6 +45,31 @@ RING_BYTES = (
     128 << 10
 )  # K/V bytes in flight per CTA at every D: 512 / D ring slots of 128 x D bf16
 SMEM_CAP = 227 << 10  # the opt-in dynamic smem of one CTA on sm_100 / sm_107
+SPLIT_WARPS = 3  # the warps that issue K / V boxes under the split placement: the load warp and the two otherwise idle warps
+RUN_PAGE_MAX = 2  # pages of at most this many keys load runs of consecutive pages as run boxes (run_pages)
+RUN_KEYS = 8  # keys of a run box: 8 consecutive keys whose pages are consecutive in the pool load as one box per half
+SPLIT_LOOP_PAGE_MAX = 2  # pages of at most this many keys issue their boxes in a run-time loop (producer.issue_slot_split)
+SPLIT_PAGE_MAX = (
+    4  # pages of at most this many keys take the split placement (split_pages)
+)
+
+
+def run_pages(page: int, ragged: bool = False) -> bool:
+    """Whether a paged pool of ``page`` keys per page takes run boxes under the split placement (``producer.issue_slot_runs``):
+    pages of 1 and 2 keys, where a group of 8 keys is 8 or 4 page boxes per half. At 4 keys per page a group is two boxes
+    and the plain split placement measures faster."""
+    return split_pages(page, ragged) and page <= RUN_PAGE_MAX
+
+
+def split_pages(page: int, ragged: bool = False) -> bool:
+    """Whether the K / V boxes of a paged pool of ``page`` keys per page are issued under the split placement. A tile of small pages
+    is hundreds of boxes of one to four 128-byte rows each (``128 / page`` per 64-wide half of a 128-key slot), and the load warp,
+    not the softmax, paces the unit: every box waits on the global load of its own page index, and the boxes of one warp are
+    issued one at a time. Under the split placement the slot's page indices are read once, ahead of its boxes
+    (``producer.slot_page_ids``), and ``SPLIT_WARPS`` warps issue a third of the boxes each onto the slot's one barrier. The
+    boxes, and the bytes they deliver, are those of the unsplit placement. From 8 keys per page up the boxes hide under the
+    tile's softmax; the ragged pool is one box per half at any length."""
+    return not ragged and page <= SPLIT_PAGE_MAX
 
 
 def slot_bytes(D: int) -> int:
@@ -197,6 +222,7 @@ class StaticPlan:
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
         self.hw_rowmax = hw_rowmax
+        self.sinks = False  # set by the kernel compiled for attention sinks
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
@@ -230,6 +256,15 @@ class StaticPlan:
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
         self.roles = Roles(n_wg, D, q2)
+        # the K / V boxes of small pages are issued under the split placement, by kv_warps warps (the load warp alone otherwise)
+        self.split = split_pages(page, ragged)
+        self.kv_warps = SPLIT_WARPS if self.split else 1
+        self.split_loop = self.split and page <= SPLIT_LOOP_PAGE_MAX
+        self.runs = run_pages(page, ragged)  # run boxes (producer.issue_slot_runs)
+        self.run_tma: tuple = ()  # set by the kernel: the per-pool run atoms and TMA tensors
+        self.ring_run: object = (
+            None  # set by the kernel: the ring as run boxes address it
+        )
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
@@ -383,6 +418,22 @@ class StaticPlan:
                     self.slot_keys * HALF,
                     self.kv_slot_elems,
                 ),
+            ),
+        )
+        # the run box of the split placement: (64 d, page keys, 1, 8 / page consecutive pages) = 8 keys of one half, and the ring as
+        # run boxes address it: (d in half, key in page, 1, page in run, run, half, slot) -- the bytes of the page boxes it replaces
+        self.run_box = (HALF, min(page, RUN_KEYS), 1, max(1, RUN_KEYS // page))
+        run_stride = (1, HALF, 0, HALF * min(page, RUN_KEYS))
+        self.run_slab_layout = cute.make_composed_layout(
+            self.swizzle, 0, cute.make_layout(self.run_box, stride=run_stride)
+        )
+        self.run_view_layout = cute.make_composed_layout(
+            self.swizzle,
+            0,
+            cute.make_layout(
+                self.run_box + (self.slot_keys // RUN_KEYS, self.halves, self.n_slots),
+                stride=run_stride
+                + (HALF * RUN_KEYS, self.slot_keys * HALF, self.kv_slot_elems),
             ),
         )
         # the producer's view of the Q tile: (d in half, head, token, half, stage)
@@ -574,3 +625,13 @@ class TmaSetup:
         self.atom_v, self.tensor_v = cpasync.make_tiled_tma_atom(
             op, mV, st.kv_slab_layout, (HALF, st.box_rows, 1, 1)
         )
+        # the run boxes of the split placement (the page boxes' atoms again where no build issues a run box)
+        self.atom_k_run, self.tensor_k_run = self.atom_k, self.tensor_k
+        self.atom_v_run, self.tensor_v_run = self.atom_v, self.tensor_v
+        if st.runs:
+            self.atom_k_run, self.tensor_k_run = cpasync.make_tiled_tma_atom(
+                op, mK, st.run_slab_layout, st.run_box
+            )
+            self.atom_v_run, self.tensor_v_run = cpasync.make_tiled_tma_atom(
+                op, mV, st.run_slab_layout, st.run_box
+            )

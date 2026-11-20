@@ -14,6 +14,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..plan import GROUP_FIELDS
+from ..blocks.operands import run_pages, split_pages
 from .kernel import SwapsKernel
 
 MODULE = "batch_invariant_attention"
@@ -27,12 +28,18 @@ def kernel_name(
     ragged: bool = False,
     cap: int = 0,
     pdl: bool = False,
+    sinks: bool = False,
+    fixed: bool = False,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}"
         + ("_rg" if ragged else "")
+        + ("_sp" if split_pages(page, ragged) else "")
+        + ("r" if run_pages(page, ragged) else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("_pdl" if pdl else "")
+        + ("_sink" if sinks else "")
+        + ("_cg" if fixed else "")
     )
 
 
@@ -45,14 +52,17 @@ def get_compiled_swaps(
     ragged: bool = False,
     cap: int = 0,
     pdl: bool = False,
+    sinks: bool = False,
+    fixed: bool = False,
 ):
-    """``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
+    """``fixed``: the kernel of a fixed launch (``engine.FixedLaunch``: the unit count and the walking CTAs read from the counts
+    table), part of its name. ``sinks``: the kernel of the class's sink member, part of its name. ``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
     the kernel's identity in this process's cache and on disk; ``pdl``: launched as a programmatic dependent (its load warp waits
     for the preceding grid before the first TMA)."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl)
+    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl, sinks, fixed)
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -96,6 +106,12 @@ def get_compiled_swaps(
             (cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
+        lse_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
+        sink_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         ws_fake = cute.runtime.make_fake_tensor(f32, (s_ws,), (1,), assumed_align=16)
         groups_fake = cute.runtime.make_fake_tensor(
             i32, (cute.sym_int(32), GROUP_FIELDS), (GROUP_FIELDS, 1), assumed_align=4
@@ -109,14 +125,19 @@ def get_compiled_swaps(
         indices_fake = cute.runtime.make_fake_tensor(
             i32, (s_nidx,), (1,), assumed_align=4
         )
+        counts_fake = cute.runtime.make_fake_tensor(
+            i32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl)
+        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl, sinks, fixed)
         return cute.compile(
             k,
             q_fake,
             k_fake,
             v_fake,
             o_fake,
+            lse_fake,
+            sink_fake,
             ws_fake,
             groups_fake,
             counters_fake,
@@ -126,7 +147,9 @@ def get_compiled_swaps(
             cutlass.Float32(-1.0),
             cutlass.Int32(-1),
             cutlass.Int32(1),
+            counts_fake,
             cutlass.Int32(1),
+            cutlass.Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )
