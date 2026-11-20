@@ -1,5 +1,6 @@
 """Staging parity and preparation helpers under CUDA graph replay."""
 
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -215,6 +216,8 @@ def test_routing_check_reuses_kernel_across_row_counts(
         pytest.fail("A new row count must reuse the warmed routing kernel")
 
     monkeypatch.setattr(routing_validation.cute, "compile", unexpected_compile)
+    # Collect retired CuTe modules before capture: their finalizers unload CUDA libraries.
+    gc.collect()
     graphs = []
     inputs = []
     try:

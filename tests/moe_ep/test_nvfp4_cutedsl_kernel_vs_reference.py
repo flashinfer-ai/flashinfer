@@ -872,8 +872,11 @@ def _torch_nvfp4_mega_reference(
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("mode", NVFP4_MODES)
-@pytest.mark.parametrize("hidden,intermediate", [(2048, 1024), (288, 448)])
+@pytest.mark.parametrize(
+    "mode,hidden,intermediate",
+    [(mode, h, i) for mode in NVFP4_MODES for h, i in [(2048, 1024), (288, 448)]]
+    + [("w4a4_standard", 2048, 1024), ("w4a4_standard", 384, 96)],
+)
 @pytest.mark.parametrize("weight_dtype", ["bfloat16", "float32"])
 def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
     mode, hidden, intermediate, weight_dtype
@@ -889,9 +892,13 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
         to_blocked,
     )
 
-    if mode == "w4a4":
+    if mode == "w4a4_standard":
         from flashinfer.moe_ep import (
             preprocess_nvfp4_cutedsl_mega_weights as preprocess_mega_weights,
+        )
+    elif mode == "w4a4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
         )
     elif mode == "w4a16":
         from flashinfer.moe_ep import (
@@ -914,6 +921,14 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
 
     fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
 
+    def expected_fp4(packed):
+        raw = packed.view(torch.uint8)
+        if mode == "w4a4_standard":
+            # Standard preprocessing canonicalizes signed FP4 zeros.
+            raw = torch.where((raw & 0x07) == 0, raw & 0xF7, raw)
+            raw = torch.where((raw & 0x70) == 0, raw & 0x7F, raw)
+        return raw
+
     # Kernel weights are logically (E, K//2, N) but MUST keep the packed K
     # axis stride-1 (transpose view over K-major memory) — the kernel's TMA
     # descriptors read K-major, so a materialized N-stride-1 tensor scrambles
@@ -927,13 +942,13 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
     # Values: compare the K-major memory against the independent plain quant.
     torch.testing.assert_close(
         fc1_kernel.transpose(1, 2).contiguous().view(torch.uint8),
-        fc1_plain,
+        expected_fp4(fc1_plain),
         atol=0,
         rtol=0,
     )
     torch.testing.assert_close(
         fc2_kernel.transpose(1, 2).contiguous().view(torch.uint8),
-        fc2_plain,
+        expected_fp4(fc2_plain),
         atol=0,
         rtol=0,
     )
@@ -961,7 +976,9 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
         q, sf = nvfp4_quantize_per_block_16(
             weight.float().reshape(-1, weight.shape[-1]), 1.0
         )
-        if mode == "w4a4" or weight_dtype == "float32":
+        if mode == "w4a4_standard":
+            q = expected_fp4(q)
+        elif mode == "w4a4" or weight_dtype == "float32":
             q = q.view(torch.uint8)
         packed[name] = q.reshape(*weight.shape[:-1], weight.shape[-1] // 2)
         packed[f"{name}_scale"] = sf.reshape(*weight.shape[:-1], weight.shape[-1] // 16)
@@ -976,6 +993,25 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
                 expected.shape == result.shape and expected.stride() == result.stride()
             )
             assert torch.equal(expected.view(torch.uint8), result.view(torch.uint8))
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("hidden,intermediate", [(288, 448), (384, 112)])
+def test_standard_nvfp4_preprocess_rejects_unaligned_weights(hidden, intermediate):
+    _require_cuda()
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_nvfp4_cutedsl_mega_weights,
+    )
+
+    weights = MoEWeightPack(
+        torch.zeros(1, 2 * intermediate, hidden, device="cuda"),
+        torch.zeros(1, hidden, intermediate, device="cuda"),
+    )
+    with pytest.raises(ValueError, match="scale-vector alignment"):
+        preprocess_nvfp4_cutedsl_mega_weights(
+            weights, hidden_size=hidden, intermediate_size=intermediate
+        )
 
 
 @pytest.mark.arch_blackwell
@@ -1123,8 +1159,8 @@ def _check_nvfp4_kernel_matches_torch_reference(
         from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
-        from flashinfer.moe_ep import (
-            preprocess_nvfp4_cutedsl_mega_weights as preprocess_mega_weights,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
         )
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
             get_symm_buffer_for_mega_moe,
