@@ -682,7 +682,9 @@ _SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {
     # B200: every measured cell of max_seq_len buckets 4096 to 16384 (1 to 18
     # query rows, page 32 and 64, uniform, varied, padded and sink lengths) ran
     # faster than the value-split program beyond noise; bucket 2048 had slower
-    # cells up to its upper edge, so the range starts at bucket 4096.
+    # cells up to its upper edge, so the range starts at bucket 4096.  Measured
+    # with q_len 1 and 2 and KV lengths 4096, 8192 and 16384 only: other q_len
+    # values and KV lengths 2049 to 4095 are not measured yet.
     ("sm_100a", 148): (2049, 18),
     # GB300: provisional, until its stateless A/B against the value-split
     # program is measured.
