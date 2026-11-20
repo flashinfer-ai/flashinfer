@@ -524,7 +524,7 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
             rank_grouped_nvfp4,
             rows_per_expert,
         )
-        from .spec_nvfp4 import expert_classes
+        from .api_nvfp4 import expert_classes
 
         cfg = self.config
         E, k, I = (

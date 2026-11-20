@@ -348,11 +348,11 @@ def _moe_nvfp4_fingerprint(
     device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
     unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
     intermediate's quantization class (``per_token`` / ``static``)."""
-    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import ALIGN_NVFP4
-    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        ALIGN_NVFP4,
         expert_classes,
-        spec_fingerprint_nvfp4,
     )
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import spec_fingerprint_nvfp4
 
     for dim, value in (("H", H), ("I", I)):
         if value <= 0 or value % ALIGN_NVFP4:

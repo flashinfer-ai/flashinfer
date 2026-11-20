@@ -129,15 +129,8 @@ def sfu_tables():
 
 
 def sfu_eval(op: str, x: float) -> float:
-    """The bound part's ``ex2`` or ``rcp`` of one binary32 value."""
-    import torch
-
-    from ...batch_invariant.fp_interface import sfu
-
-    t = torch.tensor([x], dtype=torch.float32)
-    tables = sfu_tables()
-    y = sfu.ex2_hw(t, tables) if op == "ex2" else sfu.rcp_hw(t, tables)
-    return float(y[0].item())
+    """The bound part's ``ex2`` or ``rcp`` of one binary32 value (the tables' own CPU model)."""
+    return sfu_tables().eval(op, x)
 
 
 def rowmax_f32(*vals: float) -> float:
