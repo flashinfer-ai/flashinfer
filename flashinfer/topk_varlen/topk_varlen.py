@@ -1731,6 +1731,10 @@ def top_k_varlen(
         the buffer holds; nothing is read beyond it. In windowed (prefill)
         mode there is one entry per row and ``seq_lens[r]`` is the window
         length of row ``r`` in columns, after compression (see ``row_starts``).
+        ``seq_lens`` must not change while the call runs: under ``"gvr_2"`` the
+        parts of a row that saw different lengths could leave the workspace's
+        arrival counters set, and every later call on that workspace would
+        return wrong rows.
     top_k : int
         Number of top elements per row; the accepted values are
         backend-specific (see ``backend``).
