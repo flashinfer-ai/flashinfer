@@ -27,8 +27,10 @@ pytestmark = [pytest.mark.gpu_2, pytest.mark.arch_rubin]
 def ep_runtime():
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
-    if world not in (2, 4, 8) or os.environ.get("MEGA_NO_DIST") == "1":
-        pytest.skip("requires torchrun with 2, 4, or 8 ranks and MEGA_NO_DIST unset")
+    if world not in (2, 4, 8, 16, 32) or os.environ.get("MEGA_NO_DIST") == "1":
+        pytest.skip(
+            "requires torchrun with 2, 4, 8, 16, or 32 ranks and MEGA_NO_DIST unset"
+        )
     bootstrap = BootstrapConfig(rank=rank, world_size=world)
     ensure_moe_ep_cuda_device(bootstrap)
     runtime = bootstrap_moe_ep_runtime(
@@ -87,7 +89,7 @@ def _check_sparse_to_dense_graph_multirank(
     preserve numerical accuracy through repeated replays with fixed bindings.
     """
     rank, world = ep_runtime
-    hidden, intermediate, experts = 512, 256, 16
+    hidden, intermediate, experts = 512, 256, max(16, 2 * world)
     # DATA CTA count depends on capacity * topk, not token capacity alone.
     # Exceed 16384 routes so the 2048-capacity case exercises two DATA CTAs.
     topk = 10 if capacity == 2048 else 4
