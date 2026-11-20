@@ -101,7 +101,9 @@ def _model(gated, experts=E, seed=0):
     return m
 
 
-def _reference(m, xr, ids, weights, gemm2_input, act=lambda g, u: F.silu(g) * u):
+def _reference(
+    m, xr, ids, weights, gemm2_input, act=lambda g, u: F.silu(g) * u, gemm1_bf16=True
+):
     """The top-k sum from the dequantized input xr, quantizing GEMM2's input by gemm2_input."""
     tokens, top_k = ids.shape
     y = torch.zeros(tokens * top_k, H, device=xr.device)
@@ -109,8 +111,9 @@ def _reference(m, xr, ids, weights, gemm2_input, act=lambda g, u: F.silu(g) * u)
     for e in range(m["w1"].shape[0]):
         sel = (flat == e).nonzero().squeeze(1)
         if sel.numel():
-            # the GEMM1 output in BF16
-            h = (xr[sel // top_k] @ m["w1_deq"][e].T).bfloat16().float()
+            h = xr[sel // top_k] @ m["w1_deq"][e].T
+            if gemm1_bf16:  # the GEMM1 output in BF16
+                h = h.bfloat16().float()
             a = act(h[:, I:], h[:, :I]) if m["gated"] else F.relu(h).square()
             y[sel] = gemm2_input(a.bfloat16()) @ m["w2_deq"][e].T
     return (y.view(tokens, top_k, H) * weights.float()[..., None]).sum(1)

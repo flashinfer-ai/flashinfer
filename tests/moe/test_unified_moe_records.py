@@ -68,6 +68,7 @@ def _mxfp4(a):
 @pytest.mark.parametrize("tokens", [1, 37])
 def test_records_unified(case, tokens):
     (pair, per_token, activation), pt = case, None
+    torch.manual_seed(0)
     x = torch.randn(tokens, H, device="cuda").bfloat16()
     ids, weights = _routing(tokens)
     xs, sizes = None, dict(num_local_experts=E, hidden_size=H, intermediate_size=I)
@@ -116,7 +117,12 @@ def test_records_unified(case, tokens):
         per_token_scale=pt,
     )
     out = MoELayer(config, device=torch.device("cuda"))(act, pack)
-    ref = _reference(
-        m, xr, ids, weights, gemm2_input, lambda g, u: _act(g, u, activation)
-    )
-    _close(out, ref)
+    # Tactics take GEMM1's output in FP32 or BF16 into GEMM2's quantized input, and the
+    # codes that this flips cost up to 7e-2 under MXFP4's E8M0 scales: the closer reference.
+    refs = [
+        _reference(
+            m, xr, ids, weights, gemm2_input, lambda g, u: _act(g, u, activation), b
+        )
+        for b in (True, False)
+    ]
+    _close(out, min(refs, key=lambda r: (out.float() - r).norm()))
