@@ -12,7 +12,7 @@ or dtypes. General workflow rules are in [AGENTS.md](../../AGENTS.md).
 
 ## cuDNN linear attention
 
-Use `nvidia-cudnn-frontend>=1.33.0`; automatic selection also requires CuTe DSL
+Use `nvidia-cudnn-frontend>=1.32.0`; automatic selection also requires CuTe DSL
 4.7+. KDA/GDN normalization adds `1e-6`, without an epsilon argument. KDA's
 SM100/SM103 policies live in `flashinfer/kda.py`; GDN's SM100 policy lives in
 `flashinfer/gdn_prefill.py`. See [KDA shape regions](../api/kda.rst).
@@ -68,7 +68,7 @@ rewrites cached entries must respect that:
 
 ## Attention plan and CUDA Graph lifetime
 
-FlashInfer requires cuDNN Frontend >=1.33.0. Attention code can rely on its
+FlashInfer requires cuDNN Frontend >=1.32.0. Attention code can rely on its
 cumulative-length graph arguments, shape-override constructor, short-cache
 placement, and CUDA-graph replay hint. Do not retain compatibility branches for
 older FE releases. Backend versions and native/runtime capabilities remain
