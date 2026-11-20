@@ -105,6 +105,12 @@ class _AllGatherWorkspace(Generic[_Impl]):
 
         Call on every rank during warmup, even when its local result is False.
         All ranks must use the agreed path and keep valid layouts for replay.
+
+        Args:
+            local_supported: This rank's ``supports_*`` result.
+
+        Returns:
+            True only if every rank passed True.
         """
         return collective_support(local_supported, self._group, self.device)
 
@@ -145,6 +151,16 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDual
         group: ProcessGroup,
         tuning: LLAllGatherDualNormTuning | None = None,
     ) -> None:
+        """Create the workspace on every rank of ``group`` (collective).
+
+        Args:
+            tp_size: Number of ranks in ``group``, at least 2.
+            tp_rank: This rank's index in ``group``.
+            max_token_num: Largest ``M`` a call may gather.
+            hidden_dim: Full hidden size ``H``; each rank holds ``H/tp_size`` columns.
+            group: TP process group.
+            tuning: Kernel launch tuning; None uses the defaults.
+        """
         super().__init__(
             tp_size,
             max_token_num,
@@ -170,7 +186,15 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDual
         has_post_weight: bool = False,
         post_gain_center: float = 0.0,
     ) -> None:
-        """Compile one constant set ahead of time, e.g. before graph capture."""
+        """Compile one constant set ahead of time, e.g. before graph capture.
+
+        Args:
+            post_eps: Epsilon of the branch RMSNorm.
+            next_eps: Epsilon of the next RMSNorm.
+            next_gain_center: Constant added to ``next_weight``.
+            has_post_weight: Whether calls pass ``post_weight``.
+            post_gain_center: Constant added to ``post_weight``.
+        """
         self.impl.compiled(
             _norm_constants(
                 post_eps, next_eps, next_gain_center, has_post_weight, post_gain_center
@@ -204,7 +228,16 @@ def supports_all_gather_gated_residual_next_rmsnorm(
     next_weight: torch.Tensor,
     post_weight: torch.Tensor | None = None,
 ) -> bool:
-    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks.
+
+    Args:
+        workspace: Workspace the call will use.
+        branch_shard, residual, alpha, beta, next_weight, post_weight: The
+            arguments of :func:`all_gather_gated_residual_next_rmsnorm`.
+
+    Returns:
+        Whether this rank's arguments fit the fused path.
+    """
     hidden = workspace.hidden_dim
     device = workspace.device
     vectors = [(alpha, torch.float32, 32), (beta, torch.float32, 32)]
@@ -307,6 +340,18 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
         enable_pdl: bool = True,
         push_plane: PushPlane | None = None,
     ) -> None:
+        """Create the workspace on every rank of ``group`` (collective).
+
+        Args:
+            tp_size: Number of ranks in ``group``, at least 2.
+            tp_rank: This rank's index in ``group``.
+            max_token_num: Largest ``M`` a call may gather.
+            hidden_dim: Full hidden size ``H``; each rank holds ``H/tp_size`` columns.
+            group: TP process group.
+            enable_pdl: Launch the kernels with programmatic dependent launch.
+            push_plane: Exchange through the caller's two-slot buffer instead of
+                an own mailbox; must pass :func:`supports_push_plane` on every rank.
+        """
         # Every rank votes, so all ranks reject or construct together.
         if push_plane is not None and not collective_support(
             supports_push_plane(push_plane, max_token_num, hidden_dim),
@@ -332,7 +377,12 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
 
     @flashinfer_api
     def compile(self, *, eps: float, gain_center: float = 0.0) -> None:
-        """Compile one constant set ahead of time, e.g. before graph capture."""
+        """Compile one constant set ahead of time, e.g. before graph capture.
+
+        Args:
+            eps: RMSNorm epsilon.
+            gain_center: Constant added to the RMSNorm weight.
+        """
         self.impl.compiled(_NormQuantConstants(float(eps), float(gain_center)))
 
 
@@ -340,7 +390,16 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
 def supports_push_plane(
     push_plane: PushPlane, max_token_num: int, hidden_dim: int
 ) -> bool:
-    """Whether one phase half holds ``max_token_num`` gathered rows."""
+    """Whether ``push_plane`` is valid and one phase half holds ``max_token_num`` rows.
+
+    Args:
+        push_plane: The caller's two-slot buffer, multicast address and epoch.
+        max_token_num: Largest ``M`` of the workspace.
+        hidden_dim: Full hidden size ``H``.
+
+    Returns:
+        Whether the workspace can exchange through ``push_plane`` on this rank.
+    """
     device = torch.device("cuda", torch.cuda.current_device())
     half_bytes = push_plane.half_bytes
     buffer = push_plane.buffer
@@ -370,7 +429,14 @@ def supports_all_gather_rmsnorm_fp4_quantize(
 ) -> bool:
     """Check only this rank. Use ``workspace.check_support`` to agree across ranks.
 
-    ``shard`` None checks the consumer-only call for ``num_tokens`` rows.
+    Args:
+        workspace: Workspace the call will use.
+        shard, weight, global_scale, num_tokens: The arguments of
+            :func:`all_gather_rmsnorm_fp4_quantize`; ``shard`` None checks the
+            consumer-only call for ``num_tokens`` rows.
+
+    Returns:
+        Whether this rank's arguments fit the fused path.
     """
     hidden = workspace.hidden_dim
     device = workspace.device

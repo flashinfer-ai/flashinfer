@@ -71,6 +71,17 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
         group: ProcessGroup,
         enable_pdl: bool = True,
     ) -> None:
+        """Create the workspace on every rank of ``group`` (collective).
+
+        Args:
+            tp_size: Number of ranks in ``group``, at least 2.
+            tp_rank: This rank's index in ``group``.
+            max_token_num: Largest ``M`` a call may reduce.
+            hidden_dim: Hidden size, a positive multiple of 1024.
+            top_k: Routes per token.
+            group: TP process group.
+            enable_pdl: Launch the kernels with programmatic dependent launch.
+        """
         if tp_size < 2:
             raise ValueError("tp_size must be at least 2")
         if max_token_num <= 0:
@@ -98,6 +109,12 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
 
         Call on every rank during warmup, even when its local result is False.
         All ranks must use the agreed path and keep valid layouts for replay.
+
+        Args:
+            local_supported: This rank's ``supports_*`` result.
+
+        Returns:
+            True only if every rank passed True.
         """
         return collective_support(local_supported, self._group, self.device)
 
@@ -125,7 +142,15 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
         gain_center: float = 0.0,
         weight_before_norm: bool = True,
     ) -> None:
-        """Compile one configuration ahead of time, e.g. before graph capture."""
+        """Compile one configuration ahead of time, e.g. before graph capture.
+
+        Args:
+            row_stride: ``routed_rows.shape[1]`` of the calls.
+            weight_dtype: ``route_weights.dtype`` of the calls.
+            eps: RMSNorm epsilon.
+            gain_center: Constant added to ``norm_weight``.
+            weight_before_norm: Whether the weight scales the row before the norm.
+        """
         self.impl.publisher(
             row_stride=row_stride,
             weight_dtype=weight_dtype,
@@ -144,7 +169,16 @@ def supports_moe_finalize_rmsnorm_allreduce(
     norm_weight: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
-    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks.
+
+    Args:
+        workspace: Workspace the call will use.
+        routed_rows, route_weights, permuted_idx, norm_weight, output: The
+            arguments of :func:`moe_finalize_rmsnorm_allreduce`.
+
+    Returns:
+        Whether this rank's arguments fit the fused path.
+    """
     hidden = workspace.hidden_dim
     device = workspace.device
     m = output.shape[0] if output.ndim == 2 else 0
