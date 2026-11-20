@@ -535,6 +535,12 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
     smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8
 
     def _main(BLK, MINB, U, SPLIT):
+        # R > 1 parts of one row are merged only by the SPLIT body; an unsplit
+        # body would emit each part's own top-k (inexact, seen when forced).
+        if R > 1 and not SPLIT:
+            raise RuntimeError(
+                f"gvr_2 route: R={R} needs the SPLIT body (b={b}, n={n})"
+            )
         # KPT ladder 1/2/4/8; grid = (R, b).
         kpt = 1 if k <= BLK else (2 if k <= 2 * BLK else (4 if k <= 4 * BLK else 8))
         # TSH-floor staging gate.  The CUDA form is a grid-uniform RUNTIME
@@ -825,6 +831,12 @@ def route_streaming(
     smem_main = (scap + 4) * (8 if (R > 1 or b <= 296) else 4) + (cmp_ + 1) * 8
 
     def _main(blk_, minb_, u_, split_):
+        # R > 1 parts of one row are merged only by the SPLIT body; an unsplit
+        # body would emit each part's own top-k (inexact, seen when forced).
+        if R > 1 and not split_:
+            raise RuntimeError(
+                f"gvr_2 route_streaming: R={R} needs the SPLIT body (b={b}, n={n})"
+            )
         kpt = 1 if k <= blk_ else (2 if k <= 2 * blk_ else (4 if k <= 4 * blk_ else 8))
         tshg = bool(split_) and b > 15 and k <= 1024 and (n >> 2) <= 32768
         return {
