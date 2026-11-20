@@ -2752,15 +2752,43 @@ def _journal_fp8_graph_writes(wrapper, candidate, num_indices, num_lengths):
     ):
         destinations.append(buf.as_strided((buf.numel(),), (1,)).view(torch.uint8))
 
-    # Finish earlier ordered uses of the pinned workspace before reading it.
-    # Pageable host backups avoid doubling device or locked-host reservations.
-    # Complete all allocations before making even the first live write.
-    torch.cuda.current_stream(wrapper.device).synchronize()
+    # One slot per write destination, not per shape or pointer. Install the
+    # replacement tuple on the staged wrapper only. Slots contain scratch,
+    # never references to the live destination or a previous transaction.
+    previous = getattr(wrapper, "_fp8_replan_backup_pool", ())
     backups = []
-    for dst in destinations:
-        saved = torch.empty(dst.shape, device="cpu", dtype=dst.dtype, pin_memory=False)
-        saved.copy_(dst)
+    for i, dst in enumerate(destinations):
+        # Local CUDA copies are ordered with the native planner. Preserve the
+        # blocking host snapshot for any destination on a different device.
+        device = dst.device if dst.device == wrapper.device else torch.device("cpu")
+        saved = previous[i] if i < len(previous) else None
+        if (
+            saved is None
+            or saved.device != device
+            or saved.dtype != dst.dtype
+            or saved.shape != dst.shape
+        ):
+            # Scratch can outlive the caller's inference_mode context.
+            with torch.inference_mode(False):
+                saved = torch.empty(
+                    dst.shape, device=device, dtype=dst.dtype, pin_memory=False
+                )
         backups.append((dst, saved))
+    wrapper._fp8_replan_backup_pool = tuple(saved for _, saved in backups)
+
+    stream = torch.cuda.current_stream(wrapper.device)
+    with torch.no_grad():
+        try:
+            for dst, saved in backups:
+                if saved.is_cuda:
+                    saved.copy_(dst, non_blocking=True)
+        finally:
+            # Finish the device snapshots (also on partial snapshot failure)
+            # and prior ordered DMA before touching the pinned host workspace.
+            stream.synchronize()
+        for dst, saved in backups:
+            if not saved.is_cuda:
+                saved.copy_(dst)
     wrapper._fp8_replan_journal.extend(backups)
 
 

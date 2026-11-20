@@ -663,6 +663,13 @@ def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
         }
 
     plan(24)
+    pool = w._fp8_replan_backup_pool
+    assert sum(t.nbytes for t in pool if t.device.type == "cpu") == workspaces[1].nbytes
+    assert not any(t.is_pinned() for t in pool if t.device.type == "cpu")
+    assert sum(t.nbytes for t in pool if t.is_cuda) == workspaces[0].nbytes + 72
+    plan(24)
+    assert len(w._fp8_replan_backup_pool) == len(pool)
+    assert all(a is b for a, b in zip(pool, w._fp8_replan_backup_pool, strict=True))
     ref = dict(
         b,
         q=q[:24],
