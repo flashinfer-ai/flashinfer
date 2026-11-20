@@ -984,7 +984,11 @@ void trtllm_ragged_attention_launcher(
   runner_params.vStrideBatch = v_stride_batch;
 
   runner_params.mKernelType = FmhaKernelType::Context;
-  runner_params.mTileScheduler = TileScheduler::Persistent;
+  // Same SM103 persistent-context defect as the paged launcher (#9700): synccheck reports
+  // "Missing wait" in the ragged *PersistentContext kernels when one CTA processes more than one
+  // tile (#9728). Every SM103 ragged persistent kernel has a matching *StaticContext kernel.
+  runner_params.mTileScheduler =
+      fmha_runner->smVersion() == kSM_103 ? TileScheduler::Static : TileScheduler::Persistent;
   runner_params.mMultiCtasKvMode = false;
   runner_params.mMaskType =
       fixedWindowBinds(is_causal, max_kv_len, window_left, window_right)
