@@ -13,8 +13,10 @@ Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) o
 (HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16 and, with ``return_lse``, the LSE member
 ``(total_q, Hq)`` fp32 (``spec.lse_term``; base 2, or base e with ``lse_base="ln"``). ``sinks``, an fp32 ``(Hq,)`` tensor of
 per-head sink logits, selects the sink member (``spec.sink_merge``: one more merge per row, after its last chunk). The planner runs on
-host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
-split units, the fixup.
+host copies of the indptr arrays (as FlashInfer's ``plan`` does) and a plan runs with the index offsets it was
+built from: the descriptor table carries every request's query offset, KV length and page-table range, so
+``run_attention`` launches the plan's own ``kv_indptr`` and rejects a differing one (``kv_indices`` is read at
+run time). ``run`` launches the kernel and, for split units, the fixup.
 """
 
 from __future__ import annotations
@@ -397,6 +399,8 @@ class _Planned:
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
         self.page: Optional[int] = None
+        # the plan's kv_indptr (int32 on the device): the page-table offsets the descriptor table holds; the kernels run with it
+        self.kv_indptr: Optional[torch.Tensor] = None
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -518,6 +522,9 @@ def plan_attention(
     planned.config = config
     planned.page = int(page)
     planned.has_sinks = None if has_sinks is None else bool(has_sinks)
+    planned.kv_indptr = kv_indptr.to(
+        device=device, dtype=torch.int32, copy=True
+    ).contiguous()
     return planned
 
 
@@ -648,6 +655,38 @@ def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> 
     return False
 
 
+def plan_kv_indptr(planned: _Planned, kv_indptr: torch.Tensor) -> torch.Tensor:
+    """The ``kv_indptr`` a plan runs with. The descriptor table holds every request's page-table offset and page count
+    (``plan.F_KVPTR0`` / ``F_NPAGES``) next to its query offset and KV length, so the kernels take the plan's own snapshot
+    (``plan_attention`` records it); ``kv_indptr`` must be the array the plan was built from. The same storage is accepted as is;
+    another tensor is compared on the device and rejected when it differs, except under CUDA graph capture (no device read), where
+    the snapshot runs as planned. A moved page table needs a new plan; ``kv_indices`` is read at run time."""
+    snap = planned.kv_indptr
+    assert snap is not None, "plan_attention records the plan's kv_indptr"
+    if kv_indptr is snap or (
+        kv_indptr.device == snap.device
+        and kv_indptr.dtype == snap.dtype
+        and kv_indptr.data_ptr() == snap.data_ptr()
+        and kv_indptr.numel() == snap.numel()
+        and kv_indptr.is_contiguous()
+    ):
+        return snap
+    if kv_indptr.numel() != snap.numel():
+        raise ValueError(
+            f"kv_indptr of {kv_indptr.numel()} entries at run_attention over a plan built from {snap.numel()}: the descriptor "
+            "table holds the planned requests' page-table ranges; plan again"
+        )
+    if snap.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return snap
+    if not torch.equal(kv_indptr.to(device=snap.device, dtype=snap.dtype), snap):
+        raise ValueError(
+            "kv_indptr at run_attention differs from the plan's: the descriptor table holds the requests' page-table offsets and "
+            "page counts, so a plan runs with the kv_indptr it was built from; plan again for a changed page table (kv_indices "
+            "may change between runs, kv_indptr may not)"
+        )
+    return snap
+
+
 def run_attention(
     planned: _Planned,
     q: torch.Tensor,
@@ -666,9 +705,12 @@ def run_attention(
     lse_base: str = "log2",
     sinks: Optional[torch.Tensor] = None,
 ):
-    """``return_lse``: also return the LSE member ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to
-    ``lse`` when given; the output bits are the same with and without it. ``sinks``: the fp32 ``(Hq,)`` per-head sink logits
-    of the sink member (``None``: the class without sinks)."""
+    """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
+    runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time. ``return_lse``: also return the LSE member
+    ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to ``lse`` when given; the output bits are the same
+    with and without it. ``sinks``: the fp32 ``(Hq,)`` per-head sink logits of the sink member (``None``: the class without
+    sinks)."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -777,7 +819,7 @@ def run_attention(
         q,
         k_cache,
         v_cache,
-        kv_indptr,
+        plan_kv_indptr(planned, kv_indptr),
         kv_indices,
         c,
         window_left,
@@ -810,8 +852,9 @@ def _run_attention_validated(
     lse_mode: int = 0,
     sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale. ``enable_pdl``: launch the
-    attention kernel as a programmatic dependent of the preceding kernel (None: the device's default, ``device_support_pdl``).
+    """Launch after the public engine or wrapper has checked inputs; ``kv_indptr`` is the plan's snapshot (``plan_kv_indptr``), ``c``
+    the binary32 log2 scale. ``enable_pdl``: launch the attention kernel as a programmatic dependent of the preceding kernel (None:
+    the device's default, ``device_support_pdl``).
     ``lse_mode`` 1 / 2 stores the base-2 / base-e LSE member of every row into ``lse`` (contiguous fp32, ``total_q * Hq``
     elements); every kernel takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0.
     ``sinks`` (validated fp32 ``(Hq,)``) selects the kernels compiled for the sink member (their own names): the fold that
@@ -877,7 +920,6 @@ def _run_attention_validated(
             planned.groups,
             planned.fold_counters,
             planned.desc,
-            kv_indptr,
             kv_indices,
             float(c),
             float(-c),

@@ -1188,6 +1188,74 @@ def test_sm_count_and_grid_do_not_change_bits():
 
 
 @needs_device
+@pytest.mark.parametrize("decode", [True, False])
+def test_run_attention_runs_the_plan_s_kv_indptr(decode):
+    """The plan owns the page-table offsets: the descriptor table carries every request's first page-table entry and page count
+    next to its query offset and KV length, the kernels run with the plan's own kv_indptr, and run_attention accepts the array the
+    plan was built from or an equal copy (host or device) and rejects one that differs or has another length. The bits do not
+    depend on which equal tensor the caller passes."""
+    from flashinfer.attention.batch_invariant import engine
+
+    D = 128
+    pr = (
+        Problem([1] * 6, [900, 1500, 2100, 300, 4096, 777], 32, 8, D, 16, seed=23)
+        if decode
+        else Problem([200, 33, 1000], [2000, 500, 1000], 32, 8, D, 16, seed=24)
+    )
+    cfg = engine.default_config(D=D)
+    planned = engine.plan_attention(
+        pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, D, 16, -1, cfg, None, pr.device
+    )
+    assert planned.kv_indptr is not None
+    assert torch.equal(planned.kv_indptr, pr.kv_indptr)
+    assert planned.kv_indptr.data_ptr() != pr.kv_indptr.data_ptr()  # a snapshot
+
+    def run(plan, kv_indptr):
+        return bits(
+            engine.run_attention(
+                plan,
+                pr.q,
+                pr.k_nhd,
+                pr.v_nhd,
+                kv_indptr,
+                pr.kv_indices,
+                1.0 / math.sqrt(D),
+                -1,
+                "NHD",
+                None,
+                cfg,
+            )
+        )
+
+    ref = run(planned, pr.kv_indptr)
+    wrapper = run_decode(pr)[0] if decode else run_paged_prefill(pr)
+    assert torch.equal(ref, bits(wrapper))
+    assert torch.equal(run(planned, planned.kv_indptr), ref)  # the snapshot itself
+    assert torch.equal(run(planned, pr.kv_indptr.clone()), ref)  # an equal copy
+    assert torch.equal(run(planned, pr.kv_indptr.cpu()), ref)  # the host array
+    from_host = engine.plan_attention(
+        pr.qo_indptr.cpu(),
+        pr.kv_indptr.cpu(),
+        pr.kv_last.cpu(),
+        32,
+        8,
+        D,
+        16,
+        -1,
+        cfg,
+        None,
+        pr.device,
+    )  # a plan built from host arrays (the wrappers' way) runs with the device array
+    assert torch.equal(run(from_host, pr.kv_indptr), ref)
+    with pytest.raises(ValueError, match="differs from the plan"):
+        run(
+            planned, pr.kv_indptr + 1
+        )  # the same page counts at moved offsets: another page table
+    with pytest.raises(ValueError, match="entries at run_attention"):
+        run(planned, pr.kv_indptr[:-1])
+
+
+@needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
 def test_config_agreement(D):
     """R3: every member of the configuration space (ring depth, unit kind, softmax warpgroups, fold placement, small-unit body)

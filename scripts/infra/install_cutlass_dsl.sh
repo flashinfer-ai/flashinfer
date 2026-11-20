@@ -2,7 +2,7 @@
 # Resolve the DSL's matching libraries even when other CI dependencies use --no-deps.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 requirements=$(python - "${REPO_ROOT}" <<'PYTHON'
 import sys
 from importlib.metadata import PackageNotFoundError, version

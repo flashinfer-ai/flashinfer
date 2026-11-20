@@ -500,12 +500,10 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from a
-        # snapshot: a later in-place change by the caller cannot reach a plan built from the old values; the plan is published only once
-        # everything it runs with exists
-        kv_indptr_dev = kv_indptr.to(
-            device=self.device, dtype=torch.int32, non_blocking=non_blocking, copy=True
-        ).contiguous()
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
+        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets), kv_indices' is
+        # taken here; a later in-place change by the caller cannot reach a plan built from the old values, and the plan is published
+        # only once everything it runs with exists
         kv_indices_dev = (
             kv_indices.to(
                 device=self.device,
@@ -518,7 +516,7 @@ class BatchInvariantAttention:
         )
         self._planned = planned
         self._config = config
-        self._kv_indptr = kv_indptr_dev
+        self._kv_indptr = planned.kv_indptr
         self._kv_indices = kv_indices_dev
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0

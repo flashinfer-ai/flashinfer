@@ -192,9 +192,14 @@ depend on the batch; the class is what the mode promises instead.
 |---|---|---|---|
 | `softmax(..., batch_invariant=True, out_dtype=)` | `lse.row`; `fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])` (the vocabulary, the input dtype and whether a temperature enters the scale are the specification's dimensions; `out_dtype=torch.float32` names the fp32 input's specification: the leaves of a 16-bit input are its exact widenings, so only the output conversion differs) | `c = log2(e)` or `div.rn(log2(e), T)`; `z_j = mul.rn(add.rn(x_j, neg(m)), c)`; `e_j = ex2.approx.ftz(z_j)`; `s` the `add.rn` tree over the `e_j`; `p_j = cvt.rn(mul.rn(e_j, div.rn(1, s)))` in the input dtype, or `mul.rn(e_j, div.rn(1, s))` itself with `out_dtype=torch.float32`. `m` is the `max.f32` tree (a NaN operand yields the other; a NaN logit then propagates through the sum), a `-inf` logit weighs `+0` | bf16 / f16 / fp32 logits `(..., N)`, any `N` up to 2^21 (beyond it where the row's alignment admits a configuration; an odd fp32 row of 2^21 + 1 has none); temperature `None`, a positive scalar, or one per row (f16 / bf16 / f32 / f64, the last rounded to f32); same-dtype or fp32 output; `enable_pdl`; SM100 / SM103 / SM107 |
 | `log_softmax(logits, temperature[, out_dtype=])` | the same class; `fingerprint("log_softmax", N=, dtype=, temperature=[, out_dtype=])` -- the class fingerprint, or with `out_dtype` the input's 16-bit dtype the 16-bit output member's (the converted element is a different output, so a different receipt) | the row `logp_j = mul.rn(add.rn(z_j, neg(lg2.approx.ftz(s))), ln 2)` in fp32, shape `logits.shape`; with `out_dtype` the input's 16-bit dtype the same row converted once, `cvt.rn(logp_j)` (bit for bit torch's `.to(dtype)` of the fp32 row: the `aten::_log_softmax(bf16) -> bf16` shape the trainers override) | as above; `out_dtype` `None` / `torch.float32` (the fp32 row) or the input dtype (16-bit inputs); `batch_invariant=True` is the pinned contract, `batch_invariant=False` (the default) is the operator's regular kernel for this entry, today the same class (a future release may route it elsewhere) |
-| `log_probs(logits, token_ids, temperature, return_lse=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of the ids' shape / `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch); the `batch_invariant` flag as for `log_softmax` |
+| `log_probs(logits, token_ids, temperature, return_lse=[, top_k=, top_p=, min_p=, filter_apply_order=])` | the same class and fingerprint (`fingerprint("log_probs", ...)`); with a filter the kept-set log-probability's receipt, the row class's joined with `support.row.v1`'s (`fingerprint("log_probs", N=, dtype=, temperature=, top_k=, top_p=, min_p=, filter_apply_order=)`: `lse-row-<h>+support-row-<h>`) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of the ids' shape / `logits.shape[:-1]`. With `top_k` / `top_p` / `min_p` the log-probability under the sampler's kept-set distribution instead: `support.row.v1`'s kept set and mass at the row (the truncated samplers' selection, verbatim: ties at the cut kept), then `mul.rn(add.rn(z_t, neg(lg2.approx.ftz(mass))), ln 2)` -- bit for bit the `kept_logp` the samplers return for the token they drew, the engines' processed log-probability; `-inf` for a token outside the kept set (its probability there is zero), NaN for an id outside `[0, N)` or a row whose kept mass is not a positive finite number | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch; one per row with a filter); the filters as the truncated samplers take them (scalars or one per row, `filter_apply_order` `"top_k_first"` / `"joint"`), `return_lse` refused with a filter, `batch_invariant=True` required for them; the `batch_invariant` flag otherwise as for `log_softmax` |
 | `sampling_from_probs(probs, indices, generator, seed, offset, return_valid, batch_invariant=True)` | `sample.icdf.v1`; `fingerprint("sampling_from_probs", N=, dtype=)` (the vocabulary is the dimension; the dtype is validated and enters nothing: the leaves of a 16-bit input are its exact widenings and the draw converts no output) | the inverse CDF read off the row class's canonical sum tree `S` of the given weights (the same `add.rn` tree as `lse.row`'s `s`): the threshold `t = mul.rn(u, S)` with `u` the fp32 uniform of the row's stream; the vocabulary walked in the tree's order (lane-major, then block, then element), the inclusive prefix of an element `add.rn(outer, fold_e)` where `fold_e` is the slot fold's running value and `outer` the `add.rn` chain, in ascending bit order from `+0`, of the left-sibling nodes of the tree the element's address names (every one a value the kernel's placement already holds: no new reduction, no division); the token is the first present element with a positive weight whose prefix is `>= t` (the positivity is part of the rule: the last prefix of a slot and the `outer` of the next are different `add.rn` chains over the same nodes, so a zero-weight slot head could otherwise be the first crossing), else the last with a positive weight; a row whose `S` is not a positive finite number is invalid (token `-1`, `valid` False) | bf16 / f16 / fp32 weights `>= 0` of shape `(..., N)`, any `N` as for `softmax`; `indices` int32 / int64 (the gather; the output takes its dtype; an index outside the source rows makes its output row invalid: token `-1`); `seed` / `offset` as the operator takes them, one key per output row (int64 / uint64 tensors of length M; a scalar, a length-one tensor or the pair reserved from `generator` exactly as the operator's path reserves it serves a single row -- shared by several rows it is refused, since every row would draw at the same uniform); `deterministic` ignored (deterministic by construction), `check_nan` the same host check; int32 tokens; SM100 / SM103 / SM107 |
 | `sampling_from_logits(logits, indices, generator, seed, offset, batch_invariant=True[, temperature=, return_logprob=])` | `sample.icdf.v1`; `fingerprint("sampling_from_logits", N=, dtype=[, temperature=])` (the logits form embeds `lse.row`'s trees: a different fingerprint per vocabulary from the probabilities form, and another with a temperature in the scale); the returned log-probability carries `lse.row`'s receipt (`fingerprint("log_probs", N=, dtype=, temperature=)`) | the same draw over the `lse.row` weights `e_j = ex2.approx.ftz(mul.rn(add.rn(x_j, neg(m)), c))` of the row, `c = log2(e)` or `div.rn(log2(e), T)`, without materialising the probabilities; `S` is `lse.row`'s `s`, so the drawn token's log-probability under `log_probs` is the probability it was drawn with (R4, stated in Lean: `Draw.total_logits_eq_specSum`); with `return_logprob` that log-probability is returned from the same launch, `mul.rn(add.rn(z_t, neg(lg2.approx.ftz(S))), ln 2)` = `log_probs(logits, samples, temperature)` bit for bit | as above for logits (a row of `-inf` logits, or with a NaN, is invalid, its log-probability NaN); `temperature` `None`, a positive scalar or one per row as for `softmax`; the outputs `samples` or `(samples, logp)` |
+| `top_k_sampling_from_probs(probs, top_k, indices, generator, seed, offset, return_valid, batch_invariant=True)` | `sample.icdf.v1` over `support.row.v1`; `fingerprint("top_k_sampling_from_probs", N=, dtype=)` (the two classes' fingerprints joined: the draw's tree and the kept set's rules at the vocabulary; the dtype validated, it enters nothing) | the kept set `{j : w_j >= t}` with `t` the k-th largest weight, found by an exact radix selection over the weights' 31-bit patterns (two to four passes of integer histograms by input kind: order-free; ties at the cut kept, `k <= 0` keeps nothing, `k >= N` everything), then `sampling_from_probs`'s draw over the masked weights (the dropped ones `+0`): the threshold `mul.rn(u, mass)` with `mass` the canonical `add.rn` tree over the kept weights, the token the first kept element whose prefix reaches it (the prefix nodes those of the masked tree); a row with nothing kept, no positive kept weight or a non-finite sum is invalid (token `-1`) | bf16 / f16 / fp32 weights `>= 0` of shape `(..., N)`, `N` whose padded row (blocks of 256 rounded up to a power of two) fits the staging budget of a 16-CTA cluster (`MAX_CLUSTER * SMEM_BUDGET`: `N <= 2^20` for bf16 / f16, `N <= 2^19` for fp32; beyond it `BatchInvariantUnsupportedError`); `top_k` an int or an int32 / int64 tensor of one value or one per row (an int64 value is clamped to `[0, N]` before the int32 cast; `top_k <= 0` keeps nothing, where the operator's kernel treats it as no filter) (one per *source* row when `indices` is given, read at `indices[i]` for output `i`: the operator's rule; `temperature` is one per output row); `indices`, `seed` / `offset` / `generator` as for `sampling_from_probs` (one key per output row); `deterministic` ignored (deterministic by construction), `check_nan` the same host check; int32 tokens (the indices' dtype with `indices`), `return_valid`; SM100 / SM103 / SM107 |
+| `top_p_sampling_from_probs(probs, top_p, ..., batch_invariant=True)` | the same classes; `fingerprint("top_p_sampling_from_probs", N=, dtype=)` | the kept set the smallest upward-closed set whose declared fixed-point mass -- `q_j = trunc(mul.rn(p_j, div.rn(2^44, S)))` (`cvt.rzi`), an exact integer sum -- reaches `trunc(mul.rn(p, 2^44))`, `S` the row's canonical tree (ties kept; every positive weight when `p >= 1` or the positive mass does not reach the target, zero weights never; a row whose sum is below 2^-84, where the fixed-point scale `div(2^44, S)` overflows, keeps nothing and is invalid), then the draw over it | as above; `top_p` a float or an fp32 tensor of one value or one per row |
+| `min_p_sampling_from_probs(probs, min_p, ..., batch_invariant=True)` | the same classes; `fingerprint("min_p_sampling_from_probs", N=, dtype=)` | the kept set `{j : p_j >= mul.rn(p_max, min_p)}` with `p_max` the row's `max.f32` tree, then the draw over it | as above; `min_p` a float or an fp32 tensor of one value or one per row |
+| `top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices, filter_apply_order, ..., batch_invariant=True)` | the same classes; `fingerprint("top_k_top_p_sampling_from_probs", N=, dtype=[, filter_apply_order=])` (the order is a dimension) | `top_k_first`: the top-k cut, then the top-p cut with the kept mass as `S` (the masked tree); `joint`: both cuts on the whole row, intersected; then the draw over the kept set -- one kernel either way | as above; `top_k_max` ignored (no fast path) |
+| `top_k_top_p_sampling_from_logits(logits, top_k, top_p, indices, filter_apply_order, ..., batch_invariant=True[, temperature=, return_logprob=, return_kept_logprob=])` | the same classes; `fingerprint("top_k_top_p_sampling_from_logits", N=, dtype=[, filter_apply_order=, temperature=])` (the logits form embeds `lse.row`'s trees: another fingerprint per vocabulary, and another with a temperature in the scale); the returned log-probabilities carry `lse.row`'s receipt (`fingerprint("log_probs", N=, dtype=, temperature=)`) | the same over the `lse.row` weights `e_j = ex2.approx.ftz(mul.rn(add.rn(x_j, neg(m)), c))` of the row, `c = log2(e)` or `div.rn(log2(e), T)`, without materialising the probabilities: the row's `S` is `lse.row`'s `s`, the kept set and the draw are those of the row's softmax at the temperature; with `return_logprob` the drawn token's log-probability under the **full** distribution, `mul.rn(add.rn(z_t, neg(lg2.approx.ftz(S))), ln 2)` = `log_probs(logits, samples, temperature)` bit for bit (never renormalised over the kept set); with `return_kept_logprob` the one renormalised over the kept set, `mul.rn(add.rn(z_t, neg(lg2.approx.ftz(mass))), ln 2)` (the probability it was drawn with) | bf16 / f16 / fp32 logits of shape `(..., N)`; `temperature` `None`, a positive scalar or one per row as for `softmax`; a row of `-inf` logits, or with a NaN, is invalid (its log-probabilities NaN); the outputs `samples[, logp][, kept_logp]`, or into the caller-owned buffers `out=` / `logprob_out=` / `kept_logprob_out=` (written in place, returned as given; every truncated sampler takes `out=`: int32, or int64 with int64 `indices`; the buffers are refused, never copied, when they do not fit, and may not overlap an input or each other; the default path refuses them; the kernel's validity word and, unless the caller asks for it, the kept mass go to a per-device scratch, so a step allocates nothing it does not return) |
 
 **The stream.** Under the flag the uniform of a row comes from `stream.philox4x32-10.splitmix-key.v1` (`sampling/stream.py`,
 `lean/BIKernels/Stream.lean`): the key `K = mix64(seed ^ mix64(offset))` (SplitMix64's finalizer), Philox4x32-10 on the
@@ -239,10 +244,15 @@ the value is fp32 (or its one conversion to the input's 16-bit dtype), and two c
 pass the same logits bits with the same temperature (or identically pre-scaled logits and `temperature=None`) on the same
 architecture (the two MUFU tables are identical on SM100 and SM107, measured over every input); a greedy row's temperature
 of 0 is replaced by `1.0` or `None` before the call. The draw's `return_logprob` is this value -- the full
-distribution's, never renormalised over a filtered support (the truncated samplers' companion PR, `bi/09-sampling-support`,
-gives `top_k_top_p_sampling_from_logits` the same `return_logprob`, and the renormalised value the engines' `processed_logprobs`
+distribution's, never renormalised over a filtered support (`top_k_top_p_sampling_from_logits`
+gives the same `return_logprob`, and the renormalised value the engines' `processed_logprobs`
 of a filtered mode report as a separate named output, `return_kept_logprob`) -- so
 the engine's returned log-probability and the trainer's `log_probs` / `log_softmax` of the same row are one definition.
+A trainer that re-scores under the sampler's filters instead (NeMo RL's sampler replay; a comparison against the engine's
+processed log-probabilities) calls `log_probs(logits, token_ids, temperature, batch_invariant=True, top_k=, top_p=, min_p=,
+filter_apply_order=)`: the same kept set as the sampler's (ties at the cut kept, as the class defines it -- a torch
+re-implementation breaks ties by position, and bf16 logits widened to fp32 tie constantly across a 150k vocabulary) and
+the same chain, so the value is the engine's `return_kept_logprob` bit for bit, `-inf` for a token outside the kept set.
 Nothing is stored and no RNG state crosses to the trainer: the draw is a function of the row, its `(seed, offset)` key
 and the temperature, and the trainer never re-draws.
 
@@ -258,7 +268,8 @@ Megatron-Core's `batch_invariant_kernels.py` registration of `aten::_log_softmax
 
 **Caller-owned outputs.** Every sampling entry under the flag takes its outputs as optional caller-owned buffers --
 `softmax(..., out=)`, `log_softmax(..., out=)`, `log_probs(..., out=, lse_out=)`, `sampling_from_probs(..., out=)`,
-`sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates nothing
+`sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates no output (a Python-scalar filter of the truncated samplers
+is broadcast into a per-row tensor per call; per-row tensors avoid it)
 (the kernels' validity word, which the draws do not return unless asked, goes to a per-device scratch grown to the largest
 batch seen and never freed once handed out: a graph that captured it, or a kernel still pending on another stream, keeps
 writing to its address after the cache has grown): CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
@@ -272,7 +283,7 @@ with int64 `indices` (filled by a cast from the kernel's int32 tokens, the opera
 the entries allocate their outputs as the operator's own kernels do (graph-safe through torch's private pools). The
 inputs are read in place when they are in the kernels' form -- int64 or uint64 keys, an fp32 per-row temperature, int64
 indices, contiguous rows -- and conditioned (a cast or a copy) otherwise; the validity mask is formed only when asked
-for (`return_valid`). `softmax`, `sampling_from_probs` and `sampling_from_logits` refuse the buffers on their default path
+for (`return_valid`). A probability row with a negative weight is outside the contract (the samplers' weights are non-negative) and is invalid on every path and placement: token `-1`, `valid` false, NaN mass and log-probabilities; `-0.0` is a zero, a NaN weight of either sign invalidates the row as before, and a logits input cannot produce a negative weight (`ex2` is never negative). The test costs nothing: every candidate filter compares the value (`w >= threshold`, the pattern test's set for non-negative weights), the list paths read the flag off the selection's own candidate count, and the dense tail's masked tree flags its leaves and poisons one partial (NaN mass) -- no extra pass, no extra exchange. `softmax`, `sampling_from_probs` and `sampling_from_logits` refuse the buffers on their default path
 (`batch_invariant=False`: the operator's kernels allocate their own outputs) rather than copying into them; `log_softmax`
 and `log_probs` run the class under either flag value and take them.
 
@@ -314,6 +325,39 @@ as placement-invariant as the tree), the selection rule (`select`; `select_pos`:
 decides the published Philox4x32-10 and SplitMix64 vectors; the generated `draw*` / `stream*` cases compare the terms
 and the blocks with the Python specification. Exact CPU model: `sampling/draw_reference.py`. Tests:
 `tests/utils/test_batch_invariant_sampling_draw.py`.
+
+The support class `support.row.v1` (`sampling/support_spec.py`, `support_reference.py`, `support_schedule.py`; the device
+code of its selection passes in `sampling/support_kernel.py`) is the kept set of a row under top-k / top-p / min-p filters
+-- a function of the row's own values and the parameters alone, ties at the cut kept -- with its effective threshold, kept
+count and kept mass: the selection stage of the five truncated samplers above (`sampling/draw_support_kernel.py`: the
+support's passes, then the draw kernel's recording sum pass over the masked weights and its crossing pass, in one launch;
+the generic entry `draw_support_api.draw_support`; exact model `draw_reference.draw_support_reference`) and of
+`log_probs(..., top_k / top_p / min_p)` (the score form of the same kernel, `draw_support_api.kept_log_probs`). It has no
+entry of its own: `top_k_renorm_probs` / `top_p_renorm_probs` / `top_k_mask_logits` keep their `is_deterministic=True`
+kernels in this release (a flag there is deferred). The kernel
+stages the CTA's share of the row in shared memory once (the draw kernel's loader) and runs every pass from it: the row
+class's trees, then per filter a radix selection over the weights' bit patterns -- passes of 256-bin integer histograms
+(`red.shared.add.u32`, hardware-aggregated; the top-p masses in 32-bit chunks of lane-spread replicas) each scanned from
+the top by every warp with an exact integer prefix, a cluster's CTAs reducing their bins through `mapa`; a bf16
+probability's fp32 pattern has 16 zero low bits and an f16 one 13, so two / three passes determine its threshold (fp32
+inputs and the `ex2` weights of logits take four), and for the mass selection an early finish replaces the last passes by
+one compaction sweep and an exact rank selection when the selected bin holds at most 64 candidates (a placement pinned
+against the plain passes); with both filters in the `top_k_first` order the top-p candidates are the top-k kept set, so
+they are compacted once and selected by rank whenever they fit the list (about `k` of them), the mass passes running
+only when they do not; and for the four-pass kernels at the 128 KB shares the count selection's own passes after the
+first run on a gathered list of the selected bin's candidates (CTA-local, no cluster reduction) whenever those fit it
+(`count_list`, a placement pinned both ways) -- then the kept mass as the canonical tree over the kept weights. Every
+number the kernel compares or sums is an integer or a declared `.rn` / `cvt.rzi` result, so the kept set and the threshold
+are bit-identical in every member of the row class's space at one row per CTA; its dispatcher
+(`sampling/support_schedule.py`) is a closed form of `(N, M, elem_bytes, sm_count)` fitted on regret sweeps of that space on
+Rubin NVL8 and B200 (three regimes by how many rows share the device: the staged share per CTA, the cluster, the threads). The Lean model
+(`Support.lean`) states the threshold procedures over pattern lists and proves what the class declares of them (top-k
+keeps at least `k` and the cut one step up fewer; top-p reaches the target, no cut at a larger positive weight does, keeps
+only positive weights and in the fallback every positive weight; the intersection of cuts is the cut at the larger
+threshold) and the kept mass tree's placement invariance (`mass_invariance`); the generated `sup*` cases evaluate the
+procedures on concrete pattern lists against the Python reference and the conformance executable prints the mass and
+renormalisation terms. Exact CPU model: `sampling/support_reference.py`. Tests: the model's properties, the dispatcher's
+membership and the placement pins in `tests/utils/test_batch_invariant_sampling_draw_support.py`.
 
 ## Linear attention (GDN)
 
@@ -366,6 +410,9 @@ the whole remainder, so give the pool a storage of its own.
 
 What the caller owes the class:
 
+* A call that carries a sequence's state passes the pool. Without `initial_state` (and without the other state
+  arguments) the call does not raise: it is the stateless call below and returns rows from the zero state, so a decode
+  step that drops its pool returns every token as a first token.
 * A new sequence loaded into a slot starts with a prefill call (more tokens than sequences) or carries `prefix_lens`.
   A one-token call without `prefix_lens` continues what the slot holds: on a reused slot it continues the previous
   sequence, with finite rows that are not the new sequence's (nothing detects a slot whose state the caller replaced).
@@ -389,6 +436,94 @@ What the caller owes the class:
 `output_final_state` returns the pool. The decode entries (`gated_delta_rule_decode_pretranspose`,
 `gated_delta_rule_mtp`) do not take the flag: they compute the gates from the raw parameters and keep another state
 layout; a decode step of the class is a one-token call of `chunk_gated_delta_rule`.
+
+### Stateless call: a trainer's forward pass
+
+Without `initial_state` the same entry is a stateless call, the form a training forward takes: packed whole sequences,
+every one from the zero state, rows only.
+
+```python
+out = torch.empty_like(v)          # once, reused every step
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+```
+
+* The rows of a sequence are bit for bit the rows the pool calls return for it (prefill, chunked prefill and decode),
+  whatever the other sequences of the call, their order and their number. It is one launch of the class's prefill
+  kernel with every sequence reading the zero state and storing none.
+* No pool, no state next to a pool, no state returned: `state_indices`, `prefix_lens`, `output_state` and
+  `output_final_state=True` raise the typed error without `initial_state`. A sequence that has to continue later is a
+  pool call.
+* With `output=` and a contiguous int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and
+  adds no allocation of its own, and reads the offsets back to check them. With `cu_seqlens_cpu` it runs from those
+  host offsets instead (no read of a device tensor), so device and host offsets cannot disagree in it; only their lengths are compared.
+  The host offsets are copied to the device once and the last 16 copies are kept (across streams, devices and the
+  two forms of the call; a few int32 per sequence, and per stored state with `train_states`), so a call that repeats
+  the offsets of an earlier one on the same stream copies nothing. Offsets that are not 1-D integers raise the typed error. The
+  prefill underneath allocates, as in every prefill of the class, the normalized `q` and `k` (`2 * T * HQ * 256`
+  bytes), the linear gates (`4 * T * HV` bytes) and a small kernel workspace, all freed at return. Per device and
+  v-head count the class keeps one state tensor the kernel is pointed at and never reads or writes (3.1 MB at 48 v
+  heads) and, for the call without `train_states`, an int32 index tensor, allocated at the first stateless call and
+  regrown to twice the sequence count when a call brings more sequences than it holds (the replaced ones are kept,
+  a few bytes per sequence).
+* `output` may share no memory with an input, the offsets, `train_states` or one of the class's state pools (a pool
+  owns its storage from its first slot to the storage's end), and an `output` allocated under `inference_mode` is
+  refused in a call outside it (typed errors, before anything is written). The call bumps its autograd version (an
+  inference tensor has none).
+* It cannot be captured in a CUDA graph (it raises).
+* **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
+  `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
+  differentiable op on the same inputs wrapped in an `autograd.Function` whose forward returns these rows. The
+  shortcut `ref + (out - ref).detach()` rounds in bf16 and does not return these bits. What that gradient is, and
+  whether it is batch-invariant, is the trainer's.
+
+**Intermediates for a backward pass: `train_states`.** The same call stores the state every 64-token chunk of every
+sequence starts from in a caller-owned buffer:
+
+```python
+from flashinfer.batch_invariant.gdn import training_state_rows, training_state_slots
+
+states = torch.empty(training_state_slots(seq_lens), HV, 128, 128, device=v.device)   # fp32, once per layer
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out, train_states=states,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequence i starts from (zero for j = 0)
+```
+
+* A backward over the class's recurrence works from the inputs, the output gradient and, per 64-token chunk, the
+  state the chunk starts from. That state is the one term it cannot recompute from the chunk's own inputs; without
+  it a backward first re-runs the state scan over the sequence (FLA's backward and cuDNN's default path do). Every
+  other term of a chunk (the normalized `q` / `k`, the cumulative gates, the triangular solve, the corrected values)
+  is a function of the chunk's own 64 input rows and that state, so a backward evaluates the chunks independently of
+  each other and only the state adjoint runs from chunk to chunk. Those per-chunk terms are internal to the kernel
+  and are not exported, and no backward surveyed takes them from a forward.
+* **The layout is the one cuDNN's GDN backward takes** (`cudnn::gated_delta_net_bwd`, argument `state_checkpoints`
+  with `checkpoint_every_n_tokens=64`): `(n - 1) // 64 + 1` rows per sequence of `n` tokens, sequences in call order,
+  a sequence's first row the zero state its first chunk starts from (the call writes the zeros) and row `j` the state
+  after its first `64 * j` tokens; a state is `[HV, 128 (value), 128 (key)]`, one per v head (`state @ k` is the
+  predicted value). The state after a sequence's last token is not stored. With the same `q`, `k`, `v`, `g`, `beta`,
+  `cu_seqlens` and `scale`, `use_qk_l2norm_in_kernel=True` and `gate_domain="log"`, cuDNN frontend 1.32.3 takes the
+  buffer as it is; a frontend that requires the series in the input dtype takes `states.to(torch.bfloat16)`. The
+  gradients it returns from this series agree with the ones from its own recomputed series, and with an fp64 autograd
+  of the token recurrence, to bf16 rounding (`tests/gdn/test_batch_invariant_gdn_stateless.py`, skipped without the
+  frontend). cuDNN's own series is a bf16 rounding of its forward's states and is not these bits; the gradient is
+  the backward's, and this class makes no bitwise statement about it. FLA's `h` is the transpose,
+  `[..., key, value]`.
+* Each stored state is bit for bit the state an inference prefill of the same prefix leaves in its pool, whatever the
+  other sequences of the call. The output rows are the rows of the call without `train_states`.
+* 64 KiB per v head and chunk, which approaches 1 KiB per token and v head for long sequences (48 KiB per token at
+  48 v heads, four times the output) and is one state per sequence for sequences of at most 64 tokens. Rows past
+  `training_state_slots` are left as they are. The layout's index tensors are kept with the offsets' copies.
+* The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
+  that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is not 16-byte aligned
+  or shares memory with one of the class's state pools, the output, an input or the offsets, raises the typed error.
+  A pool owns its storage from its first slot to the storage's end, so a buffer carved from the same allocation
+  after a pool is refused too: give `train_states` an allocation of its own.
+
+Tests: `tests/gdn/test_batch_invariant_gdn_stateless.py`.
 
 `lean/BIKernels/Gdn.lean` models the two kernels as an opaque chunk step and an opaque row step and defines the
 prefill as the fold of the chunk step over 64-row chunks. Four device facts carry the model, all checked bit for bit

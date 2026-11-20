@@ -684,17 +684,48 @@ class TrtllmFp4Config:
 
 @dataclass(frozen=True)
 class CakeWarpDecodeConfig:
-    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
+    """Cake NVFP4 warp-decode backend for exact SM100 and SM103.
 
     This backend is intentionally narrow: it accepts only the
     activation-qualified expert geometries documented by
-    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
-    It is never part of the default backend list; users opt in with
-    ``CakeWarpDecodeConfig(backend="cake")``.
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, BF16 routing weights, and
+    unpacked precomputed routing.
+
+    The default backend list ends with
+    ``CakeWarpDecodeConfig(default_candidate=True)``. ``MoELayer`` times every
+    eligible candidate on the first call for each token bucket and keeps a
+    later candidate only when it is strictly faster, so this entry is selected
+    only when it measures faster than every earlier eligible backend. It is
+    eligible only for weight packs with a ``"cake"`` view and for activation
+    packs it can serve; other calls select exactly as without it. Like the
+    TRT-LLM routing kernels, this entry drops a ``topk_ids`` value outside
+    ``[0, num_experts)``, such as ``-1`` padding, on the device without a host
+    sync: the slot adds nothing to the output. During CUDA Graph
+    capture it is eligible only for a token count it already served in an
+    eager call, and while an autotune process group tunes
+    (:func:`flashinfer.autotuner.set_autotune_process_group`) it is not
+    eligible. Setting ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` before a
+    ``MoELayer`` is built leaves this entry out of that layer (see
+    :func:`flashinfer.api_logging.cake_auto_candidates_enabled`). The default
+    entry resolves ``ExecutionConfig(enable_pdl=None)`` from the device, still
+    rejects ``enable_pdl=False``, and loads its kernel module on first use; if
+    that load fails, the entry is left out and the other candidates serve the
+    call.
+
+    An explicit ``CakeWarpDecodeConfig(backend="cake")`` is not affected by
+    that switch, requires ``ExecutionConfig(enable_pdl=True)``, and drops a
+    ``topk_ids`` value outside ``[0, num_experts)`` in the same way.
 
     The physical weight and activation layouts are exactly those produced by
     :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
     representation usable by both runners.
+
+    A routing slot whose ``topk_ids`` value lies outside ``[0, num_experts)``,
+    such as a ``-1`` padding slot, is dropped inside the kernels: it adds
+    nothing to the output and its weight is ignored, even if NaN or Inf. A
+    token may have several dropped slots, and a token without a valid slot
+    outputs zeros. No host check reads ``topk_ids``, so CUDA Graph replays may
+    change the ids freely.
 
     CUDA Graph capture requires a warmed workspace. Graph replays and eager
     calls that share a workspace must be ordered by the caller; captured calls
@@ -703,6 +734,8 @@ class CakeWarpDecodeConfig:
     """
 
     backend: Literal["cake"] = "cake"
+    # Marks the default backend list's entry; see the class docstring.
+    default_candidate: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.backend != "cake":
@@ -801,6 +834,8 @@ class CakeWarpDecodeConfig:
         )
 
     def __repr__(self) -> str:
+        if self.default_candidate:
+            return "CakeWarpDecodeConfig(backend='cake', default_candidate=True)"
         return "CakeWarpDecodeConfig(backend='cake')"
 
 
@@ -3674,6 +3709,8 @@ _DEFAULT_BACKEND = BackendOptions(
         CudnnFrostMxfp8Config(),
         CudnnFrostNvfp4Config(),
         CudnnFrostMxfp8Mxfp4Config(),
+        # Last, so it never displaces an earlier backend on a timing tie.
+        CakeWarpDecodeConfig(default_candidate=True),
     )
 )
 

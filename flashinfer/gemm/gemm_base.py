@@ -25,7 +25,17 @@ import weakref
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Callable, cast, List, Literal, NamedTuple, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    cast,
+    FrozenSet,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 from packaging.version import Version
 import torch
@@ -33,11 +43,11 @@ import tvm_ffi
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
-from ..api_logging import cake_auto_candidates_enabled, flashinfer_api
+from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
-    bmm_fp8_trace,
+    bmm_fp8_trace_dispatch,
     bmm_mxfp8_trace_dispatch,
     fp8_blockscale_gemm_sm90_trace,
     gemm_fp8_nt_groupwise_trace,
@@ -56,7 +66,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
-    get_autotune_process_group,
+    cake_auto_candidate_open,
     is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
@@ -351,9 +361,26 @@ def get_gemm_module():
         class CublasFp8GemmRunner(TunableRunner):
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 # Must be synthesis-invariant: shapes are already in the
-                # autotuner's input_shapes, with M bucketed; add only dtypes.
-                a, b, _, _, out, _ = inputs
-                return (a.dtype, b.dtype, out.dtype)
+                # autotuner's input_shapes, with M bucketed; add only dtypes and
+                # the bias alignment, which the candidate algorithms depend on
+                # (profiling reuses the bias tensor, so it is invariant too).
+                a, b, out = inputs[0], inputs[1], inputs[4]
+                bias = self._bias(inputs)
+                if bias is None:
+                    return (a.dtype, b.dtype, out.dtype)
+                return (a.dtype, b.dtype, out.dtype, self._pointer_alignment(bias))
+
+            @staticmethod
+            def _bias(inputs: List[torch.Tensor]) -> Optional[torch.Tensor]:
+                # fp8_gemm_sm100 appends the bias only when one is given.
+                return inputs[6] if len(inputs) > 6 else None
+
+            @staticmethod
+            def _pointer_alignment(tensor: Optional[torch.Tensor]) -> int:
+                if tensor is None:
+                    return 0
+                address = tensor.data_ptr()
+                return min(address & -address, 256)
 
             def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
                 return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
@@ -361,7 +388,8 @@ def get_gemm_module():
             def _get_algos(self, inputs) -> List[tuple]:
                 # Enumerate at the bucketed M that keys the tuned tactic, so the
                 # candidates are the same for every M of the bucket.
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs[:6]
+                bias = self._bias(inputs)
                 bucket_m = AutoTuner.get().get_effective_map_to_tuning_buckets(
                     _FP8_GEMM_SM100_TUNING_CONFIG
                 )(a.shape[-2])
@@ -375,6 +403,7 @@ def get_gemm_module():
                     b.dtype,
                     out.dtype,
                     workspace_buffer.numel() * workspace_buffer.element_size(),
+                    self._pointer_alignment(bias),
                 )
                 cached = algo_cache.get(key)
                 if cached is not None:
@@ -393,6 +422,7 @@ def get_gemm_module():
                     workspace_buffer,
                     algo_buf,
                     bucket_m,
+                    bias,
                 )
                 tactics = _cublaslt_algos_to_tactics(algo_buf, count)
                 algo_cache.put(key, tactics)
@@ -412,9 +442,10 @@ def get_gemm_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs[:6]
+                bias = self._bias(inputs)
                 if tactic == -1:
-                    module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
+                    module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer, bias)
                     return out
                 used_descriptor = module.bmm_fp8_run_with_descriptor(
                     a,
@@ -424,6 +455,7 @@ def get_gemm_module():
                     scale_b,
                     workspace_buffer,
                     _cublaslt_algo_arg(tactic),
+                    bias,
                 )
                 _check_cublaslt_descriptor_ran(used_descriptor, tactic)
                 return out
@@ -1242,35 +1274,9 @@ _CAKE_BF16_BMM_RUNNER = "CakeBf16BmmRunner"
 _CAKE_FP4_GEMM_RUNNER = "CakeFp4GemmRunner"
 
 
-def _cake_auto_candidate_open(runner_class_name: str) -> bool:
-    """Whether ``backend="auto"`` lists the Cake runner of this class now.
-
-    The runner is always the last candidate, so the tuner selects it only
-    while tuning or from a cache entry of its class
-    (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
-    no selection, so it is left out: the call keeps the runner list and host
-    cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
-    always leaves it out, and so does tuning under an autotune process group
-    (:func:`_cake_group_tuning`).
-    """
-    return (
-        cake_auto_candidates_enabled()
-        and not _cake_group_tuning()
-        and AutoTuner.get().may_select_runner_class(runner_class_name)
-    )
-
-
-def _cake_group_tuning() -> bool:
-    """Whether the tuner now tunes under an autotune process group
-    (:func:`~flashinfer.autotuner.set_autotune_process_group`).
-
-    Group tuning requires every rank to list the same runners for an op. The
-    automatic Cake candidates are offered per operands and per tuning bucket of
-    the rank-local M, so ranks could disagree; they are left out while a group
-    tunes, and every rank lists the other backends only. Outside tuning the
-    group checks nothing, and Cake is listed as without a group.
-    """
-    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
+# The shared gate (FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES, autotune process
+# group, AutoTuner.may_select_runner_class); see cake_auto_candidate_open.
+_cake_auto_candidate_open = cake_auto_candidate_open
 
 
 @backend_requirement(
@@ -3510,7 +3516,11 @@ def fp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
+    if bias is not None and runner_names != ["cublas"]:
+        # The backend checks refuse this too, but skip_check=True skips them.
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     tuner = AutoTuner.get()
 
     # Keep the caller's order: untuned, the autotuner runs runners[0].
@@ -3531,6 +3541,10 @@ def fp8_gemm_sm100(
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
+    if bias is not None:
+        # Only the cuBLAS runner takes a bias. It is appended only when given,
+        # so unbiased calls keep their tuning cache keys.
+        inputs.append(bias)
     runner, tactic = tuner.choose_one(
         "fp8_gemm",
         runners,
@@ -3541,20 +3555,71 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
-    """Helper function to create cutlass FP4 GEMM module."""
+def _create_cutlass_fp4_gemm_module(
+    module: Any,
+    op_name: str,
+    tuner_name: str,
+    is_stream_k_tactic: Optional[Callable[[int], bool]] = None,
+):
+    """Helper function to create cutlass FP4 GEMM module.
+
+    Args:
+        is_stream_k_tactic: Tells whether a tactic index is a stream-K config. When
+            given, FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 leaves those tactics out
+            of tuning and rejects them when read back from an autotune cache.
+    """
+
+    def _stream_k_disabled() -> bool:
+        # A stream-K tactic sums a tile's K range in more than one CTA, so its result
+        # can differ in the last bits from the data-parallel tactics. When the
+        # autotuner picks by timing, the output then depends on which tactic won;
+        # this option limits the choice to data-parallel tactics.
+        return (
+            is_stream_k_tactic is not None
+            and os.environ.get("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0") == "1"
+        )
 
     def cutlass_fp4_gemm_runner():
         class CutlassFp4GemmRunner(TunableRunner):
             def __init__(self):
                 self._fp4_gemm_runner = module.fp4_gemm
+                # validate_tactic runs on every cache hit; count the configs once.
+                self._tactic_num = module.fp4_gemm_tactic_num()
+                # The name ends in _cache, so TunableRunner.__hash__ skips it. The hash
+                # keys the in-process autotune cache and stays the same when the set
+                # is filled later.
+                self._stream_k_tactics_cache: Optional[FrozenSet[int]] = None
+
+            def _stream_k(self) -> FrozenSet[int]:
+                # Builds the set of stream-K tactics on the first call and caches it.
+                # Without is_stream_k_tactic it returns an empty set and caches nothing.
+                if is_stream_k_tactic is None:
+                    return frozenset()
+                if self._stream_k_tactics_cache is None:
+                    self._stream_k_tactics_cache = frozenset(
+                        t for t in range(self._tactic_num) if is_stream_k_tactic(t)
+                    )
+                return self._stream_k_tactics_cache
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                return list(range(module.fp4_gemm_tactic_num()))
+                tactics = list(range(self._tactic_num))
+                if _stream_k_disabled():
+                    stream_k = self._stream_k()
+                    tactics = [t for t in tactics if t not in stream_k]
+                return tactics
+
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+                # Checks a tactic read back from a saved autotune cache: it must be
+                # one of this module's configs, and not stream-K when that is off.
+                if tactic == -1:
+                    return True
+                if not 0 <= tactic < self._tactic_num:
+                    return False
+                return not (_stream_k_disabled() and tactic in self._stream_k())
 
             def forward(
                 self,
@@ -3615,8 +3680,26 @@ def get_gemm_sm103_module_cutlass_fp4():
 def get_gemm_sm120_module_cutlass_fp4():
     """Get the SM120/121 FP4 GEMM module."""
     module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    is_stream_k_tactic = getattr(module, "fp4_gemm_tactic_is_stream_k", None)
+    if is_stream_k_tactic is None:
+        # A module built by an older FlashInfer lacks fp4_gemm_tactic_is_stream_k but
+        # still runs every tactic. The runner calls _missing_stream_k_export only when
+        # FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1, and that call raises a RuntimeError.
+        def _missing_stream_k_export(tactic: int) -> bool:
+            raise RuntimeError(
+                "FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 needs "
+                "fp4_gemm_tactic_is_stream_k, which this SM120 FP4 GEMM module "
+                "does not export; it was built from an older FlashInfer. Rebuild "
+                "the module or unset the variable."
+            )
+
+        is_stream_k_tactic = _missing_stream_k_export
+
     return _create_cutlass_fp4_gemm_module(
-        module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
+        module,
+        "flashinfer::cutlass_fp4_gemm_sm120",
+        "cutlass_fp4_gemm_sm120",
+        is_stream_k_tactic=is_stream_k_tactic,
     )
 
 
@@ -11077,7 +11160,10 @@ def _cudnn_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
+    if bias is not None:
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -11091,6 +11177,7 @@ def _cublas_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     return True
 
@@ -11105,7 +11192,10 @@ def _cutlass_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
+    if bias is not None:
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
     return True
@@ -11124,8 +11214,11 @@ def _cute_dsl_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     """Requirement check for CuTe-DSL FP8 BMM backend."""
+    if bias is not None:
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     if not CUTE_DSL_AVAILABLE:
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
@@ -11162,8 +11255,19 @@ def _check_bmm_fp8_problem_size(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     _validate_fp8_output_dtype(dtype)
+    if bias is not None:
+        if bias.shape != (B.shape[2],) or bias.dtype != dtype:
+            raise ValueError(
+                f"bias must have shape {(B.shape[2],)} and dtype {dtype}, "
+                f"got {tuple(bias.shape)} and {bias.dtype}."
+            )
+        # cuBLASLt FP8 GEMMs need 16-byte-aligned pointers, the bias included;
+        # with a bias that is not, it lists no algo.
+        if not bias.is_contiguous() or bias.data_ptr() % 16 != 0:
+            raise ValueError("bias must be contiguous and 16-byte aligned.")
     return True
 
 
@@ -11182,6 +11286,7 @@ def _heuristic_func_bmm_fp8(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ):
     # No e5m2 for cutlass (but cute-dsl supports it)
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -11256,7 +11361,7 @@ def _heuristic_func_bmm_fp8(
     heuristic_func=_heuristic_func_bmm_fp8,
     bypass=_batch_invariant_requested,
 )
-@flashinfer_api(trace=bmm_fp8_trace)
+@flashinfer_api(trace=bmm_fp8_trace_dispatch)
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11267,6 +11372,7 @@ def bmm_fp8(
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
     *,
     batch_invariant: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -11310,6 +11416,11 @@ def bmm_fp8(
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
 
+    bias: Optional[torch.Tensor]
+        Bias tensor, shape (n,), contiguous and 16-byte aligned, with the out
+        dtype, added to every batch in the GEMM epilogue. Only the ``"cublas"``
+        backend supports it (``"auto"`` picks it). Defaults to ``None``.
+
     Returns
     -------
     out: torch.Tensor
@@ -11341,6 +11452,12 @@ def bmm_fp8(
     """
 
     if batch_invariant:
+        # Here rather than in the problem-size check, which skip_check=True skips.
+        if bias is not None:
+            raise ValueError(
+                "bmm_fp8 supports a bias only with the cublas backend, "
+                "not with batch_invariant=True."
+            )
         from .batch_invariant.tuning import bmm_fp8_batch_invariant_auto
 
         return bmm_fp8_batch_invariant_auto(A, B, A_scale, B_scale, dtype, out, backend)
@@ -11357,7 +11474,9 @@ def bmm_fp8(
     )
 
     if backend == "auto":
-        backends = bmm_fp8.suitable_auto_backends
+        # With a bias only cublas qualifies, whatever list the decorator last
+        # stored on the function (skip_check=True can leave it stale).
+        backends = ["cublas"] if bias is not None else bmm_fp8.suitable_auto_backends
     elif backend == "cutlass":
         backends = _heuristic_func_bmm_fp8(
             ["cutlass"], A, B, A_scale, B_scale, dtype, out, backend
@@ -11371,7 +11490,7 @@ def bmm_fp8(
     else:
         backends = [backend]
 
-    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
+    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends, bias)
     return out
 
 

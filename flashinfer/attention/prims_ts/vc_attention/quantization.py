@@ -31,11 +31,14 @@ matrix and quantizes them to E4M3 with one scale per 128-token Q block and per
 * ``vc_quantize`` permutes K, subtracts the V tile means, quantizes the
   residuals per channel to E4M3 and packs the kernel operands with the CuTe
   DSL kernels of ``prepare``.
-* ``vc_quantize_fp8`` does the same plus the E4M3 Q/K operands and scales.
+* ``vc_quantize_fp8`` does the same plus the E4M3 Q/K operands and scales;
+  ``vc_quantize_int8`` writes INT8 Q/K codes instead, for the INT8 tensor core
+  of SM100 (B200).
 * ``vc_quantize_repair`` writes V repair rows instead of tile means, for
-  either recipe.
+  either recipe; ``vc_quantize_repair_int8`` with INT8 Q/K codes.
 * ``VCAttentionPreprocessor`` applies the paper's V-Smooth schedule over the
-  denoising steps on top of the two.
+  denoising steps on top of them, with the Q/K code type of the device
+  (``vc_qk8_dtype``: INT8 on B200, E4M3 elsewhere, as the paper configures).
 
 The operand contract the kernel consumes is defined in
 ``flashinfer.attention.prims_ts.vc_attention``.
@@ -53,6 +56,7 @@ import torch
 from . import (
     VC_HEAD_DIM,
     VCAttentionParams,
+    vc_qk8_dtype,
     vc_repair_tiles,
 )
 
@@ -274,18 +278,20 @@ def vc_quantize(
 
 
 @torch.no_grad()
-def vc_quantize_fp8(
+def _quantize_qk8(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    perm: torch.Tensor | None = None,
-    kmeans_iters: int = VC_KMEANS_ITERS,
-    generator: torch.Generator | None = None,
-    demean: bool = True,
+    prepare_fn,
+    perm: torch.Tensor | None,
+    kmeans_iters: int,
+    generator: torch.Generator | None,
+    demean: bool,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` bf16/fp16 Q/K/V into VC-Attention-QK8 kernel
-    operands with four CuTe DSL kernels (``prepare``).
+    operands with four CuTe DSL kernels (``prepare_fn``, the E4M3 or INT8
+    ``vc_prepare_*`` of ``prepare``).
 
     Keys are centred by their per-(batch, head) channel mean over tokens
     (softmax-invariant), permuted with the values, rotated with Q by the
@@ -306,11 +312,9 @@ def vc_quantize_fp8(
             "q, k, v must be [B, S, H, D] with matching batch, heads, head_dim and dtype"
         )
     _check_prepare_inputs(q)
-    from .prepare import vc_prepare_fp8
-
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
-    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = vc_prepare_fp8(
+    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = prepare_fn(
         q.contiguous(), k.contiguous(), v.contiguous(), perm, demean=demean
     )
     return VCAttentionOperands(
@@ -328,15 +332,66 @@ def vc_quantize_fp8(
 
 
 @torch.no_grad()
-def vc_quantize_repair(
+def vc_quantize_fp8(
+    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    perm: torch.Tensor | None = None,
+    kmeans_iters: int = VC_KMEANS_ITERS,
+    generator: torch.Generator | None = None,
+    demean: bool = True,
+) -> VCAttentionOperands:
+    """``_quantize_qk8`` with E4M3 Q/K codes."""
+    from .prepare import vc_prepare_fp8
+
+    return _quantize_qk8(
+        q,
+        k,
+        v,
+        prepare_fn=vc_prepare_fp8,
+        perm=perm,
+        kmeans_iters=kmeans_iters,
+        generator=generator,
+        demean=demean,
+    )
+
+
+def vc_quantize_int8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    perm: torch.Tensor | None = None,
+    kmeans_iters: int = VC_KMEANS_ITERS,
+    generator: torch.Generator | None = None,
+    demean: bool = True,
+) -> VCAttentionOperands:
+    """``_quantize_qk8`` with INT8 Q/K codes, for the INT8 tensor core of SM100."""
+    from .prepare import vc_prepare_int8
+
+    return _quantize_qk8(
+        q,
+        k,
+        v,
+        prepare_fn=vc_prepare_int8,
+        perm=perm,
+        kmeans_iters=kmeans_iters,
+        generator=generator,
+        demean=demean,
+    )
+
+
+def _quantize_repair(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    prepare_fn,
     budget: float,
-    q: torch.Tensor | None = None,
+    q: torch.Tensor | None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` K/V into V repair operands, of VC-Attention-QK8
-    with ``q``.
+    with ``q`` (``prepare_fn``: the E4M3 or INT8 ``vc_prepare_repair*``).
 
     Values are quantized to E4M3 in input order with one scale per batch,
     head and channel. The ``budget`` fraction of tokens with the largest
@@ -356,12 +411,10 @@ def vc_quantize_repair(
             "q must be [B, S, H, D] with the batch, heads, head_dim and dtype of k"
         )
     _check_prepare_inputs(k)
-    from .prepare import vc_prepare_repair
-
     s_k = k.shape[1]
     repair_tiles = vc_repair_tiles(s_k, budget)
     repair_tokens = max(1, round(budget * s_k))
-    q8, k_all, v_all, q_scale, k_scale, v_scale = vc_prepare_repair(
+    q8, k_all, v_all, q_scale, k_scale, v_scale = prepare_fn(
         None if q is None else q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -382,6 +435,32 @@ def vc_quantize_repair(
         q_scale=q_scale,
         k_scale=k_scale,
     )
+
+
+def vc_quantize_repair(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    budget: float,
+    q: torch.Tensor | None = None,
+) -> VCAttentionOperands:
+    """``_quantize_repair`` with E4M3 Q/K codes under QK8."""
+    from .prepare import vc_prepare_repair
+
+    return _quantize_repair(k, v, prepare_fn=vc_prepare_repair, budget=budget, q=q)
+
+
+def vc_quantize_repair_int8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    budget: float,
+    q: torch.Tensor,
+) -> VCAttentionOperands:
+    """``_quantize_repair`` with INT8 Q/K codes, for the INT8 tensor core of SM100."""
+    from .prepare import vc_prepare_repair_int8
+
+    return _quantize_repair(k, v, prepare_fn=vc_prepare_repair_int8, budget=budget, q=q)
 
 
 class VCAttentionPreprocessor:
@@ -484,7 +563,13 @@ class VCAttentionPreprocessor:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int32)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
         if q is not None:
-            return vc_quantize_fp8(q, k, v, perm=perm, demean=smooth)
+            # The paper's Q/K code type of the device: INT8 on B200, E4M3 elsewhere.
+            quantize = (
+                vc_quantize_int8
+                if vc_qk8_dtype(k.device) is torch.int8
+                else vc_quantize_fp8
+            )
+            return quantize(q, k, v, perm=perm, demean=smooth)
         return vc_quantize(k, v, perm=perm, demean=smooth)
 
 
@@ -498,6 +583,8 @@ __all__ = [
     "hadamard_matrix",
     "vc_quantize",
     "vc_quantize_fp8",
+    "vc_quantize_int8",
     "vc_quantize_repair",
+    "vc_quantize_repair_int8",
     "vc_token_permutation",
 ]
