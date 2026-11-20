@@ -190,8 +190,7 @@ _BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
     "token_back_mode": "epi_warps",
     "load_balance_mode": "static",
     "direct_bf16_cvt": True,
-    "mma_inst_n": 64,
-    "full_tile_mma": True,
+    "runtime_mma_split": True,
     "num_weight_stages": 6,
     "num_activation_stages": 5,
 }
@@ -423,14 +422,7 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         and knobs.get("token_back_mode", "epi_warps")
         in ("epi_warps", "reuse_dispatch_warps")
         and knobs.get("clc_bundle_size") is None
-        and knobs.get("mma_inst_n") in (None, 64, impl[0][1])
-        and (
-            not knobs.get("full_tile_mma", False)
-            or (
-                impl == ((256, 128, 128), "tmem", False, 128)
-                and knobs.get("mma_inst_n") == 64
-            )
-        )
+        and (not knobs.get("runtime_mma_split", False) or impl[0][1] == 128)
         and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
     )
 

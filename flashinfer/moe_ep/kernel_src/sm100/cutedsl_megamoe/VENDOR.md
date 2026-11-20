@@ -103,15 +103,14 @@ replace its own device snapshot.
 - **BF16xMXFP8 transform and MMA issue (local, 2026-11-09):**
   `src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py` adds
   `direct_bf16_cvt` (direct E4M3x2->BF16x2 convert in the transform warps),
-  `mma_inst_n` (build the N128 tile from N64 instruction atoms and skip
-  chunks without valid tokens), `full_tile_mma` (one N128 instruction for
-  FC1 tiles above 64 valid tokens) and the `((256, 64, 128), "tmem", False,
-  128)` implementation tuple; `src/moe_mxfp8_bf16_glu/epilogue_mxfp8_bf16.py`
-  adds the matching FC1 token-block remap (`fc1_n128_block_swap`), FC2 B is
-  loaded in plain N order through a full-N TMA atom when `full_tile_mma` is
-  set, `num_weight_stages` decouples the raw weight/scale SMEM stages from the
+  `runtime_mma_split` (N128 only: one N64 instruction for tiles of at most 64
+  valid tokens, one N128 instruction above that) and the
+  `((256, 64, 128), "tmem", False, 128)` implementation tuple;
+  `src/moe_mxfp8_bf16_glu/epilogue_mxfp8_bf16.py` stores FC1 hand-off rows in
+  the N128 block-swapped order, which FC2's N128 instruction undoes;
+  `num_weight_stages` decouples the raw weight/scale SMEM stages from the
   transformed stages, and `megamoe_kernel_mxfp8_bf16.py` forwards the
-  arguments. All are bit-identical to the previous kernel (see `TUNING.md`).
+  arguments. All are bit-identical to the previous kernel.
   Upstream candidate.
 
 - **BF16xMXFP8 B-stage count (`bangyus/cutedsl_megamoe!91`, 2026-11-09):**

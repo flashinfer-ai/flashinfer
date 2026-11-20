@@ -82,8 +82,8 @@ def test_mixed_knobs_and_candidates():
             "transform_buffer": "smem",
             "accumulator_overlap": False,
             "transform_k_tile": 128,
-            "mma_inst_n": 64,
-            "full_tile_mma": False,
+            "num_activation_stages": None,
+            "runtime_mma_split": False,
         }
     )
     assert not is_valid_bf16_mxfp8({**knobs, "mma_tiler_mnk": (256, 256, 128)})
@@ -125,7 +125,17 @@ def test_mixed_knobs_and_candidates():
     assert permitted[:24] == candidates
     assert all(c["in_kernel_fc2_reduce"] is True for c in permitted[24:])
 
-    assert not is_valid_bf16_mxfp8({**knobs, "mma_inst_n": 32})
+    assert not is_valid_bf16_mxfp8(
+        {
+            **knobs,
+            "mma_tiler_mnk": (256, 256, 128),
+            "transform_buffer": "tmem",
+            "accumulator_overlap": True,
+            "transform_k_tile": 64,
+            "num_activation_stages": None,
+            "runtime_mma_split": True,
+        }
+    )
     assert not is_valid_bf16_mxfp8(
         {
             **knobs,
@@ -137,8 +147,7 @@ def test_mixed_knobs_and_candidates():
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     frontend.apply_knobs(knobs)
     assert frontend.config == _config(
-        mma_inst_n=64,
-        full_tile_mma=True,
+        runtime_mma_split=True,
         num_weight_stages=6,
         num_activation_stages=5,
     )
