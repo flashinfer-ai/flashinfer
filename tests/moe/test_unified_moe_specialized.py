@@ -643,8 +643,9 @@ def test_kernel_check(spec, monkeypatch, case):
 def test_performance_layer_selects_specialized(spec, case):
     """A performance test, not a functional one: the kernel is at least
     ``SPEC.min_speedup`` faster than the reference backend at these sizes
-    (``MoELayer`` with only one or the other, CUPTI, the reference backend's
-    default tactic; the speedup is asserted only when CUPTI timing is
+    (``MoELayer`` with only one or the other, CUPTI on CUDA-graph replay, so
+    host launch gaps between the layer's kernels do not count; the reference
+    backend's default tactic; the speedup is asserted only when CUPTI timing is
     available), and the default layer runs the kernel. A failure here is a
     speed regression (or a contended GPU), not a numerical one."""
     from flashinfer.testing import bench_gpu_time
@@ -666,7 +667,9 @@ def test_performance_layer_selects_specialized(spec, case):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             times = bench_gpu_time(
-                lambda single=single: single(pack, weights), enable_cupti=True
+                lambda single=single: single(pack, weights),
+                enable_cupti=True,
+                use_cuda_graph=True,
             )
         if any("Falling back to CUDA events" in str(w.message) for w in caught):
             cupti = False
