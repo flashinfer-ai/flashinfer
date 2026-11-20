@@ -4422,10 +4422,12 @@ def _mla_cake_auto_memo_put(
     ``selected`` is one of ``runners``."""
     if offers is not _CAKE_MLA_AUTO_OFFERS:
         return
-    for index, runner in enumerate(runners):
+    index = None
+    for position, runner in enumerate(runners):
         if runner is selected[0]:
+            index = position
             break
-    else:
+    if index is None:
         return
     if len(_CAKE_MLA_AUTO_MEMO) > _CAKE_MLA_MEMO_LIMIT:
         _CAKE_MLA_AUTO_MEMO.clear()
@@ -5616,27 +5618,32 @@ def _mla_with_kv_cache_impl(
                 # A lookup-only call of a listed batch reuses the decision of
                 # both stages memoized for its arguments (``_CAKE_MLA_AUTO_MEMO``)
                 # instead of the eligibility check and both lookups.
-                if cake_auto_candidate_open(_CAKE_MLA_RUNNER):
-                    # Read once: a decision is memoized only while the table
-                    # it was made under is the offer table.
-                    cake_offers = _CAKE_MLA_AUTO_OFFERS
-                    offered = _cake_mla_auto_batch_ranges(
-                        query.get_device(),
-                        query.dtype,
-                        page_size,
-                        query.size(1),
-                        sinks is not None,
-                        max_seq_len,
+                # Read once: a decision is memoized only while the table it
+                # was made under is the offer table.
+                cake_offers = _CAKE_MLA_AUTO_OFFERS
+                # The memoized ranges and the batch come before the switch,
+                # process-group and tuner gate: an unlisted unit, or a batch
+                # outside its ranges outside tuning, pays for neither.
+                offered = _cake_mla_auto_batch_ranges(
+                    query.get_device(),
+                    query.dtype,
+                    page_size,
+                    query.size(1),
+                    sinks is not None,
+                    max_seq_len,
+                )
+                tuner = AutoTuner.get()
+                if (
+                    offered
+                    and (
+                        tuner.is_tuning_mode
+                        or _in_batch_ranges(query.size(0), offered)
                     )
-                    tuner = AutoTuner.get()
+                    and cake_auto_candidate_open(_CAKE_MLA_RUNNER)
+                ):
                     if (
-                        offered
-                        and (
-                            tuner.is_tuning_mode
-                            or _in_batch_ranges(query.size(0), offered)
-                        )
                         # Before the memo key: such calls pay nothing for it.
-                        and _cake_mla_auto_scalar_reason(
+                        _cake_mla_auto_scalar_reason(
                             bmm1_scale=bmm1_scale,
                             bmm2_scale=bmm2_scale,
                             sparse_mla_top_k=sparse_mla_top_k,
