@@ -3015,7 +3015,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         dict(num_qo_heads=0, num_kv_heads=8),
         dict(sm_scale=float("inf")),
         dict(sm_scale=3e38),
-        dict(seq_lens=torch.tensor([700], dtype=torch.int32, device=pr.device)),
+        # seq_lens that contradict the page table (the request has 700 keys)
+        dict(seq_lens=torch.tensor([699], dtype=torch.int32, device=pr.device)),
         dict(prefix_len_ptr=torch.zeros(1, dtype=torch.int32, device=pr.device)),
     ):
         args = dict(num_qo_heads=32, num_kv_heads=8, causal=True, **kw)
@@ -4134,8 +4135,8 @@ def test_cuda_graph_lse_and_sinks_replay(D, q_len):
 @needs_device
 def test_cuda_graph_sliding_window_and_serving_arguments():
     """A sliding window under replan and replay, and the arguments serving engines pass on every plan: ``seq_lens`` equal to
-    the page table's KV lengths, ``fixed_split_size`` (-1, or a positive value under ``use_cuda_graph=True``: accepted and not
-    used) and ``disable_split_kv`` (fused units). None of them changes a bit."""
+    the page table's KV lengths, ``fixed_split_size`` (-1 or a positive value: accepted and not used) and
+    ``disable_split_kv`` (fused units). None of them changes a bit."""
     pr = Problem([1] * 3, [5120, 5120, 5120], 32, 8, 128, 16, seed=16)
     gd = _GraphDecode(pr, 1, window_left=700)
     seq = lambda lens: torch.tensor(lens, dtype=torch.int32)  # noqa: E731
@@ -4147,7 +4148,7 @@ def test_cuda_graph_sliding_window_and_serving_arguments():
     gd.check([5120, 800, 2049], "fast", fixed_split_size=2048, disable_split_kv=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         gd.plan([300, 40, 129], seq_lens=seq([300, 41, 129]))
-    # the same arguments on an eager wrapper: a positive fixed_split_size is refused there
+    # the same arguments on an eager wrapper
     w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace(pr.device), "NHD", batch_invariant=True
     )
@@ -4167,8 +4168,8 @@ def test_cuda_graph_sliding_window_and_serving_arguments():
     assert torch.equal(bits(w.run(q, pr.cache("NHD"))), ref)
     flashinfer.decode.fast_decode_plan(w, *args, fixed_split_size=-1, **kw)
     assert torch.equal(bits(w.run(q, pr.cache("NHD"))), ref)
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(*args, fixed_split_size=2048, **kw)
+    w.plan(*args, fixed_split_size=2048, **kw)
+    assert torch.equal(bits(w.run(q, pr.cache("NHD"))), ref)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         w.plan(*args, seq_lens=seq([3000, 1500, 701]), **kw)
 
@@ -4976,3 +4977,42 @@ def test_cuda_graph_plan_argument_spellings():
     for how in ("plan", "fast"):
         with pytest.raises(bi.BatchInvariantUnsupportedError):
             gd.plan([300, 40, 129], how, **dict(none, data_type=torch.float16))
+
+
+@needs_device
+def test_cuda_graph_sinks_declaration_and_neutral_arguments():
+    """``use_cuda_graph=True`` with the plan-time sinks declaration and the neutral serving arguments: the first
+    ``has_sinks`` given is the wrapper's (a fast replan, which has no such argument, keeps it; another value raises; a run
+    that departs from it raises), a declaration after a first ``run()`` must agree with that run, unit scales are accepted
+    at ``run()``, and ``_logits_soft_cap`` reads 0.0 after ``plan()`` and after ``fast_decode_plan``."""
+    pr = Problem([1] * 3, [3000] * 3, 32, 8, 128, 16, seed=35)
+    cache = pr.cache("NHD")
+    sinks = sink_logits(pr, seed=7)
+    with_sinks = dict(run_kw=dict(sinks=sinks))
+    gd = _GraphDecode(pr, 1, sinks=sinks)
+    gd.check([300, 40, 129], has_sinks=True, **with_sinks)
+    assert gd.w._logits_soft_cap == 0.0
+    for how in ("fast", "partial", "plan"):
+        gd.check([3000, 1500, 700], how, **with_sinks)
+        assert gd.w._batch_invariant._planned.has_sinks is True
+        assert gd.w._logits_soft_cap == 0.0
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gd.plan([300, 40, 129], has_sinks=False)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        gd.w.run(gd.q, cache)
+    gd.check([513, 2049, 64], "fast", **with_sinks)
+    plain = _GraphDecode(pr, 1)
+    plain.check([300, 40, 129], has_sinks=False)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        plain.w.run(plain.q, cache, sinks=sinks)
+    late = _GraphDecode(pr, 1)
+    late.check([300, 40, 129])
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        late.plan([300, 40, 129], has_sinks=True)
+    late.check([3000, 1500, 700], has_sinks=False)
+    unit = _GraphDecode(pr, 1)
+    unit.run_kw.update(q_scale=1.0, k_scale=1.0, v_scale=1.0)
+    unit.check([300, 40, 129])
+    unit.check([3000, 1500, 700], "fast")
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        unit.w.run(unit.q, cache, k_scale=0.5)
