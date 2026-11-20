@@ -310,7 +310,7 @@ def test_mm_bf16_tgv_tactic_rejects():
         mm_bf16(a, b, backend="tgv", tactic=num_tactics)
     with pytest.raises(ValueError, match="batch_invariant"):
         mm_bf16(a, b, backend="auto", batch_invariant=True, tactic=1)
-    with pytest.raises(ValueError, match="float32 output only"):
+    with pytest.raises(ValueError, match="TGV backend supports bfloat16"):
         mm_bf16(a, b, out_dtype=torch.float16, backend="tgv")
 
 

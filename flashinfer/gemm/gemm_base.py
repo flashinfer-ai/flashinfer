@@ -656,9 +656,12 @@ def _tgv_gemm_requirement(
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
 ):
-    if out_dtype not in (torch.bfloat16, torch.float32):
+    # FP32 output only when TGV is named, so backend="auto" keeps its candidates.
+    if out_dtype != torch.bfloat16 and not (
+        out_dtype == torch.float32 and backend == "tgv"
+    ):
         raise ValueError(
-            "The TGV backend supports bfloat16 and float32 output only. Use the CUTLASS or cuDNN backend instead."
+            "The TGV backend supports bfloat16 output, and float32 output with backend='tgv'. Use the CUTLASS or cuDNN backend instead."
         )
     _require_tma_bf16_k_alignment("TGV", a.shape[-1])
     # The TGV backend dispatches to the CuTeDSL (cute_ext) implementation
