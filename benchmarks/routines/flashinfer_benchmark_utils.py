@@ -823,6 +823,7 @@ routine_cc_to_supported_backends = {
         "7.5": [],
         "8.0": ["cudnn", "cublaslt", "auto"],
         "8.6": ["cudnn", "cublaslt", "auto"],
+        "8.7": ["cudnn", "cublaslt", "auto"],
         "8.9": ["cudnn", "cublaslt", "auto"],
         "9.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
         "10.0": [
@@ -868,6 +869,7 @@ routine_cc_to_supported_backends = {
         "7.5": [],
         "8.0": ["cudnn", "auto"],
         "8.6": ["cudnn", "auto"],
+        "8.7": ["cudnn", "auto"],
         "8.9": ["cudnn", "auto"],
         "9.0": ["cudnn", "cutile", "auto"],
         "10.0": ["cudnn", "cutlass", "cutile", "tgv", "auto"],

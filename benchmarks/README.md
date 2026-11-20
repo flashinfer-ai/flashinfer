@@ -39,7 +39,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
     - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
 - GEMM:
-    - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling (cutlass, trtllm, cutile (K-major), cute-dsl (SM107), auto). `--input_dtype fp8_e5m2` and `--scale_granularity_m 128` (= `gemm_fp8_nt_blockscaled`) are CUTLASS-only modes.
+    - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling (cutlass, trtllm, cutile (K-major), cute-dsl (SM107), auto). `--input_dtype fp8_e5m2 --mat2_dtype fp8_e5m2` (both operands) and `--scale_granularity_m 128` (= `gemm_fp8_nt_blockscaled`; needs `--tile_size 128` and `m % 128 == 0`) are CUTLASS-only modes.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling (cutlass; with K-major scales also cutile, deepgemm = `group_deepgemm_fp8_nt_groupwise`, cute-dsl = `group_gemm_fp8_nt_groupwise_contiguous`).
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
     - `mm_mxfp8` / `bmm_mxfp8` - Dense / batched MXFP8 matrix multiplication.
@@ -333,7 +333,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
 | `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
-| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend), `tinygemm_bf16`, `mm_nvfp4_svdquant`, `fused_linear`      |
+| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend), `tinygemm_bf16`, `mm_nvfp4_svdquant`, `fused_linear` (`linear` / `swiglu` epilogues only) |
 | `--scale_granularity_m`  | `gemm_fp8_nt_groupwise`: rows per A scale; `128` benchmarks `gemm_fp8_nt_blockscaled` (CUTLASS only)       |
 | `--expected_m`           | `masked_grouped_gemm`: mean valid rows per group (default `m // 2`)                                        |
 | `--rank`                 | `mm_nvfp4_svdquant`: LoRA rank (multiple of 32)                                                            |

@@ -21,6 +21,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    get_compute_capability,
     warn_if_pdl_unsupported,
 )
 
@@ -304,6 +305,7 @@ def parse_gemm_args(line, parser):
         args.backends = ["cutile"]
     if args.routine == "router_gemm" and not has_input_dtype_arg:
         args.input_dtype = "bfloat16"
+    args.backends_defaulted = not has_backends_arg
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -399,6 +401,11 @@ def testGemmFp8NtGroupwise(args):
         raise ValueError(
             f"--scale_granularity_m must be 1 or --tile_size ({tile_size}), got {scale_granularity_m}"
         )
+    if scale_granularity_m != 1 and (tile_size != 128 or m % 128 != 0):
+        # gemm_fp8_nt_blockscaled is fixed at 128x128 A-scale tiles.
+        raise ValueError(
+            "--scale_granularity_m 128 (gemm_fp8_nt_blockscaled) needs --tile_size 128 and m % 128 == 0"
+        )
     ## Done parsing input arguments
 
     # Only CUTLASS implements e5m2 and the 128x128 A-scale (blockscaled) wrapper;
@@ -473,6 +480,11 @@ def testGemmFp8NtGroupwise(args):
     # outputs are wrong.
     b_scale_trtllm = b_scale.t().contiguous() if "trtllm" in backends else None
 
+    def b_scale_for(backend):
+        # Passed as an argument so CUDA-graph timing rotates the buffer the
+        # backend really reads.
+        return b_scale_trtllm if backend == "trtllm" else b_scale
+
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
         if backend == "cutlass" and scale_granularity_m != 1:
             return flashinfer.gemm.gemm_fp8_nt_blockscaled(
@@ -489,7 +501,7 @@ def testGemmFp8NtGroupwise(args):
                 a=a_fp8,
                 b=b_fp8,
                 a_scale=a_scale,
-                b_scale=b_scale_trtllm if backend == "trtllm" else b_scale,
+                b_scale=b_scale,
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
@@ -514,7 +526,7 @@ def testGemmFp8NtGroupwise(args):
     # problem (cutile: K-major only, cute-dsl: SM107 tiling limits, ...)
     # instead of failing the whole case in the timed loop.
     backends = _drop_failing_backends(
-        backends, lambda bk: run_backend(bk, a_fp8, b_fp8, a_scale, b_scale)
+        backends, lambda bk: run_backend(bk, a_fp8, b_fp8, a_scale, b_scale_for(bk))
     )
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
@@ -541,7 +553,9 @@ def testGemmFp8NtGroupwise(args):
                     )
                 with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
-                        run_backend(cur_backend, a_fp8, b_fp8, a_scale, b_scale)
+                        run_backend(
+                            cur_backend, a_fp8, b_fp8, a_scale, b_scale_for(cur_backend)
+                        )
             else:
                 print(f"[INFO] {cur_backend} backend does not support autotune")
     elif cache_path:
@@ -554,7 +568,7 @@ def testGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, a_fp8, b_fp8, a_scale, b_scale
+                cur_backend, a_fp8, b_fp8, a_scale, b_scale_for(cur_backend)
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -564,7 +578,7 @@ def testGemmFp8NtGroupwise(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale),
+            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale_for(cur_backend)),
         )
 
     tested_backends = list(outputs.keys())
@@ -767,14 +781,33 @@ def testGroupGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {b_scale.shape = }")
         print(f"[VVERBOSE] {m_indptr.shape = }")
 
-    def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr):
+    if "cute-dsl" in backends and group_size > 1 and m % 128 != 0:
+        # The contiguous kernel assigns one expert per 128-row tile and does not
+        # check the boundaries (validate_indices=False), so an unaligned group
+        # would silently use the wrong weights.
+        print(
+            "[INFO] cute-dsl needs expert boundaries on 128 rows (m % 128 == 0), removing cute-dsl from backends"
+        )
+        backends.remove("cute-dsl")
+
+    def operands_for(backend):
+        # The tensors each backend really reads, so CUDA-graph timing rotates
+        # them (cold L2): packed scales for deepgemm, row indices instead of
+        # segment offsets for the contiguous kernels.
+        if backend == "deepgemm":
+            return (a_fp8, b_fp8, *deepgemm_scales, m_indices)
+        if backend == "cute-dsl":
+            return (a_fp8, b_fp8, a_scale, b_scale, m_indices)
+        return (a_fp8, b_fp8, a_scale, b_scale, m_indptr)
+
+    def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale, m_idx):
         if backend in ["cutlass", "cutile"]:
             return flashinfer.gemm.group_gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
                 a_scale=a_scale,
                 b_scale=b_scale,
-                m_indptr=m_indptr,
+                m_indptr=m_idx,
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
@@ -782,11 +815,11 @@ def testGroupGemmFp8NtGroupwise(args):
             )
         elif backend == "deepgemm":
             return flashinfer.gemm.group_deepgemm_fp8_nt_groupwise(
-                a_fp8, b_fp8, *deepgemm_scales, m_indices, out_dtype=out_dtype
+                a_fp8, b_fp8, a_scale, b_scale, m_idx, out_dtype=out_dtype
             )
         elif backend == "cute-dsl":
             return flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous(
-                a_fp8, b_fp8, a_scale, b_scale, m_indices, out_dtype=out_dtype
+                a_fp8, b_fp8, a_scale, b_scale, m_idx, out_dtype=out_dtype
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -794,8 +827,7 @@ def testGroupGemmFp8NtGroupwise(args):
     # Drop backends whose API rejects this problem (deepgemm / cute-dsl need
     # 128-row aligned groups, cute-dsl a bfloat16 output, ...).
     backends = _drop_failing_backends(
-        backends,
-        lambda bk: run_backend(bk, a_fp8, b_fp8, a_scale, b_scale, m_indptr),
+        backends, lambda bk: run_backend(bk, *operands_for(bk))
     )
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
@@ -818,7 +850,7 @@ def testGroupGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr
+                cur_backend, *operands_for(cur_backend)
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -828,7 +860,7 @@ def testGroupGemmFp8NtGroupwise(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr),
+            input_args=(cur_backend, *operands_for(cur_backend)),
         )
 
     tested_backends = list(outputs.keys())
@@ -1264,10 +1296,14 @@ def testMmFp8(args):
         else None
     )
 
+    def scale_for(backend):
+        # Passed as an argument so CUDA-graph timing rotates what is read.
+        return prims_ts_scales if backend == "prims-ts" else alpha
+
     def run_backend(backend, input_fp8, mat2, alpha):
         if backend == "prims-ts":
             return flashinfer.gemm.fp8_linear(
-                input_fp8, mat2, *prims_ts_scales, out_dtype=res_dtype
+                input_fp8, mat2, *alpha, out_dtype=res_dtype
             )
         return flashinfer.mm_fp8(
             input_fp8,
@@ -1284,7 +1320,7 @@ def testMmFp8(args):
     # are reported without the "_autotune" suffix).
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     backends = _drop_failing_backends(
-        backends, lambda bk: run_backend(bk, input_fp8, weight_for(bk), alpha)
+        backends, lambda bk: run_backend(bk, input_fp8, weight_for(bk), scale_for(bk))
     )
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
@@ -1307,7 +1343,10 @@ def testMmFp8(args):
                 with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
-                            cur_backend, input_fp8, weight_for(cur_backend), alpha
+                            cur_backend,
+                            input_fp8,
+                            weight_for(cur_backend),
+                            scale_for(cur_backend),
                         )
     elif cache_path:
         with autotune(False, cache=cache_path):
@@ -1319,7 +1358,7 @@ def testMmFp8(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, input_fp8, weight_for(cur_backend), alpha
+                cur_backend, input_fp8, weight_for(cur_backend), scale_for(cur_backend)
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -1329,7 +1368,12 @@ def testMmFp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_fp8, weight_for(cur_backend), alpha),
+            input_args=(
+                cur_backend,
+                input_fp8,
+                weight_for(cur_backend),
+                scale_for(cur_backend),
+            ),
         )
 
     tested_backends = list(outputs.keys())
@@ -3207,6 +3251,7 @@ def _bench_and_report(
     extra_fields,
     cos_sim_min=0.99,
     autotune_backends=(),
+    backend_overrides=None,
 ):
     """Shared timing / refcheck / CSV tail of the routines below.
 
@@ -3215,7 +3260,11 @@ def _bench_and_report(
                CUDA-graph path can rotate copies and keep L2 cold.
     refchecks: backend -> callable(output) returning the cosine similarity of
                the backend's valid output against its reference, or None.
+    backend_overrides: backend -> {"problem_bytes": ..., <CSV field>: ...} for a
+               backend whose output differs from the line's (e.g. a kernel
+               that always writes float32).
     """
+    backend_overrides = backend_overrides or {}
     res = []
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -3264,8 +3313,10 @@ def _bench_and_report(
             continue
         median_time = np.median(backend_times[backend])
         std_time = np.std(backend_times[backend])
+        overrides = dict(backend_overrides.get(backend, {}))
+        backend_bytes = overrides.pop("problem_bytes", problem_bytes)
         tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
-        tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+        tb_per_sec = backend_bytes / (10**9 * median_time)  # in TB/sec
         print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
         if args.output_path is not None:
             cur_res = defaultdict(str)
@@ -3280,15 +3331,17 @@ def _bench_and_report(
             cur_res["backend"] = backend_name
             cur_res["case_tag"] = args.case_tag
             cur_res.update(extra_fields)
+            cur_res.update(overrides)
             res.append(cur_res)
     return res
 
 
 def _filter_and_probe(args, device, backends, run_fns):
     """cc whitelist, then a trial launch per backend (shape/dtype limits)."""
-    backends = filter_backends_by_compute_capability(
-        [b for b in backends if b in run_fns], args.routine, device
-    )
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    for backend in [b for b in backends if b not in run_fns]:
+        print(f"[WARNING] {backend} is not a backend of {args.routine}. Skipping.")
+        backends.remove(backend)
     return _drop_failing_backends(backends, lambda bk: run_fns[bk]())
 
 
@@ -3369,7 +3422,7 @@ def testRouterGemm(args):
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
         return []
-    reference = a.float() @ b.float()
+    reference = a.float() @ b.float() if args.refcheck else None
     refchecks = {backend: (lambda o: _cos_sim(reference, o)) for backend in backends}
     problem_flops = 2 * m * n * k
     problem_bytes = (m * k + n * k) * torch.bfloat16.itemsize + m * n * out.itemsize
@@ -3460,11 +3513,15 @@ def testGroupGemmMxfp4NtGroupwise(args):
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
         return []
-    reference = torch.cat(
-        [
-            a_val[g * m : (g + 1) * m].float() @ b_val[g].float().T
-            for g in range(group_size)
-        ]
+    reference = (
+        torch.cat(
+            [
+                a_val[g * m : (g + 1) * m].float() @ b_val[g].float().T
+                for g in range(group_size)
+            ]
+        )
+        if args.refcheck
+        else None
     )
     refchecks = {backend: (lambda o: _cos_sim(reference, o)) for backend in backends}
     problem_flops = 2 * group_size * m * n * k
@@ -3507,13 +3564,16 @@ _ELEMENT_BYTES = {
 
 
 def _make_masked_m(num_groups, expected_m, max_m, seed, device, align=1):
-    """DeepGEMM-style per-group valid rows (0.7-1.3 x expected_m), rounded up
-    to ``align`` and clamped to max_m."""
+    """DeepGEMM-style per-group valid rows (0.7-1.3 x expected_m, at least 1),
+    rounded up to ``align`` and clamped to max_m."""
     import random
 
     rng = random.Random(seed)
     counts = [
-        min(max_m, -(-int(expected_m * rng.uniform(0.7, 1.3)) // align) * align)
+        min(
+            max_m,
+            -(-max(1, int(expected_m * rng.uniform(0.7, 1.3))) // align) * align,
+        )
         for _ in range(num_groups)
     ]
     return torch.tensor(counts, dtype=torch.int32, device=device)
@@ -3613,6 +3673,10 @@ def testMaskedGroupedGemm(args):
     if max_m % 128 != 0:
         raise ValueError("masked_grouped_gemm requires --m (max_m) % 128 == 0")
     expected_m = args.expected_m if args.expected_m is not None else max_m // 2
+    if not 1 <= expected_m <= max_m:
+        raise ValueError(
+            f"--expected_m must be in [1, --m ({max_m})], got {expected_m}"
+        )
     backends = filter_backends_by_compute_capability(
         list(args.backends), args.routine, device
     )
@@ -3630,7 +3694,12 @@ def testMaskedGroupedGemm(args):
     # that requests them rounds the shared mask up to 128; other lines run the
     # requested rows. Keyed on --backends, not the arch-filtered list, so a
     # line runs the same mask on every GPU.
-    align = 128 if "cutile" in args.backends and dtype != "bfloat16" else 1
+    cutile_block_scaled = "cutile" in args.backends and dtype in (
+        "nvfp4",
+        "mxfp4",
+        "mxfp8",
+    )
+    align = 128 if cutile_block_scaled else 1
     masked_m = _make_masked_m(
         G, expected_m, max_m, args.random_seed, device, align=align
     )
@@ -3650,10 +3719,14 @@ def testMaskedGroupedGemm(args):
                 b_q, b_s = quantize_fp8(
                     b_val, (G, n // 128, k // 128), (1, 128, 128), "K"
                 )
-                ref = torch.einsum(
-                    "gmk,gnk->gmn",
-                    dequantize_fp8(a_q, a_s, "K"),
-                    dequantize_fp8(b_q, b_s, "K"),
+                ref = (
+                    torch.einsum(
+                        "gmk,gnk->gmn",
+                        dequantize_fp8(a_q, a_s, "K"),
+                        dequantize_fp8(b_q, b_s, "K"),
+                    )
+                    if args.refcheck
+                    else None
                 )
                 a_s, b_s = _deepgemm_packed_scales(
                     a_s, b_s, max_m, n, k, G, sfa_groups=G
@@ -3731,7 +3804,11 @@ def testMaskedGroupedGemm(args):
                     G, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
                 )
                 # (m, k, l) x (n, k, l) -> (l, m, n)
-                ref = torch.einsum("mkl,nkl->lmn", a_ref * sfa_ref, b_ref * sfb_ref)
+                ref = (
+                    torch.einsum("mkl,nkl->lmn", a_ref * sfa_ref, b_ref * sfb_ref)
+                    if args.refcheck
+                    else None
+                )
 
                 def run_cute_dsl(
                     a_t=a_t,
@@ -3760,11 +3837,18 @@ def testMaskedGroupedGemm(args):
 
                 run_fns[backend] = run_cute_dsl
             elif backend == "cutile" and dtype == "bfloat16":
+                if out_dtype != torch.bfloat16:
+                    # masked_bmm has no out_dtype: the output takes a's dtype.
+                    raise ValueError("masked_bmm (bfloat16) only writes bfloat16")
                 a_q = torch.randn(G, max_m, k, device=device, dtype=torch.bfloat16)
                 b_q = (torch.randn(G, n, k, device=device) / np.sqrt(k)).to(
                     torch.bfloat16
                 )
-                ref = torch.einsum("gmk,gnk->gmn", a_q.float(), b_q.float())
+                ref = (
+                    torch.einsum("gmk,gnk->gmn", a_q.float(), b_q.float())
+                    if args.refcheck
+                    else None
+                )
 
                 def run_cutile_bf16(a_q=a_q, b_q=b_q, masked_m=masked_m):
                     return flashinfer.gemm.masked_bmm(
@@ -3776,7 +3860,11 @@ def testMaskedGroupedGemm(args):
                 a_q, b_q, a_s, b_s, a_deq, b_deq = _cutile_block_scaled_operands(
                     (G, max_m, k), (G, n, k), dtype, device
                 )
-                ref = torch.einsum("gmk,gnk->gmn", a_deq, b_deq)
+                ref = (
+                    torch.einsum("gmk,gnk->gmn", a_deq, b_deq)
+                    if args.refcheck
+                    else None
+                )
 
                 def run_cutile(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, masked_m=masked_m):
                     return flashinfer.gemm.masked_scaled_bmm(
@@ -3878,9 +3966,17 @@ def testGroupedMm(args):
     m_indptr = torch.arange(0, G + 1, dtype=torch.int32, device=device) * m
     a_bf16 = torch.randn(total_m, k, device=device, dtype=torch.bfloat16)
     b_bf16 = (torch.randn(G, n, k, device=device) / np.sqrt(k)).to(torch.bfloat16)
-    bf16_reference = torch.cat(
-        [a_bf16[g * m : (g + 1) * m].float() @ b_bf16[g].float().T for g in range(G)]
-    )
+    # cuTile block-scaled operands carry their own reference; every other
+    # path is checked against the unquantized bf16 product.
+    cutile_scaled = dtype != "bfloat16"
+    bf16_reference = None
+    if args.refcheck and any(not (b == "cutile" and cutile_scaled) for b in backends):
+        bf16_reference = torch.cat(
+            [
+                a_bf16[g * m : (g + 1) * m].float() @ b_bf16[g].float().T
+                for g in range(G)
+            ]
+        )
     run_fns, refchecks = {}, {}
 
     for backend in list(backends):
@@ -3977,8 +4073,12 @@ def testGroupedMm(args):
                 a_q, b_q, a_s, b_s, a_deq, b_deq = _cutile_block_scaled_operands(
                     (total_m, k), (G, n, k), dtype, device
                 )
-                ref = torch.cat(
-                    [a_deq[g * m : (g + 1) * m] @ b_deq[g].T for g in range(G)]
+                ref = (
+                    torch.cat(
+                        [a_deq[g * m : (g + 1) * m] @ b_deq[g].T for g in range(G)]
+                    )
+                    if args.refcheck
+                    else None
                 )
 
                 def run_ragged_scaled(
@@ -4003,9 +4103,15 @@ def testGroupedMm(args):
 
     elem = _ELEMENT_BYTES[dtype]
     problem_flops = 2 * total_m * n * k
-    problem_bytes = int(
-        total_m * k * elem + G * n * k * elem + total_m * n * out_dtype.itemsize
-    )
+    in_bytes = total_m * k * elem + G * n * k * elem
+    problem_bytes = int(in_bytes + total_m * n * out_dtype.itemsize)
+    backend_overrides = {}
+    if cutile_scaled and "cutile" in backends:
+        # ragged_scaled_bmm has no out_dtype: it always writes float32.
+        backend_overrides["cutile"] = {
+            "problem_bytes": int(in_bytes + total_m * n * torch.float32.itemsize),
+            "out_dtype": str(torch.float32),
+        }
     return _bench_and_report(
         args,
         backends,
@@ -4015,6 +4121,7 @@ def testGroupedMm(args):
         problem_bytes,
         {"group_size": G, "input_dtype": dtype, "out_dtype": str(out_dtype)},
         cos_sim_min=0.97 if dtype != "bfloat16" else 0.99,
+        backend_overrides=backend_overrides,
     )
 
 
@@ -4040,6 +4147,8 @@ def testMmNvfp4Svdquant(args):
         )
 
     m, n, k, rank = args.m, args.n, args.k, args.rank
+    if dtype_str_to_torch_dtype(args.out_dtype) != torch.bfloat16:
+        raise ValueError("mm_nvfp4_svdquant only writes bfloat16")
     x = torch.randn(m, k, dtype=torch.bfloat16, device=device) / (k**0.25)
     pqs = (1.0 + 0.3 * torch.randn(k, dtype=torch.bfloat16, device=device)).abs()
     smoothed = (x * pqs).to(torch.bfloat16)
@@ -4064,7 +4173,17 @@ def testMmNvfp4Svdquant(args):
     out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
 
     def make_run(backend):
-        def run(xq=xq, wq=wq, x_sf=x_sf, w_sf=w_sf, alpha=alpha, d=d, l1=l1, out=out):
+        def run(
+            xq=xq,
+            wq=wq,
+            x_sf=x_sf,
+            w_sf=w_sf,
+            alpha=alpha,
+            d=d,
+            l1=l1,
+            bias=bias,
+            out=out,
+        ):
             return flashinfer.mm_nvfp4_svdquant(
                 xq,
                 wq,
@@ -4091,13 +4210,22 @@ def testMmNvfp4Svdquant(args):
             "auto",
         ]
     }
-    backends = _filter_and_probe(args, device, list(args.backends), run_fns)
+    requested = list(args.backends)
+    if (
+        getattr(args, "backends_defaulted", False)
+        and get_compute_capability(device)[0] == 12
+    ):
+        # The default (cutlass) is the SM10x kernel; SM12x has its own.
+        requested = ["auto"]
+    backends = _filter_and_probe(args, device, requested, run_fns)
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
         return []
-    reference = smoothed.float() @ w.float().T + d.float() @ lora_b.float().T
-    if bias is not None:
-        reference = reference + bias.float()
+    reference = None
+    if args.refcheck:
+        reference = smoothed.float() @ w.float().T + d.float() @ lora_b.float().T
+        if bias is not None:
+            reference = reference + bias.float()
     refchecks = {backend: (lambda o: _cos_sim(reference, o)) for backend in backends}
     problem_flops = 2 * m * n * k + 2 * m * n * rank
     problem_bytes = (
@@ -4187,9 +4315,11 @@ def testFusedLinear(args):
         a_q = (a_val.float() / a_scale[:, None]).to(torch.float8_e4m3fn)
         w_q = (w_val.float() / w_scale[:, None]).to(torch.float8_e4m3fn)
         a_scale, w_scale = a_scale.contiguous(), w_scale.contiguous()
-        linear_ref = (a_q.float() * a_scale[:, None]) @ (
-            w_q.float() * w_scale[:, None]
-        ).T
+        linear_ref = (
+            (a_q.float() * a_scale[:, None]) @ (w_q.float() * w_scale[:, None]).T
+            if args.refcheck
+            else None
+        )
         operands = (a_q, w_q, a_scale, w_scale)
         in_bytes = m * k + n * k
     else:
@@ -4211,9 +4341,9 @@ def testFusedLinear(args):
         )
         # nvfp4 quantization error is the refcheck's tolerance; compare with
         # the unquantized product.
-        linear_ref = a_val.float() @ w_val.float().T
+        linear_ref = a_val.float() @ w_val.float().T if args.refcheck else None
         in_bytes = (m * k + n * k) // 2
-    if bias is not None:
+    if bias is not None and linear_ref is not None:
         linear_ref = linear_ref + bias.float()
 
     rope_args = {}
@@ -4228,7 +4358,7 @@ def testFusedLinear(args):
             q_norm=q_norm, k_norm=k_norm, cos_sin=cos_sin, positions=positions
         )
 
-    def run(operands=operands, rope_args=rope_args):
+    def run(operands=operands, rope_args=rope_args, bias=bias):
         gemm = flashinfer.gemm
         if epilogue == "qkv_qknorm_rope":
             fn = (
@@ -4258,7 +4388,7 @@ def testFusedLinear(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return []
 
-    if epilogue == "linear":
+    if epilogue == "linear" or not args.refcheck:
         reference = linear_ref
     elif epilogue == "swiglu":
         reference = linear_ref[:, 0::2] * F.silu(linear_ref[:, 1::2])
