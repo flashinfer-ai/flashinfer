@@ -5604,8 +5604,7 @@ def _mla_with_kv_cache_impl(
                 if (
                     offered
                     and (
-                        tuner.is_tuning_mode
-                        or _in_batch_ranges(query.size(0), offered)
+                        tuner.is_tuning_mode or _in_batch_ranges(query.size(0), offered)
                     )
                     and cake_auto_candidate_open(_CAKE_MLA_RUNNER)
                 ):
