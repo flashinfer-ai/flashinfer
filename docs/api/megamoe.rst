@@ -256,3 +256,7 @@ same storage, capacity, seed and ``torchrun`` topology before timing, for exampl
 For EP16, use the two-node launcher above. Cross-node tests use NCCL windows
 and skip the single-node transport comparison. The benchmark's finite-output
 check alone does not replace dense-reference or replay validation.
+
+The `EP8/EP16 measurement tables <https://github.com/liz-badada/flashinfer/blob/megamoe-sm90-mxfp4-eplb/benchmarks/data/megamoe_sm90_ep8_ep16/README.md>`_
+include both token-count comparisons, physical storage, operating clocks,
+modeled SOL and downloadable CSVs.
