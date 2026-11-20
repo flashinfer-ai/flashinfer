@@ -134,6 +134,21 @@ def is_cake_sage_sm120_supported(device: Optional[torch.device] = None) -> bool:
     return _capability(device) in SM120_CAPABILITIES
 
 
+#: :func:`is_cake_sage_sm100_supported` per device a dispatched call ran on: answers that
+#: cannot change in the process (an indexed CUDA device once CUDA is available, or
+#: another device type).
+_SM100_SUPPORTED: dict = {}
+
+
+def _sm100_supported_on(device: torch.device) -> bool:
+    supported = _SM100_SUPPORTED.get(device)
+    if supported is None:
+        supported = is_cake_sage_sm100_supported(device)
+        if device.type != "cuda" or (device.index is not None and _CUDA_AVAILABLE):
+            _SM100_SUPPORTED[device] = supported
+    return supported
+
+
 def _sm100_arch(device_index: int) -> str:
     arch = _loader.device_arch(device_index)
     if arch not in SM100_ARCHES:
@@ -221,6 +236,9 @@ def _check_aligned(name: str, tensor: torch.Tensor, alignment: int) -> None:
 
 
 def _softmax_scale(softmax_scale: Optional[float], dim: int) -> float:
+    # A finite positive float (NaN fails the comparison) is its own value.
+    if type(softmax_scale) is float and 0.0 < softmax_scale < math.inf:
+        return softmax_scale
     if softmax_scale is None:
         softmax_scale = dim**-0.5
     if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, (int, float)):
@@ -772,8 +790,17 @@ def _attention_operands(
     if return_lse and lse is not None:
         _check_tensor("lse", lse, device, torch.float32, (batch, heads, seqlen_q))
     if out is None:
-        out = torch.empty(
-            (batch, seqlen_q, heads, dim), dtype=torch.bfloat16, device=device
+        # Shaped like Q: ``empty_like`` costs about half a microsecond less host time
+        # than ``empty`` with a shape and device.  Fake tensors (``check_addresses=False``)
+        # keep ``empty``, the op a fake-mode trace of the call records.
+        out = (
+            torch.empty_like(
+                q, dtype=torch.bfloat16, memory_format=torch.contiguous_format
+            )
+            if check_addresses
+            else torch.empty(
+                (batch, seqlen_q, heads, dim), dtype=torch.bfloat16, device=device
+            )
         )
     if return_lse:
         if lse is None:
@@ -784,17 +811,19 @@ def _attention_operands(
     else:
         lse_arg = q_scale
 
-    total_tiles = batch * heads * q_blocks
+    block_sparse_num = int(block_sparse_num)
     pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
-    record, items, split, tail = _route(
+    key = (
         arch,
-        int(block_sparse_num),
-        total_tiles,
+        block_sparse_num,
+        batch * heads * q_blocks,
         device_index,
         pdl,
         after_one_launch,
         q_blocks,
     )
+    hit = _ROUTES.get(key)
+    record, items, split, tail = _route(*key) if hit is None else hit
     # Positional binding in the record's ``arg_plan`` order (buffers, parameters,
     # the PDL launch flag, grid).
     args: Tuple[Any, ...] = (
@@ -817,7 +846,7 @@ def _attention_operands(
         k_blocks,
         k_scale_groups,
         capacity,
-        int(block_sparse_num),
+        block_sparse_num,
         int(has_block_nums),
         block_sizes_mode,
         v_scale_batch_stride,
@@ -828,12 +857,6 @@ def _attention_operands(
         *tail,
     )
     return record, arch, args, out, (lse if return_lse else None)
-
-
-def _attention_call(*args, **kwargs):
-    """Validate one attention call and return ``((run, args), out, lse)``; launches nothing."""
-    record, arch, call_args, out, lse = _attention_operands(*args, **kwargs)
-    return (_loader.entry(record, arch), call_args), out, lse
 
 
 def bsa_attn_sm100_sage_fwd_cake(
@@ -904,7 +927,11 @@ def bsa_attn_sm100_sage_fwd_cake(
         lse,
         enable_pdl,
     )
-    _launch((_loader.entry(record, arch), args))
+    run = _loader.entry(record, arch)
+    if _FFI_TAKES_TORCH_STREAM:
+        run(*args)
+    else:
+        _launch((run, args))
     return out, lse
 
 
@@ -1327,7 +1354,7 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
     calls, (q8, k8, v8, q_scale, k_scale, v_scale), impl = _quantize_program(
         q, k, v, "auto", enable_pdl
     )
-    attention, out, lse = _attention_call(
+    record, arch, args, out, lse = _attention_operands(
         q8,
         k8,
         v8,
@@ -1346,7 +1373,7 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
         operands_checked=True,
         after_one_launch=impl == "one_launch",
     )
-    _launch(*calls, attention)
+    _launch(*calls, (_loader.entry(record, arch), args))
     return out, lse
 
 
@@ -1379,9 +1406,7 @@ def sm100_sage_fwd_cake_dispatch(
     loads the kernel and returns the allocated outputs without launching it; the address
     checks are skipped (fake tensors have no data).
     """
-    if fallback and not (
-        isinstance(q, torch.Tensor) and is_cake_sage_sm100_supported(q.device)
-    ):
+    if fallback and not (isinstance(q, torch.Tensor) and _sm100_supported_on(q.device)):
         return None
     try:
         record, arch, args, out, lse = _attention_operands(
@@ -1408,7 +1433,10 @@ def sm100_sage_fwd_cake_dispatch(
         raise
     run = _loader.entry(record, arch)
     if not fake:
-        _launch((run, args))
+        if _FFI_TAKES_TORCH_STREAM:
+            run(*args)
+        else:
+            _launch((run, args))
     return out, lse
 
 

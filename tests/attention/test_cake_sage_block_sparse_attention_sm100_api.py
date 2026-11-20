@@ -268,7 +268,14 @@ def test_fake_mode_launches_no_cake_kernel(monkeypatch) -> None:
     def no_launch(*calls):
         raise AssertionError("a Cake kernel was launched under fake mode")
 
+    def no_entry(name, arch):
+        def run(*args):
+            raise AssertionError(f"{name} was launched under fake mode")
+
+        return run
+
     monkeypatch.setattr(backend, "_launch", no_launch)
+    monkeypatch.setattr(loader, "entry", no_entry)
     with FakeTensorMode():
         q8, k8, v8, index, scales = _fp8_operands(2, 4, 128, 128)
         with pytest.raises(ValueError, match="batch_size == 1"):
@@ -322,6 +329,11 @@ def _refusal_table(ops: dict):
         "v_scale must be [Hkv,128]=(2, 128) or [B,Hkv,128]=(2, 2, 128), got {}"
     )
     index_shape = "q2k_block_index must be int32 [B,H,2,capacity]"
+    sel_type = "block_sparse_num must be an integer"
+    sel_capacity = "block_sparse_num (3) exceeds capacity (2)"
+    scale_type = "softmax_scale must be a number"
+    scale_value = "softmax_scale must be finite and positive"
+    out_shape = (2, 128, 4, _HEAD_DIM)
     big = (2, 2**22, 2, _HEAD_DIM)
     big_msg = (
         "{} has 2147483648 elements (shape (2, 4194304, 2, 128)); the kernels index it "
@@ -522,6 +534,51 @@ def _refusal_table(ops: dict):
             ValueError,
             big_msg.format("k"),
         ),
+        ("sel_bool", dict(block_sparse_num=True), TypeError, sel_type),
+        ("sel_float", dict(block_sparse_num=2.0), TypeError, sel_type),
+        ("sel_capacity", dict(block_sparse_num=3), ValueError, sel_capacity),
+        (
+            "sel_capacity_scale_nan",
+            dict(block_sparse_num=3, softmax_scale=math.nan),
+            ValueError,
+            sel_capacity,
+        ),
+        ("scale_bool", dict(softmax_scale=True), TypeError, scale_type),
+        ("scale_str", dict(softmax_scale="0.1"), TypeError, scale_type),
+        ("scale_nan", dict(softmax_scale=math.nan), ValueError, scale_value),
+        ("scale_inf", dict(softmax_scale=math.inf), ValueError, scale_value),
+        ("scale_zero", dict(softmax_scale=0.0), ValueError, scale_value),
+        ("scale_negative", dict(softmax_scale=-0.5), ValueError, scale_value),
+        (
+            "scale_negative_out_fp32",
+            dict(softmax_scale=-0.5, out=_f32(out_shape)),
+            ValueError,
+            scale_value,
+        ),
+        (
+            "out_fp32",
+            dict(out=_f32(out_shape)),
+            TypeError,
+            "out must use torch.bfloat16, got torch.float32",
+        ),
+        (
+            "out_shape",
+            dict(out=_f32((2, 128, 4, 64)).to(bf16)),
+            ValueError,
+            "out must have shape (2, 128, 4, 128), got (2, 128, 4, 64)",
+        ),
+        (
+            "out_misaligned",
+            dict(out=_offset_view(_f32(out_shape).to(bf16), 2)),
+            ValueError,
+            "out must start on a 16-byte boundary, got address ...",
+        ),
+        (
+            "lse_shape",
+            dict(return_lse=True, lse=_f32((2, 4, 127))),
+            ValueError,
+            "lse must have shape (2, 4, 128), got (2, 4, 127)",
+        ),
     ]
 
 
@@ -567,3 +624,65 @@ def test_attention_refuses_invalid_operands_in_check_order() -> None:
         ):
             _raises(exc, message, bsa_attn_sm100_blk64_fwd, **ops, backend="cake")
     torch.cuda.empty_cache()
+
+
+class _Scale(float):
+    """A float subclass (a caller's own scale type)."""
+
+
+def test_attention_accepts_scales_and_allocates_contiguous_outputs() -> None:
+    """Every accepted ``softmax_scale`` form gives the bits of its float value, and each
+    entry allocates its outputs as contiguous BF16 / float32 tensors on the inputs'
+    device, also for Q whose size-1 dimensions carry other strides."""
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import bsa_attn_sm100_blk64_fwd
+
+    q8, k8, v8, q_scale, k_scale, v_scale, index = _inputs(1, 1, 1, 128, 256, 2, 13)
+    scales = dict(q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+    ref, _ = bsa_attn_sm100_sage_fwd_cake(q8, k8, v8, index, 2, **scales)
+    default = _HEAD_DIM**-0.5
+    for scale in (default, _Scale(default), None):
+        out, _ = bsa_attn_sm100_sage_fwd_cake(
+            q8, k8, v8, index, 2, softmax_scale=scale, **scales
+        )
+        assert torch.equal(out, ref), scale
+    out_one, _ = bsa_attn_sm100_sage_fwd_cake(
+        q8, k8, v8, index, 2, softmax_scale=1, **scales
+    )
+    assert out_one.dtype == torch.bfloat16 and not torch.equal(out_one, ref)
+    # Q of shape (1, 128, 1, 128) as a transposed (1, 1, 128, 128) buffer: contiguous,
+    # strides of its size-1 dimensions differ from a fresh tensor's.
+    q_odd = torch.empty((1, 1, 128, _HEAD_DIM), dtype=q8.dtype, device=q8.device)
+    q_odd = q_odd.transpose(1, 2)
+    q_odd.copy_(q8)
+    assert q_odd.is_contiguous() and q_odd.stride() != q8.stride()
+    q_bf16 = torch.randn((1, 128, 1, _HEAD_DIM), device=q8.device).bfloat16()
+    k_bf16 = torch.randn((1, 256, 1, _HEAD_DIM), device=q8.device).bfloat16()
+    calls = {
+        "attention": lambda q: bsa_attn_sm100_sage_fwd_cake(
+            q, k8, v8, index, 2, return_lse=True, **scales
+        ),
+        "dispatch": lambda q: backend.sm100_sage_fwd_cake_dispatch(
+            q, k8, v8, index, 2, return_lse=True, **scales
+        ),
+        "dispatch_fallback": lambda q: backend.sm100_sage_fwd_cake_dispatch(
+            q, k8, v8, index, 2, return_lse=True, fallback=True, **scales
+        ),
+        "sglang": lambda q: bsa_attn_sm100_blk64_fwd(
+            q, k8, v8, index, 2, return_lse=True, **scales
+        ),
+        "combined": lambda q: backend.bsa_attn_sm100_sage_quantize_fwd_cake(
+            q_bf16, k_bf16, k_bf16, index, 2, return_lse=True
+        ),
+    }
+    for name, call in calls.items():
+        for q in (q8, q_odd):
+            out, lse = call(q)
+            assert type(out) is torch.Tensor and type(lse) is torch.Tensor, name
+            assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32, name
+            assert out.shape == (1, 128, 1, _HEAD_DIM), name
+            assert out.stride() == (128 * _HEAD_DIM, _HEAD_DIM, _HEAD_DIM, 1), name
+            assert lse.shape == (1, 1, 128) and lse.stride() == (128, 128, 1), name
+            assert out.device == q8.device and lse.device == q8.device, name
+            if name != "combined":
+                assert torch.equal(out, ref), name
+    torch.cuda.synchronize()

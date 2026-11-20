@@ -544,6 +544,10 @@ def _stream_cases(device):
             fp8,
             lambda: _run(c),
         ),
+        "attention_no_pdl": (
+            fp8,
+            lambda: _run(c, enable_pdl=False),
+        ),
         "dispatch": (
             fp8,
             lambda: pkg.sm100_sage_fwd_cake_dispatch(
@@ -555,6 +559,12 @@ def _stream_cases(device):
                 return_lse=True,
                 fallback=True,
                 **scales,
+            ),
+        ),
+        "dispatch_strict": (
+            fp8,
+            lambda: pkg.sm100_sage_fwd_cake_dispatch(
+                c["q8"], c["k8"], c["v8"], index, c["sel"], **scales
             ),
         ),
         "combined_one_launch": (
@@ -604,7 +614,15 @@ def _after_stream_work(stream, inputs, call, device=None):
 @requires_sm100
 @pytest.mark.parametrize(
     "name",
-    ["attention", "dispatch", "combined_one_launch", "combined_wide", "quantize"],
+    [
+        "attention",
+        "attention_no_pdl",
+        "dispatch",
+        "dispatch_strict",
+        "combined_one_launch",
+        "combined_wide",
+        "quantize",
+    ],
 )
 def test_host_entries_launch_on_the_current_stream(name):
     """Each host entry launches on torch's current stream: on a side stream it runs
@@ -635,7 +653,8 @@ def test_host_entries_launch_on_the_current_stream(name):
 @requires_sm100
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second CUDA device")
 @pytest.mark.parametrize(
-    "name", ["attention", "combined_one_launch", "combined_wide", "quantize"]
+    "name",
+    ["attention", "dispatch", "combined_one_launch", "combined_wide", "quantize"],
 )
 def test_host_entries_launch_on_the_current_stream_of_the_inputs_device(name):
     """With another device current, a call on device 1 tensors launches on device 1's
