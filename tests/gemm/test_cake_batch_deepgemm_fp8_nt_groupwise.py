@@ -20,12 +20,16 @@ from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
     PACKED_GROUPS,
     PACKED_NK,
     PAIR_COUNTER_WORDS,
+    PAIR_GROUP_MAX,
+    PAIR_SERVING_ROUTE,
     SUPPORTED_NK,
     domain_serving_program,
     domain_serving_routed,
     expected_m_class,
     is_batch_deepgemm_fp8_nt_groupwise_cake_available,
     localize_weights,
+    pair_serving_key,
+    pair_serving_tile,
     prepare_batch_deepgemm_fp8_nt_groupwise,
     select_route,
     serving_config,
@@ -34,8 +38,10 @@ from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
     supported_nk,
 )
 from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
+    ARG_PLANS,
     DOMAIN_SERVING_CELLS,
     DOMAIN_SERVING_PROGRAMS,
+    PAIR_SERVING_EXPECTED_M,
     SERVING_PROGRAMS,
     _SM100A_SM103A_MMSETUP_TWINS,
     _SM107A_CELLS,
@@ -1284,13 +1290,16 @@ def test_serving_grid_reserve():
         assert plan.route == _SERVING_ROUTE
         return plan.stages[0].grid[0]
 
+    low = PAIR_SERVING_EXPECTED_M[212][0]
     for k in (7168, 2048):
         assert grid("sm_107a", 212, k, 1) == 212
         assert grid("sm_107a", 212, k, 2) == 212 - (16 if k == 7168 else 20)
         for expected_m in (4, 8, 16, 32, 35):
             assert grid("sm_107a", 212, k, expected_m) == 188
         for expected_m in (36, 64, 512, 4096):
-            assert grid("sm_107a", 212, k, expected_m) == 212
+            # From the masked pair program's low bound, 212-SM devices run it instead.
+            if expected_m < low:
+                assert grid("sm_107a", 212, k, expected_m) == 212
             assert serving_config(512, k, expected_m, 212, "sm_107a")[3] == 0
         for arch, sm_count, reserve in (
             ("sm_100a", 148, 20 if k == 7168 else 24),
@@ -1299,6 +1308,171 @@ def test_serving_grid_reserve():
         ):
             for expected_m in (36, 64, 4096):
                 assert serving_config(512, k, expected_m, sm_count, arch)[3] == reserve
+
+
+_PAIR_SM_COUNT = 212
+_PAIR_TILES = (256, 512)
+
+
+def _pair_items(n, groups, m, pair_w):
+    return (n // pair_w) * groups * -(-m // 256)
+
+
+@_host_only
+def test_pair_serving_plan_thresholds():
+    """On 212-SM SM107a devices a packed-scale serving shape runs the masked pair
+    program from the low bound of PAIR_SERVING_EXPECTED_M on (homed weights:
+    from the homed low bound): the 256-row pair tile below the high bound, the
+    512-row tile from it, at a grid of at most half as many 2-CTA clusters as
+    SMs.  Below the bound the serving program (or its twin) keeps the problem."""
+    low, high, homed_low = PAIR_SERVING_EXPECTED_M[_PAIR_SM_COUNT]
+    # localize_weights probes expected_m up to 17: its keys stay serving keys.
+    assert 17 < low < high
+    assert homed_low > 17
+    for n, k in sorted(PACKED_NK):
+        for groups in sorted(PACKED_GROUPS):
+            for m in (128, 512, 4096):
+                below = serving_plan("sm_107a", 212, groups, m, n, k, low - 1)
+                key = _serving_key("sm_107a", 212, (n, k), groups, low - 1)
+                assert below.route == _SERVING_ROUTE
+                assert below.stages[0].program == _whole_program(key)
+                for expected_m in sorted(
+                    {low, high - 1, high, 4096, homed_low - 1, homed_low}
+                ):
+                    if expected_m < low:
+                        continue
+                    pair_w = 512 if expected_m >= high else 256
+                    plan = serving_plan("sm_107a", 212, groups, m, n, k, expected_m)
+                    assert plan.route == PAIR_SERVING_ROUTE
+                    assert plan.parent == _SERVING_ROUTE
+                    (stage,) = plan.stages
+                    assert (
+                        stage.program
+                        == SERVING_PROGRAMS[f"sm_107a:{pair_serving_key(n, k, pair_w)}"]
+                    )
+                    items = _pair_items(n, groups, m, pair_w)
+                    assert stage.grid == (2, 1, min(items, 106))
+                    assert stage.args == (n // pair_w,)
+                    assert plan.workspaces == {}
+                    for counts in ((106, 106), (102, 110)):
+                        homed = serving_plan(
+                            "sm_107a", 212, groups, m, n, k, expected_m, counts=counts
+                        )
+                        if expected_m >= homed_low:
+                            assert homed == plan
+                        else:
+                            assert homed.route != PAIR_SERVING_ROUTE
+    # Every other measured architecture and SM count keeps the serving program.
+    for arch, sm_count in (("sm_107a", 216), ("sm_100a", 148), ("sm_103a", 148)):
+        for expected_m in (low, high, 4096):
+            plan = serving_plan(arch, sm_count, 64, 4096, 4096, 7168, expected_m)
+            assert plan.route == _SERVING_ROUTE, (arch, sm_count, expected_m)
+
+
+@_host_only
+def test_pair_serving_refusals(monkeypatch):
+    """The router names no pair tile (the serving program keeps the problem)
+    outside the measured devices, the serving shapes, the program's limits
+    (at most 1024 groups, K a multiple of 512, N a multiple of the pair tile,
+    M a positive multiple of 128), below the low bound, or when the key has no
+    registered program."""
+    from flashinfer.gemm import cake_batch_deepgemm_fp8 as host
+
+    low, high, homed_low = PAIR_SERVING_EXPECTED_M[_PAIR_SM_COUNT]
+
+    def tile(**changes):
+        problem = dict(
+            arch="sm_107a",
+            sm_count=212,
+            groups=64,
+            m=512,
+            n=4096,
+            k=7168,
+            expected_m=high,
+        )
+        problem.update(changes)
+        return pair_serving_tile(**problem)
+
+    assert tile() == 512 and tile(expected_m=low) == 256
+    assert tile(homed=True) == 512
+    homed_w = 512 if homed_low >= high else 256
+    assert tile(expected_m=homed_low, homed=True) == homed_w
+    assert tile(expected_m=homed_low - 1, homed=True) is None
+    assert tile(n=7168, k=2048, groups=32, m=128) == 512
+    for changes in (
+        {"arch": "sm_100a"},
+        {"arch": "sm_103a"},
+        {"sm_count": 216},
+        {"sm_count": 148},
+        {"sm_count": 210},
+        {"groups": 16},
+        {"groups": 128},
+        {"n": 6144, "k": 7168},
+        {"n": 4096, "k": 2048},
+        {"m": 0},
+        {"m": 64},
+        {"m": 200},
+        {"expected_m": low - 1},
+        {"expected_m": 0},
+    ):
+        assert tile(**changes) is None, changes
+    # The program's own limits hold for any shape the serving set might list.
+    monkeypatch.setattr(
+        host, "PACKED_NK", PACKED_NK | {(4352, 7168), (4096, 2304), (256, 7168)}
+    )
+    monkeypatch.setattr(host, "PACKED_GROUPS", PACKED_GROUPS | {PAIR_GROUP_MAX + 1})
+    for changes in (
+        {"n": 4352},
+        {"n": 4352, "expected_m": low},
+        {"k": 2304},
+        {"n": 256, "expected_m": low},
+        {"groups": PAIR_GROUP_MAX + 1},
+    ):
+        assert tile(**changes) is None, changes
+    monkeypatch.delitem(SERVING_PROGRAMS, "sm_107a:pair_masked_n4096_k7168_w512")
+    assert tile() is None and tile(expected_m=low) == 256
+    monkeypatch.setitem(PAIR_SERVING_EXPECTED_M, 216, (low, high, homed_low))
+    monkeypatch.delitem(PAIR_SERVING_EXPECTED_M, _PAIR_SM_COUNT)
+    assert tile(expected_m=low) is None and tile(sm_count=216, expected_m=low) == 256
+
+
+@_host_only
+def test_pair_keys_registered():
+    """The pair keys name the masked pair program's two builds for every serving
+    (N, K), each built for SM107a alone without fast math, binding plan9: the
+    operands, both views of the output, G, M, N, K and the pair-tile divisor."""
+    keys = {key for key in SERVING_PROGRAMS if ":pair_masked_" in key}
+    assert keys == {
+        f"sm_107a:{pair_serving_key(n, k, pair_w)}"
+        for n, k in PACKED_NK
+        for pair_w in _PAIR_TILES
+    }
+    by_tile = {
+        pair_w: {SERVING_PROGRAMS[key] for key in keys if key.endswith(f"_w{pair_w}")}
+        for pair_w in _PAIR_TILES
+    }
+    assert all(len(programs) == 1 for programs in by_tile.values())
+    assert by_tile[256] != by_tile[512]
+    for programs in by_tile.values():
+        (program,) = programs
+        record = PROGRAMS[program]
+        assert record["arches"] == ["sm_107a"] and record["compile_flags"] == []
+        assert record["arg_plan"] == "plan9"
+    assert [name for kind, name in ARG_PLANS["plan9"] if kind != "grid"] == [
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "masked_m",
+        "C",
+        "C_rows",
+        "G",
+        "M",
+        "N",
+        "K",
+        "fd_w",
+    ]
+    assert set(PAIR_SERVING_EXPECTED_M) == {_PAIR_SM_COUNT}
 
 
 @_host_only
@@ -2856,3 +3030,173 @@ def test_domain_twin_race(cell, placement):
         f"launches={launches} wrong={wrong}"
     )
     assert not wrong, "\n".join(failures)
+
+
+def _require_pair():
+    """A device whose SM count has measured masked pair bounds (SM107a)."""
+    _require_packed()
+    index = torch.cuda.current_device()
+    if _arch() != "sm_107a" or device_sm_count(index) not in PAIR_SERVING_EXPECTED_M:
+        pytest.skip(
+            "the masked pair program serves SM107a devices of "
+            f"{sorted(PAIR_SERVING_EXPECTED_M)} SMs"
+        )
+
+
+def _pair_masks(groups, m):
+    """Group masks around every pass and strip edge: empty, one row, partial and
+    full 16-row strips, one and two 128-row blocks and a row past them, a 256-row
+    pass and its odd last block, all M rows and more than M (the program clamps)."""
+    edges = (0, 1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 383, m, m + 100)
+    return [edges[g % len(edges)] for g in range(groups)]
+
+
+def _pair_problem(nk, groups, m, masked, seed):
+    n, k = nk
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=seed, device=torch.device("cuda"), masked=masked
+    )
+    a_packed = _pack_ue8m0(a_scale)
+    b_packed = _pack_ue8m0(b_scale.repeat_interleave(128, dim=1))
+    reference = _reference(a, b, a_scale, b_scale, masked_m)
+    rows = torch.arange(m, device=a.device)[None, :]
+    valid = rows < masked_m.clamp(max=m)[:, None]
+    return a, b, a_packed, b_packed, masked_m, reference, valid
+
+
+@_packed_serving
+@pytest.mark.parametrize("bound", ["low", "high"])
+@pytest.mark.parametrize("groups", sorted(PACKED_GROUPS))
+@pytest.mark.parametrize("nk", sorted(PACKED_NK))
+def test_pair_serving_matches_reference(nk, groups, bound):
+    """The masked pair program at both pair tiles: every valid row within the
+    family's tolerance, and no row at or beyond ``masked_m`` written (the output
+    is NaN-filled first)."""
+    _require_pair()
+    low, high, _ = PAIR_SERVING_EXPECTED_M[device_sm_count(torch.cuda.current_device())]
+    expected_m, pair_w = (low, 256) if bound == "low" else (high, 512)
+    m = max(512, -(-high // 128) * 128)
+    a, b, a_packed, b_packed, masked_m, reference, valid = _pair_problem(
+        nk, groups, m, _pair_masks(groups, m), seed=950
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == PAIR_SERVING_ROUTE
+    assert prepared.programs == (
+        SERVING_PROGRAMS[f"sm_107a:{pair_serving_key(*nk, pair_w)}"],
+    )
+    prepared.out.fill_(float("nan"))
+    prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    untouched = prepared.out.view(torch.int16)[~valid]
+    nan_bits = torch.full((1,), float("nan"), dtype=torch.bfloat16).view(torch.int16)
+    assert bool((untouched == nan_bits.to(untouched.device)).all())
+
+
+@_packed_serving
+@pytest.mark.parametrize("bound", ["low", "high"])
+def test_pair_serving_prepared_public_graph_bits(bound):
+    """Prepared, public, CUDA-graph-captured (first launch) and repeated launches
+    of the masked pair program give the same bits; ``launch()`` allocates
+    nothing."""
+    _require_pair()
+    low, high, _ = PAIR_SERVING_EXPECTED_M[device_sm_count(torch.cuda.current_device())]
+    expected_m = low if bound == "low" else high
+    nk, groups, m = (4096, 7168), 64, max(512, -(-high // 128) * 128)
+    a, b, a_packed, b_packed, masked_m, reference, valid = _pair_problem(
+        nk, groups, m, _pair_masks(groups, m), seed=951
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == PAIR_SERVING_ROUTE
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch()
+    prepared.out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    first = _valid_bits(prepared.out, valid)
+    for _ in range(2):
+        prepared.out.fill_(float("nan"))
+        before = torch.cuda.memory_stats()
+        prepared.launch()
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_stats()
+        assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+        assert torch.equal(_valid_bits(prepared.out, valid), first)
+    public = batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, expected_m, backend="cake"
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(public, valid), first)
+
+
+@_packed_serving
+@pytest.mark.parametrize("expected_m", ["low", 4096])
+def test_pair_serving_uneven_masks(expected_m):
+    """Uneven group masks (0.7x to 1.3x of ``expected_m``) on the pair route."""
+    _require_pair()
+    low = PAIR_SERVING_EXPECTED_M[device_sm_count(torch.cuda.current_device())][0]
+    em = low if expected_m == "low" else expected_m
+    nk, groups = (7168, 2048), 32
+    m = -(-int(1.3 * em) // 128) * 128
+    generator = torch.Generator().manual_seed(952)
+    masked = [
+        int(em * (0.7 + 0.6 * float(u)))
+        for u in torch.rand(groups, generator=generator)
+    ]
+    a, b, a_packed, b_packed, masked_m, reference, valid = _pair_problem(
+        nk, groups, m, masked, seed=953
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, em
+    )
+    assert prepared.route == PAIR_SERVING_ROUTE
+    prepared.out.fill_(float("nan"))
+    prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    nan_bits = torch.full((1,), float("nan"), dtype=torch.bfloat16).view(torch.int16)
+    assert bool((prepared.out.view(torch.int16)[~valid] == nan_bits.to(a.device)).all())
+
+
+@_packed_serving
+def test_pair_serving_homed_bound():
+    """Weights homed by groups keep their locality-domain or serving route below
+    the homed low bound of PAIR_SERVING_EXPECTED_M and run the masked pair
+    program from it, with the same bits as on plain weights."""
+    device, table = _require_domain()
+    _require_pair()
+    low, high, homed_low = PAIR_SERVING_EXPECTED_M[device_sm_count(device)]
+    nk, groups, m = (4096, 7168), 64, max(512, -(-homed_low // 128) * 128)
+    a, b, a_packed, b_packed, masked_m, reference, valid = _pair_problem(
+        nk, groups, m, _pair_masks(groups, m), seed=954
+    )
+    homed = _home(b, table)
+    below = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, homed_low - 1
+    )
+    assert below.route != PAIR_SERVING_ROUTE
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, homed_low
+    )
+    assert prepared.route == PAIR_SERVING_ROUTE
+    pair_w = 512 if homed_low >= high else 256
+    assert prepared.programs == (
+        SERVING_PROGRAMS[f"sm_107a:{pair_serving_key(*nk, pair_w)}"],
+    )
+    out = prepared.launch()
+    plain = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, homed_low
+    )
+    assert plain.programs == prepared.programs
+    plain_out = plain.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(out, reference, masked_m)
+    assert torch.equal(_valid_bits(out, valid), _valid_bits(plain_out, valid))
