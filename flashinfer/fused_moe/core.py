@@ -3916,6 +3916,7 @@ def _build_trtllm_moe_namespace(module):
         valid_hidden_size: Optional[int],
         hidden_states_scale_layout: Optional[int],
         nvfp4_4over6_code: int,
+        output: Optional[torch.Tensor],
     ) -> Optional[int]:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1] * (
@@ -3927,13 +3928,15 @@ def _build_trtllm_moe_namespace(module):
             topk_weights = torch.empty(
                 num_tokens, top_k, dtype=torch.bfloat16, device=meta
             )
-        moe_inputs = MoeRunnerInputs(
-            output=_alloc_trtllm_moe_output(
+        if output is None:
+            output = _alloc_trtllm_moe_output(
                 num_tokens,
                 _trtllm_moe_output_width(hidden_size, valid_hidden_size),
                 do_finalize,
                 meta,
-            ),
+            )
+        moe_inputs = MoeRunnerInputs(
+            output=output,
             routing_logits=None,
             topk_ids=topk_ids,
             expert_weights=topk_weights,
@@ -4919,6 +4922,7 @@ def trtllm_fp4_block_scale_moe_routing_tile_n(
     valid_hidden_size: Optional[int] = None,
     hidden_states_scale_layout: Optional[SfLayout] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    output: Optional[torch.Tensor] = None,
 ) -> Optional[int]:
     """The tile_N :func:`trtllm_fp4_block_scale_routed_moe` runs with the same arguments:
     the autotuned tile if the tactic cache has one, else the default tile after the call's
@@ -4926,7 +4930,8 @@ def trtllm_fp4_block_scale_moe_routing_tile_n(
 
     It only looks the cache up (inside a tuning context it returns the default tile,
     so tune the call without ``routing_metadata``). Only the shapes and dtypes of the
-    activation tensors are read, so they may be ``meta`` tensors.
+    activation tensors and ``output`` are read, so they may be ``meta`` tensors; pass the
+    call's ``output`` when it is narrower than the default, since its width keys the cache.
     """
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe_routing_tile_n(
@@ -4948,6 +4953,7 @@ def trtllm_fp4_block_scale_moe_routing_tile_n(
         valid_hidden_size,
         hidden_states_scale_layout,
         _trtllm_fp4_nvfp4_4over6_code(nvfp4_4over6, per_token_scale, hidden_states),
+        output,
     )
 
 

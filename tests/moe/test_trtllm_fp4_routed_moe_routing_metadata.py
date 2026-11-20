@@ -412,6 +412,37 @@ def test_routing_tile_n_tuned(experts, monkeypatch, num_tokens, do_finalize):
     assert torch.equal(_result(num_tokens, out, do_finalize), want)
 
 
+def test_routing_tile_n_tuned_narrow_output(experts, monkeypatch):
+    """A narrow caller ``output`` keys the cache by its width; passing it finds the tuned tile."""
+    AutoTuner.get().clear_cache()
+    quant, view = experts
+    num_tokens = 64
+    hidden_states, scale = _activations(quant, num_tokens, seed=num_tokens)
+    routing = _routing(num_tokens, seed=num_tokens, packed=True)
+
+    def narrow():
+        return torch.empty(num_tokens, HIDDEN // 2, dtype=torch.bfloat16, device="cuda")
+
+    tune = dict(tune_max_num_tokens=num_tokens)
+    with autotune(True):
+        _call(view, hidden_states, scale, routing, True, output=narrow(), **tune)
+    chosen, bodies = _record_tactics(monkeypatch)
+    want = _call(view, hidden_states, scale, routing, True, output=narrow(), **tune)[0]
+    (tuned,) = chosen
+    assert tuned != -1
+    tuned = [int(t) for t in tuned]
+
+    tile_n = _tile_n(
+        view, hidden_states, scale, routing, True, output=narrow().to("meta"), **tune
+    )
+    assert tile_n == tuned[0]
+    out = _run_with_tile_metadata(
+        view, hidden_states, scale, routing, True, tile_n, output=narrow(), **tune
+    )
+    assert bodies[-1] == tuned
+    assert torch.equal(out[0], want)
+
+
 @pytest.mark.parametrize("runnable", [True, False], ids=["fallback_tile", "no_tile"])
 def test_routing_tile_n_follows_tile_fallback(experts, monkeypatch, runnable):
     """The default tile cannot run: the query gives the launch's fallback tile, or None.
