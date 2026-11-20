@@ -255,6 +255,7 @@ class JitSpecCuteDsl(JitSpec):
         # caller provides the engine-less compile.
         self._compiled_kernel = (self.export_compile_fn or self.compile_fn)()
         _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
+        exported = False
         with FileLock(self.lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
@@ -266,6 +267,7 @@ class JitSpecCuteDsl(JitSpec):
                 shutil.rmtree(self.module_dir, ignore_errors=True)
             try:
                 self._export()
+                exported = True
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
                 logger.warning(
                     f"Failed to persist CuTe-DSL kernel {self.name} to "
@@ -273,7 +275,9 @@ class JitSpecCuteDsl(JitSpec):
                     f"next run."
                 )
         if self.export_compile_fn is not None:
-            self._compiled_kernel = None
+            # the exported object is what load() hands back; an engine-less
+            # kernel cannot run, so without one compile again with the engine
+            self._compiled_kernel = None if exported else self.compile_fn()
 
     def load(self) -> Any:
         """The kernel to hand back: the exported artifact whenever one exists.

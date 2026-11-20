@@ -104,6 +104,15 @@ def test_compile_and_persist_exports_the_engine_less_kernel(jit_dir):
     assert json.loads(spec.meta_path.read_text())["source_sha256"] == "sha"
 
 
+def test_compile_and_persist_failed_export_compiles_again_with_the_engine(jit_dir):
+    c = _Closures(fail_export=True)
+    spec = _spec(c)
+    spec.compile_and_persist()
+    assert c.calls == ["no_engine", "engine"] and not spec.object_path.exists()
+    kernel = spec.load()
+    assert isinstance(kernel, _Kernel) and kernel.tag == "engine"
+
+
 def test_build_and_load_cute_dsl_kernel_passes_the_closure(jit_dir, monkeypatch):
     monkeypatch.setattr(cute_dsl_core, "_hash_source_files", lambda paths: "sha")
     c = _Closures()
