@@ -2336,7 +2336,12 @@ class SpecializedFp8BlockSmallTConfig:
     Same weight and routing contract as :class:`CutlassFp8BlockConfig`:
     prepare weights once with either class and register the view under
     either backend key — the runner accepts the ``"cutlass_fp8_block"``
-    view as its own, with no second weight copy.
+    view as its own, with no second weight copy. Externally prepared views
+    must supply finite, strictly positive FC1 and FC2 block scales.
+
+    Before CUDA graph capture, finish all eager calls that could donate a
+    workspace on the device, not just calls on the capture stream. Capture
+    can adopt a buffer from another stream without waiting for its last use.
 
     A DEFAULT backend candidate: ``supported()`` gates the arch (SM90) and
     the runner gates the kernel's contract (dsfp8 quant, canonical SwiGLU,

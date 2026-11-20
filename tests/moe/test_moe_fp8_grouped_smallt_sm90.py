@@ -55,6 +55,7 @@ TOKEN_SUM_REL, TOKEN_L2_REL = 0.15, 0.10
 def _clean(monkeypatch):
     monkeypatch.delenv(DISABLE_ENV, raising=False)
     monkeypatch.delenv(DISABLE_ENV_LEGACY, raising=False)
+    monkeypatch.delenv("FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE", raising=False)
     _reset_moe_smallt_sm90_stats()
     yield
     _reset_moe_smallt_sm90_stats()
@@ -526,6 +527,97 @@ def test_block_peak_uniform_weights_match_analytic(T, w2_value, expected):
     )
 
 
+@pytest.mark.parametrize("T", [1, 4])
+def test_fc1_overflow_before_block_scale(T):
+    _sm90_or_skip()
+    # Six 512-column steps plus a tail in fc1_t1_u4. Put the up peak
+    # in the unrolled loop and the gate peak in the tail, then swap.
+    b = _make(T, torch.device("cuda"), h=3584, e=K)
+    b["x"].zero_()
+    b["x"][:, :16] = 300
+    b["x"][:, -16:] = 300
+    b["s13"].fill_(2.0**-20)
+    b["s2"].fill_(1.0 / I)
+    b["w2"].fill_(1)
+    for up, gate in (
+        (slice(0, 16), slice(-16, None)),
+        (slice(-16, None), slice(0, 16)),
+    ):
+        b["w13"].zero_()
+        b["w13"][:, :I, up] = 448
+        b["w13"][:, I:, gate] = 448
+        out = _dispatch(b)
+        assert out is not None
+        ref = _reference(b)
+        assert (ref > 1).all() and torch.isfinite(out).all()
+        torch.testing.assert_close(out.float(), ref, atol=0, rtol=0.01)
+
+
+@pytest.mark.parametrize("first_scale", [2.0**-19, 2.0**110])
+def test_native_fp8_fc2_independent_block_scales(first_scale):
+    _sm90_or_skip()
+    T, e, h = 2048, K, 256
+    device = torch.device("cuda")
+    w13 = torch.full((e, 2 * I, h), 0.5, device=device, dtype=torch.bfloat16)
+    # First 128 up rows cancel on x=1, without any zero-scale FC1 block.
+    w13[:, :128, h // 2 :] = -0.5
+    second_scale = 2.0**-20
+    w2 = torch.empty((e, h, I), device=device, dtype=torch.bfloat16)
+    w2[:, :, :128] = 448 * first_scale
+    w2[:, :, 128:] = 448 * second_scale
+    view = SpecializedFp8BlockSmallTConfig.prepare_weights(
+        w13, w2, num_local_experts=e, hidden_size=h, intermediate_size=I
+    )
+    scales = view["fc2_block_scale"]
+    assert (scales[..., 0] == first_scale).all()
+    assert (scales[..., 1] == second_scale).all()
+    b = dict(
+        x=torch.ones((T, h), device=device, dtype=torch.bfloat16),
+        w13=view["fc1_expert_weights"],
+        s13=view["fc1_block_scale"],
+        w2=view["fc2_expert_weights"],
+        s2=scales,
+        ids=torch.arange(K, device=device, dtype=torch.int32).repeat(T, 1),
+        tw=torch.full((T, K), 1 / K, device=device, dtype=torch.float32),
+    )
+    out = _dispatch(b)
+    assert out is not None
+    # Identical experts: first dot is zero, second has 128 terms with
+    # up=gate=128 (SiLU(128) rounds to 128) and physical weight w2.
+    expected = 128 * (128 * 128) * (448 * second_scale)
+    assert torch.equal(out, torch.full_like(out, expected))
+
+
+def test_workspace_planner_bounds_and_layout():
+    _sm90_or_skip()
+    from flashinfer.jit.moe_fp8_grouped_smallt_sm90 import (
+        gen_moe_fp8_grouped_smallt_sm90_module,
+    )
+
+    plan = (
+        gen_moe_fp8_grouped_smallt_sm90_module().build_and_load().plan_workspace_bytes
+    )
+    assert plan(4, 9, 256, 512, 16) == 18432
+    t, k, i, h, e = 257, 9, 256, 512, 16
+    p = t * k
+    segments = (
+        4 * p * i,
+        2 * p * i,
+        2 * p * h,
+        4 * (4 * e + 1 + p),
+        8 * (e + (p + 63) // 64),
+    )
+    assert plan(t, k, i, h, e) == sum(16 * ((n + 15) // 16) for n in segments)
+    for dims in (
+        (4096, 9, 256, 1 << 51, 16),
+        (4, 9, 1 << 60, 512, 16),
+        (16, 1 << 30, 256, 512, 16),
+        ((1 << 31) - 256, 1, 1 << 29, (1 << 31) - 128, 16),
+    ):
+        with pytest.raises(RuntimeError):
+            plan(*dims)
+
+
 def test_independent_graph_captures_get_distinct_scratch():
     # Regression (Codex, H100-reproduced): torch.cuda.graph reuses one
     # default capture stream for every capture in the process, so keying
@@ -782,19 +874,19 @@ def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
 # --------------------------------------------------------------------------
 
 
-def _unified_layer(T, backends=None, tune_max=64, seed=0):
+def _unified_layer(T, backends=None, tune_max=64, seed=0, *, e=E, k=K, h=H, i=I):
     """Build a dsfp8 MoELayer over the contract geometry plus matching packs."""
     if backends is None:
         backends = (SpecializedFp8BlockSmallTConfig(),)
     device = torch.device("cuda", torch.cuda.current_device())
-    b = _make(T, device, seed=seed)
+    b = _make(T, device, seed=seed, e=e, k=k, h=h, i=i)
     config = MoEConfig(
-        routing=RoutingConfig(num_experts=E, top_k=K),
+        routing=RoutingConfig(num_experts=e, top_k=k),
         quant=QuantConfig(
             weight=QuantFormat.DeepSeekFp8,
             activation=QuantFormat.DeepSeekFp8,
         ),
-        experts=ExpertConfig(intermediate_size=I),
+        experts=ExpertConfig(intermediate_size=i),
         activation=SwiGLU(),
         backend=BackendOptions(candidates=backends),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
@@ -856,12 +948,37 @@ def test_unified_config_gating_and_registration():
     )
 
 
-def test_unified_layer_dispatches_specialized_kernel():
+def test_unified_smem_rejection_precedes_specialized_forward(monkeypatch):
+    _sm90_or_skip()
+    layer, act, weights, _ = _unified_layer(
+        4,
+        (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig()),
+        e=2,
+        k=2,
+        h=4096,
+        i=14336,
+    )
+    assert {r.backend_key for r in layer.runners} == {
+        "specialized_fp8_block_smallt",
+        "cutlass_fp8_block",
+    }
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("specialized forward entered for 57344-byte FC2 staging")
+
+    monkeypatch.setattr(SpecializedFp8BlockSmallTRunner, "forward", unexpected)
+    out = layer(act, weights)
+    assert out.shape == (4, 4096)
+    assert layer.winner_backend == "cutlass_fp8_block"
+
+
+@pytest.mark.parametrize("T", [1, 4, 16])
+def test_unified_layer_dispatches_specialized_kernel(T):
     """MoELayer with the opt-in backend serves an in-band call with the
     specialized kernel (the determinism premise: eligible shape => the
     specialized kernel, not the stock route)."""
     _sm90_or_skip()
-    layer, act, weights, b = _unified_layer(4, None)
+    layer, act, weights, b = _unified_layer(T, None)
     assert [r.backend_key for r in layer.runners] == ["specialized_fp8_block_smallt"]
     before = _moe_smallt_sm90_stats()
     out = layer(act, weights)

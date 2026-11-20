@@ -17,9 +17,9 @@ __device__ __forceinline__ void unpack4(uint32_t v, __half2& a, __half2& b) {
 // products per half lane) against RAW e4m3 weight mantissas — which the
 // [128,128] block quantizer drives to ~448 at every block's peak — folding
 // the fp32 block scale only once per chunk. Staging the bf16 activation
-// row prescaled by 1/16 keeps those chunk partials inside half range for
-// activation magnitudes up to ~2^9 instead of ~2^5 (outlier channels of
-// O(10..100) occur in real post-norm hidden states). The exact power of
+// row prescaled by 1/16 increases headroom, but eight aligned peaks
+// at X=300 still sum to 67200 per lane. The launched kernels recompute
+// nonfinite chunks before applying the block scale. The exact power of
 // two is restored in fp32 (FC1_XS_UNSCALE on accU/accG) before the
 // nonlinearity, so in-range results are unchanged up to half rounding.
 #define FC1_XS_PRESCALE 0.0625f
@@ -28,6 +28,28 @@ __device__ __forceinline__ void unpack4(uint32_t v, __half2& a, __half2& b) {
 __device__ __forceinline__ __half2 bf2_to_h2_prescaled(__nv_bfloat162 v) {
   const float2 f = __bfloat1622float2(v);
   return __floats2half2_rn(f.x * FC1_XS_PRESCALE, f.y * FC1_XS_PRESCALE);
+}
+
+// Keep the original half result when finite. On overflow read the original
+// bf16 chunk, independent of the kernel's shared-memory staging layout.
+__device__ __forceinline__ float fc1_chunk_sum(__half2 lanes, uint4 w, const __nv_bfloat16* x) {
+  const float2 f = __half22float2(lanes);
+  const float sum = f.x + f.y;
+  if (isfinite(sum)) return sum;
+  float s = 0.f;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    __half2 a, b;
+    unpack4(((const uint32_t*)&w)[q], a, b);
+    const float2 wa = __half22float2(a), wb = __half22float2(b);
+    const float2 xa = __bfloat1622float2(((const __nv_bfloat162*)x)[2 * q]);
+    const float2 xb = __bfloat1622float2(((const __nv_bfloat162*)x)[2 * q + 1]);
+    s = fmaf(wa.x, xa.x * FC1_XS_PRESCALE, s);
+    s = fmaf(wa.y, xa.y * FC1_XS_PRESCALE, s);
+    s = fmaf(wb.x, xb.x * FC1_XS_PRESCALE, s);
+    s = fmaf(wb.y, xb.y * FC1_XS_PRESCALE, s);
+  }
+  return s;
 }
 
 // The small-T fc2 inner products accumulate RAW e4m3 mantissas (the
@@ -188,9 +210,9 @@ extern "C" __global__ void fc1_small(const __nv_bfloat16* __restrict__ X,
       lg = __hfma2(a, x6, lg);
       lg = __hfma2(b, x7, lg);
       const int kb = k0 >> 7;
-      float2 fu = __half22float2(lu), fg = __half22float2(lg);
-      accU = fmaf(Su[kb], fu.x + fu.y, accU);
-      accG = fmaf(Sg[kb], fg.x + fg.y, accG);
+      const auto* x = X + (size_t)t * H + k0;
+      accU = fmaf(Su[kb], fc1_chunk_sum(lu, wu, x), accU);
+      accG = fmaf(Sg[kb], fc1_chunk_sum(lg, wg, x), accG);
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -294,9 +316,9 @@ __global__ __launch_bounds__(NT, MINB) void fc1_t1_u4(const __nv_bfloat16* __res
         lg = __hfma2(a, x6, lg);
         lg = __hfma2(b, x7, lg);
         const int kb = kk >> 7;
-        float2 fu = __half22float2(lu), fg = __half22float2(lg);
-        accU = fmaf(Su[kb], fu.x + fu.y, accU);
-        accG = fmaf(Sg[kb], fg.x + fg.y, accG);
+        const auto* x = X + (size_t)t * H + kk;
+        accU = fmaf(Su[kb], fc1_chunk_sum(lu, wu[u], x), accU);
+        accG = fmaf(Sg[kb], fc1_chunk_sum(lg, wg[u], x), accG);
       }
     }
     for (; k0 < H; k0 += STEP) {
@@ -334,9 +356,9 @@ __global__ __launch_bounds__(NT, MINB) void fc1_t1_u4(const __nv_bfloat16* __res
       lg = __hfma2(a, x6, lg);
       lg = __hfma2(b, x7, lg);
       const int kb = k0 >> 7;
-      float2 fu = __half22float2(lu), fg = __half22float2(lg);
-      accU = fmaf(Su[kb], fu.x + fu.y, accU);
-      accG = fmaf(Sg[kb], fg.x + fg.y, accG);
+      const auto* x = X + (size_t)t * H + k0;
+      accU = fmaf(Su[kb], fc1_chunk_sum(lu, wu, x), accU);
+      accG = fmaf(Sg[kb], fc1_chunk_sum(lg, wg, x), accG);
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {

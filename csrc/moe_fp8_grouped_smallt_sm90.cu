@@ -45,7 +45,8 @@
 //    T <= 16 and 256 <= T <= 4096);
 //  * fc1 weights [E, 2*I, H] e4m3 with [128,128] block scales
 //    [E, ceil(2I/128), ceil(H/128)] f32; fc2 [E, H, I] e4m3 with scales
-//    [E, ceil(H/128), ceil(I/128)] f32 (contiguous);
+//    [E, ceil(H/128), ceil(I/128)] f32 (contiguous). The caller supplies
+//    finite, strictly positive block scales; run does not read them on host;
 //  * topk_ids [T, K] int32 in [0, E), topk_weights [T, K] f32, consumed
 //    as-is (the serve's routing math, including any fused shared-expert
 //    slot, is baked into the capture);
@@ -58,6 +59,7 @@
 // queries: it launches on the caller's current stream and is CUDA-graph
 // capturable.
 
+#include <climits>
 #include <cstdint>
 
 #include "tvm_ffi_utils.h"
@@ -161,7 +163,7 @@ __global__ __launch_bounds__(512) void k_silu_q_fp8(const __nv_bfloat16* __restr
     *(__nv_fp8x2_storage_t*)(hq + qoff + 2) =
         __nv_cvt_float2_to_fp8x2(h1, __NV_SATFINITE, __NV_E4M3);
   }
-  if (lane == 0) hs[gidx] = make_float2(__frcp_rn(invs[0]) * invs[1], __frcp_rn(invs[1]));
+  if (lane == 0) hs[gidx] = make_float2(__frcp_rn(invs[0]), __frcp_rn(invs[1]));
 }
 
 __global__ __launch_bounds__(128, 8) void k_reduce9_v16(const __nv_bfloat16* __restrict__ partial,
@@ -222,8 +224,8 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
 
   extern __shared__ __align__(1024) unsigned char smem[];
   int* sPair = (int*)smem;
-  float* sWr = (float*)(sPair + BM);
-  float* sW1 = sWr + NGROUP;
+  float* sW0 = (float*)(sPair + BM);
+  float* sW1 = sW0 + NGROUP;
   uint8_t* sA = smem + 1024;
   uint8_t* sB = sA + BM * 256;
   uint8_t* sB1 = sB + 128 * 128;
@@ -245,7 +247,7 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
       w0 = W2S[((size_t)e * Sh + nt) * Si + 0];
       w1 = W2S[((size_t)e * Sh + nt) * Si + 1];
     }
-    sWr[tid] = w0 * __frcp_rn(w1);
+    sW0[tid] = w0;
     sW1[tid] = w1;
   }
   __syncthreads();
@@ -329,23 +331,28 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
         "wgmma.wait_group.sync.aligned 0;" ::
             : "memory");
 
-    // Convert the block-0-normalized accumulator to block-1 raw units.
-    const float wr = sWr[ni];
-    const float ws1 = sW1[ni];
-    scale_wgmma128_rows(acc, a0.x * wr, a8.x * wr);
+    // Keep independent raw K128 dots: neither block's units need to be
+    // representable as a multiple of the other's.
+    float acc1[64];
+#pragma unroll
+    for (int i = 0; i < 64; ++i) acc1[i] = 0.f;
     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
     da = wgmma_desc_fp8(sA + 128 * BM + wgid * 64 * 128);
     db = wgmma_desc_fp8(sB1);
 #pragma unroll
-    for (int kk = 0; kk < 128; kk += 32) wgmma128_fp8(acc, da + (kk >> 4), db + (kk >> 4));
+    for (int kk = 0; kk < 128; kk += 32) wgmma128_fp8(acc1, da + (kk >> 4), db + (kk >> 4));
     asm volatile(
         "wgmma.commit_group.sync.aligned;\n"
         "wgmma.wait_group.sync.aligned 0;" ::
             : "memory");
     __syncthreads();
 
-    // Return from raw block-1 units to the physical output scale.
-    scale_wgmma128_rows(acc, a0.y * ws1, a8.y * ws1);
+    // Apply the row scales to the dots, not to a ratio of weight scales.
+    scale_wgmma128_rows(acc, a0.x, a8.x);
+    scale_wgmma128_rows(acc1, a0.y, a8.y);
+    const float ws0 = sW0[ni], ws1 = sW1[ni];
+#pragma unroll
+    for (int i = 0; i < 64; ++i) acc[i] = fmaf(acc[i], ws0, acc1[i] * ws1);
 
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
@@ -436,18 +443,31 @@ struct MoeWsLayout {
   int max_tasks;
 };
 
-inline size_t moe_align16(size_t x) { return (x + 15) & ~size_t(15); }
+// Also bound the sign of the exported int64_t result. All arguments are
+// nonnegative; check before multiplying, advancing or rounding the offset.
+constexpr uint64_t kMaxWs = SIZE_MAX < INT64_MAX ? SIZE_MAX : INT64_MAX;
+
+size_t moe_ws_end(size_t start, uint64_t count, uint64_t stride, bool align = true) {
+  TVM_FFI_ICHECK_LE(count, (kMaxWs - start) / stride) << "workspace size overflow";
+  const size_t end = start + count * stride;
+  if (!align) return end;
+  const size_t pad = (-end) & size_t(15);
+  TVM_FFI_ICHECK_LE(pad, kMaxWs - end) << "aligned workspace size overflow";
+  return end + pad;
+}
 
 MoeWsLayout moe_grouped_ws_layout(int64_t T, int64_t K, int64_t I, int64_t H, int64_t E) {
   MoeWsLayout L;
   const int64_t pairs = T * K;
-  L.max_tasks = (int)(E + (pairs + 63) / 64);
+  const int64_t max_tasks = E + (pairs + 63) / 64;
+  TVM_FFI_ICHECK_LE(max_tasks, INT_MAX);
+  L.max_tasks = static_cast<int>(max_tasks);
   L.raw_off = 0;
-  L.hb_off = moe_align16(L.raw_off + (size_t)pairs * 2 * I * 2);    // bf16
-  L.partial_off = moe_align16(L.hb_off + (size_t)pairs * I * 2);    // bf16
-  L.ibuf_off = moe_align16(L.partial_off + (size_t)pairs * H * 2);  // bf16 (output-ranged partials)
-  L.tasks_off = moe_align16(L.ibuf_off + (size_t)(3 * E + E + 1 + pairs) * 4);
-  L.total = moe_align16(L.tasks_off + (size_t)L.max_tasks * 2 * 4);
+  L.hb_off = moe_ws_end(L.raw_off, pairs, 4 * I);
+  L.partial_off = moe_ws_end(L.hb_off, pairs, 2 * I);
+  L.ibuf_off = moe_ws_end(L.partial_off, pairs, 2 * H);
+  L.tasks_off = moe_ws_end(L.ibuf_off, 4 * E + 1 + pairs, 4);
+  L.total = moe_ws_end(L.tasks_off, max_tasks, sizeof(int2));
   return L;
 }
 
@@ -465,8 +485,16 @@ int64_t moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(int64_t tokens, int64_t
   TVM_FFI_ICHECK_GE(intermediate_size, 1);
   TVM_FFI_ICHECK_GE(hidden_size, 1);
   TVM_FFI_ICHECK_GE(num_experts, 1);
+  TVM_FFI_ICHECK_LE(tokens, INT_MAX);
+  TVM_FFI_ICHECK_LE(top_k, INT_MAX);
+  TVM_FFI_ICHECK_LE(hidden_size, INT_MAX - 127);
+  TVM_FFI_ICHECK_LE(intermediate_size, (INT_MAX - 127) / 2);
+  TVM_FFI_ICHECK_LE(num_experts, INT_MAX);
+  const int64_t pairs = tokens * top_k;
+  TVM_FFI_ICHECK_LE(pairs, tokens < 256 ? INT_MAX : INT_MAX - 255);
   if (tokens < 256) {
-    return tokens * top_k * intermediate_size * (int64_t)sizeof(__half);
+    TVM_FFI_ICHECK_LE(top_k * intermediate_size, INT_MAX);
+    return moe_ws_end(0, pairs, intermediate_size * sizeof(__half), false);
   }
   return (int64_t)moe_grouped_ws_layout(tokens, top_k, intermediate_size, hidden_size, num_experts)
       .total;
@@ -495,6 +523,9 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   CHECK_DIM(2, topk_ids);
   CHECK_DIM(2, topk_weights);
 
+  const int64_t workspace_bytes = moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(
+      hidden_states.size(0), topk_ids.size(1), fc2_weights.size(2), hidden_states.size(1),
+      fc1_weights.size(0));
   const int T = static_cast<int>(hidden_states.size(0));
   const int H = static_cast<int>(hidden_states.size(1));
   const int E = static_cast<int>(fc1_weights.size(0));
@@ -577,10 +608,9 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   TVM_FFI_ICHECK(aligned16(out.data_ptr())) << "out must be 16-byte aligned (vectorized stores)";
   TVM_FFI_ICHECK(aligned16(workspace.data_ptr()))
       << "workspace must be 16-byte aligned (vectorized intermediate)";
-  TVM_FFI_ICHECK_GE((int64_t)workspace.numel(),
-                    moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(T, KTOP, I, H, E))
+  TVM_FFI_ICHECK_GE((int64_t)workspace.numel(), workspace_bytes)
       << "workspace too small: plan with plan_workspace_bytes(" << T << ", " << KTOP << ", " << I
-      << ")";
+      << ", " << H << ", " << E << ")";
 
   CHECK_DEVICE(hidden_states, fc1_weights);
   CHECK_DEVICE(hidden_states, fc1_scales);
