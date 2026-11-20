@@ -33,6 +33,7 @@ Unsupported = bi.BatchInvariantUnsupportedError
         (1.0, 1.0, 1.0),
         (1, 1.0, None, 1.0),
         (np.float32(1.0), torch.tensor(1.0), torch.ones(1, dtype=torch.float64)),
+        (np.float64(1.0), np.int64(1), 1),
     ],
 )
 def test_unit_scales_are_accepted(scales):
@@ -60,7 +61,7 @@ def test_scales_a_class_takes_as_operands_are_not_checked():
         ((None, float("nan"), None), "k_scale=nan"),
         ((None, torch.tensor(0.25), None), "k_scale=0.25"),
         ((None, None, torch.ones(2)), "v_scale as a tensor of 2 elements"),
-        ((None, "1.0x", None), "k_scale='1.0x'"),
+        ((None, "1.0x", None), "k_scale='1.0x' (str)"),
     ],
 )
 def test_non_unit_scales_raise(scales, named):
@@ -73,6 +74,10 @@ def test_non_unit_scales_raise(scales, named):
     "bad,named",
     [
         (True, "q_scale=True"),
+        ("1.0", "q_scale='1.0' (str)"),
+        (np.bool_(True), "(bool"),
+        (np.ones(1), "(ndarray)"),
+        ([1.0], "q_scale=[1.0] (list)"),
         (torch.tensor(1), "q_scale as a tensor of dtype torch.int64"),
         (torch.tensor(True), "q_scale as a tensor of dtype torch.bool"),
     ],
@@ -80,7 +85,21 @@ def test_non_unit_scales_raise(scales, named):
 def test_scale_forms_that_are_not_numbers_raise(bad, named):
     with pytest.raises(Unsupported) as e:
         neutral.check_unit_scales(CLASS, (bad, None, None))
-    assert named in str(e.value)
+    assert named in str(e.value) and "exactly 1.0" in str(e.value)
+
+
+def test_resolve_scale_returns_the_number_and_quotes_the_callers_limit():
+    """A class that owns a scale resolves it with its own limit text; the forms read are the same."""
+    limit = "per-tensor K / V scales"
+    assert neutral.resolve_scale(CLASS, "k_scale", None, limit) is None
+    assert neutral.resolve_scale(CLASS, "k_scale", 0.0371, limit) == 0.0371
+    assert neutral.resolve_scale(CLASS, "k_scale", 2, limit) == 2
+    assert neutral.resolve_scale(CLASS, "k_scale", np.float32(0.5), limit) == 0.5
+    assert neutral.resolve_scale(CLASS, "k_scale", torch.tensor(0.25), limit) == 0.25
+    for bad in (True, "0.5", torch.ones(2), torch.tensor(1)):
+        with pytest.raises(Unsupported) as e:
+            neutral.resolve_scale(CLASS, "k_scale", bad, limit)
+        assert limit in str(e.value) and "exactly 1.0" not in str(e.value)
 
 
 @needs_device

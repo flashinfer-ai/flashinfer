@@ -27,6 +27,7 @@ argument                                    accepted (no effect on the bits); ev
 
 from __future__ import annotations
 
+import numbers
 import weakref
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -51,10 +52,11 @@ def _read_device_scale(value: torch.Tensor) -> float:
     return float(value.item())
 
 
-def resolve_scale(class_name: str, name: str, value):
-    """The host number of one scale argument, for every wrapper and for eager and CUDA graph mode alike:
+def resolve_scale(class_name: str, name: str, value, limit: str = _UNIT_SCALES):
+    """The host number of one scale argument, for every wrapper and for eager and CUDA graph mode alike (``None``, no
+    scale, stays ``None``):
 
-    * a Python or numpy number (not a bool) is itself;
+    * a real number (``numbers.Real``: a Python int or float, a numpy integer or floating scalar; not a bool) is itself;
     * a one-element floating-point CPU tensor is read on the host at every call;
     * a one-element floating-point device tensor is read back at most once per tensor version: the value is remembered
       for the tensor object (held through a weak reference, so a recycled ``id`` cannot alias it) and its ``_version``,
@@ -64,17 +66,21 @@ def resolve_scale(class_name: str, name: str, value):
       a tensor whose value is not known when ``run()`` executes inside a capture raises, so it is resolved by a call
       before the capture (the warm-up ``run()``).
 
-    Any other form (several elements, an integer or bool tensor, a bool, a non-number) raises the typed error."""
+    Any other form (several elements, an integer or bool tensor, a bool, a string or another non-number) raises the
+    typed error. ``limit``: the calling class's statement of the scales it takes, quoted in those refusals (the unit-scale
+    text by default; a class that owns the operand passes its own)."""
+    if value is None:
+        return None
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
             raise unsupported(
                 class_name,
                 f"{name} as a tensor of {value.numel()} elements",
-                _UNIT_SCALES,
+                limit,
             )
         if not value.dtype.is_floating_point:
             raise unsupported(
-                class_name, f"{name} as a tensor of dtype {value.dtype}", _UNIT_SCALES
+                class_name, f"{name} as a tensor of dtype {value.dtype}", limit
             )
         if value.device.type == "cpu":
             return value.item()
@@ -98,8 +104,10 @@ def resolve_scale(class_name: str, name: str, value):
 
         _DEVICE_SCALES[key] = (weakref.ref(value, forget), value._version, number)
         return number
-    if isinstance(value, bool):
-        raise unsupported(class_name, f"{name}={value!r}", _UNIT_SCALES)
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise unsupported(
+            class_name, f"{name}={value!r} ({type(value).__name__})", limit
+        )
     return value
 
 
@@ -114,12 +122,8 @@ def check_unit_scales(
     for name, value in zip(SCALE_NAMES, scales, strict=False):
         if value is None or name in free:
             continue
-        shown = resolve_scale(class_name, name, value)
-        try:
-            unit = float(shown) == 1.0
-        except (TypeError, ValueError):
-            unit = False
-        if not unit:
+        shown = resolve_scale(class_name, name, value, _UNIT_SCALES)
+        if float(shown) != 1.0:
             raise unsupported(class_name, f"{name}={shown!r}", _UNIT_SCALES)
 
 
