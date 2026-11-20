@@ -810,7 +810,20 @@ def class_name(op: str) -> str:
     return info.name
 
 
+#: The attention wrappers that accept ``use_cuda_graph=True`` together with ``batch_invariant=True`` (class names of
+#: :mod:`flashinfer`): the wrapper is built over persistent ``paged_kv_*`` buffers, ``run()`` is captured once and a
+#: ``plan()`` (for the decode wrapper also :func:`flashinfer.decode.fast_decode_plan`) before every replay refreshes what the
+#: captured launch follows, within the shape fixed at construction and at the first plan (the batch size and
+#: ``q_len_per_req`` of the decode wrapper; the request slots and the row capacity of the prefill wrapper) -- the contract
+#: stated in each wrapper's docstring. A wrapper that is not listed refuses the flag. Engines test membership here; how a
+#: listed wrapper holds its buffers (``bind_graph_buffers`` and the like) is private and may change.
+ATTENTION_CUDA_GRAPH_WRAPPERS = (
+    "BatchDecodeWithPagedKVCacheWrapper",
+    "BatchPrefillWithPagedKVCacheWrapper",
+)
+
 __all__ = [
+    "ATTENTION_CUDA_GRAPH_WRAPPERS",
     "CLASSES",
     "ClassInfo",
     "BatchInvariantUnsupportedError",

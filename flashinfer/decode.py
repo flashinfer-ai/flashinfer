@@ -1521,16 +1521,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``sm_scale`` and -- from the first ``run()`` -- the LSE mode and the presence of sinks are frozen (a change
             raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`), and ``plan()`` or
             :func:`flashinfer.decode.fast_decode_plan` before every replay refreshes the KV lengths and the page table
-            that the captured ``run()`` follows, with the bits of an eager call on the same batch. There a request
-            without pages (a padded slot) is a null request: zeros in its output rows and ``-inf`` in its LSE; a request
-            with fewer keys than ``q_len_per_req`` is refused as elsewhere. ``plan()`` runs a host-side planner whose cost
+            that the captured ``run()`` follows, with the bits of an eager call on the same batch. A request
+            without pages (a padded slot) is a null request, with and without ``use_cuda_graph``: zeros in its output
+            rows and ``-inf`` in its LSE, or with sinks the LSE of the sink alone; a request with fewer keys than
+            ``q_len_per_req`` is refused. A full ``plan()`` range-checks the page indices; ``fast_decode_plan`` under
+            ``use_cuda_graph=True`` does not (the caller's page table is trusted, as on the regular fast path). ``plan()`` runs a host-side planner whose cost
             grows with the number of requests (of the order of 10 us per request).
 
             Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
             nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` of ``None`` or exactly
             ``1.0``, ``seq_lens`` / ``block_tables`` that restate the page table,
             ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
-            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            and ``disable_split_kv`` (either value: the plan is the default plan). None of them
             changes an output bit.
 
         jit_args : Optional[List[Any]]
