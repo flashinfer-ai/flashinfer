@@ -848,7 +848,7 @@ def test_auto_admission_resolves_the_full_domain_gpu_free():
     """backend='auto' admission must check the whole measured domain (q_len,
     batch, kv envelope, plan options) from host metadata, not just geometry."""
     ok, reason, kv_meta = _gqa_dec_fp8q_sm90_auto_admits(
-        **_admit_kwargs(2, [0, 6, 12], [128, 129])
+        **_admit_kwargs(2, [0, 6, 12], [256, 257])
     )
     assert ok and reason is None and kv_meta is not None
     declined = [
@@ -1060,7 +1060,7 @@ def test_small_probabilities_survive_pv_staging(gap, single_key):
 def test_eight_auto_plans_retain_only_one_float_scratch_allocation():
     _sm90_or_skip()
     device = torch.device("cuda:0")
-    batch = _make_batch([256, 256], device)
+    batch = _make_batch([512, 512], device)
     ws = torch.empty(256 << 20, dtype=torch.uint8, device=device)
     wrappers = [flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws) for _ in range(8)]
     float_storage_bytes = {ws.data_ptr(): ws.nbytes}
@@ -1081,7 +1081,7 @@ def test_eight_auto_plans_retain_only_one_float_scratch_allocation():
     assert len(schedules) == len(wrappers)
 
 
-def _graph_batch_and_wrapper(device, kv_lens=(256, 256)):
+def _graph_batch_and_wrapper(device, kv_lens=(512, 512)):
     batch = _make_batch(list(kv_lens), device)
     ws = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -1223,9 +1223,9 @@ def test_retained_graph_replay_follows_an_in_contract_replan():
     assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched_capturing"] == 1
     # in-contract replan: same geometry, permuted page ids and a shorter kv
     # (request 1 drops to 3 pages / 48 keys)
-    new_lens = [256, 48]
-    new_indptr = batch["kv_indptr"].new_tensor([0, 16, 19])
-    new_indices = batch["kv_indices"].flip([0])[:19].contiguous()
+    new_lens = [512, 48]
+    new_indptr = batch["kv_indptr"].new_tensor([0, 32, 35])
+    new_indices = batch["kv_indices"].flip([0])[:35].contiguous()
     _graph_plan(
         wrapper,
         batch["qo_indptr"],
@@ -1275,8 +1275,8 @@ def test_refused_replan_preserves_graph_and_eager(monkeypatch, change):
     last = batch["last_page_len"]
     with monkeypatch.context() as m:
         if change == "short_auto":
-            ki = ki.new_tensor([0, 8, 16])
-            ids = ids[:16]
+            ki = ki.new_tensor([0, 16, 32])
+            ids = ids[:32]
             last = last.new_tensor([PAGE, PAGE])
         elif change == "disabled":
             m.setenv(DISABLE_ENV, "1")
@@ -1284,7 +1284,7 @@ def test_refused_replan_preserves_graph_and_eager(monkeypatch, change):
             opts["q_data_type"] = torch.bfloat16
         elif change == "mask":
             opts["custom_mask"] = torch.ones(
-                2 * QL * 256, device=device, dtype=torch.bool
+                2 * QL * 512, device=device, dtype=torch.bool
             )
         elif change == "query_lengths":
             opts["seq_lens_q"] = torch.tensor([5, 7])
@@ -1413,7 +1413,11 @@ def test_graph_q_partition_replan_is_rejected_before_state_changes():
         ([96], False),
         ([128], False),
         ([16, 128], False),
-        ([128, 129], True),
+        ([129], True),
+        ([128, 129], False),
+        ([256, 256], False),
+        ([256] * 4, False),
+        ([256, 257], True),
         ([256], True),
         ([2048], True),
         ([16, 8192, 48, 128], True),
@@ -1428,7 +1432,9 @@ def test_auto_whole_batch_short_preference(lens, admitted):
     if admitted:
         assert reason is None and meta is not None
     else:
-        assert reason == "all KV lengths <= 128 (prefer stock auto)" and meta is None
+        cutoff = 128 if len(lens) == 1 else 256
+        assert reason == f"all KV lengths <= {cutoff} (prefer stock auto)"
+        assert meta is None
 
 
 def test_gap_analytic_and_mutated_descale_replay():
@@ -1487,7 +1493,19 @@ def test_signed_packed_v_lanes_keep_order():
 
 
 @pytest.mark.parametrize(
-    "lens", [[16], [64], [16, 64], [64, 65], [96], [128], [16, 128]]
+    "lens",
+    [
+        [16],
+        [64],
+        [16, 64],
+        [64, 65],
+        [96],
+        [128],
+        [16, 128],
+        [128, 129],
+        [256, 256],
+        [256] * 4,
+    ],
 )
 def test_all_short_auto_is_native_fa3(lens, monkeypatch):
     import flashinfer.prefill as fp
@@ -1546,7 +1564,9 @@ def test_all_short_auto_is_native_fa3(lens, monkeypatch):
     assert str(auto_error.value) == str(stock_error.value)
 
 
-@pytest.mark.parametrize("lens", [[128, 129], [256], [2048], [16, 8192, 48, 128]])
+@pytest.mark.parametrize(
+    "lens", [[129], [256], [256, 257], [2048], [16, 8192, 48, 128]]
+)
 def test_long_and_mixed_auto_still_dispatch(lens):
     _sm90_or_skip()
     device = torch.device("cuda:0")

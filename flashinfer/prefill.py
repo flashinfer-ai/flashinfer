@@ -2530,8 +2530,8 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # bf16. PV accumulates in fp32; normalized bf16 split partials merge in
 # fp32 before V descale. Wider P exponent range is not extra significand
 # precision: small contributions can still round away.
-# Auto prefers stock for whole batches with maximum KV length <= 128;
-# this tuning preference does not constrain explicit specialized plans.
+# Auto prefers stock through maximum KV 128 for one request, or 256 for
+# multiple requests; explicit specialized plans retain the full domain.
 #
 # All allocation and compilation happen at plan time, outside CUDA-graph
 # capture; run() only launches on the current stream (re-queried per call),
@@ -2566,11 +2566,11 @@ _GQA_DEC_FP8Q_SM90_COMPUTE_CAPABILITY = (9, 0)
 # dispatcher fails closed (dequant + stock path) outside it.
 _GQA_DEC_FP8Q_SM90_MAX_BATCH = 128
 _GQA_DEC_FP8Q_SM90_MAX_KV_LEN = 262144
-# H100 NVL, six paired rounds of graph replay: at KV 128, stock FA3 took
-# 6.15 us vs 7.07 us specialized; at 256, specialized took 6.94 us vs
-# 7.99 us stock. Eager host submission is separate: about 19 us specialized
-# vs 13 us stock. This is a replay preference, not an eager speedup claim.
-_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX = 128
+# H100 NVL graph replay: at batch 1, specialized wins at KV 129; at
+# batches 2 and 4, stock wins at KV 256. Specialized wins at 4 x 512.
+# These are auto preferences, not kernel limits or eager speedup claims.
+_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX_SINGLE = 128
+_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX_MULTI = 256
 
 _gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
     "plans_seen": 0,  # fp8-Q fa2 SM90 plans that reached the hook
@@ -2812,8 +2812,13 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                                 "explicit seq_lens differ from the "
                                 "page-derived KV lengths"
                             )
-                if reason is None and max_kv <= _GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX:
-                    reason = f"all KV lengths <= {_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX} (prefer stock auto)"
+                short_kv_max = (
+                    _GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX_SINGLE
+                    if batch_size == 1
+                    else _GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX_MULTI
+                )
+                if reason is None and max_kv <= short_kv_max:
+                    reason = f"all KV lengths <= {short_kv_max} (prefer stock auto)"
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
