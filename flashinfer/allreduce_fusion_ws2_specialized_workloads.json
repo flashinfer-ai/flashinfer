@@ -1,0 +1,11 @@
+{
+  "note": "Dispatch surface of the specialized two-rank all-reduce + residual add + RMSNorm kernel (flashinfer.comm._allreduce_fusion_ws2_specialized: the specialized backend of flashinfer.comm.allreduce_fusion, on a create_allreduce_fusion_workspace(backend='specialized') workspace, which backend='auto' builds first when it can): pattern kARResidualRMSNorm with fp32_acc=True, the listed weight_bias values, world size 2 on one node, hidden size 6144, bfloat16, contiguous tensors, on compute capability 10.3. num_tokens is a list of inclusive [min, max] ranges; the kernel is parametric in the token count (one module, nothing compiled per shape) and the peer-mapped region is sized for min(max_token_num, largest max). Every other call takes the workspace's fallback backend (the stock backend 'auto' would otherwise choose).",
+  "world_size": 2,
+  "hidden_dim": 6144,
+  "dtype": "bfloat16",
+  "pattern": 1,
+  "compute_capability": [10, 3],
+  "fp32_acc": true,
+  "weight_bias": [1.0],
+  "num_tokens": [[513, 5461]]
+}
