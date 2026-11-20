@@ -199,6 +199,44 @@ def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
         torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize(
+    "backend,runner", [("tgv", "TGVRunner"), ("tinygemm", "TinyGemmBf16GemmRunner")]
+)
+@pytest.mark.parametrize("k", [2049, 2052])
+def test_mm_bf16_tma_unaligned_k(monkeypatch, backend, runner, k):
+    """TGV/TinyGEMM need K % 8 == 0 (TMA strides): reject them, keep them out of auto."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported(backend, cc_num):
+        pytest.skip(f"{backend} backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(128, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    with pytest.raises(ValueError, match="requires K divisible by 8"):
+        mm_bf16(a, w.T, backend=backend)
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    with autotune(True, tuning_buckets=[1, 16]):
+        mm_bf16(a, w.T, backend="auto")
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert runner not in profiled, profiled
+
+    for m in (1, 16):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_tgv_single_element_output(pdl):
     """M = N = 1: the 1x1 output's batch dim also has stride 1."""

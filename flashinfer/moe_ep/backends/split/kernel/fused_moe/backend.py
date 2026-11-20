@@ -180,6 +180,17 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                     else None
                 ),
             )
+            # The context's buffer holds one row per received row of the
+            # token width; the runners that write in place take it, and the
+            # rows the combine never reads need no zeros there.
+            if ctx.output is not None and tuple(ctx.output.shape) == (
+                expert_tensors.shape[0] * expert_tensors.shape[1],
+                fleet_params.token_hidden_size,
+            ):
+                act_pack.output = ctx.output
+                act_pack.zero_rows_without_local_expert = (
+                    ctx.zero_rows_without_local_expert
+                )
         else:
             act_pack = build_activation_pack(
                 expert_tensors,

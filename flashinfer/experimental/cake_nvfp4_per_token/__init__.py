@@ -24,4 +24,6 @@ limitations under the License.
 #
 # This module stays import-light on purpose (no kernel or JIT imports): core
 # imports ``.support`` for the ``@experimental_backend`` checker at module
-# level and reaches ``.cake_backend`` through deferred imports only.
+# level and reaches ``.cake_backend`` and ``.auto_candidate`` (the automatic
+# ``mm_fp4`` candidate's operand check and runner) through deferred imports
+# only.
