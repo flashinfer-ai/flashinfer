@@ -39,6 +39,7 @@ from flashinfer.testing.utils import (
     bench_gpu_time,
 )
 
+from .value_inputs import add_routing_args, shape_routing_logits
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     enum_type,
@@ -146,6 +147,18 @@ _MODE_FLAG_ROUTINES = {
     "valid_intermediate_size": (None, _TRTLLM_ROUTINES),
     "num_fused_shared_experts": (0, _TRTLLM_ROUTINES),
     "alphamoe_routing": ("aligned", ("alphamoe_nvfp4_aligned_moe",)),
+    # Routines whose router logits go through shape_routing_logits; the rest
+    # build their own expert ids.
+    "routing_dist": (
+        "",
+        (
+            *_TRTLLM_ROUTINES,
+            "cutlass_fused_moe",
+            "cute_dsl_fp4_block_scale_moe",
+            "cute_dsl_bf16_moe",
+            "b12x_fused_moe",
+        ),
+    ),
 }
 
 
@@ -293,6 +306,7 @@ def parse_moe_args(line, parser):
             "every backend that implements --routing_method)."
         ),
     )
+    add_routing_args(parser)
     parser.add_argument(
         "--routing_input",
         type=str,
@@ -869,6 +883,8 @@ def _trtllm_moe_setup(args, moe_kernel_type, device):
             num_weight_experts=weight_rows,
         )
     )
+    # Serving-shaped expert load; a no-op for the default (iid) routing.
+    routing_logits = shape_routing_logits(routing_logits, args.top_k, args.routing_dist)
     n_group = args.n_group if args.n_group is not None and args.n_group > 0 else None
     topk_group = (
         args.topk_group if args.topk_group is not None and args.topk_group > 0 else None
@@ -1858,6 +1874,7 @@ def testCutlassFusedMoe(args):
     router_logits = torch.randn(
         num_tokens, num_experts, dtype=input_dtype, device=device
     )
+    router_logits = shape_routing_logits(router_logits, top_k, args.routing_dist)
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
     if args.verbose >= 2:
@@ -2212,6 +2229,7 @@ def _create_nvfp4_moe_test_data(
     device: torch.device,
     backend: str,
     is_gated: bool = True,
+    routing_dist: Optional[str] = None,
 ):
     """Create NVFP4-quantized test data for CuTe-DSL-family MoE kernels.
 
@@ -2248,6 +2266,7 @@ def _create_nvfp4_moe_test_data(
 
     # Routing (simple top-k; the wrapper takes pre-computed assignments)
     routing_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_logits = shape_routing_logits(routing_logits, top_k, routing_dist)
     routing_weights, selected_experts = compute_routing(routing_logits, top_k)
     selected_experts = selected_experts.to(torch.int32)
 
@@ -2882,6 +2901,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         device=device,
         backend="cute-dsl",
         is_gated=is_gated,
+        routing_dist=args.routing_dist,
     )
 
     if args.verbose >= 2:
@@ -3180,6 +3200,7 @@ def testCuteDslBf16Moe(args):
     router_logits = torch.randn(
         num_tokens, num_experts, dtype=input_dtype, device=device
     )
+    router_logits = shape_routing_logits(router_logits, top_k, args.routing_dist)
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     token_selected_experts = selected_experts.to(torch.int32)
     token_final_scales = routing_weights.to(torch.float32)
@@ -3438,6 +3459,7 @@ def testB12xFusedMoe(args):
         device=device,
         backend="b12x",
         is_gated=is_gated,
+        routing_dist=args.routing_dist,
     )
 
     if args.verbose >= 2:

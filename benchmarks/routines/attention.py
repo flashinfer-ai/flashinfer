@@ -38,6 +38,7 @@ from flashinfer.testing.utils import (
     bench_gpu_time,
 )
 
+from .value_inputs import add_seq_len_args, explicit_seq_lens
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
@@ -132,6 +133,9 @@ def _has_ignored_mode_flags(args, consumed=()):
         "skip_softmax_threshold_scale_factor": (
             args.skip_softmax_threshold_scale_factor is not None
         ),
+        "seq_lens_kv": bool(args.seq_lens_kv),
+        "seq_lens_q": bool(args.seq_lens_q),
+        "decode_max_seq_len": bool(args.decode_max_seq_len),
     }
     ignored = [f"--{k}" for k, on in requested.items() if on and k not in consumed]
     if ignored:
@@ -662,6 +666,7 @@ def parse_attention_args(line, parser):
         default=False,
         help="Use random actual sequence lengths for the query and key and value. Random values are generated between 1 and maximum sequence length. If False, use maximum sequence length.",
     )
+    add_seq_len_args(parser)
     parser.add_argument(
         "--row_activity_mode",
         choices=TRTLLM_RAGGED_ROW_ACTIVITY_MODES,
@@ -934,6 +939,31 @@ def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len
     return actual_seq_lens
 
 
+def _resolve_seq_lens(args, which, max_seqlen, batch_size, device):
+    """Per-request lengths: --seq_lens_<which> when given, else the sampled ones."""
+    name = f"seq_lens_{which}"
+    lens = explicit_seq_lens(
+        getattr(args, name, None), name, batch_size, max_seqlen, device
+    )
+    if lens is not None:
+        return lens
+    return sample_actual_seq_lens(
+        max_seqlen, batch_size, device, args.random_actual_seq_len
+    )
+
+
+def _resolve_max_seq_len(args, s_kv):
+    """max_seq_len handed to trtllm-gen decode: --decode_max_seq_len, else --s_kv."""
+    if not args.decode_max_seq_len:
+        return s_kv
+    max_seq_len = int(args.decode_max_seq_len)
+    if max_seq_len < s_kv:
+        raise ValueError(
+            f"--decode_max_seq_len {max_seq_len} is below --s_kv {s_kv}, which sizes the cache"
+        )
+    return max_seq_len
+
+
 def generate_speculative_mask(batch_size, q_seq_len, device, mask_mode="causal"):
     """Packed draft-block mask for speculative decode (q_len > 1).
 
@@ -1060,6 +1090,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     if s_qo > s_kv:
         print("[ERROR] Causal decode requires s_qo <= s_kv. Exiting.")
         return res
+    if args.seq_lens_q:
+        print(f"[ERROR] {args.routine} does not take --seq_lens_q (use --s_qo).")
+        return res
+    max_seq_len = _resolve_max_seq_len(args, s_kv)
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
@@ -1287,8 +1321,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     outputs = {}
 
     # Sample sequence lengths and create tensors
-    actual_seq_lens_kv = sample_actual_seq_lens(
-        s_kv, batch_size, device, args.random_actual_seq_len
+    actual_seq_lens_kv = _resolve_seq_lens(
+        args, "kv", s_kv, batch_size, device
     ).clamp_min(s_qo)
     sum_seq_kv = torch.sum(actual_seq_lens_kv).item()
     avg_seq_len_kv = sum_seq_kv // batch_size
@@ -1710,7 +1744,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
                 seq_lens=actual_seq_lens_kv,
-                max_seq_len=s_kv,
+                max_seq_len=max_seq_len,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 kv_layout="HND",
@@ -2011,6 +2045,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if _has_ignored_mode_flags(
         args,
         (
+            "seq_lens_kv",
+            "seq_lens_q",
             "window_left",
             "logits_soft_cap",
             "sinks",
@@ -2238,10 +2274,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Sample sequence lengths.
     # If s_qo == s_kv, then make sampled actual_seq_lens_kv the same as actual_seq_lens_q.
     # IF s_qo < s_kv, then sample actual_seq_lens_kv separately. Then ensure actual_seq_lens_kv is at least as long as actual_seq_lens_q.
-    actual_seq_lens_q = sample_actual_seq_lens(
-        s_qo, batch_size, None, args.random_actual_seq_len
-    )
-    if s_qo == s_kv:
+    actual_seq_lens_q = _resolve_seq_lens(args, "q", s_qo, batch_size, None)
+    if s_qo == s_kv and not args.seq_lens_kv:
         if args.verbose >= 2:
             print(
                 "[VVERBOSE] s_qo == s_kv, making actual_seq_lens_kv the same as actual_seq_lens_q"
@@ -2250,9 +2284,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     else:  # s_qo < s_kv
         if args.verbose >= 2:
             print("[VVERBOSE] s_qo < s_kv, sampling actual_seq_lens_kv")
-        actual_seq_lens_kv = sample_actual_seq_lens(
-            s_kv, batch_size, None, args.random_actual_seq_len
-        )
+        actual_seq_lens_kv = _resolve_seq_lens(args, "kv", s_kv, batch_size, None)
         actual_seq_lens_kv = torch.maximum(actual_seq_lens_kv, actual_seq_lens_q)
 
     avg_seq_len_q = actual_seq_lens_q.sum().item() // batch_size
@@ -3200,6 +3232,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     if _has_ignored_mode_flags(
         args,
         (
+            "seq_lens_kv",
+            "seq_lens_q",
             "window_left",
             "logits_soft_cap",
             "sinks",
@@ -3443,10 +3477,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Sample sequence lengths.
     # If s_qo == s_kv, then make sampled actual_seq_lens_kv the same as actual_seq_lens_q.
     # IF s_qo < s_kv, then sample actual_seq_lens_kv separately. Then ensure actual_seq_lens_kv is at least as long as actual_seq_lens_q.
-    actual_seq_lens_q = sample_actual_seq_lens(
-        s_qo, batch_size, None, args.random_actual_seq_len
-    )
-    if s_qo == s_kv:
+    actual_seq_lens_q = _resolve_seq_lens(args, "q", s_qo, batch_size, None)
+    if s_qo == s_kv and not args.seq_lens_kv:
         if args.verbose >= 2:
             print(
                 "[VVERBOSE] s_qo == s_kv, making actual_seq_lens_kv the same as actual_seq_lens_q"
@@ -3455,9 +3487,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     else:  # s_qo < s_kv
         if args.verbose >= 2:
             print("[VVERBOSE] s_qo < s_kv, sampling actual_seq_lens_kv")
-        actual_seq_lens_kv = sample_actual_seq_lens(
-            s_kv, batch_size, None, args.random_actual_seq_len
-        )
+        actual_seq_lens_kv = _resolve_seq_lens(args, "kv", s_kv, batch_size, None)
         actual_seq_lens_kv = torch.maximum(actual_seq_lens_kv, actual_seq_lens_q)
 
     avg_seq_len_q = actual_seq_lens_q.sum().item() // batch_size
@@ -4806,7 +4836,9 @@ def testBatchMLAPagedAttentionWrapper(args):
     rtol = 2e-1
     atol = 1e-2
     res = []
-    if _has_ignored_mode_flags(args, ("use_fp16_softmax",)):
+    if _has_ignored_mode_flags(
+        args, ("use_fp16_softmax", "seq_lens_kv", "decode_max_seq_len")
+    ):
         return res
 
     # Handle different query data types.
@@ -4855,6 +4887,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     if s_qo > s_kv:
         print("[ERROR] Causal MLA decode requires s_qo <= s_kv. Exiting.")
         return res
+    max_seq_len = _resolve_max_seq_len(args, s_kv)
 
     # Resolve the MLA is_var_seq override (selects var-seq vs. persistent
     # scheduler). None => do not pass is_var_seq to the API, keeping its default
@@ -5018,8 +5051,8 @@ def testBatchMLAPagedAttentionWrapper(args):
     backend_times = {backend: [] for backend in backends}
     outputs = {}
 
-    actual_seq_lens_kv = sample_actual_seq_lens(
-        s_kv, batch_size, device, args.random_actual_seq_len
+    actual_seq_lens_kv = _resolve_seq_lens(
+        args, "kv", s_kv, batch_size, device
     ).clamp_min(s_qo)
     sum_seq_kv = torch.sum(actual_seq_lens_kv).item()
     avg_seq_len_kv = sum_seq_kv // batch_size
@@ -5350,7 +5383,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qk_rope_head_dim=head_dim_kpe,
                 block_tables=direct_block_tables,
                 seq_lens=actual_seq_lens_kv.flatten(),
-                max_seq_len=s_kv,
+                max_seq_len=max_seq_len,
                 out=out,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
@@ -5385,7 +5418,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qk_rope_head_dim=head_dim_kpe,
                 block_tables=direct_block_tables,
                 seq_lens=actual_seq_lens_kv.flatten(),
-                max_seq_len=s_kv,
+                max_seq_len=max_seq_len,
                 out=out,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
@@ -5409,7 +5442,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qk_rope_head_dim=head_dim_kpe,
                 block_tables=block_tables,
                 seq_lens=actual_seq_lens_kv.flatten(),
-                max_seq_len=s_kv,
+                max_seq_len=max_seq_len,
                 out=out,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,

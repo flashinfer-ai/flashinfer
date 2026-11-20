@@ -25,6 +25,12 @@ import flashinfer
 import flashinfer.topk
 from flashinfer.testing.utils import bench_gpu_time
 
+from .value_inputs import (
+    PROB_DIST_HELP,
+    make_logits,
+    make_probs,
+    validate_prob_dist,
+)
 from .flashinfer_benchmark_utils import (
     blank_unused_mode_columns,
     check_batch_invariance,
@@ -87,7 +93,15 @@ _MODE_FLAG_ROUTINES = {
         )
         + _TOPK_ROUTINES,
     ),
-    "input_distribution": ("uniform", _PROBS_ROUTINES),
+    "input_distribution": (
+        "uniform",
+        _PROBS_ROUTINES
+        + (
+            "sampling_from_logits",
+            "top_k_top_p_sampling_from_logits",
+            "top_k_mask_logits",
+        ),
+    ),
     "sorted": (False, ("top_k",)),
     "tie_break": ("none", _TOPK_ROUTINES),
     "dsa_graph_safe": (False, _TOPK_ROUTINES),
@@ -119,13 +133,13 @@ def _deterministic_kwargs(args, name="deterministic"):
 
 
 def _make_probs(args, batch_size, vocab_size, device, dtype=None):
-    """Random probabilities: near-uniform (default) or softmax of normal logits."""
-    if args.input_distribution == "normal":
-        logits = torch.randn(batch_size, vocab_size, device=device)
-        probs = torch.softmax(logits, dim=-1)
-        return probs if dtype is None else probs.to(dtype)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, dtype=dtype, device=device)
-    return pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    """Probability rows following --input_distribution (see value_inputs.py)."""
+    return make_probs(args.input_distribution, batch_size, vocab_size, device, dtype)
+
+
+def _make_logits(args, batch_size, vocab_size, device, dtype):
+    """Logit rows: standard normal by default, else log of the shaped probabilities."""
+    return make_logits(args.input_distribution, batch_size, vocab_size, device, dtype)
 
 
 @contextlib.contextmanager
@@ -398,8 +412,9 @@ def parse_sampling_args(line, parser):
         type=str,
         required=False,
         default="uniform",
-        choices=["uniform", "normal"],
-        help="Probability inputs: normalized uniform noise (default) or softmax of normal logits.",
+        help=PROB_DIST_HELP
+        + " Logit-input samplers take the log of these rows (uniform and plain "
+        "normal keep standard-normal logits).",
     )
     parser.add_argument(
         "--sorted",
@@ -439,6 +454,10 @@ def parse_sampling_args(line, parser):
     )
 
     args = parser.parse_args(line)
+    try:
+        validate_prob_dist(args.input_distribution)
+    except ValueError as e:
+        parser.error(str(e))
 
     if args.routine in batch_invariant_only_routines and any(
         backend != "batch_invariant" for backend in args.backends
@@ -972,7 +991,7 @@ def testSamplingFromLogits(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     ## Prepare input tensors
-    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    logits = _make_logits(args, batch_size, vocab_size, device, input_dtype)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {logits.shape = }")
@@ -1417,7 +1436,7 @@ def testTopKTopPSamplingFromLogits(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     ## Prepare input tensors
-    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    logits = _make_logits(args, batch_size, vocab_size, device, input_dtype)
     top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
     top_p_arg = _sampling_param(args, top_p, batch_size, device, torch.float32)
 
@@ -1917,7 +1936,7 @@ def testTopKMaskLogits(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     ## Prepare input tensors
-    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    logits = _make_logits(args, batch_size, vocab_size, device, input_dtype)
     top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
 
     if args.verbose >= 2:

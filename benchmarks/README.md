@@ -291,6 +291,47 @@ The output CSV will contain detailed metrics including:
 - Input flags
 - Reproducer commands if `--generate_repro_command` is provided
 
+## Serving-shaped inputs
+
+Most kernels do the same work whatever the input values are, so random tensors time the
+served workload. Three families do not, and for them the default random inputs describe a
+workload serving does not run:
+
+| Family | What the time depends on | Default input | Flag |
+|---|---|---|---|
+| MoE | Tokens each expert receives. Serving leaves experts idle at small token counts and overloads a few at large ones. | Random router logits: an even share per expert. | `--routing_dist` |
+| Sampling | How peaked each probability row is. Serving rows put most of the mass on a few tokens. | Normalized uniform noise: almost flat. | `--input_distribution` |
+| Attention | Each request's length. A serving batch mixes short and long requests and the longest sets the tail. | All requests at `--s_kv` (or uniform-random lengths). | `--seq_lens_kv`, `--seq_lens_q`, `--decode_max_seq_len` |
+
+The defaults are unchanged, so existing rows keep their inputs. The flags (implemented in
+`routines/value_inputs.py`) select other inputs and are recorded in the CSV:
+
+- `--routing_dist uniform | zipf:<s> | counts:<list-or-file>`: an exactly even load, a few hot
+  experts, or expert popularity proportional to tokens-per-expert counts captured from serving
+  (one number per expert). The result is still a router-logits tensor, so it drives both the
+  in-kernel router and `--routing_input precomputed`.
+- `--input_distribution normal:<std> | zipf:<s> | rows:<file>`: softmax of wider normal logits
+  (`normal:8` puts about 95% of the mass on roughly ten tokens of a 50k vocabulary), a power-law row, or captured rows of
+  leading probabilities (the rest of the vocabulary shares the remaining mass). Logit-input
+  samplers take the log of the same rows.
+- `--seq_lens_kv 492,1069,424,55495,424`: explicit per-request lengths.
+
+`<list-or-file>` is comma-separated numbers or a path to a `.json`, `.txt`, `.pt`, `.npy` or
+`.safetensors` file; `file#key` picks one entry and `file@i` one row of a 2-D array.
+
+`zipf` and `normal:<std>` are bounds, not a model of any deployment: use captured counts,
+rows and lengths for a number that is compared with serving.
+
+```bash
+# MoE with a few hot experts instead of an even spread
+python3 flashinfer_benchmark.py --routine trtllm_fp8_block_scale_moe --num_tokens 320 \
+  --hidden_size 4096 --intermediate_size 256 --num_experts 512 --top_k 10 \
+  --routing_method renormalize_naive --routing_dist zipf:1.2
+# Top-p renormalization on peaked rows
+python3 flashinfer_benchmark.py --routine top_p_renorm_probs --batch_size 162 \
+  --vocab_size 154880 --top_p 0.95 --input_distribution normal:8
+```
+
 ## Command Line Arguments
 ### General Flags
 | Flag                     | Description                                                                                                 |
@@ -346,6 +387,9 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Backend-dependent; PrimTS context accepts bfloat16, float16, or fp8_e4m3, while PrimTS FP8 decode accepts float16 or fp8_e4m3. FP8 ragged comparisons with non-PrimTS backends require bfloat16 or float16. |
 | `--causal`               | Use causal attention masking for context/prefill. Multi-query FMHA and MLA decode use bottom-right causal masking automatically. |
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |
+| `--seq_lens_kv`          | Per-request KV lengths, one per request: comma-separated or a file. Each must be `<= --s_kv`, which still sizes the cache. Overrides `--random_actual_seq_len`. See "Serving-shaped inputs". |
+| `--seq_lens_q`           | Paged / ragged prefill: per-request query lengths, each `<= --s_qo`.                                        |
+| `--decode_max_seq_len`   | trtllm-gen decode and MLA decode: the `max_seq_len` passed to the kernel. Default: `--s_kv`.                |
 | `--swa_topk`             | DSV4 sparse MLA only: sliding-window segment width. Must be 128.                                           |
 | `--compressed_topk`      | DSV4 sparse MLA only: maximum compressed-cache rows selected per query. Default: 1920.                    |
 | `--compressed_kv_len`    | DSV4 sparse MLA only: compressed-cache rows per request. Default: `ceil(s_kv / 4)`.                       |
@@ -400,6 +444,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--routing_method`       | Routing method: `default`, `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`, `topk`, `sigmoid_renorm`, `minimax2`, `sigmoid`, `topk_sigmoid` (all `RoutingMethodType` values), or `hash` (`moe_routing` only). Default: `deepseek_v3`. |
 | `--backends`             | `trtllm_*` routines: `trtllm` (default) and/or `prims-ts`. `moe_routing`: `trtllm`, `dsv3`, `alphamoe`, `hash` (default: all that implement the routing method, except `alphamoe`, which runs only when named). `unified_moe`: see the routine description. A backend that rejects the configuration is reported and skipped; the other backends still produce rows. |
 | `--routing_input`        | `trtllm_*` routines: `logits` (default, in-kernel routing) or `precomputed` (`*_routed_moe` APIs with packed top-k ids) |
+| `--routing_dist`         | How tokens spread over experts: `iid` (default), `uniform`, `zipf:<s>` or `counts:<list-or-file>`. `trtllm_*`, `cutlass_fused_moe`, `cute_dsl_*` and `b12x_fused_moe` routines. See "Serving-shaped inputs". |
 | `--fp8_quant_type`       | `trtllm_fp8_block_scale_moe`: `deepseek` (default, 128x128 FP8 blocks) or `mxfp8`                           |
 | `--fp8_scale_granularity`| `trtllm_fp8_per_tensor_scale_moe`: `per_tensor` (default) or `per_channel` (`trtllm_fp8_per_channel_scale_moe`) |
 | `--swiglu_alpha` / `--swiglu_beta` / `--swiglu_limit` | gpt-oss style SwiGLU parameters (`trtllm_*` routines where the API accepts them, `cutlass_fused_moe`) |
@@ -569,7 +614,8 @@ New routines (all write `refcheck`-checked rows where a reference exists):
 New modes on existing routines: `nvfp4_quantize --per_token_activation`, `--nvfp4_4over6 env|off|mae|mse`,
 fp8 input, `8x4`/`linear` layouts, cute-dsl vs cuda bitwise refcheck; RoPE `--inplace` (the `*_inplace` APIs),
 `--mla_kv`, `rope_quantize_fp8 --backends cutile`; sampling `--param_mode tensor` (per-request tensors),
-`--deterministic`, `--input_distribution`; top-k `--backends radix|clusters|cub` (forced through
+`--deterministic`, `--input_distribution` (`uniform`, `normal[:<std>]`, `zipf:<s>`, `rows:<file>`; see
+"Serving-shaped inputs"); top-k `--backends radix|clusters|cub` (forced through
 `FLASHINFER_TOPK_ALGO`; `cuda` = library auto-dispatch), `--sorted`, `--tie_break`, `--dsa_graph_safe`,
 top-k page-table `--page_size`. The Cake backend is not benchmarked by these routines.
 
