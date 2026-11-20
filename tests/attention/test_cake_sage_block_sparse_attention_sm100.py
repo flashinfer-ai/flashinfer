@@ -953,11 +953,10 @@ def test_serial_rule_thresholds():
 )
 def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads, sel):
     """A combined call whose quantizer is the one-launch program and whose attention
-    routes to ``attention_sd_tsplit_p3`` follows ``_TAIL_SPLIT_P3_SERIAL`` and
-    ``_TAIL_SPLIT_P3_SERIAL_BELOW``: the build without programmatic dependent launch
-    (its PDL flag is 0) where a rule holds, ``attention_sd_tsplit`` with PDL where
-    ``_TAIL_SPLIT_P3_SERIAL`` gives way, the build with PDL on the other rows and
-    architectures and outside a combined call; the bits are those of the attention call
+    routes to ``attention_sd_tsplit_p3`` follows ``_TAIL_SPLIT_P3_SERIAL``: the build
+    without programmatic dependent launch (its PDL flag is 0) where a rule holds,
+    ``attention_sd_tsplit`` with PDL where it gives way, the build with PDL on the other
+    rows, on SM103 and outside a combined call; the bits are those of the attention call
     on the quantizer's outputs."""
     device = torch.device("cuda")
     index = torch.cuda.current_device()
@@ -983,8 +982,6 @@ def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads, sel)
     _, (q8, k8, v8, qs, ks, vs), impl = pkg._quantize_program(q, k, v, "auto", None)
     assert impl == "one_launch", impl
     rule = pkg._p3_serial(arch, plan, sel)
-    if rule is None and pkg._p3_serial_below(arch, plan, sel, tiles, sms):
-        rule = True
     for after in (False, True):
         record, _, args, _, _ = pkg._attention_operands(
             q8,
@@ -1023,37 +1020,12 @@ def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads, sel)
 
 
 def test_after_one_launch_rule_thresholds():
-    """``_TAIL_SPLIT_P3_SERIAL_BELOW`` and ``_SDP3_GIVE_WAY`` with their thresholds
-    written out on plans ``(grid, split_from, items)`` of 152 tile slots (SM103): below
-    32 selected blocks a row or two waves, a split row whose split tiles fill at most a
-    third of the slots launches without PDL, the other rows keep PDL;
+    """``_SDP3_GIVE_WAY`` with its thresholds written out (SM103, 152 SMs):
     ``attention_sdp3`` is given up to 22 selected blocks a row below three waves.  SM100
-    has neither rule."""
+    has no such rule, and SM103 has no ``_TAIL_SPLIT_P3_SERIAL`` rule: its p3 tail
+    splits keep PDL behind the one-launch quantizer."""
     assert pkg._TAIL_SPLIT_P3_SERIAL == {"sm_100a": ((3, 3, None), (3, 2, 47))}
-    assert pkg._TAIL_SPLIT_P3_SERIAL_BELOW == {"sm_103a": (32, 2, 3)}
     assert pkg._SDP3_GIVE_WAY == {"sm_103a": (22, 3)}
-
-    def plan(tiles, slots):
-        full = tiles // slots * slots
-        return min(full + 2 * (tiles - full), slots), full, full + 2 * (tiles - full)
-
-    for sel, tiles, serial in [
-        (24, 160, True),
-        (24, 192, True),
-        (31, 960, True),
-        (24, 1088, True),
-        (40, 192, True),
-        (58, 200, True),
-        (24, 512, False),
-        (28, 512, False),
-        (32, 320, False),
-        (58, 512, False),
-        (64, 1224, False),
-    ]:
-        got = pkg._p3_serial_below("sm_103a", plan(tiles, 152), sel, tiles, 152)
-        assert got is serial, (sel, tiles)
-        got = pkg._p3_serial_below("sm_100a", plan(tiles, 148), sel, tiles, 148)
-        assert got is False
     for sel, tiles, gives in [
         (5, 32, True),
         (6, 455, True),
