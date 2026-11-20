@@ -1562,15 +1562,17 @@ def test_second_stage_memo_skipped_under_replay_diagnostics(monkeypatch, stages)
         "unrelated_entry",
         "offer_table",
         "splitkv_range",
+        "splitkv_range_in_place",
     ],
 )
 def test_memoized_decision_follows_tuner_and_family_changes(
     monkeypatch, stages, change
 ):
     """A memoized decision is dropped when any tuner's winners or loaded
-    configs change, the tuner, the offer table or the split-KV device ranges
-    are replaced, or a family it launches becomes unavailable: the next call
-    looks up and returns what the lookup returns. No GPU needed."""
+    configs change, the tuner or the offer table is replaced, a split-KV
+    device range changes (replaced or in place), or a family it launches
+    becomes unavailable: the next call looks up and returns what the lookup
+    returns. No GPU needed."""
     stages.select(4, tune=True)
     assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
     lookups = _count_margin_lookups(monkeypatch)
@@ -1606,10 +1608,20 @@ def test_memoized_decision_follows_tuner_and_family_changes(
     elif change == "unrelated_entry":
         _hold_cake_entry(stages.tuner)
     elif change == "splitkv_range":
-        # The same ranges in a new object: the domain could have changed.
+        # New ranges in a new object (max_seq_len 1024 keeps its domain).
+        monkeypatch.setattr(
+            cake_module,
+            "_SPLITKV_RANGE",
+            {**cake_module._SPLITKV_RANGE, ("sm_100a", 148): (4097, 18)},
+        )
+    elif change == "splitkv_range_in_place":
+        # The same ranges in a new object keep the memoized decision.
         monkeypatch.setattr(
             cake_module, "_SPLITKV_RANGE", dict(cake_module._SPLITKV_RANGE)
         )
+        assert _decision(stages.select(4, memo=True)) == expected
+        assert lookups[0] == 0
+        cake_module._SPLITKV_RANGE[("sm_100a", 148)] = (4097, 18)
     else:
         monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
     assert _decision(stages.select(4, memo=True)) == expected

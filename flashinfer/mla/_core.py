@@ -4056,12 +4056,14 @@ def _mla_cake_margin_tuning_config(
 # by the dispatcher) holds every argument and tensor size, dtype and device the
 # two stages' lookups and the Cake checks read. A value is ``(weak reference
 # to the tuner, tuner state, offer table, families, launch plan, FP8 decode
-# table, split-KV device ranges)``; ``families`` is ``None`` for a decision to
-# run the first stage's selection. The offer table and the Cake module's
-# ``_SPLITKV_RANGE`` decide the launched domain with the memo key (its device
-# and max_seq_len), so an entry is reused only while both name the objects it
-# was decided with. The weak reference keeps an entry from holding a discarded tuner
-# alive. See ``_mla_cake_stage_two``. Bounded like ``_CAKE_MLA_TABLE_MEMO``.
+# table, copy of the split-KV device ranges)``; ``families`` is ``None`` for a
+# decision to run the first stage's selection. The offer table and the Cake
+# module's ``_SPLITKV_RANGE`` decide the launched domain with the memo key (its
+# device and max_seq_len), so an entry is reused only while the offer table is
+# the object and the ranges equal the values it was decided with (also after an
+# in-place change of a range). The weak reference keeps an entry from holding a
+# discarded tuner alive. See ``_mla_cake_stage_two``. Bounded like
+# ``_CAKE_MLA_TABLE_MEMO``.
 _CAKE_MLA_STAGE_TWO_MEMO: Dict[Any, Any] = {}
 
 
@@ -4130,12 +4132,12 @@ def _mla_cake_stage_two(
     when the call needs it). With a ``memo_key`` (the dispatcher's), a
     lookup-only decision is memoized per ``(memo_key, batch_ranges, first-stage
     selection)`` and reused while ``_mla_cake_memo_state``, the offer table
-    and the split-KV device ranges are unchanged: a decision to run Cake while its families stay loaded and
-    available (else the call looks up again), a decision to run the first
-    stage's selection only when no readiness check decided it (a Cake choice
-    that does not launch for these sizes, does not name the first stage's
-    winner, or no Cake choice). The memo is skipped whenever
-    ``_mla_cake_memo_state`` is ``None``.
+    and the values of the split-KV device ranges are unchanged: a decision to
+    run Cake while its families stay loaded and available (else the call
+    looks up again), a decision to run the first stage's selection only when
+    no readiness check decided it (a Cake choice that does not launch for
+    these sizes, does not name the first stage's winner, or no Cake choice).
+    The memo is skipped whenever ``_mla_cake_memo_state`` is ``None``.
     """
     skip_ops = tuner._effective_skip_ops
     if skip_ops and (_MLA_DECODE_OP in skip_ops or _MLA_CAKE_MARGIN_OP in skip_ops):
@@ -4160,7 +4162,7 @@ def _mla_cake_stage_two(
             and entry[0]() is tuner
             and entry[1] == state
             and entry[2] is _CAKE_MLA_AUTO_OFFERS
-            and entry[6] is _cake_mla_module()._SPLITKV_RANGE
+            and entry[6] == _cake_mla_module()._SPLITKV_RANGE
         ):
             families = entry[3]
             if families is None:
@@ -4255,7 +4257,7 @@ def _mla_cake_stage_two(
             cake._validated_families if cake_ok else None,
             plan,
             _cake_mla_module()._FP8_LUTS.get(inputs[0].device) if cake_ok else None,
-            _cake_mla_module()._SPLITKV_RANGE,
+            dict(_cake_mla_module()._SPLITKV_RANGE),
         )
     return (cake, tactic) if cake_ok else selected
 
