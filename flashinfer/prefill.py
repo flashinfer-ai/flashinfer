@@ -2496,12 +2496,10 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 #   kv_data_type=float8_e4m3fn, o_data_type=bfloat16)`` on an SM90 device
 #   selects it explicitly; a plan or call it cannot serve RAISES with the
 #   refusal reason — an explicitly selected backend never falls back; only
-#   ``"auto"`` routes around a refusal (to the composable path: exact
-#   dequantisation — bf16 holds every e4m3 value exactly — into the stock
-#   fa2 plan, never another fused backend).
-# - ``backend="auto"`` routes to ``"specialized"`` only on the dispatch
-#   allowlist (``gqa_fp8q_sm90_dispatch.json`` auto-routing keys); off the
-#   allowlist, auto keeps its stock resolution untouched.
+# - ``backend="auto"`` retains stock resolution. No shape/device region is
+#   qualified for automatic selection of the FP32-accumulating kernel.
+#   The plan-time kill switch retains the composable fallback on the former
+#   auto geometry; clearing it later never opts that plan into the kernel.
 # - A caller who names a stock backend (``fa2``/``fa3``/``cudnn``/...) is
 #   NEVER served by this kernel: an explicitly selected backend is never
 #   silently swapped.
@@ -2509,10 +2507,10 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # The underlying plan of an armed wrapper is always made for the exact
 # bf16-dequantised query on the stock fa2 route; ``run()`` dispatches the
 # specialized kernel at the supported contract and otherwise serves the call
-# on that composable route (auto-armed plans) or raises (explicit plans).
+# on that composable route (fallback-only plans) or raises (explicit plans).
 # ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at plan and run time; the
 # kill switch shared by FlashInfer's specialized kernels) disables the
-# kernel: auto-armed plans keep the composable route, explicit plans raise;
+# kernel: fallback-only plans keep the composable route, explicit plans raise;
 # ``FLASHINFER_DISABLE_GQA_CONTEXT_FP8_PAGED_SM90=1`` remains a deprecated
 # alias for one release.
 #
@@ -2541,7 +2539,7 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # per call), so plan/capture/replay works like any other fa2 plan.
 # ---------------------------------------------------------------------------
 # Kill switch shared by FlashInfer's specialized kernels (read at plan and
-# run time): disables the specialized kernel — auto-armed plans keep the
+# run time): disables the specialized kernel — fallback-only plans keep the
 # composable path (exact dequant + stock kernel), explicit plans raise.
 _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 # Deprecated alias (kept for one release): the per-kernel switch this kernel
@@ -2552,10 +2550,9 @@ _GQA_CTX_FP8Q_SM90_DISABLE_ENV = "FLASHINFER_DISABLE_GQA_CONTEXT_FP8_PAGED_SM90"
 # composable fallback plans on. An explicitly selected stock backend is never
 # swapped for "specialized".
 GQA_CTX_FP8Q_SM90_BACKENDS = ("auto", "specialized", "fa2")
-# Dispatch surface (package data): {"backends": [...], "ops": {"context":
-# {auto-routing keys + measured envelope}}}. Consulted by backend="auto"
-# only; the compiled-in guard constants below stay authoritative for
-# eligibility.
+# Package metadata describes the explicit contract and the geometry for
+# the user-disabled composable fallback. It cannot enable automatic kernel
+# selection. Compiled-in guard constants stay authoritative for eligibility.
 _GQA_FP8Q_SM90_DISPATCH_FILE = "gqa_fp8q_sm90_dispatch.json"
 _GQA_CTX_FP8Q_SM90_NUM_QO_HEADS = 8
 _GQA_CTX_FP8Q_SM90_NUM_KV_HEADS = 1
@@ -2792,7 +2789,7 @@ def _journal_fp8_graph_writes(wrapper, candidate, num_indices, num_lengths):
     wrapper._fp8_replan_journal.extend(backups)
 
 
-def _gqa_ctx_fp8q_sm90_auto_routes(
+def _gqa_ctx_fp8q_sm90_auto_composable(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim_qk: int,
@@ -2801,9 +2798,12 @@ def _gqa_ctx_fp8q_sm90_auto_routes(
     kv_layout: str,
     causal: bool,
 ) -> Tuple[bool, Optional[str]]:
-    """Shape-keyed auto-routing decision for ``backend="auto"``: route to
-    "specialized" only when the plan geometry matches the allowlist's
-    "context" auto-routing keys. Returns (routed, reason-if-not)."""
+    """Select the existing composable FA2 fallback when disabled at plan time."""
+    # Precision repair invalidated the old performance envelope. Ordinary
+    # auto retains the stock dispatcher; only the user's plan-time kill switch
+    # selects the existing composable fallback on the former geometry.
+    if not _gqa_ctx_fp8q_sm90_disabled():
+        return False, "no qualified automatic admission"
     table = _gqa_fp8q_sm90_dispatch_table()
     if table is None:
         return False, "dispatch allowlist unavailable"
@@ -2832,11 +2832,11 @@ def _gqa_ctx_fp8q_sm90_backend_order(
     exact-dequant stock route; a caller who named a stock backend never sees
     "specialized" here (an explicit backend is never silently swapped), and
     explicit "specialized" runs the specialized kernel or raises — it never
-    falls back. Only "auto" routes around a refusal."""
+    falls back. Auto's disabled fallback cannot select the kernel."""
     if requested == "specialized":
         return ("specialized",)
     if requested == "auto":
-        return ("specialized", "composable") if auto_routed else ("composable",)
+        return ("composable",) if auto_routed else ()
     return ()
 
 
@@ -2977,6 +2977,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
     prefix_len_ptr: Optional[torch.Tensor],
     token_pos_in_items_len: int,
     disable_split_kv: bool = False,
+    composable_only: bool = False,
 ) -> None:
     """Plan-time half of the dispatch: decide eligibility, JIT-build the
     module (first time in the process), opt the kernels into their dynamic
@@ -3021,7 +3022,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
     except Exception:  # the map must never break planning
         wrapper._gqa_ctx_fp8q_sm90_row_seq = None
         wrapper._gqa_ctx_fp8q_sm90_row_seq_batch = None
-    if _gqa_ctx_fp8q_sm90_disabled():
+    if composable_only or _gqa_ctx_fp8q_sm90_disabled():
         counters["plans_disabled"] += 1
         _gqa_ctx_fp8q_sm90_fallback("plan: kill switch")
         logger.info_once(
@@ -3524,6 +3525,9 @@ def _gqa_ctx_fp8q_sm90_dispatch(
     allocation is the output tensor when the caller did not pass one (the
     stock path allocates it in the same place)."""
     global _gqa_ctx_fp8q_sm90_announced
+    # A process-wide module cache or retained scratch is not a kernel opt-in.
+    if wrapper._requested_backend != "specialized":
+        return None
     state = getattr(wrapper, "_gqa_ctx_fp8q_sm90_state", None)
     if state is None:
         return None
@@ -4447,13 +4451,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             context kernel explicitly (``plan()`` raises for contracts it has no
             kernel for, and a plan or call it cannot serve raises with the
             refusal reason — an explicitly selected backend never falls back);
-            ``auto`` routes to it only on its dispatch allowlist and otherwise
-            keeps the stock resolution (auto-armed plans that decline at run
-            time are served by the composable path: exact dequantisation into
-            the stock fa2 kernel, never another fused backend); an explicitly
-            named stock backend is never served by it.
-            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the kernel
-            (auto: composable path; explicit: raise).
+            ``auto`` uses stock resolution. Automatic selection of this kernel
+            is disabled pending performance qualification of the precision fix.
+            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` makes explicit selection
+            refuse. When set before an eligible auto plan, it retains the
+            composable fallback (exact dequantisation into stock FA2) for
+            that plan's lifetime. Clearing the switch does not opt that plan
+            into the specialized kernel; replan to restore stock auto.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
             CUTLASS primitives.
@@ -4962,8 +4966,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             fixed_split_size = -1
 
         # gqa_context_fp8_paged_sm90: size the workspace for the plan that
-        # plan() would actually make. An armed specialized (or allowlisted
-        # auto) fp8-Q plan is planned on the stock fa2 route with a
+        # plan() would actually make. An explicit specialized plan or an
+        # auto plan with the kill switch set uses stock fa2 with a
         # bf16-dequantised query, so apply the same rewrite here — and raise
         # plan()'s contract error for backend="specialized" requests the plan
         # would reject — instead of handing "specialized" (or the un-rewritten
@@ -4986,7 +4990,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     )
                 _fp8q_sizing_as_fa2 = True
             elif _fp8q_contract_ok and self._cuda_graph_backend in (None, "fa2"):
-                _fp8q_sizing_as_fa2 = _gqa_ctx_fp8q_sm90_auto_routes(
+                _fp8q_sizing_as_fa2 = _gqa_ctx_fp8q_sm90_auto_composable(
                     num_qo_heads,
                     num_kv_heads,
                     head_dim_qk,
@@ -5242,21 +5246,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``torch.float8_e4m3fn`` with ``kv_data_type=torch.float8_e4m3fn``
             and ``o_data_type=torch.bfloat16`` is supported on SM90 devices
             through the ``"specialized"`` backend: ``backend="specialized"``
-            selects it explicitly, and ``backend="auto"`` routes to it only on
-            the dispatch allowlist (8 query heads / 1 KV head / head_dim 128,
+            selects it explicitly (8 query heads / 1 KV head / head_dim 128,
             page size 16, NHD, causal chunked prefill, per-sequence float32
             descales, batch <= 128, total query tokens <= 32768, kv_len <=
-            262144). Under ``backend="auto"`` a call the specialized kernel
-            cannot serve falls back to the composable path — exact
-            dequantisation (bf16 holds every e4m3 value exactly) into the
-            stock fa2 kernel — never to another fused backend; under explicit
-            ``backend="specialized"`` such a plan or call raises with the
-            refusal reason (an explicitly selected backend never falls back),
-            and a caller who names a stock backend (``fa2``, ``fa3``,
-            ...) is never served by the specialized kernel.
-            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at plan and run
-            time) disables the kernel (auto: composable path; explicit:
-            raise);
+            262144). An explicit plan or call it cannot serve raises.
+            Auto retains stock backend resolution; no current performance
+            region qualifies the precision-corrected kernel for auto selection.
+            ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` refuses explicit
+            specialization. If set before an eligible auto plan, it selects
+            the existing dequantisation + stock FA2 fallback. Clearing it
+            does not change the accepted plan; replan to restore stock auto.
+            A graph already planned for FA3 keeps its native backend.
             ``FLASHINFER_DISABLE_GQA_CONTEXT_FP8_PAGED_SM90=1`` is a
             deprecated alias kept for one release.
             The specialized kernel quantises the softmax
@@ -5266,7 +5266,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             contract. Raw QK scores and PV numerators accumulate in fp32.
             Once a specialized run is captured in graph mode, a replan that
             cannot refresh that capture raises before installing the new plan,
-            including under ``auto``. Use a separate wrapper for the new plan.
+            preserving the original capture. Use a separate wrapper for the new plan.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
@@ -5357,9 +5357,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # the "specialized" backend (see the dispatcher section above
         # _build_block_tables_from_paged_kv_indices). Explicit
         # backend="specialized" selects it (and otherwise raises — never a
-        # silent swap); backend="auto" routes to it only on the dispatch
-        # allowlist's auto-routing keys; an explicitly named stock backend
-        # (fa2/fa3/cudnn/...) is NEVER served by it. An armed plan is made for
+        # silent swap). Ordinary auto uses stock resolution; the plan-time
+        # kill switch alone selects the former geometry's composable fallback.
+        # Explicit stock backends are never intercepted. An armed plan uses
         # the exact bf16-dequantised query (bf16 holds every e4m3 value
         # exactly) on the stock fa2 route — the composable path run() falls
         # back to.
@@ -5401,7 +5401,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # to the wrapper only after validation, below)
             q_data_type = torch.bfloat16
         elif self._requested_backend == "auto" and _gqa_fp8q_contract_ok:
-            _auto_routed, _auto_reason = _gqa_ctx_fp8q_sm90_auto_routes(
+            _auto_routed, _auto_reason = _gqa_ctx_fp8q_sm90_auto_composable(
                 num_qo_heads,
                 num_kv_heads,
                 head_dim_qk,
@@ -5621,7 +5621,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # not just its geometry allowlist, before common plan state or
             # the caller's graph buffers are touched.
             reason = None
-            if not _gqa_ctx_fp8q_sm90_armed or planned_backend != "fa2":
+            if not _gqa_ctx_fp8q_sm90_armed_explicit or planned_backend != "fa2":
                 reason = "graph-retained specialized provider"
             elif _gqa_ctx_fp8q_sm90_disabled():
                 reason = "kill switch"
@@ -5709,6 +5709,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if candidate is None:
             self._gqa_ctx_fp8q_sm90_state = None
             self._gqa_ctx_fp8q_sm90_row_seq = None
+            self._gqa_ctx_fp8q_sm90_row_seq_batch = None
         self._head_dim_qk = head_dim_qk
         self._head_dim_vo = head_dim_vo
 
@@ -6244,6 +6245,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         prefix_len_ptr,
                         token_pos_in_items_len,
                         disable_split_kv=disable_split_kv,
+                        composable_only=not _gqa_ctx_fp8q_sm90_armed_explicit,
                     )
         if (
             getattr(self, "_gqa_ctx_fp8q_sm90_explicit", False)
@@ -6773,15 +6775,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # be dropped silently. Reject them loudly instead.
                 raise NotImplementedError(
                     "positional run() arguments are not supported on an "
-                    "fp8-Q 'specialized' (or specialized-armed 'auto') plan: "
+                    "fp8-Q 'specialized' (or composable 'auto') plan: "
                     "the positional FP8 scale contract is consumed by the "
                     "stock fp8 kernels, while this plan's fallback "
                     "dequantises Q to bf16 and would silently drop them. "
                     "Pass q_scale=, k_scale= and v_scale= keywords instead."
                 )
             # fp8 Q on the SM90 paged route, armed by backend="specialized"
-            # or an allowlisted backend="auto" plan: the specialized kernel at
-            # the supported contract, the composable path (exact
+            # or a fallback-only auto plan. Explicit specialization launches
+            # the kernel or raises; the auto fallback performs exact
             # dequantisation into the stock fa2 plan) otherwise — including
             # under FLASHINFER_SPECIALIZED_KERNEL_DISABLE (or its deprecated
             # per-kernel alias). The specialized kernel's P.V product accumulates in
@@ -6824,13 +6826,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # served once the specialized kernel is not dispatched
                 raise NotImplementedError(
                     "per-sequence k_scale/v_scale tensors are only served by "
-                    "the specialized SM90 fp8-Q kernel; this auto-armed call "
+                    "the specialized SM90 fp8-Q kernel; this composable call "
                     "fell back to the composable dequant + stock fa2 path "
                     f"(disabled via {_SPECIALIZED_KERNEL_DISABLE_ENV} — or "
                     f"its deprecated alias {_GQA_CTX_FP8Q_SM90_DISABLE_ENV} — "
                     "or outside the allowlist), which takes scalar or None "
                     "k_scale/v_scale. Pass scalars (unit descales may simply "
-                    "be omitted) or re-enable the specialized kernel."
+                    "be omitted), or use an explicit specialized plan."
                 )
             q, q_scale = _gqa_ctx_fp8q_sm90_dequant_q(self, q, q_scale)
         _check_cached_qkv_data_type(

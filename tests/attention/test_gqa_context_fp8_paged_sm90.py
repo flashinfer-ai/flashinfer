@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import contextlib
 import math
 
 import pytest
@@ -23,7 +22,7 @@ import torch
 import flashinfer
 from flashinfer.prefill import (
     GQA_CTX_FP8Q_SM90_BACKENDS,
-    _gqa_ctx_fp8q_sm90_auto_routes,
+    _gqa_ctx_fp8q_sm90_auto_composable,
     _gqa_ctx_fp8q_sm90_backend_order,
     _gqa_ctx_fp8q_sm90_plan_eligibility,
     _gqa_ctx_fp8q_sm90_stats,
@@ -150,6 +149,7 @@ def test_dispatch_table_loads_and_matches_guard_constants():
     assert table["kill_switch"] == DISABLE_ENV
     assert "specialized" in table["backends"]
     op = table["ops"]["context"]
+    assert op["auto_admission"] is False
     assert op["num_qo_heads"] == H_QO
     assert op["num_kv_heads"] == H_KV
     assert op["head_dim"] == HEAD_DIM
@@ -163,8 +163,13 @@ def test_dispatch_table_loads_and_matches_guard_constants():
     assert env["max_referenced_pages"] == 131072
 
 
-def test_auto_routes_only_on_the_allowlist():
-    ok, reason = _gqa_ctx_fp8q_sm90_auto_routes(
+def test_auto_composable_requires_plan_time_disable_and_matching_geometry(monkeypatch):
+    ok, reason = _gqa_ctx_fp8q_sm90_auto_composable(
+        H_QO, H_KV, HEAD_DIM, HEAD_DIM, PAGE, "NHD", True
+    )
+    assert not ok and "no qualified" in reason
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    ok, reason = _gqa_ctx_fp8q_sm90_auto_composable(
         H_QO, H_KV, HEAD_DIM, HEAD_DIM, PAGE, "NHD", True
     )
     assert ok and reason is None
@@ -187,19 +192,16 @@ def test_auto_routes_only_on_the_allowlist():
             causal=True,
         )
         kwargs.update(bad)
-        ok, reason = _gqa_ctx_fp8q_sm90_auto_routes(**kwargs)
+        ok, reason = _gqa_ctx_fp8q_sm90_auto_composable(**kwargs)
         assert not ok and reason, bad
 
 
 def test_backend_order_never_swaps_an_explicit_stock_backend():
     # explicit "specialized" never falls back: it runs the kernel or raises
     assert _gqa_ctx_fp8q_sm90_backend_order("specialized", False) == ("specialized",)
-    # auto: "specialized" only on the allowlist
-    assert _gqa_ctx_fp8q_sm90_backend_order("auto", True) == (
-        "specialized",
-        "composable",
-    )
-    assert _gqa_ctx_fp8q_sm90_backend_order("auto", False) == ("composable",)
+    # Auto either selects the user-disabled fallback or leaves stock untouched.
+    assert _gqa_ctx_fp8q_sm90_backend_order("auto", True) == ("composable",)
+    assert _gqa_ctx_fp8q_sm90_backend_order("auto", False) == ()
     # an explicitly named stock backend never sees "specialized"
     for stock in ("fa2", "fa3", "cudnn", "trtllm-gen", "cute-dsl"):
         assert "specialized" not in _gqa_ctx_fp8q_sm90_backend_order(stock, True)
@@ -368,9 +370,7 @@ def test_specialized_matches_reference_and_stock(q_lens, kv_lens, monkeypatch):
         wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["runs_disabled"] == 1, stats
-    monkeypatch.delenv(DISABLE_ENV)
     wrapper_auto = _plan_wrapper(batch, device, backend="auto")
-    monkeypatch.setenv(DISABLE_ENV, "1")
     out_stock = wrapper_auto.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["runs_dequant_fallback"] == 1, stats
@@ -382,15 +382,16 @@ def test_legacy_kill_switch_alias_still_disables(monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
-    wrapper = _plan_wrapper(batch, device, backend="auto")
+    explicit = _plan_wrapper(batch, device)
     monkeypatch.setenv(DISABLE_ENV_LEGACY, "1")
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        explicit.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    wrapper = _plan_wrapper(batch, device, backend="auto")
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_ctx_fp8q_sm90_stats()
-    assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
-    assert stats["runs_dispatched"] == 0
+    assert stats["runs_disabled"] == 1 and stats["plans_disabled"] == 1
+    assert stats["runs_dequant_fallback"] == 1 and stats["runs_dispatched"] == 0
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
-    # explicit "specialized" raises under the alias too — at plan time: the
-    # kill switch is read at plan and run, so the explicit plan itself refuses
     with pytest.raises(NotImplementedError, match="never falls back"):
         _plan_wrapper(batch, device)
 
@@ -426,32 +427,90 @@ def test_explicit_stock_backend_is_never_swapped():
     assert stats["backend_dispatches"]["specialized"] == 0, stats
 
 
-def test_auto_routes_to_specialized_on_the_allowlist_only():
+@pytest.mark.parametrize(
+    "q_lens,kv_lens", [([5, 90, 7], [584, 727, 75]), ([8192], [32768])]
+)
+def test_auto_retains_native_fp8_dispatch(q_lens, kv_lens, monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
-    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
-    wrapper = _plan_wrapper(batch, device, backend="auto")
-    stats = _gqa_ctx_fp8q_sm90_stats()
-    assert stats["plans_prepared"] == 1, stats
-    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
-    stats = _gqa_ctx_fp8q_sm90_stats()
-    assert stats["runs_dispatched"] == 1, stats
-    assert stats["backend_dispatches"]["specialized"] == 1, stats
-    assert _matched_ratio(out, _reference(batch)) >= MATCHED
-
-    # off-allowlist geometry: auto never routes to "specialized"
+    batch = _make_batch(q_lens, kv_lens, device)
+    q, kv = batch["q"], (batch["k_cache"], batch["v_cache"])
+    # Populate the specialized module cache before checking a fresh auto plan.
+    explicit = _plan_wrapper(batch, device)
+    explicit.run(q, kv)
     _reset_gqa_ctx_fp8q_sm90_stats()
-    batch4 = _make_batch([5, 7], [584, 75], device)
-    batch4["q"] = batch4["q"][:, :4, :].contiguous()
-    # stock auto may reject fp8-Q; it must simply never arm us
-    with contextlib.suppress(Exception):
-        _plan_wrapper(batch4, device, backend="auto", num_qo_heads=4)
+    wrapper = _plan_wrapper(batch, device, backend="auto")
+    assert wrapper._backend == "fa3"
+    assert wrapper._cached_q_data_type == torch.float8_e4m3fn
+    assert not wrapper._gqa_ctx_fp8q_sm90_requested
+    assert wrapper._gqa_ctx_fp8q_sm90_state is None
+    stock = _plan_wrapper(batch, device, backend="fa3")
+    ref = stock.run(q, kv)
+    out = torch.empty_like(ref)
+    for disabled in (False, True):
+        if disabled:
+            monkeypatch.setenv(DISABLE_ENV, "1")
+        wrapper.run(q, kv, out=out)
+        assert _matched_ratio(out, ref) >= MATCHED
+        assert wrapper._backend == "fa3"
+    if sum(q_lens) < 1024:
+        assert _matched_ratio(out, _reference(batch)) >= MATCHED
     stats = _gqa_ctx_fp8q_sm90_stats()
-    assert stats["plans_prepared"] == 0, stats
-    assert any(r.startswith("auto:") for r in stats["fallback_reasons"]), stats
+    for key in (
+        "plans_seen",
+        "plans_prepared",
+        "workspace_allocs",
+        "runs_dispatched",
+        "runs_dequant_fallback",
+    ):
+        assert stats[key] == 0, stats
 
 
-def test_run_guard_declines_on_mismatched_arguments():
+def test_auto_off_geometry_keeps_stock_dispatch():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 7], [584, 75], device)
+    batch["q"] = batch["q"][:, :4, :].contiguous()
+    auto = _plan_wrapper(batch, device, backend="auto", num_qo_heads=4)
+    stock = _plan_wrapper(batch, device, backend="fa3", num_qo_heads=4)
+    kv = (batch["k_cache"], batch["v_cache"])
+    assert (
+        _matched_ratio(auto.run(batch["q"], kv), stock.run(batch["q"], kv)) >= MATCHED
+    )
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == stats["runs_dispatched"] == 0
+
+
+def test_cached_specialized_state_cannot_opt_auto_into_kernel():
+    from types import SimpleNamespace
+    from flashinfer.prefill import _gqa_ctx_fp8q_sm90_dispatch
+
+    wrapper = SimpleNamespace(
+        _requested_backend="auto", _gqa_ctx_fp8q_sm90_state=object()
+    )
+    assert (
+        _gqa_ctx_fp8q_sm90_dispatch(
+            wrapper,
+            q=None,
+            k_cache=None,
+            v_cache=None,
+            out=None,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+            return_lse=False,
+            window_left=None,
+            sinks=None,
+            kv_cache_sf=None,
+            skip_softmax_threshold_scale_factor=None,
+            extra_args=(),
+        )
+        is None
+    )
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
+
+
+def test_run_guard_declines_on_mismatched_arguments(monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
@@ -461,14 +520,15 @@ def test_run_guard_declines_on_mismatched_arguments():
         wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), return_lse=True)
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0 and stats["runs_ineligible"] == 1
-    # an auto-armed plan is served by the dequant fallback
+    # The user-selected fallback retains LSE support.
+    monkeypatch.setenv(DISABLE_ENV, "1")
     wrapper_auto = _plan_wrapper(batch, device, backend="auto")
     out, lse = wrapper_auto.run(
         batch["q"], (batch["k_cache"], batch["v_cache"]), return_lse=True
     )
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0
-    assert stats["runs_ineligible"] == 2 and stats["runs_dequant_fallback"] == 1
+    assert stats["runs_ineligible"] == 1 and stats["runs_dequant_fallback"] == 1
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
 
 
@@ -522,7 +582,7 @@ def test_raw_score_range_and_unit_pv(q_len, kv_len):
     for name in ("q", "k_cache"):
         b[name].view(torch.uint8).fill_(0x60)  # 32; raw QK = 131072
     b["v_cache"].view(torch.uint8).fill_(0x38)  # constant 1
-    w = _plan_wrapper(b, device, backend="auto")
+    w = _plan_wrapper(b, device)
     if q_len == 8192:
         assert w._gqa_ctx_fp8q_sm90_state.psplit == 1
     scale = torch.tensor([[1 / 32]], device=device)
@@ -534,12 +594,11 @@ def test_raw_score_range_and_unit_pv(q_len, kv_len):
     }
 
 
-@pytest.mark.parametrize("backend", ["auto", "specialized"])
-def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
+def test_refused_captured_replan_preserves_last_plan(monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     b = _make_batch([32], [64], device)
-    w = _plan_wrapper(b, device, use_cuda_graph=True, backend=backend)
+    w = _plan_wrapper(b, device, use_cuda_graph=True)
     q = b["q"]
     kv = (b["k_cache"], b["v_cache"])
     eager = w.run(q, kv)
@@ -594,7 +653,6 @@ def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
 
     accepted_module = w._cached_module
     accepted_plan = w._plan_info
-    old_ref = _reference(b)
     old_cu = b["qo_indptr"].clone()
     old_indices = b["kv_indices"].clone()
     workspaces = (
@@ -651,16 +709,12 @@ def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
     out.fill_(17)
     g.replay()
     assert torch.equal(out, eager)
-    if backend == "auto":
-        before = _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"]
-        with monkeypatch.context() as patch:
-            patch.setenv(DISABLE_ENV, "1")
-            stock = w.run(q, kv)
-        assert _matched_ratio(stock, old_ref) >= MATCHED
-        assert _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"] == {
-            "specialized": before["specialized"],
-            "composable": before["composable"] + 1,
-        }
+    before = _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"]
+    with monkeypatch.context() as patch:
+        patch.setenv(DISABLE_ENV, "1")
+        with pytest.raises(NotImplementedError, match="never falls back"):
+            w.run(q, kv)
+    assert _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"] == before
 
     plan(24)
     pool = w._fp8_replan_backup_pool
@@ -888,9 +942,7 @@ def test_kill_switch_before_plan_still_serves_tensor_q_scale(monkeypatch):
 
 
 def test_mutated_sm_scale_declines_specialization():
-    """forward()-style mutators can rewrite _sm_scale after an armed plan;
-    the fixed-scale kernel must decline: an auto-armed plan is served by the
-    stock path, an explicit plan raises."""
+    """Stock auto keeps mutable scales; explicit fixed-scale kernels refuse."""
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
@@ -898,55 +950,83 @@ def test_mutated_sm_scale_declines_specialization():
     wrapper._sm_scale = 0.5
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     stats = _gqa_ctx_fp8q_sm90_stats()
-    assert stats["runs_dispatched"] == 0
-    assert stats["runs_ineligible"] == 1 and stats["runs_dequant_fallback"] == 1
+    assert stats["runs_dispatched"] == stats["runs_ineligible"] == 0
+    assert stats["runs_dequant_fallback"] == 0
     assert _matched_ratio(out, _reference(batch, sm_scale=0.5)) >= MATCHED
     wrapper._sm_scale = None
     out2 = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
-    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
     assert _matched_ratio(out2, _reference(batch)) >= MATCHED
-    # the explicit form raises on the same decline
-    wrapper_exp = _plan_wrapper(batch, device)
-    wrapper_exp._sm_scale = 0.5
+    explicit = _plan_wrapper(batch, device)
+    explicit._sm_scale = 0.5
     with pytest.raises(NotImplementedError, match="never falls back"):
-        wrapper_exp.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+        explicit.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    explicit._sm_scale = None
+    out3 = explicit.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out3, _reference(batch)) >= MATCHED
 
 
-def test_workspace_size_matches_the_armed_plan():
-    """workspace_size(backend='specialized' or allowlisted fp8 'auto') must
-    size the fa2 route the armed plan is actually planned on (bf16 query),
-    and raise plan()'s contract error for contracts plan() would reject."""
+def test_workspace_size_matches_the_selected_plan(monkeypatch):
+    """Sizing and planning must select the same backend and query dtype."""
+    import flashinfer.prefill as prefill
+
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    native_get = prefill.get_batch_prefill_module
+    selected = []
 
-    def _ws(backend, q_dtype):
-        ws = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device=device)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            ws, kv_layout="NHD", backend=backend
-        )
-        return wrapper.workspace_size(
-            batch["qo_indptr"],
-            batch["kv_indptr"],
-            batch["kv_indices"],
-            batch["last_page_len"],
-            H_QO,
-            H_KV,
-            HEAD_DIM,
-            PAGE,
-            causal=True,
-            q_data_type=q_dtype,
-            kv_data_type=torch.float8_e4m3fn,
-            o_data_type=torch.bfloat16,
-        )
+    def get_module(backend, q_dtype, *args):
+        selected.append((backend, q_dtype))
+        return native_get(backend, q_dtype, *args)
 
-    stock = _ws("fa2", torch.bfloat16)
-    specialized = _ws("specialized", torch.float8_e4m3fn)
-    auto = _ws("auto", torch.float8_e4m3fn)
-    assert specialized == stock
-    assert auto == stock
+    monkeypatch.setattr(prefill, "get_batch_prefill_module", get_module)
+
+    def query(backend, q_dtype, wrapper=None):
+        if wrapper is None:
+            ws = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device=device)
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                ws, kv_layout="NHD", backend=backend
+            )
+        selected.clear()
+        saved = dict(wrapper.__dict__)
+        try:
+            result = wrapper.workspace_size(
+                batch["qo_indptr"],
+                batch["kv_indptr"],
+                batch["kv_indices"],
+                batch["last_page_len"],
+                H_QO,
+                H_KV,
+                HEAD_DIM,
+                PAGE,
+                causal=True,
+                q_data_type=q_dtype,
+                kv_data_type=torch.float8_e4m3fn,
+                o_data_type=torch.bfloat16,
+            )
+        except NotImplementedError as exc:
+            assert "workspace_size is not available" in str(exc)
+            result = (type(exc).__name__, str(exc))
+        assert selected
+        assert wrapper.__dict__.keys() == saved.keys()
+        assert all(wrapper.__dict__[key] is value for key, value in saved.items())
+        return result, selected[-1]
+
+    stock_fa2 = query("fa2", torch.bfloat16)
+    assert stock_fa2[1] == ("fa2", torch.bfloat16)
+    assert query("specialized", torch.float8_e4m3fn) == stock_fa2
+    stock_fa3 = query("fa3", torch.float8_e4m3fn)
+    assert stock_fa3[1] == ("fa3", torch.float8_e4m3fn)
+    assert query("auto", torch.float8_e4m3fn) == stock_fa3
+    graph_wrapper = _plan_wrapper(batch, device, use_cuda_graph=True, backend="auto")
+    assert graph_wrapper._cuda_graph_backend == "fa3"
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    assert query("auto", torch.float8_e4m3fn) == stock_fa2
+    assert query("auto", torch.float8_e4m3fn, graph_wrapper) == stock_fa3
     with pytest.raises(ValueError, match="specialized"):
-        _ws("specialized", torch.bfloat16)
+        query("specialized", torch.bfloat16)
 
 
 def test_batch_invariant_workspace_size_and_plan_keep_original_dtype():
@@ -987,23 +1067,27 @@ def test_batch_invariant_workspace_size_and_plan_keep_original_dtype():
     assert w._cached_q_data_type == torch.bfloat16
 
 
-def test_auto_arming_declines_on_a_captured_fa3_graph():
-    """An allowlisted fp8 auto plan must not rewrite the backend to fa2 when
-    the wrapper's captured CUDA-graph backend is fa3 (the fa2 schedule would
-    clobber the captured graph's integer workspace)."""
+def test_auto_graph_replan_retains_native_fa3(monkeypatch):
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
     wrapper = _plan_wrapper(batch, device, use_cuda_graph=True, backend="auto")
-    assert _gqa_ctx_fp8q_sm90_stats()["plans_prepared"] == 1
-    _reset_gqa_ctx_fp8q_sm90_stats()
-    # simulate a wrapper whose captured graphs hold an fa3 workspace layout
-    wrapper._cuda_graph_backend = "fa3"
-    with contextlib.suppress(Exception):
+    assert wrapper._cuda_graph_backend == "fa3"
+    assert getattr(wrapper, "_gqa_ctx_fp8q_sm90_capture_rows", None) is None
+    kv = (batch["k_cache"], batch["v_cache"])
+    expected = wrapper.run(batch["q"], kv)
+    out = torch.empty_like(expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(batch["q"], kv, out=out)
+    original = batch["kv_indices"].clone()
+    for disabled, indices in [(False, original.flip(0)), (True, original)]:
+        if disabled:
+            monkeypatch.setenv(DISABLE_ENV, "1")
         wrapper.plan(
             batch["qo_indptr"],
             batch["kv_indptr"],
-            batch["kv_indices"],
+            indices,
             batch["last_page_len"],
             H_QO,
             H_KV,
@@ -1014,11 +1098,60 @@ def test_auto_arming_declines_on_a_captured_fa3_graph():
             kv_data_type=torch.float8_e4m3fn,
             o_data_type=torch.bfloat16,
         )
+        assert wrapper._backend == "fa3"
+        assert wrapper._cached_q_data_type == torch.float8_e4m3fn
+        reference_batch = dict(batch, kv_indices=indices)
+        reference_wrapper = _plan_wrapper(reference_batch, device, backend="fa3")
+        expected = reference_wrapper.run(batch["q"], kv)
+        eager = wrapper.run(batch["q"], kv)
+        assert _matched_ratio(eager, expected) >= MATCHED
+        for _ in range(3):
+            out.fill_(17)
+            graph.replay()
+            assert torch.equal(out, eager)
     stats = _gqa_ctx_fp8q_sm90_stats()
-    assert stats["plans_prepared"] == 0, stats
-    assert any("captured CUDA-graph backend" in r for r in stats["fallback_reasons"]), (
-        stats
+    assert stats["plans_prepared"] == stats["runs_dispatched"] == 0
+    assert stats["runs_dequant_fallback"] == 0
+
+
+def test_auto_can_leave_composable_plan_without_reusing_specialized_state(monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    kv = (batch["k_cache"], batch["v_cache"])
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    wrapper = _plan_wrapper(batch, device, backend="auto")
+    assert wrapper._backend == "fa2"
+    assert wrapper._cached_q_data_type == torch.bfloat16
+    monkeypatch.delenv(DISABLE_ENV)
+    # Clearing the switch without replanning must retain the accepted FA2 ABI.
+    assert _matched_ratio(wrapper.run(batch["q"], kv), _reference(batch)) >= MATCHED
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dequant_fallback"] == 1
+    wrapper.plan(
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
     )
+    assert wrapper._backend == "fa3"
+    assert wrapper._cached_q_data_type == torch.float8_e4m3fn
+    assert not wrapper._gqa_ctx_fp8q_sm90_requested
+    assert wrapper._gqa_ctx_fp8q_sm90_state is None
+    assert wrapper._gqa_ctx_fp8q_sm90_row_seq is None
+    assert wrapper._gqa_ctx_fp8q_sm90_row_seq_batch is None
+    before = _gqa_ctx_fp8q_sm90_stats()
+    assert _matched_ratio(wrapper.run(batch["q"], kv), _reference(batch)) >= MATCHED
+    after = _gqa_ctx_fp8q_sm90_stats()
+    assert after["runs_dispatched"] == before["runs_dispatched"] == 0
+    assert after["runs_dequant_fallback"] == before["runs_dequant_fallback"]
 
 
 def test_positional_fp8_scale_args_are_rejected_loudly():
@@ -1035,7 +1168,7 @@ def test_positional_fp8_scale_args_are_rejected_loudly():
     assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
 
 
-def test_rejected_replan_does_not_arm_the_wrapper():
+def test_rejected_replan_does_not_arm_the_wrapper(monkeypatch):
     """A replan that would arm the specialized kernel but is rejected by the
     seq_lens_q validation must leave the previously accepted (unarmed) plan's
     state and run() behavior unchanged: the arming decision is committed to
@@ -1067,6 +1200,7 @@ def test_rejected_replan_does_not_arm_the_wrapper():
     )
     assert not wrapper._gqa_ctx_fp8q_sm90_requested
     # an fp8-Q replan that would arm, rejected by the seq_lens_q validation
+    monkeypatch.setenv(DISABLE_ENV, "1")
     bad_lens = torch.tensor([6, 90, 7], dtype=torch.int32)  # != qo_indptr diffs
     with pytest.raises(ValueError, match="seq_lens_q"):
         wrapper.plan(
@@ -1108,9 +1242,11 @@ def test_armed_plan_rejects_non_fp8_query_at_run(backend):
         "specialized": 0,
         "composable": 0,
     }
-    # valid e4m3 input still dispatches the specialized kernel
+    # Valid input recovers on the originally requested backend.
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
-    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == int(
+        backend == "specialized"
+    )
     assert _matched_ratio(out, _reference(batch)) >= MATCHED
 
 
@@ -1299,6 +1435,7 @@ def test_one_element_q_scale_broadcasts_in_dequant_fallback(monkeypatch):
     monkeypatch.setenv(DISABLE_ENV, "1")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
     wrapper = _plan_wrapper(batch, device, backend="auto")
+    monkeypatch.delenv(DISABLE_ENV)
     one = torch.tensor([2.0], dtype=torch.float32, device=device)
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=one)
     assert _matched_ratio(out, _reference(batch, qk_descale=[2.0, 2.0, 2.0])) >= MATCHED

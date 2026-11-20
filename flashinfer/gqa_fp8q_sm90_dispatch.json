@@ -1,9 +1,10 @@
 {
-  "comment": "Dispatch surface of the specialized SM90 fp8-Q paged attention kernels. 'backends' lists the backend strings of this contract; each op entry carries the auto-routing keys backend='auto' matches a plan against (the compiled-in guards in flashinfer/prefill.py stay authoritative for eligibility) plus the measured envelope the kernel was validated on. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the composable path regardless of this file.",
+  "comment": "Geometry and limits describe the explicit SM90 FP8-Q kernel contract, not a qualified performance region. No automatic kernel admission is qualified after the precision repair. These geometry keys also delimit the existing plan-time kill-switch composable fallback for auto.",
   "backends": ["auto", "specialized", "fa2"],
   "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
   "ops": {
     "context": {
+      "auto_admission": false,
       "kv_layout": "NHD",
       "causal": true,
       "num_qo_heads": 8,
