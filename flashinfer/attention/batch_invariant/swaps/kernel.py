@@ -75,10 +75,13 @@ class SwapsKernel:
         ragged: bool = False,
         cap: int = 0,
         pdl: bool = False,
+        *,
+        causal: bool = True,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     @cute.jit
     def __call__(
@@ -99,7 +102,15 @@ class SwapsKernel:
         grid: Int32,
         stream: cuda.CUstream,
     ):
-        st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
+        st = SwapsPlan(
+            self.D,
+            self.g,
+            self.page,
+            self.n_pad,
+            self.ragged,
+            self.cap,
+            causal=self.causal,
+        )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
