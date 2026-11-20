@@ -360,7 +360,9 @@ def _nccl_paths():
         ),
         home / "lib",
     )
-    libraries = sorted(lib_dir.glob("libnccl.so.*")) or sorted(lib_dir.glob("libnccl.so"))
+    libraries = sorted(lib_dir.glob("libnccl.so.*")) or sorted(
+        lib_dir.glob("libnccl.so")
+    )
     if not (include / "nccl_device.h").is_file() or not libraries:
         raise FileNotFoundError(
             f"NCCL device API headers or libnccl not found under {home}"
@@ -396,11 +398,18 @@ def get_megamoe_sm90_mxfp4_uri(
     fast_math,
     in_kernel_weight_copy: bool = False,
     num_nodes: int = 1,
-    phase_stamps: bool = False,
+    weight_tile_bytes: int = 8704,
 ) -> str:
     """Module key of the MXFP4 fused kernel: every compile-time policy, the rank
-    width, whether the kernel copies the weights of a replica plan, the node count
-    and whether the phase stamps are compiled in."""
+    width, weight-record format, replica-copy mode and node count."""
+    if weight_tile_bytes not in (8704, 8448, 16384):
+        raise ValueError("unsupported MXFP4 weight-record size")
+    if weight_tile_bytes == 8448 and not plan.rs_swap_ab:
+        raise ValueError("compact MXFP4 weights require register-source math")
+    if weight_tile_bytes == 16384 and plan.rs_swap_ab:
+        raise ValueError("predecoded FP8 weights require shared-source math")
+    if in_kernel_weight_copy and (num_nodes > 1 or weight_tile_bytes != 8704):
+        raise ValueError("expert slots require single-node canonical MXFP4 storage")
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -413,9 +422,10 @@ def get_megamoe_sm90_mxfp4_uri(
         fast_math,
         num_ranks=num_ranks,
     ).replace("nvfp4", "mxfp4")
+    uri += f"_wt{weight_tile_bytes}"
     uri += "_eplbcopy" if in_kernel_weight_copy else ""
     uri += f"_nodes{num_nodes}" if num_nodes > 1 else ""
-    return uri + ("_stamps" if phase_stamps else "")
+    return uri
 
 
 def gen_megamoe_sm90_mxfp4_module(
@@ -431,11 +441,10 @@ def gen_megamoe_sm90_mxfp4_module(
     fast_math,
     in_kernel_weight_copy: bool = False,
     num_nodes: int = 1,
-    phase_stamps: bool = False,
+    weight_tile_bytes: int = 8704,
 ) -> JitSpec:
     """JIT spec of the MXFP4 fused kernel, with or without the in-kernel weight copy,
-    for ranks on one node or spread over ``num_nodes`` nodes, optionally with the
-    phase stamps (globaltimer slots) compiled in."""
+    for ranks on one node or spread over ``num_nodes`` nodes."""
     uri = get_megamoe_sm90_mxfp4_uri(
         plan,
         num_sms,
@@ -449,7 +458,7 @@ def gen_megamoe_sm90_mxfp4_module(
         fast_math,
         in_kernel_weight_copy,
         num_nodes,
-        phase_stamps,
+        weight_tile_bytes,
     )
     return _gen_fp4_module(
         uri,
@@ -468,7 +477,7 @@ def gen_megamoe_sm90_mxfp4_module(
             fast_math=fast_math,
             in_kernel_weight_copy=in_kernel_weight_copy,
             num_nodes=num_nodes,
-            phase_stamps=phase_stamps,
+            weight_tile_bytes=weight_tile_bytes,
         ),
         fast_math,
         extra_include_paths=[_nccl_paths()[0]] if num_nodes > 1 else (),

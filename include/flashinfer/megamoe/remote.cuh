@@ -45,14 +45,6 @@ struct RemoteLinks {
   uint32_t gin_context;
 };
 
-// Signal ids: two per remote node, inbox then return.
-CUTLASS_HOST_DEVICE constexpr uint32_t remote_inbox_signal(const uint32_t& node) {
-  return node * 2;
-}
-CUTLASS_HOST_DEVICE constexpr uint32_t remote_return_signal(const uint32_t& node) {
-  return node * 2 + 1;
-}
-
 #if defined(__CUDA_ARCH__) or defined(__CLION_IDE__)
 
 // Warp-cooperative copy of `bytes` (multiple of 16) from `src` to `dst`: up to
@@ -90,12 +82,12 @@ struct RemoteIO {
 
   // Put `bytes` from `src` (inside this rank's buffer) to the mirror on `node`,
   // at the address `dst_equiv` has in this rank's own layout. Called by a full
-  // warp. With `signal`, the mirror's `flag_equiv` word (load/store carrier) or
-  // the GIN signal `signal_id` is incremented once the data is visible; a put
+  // warp. With `signal`, the mirror's window-local `flag_equiv` word is
+  // incremented once the data is visible; a put
   // without a signal is ordered before a later signalled put to the same node.
   CUTLASS_DEVICE void put_warp(const uint32_t& node, void* dst_equiv, const void* src,
                                const uint64_t& bytes, const uint32_t& lane_idx, const bool& signal,
-                               uint64_t* flag_equiv, const uint32_t& signal_id) const {
+                               uint64_t* flag_equiv) const {
     const auto& peer = links.peers[node];
     if (is_lsa(node)) {
       auto* dst = reinterpret_cast<void*>(reinterpret_cast<int64_t>(dst_equiv) + peer.lsa_offset);
@@ -104,9 +96,9 @@ struct RemoteIO {
         __threadfence_system();
         __syncwarp();
         if (lane_idx == 0)
-          ptx::atomic_add_sys(reinterpret_cast<uint64_t*>(reinterpret_cast<int64_t>(flag_equiv) +
-                                                          peer.lsa_offset),
-                              1ull);
+          ptx::atomic_add_sys(
+              reinterpret_cast<uint64_t*>(reinterpret_cast<int64_t>(flag_equiv) + peer.lsa_offset),
+              1ull);
       }
       __syncwarp();
       return;
@@ -116,12 +108,15 @@ struct RemoteIO {
       const auto* dev_comm = static_cast<const ncclDevComm*>(links.dev_comm);
       ncclGin gin{*dev_comm, static_cast<int>(links.gin_context)};
       const auto window = reinterpret_cast<ncclWindow_t>(links.window);
-      const auto dst_off = static_cast<size_t>(reinterpret_cast<int64_t>(dst_equiv) - links.window_base);
+      const auto dst_off =
+          static_cast<size_t>(reinterpret_cast<int64_t>(dst_equiv) - links.window_base);
       const auto src_off = static_cast<size_t>(reinterpret_cast<int64_t>(src) - links.window_base);
-      if (signal)
+      if (signal) {
+        const auto flag_off =
+            static_cast<size_t>(reinterpret_cast<int64_t>(flag_equiv) - links.window_base);
         gin.put(ncclTeamWorld(*dev_comm), static_cast<int>(peer.rank), window, dst_off, window,
-                src_off, bytes, ncclGin_StrongSignalAdd{static_cast<ncclGinSignal_t>(signal_id), 1ull});
-      else
+                src_off, bytes, ncclGin_StrongVASignalInc{window, flag_off});
+      } else
         gin.put(ncclTeamWorld(*dev_comm), static_cast<int>(peer.rank), window, dst_off, window,
                 src_off, bytes);
     }
@@ -132,8 +127,9 @@ struct RemoteIO {
   }
 
   // Wait until the mirror on `node` has signalled at least `least` times
-  // (load/store carrier: the local `flag` word; GIN: `signal_id`). One thread.
-  CUTLASS_DEVICE void wait(const uint32_t& node, const uint64_t* flag, const uint32_t& signal_id,
+  // in this token buffer's local `flag` word. One thread. Each buffer has its
+  // own epoch and flags even when several buffers share a device communicator.
+  CUTLASS_DEVICE void wait(const uint32_t& node, const uint64_t* flag,
                            const uint64_t& least) const {
     if (is_lsa(node)) {
       while (ptx::ld_acq_sys(flag) < least) {
@@ -143,7 +139,9 @@ struct RemoteIO {
 #if defined(FI_MEGAMOE_WITH_NCCL_GIN)
     const auto* dev_comm = static_cast<const ncclDevComm*>(links.dev_comm);
     ncclGin gin{*dev_comm, static_cast<int>(links.gin_context)};
-    gin.waitSignal(ncclCoopThread{}, static_cast<ncclGinSignal_t>(signal_id), least);
+    const auto window = reinterpret_cast<ncclWindow_t>(links.window);
+    const auto flag_off = static_cast<size_t>(reinterpret_cast<int64_t>(flag) - links.window_base);
+    gin.waitSignal(ncclCoopThread{}, window, flag_off, least);
 #else
     FI_MEGAMOE_DEVICE_ASSERT(false and "GIN carrier not compiled in");
 #endif

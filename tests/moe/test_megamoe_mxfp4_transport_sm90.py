@@ -10,6 +10,7 @@ Run with plain Python (workers are spawned here):
 
 import argparse
 import datetime
+import functools
 import os
 import sys
 
@@ -21,12 +22,40 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tests.moe.test_megamoe_fp4_sm90 import _reference, _weights  # noqa: E402
+from benchmarks.megamoe_sm90_utils import make_input, make_weights, resolve_tokens  # noqa: E402
+from tests.moe.test_megamoe_fp4_sm90 import _reference  # noqa: E402
 from tests.moe.test_megamoe_mxfp4_eplb_sm90 import (  # noqa: E402
     BITWISE_REPEAT_MAX_TOKENS,
     _assert_close,
-    _skewed_routing,
 )
+
+
+def _reference_weights(raw):
+    """Decode Marlin nibbles independently of the storage transform under test."""
+    packed, scales = raw
+    e, n, half_k = packed.shape
+    words = packed.reshape(e, n, -1, 4)
+    codes = torch.cat((words >> 4, words & 15), dim=-1).reshape(e, n, 2 * half_k)
+    lattice = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=packed.device)
+    values = lattice[(codes & 7).long()] * torch.where(codes < 8, 1.0, -1.0)
+    values *= torch.exp2(scales.float() - 127).repeat_interleave(32, dim=-1)
+    values = torch.where(values.abs() < 2**-6, 0.0, values)
+    return values.to(torch.float8_e4m3fn).float()
+
+
+def _check_graph(run, y, stats, expected, counts, m, label):
+    """Check repeated graph calls with fresh statistics and the original inputs."""
+    graph = torch.cuda.CUDAGraph()
+    dist.barrier()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        stats.zero_()
+        run()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _same(y, expected, m, label)
+        assert torch.equal(stats, counts), label
 
 
 def _same(y, expected, m, label):
@@ -40,7 +69,9 @@ def _same(y, expected, m, label):
 
 def _worker(rank, args):
     """Per-rank body: build both buffers, run identical inputs through each and compare."""
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % max(torch.cuda.device_count(), 1)))
+    local_rank = int(
+        os.environ.get("LOCAL_RANK", rank % max(torch.cuda.device_count(), 1))
+    )
     from flashinfer.megamoe import (
         MegaMoEExpertSlots,
         MegaMoENcclTransport,
@@ -67,15 +98,13 @@ def _worker(rank, args):
         args.slots,
     )
     H = E // ep
-    generator = torch.Generator(device="cuda").manual_seed(4099 + rank)
-    raw1, ref1 = _weights(H, ih * 2, h, 32, generator)
-    raw2, ref2 = _weights(H, h, ih, 32, generator)
-    w1, w2 = transform_mxfp4_weights_for_mega_moe(raw1, raw2)
-    gs1 = torch.linspace(0.73, 1.37, H, device="cuda")
-    gs2 = torch.linspace(1.31, 0.67, H, device="cuda")
-    hot = torch.randperm(
-        E, device="cuda", generator=torch.Generator(device="cuda").manual_seed(31)
-    )[:S].tolist()
+    raw, _ = make_weights(rank * H, H, h, ih, 32, args.seed, "cuda")
+    ref1, ref2 = (_reference_weights(value) for value in raw)
+    w1, w2 = transform_mxfp4_weights_for_mega_moe(*raw, storage=args.weight_storage)
+    del raw
+    gs1 = torch.linspace(0.73, 1.37, E, device="cuda")[rank * H : (rank + 1) * H]
+    gs2 = torch.linspace(1.31, 0.67, E, device="cuda")[rank * H : (rank + 1) * H]
+    hot = torch.randperm(E, generator=torch.Generator().manual_seed(31))[:S].tolist()
 
     transport = MegaMoENcclTransport(
         group,
@@ -87,15 +116,21 @@ def _worker(rank, args):
         # Plain resident experts: one buffer per transport.
         plain = [
             MegaMoESymmBuffer(group, E, args.capacity, topk, h, ih),
-            MegaMoESymmBuffer(group, E, args.capacity, topk, h, ih, transport=transport),
-        ]
-        # Redundant expert slots: the buffer geometry counts the slots as experts.
-        slotted = [
-            MegaMoESymmBuffer(group, E + ep * S, args.capacity, topk, h, ih),
             MegaMoESymmBuffer(
-                group, E + ep * S, args.capacity, topk, h, ih, transport=transport
+                group, E, args.capacity, topk, h, ih, transport=transport
             ),
         ]
+        # Redundant expert slots: the buffer geometry counts the slots as experts.
+        slotted = (
+            [
+                MegaMoESymmBuffer(group, E + ep * S, args.capacity, topk, h, ih),
+                MegaMoESymmBuffer(
+                    group, E + ep * S, args.capacity, topk, h, ih, transport=transport
+                ),
+            ]
+            if S
+            else []
+        )
         slots = [MegaMoEExpertSlots(b, E, S) for b in slotted]
         for s in slots:
             s.set_resident_weights(w1, w2, gs1, gs2)
@@ -109,24 +144,30 @@ def _worker(rank, args):
         # Ranks spread over `nodes` nodes (node-major): tokens with an expert on
         # another node travel through the mirror ranks' inboxes and outboxes.
         nodes_buffer = MegaMoESymmBuffer(
-            group, E, args.capacity, topk, h, ih, transport=transport, num_nodes=args.nodes
+            group,
+            E,
+            args.capacity,
+            topk,
+            h,
+            ih,
+            transport=transport,
+            num_nodes=args.nodes,
         )
 
     for m in args.tokens:
-        x = (torch.randn(m, h, device="cuda", generator=generator) * 32).to(
-            torch.float8_e4m3fn
+        (x, sf, idx, routing), _ = make_input(
+            m, rank, h, E, topk, args.seed, "cuda", hot=hot
         )
-        sf = torch.full((m, h // 128), 1 / 128, device="cuda")
-        idx, routing = _skewed_routing(m, E, topk, hot, 0.5, generator)
+        expected, counts_logical = _reference(
+            x.float() / 128, idx, routing, ref1, ref2, gs1, gs2, rank, H
+        )
 
         if nodes_buffer is not None:
-            expected, counts_logical = _reference(
-                x.float() / 128, idx, routing, ref1, ref2, gs1, gs2, rank, H
-            )
             nodes_buffer.stage(x, sf, idx, routing)
             y = torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
             stats = torch.zeros(H, dtype=torch.int32, device="cuda")
-            mxfp4_mega_moe(
+            run = functools.partial(
+                mxfp4_mega_moe,
                 y,
                 w1,
                 w2,
@@ -135,11 +176,21 @@ def _worker(rank, args):
                 l1_global_scales=gs1,
                 l2_global_scales=gs2,
             )
+            run()
             torch.cuda.synchronize()
             _assert_close(y, expected, (f"{args.nodes} nodes", m))
-            assert torch.equal(stats.long(), counts_logical), (f"{args.nodes} nodes counts", m)
+            assert torch.equal(stats.long(), counts_logical), (
+                f"{args.nodes} nodes counts",
+                m,
+            )
+            _check_graph(
+                run, y, stats, y.clone(), counts_logical.int(), m, ("nodes graph", m)
+            )
             if rank == 0:
-                print(f"{args.nodes}-node protocol check passed at {m} tokens per rank", flush=True)
+                print(
+                    f"{args.nodes}-node protocol check passed at {m} tokens per rank",
+                    flush=True,
+                )
             if args.nodes_only:
                 continue
 
@@ -148,7 +199,8 @@ def _worker(rank, args):
             b.stage(x, sf, idx, routing)
             y = torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
             stats = torch.zeros(H, dtype=torch.int32, device="cuda")
-            mxfp4_mega_moe(
+            run = functools.partial(
+                mxfp4_mega_moe,
                 y,
                 w1,
                 w2,
@@ -157,13 +209,19 @@ def _worker(rank, args):
                 l1_global_scales=gs1,
                 l2_global_scales=gs2,
             )
+            run()
+            _assert_close(y, expected, ("plain reference", m))
+            assert torch.equal(stats.long(), counts_logical), ("plain counts", m)
+            _check_graph(
+                run, y, stats, y.clone(), counts_logical.int(), m, ("plain graph", m)
+            )
             outputs.append(y)
             counts.append(stats)
         _same(outputs[1], outputs[0], m, ("plain", m))
         assert torch.equal(counts[0], counts[1]), ("plain counts", m)
 
         outputs, counts = [], []
-        for b, s in zip(slotted, slots):
+        for b, s in zip(slotted, slots, strict=True):
             b.stage(x, sf, idx, routing)
             s.remap(m, s.block_m(m))
             y = torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
@@ -180,8 +238,9 @@ def _worker(rank, args):
             )
             outputs.append(y)
             counts.append(stats)
-        _same(outputs[1], outputs[0], m, ("slots", m))
-        assert torch.equal(counts[0], counts[1]), ("slot counts", m)
+        if slots:
+            _same(outputs[1], outputs[0], m, ("slots", m))
+            assert torch.equal(counts[0], counts[1]), ("slot counts", m)
         if rank == 0:
             print(f"transport check passed at {m} tokens per rank", flush=True)
 
@@ -201,10 +260,59 @@ def _worker(rank, args):
 def _run(args):
     """Spawn ``args.ep`` workers on as many GPUs, or run as one torchrun worker
     when RANK / WORLD_SIZE are set (ranks on several hosts)."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    launched = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if launched:
         args.ep = int(os.environ["WORLD_SIZE"])
+    args.ep = args.ep or 8
+    local = int(os.environ.get("LOCAL_WORLD_SIZE", args.ep))
+    if local < 1:
+        raise ValueError("LOCAL_WORLD_SIZE must be positive")
+    args.nodes = args.nodes if args.nodes is not None else args.ep // local
+    if args.ep not in (4, 8, 16) or args.nodes < 1 or args.ep % args.nodes:
+        raise ValueError("EP must be 4, 8 or 16 and divide evenly across nodes")
+    if launched and local < args.ep and args.nodes != args.ep // local:
+        raise ValueError("nodes must match the torchrun host count")
+    if args.nodes > 1:
+        args.nodes_only = True
+    elif args.nodes_only:
+        raise ValueError("nodes-only requires more than one logical node")
+    if args.gin_contexts is None:
+        args.gin_contexts = 1 if launched and local < args.ep else 0
+    if launched and local < args.ep and args.gin_contexts < 1:
+        raise ValueError("ranks on separate hosts need at least one GIN context")
+    if args.seed < 0 or args.slots < 0 or args.gin_contexts < 0:
+        raise ValueError("seed, slots and GIN context count must be nonnegative")
+    if args.weight_storage != "mxfp4" and args.slots:
+        raise ValueError("replica slots require canonical MXFP4 storage")
+    if (
+        args.hidden <= 0
+        or args.hidden % 256
+        or args.intermediate <= 0
+        or args.intermediate % 128
+    ):
+        raise ValueError(
+            "hidden must be a positive multiple of 256; intermediate of 128"
+        )
+    if (
+        args.experts < 1
+        or args.experts % args.ep
+        or not 0 < args.topk <= min(32, args.experts)
+    ):
+        raise ValueError(
+            "experts must divide by EP; topk must be in [1, min(32, experts)]"
+        )
+    if args.tokens is None:
+        args.tokens = (
+            [1, 4, 8, 16, 32, 64]
+            if args.token_scope == "per-rank"
+            else [16, 64, 128, 256, 512, 1024]
+        )
+    args.tokens = resolve_tokens(args.tokens, args.token_scope, args.ep, args.capacity)
+    if launched:
         _worker(int(os.environ["RANK"]), args)
         return
+    if torch.cuda.device_count() < args.ep:
+        raise ValueError(f"needs {args.ep} local GPUs, or launch with torchrun")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29571")
     torch.multiprocessing.spawn(_worker, args=(args,), nprocs=args.ep)
@@ -220,7 +328,10 @@ def _namespace(ep, **overrides):
         topk=4,
         slots=2,
         capacity=384,
-        tokens=[24, 96, 384],
+        tokens=[1, 4, 8, 16, 32, 64],
+        token_scope="per-rank",
+        weight_storage="mxfp4",
+        seed=7919,
         gin_contexts=0,
         nodes=1,
         nodes_only=False,
@@ -251,16 +362,23 @@ def test_mxfp4_two_virtual_nodes():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ep", type=int, default=8)
+    parser.add_argument("--ep", type=int)
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int, default=64)
     parser.add_argument("--topk", type=int, default=4)
-    parser.add_argument("--slots", type=int, default=2)
+    parser.add_argument("--slots", type=int, default=0)
     parser.add_argument("--capacity", type=int, default=384)
-    parser.add_argument("--tokens", type=int, nargs="+", default=[24, 96, 384])
-    parser.add_argument("--gin-contexts", type=int, default=0)
-    parser.add_argument("--nodes", type=int, default=1, help="nodes the ranks are spread over")
+    parser.add_argument("--tokens", type=int, nargs="+")
+    parser.add_argument(
+        "--token-scope", choices=["per-rank", "total"], default="per-rank"
+    )
+    parser.add_argument("--seed", type=int, default=7919)
+    parser.add_argument(
+        "--weight-storage", choices=["mxfp4", "mxfp4_compact", "fp8"], default="mxfp4"
+    )
+    parser.add_argument("--gin-contexts", type=int)
+    parser.add_argument("--nodes", type=int, help="defaults to the torchrun host count")
     parser.add_argument(
         "--nodes-only",
         action="store_true",

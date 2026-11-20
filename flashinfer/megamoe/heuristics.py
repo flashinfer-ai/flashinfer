@@ -202,6 +202,8 @@ def select_mxfp4_fused_plan(
     num_max_tokens_per_rank: int,
     num_tokens: int,
     num_logical_experts: Optional[int] = None,
+    *,
+    weight_tile_bytes: int = 8704,
 ) -> FusedPlan:
     """Select MXFP4 tile geometry, pipeline depth and decode-warp partition.
 
@@ -209,6 +211,8 @@ def select_mxfp4_fused_plan(
     ``num_logical_experts`` is the routed expert count when ``num_experts``
     also counts redundant expert slots: the token block is sized by the rows
     a routed expert receives, which the slots split but do not add to.
+    Noncanonical weight storage uses explicit H20 small-batch plans and never
+    falls through to a kernel expecting a different record format.
     """
     if num_sms <= 1:
         raise ValueError("num_sms must be greater than one")
@@ -235,29 +239,57 @@ def select_mxfp4_fused_plan(
     elif not 0 < num_logical_experts <= num_experts:
         raise ValueError("num_logical_experts must be in (0, num_experts]")
 
+    if weight_tile_bytes not in (8704, 8448, 16384):
+        raise ValueError("MXFP4 weight records must contain 8704, 8448 or 16384 bytes")
+
     def max_tokens(bm):
         return bm * num_logical_experts // (num_ranks * num_topk)
 
-    limit = max_tokens(24) * H20_NUM_SMS // num_sms
-    bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)
-    if num_tokens <= 1:
-        epw, stages = 24, 8
-    elif num_tokens <= 8:
-        epw, stages = 16, 8
-    elif num_tokens <= 16:
-        epw, stages = 24, 8
+    if weight_tile_bytes != 8704:
+        supported_tokens = (1, 4, 8, 16, 32, 64)
+        if num_ranks == 8:
+            supported_tokens = (1, 2, 4, 8, 16, 32, 64)
+            if weight_tile_bytes == 16384:
+                supported_tokens += (128,)
+        if (
+            num_sms != H20_NUM_SMS
+            or num_ranks not in (8, 16)
+            or (num_experts, hidden, intermediate_hidden, num_topk)
+            != (256, 4096, 2048, 6)
+            or num_tokens not in supported_tokens
+            or num_logical_experts != num_experts
+        ):
+            raise ValueError(
+                "noncanonical MXFP4 storage requires H20, EP8 or EP16, "
+                f"E256/H4096/I2048/top6 and M in {supported_tokens}, without expert slots"
+            )
+        epw, swap = 16, True
+        rs = weight_tile_bytes == 8448
+        if rs or num_tokens <= 16:
+            bm, stages = 8, 4 if num_tokens <= 2 else 6
+        else:
+            bm, stages = {32: (16, 6), 64: (24, 5), 128: (32, 4)}[num_tokens]
     else:
-        epw, stages = 48, 8
-    swap = num_tokens <= max(16, limit)
-    rs = swap
-    if num_sms > H20_NUM_SMS and bm < 16 and num_tokens <= 16:
-        rs = False
-    if swap and bm >= 16:
-        rs = False
-    if not swap:
-        bm, stages = 64, 3
-    elif not rs:
-        stages = 4 if bm == 8 else 3
+        limit = max_tokens(24) * H20_NUM_SMS // num_sms
+        bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)
+        if num_tokens <= 1:
+            epw, stages = 24, 8
+        elif num_tokens <= 8:
+            epw, stages = 16, 8
+        elif num_tokens <= 16:
+            epw, stages = 24, 8
+        else:
+            epw, stages = 48, 8
+        swap = num_tokens <= max(16, limit)
+        rs = swap
+        if num_sms > H20_NUM_SMS and bm < 16 and num_tokens <= 16:
+            rs = False
+        if swap and bm >= 16:
+            rs = False
+        if not swap:
+            bm, stages = 64, 3
+        elif not rs:
+            stages = 4 if bm == 8 else 3
     epw = min(epw, epr)
     while epr % epw:
         epw -= 1

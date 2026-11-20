@@ -15,14 +15,14 @@ transforms; FlashInfer does not read checkpoint layouts:
   every product must stay inside E4M3. NVFP4 needs ``6 * scale <= 448``;
   MXFP4 needs ``2**-5 <= scale <= 2**6`` for groups with nonzero codes, because
   its decoder saturates large products and flushes subnormal ones to zero.
-  Out-of-range scales are not detected and silently corrupt the output.
+  MXFP4 preparation rejects out-of-range scales in groups with nonzero codes.
 * Global scales: move each expert's excess into a per-expert FP32 multiplier
   (for example a power of two, which keeps the weights exact) and pass it as
   ``l1_global_scales`` / ``l2_global_scales`` at run time. L1 has one global
   per expert, so gate and up must share it.
 """
 
-from typing import Tuple
+from typing import Literal, Tuple
 
 import torch
 
@@ -52,7 +52,7 @@ def _braid_signs(rows: torch.Tensor) -> torch.Tensor:
     return rows
 
 
-def _transform_one(weights, group_size, interleave, decode_tiles):
+def _validate_weights(weights, group_size):
     packed, scales = weights
     if packed.dtype != torch.uint8 or scales.dtype != torch.uint8:
         raise ValueError("packed weights and raw scale bytes must have dtype uint8")
@@ -60,12 +60,24 @@ def _transform_one(weights, group_size, interleave, decode_tiles):
         raise ValueError("packed weights and scales must be 3-D")
     e, n, half_k = packed.shape
     k = half_k * 2
-    if n % 128 or k % 128 or tuple(scales.shape) != (e, n, k // group_size):
+    if (
+        min(e, n, k) <= 0
+        or n % 128
+        or k % 128
+        or tuple(scales.shape) != (e, n, k // group_size)
+    ):
         raise ValueError(
             "weights must contain complete N128/K128 tiles and matching scales"
         )
     if packed.device != scales.device:
         raise ValueError("weights and scales must be on the same device")
+    return packed, scales
+
+
+def _transform_one(weights, group_size, interleave, decode_tiles):
+    packed, scales = _validate_weights(weights, group_size)
+    e, n, half_k = packed.shape
+    k = half_k * 2
     if interleave:
         packed, scales = _interleave_gate_up(packed), _interleave_gate_up(scales)
     rows = torch.zeros((e, n, k // 128, 80), dtype=torch.uint8, device=packed.device)
@@ -86,7 +98,7 @@ def _transform_one(weights, group_size, interleave, decode_tiles):
     return torch.cat((fp4, sf), dim=-1).contiguous()
 
 
-def _transform(l1_weights, l2_weights, group_size, decode_tiles):
+def _validate_pair(l1_weights, l2_weights):
     p1, _ = l1_weights
     p2, _ = l2_weights
     if p1.ndim != 3 or p2.ndim != 3 or p1.shape[0] != p2.shape[0]:
@@ -95,6 +107,12 @@ def _transform(l1_weights, l2_weights, group_size, decode_tiles):
         raise ValueError(
             "expected L1 [E, 2*intermediate, hidden/2] and L2 [E, hidden, intermediate/2]"
         )
+    if p1.device != p2.device:
+        raise ValueError("L1 and L2 weights must be on the same device")
+
+
+def _transform(l1_weights, l2_weights, group_size, decode_tiles):
+    _validate_pair(l1_weights, l2_weights)
     return (
         _transform_one(l1_weights, group_size, True, decode_tiles),
         _transform_one(l2_weights, group_size, False, decode_tiles),
@@ -130,8 +148,10 @@ def transform_nvfp4_weights_for_mega_moe(
 def transform_mxfp4_weights_for_mega_moe(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    storage: Literal["mxfp4", "mxfp4_compact", "fp8"] = "mxfp4",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return chunk-major MXFP4 weights for the SM90 fused kernel.
+    """Prepare MXFP4 weights for the SM90 fused kernel.
 
     Parameters
     ----------
@@ -144,11 +164,53 @@ def transform_mxfp4_weights_for_mega_moe(
         Packed UINT8 weights of shape ``[E, hidden, intermediate // 2]``
         in Marlin byte order and raw UINT8 E8M0 scale bytes per 32 values in
         ``[2**-5, 2**6]`` for groups with nonzero codes.
+    storage : {"mxfp4", "mxfp4_compact", "fp8"}, optional
+        Physical storage per N128/K128 tile: 8704 bytes for the default
+        chunk-major layout, 8448 bytes for compact register-source decoding,
+        or 16384 bytes for predecoded FP8. The latter two require CUDA inputs
+        and a supported kernel plan; FP8 trades weight memory for less decoding.
+        All layouts represent the same weights without additional quantization.
 
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor]
         Contiguous L1 and L2 weight tensors in the kernel's packed layout,
         on the input device. Weight preparation runs before graph capture.
+
+    Raises
+    ------
+    ValueError
+        If the input layout, storage, device or nonzero-group scales are invalid.
     """
-    return _transform(l1_weights, l2_weights, 32, True)
+    if storage not in ("mxfp4", "mxfp4_compact", "fp8"):
+        raise ValueError(f"unsupported MXFP4 storage: {storage}")
+    _validate_pair(l1_weights, l2_weights)
+    result = []
+    for weights, interleave in ((l1_weights, True), (l2_weights, False)):
+        packed, scales = _validate_weights(weights, 32)
+        e, n, half_k = packed.shape
+        nonzero = (packed.reshape(e, n, -1, 16) & 0x77).any(dim=-1)
+        if (((scales < 122) | (scales > 133)) & nonzero).any():
+            raise ValueError(
+                "nonzero MXFP4 groups require E8M0 scale bytes in [122, 133]"
+            )
+        if storage == "mxfp4":
+            result.append(_transform_one(weights, 32, interleave, True))
+            continue
+        if not packed.is_cuda:
+            raise ValueError(f"{storage} weight preparation requires CUDA inputs")
+        from ..jit.megamoe import gen_megamoe_sm90_layout_module
+        from ._jit import _get_jit_module
+
+        normalized = torch.where(nonzero, scales, 127).contiguous()
+        tile_bytes = 8448 if storage == "mxfp4_compact" else 16384
+        output = torch.empty(
+            (e, n // 128 * (half_k // 64), tile_bytes),
+            dtype=torch.uint8,
+            device=packed.device,
+        )
+        _get_jit_module(gen_megamoe_sm90_layout_module).megamoe_sm90_predecode_mxfp4(
+            packed.contiguous(), normalized, output, interleave
+        )
+        result.append(output)
+    return tuple(result)

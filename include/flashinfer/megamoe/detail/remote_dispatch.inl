@@ -12,9 +12,10 @@
 //   remote_send               SM 0, right after the grid sync: puts the rows,
 //                             then scales, routing, weights and the header
 //                             (counts and lists) in one signalled put.
-//   remote_publish_by_proxy   every SM, before the node-local barrier: waits for
-//                             the inbox of every remote node and publishes its
-//                             share of the experts into this node's owners.
+//   remote_publish_by_proxy   every SM, after the local pull pass: waits for the
+//                             inbox of every remote node and publishes its share
+//                             of the experts into this node's owners (lists,
+//                             then the count with a release on the remote sum).
 //   remote_early_return       every SM, after the token pull: the mirror duty of
 //                             the combine, run while the GEMM still works on the
 //                             blocks that need no return.
@@ -93,9 +94,8 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
 // first; the scales, routing, weights and the header (the per-expert counts
 // and the lists the index pass wrote in place) are adjacent in the layout and
 // leave as one put that carries the signal, which orders the rows put before
-// it on the same context. The lists are not compacted: at a capacity of 512
-// tokens they are 32 KB per node, under a microsecond on the wire, and the
-// compaction kept the header put behind the count publication.
+// it on the same context. Fixed-stride lists let the index pass write the
+// header directly before count publication.
 const auto remote_send = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     if (sm_idx != 0 or warp_idx != 0) return;
@@ -111,7 +111,7 @@ const auto remote_send = [&]() {
       const uint32_t num_packed = *remote.packed_token_count(j);
       if (num_packed > 0)
         io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
-                    false, nullptr, 0);
+                    false, nullptr);
       if (lane_idx == 0) remote.header_control(header)[0] = num_packed;
       for (uint32_t e = lane_idx; e < kNumExpertsPerNode; e += 32)
         counts[e] = static_cast<uint32_t>(
@@ -121,50 +121,48 @@ const auto remote_send = [&]() {
       const uint64_t tail =
           static_cast<uint64_t>(remote.input_block_bytes) - sf_block_offset + remote.header_bytes();
       io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset, tail, lane_idx, true,
-                  remote.inbox_flag(at), comm::remote_inbox_signal(at));
+                  remote.inbox_flag(at));
     }
   }
 };
 
-// SM 0 before the node-local dispatch barrier: the mirror's publication for
-// every remote source into this node's owners, from the inbox header.
-// The experts of this node are spread over the SMs (on one SM the publication
-// took 35-40 us, a chain of peer stores issued by two warps); every SM waits
-// for the inbox signal itself, and the node-local barrier that follows orders
-// all of these peer writes before the owners read them, exactly as it orders
-// the local count publication and the epilogue's peer stores.
+// Every SM, after the local pull pass: the mirror's publication for every
+// remote source into this node's owners, from the inbox header. The experts of
+// this node are spread over the SMs, and each SM waits for the inbox signal.
+// Per expert the list goes first, then, after a CTA barrier,
+// one thread stores the count and adds it to the owner's remote count sum with
+// a sys-scope release: the owner's task producer and its second pull pass
+// acquire that sum, which orders the list and the count behind it.
 const auto remote_publish_by_proxy = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
     for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
       const uint32_t source_rank = remote_links.peers[j].rank;
-      if (thread_idx == 0)
-        io.wait(j, remote.inbox_flag(j), comm::remote_inbox_signal(j), launch_epoch + 1);
+      if (thread_idx == 0) io.wait(j, remote.inbox_flag(j), launch_epoch + 1);
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      if (thread_idx == 0) stamp_max(11);
       auto* header = remote.inbox_header(j);
       const auto* counts = remote.header_expert_counts(header);
-      // Per expert: one thread writes the count as the source would have, every
-      // thread copies a share of the list.
       for (uint32_t e = sm_idx; e < kNumExpertsPerNode; e += kNumSMs) {
         const uint32_t expert_idx = my_node * kNumExpertsPerNode + e;
         const uint32_t owner = expert_idx / kNumExpertsPerRank;
         const uint32_t local_expert = expert_idx % kNumExpertsPerRank;
         const uint32_t count = counts[e];
-        if (thread_idx == 0) {
-          *sym_buffer.map(workspace.get_expert_recv_count_ptr(source_rank, local_expert), owner) =
-              static_cast<uint64_t>(count);
-          // Release: the task producer reads the per-source counts after one
-          // acquire of the complete sum (`fetch_remote_rows`).
-          ptx::red_add_rel_sys(
-              sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(local_expert), owner),
-              (static_cast<uint64_t>(kNumSMs) << 32) | count);
-        }
         const auto* list = remote.header_list(header, e);
         for (uint32_t k = thread_idx; k < count; k += kNumDispatchThreads)
           *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(local_expert, source_rank, k),
                           owner) = list[k];
+        // Complete every publishing thread before the per-expert release.
+        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        if (thread_idx == 0) {
+          *sym_buffer.map(workspace.get_expert_recv_count_ptr(source_rank, local_expert), owner) =
+              static_cast<uint64_t>(count);
+          // Publish list and count before the release sum; consumers acquire
+          // the completed sum before reading any owned expert list/count.
+          ptx::red_add_rel_sys(
+              sym_buffer.map(workspace.get_expert_recv_count_remote_sum_ptr(local_expert), owner),
+              (static_cast<uint64_t>(kNumSMs) << 32) | count);
+        }
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
     }
@@ -172,10 +170,10 @@ const auto remote_publish_by_proxy = [&]() {
 };
 
 // Mirror duty, ahead of the combine barrier. The rows pulled from other nodes
-// sit first within every expert and the scheduler claims their blocks first,
-// so their FC2 tasks are done while the blocks of this node's own rows still
-// run; every such task releases one count. SM 0 waits for this rank's count and
-// tells the ranks of the node; once every rank of the node has reported, the
+// sit in the remote segment of every expert and the scheduler claims those
+// blocks before the last local blocks, so their FC2 tasks are done while
+// blocks of this node's own rows still run; every such task releases one count. SM 0 waits for this
+// rank's count and tells the ranks of the node; once every rank of the node has reported, the
 // outbox rows of this rank's packed tokens are complete, and the dispatch warps
 // (idle until the cleanup) reduce them over the top-k slots whose experts live
 // on this node and put the BF16 rows into the source's return inbox, hidden
@@ -185,26 +183,21 @@ const auto remote_publish_by_proxy = [&]() {
 const auto remote_early_return = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     if (sm_idx == 0 and warp_idx == 0) {
-      // Remote-dependent FC2 tasks of this rank: the first ceil(remote rows /
-      // BLOCK_M) blocks of every local expert, one task per N block.
-      uint32_t num_blocks = 0;
-      for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32) {
-        uint32_t rows = 0;
-        for (uint32_t r = 0; r < kNumRanks; ++r) {
-          if (r / kNumLocalRanks != my_node)
-            rows += static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(r, e));
-        }
-        num_blocks += math::ceil_div(rows, BLOCK_M);
-      }
-      const uint32_t expected = __reduce_add_sync(0xffffffff, num_blocks) * kNumRoutedL2BlockNs;
+      // Remote-dependent FC2 tasks of this rank: one per N block of every
+      // remote-segment block (the dispatch warps laid out both waves).
+      const uint32_t expected =
+          interleaved_scheduler.num_remote_dependent_m_blocks * kNumRoutedL2BlockNs;
       if (lane_idx == 0) {
         while (ptx::ld_acq(workspace.get_remote_l2_done_ptr()) < expected) __nanosleep(256);
-        stamp_max(2);
-        const uint32_t local_rank_base = my_node * kNumLocalRanks;
-        for (uint32_t r = 0; r < kNumLocalRanks; ++r)
-          ptx::red_add_rel_sys(
-              sym_buffer.map(workspace.get_remote_rows_ready_ptr(), local_rank_base + r), 1);
       }
+      // Relay lane0's original acquire to every publisher in this full warp.
+      // Each destination still receives exactly one original SYS release-add.
+      __syncwarp();
+      static_assert(kNumLocalRanks <= 32, "Node-local ranks must fit a warp");
+      const uint32_t local_rank_base = my_node * kNumLocalRanks;
+      if (lane_idx < kNumLocalRanks)
+        ptx::red_add_rel_sys(
+            sym_buffer.map(workspace.get_remote_rows_ready_ptr(), local_rank_base + lane_idx), 1);
       __syncwarp();
     }
     // Every rank of the node has stored its FC2 rows of this rank's packed tokens.
@@ -212,7 +205,6 @@ const auto remote_early_return = [&]() {
       while (ptx::ld_acq_sys(workspace.get_remote_rows_ready_ptr()) <
              static_cast<int>(kNumLocalRanks))
         __nanosleep(256);
-      stamp_max(28);
     }
     ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
     // One acquire per thread orders its outbox loads after the arrivals.
@@ -229,8 +221,13 @@ const auto remote_early_return = [&]() {
       auto* outbox = static_cast<const uint8_t*>(remote.outbox(j));
       auto* out_rows = static_cast<uint8_t*>(remote.return_outbound(j));
       // One warp per packed token; lanes over 16-byte columns of the row.
-      for (uint32_t p = sm_idx * kNumDispatchWarps + warp_idx; p < num_packed;
-           p += kNumSMs * kNumDispatchWarps) {
+      // Split returned-row columns across dispatch warps without changing
+      // the ascending top-k accumulation order.
+      constexpr uint32_t kReturnWarpsPerRow = 2;
+      static_assert(kNumDispatchWarps % kReturnWarpsPerRow == 0);
+      constexpr uint32_t kReturnRowsPerCTA = kNumDispatchWarps / kReturnWarpsPerRow;
+      for (uint32_t p = sm_idx * kReturnRowsPerCTA + warp_idx / kReturnWarpsPerRow; p < num_packed;
+           p += kNumSMs * kReturnRowsPerCTA) {
         uint32_t mask = 0;
         if (lane_idx < kNumTopk) {
           const int64_t expert_idx = inbox_idx[p * kNumTopk + lane_idx];
@@ -239,41 +236,52 @@ const auto remote_early_return = [&]() {
                      : 0u;
         }
         mask = __ballot_sync(0xffffffff, mask);
-        for (uint32_t c = lane_idx; c < kUint4PerRow; c += 32) {
-          // All slot rows of this column are loaded before any is summed, so the
-          // k loads overlap instead of paying one memory latency each.
-          uint4 v[kNumTopk];
-#pragma unroll
-          for (uint32_t k = 0; k < kNumTopk; ++k) {
-            if (mask & (1u << k))
-              // Combine layout: [top-k slot][packed token][row].
-              v[k] = reinterpret_cast<const uint4*>(
-                  outbox + (static_cast<uint64_t>(k) * remote.capacity + p) * kRowBytes)[c];
-          }
-          float2 acc[4] = {};
+        // Expose independent column loads before using
+        // either. Every output column retains the original ascending top-k
+        // accumulation and BF16 rounding. Hidden4096 gives eight columns per
+        // lane with two warps/row, so this batch introduces no padded loads.
+        constexpr uint32_t kColumnStride = 32 * kReturnWarpsPerRow;
+        constexpr uint32_t kColumnBatch = 2;
+        static_assert(kUint4PerRow % (kColumnStride * kColumnBatch) == 0);
+        for (uint32_t c = (warp_idx % kReturnWarpsPerRow) * 32 + lane_idx; c < kUint4PerRow;
+             c += kColumnStride * kColumnBatch) {
+          uint4 values[kNumTopk][kColumnBatch];
 #pragma unroll
           for (uint32_t k = 0; k < kNumTopk; ++k) {
             if (mask & (1u << k)) {
-              const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&v[k]);
 #pragma unroll
-              for (uint32_t q = 0; q < 4; ++q) ptx::accumulate(acc[q], pairs[q]);
+              for (uint32_t b = 0; b < kColumnBatch; ++b)
+                values[k][b] = reinterpret_cast<const uint4*>(
+                    outbox + (static_cast<uint64_t>(k) * remote.capacity + p) *
+                                 kRowBytes)[c + b * kColumnStride];
             }
           }
-          uint4 packed;
-          auto* out_pairs = reinterpret_cast<nv_bfloat162*>(&packed);
 #pragma unroll
-          for (uint32_t q = 0; q < 4; ++q) out_pairs[q] = __float22bfloat162_rn(acc[q]);
-          reinterpret_cast<uint4*>(out_rows + static_cast<uint64_t>(p) * kRowBytes)[c] = packed;
+          for (uint32_t b = 0; b < kColumnBatch; ++b) {
+            float2 acc[4] = {};
+#pragma unroll
+            for (uint32_t k = 0; k < kNumTopk; ++k) {
+              if (mask & (1u << k)) {
+                const auto* pairs = reinterpret_cast<const nv_bfloat162*>(&values[k][b]);
+#pragma unroll
+                for (uint32_t q = 0; q < 4; ++q) ptx::accumulate(acc[q], pairs[q]);
+              }
+            }
+            uint4 packed;
+            auto* out_pairs = reinterpret_cast<nv_bfloat162*>(&packed);
+#pragma unroll
+            for (uint32_t q = 0; q < 4; ++q) out_pairs[q] = __float22bfloat162_rn(acc[q]);
+            reinterpret_cast<uint4*>(out_rows + static_cast<uint64_t>(p) *
+                                                    kRowBytes)[c + b * kColumnStride] = packed;
+          }
         }
         __syncwarp();
       }
     }
-    if (thread_idx == 0) stamp_max(16);
     // Every return row of this rank is written before SM 0 ships them.
     comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx, [=]() {
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
     });
-    if (sm_idx == 0 and thread_idx == 0) stamp_max(17);
     if (sm_idx == 0 and warp_idx == 0) {
       comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
@@ -282,9 +290,8 @@ const auto remote_early_return = [&]() {
         const uint32_t at = remote_links.peers[j].node_at_mirror;
         io.put_warp(j, remote.return_inbox(at), remote.return_outbound(j),
                     static_cast<uint64_t>(cute::max(num_packed, 1u)) * kRowBytes, lane_idx, true,
-                    remote.return_flag(at), comm::remote_return_signal(at));
+                    remote.return_flag(at));
       }
-      if (lane_idx == 0) stamp_max(13);
     }
   }
 };

@@ -190,6 +190,7 @@ struct MegaMoEScheduler {
     return {BlockPhase::None, 0, 0, 0};
   }
 
+  template <bool AcquirePublished = false>
   CUTLASS_DEVICE void fetch_expert_recv_count() {
 // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
 #pragma unroll
@@ -200,6 +201,8 @@ struct MegaMoEScheduler {
         do {
           value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
         } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+        if constexpr (AcquirePublished)
+          value = ptx::ld_acq_sys(workspace.get_expert_recv_count_sum_ptr(expert_idx));
       }
       stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
     }
@@ -262,7 +265,7 @@ struct MegaMoEScheduler {
   }
 };
 
-// Return the minimum all-L1 warm-up needed before the D40 scheduler starts
+// Return the minimum all-L1 warm-up needed before the scheduler starts
 // interleaving L2 claims.  This prevents an L2 readiness wait from forming a
 // cycle with L1 task publication.
 CUTLASS_HOST_DEVICE constexpr int get_num_l1_warmup_waves(const int& num_total_m_blocks,
@@ -285,7 +288,7 @@ CUTLASS_HOST_DEVICE constexpr int get_num_l1_warmup_waves(const int& num_total_m
   return cute::max(num_l1_warmup_waves_for_first_l2_wave, num_warmup_waves_for_interleave_schedule);
 }
 
-// Dynamic task payload shared by the dev-m producer and all consumers in one
+// Dynamic task payload shared by the weight loader and all consumers in one
 // CTA.  The layout is part of the validated two-stage mailbox protocol.
 struct alignas(16) TaskInfo {
   BlockPhase block_phase;
@@ -320,16 +323,14 @@ struct alignas(16) TaskInfo {
 
 FI_MEGAMOE_STATIC_ASSERT(sizeof(TaskInfo) == 32, "Invalid task payload layout");
 
-// SM90 one-CTA dynamic scheduler from Aichen dev-m.  The weight-loader warp
-// is the sole task producer and publishes work through a two-stage shared
-// mailbox.  The static scheduler above remains intact for bigM split and the
-// D40 KF static-RS arm.
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t L1_SHAPE_N,
-          uint32_t L1_SHAPE_K, uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
-          uint32_t kNumExpertsPerRank, uint32_t kNumSMs, uint32_t kNumRanks,
-          uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
-          uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
-          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N>
+// The weight-loader warp is the sole task producer in each CTA and publishes
+// work through a two-stage shared mailbox. Static plans use MegaMoEScheduler.
+template <
+    uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
+    uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K, uint32_t kNumExpertsPerRank, uint32_t kNumSMs,
+    uint32_t kNumRanks, uint32_t kNumLocalRanks = kNumRanks,
+    uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
+    uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N, uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N>
 struct InterleavedMegaMoEScheduler {
   using Barrier = cutlass::arch::ClusterTransactionBarrier;
   using task_info_t = TaskInfo;
@@ -352,14 +353,24 @@ struct InterleavedMegaMoEScheduler {
 
   uint32_t sched_stage_idx = 0;
   uint32_t sched_phase = 0;
+  // Whole local M blocks can run while the remote input is in flight. The
+  // bootstrap counter is closed atomically as soon as remote counts are ready;
+  // its low bits are the exact FC1 N-task prefix already claimed. Main claims
+  // prioritize every remote-dependent block, then finish the local FC1 suffix.
+  // Local FC2 stays last to overlap the remote return. Splitting only at full
+  // M blocks preserves the total issued M rows for every expert.
   uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
-  // Rows of each expert pulled from other nodes; they come first within the
-  // expert, so its first ceil(rows / BLOCK_M) blocks depend on the inter-node
-  // dispatch. Zero (every block local) unless `fetch_remote_rows` ran.
+  uint32_t stored_num_local_pulled_per_expert[kNumExpertsPerLane] = {};
   uint32_t stored_num_remote_tokens_per_expert[kNumExpertsPerLane] = {};
-  uint32_t num_total_m_blocks = 0;
+  uint32_t num_local_m_blocks = 0;
   uint32_t num_remote_m_blocks = 0;
+  uint32_t num_remote_dependent_m_blocks = 0;
+  uint32_t num_bootstrap_l1_tasks = 0;
+  uint32_t num_total_m_blocks = 0;
   uint32_t num_l1_warmup_waves = 0;
+  bool remote_fetched = false;
+  static constexpr bool kSingleNode = kNumLocalRanks == kNumRanks;
+  static constexpr uint32_t kBootstrapClosed = 0x80000000u;
 
   CUTLASS_DEVICE
   InterleavedMegaMoEScheduler(const layout::Workspace& workspace, Barrier* task_info_full_barriers,
@@ -374,30 +385,58 @@ struct InterleavedMegaMoEScheduler {
     sched_phase ^= sched_stage_idx == 0;
   }
 
-  CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
+  CUTLASS_DEVICE uint32_t expert_value(const uint32_t (&values)[kNumExpertsPerLane],
+                                       const uint32_t& expert_idx) const {
     uint32_t valid_value = 0;
 #pragma unroll
-    for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
-      valid_value = (expert_idx == i * 32 + ptx::get_lane_idx()) ? stored_num_tokens_per_expert[i]
-                                                                 : valid_value;
-    }
+    for (uint32_t i = 0; i < kNumExpertsPerLane; ++i)
+      valid_value = (expert_idx == i * 32 + ptx::get_lane_idx()) ? values[i] : valid_value;
     return ptx::exchange(valid_value, expert_idx % 32);
   }
 
-  CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& expert_idx) const {
+  // Rows from this node's ranks (every row with one node).
+  CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
+    return expert_value(stored_num_tokens_per_expert, expert_idx);
+  }
+  // Of them, the rows pulled into the expert's local segment.
+  CUTLASS_DEVICE uint32_t get_num_local_pulled(const uint32_t& expert_idx) const {
+    return expert_value(stored_num_local_pulled_per_expert, expert_idx);
+  }
+  // Rows from other nodes (valid after `fetch_remote_rows`).
+  CUTLASS_DEVICE uint32_t get_num_remote_tokens(const uint32_t& expert_idx) const {
+    return expert_value(stored_num_remote_tokens_per_expert, expert_idx);
+  }
+
+  // Rows of lane entry `i` in one segment, and the segment's blocks.
+  CUTLASS_DEVICE uint32_t segment_rows(const uint32_t& i, const bool& remote) const {
+    return remote ? stored_num_tokens_per_expert[i] - stored_num_local_pulled_per_expert[i] +
+                        stored_num_remote_tokens_per_expert[i]
+                  : stored_num_local_pulled_per_expert[i];
+  }
+  CUTLASS_DEVICE uint32_t sum_segment_blocks(const bool& remote) const {
+    uint32_t num_blocks = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kNumExpertsPerLane; ++i)
+      num_blocks += math::ceil_div(segment_rows(i, remote), BLOCK_M);
+    return __reduce_add_sync(0xffffffff, num_blocks);
+  }
+  // First pool block of the expert's segment.
+  CUTLASS_DEVICE uint32_t get_segment_block_offset(const uint32_t& expert_idx,
+                                                   const bool& remote) const {
     uint32_t num_blocks = 0;
 #pragma unroll
     for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
       if (i * 32 + ptx::get_lane_idx() < expert_idx)
-        num_blocks += math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+        num_blocks += math::ceil_div(segment_rows(i, remote), BLOCK_M);
     }
-    return __reduce_add_sync(0xffffffff, num_blocks);
+    return (remote ? num_local_m_blocks : 0u) + __reduce_add_sync(0xffffffff, num_blocks);
   }
 
   // Push dispatch (`push_done_ptr != nullptr`): wait for every rank's DONE
   // signal (lane 0 relaxed spin, then one acquire.sys load; bar.warp.sync
   // extends the ordering to the other lanes), then read the low words of the
   // recv-count sums of the given parity slot (the per-row remote tickets).
+  template <bool AcquirePublished = false>
   CUTLASS_DEVICE void fetch_expert_recv_count(const int* push_done_ptr = nullptr,
                                               const int& push_done_target = 0,
                                               const uint32_t& parity = 0) {
@@ -421,98 +460,142 @@ struct InterleavedMegaMoEScheduler {
         } else {
           do {
             value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-          } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+          } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumLocalRanks);
+          if constexpr (AcquirePublished)
+            value = ptx::ld_acq_sys(workspace.get_expert_recv_count_sum_ptr(expert_idx));
         }
       }
-      stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+      const uint32_t num_tokens = static_cast<uint32_t>(value);
+      const uint32_t leftover = num_tokens % BLOCK_M;
+      stored_num_tokens_per_expert[i] = num_tokens;
+      stored_num_local_pulled_per_expert[i] = kSingleNode ? num_tokens : num_tokens - leftover;
+      stored_num_remote_tokens_per_expert[i] = 0;
     }
     __syncwarp();
 
-    num_total_m_blocks = get_pool_block_offset(kNumExpertsPerRank);
-    const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1BlockNs;
-    const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, kNumSMs);
-    const uint32_t min_l1_warmup_waves =
-        get_num_l1_warmup_waves(num_total_m_blocks, kNumSMs, kNumL1BlockNs, kNumL2BlockNs);
-    num_l1_warmup_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+    num_local_m_blocks = sum_segment_blocks(false);
+    num_remote_m_blocks = 0;
+    num_remote_dependent_m_blocks = 0;
+    num_total_m_blocks = num_local_m_blocks;
+    num_bootstrap_l1_tasks = 0;
+    remote_fetched = kSingleNode;
+    update_l1_warmup();
   }
 
-  // Rows of every local expert that were pulled from other nodes: the sources
-  // outside this node's `num_local_ranks` consecutive ranks from
-  // `local_rank_base`. The mirror publishes each such source's count with a
-  // sys-scope release before its share of the count sum, so one acquire of the
-  // complete sum (see `fetch_expert_recv_count`) orders the per-source reads.
-  CUTLASS_DEVICE void fetch_remote_rows(const uint32_t& local_rank_base,
-                                        const uint32_t& num_local_ranks) {
-    const uint32_t lane_idx = ptx::get_lane_idx();
-    uint32_t num_blocks = 0;
+  CUTLASS_DEVICE uint32_t num_main_l1_tasks() const {
+    return num_total_m_blocks * kNumL1BlockNs - num_bootstrap_l1_tasks;
+  }
+
+  CUTLASS_DEVICE void update_l1_warmup() {
+    const uint32_t waves = math::ceil_div(num_main_l1_tasks(), kNumSMs);
+    num_l1_warmup_waves = cute::min(static_cast<uint32_t>(get_num_l1_warmup_waves(
+                                        num_total_m_blocks, kNumSMs, kNumL1BlockNs, kNumL2BlockNs)),
+                                    waves);
+  }
+
+  // Counts of the sources on other nodes, which their mirror on this node
+  // publishes with a sys-scope release after its list copies: spin on the
+  // remote sum of every local expert until all of those sources are in (the
+  // low word is the expert's remote row count), then lay out the remote
+  // segments. One acquire per expert also orders the per-source counts and the
+  // lists that the pull reads afterwards.
+  CUTLASS_DEVICE void fetch_remote_rows() {
+    if (remote_fetched) return;
 #pragma unroll
     for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
-      const uint32_t expert_idx = i * 32 + lane_idx;
-      uint32_t rows = 0;
+      const uint32_t expert_idx = i * 32 + ptx::get_lane_idx();
+      uint64_t value = 0;
       if (expert_idx < kNumExpertsPerRank) {
-        ptx::ld_acq_sys(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-        for (uint32_t r = 0; r < kNumRanks; ++r) {
-          if (r < local_rank_base or r >= local_rank_base + num_local_ranks)
-            rows += static_cast<uint32_t>(
-                ptx::ld_volatile(workspace.get_expert_recv_count_ptr(r, expert_idx)));
-        }
+        do {
+          value = ptx::ld_acq_sys(workspace.get_expert_recv_count_remote_sum_ptr(expert_idx));
+        } while (static_cast<uint32_t>(value >> 32) != kNumSMs * (kNumRanks - kNumLocalRanks));
       }
-      stored_num_remote_tokens_per_expert[i] = rows;
-      num_blocks += math::ceil_div(rows, BLOCK_M);
+      stored_num_remote_tokens_per_expert[i] = static_cast<uint32_t>(value);
     }
-    num_remote_m_blocks = __reduce_add_sync(0xffffffff, num_blocks);
+    __syncwarp();
+    // Close and reserve are atomic operations on the same word. A successful
+    // reserve racing the close is included in H and MUST still be published.
+    // A later reserve observes the closed bit and cannot duplicate a main task.
+    uint32_t state = 0;
+    if (ptx::get_lane_idx() == 0)
+      state = atomicOr(workspace.get_bootstrap_l1_count_ptr(), kBootstrapClosed);
+    num_bootstrap_l1_tasks = ptx::exchange(state, 0) & ~kBootstrapClosed;
+    num_remote_m_blocks = sum_segment_blocks(true);
+    uint32_t dependent_blocks = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kNumExpertsPerLane; ++i)
+      dependent_blocks += math::ceil_div(stored_num_remote_tokens_per_expert[i], BLOCK_M);
+    num_remote_dependent_m_blocks = __reduce_add_sync(0xffffffff, dependent_blocks);
+    num_total_m_blocks = num_local_m_blocks + num_remote_m_blocks;
+    update_l1_warmup();
+    remote_fetched = true;
   }
 
-  // Tasks are claimed in block order; the blocks that hold rows pulled from
-  // other nodes (the first ceil(remote rows / BLOCK_M) blocks of every expert)
-  // come before the others, so that their FC2 rows can be returned to those
-  // nodes while the remaining blocks still run. With no remote rows the order
-  // is the pool order.
-  CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase, const uint32_t& task_idx,
-                                         const uint32_t& num_n_blocks,
-                                         const uint32_t& shape_n) const {
-    const uint32_t lane_idx = ptx::get_lane_idx();
-    const uint32_t block_ordinal = task_idx / num_n_blocks;
-    const uint32_t n_block_idx = task_idx % num_n_blocks;
-    const bool remote_dependent = block_ordinal < num_remote_m_blocks;
-    const uint32_t segment_block_idx =
-        remote_dependent ? block_ordinal : block_ordinal - num_remote_m_blocks;
+  enum class TaskGroup : uint32_t { Local, Remote, Tail };
 
-    task_info_t result(block_phase, 0, 0, n_block_idx, 0, 0, shape_n, remote_dependent ? 1u : 0u);
-    uint32_t pool_offset = 0, segment_offset = 0;
+  // Main FC1/FC2 use the same three-group order. Only actual remote rows
+  // constrain the return: remote-segment local tails follow every dependent
+  // block rather than delaying other experts' remote work.
+  CUTLASS_DEVICE task_info_t create_group_task(const BlockPhase& block_phase,
+                                               const uint32_t& task_idx,
+                                               const uint32_t& num_n_blocks,
+                                               const uint32_t& shape_n,
+                                               const TaskGroup& group) const {
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const bool remote_segment = group != TaskGroup::Local;
+    const uint32_t group_block_idx = task_idx / num_n_blocks;
+    const uint32_t n_block_idx = task_idx % num_n_blocks;
+    task_info_t result(block_phase, 0, 0, n_block_idx, 0, 0, shape_n,
+                       group == TaskGroup::Remote ? 1u : 0u);
+    uint32_t group_offset = 0, pool_offset = 0;
 #pragma unroll
     for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
       const uint32_t expert_idx = i * 32 + lane_idx;
-      const uint32_t num_tokens = stored_num_tokens_per_expert[i];
-      const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
-      const uint32_t num_remote_blocks =
+      const uint32_t rows = segment_rows(i, remote_segment);
+      const uint32_t segment_blocks = math::ceil_div(rows, BLOCK_M);
+      const uint32_t dependent_blocks =
           math::ceil_div(stored_num_remote_tokens_per_expert[i], BLOCK_M);
-      const uint32_t num_segment_blocks =
-          remote_dependent ? num_remote_blocks : num_m_blocks - num_remote_blocks;
-      const uint32_t inclusive_pool = math::warp_inclusive_sum(num_m_blocks, lane_idx);
-      const uint32_t inclusive_segment = math::warp_inclusive_sum(num_segment_blocks, lane_idx);
-      const uint32_t lane_segment_offset = segment_offset + inclusive_segment - num_segment_blocks;
-      const bool is_owner = expert_idx < kNumExpertsPerRank &&
-                            segment_block_idx >= lane_segment_offset &&
-                            segment_block_idx < lane_segment_offset + num_segment_blocks;
+      const uint32_t group_blocks = group == TaskGroup::Remote ? dependent_blocks
+                                    : group == TaskGroup::Tail ? segment_blocks - dependent_blocks
+                                                               : segment_blocks;
+      const uint32_t group_inclusive = math::warp_inclusive_sum(group_blocks, lane_idx);
+      const uint32_t lane_group_offset = group_offset + group_inclusive - group_blocks;
+      const uint32_t pool_inclusive = math::warp_inclusive_sum(segment_blocks, lane_idx);
+      const uint32_t lane_pool_offset = pool_offset + pool_inclusive - segment_blocks;
+      const bool is_owner = expert_idx < kNumExpertsPerRank and
+                            group_block_idx >= lane_group_offset and
+                            group_block_idx < lane_group_offset + group_blocks;
       const uint32_t owner_mask = __ballot_sync(0xffffffff, is_owner);
-
       if (owner_mask) {
-        const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
-        const uint32_t owner_m_block_idx =
-            segment_block_idx - lane_segment_offset + (remote_dependent ? 0u : num_remote_blocks);
-        const uint32_t owner_pool_block_idx =
-            pool_offset + inclusive_pool - num_m_blocks + owner_m_block_idx;
-        const uint32_t owner_valid_m = cute::min(num_tokens - owner_m_block_idx * BLOCK_M, BLOCK_M);
-        result.local_expert_idx = ptx::exchange(expert_idx, owner_lane_idx);
-        result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
-        result.pool_block_idx = ptx::exchange(owner_pool_block_idx, owner_lane_idx);
-        result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
+        const uint32_t owner_lane = static_cast<uint32_t>(__ffs(owner_mask) - 1);
+        const uint32_t m_block = group_block_idx - lane_group_offset +
+                                 (group == TaskGroup::Tail ? dependent_blocks : 0u);
+        result.local_expert_idx = ptx::exchange(expert_idx, owner_lane);
+        result.m_block_idx = ptx::exchange(m_block, owner_lane);
+        result.valid_m = ptx::exchange(cute::min(rows - m_block * BLOCK_M, BLOCK_M), owner_lane);
+        result.pool_block_idx = (remote_segment ? num_local_m_blocks : 0u) +
+                                ptx::exchange(lane_pool_offset + m_block, owner_lane);
       }
-      pool_offset += ptx::exchange(inclusive_pool, 31);
-      segment_offset += ptx::exchange(inclusive_segment, 31);
+      group_offset += ptx::exchange(group_inclusive, 31);
+      pool_offset += ptx::exchange(pool_inclusive, 31);
     }
     return result;
+  }
+
+  CUTLASS_DEVICE task_info_t create_main_task(const BlockPhase& block_phase,
+                                              const uint32_t& task_idx,
+                                              const uint32_t& num_n_blocks,
+                                              const uint32_t& shape_n) const {
+    const uint32_t dependent_tasks = num_remote_dependent_m_blocks * num_n_blocks;
+    const uint32_t remote_segment_tasks = num_remote_m_blocks * num_n_blocks;
+    if (task_idx < dependent_tasks)
+      return create_group_task(block_phase, task_idx, num_n_blocks, shape_n, TaskGroup::Remote);
+    if (task_idx < remote_segment_tasks)
+      return create_group_task(block_phase, task_idx - dependent_tasks, num_n_blocks, shape_n,
+                               TaskGroup::Tail);
+    const uint32_t skip = block_phase == BlockPhase::Linear1 ? num_bootstrap_l1_tasks : 0u;
+    return create_group_task(block_phase, skip + task_idx - remote_segment_tasks, num_n_blocks,
+                             shape_n, TaskGroup::Local);
   }
 
   static CUTLASS_DEVICE uint32_t get_next_task_idx(uint32_t* task_count_ptr) {
@@ -522,28 +605,59 @@ struct InterleavedMegaMoEScheduler {
   }
 
   CUTLASS_DEVICE task_info_t claim_next_task() {
+    // Do not consume the main FC1 counter until every producer knows the same
+    // stable bootstrap prefix. Dispatch closes it immediately after acquiring
+    // the remote layout; a producer with no local work left may also close it.
+    while (not remote_fetched) {
+      uint32_t state = 0;
+      if (ptx::get_lane_idx() == 0)
+        state = ptx::ld_volatile(workspace.get_bootstrap_l1_count_ptr());
+      state = ptx::exchange(state, 0);
+      if ((state & kBootstrapClosed) or state >= num_local_m_blocks * kNumL1BlockNs) {
+        fetch_remote_rows();
+        break;
+      }
+      uint32_t observed = 0;
+      if (ptx::get_lane_idx() == 0)
+        observed = atomicCAS(workspace.get_bootstrap_l1_count_ptr(), state, state + 1u);
+      if (ptx::exchange(observed, 0) == state)
+        return create_group_task(BlockPhase::Linear1, state, kNumL1BlockNs, L1_SHAPE_N,
+                                 TaskGroup::Local);
+    }
+
     while (true) {
       if (num_l1_warmup_waves != kNumL1WavesDone && num_l1_warmup_waves > 0) {
         --num_l1_warmup_waves;
         const uint32_t task_idx = get_next_task_idx(workspace.get_l1_task_count_ptr());
-        if (task_idx >= num_total_m_blocks * kNumL1BlockNs) {
+        if (task_idx >= num_main_l1_tasks()) {
           num_l1_warmup_waves = kNumL1WavesDone;
           continue;
         }
-        return create_task(BlockPhase::Linear1, task_idx, kNumL1BlockNs, L1_SHAPE_N);
+        return create_main_task(BlockPhase::Linear1, task_idx, kNumL1BlockNs, L1_SHAPE_N);
       }
 
       const uint32_t task_idx = get_next_task_idx(workspace.get_l2_task_count_ptr());
       if (task_idx >= num_total_m_blocks * kNumL2BlockNs) break;
-
       if (num_l1_warmup_waves != kNumL1WavesDone) num_l1_warmup_waves = 1;
 
-      auto task_info = create_task(BlockPhase::Linear2, task_idx, kNumL2BlockNs, L2_SHAPE_N);
-      // The L1 tasks of this block were claimed in the same block order.
-      const uint32_t num_required_l1_tasks = (task_idx / kNumL2BlockNs + 1) * kNumL1BlockNs;
-      while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_l1_tasks) {
+      // Dependent and remote-tail groups share the first main FC1 ordinal
+      // range. Whole-local FC2 uses the stable bootstrap-adjusted suffix.
+      const uint32_t remote_tasks = num_remote_m_blocks * kNumL2BlockNs;
+      const uint32_t block_l1_end =
+          ((task_idx < remote_tasks ? task_idx : task_idx - remote_tasks) / kNumL2BlockNs + 1u) *
+          kNumL1BlockNs;
+      const uint32_t required_l1 =
+          task_idx < remote_tasks
+              ? block_l1_end
+              : num_remote_m_blocks * kNumL1BlockNs + (block_l1_end > num_bootstrap_l1_tasks
+                                                           ? block_l1_end - num_bootstrap_l1_tasks
+                                                           : 0u);
+      // Claim progress prevents a scheduler dependency cycle. The per-pool
+      // acquire readiness mask separately waits for actual FC1 completion,
+      // including bootstrap tasks whose publication raced the close.
+      while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < required_l1) {
       }
-      return task_info;
+      return create_main_task(BlockPhase::Linear2, task_idx, kNumL2BlockNs, L2_SHAPE_N);
     }
     return task_info_t();
   }

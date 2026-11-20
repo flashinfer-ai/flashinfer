@@ -135,6 +135,10 @@ class MegaMoEExpertSlots:
         import torch.distributed._symmetric_memory as symm_mem
 
         b = symm_buffer
+        if b.num_nodes != 1:
+            raise ValueError(
+                "dynamic expert load balancing currently requires a single node"
+            )
         group = b.group
         num_ranks = group.size()
         _check_geometry(num_ranks, num_experts, num_redundant_slots, b.num_experts)

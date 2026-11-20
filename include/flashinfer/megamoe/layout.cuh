@@ -57,9 +57,7 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
-// D40's dev-m dynamic scheduler owns two global task counters.  Keep the
-// complete 128-byte scheduler-state ABI used by every accepted D40 run; the
-// big-M static split kernels simply leave these counters unused.
+// Two shared mailbox stages, each with full/empty barriers and one TaskInfo.
 static constexpr int kSM90InterleavedSchedulerSMEMBytes = 96;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M
@@ -98,7 +96,7 @@ struct Workspace {
   uint32_t num_max_pool_tokens;
   uint32_t num_max_pool_blocks;
 
-  // Grid/NVLink state plus the two dev-m dynamic task counters.  Expert
+  // Grid/NVLink state plus the two dynamic task counters. Expert
   // counters begin at the next 128-byte cache line so the hot task counters
   // do not share an L2 sector with communication state.
   static constexpr uint64_t kNumBarrierSignalBytes = 128;
@@ -127,9 +125,10 @@ struct Workspace {
     // Expert send/recv count
     num_bytes += num_experts * sizeof(uint64_t) * 2;
 
-    // Expert recv count sum (two sets: launch parity for the rotated push pool),
-    // each set padded to whole 128 B lines (remote sys-scope tickets land here)
-    num_bytes += math::align<uint64_t>(num_experts_per_rank * sizeof(uint64_t), 128) * 2;
+    // Expert recv count sum (three sets: launch parity for the rotated push
+    // pool, then the sources on other nodes), each set padded to whole 128 B
+    // lines (remote sys-scope tickets land here)
+    num_bytes += math::align<uint64_t>(num_experts_per_rank * sizeof(uint64_t), 128) * 3;
 
     // L1 arrival count (padded to even entry count for `uint64_t` alignment of L2 mask)
     num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
@@ -187,8 +186,13 @@ struct Workspace {
   CUTLASS_DEVICE
   uint32_t* get_remote_l2_done_ptr() const { return math::advance_ptr<uint32_t>(base, 36u); }
 
+  // [40..43] adaptive local FC1 bootstrap cursor; high bit closes the queue,
+  // low bits are the stable claimed N-task prefix. Reset after math completes.
+  CUTLASS_DEVICE
+  uint32_t* get_bootstrap_l1_count_ptr() const { return math::advance_ptr<uint32_t>(base, 40u); }
+
   // Counter-based words (second 64 B sector of the signal line, away from the
-  // dev-m task counters that gpu-scope atomics hammer all kernel long):
+  // task counters updated by GPU-scope atomics throughout the kernel):
   // [64..67] int push DONE count (monotonic; remote red.release.sys, +1 per rank per launch)
   // [68..71] push epoch (launches completed; SM0 bumps it in the cleanup; DONE target =
   //          ranks * (epoch + 1); also the pool parity slot)
@@ -246,9 +250,17 @@ struct Workspace {
            (parity & 1u) * get_recv_count_sum_set_stride() + expert_idx;
   }
 
+  // Third set: the counts of the sources on other nodes, published by their
+  // mirror on this node (the two-wave schedule lays the local wave out from
+  // the first set and the remote wave from this one).
+  CUTLASS_DEVICE
+  uint64_t* get_expert_recv_count_remote_sum_ptr(const uint32_t& expert_idx = 0) const {
+    return get_expert_recv_count_sum_ptr(get_recv_count_sum_set_stride() * 2) + expert_idx;
+  }
+
   CUTLASS_DEVICE
   uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
-    const auto base = get_expert_recv_count_sum_ptr(get_recv_count_sum_set_stride() * 2);
+    const auto base = get_expert_recv_count_sum_ptr(get_recv_count_sum_set_stride() * 3);
     return reinterpret_cast<uint32_t*>(base) + pool_block_idx;
   }
 
@@ -439,17 +451,18 @@ struct RemoteRegions {
   CUTLASS_HOST_DEVICE int32_t* packed_slot_map(const uint32_t& node) const {
     return static_cast<int32_t*>(math::advance_ptr(return_outbound(node), return_bytes()));
   }
-  // Control words after the slot map: [0] packed tokens of this layer, [8]
-  // inbox flag and [16] return flag (load/store carrier signals, monotonic),
-  // [24] launch epoch (node 0's block only: launches completed by this rank).
+  // Control words in the aligned trailing 128 bytes after the slot map: byte
+  // [0] packed tokens, [8] inbox flag, [16] return flag (both carriers use these
+  // monotonic window-local flags), [24] launch epoch (node 0's block only).
   CUTLASS_HOST_DEVICE uint32_t* packed_token_count(const uint32_t& node) const {
-    return reinterpret_cast<uint32_t*>(packed_slot_map(node) + capacity);
+    return static_cast<uint32_t*>(math::advance_ptr(
+        packed_slot_map(node), math::align<uint64_t>(capacity * sizeof(int32_t), 128)));
   }
   CUTLASS_HOST_DEVICE uint64_t* inbox_flag(const uint32_t& node) const {
-    return reinterpret_cast<uint64_t*>(packed_slot_map(node) + capacity + 2);
+    return reinterpret_cast<uint64_t*>(packed_token_count(node) + 2);
   }
   CUTLASS_HOST_DEVICE uint64_t* return_flag(const uint32_t& node) const {
-    return reinterpret_cast<uint64_t*>(packed_slot_map(node) + capacity + 4);
+    return reinterpret_cast<uint64_t*>(packed_token_count(node) + 4);
   }
   CUTLASS_HOST_DEVICE uint32_t* launch_epoch() const { return packed_token_count(0) + 6; }
   // Header: control word [0] packed tokens, then per expert of the receiving

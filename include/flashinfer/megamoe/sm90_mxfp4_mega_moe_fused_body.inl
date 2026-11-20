@@ -2,6 +2,19 @@
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or \
     defined(__CLION_IDE__)
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
+FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes == 8704 || kWeightTileBytes == 8448 ||
+                             kWeightTileBytes == 16384,
+                         "Unsupported weight record size");
+FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes != 8448 || kUseRSOperand,
+                         "Compact weights require register-source MMA");
+FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes != 16384 || !kUseRSOperand,
+                         "FP8 weights require shared-source MMA");
+FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes == 8704 ||
+                             (kNumSMs == 78 && (kNumRanks == 8 || kNumRanks == 16) &&
+                              kNumExperts == 256 && kHidden == 4096 &&
+                              kIntermediateHidden == 2048 && kNumTopk == 6 && BLOCK_N == 256 &&
+                              kSwapABRequested && !kInKernelWeightCopy),
+                         "Prepared weight formats require the supported H20 geometry");
 
 // =====================================================================
 // Template checks
@@ -9,10 +22,8 @@ using Barrier = cutlass::arch::ClusterTransactionBarrier;
 FI_MEGAMOE_STATIC_ASSERT(BLOCK_M == 8 || BLOCK_M == 16 || BLOCK_M == 24 || BLOCK_M == 32 ||
                              BLOCK_M == 64 || BLOCK_M == 128,
                          "H200 fused kernel requires BM8/BM16/BM24/BM32/BM64/BM128");
-// Pipeline depth used to be pinned to one value per BLOCK_M, which made the
-// shipped table the only reachable schedule. The binding constraint is
-// shared memory, and the layout assertions below already enforce it
-// exactly, so only the pipelining minimum is asserted here.
+// The shared-memory layout below bounds pipeline depth; every pipeline needs
+// at least two stages.
 FI_MEGAMOE_STATIC_ASSERT(kNumStages >= 2, "Pipelining needs at least two stages");
 FI_MEGAMOE_STATIC_ASSERT(BLOCK_M != 128 || kNumStages == 6,
                          "BM128 split-M is only validated at stage depth 6");
@@ -25,6 +36,10 @@ FI_MEGAMOE_STATIC_ASSERT(!kSwapABRequested || BLOCK_M <= 32,
 // order (blocks with rows from other nodes first) and its task flag.
 FI_MEGAMOE_STATIC_ASSERT(kNumRemoteNodes == 0 || kUseInterleavedScheduler,
                          "Inter-node layers need the interleaved scheduler");
+// Local segments contain whole M blocks; only each expert's remote segment
+// can be partial. The pool padding allowance holds the final partial block.
+FI_MEGAMOE_STATIC_ASSERT(kNumRemoteNodes == 0 || BLOCK_M - 1 <= layout::kMaxCandidateBlockM - 1,
+                         "The pool padding allowance must hold the final partial block");
 
 // =====================================================================
 // Thread / warp identification
@@ -34,59 +49,7 @@ const uint32_t thread_idx = threadIdx.x;
 const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
 const uint32_t lane_idx = ptx::get_lane_idx();
 
-// Phase timestamps (globaltimer, ns), written only when kPhaseStamps.
-// Compiled out entirely otherwise -- see the note on the template parameter.
-//
-//   0  min  kernel entry              1  max  dispatch barrier #1 done
-//   2  max  own remote-dependent FC2 tasks done (SM 0)
-//                                    3  min  first math task
-//   4  max  last L1 task end          5  max  last L2 task end
-//   6  max  combine barrier #2 done   7  max  combine end (returned rows added)
-//   8  max  cleanup barrier #3 done   9  max  index pass grid sync done
-//  15  max  node-local combine done (before the return wait)
-//  Inter-node steps: 10 remote puts issued (SM 0), 11 inbox wait done,
-//  12 proxy publication done, 13 return put issued (SM 0), 14 return wait done
-//  (SM 0), 16 mirror reduction done, 17 its grid sync done (SM 0),
-//  18 packing pass done, 19 count pass and send-offset stake-out done,
-//  28 node's remote-dependent FC2 tasks seen done (the early return starts).
-//  2, 13, 16, 17 and 28 are written by the dispatch warps during the GEMM.
-//
-// Accumulators, summed over every CTA (value, then count):
-//  20/21 L1 task ns     22/23 L2 task ns
-//  24/25 decode warps waiting on the weight TMA (decode starved by the load)
-//  26/27 math warps waiting on the decoded ring (WGMMA starved by decode)
-// 24 and 26 are the pair that says whether the mainloop is stream-bound or
-// decode-bound, which is the question the end-to-end numbers cannot answer.
-const auto stamp_min = [&](const uint32_t slot) {
-  if constexpr (kPhaseStamps) {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    atomicMin(phase_stamps + slot, t);
-  }
-};
-const auto stamp_max = [&](const uint32_t slot) {
-  if constexpr (kPhaseStamps) {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    atomicMax(phase_stamps + slot, t);
-  }
-};
-const auto stamp_now = [&]() -> unsigned long long {
-  unsigned long long t = 0;
-  if constexpr (kPhaseStamps) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-};
-const auto stamp_add = [&](const uint32_t slot, const unsigned long long delta) {
-  if constexpr (kPhaseStamps) {
-    atomicAdd(phase_stamps + slot, delta);
-    atomicAdd(phase_stamps + slot + 1, 1ull);
-  }
-};
-(void)stamp_now;
-(void)stamp_add;
-
 if (warp_idx == 0 and cute::elect_one_sync()) {
-  stamp_min(0);
   cute::prefetch_tma_descriptor(&tensor_map_l1_acts);
   cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf);
   cute::prefetch_tma_descriptor(&tensor_map_l1_output);
@@ -102,6 +65,9 @@ if (warp_idx == 0 and cute::elect_one_sync()) {
 #define FI_MEGAMOE_BUFFERS_WITH_REMOTE_NODES 1
 #include <flashinfer/megamoe/detail/buffers.inl>
 #undef FI_MEGAMOE_BUFFERS_WITH_REMOTE_NODES
+const auto map_combine = [&](const auto& ptr, const uint32_t& dst_rank_idx) {
+  return sym_regions.map_combine(ptr, dst_rank_idx);
+};
 #include <flashinfer/megamoe/detail/remote_common.inl>
 
 // =====================================================================
@@ -113,7 +79,7 @@ using task_info_t = sched::TaskInfo;
 using interleaved_scheduler_t =
     sched::InterleavedMegaMoEScheduler<BLOCK_M, BLOCK_N, BLOCK_K, L1_SHAPE_N, L1_SHAPE_K,
                                        L2_SHAPE_N, L2_SHAPE_K, kNumExpertsPerRank, kNumSMs,
-                                       kNumRanks>;
+                                       kNumRanks, kNumLocalRanks>;
 constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / BLOCK_N;
 constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / BLOCK_N;
 constexpr bool kSplitMDecodedWeightReuse =
@@ -126,7 +92,7 @@ constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
 constexpr uint32_t kSwapABWeightHalves = WG_BLOCK_N / 64;
 constexpr uint32_t kSwapABHalfAccumPerThread = 64 * 64 / 128;
 FI_MEGAMOE_STATIC_ASSERT(!kSwapABRequested || WG_L1_OUT_BLOCK_N == 64,
-                         "swapAB expects BN256 split-N with 64 L1 output columns per WG");
+                         "swapAB requires BN256 split-N tiles");
 // Both dispatch warps participate in CTA-wide barriers. Selected plans may
 // use one warp for routing and token pulls, leaving the other warp's send
 // buffer available for an additional GEMM stage.
@@ -141,7 +107,7 @@ constexpr uint32_t LOAD_BLOCK_M = BLOCK_M;
 constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
 constexpr uint32_t kSwizzleAMode = BLOCK_K * sizeof(a_dtype_t);  // 128
 constexpr uint32_t kL2ActsSFGranK = kSplitMDecodedWeightReuse ? 64u : 128u;
-FI_MEGAMOE_STATIC_ASSERT(kSplitMDecodedWeightReuse || WG_L1_OUT_BLOCK_N < kL2ActsSFGranK,
+FI_MEGAMOE_STATIC_ASSERT(kSplitMDecodedWeightReuse || WG_L1_OUT_BLOCK_N <= kL2ActsSFGranK,
                          "split-N warpgroups must share one L2 activation scale");
 
 // =====================================================================
@@ -156,37 +122,20 @@ constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
 constexpr uint32_t SMEM_SEND_BUFFER_SIZE = math::constexpr_align(
     fp8_token_layout.get_num_bytes() * kNumActiveDispatchWarps, kSharedMemoryAlignment);
 // Scaled-magnitude tables for all 256 E8M0 codes; see kScaledLutSize.
-constexpr uint32_t SMEM_MXFP4_LUT_SIZE = math::constexpr_align<uint32_t>(
-    mxfp4::kScaledLutSize * sizeof(mxfp4::ScaledLut), kSharedMemoryAlignment);
+constexpr uint32_t SMEM_MXFP4_LUT_SIZE =
+    kWeightTileBytes == 8704
+        ? math::constexpr_align<uint32_t>(mxfp4::kScaledLutSize * sizeof(mxfp4::ScaledLut),
+                                          kSharedMemoryAlignment)
+        : 0u;
 constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
 constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
-// BM128 split-M alternates two decoded-B slots. This lets one WG begin
-// decoding K+1 after its K WGMMA completes without overwriting the slot
-// that the paired WG may still be consuming.
-//
-// Every other plan needs exactly one. Decode and consume are serialized
-// inside a K-block iteration -- the warpgroup drains its own WGMMA with
-// warpgroup_wait<0> before it loops -- and the two warpgroups decode and
-// read disjoint N halves of the same BN256 tile, so no slot is ever live
-// across iterations. Sizing this ring by kNumStages spent
-// (kNumStages - 1) * BN256 * BK128 bytes (64 KB at three stages) to hold
-// tiles nobody could read, and that is what capped the TMA pipeline at
-// three or four stages.
-// One slot is enough outside split-M. Decode and consume are serialized
-// inside a K-block iteration -- the warpgroup drains its own WGMMA with
-// warpgroup_wait<0> before it loops -- and the two warpgroups decode and
-// read disjoint N halves of the same BN256 tile, so no slot is live across
-// iterations.
-//
-// Rotating two slots to decode K+1 under K's in-flight WGMMAs was measured
-// and is worse: at MiMo/H20 M=64 it cost +5.9 / +7.1 / +10.8 % over three
-// runs. The prefetch has to wait on stage K+1's TMA barrier, and that wait
-// sits between the WGMMA issue and arrive_empty(K), so it delays the loader
-// by exactly as much as it saves on the decode.
+// Canonical packed weights may require shared decode slots; prepared weights do not.
 FI_MEGAMOE_STATIC_ASSERT(!kUseRSOperand || kSwapABRequested,
                          "The register-source A path is swapAB-only");
 constexpr uint32_t kNumDecodedBStages =
-    (kSplitMDecodedWeightReuse || kSplitDecodeWarps) ? 2u : (kUseRSOperand ? 0u : 1u);
+    kWeightTileBytes == 8704
+        ? ((kSplitMDecodedWeightReuse || kSplitDecodeWarps) ? 2u : (kUseRSOperand ? 0u : 1u))
+        : 0u;
 // Only the split hands decoded tiles between warps, so only it needs the
 // ring's barriers; every other plan decodes and consumes in one warp.
 constexpr uint32_t kNumBRingStages = kSplitDecodeWarps ? 2u : 0u;
@@ -196,7 +145,7 @@ constexpr uint32_t kNumBRingStages = kSplitDecodeWarps ? 2u : 0u;
 // Local copies: `tma_load_1d` takes its byte count by reference, which
 // odr-uses the operand, and a namespace-scope constant is host-side.
 constexpr uint32_t kBTileRows = mxfp4::kBTileRows;
-constexpr uint32_t kBTileBytes = mxfp4::kBTileBytes;
+constexpr uint32_t kBTileBytes = kWeightTileBytes;
 constexpr uint32_t SMEM_PACKED_B_SIZE_PER_STAGE =
     (LOAD_BLOCK_N / kBTileRows) * kBTileBytes * sizeof(b_dtype_t);
 FI_MEGAMOE_STATIC_ASSERT(LOAD_BLOCK_N % kBTileRows == 0,
@@ -261,22 +210,21 @@ auto smem_cd_l2 = reinterpret_cast<nv_bfloat16*>(smem_cd_base);
 auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
   return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
 });
+auto smem_packed_b = utils::PatternVisitor([=](const uint32_t& i) {
+  return math::advance_ptr<b_dtype_t>(smem_gemm_base,
+                                      SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +
+                                          kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE +
+                                          i * SMEM_PACKED_B_SIZE_PER_STAGE);
+});
+// TMA writes directly into the ring consumed by WGMMA.
 auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
-  // Callers pass a decoded-slot index, not a pipeline stage. The RS path
-  // allocates no decoded tile at all, so the index degenerates to zero and
-  // the pointer is never dereferenced.
+  if constexpr (kWeightTileBytes == 16384) return smem_packed_b[i];
   const uint32_t decoded_stage = kSplitMDecodedWeightReuse
                                      ? (i & 1u)
                                      : (kNumDecodedBStages <= 1u ? 0u : (i % kNumDecodedBStages));
   return math::advance_ptr<b_dtype_t>(
       smem_gemm_base,
       SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + decoded_stage * SMEM_B_SIZE_PER_STAGE);
-});
-auto smem_packed_b = utils::PatternVisitor([=](const uint32_t& i) {
-  return math::advance_ptr<b_dtype_t>(smem_gemm_base,
-                                      SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +
-                                          kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE +
-                                          i * SMEM_PACKED_B_SIZE_PER_STAGE);
 });
 auto sf_start_ptr = math::advance_ptr<uint8_t>(
     smem_gemm_base, SMEM_CD_SIZE +
@@ -322,7 +270,8 @@ FI_MEGAMOE_STATIC_ASSERT(!kUseInterleavedScheduler || kInterleavedSMEMEnd <= 232
 // =====================================================================
 // Initialization
 // =====================================================================
-mxfp4::init_scaled_lut(smem_mxfp4_lut, thread_idx, kNumThreads);
+if constexpr (kWeightTileBytes == 8704)
+  mxfp4::init_scaled_lut(smem_mxfp4_lut, thread_idx, kNumThreads);
 
 if (warp_idx == 0) {
 // Clean expert-count shared memory
@@ -394,7 +343,7 @@ auto advance_pipeline = [&](uint32_t& k_block_idx) {
     b_ring_phase ^= b_ring_idx == 0;
   }
 };
-// Intra-SM barrier indices (mirroring SM100)
+// Intra-SM barrier indices
 constexpr uint32_t kDispatchBarrierIdx = 0;
 constexpr uint32_t kDispatchWithEpilogueBarrierIdx = 1;
 constexpr uint32_t kEpilogueFullBarrierIdx = 2;
@@ -407,12 +356,19 @@ constexpr uint32_t kBeforeCombineReduceBarrierTag = 2;
 constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 3;
 
 // Register reconfiguration counts (chosen to fit in 64512 reg budget).
-constexpr uint32_t kNumDispatchRegisters = 48;
+// Prepared weights do not need a separate decode warpgroup.
+constexpr bool kPreparedWeightRegisterLadder =
+    kWeightTileBytes != 8704 && kSwapABRequested && !kInKernelWeightCopy && !kSplitDecodeWarps &&
+    (BLOCK_M == 8 || BLOCK_M == 16 || BLOCK_M == 24 || BLOCK_M == 32);
+constexpr uint32_t kNumDispatchRegisters =
+    kPreparedWeightRegisterLadder ? (BLOCK_M == 32 ? 128u : 160u) : 80u;
 constexpr uint32_t kNumNonEpilogueRegisters = kUseInterleavedScheduler ? 64 : 40;
 constexpr uint32_t kNumDecodeRegisters = 48;
 // The decode warps take their share out of the epilogue's budget, so the
 // split runs the math warps leaner.
-constexpr uint32_t kNumEpilogueRegisters = kSplitDecodeWarps ? 152 : 208;
+constexpr uint32_t kNumEpilogueRegisters =
+    kSplitDecodeWarps ? 152u
+                      : (kPreparedWeightRegisterLadder ? (BLOCK_M == 32 ? 176u : 160u) : 208u);
 // The register file is handed out per warp in 256-register granules, so
 // what setmaxnreg can redistribute is not 64K but what the launch could
 // actually reserve at this width -- 64512 at 384 threads, 61440 at 640.
@@ -436,7 +392,7 @@ constexpr uint32_t kDispatchGridSyncIndex = 0;
 constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
 const auto for_each_static_selected_block = [&](auto&& func) {
-  scheduler.fetch_expert_recv_count();
+  scheduler.template fetch_expert_recv_count<(kNumRemoteNodes > 0)>();
   scheduler.set_expert_idx(0);
   while (true) {
     CUTE_TIE_DECL(scheduler.get_next_block(), block_phase, local_expert_idx, m_block_idx,
@@ -477,9 +433,9 @@ const auto for_each_published_block = [&](auto&& func) {
 };
 
 const auto produce_interleaved_blocks = [&](auto&& func) {
-  interleaved_scheduler.fetch_expert_recv_count();
-  if constexpr (kNumRemoteNodes > 0)
-    interleaved_scheduler.fetch_remote_rows(my_node * kNumLocalRanks, kNumLocalRanks);
+  // Acquire local publications without waiting for the remote input. The
+  // bootstrap FC1 queue closes when dispatch acquires the remote layout.
+  interleaved_scheduler.template fetch_expert_recv_count<(kNumRemoteNodes > 0)>();
   while (true) {
     interleaved_scheduler.wait_task_slot_empty();
     const auto task_info = interleaved_scheduler.claim_next_task();
@@ -506,20 +462,35 @@ const auto cleanup_workspace = [&]() {
       if (thread_idx == 0) {
         *workspace.get_l1_task_count_ptr() = 0;
         *workspace.get_l2_task_count_ptr() = 0;
+        *workspace.get_bootstrap_l1_count_ptr() = 0;
       }
     }
   } else {
     for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
-      const auto num_recv_tokens =
-          static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(i));
-      const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
-      const auto cleanup_pool_block_offset = scheduler.get_pool_block_offset(i);
-
+      // Pool blocks of the expert: one range on one node, the local and the
+      // remote segment with remote nodes (both waves were fetched by every
+      // dispatch warp).
+      uint32_t num_recv_tokens, segment_offsets[2] = {0u, 0u}, segment_blocks[2] = {0u, 0u};
+      if constexpr (kNumRemoteNodes > 0) {
+        const uint32_t num_local = interleaved_scheduler.get_num_tokens(i);
+        const uint32_t num_pulled = interleaved_scheduler.get_num_local_pulled(i);
+        const uint32_t num_remote = interleaved_scheduler.get_num_remote_tokens(i);
+        num_recv_tokens = num_local + num_remote;
+        segment_offsets[0] = interleaved_scheduler.get_segment_block_offset(i, false);
+        segment_blocks[0] = math::ceil_div(num_pulled, BLOCK_M);
+        segment_offsets[1] = interleaved_scheduler.get_segment_block_offset(i, true);
+        segment_blocks[1] = math::ceil_div(num_local - num_pulled + num_remote, BLOCK_M);
+      } else {
+        num_recv_tokens = static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(i));
+        segment_offsets[0] = scheduler.get_pool_block_offset(i);
+        segment_blocks[0] = math::ceil_div(num_recv_tokens, BLOCK_M);
+      }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
       FI_MEGAMOE_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
       if (warp_idx == 0) {
         *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+        if constexpr (kNumRemoteNodes > 0) *workspace.get_expert_recv_count_remote_sum_ptr(i) = 0;
       } else if (warp_idx == 1) {
         if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
           ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
@@ -530,9 +501,12 @@ const auto cleanup_workspace = [&]() {
         *workspace.get_expert_recv_count_ptr(j, i) = 0;
       __syncwarp();
 
-      for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-        *workspace.get_l1_arrival_count_ptr(cleanup_pool_block_offset + j) = 0;
-        *workspace.get_l2_arrival_mask_ptr(cleanup_pool_block_offset + j) = 0;
+#pragma unroll
+      for (uint32_t segment = 0; segment < 2; ++segment) {
+        for (uint32_t j = thread_idx; j < segment_blocks[segment]; j += kNumDispatchThreads) {
+          *workspace.get_l1_arrival_count_ptr(segment_offsets[segment] + j) = 0;
+          *workspace.get_l2_arrival_mask_ptr(segment_offsets[segment] + j) = 0;
+        }
       }
       __syncwarp();
     }
@@ -543,180 +517,155 @@ const auto cleanup_workspace = [&]() {
 
 // =====================================================================
 // ROLE 1: DISPATCH WARPS
-//   Mirrors SM100 dispatch with two changes:
-//     * SF is per-128 channel float (no UTCCP transpose). We store the
-//       remote per-token SF directly into the local L1 SF buffer in
-//       MN-major layout: `local_sf[k_chunk * num_padded_sf_pool_tokens + token_idx]`.
-//     * The "token_idx_in_expert" → SF token index is now the simple
-//       per-block linear mapping (no 4×32 transpose).
+// Per-128 FP32 scales are stored in the local L1 SF buffer in MN-major layout:
+// `local_sf[k_chunk * num_padded_sf_pool_tokens + token_idx]`. The SF token index
+// is the linear row index within each pool block.
 // =====================================================================
 // Local experts below this index are resident experts, never the target of an
 // in-kernel weight copy; with the copy compiled out every slot is resident.
 const uint32_t eplb_num_resident_experts =
     kInKernelWeightCopy ? in_kernel_copy.num_resident_experts : kNumExpertsPerRank;
 
-if (warp_idx < kNumDispatchWarps) {
-  cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+// setmaxnreg must execute collectively at one PC for the whole warpgroup.
+FI_MEGAMOE_STATIC_ASSERT(kFirstDecodeWarp == 4u,
+                         "Register handoff requires one complete loader warpgroup");
+if (warp_idx < kFirstDecodeWarp) {
+  cutlass::arch::warpgroup_reg_dealloc<kNumLoaderWarpgroupRegisters>();
 
-  FI_MEGAMOE_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
-  constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-  const auto read_topk_idx = [&](const auto& process) {
-    if (warp_idx < kNumActiveDispatchWarps) {
+  if (warp_idx < kNumDispatchWarps) {
+    FI_MEGAMOE_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+    constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
+    const auto read_topk_idx = [&](const auto& process) {
+      if (warp_idx < kNumActiveDispatchWarps) {
 #pragma unroll
-      for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
-           i < num_tokens; i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
-        int expert_idx = -1;
-        if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-          expert_idx = static_cast<int>(
-              __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
-          if (expert_idx >= 0) process(i * kNumTopk + lane_idx, expert_idx);
+        for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
+             i < num_tokens; i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
+          int expert_idx = -1;
+          if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+            expert_idx = static_cast<int>(
+                __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+            if (expert_idx >= 0) process(i * kNumTopk + lane_idx, expert_idx);
+          }
+          __syncwarp();
         }
-        __syncwarp();
       }
-    }
-  };
+    };
 
-  // Count tokens per expert
-  read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-    atomicAdd_block(smem_expert_count + expert_idx, 1);
-  });
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+    // Count tokens per expert
+    read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+      atomicAdd_block(smem_expert_count + expert_idx, 1);
+    });
+    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
 // Stake out per-expert SM offsets via global atomic
 #pragma unroll
-  for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-    const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-    smem_expert_count[i] =
-        static_cast<uint32_t>(ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
-  }
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+    for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+      const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
+      smem_expert_count[i] = static_cast<uint32_t>(
+          ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+    }
+    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-  if (thread_idx == 0) stamp_max(19);
-  // Inter-node: the math warps packed the tokens that have an expert on another
-  // node (slot map and outbound copies) while the counts were staked out; the
-  // index pass below writes their packed index.
-  if constexpr (kNumRemoteNodes > 0)
+    // Inter-node: the math warps packed the tokens that have an expert on another
+    // node (slot map and outbound copies) while the counts were staked out; the
+    // index pass below writes their packed index.
+    if constexpr (kNumRemoteNodes > 0)
+      ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads,
+                          kDispatchWithEpilogueBarrierIdx);
+
+    // Write source token-topk indices to remote ranks
+    read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+      const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+      const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
+      if constexpr (kNumRemoteNodes > 0) {
+        if (dst_rank_idx / kNumLocalRanks != my_node) {
+          remote_list_entry(token_topk_idx, static_cast<uint32_t>(expert_idx), dst_slot_idx);
+          return;
+        }
+      }
+      const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(expert_idx % kNumExpertsPerRank,
+                                                                sym_buffer.rank_idx, dst_slot_idx);
+      *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+    });
+
+    comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx, [=]() {
+      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+    });
+
+    // Inter-node: every SM's packed rows and list entries are complete, so this
+    // rank's tokens leave now; their wire time overlaps the count publication.
+    remote_send();
+
+    if (sm_idx == 0 and thread_idx < kNumActiveDispatchThreads) {
+#pragma unroll
+      for (uint32_t i = thread_idx; i < kNumExperts; i += kNumActiveDispatchThreads) {
+        const auto dst_rank_idx = i / kNumExpertsPerRank;
+        const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+        if constexpr (kNumRemoteNodes > 0) {
+          // Owners on other nodes get this rank's counts from its mirror.
+          if (dst_rank_idx / kNumLocalRanks != my_node) continue;
+        }
+        const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+        *sym_buffer.map(
+            workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+            dst_rank_idx) = expert_status & 0xffffffff;
+        if constexpr (kNumRemoteNodes > 0) {
+          ptx::red_add_rel_sys(
+              sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
+                             dst_rank_idx),
+              expert_status);
+        } else {
+          ptx::atomic_add_sys(
+              sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
+                             dst_rank_idx),
+              expert_status);
+        }
+      }
+    }
+    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+    // Cross-node consumers acquire completed expert publications below. The
+    // remaining combine/cleanup barriers keep their shared counter sequence.
+    // Preserve the inherited dispatch barrier on the single-node path.
+    if constexpr (kNumRemoteNodes == 0) {
+      comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
+                           kBeforeDispatchPullBarrierTag, kNumLocalRanks>(
+          workspace, sym_buffer, sm_idx, thread_idx,
+          [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+          kNumRemoteNodes > 0, true);
+    }
+
+    // Sync with epilogue warps before pulling tokens
     ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-  // Write source token-topk indices to remote ranks
-  read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-    const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-    const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
-    if constexpr (kNumRemoteNodes > 0) {
-      if (dst_rank_idx / kNumLocalRanks != my_node) {
-        remote_list_entry(token_topk_idx, static_cast<uint32_t>(expert_idx), dst_slot_idx);
-        return;
-      }
-    }
-    const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(expert_idx % kNumExpertsPerRank,
-                                                              sym_buffer.rank_idx, dst_slot_idx);
-    *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-  });
-
-  comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(workspace, sm_idx, thread_idx, [=]() {
-    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-  });
-  if (thread_idx == 0) stamp_max(9);
-
-  // Inter-node: every SM's packed rows and list entries are complete, so this
-  // rank's tokens leave now; their wire time overlaps the count publication.
-  remote_send();
-  if (sm_idx == 0 and thread_idx == 0) stamp_max(10);
-
-  if (sm_idx == 0 and thread_idx < kNumActiveDispatchThreads) {
-#pragma unroll
-    for (uint32_t i = thread_idx; i < kNumExperts; i += kNumActiveDispatchThreads) {
-      const auto dst_rank_idx = i / kNumExpertsPerRank;
-      const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-      if constexpr (kNumRemoteNodes > 0) {
-        // Owners on other nodes get this rank's counts from its mirror.
-        if (dst_rank_idx / kNumLocalRanks != my_node) continue;
-      }
-      const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-      *sym_buffer.map(
-          workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-          dst_rank_idx) = expert_status & 0xffffffff;
-      ptx::atomic_add_sys(
-          sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
-                         dst_rank_idx),
-          expert_status);
-    }
-  }
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-  // Inter-node: the mirrored sources' counts and lists are published into
-  // this node's owners.
-  remote_publish_by_proxy();
-  if (thread_idx == 0) stamp_max(12);
-
-  // With remote nodes every SM published peer writes just above, so the barrier
-  // needs its grid sync before SM 0 signals the peers (the same ordering the
-  // combine barrier gives the epilogue's peer stores); on one node only SM 0
-  // wrote and the sync is skipped as before.
-  comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
-                       kBeforeDispatchPullBarrierTag, kNumLocalRanks>(
-      workspace, sym_buffer, sm_idx, thread_idx,
-      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, kNumRemoteNodes > 0,
-      true);
-  if (thread_idx == 0) stamp_max(1);
-
-  // Sync with epilogue warps before pulling tokens
-  ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
-
-  // Token / SF pull loop
-  if (warp_idx < kNumActiveDispatchWarps) {
+    // Token / SF pull. `pull_row` fetches one (source rank, k) row of a local
+    // expert into pool row `pool_token_idx` and counts it in `arrival_block_idx`.
+    const uint32_t pull_warp = warp_idx < kNumActiveDispatchWarps ? warp_idx : 0u;
     uint32_t pull_mbarrier_phase = 0;
-    const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
-    const auto pull_mbarrier = dispatch_barriers[warp_idx];
-
-    scheduler.fetch_expert_recv_count();
-
+    const auto pull_buffer = smem_send_buffers.get_rank_buffer(pull_warp).get_data_buffer(0);
+    const auto pull_mbarrier = dispatch_barriers[pull_warp];
     constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
-    int current_expert_idx = -1;
-    uint32_t stored_rank_count[kNumRanksPerLane] = {};
-    uint32_t expert_start_idx = 0, expert_end_idx = 0;
-    uint32_t expert_pool_block_offset = 0;
-    // Rows of the current expert pulled from other nodes; they come first in
-    // the expert (see detail/dispatch_rank_selection.inl).
-    uint32_t remote_rows = 0;
+    constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumActiveDispatchWarps;
     const auto rank_is_remote = [&](const uint32_t& rank_idx) {
       return kNumRemoteNodes > 0 and rank_idx / kNumLocalRanks != my_node;
     };
-
-    constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumActiveDispatchWarps;
-    for (uint32_t token_idx = sm_idx * kNumActiveDispatchWarps + warp_idx;;
-         token_idx += kNumGlobalWarps) {
-      int old_expert_idx = current_expert_idx;
-      while (token_idx >= expert_end_idx) {
-        if (++current_expert_idx >= kNumExpertsPerRank) break;
-        expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
-        expert_start_idx = expert_end_idx;
-        expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
-      }
-      if (current_expert_idx >= kNumExpertsPerRank) break;
-
-      if (old_expert_idx != current_expert_idx) {
-        old_expert_idx = current_expert_idx;
+    const auto load_rank_counts = [&](const uint32_t& expert_idx,
+                                      uint32_t(&counts)[kNumRanksPerLane]) {
 #pragma unroll
-        for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
-          const uint32_t j = i * 32 + lane_idx;
-          stored_rank_count[i] = j < kNumRanks
-                                     ? static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(
-                                           j, current_expert_idx))
-                                     : 0;
-        }
-        uint32_t remote_in_lane = 0;
-#pragma unroll
-        for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
-          if (rank_is_remote(i * 32 + lane_idx)) remote_in_lane += stored_rank_count[i];
-        remote_rows = __reduce_add_sync(0xffffffff, remote_in_lane);
+      for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
+        const uint32_t j = i * 32 + lane_idx;
+        counts[i] =
+            j < kNumRanks and (kNumRemoteNodes == 0 or interleaved_scheduler.remote_fetched or
+                               not rank_is_remote(j))
+                ? static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, expert_idx))
+                : 0u;
       }
-
-      // Round-robin rank selection (identical to SM100)
-
-#include <flashinfer/megamoe/detail/dispatch_rank_selection.inl>
-      const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
-          current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+    };
+    const auto pull_row = [&](const uint32_t& expert_idx, const uint32_t& src_rank_idx,
+                              const uint32_t& token_idx_in_rank, const uint32_t& pool_token_idx,
+                              const uint32_t& arrival_block_idx) {
+      const uint32_t src_token_topk_idx =
+          *workspace.get_src_token_topk_idx_ptr(expert_idx, src_rank_idx, token_idx_in_rank);
       const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
       const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -725,7 +674,7 @@ if (warp_idx < kNumDispatchWarps) {
         ptx::tma_load_1d(
             pull_buffer.get_base_ptr(),
             sym_regions.map_input(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                                  current_rank_in_expert_idx),
+                                  src_rank_idx),
             pull_mbarrier, kHidden);
       }
       __syncwarp();
@@ -734,10 +683,8 @@ if (warp_idx < kNumDispatchWarps) {
       constexpr uint32_t kNumSFFloats = kHidden / 128;
       FI_MEGAMOE_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
       const auto remote_sf_ptr = sym_regions.map_input(
-          input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
-          current_rank_in_expert_idx);
+          input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(), src_rank_idx);
       const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<float>();
-      const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
 #pragma unroll
       for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++i) {
         const uint32_t j = i * 32 + lane_idx;
@@ -748,8 +695,7 @@ if (warp_idx < kNumDispatchWarps) {
 
       if (cute::elect_one_sync()) {
         const auto weight = *sym_regions.map_input(
-            input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-            current_rank_in_expert_idx);
+            input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx, src_rank_idx);
         *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
         ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
@@ -758,204 +704,284 @@ if (warp_idx < kNumDispatchWarps) {
         ptx::tma_store_1d(l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
                           pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
 
-        *workspace.get_token_src_metadata_ptr(pool_token_idx) = {current_rank_in_expert_idx,
-                                                                 src_token_idx, src_topk_idx};
+        *workspace.get_token_src_metadata_ptr(pool_token_idx) = {src_rank_idx, src_token_idx,
+                                                                 src_topk_idx};
 
         cute::tma_store_arrive();
         ptx::tma_store_wait<0>();
-        ptx::red_add_rel(workspace.get_l1_arrival_count_ptr(expert_pool_block_offset +
-                                                            token_idx_in_expert / BLOCK_M),
-                         1u);
+        ptx::red_add_rel(workspace.get_l1_arrival_count_ptr(arrival_block_idx), 1u);
       }
       __syncwarp();
-    }
-  }
+    };
 
-  // `cleanup_workspace` derives each expert's pool block offset from the calling warp's
-  // cached expert counts; dispatch warps that skipped the pull loop never fetched them.
-  if (warp_idx >= kNumActiveDispatchWarps) scheduler.fetch_expert_recv_count();
+    if constexpr (kNumRemoteNodes == 0) {
+      if (warp_idx < kNumActiveDispatchWarps) {
+        scheduler.fetch_expert_recv_count();
+        int current_expert_idx = -1;
+        uint32_t stored_rank_count[kNumRanksPerLane] = {};
+        uint32_t expert_start_idx = 0, expert_end_idx = 0;
+        uint32_t expert_pool_block_offset = 0;
+        constexpr uint32_t remote_rows = 0;
+        for (uint32_t token_idx = sm_idx * kNumActiveDispatchWarps + warp_idx;;
+             token_idx += kNumGlobalWarps) {
+          int old_expert_idx = current_expert_idx;
+          while (token_idx >= expert_end_idx) {
+            if (++current_expert_idx >= kNumExpertsPerRank) break;
+            expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
+            expert_start_idx = expert_end_idx;
+            expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+          }
+          if (current_expert_idx >= kNumExpertsPerRank) break;
+          if (old_expert_idx != current_expert_idx)
+            load_rank_counts(current_expert_idx, stored_rank_count);
 
-  // In-kernel weight copy: the dispatch warps are idle from the end of the token
-  // pull until the combine, the whole GEMM phase, so they copy the changed
-  // redundant expert slots now. The scheduler visits local experts in index
-  // order and the redundant slots are the last ones, so their tasks follow every
-  // resident expert's and the weight loader rarely waits.
-  if constexpr (kInKernelWeightCopy) {
-    eplb::in_kernel_copy_share<kNumRanks, kNumDispatchThreads>(
-        in_kernel_copy, sm_idx, kNumSMs, thread_idx,
-        [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
-  }
-
-  // Inter-node: the mirror duty of the combine, while the GEMM still runs the
-  // blocks that need no return (after the weight copy: the loader waits on it).
-  remote_early_return();
-
-  // Cleanup workspace, overlapping with combine
-  ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
-
-  cleanup_workspace();
-  comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
-                       kAfterWorkspaceCleanBarrierTag, kNumLocalRanks>(
-      workspace, sym_buffer, sm_idx, thread_idx,
-      [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, true, false);
-  if (thread_idx == 0) stamp_max(8);
-  if constexpr (kNumRemoteNodes > 0) {
-    // Signal targets of the next launch; every CTA read the epoch at entry.
-    if (sm_idx == 0 and thread_idx == 0) *remote.launch_epoch() = launch_epoch + 1;
-  }
-  // In-kernel weight copy: the copy list is consumed. Every CTA of every rank
-  // has passed the barrier above, so none can still be reading it: the copier
-  // reads `copy_count` before its first copy, and the weight-loader warp reads
-  // it once, before its first bulk copy, so on every CTA with a GEMM task that
-  // read precedes the epilogue's last stage, the dispatch-epilogue barrier and
-  // this CTA's arrival at the grid barrier; a CTA without a task never waits on
-  // a slot. The slot readiness itself is published through `copy_done`, which
-  // the planner resets per listed slot, not through this counter.
-  if constexpr (kInKernelWeightCopy) {
-    if (sm_idx == 0 and thread_idx == 0) *in_kernel_copy.copy_count = 0;
-  }
-} else if (warp_idx == kNumDispatchWarps) {
-  // =====================================================================
-  // ROLE 2: GEMM TMA LOAD warps (load A+SFA, B+SFB)
-  //   The two warps inside `kNumNonEpilogueThreads` load A + SFA and
-  //   B + SFB, respectively.
-  // =====================================================================
-  cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-
-  const auto load_a_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
-                               const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
-                               const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
-                               const uint32_t& valid_m, const bool& remote_dependent) {
-    using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
-    constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
-    const auto tensor_map_a_ptr = kBlockIsL2 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
-    const auto tensor_map_sfa_ptr = kBlockIsL2 ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
-
-    const bool has_valid_m = valid_m > 0;
-
-    // Wait for the pool to be ready.
-    if (has_valid_m) {
-      if constexpr (!kBlockIsL2) {
-        const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-        while (ptx::ld_acq(ptr) != valid_m) {
-        }
-      } else {
-        const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-        const uint64_t expected =
-            (kNumRoutedL1BlockNs >= 64) ? ~0ull : ((1ull << kNumRoutedL1BlockNs) - 1ull);
-        while (ptx::ld_acq_gpu(ptr) != expected) {
+          // Round-robin rank selection
+#include <flashinfer/megamoe/detail/dispatch_rank_selection.inl>
+          pull_row(current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank,
+                   expert_pool_block_offset * BLOCK_M + token_idx_in_expert,
+                   expert_pool_block_offset + token_idx_in_expert / BLOCK_M);
         }
       }
+      // `cleanup_workspace` derives each expert's pool block offset from the calling warp's
+      // cached expert counts; dispatch warps that skipped the pull loop never fetched them.
+      if (warp_idx >= kNumActiveDispatchWarps) scheduler.fetch_expert_recv_count();
+    } else {
+      // Two waves. The local wave (rows from this node's ranks, laid out from the
+      // local count sums) is pulled right after the barrier above so that the
+      // owners start on it while the inter-node rows are in flight; then every SM
+      // waits for its inbox and publishes the mirrored sources; then the remote
+      // wave (the remote rows and the leftover local rows of every expert, laid
+      // out once the remote count sums are complete) is pulled into the remote
+      // segments. Every dispatch warp fetches both layouts: the cleanup and the
+      // early return use them.
+      interleaved_scheduler.template fetch_expert_recv_count<(kNumRemoteNodes > 0)>();
+      const auto pull_pass = [&](const bool& remote_pass) {
+        int current_expert_idx = -1;
+        uint32_t stored_rank_count[kNumRanksPerLane] = {};
+        uint32_t segment_start = 0, segment_end = 0;
+        uint32_t block_offset = remote_pass ? interleaved_scheduler.num_local_m_blocks : 0u;
+        uint32_t num_local = 0, num_pulled = 0, num_remote = 0;
+        for (uint32_t row = sm_idx * kNumActiveDispatchWarps + warp_idx;; row += kNumGlobalWarps) {
+          int old_expert_idx = current_expert_idx;
+          while (row >= segment_end) {
+            if (++current_expert_idx >= kNumExpertsPerRank) break;
+            block_offset += math::ceil_div(segment_end - segment_start, BLOCK_M);
+            segment_start = segment_end;
+            num_local = interleaved_scheduler.get_num_tokens(current_expert_idx);
+            num_pulled = interleaved_scheduler.get_num_local_pulled(current_expert_idx);
+            num_remote =
+                remote_pass ? interleaved_scheduler.get_num_remote_tokens(current_expert_idx) : 0u;
+            segment_end += remote_pass ? num_local - num_pulled + num_remote : num_pulled;
+          }
+          if (current_expert_idx >= kNumExpertsPerRank) break;
+          if (old_expert_idx != current_expert_idx)
+            load_rank_counts(current_expert_idx, stored_rank_count);
+
+          // Remote rows first: any last block beyond ceil(R / BM) contains
+          // only local leftovers and belongs behind every remote-dependent task.
+          const uint32_t segment_row = row - segment_start;
+          const uint32_t remote_rows = remote_pass ? num_remote : 0u;
+          const uint32_t token_idx =
+              remote_pass ? (segment_row < remote_rows ? segment_row : num_pulled + segment_row)
+                          : segment_row;
+          const uint32_t expert_start_idx = 0;
+#include <flashinfer/megamoe/detail/dispatch_rank_selection.inl>
+          pull_row(current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank,
+                   block_offset * BLOCK_M + segment_row, block_offset + segment_row / BLOCK_M);
+        }
+      };
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+      if (warp_idx < kNumActiveDispatchWarps) pull_pass(false);
+      remote_publish_by_proxy();
+      interleaved_scheduler.fetch_remote_rows();
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+
+      if (warp_idx < kNumActiveDispatchWarps) pull_pass(true);
     }
-    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-      empty_barriers[stage_idx]->wait(phase ^ 1);
 
-      if (cute::elect_one_sync()) {
-        if (has_valid_m) {
-          const uint32_t m_idx = pool_block_idx * BLOCK_M;
-          const uint32_t k_idx = k_block_idx * BLOCK_K;
+    // In-kernel weight copy: the dispatch warps are idle from the end of the token
+    // pull until the combine, the whole GEMM phase, so they copy the changed
+    // redundant expert slots now. The scheduler visits local experts in index
+    // order and the redundant slots are the last ones, so their tasks follow every
+    // resident expert's and the weight loader rarely waits.
+    if constexpr (kInKernelWeightCopy) {
+      eplb::in_kernel_copy_share<kNumRanks, kNumDispatchThreads>(
+          in_kernel_copy, sm_idx, kNumSMs, thread_idx,
+          [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+    }
 
-          // TMA load A
-          tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-              tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 1);
+    // Inter-node: the mirror duty of the combine, while the GEMM still runs the
+    // blocks that need no return (after the weight copy: the loader waits on it).
+    remote_early_return();
 
-          if constexpr (!kBlockIsL2 || !kSplitMDecodedWeightReuse) {
-            tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
-                                            smem_sfa[stage_idx], m_idx, k_block_idx, 1);
-            full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE +
-                                                           BLOCK_M * sizeof(float));
-          } else {
-            // BN128 L1 produces per-64 activation scales. L2
-            // consumes both scale groups for each BK128 tile.
-            tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
-                                            smem_sfa[stage_idx], m_idx, k_block_idx * 2, 1);
-            tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
-                                            smem_sfa[stage_idx] + kL2SFAHalfStride, m_idx,
-                                            k_block_idx * 2 + 1, 1);
-            full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE +
-                                                           2 * BLOCK_M * sizeof(float));
+    // Cleanup workspace, overlapping with combine
+    ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+    cleanup_workspace();
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex,
+                         kAfterWorkspaceCleanBarrierTag, kNumLocalRanks>(
+        workspace, sym_buffer, sm_idx, thread_idx,
+        [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, true, false);
+    if constexpr (kNumRemoteNodes > 0) {
+      // Signal targets of the next launch; every CTA read the epoch at entry.
+      if (sm_idx == 0 and thread_idx == 0) *remote.launch_epoch() = launch_epoch + 1;
+    }
+    // In-kernel weight copy: the copy list is consumed. Every CTA of every rank
+    // has passed the barrier above, so none can still be reading it: the copier
+    // reads `copy_count` before its first copy, and the weight-loader warp reads
+    // it once, before its first bulk copy, so on every CTA with a GEMM task that
+    // read precedes the epilogue's last stage, the dispatch-epilogue barrier and
+    // this CTA's arrival at the grid barrier; a CTA without a task never waits on
+    // a slot. The slot readiness itself is published through `copy_done`, which
+    // the planner resets per listed slot, not through this counter.
+    if constexpr (kInKernelWeightCopy) {
+      if (sm_idx == 0 and thread_idx == 0) *in_kernel_copy.copy_count = 0;
+    }
+  } else if (warp_idx == kNumDispatchWarps) {
+    // =====================================================================
+    // ROLE 2: GEMM TMA LOAD warps (load A+SFA, B+SFB)
+    //   The two warps inside `kNumNonEpilogueThreads` load A + SFA and
+    //   B + SFB, respectively.
+    // =====================================================================
+
+    const auto load_a_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
+                                 const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
+                                 const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
+                                 const uint32_t& valid_m, const bool& remote_dependent) {
+      using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
+      constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
+      const auto tensor_map_a_ptr = kBlockIsL2 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
+      const auto tensor_map_sfa_ptr = kBlockIsL2 ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
+
+      const bool has_valid_m = valid_m > 0;
+
+      // Wait for the pool to be ready.
+      if (has_valid_m) {
+        if constexpr (!kBlockIsL2) {
+          const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
+          while (ptx::ld_acq(ptr) != valid_m) {
           }
         } else {
-          full_barriers[stage_idx]->arrive();
+          const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+          const uint64_t expected =
+              (kNumRoutedL1BlockNs >= 64) ? ~0ull : ((1ull << kNumRoutedL1BlockNs) - 1ull);
+          while (ptx::ld_acq_gpu(ptr) != expected) {
+          }
         }
       }
-      __syncwarp();
-    }
-  };
-  if constexpr (kUseInterleavedScheduler)
-    for_each_published_block(load_a_task);
-  else
-    for_each_static_selected_block(load_a_task);
+      if constexpr (kNumRemoteNodes > 0) {
+        if (has_valid_m) asm volatile("fence.proxy.async.global;" ::: "memory");
+      }
+      for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+        empty_barriers[stage_idx]->wait(phase ^ 1);
 
-} else if (warp_idx == kNumDispatchWarps + 1) {
-  cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if (cute::elect_one_sync()) {
+          if (has_valid_m) {
+            const uint32_t m_idx = pool_block_idx * BLOCK_M;
+            const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-  // In-kernel weight copy: redundant expert slots still being written in this
-  // launch, one mask per plane group (L1, L2), held in two scalar registers (an
-  // indexed array would go to local memory, and this warp runs inside the
-  // loader register budget). A bit is cleared once the slot's group has been
-  // seen complete; a zero mask is the common case and costs one predicated
-  // branch per task.
-  uint32_t eplb_pending_l1 = 0u, eplb_pending_l2 = 0u;
-  if constexpr (kInKernelWeightCopy) {
-    eplb_pending_l1 = eplb::in_kernel_copy_pending_mask(in_kernel_copy);
-    eplb_pending_l2 = eplb_pending_l1;
-  }
+            // TMA load A
+            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 1);
 
-  const auto load_b_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
-                               const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
-                               const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
-                               const uint32_t& valid_m, const bool& remote_dependent) {
-    using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
-    constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
-    const uint8_t* b_base = kBlockIsL2 ? l2_weights : l1_weights;
-    constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
-    // One tile is `kBTileRows` fused rows laid out contiguously, so a
-    // stage is `BLOCK_N / kBTileRows` bulk copies of adjacent tiles.
-    constexpr uint32_t kNumTileLoads = LOAD_BLOCK_N / kBTileRows;
-    constexpr uint32_t kNumNTiles = shape_n / kBTileRows;
+            if constexpr (!kBlockIsL2 || !kSplitMDecodedWeightReuse) {
+              tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                              smem_sfa[stage_idx], m_idx, k_block_idx, 1);
+              full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE +
+                                                             BLOCK_M * sizeof(float));
+            } else {
+              // BN128 L1 produces per-64 activation scales. L2
+              // consumes both scale groups for each BK128 tile.
+              tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                              smem_sfa[stage_idx], m_idx, k_block_idx * 2, 1);
+              tma::copy<BLOCK_M, 1, 0, float>(tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                              smem_sfa[stage_idx] + kL2SFAHalfStride, m_idx,
+                                              k_block_idx * 2 + 1, 1);
+              full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE +
+                                                             2 * BLOCK_M * sizeof(float));
+            }
+          } else {
+            full_barriers[stage_idx]->arrive();
+          }
+        }
+        __syncwarp();
+      }
+    };
+    if constexpr (kUseInterleavedScheduler)
+      for_each_published_block(load_a_task);
+    else
+      for_each_static_selected_block(load_a_task);
 
+  } else if (warp_idx == kNumDispatchWarps + 1) {
+    // In-kernel weight copy: redundant expert slots still being written in this
+    // launch, one mask per plane group (L1, L2), held in two scalar registers (an
+    // indexed array would go to local memory, and this warp runs inside the
+    // loader register budget). A bit is cleared once the slot's group has been
+    // seen complete; a zero mask is the common case and costs one predicated
+    // branch per task.
+    uint32_t eplb_pending_l1 = 0u, eplb_pending_l2 = 0u;
     if constexpr (kInKernelWeightCopy) {
-      constexpr uint32_t group = kBlockIsL2 ? 1u : 0u;
-      uint32_t& pending = kBlockIsL2 ? eplb_pending_l2 : eplb_pending_l1;
-      if (pending != 0u and local_expert_idx >= eplb_num_resident_experts) {
-        const uint32_t slot = local_expert_idx - eplb_num_resident_experts;
-        if ((pending >> slot) & 1u) {
-          // Every lane acquires, so whichever lane is elected to issue the bulk
-          // copies is ordered after the copy.
-          eplb::in_kernel_copy_wait_slot(in_kernel_copy.copy_done + slot * 2 + group, kNumSMs);
-          __syncwarp();
-          pending &= ~(1u << slot);
-        }
-      }
+      eplb_pending_l1 = eplb::in_kernel_copy_pending_mask(in_kernel_copy);
+      eplb_pending_l2 = eplb_pending_l1;
     }
 
-    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-      empty_barriers[stage_idx]->wait(phase ^ 1);
+    const auto load_b_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
+                                 const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
+                                 const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
+                                 const uint32_t& valid_m, const bool& remote_dependent) {
+      using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
+      constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
+      const uint8_t* b_base = kBlockIsL2 ? l2_weights : l1_weights;
+      constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
+      // One tile is `kBTileRows` fused rows laid out contiguously, so a
+      // stage is `BLOCK_N / kBTileRows` bulk copies of adjacent tiles.
+      constexpr uint32_t kNumTileLoads = LOAD_BLOCK_N / kBTileRows;
+      constexpr uint32_t kNumNTiles = shape_n / kBTileRows;
 
-      const uint32_t n_tile_idx = local_expert_idx * kNumNTiles + n_block_idx * kNumTileLoads;
-      if (cute::elect_one_sync()) {
+      if constexpr (kInKernelWeightCopy) {
+        constexpr uint32_t group = kBlockIsL2 ? 1u : 0u;
+        uint32_t& pending = kBlockIsL2 ? eplb_pending_l2 : eplb_pending_l1;
+        if (pending != 0u and local_expert_idx >= eplb_num_resident_experts) {
+          const uint32_t slot = local_expert_idx - eplb_num_resident_experts;
+          if ((pending >> slot) & 1u) {
+            // Every lane acquires, so whichever lane is elected to issue the bulk
+            // copies is ordered after the copy.
+            eplb::in_kernel_copy_wait_slot(in_kernel_copy.copy_done + slot * 2 + group, kNumSMs);
+            __syncwarp();
+            pending &= ~(1u << slot);
+          }
+        }
+      }
+
+      for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+        empty_barriers[stage_idx]->wait(phase ^ 1);
+
+        const uint32_t n_tile_idx = local_expert_idx * kNumNTiles + n_block_idx * kNumTileLoads;
+        if (cute::elect_one_sync()) {
 #pragma unroll
-        for (uint32_t i = 0; i < kNumTileLoads; ++i) {
-          const uint64_t tile_idx =
-              static_cast<uint64_t>(n_tile_idx + i) * num_k_blocks + k_block_idx;
-          // EVICT_NORMAL, not tma_load_1d's streaming default:
-          // above the swapAB tiers an expert spans several
-          // m-blocks, and those CTAs share these tiles via L2.
-          ptx::tma_load_1d(smem_packed_b[stage_idx] + i * kBTileBytes,
-                           b_base + tile_idx * kBTileBytes, full_barriers[stage_idx], kBTileBytes,
-                           cute::TMA::CacheHintSm90::EVICT_NORMAL);
+          for (uint32_t i = 0; i < kNumTileLoads; ++i) {
+            const uint64_t tile_idx =
+                static_cast<uint64_t>(n_tile_idx + i) * num_k_blocks + k_block_idx;
+            constexpr auto cache_hint = kWeightTileBytes == 8704
+                                            ? cute::TMA::CacheHintSm90::EVICT_NORMAL
+                                            : ((kWeightTileBytes == 8448 && kNumRanks == 16 &&
+                                                kNumMaxTokensPerRank == 2 && kBlockIsL2)
+                                                   ? cute::TMA::CacheHintSm90::EVICT_LAST
+                                                   : cute::TMA::CacheHintSm90::EVICT_FIRST);
+            ptx::tma_load_1d(smem_packed_b[stage_idx] + i * kBTileBytes,
+                             b_base + tile_idx * kBTileBytes, full_barriers[stage_idx], kBTileBytes,
+                             cache_hint);
+          }
+          full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_PACKED_B_SIZE_PER_STAGE);
         }
-        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_PACKED_B_SIZE_PER_STAGE);
+        __syncwarp();
       }
-      __syncwarp();
-    }
-  };
-  if constexpr (kUseInterleavedScheduler)
-    produce_interleaved_blocks(load_b_task);
-  else
-    for_each_static_selected_block(load_b_task);
-
+    };
+    if constexpr (kUseInterleavedScheduler)
+      produce_interleaved_blocks(load_b_task);
+    else
+      for_each_static_selected_block(load_b_task);
+  }
 } else if (kSplitDecodeWarps and warp_idx < kFirstMathWarp) {
   // =====================================================================
   // ROLE 3a: DECODE WARPS (FP4 -> FP8 into the decoded ring)
@@ -968,11 +994,7 @@ if (warp_idx < kNumDispatchWarps) {
                                    const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
                                    const uint32_t& valid_m, const bool& remote_dependent) {
     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-      {
-        const unsigned long long w0 = stamp_now();
-        full_barriers[stage_idx]->wait(phase);
-        if (decode_thread_idx == 0) stamp_add(24, stamp_now() - w0);
-      }
+      full_barriers[stage_idx]->wait(phase);
       if constexpr (kUseInterleavedScheduler) {
         if (k_block_idx == 0) interleaved_scheduler.release_task_info(lane_idx);
       }
@@ -1051,7 +1073,6 @@ if (warp_idx < kNumDispatchWarps) {
                                  (epilogue_warp_idx / kNumActiveDispatchWarps) * kChunkStride;
     remote_pack_tokens(first_chunk * kNumTokensPerWarp,
                        kWarpsPerDispatchWarp * kChunkStride * kNumTokensPerWarp);
-    if (epilogue_thread_idx == 0) stamp_max(18);
     ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
   }
 
@@ -1062,8 +1083,6 @@ if (warp_idx < kNumDispatchWarps) {
                                  const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                  const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
                                  const uint32_t& valid_m, const bool& remote_dependent) {
-    const unsigned long long task_t0 = stamp_now();
-    if (epilogue_thread_idx == 0) stamp_min(3);
     const uint32_t m_idx = pool_block_idx * BLOCK_M;
     const uint32_t wg_n_idx = kSplitMDecodedWeightReuse ? 0u : epilogue_wg_idx * WG_BLOCK_N;
     const uint32_t wg_l1_out_n_idx =
@@ -1082,9 +1101,7 @@ if (warp_idx < kNumDispatchWarps) {
     // landed. A read at task start raced the copy and could apply the slot's
     // previous scale. Resident slots are never written by a copy, so their
     // scale is read through the non-coherent path at task start, as in the
-    // kernel without the copy, and the load hides behind the main loop. (A
-    // coherent load after the loop on every task cost about 3% of the L2 task
-    // time; pinning the load into the first k-block slowed every task by 2%.)
+    // kernel without the copy, and the load hides behind the main loop.
     const bool scale_after_loop =
         kInKernelWeightCopy and local_expert_idx >= eplb_num_resident_experts;
     const auto load_global_scale = [&](const float* scales) -> float {
@@ -1107,26 +1124,28 @@ if (warp_idx < kNumDispatchWarps) {
     constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
     float final_accum[kAccumPerThread] = {};
     const auto decode_b_stage = [&](const uint32_t& packed_stage, const uint32_t& decoded_slot) {
-      if constexpr (kSplitMDecodedWeightReuse) {
-        // Both M64 consumers share the same decoded N128 tile.
-        // The two physical decoded slots remove the overwrite
-        // hazard; the trailing pair barrier publishes K+1 before
-        // either consumer issues its WGMMA.
-        FI_MEGAMOE_STATIC_ASSERT(kUseMode2RowDecoder,
-                                 "BM128 split-M uses the cooperative Mode2 decoder");
-        flashinfer::megamoe::mxfp4::dequant_smem_b_from_packed_mode2_nibble_split_m(
-            reinterpret_cast<uint8_t*>(smem_b[decoded_slot]),
-            reinterpret_cast<const uint8_t*>(smem_packed_b[packed_stage]), epilogue_thread_idx,
-            smem_mxfp4_lut);
-        cutlass::arch::fence_view_async_shared();
-        asm volatile("bar.sync %0, %1;" : : "n"(kSplitMDecodeBarrierIdx), "n"(256) : "memory");
-      } else {
-        flashinfer::megamoe::mxfp4::dequant_smem_b_from_packed_mode2_nibble<kQuadDequantIlp>(
-            reinterpret_cast<uint8_t*>(smem_b[decoded_slot]),
-            reinterpret_cast<const uint8_t*>(smem_packed_b[packed_stage]), epilogue_thread_idx,
-            smem_mxfp4_lut);
-        cutlass::arch::fence_view_async_shared();
-        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+      if constexpr (kWeightTileBytes == 8704) {
+        if constexpr (kSplitMDecodedWeightReuse) {
+          // Both M64 consumers share the same decoded N128 tile.
+          // The two physical decoded slots remove the overwrite
+          // hazard; the trailing pair barrier publishes K+1 before
+          // either consumer issues its WGMMA.
+          FI_MEGAMOE_STATIC_ASSERT(kUseMode2RowDecoder,
+                                   "BM128 split-M uses the cooperative Mode2 decoder");
+          flashinfer::megamoe::mxfp4::dequant_smem_b_from_packed_mode2_nibble_split_m(
+              reinterpret_cast<uint8_t*>(smem_b[decoded_slot]),
+              reinterpret_cast<const uint8_t*>(smem_packed_b[packed_stage]), epilogue_thread_idx,
+              smem_mxfp4_lut);
+          cutlass::arch::fence_view_async_shared();
+          asm volatile("bar.sync %0, %1;" : : "n"(kSplitMDecodeBarrierIdx), "n"(256) : "memory");
+        } else {
+          flashinfer::megamoe::mxfp4::dequant_smem_b_from_packed_mode2_nibble<kQuadDequantIlp>(
+              reinterpret_cast<uint8_t*>(smem_b[decoded_slot]),
+              reinterpret_cast<const uint8_t*>(smem_packed_b[packed_stage]), epilogue_thread_idx,
+              smem_mxfp4_lut);
+          cutlass::arch::fence_view_async_shared();
+          ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+        }
       }
     };
 
@@ -1136,25 +1155,67 @@ if (warp_idx < kNumDispatchWarps) {
     // this path allocates no decoded-B tile at all.
     const auto decode_rs_half = [&](const uint32_t& rs_stage, const uint32_t& half,
                                     uint32_t(&a_frag)[4][4]) {
-      const uint32_t frag_row0 = wg_n_idx + half * 64u + warp_idx_in_wg * 16u + row_idx;
-      const uint32_t decode_row = frag_row0 + ((lane_idx & 1u) << 3);
-      const uint32_t word_sel = (lane_idx >> 1) & 1u;
-      const bool keep_hi = (lane_idx & 1u) == 0;
-      const auto src = mxfp4::decode_tile_row(
-          reinterpret_cast<const uint8_t*>(smem_packed_b[rs_stage]), decode_row);
-      const uint32_t scale_word = ptx::ld_shared(reinterpret_cast<const uint32_t*>(src.scale));
+      // Register decode adapted from GC-MoE; see LICENSE.GC-MoE.
+      if constexpr (kWeightTileBytes == 8448) {
+        const uint8_t* record =
+            reinterpret_cast<const uint8_t*>(smem_packed_b[rs_stage]) + (wg_n_idx / 128u) * 8448u;
+        const uint8_t* words = record + half * 4096u + warp_idx_in_wg * 1024u + lane_idx * 16u;
+        const uint8_t* sfptr =
+            record + 8192u + half * 128u + warp_idx_in_wg * 32u + (lane_idx / 4u) * 4u;
+        uint32_t packed[8], sf;
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3},[%4];"
+                     : "=r"(packed[0]), "=r"(packed[1]), "=r"(packed[2]), "=r"(packed[3])
+                     : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(words)))
+                     : "memory");
+        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3},[%4];"
+                     : "=r"(packed[4]), "=r"(packed[5]), "=r"(packed[6]), "=r"(packed[7])
+                     : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(words + 512u)))
+                     : "memory");
+        sf = ptx::ld_shared(reinterpret_cast<const uint32_t*>(sfptr));
+#pragma unroll
+        for (uint32_t group = 0; group < 4; ++group) {
+#pragma unroll
+          for (uint32_t row_pair = 0; row_pair < 2; ++row_pair) {
+            const uint32_t exponent = (sf >> (4u * group + 16u * row_pair)) & 15u;
+            const uint32_t lo = exponent * 0x08080800u + 0x0c080000u;
+            const uint32_t hi = exponent * 0x08080808u + 0x1c181410u;
+            const uint32_t word = packed[group * 2u + row_pair];
+            const uint32_t magnitude = word & 0x77777777u;
+            uint32_t first, second;
+            asm("prmt.b32 %0,%1,%2,%3;" : "=r"(first) : "r"(lo), "r"(hi), "r"(magnitude));
+            asm("prmt.b32 %0,%1,%2,%3;" : "=r"(second) : "r"(lo), "r"(hi), "r"(magnitude >> 16u));
+            asm("lop3.b32 %0,%1,0x80808080,%2,0xea;"
+                : "=r"(a_frag[group][row_pair])
+                : "r"(word << 4u), "r"(first));
+            asm("lop3.b32 %0,%1,0x80808080,%2,0xea;"
+                : "=r"(a_frag[group][row_pair + 2u])
+                : "r"(word), "r"(second));
+          }
+#pragma unroll
+          for (uint32_t i = 0; i < 4; ++i) mma::sm90::warpgroup_fence_operand(a_frag[group][i]);
+        }
+
+      } else {
+        const uint32_t frag_row0 = wg_n_idx + half * 64u + warp_idx_in_wg * 16u + row_idx;
+        const uint32_t decode_row = frag_row0 + ((lane_idx & 1u) << 3);
+        const uint32_t word_sel = (lane_idx >> 1) & 1u;
+        const bool keep_hi = (lane_idx & 1u) == 0;
+        const auto src = mxfp4::decode_tile_row(
+            reinterpret_cast<const uint8_t*>(smem_packed_b[rs_stage]), decode_row);
+        const uint32_t scale_word = ptx::ld_shared(reinterpret_cast<const uint32_t*>(src.scale));
 
 #pragma unroll
-      for (uint32_t slice = 0; slice < 4; ++slice) {
-        const auto* __restrict__ chunk =
-            src.chunk + slice * mxfp4::kBChunkStride + word_sel * sizeof(uint32_t);
-        const uint32_t w_lo = ptx::ld_shared(reinterpret_cast<const uint32_t*>(chunk));
-        const uint32_t w_hi = ptx::ld_shared(reinterpret_cast<const uint32_t*>(chunk + 8u));
-        const auto lut =
-            mxfp4::load_scaled_lut(smem_mxfp4_lut, (scale_word >> (slice * 8u)) & 0xffu);
-        mxfp4::dequant_rs_word_pair(w_lo, w_hi, lut, keep_hi, a_frag[slice]);
+        for (uint32_t slice = 0; slice < 4; ++slice) {
+          const auto* __restrict__ chunk =
+              src.chunk + slice * mxfp4::kBChunkStride + word_sel * sizeof(uint32_t);
+          const uint32_t w_lo = ptx::ld_shared(reinterpret_cast<const uint32_t*>(chunk));
+          const uint32_t w_hi = ptx::ld_shared(reinterpret_cast<const uint32_t*>(chunk + 8u));
+          const auto lut =
+              mxfp4::load_scaled_lut(smem_mxfp4_lut, (scale_word >> (slice * 8u)) & 0xffu);
+          mxfp4::dequant_rs_word_pair(w_lo, w_hi, lut, keep_hi, a_frag[slice]);
 #pragma unroll
-        for (uint32_t i = 0; i < 4; ++i) mma::sm90::warpgroup_fence_operand(a_frag[slice][i]);
+          for (uint32_t i = 0; i < 4; ++i) mma::sm90::warpgroup_fence_operand(a_frag[slice][i]);
+        }
       }
     };
     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -1164,9 +1225,10 @@ if (warp_idx < kNumDispatchWarps) {
       // reading. Every other plan decodes and consumes inside one
       // iteration and has a single slot.
       const uint32_t b_slot =
-          kSplitDecodeWarps ? b_ring_idx : (kSplitMDecodedWeightReuse ? stage_idx : 0u);
+          kWeightTileBytes == 16384
+              ? stage_idx
+              : (kSplitDecodeWarps ? b_ring_idx : (kSplitMDecodedWeightReuse ? stage_idx : 0u));
       {
-        const unsigned long long w0 = stamp_now();
         if constexpr (kSplitDecodeWarps) {
           // The decode warps own the packed stage and its release,
           // so wait on the decoded tile rather than the TMA.
@@ -1174,7 +1236,6 @@ if (warp_idx < kNumDispatchWarps) {
         } else {
           full_barriers[stage_idx]->wait(phase);
         }
-        if (epilogue_thread_idx == 0) stamp_add(26, stamp_now() - w0);
       }
       if constexpr (kUseInterleavedScheduler) {
         if (k_block_idx == 0) interleaved_scheduler.release_task_info(lane_idx);
@@ -1203,9 +1264,6 @@ if (warp_idx < kNumDispatchWarps) {
                                      "BN256 swapAB splits the weight tile into two halves");
             float swap_accum[2][kSwapAccum];
 
-            // The two halves are independent WGMMA groups, so issue both and only
-            // then wait. The window between the last issue and the first wait is
-            // where the next K-block's dequant hides.
             using RSWGMMA = typename mma::sm90::FP8RSMMASelector<N_SWAP>::type;
             // One fragment set per half. Under RS the decode sits
             // between the stage barrier and the WGMMA, so giving
@@ -1270,7 +1328,7 @@ if (warp_idx < kNumDispatchWarps) {
               }
             };
 
-            if constexpr (kUseRSOperand) {
+            if constexpr (kUseRSOperand || kWeightTileBytes == 16384) {
               issue_half(0);
               issue_half(1);  // decodes under half 0's MMA
               ptx::warpgroup_wait<1>();
@@ -1371,9 +1429,6 @@ if (warp_idx < kNumDispatchWarps) {
                                      "BN256 swapAB splits the weight tile into two halves");
             float swap_accum[2][kSwapAccum];
 
-            // The two halves are independent WGMMA groups, so issue both and only
-            // then wait. The window between the last issue and the first wait is
-            // where the next K-block's dequant hides.
             using RSWGMMA = typename mma::sm90::FP8RSMMASelector<N_SWAP>::type;
             // One fragment set per half. Under RS the decode sits
             // between the stage barrier and the WGMMA, so giving
@@ -1438,7 +1493,7 @@ if (warp_idx < kNumDispatchWarps) {
               }
             };
 
-            if constexpr (kUseRSOperand) {
+            if constexpr (kUseRSOperand || kWeightTileBytes == 16384) {
               issue_half(0);
               issue_half(1);  // decodes under half 0's MMA
               ptx::warpgroup_wait<1>();
@@ -1581,10 +1636,6 @@ if (warp_idx < kNumDispatchWarps) {
       if (remote_dependent and epilogue_thread_idx == 0)
         ptx::red_add_rel(workspace.get_remote_l2_done_ptr(), 1u);
     }
-    if (epilogue_thread_idx == 0) {
-      stamp_add(kBlockIsL2 ? 22u : 20u, stamp_now() - task_t0);
-      stamp_max(kBlockIsL2 ? 5u : 4u);
-    }
   };
   if constexpr (kUseInterleavedScheduler)
     for_each_published_block(run_math_task);
@@ -1598,7 +1649,6 @@ if (warp_idx < kNumDispatchWarps) {
                        kBeforeCombineReduceBarrierTag, kNumLocalRanks>(
       workspace, sym_buffer, sm_idx, epilogue_thread_idx,
       [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); });
-  if (epilogue_thread_idx == 0) stamp_max(6);
 
   // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
   // dispatch may now safely clean workspace state.
@@ -1611,14 +1661,14 @@ if (warp_idx < kNumDispatchWarps) {
 // These are function fragments: sizing declarations must precede the combine body.
 // clang-format off
 #define FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES 1
+constexpr bool kLocalCombineStripe8 =
+    kWeightTileBytes == 8448 && kNumMaxTokensPerRank <= 2;
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
 #undef FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES
   // clang-format on
-  if (epilogue_thread_idx == 0) stamp_max(15);
   remote_wait_return();
   remote_add_returns();
-  if (epilogue_thread_idx == 0) stamp_max(7);
 }
 #else
 if (blockIdx.x == 0 and threadIdx.x == 0)

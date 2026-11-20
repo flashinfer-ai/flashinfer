@@ -1,3 +1,5 @@
+constexpr bool kReturnRowCTA = kWeightTileBytes != 8704;
+
 // Inter-node part of the combine (MXFP4 fused kernel), included inside ROLE 3
 // after the node-local combine barrier. The mirror duty (reduce the outbox rows
 // of the mirrored source and put them back) ran on the dispatch warps during
@@ -17,8 +19,13 @@ const auto remote_wait_return = [&]() {
       comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
       for (uint32_t j = 0; j < kNumRemoteNodes; ++j)
-        io.wait(j, remote.return_flag(j), comm::remote_return_signal(j), launch_epoch + 1);
-      stamp_max(14);
+        io.wait(j, remote.return_flag(j), launch_epoch + 1);
+    }
+    if constexpr (kReturnRowCTA) {
+      // Full completion, not .read: all first-pass y writes complete before
+      // the original pre-grid CTA barrier and GPU release/acquire grid.
+      if (cute::elect_one_sync()) ptx::tma_store_wait<0>();
+      __syncwarp();
     }
     comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() {
       ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -26,17 +33,22 @@ const auto remote_wait_return = [&]() {
   }
 };
 
-// Second combine pass: y[token] += returned row of every remote node that
-// holds a slot for the token. Same token-to-warp map as the first pass, so
-// each warp only touches rows it wrote itself.
+// Prepared formats assign each row to one CTA after all first-pass TMA stores
+// complete and the grid synchronizes. Canonical weights retain same-warp row
+// ownership and wait for those stores after the grid. Both use the same
+// ordered per-column BF16/FP32 accumulation.
 const auto remote_add_returns = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     constexpr uint32_t kRowBytes = kHidden * sizeof(nv_bfloat16);
     constexpr uint32_t kUint4PerRow = kRowBytes / sizeof(uint4);
-    if (cute::elect_one_sync()) ptx::tma_store_wait<0>();
-    __syncwarp();
-    for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
-         token_idx < num_tokens; token_idx += kNumSMs * kNumEpilogueWarps) {
+    if constexpr (!kReturnRowCTA) {
+      if (cute::elect_one_sync()) ptx::tma_store_wait<0>();
+      __syncwarp();
+    }
+    const uint32_t first_token =
+        kReturnRowCTA ? sm_idx : sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
+    constexpr uint32_t token_stride = kReturnRowCTA ? kNumSMs : kNumSMs * kNumEpilogueWarps;
+    for (uint32_t token_idx = first_token; token_idx < num_tokens; token_idx += token_stride) {
       uint32_t mask = 0;
       int32_t slots[kNumRemoteNodes];
 #pragma unroll
@@ -47,7 +59,9 @@ const auto remote_add_returns = [&]() {
       if (mask == 0) continue;
       auto* row = reinterpret_cast<uint4*>(
           math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kRowBytes));
-      for (uint32_t c = lane_idx; c < kUint4PerRow; c += 32) {
+      const uint32_t first_col = kReturnRowCTA ? epilogue_warp_idx * 32u + lane_idx : lane_idx;
+      constexpr uint32_t col_stride = kReturnRowCTA ? 256u : 32u;
+      for (uint32_t c = first_col; c < kUint4PerRow; c += col_stride) {
         uint4 v = row[c];
         auto* pairs = reinterpret_cast<nv_bfloat162*>(&v);
         float2 acc[4];

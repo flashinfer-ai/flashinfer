@@ -97,8 +97,8 @@ int64_t megamoe_sm90_transport_create(int64_t comm_pointer, int64_t rank, int64_
   int runtime_version = 0;
   check_nccl(ncclGetVersion(&runtime_version), "ncclGetVersion");
   TVM_FFI_ICHECK(runtime_version == NCCL_VERSION_CODE)
-      << "the NCCL runtime (" << runtime_version << ") differs from the headers this module was built with ("
-      << NCCL_VERSION_CODE << ")";
+      << "the NCCL runtime (" << runtime_version
+      << ") differs from the headers this module was built with (" << NCCL_VERSION_CODE << ")";
 
   auto s = std::make_unique<Session>();
   s->comm = reinterpret_cast<ncclComm_t>(comm_pointer);
@@ -108,14 +108,15 @@ int64_t megamoe_sm90_transport_create(int64_t comm_pointer, int64_t rank, int64_
   if (gin_contexts > 0) {
     ncclDevCommRequirements_t requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     requirements.ginContextCount = static_cast<int>(gin_contexts);
-    requirements.ginSignalCount = static_cast<int>(gin_signals);
+    requirements.ginSignalCount = static_cast<int>(gin_signals > 0 ? gin_signals : 1);
     requirements.worldGinBarrierCount = static_cast<int>(gin_barriers);
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     requirements.ginStrongSignalsRequired = true;
     check_nccl(ncclDevCommCreate(s->comm, &requirements, &s->host_dev_comm), "ncclDevCommCreate");
     s->has_dev_comm = true;
     TVM_FFI_ICHECK(s->host_dev_comm.ginContextCount > 0)
-        << "the communicator offers no GIN context (no GPU-initiated network path between the ranks)";
+        << "the communicator offers no GIN context (no GPU-initiated network path between the "
+           "ranks)";
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&s->device_dev_comm), sizeof(ncclDevComm_t)),
                "cudaMalloc(dev comm)");
     check_cuda(cudaMemcpy(s->device_dev_comm, &s->host_dev_comm, sizeof(ncclDevComm_t),

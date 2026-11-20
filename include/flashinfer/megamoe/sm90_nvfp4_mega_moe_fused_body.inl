@@ -87,6 +87,9 @@ if (warp_idx == 0 and cute::elect_one_sync()) {
 // as a dense per-128 layout so no framework allocation change is needed.
 // =====================================================================
 #include <flashinfer/megamoe/detail/buffers.inl>
+const auto map_combine = [&](const auto& ptr, const uint32_t& dst_rank_idx) {
+  return sym_buffer.map(ptr, dst_rank_idx);
+};
 
 // =====================================================================
 // GEMM data types and shape constants
@@ -1587,8 +1590,9 @@ if (warp_idx < kNumDispatchWarps) {
   // dispatch may now safely clean workspace state.
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-// These are function fragments: sizing declarations must precede the combine body.
-// clang-format off
+  // These are function fragments: sizing declarations must precede the combine body.
+  // clang-format off
+constexpr bool kLocalCombineStripe8 = false;
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
   // clang-format on

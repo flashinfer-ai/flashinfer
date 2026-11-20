@@ -385,12 +385,12 @@ if constexpr (!kBlockIsL2) {
         const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
         auto dst_ptr = math::advance_ptr<uint4>(
             dst_token.get_base_ptr(), n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
-        *sym_regions.map_combine(dst_ptr, dst_rank_idx) = packed;
+        *map_combine(dst_ptr, dst_rank_idx) = packed;
       } else {
         const auto packed = *reinterpret_cast<uint2*>(smem_ptr);
         auto dst_ptr = math::advance_ptr<uint2>(
             dst_token.get_base_ptr(), n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint2));
-        *sym_regions.map_combine(dst_ptr, dst_rank_idx) = packed;
+        *map_combine(dst_ptr, dst_rank_idx) = packed;
       }
     }
     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -412,7 +412,7 @@ if constexpr (!kBlockIsL2) {
             combine_token_buffer.get_rank_buffer(dst_topk_idx).get_data_buffer(dst_token_idx);
         auto dst_base =
             math::advance_ptr<uint8_t>(dst_token.get_base_ptr(), n_idx * sizeof(nv_bfloat16));
-        auto mapped_dst_base = sym_regions.map_combine(dst_base, dst_rank_idx);
+        auto mapped_dst_base = map_combine(dst_base, dst_rank_idx);
 
 #pragma unroll
         for (uint32_t i = 0; i < kAccumPerThread / 8; ++i) {

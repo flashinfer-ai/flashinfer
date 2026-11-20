@@ -22,13 +22,37 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
             tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
             tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
             int64_t window_base, int64_t gin_context,
-            tvm::ffi::Optional<tvm::ffi::TensorView> phase_stamps,
             const eplb::InKernelCopy<cfg::kNumRanks>& in_kernel_copy) {
   TVM_FFI_ICHECK_EQ(symm_buffer_ptrs.size(), cfg::kNumRanks);
   TVM_FFI_ICHECK_GE(rank_idx, 0);
   TVM_FFI_ICHECK_LT(rank_idx, cfg::kNumRanks);
   TVM_FFI_ICHECK_GE(num_tokens, 1);
   TVM_FFI_ICHECK_LE(num_tokens, cfg::kNumMaxTokensPerRank);
+  TVM_FFI_ICHECK_EQ(l1_weights.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(l2_weights.ndim(), 3);
+  TVM_FFI_ICHECK_EQ(l1_weights.size(2), cfg::kWeightTileBytes);
+  TVM_FFI_ICHECK_EQ(l2_weights.size(2), cfg::kWeightTileBytes);
+  CHECK_CUDA(l1_weights);
+  CHECK_CUDA(l2_weights);
+  CHECK_CONTIGUOUS(l1_weights);
+  CHECK_CONTIGUOUS(l2_weights);
+  const DLDataType u8{kDLUInt, 8, 1};
+  TVM_FFI_ICHECK_EQ(l1_weights.dtype(), u8);
+  TVM_FFI_ICHECK_EQ(l2_weights.dtype(), u8);
+  TVM_FFI_ICHECK_EQ(l1_weights.device().device_id, y.device().device_id);
+  TVM_FFI_ICHECK_EQ(l2_weights.device().device_id, y.device().device_id);
+  TVM_FFI_ICHECK_EQ(l1_weights.size(0), cfg::kNumExperts / cfg::kNumRanks);
+  TVM_FFI_ICHECK_EQ(l2_weights.size(0), cfg::kNumExperts / cfg::kNumRanks);
+  TVM_FFI_ICHECK_EQ(l1_weights.size(1),
+                    (cfg::kIntermediateHidden * 2 / 128) * (cfg::kHidden / 128));
+  TVM_FFI_ICHECK_EQ(l2_weights.size(1), (cfg::kHidden / 128) * (cfg::kIntermediateHidden / 128));
+  if constexpr (cfg::kWeightTileBytes != 8704) {
+    TVM_FFI_ICHECK(num_tokens == 1 || num_tokens == 4 || num_tokens == 8 || num_tokens == 16 ||
+                   num_tokens == 32 || num_tokens == 64 ||
+                   (cfg::kNumRanks == 8 &&
+                    (num_tokens == 2 || (cfg::kWeightTileBytes == 16384 && num_tokens == 128))))
+        << "unsupported token count for the prepared weight format";
+  }
   const DLDataType fp8{kDLFloat8_e4m3fn, 8, 1}, f32{kDLFloat, 32, 1};
   using detail::make_tma_2d_desc;
   using detail::make_tma_sf_desc;
@@ -63,7 +87,8 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
   TVM_FFI_ICHECK_EQ(link_lsa_offsets.size(), kNumRemoteNodes);
   comm::RemoteLinks<cfg::kNumNodes - 1> remote_links{};
   for (int64_t j = 0; j < kNumRemoteNodes; ++j) {
-    TVM_FFI_ICHECK(link_ranks[j] >= 0 and link_ranks[j] < cfg::kNumRanks) << "mirror rank out of range";
+    TVM_FFI_ICHECK(link_ranks[j] >= 0 and link_ranks[j] < cfg::kNumRanks)
+        << "mirror rank out of range";
     TVM_FFI_ICHECK(link_lsa_offsets[j] != 0 or (dev_comm_ptr != 0 and window_handle != 0))
         << "a mirror rank on another host needs the GIN device communicator and window";
     remote_links.peers[j] = {static_cast<uint32_t>(link_ranks[j]),
@@ -80,19 +105,14 @@ void launch(tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
   const float* gs1 = detail::optional_tensor_ptr<const float>(l1_global_scales);
   const float* gs2 = detail::optional_tensor_ptr<const float>(l2_global_scales);
   uint32_t tokens = static_cast<uint32_t>(num_tokens);
-  // Phase stamps: 32 globaltimer slots, only read by a module built with them.
-  auto* stamps = detail::optional_tensor_ptr<unsigned long long>(phase_stamps);
-  if constexpr (cfg::kPhaseStamps) {
-    TVM_FFI_ICHECK(stamps != nullptr and phase_stamps.value().numel() >= 32)
-        << "this module records phase stamps; pass an int64 tensor of at least 32 slots";
-  }
-  void* args[] = {
-      &output,      &stats,  &tokens,
-      &sym_buffer,  &sym_regions, &remote_links,
-      &tm_l1,       &tm_l1_sf,    &tm_out,
-      &tm_l2,       &tm_l2_sf,    &w1,
-      &w2,          &gs1,         &gs2,
-      &stamps,      const_cast<eplb::InKernelCopy<cfg::kNumRanks>*>(&in_kernel_copy)};
+  void* args[] = {&output,      &stats,
+                  &tokens,      &sym_buffer,
+                  &sym_regions, &remote_links,
+                  &tm_l1,       &tm_l1_sf,
+                  &tm_out,      &tm_l2,
+                  &tm_l2_sf,    &w1,
+                  &w2,          &gs1,
+                  &gs2,         const_cast<eplb::InKernelCopy<cfg::kNumRanks>*>(&in_kernel_copy)};
   auto* kernel = reinterpret_cast<void*>(cfg::kKernel);
   TVM_FFI_ICHECK_EQ(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg::kSmemSize),
@@ -114,24 +134,21 @@ void megamoe_sm90_mxfp4_fused(
     tvm::ffi::Array<int64_t> input_block_ptrs, tvm::ffi::Array<int64_t> combine_block_ptrs,
     tvm::ffi::Array<int64_t> link_ranks, tvm::ffi::Array<int64_t> link_nodes_at_mirror,
     tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
-    int64_t window_base, int64_t gin_context,
-    tvm::ffi::Optional<tvm::ffi::TensorView> phase_stamps) {
+    int64_t window_base, int64_t gin_context) {
   TVM_FFI_ICHECK(!cfg::kInKernelWeightCopy)
       << "this module carries the in-kernel weight copy; call "
          "megamoe_sm90_mxfp4_fused_in_kernel_copy";
   launch(y, symm_buffer, symm_buffer_ptrs, rank_idx, l1_weights, l2_weights, offsets, num_tokens,
          cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, input_block_ptrs,
          combine_block_ptrs, link_ranks, link_nodes_at_mirror, link_lsa_offsets, dev_comm_ptr,
-         window_handle, window_base, gin_context, phase_stamps,
-         eplb::InKernelCopy<cfg::kNumRanks>{});
+         window_handle, window_base, gin_context, eplb::InKernelCopy<cfg::kNumRanks>{});
 }
 
 // Same launch with the in-kernel weight copy: the redundant expert slots listed
 // in `eplb_workspace` are copied from the resident ranks' arenas
 // (`arena_ptrs`) by the kernel itself. The weights and global scales are views
 // of this rank's arena; `l1_planes` / `l2_planes` are (byte offset, bytes per
-// slot) pairs of the arena planes each GEMM reads. `phase_stamps` is the slot
-// tensor of a module built with the phase stamps, None otherwise.
+// slot) pairs of the arena planes each GEMM reads.
 void megamoe_sm90_mxfp4_fused_in_kernel_copy(
     tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
     tvm::ffi::Array<int64_t> symm_buffer_ptrs, int64_t rank_idx, tvm::ffi::TensorView l1_weights,
@@ -144,8 +161,9 @@ void megamoe_sm90_mxfp4_fused_in_kernel_copy(
     tvm::ffi::Array<int64_t> link_lsa_offsets, int64_t dev_comm_ptr, int64_t window_handle,
     int64_t window_base, int64_t gin_context, tvm::ffi::TensorView eplb_workspace,
     tvm::ffi::TensorView arena, tvm::ffi::Array<int64_t> arena_ptrs, int64_t num_resident_experts,
-    tvm::ffi::Array<int64_t> l1_planes, tvm::ffi::Array<int64_t> l2_planes,
-    tvm::ffi::Optional<tvm::ffi::TensorView> phase_stamps) {
+    tvm::ffi::Array<int64_t> l1_planes, tvm::ffi::Array<int64_t> l2_planes) {
+  TVM_FFI_ICHECK(cfg::kNumNodes == 1 && cfg::kWeightTileBytes == 8704)
+      << "in-kernel expert copies require canonical weights on one node";
   TVM_FFI_ICHECK(cfg::kInKernelWeightCopy)
       << "this module has no in-kernel weight copy; call megamoe_sm90_mxfp4_fused";
   constexpr int64_t kNumExpertsPerRank = cfg::kNumExperts / cfg::kNumRanks;
@@ -175,7 +193,7 @@ void megamoe_sm90_mxfp4_fused_in_kernel_copy(
   launch(y, symm_buffer, symm_buffer_ptrs, rank_idx, l1_weights, l2_weights, offsets, num_tokens,
          cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, input_block_ptrs,
          combine_block_ptrs, link_ranks, link_nodes_at_mirror, link_lsa_offsets, dev_comm_ptr,
-         window_handle, window_base, gin_context, phase_stamps, in_kernel_copy);
+         window_handle, window_base, gin_context, in_kernel_copy);
 }
 
 }  // namespace flashinfer::megamoe

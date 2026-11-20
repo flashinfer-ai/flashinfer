@@ -260,7 +260,9 @@ class MegaMoESymmBuffer:
             self.buffer.zero_()
         else:
             if transport.group is not group:
-                raise ValueError("the transport must belong to the buffer's process group")
+                raise ValueError(
+                    "the transport must belong to the buffer's process group"
+                )
             self.window = transport.alloc_window(num_bytes)
             self.buffer = transport.window_tensor(self.window, torch.int8)
             self.handle = transport.peer_handle(self.window)
@@ -297,7 +299,9 @@ class MegaMoESymmBuffer:
             node = r // local
             if node == my_node:
                 if bases[r] == 0:
-                    raise ValueError(f"rank {r} on this node is not load/store reachable")
+                    raise ValueError(
+                        f"rank {r} on this node is not load/store reachable"
+                    )
                 input_ptrs.append(bases[r] + input_off)
                 combine_ptrs.append(bases[r] + combine_off)
             else:
@@ -315,8 +319,14 @@ class MegaMoESymmBuffer:
             link_lsa.append(bases[peer] - base if bases[peer] else 0)
         transport = self.transport
         needs_gin = any(offset == 0 for offset in link_lsa)
-        dev_comm = transport.dev_comm_pointer if (transport is not None and needs_gin) else 0
-        window = transport.window_handle(self.window) if (transport is not None and needs_gin) else 0
+        dev_comm = (
+            transport.dev_comm_pointer if (transport is not None and needs_gin) else 0
+        )
+        window = (
+            transport.window_handle(self.window)
+            if (transport is not None and needs_gin)
+            else 0
+        )
         if needs_gin and (dev_comm == 0 or window == 0):
             raise ValueError(
                 "a mirror rank on another host needs a transport created with GIN contexts"
@@ -534,6 +544,8 @@ def nvfp4_mega_moe(
     supports four or eight ranks, which must call matching families in matching order.
     """
     b = symm_buffer
+    if b.num_nodes != 1:
+        raise ValueError("NVFP4 MegaMoE supports a single node")
     m = int(num_tokens if num_tokens is not None else y.shape[0])
     _validate_call(
         y,
@@ -594,6 +606,20 @@ def nvfp4_mega_moe(
     )
 
 
+def _mxfp4_weight_tile_bytes(w1, w2):
+    """Identify matching canonical, compact or predecoded weight records."""
+    if (
+        w1.ndim != 3
+        or w2.ndim != 3
+        or w1.shape[-1] != w2.shape[-1]
+        or w1.shape[-1] not in (MXFP4_TILE_BYTES, 8448, 16384)
+    ):
+        raise ValueError(
+            "MXFP4 weights must use matching 3-D records of 8704, 8448 or 16384 bytes"
+        )
+    return w1.shape[-1]
+
+
 def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
     """Check ``y``, the expert weights and the optional per-expert tensors against the buffer geometry; raise ``ValueError`` on a mismatch."""
     if b.buffer is None:
@@ -607,13 +633,14 @@ def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
             (epr, b.hidden, b.intermediate_hidden // 128 * 80),
         )
     else:
+        tile_bytes = _mxfp4_weight_tile_bytes(w1, w2)
         shapes = (
             (
                 epr,
                 b.intermediate_hidden * 2 // 128 * (b.hidden // 128),
-                MXFP4_TILE_BYTES,
+                tile_bytes,
             ),
-            (epr, b.hidden // 128 * (b.intermediate_hidden // 128), MXFP4_TILE_BYTES),
+            (epr, b.hidden // 128 * (b.intermediate_hidden // 128), tile_bytes),
         )
     if (
         y.ndim != 2
@@ -658,7 +685,6 @@ def mxfp4_mega_moe(
     l1_global_scales: Optional[torch.Tensor] = None,
     l2_global_scales: Optional[torch.Tensor] = None,
     expert_slots: Optional[MegaMoEExpertSlots] = None,
-    phase_stamps: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run fused MXFP4 MegaMoE with chunk-major weights and FP8 activations.
 
@@ -668,7 +694,8 @@ def mxfp4_mega_moe(
         Contiguous BF16 output with shape ``[at least num_tokens, hidden]``.
         The kernel writes the first ``num_tokens`` rows in place.
     l1_weights, l2_weights : torch.Tensor
-        Packed MXFP4 weights from :func:`transform_mxfp4_weights_for_mega_moe`.
+        Weights from :func:`transform_mxfp4_weights_for_mega_moe`. Both tensors
+        must use the same canonical MXFP4, compact MXFP4 or predecoded FP8 storage.
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional
@@ -688,12 +715,7 @@ def mxfp4_mega_moe(
         from their resident ranks while it computes, and the weights and global
         scales must be the slots' arena views. The routing staged in the buffer
         must already be physical (:meth:`MegaMoEExpertSlots.remap`).
-    phase_stamps : torch.Tensor, optional
-        CUDA INT64 tensor of at least 32 slots. When given, a variant of the
-        kernel built with its phase stamps records globaltimer values of the
-        dispatch, GEMM, combine and inter-node steps into the slots (min slots
-        must start at -1, the others at 0; see the slot map in the kernel body).
-        Timing instrumentation only: the variant is slower than the shipped kernel.
+        Only single-node canonical MXFP4 storage supports expert slots.
 
     Returns
     -------
@@ -708,7 +730,10 @@ def mxfp4_mega_moe(
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
+    weight_tile_bytes = _mxfp4_weight_tile_bytes(l1_weights, l2_weights)
     if expert_slots is not None:
+        if b.num_nodes > 1 or weight_tile_bytes != MXFP4_TILE_BYTES:
+            raise ValueError("expert slots require single-node canonical MXFP4 storage")
         # The slots' arena carries the resident scales; an omitted argument
         # must not silently run the kernel without them.
         if l1_global_scales is None:
@@ -736,14 +761,15 @@ def mxfp4_mega_moe(
         b.num_max_tokens_per_rank,
         m,
         num_logical_experts=None if expert_slots is None else expert_slots.num_experts,
+        weight_tile_bytes=weight_tile_bytes,
     )
     entry = "megamoe_sm90_mxfp4_fused"
     # Positional tail of gen_megamoe_sm90_mxfp4_module: in-kernel weight copy,
-    # nodes, phase stamps.
+    # nodes, weight-record bytes.
     extra_jit_args: Tuple[Any, ...] = (
         expert_slots is not None,
         b.num_nodes,
-        phase_stamps is not None,
+        weight_tile_bytes,
     )
     # Region pointers and mirror links precede the in-kernel copy operands.
     extra_kernel_args: Tuple[Any, ...] = b._remote_args
@@ -752,15 +778,9 @@ def mxfp4_mega_moe(
             b, l1_weights, l2_weights, l1_global_scales, l2_global_scales
         )
         entry = "megamoe_sm90_mxfp4_fused_in_kernel_copy"
-        extra_kernel_args = extra_kernel_args + tuple(expert_slots._in_kernel_copy_args())
-    if phase_stamps is not None and (
-        phase_stamps.dtype != torch.int64
-        or phase_stamps.numel() < 32
-        or phase_stamps.device != y.device
-    ):
-        raise ValueError("phase_stamps must be an INT64 tensor of at least 32 slots on the output's device")
-    # The stamp slots close the operand list of both entries.
-    extra_kernel_args = extra_kernel_args + (phase_stamps,)
+        extra_kernel_args = extra_kernel_args + tuple(
+            expert_slots._in_kernel_copy_args()
+        )
     return _run_kernel(
         gen_megamoe_sm90_mxfp4_module,
         entry,
