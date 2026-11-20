@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/a003_tuned.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 // ---------------------------------------------------------------- dispatch
@@ -19,11 +21,13 @@ static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As
                              int threads, cudaStream_t s) {
   constexpr int SMEM = red_smem_bytes<NW_N, NW_K, NT, MR>();
   if constexpr (SMEM > 48 * 1024) {
-    cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    sm120_launch::check(cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM),
+                        "cudaFuncSetAttribute");
   }
   gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>
       <<<grid, threads, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+  sm120_launch::check_submission();
 }
 
 template <int NW_N, int NW_K, int NT, int KU, int ITERS, int MINB>

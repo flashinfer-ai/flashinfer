@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/a003_leader.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 void RunSpecial(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
@@ -20,6 +22,7 @@ namespace a003_leader_impl {  // reopened; the device code is in the header
                     1);                                                                           \
     gk<NWv, NWNv, NTv, MRv, KIv, MINBv>                                                           \
         <<<grid, NWv * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);                       \
+    sm120_launch::check_submission();                                                             \
     return;                                                                                       \
   } while (0)
 

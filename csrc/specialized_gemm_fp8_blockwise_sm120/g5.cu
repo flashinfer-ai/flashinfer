@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/g5.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 void LaunchExactN64Rows1(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
@@ -27,6 +29,7 @@ namespace g5_impl {  // reopened; the device code is in the header
     const dim3 grid(SWAPGv ? mc : nt, SWAPGv ? nt : mc, 1);                   \
     gk<NWv, NWNv, NTv, MRv, KIv, MINBv, SWAPGv, AMv>                          \
         <<<grid, (NWv) * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB); \
+    sm120_launch::check_submission();                                         \
     return;                                                                   \
   } while (0)
 

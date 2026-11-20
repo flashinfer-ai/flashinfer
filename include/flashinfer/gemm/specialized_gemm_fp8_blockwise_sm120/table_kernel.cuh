@@ -28,7 +28,7 @@
 
 namespace table_impl {
 
-#define MMA16832(d, a0, a1, a2, a3, b0, b1)                     \
+#define FLASHINFER_SM120_TABLE_MMA(d, a0, a1, a2, a3, b0, b1)   \
   asm volatile(                                                 \
       "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
@@ -176,7 +176,7 @@ __global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
             const uint32_t a0 = F0.v[2 * j], a2 = F0.v[2 * j + 1];
             const uint32_t a1 = (HH == 2) ? F1.v[2 * j] : z;
             const uint32_t a3 = (HH == 2) ? F1.v[2 * j + 1] : z;
-            MMA16832(d, a0, a1, a2, a3, bf[u][i].v[2 * j], bf[u][i].v[2 * j + 1]);
+            FLASHINFER_SM120_TABLE_MMA(d, a0, a1, a2, a3, bf[u][i].v[2 * j], bf[u][i].v[2 * j + 1]);
           }
           const int b = (t * NT + i) * ACT;
 #pragma unroll
@@ -266,5 +266,7 @@ constexpr int red_smem_bytes() {
   const int NACC = MT * NT * (HH * 2);
   return (NW_K > 1) ? NW_N * NW_K * NACC * 32 * static_cast<int>(sizeof(float)) : 0;
 }
+
+#undef FLASHINFER_SM120_TABLE_MMA
 
 }  // namespace table_impl

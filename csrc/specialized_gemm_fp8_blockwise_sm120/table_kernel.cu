@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/table_kernel.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 // ---------------------------------------------------------------- dispatch
@@ -18,10 +20,7 @@ namespace table_impl {  // reopened; the device code is in the header
 // successful and mark the shape warmed for capture. Successful launches are
 // never synchronized; for <<<...>>> launches the immediate error is only
 // observable through cudaGetLastError().
-static inline void check_launch(cudaError_t status) {
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "specialized sm120 fp8 gemm launch failed: " << cudaGetErrorString(status);
-}
+static inline void check_launch(cudaError_t status) { sm120_launch::check(status, "launch"); }
 
 template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB>
 static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
@@ -30,12 +29,11 @@ static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As
   constexpr int TH = NW_N * NW_K * 32;
   constexpr int SMEM = red_smem_bytes<NW_N, NW_K, NT, MR>();
   if constexpr (SMEM > 48 * 1024) {
-    cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    const cudaError_t status =
+        cudaFuncSetAttribute(gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    sm120_launch::check(status, "cudaFuncSetAttribute");
   }
-  // Clear any stale status a handled earlier error left in the per-thread
-  // slot: the post-launch check must report only THIS launch's outcome.
-  (void)cudaGetLastError();
   gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB><<<grid, TH, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
   check_launch(cudaGetLastError());
 }

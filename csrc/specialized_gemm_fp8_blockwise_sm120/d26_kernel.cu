@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/d26_kernel.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 namespace d26_impl {  // reopened; the device code is in the header
@@ -24,6 +26,7 @@ namespace d26_impl {  // reopened; the device code is in the header
       gk<NWv, NWNv, NTv, MRv, KIv, MINBv, false>                              \
           <<<grid, NWv * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB); \
     }                                                                         \
+    sm120_launch::check_submission();                                         \
     return;                                                                   \
   } while (0)
 
@@ -33,6 +36,7 @@ namespace d26_impl {  // reopened; the device code is in the header
                     (unsigned)((M + MRv - 1) / MRv), 1);                    \
     gk<NWv, NWNv, NTv, MRv, KIv, MINBv, false>                              \
         <<<grid, NWv * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB); \
+    sm120_launch::check_submission();                                       \
     return;                                                                 \
   } while (0)
 
@@ -90,8 +94,8 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Tens
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gk<16, 1, 1, 8, 1, 1, false, 8, false, true>, Ap, Bp, Asp, Bsp, Yp,
-                       M, N, K, KB);
+    sm120_launch::launch_ex(&config, gk<16, 1, 1, 8, 1, 1, false, 8, false, true>, Ap, Bp, Asp, Bsp,
+                            Yp, M, N, K, KB);
     return;
   }
 
@@ -117,8 +121,8 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Tens
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gk<16, 1, 1, 8, 1, 1, false, 8, true>, Ap, Bp, Asp, Bsp, Yp, M, N,
-                       K, KB);
+    sm120_launch::launch_ex(&config, gk<16, 1, 1, 8, 1, 1, false, 8, true>, Ap, Bp, Asp, Bsp, Yp, M,
+                            N, K, KB);
     return;
   }
 
@@ -138,7 +142,7 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Tens
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gk_m16_n64<2, true, true>, Ap, Bp, Asp, Bsp, Yp);
+    sm120_launch::launch_ex(&config, gk_m16_n64<2, true, true>, Ap, Bp, Asp, Bsp, Yp);
     return;
   }
 
@@ -158,13 +162,14 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Tens
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gk_m16_n64<4, true>, Ap, Bp, Asp, Bsp, Yp);
+    sm120_launch::launch_ex(&config, gk_m16_n64<4, true>, Ap, Bp, Asp, Bsp, Yp);
     return;
   }
 
   if (M == 8 && N == 64 && K == 2048) {
     const dim3 grid(M / 4, 8, 1);
     gk<8, 1, 1, 8, 2, 2, true, 4><<<grid, 256, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);
+    sm120_launch::check_submission();
     return;
   }
 
@@ -258,7 +263,7 @@ void LaunchExactN64Rows1(const uint8_t* A, const uint8_t* B, const float* As, co
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = attrs;
   config.numAttrs = 2;
-  cudaLaunchKernelEx(&config, d26_impl::gk_m16_n64<1, true>, A, B, As, Bs, Y);
+  sm120_launch::launch_ex(&config, d26_impl::gk_m16_n64<1, true>, A, B, As, Bs, Y);
 }
 
 void LaunchExactN64Rows2(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
@@ -277,7 +282,7 @@ void LaunchExactN64Rows2(const uint8_t* A, const uint8_t* B, const float* As, co
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = attrs;
   config.numAttrs = 2;
-  cudaLaunchKernelEx(&config, d26_impl::gk_m16_n64<2, true, true>, A, B, As, Bs, Y);
+  sm120_launch::launch_ex(&config, d26_impl::gk_m16_n64<2, true, true>, A, B, As, Bs, Y);
 }
 
 void RunD26(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,

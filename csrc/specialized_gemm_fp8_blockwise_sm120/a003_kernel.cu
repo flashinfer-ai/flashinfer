@@ -7,11 +7,16 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/a003_kernel.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
-#define LAUNCH(Wv, MRv, SPv, K1)       \
-  gemm_fp8_bw_kernel<Wv, MRv, SPv, K1> \
-      <<<grid, Wv * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, mm, N, K, KB)
+#define LAUNCH(Wv, MRv, SPv, K1)                                            \
+  do {                                                                      \
+    gemm_fp8_bw_kernel<Wv, MRv, SPv, K1>                                    \
+        <<<grid, Wv * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, mm, N, K, KB); \
+    sm120_launch::check_submission();                                       \
+  } while (0)
 
 #define DISP_SP(Wv, MRv, K1)      \
   do {                            \
@@ -88,6 +93,7 @@ void RunSpecial(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::T
     const dim3 grid((N + 7) >> 3, 1, 1);
     gemm_fp8_bw_kernel<4, 16, false, 0, true, true>
         <<<grid, 128, 0, stream>>>(Abase, Bp, Asbase, Bsp, Ybase, M, N, K, KB);
+    sm120_launch::check_submission();
     return;
   }
 
@@ -95,6 +101,7 @@ void RunSpecial(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::T
     const dim3 grid((N + 7) >> 3, 1, 1);
     gemm_fp8_bw_kernel<4, 16, false, 0, true>
         <<<grid, 128, 0, stream>>>(Abase, Bp, Asbase, Bsp, Ybase, M, N, K, KB);
+    sm120_launch::check_submission();
     return;
   }
 

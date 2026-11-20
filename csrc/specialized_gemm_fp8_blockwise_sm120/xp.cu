@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/xp.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 namespace xp_impl {  // reopened; the device code is in the header
@@ -19,6 +21,7 @@ namespace xp_impl {  // reopened; the device code is in the header
     const dim3 grid((SWAPv) ? mc : nt, (SWAPv) ? nt : mc, 1);                 \
     xpk<NWv, NWNv, NTv, MRv, KIv, MINBv, SWAPv, WTv>                          \
         <<<grid, (NWv) * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB); \
+    sm120_launch::check_submission();                                         \
     return;                                                                   \
   } while (0)
 
@@ -65,8 +68,8 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Tens
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, xpk<16, 2, 1, 16, 2, 1, false, false>, Ap, Bp, Asp, Bsp, Yp, M, N,
-                       K, KB);
+    sm120_launch::launch_ex(&config, xpk<16, 2, 1, 16, 2, 1, false, false>, Ap, Bp, Asp, Bsp, Yp, M,
+                            N, K, KB);
     return;
   }
   if (K == 2048) {

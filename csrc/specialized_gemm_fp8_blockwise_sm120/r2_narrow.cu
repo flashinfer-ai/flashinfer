@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/r2_narrow.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
@@ -40,10 +42,10 @@ void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::
   // The paired path wins at two and eight live rows; four rows remains on the
   // lean path after an isolated A/B was flat.
   if (M == 2 || M == 4 || M == 8) {
-    cudaLaunchKernelEx(&config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2, true, true>, Ap,
-                       Bp, Asp, Bsp, Yp, M, N, K, KB);
+    sm120_launch::launch_ex(&config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2, true, true>,
+                            Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);
   } else {
-    cudaLaunchKernelEx(&config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2>, Ap, Bp, Asp, Bsp,
-                       Yp, M, N, K, KB);
+    sm120_launch::launch_ex(&config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2>, Ap, Bp, Asp,
+                            Bsp, Yp, M, N, K, KB);
   }
 }

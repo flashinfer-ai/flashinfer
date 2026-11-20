@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/fx103.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
@@ -38,6 +40,6 @@ void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::Ten
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = attrs;
   config.numAttrs = 2;
-  cudaLaunchKernelEx(&config, fx103::fxk<2, 16, 2, 16, 1, 2, 1, true>, Ap, Bp, Asp, Bsp, Yp, M, N,
-                     K, KB);
+  sm120_launch::launch_ex(&config, fx103::fxk<2, 16, 2, 16, 1, 2, 1, true>, Ap, Bp, Asp, Bsp, Yp, M,
+                          N, K, KB);
 }

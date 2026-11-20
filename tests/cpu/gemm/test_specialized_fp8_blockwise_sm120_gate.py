@@ -141,3 +141,40 @@ def test_gate_refuses_out_overlapping_an_input():
             a, b, a_scale, b_scale, "K", (1, 128, 128), out=disjoint, out_dtype=None
         )
     assert ("specialized", "layout:out_overlaps_input") not in spec.fallback_reasons
+
+
+@pytest.mark.cpu_only
+def test_failed_build_is_shared_without_retaining_build_frames(monkeypatch):
+    import gc
+    import weakref
+
+    refs = []
+
+    class BuildLocal:
+        pass
+
+    class BrokenSpec:
+        def build_and_load(self):
+            local = BuildLocal()
+            refs.append(weakref.ref(local))
+            try:
+                raise OSError("no nvcc")
+            except OSError as exc:
+                raise RuntimeError("build failed") from exc
+
+    monkeypatch.setattr(spec, "_module", None)
+    monkeypatch.setattr(spec, "_module_failure", None)
+    monkeypatch.setattr(
+        spec, "gen_specialized_gemm_fp8_blockwise_sm120_module", BrokenSpec
+    )
+    monkeypatch.setattr(spec, "is_specialized_supported", lambda *args: True)
+    for m, n in ((4, 64), (8, 1024), (4, 64)):
+        assert not spec.check_specialized_requirement(
+            *_valid_cpu_contract(m=m, n=n), backend="auto"
+        )
+        assert _last_reason() == "module_unavailable:RuntimeError"
+    with pytest.raises(RuntimeError, match="build failed"):
+        spec.get_specialized_gemm_fp8_blockwise_sm120_module()
+    gc.collect()
+    assert len(refs) == 1
+    assert refs[0]() is None

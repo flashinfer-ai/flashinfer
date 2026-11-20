@@ -35,6 +35,7 @@ range. Autotune mode falls back.
 import functools
 import json
 import os
+import threading
 from collections import Counter, deque
 from pathlib import Path
 from typing import Set, Tuple
@@ -74,12 +75,32 @@ dispatch_stats: Counter = Counter()
 _warmed: Set[Tuple[int, int, int, int]] = set()
 
 
-@functools.cache
+_module_lock = threading.Lock()
+_module = None
+_module_failure = None  # (exception name, diagnostic), never an exception or traceback
+
+
+class _ModuleUnavailable(RuntimeError):
+    def __init__(self, kind, detail):
+        super().__init__(f"SM120 specialized GEMM module unavailable: {kind}: {detail}")
+        self.kind = kind
+
+
 def get_specialized_gemm_fp8_blockwise_sm120_module():
-    # The JIT spec lives with its siblings in flashinfer/jit/gemm/ and is
-    # registered in flashinfer/aot.py (exact sm_120a target), so jit-cache
-    # installs carry a prebuilt copy instead of compiling on first call.
-    return gen_specialized_gemm_fp8_blockwise_sm120_module().build_and_load()
+    global _module, _module_failure
+    if _module is not None:
+        return _module
+    with _module_lock:
+        if _module is None and _module_failure is None:
+            try:
+                _module = (
+                    gen_specialized_gemm_fp8_blockwise_sm120_module().build_and_load()
+                )
+            except Exception as exc:  # build/load only; do not cache launch failures
+                _module_failure = (type(exc).__name__, str(exc)[-2048:])
+        if _module_failure is not None:
+            raise _ModuleUnavailable(*_module_failure)
+        return _module
 
 
 @functools.cache
@@ -234,8 +255,8 @@ def run_composable_fallback(
     scale_major_mode=None,
     scale_granularity_mnk=(1, 128, 128),
 ) -> torch.Tensor:
-    """Composable torch path (dequant + matmul) for an EXPLICIT
-    ``backend="specialized"`` call the kernel cannot serve. Correct for any
+    """Composable torch path for a declined explicit specialized call or
+    an auto N=64 call with no eligible fused implementation. Correct for any
     shape (including 128-unaligned N), either scale layout, and any scale
     granularity; not performance-tuned."""
     M, K = a.shape
@@ -316,8 +337,7 @@ def check_specialized_requirement(
     try:
         get_specialized_gemm_fp8_blockwise_sm120_module()
     except Exception as e:  # noqa: BLE001 - any build/load failure falls back
-        fallback_reasons.append(
-            ("specialized", f"module_unavailable:{type(e).__name__}")
-        )
+        kind = e.kind if isinstance(e, _ModuleUnavailable) else type(e).__name__
+        fallback_reasons.append(("specialized", f"module_unavailable:{kind}"))
         return False
     return True

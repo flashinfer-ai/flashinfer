@@ -27,7 +27,7 @@
 
 namespace r2_narrow {
 
-#define MMA16832(d, a0, a1, a2, a3, b0, b1)                     \
+#define FLASHINFER_SM120_R2_MMA(d, a0, a1, a2, a3, b0, b1)      \
   asm volatile(                                                 \
       "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
@@ -150,7 +150,7 @@ __global__ void __launch_bounds__(W * 32)
           const uint32_t a0 = F0.v[2 * j], a2 = F0.v[2 * j + 1];
           const uint32_t a1 = (HH == 2) ? F1.v[2 * j] : z;
           const uint32_t a3 = (HH == 2) ? F1.v[2 * j + 1] : z;
-          MMA16832(d, a0, a1, a2, a3, bf[i].v[2 * j], bf[i].v[2 * j + 1]);
+          FLASHINFER_SM120_R2_MMA(d, a0, a1, a2, a3, bf[i].v[2 * j], bf[i].v[2 * j + 1]);
         }
         const int b = (t * NT + i) * ACT;
         acc[b + 0] += sc[t * HH] * d[0];
@@ -296,5 +296,7 @@ __global__ void __launch_bounds__(W * 32)
     }
   }
 }
+
+#undef FLASHINFER_SM120_R2_MMA
 
 }  // namespace r2_narrow

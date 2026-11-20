@@ -7,6 +7,8 @@
 
 #include <flashinfer/gemm/specialized_gemm_fp8_blockwise_sm120/peer_kernel.cuh>
 
+#include "launch_status.h"
+
 namespace ffi = tvm::ffi;
 
 namespace peer_impl {  // reopened; the device code is in the header
@@ -17,6 +19,7 @@ namespace peer_impl {  // reopened; the device code is in the header
                     (unsigned)((M + MRv - 1) / MRv), 1);                    \
     gk<NWv, NWNv, NTv, MRv, KIv, MINBv>                                     \
         <<<grid, NWv * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB); \
+    sm120_launch::check_submission();                                       \
     return;                                                                 \
   } while (0)
 
@@ -69,7 +72,7 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gk<16, 2, 2, 16, 4, 1>, Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);
+    sm120_launch::launch_ex(&config, gk<16, 2, 2, 16, 4, 1>, Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);
     return;
   }
 

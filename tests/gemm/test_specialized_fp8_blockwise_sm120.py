@@ -282,10 +282,7 @@ def test_kill_switch_disables_backend(stock_sentinel, monkeypatch):
     from flashinfer.gemm import specialized_fp8_blockwise_sm120 as specmod
 
     monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
-    # Stock-routing assertion on an aligned-N class: the stock cutlass
-    # groupwise checker rejects 128-unaligned N on SM120 (#9555), so an N=64
-    # auto call with the kill switch set raises BackendSupportedError before
-    # it could reach the sentinel.
+    # Stock-routing assertion on an aligned-N class; CUTLASS rejects N=64.
     a, b, a_scale, b_scale = _gen_inputs(4, 1024, 2048, seed=47)
     with pytest.raises(stock_sentinel):
         _call(a, b, a_scale, b_scale, backend="auto")
@@ -368,6 +365,62 @@ def test_capture_guard_is_keyed_by_exact_m(monkeypatch):
         )
     finally:
         specmod._warmed |= snapshot
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["autotune_mode", "module_unavailable:OSError", "capture:unwarmed", "kill_switch"],
+)
+def test_unaligned_auto_decline_matches_oracle(monkeypatch, stock_sentinel, reason):
+    from flashinfer import autotune
+    from flashinfer.gemm import specialized_fp8_blockwise_sm120 as spec
+
+    args = _gen_inputs(4, 64, 2048, seed=912)
+    out = _nan_out(4, 64)
+    ref = _reference(*args)
+    monkeypatch.setattr(spec, "_warmed", set())
+    monkeypatch.delenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", raising=False)
+    attempts = []
+
+    def no_module():
+        attempts.append(1)
+        raise OSError("injected missing compiler")
+
+    monkeypatch.setattr(spec, "_module", None)
+    monkeypatch.setattr(spec, "_module_failure", None)
+    monkeypatch.setattr(
+        spec, "gen_specialized_gemm_fp8_blockwise_sm120_module", no_module
+    )
+    before = spec.dispatch_stats["specialized_composable_fallback"]
+    if reason == "autotune_mode":
+        with autotune():
+            result = _call(*args, backend="auto", out=out)
+    elif reason == "capture:unwarmed":
+        # Initialize torch/cuBLAS on the capture stream without warming a
+        # specialized shape. Poison the output again before graph replay.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _reference(*args)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result = _call(*args, backend="auto", out=out)
+        args[2].mul_(2)
+        ref = _reference(*args)
+        out.fill_(float("nan"))
+        graph.replay()
+    else:
+        if reason == "kill_switch":
+            monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
+        result = _call(*args, backend="auto", out=out)
+    assert result is out
+    assert spec.fallback_reasons[-1] == ("specialized", reason)
+    assert len(attempts) == int(reason.startswith("module_unavailable"))
+    assert spec.dispatch_stats["specialized_composable_fallback"] == before + 1
+    assert _rel(out, ref) < REL_TOL
+    with pytest.raises(RuntimeError, match="multiple of 128"):
+        _call(*args, backend="cutlass", out=out)
 
 
 def test_cuda_graph_replay_matches_eager():
