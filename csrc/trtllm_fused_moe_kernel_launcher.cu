@@ -1035,6 +1035,9 @@ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_
 }
 
 inline ActivationType validateAndCastActivationType(int64_t act_type) {
+  if (act_type == static_cast<int64_t>(ActivationType::ClampedRelu2)) {
+    return ActivationType::ClampedRelu2;
+  }
   TVM_FFI_ICHECK(act_type >= 0 && act_type < static_cast<int64_t>(ActivationType::InvalidType))
       << "Invalid activation type: " << act_type;
   return static_cast<ActivationType>(act_type);
@@ -1063,6 +1066,14 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
+  if (activation_type == ActivationType::ClampedRelu2) {
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+        << "TRTLLM ClampedRelu2 requires MXFP8.";
+    TVM_FFI_ICHECK(gemm1_clamp_limit.has_value()) << "ClampedRelu2 requires gemm1_clamp_limit.";
+    TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+        << "ClampedRelu2 accepts gemm1_clamp_limit only.";
+    return;
+  }
   validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
   TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
                  quantization_type == Fp8QuantizationType::MxFp8)
@@ -1716,6 +1727,12 @@ class FusedMoeLauncher {
   }
 
   void check_moe_common(bool allow_bias_with_none_type = false) const {
+    TVM_FFI_ICHECK(
+        activation_type != ActivationType::ClampedRelu2 ||
+        (((mDtypeAct == btg::Dtype::MxE4m3 && mDtypeWeights == btg::Dtype::MxE4m3) ||
+          (mDtypeAct == btg::Dtype::Bfloat16 && mDtypeWeights == btg::Dtype::Bfloat16)) &&
+         !args->mUseDeepSeekFp8))
+        << "TRTLLM ClampedRelu2 requires BF16 or MXFP8.";
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
     check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
@@ -2126,7 +2143,11 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
     check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
     validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
-    if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
+    if (activation_type == ActivationType::ClampedRelu2) {
+      TVM_FFI_ICHECK(gemm1_clamp_limit.has_value()) << "ClampedRelu2 requires gemm1_clamp_limit.";
+      TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+          << "ClampedRelu2 accepts gemm1_clamp_limit only.";
+    } else if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
       TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
                      activation_type == ActivationType::SwigluStep)
           << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
@@ -2281,6 +2302,8 @@ class StagedMoeLauncher : public FusedMoeLauncher {
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
             bool norm_topk_prob = true) {
+    TVM_FFI_ICHECK(activation_type != ActivationType::ClampedRelu2)
+        << "Staged MoE does not support ClampedRelu2: no gemm1_clamp_limit input.";
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
                                   use_shuffled_weight, weight_layout, activation_type,
                                   gemm1_bias_type, norm_topk_prob);
@@ -3575,6 +3598,8 @@ void trtllm_moe_run_deepseek_fp8_activation(
     TensorView activation_output_scale, TensorView expanded_idx_to_permuted_idx,
     TensorView total_num_padded_tokens, int64_t num_tokens, int64_t top_k,
     int64_t intermediate_size, int64_t activation_type, bool enable_pdl, int64_t sf_block_size) {
+  TVM_FFI_ICHECK(activation_type != static_cast<int64_t>(ActivationType::ClampedRelu2))
+      << "Standalone DeepSeek FP8 activation does not support ClampedRelu2.";
   TVM_FFI_ICHECK(sf_block_size == 128 || sf_block_size == 32)
       << "DeepSeek FP8 activation: sf_block_size must be 128 or 32.";
   TVM_FFI_ICHECK_EQ(intermediate_size % sf_block_size, 0)
