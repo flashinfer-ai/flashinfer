@@ -3536,13 +3536,14 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
     Wraps ``trtllm_mla_blackwell_decode``, the route ``backend="cake"`` takes for
     its generated dimension tuples, over the functional tuner inputs
     ``[query, block_tables, seq_lens, out]``. The route picks its program on the
-    host. It is the second candidate of the second selection stage
-    (``_MLA_CAKE_MARGIN_OP``), after ``_MlaStageOneWinnerRunner``, which replays
-    the runner and tactic the first stage (the TRTLLM-GEN / CuTe DSL selection,
-    unchanged) chose. Its single tactic per profile names that first-stage
-    winner, ``(runner class name, tactic)``: the profile offers it only when the
-    first stage holds a winner there, and a cached Cake choice is valid only
-    while the first stage still selects the winner it beat. An untuned call or a
+    host. It is a candidate of the second selection stage
+    (``_MLA_CAKE_MARGIN_OP``), enumerated before ``_MlaStageOneWinnerRunner``
+    (see ``_mla_cake_stage_two_runners``), which replays the runner and tactic
+    the first stage (the TRTLLM-GEN / CuTe DSL selection, unchanged) chose. Its
+    single tactic per profile names that first-stage winner, ``(runner class
+    name, tactic)``: the profile offers it only when the first stage holds a
+    winner there, and a cached Cake choice is valid only while the first stage
+    still selects the winner it beat or tied. An untuned call or a
     cache miss never selects it.
 
     The route runs with ``stateless=True``: like the other candidates it reads
@@ -4149,21 +4150,6 @@ class _MlaStageOneWinnerRunner(TunableRunner):
         return hash(type(self))
 
 
-# Launches per cold-L2 sample of the second stage. One cold graph replay of a
-# microsecond decode kernel measures mostly launch latency, quantized to the
-# event timer's step, so the first-stage winner and Cake often measure the same
-# and the incumbent keeps the tie. A chain of launches, each on its own query
-# and output lane, is reported per launch. Only the first launch follows the
-# L2 flush: the KV cache and workspace (held by the runners) and block_tables
-# and seq_lens are not laned, so the later launches read them from L2 when
-# they fit there, and a chained sample of a small KV cache is closer to a
-# warm-KV time than to the cold single replay of the first stage.
-_MLA_CAKE_MARGIN_CHAIN_LAUNCHES = 8
-# The second stage's profile-arena inputs: query and out. block_tables,
-# seq_lens and the optional fifth tensor are read-only and keep one pointer.
-_MLA_CAKE_MARGIN_ARENA_INPUTS = (0, 3)
-
-
 @functools.lru_cache(maxsize=256)
 def _mla_cake_margin_tuning_config(
     config: TuningConfig, batch_ranges: Tuple[Tuple[int, int], ...]
@@ -4173,12 +4159,6 @@ def _mla_cake_margin_tuning_config(
     bounds its profile's batches (no candidate offers a tactic there, so it
     is not timed). Its batch mapping, and so every cache key, is the first
     stage's. ``None`` when no bucket is within the ranges.
-
-    Each cold-L2 sample times a chain of ``_MLA_CAKE_MARGIN_CHAIN_LAUNCHES``
-    launches on query and output lanes of the profile arena, reported per
-    launch (``TuningConfig.cold_chain_launches``); the first stage keeps its
-    single cold replay. The second stage's persisted measurement policy is
-    therefore ``cold-chain:N``.
 
     ``autotune(tuning_buckets=...)`` replaces the generated buckets with its
     own; the candidates then still offer tactics only in the offered buckets,
@@ -4197,8 +4177,6 @@ def _mla_cake_margin_tuning_config(
             replace(spec, gen_tuning_buckets=tuple(sorted(kept))),
             *others,
         ),
-        cold_chain_launches=_MLA_CAKE_MARGIN_CHAIN_LAUNCHES,
-        profile_arena_input_indices=_MLA_CAKE_MARGIN_ARENA_INPUTS,
     )
 
 
@@ -4321,6 +4299,33 @@ def _cake_mla_families_ready(families: frozenset, device: torch.device, lut) -> 
     )
 
 
+def _mla_cake_stage_two_runners(
+    tuner: AutoTuner,
+    incumbent: _MlaStageOneWinnerRunner,
+    cake: _CakeTrtllmMlaBlackwellRunner,
+) -> List[TunableRunner]:
+    """The second stage's candidates in enumeration order: Cake first, so an
+    exact tie with the first stage's winner selects Cake (the tuner keeps the
+    first of equal times); a strictly faster first-stage winner still wins.
+
+    Only offered units reach the second stage, and the offer table admits a
+    unit only where Cake measured a median of at most 0.98 and every round at
+    most 1.00 of the best other candidate. The tuner's single cold replay
+    quantizes a microsecond decode kernel to steps of about 2 us, so a tie in
+    an offered unit is the timer's resolution, not evidence that the first
+    stage's winner is faster. Under ``autotune(tie_tolerance=...)`` Cake is
+    likewise kept within the tolerance once its re-timing confirms it.
+
+    Inside an ``autotune_v2`` context the first candidate also races the
+    default tactic ``-1``, the not-tuned path, which for the second stage is
+    the first stage's selection; there the first-stage winner stays first (an
+    exact tie keeps it). The order decides no cache key, and every consumer
+    identifies Cake by the runner object, never by its position."""
+    if tuner._in_v2_context:
+        return [incumbent, cake]
+    return [cake, incumbent]
+
+
 def _mla_cake_stage_two(
     tuner: AutoTuner,
     runners: List[TunableRunner],
@@ -4335,10 +4340,10 @@ def _mla_cake_stage_two(
     memoizable: Optional[List[Optional[tuple]]] = None,
     memo_state: Optional[tuple] = None,
 ) -> Tuple[TunableRunner, Any]:
-    """The second selection stage: Cake when it beat the first stage's winner
-    for this call's bucket and launches now, else ``selected``, the first
-    stage's runner and tactic (also on every Cake miss, and when tuning the
-    second stage fails).
+    """The second selection stage: Cake when it beat or tied the first stage's
+    winner for this call's bucket (``_mla_cake_stage_two_runners``) and
+    launches now, else ``selected``, the first stage's runner and tactic (also
+    on every Cake miss, and when tuning the second stage fails).
 
     While tuning outside stream capture it times the buckets within
     ``batch_ranges``; otherwise, and during capture, it only looks up. The
@@ -4406,8 +4411,7 @@ def _mla_cake_stage_two(
     if not isinstance(cake, _CakeTrtllmMlaBlackwellRunner):
         cake = cake()
     # autotune(round_up=True) rebuilds the batch mapping from the profiled
-    # buckets, so the second stage then uses the first stage's config (its
-    # buckets and its single cold replay).
+    # buckets, so the second stage then generates the first stage's buckets.
     config = (
         tuning_config
         if tuner._override_round_up
@@ -4420,7 +4424,7 @@ def _mla_cake_stage_two(
         return selected
     incumbent = _MlaStageOneWinnerRunner(runners, tuning_config, inputs, cake)
     cake._incumbent = incumbent
-    pair: List[TunableRunner] = [incumbent, cake]
+    pair = _mla_cake_stage_two_runners(tuner, incumbent, cake)
     if not lookup_only:
         from ..autotuner.autotuner import _StickyCudaError, _TuningGroupError
 
@@ -5459,7 +5463,8 @@ def _mla_with_kv_cache_impl(
     listed batch reuses that result, see below). The second stage, the op
     ``"trtllm_batch_decode_mla_cake_margin"``, compares that winner with Cake per
     tuning bucket, under the same ``autotune()`` settings including
-    ``tie_tolerance``; it profiles Cake only against a first-stage winner, and a
+    ``tie_tolerance``, and keeps Cake at an exact tie (outside ``autotune_v2``
+    contexts); it profiles Cake only against a first-stage winner, and a
     Cake result is valid only while the first stage keeps the winner Cake beat.
     The second stage runs only for the units the device's offer table
     (``_CAKE_MLA_AUTO_OFFERS``: device, dtype, page size, ``q_len``,
