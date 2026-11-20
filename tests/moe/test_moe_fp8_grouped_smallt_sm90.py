@@ -618,16 +618,36 @@ def test_workspace_planner_bounds_and_layout():
             plan(*dims)
 
 
-def test_independent_graph_captures_get_distinct_scratch():
+def _trace_capture_scratch(monkeypatch):
+    """Observe addresses, never retain the scratch tensor or its storage."""
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    native = smallt._get_module()
+    addresses = []
+
+    class Traced:
+        plan_workspace_bytes = staticmethod(native.plan_workspace_bytes)
+
+        @staticmethod
+        def run(*args):
+            if torch.cuda.is_current_stream_capturing():
+                addresses.append(args[-1].data_ptr())
+            return native.run(*args)
+
+    monkeypatch.setattr(smallt, "_module", Traced())
+    return addresses
+
+
+@pytest.mark.parametrize("legacy_share", [False, True])
+def test_independent_graph_captures_get_distinct_scratch(monkeypatch, legacy_share):
     # Regression (Codex, H100-reproduced): torch.cuda.graph reuses one
     # default capture stream for every capture in the process, so keying
     # graph scratch by (device, capture stream) handed two INDEPENDENT
-    # graphs the same buffer — each correct in isolation, 42-58/100 trials
-    # corrupted under concurrent replay. Ownership is per capture now
-    # (CUDA capture-sequence id); sharing is only by explicit opt-in
-    # (FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE=1).
+    # graphs the same buffer.
     _sm90_or_skip()
-    import flashinfer.fused_moe.smallt_sm90 as smallt
+    if legacy_share:
+        monkeypatch.setenv("FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE", "1")
+    addresses = _trace_capture_scratch(monkeypatch)
 
     device = torch.device("cuda:0")
     T = 16
@@ -649,12 +669,10 @@ def test_independent_graph_captures_get_distinct_scratch():
             assert _dispatch(b, output=out) is not None
         return g
 
-    before = set(smallt._graph_workspaces)
     g1 = capture(b1, out1)
     g2 = capture(b2, out2)
-    new_ws = [v for k, v in smallt._graph_workspaces.items() if k not in before]
-    assert len(new_ws) == 2, "each independent capture must own its scratch"
-    assert new_ws[0].data_ptr() != new_ws[1].data_ptr()
+    assert len(addresses) == 2
+    assert addresses[0] != addresses[1]
 
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
     for _ in range(100):
@@ -750,7 +768,10 @@ def test_block_peak_small_products_survive(T, w13_value):
     assert rel <= 0.02, (rel, float(out.float().min()), float(ref.min()))
 
 
-def test_fork_join_branches_within_one_capture_get_distinct_scratch():
+@pytest.mark.parametrize("legacy_share", [False, True])
+def test_fork_join_branches_within_one_capture_get_distinct_scratch(
+    monkeypatch, legacy_share
+):
     # Regression (Codex, round 2): keying graph scratch by capture id ALONE
     # aliased parallel fork/join branches recorded on different streams
     # inside one capture — those branches run concurrently at replay (only
@@ -758,7 +779,9 @@ def test_fork_join_branches_within_one_capture_get_distinct_scratch():
     # in forked branches corrupted each other 100/100. Scratch is owned per
     # (capture, capture-time stream) now.
     _sm90_or_skip()
-    import flashinfer.fused_moe.smallt_sm90 as smallt
+    if legacy_share:
+        monkeypatch.setenv("FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE", "1")
+    addresses = _trace_capture_scratch(monkeypatch)
 
     layer1, act1, weights1, _b1 = _unified_layer(16, None, seed=11)
     layer2, act2, weights2, _b2 = _unified_layer(16, None, seed=83)
@@ -776,7 +799,7 @@ def test_fork_join_branches_within_one_capture_get_distinct_scratch():
     torch.cuda.current_stream().wait_stream(sb)
     torch.cuda.synchronize()
 
-    before = set(smallt._graph_workspaces)
+    addresses.clear()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g, stream=sa):
         fork = torch.cuda.Event()
@@ -786,9 +809,8 @@ def test_fork_join_branches_within_one_capture_get_distinct_scratch():
             sb.wait_event(fork)
             out2 = layer2(act2, weights2)  # branch 1, forked stream
         torch.cuda.current_stream().wait_stream(sb)  # join
-    new_ws = [v for k, v in smallt._graph_workspaces.items() if k not in before]
-    assert len(new_ws) == 2, "each forked branch must own its scratch"
-    assert new_ws[0].data_ptr() != new_ws[1].data_ptr()
+    assert len(addresses) == 2
+    assert addresses[0] != addresses[1]
 
     for _ in range(100):
         g.replay()
@@ -824,49 +846,87 @@ def test_nvfp4_4over6_pinned_recipe_rejects_at_config_time():
         )
 
 
-def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
-    # Regression (CodeRabbit): the native run launches on the caller's
-    # current stream, so two streams must not share one cached workspace;
-    # and a workspace replaced by a larger one must be retained, since a
-    # CUDA graph captured earlier may still replay into its address.
+def test_eager_workspace_stream_ordering_and_resize():
     _sm90_or_skip()
-    import flashinfer.fused_moe.smallt_sm90 as smallt
 
     device = torch.device("cuda:0")
-    # start from a clean cache without freeing buffers a captured graph
-    # from an earlier test may still replay into
-    smallt._retired_workspaces.extend(smallt._workspaces.values())
-    smallt._workspaces.clear()
-    _reset_moe_smallt_sm90_stats()
-
     b = _make(4, device)
+    big = _make(256, device)
     ref = _reference(b)
     out_default = _dispatch(b)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         out_side = _dispatch(b)
+    # No wait for the side-stream kernel before requesting grouped scratch.
+    out_big = _dispatch(big)
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     stats = _moe_smallt_sm90_stats()
-    assert stats["runs_dispatched"] == 2, stats
-    assert stats["workspace_allocs"] == 2, stats  # one per (device, stream)
-    assert len(smallt._workspaces) == 2
+    assert stats["runs_dispatched"] == 3, stats
+    assert stats["workspace_allocs"] == 3, stats
     for y in (out_default, out_side):
         ts, l2 = _gate(y, ref)
         assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
-    # growing the default stream's workspace (band-2 capacity) retires the
-    # old buffer instead of dropping the only reference to it
-    retired_before = len(smallt._retired_workspaces)
-    big = _make(256, device)
-    out_big = _dispatch(big)
-    stats = _moe_smallt_sm90_stats()
-    assert stats["runs_dispatched"] == 3, stats
-    assert stats["workspace_allocs"] == 3, stats
-    assert len(smallt._retired_workspaces) == retired_before + 1
     ts, l2 = _gate(out_big, _reference(big))
     assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+
+
+@pytest.mark.parametrize("timed", [False, True], ids=["public-graph", "candidate"])
+def test_transient_graph_scratch_plateaus(timed):
+    import gc
+
+    from flashinfer.testing.utils import bench_gpu_time
+
+    _sm90_or_skip()
+    layer, act, weights, _ = _unified_layer(256, tune_max=256)
+    (runner,) = layer.runners
+    eager = layer(act, weights).clone()
+
+    def candidate():
+        inputs = runner.pack_inputs(act, weights)
+        return runner.forward(inputs, tactic=-1, **runner.launch_kwargs_for(inputs))
+
+    def cycle():
+        before = _moe_smallt_sm90_stats()["runs_dispatched_capturing"]
+        if timed:
+            bench_gpu_time(
+                candidate, dry_run_iters=5, repeat_iters=30, use_cuda_graph=True
+            )
+        else:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                out = layer(act, weights)
+            out.zero_()
+            g.replay()
+            assert torch.equal(out, eager)
+            g.reset()
+        assert _moe_smallt_sm90_stats()["runs_dispatched_capturing"] > before
+
+    samples = []
+    for _ in range(4):
+        cycle()
+        torch.cuda.synchronize()
+        gc.collect()
+        samples.append(torch.cuda.memory_allocated(eager.device))
+    # Allow incidental small allocations, not another ~90 MiB band buffer.
+    assert max(samples[1:]) <= samples[0] + (1 << 20), samples
+
+
+def test_sequential_grouped_calls_reuse_capture_scratch(monkeypatch):
+    _sm90_or_skip()
+    b = _make(256, torch.device("cuda"))
+    eager = _dispatch(b)
+    out = torch.empty_like(eager)
+    addresses = _trace_capture_scratch(monkeypatch)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(8):
+            assert _dispatch(b, output=out) is out
+    assert len(addresses) == 8 and len(set(addresses)) == 1
+    g.replay()
+    assert torch.equal(out, eager)
 
 
 # --------------------------------------------------------------------------
@@ -1084,3 +1144,63 @@ def test_unified_override_views_route_to_stock():
     assert _moe_smallt_sm90_stats()["runs_dispatched"] > 0
     ts, l2 = _gate(out2, _reference(b))
     assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
+
+
+def test_disabled_constructor_defers_real_jit_until_eager(monkeypatch):
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+    import flashinfer.jit.moe_fp8_grouped_smallt_sm90 as recipe
+
+    generate = recipe.gen_moe_fp8_grouped_smallt_sm90_module
+    calls = []
+
+    def observed():
+        calls.append(None)
+        return generate()
+
+    monkeypatch.setattr(recipe, "gen_moe_fp8_grouped_smallt_sm90_module", observed)
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    layer, act, weights, _ = _unified_layer(4)
+    assert not calls and smallt._module is None
+    monkeypatch.delenv(DISABLE_ENV)
+    out = layer(act, weights)
+    torch.cuda.synchronize()
+    assert len(calls) == 1 and smallt._module is not None
+    assert torch.isfinite(out).all()
+
+
+def test_cold_capture_on_input_device_with_other_device_current(monkeypatch):
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires a second CUDA device")
+    if torch.cuda.get_device_capability(1) != (9, 0):
+        pytest.skip("requires SM90 on the second device")
+    b = _make(4, torch.device("cuda:1"))
+    torch.cuda.synchronize(1)
+    monkeypatch.setattr(smallt, "_module", None)
+
+    def forbidden():
+        raise AssertionError("cold capture must not load or compile a module")
+
+    monkeypatch.setattr(smallt, "_get_module", forbidden)
+    previous = torch.cuda.current_device()
+    try:
+        with torch.cuda.device(1):
+            stream = torch.cuda.Stream()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=stream):
+                b["x"].add_(0)
+                torch.cuda.set_device(0)
+                try:
+                    assert _dispatch(b) is None
+                    assert torch.cuda.current_device() == 0
+                finally:
+                    torch.cuda.set_device(1)
+            g.replay()
+            torch.cuda.synchronize(1)
+    finally:
+        torch.cuda.set_device(previous)

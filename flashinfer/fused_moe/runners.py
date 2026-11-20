@@ -2901,7 +2901,12 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
         # (the dispatch refuses to compile under capture); a failed JIT
         # build rejects the backend here, so MoELayer reports the reason
         # and selects among the remaining candidates.
-        from .smallt_sm90 import _get_module
+        from .smallt_sm90 import _disabled, _get_module
+
+        # Keep the runner registered. Dispatch can load the module on its
+        # first eligible eager call if the switch is subsequently cleared.
+        if _disabled():
+            return
 
         if _get_module() is None:
             from .smallt_sm90 import _module_error
@@ -3046,8 +3051,8 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
         )
         if out is None:
             # _accepts_shape admitted the call, so a decline here is a
-            # call-time state change (kill switch flipped, capture without a
-            # primed workspace, guard mismatch). Raising keeps the backend
+            # call-time state change (kill switch flipped, uncompiled under
+            # capture, guard mismatch). Raising keeps the backend
             # honest: it never serves a call with a different kernel.
             new_reasons = [
                 reason

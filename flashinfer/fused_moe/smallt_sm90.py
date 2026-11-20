@@ -51,21 +51,16 @@ call, so ``MoELayer`` selects among the remaining backends;
 ``FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90=1`` is a deprecated alias
 kept for one release.
 
-The dispatch never allocates on the hot path except the output tensor when
-the caller did not pass one: the intermediate workspace is cached per
-(device, stream) at the serving band's capacity. A CUDA-graph capture
-adopts a primed buffer and takes ownership of it per (capture, stream):
-the CUDA capture-sequence id keeps two independent graphs from sharing
-scratch, and the capture-time stream handle keeps fork/join branches
-inside one capture (which replay concurrently) from sharing it
-(``FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE=1`` opts back into
-per-capture-stream sharing for callers that serialize their replays), and
-the JIT build happens at layer init or on the first eligible call outside
-any CUDA-graph capture (a capture without a built module is declined).
+Scratch is temporary PyTorch storage on the native launch stream. During
+capture the graph pool protects its address for replay; ordered calls can
+reuse storage without retaining a tensor per graph or per warmup stream.
+``FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE`` is a deprecated no-op.
+Serialized graphs can use PyTorch's explicit graph-pool sharing contract.
+A capture without an already-built module is still declined.
 """
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -76,11 +71,6 @@ from ..utils import get_compute_capability
 _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 # Deprecated alias (kept for one release).
 _DISABLE_ENV = "FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90"
-# Explicit opt-in: share ONE graph workspace among every graph captured on
-# the same capture stream (the pre-fix behavior). Only safe when the caller
-# guarantees the graphs never replay concurrently; by default each capture
-# owns its own scratch (see _graph_workspaces).
-_SHARE_GRAPH_WS_ENV = "FLASHINFER_MOE_SMALLT_SHARE_GRAPH_WORKSPACE"
 _MAX_TOKENS = 16  # small-path band cap (measured won rows T=1/4/16)
 # Expansion (measured vs FI's own grouped-fp8 route at contract): the
 # candidate also wins the T=256/1024/4096 classes against FI's stock cutlass
@@ -116,74 +106,13 @@ _counters: Dict[str, int] = {
     "calls_disabled": 0,  # disable switch set
     "calls_ineligible": 0,  # dsfp8 route, but geometry/arguments differ
     "build_failed": 0,  # JIT build/load failed (falls back, logged once)
-    "workspace_allocs": 0,  # per-device workspace (re)allocations
+    "workspace_allocs": 0,  # scratch tensor requests, not driver allocations
     "runs_dispatched": 0,  # specialized kernel launched
     "runs_dispatched_capturing": 0,  # ... of which during CUDA-graph capture
     "runs_capture_unready": 0,  # capturing without a built module: fallback
 }
 _module: Any = None
 _module_error: Optional[str] = None
-# Intermediate workspaces keyed by (device index, CUDA stream handle): the
-# native run launches on the caller's current stream, so two streams sharing
-# one buffer would overwrite each other's intermediates. A CUDA-graph
-# capture adopts the device's largest primed workspace (the torch.cuda.graph
-# warmup pattern primes the cache on the warmup stream) and takes OWNERSHIP
-# of it: the buffer moves to _graph_workspaces and never returns to eager
-# use — a replay is ordered only against work on its own replay stream, so
-# scratch shared with eager calls could be written by two executions
-# concurrently.
-#
-# _graph_workspaces is keyed by (device index, CUDA capture-sequence id,
-# capture-time stream handle): ownership needs BOTH identities.
-#
-# * The capture-sequence id isolates independent graphs: torch.cuda.graph
-#   reuses one default capture stream for every capture in the process, so
-#   a stream-only key would hand two independent graphs (e.g. two MoELayer
-#   instances captured back to back) the same scratch, corrupted under
-#   concurrent replay even with separate output allocations and no shared
-#   graph pool.
-# * The stream handle isolates parallel branches INSIDE one capture: a
-#   CUDA graph may contain fork/join branches (work recorded on different
-#   streams joined into the same capture), and those branches run
-#   concurrently at replay — only work recorded on the SAME stream within
-#   a capture is ordered. Sequential calls on one stream of one capture
-#   therefore share one buffer (an N-layer single-stream model capture
-#   still uses a single buffer), while each forked stream adopts its own.
-#
-# Callers that guarantee their graphs never replay concurrently can opt
-# into per-capture-stream sharing (the pre-fix cross-graph behavior) with
-# _SHARE_GRAPH_WS_ENV=1 to reclaim the per-graph buffers.
-_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
-_graph_workspaces: Dict[Tuple[int, ...], torch.Tensor] = {}
-
-
-def _current_capture_id(device: torch.device) -> Optional[int]:
-    """Unique id of the capture sequence the current stream is recording
-    into, or ``None`` when it cannot be established. ``cudaStreamGetCaptureInfo``
-    is explicitly legal during capture; the id is unique per capture within
-    the process, which is exactly the ownership boundary graph scratch
-    needs (the capture stream is reused across independent captures)."""
-    try:
-        from ..cuda_utils import runtime
-
-        stream = torch.cuda.current_stream(device).cuda_stream
-        res = runtime.cudaStreamGetCaptureInfo(stream)
-        if int(res[0]) != 0:
-            return None
-        status, capture_id = res[1], res[2]
-        if status != runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
-            return None
-        return int(capture_id)
-    except Exception:
-        return None
-
-
-# Workspaces replaced by larger ones are retained for the life of the
-# process: a CUDA graph captured earlier may still replay into the old
-# tensor's address, so releasing it to the allocator would let unrelated
-# allocations alias a buffer a replay still writes. Bounded by the few
-# distinct plan sizes a process uses.
-_retired_workspaces: List[torch.Tensor] = []
 _announced = False
 
 
@@ -445,10 +374,14 @@ def _moe_smallt_sm90_dispatch(
             reason,
         )
         return None
-    capturing = bool(
-        hasattr(torch.cuda, "is_current_stream_capturing")
-        and torch.cuda.is_current_stream_capturing()
-    )
+    # Capture belongs to the input's launch device, which need not be the
+    # current device. In particular a disabled constructor can leave this
+    # module cold until its first eligible eager call.
+    with torch.cuda.device(input.device):
+        capturing = bool(
+            hasattr(torch.cuda, "is_current_stream_capturing")
+            and torch.cuda.is_current_stream_capturing()
+        )
     if capturing and _module is None:
         # never compile inside a capture
         _counters["runs_capture_unready"] += 1
@@ -464,89 +397,10 @@ def _moe_smallt_sm90_dispatch(
     T = input.shape[0]
     KTOP = token_selected_experts.shape[1]
     I = fc2_expert_weights.shape[2]
-    dev_index = (
-        input.device.index
-        if input.device.index is not None
-        else torch.cuda.current_device()
-    )
     H_sz = input.shape[1]
     E_sz = fc1_expert_weights.shape[0]
     band_cap = _MAX_TOKENS if T <= _MAX_TOKENS else _BAND2_HI
     need = int(module.plan_workspace_bytes(band_cap, KTOP, I, H_sz, E_sz))
-    ws_key = (dev_index, torch.cuda.current_stream(input.device).cuda_stream)
-    if capturing:
-        # Scratch ownership boundary: (capture, capture-time stream). The
-        # capture-sequence id isolates independent graphs (torch.cuda.graph
-        # reuses one default capture stream, so a stream-only key aliases
-        # them); the stream handle isolates fork/join branches recorded on
-        # different streams INSIDE one capture, which run concurrently at
-        # replay — only same-stream work within a capture is ordered.
-        # _SHARE_GRAPH_WS_ENV=1 restores per-capture-stream sharing for
-        # callers that explicitly agree to serialize their replays.
-        if os.environ.get(_SHARE_GRAPH_WS_ENV, "") not in ("", "0"):
-            graph_key: Tuple[int, ...] = ws_key
-        else:
-            capture_id = _current_capture_id(input.device)
-            if capture_id is None:
-                _counters["runs_capture_unready"] += 1
-                _fallback("capture id query failed under capture")
-                _backend_dispatches["declined"] += 1
-                return None
-            graph_key = (dev_index, capture_id, ws_key[1])
-        ws = _graph_workspaces.get(graph_key)
-        if ws is not None and (ws.numel() < need or ws.device != input.device):
-            ws = None
-        if ws is None:
-            # Never allocate (or cache) inside a capture: adopt the device's
-            # largest primed eager workspace — the torch.cuda.graph warmup
-            # pattern primes it on the warmup stream — and take ownership:
-            # the buffer leaves the eager cache so no eager call or capture
-            # on another stream can race the graph's replays over it (see
-            # the _graph_workspaces comment).
-            #
-            # ORDERING CONTRACT: adoption covers only work queued AFTER it;
-            # work already queued on the donor stream must have completed
-            # before capture begins. No ordering can be established from
-            # inside an active capture (a stream/device synchronize here
-            # would invalidate the capture, and a wait on an event recorded
-            # outside the capture cannot be recorded into it), so the caller
-            # owns it: torch.cuda.graph's capture entry synchronizes after
-            # its warmup iterations, which quiesces the donor stream and is
-            # the pattern that primes this cache. A capture started while an
-            # eager small-T call is still in flight on another stream is
-            # outside this contract.
-            adopt_key = None
-            for key, cand in _workspaces.items():
-                if (
-                    key[0] == dev_index
-                    and cand.numel() >= need
-                    and (ws is None or cand.numel() > ws.numel())
-                ):
-                    ws, adopt_key = cand, key
-            if ws is None:
-                _counters["runs_capture_unready"] += 1
-                _fallback("workspace alloc under capture")
-                _backend_dispatches["declined"] += 1
-                return None
-            del _workspaces[adopt_key]
-            old = _graph_workspaces.get(graph_key)
-            if old is not None:
-                # an earlier adoption under this key (same capture, or the
-                # shared-stream opt-in) may still be replayed into
-                _retired_workspaces.append(old)
-            _graph_workspaces[graph_key] = ws
-    else:
-        ws = _workspaces.get(ws_key)
-        if ws is not None and (ws.numel() < need or ws.device != input.device):
-            ws = None
-        if ws is None:
-            old = _workspaces.get(ws_key)
-            ws = torch.empty(need, dtype=torch.uint8, device=input.device)
-            if old is not None:
-                # a captured graph may still replay into the old buffer
-                _retired_workspaces.append(old)
-            _workspaces[ws_key] = ws
-            _counters["workspace_allocs"] += 1
 
     ids = token_selected_experts
     if ids.dtype != torch.int32:
@@ -561,6 +415,12 @@ def _moe_smallt_sm90_dispatch(
         out = torch.empty(
             (T, input.shape[1]), dtype=torch.bfloat16, device=input.device
         )
+    # Allocate after the output. All scratch accesses are enqueued by run
+    # on the allocation stream. Same-stream reuse (also after a change of
+    # size) is ordered; no record_stream, donor event or retired list is
+    # needed. In capture the allocator uses the capturing stream's pool.
+    ws = torch.empty(need, dtype=torch.uint8, device=input.device)
+    _counters["workspace_allocs"] += 1
     module.run(
         input,
         fc1_expert_weights,
