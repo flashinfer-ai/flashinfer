@@ -490,10 +490,16 @@ def test_sparse_mla_sm90_in_aot_collection(monkeypatch, enabled):
 
     # Exercise the collector, not the spec generators' local target flags.
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
-    for name in ("spdlog", "mla_swa_sm90", "sparse_mla_sm90", "cudnn_fmha"):
-        monkeypatch.setattr(
-            aot, f"gen_{name}_module", lambda n=name: SimpleNamespace(name=n)
-        )
+    # Main may add other SM90 collectors (for example QSA). Stub every
+    # single-module generator so this registration test never probes the
+    # runner's local architecture through an unrelated generator.
+    for name in vars(aot):
+        if name.startswith("gen_") and name.endswith("_module"):
+            monkeypatch.setattr(
+                aot,
+                name,
+                lambda *args, _name=name, **kwargs: SimpleNamespace(name=_name),
+            )
 
     specs = aot.gen_all_modules(
         [],
@@ -511,7 +517,7 @@ def test_sparse_mla_sm90_in_aot_collection(monkeypatch, enabled):
         False,
         False,
     )
-    assert ("sparse_mla_sm90" in [s.name for s in specs]) == enabled
+    assert ("gen_sparse_mla_sm90_module" in [s.name for s in specs]) == enabled
 
 
 def test_cold_probe_failure_and_retry(monkeypatch):
