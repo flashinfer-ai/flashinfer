@@ -222,3 +222,26 @@ def test_umma_backend_rejects_bad_values():
     """The drop-in validates its backend argument."""
     with pytest.raises(ValueError, match="backend must be"):
         _WY_DROPIN(*([None] * 13), 4, backend="bogus")
+
+
+@pytest.mark.parametrize("T", [1, 8, 16])
+def test_umma_cuda_graph_replay(T):
+    """A captured UMMA launch replays with new input values (in place) and matches
+    eager launches on the same values."""
+    args, kw = _inputs(33, T, 4, 4, "lb", seed=T)
+    _WY_DENSE(*args, **kw, emit_corrections=True, backend="umma")  # compile outside
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(graph, stream=s):
+        outs = _WY_DENSE(*args, **kw, emit_corrections=True, backend="umma")
+    torch.cuda.current_stream().wait_stream(s)
+    for seed in range(3):
+        fresh, _ = _inputs(33, T, 4, 4, "lb", seed=50 + seed)
+        for dst, src in zip(args, fresh, strict=True):
+            dst.copy_(src)
+        graph.replay()
+        ref = _WY_DENSE(*args, **kw, emit_corrections=True, backend="umma")
+        torch.cuda.synchronize()
+        for a, b in zip(outs, ref, strict=True):
+            assert torch.equal(a, b)
