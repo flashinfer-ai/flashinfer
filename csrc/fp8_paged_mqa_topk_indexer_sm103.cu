@@ -24,6 +24,9 @@ struct CheckedLaunch {
 
   void Check(cudaError_t status) const {
     if (status != cudaSuccess) {
+      // Preserve status for the exception, but do not leave a rejected
+      // cudaLaunchKernelEx in this thread's runtime last-error slot.
+      (void)cudaGetLastError();
       if (workspace) cudaFreeAsync(workspace, stream);
       throw std::runtime_error(cudaGetErrorString(status));
     }

@@ -165,6 +165,115 @@ requires_validated_toolkit = pytest.mark.skipif(
 )
 
 
+def _build_launch_fault_module(tmp_path):
+    import shutil
+    from uuid import uuid4
+
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import gen_jit_spec, sm103a_nvcc_flags
+
+    stem = "fp8_paged_mqa_topk_indexer_sm103"
+    src = tmp_path / f"{stem}.cu"
+    shutil.copyfile(jit_env.FLASHINFER_CSRC_DIR / src.name, src)
+    headers = jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer" / "attention" / stem
+    shutil.copytree(headers, tmp_path / stem)
+    text = src.read_text()
+
+    def replace(old, new):
+        nonlocal text
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+
+    for header in ("device.cuh", "device_legacy.cuh"):
+        replace(f"<flashinfer/attention/{stem}/{header}>", f'"{stem}/{header}"')
+    replace(
+        "struct CheckedLaunch {",
+        """// Test-local, on the calling host thread. Stages: 1 score, 2 select, 3 direct.
+thread_local int64_t fault_stage, attempts, frees;
+void ArmFault(int64_t stage) {
+  fault_stage = stage;
+  attempts = frees = 0;
+}
+int64_t Attempts() { return attempts; }
+int64_t Frees() { return frees; }
+int64_t PendingError() { return static_cast<int64_t>(cudaPeekAtLastError()); }
+dim3 DirectGrid(int rows) {
+  attempts = attempts * 10 + 3;
+  return dim3(fault_stage == 3 ? 0 : rows);
+}
+struct CheckedLaunch {""",
+    )
+    replace(
+        "Check(cudaLaunchKernelEx(cfg, kernel, args...));",
+        """auto actual = *cfg;
+    const int stage = actual.numAttrs ? 2 : 1;
+    attempts = attempts * 10 + stage;
+    if (fault_stage == stage) actual.gridDim.x = 0;
+    Check(cudaLaunchKernelEx(&actual, kernel, args...));""",
+    )
+    replace(
+        "if (workspace) cudaFreeAsync(workspace, stream);",
+        "if (workspace && cudaFreeAsync(workspace, stream) == cudaSuccess) ++frees;",
+    )
+    replace(
+        "select_trivial_256<1, 64><<<T, 256, 0, stream>>>(p_cu, p_pos, p_vis, p_out, min_req_nblk);",
+        "select_trivial_256<1, 64><<<DirectGrid(T), 256, 0, stream>>>(p_cu, p_pos, p_vis, p_out, min_req_nblk);",
+    )
+    src.write_text(
+        text
+        + """
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(arm_fault, ArmFault);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(attempts, Attempts);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(frees, Frees);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pending_error, PendingError);
+"""
+    )
+    return gen_jit_spec(
+        f"{stem}_fault_{uuid4().hex}",
+        [src],
+        extra_cuda_cflags=sm103a_nvcc_flags + ["--use_fast_math", "-lineinfo"],
+    ).build_and_load()
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_native_launch_rejection_and_recovery(tmp_path, monkeypatch):
+    mod = _build_launch_fault_module(tmp_path)
+    release = mod.compiled_nvcc_release()
+    assert f"{release >> 32}.{release & 0xFFFFFFFF}" in VALIDATED_CUDA_VERSIONS
+    monkeypatch.setattr(pi, "get_fp8_paged_mqa_topk_indexer_module", lambda: mod)
+    monkeypatch.setattr(pi, "DISPATCH_STATS", pi.DISPATCH_STATS.copy())
+    direct = _make_inputs(122, 1)
+    scored = _make_inputs(2060, 1)
+    # Pad only unused page-table capacity: 33 * 64 > PW forces private ws.
+    scored["cpage_table"] = torch.nn.functional.pad(
+        scored["cpage_table"], (0, 33 - scored["cpage_table"].shape[1])
+    )
+    direct_gold, scored_gold = _reference(direct), _reference(scored)
+    for stage, inp, gold, trace, frees in (
+        (1, scored, scored_gold, 1, 1),
+        (2, scored, scored_gold, 12, 1),
+        (3, direct, direct_gold, 3, 0),
+    ):
+        buf = torch.full_like(gold, -7)
+        torch.cuda.current_stream().synchronize()
+        before = pi.DISPATCH_STATS.copy()
+        mod.arm_fault(stage)
+        with pytest.raises(RuntimeError, match=r"invalid (?:configuration )?argument"):
+            _api(inp, out=buf)
+        assert mod.pending_error() == 0
+        assert (mod.attempts(), mod.frees()) == (trace, frees)
+        assert before == pi.DISPATCH_STATS
+        torch.cuda.current_stream().synchronize()  # retire accepted work and async free
+        assert (buf == -7).all().item()
+
+        mod.arm_fault(0)
+        assert _api(inp, out=buf) is buf
+        assert torch.equal(buf, gold)
+        assert mod.attempts() == (3 if stage == 3 else 12)
+        assert {**before, "specialized": before["specialized"] + 1} == pi.DISPATCH_STATS
+
+
 def test_cuda_130_admitted_with_workaround():
     """CPU-reachable: CUDA 13.0 is a validated toolkit — served through the
     compiled-in unroll-1 workaround for its ptxas optimizer defect (see the
