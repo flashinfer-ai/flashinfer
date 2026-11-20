@@ -46,3 +46,10 @@ and FlashInfer PR #4266 provenance. The fixed-order batched GEMM retains
 code derived from batch_invariant_ops, Copyright 2025 Thinking Machines Lab,
 under the MIT License (licenses/LICENSE.batch-invariant-ops.txt).
 Pinned sources and modifications: flashinfer/experimental/hc_sum_sm100/SOURCES.md.
+
+The persistent block-scaled grouped GEMM of the specialized SM103 FP8 MoE prefill
+path (flashinfer/fused_moe/cute_dsl/blackwell/fp8_block_scale_moe_prefill.py) is
+adapted from the CUTLASS CuTe DSL Blackwell blockwise contiguous grouped GEMM example,
+Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES, under the BSD-3-Clause
+License (licenses/LICENSE.cutlass.txt).
+Source: https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL/blackwell/blockwise_gemm

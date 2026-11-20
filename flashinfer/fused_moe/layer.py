@@ -77,6 +77,7 @@ from .api import (
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
+    SpecializedMoEConfig,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -128,6 +129,7 @@ from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
+from .backends.specialized.runner import SpecializedMoERunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
 from .utils import map_to_hybrid_bucket
@@ -179,6 +181,7 @@ _RunnerT = Union[
     TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    SpecializedMoERunner,
 ]
 
 # Map backend-config class -> runner class
@@ -228,7 +231,16 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
     BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
+    SpecializedMoEConfig: SpecializedMoERunner,
 }
+
+
+def _stream_capturing() -> bool:
+    """Whether the current CUDA stream is capturing a graph."""
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:  # no CUDA in this build
+        return False
 
 
 class NoEligibleBackend(RuntimeError):
@@ -450,8 +462,27 @@ class MoELayer:
         # and prevent changing weight views or shape eligibility from reusing a winner.
         winner_key = (bucket, mode, eligible)
         winner = self._winners.get(winner_key)
+        pool = eligible
+        if winner is None and len(eligible) > 1 and _stream_capturing():
+            # A miss inside a CUDA-graph capture selects without the runners that
+            # serve captured calls only for winners timed eagerly (see
+            # _select_winner). Key that selection by the pool it chose from, never
+            # the full pool: an eager call of this bucket must still select among
+            # every eligible runner.
+            pool = (
+                tuple(
+                    index
+                    for index in eligible
+                    if not getattr(
+                        self.runners[index], "capture_requires_eager_selection", False
+                    )
+                )
+                or eligible
+            )
+            winner_key = (bucket, mode, pool)
+            winner = self._winners.get(winner_key)
         if winner is None:
-            runners = [self.runners[index] for index in eligible]
+            runners = [self.runners[index] for index in pool]
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
             if len(self._winners) > 128:
@@ -576,6 +607,17 @@ class MoELayer:
         best_tactic: Any = -1
         best_inputs: Optional[List[torch.Tensor]] = None
 
+        if len(runners) > 1 and _stream_capturing():
+            # A winner-cache miss inside a CUDA-graph capture, where timing the
+            # candidates (it synchronizes the device) is not allowed. Runners
+            # that serve captured calls only for winners timed eagerly (the
+            # specialized backend) step aside rather than add a timed candidate.
+            runners = [
+                r
+                for r in runners
+                if not getattr(r, "capture_requires_eager_selection", False)
+            ] or runners
+
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
             launch_kwargs = runner.launch_kwargs_for(inputs)
@@ -638,6 +680,12 @@ class MoELayer:
         """Clear all cached per-bucket winners — next call re-tunes."""
         self._winners.clear()
         self._last_winner_backend = None
+        # Runners that admit captured calls only for winners selected eagerly
+        # (the specialized backend) forget those selections with the winners.
+        for runner in self.runners:
+            forget = getattr(runner, "forget_selections", None)
+            if forget is not None:
+                forget()
 
     def refresh_backends(self) -> None:
         """Refresh backend preparation and clear cached winners.
