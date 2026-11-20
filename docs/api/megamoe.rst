@@ -104,8 +104,7 @@ global expert ID and inputs by global token ID. For global token ``t`` and slot
 global expert assignment counts differ by at most one. Routing coefficients
 are generated softmax weights, not the output of a learned router. Inputs use
 FP8 E4M3 values with scale 1/128 per 128 elements; generated MXFP4 weight scale
-bytes are 122 through 124. This is a synthetic balanced fixture, not the
-checkpoint replay or a measured customer routing trace.
+bytes are 122 through 124. Inputs and routing in this fixture are synthetic.
 
 Equal-total-token runs with the same seed therefore use the same global input
 rows, routes, coefficients and source weights across EP partitions. Equal
@@ -206,7 +205,7 @@ one host with eight H20 GPUs::
       m=${mc%:*}; capacity=${mc#*:}
       torchrun --standalone --nproc-per-node=8 benchmarks/bench_megamoe_fp4_sm90.py \
         --shapes flash --tokens "$m" --capacity "$capacity" \
-        --routing balanced --seed 7919 --repeats 2000 --warmup-graphs 10 --rounds 5 \
+        --routing balanced --seed 7919 --repeats 10000 --warmup-graphs 3 --rounds 5 \
         --output "ep8-m${m}.json" --csv "ep8-m${m}.csv"
     done
 
@@ -219,7 +218,7 @@ different ``NODE_RANK`` (0 or 1). Execute the same loop in the same order::
         --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
         benchmarks/bench_megamoe_fp4_sm90.py --shapes flash \
         --tokens "$m" --capacity "$capacity" --routing balanced --seed 7919 \
-        --repeats 2000 --warmup-graphs 10 --rounds 5 \
+        --repeats 10000 --warmup-graphs 3 --rounds 5 \
         --output "ep16-m${m}.json" --csv "ep16-m${m}.csv"
     done
 
@@ -237,6 +236,14 @@ CSV) is the median of the per-sample maximum rank latency.
 ``max_rank_median_us`` is the maximum of the rank-wise medians; these statistics
 are not interchangeable. Input staging and the graph's initial collective gate
 precede the measured events.
+
+The H20 validation profile uses CUDA 13.0, PyTorch 2.13.0+cu130 and NCCL 2.30.7,
+with ``NCCL_GIN_TYPE=2``, ``NCCL_CUMEM_ENABLE=1`` and
+``NCCL_GDRCOPY_ENABLE=0``. Select routable socket interfaces and data HCAs for
+the deployment. Clock requests can be set with ``nvidia-smi -lgc 1740,1740``
+on each host and restored with ``nvidia-smi -rgc``. Record observed clocks and
+power-limit events alongside the request: the GPU can run below the requested
+clock when power limited.
 
 Run the independent dense-reference and repeated CUDA Graph checks with the
 same storage, capacity, seed and ``torchrun`` topology before timing, for example::
